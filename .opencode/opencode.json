@@ -41,6 +41,48 @@
         "external_directory": "deny"
       }
     },
+    "rustynet-edit-full": {
+      "mode": "primary",
+      "description": "Rustynet delegated-edit agent, FULL autonomy. Driven by the ai_edit_run MCP tool inside an isolated git worktree; never run against the shared working tree. Edits without per-change approval, self-verifies with gates, surfaces a diff for human review+merge. Model is passed per-call, not pinned here.",
+      "steps": 250,
+      "permission": {
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "list": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "todowrite": "allow",
+        "task": "deny",
+        "question": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "lsp": "deny",
+        "skill": "deny",
+        "external_directory": "deny"
+      }
+    },
+    "rustynet-edit-restricted": {
+      "mode": "primary",
+      "description": "Rustynet delegated-edit agent, RESTRICTED. Same as rustynet-edit-full except every file mutation pauses for explicit approval from the driving agent (edit=ask, surfaced via ai_edit_result and answered with ai_edit_approve/ai_edit_deny). bash stays allow so investigation/gates don't need per-command sign-off — edit is the action that actually mutates state. Model is passed per-call, not pinned here.",
+      "steps": 120,
+      "permission": {
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "list": "allow",
+        "edit": "ask",
+        "bash": "allow",
+        "todowrite": "allow",
+        "task": "deny",
+        "question": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "lsp": "deny",
+        "skill": "deny",
+        "external_directory": "deny"
+      }
+    },
     "rustynet-loop-main": {
       "model": "deepseek/deepseek-v4-pro",
       "variant": "max",

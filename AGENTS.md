@@ -708,6 +708,86 @@ best-effort one-line summary plus the raw response. Only DeepSeek's is confirmed
 balance checking isn't configured rather than guessing at a URL. Add `balance_url` to a registry
 entry once you've confirmed the right endpoint for another provider.
 
+### 12.6 Delegated Edits — the write-capable tier (OpenCode harness, worktree-isolated)
+
+Everything in §12.5 is read-only or advisory: `ai_agent` inspects, the proxies
+opine on pasted text, `ai_doc_sync` *proposes* edits a human applies. The
+delegated-edit tier is the one exception that actually **writes files** — and it
+is fenced so that an untrusted external model can never touch the real tree.
+
+**Why a different harness.** The read-only research loop (`ai_agent`) is a small
+hand-rolled tool-calling loop, deliberately: its value is a narrow, enumerable,
+read-only tool surface. Editing needs the opposite — multi-file writes, `bash`,
+session state, gate-running. Rather than reimplement a coding agent badly in
+Rust, the edit tier **delegates to OpenCode** (already used by the
+`rustynet-loop-main` loop) driven over its HTTP API. Model routing here is
+OpenCode's own `provider/model` naming (e.g. `deepseek/deepseek-v4-pro`,
+`opencode/deepseek-v4-flash-free`), **not** this server's `LlmProvider` registry
+or `flash`/`pro` shortcuts — two different harnesses, two different model routers.
+
+**The isolation is the whole safety model.** Every `ai_edit_run` job:
+- creates its own **git worktree** under `state/edit-worktrees/<job_id>` on a
+  throwaway branch `ai-edit/<job_id>` (branched from `HEAD`, or `base_ref`);
+- spawns a detached `opencode serve` scoped to that worktree (cwd-scoping is
+  what confines the writes — verified: an agent asked to write a file resolved
+  it inside the worktree, real repo untouched);
+- **never merges the branch back.** No tool does. Reviewing and merging (or
+  discarding) that branch is a human step — that is the actual security
+  checkpoint, and automating it would defeat the isolation. Because the worktree
+  is under gitignored `state/`, the scratch tree can't be committed to `main` by
+  accident either.
+
+**Two tiers, both fully permission-gated in `.opencode/opencode.json`:**
+
+| Agent | `edit` | Use |
+|---|---|---|
+| `rustynet-edit-full` | `allow` | Unattended: edits without per-change approval, self-verifies with gates, hands back a diff. For work you trust the model to run start-to-finish. |
+| `rustynet-edit-restricted` | `ask` | Every file mutation pauses for YOUR approval before it lands. For work you want to supervise edit-by-edit. |
+
+Both keep `bash: allow` (so investigation/gates don't need per-command sign-off —
+`edit` is the mutation that matters) and deny `task`/`webfetch`/`websearch`/
+`lsp`/`skill`/`external_directory`. Note OpenCode has **no separate `write`
+permission**: the one `edit` gate covers both new-file creation and existing-file
+edits (verified — `edit: deny` blocks new files too).
+
+**The four tools:**
+- `ai_edit_run` — launch a job. `task` (required), `mode` (`restricted` default /
+  `full`), `model` (OpenCode `provider/model`, default `deepseek/deepseek-v4-pro`),
+  `base_ref` (default `HEAD`). Async: returns a `job_id`, poll `ai_edit_result`.
+  The worktree checks out `HEAD` — so the edit agent sees **committed** config,
+  including these agent definitions. Uncommitted changes to `.opencode/` are NOT
+  visible to a freshly launched job; commit config changes before relying on them.
+- `ai_edit_result` — poll. States: `launching` (worktree+serve booting) →
+  `running` → (restricted only) `awaiting_approval` (returns the proposed unified
+  diff; answer with approve/deny) → `done` (returns the branch's full diff to
+  review + merge) / `failed` (setup error) / `timed_out`.
+- `ai_edit_approve` — approve the one pending edit; the agent applies it and
+  continues (the *next* edit pauses again).
+- `ai_edit_deny` — reject it; `reason` is fed back to the agent as context and it
+  adjusts (a rejection does NOT kill the job — the session incorporates the
+  feedback and continues, verified live).
+
+**Two watchdogs, because OpenCode has none of its own here.** A pending approval
+in OpenCode never self-expires (its permission API has no timeout field, verified
+against a live server — a pending request sat unanswered indefinitely). So this
+server enforces its own: `ai_edit_result` stamps an approval deadline on first
+observing a pending request and, if the driving agent never answers,
+auto-rejects and marks the job `timed_out` rather than letting it hang for hours
+holding a worktree + serve process. A separate overall wall-clock cap bounds the
+whole job. Both are OUR safety nets, not OpenCode's.
+
+**A finished session disappears from OpenCode's status map** (it reports `busy`
+while working, then omits the session entirely — which is indistinguishable from
+"not started yet"). `ai_edit_result` disambiguates with an `observed_busy` flag +
+a start-grace window, so a poll landing in the gap between launch and first token
+reads as "starting", not "done against an empty diff".
+
+**Worktrees are not auto-removed** (removing one would destroy uncommitted work
+before you review it) — the edit agent is prompted to COMMIT to its branch so the
+diff is durable, but clean up merged/abandoned worktrees yourself with
+`git worktree remove state/edit-worktrees/<job_id>` (the branch ref survives the
+worktree removal for later inspection).
+
 ## 13) Operating Checklists
 
 ### 13.1 Live-Lab Hardening Loop

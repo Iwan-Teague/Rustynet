@@ -413,6 +413,43 @@ const DEEPSEEK_JOBS_SUBDIR: &str = "state/deepseek-mcp-jobs";
 /// the in-memory worker that was waiting on it died.
 const ORCHESTRATE_RESULT_REL: &str = "orchestration/orchestrate_result.json";
 
+// ── Delegated-edit (OpenCode-harness) constants ──────────────────────────────
+//
+// The read-only research agent above (`run_grounded`) is a hand-rolled
+// tool-calling loop, deliberately: its whole value is a NARROW, enumerable,
+// read-only tool surface. The delegated-EDIT tier below is the opposite shape —
+// it needs multi-file edits, bash, and session state — so it delegates to
+// OpenCode (an existing, proven harness) rather than reimplementing one badly.
+// The MCP server never lets the model write the real tree: every edit job runs
+// in its own throwaway git worktree on its own branch, and merging that branch
+// back is a HUMAN step with no tool behind it.
+
+/// Where delegated-edit worktrees are created (repo-relative; under gitignored
+/// `state/`, so an agent's scratch tree is never committable by accident).
+const EDIT_WORKTREES_SUBDIR: &str = "state/edit-worktrees";
+/// Branch-name prefix for a delegated-edit job's isolated branch. The branch
+/// OUTLIVES the job on purpose — it is the deliverable a human reviews and
+/// merges. Nothing in this server ever merges or deletes it.
+const EDIT_BRANCH_PREFIX: &str = "ai-edit";
+/// How long to wait for a spawned `opencode serve` to report its listening port.
+const OPENCODE_SERVE_BOOT_TIMEOUT_SECS: u64 = 30;
+/// Default wall-clock cap on a single delegated-edit job before it is abandoned.
+const EDIT_JOB_TIMEOUT_SECS: u64 = 3600;
+/// Default deadline for a RESTRICTED job's pending approval. OpenCode itself
+/// applies NO timeout to a pending permission (verified against its API: the
+/// permission schema has no expiry field, and a pending request sat unanswered
+/// indefinitely) — so if the driving agent never answers, the job would block
+/// forever holding a worktree and a serve process. This is OUR watchdog, not
+/// OpenCode's: `ai_edit_result` enforces it on every poll and auto-rejects.
+const EDIT_APPROVAL_TIMEOUT_SECS: u64 = 1800;
+/// Grace period after launch during which a session that has not yet been
+/// observed `busy` is reported as still starting rather than finished.
+/// Necessary because OpenCode's `/session/status` map reports a FINISHED session
+/// by OMITTING it — which is indistinguishable from one that has not begun yet.
+/// Without this, a poll landing in the gap between `prompt_async` returning and
+/// the model actually streaming would read as "done" against an empty diff.
+const EDIT_SESSION_START_GRACE_SECS: u64 = 90;
+
 /// State of an async triage job: still running (with its start time, for elapsed
 /// reporting) or finished with its assembled report.
 enum TriageJob {
@@ -1834,6 +1871,671 @@ impl AiAgentServer {
         // (younger than RECONCILE_NO_PID_STALE_SECS) → genuinely in flight, or
         // indeterminate. Be conservative: leave it running.
         None
+    }
+
+    // ── Delegated edit (OpenCode harness, worktree-isolated) ─────────────
+    //
+    // Unlike every other tool on this server, this tier can WRITE — but never
+    // to the real working tree. Each job gets its own git worktree + branch,
+    // and merging that branch back is a deliberate human step with no tool
+    // behind it (see `EDIT_BRANCH_PREFIX`).
+
+    /// Root dir holding per-job delegated-edit worktrees.
+    fn edit_worktrees_dir(&self) -> PathBuf {
+        self.repo_root.join(EDIT_WORKTREES_SUBDIR)
+    }
+
+    /// Create the isolated worktree + branch for an edit job. Returns
+    /// `(worktree_path, branch_name)`. `base_ref` defaults to `HEAD`.
+    ///
+    /// The worktree is a REAL git worktree, not a copy: the agent gets full
+    /// history/tooling, but its commits land on a throwaway branch that cannot
+    /// affect the caller's checked-out tree.
+    fn create_edit_worktree(
+        &self,
+        job_id: &str,
+        base_ref: &str,
+    ) -> Result<(PathBuf, String), String> {
+        let dir = self.edit_worktrees_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create worktree dir {}: {e}", dir.display()))?;
+        let path = dir.join(job_id);
+        let branch = format!("{EDIT_BRANCH_PREFIX}/{job_id}");
+        let path_str = path.to_string_lossy().to_string();
+        let outcome = run_with_timeout(
+            "git",
+            &["worktree", "add", "-b", &branch, &path_str, base_ref],
+            &self.repo_root,
+            &[],
+            Duration::from_secs(120),
+        )?;
+        if !outcome.success {
+            return Err(format!(
+                "git worktree add failed (base_ref '{base_ref}'): {}{}",
+                outcome.stderr.trim(),
+                if outcome.timed_out {
+                    " (timed out)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        Ok((path, branch))
+    }
+
+    /// Spawn a detached `opencode serve` whose cwd is the job's worktree, and
+    /// wait for it to report a listening port.
+    ///
+    /// cwd is what scopes OpenCode to the worktree — verified empirically: an
+    /// agent asked to write a file resolved it against the serve's cwd, leaving
+    /// the real repo untouched. Detached (own process group, via `spawn_logged`)
+    /// so an MCP-server reload cannot kill a running edit job.
+    fn spawn_opencode_serve(&self, job_id: &str, worktree: &Path) -> Result<(u32, u16), String> {
+        let log_path = self.jobs_dir().join(format!("{job_id}-serve.log"));
+        std::fs::create_dir_all(self.jobs_dir())
+            .map_err(|e| format!("cannot create jobs dir: {e}"))?;
+        // --port 0 = let the OS pick a free port; we read the real one back out
+        // of the log. Hardcoding a port would collide between concurrent jobs.
+        let child = spawn_logged(
+            "opencode",
+            &["serve", "--port", "0"],
+            worktree,
+            &[],
+            &log_path,
+        )?;
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(OPENCODE_SERVE_BOOT_TIMEOUT_SECS);
+        while Instant::now() < deadline {
+            if let Ok(log) = std::fs::read_to_string(&log_path)
+                && let Some(port) = parse_serve_port(&log)
+            {
+                return Ok((pid, port));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // Never leave an unreachable serve running: if we could not learn its
+        // port we can never talk to it, so it is pure leak.
+        kill_pid_group(pid);
+        Err(format!(
+            "opencode serve did not report a listening port within {OPENCODE_SERVE_BOOT_TIMEOUT_SECS}s (log: {})",
+            log_path.display()
+        ))
+    }
+
+    /// `GET {base}{path}` against a job's OpenCode server, parsed as JSON.
+    fn oc_get(&self, port: u16, path: &str) -> Result<Value, String> {
+        self.agent
+            .get(&format!("http://127.0.0.1:{port}{path}"))
+            .call()
+            .map_err(|e| format!("opencode GET {path} failed: {e}"))?
+            .into_json()
+            .map_err(|e| format!("opencode GET {path} parse failed: {e}"))
+    }
+
+    /// `POST {base}{path}` with a JSON body against a job's OpenCode server.
+    /// The response body is returned raw (some endpoints answer 204/no-content).
+    fn oc_post(&self, port: u16, path: &str, body: Value) -> Result<String, String> {
+        self.agent
+            .post(&format!("http://127.0.0.1:{port}{path}"))
+            .set("Content-Type", "application/json")
+            .send_json(body)
+            .map_err(|e| format!("opencode POST {path} failed: {e}"))?
+            .into_string()
+            .map_err(|e| format!("opencode POST {path} read failed: {e}"))
+    }
+
+    /// Pending approval requests for a job's session, if any.
+    ///
+    /// Reads the LEGACY `/permission` endpoint, not the newer-looking
+    /// `/api/permission/request`: verified against a live server, the runtime
+    /// actually publishes pending requests on the legacy path — the v2 path
+    /// stayed empty while a request was genuinely pending on the legacy one.
+    fn oc_pending_permissions(&self, port: u16, session_id: &str) -> Vec<Value> {
+        match self.oc_get(port, "/permission") {
+            Ok(Value::Array(items)) => items
+                .into_iter()
+                .filter(|it| it["sessionID"].as_str() == Some(session_id))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether a job's session is currently executing.
+    ///
+    /// `/session/status` omits a session once its turn finishes, so absence is
+    /// "not running" — NOT necessarily "finished" (a session that has not
+    /// started yet is equally absent). Callers must disambiguate with
+    /// `observed_busy` + `EDIT_SESSION_START_GRACE_SECS`.
+    fn oc_session_busy(&self, port: u16, session_id: &str) -> bool {
+        match self.oc_get(port, "/session/status") {
+            Ok(v) => v
+                .get(session_id)
+                .and_then(|s| s["type"].as_str())
+                // "retry" = provider-level retry in progress; still working.
+                .is_some_and(|t| t == "busy" || t == "retry"),
+            Err(_) => false,
+        }
+    }
+
+    /// `git diff <base_ref>...HEAD` inside the worktree, plus the status of any
+    /// uncommitted work, so the caller sees everything the agent changed whether
+    /// or not it committed.
+    fn edit_job_diff(&self, worktree: &Path, base_ref: &str) -> String {
+        let mut out = String::new();
+        if let Ok(o) = run_with_timeout(
+            "git",
+            &["diff", base_ref],
+            worktree,
+            &[],
+            Duration::from_secs(60),
+        ) && !o.stdout.trim().is_empty()
+        {
+            out.push_str(&o.stdout);
+        }
+        if let Ok(o) = run_with_timeout(
+            "git",
+            &["status", "--porcelain=v1"],
+            worktree,
+            &[],
+            Duration::from_secs(30),
+        ) && !o.stdout.trim().is_empty()
+        {
+            out.push_str("\n# Uncommitted in worktree:\n");
+            out.push_str(&o.stdout);
+        }
+        if out.trim().is_empty() {
+            "(no changes)".to_string()
+        } else {
+            out
+        }
+    }
+
+    /// Load a persisted edit-job record, erroring if absent or not an edit job.
+    fn load_edit_record(&self, job_id: &str) -> Result<Value, String> {
+        let rec = self
+            .read_job_record(job_id)
+            .ok_or_else(|| format!("no edit job '{job_id}' found"))?;
+        if rec["kind"].as_str() != Some("edit") {
+            return Err(format!("job '{job_id}' is not a delegated-edit job"));
+        }
+        Ok(rec)
+    }
+
+    /// `ai_edit_run` — launch a delegated-edit job in an isolated worktree.
+    ///
+    /// Returns a `job_id` immediately; the worktree/serve/session setup runs on
+    /// a background thread (serve boot is a few seconds). Poll `ai_edit_result`.
+    fn call_edit_run(&self, args: &Value) -> ToolCallResult {
+        let task = match get_str(args, "task")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(t) => t.to_string(),
+            None => return tool_error("edit task ('task') is required and must be non-empty"),
+        };
+        let mode = match get_str(args, "mode").unwrap_or("restricted").trim() {
+            "full" => "full",
+            "restricted" | "" => "restricted",
+            other => {
+                return tool_error(&format!(
+                    "unknown mode '{other}' (expected 'full' or 'restricted')"
+                ));
+            }
+        };
+        let agent = match mode {
+            "full" => "rustynet-edit-full",
+            _ => "rustynet-edit-restricted",
+        };
+        // OpenCode routes models by its OWN provider/model naming (see
+        // .opencode/opencode.json), NOT this server's LlmProvider registry —
+        // the edit tier is OpenCode-native. Caller passes "provider/model".
+        let model = get_str(args, "model")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("deepseek/deepseek-v4-pro")
+            .to_string();
+        let (provider_id, model_id) = match model.split_once('/') {
+            Some((p, m)) if !p.is_empty() && !m.is_empty() => (p.to_string(), m.to_string()),
+            _ => {
+                return tool_error(&format!(
+                    "model '{model}' must be in OpenCode 'provider/model' form, e.g. \
+                     'deepseek/deepseek-v4-pro' or 'opencode/deepseek-v4-flash-free'"
+                ));
+            }
+        };
+        let base_ref = get_str(args, "base_ref")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("HEAD")
+            .to_string();
+
+        let job_id = self.new_job_id("edit");
+        // Initial record so a poll arriving before setup finishes sees "launching".
+        self.write_job_record(
+            &job_id,
+            &json!({
+                "job_id": job_id,
+                "kind": "edit",
+                "mode": mode,
+                "agent": agent,
+                "model": model,
+                "base_ref": base_ref,
+                "state": "launching",
+                "task": truncate_output(&task, 40, 4000),
+                "started_unix": now_unix(),
+                "observed_busy": false,
+            }),
+        );
+
+        let worker = self.clone();
+        let jid = job_id.clone();
+        let base_ref_thread = base_ref.clone();
+        std::thread::spawn(move || {
+            worker.run_edit_setup(
+                &jid,
+                mode,
+                agent,
+                &provider_id,
+                &model_id,
+                &base_ref_thread,
+                &task,
+            );
+        });
+
+        ToolCallResult {
+            content: text_content(format!(
+                "Delegated-edit job launched.\n\
+                 - job_id: `{job_id}`\n\
+                 - mode: {mode}{}\n\
+                 - agent: {agent}\n\
+                 - model: {model}\n\
+                 - base_ref: {base_ref}\n\n\
+                 Poll `ai_edit_result` with this job_id. In RESTRICTED mode the result will \
+                 report `awaiting_approval` with the proposed diff whenever the agent wants to \
+                 edit a file — answer with `ai_edit_approve` / `ai_edit_deny`. The agent works in \
+                 an isolated git worktree on branch `{EDIT_BRANCH_PREFIX}/{job_id}`; review and \
+                 merge that branch yourself — nothing here merges it for you.",
+                if mode == "restricted" {
+                    " (every file edit pauses for your approval)"
+                } else {
+                    " (edits without per-change approval)"
+                }
+            )),
+            is_error: None,
+        }
+    }
+
+    /// Background setup for an edit job: worktree → serve → session → prompt.
+    /// Any failure marks the record `failed` with the reason.
+    #[allow(clippy::too_many_arguments)]
+    fn run_edit_setup(
+        &self,
+        job_id: &str,
+        mode: &str,
+        agent: &str,
+        provider_id: &str,
+        model_id: &str,
+        base_ref: &str,
+        task: &str,
+    ) {
+        let fail = |e: String| {
+            let mut rec = self
+                .read_job_record(job_id)
+                .unwrap_or_else(|| json!({ "job_id": job_id, "kind": "edit" }));
+            if let Some(o) = rec.as_object_mut() {
+                o.insert("state".into(), json!("failed"));
+                o.insert("error".into(), json!(e));
+                o.insert("finished_unix".into(), json!(now_unix()));
+            }
+            self.write_job_record(job_id, &rec);
+        };
+
+        let (worktree, branch) = match self.create_edit_worktree(job_id, base_ref) {
+            Ok(v) => v,
+            Err(e) => return fail(format!("worktree setup failed: {e}")),
+        };
+        let (serve_pid, serve_port) = match self.spawn_opencode_serve(job_id, &worktree) {
+            Ok(v) => v,
+            Err(e) => return fail(format!("opencode serve failed: {e}")),
+        };
+        // Create the session, then drive it. A serve failure past this point
+        // leaves the process for post-mortem (the log path is in the record).
+        let session_id = match self.oc_post(serve_port, "/session", json!({})) {
+            Ok(body) => match serde_json::from_str::<Value>(&body) {
+                Ok(v) => v
+                    .get("data")
+                    .and_then(|d| d["id"].as_str())
+                    .or_else(|| v["id"].as_str())
+                    .map(str::to_string),
+                Err(_) => None,
+            },
+            Err(e) => {
+                kill_pid_group(serve_pid);
+                return fail(format!("could not create OpenCode session: {e}"));
+            }
+        };
+        let session_id = match session_id {
+            Some(s) => s,
+            None => {
+                kill_pid_group(serve_pid);
+                return fail("OpenCode session create returned no id".to_string());
+            }
+        };
+
+        // Preamble makes the deliverable durable: the agent commits to its
+        // branch so the work survives even if we later remove the worktree,
+        // and it knows editing is worktree-local (not the real repo).
+        let full_prompt = format!(
+            "You are working in an ISOLATED git worktree on branch `{branch}`. All your edits \
+             stay on this branch and are reviewed by a human before merging — you cannot affect \
+             the main working tree. When you finish the task, COMMIT your work to this branch \
+             with a clear message so the change is durable. Run the repo's gates \
+             (`cargo fmt --all -- --check`, `cargo check`, `cargo clippy`, `cargo test` as \
+             appropriate) before committing.\n\n\
+             TASK:\n{task}"
+        );
+        if let Err(e) = self.oc_post(
+            serve_port,
+            &format!("/session/{session_id}/prompt_async"),
+            json!({
+                "agent": agent,
+                "model": { "providerID": provider_id, "modelID": model_id },
+                "parts": [ { "type": "text", "text": full_prompt } ],
+            }),
+        ) {
+            kill_pid_group(serve_pid);
+            return fail(format!("could not send prompt to OpenCode session: {e}"));
+        }
+
+        let mut rec = self
+            .read_job_record(job_id)
+            .unwrap_or_else(|| json!({ "job_id": job_id, "kind": "edit" }));
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("state".into(), json!("running"));
+            o.insert("mode".into(), json!(mode));
+            o.insert("worktree".into(), json!(worktree.to_string_lossy()));
+            o.insert("branch".into(), json!(branch));
+            o.insert("serve_pid".into(), json!(serve_pid));
+            o.insert("serve_port".into(), json!(serve_port));
+            o.insert("session_id".into(), json!(session_id));
+            o.insert("observed_busy".into(), json!(false));
+        }
+        self.write_job_record(job_id, &rec);
+    }
+
+    /// `ai_edit_result` — poll a delegated-edit job. This is where the approval
+    /// watchdog and the busy/idle→done disambiguation live.
+    fn call_edit_result(&self, args: &Value) -> ToolCallResult {
+        let job_id = match get_str(args, "job_id")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(j) => j.to_string(),
+            None => return tool_error("job_id is required"),
+        };
+        let mut rec = match self.load_edit_record(&job_id) {
+            Ok(r) => r,
+            Err(e) => return tool_error(&e),
+        };
+        let state = rec["state"].as_str().unwrap_or("unknown");
+
+        // Terminal states: report and stop.
+        match state {
+            "failed" => {
+                return self.edit_text(format!(
+                    "Edit job `{job_id}` FAILED during setup: {}",
+                    rec["error"].as_str().unwrap_or("(no detail)")
+                ));
+            }
+            "done" | "timed_out" => {
+                return self.edit_text(self.edit_terminal_summary(&rec));
+            }
+            "launching" => {
+                return self.edit_text(format!(
+                    "Edit job `{job_id}` is still starting (creating worktree + booting OpenCode). \
+                     Poll again shortly."
+                ));
+            }
+            _ => {}
+        }
+
+        let port = rec["serve_port"].as_u64().unwrap_or(0) as u16;
+        let session_id = rec["session_id"].as_str().unwrap_or("").to_string();
+        let serve_pid = rec["serve_pid"].as_u64().unwrap_or(0) as u32;
+        let worktree = PathBuf::from(rec["worktree"].as_str().unwrap_or(""));
+        let base_ref = rec["base_ref"].as_str().unwrap_or("HEAD").to_string();
+        let started = rec["started_unix"].as_u64().unwrap_or_else(now_unix);
+
+        // Overall wall-clock cap — independent of the approval watchdog.
+        if now_unix().saturating_sub(started) > EDIT_JOB_TIMEOUT_SECS {
+            kill_pid_group(serve_pid);
+            self.mark_edit_terminal(&mut rec, "timed_out", Some("overall job timeout"));
+            self.persist_edit_diff(&mut rec, &worktree, &base_ref);
+            self.write_job_record(&job_id, &rec);
+            return self.edit_text(self.edit_terminal_summary(&rec));
+        }
+
+        // Approval-first: a pending permission is the thing a driving agent must
+        // see. Check it before "am I still busy".
+        let pending = self.oc_pending_permissions(port, &session_id);
+        if let Some(req) = pending.first() {
+            // Watchdog: OpenCode never expires a pending permission itself, so
+            // WE do. Stamp the deadline on first observation; enforce on each
+            // subsequent poll.
+            let now = now_unix();
+            let ask_expires = rec["ask_expires_unix"].as_u64();
+            match ask_expires {
+                Some(exp) if now > exp => {
+                    // Reject to unblock OpenCode cleanly, then end the job so a
+                    // mis-surfaced approval can't hang it for hours.
+                    if let Some(id) = req["id"].as_str() {
+                        let _ = self.oc_post(
+                            port,
+                            &format!("/permission/{id}/reply"),
+                            json!({ "reply": "reject",
+                                    "message": "Approval watchdog timed out — no ai_edit_approve/ai_edit_deny received." }),
+                        );
+                    }
+                    kill_pid_group(serve_pid);
+                    self.mark_edit_terminal(
+                        &mut rec,
+                        "timed_out",
+                        Some("approval watchdog timeout — driving agent never answered"),
+                    );
+                    self.persist_edit_diff(&mut rec, &worktree, &base_ref);
+                    self.write_job_record(&job_id, &rec);
+                    return self.edit_text(self.edit_terminal_summary(&rec));
+                }
+                _ => {}
+            }
+            let expires = ask_expires.unwrap_or(now + EDIT_APPROVAL_TIMEOUT_SECS);
+            if let Some(o) = rec.as_object_mut() {
+                o.insert("state".into(), json!("awaiting_approval"));
+                o.insert("ask_expires_unix".into(), json!(expires));
+                o.insert("pending_request_id".into(), json!(req["id"].as_str()));
+            }
+            self.write_job_record(&job_id, &rec);
+            let diff = req["metadata"]["diff"]
+                .as_str()
+                .unwrap_or("(no diff provided)");
+            let files: Vec<&str> = req["patterns"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            return self.edit_text(format!(
+                "Edit job `{job_id}` is AWAITING APPROVAL.\n\
+                 - action: {} ({})\n\
+                 - approve with `ai_edit_approve {{\"job_id\":\"{job_id}\"}}`\n\
+                 - deny with `ai_edit_deny {{\"job_id\":\"{job_id}\",\"reason\":\"...\"}}`\n\
+                 - watchdog auto-rejects at unix {expires} if unanswered\n\n\
+                 Proposed change:\n```diff\n{diff}\n```",
+                req["permission"].as_str().unwrap_or("edit"),
+                files.join(", "),
+            ));
+        }
+
+        // No pending. If we were awaiting approval, it was answered out of band
+        // (approve/deny) — resume the running view and clear the watchdog.
+        if state == "awaiting_approval"
+            && let Some(o) = rec.as_object_mut()
+        {
+            o.insert("state".into(), json!("running"));
+            o.remove("ask_expires_unix");
+            o.remove("pending_request_id");
+        }
+
+        // Busy/idle → done disambiguation. `/session/status` OMITS a finished
+        // session, but also omits one that hasn't started — so absence only
+        // means "done" once we've actually seen it busy (or the start grace has
+        // elapsed).
+        let busy = self.oc_session_busy(port, &session_id);
+        let observed_busy = rec["observed_busy"].as_bool().unwrap_or(false) || busy;
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("observed_busy".into(), json!(observed_busy));
+        }
+
+        if busy {
+            self.write_job_record(&job_id, &rec);
+            return self.edit_text(format!(
+                "Edit job `{job_id}` is RUNNING (agent working in worktree). Poll again."
+            ));
+        }
+
+        // Not busy. Either finished, or not started yet (within grace).
+        let elapsed = now_unix().saturating_sub(started);
+        if !observed_busy && elapsed < EDIT_SESSION_START_GRACE_SECS {
+            self.write_job_record(&job_id, &rec);
+            return self.edit_text(format!(
+                "Edit job `{job_id}` is starting up (agent has not begun streaming yet). Poll again."
+            ));
+        }
+
+        // Done (or finished with no activity). Capture the diff, stop the serve.
+        kill_pid_group(serve_pid);
+        self.mark_edit_terminal(&mut rec, "done", None);
+        self.persist_edit_diff(&mut rec, &worktree, &base_ref);
+        self.write_job_record(&job_id, &rec);
+        self.edit_text(self.edit_terminal_summary(&rec))
+    }
+
+    /// `ai_edit_approve` — approve the pending edit in a RESTRICTED job.
+    fn call_edit_approve(&self, args: &Value) -> ToolCallResult {
+        self.reply_edit_permission(args, /* approve */ true)
+    }
+
+    /// `ai_edit_deny` — reject the pending edit, feeding `reason` back to the
+    /// agent as context so it can adjust (a rejection does NOT kill the job —
+    /// verified: the session incorporates the message and continues).
+    fn call_edit_deny(&self, args: &Value) -> ToolCallResult {
+        self.reply_edit_permission(args, /* approve */ false)
+    }
+
+    fn reply_edit_permission(&self, args: &Value, approve: bool) -> ToolCallResult {
+        let job_id = match get_str(args, "job_id")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(j) => j.to_string(),
+            None => return tool_error("job_id is required"),
+        };
+        let mut rec = match self.load_edit_record(&job_id) {
+            Ok(r) => r,
+            Err(e) => return tool_error(&e),
+        };
+        let port = rec["serve_port"].as_u64().unwrap_or(0) as u16;
+        let session_id = rec["session_id"].as_str().unwrap_or("").to_string();
+        let pending = self.oc_pending_permissions(port, &session_id);
+        let req = match pending.first() {
+            Some(r) => r,
+            None => {
+                return tool_error(&format!(
+                    "edit job `{job_id}` has no pending approval right now (state: {})",
+                    rec["state"].as_str().unwrap_or("unknown")
+                ));
+            }
+        };
+        let req_id = req["id"].as_str().unwrap_or_default().to_string();
+        let body = if approve {
+            json!({ "reply": "once" })
+        } else {
+            let reason = get_str(args, "reason")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Rejected by the driving agent.");
+            json!({ "reply": "reject", "message": reason })
+        };
+        if let Err(e) = self.oc_post(port, &format!("/permission/{req_id}/reply"), body) {
+            return tool_error(&format!("could not send approval reply: {e}"));
+        }
+        // Back to running; clear the watchdog.
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("state".into(), json!("running"));
+            o.remove("ask_expires_unix");
+            o.remove("pending_request_id");
+        }
+        self.write_job_record(&job_id, &rec);
+        self.edit_text(format!(
+            "{} the pending edit in job `{job_id}`. The agent will {}. Poll `ai_edit_result` to \
+             continue.",
+            if approve { "APPROVED" } else { "DENIED" },
+            if approve {
+                "apply it and continue"
+            } else {
+                "receive the rejection and adjust"
+            }
+        ))
+    }
+
+    /// Stamp a record with a terminal state + optional reason + finish time.
+    fn mark_edit_terminal(&self, rec: &mut Value, state: &str, reason: Option<&str>) {
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("state".into(), json!(state));
+            o.insert("finished_unix".into(), json!(now_unix()));
+            if let Some(r) = reason {
+                o.insert("reason".into(), json!(r));
+            }
+        }
+    }
+
+    /// Capture the worktree's diff-vs-base into the record so the terminal
+    /// summary can show it without the serve/worktree still being live.
+    fn persist_edit_diff(&self, rec: &mut Value, worktree: &Path, base_ref: &str) {
+        let diff = self.edit_job_diff(worktree, base_ref);
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("diff".into(), json!(truncate_output(&diff, 4000, 200_000)));
+        }
+    }
+
+    /// Human-facing summary for a finished/timed-out edit job.
+    fn edit_terminal_summary(&self, rec: &Value) -> String {
+        let job_id = rec["job_id"].as_str().unwrap_or("?");
+        let state = rec["state"].as_str().unwrap_or("?");
+        let branch = rec["branch"].as_str().unwrap_or("?");
+        let worktree = rec["worktree"].as_str().unwrap_or("?");
+        let diff = rec["diff"].as_str().unwrap_or("(diff not captured)");
+        let verdict = match state {
+            "done" => "COMPLETE",
+            "timed_out" => "TIMED OUT",
+            other => other,
+        };
+        let reason = rec["reason"]
+            .as_str()
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default();
+        format!(
+            "Edit job `{job_id}` — {verdict}{reason}.\n\
+             - branch: `{branch}` (review + merge this yourself; nothing here merges it)\n\
+             - worktree: `{worktree}`\n\n\
+             Changes on the branch:\n```diff\n{diff}\n```"
+        )
+    }
+
+    /// Wrap a plain string as a non-error tool result.
+    fn edit_text(&self, s: String) -> ToolCallResult {
+        ToolCallResult {
+            content: text_content(s),
+            is_error: None,
+        }
     }
 
     /// Entry point for `ai_reconcile_jobs`: self-service repair of stale
@@ -4536,6 +5238,33 @@ fn extract_labrun_job_id(s: &str) -> Option<String> {
     }
 }
 
+/// Extract the listening port from an `opencode serve` log. It prints a line
+/// like `opencode server listening on http://127.0.0.1:4096`; we scan for that
+/// host-prefix and parse the trailing port. Returns the FIRST match (a serve
+/// prints it once at boot). Robust to log lines before/after it.
+fn parse_serve_port(log: &str) -> Option<u16> {
+    const MARKER: &str = "http://127.0.0.1:";
+    for line in log.lines() {
+        if let Some(idx) = line.find(MARKER) {
+            let rest = &line[idx + MARKER.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(port) = digits.parse::<u16>()
+                && port != 0
+            {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+/// TERM-then-KILL a process group by leader pid. Wraps `terminate_process_group`
+/// with the `u32`-pid ergonomics the OpenCode-serve lifecycle uses (pids come
+/// from `Child::id()`). No-op fallback off-unix is inherited from the callee.
+fn kill_pid_group(pid: u32) {
+    terminate_process_group(pid as i32);
+}
+
 /// TERM-then-KILL the child's whole process group (the orchestrator spawns bash
 /// workers + utmctl pushes; killing only the leader orphans them). Only invoked
 /// on a genuine wall-clock timeout — a normal exit never reaches here.
@@ -6040,6 +6769,77 @@ impl McpServer for AiAgentServer {
                     .into(),
                 input_schema: json_schema_object(json!({}), Vec::<&str>::new()),
             },
+            Tool {
+                name: "ai_edit_run".into(),
+                description: "\
+                    Delegate an actual CODE-EDITING task to an OpenCode-harnessed agent in an \
+                    ISOLATED git worktree. Unlike ai_agent / ai_read / ai_write (read-only or \
+                    advisory), this tier WRITES files — but never to the real working tree: each \
+                    job runs on its own throwaway branch `ai-edit/<job_id>` in a worktree under \
+                    state/, and merging that branch back is YOUR job (no tool merges it). \
+                    Two modes: `full` (edits without per-change approval; self-verifies with \
+                    gates) and `restricted` (DEFAULT — every file edit pauses for your approval, \
+                    surfaced via ai_edit_result and answered with ai_edit_approve/ai_edit_deny). \
+                    Async: returns a job_id immediately; poll ai_edit_result. `model` is an \
+                    OpenCode 'provider/model' ref (e.g. 'deepseek/deepseek-v4-pro'), which is \
+                    OpenCode's own model routing, NOT this server's flash/pro shortcuts. Use this \
+                    for small, well-scoped implementation work you will review; reserve `full` \
+                    for when you trust the model to run unattended."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "task":     json_schema_string("The editing task — what to change and any constraints. Be specific; the agent works from this alone."),
+                        "mode":     json_schema_string("'restricted' (default, per-edit approval) or 'full' (unattended edits)."),
+                        "model":    json_schema_string("OpenCode 'provider/model' ref (default 'deepseek/deepseek-v4-pro'). This is OpenCode's routing, not this server's flash/pro."),
+                        "base_ref": json_schema_string("Git ref to branch the worktree from (default 'HEAD')."),
+                    }),
+                    vec!["task"],
+                ),
+            },
+            Tool {
+                name: "ai_edit_result".into(),
+                description: "\
+                    Poll a delegated-edit job by job_id (non-blocking). States: `launching` \
+                    (setup in progress), `running` (agent working), `awaiting_approval` \
+                    (RESTRICTED mode — a file edit is pending; the result includes the proposed \
+                    diff, answer with ai_edit_approve/ai_edit_deny), `done` (finished — includes \
+                    the branch's full diff to review + merge), `failed` (setup error), \
+                    `timed_out` (overall or approval-watchdog timeout). Safe to call repeatedly."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({ "job_id": json_schema_string("The job_id from ai_edit_run.") }),
+                    vec!["job_id"],
+                ),
+            },
+            Tool {
+                name: "ai_edit_approve".into(),
+                description: "\
+                    Approve the pending file edit in a RESTRICTED delegated-edit job (only valid \
+                    when ai_edit_result reports `awaiting_approval`). The agent applies the edit \
+                    and continues; poll ai_edit_result again. Approves ONE edit — the next edit \
+                    pauses again."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({ "job_id": json_schema_string("The job_id awaiting approval.") }),
+                    vec!["job_id"],
+                ),
+            },
+            Tool {
+                name: "ai_edit_deny".into(),
+                description: "\
+                    Reject the pending file edit in a RESTRICTED delegated-edit job. The `reason` \
+                    is fed back to the agent as context so it can adjust — a rejection does NOT \
+                    kill the job, the agent incorporates the feedback and continues. Poll \
+                    ai_edit_result again after."
+                    .into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "job_id": json_schema_string("The job_id awaiting approval."),
+                        "reason": json_schema_string("Why you're rejecting — guidance the agent should use to adjust."),
+                    }),
+                    vec!["job_id"],
+                ),
+            },
         ]
     }
 
@@ -6073,6 +6873,18 @@ impl McpServer for AiAgentServer {
         }
         if name == "ai_reconcile_jobs" {
             return self.call_reconcile_jobs(&args);
+        }
+        if name == "ai_edit_run" {
+            return self.call_edit_run(&args);
+        }
+        if name == "ai_edit_result" {
+            return self.call_edit_result(&args);
+        }
+        if name == "ai_edit_approve" {
+            return self.call_edit_approve(&args);
+        }
+        if name == "ai_edit_deny" {
+            return self.call_edit_deny(&args);
         }
         if name == "ai_list_models" {
             return match self.list_models() {
@@ -6267,6 +7079,95 @@ mod tests {
             load_keychain_secret("rustynet-nonexistent-test-service-xyz123"),
             None
         );
+    }
+
+    #[test]
+    fn parse_serve_port_reads_the_listening_line() {
+        // The exact line an `opencode serve` prints at boot.
+        let log = "Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.\n\
+                   timestamp=... message=loading path=/x\n\
+                   opencode server listening on http://127.0.0.1:4096\n";
+        assert_eq!(parse_serve_port(log), Some(4096));
+    }
+
+    #[test]
+    fn parse_serve_port_ignores_zero_and_missing() {
+        // --port 0 asks the OS to pick; the log always reports the REAL port, so
+        // a literal :0 (or no marker at all) must not be accepted as a port.
+        assert_eq!(parse_serve_port("listening on http://127.0.0.1:0\n"), None);
+        assert_eq!(parse_serve_port("no port here at all\n"), None);
+        assert_eq!(parse_serve_port(""), None);
+    }
+
+    #[test]
+    fn parse_serve_port_takes_first_and_stops_at_nondigit() {
+        // Trailing path after the port must not corrupt the parse, and the
+        // first listening line wins.
+        let log = "opencode server listening on http://127.0.0.1:53821/some/path\n\
+                   opencode server listening on http://127.0.0.1:9999\n";
+        assert_eq!(parse_serve_port(log), Some(53821));
+    }
+
+    #[test]
+    fn edit_run_rejects_missing_task() {
+        let s = server();
+        let r = s.call_edit_run(&json!({}));
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[test]
+    fn edit_run_rejects_unknown_mode() {
+        let s = server();
+        let r = s.call_edit_run(&json!({ "task": "do a thing", "mode": "sudo" }));
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[test]
+    fn edit_run_rejects_malformed_model() {
+        // A bare model with no provider/ prefix is ambiguous under OpenCode's
+        // routing — must error, not guess a provider.
+        let s = server();
+        let r = s.call_edit_run(&json!({ "task": "x", "model": "deepseek-v4-pro" }));
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[test]
+    fn edit_result_unknown_job_errors() {
+        let s = server();
+        let r = s.call_edit_result(&json!({ "job_id": "edit-does-not-exist-0-0" }));
+        assert_eq!(r.is_error, Some(true));
+    }
+
+    #[test]
+    fn edit_approve_and_deny_require_job_id() {
+        let s = server();
+        assert_eq!(s.call_edit_approve(&json!({})).is_error, Some(true));
+        assert_eq!(s.call_edit_deny(&json!({})).is_error, Some(true));
+    }
+
+    #[test]
+    fn edit_terminal_summary_always_names_the_branch_to_merge() {
+        // The whole safety model is "review + merge the branch yourself" — the
+        // summary must always surface the branch, in every terminal state.
+        let s = server();
+        for state in ["done", "timed_out"] {
+            let rec = json!({
+                "job_id": "edit-1-2-3",
+                "state": state,
+                "branch": "ai-edit/edit-1-2-3",
+                "worktree": "state/edit-worktrees/edit-1-2-3",
+                "diff": "(no changes)",
+            });
+            let summary = s.edit_terminal_summary(&rec);
+            assert!(
+                summary.contains("ai-edit/edit-1-2-3"),
+                "summary for state '{state}' must name the branch: {summary}"
+            );
+            assert!(
+                summary.contains("merge this yourself"),
+                "summary for state '{state}' must state the human-merge rule"
+            );
+        }
     }
 
     #[test]
