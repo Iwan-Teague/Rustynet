@@ -4570,9 +4570,15 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "recover_stuck_vms".into(),
-                description: "Recover Linux QEMU VMs stuck behind a stale nftables killswitch (SSH closed but VM alive). Runs probe-and-recover.".into(),
+                description: "Recover stuck VMs. WITHOUT host: local UTM guests stuck behind a stale nftables killswitch (SSH closed but VM alive) via probe-and-recover. WITH host: a REMOTE libvirt host's stuck guests — a running-but-unleased, paused, or shut-off guest is hard-reset (destroy+start) to force a clean boot and fresh DHCP lease, while a HEALTHY running-with-IP guest is left alone (so it is a safe no-op unless something is actually stuck). Pass force to reset even healthy guests.".into(),
                 input_schema: json_schema_object(
-                    json!({"aliases": json_schema_array_string("Optional specific aliases; omit for all stuck Linux VMs")}),
+                    json!({
+                        "aliases": json_schema_array_string("Specific VMs; omit for all. Local: UTM aliases. Remote: libvirt domain names."),
+                        "host": {"type": "string", "description": "host_id of a REMOTE libvirt host from hosts[]. Omit for the local UTM path."},
+                        "force": {"type": "boolean", "description": "Remote only: reset even a healthy running guest."},
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory."},
+                        "ssh_identity_file": {"type": "string"}
+                    }),
                     vec![],
                 ),
             },
@@ -4881,8 +4887,16 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "host_disk_status".into(),
-                description: "Host disk free space + the lab's biggest consumers (state/, target-livelab/, target/). Check periodically over a long run — a full disk fails builds/runs. Reclaim with prune_jobs. SCOPE: THIS machine's disk only — it does not report a remote lab host's disk.".into(),
-                input_schema: json_schema_object(json!({}), vec![]),
+                description: "Disk free space + biggest consumers. WITHOUT host: THIS machine's disk + the local lab consumers (state/, target-livelab/, target/) — reclaim with prune_jobs. WITH host: a REMOTE lab host's image pool over SSH — filesystem headroom plus the base images and per-guest qcow2 overlays that accrue there (e.g. \"how much room is left on the 870, and what is eating it?\"). Check periodically over a long run — a full disk fails builds/runs.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "host": {"type": "string", "description": "host_id of a REMOTE host from hosts[]. Omit to report THIS machine."},
+                        "pool": {"type": "string", "description": "Image pool path on the remote host. Default /var/lib/libvirt/images. Only meaningful with host."},
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory."},
+                        "ssh_identity_file": {"type": "string"}
+                    }),
+                    vec![],
+                ),
             },
             Tool {
                 name: "prune_jobs".into(),
@@ -5595,9 +5609,43 @@ impl McpServer for LabStateServer {
             }
 
             "recover_stuck_vms" => {
-                let aliases = string_array(args, "aliases");
-                let refs: Vec<&str> = aliases.iter().map(|s| s.as_str()).collect();
-                self.run_shell_script("scripts/vm_lab/probe_and_recover_local_utm.sh", &refs, 600)
+                // With a host, recover that REMOTE libvirt host's stuck guests via the
+                // CLI (destroy+start a running-but-unleased/paused/shut-off guest,
+                // skip a healthy one). Without, keep the local UTM probe+recover.
+                if let Some(host) = arg_str(args, "host") {
+                    let mut extra: Vec<&str> = vec!["--host", host];
+                    let domains = string_array(args, "aliases");
+                    for d in &domains {
+                        extra.push("--vm");
+                        extra.push(d.as_str());
+                    }
+                    if arg_bool(args, "force") {
+                        extra.push("--force");
+                    }
+                    let ssh_owned;
+                    if let Some(ssh) = arg_str(args, "ssh_identity_file") {
+                        ssh_owned = ssh.to_owned();
+                        extra.push("--ssh-identity-file");
+                        extra.push(&ssh_owned);
+                    }
+                    match self.arg_inventory(args) {
+                        Ok(inventory) => self.run_ops_with_inventory(
+                            "vm-lab-recover-host-vms",
+                            inventory.as_deref(),
+                            &extra,
+                            300,
+                        ),
+                        Err(err) => tool_error(&err),
+                    }
+                } else {
+                    let aliases = string_array(args, "aliases");
+                    let refs: Vec<&str> = aliases.iter().map(|s| s.as_str()).collect();
+                    self.run_shell_script(
+                        "scripts/vm_lab/probe_and_recover_local_utm.sh",
+                        &refs,
+                        600,
+                    )
+                }
             }
 
             "ensure_lab_ready" => {
@@ -5992,7 +6040,36 @@ impl McpServer for LabStateServer {
                 }
             }
 
-            "host_disk_status" => self.host_disk_status(),
+            "host_disk_status" => {
+                // With a host, report that REMOTE machine's pool via the CLI; without,
+                // keep the existing local report.
+                if let Some(host) = arg_str(args, "host") {
+                    let mut extra: Vec<&str> = vec!["--host", host];
+                    let pool_owned;
+                    if let Some(pool) = arg_str(args, "pool") {
+                        pool_owned = pool.to_owned();
+                        extra.push("--pool");
+                        extra.push(&pool_owned);
+                    }
+                    let ssh_owned;
+                    if let Some(ssh) = arg_str(args, "ssh_identity_file") {
+                        ssh_owned = ssh.to_owned();
+                        extra.push("--ssh-identity-file");
+                        extra.push(&ssh_owned);
+                    }
+                    match self.arg_inventory(args) {
+                        Ok(inventory) => self.run_ops_with_inventory(
+                            "vm-lab-host-disk-status",
+                            inventory.as_deref(),
+                            &extra,
+                            DISCOVERY_TIMEOUT_SECS,
+                        ),
+                        Err(err) => tool_error(&err),
+                    }
+                } else {
+                    self.host_disk_status()
+                }
+            }
 
             _ => tool_error(&format!("Unknown tool: {name}")),
         }

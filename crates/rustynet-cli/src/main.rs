@@ -1021,6 +1021,12 @@ enum OpsCommand {
     VmLabRenumberGuestNetwork {
         config: vm_lab::VmLabRenumberGuestNetworkConfig,
     },
+    VmLabHostDiskStatus {
+        config: vm_lab::VmLabHostDiskStatusConfig,
+    },
+    VmLabRecoverHostVms {
+        config: vm_lab::VmLabRecoverHostVmsConfig,
+    },
     #[cfg(feature = "vm-lab")]
     VmLabHostNetStatus {
         config: vm_lab::VmLabHostNetStatusConfig,
@@ -3732,6 +3738,55 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        "vm-lab-recover-host-vms" => {
+            let mut domains = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv) = parser.value("--vms") {
+                domains.extend(split_csv(csv));
+            }
+            Ok(OpsCommand::VmLabRecoverHostVms {
+                config: vm_lab::VmLabRecoverHostVmsConfig {
+                    inventory_path: parser.optional_path("--inventory"),
+                    host_id: parser.value("--host").ok_or_else(|| {
+                        "vm-lab-recover-host-vms requires --host <host_id>".to_owned()
+                    })?,
+                    domains,
+                    force: parser.has_flag("--force"),
+                    ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                    known_hosts_path: parser.optional_path("--known-hosts-file"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 300)?,
+                    json: match parser.value("--format").as_deref() {
+                        None | Some("table") => false,
+                        Some("json") => true,
+                        Some(other) => {
+                            return Err(format!(
+                                "invalid value for --format: {other} (expected table|json)"
+                            ));
+                        }
+                    },
+                },
+            })
+        }
+        "vm-lab-host-disk-status" => Ok(OpsCommand::VmLabHostDiskStatus {
+            config: vm_lab::VmLabHostDiskStatusConfig {
+                inventory_path: parser.optional_path("--inventory"),
+                host_id: parser.value("--host").ok_or_else(|| {
+                    "vm-lab-host-disk-status requires --host <host_id>".to_owned()
+                })?,
+                pool: parser.value("--pool"),
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 60)?,
+                json: match parser.value("--format").as_deref() {
+                    None | Some("table") => false,
+                    Some("json") => true,
+                    Some(other) => {
+                        return Err(format!(
+                            "invalid value for --format: {other} (expected table|json)"
+                        ));
+                    }
+                },
+            },
+        }),
         "vm-lab-renumber-guest-network" => Ok(OpsCommand::VmLabRenumberGuestNetwork {
             config: vm_lab::VmLabRenumberGuestNetworkConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -8404,6 +8459,14 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabRenumberGuestNetwork { config } => {
             vm_lab::execute_ops_vm_lab_renumber_guest_network(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabHostDiskStatus { config } => {
+            vm_lab::execute_ops_vm_lab_host_disk_status(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabRecoverHostVms { config } => {
+            vm_lab::execute_ops_vm_lab_recover_host_vms(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabHostNetStatus { config } => {
@@ -19833,6 +19896,8 @@ fn help_text() -> String {
         "  ops vm-lab-stop-host-run --host <host_id> [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-fetch-host-artifact --host <host_id> --path <host-relative path> [--out <local path>] [--max-bytes <n>] [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-renumber-guest-network --host <host_id> [--dry-run] [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>] [--format table|json]",
+        "  ops vm-lab-host-disk-status --host <host_id> [--pool <path>] [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>] [--format table|json]",
+        "  ops vm-lab-recover-host-vms --host <host_id> [--vm <domain>]... [--vms <a,b>] [--force] [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-host-net-status [--host <host_id>] [--inventory <path>] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-provision-toolchain [--inventory <path>] [--vm <alias>]... [--vms <a,b>] [--all] [--verify-only] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-fetch-image --host <host_id> --name <file> --url <https://...> [--sha256 <hex>] [--pool <path>] [--inventory <path>] [--timeout-secs <secs>]",

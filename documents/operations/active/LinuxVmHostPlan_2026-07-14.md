@@ -1876,10 +1876,21 @@ These make every other result untrustworthy, so they come before new features.
   - [ ] `utm_power_status` — a per-VM precondition probe with 5 callers, all of
         which already reject non-UTM aliases upstream via `alias_to_utm`. Lower
         value than the two above; revisit only if a caller starts serving libvirt.
-- [ ] `recover_stuck_vms` — UTM/`arp`-shaped internally; unverified on libvirt.
-- [ ] `host_disk_status --host <id>` — always reports **this** machine's disk. With
-      11G of images already on the 870, "how much room is left" is a real question
-      it cannot answer.
+- [x] **DONE 2026-07-17 — `ops vm-lab-recover-host-vms` (MCP `recover_stuck_vms` gains
+        a `host` param).** The old tool ran the UTM `probe_and_recover_local_utm.sh`
+        with no libvirt notion. "Stuck" for a libvirt guest = running-but-no-lease,
+        paused, or shut off; the fix is a hard `destroy`+`start` to force a clean
+        boot and fresh DHCP lease. A HEALTHY running-with-IP guest is **skipped**
+        (safe no-op) unless `--force`. Live-proven both ways on the box: two healthy
+        guests both skipped (untouched), and a throwaway forced to "shut off" was
+        recovered to running. The MCP tool delegates to the CLI when `host` is
+        given, keeps the UTM path otherwise. 4 unit tests.
+- [x] **DONE 2026-07-17 — `ops vm-lab-host-disk-status` (MCP `host_disk_status`
+      gains a `host` param).** Reports a REMOTE host's image-pool disk over SSH:
+      filesystem headroom + the base images and per-guest qcow2 overlays that accrue
+      there, largest-first. Live on the box: `/dev/sdb2 457G, 405G avail, 11G in the
+      pool`, with the two 3.7-3.8G guest overlays itemised. The MCP tool delegates to
+      the CLI when `host` is given, keeps the local report otherwise. 1 unit test.
 
 ### 12.7 Step 4 — run labs on the box (the point of the whole program)
 

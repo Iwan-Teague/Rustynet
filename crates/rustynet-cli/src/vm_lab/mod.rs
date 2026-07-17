@@ -5013,6 +5013,232 @@ fn ensure_orchestrator_arg_safe(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Recover stuck libvirt guests on a host — the counterpart to the UTM
+/// `probe_and_recover_local_utm.sh` for the libvirt/KVM backend.
+///
+/// "Stuck" for a libvirt guest means: **running but with no DHCP lease** (the
+/// network wedged and it never got an address), **paused**, or **shut off** when it
+/// should be up. The fix is a hard `destroy` + `start`, which forces a clean boot
+/// and a fresh lease. A **healthy** guest — running with an IP — is left alone
+/// unless `--force`, so running this against a host with healthy guests is a safe
+/// no-op that reports "skip (healthy)" rather than needlessly bouncing them.
+const HOST_RECOVER_VMS_SCRIPT: &str = r#"#!/bin/bash
+set -uo pipefail
+FORCE='__FORCE__'
+TARGETS='__TARGETS__'
+
+if [ -z "$TARGETS" ]; then
+  TARGETS="$(virsh -c qemu:///system list --name --all 2>/dev/null | grep -v '^$' | tr '\n' ' ')"
+fi
+
+echo "RECOVER-BEGIN"
+for d in $TARGETS; do
+  st="$(virsh -c qemu:///system domstate "$d" 2>/dev/null || echo missing)"
+  if [ "$st" = "missing" ]; then echo "  $d: NOT FOUND on this host"; continue; fi
+  ip="$(virsh -c qemu:///system domifaddr "$d" 2>/dev/null | grep -oE '([0-9]+\.){3}[0-9]+' | grep -v '^127\.' | head -1)"
+  case "$st" in
+    running)
+      if [ "$FORCE" = "1" ] || [ -z "$ip" ]; then
+        virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 || true
+        virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true
+        echo "  $d: RESET (was running${ip:+, ip=$ip}${ip:+, forced}${ip:-, no lease})"
+      else
+        echo "  $d: skip (healthy: running, ip=$ip)"
+      fi
+      ;;
+    paused)
+      virsh -c qemu:///system resume "$d" >/dev/null 2>&1 \
+        || { virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 || true; virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true; }
+      echo "  $d: RECOVERED (was paused)"
+      ;;
+    *)
+      virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true
+      echo "  $d: STARTED (was $st)"
+      ;;
+  esac
+done
+echo "RECOVER-END"
+"#;
+
+/// Config for `ops vm-lab-recover-host-vms`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabRecoverHostVmsConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    /// Domain names to check. Empty ⇒ every domain on the host.
+    pub domains: Vec<String>,
+    /// Reset even a healthy running guest.
+    pub force: bool,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
+/// Recover stuck libvirt guests on a remote host.
+pub fn execute_ops_vm_lab_recover_host_vms(
+    config: VmLabRecoverHostVmsConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+    let endpoint = host.ssh_endpoint().ok_or_else(|| {
+        format!(
+            "host {} is local; recover its guests directly",
+            host.host_id
+        )
+    })?;
+
+    // Each domain name lands in the script as a bare word, so it must be a plain
+    // libvirt domain name — no whitespace or shell metacharacters.
+    for domain in &config.domains {
+        ensure_provision_guest_name(domain)
+            .map_err(|err| format!("--vm {domain:?} is not a valid domain name: {err}"))?;
+    }
+    let targets = config.domains.join(" ");
+    let script = HOST_RECOVER_VMS_SCRIPT
+        .replace("__FORCE__", if config.force { "1" } else { "0" })
+        .replace("__TARGETS__", targets.as_str());
+
+    let timeout = timeout_or_default(config.timeout_secs, 300);
+    let out = run_guest_script(
+        endpoint.as_str(),
+        None,
+        script.as_str(),
+        false,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout,
+    )?;
+    let body = out
+        .split_once("RECOVER-BEGIN\n")
+        .and_then(|(_, rest)| rest.split_once("RECOVER-END").map(|(b, _)| b))
+        .ok_or_else(|| format!("host {}: recovery did not report:\n{out}", host.host_id))?;
+    let lines: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if config.json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "host_id": host.host_id,
+            "actions": lines,
+            "recovered_any": lines.iter().any(|l| !l.contains("skip (healthy")),
+        }))
+        .unwrap_or_else(|_| "{}".to_owned()));
+    }
+    Ok(format!(
+        "host {} — recover stuck guests\n  {}\n",
+        host.host_id,
+        lines.join("\n  ")
+    ))
+}
+
+/// Report a remote host's disk: filesystem headroom on the image pool, plus what
+/// is consuming it (base images + per-guest qcow2 overlays accrue there).
+///
+/// The `du` is capped to one directory level (`--max-depth=1`) and to the pool, so
+/// it stays fast and cannot wander the whole disk. Sizes are listed largest-first
+/// because "what do I delete to reclaim space?" is the question this answers.
+const HOST_DISK_STATUS_SCRIPT: &str = r#"#!/bin/bash
+set -uo pipefail
+POOL='__POOL__'
+echo "DISK-BEGIN"
+echo "-- filesystem holding the pool --"
+df -h "$POOL" 2>/dev/null || echo "(df failed for $POOL)"
+echo "-- pool total --"
+du -sh "$POOL" 2>/dev/null || echo "(du failed)"
+echo "-- largest files in the pool (base images + guest overlays) --"
+ls -1S "$POOL" 2>/dev/null | head -20 | while IFS= read -r f; do
+  [ -e "$POOL/$f" ] && printf '  %s\t%s\n' "$(du -h "$POOL/$f" 2>/dev/null | cut -f1)" "$f"
+done
+echo "DISK-END"
+"#;
+
+/// Config for `ops vm-lab-host-disk-status`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabHostDiskStatusConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    pub pool: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
+/// Report a remote lab host's image-pool disk usage.
+pub fn execute_ops_vm_lab_host_disk_status(
+    config: VmLabHostDiskStatusConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+    let endpoint = host.ssh_endpoint().ok_or_else(|| {
+        format!(
+            "host {} is local — this reports a REMOTE host's disk; use `df` locally",
+            host.host_id
+        )
+    })?;
+    let pool = config
+        .pool
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LIBVIRT_IMAGE_POOL.to_owned());
+    ensure_script_safe_value("pool", pool.as_str())?;
+    if pool.contains('\'') {
+        return Err("--pool must not contain a single quote".to_owned());
+    }
+
+    let script = HOST_DISK_STATUS_SCRIPT.replace("__POOL__", pool.as_str());
+    let timeout = timeout_or_default(config.timeout_secs, 60);
+    let out = run_guest_script(
+        endpoint.as_str(),
+        None,
+        script.as_str(),
+        false,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout,
+    )?;
+    let body = match out.split_once("DISK-BEGIN\n") {
+        Some((_, rest)) => rest.split_once("DISK-END").map(|(b, _)| b).unwrap_or(rest),
+        None => {
+            return Err(format!(
+                "host {}: disk status did not return a report:\n{out}",
+                host.host_id
+            ));
+        }
+    };
+
+    if config.json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "host_id": host.host_id,
+            "pool": pool,
+            "report": body.trim(),
+        }))
+        .unwrap_or_else(|_| "{}".to_owned()));
+    }
+    Ok(format!(
+        "host {} — disk status (pool {})\n{}",
+        host.host_id,
+        pool,
+        body.trim_end()
+    ))
+}
+
 /// Renumber a host's libvirt `default` network off the shared libvirt default
 /// (`192.168.122.0/24`) onto the host's declared `guest_subnet`, so several KVM
 /// hosts can each advertise their guest subnet to the tailnet without colliding.
@@ -54700,5 +54926,61 @@ mod provision_guest_create_tests {
         // which works uniformly across debian/ubuntu/rocky bases.
         assert!(s.contains("ssh_authorized_keys:"));
         assert!(s.contains("- $PUBKEY"));
+    }
+}
+
+#[cfg(test)]
+mod host_disk_status_tests {
+    use super::HOST_DISK_STATUS_SCRIPT;
+
+    #[test]
+    fn the_pool_is_single_quoted_and_du_is_depth_bounded() {
+        let s = HOST_DISK_STATUS_SCRIPT.replace("__POOL__", "/var/lib/libvirt/images");
+        assert!(s.contains("POOL='/var/lib/libvirt/images'"));
+        // Fenced between sentinels the executor splits on.
+        assert!(s.contains("DISK-BEGIN"));
+        assert!(s.contains("DISK-END"));
+        // du is scoped to the pool, never the whole disk.
+        assert!(s.contains(r#"du -sh "$POOL""#));
+    }
+}
+
+#[cfg(test)]
+mod recover_host_vms_tests {
+    use super::HOST_RECOVER_VMS_SCRIPT;
+
+    fn render(force: bool, targets: &str) -> String {
+        HOST_RECOVER_VMS_SCRIPT
+            .replace("__FORCE__", if force { "1" } else { "0" })
+            .replace("__TARGETS__", targets)
+    }
+
+    #[test]
+    fn a_healthy_running_guest_is_skipped_unless_forced() {
+        let s = render(false, "");
+        // Only reset a running guest when forced OR it has no lease.
+        assert!(s.contains(r#"if [ "$FORCE" = "1" ] || [ -z "$ip" ]; then"#));
+        assert!(s.contains("skip (healthy: running"));
+    }
+
+    #[test]
+    fn a_shut_off_or_paused_guest_is_recovered() {
+        let s = render(false, "");
+        assert!(s.contains("STARTED (was $st)"));
+        assert!(s.contains("RECOVERED (was paused)"));
+    }
+
+    #[test]
+    fn empty_targets_means_every_domain_on_the_host() {
+        let s = render(false, "");
+        assert!(s.contains("virsh -c qemu:///system list --name --all"));
+    }
+
+    #[test]
+    fn recovery_uses_a_hard_reset_to_force_a_fresh_lease() {
+        let s = render(true, "d1 d2");
+        // destroy then start = clean boot + new DHCP lease, the whole point.
+        assert!(s.contains(r#"virsh -c qemu:///system destroy "$d""#));
+        assert!(s.contains(r#"virsh -c qemu:///system start "$d""#));
     }
 }
