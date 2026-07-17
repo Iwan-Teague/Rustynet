@@ -327,6 +327,14 @@ enum CliCommand {
     /// `rustynet_sysinfo::observe_system_diagnostics`.
     Diagnostics,
     Help,
+    /// A subcommand parser rejected the argv.
+    ///
+    /// Carries the parser's own message so it reaches the operator AND a non-zero
+    /// exit. Every one of these used to collapse to `Help`, which prints usage and
+    /// exits 0 — so `ops <typo>` looked like success. The MCP shells out to this
+    /// CLI and trusts the exit code, so it reported a usage dump as "✅ PASSED";
+    /// `role set <invalid>` did the same. A parse error is not a help request.
+    UsageError(String),
 }
 
 /// D12.b — operator-facing role surface backed by
@@ -1705,7 +1713,7 @@ fn classify_cli_error(message: &str) -> rustynetd::exit_codes::ExitCode {
     use rustynetd::exit_codes::ExitCode;
     let lower = message.to_ascii_lowercase();
     if lower.contains("unknown command")
-        || lower.contains("unknown subcommand")
+        || (lower.contains("unknown") && lower.contains("subcommand"))
         || lower.contains("missing required")
         || lower.contains("requires --")
         || lower.contains("requires argument")
@@ -1826,7 +1834,7 @@ fn parse_command(args: &[String]) -> CliCommand {
                     target,
                     accept_irreversible: false,
                 }),
-                Err(_) => CliCommand::Help,
+                Err(err) => CliCommand::UsageError(err.user_message()),
             }
         }
         [cmd, subcmd, raw, flag]
@@ -1837,7 +1845,7 @@ fn parse_command(args: &[String]) -> CliCommand {
                     target,
                     accept_irreversible: true,
                 }),
-                Err(_) => CliCommand::Help,
+                Err(err) => CliCommand::UsageError(err.user_message()),
             }
         }
         [cmd, subcmd, flag, raw]
@@ -1845,7 +1853,7 @@ fn parse_command(args: &[String]) -> CliCommand {
         {
             match role_cli::parse_preset_arg(raw) {
                 Ok(target) => CliCommand::Role(RoleCommand::TransitionCheck { target }),
-                Err(_) => CliCommand::Help,
+                Err(err) => CliCommand::UsageError(err.user_message()),
             }
         }
         [cmd, subcmd, rest @ ..] if cmd == "role" && subcmd == "recommend" => {
@@ -1892,13 +1900,13 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd, subcmd, flag] if cmd == "capability" && subcmd == "add" => {
             match role_cli::parse_capability_arg(flag) {
                 Ok(cap) => CliCommand::Capability(CapabilityCommand::Add(cap)),
-                Err(_) => CliCommand::Help,
+                Err(err) => CliCommand::UsageError(err.user_message()),
             }
         }
         [cmd, subcmd, flag] if cmd == "capability" && subcmd == "remove" => {
             match role_cli::parse_capability_arg(flag) {
                 Ok(cap) => CliCommand::Capability(CapabilityCommand::Remove(cap)),
-                Err(_) => CliCommand::Help,
+                Err(err) => CliCommand::UsageError(err.user_message()),
             }
         }
         [cmd, subcmd, peer, rest @ ..] if cmd == "llm" && subcmd == "allow" => {
@@ -2072,12 +2080,12 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd, subcmd, action, rest @ ..] if cmd == "dns" && subcmd == "zone" => {
             match parse_dns_zone_command(action, rest) {
                 Ok(command) => command,
-                Err(_) => CliCommand::Help,
+                Err(err) => CliCommand::UsageError(err),
             }
         }
         [cmd, rest @ ..] if cmd == "traversal" => match parse_traversal_command(rest) {
             Ok(command) => CliCommand::Traversal(Box::new(command)),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, subcmd, cidr] if cmd == "route" && subcmd == "advertise" => {
             CliCommand::RouteAdvertise(cidr.clone())
@@ -2086,70 +2094,76 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd, subcmd] if cmd == "key" && subcmd == "revoke" => CliCommand::KeyRevoke,
         [cmd, rest @ ..] if cmd == "assignment" => match parse_assignment_command(rest) {
             Ok(command) => CliCommand::Assignment(Box::new(command)),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "membership" => match parse_membership_command(rest) {
             Ok(command) => CliCommand::Membership(Box::new(command)),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "anchor" => match parse_anchor_command(rest) {
             Ok(command) => CliCommand::Anchor(Box::new(command)),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "enrollment" => match parse_enrollment_command(rest) {
             Ok(command) => CliCommand::Enrollment(Box::new(command)),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "install" => CliCommand::Install(rest.to_vec()),
         [cmd, rest @ ..] if cmd == "trust" => match parse_trust_command(rest) {
             Ok(command) => CliCommand::Trust(Box::new(command)),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "ops" => match parse_ops_command(rest) {
             Ok(command) => CliCommand::Ops(Box::new(command)),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "node" => match parse_node_command(rest) {
             Ok(command) => CliCommand::Node(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "policy" => match parse_policy_command(rest) {
             Ok(command) => CliCommand::Policy(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "relay" => match parse_relay_command(rest) {
             Ok(command) => CliCommand::Relay(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "cert" => match parse_cert_command(rest) {
             Ok(command) => CliCommand::Cert(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "trust-state" => match parse_trust_state_command(rest) {
             Ok(command) => CliCommand::TrustState(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "analytics" => match parse_analytics_command(rest) {
             Ok(command) => CliCommand::Analytics(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "backup" => match parse_backup_command(rest) {
             Ok(command) => CliCommand::Backup(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "restore" => match parse_restore_command(rest) {
             Ok(command) => CliCommand::RestoreState(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "export-keys" => match parse_export_keys_command(rest) {
             Ok(command) => CliCommand::ExportKeys(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
         [cmd, rest @ ..] if cmd == "config" => match parse_config_subcommand(rest) {
             Ok(command) => CliCommand::Config(command),
-            Err(_) => CliCommand::Help,
+            Err(err) => CliCommand::UsageError(err),
         },
-        _ => CliCommand::Help,
+        // Bare `rustynet`, and an explicit help request, are help — exit 0.
+        [] => CliCommand::Help,
+        [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => CliCommand::Help,
+        // Anything else is a typo or a command this build does not have (e.g. a
+        // vm-lab subcommand in a default-feature build). Printing usage and exiting
+        // 0 made those indistinguishable from success.
+        rest => CliCommand::UsageError(format!("unknown command: {}", rest.join(" "))),
     }
 }
 
@@ -6318,6 +6332,7 @@ fn proposal_config(
 fn execute(command: CliCommand) -> Result<String, String> {
     match command {
         CliCommand::Help => Ok(help_text()),
+        CliCommand::UsageError(message) => Err(message),
         CliCommand::Version => Ok(version_text()),
         CliCommand::Info => execute_info(),
         CliCommand::Doctor => execute_doctor(),
@@ -16165,6 +16180,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         CliCommand::KeyRevoke => IpcCommand::KeyRevoke,
         CliCommand::Login
         | CliCommand::Help
+        | CliCommand::UsageError(_)
         | CliCommand::Version
         | CliCommand::Info
         | CliCommand::Doctor
@@ -24942,7 +24958,26 @@ mod tests {
             "--salvage-twohop".to_owned(),
             "skipped".to_owned(),
         ]);
-        assert_eq!(format!("{missing_dns_refresh_checks:?}"), "Help");
+        // This asserted "Help" until 2026-07-17 — i.e. it enshrined the fail-open:
+        // a missing REQUIRED option produced a usage dump and exit 0, so a caller
+        // (the lab-state MCP shells out to this CLI and trusts the exit code) read
+        // a rejected command as success. The parser's message now survives to the
+        // operator and the exit is non-zero. Assert the message NAMES the missing
+        // option, which is the part that makes the error actionable.
+        match &missing_dns_refresh_checks {
+            CliCommand::UsageError(message) => {
+                assert!(
+                    message.contains("--post-exit-dns-refresh"),
+                    "must name the missing option: {message}"
+                );
+                assert_eq!(
+                    classify_cli_error(message.as_str()),
+                    rustynetd::exit_codes::ExitCode::BadArgs,
+                    "a missing required option is a bad-args error, not success"
+                );
+            }
+            other => panic!("expected UsageError, got {other:?}"),
+        }
     }
 
     #[test]
@@ -25760,6 +25795,94 @@ mod tests {
         let c = render_key_value_line_as_json(line).unwrap();
         assert_eq!(a, b);
         assert_eq!(b, c);
+    }
+
+    // ---- Parse errors must not masquerade as help (2026-07-17) ----------
+
+    fn parse(argv: &[&str]) -> CliCommand {
+        parse_command(&argv.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn an_unknown_ops_subcommand_is_a_usage_error_not_help() {
+        // It used to collapse to Help, which prints usage and exits 0 — so the
+        // lab-state MCP, which shells out to this CLI and trusts the exit code,
+        // reported a usage dump as "✅ PASSED" for a command that never ran.
+        match parse(&["ops", "vm-lab-total-nonsense"]) {
+            CliCommand::UsageError(message) => {
+                assert!(message.contains("unknown ops subcommand"), "got: {message}");
+                assert!(
+                    message.contains("vm-lab-total-nonsense"),
+                    "must name it: {message}"
+                );
+            }
+            other => panic!("expected UsageError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_top_level_command_is_a_usage_error_not_help() {
+        match parse(&["total-nonsense"]) {
+            CliCommand::UsageError(message) => assert!(message.contains("unknown command")),
+            other => panic!("expected UsageError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_is_still_help_and_stays_exit_zero() {
+        // The fix must not turn a help request into an error.
+        assert!(matches!(parse(&[]), CliCommand::Help));
+        assert!(matches!(parse(&["help"]), CliCommand::Help));
+        assert!(matches!(parse(&["--help"]), CliCommand::Help));
+        assert!(matches!(parse(&["-h"]), CliCommand::Help));
+    }
+
+    #[test]
+    fn a_usage_error_executes_as_an_error_so_the_exit_code_is_nonzero() {
+        let err = execute(CliCommand::UsageError(
+            "unknown ops subcommand: x".to_owned(),
+        ))
+        .expect_err("UsageError must execute as Err");
+        assert_eq!(
+            classify_cli_error(err.as_str()),
+            rustynetd::exit_codes::ExitCode::BadArgs
+        );
+    }
+
+    #[test]
+    fn classify_maps_the_ops_parsers_wording_to_bad_args() {
+        use rustynetd::exit_codes::ExitCode;
+        // The ops parser says "unknown ops subcommand", which does NOT contain the
+        // literal "unknown subcommand" the rule originally looked for — so even a
+        // propagated error would have been misclassified.
+        assert_eq!(
+            classify_cli_error("unknown ops subcommand: vm-lab-nope"),
+            ExitCode::BadArgs
+        );
+        assert_eq!(
+            classify_cli_error("unknown subcommand: nope"),
+            ExitCode::BadArgs
+        );
+        assert_eq!(
+            classify_cli_error("unknown command: nope"),
+            ExitCode::BadArgs
+        );
+    }
+
+    #[test]
+    fn a_rejected_role_reaches_the_operator_instead_of_a_usage_dump() {
+        // `role set <invalid>` used to print generic help and exit 0. RoleCliError
+        // carries user_message() precisely so the operator sees WHY.
+        match parse(&["role", "set", "not-a-role"]) {
+            CliCommand::UsageError(message) => {
+                assert!(!message.is_empty());
+                assert!(
+                    message.to_ascii_lowercase().contains("role"),
+                    "must explain the role problem: {message}"
+                );
+            }
+            other => panic!("expected UsageError, got {other:?}"),
+        }
     }
 
     // ---- X6: classify_cli_error coverage --------------------------------

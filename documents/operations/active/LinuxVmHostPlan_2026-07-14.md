@@ -1753,11 +1753,34 @@ predates the fix.
 
 These make every other result untrustworthy, so they come before new features.
 
-- [ ] **`ops <unknown-subcommand>` exits 0** and prints usage, so the MCP's
-      `format_lab_outcome` (which trusts the exit code) reports **`✅ PASSED` for a
-      command that never ran**. Hit live via `get_vm_diagnostics` on 2026-07-17.
-      An unknown subcommand must exit `BadArgs (64)`. (An unknown *flag* correctly
-      exits 1 — it is only the subcommand path that is wrong.)
+- [x] **DONE 2026-07-17.** `ops <unknown-subcommand>` exited 0 and printed usage,
+      so the MCP's `format_lab_outcome` (which trusts the exit code) reported
+      **`✅ PASSED` for a command that never ran** — hit live via
+      `get_vm_diagnostics`. Root cause was **23 sites** of
+      `Err(_) => CliCommand::Help`: every subcommand parser's error was *discarded*
+      (`Err(_)`, underscore) and turned into a usage dump at exit 0. Not just `ops`
+      — `role set <invalid>` did it too, printing generic help instead of
+      `RoleCliError::user_message()`'s explanation, at exit 0.
+      Fixed with a `CliCommand::UsageError(String)` variant that carries the
+      parser's own message and executes as `Err`, so `classify_cli_error` gives it a
+      real exit code. `classify` also had to widen: it matched the literal
+      `"unknown subcommand"`, which `"unknown ops subcommand"` does **not** contain,
+      so even a propagated error would have been misclassified. Top-level
+      fallthrough split so bare `rustynet` / `help` / `--help` / `-h` stay exit-0
+      help while an unknown command is a usage error.
+      Now: `ops <unknown>` → **64**, unknown top-level → **64**,
+      `role set not-a-role` → 1 *with the real message*, help paths → 0,
+      real vm-lab commands → 0. 6 new tests; full bin suite 2427 passed / 0 failed.
+      **Two existing tests had to be fixed, and both are instructive:**
+      `parse_reboot_recovery_report_requires_dns_refresh_checks` **asserted
+      `Help`** for a missing required option — the fail-open was entrenched enough
+      to have a test enforcing it; it now asserts the message names the option and
+      classifies as BadArgs. And `bootstrap_script_uses_root_for_system_keychain_writes_only`
+      pinned `rm -f "${runtime_key}"`, which RSA-0080's fix (02deff8) had changed to
+      `secure_remove_file` — that commit landed with the break because only targeted
+      tests + the gate were run, not the full suite (AGENTS/CLAUDE §13.1 says run it
+      before landing). The assertion is now the stronger one: secure removal, and
+      *no* plain `rm -f` on that path.
 - [ ] **`discover_hosts` fails open off-macOS.** Run on the box it reports
       `host mac-utm-1 … probe=ok` and lists the Mac's 7 domains as **"shut off"** —
       but the UTM paths and `utmctl` do not exist there, so those names came from
