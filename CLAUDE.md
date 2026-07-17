@@ -392,6 +392,19 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
   `scripts/vm_lab/probe_and_recover_local_utm.sh` before retrying.
 - Never hand-edit `vm_lab_inventory.json` — refresh with
   `--update-inventory-live-ips`.
+- **Lab SSH passwords live OUTSIDE the inventory.** This repository is public, so
+  an `ssh_password` written into `vm_lab_inventory.json` is published to the
+  internet and preserved in git history (eight were, before this rule). They are
+  still needed — `sshpass` primes SSH keys onto guests that have none — so the
+  value lives in an untracked sidecar and only the alias stays in the inventory:
+  `documents/operations/active/vm_lab_inventory.secrets.json`, mode `600`,
+  `{"ssh_passwords": {"<alias>": "<password>"}}`. The loader merges it by alias at
+  load time (inline still wins, so the split is additive); override the location
+  with `RUSTYNET_LAB_SECRETS`. A group/world-readable sidecar fails the load
+  closed, and `scripts/ci/secrets_hygiene_gates.sh` rejects any inline
+  `ssh_password` that drifts back into a tracked inventory. On a fresh checkout
+  the sidecar is absent — that is not an error; recreate it for the guests that
+  need one.
 - After every evidence run, verify the appended row in
   `documents/operations/live_lab_node_run_matrix.csv` (§2, §10.9).
 

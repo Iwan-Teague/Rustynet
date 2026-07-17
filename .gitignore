@@ -55,3 +55,6 @@ __pycache__/
 
 # Transient agent worktrees (harness-managed, never commit)
 .claude/worktrees/
+
+# Lab SSH bootstrap passwords. The inventory beside this is public; these are not.
+*.secrets.json

@@ -143,6 +143,63 @@ pub struct VmLabDiscoverLocalUtmConfig {
     pub report_dir: Option<PathBuf>,
 }
 
+/// Validate a caller-pinned SHA-256 and return it in the canonical lowercase hex
+/// form the host script compares against.
+///
+/// Returns an empty string when nothing is pinned — the script reads that as
+/// "unpinned" and warns. Anything present must be a real digest: this value is
+/// interpolated into a shell script, so a permissive parse here would be both an
+/// injection surface and a silently-never-matching comparison.
+fn normalise_pinned_sha256(value: Option<&str>) -> Result<String, String> {
+    let Some(raw) = value else {
+        return Ok(String::new());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("--sha256 was given but is empty".to_owned());
+    }
+    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "--sha256 must be 64 hex characters (got {} chars: {:?})",
+            trimmed.len(),
+            trimmed
+        ));
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+/// Config for `ops vm-lab-fetch-image`: pull a base image into a host's pool.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabFetchImageConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    /// Filename to store in the pool (bare name).
+    pub name: String,
+    /// https:// source.
+    pub url: String,
+    /// Pinned lowercase hex SHA-256 of the artifact. When set, the image is
+    /// verified on the host before it is installed into the pool, and a mismatch
+    /// refuses the install. TLS authenticates the mirror, not the file.
+    pub sha256: Option<String>,
+    pub pool: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+}
+
+/// Config for `ops vm-lab-guest-console`: capture a guest's boot console.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabGuestConsoleConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    /// libvirt domain name.
+    pub domain: String,
+    /// Seconds of boot output to capture (clamped 5..=180).
+    pub seconds: u32,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+}
+
 /// Config for `ops vm-lab-provision-toolchain`: install what rn_bootstrap verifies.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VmLabProvisionToolchainConfig {
@@ -3763,6 +3820,173 @@ fn classify_ssh_probe_failure(err: &str) -> &'static str {
     }
 }
 
+/// Fetch a base image into a libvirt host's pool, resumably.
+///
+/// Runs ON the host (the pool is there, and the bytes should not transit the
+/// orchestrator). Shipped over stdin; the only interpolated values are validated
+/// first.
+///
+/// Every choice here is a lesson from a failure that actually happened:
+/// - **No sudo inside the retry loop.** Caching sudo once and calling `sudo curl`
+///   per image meant the 15-minute timestamp expired mid-download, so every later
+///   call hit a passwordless prompt and exited 1 — burning all retries in seconds
+///   and looking exactly like a network failure. Download as the user; one
+///   privileged `install` at the end.
+/// - **`-C -` resume + retry.** Sources are verified to send `Accept-Ranges`, so a
+///   drop resumes at the byte it stopped rather than restarting.
+/// - **`--proto-redir =https`.** A mirror redirector bounced curl to a non-HTTPS
+///   mirror, which curl refuses with rc=1 — indistinguishable from other failures.
+/// - **A stall detector** (`--speed-time`), so a hung transfer dies and resumes
+///   instead of hanging until the outer timeout.
+const HOST_FETCH_IMAGE_SCRIPT: &str = r#"#!/bin/bash
+set -uo pipefail
+POOL="__POOL__"
+NAME="__NAME__"
+URL="__URL__"
+STAGE="$HOME/.rustynet-image-staging"
+mkdir -p "$STAGE"
+
+if [ -f "$POOL/$NAME" ] && [ -f "$POOL/$NAME.done" ]; then
+  # A pinned digest re-verifies what is already there. The .done marker only
+  # records that some past run finished; it is not evidence the bytes on disk are
+  # still the bytes that were fetched.
+  if [ -n "__SHA256__" ]; then
+    POOL_ACTUAL="$(sha256sum "$POOL/$NAME" | cut -d' ' -f1)"
+    if [ "$POOL_ACTUAL" != "__SHA256__" ]; then
+      echo "[image] REFUSING: $NAME is in the pool but its sha256 does not match" >&2
+      echo "[image]   expected __SHA256__" >&2
+      echo "[image]   actual   $POOL_ACTUAL" >&2
+      echo "[image] Not overwriting. Remove $POOL/$NAME and re-run to refetch." >&2
+      exit 1
+    fi
+    echo "[image] $NAME already complete in the pool (sha256 verified)"
+    exit 0
+  fi
+  echo "[image] $NAME already complete in the pool"
+  exit 0
+fi
+
+# Guard BEFORE writing: the pool must sit on the declared disk, matched by MODEL.
+# Device letters are not stable across boots, so a letter is not a guard.
+if [ -n "__EXPECT_MODEL__" ]; then
+  DEV="$(findmnt -n -o SOURCE --target "$POOL" | sed 's/[0-9]*$//')"
+  MODEL="$(lsblk -no MODEL "$DEV" | head -1 | xargs)"
+  if [ "$MODEL" != "__EXPECT_MODEL__" ]; then
+    echo "[image] REFUSING: $POOL is on '$MODEL' ($DEV), not '__EXPECT_MODEL__'. Nothing written." >&2
+    exit 1
+  fi
+  echo "[image] guard: $POOL -> $DEV = $MODEL (ok)"
+fi
+
+# A COMPLETE staged file must skip the transfer entirely.
+#
+# `curl -C -` on an already-complete file asks for `Range: <size>-`, the server
+# answers 416, and curl exits 33/36 — which the loop below reads as "resume
+# rejected" and responds to by DELETING the file and re-downloading from zero.
+# So an interrupted-then-completed run (download succeeded, install failed) would
+# throw away a finished multi-GB transfer on the retry. Compare the staged size
+# against Content-Length up front and jump straight to install when they match.
+# NOTE: no `awk BEGIN{IGNORECASE=1}` here. IGNORECASE is a GAWK extension and the
+# hosts run mawk, which silently ignores it — so /^content-length:/ never matched
+# the real `Content-Length:` header and this probe returned empty, defeating
+# itself without a word. tr+grep -i is portable across both awks.
+REMOTE_SIZE="$(curl -4 -sIL --proto-redir =https --connect-timeout 30 "$URL" 2>/dev/null \
+  | tr -d '\r' | grep -i '^content-length:' | tail -1 | awk '{print $2}')"
+if [ -f "$STAGE/$NAME" ] && [ -n "${REMOTE_SIZE:-}" ]; then
+  LOCAL_SIZE="$(stat -c %s "$STAGE/$NAME" 2>/dev/null || echo 0)"
+  if [ "$LOCAL_SIZE" = "$REMOTE_SIZE" ]; then
+    echo "[image] staged $NAME is already complete ($LOCAL_SIZE bytes) — skipping download"
+    SKIP_DOWNLOAD=1
+  fi
+fi
+
+for attempt in 1 2 3 4 5; do
+  if [ "${SKIP_DOWNLOAD:-0}" = "1" ]; then rc=0; else
+  # NO sudo in this loop, deliberately.
+  curl -4 -L -C - --proto-redir =https \
+       --retry 10 --retry-delay 10 --retry-all-errors --retry-max-time 0 \
+       --connect-timeout 30 --speed-limit 1024 --speed-time 180 \
+       -o "$STAGE/$NAME" "$URL" >/dev/null 2>&1
+  rc=$?
+  fi
+  if [ $rc -eq 0 ]; then
+    echo "[image] downloaded $NAME ($(du -h "$STAGE/$NAME" | cut -f1))"
+    # Integrity gate BEFORE the image is placed where libvirt will boot guests from.
+    # TLS authenticates the transport, not the artifact: these URLs are redirectors
+    # onto mirrors/archives, and this file is a driver ISO that gets injected into
+    # guests. Verify against the caller's pinned digest, and refuse+delete on a
+    # mismatch rather than leave a bad image staged for a later retry to install.
+    if [ -n "__SHA256__" ]; then
+      ACTUAL="$(sha256sum "$STAGE/$NAME" | cut -d' ' -f1)"
+      if [ "$ACTUAL" != "__SHA256__" ]; then
+        echo "[image] REFUSING: sha256 mismatch for $NAME" >&2
+        echo "[image]   expected __SHA256__" >&2
+        echo "[image]   actual   $ACTUAL" >&2
+        rm -f "$STAGE/$NAME"
+        exit 1
+      fi
+      echo "[image] sha256 verified: $ACTUAL"
+    else
+      echo "[image] WARNING: no --sha256 pinned; integrity rests on TLS alone" >&2
+    fi
+    # Unprivileged install first. A pool that is group-writable to kvm with the
+    # setgid bit set (see the remediation below) needs no root at all: the new
+    # file inherits group kvm, and libvirt-qemu is a member, so qemu can read it.
+    # Preferring this path keeps image staging out of the sudo blast radius.
+    if install -m 0644 "$STAGE/$NAME" "$POOL/$NAME" 2>/dev/null; then
+      touch "$POOL/$NAME.done" 2>/dev/null
+      rm -f "$STAGE/$NAME"
+      echo "[image] installed into $POOL/$NAME (unprivileged)"
+      exit 0
+    fi
+    # Root-owned pool: only works where sudo is already passwordless.
+    if sudo -n install -o libvirt-qemu -g kvm -m 0644 "$STAGE/$NAME" "$POOL/$NAME" 2>/dev/null; then
+      sudo -n touch "$POOL/$NAME.done" 2>/dev/null
+      rm -f "$STAGE/$NAME"
+      echo "[image] installed into $POOL/$NAME (via sudo)"
+      exit 0
+    fi
+    echo "[image] downloaded OK but $POOL is not writable by $(id -un)." >&2
+    echo "[image] The download is kept at $STAGE/$NAME — re-run to install, no re-download." >&2
+    echo "[image] Grant write access ONCE on the host (no stored credential, world perms unchanged):" >&2
+    echo "[image]   sudo chgrp kvm $POOL && sudo chmod 2771 $POOL" >&2
+    echo "[image] Requires $(id -un) in group kvm; verify with: id -nG" >&2
+    exit 1
+  fi
+  # 33/36: the server refused the range -> the partial is unusable, restart clean
+  if [ $rc -eq 33 ] || [ $rc -eq 36 ]; then
+    echo "[image] resume rejected (rc=$rc), restarting from zero"
+    rm -f "$STAGE/$NAME"
+  fi
+  echo "[image] attempt $attempt failed rc=$rc, re-resuming"
+  sleep 10
+done
+echo "[image] FAILED after 5 attempts: $NAME" >&2
+exit 1
+"#;
+
+/// Capture a guest's serial console during a fresh boot.
+///
+/// The tool for "the VM will not boot and nothing says why". It is what surfaced
+/// the `--graphics none` GRUB loop: the console showed GRUB re-printing
+/// ``Booting `Debian GNU/Linux'`` forever with no kernel output at all, which no
+/// other signal revealed — `domstate` cheerfully said `running` throughout.
+///
+/// Destructive to the guest's uptime: it force-stops the domain to catch the boot
+/// from the start, because attaching afterwards shows nothing on a hung guest.
+const HOST_GUEST_CONSOLE_SCRIPT: &str = r#"#!/bin/bash
+set -uo pipefail
+DOM="__DOMAIN__"
+SECS="__SECONDS__"
+virsh -c qemu:///system destroy "$DOM" >/dev/null 2>&1 || true
+sleep 2
+# `script` supplies the pty that `virsh console` requires over a non-tty ssh session.
+timeout "$SECS" script -qec "virsh -c qemu:///system start --console $DOM" /dev/null 2>&1 | head -120
+echo
+echo "--- capture ended ---"
+echo "domstate: $(virsh -c qemu:///system domstate "$DOM" 2>&1)"
+"#;
+
 /// The toolchain a Debian-family lab guest needs before `rn_bootstrap.sh` will run.
 ///
 /// `rn_bootstrap` **verifies** prerequisites and fails when they are missing — it
@@ -3901,6 +4125,136 @@ fn pinned_toolchain_channel() -> Result<String, String> {
         return Err(format!("refusing unsafe toolchain channel: {channel:?}"));
     }
     Ok(channel)
+}
+
+/// A value interpolated into a host script must not be able to escape its quotes.
+fn ensure_script_safe_value(label: &str, value: &str) -> Result<(), String> {
+    ensure_no_control_chars(label, value)?;
+    if value.contains('"') || value.contains('$') || value.contains('`') || value.contains('\\') {
+        return Err(format!(
+            "{label} contains a shell metacharacter and is refused: {value:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Download a base image into a libvirt host's pool.
+///
+/// The bytes are pulled **by the host**, not relayed through the orchestrator: the
+/// pool lives there, and a lab host usually has better connectivity to a mirror
+/// than a laptop tethered to it.
+pub fn execute_ops_vm_lab_fetch_image(config: VmLabFetchImageConfig) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+    if host.kind != LabHostKind::Libvirt {
+        return Err(format!(
+            "host {} is kind={}; image pools are a libvirt concept",
+            host.host_id,
+            host.kind.as_str()
+        ));
+    }
+    let endpoint = host
+        .ssh_endpoint()
+        .ok_or_else(|| format!("host {} has no ssh endpoint in connect_uri", host.host_id))?;
+
+    ensure_provision_image_name(config.name.as_str())?;
+    ensure_script_safe_value("name", config.name.as_str())?;
+    // https only: an image is executable content in every meaningful sense.
+    if !config.url.starts_with("https://") {
+        return Err(format!(
+            "--url must be https (got {:?}); an image is executable content and must not be fetched in the clear",
+            config.url
+        ));
+    }
+    ensure_script_safe_value("url", config.url.as_str())?;
+    let pool = config
+        .pool
+        .clone()
+        .unwrap_or_else(|| DEFAULT_LIBVIRT_IMAGE_POOL.to_owned());
+    ensure_script_safe_value("pool", pool.as_str())?;
+    let expect_model = host.pool_disk_model.clone().unwrap_or_default();
+    ensure_script_safe_value("pool_disk_model", expect_model.as_str())?;
+    let sha256 = normalise_pinned_sha256(config.sha256.as_deref())?;
+
+    let script = HOST_FETCH_IMAGE_SCRIPT
+        .replace("__POOL__", pool.as_str())
+        .replace("__NAME__", config.name.as_str())
+        .replace("__URL__", config.url.as_str())
+        .replace("__SHA256__", sha256.as_str())
+        .replace("__EXPECT_MODEL__", expect_model.as_str());
+
+    let timeout = timeout_or_default(config.timeout_secs, 3600);
+    let ssh_user = endpoint.split_once('@').map(|(user, _)| user.to_owned());
+    let target = endpoint
+        .split_once('@')
+        .map(|(_, host)| host.to_owned())
+        .unwrap_or(endpoint.clone());
+
+    let output = run_guest_script(
+        target.as_str(),
+        ssh_user.as_deref(),
+        script.as_str(),
+        false,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout,
+    )?;
+    Ok(format!(
+        "host {} — {}\n{output}\n",
+        host.host_id, config.name
+    ))
+}
+
+/// Capture a guest's boot console — the tool for "it will not boot and nothing says why".
+pub fn execute_ops_vm_lab_guest_console(config: VmLabGuestConsoleConfig) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+    let endpoint = host
+        .ssh_endpoint()
+        .ok_or_else(|| format!("host {} has no ssh endpoint in connect_uri", host.host_id))?;
+
+    ensure_provision_guest_name(config.domain.as_str())?;
+    ensure_script_safe_value("domain", config.domain.as_str())?;
+    let seconds = config.seconds.clamp(5, 180);
+
+    let script = HOST_GUEST_CONSOLE_SCRIPT
+        .replace("__DOMAIN__", config.domain.as_str())
+        .replace("__SECONDS__", seconds.to_string().as_str());
+
+    let ssh_user = endpoint.split_once('@').map(|(user, _)| user.to_owned());
+    let target = endpoint
+        .split_once('@')
+        .map(|(_, host)| host.to_owned())
+        .unwrap_or(endpoint.clone());
+
+    let output = run_guest_script(
+        target.as_str(),
+        ssh_user.as_deref(),
+        script.as_str(),
+        false,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        Duration::from_secs(u64::from(seconds) + 60),
+    )?;
+    Ok(format!(
+        "=== boot console: {} on {} ({}s) ===\n\
+         (the domain was force-stopped to capture the boot from the start)\n{output}\n",
+        config.domain, host.host_id, seconds
+    ))
 }
 
 /// Install the toolchain a Linux lab guest needs before Rustynet can be built on it.
@@ -32569,7 +32923,120 @@ fn load_inventory_with_hosts(path: &Path) -> Result<(Vec<VmInventoryEntry>, Vec<
         }
         parsed.push(parsed_entry);
     }
+    merge_secrets_sidecar(path, &mut parsed)?;
     Ok((parsed, hosts))
+}
+
+/// Filename of the untracked sidecar that supplies `ssh_password`, resolved next
+/// to the inventory it accompanies.
+const SECRETS_SIDECAR_SUFFIX: &str = ".secrets.json";
+
+/// Env override for the sidecar location, for hosts that keep lab secrets outside
+/// the checkout entirely.
+const SECRETS_SIDECAR_ENV: &str = "RUSTYNET_LAB_SECRETS";
+
+/// Resolve the sidecar path for an inventory: `$RUSTYNET_LAB_SECRETS` if set,
+/// else `<inventory-stem>.secrets.json` beside the inventory.
+fn secrets_sidecar_path(inventory: &Path) -> PathBuf {
+    if let Ok(explicit) = std::env::var(SECRETS_SIDECAR_ENV) {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    let stem = inventory
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "vm_lab_inventory".to_owned());
+    inventory.with_file_name(format!("{stem}{SECRETS_SIDECAR_SUFFIX}"))
+}
+
+/// Fill in `ssh_password` from the untracked sidecar for entries that do not carry
+/// one inline.
+///
+/// Why this exists: the inventory is committed to a public repository, so a
+/// password written into it is published to the internet and baked into git
+/// history. The passwords are still needed — `sshpass` uses them to prime SSH keys
+/// onto macOS guests and to reach guests that have no key yet — so they cannot
+/// simply be dropped. Keeping the *value* in an untracked sidecar and the
+/// *reference* (the alias) in the inventory keeps the lab working without
+/// publishing the credential.
+///
+/// Inline `ssh_password` still wins, so this is additive and cannot break an
+/// existing inventory. A missing sidecar is not an error: most commands never need
+/// a password, and failing every load over an absent optional file would be worse
+/// than the problem it solves. The command that actually needs a password already
+/// fails when it is absent.
+fn merge_secrets_sidecar(inventory: &Path, entries: &mut [VmInventoryEntry]) -> Result<(), String> {
+    let sidecar = secrets_sidecar_path(inventory);
+    if !sidecar.exists() {
+        return Ok(());
+    }
+    ensure_secrets_file_permissions(sidecar.as_path())?;
+
+    let body = fs::read_to_string(sidecar.as_path())
+        .map_err(|err| format!("read lab secrets failed ({}): {err}", sidecar.display()))?;
+    let value = serde_json::from_str::<Value>(body.as_str())
+        .map_err(|err| format!("parse lab secrets failed ({}): {err}", sidecar.display()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("lab secrets must be a JSON object: {}", sidecar.display()))?;
+    let passwords = match object.get("ssh_passwords") {
+        Some(Value::Object(map)) => map,
+        Some(_) => {
+            return Err(format!(
+                "lab secrets 'ssh_passwords' must be an object of alias -> password: {}",
+                sidecar.display()
+            ));
+        }
+        None => return Ok(()),
+    };
+
+    for (alias, secret) in passwords {
+        let Some(secret) = secret.as_str() else {
+            return Err(format!(
+                "lab secrets ssh_passwords.{alias} must be a string: {}",
+                sidecar.display()
+            ));
+        };
+        // Same validation the inline field gets: the sidecar is not a trusted
+        // channel just because it is local.
+        ensure_no_control_chars("ssh_password", secret)?;
+        for entry in entries.iter_mut() {
+            if entry.alias.as_str() == alias.as_str() && entry.ssh_password.is_none() {
+                entry.ssh_password = Some(secret.to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to read a secrets file that other local users can read.
+///
+/// Mirrors the key-custody rule in the security bar: an encrypted-at-rest or
+/// plaintext fallback is only acceptable with strict permissions and a startup
+/// permission check. Fails closed — an unreadable mode is not waved through.
+#[cfg(unix)]
+fn ensure_secrets_file_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = fs::metadata(path)
+        .map_err(|err| format!("stat lab secrets failed ({}): {err}", path.display()))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "lab secrets file {} is mode {:04o}; it must not be readable by group or other. \
+             Fix with: chmod 600 {}",
+            path.display(),
+            mode,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_secrets_file_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn parse_inventory_entry(value: &Value, hosts: &[LabHost]) -> Result<VmInventoryEntry, String> {
@@ -52584,5 +53051,239 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(windows.contains("WindowsBuiltInRole"));
         assert!(windows.contains("cmd.rustup=present"));
         assert!(!windows.contains("command -v"));
+    }
+}
+
+#[cfg(test)]
+mod fetch_image_sha256_tests {
+    use super::{HOST_FETCH_IMAGE_SCRIPT, normalise_pinned_sha256};
+
+    const VALID: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[test]
+    fn unpinned_digest_is_empty_not_an_error() {
+        // The script branches on emptiness to mean "unpinned" and warns.
+        assert_eq!(normalise_pinned_sha256(None), Ok(String::new()));
+    }
+
+    #[test]
+    fn valid_digest_is_canonicalised_to_lowercase() {
+        assert_eq!(
+            normalise_pinned_sha256(Some(&VALID.to_ascii_uppercase())),
+            Ok(VALID.to_owned())
+        );
+        assert_eq!(normalise_pinned_sha256(Some(VALID)), Ok(VALID.to_owned()));
+        // sha256sum output is lowercase; an uppercase pin must still match it.
+        assert_eq!(
+            normalise_pinned_sha256(Some(&format!("  {VALID}  "))),
+            Ok(VALID.to_owned())
+        );
+    }
+
+    #[test]
+    fn malformed_digests_are_rejected() {
+        // Empty-but-present is a caller mistake, not "unpinned" — it must not
+        // silently degrade into the no-verification path.
+        assert!(normalise_pinned_sha256(Some("")).is_err());
+        assert!(normalise_pinned_sha256(Some("   ")).is_err());
+        assert!(
+            normalise_pinned_sha256(Some("deadbeef")).is_err(),
+            "too short"
+        );
+        assert!(
+            normalise_pinned_sha256(Some(&format!("{VALID}0"))).is_err(),
+            "too long"
+        );
+        assert!(
+            normalise_pinned_sha256(Some(&VALID.replace('e', "z"))).is_err(),
+            "non-hex must be rejected"
+        );
+    }
+
+    #[test]
+    fn shell_metacharacters_cannot_reach_the_script() {
+        // This value is interpolated into a bash script on the host, so the hex
+        // check is the injection boundary as well as a correctness check.
+        for hostile in [
+            "$(id)",
+            "`id`",
+            "\" ; rm -rf / ; echo \"",
+            "'; touch /tmp/pwned; '",
+            "aa\nrm -rf /",
+        ] {
+            assert!(
+                normalise_pinned_sha256(Some(hostile)).is_err(),
+                "must reject {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_verifies_before_install_and_refuses_on_mismatch() {
+        let script = HOST_FETCH_IMAGE_SCRIPT;
+        let verify = script
+            .find("sha256sum \"$STAGE/$NAME\"")
+            .expect("stage verify");
+        let install = script.find("install -m 0644").expect("install step");
+        assert!(
+            verify < install,
+            "sha256 must be verified BEFORE the image is installed into the pool"
+        );
+        assert!(script.contains("REFUSING: sha256 mismatch"));
+        // A pinned digest must also re-check an image already sitting in the pool.
+        assert!(script.contains("sha256 does not match"));
+    }
+}
+
+#[cfg(test)]
+mod secrets_sidecar_tests {
+    use super::{load_inventory_with_hosts, secrets_sidecar_path};
+    use std::path::{Path, PathBuf};
+
+    /// Minimal valid inventory with one entry that carries no inline password.
+    fn write_inventory(dir: &Path, inline_password: Option<&str>) -> PathBuf {
+        let pw = inline_password
+            .map(|p| format!(r#""ssh_password": "{p}","#))
+            .unwrap_or_default();
+        let body = format!(
+            r#"{{
+              "version": 1,
+              "entries": [
+                {{
+                  "alias": "guest-a",
+                  "vm_name": "guest-a",
+                  "ssh_target": "10.0.0.9",
+                  {pw}
+                  "controller": {{
+                    "type": "local_utm",
+                    "utm_name": "guest-a",
+                    "bundle_path": "/tmp/guest-a.utm"
+                  }}
+                }}
+              ]
+            }}"#
+        );
+        let path = dir.join("vm_lab_inventory.json");
+        std::fs::write(&path, body).expect("write inventory");
+        path
+    }
+
+    fn write_sidecar(dir: &Path, body: &str, mode: u32) -> PathBuf {
+        let path = dir.join("vm_lab_inventory.secrets.json");
+        std::fs::write(&path, body).expect("write sidecar");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod sidecar");
+        }
+        let _ = mode;
+        path
+    }
+
+    #[test]
+    fn sidecar_supplies_password_for_an_entry_that_has_none() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inv = write_inventory(temp.path(), None);
+        write_sidecar(
+            temp.path(),
+            r#"{"ssh_passwords": {"guest-a": "from-sidecar"}}"#,
+            0o600,
+        );
+        let (entries, _) = load_inventory_with_hosts(&inv).expect("load");
+        assert_eq!(entries[0].ssh_password.as_deref(), Some("from-sidecar"));
+    }
+
+    #[test]
+    fn missing_sidecar_is_not_an_error() {
+        // Most commands never need a password; failing every load over an absent
+        // optional file would be worse than the problem the sidecar solves.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inv = write_inventory(temp.path(), None);
+        let (entries, _) = load_inventory_with_hosts(&inv).expect("load without sidecar");
+        assert_eq!(entries[0].ssh_password.as_deref(), None);
+    }
+
+    #[test]
+    fn inline_password_wins_so_the_change_is_additive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inv = write_inventory(temp.path(), Some("inline"));
+        write_sidecar(
+            temp.path(),
+            r#"{"ssh_passwords": {"guest-a": "from-sidecar"}}"#,
+            0o600,
+        );
+        let (entries, _) = load_inventory_with_hosts(&inv).expect("load");
+        assert_eq!(entries[0].ssh_password.as_deref(), Some("inline"));
+    }
+
+    #[test]
+    fn unknown_alias_in_sidecar_is_ignored_not_fatal() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inv = write_inventory(temp.path(), None);
+        write_sidecar(
+            temp.path(),
+            r#"{"ssh_passwords": {"retired-guest": "x"}}"#,
+            0o600,
+        );
+        let (entries, _) = load_inventory_with_hosts(&inv).expect("load");
+        assert_eq!(entries[0].ssh_password.as_deref(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_or_world_readable_sidecar_is_refused() {
+        for mode in [0o640, 0o604, 0o644, 0o666] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let inv = write_inventory(temp.path(), None);
+            write_sidecar(temp.path(), r#"{"ssh_passwords": {"guest-a": "x"}}"#, mode);
+            let err = load_inventory_with_hosts(&inv).expect_err("must refuse mode {mode:04o}");
+            assert!(
+                err.contains("must not be readable by group or other"),
+                "mode {mode:04o} gave: {err}"
+            );
+            assert!(err.contains("chmod 600"), "error must say how to fix it");
+        }
+    }
+
+    #[test]
+    fn malformed_sidecar_fails_closed_rather_than_silently_skipping() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inv = write_inventory(temp.path(), None);
+        write_sidecar(
+            temp.path(),
+            r#"{"ssh_passwords": ["not-an-object"]}"#,
+            0o600,
+        );
+        let err = load_inventory_with_hosts(&inv).expect_err("must reject");
+        assert!(err.contains("alias -> password"), "got: {err}");
+    }
+
+    #[test]
+    fn sidecar_secret_gets_the_same_validation_as_the_inline_field() {
+        // A local file is not a trusted channel just because it is local: the
+        // sidecar must reject exactly what the inline field rejects. Asserted with
+        // a newline, which is what ensure_no_control_chars actually blocks (it
+        // covers NUL/LF/CR only, despite the name) — testing a character it does
+        // not block would assert a contract that does not exist.
+        for hostile in ["line\nbreak", "car\rriage", "nul\0byte", "   "] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let inv = write_inventory(temp.path(), None);
+            let body = serde_json::json!({ "ssh_passwords": { "guest-a": hostile } });
+            write_sidecar(temp.path(), &body.to_string(), 0o600);
+            assert!(
+                load_inventory_with_hosts(&inv).is_err(),
+                "sidecar must reject {hostile:?} just as the inline field does"
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_path_sits_beside_the_inventory_it_serves() {
+        let derived = secrets_sidecar_path(Path::new("/lab/documents/vm_lab_inventory.json"));
+        assert_eq!(
+            derived,
+            PathBuf::from("/lab/documents/vm_lab_inventory.secrets.json")
+        );
     }
 }

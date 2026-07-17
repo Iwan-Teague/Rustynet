@@ -92,8 +92,94 @@ fn run() -> Result<(), i32> {
     }
 
     run_check_secrets_hygiene(&root_dir)?;
+    run_check_no_tracked_lab_passwords(&root_dir)?;
 
     println!("Secrets hygiene gate: PASS");
+    Ok(())
+}
+
+/// Fail if any tracked VM-lab inventory carries an inline `ssh_password`.
+///
+/// These inventories live in a public repository, so a password written into one
+/// is published to the internet and preserved in git history. Eight of them were
+/// committed that way before this gate existed. The passwords are still needed —
+/// `sshpass` uses them to prime SSH keys onto guests that have none — so they now
+/// live in an untracked `*.secrets.json` sidecar that the loader merges by alias.
+/// This gate keeps them from drifting back into the tracked file.
+fn run_check_no_tracked_lab_passwords(root_dir: &Path) -> Result<(), i32> {
+    // `git ls-files` scopes this to TRACKED files only: the sidecar is ignored and
+    // must not trip the gate, which is the entire point of the split.
+    let output = Command::new("git")
+        .args(["ls-files", "-z", "--", "*vm_lab_inventory*.json"])
+        .current_dir(root_dir)
+        .stdin(Stdio::null())
+        .output();
+    let output = match output {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            eprintln!(
+                "error [{}]: git ls-files failed: {}",
+                ExitCode::ConfigError,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return Err(ExitCode::ConfigError.as_i32());
+        }
+        Err(err) => {
+            eprintln!(
+                "error [{}]: git ls-files failed: {err}",
+                ExitCode::ConfigError
+            );
+            return Err(ExitCode::ConfigError.as_i32());
+        }
+    };
+
+    let mut offenders = Vec::new();
+    for rel in String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+    {
+        let path = root_dir.join(rel);
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let Some(entries) = value.get("entries").and_then(|e| e.as_array()) else {
+            continue;
+        };
+        for entry in entries {
+            // Only a non-empty value is a leak; an explicit null is not.
+            let has_secret = entry
+                .get("ssh_password")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| !p.trim().is_empty());
+            if has_secret {
+                let alias = entry
+                    .get("alias")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("<unknown>");
+                offenders.push(format!("{rel}: entry {alias}"));
+            }
+        }
+    }
+
+    if !offenders.is_empty() {
+        eprintln!(
+            "error [{}]: tracked inventory contains inline ssh_password values.",
+            ExitCode::PolicyReject
+        );
+        for offender in &offenders {
+            eprintln!("  {offender}");
+        }
+        eprintln!(
+            "  These files are public. Move the value to the untracked sidecar\n  \
+             (<inventory-stem>.secrets.json, mode 600, {{\"ssh_passwords\": {{\"<alias>\": \"...\"}}}})\n  \
+             and delete it from the tracked JSON. The loader merges it by alias."
+        );
+        return Err(ExitCode::PolicyReject.as_i32());
+    }
+    println!("  no inline ssh_password in tracked inventories: ok");
     Ok(())
 }
 
