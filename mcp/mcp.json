@@ -111,11 +111,12 @@
   "notes": "The repo root is baked into each binary at compile time (build.rs), so the servers resolve documents/ and crates/ regardless of the client's working directory. Override with the RUSTYNET_REPO_ROOT env var if needed. rustynet-mcp-deepseek's deepseek_agent reads the LOCAL repo (read-only) and resolves the baked repo root like the other servers; its three proxy tools (read/write/read_write) do not need it.",
   "deepseek_server": {
     "name": "rustynet-mcp-deepseek",
-    "description": "Calls a configured LLM provider (DeepSeek by default; any OpenAI-compatible API via an optional registry — see llm_provider below) as a first-class sub-agent and exposes standardized live-lab loop helpers. Tools: prompt proxies (deepseek_read/write/read_write), deepseek_agent (READ-ONLY grounded repo+UTM lab researcher), deepseek_lab_run (deterministic live-lab launch + triage only on fail unless triage_on_failure=false), deepseek_next_live_lab_target (read-only run-matrix target chooser), deepseek_autonomous_live_lab_loop (reconcile stale jobs → choose next target → launch), deepseek_recover_lab_environment (async stop-after-ready recovery after interruption), deepseek_reconcile_jobs (repair stale singleton-blocking labrun records), deepseek_live_lab/deepseek_live_lab_result (failure triage + async polling), and deepseek_doc_sync (read-only docs edit proposal). API key from DEEPSEEK_API_KEY, ~/Desktop/deepseek_api.md, or ~/.deepseek_api_key (DeepSeek); any other configured provider resolves its key from its own api_key_env only.",
+    "description": "Calls a configured LLM provider (DeepSeek by default; any OpenAI-compatible API via an optional registry — see llm_provider below) as a first-class sub-agent and exposes standardized live-lab loop helpers. Tools: prompt proxies (deepseek_read/write/read_write) whose `model` parameter accepts 'flash'/'pro' shortcuts OR any literal model id unchanged, deepseek_list_models (READ-ONLY: fetches the active provider's LIVE model list via its OpenAI-compatible models endpoint — not hardcoded, so a caller can discover and use models the two shortcuts don't cover), deepseek_agent (READ-ONLY grounded repo+UTM lab researcher), deepseek_lab_run (deterministic live-lab launch + triage only on fail unless triage_on_failure=false), deepseek_next_live_lab_target (read-only run-matrix target chooser), deepseek_autonomous_live_lab_loop (reconcile stale jobs → choose next target → launch), deepseek_recover_lab_environment (async stop-after-ready recovery after interruption), deepseek_reconcile_jobs (repair stale singleton-blocking labrun records), deepseek_live_lab/deepseek_live_lab_result (failure triage + async polling), and deepseek_doc_sync (read-only docs edit proposal). API key from DEEPSEEK_API_KEY, ~/Desktop/deepseek_api.md, or ~/.deepseek_api_key (DeepSeek); any other configured provider resolves its key from its own api_key_env only.",
     "tools": [
       "deepseek_read",
       "deepseek_write",
       "deepseek_read_write",
+      "deepseek_list_models",
       "deepseek_agent",
       "deepseek_live_lab",
       "deepseek_live_lab_result",
@@ -130,7 +131,7 @@
     "no_repo_root_required": false
   },
   "llm_provider": {
-    "description": "The 'flash'/'pro' model tiers and API endpoint used by rustynet-mcp-deepseek are resolved from an LlmProvider, not hardcoded. DeepSeek's model ids are the built-in, zero-configuration default. Optional non-secret registry file (default ~/.config/rustynet/llm_providers.json, override path via RUSTYNET_LLM_PROVIDERS_FILE) lets other OpenAI-Chat-Completions-compatible providers (Groq, Together, Fireworks, OpenAI, a local Ollama shim, ...) be added as entries with no code change; switch the active one via RUSTYNET_LLM_PROVIDER=<name> without editing the file. The registry never stores a key value, only the name of the env var holding it (api_key_env, default {NAME}_API_KEY).",
+    "description": "The 'flash'/'pro' model tiers and API endpoint used by rustynet-mcp-deepseek are resolved from an LlmProvider, not hardcoded. DeepSeek's model ids are the built-in, zero-configuration default. Optional non-secret registry file (default ~/.config/rustynet/llm_providers.json, override path via RUSTYNET_LLM_PROVIDERS_FILE) lets other OpenAI-Chat-Completions-compatible providers (Groq, Together, Fireworks, OpenAI, a local Ollama shim, ...) be added as entries with no code change; switch the active one via RUSTYNET_LLM_PROVIDER=<name> without editing the file. The registry never stores a key value, only the name of the env var holding it (api_key_env, default {NAME}_API_KEY). The model list itself is NOT hardcoded either: deepseek_list_models fetches it live from the active provider's models_url (an OpenAI-compatible GET endpoint, derived from base_url by convention if not set explicitly — swap /chat/completions for /models), and any deepseek_* tool's `model` argument accepts any id from that list directly, not just the 'flash'/'pro' shortcuts.",
     "registry_path_default": "~/.config/rustynet/llm_providers.json",
     "registry_path_env_override": "RUSTYNET_LLM_PROVIDERS_FILE",
     "active_provider_env_override": "RUSTYNET_LLM_PROVIDER",
@@ -139,12 +140,14 @@
       "providers": {
         "groq": {
           "base_url": "https://api.groq.com/openai/v1/chat/completions",
+          "models_url": "https://api.groq.com/openai/v1/models",
           "api_key_env": "GROQ_API_KEY",
           "flash_model": "llama-3.3-70b-versatile",
           "pro_model": "llama-3.3-70b-versatile"
         }
       }
-    }
+    },
+    "example_note": "models_url is optional in a real entry — omit it and it derives from base_url by convention; shown explicitly here only to document the field."
   },
   "platform_configs": {
     "zed": {

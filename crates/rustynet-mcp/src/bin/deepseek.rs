@@ -53,6 +53,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 type RunMatrixRows = (Vec<String>, Vec<Vec<String>>);
 
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/chat/completions";
+/// DeepSeek's OpenAI-compatible model-listing endpoint. Confirmed live via
+/// `deepseek_list_models` before relying on it for anything load-bearing —
+/// this const is the documented convention, not a guarantee it never moves.
+const DEEPSEEK_MODELS_URL: &str = "https://api.deepseek.com/models";
 const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
 const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 /// DeepSeek-v4-pro honors an OpenAI-incompatible `reasoning_effort` field
@@ -73,7 +77,16 @@ const REQUEST_TIMEOUT_SECS: u64 = 180;
 struct LlmProvider {
     name: String,
     base_url: String,
+    /// OpenAI-compatible model-listing endpoint (`GET`, returns
+    /// `{"data": [{"id": ...}, ...]}`). Used by `deepseek_list_models` so an
+    /// agent can discover what's ACTUALLY available right now instead of
+    /// being limited to the `flash`/`pro` shortcuts below.
+    models_url: String,
     api_key: String,
+    /// `"flash"`/`"pro"` are convenience shortcuts, not the only usable
+    /// values — `resolve_model` passes any other string straight through as
+    /// a literal model id, so a model discovered via `deepseek_list_models`
+    /// (or any id the caller already knows) is directly usable.
     flash_model: String,
     pro_model: String,
     /// Empty = omit `reasoning_effort` from the request body for this
@@ -89,11 +102,23 @@ impl LlmProvider {
         Self {
             name: "deepseek".to_string(),
             base_url: DEEPSEEK_BASE_URL.to_string(),
+            models_url: DEEPSEEK_MODELS_URL.to_string(),
             api_key,
             flash_model: DEEPSEEK_FLASH_MODEL.to_string(),
             pro_model: DEEPSEEK_PRO_MODEL.to_string(),
             pro_reasoning_effort: DEEPSEEK_PRO_REASONING_EFFORT.to_string(),
         }
+    }
+}
+
+/// Derive a provider's model-listing URL from its chat-completions
+/// `base_url` by the standard OpenAI-compatible convention (the `/models`
+/// endpoint is a sibling of `/chat/completions`, sharing the same prefix).
+/// Used only when a registry entry doesn't set `models_url` explicitly.
+fn derive_models_url(base_url: &str) -> String {
+    match base_url.rsplit_once("/chat/completions") {
+        Some((prefix, _)) => format!("{prefix}/models"),
+        None => format!("{}/models", base_url.trim_end_matches('/')),
     }
 }
 
@@ -113,6 +138,11 @@ struct ProviderRegistryFile {
 #[derive(serde::Deserialize, Clone)]
 struct ProviderEntry {
     base_url: String,
+    /// Model-listing endpoint. Omit to derive it from `base_url` by the
+    /// standard OpenAI-compatible convention (see `derive_models_url`); set
+    /// explicitly only if a provider doesn't follow that convention.
+    #[serde(default)]
+    models_url: Option<String>,
     /// Env var holding this provider's API key. Defaults to
     /// `{NAME}_API_KEY` (uppercased) when omitted.
     #[serde(default)]
@@ -186,9 +216,14 @@ fn load_provider() -> Result<LlmProvider, String> {
                 .clone()
                 .unwrap_or_else(|| format!("{}_API_KEY", active_name.to_uppercase()));
             let api_key = load_api_key(&active_name, &api_key_env)?;
+            let models_url = entry
+                .models_url
+                .clone()
+                .unwrap_or_else(|| derive_models_url(&entry.base_url));
             Ok(LlmProvider {
                 name: active_name,
                 base_url: entry.base_url.clone(),
+                models_url,
                 api_key,
                 flash_model: entry.flash_model.clone(),
                 pro_model: entry.pro_model.clone(),
@@ -4816,19 +4851,104 @@ fn resolve_cargo_target(s: Option<&str>) -> Result<Option<&'static str>, String>
 }
 
 impl DeepSeekServer {
-    /// Resolve a caller-supplied tier name to the ACTIVE provider's model id
-    /// for that tier. `"pro"` and its DeepSeek-historical aliases
-    /// (`"reasoner"`/`"deepseek-reasoner"`/`"deepseek-v4-pro"` — every caller
-    /// in this repo only ever passes `"flash"`/`"pro"`, but the aliases are
-    /// kept for anyone calling the tool surface directly) mean the pro tier
-    /// regardless of which provider is active; anything else means flash.
+    /// Resolve a caller-supplied `model` value to an actual model id to send
+    /// to the API. `"flash"`/`""` and `"pro"`/`"reasoner"` are convenience
+    /// shortcuts for the active provider's two configured tiers; ANYTHING
+    /// ELSE is passed through UNCHANGED as a literal model id — this is what
+    /// makes `deepseek_list_models` useful: an agent can discover a model id
+    /// live and use it directly, not just pick between two hardcoded
+    /// shortcuts. (Previously this silently mapped any unrecognized string to
+    /// the flash tier — a real bug, since a caller passing a literal id got a
+    /// different model than the one it asked for with no error. Fixed here:
+    /// unrecognized now means "literal id", never "silently substitute
+    /// flash".)
     fn resolve_model(&self, model_str: &str) -> String {
-        match model_str.to_lowercase().as_str() {
-            "pro" | "reasoner" | "deepseek-reasoner" | "deepseek-v4-pro" => {
-                self.provider.pro_model.clone()
-            }
-            _ => self.provider.flash_model.clone(),
+        match model_str.trim().to_lowercase().as_str() {
+            "" | "flash" => self.provider.flash_model.clone(),
+            "pro" | "reasoner" => self.provider.pro_model.clone(),
+            _ => model_str.trim().to_string(),
         }
+    }
+
+    /// Fetch the ACTIVE provider's live list of available models via its
+    /// OpenAI-compatible `GET {models_url}` (returns `{"data": [{"id": ...},
+    /// ...]}`). Read-only, no side effects. Formats a human-readable answer
+    /// rather than raw JSON so the calling agent can act on it directly:
+    /// which ids exist, which two are currently aliased `flash`/`pro`, and
+    /// how to use any other id directly.
+    fn list_models(&self) -> Result<String, String> {
+        if self.provider.api_key.is_empty() {
+            return Err(format!(
+                "No API key configured for LLM provider '{}' — cannot list models.",
+                self.provider.name
+            ));
+        }
+        let response = self
+            .agent
+            .get(&self.provider.models_url)
+            .set(
+                "Authorization",
+                &format!("Bearer {}", self.provider.api_key),
+            )
+            .call()
+            .map_err(|e| {
+                format!(
+                    "{} models request failed ({}): {e}",
+                    self.provider.name, self.provider.models_url
+                )
+            })?;
+        let parsed: Value = response
+            .into_json()
+            .map_err(|e| format!("{} models response parse failed: {e}", self.provider.name))?;
+
+        let ids: Vec<String> = parsed["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m["id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if ids.is_empty() {
+            return Err(format!(
+                "{} returned no models at {} — unexpected response shape: {parsed}",
+                self.provider.name, self.provider.models_url
+            ));
+        }
+
+        let mut ids_sorted = ids.clone();
+        ids_sorted.sort();
+        let listing = ids_sorted
+            .iter()
+            .map(|id| {
+                let mut tags = Vec::new();
+                if *id == self.provider.flash_model {
+                    tags.push("= \"flash\" shortcut");
+                }
+                if *id == self.provider.pro_model {
+                    tags.push("= \"pro\" shortcut");
+                }
+                if tags.is_empty() {
+                    format!("- {id}")
+                } else {
+                    format!("- {id}  ({})", tags.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(format!(
+            "Provider: {}\nConfigured shortcuts: flash={}, pro={}\n\n\
+             {} model(s) available:\n{listing}\n\n\
+             Pass any id above directly as `model` to deepseek_read/write/read_write/agent/\
+             lab_run/etc. — \"flash\"/\"pro\" remain valid shortcuts for the two ids marked \
+             above, but any other id is used exactly as given.",
+            self.provider.name,
+            self.provider.flash_model,
+            self.provider.pro_model,
+            ids.len()
+        ))
     }
 }
 
@@ -5333,10 +5453,13 @@ fn fn_tool(name: &str, description: &str, properties: Value, required: &[&str]) 
 fn model_schema(provider: &LlmProvider) -> Value {
     json!({
         "type": "string",
-        "enum": ["flash", "pro"],
         "description": format!(
-            "'flash' = {} (fast, low cost, default). 'pro' = {} (chain-of-thought at max \
-             reasoning effort, slower, for hard reasoning tasks). Provider: {}.",
+            "'flash' (default) and 'pro' are shortcuts for this provider's two configured \
+             tiers — currently 'flash' = {} (fast, low cost), 'pro' = {} (chain-of-thought \
+             at max reasoning effort, slower, for hard reasoning). ANY OTHER STRING is used \
+             as a literal model id, unchanged — call deepseek_list_models first to see what's \
+             actually available right now and pass one of those ids directly if 'flash'/'pro' \
+             aren't the right fit. Provider: {}.",
             provider.flash_model, provider.pro_model, provider.name
         ),
     })
@@ -5639,6 +5762,27 @@ impl McpServer for DeepSeekServer {
                     Vec::<&str>::new(),
                 ),
             },
+            Tool {
+                name: "deepseek_list_models".into(),
+                description: "\
+                    Fetch the ACTIVE LLM provider's LIVE list of available models via its \
+                    OpenAI-compatible models-list endpoint — READ-ONLY, no side effects, not \
+                    hardcoded. Answers 'what can I actually use right now' instead of being \
+                    limited to the two 'flash'/'pro' shortcuts: returns every model id the \
+                    provider currently reports, flags which two are aliased 'flash'/'pro' for \
+                    convenience, and tells you to pass any OTHER id directly as the `model` \
+                    argument to deepseek_read/write/read_write/agent/lab_run/etc. — an \
+                    unrecognized `model` string is used as a literal id, never silently \
+                    coerced to a default. Call this whenever you need a model 'flash'/'pro' \
+                    doesn't cover (e.g. a specific model version, a cheaper/faster/larger \
+                    option the provider added since this server was built), or whenever you \
+                    are unsure the configured shortcuts still point at real, current model \
+                    ids. Reflects whichever provider is currently active (see the `model` \
+                    parameter's description on any other tool, or CLAUDE.md/AGENTS.md §12.5) \
+                    — not necessarily DeepSeek specifically."
+                    .into(),
+                input_schema: json_schema_object(json!({}), Vec::<&str>::new()),
+            },
         ]
     }
 
@@ -5672,6 +5816,15 @@ impl McpServer for DeepSeekServer {
         }
         if name == "deepseek_reconcile_jobs" {
             return self.call_reconcile_jobs(&args);
+        }
+        if name == "deepseek_list_models" {
+            return match self.list_models() {
+                Ok(text) => ToolCallResult {
+                    content: text_content(text),
+                    is_error: None,
+                },
+                Err(e) => tool_error(&e),
+            };
         }
 
         let prompt = match get_str(&args, "prompt") {
@@ -5758,6 +5911,52 @@ mod tests {
 
     fn server() -> DeepSeekServer {
         DeepSeekServer::new()
+    }
+
+    #[test]
+    fn derive_models_url_follows_openai_convention() {
+        assert_eq!(
+            derive_models_url("https://api.deepseek.com/chat/completions"),
+            "https://api.deepseek.com/models"
+        );
+        assert_eq!(
+            derive_models_url("https://api.groq.com/openai/v1/chat/completions"),
+            "https://api.groq.com/openai/v1/models"
+        );
+        // No conventional suffix: append rather than guess-and-mangle.
+        assert_eq!(
+            derive_models_url("https://example.invalid/api"),
+            "https://example.invalid/api/models"
+        );
+    }
+
+    #[test]
+    fn resolve_model_shortcuts_map_to_configured_tiers() {
+        let s = server();
+        assert_eq!(s.resolve_model("flash"), s.provider.flash_model);
+        assert_eq!(s.resolve_model(""), s.provider.flash_model);
+        assert_eq!(s.resolve_model("FLASH"), s.provider.flash_model);
+        assert_eq!(s.resolve_model("pro"), s.provider.pro_model);
+        assert_eq!(s.resolve_model("Reasoner"), s.provider.pro_model);
+    }
+
+    #[test]
+    fn resolve_model_passes_through_unknown_strings_as_literal_ids() {
+        // Regression test: this used to silently coerce ANY unrecognized
+        // string to the flash tier, so a caller passing a real model id
+        // discovered via deepseek_list_models silently got a different
+        // model with no error. Unrecognized must now mean "use it exactly
+        // as given", never "silently substitute a default".
+        let s = server();
+        assert_eq!(
+            s.resolve_model("some-custom-model-id"),
+            "some-custom-model-id"
+        );
+        assert_eq!(s.resolve_model("deepseek-chat"), "deepseek-chat");
+        assert_ne!(
+            s.resolve_model("some-custom-model-id"),
+            s.provider.flash_model
+        );
     }
 
     #[test]
@@ -5999,6 +6198,7 @@ mod tests {
             "deepseek_autonomous_live_lab_loop",
             "deepseek_recover_lab_environment",
             "deepseek_reconcile_jobs",
+            "deepseek_list_models",
         ] {
             assert!(
                 !names.contains(&forbidden),

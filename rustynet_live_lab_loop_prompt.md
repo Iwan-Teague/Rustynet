@@ -419,6 +419,7 @@ driver — list them first:
 | `mcp__rustynet-deepseek__deepseek_read` | Analysis, code review, security review, second opinion, risk ID — read-only (proxy; sees only pasted context). |
 | `mcp__rustynet-deepseek__deepseek_write` | Generate boilerplate, test scaffolds, doc drafts — advisory only (proxy). |
 | `mcp__rustynet-deepseek__deepseek_read_write` | Analyze pasted content then generate changes (review-then-fix, audit-then-patch) (proxy). |
+| `mcp__rustynet-deepseek__deepseek_list_models` | **READ-ONLY, no args.** Fetches the ACTIVE provider's LIVE model list via its OpenAI-compatible models endpoint — not hardcoded. Returns every id it currently reports, flags which two are aliased `"flash"`/`"pro"`. Call this when the two shortcuts don't fit (need a specific version, a cheaper/larger option the provider added since this doc was written, or you're unsure the shortcuts still point at real ids) — then pass whichever id you pick directly as `model` on any other `deepseek_*` tool; it is used exactly as given, not coerced to a default. |
 
 The MCP server runs `bin/rustynet-mcp-deepseek`; a rebuilt binary is only live in-session after a `/mcp`
 reconnect (kill ≠ auto-respawn; `claude mcp` has no reconnect). When you can't reconnect, drive the latest
@@ -460,11 +461,14 @@ API endpoint from an `LlmProvider`, overridable via an optional, non-secret regi
 provider override: `RUSTYNET_LLM_PROVIDER=<name>`). Adding another OpenAI-Chat-Completions-
 compatible provider (Groq, Together, Fireworks, OpenAI, a local Ollama shim, ...) is a registry
 entry, not a code change. Full mechanism + example registry JSON:
-`CLAUDE.md`/`AGENTS.md` §12.5. This doesn't change how you call the tools — `model: "flash"|"pro"`
-stays the same regardless of which provider is active; only the underlying model ids and endpoint
-move. If a `deepseek_read`/`deepseek_agent`/etc. call errors "unknown LLM provider," someone set
-`RUSTYNET_LLM_PROVIDER` to a name that isn't `"deepseek"` and isn't in the registry — check
-`RUSTYNET_LLM_PROVIDER`'s value and the registry file before assuming the MCP server is broken.
+`CLAUDE.md`/`AGENTS.md` §12.5. `model: "flash"|"pro"` remain valid shortcuts regardless of which
+provider is active, but the parameter is a plain string, not a restricted enum: **call
+`deepseek_list_models` to see what's actually available right now, then pass any id from that
+list directly** — it goes to the API exactly as given, never silently coerced to flash (that WAS
+a real bug in `resolve_model` — fixed). If a `deepseek_read`/`deepseek_agent`/etc. call errors
+"unknown LLM provider," someone set `RUSTYNET_LLM_PROVIDER` to a name that isn't `"deepseek"` and
+isn't in the registry — check `RUSTYNET_LLM_PROVIDER`'s value and the registry file before
+assuming the MCP server is broken.
 
 **When to fan DeepSeek proactively:**
 - After every lab failure: paste the daemon journal + recent diff → flash → candidate root

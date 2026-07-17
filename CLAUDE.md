@@ -602,6 +602,17 @@ itself still resolves from that env var (DeepSeek additionally falls back to
 `RUSTYNET_LLM_PROVIDER` value is a hard, logged error — it never silently reuses the wrong
 provider's key against the wrong URL.
 
+**Models are discoverable live, not just the two hardcoded shortcuts.** `deepseek_list_models`
+calls the active provider's OpenAI-compatible `GET {models_url}` (derived by convention from
+`base_url`, or set explicitly in a registry entry) and returns every model id it currently
+reports, flagging which two are aliased `"flash"`/`"pro"`. The `model` parameter on every other
+`deepseek_*` tool is a plain string, not a restricted enum: `"flash"`/`""` and `"pro"`/`"reasoner"`
+remain shortcuts for the configured tiers, but ANY other string is sent to the API exactly as
+given — call `deepseek_list_models` first, then pass whichever id actually fits the task. (This
+also fixed a real bug: `resolve_model` used to silently substitute the flash tier for any
+unrecognized string, so a caller that already knew a real model id got a different model with no
+error — it now passes an unrecognized string through unchanged instead.)
+
 ## 13) Operating Checklists
 
 ### 13.1 Live-Lab Hardening Loop
