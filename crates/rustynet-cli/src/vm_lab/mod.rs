@@ -143,6 +143,19 @@ pub struct VmLabDiscoverLocalUtmConfig {
     pub report_dir: Option<PathBuf>,
 }
 
+/// Config for `ops vm-lab-host-net-status`: is a host reachable, and has its
+/// address drifted from what the inventory declares?
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabHostNetStatusConfig {
+    pub inventory_path: Option<PathBuf>,
+    /// Restrict to one host_id. Absent ⇒ every declared host.
+    pub host_id: Option<String>,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+    pub json: bool,
+}
+
 /// Config for `ops vm-lab-host-run-status`: read a REMOTE lab host's run state and
 /// its own evidence ledger over SSH.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1832,6 +1845,16 @@ pub(crate) struct LabHost {
     pub(crate) utm_documents_roots: Vec<PathBuf>,
     /// CIDR this host hands to its guests, e.g. `192.168.121.0/24`.
     pub(crate) guest_subnet: Option<String>,
+    /// Additional SSH endpoints this host can be reached on, e.g.
+    /// `["ubuntu-server@10.230.76.5"]` when `connect_uri` names a tailnet host.
+    ///
+    /// The declared `connect_uri` remains the single source of truth for *how the
+    /// orchestrator drives this host*; these are only alternates for **diagnosis**
+    /// — so `vm-lab-host-net-status` can answer "the declared path is dead, but the
+    /// machine is alive over here" instead of just "unreachable". Nothing failing
+    /// over automatically: a silent fallback would hide exactly the drift worth
+    /// reporting.
+    pub(crate) alt_ssh_endpoints: Vec<String>,
     /// Disk model the guest-image pool MUST sit on, e.g. `Samsung SSD 870 EVO 500GB`.
     ///
     /// Encodes an operator hard rule as **data + an enforced check** rather than
@@ -3694,6 +3717,224 @@ fn resolve_discovery_bundle_paths(
             Ok((inventory_bundle_paths, Some(note)))
         }
     }
+}
+
+/// Why did an SSH probe fail? "Unreachable" must mean unreachable.
+///
+/// A host-key or auth failure means the machine ANSWERED — it is up, we simply do
+/// not trust or cannot authenticate to it. Reporting that as unreachable sends an
+/// operator hunting a network fault that does not exist, which is the same
+/// fail-silent class as claiming a present alias is "not in inventory". Each of
+/// these has a different fix, so each gets its own name.
+fn classify_ssh_probe_failure(err: &str) -> &'static str {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("host key verification failed") || lower.contains("no ed25519 host key") {
+        // The machine answered and offered a key we have not pinned.
+        "up:host-key-not-pinned"
+    } else if lower.contains("permission denied") {
+        "up:auth-failed"
+    } else if lower.contains("connection refused") {
+        "up:ssh-refused"
+    } else if lower.contains("timed out") || lower.contains("operation timed out") {
+        "unreachable:timeout"
+    } else if lower.contains("no route to host") || lower.contains("host is down") {
+        "unreachable:no-route"
+    } else if lower.contains("name or service not known")
+        || lower.contains("could not resolve")
+        || lower.contains("nodename nor servname")
+    {
+        "unresolved:dns"
+    } else {
+        "failed:other"
+    }
+}
+
+/// Answer "why can't I reach this host, and has its address drifted?"
+///
+/// Probes the **declared** endpoint first, then any declared alternates, and — via
+/// whichever path answers — asks the machine what addresses it *actually* has. That
+/// distinguishes the three cases an operator otherwise has to guess between:
+///
+/// - **the machine is down** (nothing answers),
+/// - **the path is broken** (declared endpoint dead, an alternate answers), or
+/// - **the address drifted** (it answers, but not where the inventory says).
+///
+/// Deliberately does NOT rewrite `connect_uri`. Silently failing over would hide
+/// exactly the drift worth reporting, and the transport is declared data with one
+/// source of truth (§6.6). It reports; a human decides.
+pub fn execute_ops_vm_lab_host_net_status(
+    config: VmLabHostNetStatusConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let selected: Vec<&LabHost> = match config.host_id.as_deref() {
+        Some(id) => vec![
+            hosts
+                .iter()
+                .find(|host| host.host_id == id)
+                .ok_or_else(|| format!("unknown host_id: {id}"))?,
+        ],
+        None => hosts.iter().collect(),
+    };
+    let timeout = timeout_or_default(config.timeout_secs, 30);
+    let ssh = VmLabSyncHostConfig {
+        ssh_identity_file: config.ssh_identity_file.clone(),
+        known_hosts_path: config.known_hosts_path.clone(),
+        ..VmLabSyncHostConfig::default()
+    };
+
+    let mut reports: Vec<Value> = Vec::new();
+    let mut rendered = String::new();
+
+    for host in selected {
+        if host.kind == LabHostKind::LocalUtm {
+            rendered.push_str(&format!(
+                "host {} kind=local_utm — local machine, nothing to probe\n",
+                host.host_id
+            ));
+            continue;
+        }
+
+        let declared = host.ssh_endpoint();
+        // Declared endpoint first, then alternates. Order matters: the answer
+        // "the declared path works" must not be reached via a fallback.
+        let mut candidates: Vec<(String, bool)> = Vec::new();
+        if let Some(endpoint) = declared.clone() {
+            candidates.push((endpoint, true));
+        }
+        for alt in &host.alt_ssh_endpoints {
+            candidates.push((alt.clone(), false));
+        }
+        if candidates.is_empty() {
+            rendered.push_str(&format!(
+                "host {} — no ssh endpoint in connect_uri and no alt_ssh_endpoints; nothing to probe\n",
+                host.host_id
+            ));
+            continue;
+        }
+
+        let mut probes: Vec<Value> = Vec::new();
+        let mut reachable_via: Option<String> = None;
+        for (endpoint, is_declared) in &candidates {
+            let (state, detail) = match run_host_cmd(endpoint.as_str(), &["true"], &ssh, timeout) {
+                Ok(_) => {
+                    if reachable_via.is_none() {
+                        reachable_via = Some(endpoint.clone());
+                    }
+                    ("reachable", String::new())
+                }
+                Err(err) => (classify_ssh_probe_failure(err.as_str()), err),
+            };
+            probes.push(serde_json::json!({
+                "endpoint": endpoint,
+                "declared": is_declared,
+                "state": state,
+                "reachable": state == "reachable",
+                "detail": detail,
+            }));
+        }
+
+        // Ask the machine what it actually has — only meaningful if something answered.
+        let mut actual_addrs: Vec<String> = Vec::new();
+        if let Some(endpoint) = reachable_via.as_deref() {
+            if let Ok(out) = run_host_cmd(endpoint, &["ip", "-4", "-br", "addr"], &ssh, timeout) {
+                for line in out.lines() {
+                    let mut parts = line.split_whitespace();
+                    let (Some(iface), Some(_state)) = (parts.next(), parts.next()) else {
+                        continue;
+                    };
+                    if iface == "lo" {
+                        continue;
+                    }
+                    for token in parts {
+                        if token.contains('/') {
+                            actual_addrs.push(format!("{iface}={token}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        // A path where the machine ANSWERED but we could not complete SSH is not
+        // "down" — it is a trust/auth problem with a different fix entirely.
+        let answered_anywhere = probes.iter().any(|probe| {
+            probe["reachable"] == true
+                || probe["state"]
+                    .as_str()
+                    .is_some_and(|state| state.starts_with("up:"))
+        });
+        let declared_ok = probes
+            .iter()
+            .any(|probe| probe["declared"] == true && probe["reachable"] == true);
+        let verdict = match (&reachable_via, declared_ok, answered_anywhere) {
+            (Some(_), true, _) => "OK",
+            (Some(_), false, _) => "PATH-DRIFT",
+            // Nothing usable, but something answered => the machine is UP and the
+            // problem is trust/auth, not the network. Saying DOWN here would be a lie.
+            (None, _, true) => "UP-BUT-UNUSABLE",
+            (None, _, false) => "DOWN",
+        };
+
+        reports.push(serde_json::json!({
+            "host_id": host.host_id,
+            "verdict": verdict,
+            "declared_endpoint": declared,
+            "reachable_via": reachable_via,
+            "probes": probes,
+            "actual_ipv4": actual_addrs,
+        }));
+
+        rendered.push_str(&format!("host {} — {verdict}\n", host.host_id));
+        for probe in &probes {
+            rendered.push_str(&format!(
+                "  {:<38} {:<10} {}\n",
+                probe["endpoint"].as_str().unwrap_or("?"),
+                if probe["declared"] == true {
+                    "(declared)"
+                } else {
+                    "(alt)"
+                },
+                // The classified state, never a flattened "UNREACHABLE": a host-key
+                // or auth failure means the machine ANSWERED, and calling that
+                // unreachable sends an operator hunting a network fault that does
+                // not exist.
+                probe["state"].as_str().unwrap_or("?")
+            ));
+        }
+        if actual_addrs.is_empty() {
+            rendered.push_str("  actual addresses: (could not ask — nothing answered)\n");
+        } else {
+            rendered.push_str(&format!(
+                "  actual addresses: {}\n",
+                actual_addrs.join(", ")
+            ));
+        }
+        match verdict {
+            "UP-BUT-UNUSABLE" => rendered.push_str(
+                "  → the machine ANSWERED but SSH could not complete. This is NOT a network fault: \n                      up:host-key-not-pinned  -> pin it (ssh-keyscan >> known_hosts) — the tooling uses \n                      StrictHostKeyChecking=yes on purpose;  up:auth-failed -> wrong key/user;  \n                      up:ssh-refused -> sshd is not listening there.\n",
+            ),
+            "DOWN" => rendered.push_str(
+                "  → nothing answered on any known path. The machine may be off, or every path is broken.\n",
+            ),
+            "PATH-DRIFT" => rendered.push_str(
+                "  → the DECLARED endpoint is dead but the machine is alive on an alternate. \
+                 The inventory's connect_uri is stale or that path is broken. Nothing was changed \
+                 automatically — decide, then edit hosts[].connect_uri.\n",
+            ),
+            _ => {}
+        }
+    }
+
+    if config.json {
+        return Ok(
+            serde_json::to_string_pretty(&serde_json::json!({ "hosts": reports }))
+                .unwrap_or_else(|_| "{}".to_owned()),
+        );
+    }
+    Ok(rendered)
 }
 
 /// Report what a lab host is doing and what its runs found — without going there.
@@ -32183,6 +32424,25 @@ fn parse_host(value: &Value) -> Result<LabHost, String> {
         ensure_guest_subnet_cidr(host_id.as_str(), subnet)?;
     }
 
+    let mut alt_ssh_endpoints: Vec<String> = Vec::new();
+    if let Some(value) = object.get("alt_ssh_endpoints") {
+        let array = value.as_array().ok_or_else(|| {
+            format!("host {host_id}: alt_ssh_endpoints must be an array of user@host strings")
+        })?;
+        for item in array {
+            let endpoint = item.as_str().ok_or_else(|| {
+                format!("host {host_id}: alt_ssh_endpoints entries must be strings")
+            })?;
+            ensure_no_control_chars("alt_ssh_endpoints", endpoint)?;
+            if endpoint.trim().is_empty() {
+                return Err(format!(
+                    "host {host_id}: alt_ssh_endpoints entry must not be empty"
+                ));
+            }
+            alt_ssh_endpoints.push(endpoint.trim().to_owned());
+        }
+    }
+
     let pool_disk_model = optional_string_field(object, "pool_disk_model")?;
     if let Some(model) = pool_disk_model.as_deref() {
         ensure_no_control_chars("pool_disk_model", model)?;
@@ -32213,6 +32473,7 @@ fn parse_host(value: &Value) -> Result<LabHost, String> {
         connect_uri,
         utm_documents_roots,
         guest_subnet,
+        alt_ssh_endpoints,
         pool_disk_model,
         repo_dir: repo_dir.map(PathBuf::from),
         notes,
@@ -37893,9 +38154,9 @@ mod tests {
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
         build_vm_lab_topology, build_windows_local_source_extract_result_script,
         build_windows_local_source_extract_script,
-        build_windows_local_source_presync_cleanup_script, collect_live_lab_stage_local_bundle,
-        commit_matches, create_orchestration_staging_dir, decide_restart_unready,
-        default_inventory_path, default_live_lab_iteration_profile_path,
+        build_windows_local_source_presync_cleanup_script, classify_ssh_probe_failure,
+        collect_live_lab_stage_local_bundle, commit_matches, create_orchestration_staging_dir,
+        decide_restart_unready, default_inventory_path, default_live_lab_iteration_profile_path,
         default_live_lab_iteration_report_dir, default_live_lab_orchestrator_path,
         default_platform_profile, default_utmctl_path, discover_local_utm_bundle_paths,
         discover_local_utm_bundle_paths_bounded, encode_powershell_command,
@@ -38765,6 +39026,7 @@ mod tests {
             connect_uri: uri.map(str::to_owned),
             utm_documents_roots: Vec::new(),
             guest_subnet: None,
+            alt_ssh_endpoints: Vec::new(),
             pool_disk_model: None,
             repo_dir: None,
             notes: None,
@@ -38937,6 +39199,52 @@ mod tests {
             None,
             "must not guess between two UTM hosts"
         );
+    }
+
+    /// "Unreachable" must mean unreachable. A host-key or auth failure means the
+    /// machine ANSWERED — reporting it as a network fault sends an operator
+    /// hunting something that does not exist.
+    #[test]
+    fn ssh_probe_failures_are_classified_not_flattened() {
+        assert_eq!(
+            classify_ssh_probe_failure(
+                "No ED25519 host key is known for 10.0.0.1 and you have requested strict checking.\nHost key verification failed."
+            ),
+            "up:host-key-not-pinned"
+        );
+        assert_eq!(
+            classify_ssh_probe_failure("ubuntu@h: Permission denied (publickey,password)."),
+            "up:auth-failed"
+        );
+        assert_eq!(
+            classify_ssh_probe_failure("ssh: connect to host h port 22: Connection refused"),
+            "up:ssh-refused"
+        );
+        assert_eq!(
+            classify_ssh_probe_failure("timed out after 30 seconds"),
+            "unreachable:timeout"
+        );
+        assert_eq!(
+            classify_ssh_probe_failure("ssh: connect to host h port 22: No route to host"),
+            "unreachable:no-route"
+        );
+        assert_eq!(
+            classify_ssh_probe_failure(
+                "ssh: Could not resolve hostname h: nodename nor servname provided"
+            ),
+            "unresolved:dns"
+        );
+        // every `up:` state means the box answered — that must remain distinguishable
+        for answered in [
+            "Host key verification failed.",
+            "Permission denied (publickey).",
+            "Connection refused",
+        ] {
+            assert!(
+                classify_ssh_probe_failure(answered).starts_with("up:"),
+                "{answered:?} means the machine answered"
+            );
+        }
     }
 
     /// A guest name becomes a libvirt domain name AND a filename in the image
