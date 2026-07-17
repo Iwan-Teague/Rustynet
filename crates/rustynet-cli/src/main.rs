@@ -1006,6 +1006,10 @@ enum OpsCommand {
         config: vm_lab::VmLabHostNetStatusConfig,
     },
     #[cfg(feature = "vm-lab")]
+    VmLabProvisionToolchain {
+        config: vm_lab::VmLabProvisionToolchainConfig,
+    },
+    #[cfg(feature = "vm-lab")]
     VmLabNetworkAudit {
         config: vm_lab::network_audit::VmLabNetworkAuditConfig,
     },
@@ -3678,6 +3682,33 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             },
         }),
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-provision-toolchain" => {
+            let mut vm_aliases = collect_repeated_option_values(&args[1..], "--vm");
+            if let Some(csv_vms) = parser.value("--vms") {
+                vm_aliases.extend(split_csv(csv_vms));
+            }
+            Ok(OpsCommand::VmLabProvisionToolchain {
+                config: vm_lab::VmLabProvisionToolchainConfig {
+                    inventory_path: parser.optional_path("--inventory"),
+                    vm_aliases,
+                    select_all: parser.has_flag("--all"),
+                    verify_only: parser.has_flag("--verify-only"),
+                    ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                    known_hosts_path: parser.optional_path("--known-hosts-file"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 1800)?,
+                    json: match parser.value("--format").as_deref() {
+                        None | Some("table") => false,
+                        Some("json") => true,
+                        Some(other) => {
+                            return Err(format!(
+                                "invalid value for --format: {other} (expected table|json)"
+                            ));
+                        }
+                    },
+                },
+            })
+        }
         #[cfg(feature = "vm-lab")]
         "vm-lab-network-audit" => Ok(OpsCommand::VmLabNetworkAudit {
             config: vm_lab::network_audit::VmLabNetworkAuditConfig {
@@ -8176,6 +8207,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabHostNetStatus { config } => {
             vm_lab::execute_ops_vm_lab_host_net_status(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabProvisionToolchain { config } => {
+            vm_lab::execute_ops_vm_lab_provision_toolchain(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabNetworkAudit { config } => {
@@ -19587,6 +19622,7 @@ fn help_text() -> String {
         "  ops vm-lab-run-matrix-compare [--commit <ref|sha>] [--inventory <path>] [--stage-results <path>] [--expect-runs <n>] [--allow-dirty] [--stage <substring>] [--include-hosts <id,id>] [--ssh-identity-file <path>] [--format table|json]",
         "  ops vm-lab-host-run-status --host <host_id> [--run-id <id>] [--stage <substring>] [--inventory <path>] [--ssh-identity-file <path>] [--format table|json]",
         "  ops vm-lab-host-net-status [--host <host_id>] [--inventory <path>] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
+        "  ops vm-lab-provision-toolchain [--inventory <path>] [--vm <alias>]... [--vms <a,b>] [--all] [--verify-only] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-network-audit [--inventory <path>] [--profile-dir <path>] [--profile <id>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only: observes UTM/host/guest network state, validates profile manifests, writes redacted evidence; never mutates)",
         "  ops vm-lab-network-preflight --profile <id> [--inventory <path>] [--profile-dir <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only fail-closed gate: errors unless the observed fleet satisfies the profile)",
         "  ops vm-lab-network-prepare --profile <id> [--inventory <path>] [--profile-dir <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--state-dir <path>] [--dry-run] [--approve-reconfigure]  (the ONLY VM network mutation path; without --approve-reconfigure prints the plan and changes nothing; atomic lease + stopped-VM-only apply + verified rollback)",
