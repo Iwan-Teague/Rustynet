@@ -16,7 +16,7 @@ pub use overnight::{VmLabOvernightConfig, execute_ops_vm_lab_overnight};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs as _};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -1944,10 +1944,90 @@ pub(crate) struct LabHost {
     pub(crate) notes: Option<String>,
 }
 
+/// Env override naming the `host_id` this machine IS. Explicit beats inference.
+const LAB_HOST_ID_ENV: &str = "RUSTYNET_LAB_HOST_ID";
+
+/// True when `address` belongs to this machine.
+///
+/// Binding is the test, not a heuristic: the kernel only allows a bind to an
+/// address the machine actually holds and answers `EADDRNOTAVAIL` otherwise. Port
+/// 0 and UDP mean nothing is sent, nothing is listened for, and no port is
+/// consumed — this is a question, not a connection.
+///
+/// Chosen over comparing hostnames because a name can collide and an address
+/// cannot: two machines called `ubuntu-headless` would make a name match point the
+/// orchestrator at the WRONG machine's libvirt and power-cycle the wrong VMs.
+/// Chosen over enumerating interfaces because that needs per-OS collectors
+/// (`ip -j addr` / `ifconfig`) which are exactly the platform-specific paths this
+/// crate keeps having to special-case.
+fn address_is_local(address: IpAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::new(address, 0)).is_ok()
+}
+
+/// Does the declared host refer to the machine we are running on?
+///
+/// Why this exists: `connect_uri` is written from the *Mac's* viewpoint, so on the
+/// box itself `qemu+ssh://ubuntu-server@ubuntu-headless/system` is an SSH loopback
+/// to itself and fails with `Host key verification failed`. The run-on-host
+/// architecture (§11) needs the box to drive its OWN libvirt directly.
+///
+/// Order is deliberate:
+/// 1. `RUSTYNET_LAB_HOST_ID` — explicit always wins, including a deliberate "I am
+///    not that host" (a value naming a *different* host answers false without a
+///    lookup).
+/// 2. Address identity — resolve the endpoint's host and ask whether any resolved
+///    address is ours.
+///
+/// **Fails safe.** Unresolvable name, no endpoint, no match ⇒ `false` ⇒ we treat
+/// the host as remote and go over SSH, which is today's behaviour and fails
+/// loudly. The dangerous direction is a false *positive* (silently driving the
+/// wrong machine's hypervisor), and address identity cannot produce one.
+fn host_is_this_machine(host: &LabHost) -> bool {
+    host_is_this_machine_given(host, std::env::var(LAB_HOST_ID_ENV).ok().as_deref())
+}
+
+/// The decision, with the environment passed in rather than read.
+///
+/// Split out because the workspace forbids `unsafe`, and `std::env::set_var` is
+/// unsafe in edition 2024 — so a test could not exercise the override by setting
+/// the variable. Taking it as an argument makes the rule pure and directly
+/// testable, which is what it deserves: this decides whether we drive the local
+/// hypervisor or a remote one.
+fn host_is_this_machine_given(host: &LabHost, declared_host_id: Option<&str>) -> bool {
+    if let Some(declared) = declared_host_id {
+        let declared = declared.trim();
+        if !declared.is_empty() {
+            return declared == host.host_id;
+        }
+    }
+    let Some(endpoint) = host.ssh_endpoint() else {
+        // No `+ssh://` authority ⇒ the URI is already local (`qemu:///system`).
+        return host.connect_uri.is_some();
+    };
+    let hostname = endpoint.rsplit('@').next().unwrap_or(endpoint.as_str());
+    if hostname.is_empty() {
+        return false;
+    }
+    // Port is irrelevant to identity; 22 just satisfies the resolver.
+    match (hostname, 22u16).to_socket_addrs() {
+        Ok(addrs) => addrs.into_iter().any(|addr| address_is_local(addr.ip())),
+        Err(_) => false,
+    }
+}
+
 impl LabHost {
     /// Resolved libvirt connection URI for this host, defaulting to the local
     /// system hypervisor. Meaningless for `LocalUtm`.
+    ///
+    /// Collapses to `qemu:///system` when this machine IS the host: the declared
+    /// URI describes how to reach it from *elsewhere*, and using it here would SSH
+    /// to ourselves (and fail on our own host key). This is the single choke point
+    /// every libvirt call already goes through, so run-on-host works everywhere
+    /// rather than in whichever call sites remembered to check.
     pub(crate) fn resolved_connect_uri(&self) -> String {
+        if self.kind == LabHostKind::Libvirt && host_is_this_machine(self) {
+            return DEFAULT_LIBVIRT_CONNECT_URI.to_owned();
+        }
         self.connect_uri
             .clone()
             .unwrap_or_else(|| DEFAULT_LIBVIRT_CONNECT_URI.to_owned())
@@ -53411,5 +53491,102 @@ mod local_utm_locality_tests {
             "must be explicit about why: {err}"
         );
         assert!(guests.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod host_locality_tests {
+    use super::{
+        DEFAULT_LIBVIRT_CONNECT_URI, LabHost, LabHostKind, address_is_local, host_is_this_machine,
+        host_is_this_machine_given,
+    };
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn libvirt_host(host_id: &str, uri: Option<&str>) -> LabHost {
+        LabHost {
+            host_id: host_id.to_owned(),
+            kind: LabHostKind::Libvirt,
+            connect_uri: uri.map(str::to_owned),
+            utm_documents_roots: Vec::new(),
+            guest_subnet: None,
+            alt_ssh_endpoints: Vec::new(),
+            pool_disk_model: None,
+            repo_dir: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn loopback_is_local_and_a_public_address_is_not() {
+        // The bind test itself. 127.0.0.1 is always ours; 192.0.2.1 is TEST-NET-1
+        // (RFC 5737), reserved for documentation and never assigned to a host.
+        assert!(address_is_local(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!address_is_local(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
+    }
+
+    #[test]
+    fn a_host_pointing_at_localhost_is_this_machine() {
+        let host = libvirt_host("self", Some("qemu+ssh://someone@127.0.0.1/system"));
+        assert!(host_is_this_machine(&host));
+        // …and therefore drives local libvirt instead of SSH-ing to itself.
+        assert_eq!(host.resolved_connect_uri(), DEFAULT_LIBVIRT_CONNECT_URI);
+    }
+
+    #[test]
+    fn a_host_at_an_address_we_do_not_hold_is_remote() {
+        // The load-bearing property: this must NOT false-positive. A false positive
+        // silently drives the WRONG machine's hypervisor; a false negative merely
+        // SSHes and fails loudly.
+        let host = libvirt_host("elsewhere", Some("qemu+ssh://ubuntu@192.0.2.1/system"));
+        assert!(!host_is_this_machine(&host));
+        assert_eq!(
+            host.resolved_connect_uri(),
+            "qemu+ssh://ubuntu@192.0.2.1/system",
+            "a remote host must keep its declared URI"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_name_fails_safe_to_remote() {
+        let host = libvirt_host(
+            "gone",
+            Some("qemu+ssh://ubuntu@no-such-host.invalid/system"),
+        );
+        assert!(
+            !host_is_this_machine(&host),
+            "an unresolvable name must not be mistaken for ourselves"
+        );
+    }
+
+    #[test]
+    fn an_already_local_uri_is_this_machine() {
+        let host = libvirt_host("local", Some(DEFAULT_LIBVIRT_CONNECT_URI));
+        assert!(host_is_this_machine(&host));
+    }
+
+    #[test]
+    fn the_env_override_wins_in_both_directions() {
+        let host = libvirt_host("ubuntu-kvm-1", Some("qemu+ssh://u@192.0.2.1/system"));
+
+        // Claim we ARE it, despite the address saying otherwise.
+        assert!(host_is_this_machine_given(&host, Some("ubuntu-kvm-1")));
+
+        // Naming a DIFFERENT host is an explicit "not me" — it must not fall
+        // through to inference.
+        assert!(!host_is_this_machine_given(&host, Some("some-other-host")));
+
+        // Neither empty nor unset is a claim; inference resumes, and 192.0.2.1
+        // is not ours.
+        assert!(!host_is_this_machine_given(&host, Some("")));
+        assert!(!host_is_this_machine_given(&host, Some("   ")));
+        assert!(!host_is_this_machine_given(&host, None));
+    }
+
+    #[test]
+    fn the_override_is_trimmed_so_a_stray_newline_still_matches() {
+        // The value will be set by a shell/launchd/systemd unit; a trailing
+        // newline must not silently turn "I am this host" into "I am not".
+        let host = libvirt_host("ubuntu-kvm-1", Some("qemu+ssh://u@192.0.2.1/system"));
+        assert!(host_is_this_machine_given(&host, Some(" ubuntu-kvm-1\n")));
     }
 }

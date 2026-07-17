@@ -1793,19 +1793,35 @@ These make every other result untrustworthy, so they come before new features.
 
 ### 12.5 Step 2 — locality: let the box drive itself (blocks run-on-host)
 
-- [ ] On the box, the inventory's `qemu+ssh://ubuntu-server@ubuntu-headless/system`
-      is an **SSH loopback to itself** → `Host key verification failed` →
-      `probe=FAILED`. Local `qemu:///system` works fine (both guests listed). The
-      `connect_uri` is written from the **Mac's** viewpoint and the code has no
-      notion of "this host is me". Run-on-host (§11's ratified architecture) cannot
-      work until it does.
-- [ ] **Open design decision.** Hostname-match is automatic but collision-prone,
-      and a false match would point the orchestrator at the **wrong machine's
-      libvirt** — the dangerous direction. An explicit marker
-      (`RUSTYNET_LAB_HOST_ID` env or an inventory field) is unambiguous and fails
-      safe: unset simply degrades to today's loud self-SSH failure. Recommend
-      explicit, with hostname as a convenience fallback only if it cannot
-      false-positive.
+- [x] **DONE 2026-07-17 — run-on-host is unblocked.** On the box the inventory's
+      `qemu+ssh://ubuntu-server@ubuntu-headless/system` was an SSH loopback to
+      itself → `Host key verification failed` → `probe=FAILED`, because
+      `connect_uri` is written from the **Mac's** viewpoint.
+- [x] **Decision (owner, 2026-07-17): address identity, with an explicit override.**
+      `host_is_this_machine` resolves the endpoint's host and asks whether any
+      resolved address is ours; `RUSTYNET_LAB_HOST_ID` overrides in both directions
+      (naming a *different* host is an explicit "not me" and skips inference).
+      Rejected hostname-match: a name can collide and an address cannot, and a
+      false positive silently drives the **wrong machine's** hypervisor — it could
+      power-cycle the wrong VMs. Rejected explicit-only: every new machine would
+      need a setup step someone must remember, and env vars do not survive
+      non-login SSH — the exact trap that cost the toolchain diagnosis (§12.2).
+      **The test is a bind, not a heuristic:** the kernel only permits a bind to an
+      address the machine holds (`EADDRNOTAVAIL` otherwise); UDP + port 0 sends
+      nothing and consumes nothing. No per-OS interface collectors (`ip -j addr` /
+      `ifconfig`) — exactly the platform special-casing this crate keeps accruing.
+      **Fails safe:** unresolvable / no endpoint / no match ⇒ remote ⇒ SSH ⇒ today's
+      loud failure. Only a false *positive* is dangerous, and address identity
+      cannot produce one.
+      Wired at `LabHost::resolved_connect_uri()` — the single choke point every
+      libvirt call already goes through, so this works everywhere rather than in
+      whichever call sites remembered to check.
+      Proven on the box: `host ubuntu-kvm-1 kind=libvirt endpoint=qemu:///system
+      probe=ok (QEMU 8.2.2)`, 2 domains / 2 ready. Mac output unchanged.
+      7 tests, incl. the load-bearing negative (192.0.2.1, RFC 5737 TEST-NET-1, is
+      never ours) and the override in both directions. `env::set_var` is unsafe in
+      edition 2024 and the workspace forbids unsafe, so the decision is split into a
+      pure `host_is_this_machine_given(host, declared)` — a better shape anyway.
 
 ### 12.6 Step 3 — §6.8.2 delegation refactor (kill the second, weaker path)
 
