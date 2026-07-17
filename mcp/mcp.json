@@ -111,7 +111,7 @@
   "notes": "The repo root is baked into each binary at compile time (build.rs), so the servers resolve documents/ and crates/ regardless of the client's working directory. Override with the RUSTYNET_REPO_ROOT env var if needed. rustynet-mcp-deepseek's deepseek_agent reads the LOCAL repo (read-only) and resolves the baked repo root like the other servers; its three proxy tools (read/write/read_write) do not need it.",
   "deepseek_server": {
     "name": "rustynet-mcp-deepseek",
-    "description": "Calls the DeepSeek API as a first-class sub-agent and exposes standardized live-lab loop helpers. Tools: prompt proxies (deepseek_read/write/read_write), deepseek_agent (READ-ONLY grounded repo+UTM lab researcher), deepseek_lab_run (deterministic live-lab launch + DeepSeek triage only on fail unless triage_on_failure=false), deepseek_next_live_lab_target (read-only run-matrix target chooser), deepseek_autonomous_live_lab_loop (reconcile stale jobs → choose next target → launch), deepseek_recover_lab_environment (async stop-after-ready recovery after interruption), deepseek_reconcile_jobs (repair stale singleton-blocking labrun records), deepseek_live_lab/deepseek_live_lab_result (failure triage + async polling), and deepseek_doc_sync (read-only docs edit proposal). API key from DEEPSEEK_API_KEY, ~/Desktop/deepseek_api.md, or ~/.deepseek_api_key.",
+    "description": "Calls a configured LLM provider (DeepSeek by default; any OpenAI-compatible API via an optional registry — see llm_provider below) as a first-class sub-agent and exposes standardized live-lab loop helpers. Tools: prompt proxies (deepseek_read/write/read_write), deepseek_agent (READ-ONLY grounded repo+UTM lab researcher), deepseek_lab_run (deterministic live-lab launch + triage only on fail unless triage_on_failure=false), deepseek_next_live_lab_target (read-only run-matrix target chooser), deepseek_autonomous_live_lab_loop (reconcile stale jobs → choose next target → launch), deepseek_recover_lab_environment (async stop-after-ready recovery after interruption), deepseek_reconcile_jobs (repair stale singleton-blocking labrun records), deepseek_live_lab/deepseek_live_lab_result (failure triage + async polling), and deepseek_doc_sync (read-only docs edit proposal). API key from DEEPSEEK_API_KEY, ~/Desktop/deepseek_api.md, or ~/.deepseek_api_key (DeepSeek); any other configured provider resolves its key from its own api_key_env only.",
     "tools": [
       "deepseek_read",
       "deepseek_write",
@@ -128,6 +128,23 @@
     ],
     "binary": "bin/rustynet-mcp-deepseek",
     "no_repo_root_required": false
+  },
+  "llm_provider": {
+    "description": "The 'flash'/'pro' model tiers and API endpoint used by rustynet-mcp-deepseek are resolved from an LlmProvider, not hardcoded. DeepSeek's model ids are the built-in, zero-configuration default. Optional non-secret registry file (default ~/.config/rustynet/llm_providers.json, override path via RUSTYNET_LLM_PROVIDERS_FILE) lets other OpenAI-Chat-Completions-compatible providers (Groq, Together, Fireworks, OpenAI, a local Ollama shim, ...) be added as entries with no code change; switch the active one via RUSTYNET_LLM_PROVIDER=<name> without editing the file. The registry never stores a key value, only the name of the env var holding it (api_key_env, default {NAME}_API_KEY).",
+    "registry_path_default": "~/.config/rustynet/llm_providers.json",
+    "registry_path_env_override": "RUSTYNET_LLM_PROVIDERS_FILE",
+    "active_provider_env_override": "RUSTYNET_LLM_PROVIDER",
+    "example": {
+      "active": "deepseek",
+      "providers": {
+        "groq": {
+          "base_url": "https://api.groq.com/openai/v1/chat/completions",
+          "api_key_env": "GROQ_API_KEY",
+          "flash_model": "llama-3.3-70b-versatile",
+          "pro_model": "llama-3.3-70b-versatile"
+        }
+      }
+    }
   },
   "platform_configs": {
     "zed": {

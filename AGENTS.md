@@ -570,6 +570,38 @@ newest tools are reachable with NO client reconnect. The API key resolves from `
 `~/Desktop/deepseek_api.md`; **never commit, log, or write it into the repo or any
 artifact.**
 
+**Provider is configurable — DeepSeek is the default, not the only option.** The two model
+tiers (`"flash"`/`"pro"`) and the API endpoint are resolved from an `LlmProvider`
+(`crates/rustynet-mcp/src/bin/deepseek.rs`), not hardcoded — DeepSeek's IDs (`deepseek-v4-flash`/
+`deepseek-v4-pro`) are the built-in default (zero configuration needed, today's behavior
+unchanged), overridable via an optional, non-secret registry file at
+`~/.config/rustynet/llm_providers.json` (override the path with
+`RUSTYNET_LLM_PROVIDERS_FILE`):
+```json
+{
+  "active": "deepseek",
+  "providers": {
+    "groq": {
+      "base_url": "https://api.groq.com/openai/v1/chat/completions",
+      "api_key_env": "GROQ_API_KEY",
+      "flash_model": "llama-3.3-70b-versatile",
+      "pro_model": "llama-3.3-70b-versatile"
+    }
+  }
+}
+```
+Switch the active provider without editing the file via `RUSTYNET_LLM_PROVIDER=<name>`. Because
+DeepSeek's Chat Completions API is OpenAI-compatible, any other OpenAI-compatible provider (Groq,
+Together, Fireworks, OpenAI itself, a local Ollama shim, ...) slots in as a registry entry — no
+code change — since the request/response shape in `DeepSeekServer::chat` is shared by all of
+them; only a structurally different API (e.g. native Anthropic Messages) would need its own
+request/response mapper. **The registry file holds no secrets** — only `base_url` and the name of
+the env var holding that provider's key (`api_key_env`, defaulting to `{NAME}_API_KEY`); the key
+itself still resolves from that env var (DeepSeek additionally falls back to
+`~/Desktop/deepseek_api.md`/`~/.deepseek_api_key` for backward compatibility). An unresolvable
+`RUSTYNET_LLM_PROVIDER` value is a hard, logged error — it never silently reuses the wrong
+provider's key against the wrong URL.
+
 ## 13) Operating Checklists
 
 ### 13.1 Live-Lab Hardening Loop
