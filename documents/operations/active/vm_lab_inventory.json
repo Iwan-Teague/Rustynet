@@ -20,7 +20,7 @@
       "repo_dir": "/home/ubuntu-server/Rustynet",
       "pool_disk_model": "Samsung SSD 870 EVO 500GB",
       "alt_ssh_endpoints": [
-        "ubuntu-server@10.230.76.5"
+        "ubuntu-server@172.23.56.5"
       ]
     }
   ],
@@ -256,6 +256,28 @@
       "controller": {
         "type": "libvirt",
         "domain": "linux-x86-client-1",
+        "host_id": "ubuntu-kvm-1"
+      }
+    },
+    {
+      "alias": "linux-x86-exit-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.121.26",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.121.26",
+      "last_known_network": "192.168.121.0/24",
+      "network_group": "libvirt-192.168.121.0/24",
+      "node_id": "linux-x86-exit-1",
+      "lab_role": "linux_exit",
+      "exit_capable": true,
+      "relay_capable": false,
+      "parent_device": "ubuntu-kvm-1 (x86_64 KVM host)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "linux-x86-exit-1",
         "host_id": "ubuntu-kvm-1"
       }
     }
