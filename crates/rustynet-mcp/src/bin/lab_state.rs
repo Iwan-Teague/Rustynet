@@ -170,9 +170,37 @@ impl LabStateServer {
     }
 
     fn run_ops(&self, subcommand: &str, extra_args: &[&str], timeout_secs: u64) -> ToolCallResult {
-        let mut args: Vec<&str> = vec!["ops", subcommand, "--inventory", DEFAULT_INVENTORY];
+        self.run_ops_with_inventory(subcommand, None, extra_args, timeout_secs)
+    }
+
+    /// `run_ops`, but able to target a different inventory.
+    ///
+    /// Every tool used to be welded to DEFAULT_INVENTORY, so none could act on a
+    /// second fleet or a scratch inventory. The override is **confined to the
+    /// repo** (`confined_repo_path`): an inventory path is read AND is where live
+    /// IPs get written back, so an arbitrary path would let a caller reach outside
+    /// the workspace.
+    fn run_ops_with_inventory(
+        &self,
+        subcommand: &str,
+        inventory: Option<&str>,
+        extra_args: &[&str],
+        timeout_secs: u64,
+    ) -> ToolCallResult {
+        let inventory = inventory.unwrap_or(DEFAULT_INVENTORY);
+        let mut args: Vec<&str> = vec!["ops", subcommand, "--inventory", inventory];
         args.extend_from_slice(extra_args);
         self.run_cli(&args, &format!("ops {subcommand}"), timeout_secs)
+    }
+
+    /// Resolve an optional `inventory` argument, confined to the repo.
+    fn arg_inventory(&self, args: Option<&Value>) -> Result<Option<String>, String> {
+        match arg_str(args, "inventory") {
+            None => Ok(None),
+            Some(path) => self
+                .confined_repo_path(path, "inventory")
+                .map(|resolved| Some(resolved.to_string_lossy().to_string())),
+        }
     }
 
     fn run_shell_script(&self, script: &str, args: &[&str], timeout_secs: u64) -> ToolCallResult {
@@ -4225,6 +4253,7 @@ impl McpServer for LabStateServer {
                 description: "START HERE for any multi-machine run. Ordered, fail-closed gates over every declared host: inventory -> commit_pinned -> local_clean -> commit_pushed -> hosts_on_commit -> hosts_agree -> guests_ready. Stops at the first failure and NAMES THE COMMAND that fixes it; skipped gates report not_run (never assumed green). Verdict GO/NO-GO. `ops vm-lab-host-preflight`. This is the MACHINE-level gate; vm-lab-preflight (preflight_check) gates individual GUESTS — run this first, that second.".into(),
                 input_schema: json_schema_object(
                     json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
                         "commit": {"type": "string", "description": "Ref/SHA every host must be on. Default HEAD. Pin an explicit SHA for a multi-host comparison: this repo has concurrent sessions committing, so 'main' can resolve differently per host."},
                         "hosts": {"type": "string", "description": "Comma-separated host_ids to check. Default: every declared host."},
                         "allow_dirty": {"type": "boolean", "description": "Permit a dirty worktree. Off by default: a dirty tree is not reproducible from a SHA, so its evidence does not match the commit it claims."},
@@ -4238,6 +4267,7 @@ impl McpServer for LabStateServer {
                 description: "Put a lab host's orchestrator source on a named commit and PROVE it by reading back that host's own `git rev-parse HEAD`. Required before a host's run evidence means anything: run provenance (git_commit/git_dirty_state) is computed by shelling out to git in each host's OWN checkout, so a host that is not really on the commit produces evidence that lies. Fetches from the public origin (no credentials) — so the commit MUST be pushed first. Refuses a dirty tree; never moves your local working tree. `ops vm-lab-sync-host`.".into(),
                 input_schema: json_schema_object(
                     json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
                         "host": {"type": "string", "description": "host_id from the inventory's hosts[] (e.g. ubuntu-kvm-1)."},
                         "commit": {"type": "string", "description": "Ref/SHA to pin. Default HEAD. Must exist on origin."},
                         "verify_only": {"type": "boolean", "description": "Assert the host's state without changing it."},
@@ -4252,6 +4282,7 @@ impl McpServer for LabStateServer {
                 description: "Answer 'why can't I reach this host, and has its address drifted?'. Probes the DECLARED connect_uri endpoint first, then any declared alt_ssh_endpoints, and — over whichever path answers — asks the machine what addresses it ACTUALLY has. Distinguishes the three cases you would otherwise guess between: DOWN (nothing answered), PATH-DRIFT (declared endpoint dead but the machine is alive on an alternate — the inventory is stale), and UP-BUT-UNUSABLE (the machine ANSWERED but SSH could not complete). Probe states are classified, never flattened: up:host-key-not-pinned / up:auth-failed / up:ssh-refused mean the box is UP and it is a trust/auth problem, NOT a network fault — chasing it as one wastes real time. Never rewrites connect_uri: silent failover would hide the drift worth reporting. `ops vm-lab-host-net-status`.".into(),
                 input_schema: json_schema_object(
                     json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
                         "host": {"type": "string", "description": "Restrict to one host_id. Default: every declared host."},
                         "format": {"type": "string", "enum": ["table", "json"]},
                         "ssh_identity_file": {"type": "string"}
@@ -4264,6 +4295,7 @@ impl McpServer for LabStateServer {
                 description: "Ask a REMOTE lab host what it is doing and what its last run found — without going there. Reports whether an orchestrator process is IN FLIGHT, then reads that host's OWN evidence ledger over SSH and returns which stages passed, which failed (with alias + error_detail), the no-verdict count, the commit + dirty state the run recorded, and its report_dir. IMPORTANT: each machine keeps its own ledger — a run writes to the host that ran it — so the local ledger CANNOT see the box's runs and this is the only way to read them. Read-only. `ops vm-lab-host-run-status`.".into(),
                 input_schema: json_schema_object(
                     json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
                         "host": {"type": "string", "description": "host_id of a remote host from hosts[]."},
                         "run_id": {"type": "string", "description": "Which run to report. Default: the newest recorded on that host."},
                         "stage": {"type": "string", "description": "Report only stages whose name CONTAINS this (case-insensitive), e.g. 'two_hop' or 'dns'. One filter rather than a function per stage — the stage set changes, a filter cannot drift from it. Errors (listing the run's real stages) if nothing matches, so a typo never reads as 'nothing wrong'."},
@@ -4278,6 +4310,7 @@ impl McpServer for LabStateServer {
                 description: "STEP 6 of the multi-machine loop: collapse every run recorded at ONE commit into a single verdict, so you read a conclusion instead of two report trees. Per-platform pass/fail/no-verdict rollup + the failing stages + which machine each run came from (alias -> host_id join). SURFACES CONFLICTS: the same node+stage answering differently across runs at one commit invalidates the comparison and is reported loudly, never silently resolved. An absent result (skip/not_run/reused/unknown) is NEVER counted as pass — that is how a two-machine split would otherwise manufacture parity that was never tested. Refuses runs recorded from a dirty worktree, and refuses to call one run a comparison (--expect-runs, default 2). `ops vm-lab-run-matrix-compare`.".into(),
                 input_schema: json_schema_object(
                     json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
                         "commit": {"type": "string", "description": "Ref/SHA to compare at. Default HEAD."},
                         "expect_runs": {"type": "integer", "description": "Minimum runs required. Default 2 — one machine reporting is not agreement."},
                         "allow_dirty": {"type": "boolean", "description": "Compare runs whose worktree was dirty (their evidence does not match the commit it names)."},
@@ -4293,12 +4326,14 @@ impl McpServer for LabStateServer {
                 description: "Create a headless cloud-image guest on a libvirt lab host (e.g. ubuntu-kvm-1) from a base image already in its pool. Bakes in the lessons that are NOT obvious: --video vga (virt-install --graphics none attaches no video device, and Debian cloud images boot-loop forever in GRUB's gfxterm without one — no kernel output at all), --cpu host-passthrough (so nested virt reaches inside the guest), and a backing-file overlay so guests share one read-only base. Verifies the pool's disk BY MODEL before writing anything if the host declares pool_disk_model. ALWAYS run with dry_run first to see the plan. libvirt hosts only — UTM guests are created in the UTM app. `ops vm-lab-provision-guest`.".into(),
                 input_schema: json_schema_object(
                     json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
                         "host": {"type": "string", "description": "host_id of a libvirt host from hosts[]."},
                         "name": {"type": "string", "description": "Guest/domain name. ASCII alphanumeric, '-' or '_' only — it becomes a libvirt domain name AND a filename."},
                         "image": {"type": "string", "description": "Base image filename inside the host's pool (bare name, no path). Use discover_hosts / host_disk_status to see what is there."},
                         "ram_mb": {"type": "integer", "description": "Default 4096."},
                         "vcpus": {"type": "integer", "description": "Default 2."},
                         "disk_gb": {"type": "integer", "description": "Overlay size. Default 40."},
+                        "pool": {"type": "string", "description": "libvirt image pool path on the host. Default /var/lib/libvirt/images. The host's declared pool_disk_model guard still applies to whatever you pass."},
                         "dry_run": {"type": "boolean", "description": "Print the plan and change nothing. Do this first."},
                         "ssh_identity_file": {"type": "string"}
                     }),
@@ -4310,6 +4345,7 @@ impl McpServer for LabStateServer {
                 description: "Point at the lab's MACHINES and get the VMs each actually has, and which are ready to join a run. Covers both host kinds uniformly: libvirt/KVM (probes `virsh version`, enumerates `virsh list --all`) and macOS/UTM (delegates to the UTM bundle scan). ready = domain running AND an IP resolved — running-without-IP is deliberately NOT ready, because the SSH plane would have nowhere to connect. Unregistered VMs are reported, not hidden. An unreachable host reports probe=FAILED and contributes no guests, so 'no VMs' never looks like 'could not ask'. `ops vm-lab-discover-hosts`.".into(),
                 input_schema: json_schema_object(
                     json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
                         "host": {"type": "string", "description": "Restrict to one host_id. Default: every declared host."},
                         "format": {"type": "string", "enum": ["table", "json"], "description": "json for machine consumption."}
                     }),
@@ -4501,6 +4537,7 @@ impl McpServer for LabStateServer {
                 description: "Install everything a fresh Linux lab guest needs BEFORE Rustynet can be built on it — run this before bootstrap_vm on any new guest. rn_bootstrap.sh VERIFIES prerequisites and fails if absent; it does not install them, so a fresh cloud image needs this first. Installs the apt set (clang/llvm, build-essential, nftables, wireguard-tools, openssl+sqlite3 dev, tcpdump...) plus rustup PINNED to the repo's rust-toolchain.toml channel, and links the rustup shims into /usr/local/bin — without that `ssh guest cargo build` dies with 127 because a NON-LOGIN ssh shell never sources ~/.profile, which is exactly the shell the orchestrator uses. Idempotent; verify_only reports the prerequisite state and changes nothing. Takes a LIST of aliases. Debian-family Linux only. `ops vm-lab-provision-toolchain`.".into(),
                 input_schema: json_schema_object(
                     json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
                         "aliases": {"type": "array", "items": {"type": "string"}, "description": "Guest aliases to provision, e.g. [\"linux-x86-exit-1\",\"linux-x86-client-1\"]."},
                         "select_all": {"type": "boolean", "description": "Every include_in_all VM instead of a list."},
                         "verify_only": {"type": "boolean", "description": "Report prerequisite state, install nothing."},
@@ -4516,6 +4553,7 @@ impl McpServer for LabStateServer {
                 description: "Install/build Rustynet on one or MORE lab VMs. Phases: sync-source (ship the source), build-release (cargo build ON the guest), install-release, restart-runtime, verify-runtime, tunnel-smoke, killswitch-smoke, dns-smoke, ipv6-smoke, or `all` for the full chain. Pass `aliases` for several VMs in one call (they are handled by the same run, so a pair stays on identical source) or `select_all` for every include_in_all VM. Works for any inventory VM regardless of host — libvirt guests on a remote KVM box and local UTM guests alike, because the whole path is SSH. The guest must already have the toolchain rn_bootstrap verifies (rustup+cargo, clang/llvm, nft, wg, pkg-config openssl+sqlite3, passwordless sudo). SLOW: build-release compiles the workspace on the guest. `ops vm-lab-bootstrap-phase`.".into(),
                 input_schema: json_schema_object(
                     json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
                         "aliases": {"type": "array", "items": {"type": "string"}, "description": "VM aliases to bootstrap, e.g. [\"linux-x86-exit-1\",\"linux-x86-client-1\"]. One call keeps them on identical source."},
                         "alias": json_schema_string("Single VM alias (legacy; prefer `aliases`)"),
                         "select_all": {"type": "boolean", "description": "Every include_in_all VM instead of a list."},
@@ -4866,7 +4904,15 @@ impl McpServer for LabStateServer {
                     extra.push("--ssh-identity-file");
                     extra.push(&identity_owned);
                 }
-                self.run_ops("vm-lab-host-preflight", &extra, DISCOVERY_TIMEOUT_SECS)
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-host-preflight",
+                        inventory.as_deref(),
+                        &extra,
+                        DISCOVERY_TIMEOUT_SECS,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
             }
 
             "sync_host" => {
@@ -4892,7 +4938,15 @@ impl McpServer for LabStateServer {
                     extra.push("--ssh-identity-file");
                     extra.push(&identity_owned);
                 }
-                self.run_ops("vm-lab-sync-host", &extra, DISCOVERY_TIMEOUT_SECS)
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-sync-host",
+                        inventory.as_deref(),
+                        &extra,
+                        DISCOVERY_TIMEOUT_SECS,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
             }
 
             "host_net_status" => {
@@ -4918,7 +4972,15 @@ impl McpServer for LabStateServer {
                     extra.push("--ssh-identity-file");
                     extra.push(&identity_owned);
                 }
-                self.run_ops("vm-lab-host-net-status", &extra, DISCOVERY_TIMEOUT_SECS)
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-host-net-status",
+                        inventory.as_deref(),
+                        &extra,
+                        DISCOVERY_TIMEOUT_SECS,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
             }
 
             "host_run_status" => {
@@ -4953,7 +5015,15 @@ impl McpServer for LabStateServer {
                     extra.push("--ssh-identity-file");
                     extra.push(&identity_owned);
                 }
-                self.run_ops("vm-lab-host-run-status", &extra, DISCOVERY_TIMEOUT_SECS)
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-host-run-status",
+                        inventory.as_deref(),
+                        &extra,
+                        DISCOVERY_TIMEOUT_SECS,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
             }
 
             "compare_runs_at_commit" => {
@@ -4997,7 +5067,15 @@ impl McpServer for LabStateServer {
                     extra.push("--format");
                     extra.push(&format_owned);
                 }
-                self.run_ops("vm-lab-run-matrix-compare", &extra, DISCOVERY_TIMEOUT_SECS)
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-run-matrix-compare",
+                        inventory.as_deref(),
+                        &extra,
+                        DISCOVERY_TIMEOUT_SECS,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
             }
 
             "provision_guest" => {
@@ -5031,6 +5109,12 @@ impl McpServer for LabStateServer {
                     extra.push("--disk-gb");
                     extra.push(&disk_owned);
                 }
+                let pool_owned;
+                if let Some(pool) = arg_str(args, "pool") {
+                    pool_owned = pool.to_owned();
+                    extra.push("--pool");
+                    extra.push(&pool_owned);
+                }
                 if arg_bool(args, "dry_run") {
                     extra.push("--dry-run");
                 }
@@ -5040,7 +5124,15 @@ impl McpServer for LabStateServer {
                     extra.push("--ssh-identity-file");
                     extra.push(&identity_owned);
                 }
-                self.run_ops("vm-lab-provision-guest", &extra, DISCOVERY_TIMEOUT_SECS)
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-provision-guest",
+                        inventory.as_deref(),
+                        &extra,
+                        DISCOVERY_TIMEOUT_SECS,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
             }
 
             "discover_hosts" => {
@@ -5060,7 +5152,15 @@ impl McpServer for LabStateServer {
                     extra.push("--format");
                     extra.push(&format_owned);
                 }
-                self.run_ops("vm-lab-discover-hosts", &extra, DISCOVERY_TIMEOUT_SECS)
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-discover-hosts",
+                        inventory.as_deref(),
+                        &extra,
+                        DISCOVERY_TIMEOUT_SECS,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
             }
 
             "get_lab_topology" => self.get_lab_topology(),
@@ -5408,7 +5508,15 @@ impl McpServer for LabStateServer {
                 let timeout_owned = timeout.to_string();
                 extra.push("--timeout-secs");
                 extra.push(&timeout_owned);
-                self.run_ops("vm-lab-provision-toolchain", &extra, timeout + 120)
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-provision-toolchain",
+                        inventory.as_deref(),
+                        &extra,
+                        timeout + 120,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
             }
 
             "bootstrap_vm" => {
@@ -5485,7 +5593,15 @@ impl McpServer for LabStateServer {
                 extra.push("--timeout-secs");
                 extra.push(&timeout_owned);
 
-                self.run_ops("vm-lab-bootstrap-phase", &extra, timeout + 120)
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-bootstrap-phase",
+                        inventory.as_deref(),
+                        &extra,
+                        timeout + 120,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
             }
 
             "get_vm_diagnostics" => {
