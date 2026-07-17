@@ -487,8 +487,8 @@ Two READ-ONLY discovery tools, no args:
   endpoint, not hardcoded. Flags which two ids are currently aliased
   `"flash"`/`"pro"`.
 - `ai_check_balance` — the active provider's account balance/credit, when it
-  has a `balance_url` configured. Confirmed live for DeepSeek; not every
-  provider exposes a balance API (§ provider config below).
+  has a `balance_url` configured. Confirmed live for DeepSeek and Kimi; not
+  every provider exposes a balance API (§ provider config below).
 
 The live-lab family is standardized for simple agents. The **default loop step** is
 `ai_autonomous_live_lab_loop`: it reconciles stale/interrupted lab jobs,
@@ -650,16 +650,22 @@ endpoint are all resolved from an `LlmProvider`
 built-in presets work with zero registry file** — just set
 `RUSTYNET_LLM_PROVIDER=<name>` + that provider's key (see `built_in_provider`
 for the exact ids/endpoints; verify current ids via `ai_list_models` once a key
-is configured, since the non-DeepSeek presets are a best-effort pick, not
-independently confirmed live the way DeepSeek's are):
+is configured). DeepSeek and Kimi are verified live against real keys
+(endpoints, model ids, and balance); Grok/GLM/Qwen's endpoints follow each
+provider's documented convention but their model-id choices are a best-effort
+pick — confirm with `ai_list_models` when you configure a key:
 
-| Provider | `RUSTYNET_LLM_PROVIDER` | API key env var | Balance check |
-|---|---|---|---|
-| DeepSeek (default) | `deepseek` | `DEEPSEEK_API_KEY` | ✅ confirmed live |
-| Grok (xAI) | `grok` | `GROK_API_KEY` | not configured |
-| Kimi (Moonshot) | `kimi` | `KIMI_API_KEY` | not configured |
-| GLM (Zhipu) | `glm` | `GLM_API_KEY` | not configured |
-| Qwen (Alibaba DashScope) | `qwen` | `QWEN_API_KEY` | not configured |
+| Provider | `RUSTYNET_LLM_PROVIDER` | API key env var | flash / pro | Balance check |
+|---|---|---|---|---|
+| DeepSeek (default) | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-v4-flash / -pro | ✅ confirmed live |
+| Kimi (Moonshot, intl.) | `kimi` | `KIMI_API_KEY` | kimi-k2.6 / kimi-k2.7-code | ✅ confirmed live |
+| Grok (xAI) | `grok` | `GROK_API_KEY` | best-effort — verify | not configured |
+| GLM (Zhipu) | `glm` | `GLM_API_KEY` | best-effort — verify | not configured |
+| Qwen (Alibaba DashScope) | `qwen` | `QWEN_API_KEY` | best-effort — verify | not configured |
+
+Kimi uses the **international** platform `api.moonshot.ai` (a China-platform
+`api.moonshot.cn` key uses different credentials and 401s here — override
+`base_url`/`models_url`/`balance_url` via a registry entry for `.cn`).
 
 Beyond these five, an optional, non-secret registry file at
 `~/.config/rustynet/llm_providers.json` (override the path with
@@ -703,10 +709,12 @@ error — it now passes an unrecognized string through unchanged instead.)
 **Balance checking, where a provider exposes it.** `ai_check_balance` calls the active
 provider's `balance_url` (no derivation convention exists for this one, unlike models_url — it
 must be set explicitly, either in `built_in_provider` or a registry entry) and returns a
-best-effort one-line summary plus the raw response. Only DeepSeek's is confirmed live
-(`GET https://api.deepseek.com/user/balance`); the other four built-ins report clearly that
-balance checking isn't configured rather than guessing at a URL. Add `balance_url` to a registry
-entry once you've confirmed the right endpoint for another provider.
+best-effort one-line summary plus the raw response. DeepSeek's
+(`GET https://api.deepseek.com/user/balance`) and Kimi's
+(`GET https://api.moonshot.ai/v1/users/me/balance`) are confirmed live; the
+other three built-ins report clearly that balance checking isn't configured
+rather than guessing at a URL. Add `balance_url` to a registry entry once
+you've confirmed the right endpoint for another provider.
 
 ### 12.6 Delegated Edits — the write-capable tier (OpenCode harness, worktree-isolated)
 
@@ -722,8 +730,16 @@ session state, gate-running. Rather than reimplement a coding agent badly in
 Rust, the edit tier **delegates to OpenCode** (already used by the
 `rustynet-loop-main` loop) driven over its HTTP API. Model routing here is
 OpenCode's own `provider/model` naming (e.g. `deepseek/deepseek-v4-pro`,
-`opencode/deepseek-v4-flash-free`), **not** this server's `LlmProvider` registry
-or `flash`/`pro` shortcuts — two different harnesses, two different model routers.
+`kimi/kimi-k2.7-code`, `opencode/deepseek-v4-flash-free`), **not** this server's
+`LlmProvider` registry or `flash`/`pro` shortcuts — two different harnesses, two
+different model routers. Providers usable here are the ones in
+`.opencode/opencode.json`'s `provider` block (currently `deepseek` and `kimi`;
+`kimi-k2.7-code` is the code-tuned pick for a `full`-mode agent). The spawned
+`opencode serve` gets each provider's API key injected from Keychain
+in-process (`opencode_provider_env` reads `rustynet-<provider>-api-key` and
+passes it as the `{env:..._API_KEY}` the provider config expects), so no key
+needs to be exported in the shell — the same Keychain items `ai_read`/`ai_agent`
+already use.
 
 **The isolation is the whole safety model.** Every `ai_edit_run` job:
 - creates its own **git worktree** under `state/edit-worktrees/<job_id>` on a

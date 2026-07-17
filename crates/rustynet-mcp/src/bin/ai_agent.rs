@@ -108,8 +108,8 @@ struct LlmProvider {
     models_url: String,
     /// Account balance/credit endpoint, when this provider exposes one. No
     /// standard convention exists across providers (unlike `/models`), so
-    /// this is never derived — only DeepSeek's is confirmed live as of this
-    /// writing (`ai_check_balance`); the others are `None` until confirmed
+    /// this is never derived — DeepSeek's and Kimi's are confirmed live as of
+    /// this writing (`ai_check_balance`); the rest are `None` until confirmed
     /// against each provider's current docs and added to `built_in_provider`
     /// or a registry entry.
     balance_url: Option<String>,
@@ -145,13 +145,15 @@ struct BuiltInPreset {
 /// entry with the SAME name overrides the corresponding preset here (e.g. to
 /// repoint at a new model generation without a rebuild).
 ///
-/// CONFIDENCE NOTE: base_url/models_url follow each provider's documented
-/// OpenAI-compatible convention; the flash/pro model id CHOICES are a
-/// best-effort pick as of this writing, not independently verified live for
-/// grok/kimi/glm/qwen the way DeepSeek's are (§ see AiAgentServer::list_models
-/// tests). Once a real key is configured for one of these, run
-/// `ai_list_models` and correct `flash_model`/`pro_model` below (or override
-/// via a registry entry) if the provider's current catalog differs.
+/// CONFIDENCE NOTE: DeepSeek's and Kimi's endpoints + model ids are verified
+/// live against real keys (Kimi's `/models`, `/chat/completions`-shape, and
+/// `/v1/users/me/balance` all confirmed on api.moonshot.ai). Grok/glm/qwen's
+/// base_url/models_url follow each provider's documented OpenAI-compatible
+/// convention, but their flash/pro model id CHOICES are a best-effort pick as
+/// of this writing, not independently verified live. Once a real key is
+/// configured for one of those, run `ai_list_models` and correct
+/// `flash_model`/`pro_model` below (or override via a registry entry) if the
+/// provider's current catalog differs.
 fn built_in_provider(name: &str) -> Option<BuiltInPreset> {
     match name {
         "deepseek" => Some(BuiltInPreset {
@@ -172,12 +174,21 @@ fn built_in_provider(name: &str) -> Option<BuiltInPreset> {
             pro_reasoning_effort: "",
             api_key_env: "GROK_API_KEY",
         }),
+        // Moonshot's INTERNATIONAL platform (api.moonshot.ai), confirmed live
+        // against a real key: /models 200s and /v1/users/me/balance 200s. The
+        // separate China platform (api.moonshot.cn) uses different keys and 401s
+        // an international key, so a .cn user must override base_url/models_url/
+        // balance_url via a registry entry. flash/pro map to the two models this
+        // account exposes — kimi-k2.6 (general) and kimi-k2.7-code (code-tuned,
+        // the natural pick for the delegated-edit tier); both are 256K-context
+        // reasoning models. Verify current ids with ai_list_models, since
+        // Moonshot rotates model generations.
         "kimi" => Some(BuiltInPreset {
-            base_url: "https://api.moonshot.cn/v1/chat/completions",
-            models_url: "https://api.moonshot.cn/v1/models",
-            balance_url: None,
-            flash_model: "moonshot-v1-8k",
-            pro_model: "moonshot-v1-128k",
+            base_url: "https://api.moonshot.ai/v1/chat/completions",
+            models_url: "https://api.moonshot.ai/v1/models",
+            balance_url: Some("https://api.moonshot.ai/v1/users/me/balance"),
+            flash_model: "kimi-k2.6",
+            pro_model: "kimi-k2.7-code",
             pro_reasoning_effort: "",
             api_key_env: "KIMI_API_KEY",
         }),
@@ -1953,13 +1964,26 @@ impl AiAgentServer {
         let log_path = self.jobs_dir().join(format!("{job_id}-serve.log"));
         std::fs::create_dir_all(self.jobs_dir())
             .map_err(|e| format!("cannot create jobs dir: {e}"))?;
+        // Inject each provider's API key into the serve's environment from
+        // Keychain, so OpenCode's `{env:PROVIDER_API_KEY}` provider configs
+        // resolve. This is the retired launcher script's job, done RIGHT: it
+        // reads Keychain IN-PROCESS (via /usr/bin/security, argv-only) and
+        // passes the values as env vars to a compiled-binary spawn — no shell
+        // re-exec, so the Desktop MCP sandbox that blocked the shebang launcher
+        // (§12.5) does not apply. A provider with no Keychain item is simply
+        // omitted; an env var already set in this process still wins.
+        let key_env = opencode_provider_env();
+        let env_refs: Vec<(&str, &str)> = key_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         // --port 0 = let the OS pick a free port; we read the real one back out
         // of the log. Hardcoding a port would collide between concurrent jobs.
         let child = spawn_logged(
             "opencode",
             &["serve", "--port", "0"],
             worktree,
-            &[],
+            &env_refs,
             &log_path,
         )?;
         let pid = child.id();
@@ -5074,6 +5098,37 @@ fn load_keychain_secret(service: &str) -> Option<String> {
     if key.is_empty() { None } else { Some(key) }
 }
 
+/// Build the provider-key environment for a spawned `opencode serve` — one
+/// `(PROVIDER_API_KEY, value)` pair per built-in provider that has a Keychain
+/// item, so OpenCode's `{env:...API_KEY}` provider configs resolve for the
+/// delegated-edit tier. A key already set in this process's own environment
+/// takes precedence (it is not overridden by a Keychain lookup). Providers with
+/// neither are simply absent — harmless unless the edit job routes to one.
+fn opencode_provider_env() -> Vec<(String, String)> {
+    // (provider name, env var) — mirrors built_in_provider's api_key_env fields.
+    const PROVIDERS: &[(&str, &str)] = &[
+        ("deepseek", "DEEPSEEK_API_KEY"),
+        ("grok", "GROK_API_KEY"),
+        ("kimi", "KIMI_API_KEY"),
+        ("glm", "GLM_API_KEY"),
+        ("qwen", "QWEN_API_KEY"),
+    ];
+    let mut env = Vec::new();
+    for (provider, var) in PROVIDERS {
+        // Env var already exported wins; only fall back to Keychain otherwise.
+        if let Ok(v) = std::env::var(var)
+            && !v.trim().is_empty()
+        {
+            env.push(((*var).to_string(), v));
+            continue;
+        }
+        if let Some(k) = load_keychain_secret(&format!("rustynet-{provider}-api-key")) {
+            env.push(((*var).to_string(), k));
+        }
+    }
+    env
+}
+
 /// Resolve `provider_name`'s API key via its `api_key_env` var, then macOS
 /// Keychain item `rustynet-{provider_name}-api-key`. For the built-in
 /// `"deepseek"` provider specifically, preserves the original resolution
@@ -5950,7 +6005,14 @@ impl AiAgentServer {
                     .as_str()
                     .map(|b| format!("{b} (currency unspecified)"))
             })
-            .or_else(|| parsed["balance"].as_f64().map(|b| format!("{b}")));
+            .or_else(|| parsed["balance"].as_f64().map(|b| format!("{b}")))
+            // Moonshot/Kimi shape: {"data":{"available_balance":N,
+            // "cash_balance":N,"voucher_balance":N}} (numeric, account currency).
+            .or_else(|| {
+                parsed["data"]["available_balance"]
+                    .as_f64()
+                    .map(|b| format!("{b} available (currency per account)"))
+            });
 
         Ok(match summary {
             Some(s) => format!(
@@ -6805,8 +6867,8 @@ impl McpServer for AiAgentServer {
                     effects. Answers 'how much headroom do I have' before a long research/triage \
                     session or a big fan-out of calls. NOT every provider exposes a balance API \
                     (no shared convention exists across providers the way the models-list \
-                    endpoint has) — DeepSeek's is confirmed live; for grok/kimi/glm/qwen or a \
-                    registry-configured provider, this reports clearly that balance checking \
+                    endpoint has) — DeepSeek's and Kimi's are confirmed live; for grok/glm/qwen \
+                    or a registry-configured provider, this reports clearly that balance checking \
                     isn't configured rather than guessing at a URL (add `balance_url` to that \
                     provider's registry entry once you find the right endpoint in its docs). \
                     Returns a best-effort one-line summary PLUS the raw provider response, since \
@@ -7059,10 +7121,16 @@ mod tests {
             );
         }
         assert!(built_in_provider("not-a-real-provider").is_none());
-        // Only deepseek has a confirmed-live balance endpoint (§ ai_check_balance);
-        // the other four are None until confirmed against their current docs.
-        assert!(built_in_provider("deepseek").unwrap().balance_url.is_some());
-        for name in ["grok", "kimi", "glm", "qwen"] {
+        // deepseek and kimi have confirmed-live balance endpoints
+        // (§ ai_check_balance, both verified against a real key); the other three
+        // stay None until confirmed against their current docs rather than guessed.
+        for name in ["deepseek", "kimi"] {
+            assert!(
+                built_in_provider(name).unwrap().balance_url.is_some(),
+                "{name} has a confirmed-live balance_url"
+            );
+        }
+        for name in ["grok", "glm", "qwen"] {
             assert!(
                 built_in_provider(name).unwrap().balance_url.is_none(),
                 "{name} balance_url should be None until confirmed live, not guessed"

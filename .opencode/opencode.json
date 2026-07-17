@@ -137,6 +137,22 @@
           "name": "DeepSeek V4 Flash"
         }
       }
+    },
+    "kimi": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Moonshot Kimi (International)",
+      "options": {
+        "baseURL": "https://api.moonshot.ai/v1",
+        "apiKey": "{env:KIMI_API_KEY}"
+      },
+      "models": {
+        "kimi-k2.7-code": {
+          "name": "Kimi K2.7 Code"
+        },
+        "kimi-k2.6": {
+          "name": "Kimi K2.6"
+        }
+      }
     }
   },
   "mcp": {
