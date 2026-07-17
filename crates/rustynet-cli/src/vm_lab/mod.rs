@@ -342,6 +342,9 @@ pub struct VmLabSyncHostConfig {
     /// tracked files that a run on that host appends to, so `reset --hard` would
     /// destroy a run's results. Losing evidence must be a decision, not a default.
     pub discard_host_changes: bool,
+    /// Sync EVERY declared host instead of one. Mutually exclusive with a specific
+    /// `host_id`; the whole fleet lands on the same resolved commit in one call.
+    pub all: bool,
     /// SSH identity for reaching the host. Defaults to the lab identity; must be
     /// overridable so the tool is not welded to one key.
     pub ssh_identity_file: Option<PathBuf>,
@@ -5005,6 +5008,141 @@ fn ensure_orchestrator_arg_safe(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Read one file out of a host's checkout — the missing half of `host_run_status`,
+/// which hands back a `report_dir` nothing could then read.
+///
+/// Read-only and bounded: a size cap keeps a stray path (a multi-GB capture, a core
+/// dump) from being streamed into a tool response. The path is confined to the
+/// host's repo_dir by the caller (relative, no traversal), so this cannot exfiltrate
+/// arbitrary host files.
+const HOST_FETCH_ARTIFACT_SCRIPT: &str = r#"#!/bin/bash
+set -uo pipefail
+cd '__REPO_DIR__' || { echo "FETCH-ERROR: repo_dir not found: __REPO_DIR__" >&2; exit 1; }
+P='__PATH__'
+if [ ! -f "$P" ]; then echo "FETCH-ERROR: not a regular file: $P" >&2; exit 2; fi
+SIZE="$(stat -c %s "$P" 2>/dev/null || echo 0)"
+CAP=__CAP__
+if [ "$SIZE" -gt "$CAP" ]; then
+  echo "FETCH-ERROR: $P is $SIZE bytes, over the $CAP-byte cap; narrow the path or raise --max-bytes" >&2
+  exit 3
+fi
+echo "FETCH-META path=$P size=$SIZE"
+echo "FETCH-BODY-BEGIN"
+cat "$P"
+"#;
+
+/// Config for `ops vm-lab-fetch-host-artifact`: read a report file off a host.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VmLabFetchHostArtifactConfig {
+    pub inventory_path: Option<PathBuf>,
+    pub host_id: String,
+    /// Path to read, relative to the host's repo_dir.
+    pub path: String,
+    /// Write the body here locally instead of returning it inline.
+    pub out: Option<PathBuf>,
+    /// Refuse a file larger than this many bytes.
+    pub max_bytes: u64,
+    pub ssh_identity_file: Option<PathBuf>,
+    pub known_hosts_path: Option<PathBuf>,
+    pub timeout_secs: u64,
+}
+
+/// Read a single artifact out of a remote host's checkout.
+pub fn execute_ops_vm_lab_fetch_host_artifact(
+    config: VmLabFetchHostArtifactConfig,
+) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => default_inventory_path(),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    let host = hosts
+        .iter()
+        .find(|host| host.host_id == config.host_id)
+        .ok_or_else(|| format!("unknown host_id: {}", config.host_id))?;
+    let endpoint = host
+        .ssh_endpoint()
+        .ok_or_else(|| format!("host {} is local; read the file directly", host.host_id))?;
+    let repo_dir = host
+        .repo_dir
+        .as_ref()
+        .ok_or_else(|| format!("host {} has no repo_dir declared", host.host_id))?
+        .display()
+        .to_string();
+
+    if config.path.trim().is_empty() {
+        return Err("--path is required (relative to the host's repo_dir)".to_owned());
+    }
+    if config.path.starts_with('/') {
+        return Err(format!(
+            "--path must be relative to the host's repo_dir, got absolute: {}",
+            config.path
+        ));
+    }
+    if config.path.split('/').any(|seg| seg == "..") {
+        return Err(format!("--path must not contain '..': {}", config.path));
+    }
+    ensure_script_safe_value("path", config.path.as_str())?;
+    if config.path.contains('\'') {
+        return Err("--path must not contain a single quote".to_owned());
+    }
+    ensure_script_safe_value("repo_dir", repo_dir.as_str())?;
+    if repo_dir.contains('\'') {
+        return Err("host repo_dir must not contain a single quote".to_owned());
+    }
+    let cap = if config.max_bytes == 0 {
+        5 * 1024 * 1024
+    } else {
+        config.max_bytes
+    };
+
+    let script = HOST_FETCH_ARTIFACT_SCRIPT
+        .replace("__REPO_DIR__", repo_dir.as_str())
+        .replace("__PATH__", config.path.as_str())
+        .replace("__CAP__", cap.to_string().as_str());
+
+    let timeout = timeout_or_default(config.timeout_secs, 60);
+    let out = run_guest_script(
+        endpoint.as_str(),
+        None,
+        script.as_str(),
+        false,
+        config.ssh_identity_file.as_deref(),
+        config.known_hosts_path.as_deref(),
+        timeout,
+    )?;
+
+    // Everything after the sentinel is the file body, byte-for-byte.
+    let body = match out.split_once("FETCH-BODY-BEGIN\n") {
+        Some((_, body)) => body,
+        None => {
+            return Err(format!(
+                "host {}: fetch did not return a body:\n{out}",
+                host.host_id
+            ));
+        }
+    };
+    let meta = out
+        .lines()
+        .find(|line| line.starts_with("FETCH-META "))
+        .unwrap_or("FETCH-META (size unknown)");
+
+    if let Some(out_path) = config.out.as_deref() {
+        fs::write(out_path, body)
+            .map_err(|err| format!("write {} failed: {err}", out_path.display()))?;
+        return Ok(format!(
+            "host {} — {meta}\n  wrote {} bytes to {}\n",
+            host.host_id,
+            body.len(),
+            out_path.display()
+        ));
+    }
+    Ok(format!(
+        "host {} — {meta}\n--- {} ---\n{body}",
+        host.host_id, config.path
+    ))
+}
+
 /// Script shipped to a host to stop an in-flight live-lab run.
 ///
 /// Signals the run's **process group**, not just the leader, so the whole tree
@@ -6441,7 +6579,81 @@ fn render_preflight(gates: &[PreflightGate], json: bool, sha: Option<&str>) -> S
 /// The SHA is resolved **once, locally** and pinned: this repo has concurrent
 /// sessions committing, so "sync both hosts to main" can land two *different*
 /// commits and yield two rows that look comparable and are not.
+/// Sync every declared host to the same commit, reusing the single-host path.
+///
+/// The commit is resolved ONCE by the single-host executor from the local tree, so
+/// the whole fleet lands on the same SHA rather than each re-resolving `HEAD`
+/// (which could differ if the tree moved between hosts). Reports every host's
+/// outcome and fails if any host failed — a "synced" that skipped a broken host
+/// would be a lie the compare step later trips over.
+fn sync_all_hosts(config: &VmLabSyncHostConfig) -> Result<String, String> {
+    let inventory_path = match config.inventory_path.as_deref() {
+        Some(path) => resolve_path(path)?,
+        None => return Err("vm-lab-sync-host requires --inventory <path>".to_owned()),
+    };
+    let (_entries, hosts) = load_inventory_with_hosts(inventory_path.as_path())?;
+    if hosts.is_empty() {
+        return Err("no hosts declared in the inventory (hosts[] is empty)".to_owned());
+    }
+
+    let mut results: Vec<(String, Result<String, String>)> = Vec::new();
+    for host in &hosts {
+        let one = VmLabSyncHostConfig {
+            host_id: host.host_id.clone(),
+            all: false,
+            ..config.clone()
+        };
+        results.push((host.host_id.clone(), execute_ops_vm_lab_sync_host(one)));
+    }
+
+    let failures: Vec<&String> = results
+        .iter()
+        .filter_map(|(id, r)| r.as_ref().err().map(|_| id))
+        .collect();
+
+    if config.json {
+        let rendered = serde_json::to_string_pretty(&serde_json::json!({
+            "synced_all": failures.is_empty(),
+            "hosts": results.iter().map(|(id, r)| serde_json::json!({
+                "host_id": id,
+                "ok": r.is_ok(),
+                "detail": match r { Ok(s) => s.trim(), Err(e) => e.as_str() },
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap_or_else(|_| "{}".to_owned());
+        if failures.is_empty() {
+            return Ok(rendered);
+        }
+        return Err(rendered);
+    }
+
+    let mut out = String::new();
+    for (id, r) in &results {
+        match r {
+            Ok(detail) => out.push_str(&format!("[ok]   {id}: {}\n", detail.trim())),
+            Err(err) => out.push_str(&format!("[FAIL] {id}: {err}\n")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(out)
+    } else {
+        Err(format!(
+            "{out}\n{} of {} host(s) failed to sync: {}",
+            failures.len(),
+            results.len(),
+            failures
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
 pub fn execute_ops_vm_lab_sync_host(config: VmLabSyncHostConfig) -> Result<String, String> {
+    if config.all {
+        return sync_all_hosts(&config);
+    }
     let inventory_path = match config.inventory_path.as_deref() {
         Some(path) => resolve_path(path)?,
         None => return Err("vm-lab-sync-host requires --inventory <path>".to_owned()),
@@ -54096,5 +54308,37 @@ mod stop_host_run_tests {
         assert!(script.contains("no run in flight"));
         // Handle files removed so a later status cannot report a dead pid as live.
         assert!(script.contains("rm -f state/host-lab-runs/*.pid"));
+    }
+}
+
+#[cfg(test)]
+mod fetch_host_artifact_tests {
+    use super::HOST_FETCH_ARTIFACT_SCRIPT;
+
+    fn render(path: &str, cap: u64) -> String {
+        HOST_FETCH_ARTIFACT_SCRIPT
+            .replace("__REPO_DIR__", "/home/u/Rustynet")
+            .replace("__PATH__", path)
+            .replace("__CAP__", &cap.to_string())
+    }
+
+    #[test]
+    fn the_path_and_repo_dir_are_single_quoted() {
+        let s = render("artifacts/live_lab/x/summary.json", 1024);
+        assert!(s.contains("cd '/home/u/Rustynet'"));
+        assert!(s.contains("P='artifacts/live_lab/x/summary.json'"));
+    }
+
+    #[test]
+    fn it_guards_before_it_reads() {
+        let s = render("x", 4096);
+        // A non-file and an over-cap file are refused BEFORE cat runs.
+        assert!(s.contains("not a regular file"));
+        assert!(s.contains("CAP=4096"));
+        assert!(s.contains("over the $CAP-byte cap"));
+        // The sentinel that separates meta from body must precede the cat.
+        let begin = s.find("FETCH-BODY-BEGIN").expect("sentinel");
+        let cat = s.find("cat \"$P\"").expect("cat");
+        assert!(begin < cat, "the body sentinel must precede the cat");
     }
 }

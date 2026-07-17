@@ -4294,13 +4294,14 @@ impl McpServer for LabStateServer {
                 input_schema: json_schema_object(
                     json!({
                         "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
-                        "host": {"type": "string", "description": "host_id from the inventory's hosts[] (e.g. ubuntu-kvm-1)."},
+                        "host": {"type": "string", "description": "host_id from the inventory's hosts[] (e.g. ubuntu-kvm-1). Omit and set all:true to sync every host."},
+                        "all": {"type": "boolean", "description": "Sync EVERY declared host to the same commit in one call. Mutually exclusive with host."},
                         "commit": {"type": "string", "description": "Ref/SHA to pin. Default HEAD. Must exist on origin."},
                         "verify_only": {"type": "boolean", "description": "Assert the host's state without changing it."},
                         "allow_dirty": {"type": "boolean"},
                         "ssh_identity_file": {"type": "string"}
                     }),
-                    vec!["host"],
+                    vec![],
                 ),
             },
             Tool {
@@ -4346,6 +4347,20 @@ impl McpServer for LabStateServer {
                         "ssh_identity_file": {"type": "string"}
                     }),
                     vec!["host", "report_dir"],
+                ),
+            },
+            Tool {
+                name: "fetch_host_artifact".into(),
+                description: "Read one file out of a remote host's checkout — the missing half of host_run_status, which hands back a report_dir that nothing could then read. Give it a path RELATIVE to the host's repo_dir (a report file, a launch log under state/host-lab-runs/, a stage ledger). Read-only and size-capped (default 5MB) so a stray huge path can't be streamed back; relative + no-traversal, so it can't reach outside the checkout. Text-oriented (a trailing newline may be dropped) — for reading evidence, not byte-exact binary copy. `ops vm-lab-fetch-host-artifact`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory."},
+                        "host": {"type": "string", "description": "host_id of a remote host from hosts[]."},
+                        "path": {"type": "string", "description": "File to read, relative to the host's repo_dir (e.g. artifacts/live_lab/run-x/orchestration/summary.json)."},
+                        "max_bytes": {"type": "integer", "description": "Refuse a file larger than this. Default 5242880 (5MB)."},
+                        "ssh_identity_file": {"type": "string"}
+                    }),
+                    vec!["host", "path"],
                 ),
             },
             Tool {
@@ -4972,10 +4987,23 @@ impl McpServer for LabStateServer {
             }
 
             "sync_host" => {
-                let Some(host) = arg_str(args, "host") else {
-                    return tool_error("sync_host requires `host` (a host_id from hosts[])");
-                };
-                let mut extra: Vec<&str> = vec!["--host", host];
+                let all = arg_bool(args, "all");
+                let mut extra: Vec<&str> = Vec::new();
+                match (arg_str(args, "host"), all) {
+                    (Some(_), true) => {
+                        return tool_error("sync_host: `all` and `host` are mutually exclusive");
+                    }
+                    (Some(host), false) => {
+                        extra.push("--host");
+                        extra.push(host);
+                    }
+                    (None, true) => extra.push("--all"),
+                    (None, false) => {
+                        return tool_error(
+                            "sync_host requires `host` (a host_id from hosts[]) or `all: true`",
+                        );
+                    }
+                }
                 let commit_owned;
                 if let Some(commit) = arg_str(args, "commit") {
                     commit_owned = commit.to_owned();
@@ -5139,6 +5167,42 @@ impl McpServer for LabStateServer {
                         inventory.as_deref(),
                         &extra,
                         120,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
+            }
+
+            "fetch_host_artifact" => {
+                let Some(host) = arg_str(args, "host") else {
+                    return tool_error("fetch_host_artifact requires `host`");
+                };
+                let Some(path) = arg_str(args, "path") else {
+                    return tool_error(
+                        "fetch_host_artifact requires `path` (relative to repo_dir)",
+                    );
+                };
+                let mut extra: Vec<&str> = vec!["--host", host, "--path", path];
+                let max_owned;
+                if let Some(max) = args
+                    .and_then(|v| v.get("max_bytes"))
+                    .and_then(Value::as_u64)
+                {
+                    max_owned = max.to_string();
+                    extra.push("--max-bytes");
+                    extra.push(&max_owned);
+                }
+                let ssh_owned;
+                if let Some(ssh) = arg_str(args, "ssh_identity_file") {
+                    ssh_owned = ssh.to_owned();
+                    extra.push("--ssh-identity-file");
+                    extra.push(&ssh_owned);
+                }
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-fetch-host-artifact",
+                        inventory.as_deref(),
+                        &extra,
+                        DISCOVERY_TIMEOUT_SECS,
                     ),
                     Err(err) => tool_error(&err),
                 }
