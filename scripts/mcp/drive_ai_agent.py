@@ -5,26 +5,30 @@ When you rebuild `bin/rustynet-mcp-<name>`, the Claude Code client keeps the OLD
 server process (it holds its exec-time image and caches the tool list), so new
 tools won't appear in-session until you `/mcp` reconnect. This bypasses that: it
 spawns the freshly-built binary, does the JSON-RPC handshake, calls one tool, and
-(for the async deepseek live-lab tools) auto-polls `deepseek_live_lab_result`
+(for the async AI-agent live-lab tools) auto-polls `ai_live_lab_result`
 until the report lands. So the latest tools are always reachable with one command.
 
 Usage:
-  scripts/mcp/drive_deepseek.py --tool deepseek_lab_run \
+  scripts/mcp/drive_ai_agent.py --tool ai_lab_run \
       --args '{"area":"macOS relay","macos":true}'
-  scripts/mcp/drive_deepseek.py --tool deepseek_live_lab \
+  scripts/mcp/drive_ai_agent.py --tool ai_live_lab \
       --args '{"target":"x","failure_context":"...","max_steps":8}'
-  scripts/mcp/drive_deepseek.py --bin bin/rustynet-mcp-deepseek --tool deepseek_read \
+  scripts/mcp/drive_ai_agent.py --tool ai_read \
       --args '{"prompt":"...","model":"flash"}' --no-poll
+  # --bin defaults to the Keychain-aware launcher; override to the raw binary
+  # only if you've already exported the provider's key yourself:
+  DEEPSEEK_API_KEY=... scripts/mcp/drive_ai_agent.py --bin bin/rustynet-mcp-ai-agent \
+      --tool ai_read --args '{"prompt":"...","model":"flash"}' --no-poll
 
 Exit code 0 on a delivered result; non-zero on transport/timeout failure.
 """
 import argparse, json, os, re, select, subprocess, sys, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-JOB_RE = re.compile(r"\b(?:triage|labrun|docsync|recover)-\d+(?:-\d+)*\b")  # deepseek async job ids (incl. -millis-pid-seq)
+JOB_RE = re.compile(r"\b(?:triage|labrun|docsync|recover)-\d+(?:-\d+)*\b")  # AI-agent async job ids (incl. -millis-pid-seq)
 LIVE_LAB_LAUNCH_TOOLS = {
-    "deepseek_lab_run",
-    "deepseek_autonomous_live_lab_loop",
+    "ai_lab_run",
+    "ai_autonomous_live_lab_loop",
 }
 
 
@@ -55,13 +59,17 @@ def refuse_sandboxed_live_lab(tool: str) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default="bin/rustynet-mcp-deepseek",
-                    help="MCP server binary, repo-relative or absolute (default: bin/rustynet-mcp-deepseek)")
+    ap.add_argument("--bin", default="bin/rustynet-mcp-ai-agent-launcher.sh",
+                    help="MCP server binary or launch wrapper, repo-relative or absolute "
+                    "(default: bin/rustynet-mcp-ai-agent-launcher.sh, which injects each "
+                    "provider's API key from Keychain before exec'ing the raw binary — pass "
+                    "the raw bin/rustynet-mcp-ai-agent path instead only if DEEPSEEK_API_KEY "
+                    "or another provider's key is already exported in this shell)")
     ap.add_argument("--tool", required=True, help="tool name to call")
     ap.add_argument("--args", default="{}", help="tool arguments as a JSON object")
     ap.add_argument("--poll-interval", type=int, default=20)
     ap.add_argument("--poll-timeout", type=int, default=2400, help="max seconds to wait for an async report")
-    ap.add_argument("--no-poll", action="store_true", help="don't auto-poll deepseek async jobs")
+    ap.add_argument("--no-poll", action="store_true", help="don't auto-poll AI-agent async jobs")
     a = ap.parse_args()
 
     binpath = a.bin if os.path.isabs(a.bin) else os.path.join(REPO, a.bin)
@@ -113,7 +121,7 @@ def main() -> int:
     try:
         send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
               "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                         "clientInfo": {"name": "drive_deepseek", "version": "0"}}})
+                         "clientInfo": {"name": "drive_ai_agent", "version": "0"}}})
         if read_id(1, 30) is None:
             print("server did not answer initialize", file=sys.stderr); return 3
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
@@ -140,14 +148,14 @@ def main() -> int:
             return 0
 
         jid = job.group(0)
-        print(f"[async] {a.tool} -> job {jid}; polling deepseek_live_lab_result...", file=sys.stderr)
+        print(f"[async] {a.tool} -> job {jid}; polling ai_live_lab_result...", file=sys.stderr)
         t0 = time.time()
         pid = 10
         while time.time() - t0 < a.poll_timeout:
             time.sleep(a.poll_interval)
             pid += 1
             send({"jsonrpc": "2.0", "id": pid, "method": "tools/call",
-                  "params": {"name": "deepseek_live_lab_result", "arguments": {"job_id": jid}}})
+                  "params": {"name": "ai_live_lab_result", "arguments": {"job_id": jid}}})
             r = result_text(read_id(pid, 30))
             if "still running" in r:
                 print(f"  [{time.time()-t0:.0f}s] {r.strip()[:80]}", file=sys.stderr)

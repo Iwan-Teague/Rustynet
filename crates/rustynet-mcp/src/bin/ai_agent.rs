@@ -1,35 +1,53 @@
-//! DeepSeek MCP Server — calls the DeepSeek API as a first-class sub-agent tool.
+//! AI-Agent MCP Server — calls a configured LLM provider as a first-class
+//! sub-agent tool. DeepSeek is the built-in, zero-configuration default;
+//! Grok (xAI), Kimi (Moonshot), GLM (Zhipu), and Qwen (Alibaba DashScope) are
+//! additional built-in presets (just set their `*_API_KEY` env var — no
+//! registry file needed), and any other OpenAI-Chat-Completions-compatible
+//! API can be added via an optional registry file. See `load_provider` /
+//! `built_in_provider` for the resolution order and `LlmProvider` for the
+//! per-provider shape. Exactly one provider is active per server process
+//! (`RUSTYNET_LLM_PROVIDER`, default `"deepseek"`).
 //!
-//! Explicit DeepSeek + live-lab tools so the calling agent can choose the right
+//! Explicit provider + live-lab tools so the calling agent can choose the right
 //! level of access:
 //!
-//! - `deepseek_read`       — analysis/research only (explain, assess, review)
-//! - `deepseek_write`      — generation only (code, docs, config, tests)
-//! - `deepseek_read_write` — full autonomy: analyze existing content then generate output
-//! - `deepseek_agent` — READ-ONLY autonomous research agent: DeepSeek drives an
-//!   OpenAI-style tool-calling loop against a confined, read-only tool set
+//! - `ai_read`       — analysis/research only (explain, assess, review)
+//! - `ai_write`      — generation only (code, docs, config, tests)
+//! - `ai_read_write` — full autonomy: analyze existing content then generate output
+//! - `ai_list_models` — READ-ONLY: the active provider's LIVE model list (not
+//!   hardcoded) via its models endpoint, so a caller isn't limited to the two
+//!   `"flash"`/`"pro"` shortcuts.
+//! - `ai_check_balance` — READ-ONLY: the active provider's account
+//!   balance/credit, when that provider has a `balance_url` configured (not
+//!   every provider exposes one — see `LlmProvider::balance_url`).
+//! - `ai_agent` — READ-ONLY autonomous research agent: the active provider drives
+//!   an OpenAI-style tool-calling loop against a confined, read-only tool set
 //!   (read_file/list_dir/grep/git/find_files/find_definition/utm_vm_status/
 //!   lab_node_reachable/host_system_info/host_disk_status/lab_run_status/
 //!   lab_run_detail/lab_loop_journal/lab_inventory/lab_jobs/lab_guest_exec/
 //!   lab_job_log/lab_stage_log/lab_report_grep/lab_report_artifacts) that
 //!   inspects the LOCAL Rustynet repo + UTM lab. It cannot write.
-//! - `deepseek_lab_run` — deterministic live-lab launch + auto-triage on fail.
-//! - `deepseek_next_live_lab_target` — read-only next target chooser from the run matrix.
-//! - `deepseek_autonomous_live_lab_loop` — reconcile stale jobs, choose target, launch.
-//! - `deepseek_recover_lab_environment` — async stop-after-ready recovery pass.
-//! - `deepseek_reconcile_jobs` — repair stale labrun records after interruption.
-//! - `deepseek_doc_sync` — PROPOSE-ONLY, READ-ONLY docs-sync: after a
+//! - `ai_lab_run` — deterministic live-lab launch + auto-triage on fail.
+//! - `ai_next_live_lab_target` — read-only next target chooser from the run matrix.
+//! - `ai_autonomous_live_lab_loop` — reconcile stale jobs, choose target, launch.
+//! - `ai_recover_lab_environment` — async stop-after-ready recovery pass.
+//! - `ai_reconcile_jobs` — repair stale labrun records after interruption.
+//! - `ai_doc_sync` — PROPOSE-ONLY, READ-ONLY docs-sync: after a
 //!   lab-verified fix, a grounded agent (same loop, but the repo-reads-only tool
 //!   subset — NO lab/guest/cargo tools) reads the current docs and proposes the
 //!   exact docs-only edits (file/old_string/new_string/rationale) to keep them in
 //!   sync. It writes nothing; a human applies the edits. Async — poll
-//!   `deepseek_live_lab_result` for the structured proposal.
+//!   `ai_live_lab_result` for the structured proposal.
 //!
-//! Model selection per call:
-//! - `"flash"` → deepseek-v4-flash (fast, low cost — default)
-//! - `"pro"`   → deepseek-v4-pro (deep chain-of-thought at max reasoning effort, slower)
+//! Model selection per call: `"flash"` (default) and `"pro"` are shortcuts for
+//! the active provider's two configured tiers (DeepSeek: `deepseek-v4-flash`/
+//! `deepseek-v4-pro`, fast vs deep chain-of-thought reasoning). ANY other
+//! string is sent to the API exactly as given — call `ai_list_models` to
+//! discover what else is available. See `resolve_model`.
 //!
-//! API key resolution order:
+//! API key resolution order (per provider; DeepSeek shown, others are
+//! `{NAME}_API_KEY`-env-var-only unless a registry entry overrides
+//! `api_key_env`):
 //! 1. DEEPSEEK_API_KEY env var
 //! 2. ~/Desktop/deepseek_api.md
 //! 3. ~/.deepseek_api_key
@@ -54,9 +72,13 @@ type RunMatrixRows = (Vec<String>, Vec<Vec<String>>);
 
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/chat/completions";
 /// DeepSeek's OpenAI-compatible model-listing endpoint. Confirmed live via
-/// `deepseek_list_models` before relying on it for anything load-bearing —
+/// `ai_list_models` before relying on it for anything load-bearing —
 /// this const is the documented convention, not a guarantee it never moves.
 const DEEPSEEK_MODELS_URL: &str = "https://api.deepseek.com/models";
+/// DeepSeek's documented account-balance endpoint — the one balance_url
+/// confirmed live in this codebase (`ai_check_balance`); see `LlmProvider::
+/// balance_url` for why the other built-in presets leave this `None`.
+const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
 const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 /// DeepSeek-v4-pro honors an OpenAI-incompatible `reasoning_effort` field
@@ -66,26 +88,34 @@ const DEEPSEEK_PRO_REASONING_EFFORT: &str = "max";
 const REQUEST_TIMEOUT_SECS: u64 = 180;
 
 /// One configured LLM provider — DeepSeek by default, or any other
-/// OpenAI-Chat-Completions-compatible API (Groq, Together, Fireworks, OpenAI
-/// itself, a local Ollama OpenAI shim, ...). Only the base URL, the two
-/// model-tier IDs, and DeepSeek's `reasoning_effort` quirk vary between
-/// providers; the request/response shape in `DeepSeekServer::chat` is shared
-/// by all of them, so adding a provider is a registry entry, not a code
-/// change — see `load_provider` and `documents/operations/active/
-/// DeepSeekMultiProviderPlan_*` (if present) for the full design.
+/// OpenAI-Chat-Completions-compatible API (Grok/xAI, Kimi/Moonshot, GLM/Zhipu,
+/// Qwen/DashScope, Groq, Together, Fireworks, OpenAI itself, a local Ollama
+/// shim, ...). Only the base URL, the two model-tier IDs, the optional
+/// balance-check endpoint, and DeepSeek's `reasoning_effort` quirk vary
+/// between providers; the request/response shape in `AiAgentServer::chat` is
+/// shared by all of them, so adding a provider beyond the five built-in
+/// presets is a registry entry, not a code change — see `load_provider` and
+/// `built_in_provider`.
 #[derive(Debug, Clone)]
 struct LlmProvider {
     name: String,
     base_url: String,
     /// OpenAI-compatible model-listing endpoint (`GET`, returns
-    /// `{"data": [{"id": ...}, ...]}`). Used by `deepseek_list_models` so an
+    /// `{"data": [{"id": ...}, ...]}`). Used by `ai_list_models` so an
     /// agent can discover what's ACTUALLY available right now instead of
     /// being limited to the `flash`/`pro` shortcuts below.
     models_url: String,
+    /// Account balance/credit endpoint, when this provider exposes one. No
+    /// standard convention exists across providers (unlike `/models`), so
+    /// this is never derived — only DeepSeek's is confirmed live as of this
+    /// writing (`ai_check_balance`); the others are `None` until confirmed
+    /// against each provider's current docs and added to `built_in_provider`
+    /// or a registry entry.
+    balance_url: Option<String>,
     api_key: String,
     /// `"flash"`/`"pro"` are convenience shortcuts, not the only usable
     /// values — `resolve_model` passes any other string straight through as
-    /// a literal model id, so a model discovered via `deepseek_list_models`
+    /// a literal model id, so a model discovered via `ai_list_models`
     /// (or any id the caller already knows) is directly usable.
     flash_model: String,
     pro_model: String,
@@ -94,19 +124,95 @@ struct LlmProvider {
     pro_reasoning_effort: String,
 }
 
+/// A built-in provider preset: the same shape `load_provider` needs, minus
+/// the resolved api key. `&'static str` throughout since every field is a
+/// compile-time literal.
+struct BuiltInPreset {
+    base_url: &'static str,
+    models_url: &'static str,
+    balance_url: Option<&'static str>,
+    flash_model: &'static str,
+    pro_model: &'static str,
+    pro_reasoning_effort: &'static str,
+    api_key_env: &'static str,
+}
+
+/// The five built-in, zero-registry-file providers. Each works out of the box
+/// with just `RUSTYNET_LLM_PROVIDER=<name>` + its `api_key_env` set — no
+/// `~/.config/rustynet/llm_providers.json` entry needed, exactly like
+/// DeepSeek (the default when `RUSTYNET_LLM_PROVIDER` is unset). A registry
+/// entry with the SAME name overrides the corresponding preset here (e.g. to
+/// repoint at a new model generation without a rebuild).
+///
+/// CONFIDENCE NOTE: base_url/models_url follow each provider's documented
+/// OpenAI-compatible convention; the flash/pro model id CHOICES are a
+/// best-effort pick as of this writing, not independently verified live for
+/// grok/kimi/glm/qwen the way DeepSeek's are (§ see AiAgentServer::list_models
+/// tests). Once a real key is configured for one of these, run
+/// `ai_list_models` and correct `flash_model`/`pro_model` below (or override
+/// via a registry entry) if the provider's current catalog differs.
+fn built_in_provider(name: &str) -> Option<BuiltInPreset> {
+    match name {
+        "deepseek" => Some(BuiltInPreset {
+            base_url: DEEPSEEK_BASE_URL,
+            models_url: DEEPSEEK_MODELS_URL,
+            balance_url: Some(DEEPSEEK_BALANCE_URL),
+            flash_model: DEEPSEEK_FLASH_MODEL,
+            pro_model: DEEPSEEK_PRO_MODEL,
+            pro_reasoning_effort: DEEPSEEK_PRO_REASONING_EFFORT,
+            api_key_env: "DEEPSEEK_API_KEY",
+        }),
+        "grok" => Some(BuiltInPreset {
+            base_url: "https://api.x.ai/v1/chat/completions",
+            models_url: "https://api.x.ai/v1/models",
+            balance_url: None,
+            flash_model: "grok-4-fast",
+            pro_model: "grok-4",
+            pro_reasoning_effort: "",
+            api_key_env: "GROK_API_KEY",
+        }),
+        "kimi" => Some(BuiltInPreset {
+            base_url: "https://api.moonshot.cn/v1/chat/completions",
+            models_url: "https://api.moonshot.cn/v1/models",
+            balance_url: None,
+            flash_model: "moonshot-v1-8k",
+            pro_model: "moonshot-v1-128k",
+            pro_reasoning_effort: "",
+            api_key_env: "KIMI_API_KEY",
+        }),
+        "glm" => Some(BuiltInPreset {
+            base_url: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            models_url: "https://open.bigmodel.cn/api/paas/v4/models",
+            balance_url: None,
+            flash_model: "glm-4-flash",
+            pro_model: "glm-4-plus",
+            pro_reasoning_effort: "",
+            api_key_env: "GLM_API_KEY",
+        }),
+        "qwen" => Some(BuiltInPreset {
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            models_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+            balance_url: None,
+            flash_model: "qwen-turbo",
+            pro_model: "qwen-max",
+            pro_reasoning_effort: "",
+            api_key_env: "QWEN_API_KEY",
+        }),
+        _ => None,
+    }
+}
+
 impl LlmProvider {
-    /// The hardcoded, zero-configuration default — exactly today's behavior.
-    /// Used both as the true default and as the graceful fallback when the
-    /// optional provider registry is absent, unreadable, or malformed.
-    fn deepseek_default(api_key: String) -> Self {
+    fn from_preset(name: &str, preset: &BuiltInPreset, api_key: String) -> Self {
         Self {
-            name: "deepseek".to_string(),
-            base_url: DEEPSEEK_BASE_URL.to_string(),
-            models_url: DEEPSEEK_MODELS_URL.to_string(),
+            name: name.to_string(),
+            base_url: preset.base_url.to_string(),
+            models_url: preset.models_url.to_string(),
+            balance_url: preset.balance_url.map(str::to_string),
             api_key,
-            flash_model: DEEPSEEK_FLASH_MODEL.to_string(),
-            pro_model: DEEPSEEK_PRO_MODEL.to_string(),
-            pro_reasoning_effort: DEEPSEEK_PRO_REASONING_EFFORT.to_string(),
+            flash_model: preset.flash_model.to_string(),
+            pro_model: preset.pro_model.to_string(),
+            pro_reasoning_effort: preset.pro_reasoning_effort.to_string(),
         }
     }
 }
@@ -124,9 +230,9 @@ fn derive_models_url(base_url: &str) -> String {
 
 /// On-disk provider registry shape. NON-SECRET metadata only — an API key
 /// value is never stored here, only the name of the env var that holds one
-/// (mirroring how the DeepSeek key itself is resolved: env var first, see
-/// `load_api_key`). Optional and additive: an absent file means DeepSeek-only,
-/// today's hardcoded behavior, completely unchanged.
+/// (mirroring how each built-in provider's key is resolved: env var first,
+/// see `load_api_key`). Optional and additive: an absent file means the five
+/// built-in presets only, today's zero-configuration behavior, unchanged.
 #[derive(serde::Deserialize, Default)]
 struct ProviderRegistryFile {
     #[serde(default)]
@@ -143,6 +249,12 @@ struct ProviderEntry {
     /// explicitly only if a provider doesn't follow that convention.
     #[serde(default)]
     models_url: Option<String>,
+    /// Account balance/credit endpoint. No derivation convention exists for
+    /// this one (unlike models_url) — omit if the provider doesn't expose one
+    /// or you haven't found it yet; `ai_check_balance` reports clearly when
+    /// it's absent rather than guessing at a URL.
+    #[serde(default)]
+    balance_url: Option<String>,
     /// Env var holding this provider's API key. Defaults to
     /// `{NAME}_API_KEY` (uppercased) when omitted.
     #[serde(default)]
@@ -155,8 +267,10 @@ struct ProviderEntry {
 
 /// Path to the optional provider registry. Override with
 /// `RUSTYNET_LLM_PROVIDERS_FILE`; default `~/.config/rustynet/
-/// llm_providers.json`. Example file adding a second, OpenAI-compatible
-/// provider alongside the built-in DeepSeek default:
+/// llm_providers.json`. Only needed to add a provider BEYOND the five
+/// built-ins (`deepseek`/`grok`/`kimi`/`glm`/`qwen`, see `built_in_provider`)
+/// or to override one of their presets. Example file adding a sixth,
+/// OpenAI-compatible provider:
 /// ```json
 /// {
 ///   "active": "deepseek",
@@ -193,13 +307,13 @@ fn read_provider_registry() -> ProviderRegistryFile {
 }
 
 /// Resolve the active LLM provider: `RUSTYNET_LLM_PROVIDER` env var, else the
-/// registry file's `active` field, else `"deepseek"`. A registry entry named
-/// `"deepseek"` overrides the built-in default (e.g. to repoint at a new
-/// model generation without a rebuild); no entry at all falls back to the
-/// hardcoded default so the system works with zero configuration, exactly as
-/// it always has. Any other unresolvable provider name is a hard error — a
-/// typo in `RUSTYNET_LLM_PROVIDER` should fail loudly, not silently reuse
-/// DeepSeek's key against DeepSeek's URL under the wrong name.
+/// registry file's `active` field, else `"deepseek"`. A registry entry
+/// overrides the built-in preset of the same name (e.g. to repoint at a new
+/// model generation without a rebuild); no entry at all falls back to
+/// `built_in_provider` (deepseek/grok/kimi/glm/qwen) so five providers work
+/// with zero configuration file, only their env var. Any other unresolvable
+/// provider name is a hard error — a typo in `RUSTYNET_LLM_PROVIDER` should
+/// fail loudly, not silently reuse one provider's key against another's URL.
 fn load_provider() -> Result<LlmProvider, String> {
     let file = read_provider_registry();
 
@@ -224,23 +338,27 @@ fn load_provider() -> Result<LlmProvider, String> {
                 name: active_name,
                 base_url: entry.base_url.clone(),
                 models_url,
+                balance_url: entry.balance_url.clone(),
                 api_key,
                 flash_model: entry.flash_model.clone(),
                 pro_model: entry.pro_model.clone(),
                 pro_reasoning_effort: entry.pro_reasoning_effort.clone(),
             })
         }
-        None if active_name == "deepseek" => {
-            let api_key = load_api_key("deepseek", "DEEPSEEK_API_KEY")?;
-            Ok(LlmProvider::deepseek_default(api_key))
-        }
-        None => Err(format!(
-            "unknown LLM provider '{active_name}' (from RUSTYNET_LLM_PROVIDER or the registry's \
-             \"active\" field) — not \"deepseek\" and not defined in {}",
-            provider_registry_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<no HOME>".to_string())
-        )),
+        None => match built_in_provider(&active_name) {
+            Some(preset) => {
+                let api_key = load_api_key(&active_name, preset.api_key_env)?;
+                Ok(LlmProvider::from_preset(&active_name, &preset, api_key))
+            }
+            None => Err(format!(
+                "unknown LLM provider '{active_name}' (from RUSTYNET_LLM_PROVIDER or the \
+                 registry's \"active\" field) — not one of the built-ins (deepseek/grok/kimi/glm/\
+                 qwen) and not defined in {}",
+                provider_registry_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<no HOME>".to_string())
+            )),
+        },
     }
 }
 
@@ -256,14 +374,14 @@ const AGENT_DEFAULT_MAX_STEPS: u64 = 12;
 const AGENT_HARD_MAX_STEPS: u64 = 20;
 /// Timeout for any local subprocess the agent tools spawn (grep/git/uname/utmctl).
 const SUBPROC_TIMEOUT_SECS: u64 = 30;
-/// Wall-clock cap for a full live-lab orchestration launched by deepseek_lab_run.
+/// Wall-clock cap for a full live-lab orchestration launched by ai_lab_run.
 /// Generous (90 min) — a 3-OS pass + diagnose can run long; the worker thread
 /// blocks on it while the MCP call already returned a job_id.
 const LAB_ORCHESTRATOR_TIMEOUT_SECS: u64 = 5400;
 /// Concurrency cap for opt-in parallel lab runs (e.g. the macOS↔Windows pipeline
 /// on disjoint guests). Default is still a singleton (1) unless `allow_concurrent`.
 const MAX_CONCURRENT_LAB_RUNS: usize = 3;
-/// A deepseek_lab_run worker records the orchestrator pid within ~1s of spawning
+/// A ai_lab_run worker records the orchestrator pid within ~1s of spawning
 /// it (`record_orchestrator_pid` runs immediately after the non-blocking spawn).
 /// A `state=running` record with NO pid recorded and no completion artifact that
 /// is older than this is therefore a phantom — the worker died BEFORE the spawn
@@ -287,7 +405,7 @@ const GUEST_SSH_TIMEOUT_SECS: u64 = 45;
 /// the LAB-STATE MCP's job dir the grounding agent reads via `lab_job_log`).
 /// Mirrors the lab-state pattern so a deepseek job survives an MCP-server reload:
 /// the in-memory map is the fast path, this dir is the durable record
-/// `deepseek_live_lab_result` falls back to.
+/// `ai_live_lab_result` falls back to.
 const DEEPSEEK_JOBS_SUBDIR: &str = "state/deepseek-mcp-jobs";
 /// Completion artifact the orchestrator writes inside a run's report dir. Its
 /// presence after a reload proves the orphaned orchestrator finished even though
@@ -303,7 +421,7 @@ enum TriageJob {
 
 type JobMap = Arc<Mutex<HashMap<String, TriageJob>>>;
 
-/// One record's outcome from `deepseek_reconcile_jobs`: which record changed, the
+/// One record's outcome from `ai_reconcile_jobs`: which record changed, the
 /// transition, and why. Collected per reconciled record for the summary report.
 struct ReconcileChange {
     job_id: String,
@@ -314,7 +432,7 @@ struct ReconcileChange {
 }
 
 /// One deterministic live-lab target selected from the run matrix or an explicit
-/// operator key. The `args` object is fed directly to `deepseek_lab_run`.
+/// operator key. The `args` object is fed directly to `ai_lab_run`.
 #[derive(Clone)]
 struct LiveLabTarget {
     key: String,
@@ -329,12 +447,12 @@ struct LiveLabTarget {
 #[derive(Clone, Copy)]
 enum AgentToolset {
     /// The full grounding repertoire: repo reads + read-only git + live-lab/guest
-    /// diagnostics + cargo grounding. Used by deepseek_agent and the triage
+    /// diagnostics + cargo grounding. Used by ai_agent and the triage
     /// pipeline, which need to inspect real lab/run state.
     Full,
     /// REPO-READS-ONLY subset: read_file / list_dir / grep / find_files /
     /// find_definition / find_references / read-only git. No lab, guest, host,
-    /// or cargo tools. Used by deepseek_doc_sync so a docs-sync proposal can only
+    /// or cargo tools. Used by ai_doc_sync so a docs-sync proposal can only
     /// read repo files — it can touch no lab/guest surface at all.
     DocsRepoReadOnly,
 }
@@ -376,7 +494,7 @@ const DOC_SYNC_TOOL_NAMES: &[&str] = &[
 ];
 
 #[derive(Clone)]
-struct DeepSeekServer {
+struct AiAgentServer {
     provider: LlmProvider,
     agent: ureq::Agent,
     repo_root: PathBuf,
@@ -393,11 +511,23 @@ struct DeepSeekServer {
     job_seq: Arc<AtomicU64>,
 }
 
-impl DeepSeekServer {
+impl AiAgentServer {
     fn new() -> Self {
         let provider = load_provider().unwrap_or_else(|e| {
-            eprintln!("DeepSeek MCP: {e}");
-            LlmProvider::deepseek_default(String::new())
+            eprintln!("rustynet-mcp-ai-agent: {e}");
+            // Fall back to the deepseek preset directly (not via built_in_provider,
+            // which would need an infallible-but-still-fallible-typed lookup for a
+            // name that is, in fact, always present — the match arm is right here).
+            LlmProvider {
+                name: "deepseek".to_string(),
+                base_url: DEEPSEEK_BASE_URL.to_string(),
+                models_url: DEEPSEEK_MODELS_URL.to_string(),
+                balance_url: Some(DEEPSEEK_BALANCE_URL.to_string()),
+                api_key: String::new(),
+                flash_model: DEEPSEEK_FLASH_MODEL.to_string(),
+                pro_model: DEEPSEEK_PRO_MODEL.to_string(),
+                pro_reasoning_effort: DEEPSEEK_PRO_REASONING_EFFORT.to_string(),
+            }
         });
         let agent = ureq::AgentBuilder::new()
             .timeout_read(Duration::from_secs(REQUEST_TIMEOUT_SECS))
@@ -448,7 +578,7 @@ impl DeepSeekServer {
         let dir = self.jobs_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!(
-                "DeepSeek MCP: cannot create jobs dir {}: {e}",
+                "rustynet-mcp-ai-agent: cannot create jobs dir {}: {e}",
                 dir.display()
             );
             return;
@@ -457,11 +587,11 @@ impl DeepSeekServer {
         let tmp_path = dir.join(format!("{job_id}.json.tmp"));
         let body = serde_json::to_string_pretty(rec).unwrap_or_default();
         if let Err(e) = std::fs::write(&tmp_path, body) {
-            eprintln!("DeepSeek MCP: cannot write job record tmp: {e}");
+            eprintln!("rustynet-mcp-ai-agent: cannot write job record tmp: {e}");
             return;
         }
         if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
-            eprintln!("DeepSeek MCP: cannot finalize job record: {e}");
+            eprintln!("rustynet-mcp-ai-agent: cannot finalize job record: {e}");
             let _ = std::fs::remove_file(&tmp_path);
         }
     }
@@ -576,7 +706,7 @@ impl DeepSeekServer {
         let reasoning = msg["reasoning_content"].as_str().unwrap_or("").trim();
         let content = msg["content"]
             .as_str()
-            .ok_or_else(|| format!("Unexpected DeepSeek response shape: {parsed}"))?
+            .ok_or_else(|| format!("Unexpected {} response shape: {parsed}", self.provider.name))?
             .trim();
 
         if !reasoning.is_empty() {
@@ -589,7 +719,7 @@ impl DeepSeekServer {
     }
 
     /// Single chat-completions round trip. Returns the raw parsed response JSON.
-    /// `tools` is the OpenAI-style tool-definition array (DeepSeek is
+    /// `tools` is the OpenAI-style tool-definition array (the active provider is
     /// OpenAI-compatible); when `Some`, the request advertises the tools so the
     /// model may answer with `tool_calls`.
     fn chat(&self, messages: Value, tools: Option<&Value>, model: &str) -> Result<Value, String> {
@@ -913,7 +1043,7 @@ impl DeepSeekServer {
         )
     }
 
-    /// Entry point for the `deepseek_live_lab` tool. v1 runs the rigid triage
+    /// Entry point for the `ai_live_lab` tool. v1 runs the rigid triage
     /// pipeline (§run_triage) on a caller-supplied failure context and returns the
     /// verified multi-section report. (The v4-pro lab-orchestration layer — which
     /// launches + drives the run to PRODUCE the failure context — is wired next.)
@@ -941,7 +1071,7 @@ impl DeepSeekServer {
         // The pipeline runs for minutes (three grounded agents incl. v4-pro at max
         // reasoning) — far past the MCP client's request timeout. So run it ASYNC:
         // store a Running job, spawn the pipeline on a worker thread, and return the
-        // job id immediately. The caller polls `deepseek_live_lab_result`.
+        // job id immediately. The caller polls `ai_live_lab_result`.
         let job_id = self.new_job_id("triage");
         if let Ok(mut jobs) = self.jobs.lock() {
             jobs.insert(
@@ -967,9 +1097,10 @@ impl DeepSeekServer {
         let target_label = target.clone();
         let ctx = format!("Target under test: {target}\n\n{failure_context}");
         std::thread::spawn(move || {
+            let provider_name = worker.provider.name.clone();
             let report = worker.run_triage(&ctx, max_steps);
             let body = format!(
-                "[deepseek live-lab triage | target={target_label} | budget={max_steps}/step]\n\n{report}"
+                "[{provider_name} live-lab triage | target={target_label} | budget={max_steps}/step]\n\n{report}"
             );
             worker.finish_job(&jid, body);
         });
@@ -978,7 +1109,7 @@ impl DeepSeekServer {
             content: text_content(format!(
                 "Triage job started: `{job_id}` (target: {target}). The rigid pipeline (flash \
                  research → flash verify → v4-pro max review) runs ~1-3 min. Poll \
-                 `deepseek_live_lab_result` with job_id=\"{job_id}\" every ~30-60s until it returns \
+                 `ai_live_lab_result` with job_id=\"{job_id}\" every ~30-60s until it returns \
                  the report."
             )),
             is_error: None,
@@ -991,7 +1122,7 @@ impl DeepSeekServer {
     fn call_live_lab_result(&self, args: &Value) -> ToolCallResult {
         let job_id = match get_str(args, "job_id") {
             Some(j) if !j.trim().is_empty() => j.trim(),
-            _ => return tool_error("'job_id' is required (from the deepseek_live_lab response)."),
+            _ => return tool_error("'job_id' is required (from the ai_live_lab response)."),
         };
 
         // Fast path: the in-memory map (this server lifetime). A poisoned lock is
@@ -1072,7 +1203,7 @@ impl DeepSeekServer {
                      `{report_dir}` (completion artifact `{ORCHESTRATE_RESULT_REL}` present). \
                      Auto-triage was lost with the in-memory worker.\n\n\
                      Next: inspect the report dir (run_summary.md / state/stages.tsv / per-stage \
-                     logs under it), or call `deepseek_live_lab` manually with the failing stage's \
+                     logs under it), or call `ai_live_lab` manually with the failing stage's \
                      evidence + this report_dir to get the triage report."
                 )),
                 is_error: None,
@@ -1099,7 +1230,7 @@ impl DeepSeekServer {
     /// Run the docs-sync grounded agent: a single read-only, repo-reads-only
     /// pass that PROPOSES (never applies) the exact documentation edits needed to
     /// keep the repo docs in sync with a lab-verified fix. Reuses the same
-    /// grounded loop as deepseek_agent but with the docs-sync system prompt and
+    /// grounded loop as ai_agent but with the docs-sync system prompt and
     /// the repo-reads-only tool set (no lab/guest/cargo tools). Writes nothing.
     fn run_doc_sync(&self, prompt: &str, model: &str, max_steps: u64) -> Result<String, String> {
         self.run_grounded(
@@ -1112,12 +1243,12 @@ impl DeepSeekServer {
         )
     }
 
-    /// Entry point for the `deepseek_doc_sync` tool. PROPOSE-ONLY and READ-ONLY:
+    /// Entry point for the `ai_doc_sync` tool. PROPOSE-ONLY and READ-ONLY:
     /// given a lab-verified fix (`change_summary` + optional commit/evidence/
     /// doc_hints), it proposes the exact docs-only edits to keep the repo docs in
     /// sync. It writes NOTHING — a human applies the proposed edits. Runs ASYNC
-    /// like deepseek_live_lab: returns a job_id immediately; the caller polls the
-    /// existing `deepseek_live_lab_result` tool for the structured report.
+    /// like ai_live_lab: returns a job_id immediately; the caller polls the
+    /// existing `ai_live_lab_result` tool for the structured report.
     fn call_doc_sync(&self, args: &Value) -> ToolCallResult {
         let change_summary = match get_str(args, "change_summary") {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
@@ -1153,7 +1284,7 @@ impl DeepSeekServer {
         // The grounded pass reads several docs before proposing edits, so it can
         // run past the MCP request timeout. Run it ASYNC exactly like the triage
         // pipeline: store a Running job, spawn the worker, return the job id; the
-        // caller polls the SAME `deepseek_live_lab_result` tool.
+        // caller polls the SAME `ai_live_lab_result` tool.
         let job_id = self.new_job_id("docsync");
         if let Ok(mut jobs) = self.jobs.lock() {
             jobs.insert(
@@ -1192,11 +1323,12 @@ impl DeepSeekServer {
         let jid = job_id.clone();
         let model_owned = model.clone();
         std::thread::spawn(move || {
+            let provider_name = worker.provider.name.clone();
             let report = worker
                 .run_doc_sync(&user_prompt, &model_owned, max_steps)
                 .unwrap_or_else(|e| format!("(docs-sync proposal failed: {e})"));
             let body = format!(
-                "[deepseek/{model_owned} | DOC-SYNC (propose-only, read-only) | budget={max_steps}/step]\n\n{report}"
+                "[{provider_name}/{model_owned} | DOC-SYNC (propose-only, read-only) | budget={max_steps}/step]\n\n{report}"
             );
             worker.finish_job(&jid, body);
         });
@@ -1205,7 +1337,7 @@ impl DeepSeekServer {
             content: text_content(format!(
                 "Docs-sync proposal started: `{job_id}` (model: {model}). A read-only, \
                  repo-reads-only agent reads the current docs, then proposes the exact docs-only \
-                 edits — it writes NOTHING; you apply them. Poll `deepseek_live_lab_result` with \
+                 edits — it writes NOTHING; you apply them. Poll `ai_live_lab_result` with \
                  job_id=\"{job_id}\" every ~20-40s until it returns the structured edit list."
             )),
             is_error: None,
@@ -1235,9 +1367,9 @@ impl DeepSeekServer {
     }
 
     /// Recovery-only stale process cleanup. Interrupted/reloaded runs can leave
-    /// `live_linux_lab_orchestrator.sh` children alive after the DeepSeek job
+    /// `live_linux_lab_orchestrator.sh` children alive after the AI-agent job
     /// record is terminal or absent. Kill only process groups tied to a
-    /// DeepSeek-owned report dir whose job record is not currently running.
+    /// AI-agent-owned report dir whose job record is not currently running.
     fn terminate_stale_lab_orchestrators(&self) -> Vec<String> {
         let outcome = run_with_timeout(
             "ps",
@@ -1529,8 +1661,8 @@ impl DeepSeekServer {
                 //       (conservative: keep counting an indeterminate record) OR a
                 //       recorded pid is still alive. A recorded-but-DEAD pid with
                 //       no artifact = a crashed/killed run; it must NOT peg the
-                //       singleton slot, so the next deepseek_lab_run can proceed
-                //       even before anyone runs deepseek_reconcile_jobs.
+                //       singleton slot, so the next ai_lab_run can proceed
+                //       even before anyone runs ai_reconcile_jobs.
                 let no_artifact = rec
                     .get("report_dir")
                     .and_then(|s| s.as_str())
@@ -1543,7 +1675,7 @@ impl DeepSeekServer {
                         // spawning the orchestrator, so a no-pid record older than
                         // RECONCILE_NO_PID_STALE_SECS is a phantom (the worker died
                         // before the spawn) and must NOT peg the slot — let the
-                        // gate self-heal even before deepseek_reconcile_jobs runs.
+                        // gate self-heal even before ai_reconcile_jobs runs.
                         // A younger no-pid record is still in its startup window;
                         // count it conservatively as in flight.
                         !Self::record_no_pid_stale(&rec)
@@ -1574,7 +1706,7 @@ impl DeepSeekServer {
 
         // Case 1: completion artifact present → the orchestrator FINISHED but the
         // worker died before recording the result. Recover the report exactly as
-        // deepseek_live_lab_result's reload fallback does (overall_status + first
+        // ai_live_lab_result's reload fallback does (overall_status + first
         // failed stage) and mark the record done.
         if let Some(rd) = report_dir
             && let Some((overall, first_failed)) = self.read_orchestrate_outcome(rd)
@@ -1607,7 +1739,7 @@ impl DeepSeekServer {
             );
             // finish_job merges into the existing record (preserving the static
             // creation fields) and stamps state=done + report_text, the same
-            // shape deepseek_live_lab_result returns.
+            // shape ai_live_lab_result returns.
             self.finish_job(job_id, report);
             return Some(ReconcileChange {
                 job_id: job_id.to_string(),
@@ -1701,7 +1833,7 @@ impl DeepSeekServer {
         None
     }
 
-    /// Entry point for `deepseek_reconcile_jobs`: self-service repair of stale
+    /// Entry point for `ai_reconcile_jobs`: self-service repair of stale
     /// `state=running` labrun records so a crashed/killed run can no longer block
     /// the singleton gate forever. With `job_id` it reconciles that one record;
     /// otherwise it scans EVERY record under DEEPSEEK_JOBS_SUBDIR. Read-only with
@@ -1757,7 +1889,7 @@ impl DeepSeekServer {
         let reconciled_crashed = changes.iter().filter(|c| c.new_state == "crashed").count();
 
         let mut out = String::new();
-        out.push_str("# deepseek_reconcile_jobs\n\n");
+        out.push_str("# ai_reconcile_jobs\n\n");
         out.push_str(&format!(
             "Scanned {scanned} running labrun record(s): reconciled {reconciled_done} to \
              **done**, {reconciled_crashed} to **crashed**; left {left_running} **running** \
@@ -1797,9 +1929,9 @@ impl DeepSeekServer {
         };
         ToolCallResult {
             content: text_content(format!(
-                "# deepseek_next_live_lab_target\n\n\
+                "# ai_next_live_lab_target\n\n\
                  key: `{}`\narea: `{}`\nreason: {}\n\n\
-                 deepseek_lab_run args:\n```json\n{}\n```\n",
+                 ai_lab_run args:\n```json\n{}\n```\n",
                 target.key,
                 target.area,
                 target.reason,
@@ -1813,17 +1945,17 @@ impl DeepSeekServer {
     /// 1. reconcile stale labrun records after interruption,
     /// 2. refuse to launch if a labrun is genuinely in flight,
     /// 3. pick the next matrix-backed target,
-    /// 4. call deepseek_lab_run with the right selectors.
+    /// 4. call ai_lab_run with the right selectors.
     fn call_autonomous_live_lab_loop(&self, args: &Value) -> ToolCallResult {
         let _ = self.call_reconcile_jobs(&json!({}));
         let in_flight = self.running_lab_jobs();
         if in_flight > 0 {
             return ToolCallResult {
                 content: text_content(format!(
-                    "# deepseek_autonomous_live_lab_loop\n\n\
+                    "# ai_autonomous_live_lab_loop\n\n\
                      {in_flight} labrun already in flight. Do not launch another singleton run.\n\n\
-                     Next call: `deepseek_live_lab_result` on the running job, or \
-                     `deepseek_reconcile_jobs` if the prior run was interrupted."
+                     Next call: `ai_live_lab_result` on the running job, or \
+                     `ai_reconcile_jobs` if the prior run was interrupted."
                 )),
                 is_error: None,
             };
@@ -1841,9 +1973,9 @@ impl DeepSeekServer {
     }
 
     /// Async recovery pass for interrupted labs. This is deliberately separate
-    /// from `deepseek_lab_run`: it repairs stale DeepSeek job records, then runs
+    /// from `ai_lab_run`: it repairs stale AI-agent job records, then runs
     /// the Rust orchestrator only to the ready gate (`--stop-after-ready`) so VMs
-    /// are powered/reachable before the next labrun. It never calls DeepSeek.
+    /// are powered/reachable before the next labrun. It never calls any LLM provider.
     fn call_recover_lab_environment(&self, args: &Value) -> ToolCallResult {
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
         let dry_run = args
@@ -1853,7 +1985,7 @@ impl DeepSeekServer {
         let in_flight = self.running_lab_jobs();
         if in_flight > 0 && !force {
             return tool_error(
-                "a deepseek_lab_run is still in flight; poll deepseek_live_lab_result or pass \
+                "a ai_lab_run is still in flight; poll ai_live_lab_result or pass \
                  force=true only after proving the run is dead/interrupted",
             );
         }
@@ -1975,7 +2107,7 @@ impl DeepSeekServer {
                 &jid,
                 format!(
                     "# Lab environment recovery — {verdict}\n\n\
-                     Reconciled stale DeepSeek lab records, stopped stale orchestrator process \
+                     Reconciled stale AI-agent lab records, stopped stale orchestrator process \
                      groups ({stale_count}), then ran \
                      `vm-lab-orchestrate-live-lab --stop-after-ready{}`.\n\n\
                      Stale process cleanup:\n{stale_cleanup}\n\n\
@@ -1989,19 +2121,19 @@ impl DeepSeekServer {
 
         ToolCallResult {
             content: text_content(format!(
-                "Lab recovery started: `{job_id}`. It reconciles stale DeepSeek job records and \
-                 runs the orchestrator to `--stop-after-ready`. Poll `deepseek_live_lab_result` \
+                "Lab recovery started: `{job_id}`. It reconciles stale AI-agent job records and \
+                 runs the orchestrator to `--stop-after-ready`. Poll `ai_live_lab_result` \
                  with job_id=\"{job_id}\"."
             )),
             is_error: None,
         }
     }
 
-    /// Entry point for `deepseek_lab_run`: the WHOLE pipeline in one call. The
+    /// Entry point for `ai_lab_run`: the WHOLE pipeline in one call. The
     /// worker thread launches the hardened orchestrator (DETERMINISTIC — no LLM in
     /// the deploy path), waits for it, and on FAILURE runs the rigid triage
     /// pipeline on the run's evidence; on success it reports the pass. Async: the
-    /// call returns a job_id, the caller polls deepseek_live_lab_result.
+    /// call returns a job_id, the caller polls ai_live_lab_result.
     fn call_lab_run(&self, args: &Value) -> ToolCallResult {
         let area = get_str(args, "area")
             .map(str::trim)
@@ -2195,7 +2327,7 @@ impl DeepSeekServer {
         if in_flight >= limit {
             return tool_error(&format!(
                 "{in_flight} deepseek lab run(s) already in flight (limit {limit}{}) — poll \
-                 deepseek_live_lab_result, or wait. For a parallel run pass allow_concurrent=true \
+                 ai_live_lab_result, or wait. For a parallel run pass allow_concurrent=true \
                  AND disjoint guests (a separate exit_vm/client_vm per run, e.g. macOS on one \
                  Debian backbone, Windows on another).",
                 if allow_concurrent { "" } else { ", singleton" }
@@ -2237,7 +2369,7 @@ impl DeepSeekServer {
         let started_msg = format!(
             "Live-lab run started: `{job_id}` (area: {area}{}). The orchestrator runs \
              deterministically (no LLM in the deploy path); on failure the rigid triage pipeline \
-             runs automatically. This takes many minutes — poll `deepseek_live_lab_result` with \
+             runs automatically. This takes many minutes — poll `ai_live_lab_result` with \
              job_id=\"{job_id}\" until it returns the report.",
             if dry_run { ", DRY-RUN" } else { "" }
         );
@@ -2418,8 +2550,8 @@ impl DeepSeekServer {
                 format!(
                     "# Live-lab run: {area} — FAIL (triage disabled)\n\n\
                      Report dir: `{report_dir}`\nOrchestrator log: `{}`\n\n\
-                     `triage_on_failure=false` was set, so no external DeepSeek API call was made. \
-                     Inspect the report locally, or call `deepseek_live_lab` manually after approving \
+                     `triage_on_failure=false` was set, so no external LLM API call was made. \
+                     Inspect the report locally, or call `ai_live_lab` manually after approving \
                      external triage of the selected failure context.\n\n_log tail:_\n{}",
                     log_path.display(),
                     truncate_output(&log_tail, 120, 9000)
@@ -4204,7 +4336,7 @@ fn load_api_key(provider_name: &str, api_key_env: &str) -> Result<String, String
             }
         }
         return Err(format!(
-            "No DeepSeek API key found (checked {api_key_env}, ~/Desktop/deepseek_api.md, \
+            "No DeepSeek API key found (checked provider env var {api_key_env}, ~/Desktop/deepseek_api.md, \
              ~/.deepseek_api_key)"
         ));
     }
@@ -4213,7 +4345,7 @@ fn load_api_key(provider_name: &str, api_key_env: &str) -> Result<String, String
     ))
 }
 
-/// Strip DeepSeek-native tool-call markup (`<｜｜DSML｜｜…>`) that leaks into the
+/// Strip provider-native tool-call markup (originally observed from DeepSeek) (`<｜｜DSML｜｜…>`) that leaks into the
 /// content field when the model tries to invoke tools but none are advertised
 /// (the budget-exhausted final answer disables tools, so a model that still wants
 /// a tool emits it as text). Everything from the first such marker on is non-prose
@@ -4484,7 +4616,7 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
-/// Cross-network + network-profile propagation for a deepseek_lab_run
+/// Cross-network + network-profile propagation for a ai_lab_run
 /// (LiveLabVmConnectivityRulebook §11.2). Cross-network coverage is ON by
 /// default: skipping it is an explicit caller choice, never a hardcoded
 /// default. The selected substrate / NAT profiles / impairment / network
@@ -4499,7 +4631,7 @@ struct CrossNetworkRunOptions {
 }
 
 /// Build the `ops vm-lab-orchestrate-live-lab` argument vector (everything after
-/// `cargo run --quiet -p rustynet-cli -- ops`) for a deepseek_lab_run. Pure +
+/// `cargo run --quiet -p rustynet-cli -- ops`) for a ai_lab_run. Pure +
 /// deterministic so it is unit-testable: there is NO LLM in this deploy path —
 /// the worker shells out to the same hardened orchestrator the lab-state MCP
 /// drives. Safe defaults: trust the prepared inventory, skip the slow gates/soak
@@ -4507,7 +4639,7 @@ struct CrossNetworkRunOptions {
 /// Cross-network coverage runs unless the caller explicitly opts out.
 #[allow(clippy::too_many_arguments)] // a flat, deterministic CLI-arg builder; each arg is distinct.
 /// Synthesize `--node <alias>:<role>` assignments for the Rust engine from the
-/// deepseek_lab_run guest + role-platform selectors. A mac/win guest takes the
+/// ai_lab_run guest + role-platform selectors. A mac/win guest takes the
 /// role of whichever `*_platform` selector points at its OS
 /// (exit/relay/anchor/admin/blind_exit), defaulting to `client`; the Linux
 /// guests map to their fixed roles. Stable order (exit, client, entry, macos,
@@ -4698,7 +4830,7 @@ fn build_orchestrator_args(
         // (activate_macos_exit_role + capture, the relay/anchor lifecycle). The
         // default Rust path may not drive every role stage; the legacy bash
         // orchestrator does (it flipped relay + reached every prior macOS role
-        // stage). Mutually exclusive with --node (deepseek_lab_run never uses --node).
+        // stage). Mutually exclusive with --node (ai_lab_run never uses --node).
         if legacy_bash {
             a.push("--legacy-bash-orchestrator".to_string());
         }
@@ -4850,12 +4982,12 @@ fn resolve_cargo_target(s: Option<&str>) -> Result<Option<&'static str>, String>
     }
 }
 
-impl DeepSeekServer {
+impl AiAgentServer {
     /// Resolve a caller-supplied `model` value to an actual model id to send
     /// to the API. `"flash"`/`""` and `"pro"`/`"reasoner"` are convenience
     /// shortcuts for the active provider's two configured tiers; ANYTHING
     /// ELSE is passed through UNCHANGED as a literal model id — this is what
-    /// makes `deepseek_list_models` useful: an agent can discover a model id
+    /// makes `ai_list_models` useful: an agent can discover a model id
     /// live and use it directly, not just pick between two hardcoded
     /// shortcuts. (Previously this silently mapped any unrecognized string to
     /// the flash tier — a real bug, since a caller passing a literal id got a
@@ -4941,7 +5073,7 @@ impl DeepSeekServer {
         Ok(format!(
             "Provider: {}\nConfigured shortcuts: flash={}, pro={}\n\n\
              {} model(s) available:\n{listing}\n\n\
-             Pass any id above directly as `model` to deepseek_read/write/read_write/agent/\
+             Pass any id above directly as `model` to ai_read/write/read_write/agent/\
              lab_run/etc. — \"flash\"/\"pro\" remain valid shortcuts for the two ids marked \
              above, but any other id is used exactly as given.",
             self.provider.name,
@@ -4949,6 +5081,81 @@ impl DeepSeekServer {
             self.provider.pro_model,
             ids.len()
         ))
+    }
+
+    /// Fetch the ACTIVE provider's account balance/credit, when it has a
+    /// `balance_url` configured — not every provider exposes one (no shared
+    /// convention exists across providers the way `/models` has), so this
+    /// reports clearly rather than guessing at a URL. Read-only, no side
+    /// effects. Returns the raw JSON the provider reports (labeled), plus a
+    /// best-effort one-line summary extracted from a few common field-name
+    /// shapes — the summary is advisory; the raw JSON is the ground truth,
+    /// since balance response shapes are far less standardized across
+    /// providers than the models-list endpoint is.
+    fn check_balance(&self) -> Result<String, String> {
+        let Some(balance_url) = self.provider.balance_url.as_ref() else {
+            return Err(format!(
+                "Balance checking is not configured for provider '{}' — it has no balance_url \
+                 (not all providers expose a balance API, and no shared convention exists across \
+                 providers the way /models has). If you've found the right endpoint in this \
+                 provider's docs, add \"balance_url\" to its registry entry in \
+                 ~/.config/rustynet/llm_providers.json (see CLAUDE.md/AGENTS.md §12.5).",
+                self.provider.name
+            ));
+        };
+        if self.provider.api_key.is_empty() {
+            return Err(format!(
+                "No API key configured for LLM provider '{}' — cannot check balance.",
+                self.provider.name
+            ));
+        }
+        let response = self
+            .agent
+            .get(balance_url)
+            .set(
+                "Authorization",
+                &format!("Bearer {}", self.provider.api_key),
+            )
+            .call()
+            .map_err(|e| {
+                format!(
+                    "{} balance request failed ({balance_url}): {e}",
+                    self.provider.name
+                )
+            })?;
+        let parsed: Value = response
+            .into_json()
+            .map_err(|e| format!("{} balance response parse failed: {e}", self.provider.name))?;
+
+        // Best-effort summary across a few known/plausible shapes. Falls
+        // through to "see raw JSON" rather than asserting a number that might
+        // be wrong for a shape this hasn't seen.
+        let summary = parsed["balance_infos"]
+            .as_array()
+            .and_then(|infos| infos.first())
+            .and_then(|info| {
+                let currency = info["currency"].as_str().unwrap_or("?");
+                let total = info["total_balance"].as_str()?;
+                Some(format!("{total} {currency}"))
+            })
+            .or_else(|| {
+                parsed["total_balance"]
+                    .as_str()
+                    .map(|b| format!("{b} (currency unspecified)"))
+            })
+            .or_else(|| parsed["balance"].as_f64().map(|b| format!("{b}")));
+
+        Ok(match summary {
+            Some(s) => format!(
+                "Provider: {}\nBalance (best-effort summary): {s}\n\nRaw response:\n{parsed}",
+                self.provider.name
+            ),
+            None => format!(
+                "Provider: {}\nCould not extract a one-line summary from this response shape — \
+                 read the raw JSON below directly.\n\nRaw response:\n{parsed}",
+                self.provider.name
+            ),
+        })
     }
 }
 
@@ -5084,7 +5291,7 @@ log). Outputs are size-bounded; if truncated, narrow the range or grep. \
 Work within the step budget: plan, inspect with tools, then give a precise \
 evidence-backed answer. When you have enough, stop calling tools and answer.";
 
-/// System prompt for the `deepseek_doc_sync` tool: a PROPOSE-ONLY, READ-ONLY
+/// System prompt for the `ai_doc_sync` tool: a PROPOSE-ONLY, READ-ONLY
 /// docs-sync role. It reuses the same grounded loop as the agent but with the
 /// repo-reads-only tool set (no lab/guest/cargo tools) and must emit a structured
 /// list of exact docs-only edits a human can apply by string replacement.
@@ -5156,7 +5363,7 @@ Ground every old_string in text you actually read this run. Stay within the step
 read the relevant docs, then write the structured proposal as plain prose (no tool-call \
 syntax in the final answer).";
 
-/// The OpenAI-style tool-definition array advertised to DeepSeek. All read-only.
+/// The OpenAI-style tool-definition array advertised to the active provider. All read-only.
 fn agent_tool_definitions() -> Value {
     json!([
         fn_tool(
@@ -5361,7 +5568,7 @@ fn agent_tool_definitions() -> Value {
              a Rust identifier (letters/digits/underscore). Returns repo-relative path:line. \
              Read-only.",
             json!({
-                "symbol": {"type": "string", "description": "Rust identifier to find the definition of, e.g. 'DeepSeekServer' or 'run_with_timeout'"},
+                "symbol": {"type": "string", "description": "Rust identifier to find the definition of, e.g. 'AiAgentServer' or 'run_with_timeout'"},
                 "limit": {"type": "integer", "description": "Max result lines to return (default 40, cap 200)"}
             }),
             &["symbol"],
@@ -5406,7 +5613,7 @@ fn agent_tool_definitions() -> Value {
     ])
 }
 
-/// The REPO-READS-ONLY subset of the tool definitions for `deepseek_doc_sync`.
+/// The REPO-READS-ONLY subset of the tool definitions for `ai_doc_sync`.
 /// It exposes ONLY repo-inspection tools (read_file / list_dir / grep /
 /// find_files / find_definition / find_references + read-only git) — NO lab,
 /// guest, host, or cargo tools — so a docs-sync proposal can only read repo
@@ -5457,7 +5664,7 @@ fn model_schema(provider: &LlmProvider) -> Value {
             "'flash' (default) and 'pro' are shortcuts for this provider's two configured \
              tiers — currently 'flash' = {} (fast, low cost), 'pro' = {} (chain-of-thought \
              at max reasoning effort, slower, for hard reasoning). ANY OTHER STRING is used \
-             as a literal model id, unchanged — call deepseek_list_models first to see what's \
+             as a literal model id, unchanged — call ai_list_models first to see what's \
              actually available right now and pass one of those ids directly if 'flash'/'pro' \
              aren't the right fit. Provider: {}.",
             provider.flash_model, provider.pro_model, provider.name
@@ -5468,14 +5675,14 @@ fn model_schema(provider: &LlmProvider) -> Value {
 fn context_schema() -> Value {
     json_schema_string(
         "Optional context — file contents, code, docs, error output, etc. \
-         Prepended to the prompt so DeepSeek has the material to work from.",
+         Prepended to the prompt so the model has the material to work from.",
     )
 }
 
-impl McpServer for DeepSeekServer {
+impl McpServer for AiAgentServer {
     fn server_info(&self) -> ServerInfo {
         ServerInfo {
-            name: "rustynet-mcp-deepseek".into(),
+            name: "rustynet-mcp-ai-agent".into(),
             version: "0.1.0".into(),
         }
     }
@@ -5483,10 +5690,10 @@ impl McpServer for DeepSeekServer {
     fn tools(&self) -> Vec<Tool> {
         vec![
             Tool {
-                name: "deepseek_read".into(),
+                name: "ai_read".into(),
                 description: "\
-                    Query DeepSeek for analysis, research, explanation, or code review. \
-                    Read-only intent — DeepSeek will assess and explain, not generate new artifacts. \
+                    Query the configured LLM provider for analysis, research, explanation, or code review. \
+                    Read-only intent — the model will assess and explain, not generate new artifacts. \
                     Good for: second opinions on architecture, security review, explaining unfamiliar code, \
                     comparing approaches, identifying risks in a plan."
                     .into(),
@@ -5500,9 +5707,9 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_write".into(),
+                name: "ai_write".into(),
                 description: "\
-                    Ask DeepSeek to generate or write content — Rust code, tests, documentation, \
+                    Ask the configured LLM provider to generate or write content — Rust code, tests, documentation, \
                     config files, scripts, etc. Write intent — the primary output is content to be \
                     used or written to disk. \
                     Good for: generating boilerplate, writing test cases, drafting docs, \
@@ -5518,11 +5725,11 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_read_write".into(),
+                name: "ai_read_write".into(),
                 description: "\
-                    Full autonomy: DeepSeek analyzes existing content AND generates output. \
+                    Full autonomy: the model analyzes existing content AND generates output. \
                     Use when the task requires understanding current code/state before producing changes. \
-                    DeepSeek will structure its response as: analysis first, then generated output. \
+                    The model will structure its response as: analysis first, then generated output. \
                     Good for: review-then-fix, audit-then-patch, explain-then-refactor, \
                     read-a-plan-then-implement."
                     .into(),
@@ -5536,9 +5743,9 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_agent".into(),
+                name: "ai_agent".into(),
                 description: "\
-                    READ-ONLY autonomous research agent. DeepSeek drives a tool-calling loop against a \
+                    READ-ONLY autonomous research agent. The active provider drives a tool-calling loop against a \
                     confined, read-only tool set that inspects THIS machine's local Rustynet repo and UTM \
                     lab (read_file, list_dir, grep, find_files, find_definition, read-only git, \
                     utm_vm_status, lab_inventory, lab_node_reachable, lab_guest_exec [fixed read-only \
@@ -5549,7 +5756,7 @@ impl McpServer for DeepSeekServer {
                     audit trace of what it inspected. It CANNOT write/edit/delete anything. \
                     Good for: 'where/how is X implemented', 'does the code actually do Y', \
                     grounded cross-file investigations, lab-state and live-lab-run drill-in questions. \
-                    Use the proxy tools (deepseek_read/write/read_write) when you want to hand DeepSeek \
+                    Use the proxy tools (ai_read/write/read_write) when you want to hand the model \
                     material directly instead of having it explore."
                     .into(),
                 input_schema: json_schema_object(
@@ -5565,9 +5772,9 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_live_lab".into(),
+                name: "ai_live_lab".into(),
                 description: "\
-                    Run the RIGID live-lab failure-triage pipeline. DeepSeek v4-flash researches \
+                    Run the RIGID live-lab failure-triage pipeline. The active provider's flash tier researches \
                     why/where/what failed (grounded in the real local repo + UTM lab), a second \
                     v4-flash independently verifies every claim against the repo/lab, then v4-pro at \
                     MAX reasoning reviews, re-verifies, and judges the best fix — all three steps \
@@ -5576,7 +5783,7 @@ impl McpServer for DeepSeekServer {
                     read) as 'failure_context'; it returns one verified report for you to act on. \
                     UNTRUSTED output — you verify before changing any code. Runs ASYNC (the pipeline \
                     takes minutes, longer than the MCP request timeout): returns a job_id \
-                    immediately; poll 'deepseek_live_lab_result' for the report."
+                    immediately; poll 'ai_live_lab_result' for the report."
                     .into(),
                 input_schema: json_schema_object(
                     json!({
@@ -5593,28 +5800,28 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_live_lab_result".into(),
+                name: "ai_live_lab_result".into(),
                 description: "\
-                    Poll an async deepseek_live_lab triage job. Non-blocking: returns the verified \
+                    Poll an async ai_live_lab triage job. Non-blocking: returns the verified \
                     multi-section report once the pipeline finishes, or a 'still running' status \
                     (with elapsed seconds) to poll again. Pass the job_id returned by \
-                    deepseek_live_lab."
+                    ai_live_lab."
                     .into(),
                 input_schema: json_schema_object(
                     json!({
-                        "job_id": json_schema_string("The job id returned by deepseek_live_lab."),
+                        "job_id": json_schema_string("The job id returned by ai_live_lab."),
                     }),
                     vec!["job_id"],
                 ),
             },
             Tool {
-                name: "deepseek_lab_run".into(),
+                name: "ai_lab_run".into(),
                 description: "\
                     Run the WHOLE live-lab pipeline in one call: launch the hardened orchestrator for \
                     an area, wait for it, and on failure run the rigid triage pipeline automatically — \
                     you get back ONE report (PASS evidence, or root cause + file:line + suspected fix). \
                     The launch + wait are DETERMINISTIC (no LLM in the deploy path); only the triage \
-                    uses DeepSeek. Async: returns a job_id immediately; poll deepseek_live_lab_result \
+                    uses the active LLM provider. Async: returns a job_id immediately; poll ai_live_lab_result \
                     for the report (a run takes many minutes). The lab is a singleton — one run at a \
                     time. UNTRUSTED triage output — verify before changing code."
                     .into(),
@@ -5642,7 +5849,7 @@ impl McpServer for DeepSeekServer {
                         "windows_only": json!({"type": "boolean", "description": "Skip ALL Linux stages (incl. membership setup) and run ONLY the Windows bootstrap + validation stages; requires windows_vm. NOTE: this also skips membership distribution, so it only works when the Windows guest is already mesh-joined from a prior run — for a fresh Windows cell use skip_linux_live_suite instead (keeps setup)."}),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
                         "dry_run": json!({"type": "boolean", "description": "Run the orchestrator in --dry-run mode (fast; verifies the launch wiring without a real lab pass)."}),
-                        "triage_on_failure": json!({"type": "boolean", "description": "Default true. When false, a failed live lab returns local report/log pointers without calling the external DeepSeek API. Use this when external triage has not been explicitly approved."}),
+                        "triage_on_failure": json!({"type": "boolean", "description": "Default true. When false, a failed live lab returns local report/log pointers without calling the external LLM API. Use this when external triage has not been explicitly approved."}),
                         "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure (default 12, cap 20)."}),
                         "skip_cross_network": json!({"type": "boolean", "description": "Default FALSE: cross-network traversal-substrate coverage now RUNS by default (LiveLabVmConnectivityRulebook §11.2 removed the old unconditional skip). Set true only when the run deliberately excludes cross-network stages, and say why in the area text."}),
                         "cross_network_substrate": json_schema_string("Cross-network substrate selector passed through as --cross-network-substrate (netns|vxlan|slirp; orchestrator default netns)."),
@@ -5654,11 +5861,11 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_next_live_lab_target".into(),
+                name: "ai_next_live_lab_target".into(),
                 description: "\
                     Read-only chooser for the next live-lab target. It inspects the run matrix, \
                     prefers the latest failed stage, then release-blocking macOS/Windows role \
-                    cells that are not currently pass, and returns the exact deepseek_lab_run \
+                    cells that are not currently pass, and returns the exact ai_lab_run \
                     JSON args a simple agent should call. Pass target=<key> to render an explicit \
                     target (macos_exit, windows_anchor, full, ...)."
                     .into(),
@@ -5670,33 +5877,33 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_autonomous_live_lab_loop".into(),
+                name: "ai_autonomous_live_lab_loop".into(),
                 description: "\
                     One-call autonomous loop step for simple agents: reconcile stale/interrupted \
-                    DeepSeek labrun records, refuse to double-launch if a run is still in flight, \
-                    choose the next matrix-backed live-lab target, then launch deepseek_lab_run \
+                    AI-agent labrun records, refuse to double-launch if a run is still in flight, \
+                    choose the next matrix-backed live-lab target, then launch ai_lab_run \
                     with the right focused role selector. On pass, call again to progress to the \
-                    next target; on fail, the launched run auto-triages with DeepSeek."
+                    next target; on fail, the launched run auto-triages with the active LLM provider."
                     .into(),
                 input_schema: json_schema_object(
                     json!({
                         "target": json_schema_string("Optional explicit key instead of matrix selection."),
-                        "dry_run": json_schema_boolean("Pass through to deepseek_lab_run for wiring checks."),
-                        "triage_on_failure": json_schema_boolean("Pass through to deepseek_lab_run; false disables external DeepSeek API triage on failure."),
-                        "allow_concurrent": json_schema_boolean("Pass through to deepseek_lab_run; use only with disjoint guests."),
+                        "dry_run": json_schema_boolean("Pass through to ai_lab_run for wiring checks."),
+                        "triage_on_failure": json_schema_boolean("Pass through to ai_lab_run; false disables external LLM API triage on failure."),
+                        "allow_concurrent": json_schema_boolean("Pass through to ai_lab_run; use only with disjoint guests."),
                         "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure."}),
                     }),
                     vec![],
                 ),
             },
             Tool {
-                name: "deepseek_recover_lab_environment".into(),
+                name: "ai_recover_lab_environment".into(),
                 description: "\
                     Async recovery function for interrupted live-lab loops. Reconciles stale \
-                    DeepSeek job records, then runs the Rust orchestrator to --stop-after-ready \
+                    AI-agent job records, then runs the Rust orchestrator to --stop-after-ready \
                     so VMs are powered/reachable before the next labrun. Use when a prior lab was \
                     interrupted and the next launch is blocked or guests may be stale. Poll \
-                    deepseek_live_lab_result with the returned recover-* job id."
+                    ai_live_lab_result with the returned recover-* job id."
                     .into(),
                 input_schema: json_schema_object(
                     json!({
@@ -5707,7 +5914,7 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_doc_sync".into(),
+                name: "ai_doc_sync".into(),
                 description: "\
                     Propose docs-only edits to keep the repo in sync with a lab-verified fix. \
                     READ-ONLY + PROPOSE-ONLY: a grounded agent reads the CURRENT docs (active \
@@ -5719,7 +5926,7 @@ impl McpServer for DeepSeekServer {
                     Docs-only (documents/** + root README.md/AGENTS.md/CLAUDE.md); enforces the \
                     AGENTS.md↔CLAUDE.md mirror and index-sync, and never invents evidence/status/ \
                     dates/SHAs. UNTRUSTED output — review before applying. Runs ASYNC: returns a \
-                    job_id immediately; poll 'deepseek_live_lab_result' for the report."
+                    job_id immediately; poll 'ai_live_lab_result' for the report."
                     .into(),
                 input_schema: json_schema_object(
                     json!({
@@ -5741,10 +5948,10 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_reconcile_jobs".into(),
+                name: "ai_reconcile_jobs".into(),
                 description: "\
                     Self-service repair of stale live-lab job records so a crashed or killed \
-                    deepseek_lab_run can no longer block the singleton gate forever. Scans this \
+                    ai_lab_run can no longer block the singleton gate forever. Scans this \
                     server's persisted job records (or just `job_id` if given): a `state=running` \
                     record whose orchestrator already wrote its completion artifact is reclassified \
                     DONE (recovering the run outcome); one whose recorded orchestrator pid is dead \
@@ -5763,7 +5970,7 @@ impl McpServer for DeepSeekServer {
                 ),
             },
             Tool {
-                name: "deepseek_list_models".into(),
+                name: "ai_list_models".into(),
                 description: "\
                     Fetch the ACTIVE LLM provider's LIVE list of available models via its \
                     OpenAI-compatible models-list endpoint — READ-ONLY, no side effects, not \
@@ -5771,15 +5978,33 @@ impl McpServer for DeepSeekServer {
                     limited to the two 'flash'/'pro' shortcuts: returns every model id the \
                     provider currently reports, flags which two are aliased 'flash'/'pro' for \
                     convenience, and tells you to pass any OTHER id directly as the `model` \
-                    argument to deepseek_read/write/read_write/agent/lab_run/etc. — an \
+                    argument to ai_read/write/read_write/agent/lab_run/etc. — an \
                     unrecognized `model` string is used as a literal id, never silently \
                     coerced to a default. Call this whenever you need a model 'flash'/'pro' \
                     doesn't cover (e.g. a specific model version, a cheaper/faster/larger \
                     option the provider added since this server was built), or whenever you \
                     are unsure the configured shortcuts still point at real, current model \
-                    ids. Reflects whichever provider is currently active (see the `model` \
+                    ids. Reflects whichever provider is currently active — deepseek (default), \
+                    grok, kimi, glm, qwen, or a registry-configured provider (see the `model` \
                     parameter's description on any other tool, or CLAUDE.md/AGENTS.md §12.5) \
                     — not necessarily DeepSeek specifically."
+                    .into(),
+                input_schema: json_schema_object(json!({}), Vec::<&str>::new()),
+            },
+            Tool {
+                name: "ai_check_balance".into(),
+                description: "\
+                    Fetch the ACTIVE LLM provider's account balance/credit — READ-ONLY, no side \
+                    effects. Answers 'how much headroom do I have' before a long research/triage \
+                    session or a big fan-out of calls. NOT every provider exposes a balance API \
+                    (no shared convention exists across providers the way the models-list \
+                    endpoint has) — DeepSeek's is confirmed live; for grok/kimi/glm/qwen or a \
+                    registry-configured provider, this reports clearly that balance checking \
+                    isn't configured rather than guessing at a URL (add `balance_url` to that \
+                    provider's registry entry once you find the right endpoint in its docs). \
+                    Returns a best-effort one-line summary PLUS the raw provider response, since \
+                    balance response shapes are far less standardized than /models — read the \
+                    raw JSON if the summary looks off."
                     .into(),
                 input_schema: json_schema_object(json!({}), Vec::<&str>::new()),
             },
@@ -5793,32 +6018,41 @@ impl McpServer for DeepSeekServer {
         };
 
         // The live-lab triage pipeline has its own arg schema (no prompt/model).
-        if name == "deepseek_live_lab" {
+        if name == "ai_live_lab" {
             return self.call_live_lab(&args);
         }
-        if name == "deepseek_live_lab_result" {
+        if name == "ai_live_lab_result" {
             return self.call_live_lab_result(&args);
         }
-        if name == "deepseek_lab_run" {
+        if name == "ai_lab_run" {
             return self.call_lab_run(&args);
         }
-        if name == "deepseek_next_live_lab_target" {
+        if name == "ai_next_live_lab_target" {
             return self.call_next_live_lab_target(&args);
         }
-        if name == "deepseek_autonomous_live_lab_loop" {
+        if name == "ai_autonomous_live_lab_loop" {
             return self.call_autonomous_live_lab_loop(&args);
         }
-        if name == "deepseek_recover_lab_environment" {
+        if name == "ai_recover_lab_environment" {
             return self.call_recover_lab_environment(&args);
         }
-        if name == "deepseek_doc_sync" {
+        if name == "ai_doc_sync" {
             return self.call_doc_sync(&args);
         }
-        if name == "deepseek_reconcile_jobs" {
+        if name == "ai_reconcile_jobs" {
             return self.call_reconcile_jobs(&args);
         }
-        if name == "deepseek_list_models" {
+        if name == "ai_list_models" {
             return match self.list_models() {
+                Ok(text) => ToolCallResult {
+                    content: text_content(text),
+                    is_error: None,
+                },
+                Err(e) => tool_error(&e),
+            };
+        }
+        if name == "ai_check_balance" {
+            return match self.check_balance() {
                 Ok(text) => ToolCallResult {
                     content: text_content(text),
                     is_error: None,
@@ -5835,7 +6069,7 @@ impl McpServer for DeepSeekServer {
         let model = self.resolve_model(model_str);
 
         // The autonomous agent has its own loop + system prompt.
-        if name == "deepseek_agent" {
+        if name == "ai_agent" {
             let max_steps = args
                 .get("max_steps")
                 .and_then(|v| v.as_u64())
@@ -5843,7 +6077,10 @@ impl McpServer for DeepSeekServer {
                 .unwrap_or(AGENT_DEFAULT_MAX_STEPS);
             return match self.run_agent(prompt, &model, max_steps) {
                 Ok(answer) => {
-                    let header = format!("[deepseek/{model} | AGENT | budget={max_steps}]\n\n");
+                    let header = format!(
+                        "[{}/{model} | AGENT | budget={max_steps}]\n\n",
+                        self.provider.name
+                    );
                     ToolCallResult {
                         content: text_content(format!("{header}{answer}")),
                         is_error: None,
@@ -5856,7 +6093,7 @@ impl McpServer for DeepSeekServer {
         let context = get_str(&args, "context");
 
         let (system, intent_label) = match name {
-            "deepseek_read" => (
+            "ai_read" => (
                 "You are a senior Rust engineer and security-focused systems architect. \
                  Analyze the provided content and answer clearly and concisely. \
                  Focus on insight, explanation, risk assessment, and correctness — \
@@ -5864,7 +6101,7 @@ impl McpServer for DeepSeekServer {
                  Be direct and precise. Flag security concerns prominently.",
                 "READ",
             ),
-            "deepseek_write" => (
+            "ai_write" => (
                 "You are a senior Rust engineer. Generate the requested code, documentation, \
                  or content. Be precise, idiomatic, and production-quality. \
                  Follow Rust best practices: no unwrap in non-test paths, proper error propagation, \
@@ -5873,7 +6110,7 @@ impl McpServer for DeepSeekServer {
                  is non-obvious.",
                 "WRITE",
             ),
-            "deepseek_read_write" => (
+            "ai_read_write" => (
                 "You are a senior Rust engineer and security-focused systems architect. \
                  First analyze the provided content thoroughly, then generate the requested \
                  output. Structure your response in two clearly separated sections: \
@@ -5889,7 +6126,7 @@ impl McpServer for DeepSeekServer {
 
         match self.call(system, &user_prompt, &model) {
             Ok(response) => {
-                let header = format!("[deepseek/{model} | {intent_label}]\n\n");
+                let header = format!("[{}/{model} | {intent_label}]\n\n", self.provider.name);
                 ToolCallResult {
                     content: text_content(format!("{header}{response}")),
                     is_error: None,
@@ -5901,7 +6138,7 @@ impl McpServer for DeepSeekServer {
 }
 
 fn main() {
-    let server = DeepSeekServer::new();
+    let server = AiAgentServer::new();
     run_server(server);
 }
 
@@ -5909,8 +6146,38 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn server() -> DeepSeekServer {
-        DeepSeekServer::new()
+    fn server() -> AiAgentServer {
+        AiAgentServer::new()
+    }
+
+    #[test]
+    fn built_in_provider_covers_all_five_presets_and_rejects_unknown() {
+        for name in ["deepseek", "grok", "kimi", "glm", "qwen"] {
+            let preset = built_in_provider(name)
+                .unwrap_or_else(|| panic!("built-in preset missing for '{name}'"));
+            assert!(
+                preset.base_url.starts_with("https://"),
+                "{name} base_url should be a real https endpoint"
+            );
+            assert!(
+                !preset.flash_model.is_empty() && !preset.pro_model.is_empty(),
+                "{name} must have both tiers configured"
+            );
+            assert!(
+                !preset.api_key_env.is_empty(),
+                "{name} must name an api_key_env"
+            );
+        }
+        assert!(built_in_provider("not-a-real-provider").is_none());
+        // Only deepseek has a confirmed-live balance endpoint (§ ai_check_balance);
+        // the other four are None until confirmed against their current docs.
+        assert!(built_in_provider("deepseek").unwrap().balance_url.is_some());
+        for name in ["grok", "kimi", "glm", "qwen"] {
+            assert!(
+                built_in_provider(name).unwrap().balance_url.is_none(),
+                "{name} balance_url should be None until confirmed live, not guessed"
+            );
+        }
     }
 
     #[test]
@@ -5944,7 +6211,7 @@ mod tests {
     fn resolve_model_passes_through_unknown_strings_as_literal_ids() {
         // Regression test: this used to silently coerce ANY unrecognized
         // string to the flash tier, so a caller passing a real model id
-        // discovered via deepseek_list_models silently got a different
+        // discovered via ai_list_models silently got a different
         // model with no error. Unrecognized must now mean "use it exactly
         // as given", never "silently substitute a default".
         let s = server();
@@ -6073,11 +6340,11 @@ mod tests {
     fn grep_finds_known_token() {
         let s = server();
         // Pattern is a regex (rg/grep -e), so use a literal token without
-        // regex metacharacters. `DeepSeekServer` is defined in this file.
+        // regex metacharacters. `AiAgentServer` is defined in this file.
         let out = s
-            .tool_grep(&json!({"pattern": "DeepSeekServer", "path": "crates/rustynet-mcp/src"}))
+            .tool_grep(&json!({"pattern": "AiAgentServer", "path": "crates/rustynet-mcp/src"}))
             .unwrap();
-        assert!(out.contains("deepseek.rs"));
+        assert!(out.contains("ai_agent.rs"));
         // Paths are repo-relative, not absolute.
         assert!(
             !out.contains("/Users/"),
@@ -6175,10 +6442,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_set_excludes_deepseek_proxy_tools() {
+    fn agent_tool_set_excludes_top_level_proxy_tools() {
         // The read/write/read_write/agent proxies + the live-lab orchestrator are
-        // top-level MCP tools the *main agent* drives — a DeepSeek agent must never
-        // be able to recursively call them from inside its own tool-calling loop.
+        // top-level MCP tools the *main agent* drives — the confined grounded
+        // agent loop (whichever provider is active) must never be able to
+        // recursively call them from inside its own tool-calling loop.
         let defs = agent_tool_definitions();
         let names: Vec<&str> = defs
             .as_array()
@@ -6187,18 +6455,19 @@ mod tests {
             .map(|d| d["function"]["name"].as_str().unwrap())
             .collect();
         for forbidden in [
-            "deepseek_read",
-            "deepseek_write",
-            "deepseek_read_write",
-            "deepseek_agent",
-            "deepseek_live_lab",
-            "deepseek_live_lab_result",
-            "deepseek_lab_run",
-            "deepseek_next_live_lab_target",
-            "deepseek_autonomous_live_lab_loop",
-            "deepseek_recover_lab_environment",
-            "deepseek_reconcile_jobs",
-            "deepseek_list_models",
+            "ai_read",
+            "ai_write",
+            "ai_read_write",
+            "ai_agent",
+            "ai_live_lab",
+            "ai_live_lab_result",
+            "ai_lab_run",
+            "ai_next_live_lab_target",
+            "ai_autonomous_live_lab_loop",
+            "ai_recover_lab_environment",
+            "ai_reconcile_jobs",
+            "ai_list_models",
+            "ai_check_balance",
         ] {
             assert!(
                 !names.contains(&forbidden),
@@ -7064,7 +7333,7 @@ mod tests {
         // A real, confined dir greps cleanly (repo root '.' always exists). The
         // pattern reaches rg/grep as a separate argv element, never a shell string.
         let out = s
-            .tool_lab_report_grep(&json!({"report_dir": "crates/rustynet-mcp/src", "pattern": "DeepSeekServer", "max": 5}))
+            .tool_lab_report_grep(&json!({"report_dir": "crates/rustynet-mcp/src", "pattern": "AiAgentServer", "max": 5}))
             .expect("lab_report_grep ok");
         assert!(out.contains("report grep"));
     }
@@ -7088,7 +7357,7 @@ mod tests {
             .tool_lab_report_artifacts(&json!({"report_dir": "crates/rustynet-mcp/src/bin"}))
             .expect("lab_report_artifacts ok");
         assert!(out.contains("Report artifacts"));
-        assert!(out.contains("deepseek.rs"));
+        assert!(out.contains("ai_agent.rs"));
         assert!(
             !out.contains("/Users/"),
             "artifact listing should be report-relative"
@@ -7098,14 +7367,14 @@ mod tests {
     #[test]
     fn find_definition_finds_a_known_symbol() {
         let s = server();
-        // DeepSeekServer is a struct defined in this file. find_definition either
+        // AiAgentServer is a struct defined in this file. find_definition either
         // locates it (rg present) or returns a clear rg-absent message — both Ok.
         let out = s
-            .tool_find_definition(&json!({"symbol": "DeepSeekServer"}))
+            .tool_find_definition(&json!({"symbol": "AiAgentServer"}))
             .expect("find_definition ok");
         assert!(out.contains("find_definition"));
         if !out.contains("not on PATH") {
-            assert!(out.contains("deepseek.rs"));
+            assert!(out.contains("ai_agent.rs"));
             // Repo-relative, not absolute.
             assert!(
                 !out.contains("/Users/"),
@@ -7196,10 +7465,19 @@ mod tests {
     /// A server rooted at a throwaway temp dir, so job-record writes land in the
     /// temp tree (never the real repo's state/). Mirrors `new()` but overrides
     /// `repo_root`.
-    fn server_rooted(root: &Path) -> DeepSeekServer {
+    fn server_rooted(root: &Path) -> AiAgentServer {
         let agent = ureq::AgentBuilder::new().build();
-        DeepSeekServer {
-            provider: LlmProvider::deepseek_default(String::new()),
+        AiAgentServer {
+            provider: LlmProvider {
+                name: "deepseek".to_string(),
+                base_url: DEEPSEEK_BASE_URL.to_string(),
+                models_url: DEEPSEEK_MODELS_URL.to_string(),
+                balance_url: Some(DEEPSEEK_BALANCE_URL.to_string()),
+                api_key: String::new(),
+                flash_model: DEEPSEEK_FLASH_MODEL.to_string(),
+                pro_model: DEEPSEEK_PRO_MODEL.to_string(),
+                pro_reasoning_effort: DEEPSEEK_PRO_REASONING_EFFORT.to_string(),
+            },
             agent,
             repo_root: root.to_path_buf(),
             jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -7226,7 +7504,7 @@ mod tests {
     #[test]
     fn persisted_done_job_round_trips_after_reload() {
         // A done record written by one server instance must be readable — and
-        // surfaced by deepseek_live_lab_result — from a FRESH instance whose
+        // surfaced by ai_live_lab_result — from a FRESH instance whose
         // in-memory map is empty (the reload-survival contract).
         let root = std::env::temp_dir().join(format!(
             "deepseek_jobrec_done_{}_{}",
@@ -7355,7 +7633,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // --- job-reconcile (deepseek_reconcile_jobs) ---
+    // --- job-reconcile (ai_reconcile_jobs) ---
 
     /// A pid that is guaranteed dead: spawn a short-lived child, reap it, and
     /// return its (now-defunct) pid. The OS will not reuse it within a test, so
@@ -7555,14 +7833,14 @@ mod tests {
         // Old records without orchestrator_pid still parse (backward-compatible).
         let rec = s.read_job_record(&job_id).expect("record");
         assert_eq!(rec.get("state").and_then(|v| v.as_str()), Some("running"));
-        assert!(DeepSeekServer::job_orchestrator_pid(&rec).is_none());
+        assert!(AiAgentServer::job_orchestrator_pid(&rec).is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// (d) The in-flight filter does NOT count a dead-pid/no-artifact record, so a
-    /// crashed run no longer blocks the next deepseek_lab_run — even before anyone
-    /// calls deepseek_reconcile_jobs. A no-pid/no-artifact record IS still counted.
+    /// crashed run no longer blocks the next ai_lab_run — even before anyone
+    /// calls ai_reconcile_jobs. A no-pid/no-artifact record IS still counted.
     #[test]
     #[cfg(unix)]
     fn in_flight_filter_self_heals_on_dead_pid() {

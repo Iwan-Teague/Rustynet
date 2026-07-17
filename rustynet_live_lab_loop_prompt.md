@@ -91,30 +91,30 @@ paths; no TODO/FIXME/placeholders in completed work; no runtime fallback/downgra
 paths. Never log or commit secrets or key material. (Full detail + code-pattern examples: companion
 repo-context doc §2, §3, §9.)
 
-**Decisions are yours to make, not to surface.** Read the real code, fan DeepSeek for breadth, take the
+**Decisions are yours to make, not to surface.** Read the real code, fan the AI-agent MCP for breadth, take the
 most secure option, and proceed. Do NOT pause for confirmation. Do NOT write status reports asking for
 direction. When a lab surfaces both security and functional defects, patch security first.
 
 **DIVISION OF LABOR — who does what; do not blur these:**
 - **YOU, the main agent, own ALL CODE CHANGES, the SECURITY call, and the loop.** You write and review every
   patch (you are the reviewer of record) and decide which area to run next. You drive each live-lab cycle by
-  calling **`deepseek_lab_run(area=...)`** — one call DETERMINISTICALLY launches + monitors the run and
+  calling **`ai_lab_run(area=...)`** — one call DETERMINISTICALLY launches + monitors the run and
   auto-triages a failure → ONE report you verify, patch from, and re-run. **No LLM ever drives the lab:** the
   launch/monitor is deterministic code (no LLM in the deploy path — it can't hallucinate a deploy action),
   and the LLM does ONLY the triage. Judging the result and every code/security decision stay with you.
-- **DeepSeek (the `rustynet-deepseek` MCP) is your research / triage / run-driver layer.** Its headline tool
-  is **`deepseek_lab_run`** — one call launches the lab (deterministic) and, on failure, runs the rigid
+- **The AI-agent MCP (`rustynet-ai-agent`, DeepSeek by default, other providers configurable) is your research / triage / run-driver layer.** Its headline tool
+  is **`ai_lab_run`** — one call launches the lab (deterministic) and, on failure, runs the rigid
   triage → ONE evidence-cited report (root cause, file:line, suspected fix); async, so poll
-  `deepseek_live_lab_result`. **`deepseek_live_lab`** is that same rigid triage on a failure you ALREADY hold
+  `ai_live_lab_result`. **`ai_live_lab`** is that same rigid triage on a failure you ALREADY hold
   (v4-flash research → v4-flash verify-every-claim → v4-pro@MAX review). It also exposes the read-only
-  grounded **`deepseek_agent`** (now grounded across code + git history + cross-OS compile/test + LIVE
-  any-OS guest diagnostics) and the flash/pro `deepseek_read/write/read_write` proxies for ad-hoc research.
+  grounded **`ai_agent`** (now grounded across code + git history + cross-OS compile/test + LIVE
+  any-OS guest diagnostics) and the flash/pro `ai_read/write/read_write` proxies for ad-hoc research.
   It proposes; you verify against the real code and decide. It NEVER makes the security call, writes the
   repo, or runs the authoritative gates. (Full tool table + grounding details below.)
-- **Any info-gathering / research worker should go through DeepSeek where possible** — prefer the DeepSeek
+- **Any info-gathering / research worker should go through the AI-agent MCP where possible** — prefer its
   agent (to ground-truth against the repo/lab) or the proxies (to analyze pasted context) over spending a
   full Claude sub-agent on pure research/summarization. Reserve Claude sub-agents for concrete CODE patches
-  you will review (§8) or a repo task DeepSeek genuinely cannot do.
+  you will review (§8) or a repo task the AI-agent MCP genuinely cannot do.
 
 ═══════════════════════════════════════════
 0a) TOKEN ECONOMY — YOU ARE A CONTEXT-CONSTRAINED AGENT (CONCRETE TACTICS)
@@ -178,7 +178,7 @@ Reschedule from inside that re-entry; don't let the chain silently die.
 order-of-magnitude cadence, never one-shot/COUNT. Delete/pause it when no lab remains active, or
 when the operator explicitly says not to start another lab.
 
-**Never call `get_job_status` / `wait_for_job` / `deepseek_live_lab_result` / `get_run_progress`
+**Never call `get_job_status` / `wait_for_job` / `ai_live_lab_result` / `get_run_progress`
 more than once per wakeup tick "just to check."** Each of these is a full tool round-trip that
 returns "still running" for free — calling it again five minutes early because you're curious
 buys you nothing but cost.
@@ -189,9 +189,9 @@ happen" for the cost of a search) → `get_stage_log` (one stage's tsv row + log
 `read_report_artifact` (one named file) → only then a full manual read. Most triage questions are
 answered by the first step.
 
-**0a.3 — Offload reading to DeepSeek before it reaches your own context (§3's outsourcing
+**0a.3 — Offload reading to the AI-agent MCP before it reaches your own context (§3's outsourcing
 rule).** A 500-line daemon journal or a large diff costs real tokens twice if you read it
-yourself: once to ingest it, again to reason over it. DeepSeek flash reads it once, for a
+yourself: once to ingest it, again to reason over it. its flash tier reads it once, for a
 fraction of the cost, and hands you the 3 lines that matter. If you catch yourself about to read
 something long "just to understand it," stop and hand it to flash first.
 
@@ -221,7 +221,7 @@ command with the platform's escalation mechanism (for Codex: `require_escalated`
 treating `verify_ssh_reachability` / early preflight failure as a Rustynet bug. The live lab
 touches local UTM guests, SSH agents, known_hosts, LAN routes, and sometimes Docker/launchd;
 a restricted shell will produce false early failures. If you use
-`scripts/mcp/drive_deepseek.py` to launch `deepseek_lab_run`, launch it outside the sandbox
+`scripts/mcp/drive_ai_agent.py` to launch `ai_lab_run`, launch it outside the sandbox
 and pass `--no-poll` so it records the detached job without burning context (and without
 defeating the `run_in_background`/`ScheduleWakeup` pattern above by auto-polling internally).
 
@@ -251,16 +251,16 @@ code change may regress any one. Re-verify and re-prove. Loop forever.
 1. PICK A STAGE → read the matrix + roadmap, pick the highest-priority
    unproven/regressed/failing stage. (§6)
 
-2. LAUNCH → call deepseek_lab_run(area=..., exit_platform=...,
+2. LAUNCH → call ai_lab_run(area=..., exit_platform=...,
    skip_linux_live_suite=true, triage_on_failure=true).
    Run this from a host-capable environment (not a restricted sandbox). If using
-   scripts/mcp/drive_deepseek.py directly, include --no-poll on launch.
+   scripts/mcp/drive_ai_agent.py directly, include --no-poll on launch.
    Record the job_id. Set a recurring ~10min heartbeat that names that exact job_id.
 
 3. HEARTBEAT CHECK → only when the recurring heartbeat fires, poll
-   deepseek_live_lab_result(job_id) ONCE. Do not run an extra completion poll just
+   ai_live_lab_result(job_id) ONCE. Do not run an extra completion poll just
    because you finished a local patch or got curious.
-   - Still running → fan DeepSeek over logs for root causes, read docs,
+   - Still running → fan the AI-agent MCP over logs for root causes, read docs,
      prep the patch you expect to make. Check again at next heartbeat.
    - Complete PASS → inspect the report artifacts, verify the matrix row, write_loop_note("stage X passed"),
      go to step 1 for the next stage.
@@ -274,7 +274,7 @@ code change may regress any one. Re-verify and re-prove. Loop forever.
      first_failed_stage decide.
 
 4. SECURITY-TRIAGE-PATCH-COMMIT (this is the work):
-   a) Read the DeepSeek triage report. IT IS UNTRUSTED — verify every cited
+   a) Read the AI-agent triage report. IT IS UNTRUSTED — verify every cited
       claim against the real code before acting.
    b) Identify the root cause (not the symptom). Security issues first.
    c) Patch the code. Gate it (fmt → check → clippy → test).
@@ -296,9 +296,9 @@ stays red and you flag the design conflict in the loop journal.
 
 **Critical timing:**
 - A run takes ~15-20 minutes. Your patch-and-gate-commit cycle takes ~5-10 minutes.
-- Between heartbeats you ALWAYS have work: patching the last failure, fanning DeepSeek
+- Between heartbeats you ALWAYS have work: patching the last failure, fanning the AI-agent MCP
   for root cause, reading docs, running local gates, prepping the next patch.
-- If you genuinely have nothing between heartbeats (rare), fan DeepSeek over any crate:
+- If you genuinely have nothing between heartbeats (rare), fan the AI-agent MCP over any crate:
   "list the 10 most likely latent bugs / fail-open paths in this crate." Patch the real ones.
 - Never sit idle. Never poll more than once per heartbeat. Never launch a second run before
   the first one finishes — one stage at a time.
@@ -308,14 +308,14 @@ stages. Every time you touch shared code (control, policy, crypto), re-verify th
 that depend on it. Re-verify stages that last passed >7 days ago. The job is to keep
 every stage green, not to "finish."
 
-**Outsourcing rule (this is how you spend tokens well):** dumb *reading/summarizing* → DeepSeek flash
+**Outsourcing rule (this is how you spend tokens well):** dumb *reading/summarizing* → the AI-agent MCP's flash tier
 (cheap, read-only, safe). Dumb *deterministic ops* (clean / deploy / seed / recover) → the orchestrator +
 lab-state MCP functions (zero LLM tokens, deterministic, safe). *Code work itself* → a Claude sub-agent,
 Sonnet for simple/well-scoped, Opus for complex/security-sensitive (§8.1) — parallelizes real work off
 your own context. *Security decisions and driving the lab* → you alone, always (the one thing that never
 delegates — you review every sub-agent diff, make every security call, and are the only one calling
-`deepseek_lab_run`). **NEVER put an LLM — even cheap DeepSeek — in a mutate / deploy / cleanup path:
-that work needs determinism and trust, not intelligence, and the deepseek tooling is untrusted +
+`ai_lab_run`). **NEVER put an LLM — even a cheap flash-tier call — in a mutate / deploy / cleanup path:
+that work needs determinism and trust, not intelligence, and the AI-agent tooling is untrusted +
 read-only by design. If a deterministic op is missing a one-call helper, the fix is to add the MCP
 function, not to point an LLM at it.**
 
@@ -386,7 +386,7 @@ After orientation, use MCP servers for faster ongoing lookups:
   `get_loop_journal` so findings survive context compaction (full tool table: §3.5 below).
 - `rustynet-mcp-gate-runner` — run gates without long commands (full tool table: companion
   doc §11).
-- `rustynet-deepseek` — breadth/triage (§3).
+- `rustynet-ai-agent` — breadth/triage (§3).
 
 Read the docs in this precedence order when a decision is ambiguous:
 1. `documents/Requirements.md`, `documents/SecurityMinimumBar.md` — top precedence.
@@ -398,34 +398,35 @@ Read the docs in this precedence order when a decision is ambiguous:
    FAIL-LOUD live-stage spec, concurrent Windows+macOS pipeline.
 
 ═══════════════════════════════════════════
-3) DEEPSEEK — VIA MCP (your research / summarizing / info-gathering layer; use it constantly)
+3) THE AI-AGENT MCP (DeepSeek by default, other providers configurable) (your research / summarizing / info-gathering layer; use it constantly)
 ═══════════════════════════════════════════
-DeepSeek runs as an MCP server (`rustynet-deepseek`) with TWELVE tools. The three *proxy* tools take
+The AI-agent MCP runs as an MCP server (`rustynet-ai-agent`) with FOURTEEN tools, calling whichever LLM provider is configured (DeepSeek by default — see the provider-config block below for the multi-provider registry). The three *proxy* tools take
 `prompt`, optional `context` (paste code/diffs/logs), and `model` — they see ONLY what you paste. The
 *agent* and the *live-lab family* inspect the repo + lab themselves. The live-lab tools are your loop
 driver — list them first:
 
 | Tool | Intent |
 |---|---|
-| `mcp__rustynet-deepseek__deepseek_autonomous_live_lab_loop` | **DEFAULT loop step for simple agents.** Reconciles stale/interrupted jobs, refuses duplicate singleton launch, picks next run-matrix target, launches `deepseek_lab_run`. On PASS call again to progress; on FAIL the run auto-triages. |
-| `mcp__rustynet-deepseek__deepseek_next_live_lab_target` | Read-only target chooser. Returns exact `deepseek_lab_run` JSON for the next run-matrix-backed target, or for explicit `target=macos_exit/windows_anchor/full/...`. |
-| `mcp__rustynet-deepseek__deepseek_recover_lab_environment` | Async environment recovery after interrupted lab: reconcile stale job records, run orchestrator to `--stop-after-ready`, poll via `deepseek_live_lab_result`. |
-| `mcp__rustynet-deepseek__deepseek_reconcile_jobs` | Repair stale `labrun-*` records so crashed/reloaded DeepSeek workers stop blocking the singleton gate. |
-| `mcp__rustynet-deepseek__deepseek_lab_run` | Lower-level loop driver — ONE call = launch the lab + triage on fail → ONE report. Give it an `area` (+ optional `macos`/`windows` or `macos_vm`/`windows_vm`, `exit_vm`/`client_vm`, `rebuild_nodes`, a role-platform selector — `exit_platform`/`relay_platform`/`anchor_platform`/`admin_platform`/`blind_exit_platform`/`macos_promote_exit` — to elect a mac/win node into a role, `skip_linux_live_suite` to skip the ~30-45 min Linux suite and run setup + ONLY the targeted mac/win cell, `dry_run`, `triage_on_failure=false` when external DeepSeek API triage has not been approved, and `allow_concurrent` for disjoint guests). Deterministic deploy path; failure auto-triages unless disabled. Async → returns `job_id`; poll `deepseek_live_lab_result`. |
-| `mcp__rustynet-deepseek__deepseek_live_lab` | The rigid, non-negotiable failure-triage pipeline on a failure you ALREADY have (`target` + `failure_context`): three grounded read-only sub-agents in FIXED order — v4-flash research (why/where/what) → v4-flash verify-every-claim-against-the-repo/lab → v4-pro@MAX review (re-verify + judge the best fix) — into ONE evidence-cited report (root cause + file:line + suspected fix). Async → `job_id`. `deepseek_lab_run` calls this internally on failure; call it directly when you already hold the evidence. |
-| `mcp__rustynet-deepseek__deepseek_live_lab_result` | Poll either async tool above by `job_id` (non-blocking: the report when done, else "still running Ns"). |
-| `mcp__rustynet-deepseek__deepseek_doc_sync` | **PROPOSE-ONLY, READ-ONLY docs-sync**, for AFTER a lab-verified fix. Give it `change_summary` (required) + optional `commit`/`evidence`/`doc_hints`. Reads the current docs (active ledgers, CODE_MAP, README/AGENTS/CLAUDE, doc indexes, run-matrix) over a repo-reads-only toolset (no lab/guest/cargo tools) and returns exact `file`/`old_string`/`new_string`/`rationale` edits plus a "considered, no change" list. Writes NOTHING — you apply the edits after review. Enforces the AGENTS.md↔CLAUDE.md mirror + index-sync; never invents evidence/dates/SHAs. Async → `job_id`; poll `deepseek_live_lab_result`. Use this instead of hand-writing doc updates after a fix lands — it finds every stale reference you'd otherwise miss. |
-| `mcp__rustynet-deepseek__deepseek_agent` | **Read-only autonomous research agent** — drives a tool-calling loop over a confined read-only toolset (23 tools) to inspect the LOCAL repo + lab *itself* + answer with cited evidence + an audit trace. Code: read_file (line ranges), grep (+`context` lines), list_dir, find_files, **find_definition + find_references** (declaration + call-sites). History: read-only git (log/show/diff/**blame**/cat-file). **Grounding-by-execution: `cargo_check`** (does it COMPILE + the real compiler error — host = macOS+common, `target:windows` = the x86_64-pc-windows-gnu cross-target) and scoped **`cargo_test`**. **LIVE cross-OS runtime: `lab_guest_exec`** runs a fixed read-only diagnostic on ANY guest — Linux via utmctl, macOS/Windows via SSH — check = network/routes/dns/service/ports/firewall. Plus the lab run-reports / stage logs / inventory / jobs. **Unlike the proxies (which only reason over what you paste), the agent GROUND-TRUTHS a claim against the actual code/lab** — and now confirms compile/test/runtime by RUNNING it, cross-OS. |
-| `mcp__rustynet-deepseek__deepseek_read` | Analysis, code review, security review, second opinion, risk ID — read-only (proxy; sees only pasted context). |
-| `mcp__rustynet-deepseek__deepseek_write` | Generate boilerplate, test scaffolds, doc drafts — advisory only (proxy). |
-| `mcp__rustynet-deepseek__deepseek_read_write` | Analyze pasted content then generate changes (review-then-fix, audit-then-patch) (proxy). |
-| `mcp__rustynet-deepseek__deepseek_list_models` | **READ-ONLY, no args.** Fetches the ACTIVE provider's LIVE model list via its OpenAI-compatible models endpoint — not hardcoded. Returns every id it currently reports, flags which two are aliased `"flash"`/`"pro"`. Call this when the two shortcuts don't fit (need a specific version, a cheaper/larger option the provider added since this doc was written, or you're unsure the shortcuts still point at real ids) — then pass whichever id you pick directly as `model` on any other `deepseek_*` tool; it is used exactly as given, not coerced to a default. |
+| `mcp__rustynet-ai-agent__ai_autonomous_live_lab_loop` | **DEFAULT loop step for simple agents.** Reconciles stale/interrupted jobs, refuses duplicate singleton launch, picks next run-matrix target, launches `ai_lab_run`. On PASS call again to progress; on FAIL the run auto-triages. |
+| `mcp__rustynet-ai-agent__ai_next_live_lab_target` | Read-only target chooser. Returns exact `ai_lab_run` JSON for the next run-matrix-backed target, or for explicit `target=macos_exit/windows_anchor/full/...`. |
+| `mcp__rustynet-ai-agent__ai_recover_lab_environment` | Async environment recovery after interrupted lab: reconcile stale job records, run orchestrator to `--stop-after-ready`, poll via `ai_live_lab_result`. |
+| `mcp__rustynet-ai-agent__ai_reconcile_jobs` | Repair stale `labrun-*` records so crashed/reloaded AI-agent workers stop blocking the singleton gate. |
+| `mcp__rustynet-ai-agent__ai_lab_run` | Lower-level loop driver — ONE call = launch the lab + triage on fail → ONE report. Give it an `area` (+ optional `macos`/`windows` or `macos_vm`/`windows_vm`, `exit_vm`/`client_vm`, `rebuild_nodes`, a role-platform selector — `exit_platform`/`relay_platform`/`anchor_platform`/`admin_platform`/`blind_exit_platform`/`macos_promote_exit` — to elect a mac/win node into a role, `skip_linux_live_suite` to skip the ~30-45 min Linux suite and run setup + ONLY the targeted mac/win cell, `dry_run`, `triage_on_failure=false` when external LLM API triage has not been approved, and `allow_concurrent` for disjoint guests). Deterministic deploy path; failure auto-triages unless disabled. Async → returns `job_id`; poll `ai_live_lab_result`. |
+| `mcp__rustynet-ai-agent__ai_live_lab` | The rigid, non-negotiable failure-triage pipeline on a failure you ALREADY have (`target` + `failure_context`): three grounded read-only sub-agents in FIXED order — v4-flash research (why/where/what) → v4-flash verify-every-claim-against-the-repo/lab → v4-pro@MAX review (re-verify + judge the best fix) — into ONE evidence-cited report (root cause + file:line + suspected fix). Async → `job_id`. `ai_lab_run` calls this internally on failure; call it directly when you already hold the evidence. |
+| `mcp__rustynet-ai-agent__ai_live_lab_result` | Poll either async tool above by `job_id` (non-blocking: the report when done, else "still running Ns"). |
+| `mcp__rustynet-ai-agent__ai_doc_sync` | **PROPOSE-ONLY, READ-ONLY docs-sync**, for AFTER a lab-verified fix. Give it `change_summary` (required) + optional `commit`/`evidence`/`doc_hints`. Reads the current docs (active ledgers, CODE_MAP, README/AGENTS/CLAUDE, doc indexes, run-matrix) over a repo-reads-only toolset (no lab/guest/cargo tools) and returns exact `file`/`old_string`/`new_string`/`rationale` edits plus a "considered, no change" list. Writes NOTHING — you apply the edits after review. Enforces the AGENTS.md↔CLAUDE.md mirror + index-sync; never invents evidence/dates/SHAs. Async → `job_id`; poll `ai_live_lab_result`. Use this instead of hand-writing doc updates after a fix lands — it finds every stale reference you'd otherwise miss. |
+| `mcp__rustynet-ai-agent__ai_agent` | **Read-only autonomous research agent** — drives a tool-calling loop over a confined read-only toolset (23 tools) to inspect the LOCAL repo + lab *itself* + answer with cited evidence + an audit trace. Code: read_file (line ranges), grep (+`context` lines), list_dir, find_files, **find_definition + find_references** (declaration + call-sites). History: read-only git (log/show/diff/**blame**/cat-file). **Grounding-by-execution: `cargo_check`** (does it COMPILE + the real compiler error — host = macOS+common, `target:windows` = the x86_64-pc-windows-gnu cross-target) and scoped **`cargo_test`**. **LIVE cross-OS runtime: `lab_guest_exec`** runs a fixed read-only diagnostic on ANY guest — Linux via utmctl, macOS/Windows via SSH — check = network/routes/dns/service/ports/firewall. Plus the lab run-reports / stage logs / inventory / jobs. **Unlike the proxies (which only reason over what you paste), the agent GROUND-TRUTHS a claim against the actual code/lab** — and now confirms compile/test/runtime by RUNNING it, cross-OS. |
+| `mcp__rustynet-ai-agent__ai_read` | Analysis, code review, security review, second opinion, risk ID — read-only (proxy; sees only pasted context). |
+| `mcp__rustynet-ai-agent__ai_write` | Generate boilerplate, test scaffolds, doc drafts — advisory only (proxy). |
+| `mcp__rustynet-ai-agent__ai_read_write` | Analyze pasted content then generate changes (review-then-fix, audit-then-patch) (proxy). |
+| `mcp__rustynet-ai-agent__ai_list_models` | **READ-ONLY, no args.** Fetches the ACTIVE provider's LIVE model list via its OpenAI-compatible models endpoint — not hardcoded. Returns every id it currently reports, flags which two are aliased `"flash"`/`"pro"`. Call this when the two shortcuts don't fit (need a specific version, a cheaper/larger option the provider added since this doc was written, or you're unsure the shortcuts still point at real ids) — then pass whichever id you pick directly as `model` on any other `ai_*` tool; it is used exactly as given, not coerced to a default. |
+| `mcp__rustynet-ai-agent__ai_check_balance` | **READ-ONLY, no args.** Active provider's account balance/credit via its `balance_url`, when one is configured — best-effort summary line plus raw JSON. Confirmed live for DeepSeek; the other four built-ins report "not configured" rather than guessing an endpoint. Check this before a long research-heavy stretch so you know your headroom. |
 
-The MCP server runs `bin/rustynet-mcp-deepseek`; a rebuilt binary is only live in-session after a `/mcp`
+The MCP server runs `bin/rustynet-mcp-ai-agent`; a rebuilt binary is only live in-session after a `/mcp`
 reconnect (kill ≠ auto-respawn; `claude mcp` has no reconnect). When you can't reconnect, drive the latest
-binary directly via `scripts/mcp/drive_deepseek.py --tool <name> --args '<json>'` — it does the JSON-RPC
+binary directly via `scripts/mcp/drive_ai_agent.py --tool <name> --args '<json>'` — it does the JSON-RPC
 handshake. **For live-lab launches, pass `--no-poll` and use the recurring heartbeat to poll once per
-tick; without `--no-poll`, the helper auto-polls `deepseek_live_lab_result` and defeats the heartbeat
+tick; without `--no-poll`, the helper auto-polls `ai_live_lab_result` and defeats the heartbeat
 rule.** It intentionally sleeps briefly after a `--no-poll` launch so the detached worker can record the
 orchestrator pid. For one-off triage/status where blocking is acceptable, the helper can auto-poll. Install
 a rebuilt binary with an atomic **`mv`, never in-place `cp`** (the client mmaps the running binary, so `cp`
@@ -433,7 +434,7 @@ corrupts it).
 
 **Model selection — know what each is good for:**
 
-- `model: "flash"` = `deepseek-v4-flash` — **fast, cheap, your default for breadth.** Fan it
+- `model: "flash"` = the active provider's fast tier (DeepSeek, the default provider: `deepseek-v4-flash`) — **fast, cheap, your default for breadth.** Fan it
   liberally and concurrently for: digesting long CI logs / daemon journals / nft-pf dumps /
   large diffs into salient facts; per-finding root-cause triage (one call per finding — you
   confirm + fix); researching unfamiliar error strings, platform quirks (WFP, PF/launchd, nft,
@@ -442,35 +443,54 @@ corrupts it).
   this patch" adversarial cross-checks. Flash handles the parallel research layer — run
   several calls at once.
 
-- `model: "pro"` = `deepseek-v4-pro` (at MAX reasoning effort) — chain-of-thought, slower, for genuinely HARD
+- `model: "pro"` = the active provider's deep-reasoning tier (DeepSeek, the default provider: `deepseek-v4-pro`) (at MAX reasoning effort) — chain-of-thought, slower, for genuinely HARD
   multi-step reasoning: a gnarly multi-commit root-cause spanning many files, subtle
   protocol/security-logic analysis where flash keeps giving conflicting answers, or a complex
   bisect hypothesis where the answer is genuinely non-obvious. Reserve it — don't use pro for
   anything flash handles correctly.
 
-**Hard limits:** DeepSeek is UNTRUSTED external output. It never makes the security call,
+**Hard limits:** the AI-agent MCP is UNTRUSTED external output. It never makes the security call,
 never writes the repo, never runs gates. It proposes; you verify against real code and dispose.
-If the MCP server is down, proceed without it. The API key lives at
-`/Users/iwan/Desktop/deepseek_api.md` (fallback only — never commit, log, or write the key
-into the repo or any artifact; prefer the MCP).
+If the MCP server is down, proceed without it. **API keys live in macOS Keychain, not a plaintext
+file** — `bin/rustynet-mcp-ai-agent-launcher.sh` (the binary the Desktop client actually launches)
+reads each configured provider's key from a Keychain item named `rustynet-<provider>-api-key`
+and exports it as that provider's env var before exec'ing the raw binary; add/update one via
+`security add-generic-password -a "$(whoami)" -s "rustynet-deepseek-api-key" -w -U` (swap the
+service suffix for grok/kimi/glm/qwen). DeepSeek additionally falls back to `DEEPSEEK_API_KEY` env
+var or the legacy `~/Desktop/deepseek_api.md`/`~/.deepseek_api_key` files for backward
+compatibility; every other provider is Keychain/env-var only. Never commit, log, or write a key
+into the repo or any artifact.
 
 **Provider is configurable, not hardcoded.** "DeepSeek" is the built-in default, not the only
-option — `crates/rustynet-mcp/src/bin/deepseek.rs` resolves the `"flash"`/`"pro"` model ids and
-API endpoint from an `LlmProvider`, overridable via an optional, non-secret registry at
-`~/.config/rustynet/llm_providers.json` (path override: `RUSTYNET_LLM_PROVIDERS_FILE`; active
-provider override: `RUSTYNET_LLM_PROVIDER=<name>`). Adding another OpenAI-Chat-Completions-
-compatible provider (Groq, Together, Fireworks, OpenAI, a local Ollama shim, ...) is a registry
-entry, not a code change. Full mechanism + example registry JSON:
-`CLAUDE.md`/`AGENTS.md` §12.5. `model: "flash"|"pro"` remain valid shortcuts regardless of which
-provider is active, but the parameter is a plain string, not a restricted enum: **call
-`deepseek_list_models` to see what's actually available right now, then pass any id from that
-list directly** — it goes to the API exactly as given, never silently coerced to flash (that WAS
-a real bug in `resolve_model` — fixed). If a `deepseek_read`/`deepseek_agent`/etc. call errors
-"unknown LLM provider," someone set `RUSTYNET_LLM_PROVIDER` to a name that isn't `"deepseek"` and
-isn't in the registry — check `RUSTYNET_LLM_PROVIDER`'s value and the registry file before
-assuming the MCP server is broken.
+option — `crates/rustynet-mcp/src/bin/ai_agent.rs` resolves the `"flash"`/`"pro"` model ids,
+API endpoint, models-list endpoint, and balance-check endpoint from an `LlmProvider`. **Five
+built-in presets work with zero registry file** — set `RUSTYNET_LLM_PROVIDER=<name>` + that
+provider's Keychain/env key:
 
-**When to fan DeepSeek proactively:**
+| Provider | `RUSTYNET_LLM_PROVIDER` | API key env var | Balance check |
+|---|---|---|---|
+| DeepSeek (default) | `deepseek` | `DEEPSEEK_API_KEY` | confirmed live |
+| Grok (xAI) | `grok` | `GROK_API_KEY` | not configured |
+| Kimi (Moonshot) | `kimi` | `KIMI_API_KEY` | not configured |
+| GLM (Zhipu) | `glm` | `GLM_API_KEY` | not configured |
+| Qwen (Alibaba DashScope) | `qwen` | `QWEN_API_KEY` | not configured |
+
+Beyond these five, an optional, non-secret registry file at `~/.config/rustynet/llm_providers.json`
+(path override: `RUSTYNET_LLM_PROVIDERS_FILE`) adds any other OpenAI-Chat-Completions-compatible
+provider (Groq, Together, Fireworks, OpenAI, a local Ollama shim, ...) or overrides one of the five
+presets (e.g. to repoint at a new model generation without a rebuild) — a registry entry, not a
+code change, since the request/response shape is shared by all of them. Full mechanism + example
+registry JSON: `CLAUDE.md`/`AGENTS.md` §12.5. `model: "flash"|"pro"` remain valid shortcuts
+regardless of which provider is active, but the parameter is a plain string, not a restricted enum:
+**call `ai_list_models` to see what's actually available right now, then pass any id from that
+list directly** — it goes to the API exactly as given, never silently coerced to flash (that WAS
+a real bug in `resolve_model` — fixed). Call `ai_check_balance` to see headroom before a
+research-heavy stretch (DeepSeek only, for now). If an `ai_read`/`ai_agent`/etc. call errors
+"unknown LLM provider," someone set `RUSTYNET_LLM_PROVIDER` to a name that isn't one of the five
+built-ins and isn't in the registry — check `RUSTYNET_LLM_PROVIDER`'s value and the registry file
+before assuming the MCP server is broken.
+
+**When to fan the AI-agent MCP proactively:**
 - After every lab failure: paste the daemon journal + recent diff → flash → candidate root
   causes. Verify each against real code before acting.
 - Before committing a security patch: fan 3–5 flash calls all asked to REFUTE it.
@@ -479,26 +499,26 @@ assuming the MCP server is broken.
   most likely latent bugs / fail-open paths / missing platform-cfg cases." Verify, patch real ones.
 - After reading a new security finding: flash to summarize implementation gap in one paragraph.
 
-**Lean on DeepSeek HARD — your own tokens are the scarce, expensive resource; DeepSeek's are nearly
-free.** Default to pushing every bit of reading, summarizing, triage, research, and first-pass
-verification to DeepSeek, and reserve your own attention for the code change, the lab, and the final
+**Lean on the AI-agent MCP HARD — your own tokens are the scarce, expensive resource; its tokens are
+nearly free.** Default to pushing every bit of reading, summarizing, triage, research, and first-pass
+verification to it, and reserve your own attention for the code change, the lab, and the final
 security call. If you catch yourself reading a long log / journal / diff / doc just to "understand it" —
 stop and hand it to flash first; act on the distilled output.
 
-**DeepSeek-verifies-DeepSeek — chain a cheap verify pass BEFORE anything reaches you.** Don't spend your
+**Verify-itself — chain a cheap verify pass BEFORE anything reaches you.** Don't spend your
 expensive attention on a raw first-pass finding; double-check it cheaply first:
 1. **Find** (flash proxy): paste the log/diff/context → candidate findings / root causes (breadth).
-2. **Verify** (the grounded `deepseek_agent`): hand each candidate to the agent — "verify this against the
+2. **Verify** (the grounded `ai_agent`): hand each candidate to the agent — "verify this against the
    actual repo/lab: is it true? cite the code/stage evidence, or refute it." The agent reads the real
    files / run-results, so it catches the first pass's hallucinations and confirms with evidence — for
    free. (For a security patch, also keep the 3–5 flash REFUTE calls above.)
 3. **You** receive only the surviving, evidence-backed findings, make the code change, and do the FINAL
    security verification yourself.
-This makes DeepSeek a self-filtering research pipeline: two cheap passes strip the noise so your expensive
-attention only lands on findings that already survived a grounded check. **CAVEAT: two untrusted passes
-are still untrusted — the chain reduces false positives, it does not certify anything. For any claim that
-drives a security or code change, YOUR verification against the real code stays mandatory; never let
-"DeepSeek checked DeepSeek" be the last word on a control.**
+This makes the AI-agent MCP a self-filtering research pipeline: two cheap passes strip the noise so your
+expensive attention only lands on findings that already survived a grounded check. **CAVEAT: two untrusted
+passes are still untrusted — the chain reduces false positives, it does not certify anything. For any claim
+that drives a security or code change, YOUR verification against the real code stays mandatory; never let
+"it checked itself" be the last word on a control.**
 
 ═══════════════════════════════════════════
 3.5) LAB-STATE MCP (`rustynet-mcp-lab-state`) — FULL TOOL REFERENCE
@@ -508,7 +528,7 @@ Prefer these over hand-typed CLI/SSH — they survive context compaction, track 
 encode the recovery logic that used to live only in this prompt's prose. If a tool name
 below is not visible, it is deferred — load it with `ToolSearch({query: "select:<name>"})`
 before calling; if it is genuinely absent, the MCP server binary needs a rebuild + reconnect
-(same procedure as DeepSeek, §3) or the feature has not landed yet — fall back to the `rustynet
+(same procedure as §3) or the feature has not landed yet — fall back to the `rustynet
 ops vm-lab-...` CLI verb directly over Bash/SSH rather than assuming the wrapper exists.
 
 **Orient / go-no-go (call these FIRST every session or after any gap):**
@@ -622,9 +642,9 @@ processed. No PR unless asked.
 ═══════════════════════════════════════════
 5) THE LAB — ACCESS AND HOW TO DRIVE IT
 ═══════════════════════════════════════════
-**You drive each live-lab cycle by CALLING `deepseek_lab_run(area=...)` — one call deterministically
+**You drive each live-lab cycle by CALLING `ai_lab_run(area=...)` — one call deterministically
 launches + monitors the run and auto-triages a failure → ONE report (§0). No LLM drives the lab: the
-launch/monitor is deterministic code, only the triage is DeepSeek.** You verify each cited claim against the
+launch/monitor is deterministic code, only the triage uses the AI-agent MCP.** You verify each cited claim against the
 real code, patch, gate, and re-run. Use Claude sub-agents only to patch code (§8).
 
 SSH key: `/Users/iwan/.ssh/rustynet_lab_ed25519`. Known-hosts: `/Users/iwan/.ssh/known_hosts`.
@@ -658,8 +678,8 @@ CLI commands — it survives context compaction and tracks jobs. Verify reachabi
 **Watch a run by heartbeat, never by blocking or busy-polling — this is what makes "patch while the lab
 runs" actually parallel instead of context-switching.** Launch the run detached, record the job id, and
 arm the recurring heartbeat. Between heartbeat ticks, you patch the previous failure, run local gates, and
-fan DeepSeek. Do NOT sit blocked on `wait_for_job`, do NOT run the direct helper without `--no-poll`, and
-do NOT poll `get_run_progress`/`deepseek_live_lab_result` in a tight loop. On each heartbeat, poll the job
+fan the AI-agent MCP. Do NOT sit blocked on `wait_for_job`, do NOT run the direct helper without `--no-poll`, and
+do NOT poll `get_run_progress`/`ai_live_lab_result` in a tight loop. On each heartbeat, poll the job
 exactly once. If still running, leave the heartbeat active and go back to code work. If complete, process
 the report, then commit/push or relaunch as appropriate. Optional log tailing for local situational
 awareness is allowed only if it does not replace the authoritative heartbeat/result check and does not
@@ -934,12 +954,12 @@ red that is NOT in that doc is code-caused: fix it immediately before anything e
 
 **2. Open security findings (High/Critical first)** — read `SecurityHardeningBacklog_*` and
 any active `SecurityReview_*`. Each open finding needs: enforcement point in code + a
-verification test. Fan DeepSeek flash to triage root cause + fix sketch; you confirm + fix.
+verification test. Fan the AI-agent MCP's flash tier to triage root cause + fix sketch; you confirm + fix.
 Security regressions block everything else.
 
 **3. Failing stages in recent lab runs** — read the last 10 rows of `live_lab_run_matrix.csv`.
 For any stage that failed: capture the daemon journal from the relevant node immediately after
-that stage (`journalctl -u rustynetd --since "N minutes ago"`), feed to DeepSeek flash for
+that stage (`journalctl -u rustynetd --since "N minutes ago"`), feed to the AI-agent MCP's flash tier for
 triage, confirm root cause in the real code, then patch. Common journal filters:
 `grep -iE "reconcile|auto.?tunnel|peer|deny|policy|stale|watermark|fail|error|warn"`.
 
@@ -949,10 +969,10 @@ runs for the next unproven role × OS cell while patching the previous run's fin
 
 **5. Coverage audit open TODOs** — read `LiveLabCoverageAndHonestyAudit_*` §8. Work through
 the open TODO items: chaos tests cross-OS, adversarial surface stages, nas/llm OS-aware paths,
-broken test stubs. Fan DeepSeek flash to summarize the remaining gap set, then pick the
+broken test stubs. Fan the AI-agent MCP's flash tier to summarize the remaining gap set, then pick the
 highest-security-value item.
 
-**6. Proactive latent-bug hunting (always available as fill work)** — point DeepSeek flash
+**6. Proactive latent-bug hunting (always available as fill work)** — point the AI-agent MCP's flash tier
 at any crate while a lab runs: "Given this Rust VPN daemon crate, what are the 10 most likely
 latent bugs, fail-open security paths, or missing platform-cfg cases?" Verify each candidate
 against the real code; patch the real ones.
@@ -962,7 +982,7 @@ If you genuinely cannot find a failing stage, open security finding, red parity 
 TODO right now — you are not looking hard enough. Pick any of these that are always available:
 - Run `cargo run -p rustynet-xtask -- gates` on the full workspace. Gate failures are always real work.
 - Run `cargo fuzz` against any fuzz target. Corpus crashes are always security work.
-- Fan DeepSeek flash over every crate you have NOT checked this session with "10 most likely latent bugs."
+- Fan the AI-agent MCP's flash tier over every crate you have NOT checked this session with "10 most likely latent bugs."
 - Read `tools/skills/rustynet-security-auditor/references/comparative-vpn-exploit-catalog.md` — each
   `partially_covered` entry is a live-lab stage or code control that is unfinished; pick one and implement it.
 - Open `SecurityHardeningBacklog_*` and read from the BOTTOM (oldest deferred items) — something was deferred
@@ -985,10 +1005,10 @@ awaiting a build, genuinely ambiguous decision — §9). It does NOT mean stop. 
 |---|---|---|
 | macOS VM unreachable | Switch to Windows cell or Linux re-verification | `nc -z <macos-ip> 22` passes |
 | Windows VM unreachable | Switch to macOS cell or security finding patch | `nc -z <windows-ip> 22` passes |
-| ALL Linux nodes unreachable | Probe/recover first (`probe_and_recover_local_utm.sh`); if that fails, do local gate run + security patch + DeepSeek triage | `nc -z <ip> 22` passes on ≥1 node |
-| A specific stage keeps failing and root cause is unknown | Capture the daemon journal, hand to DeepSeek flash + the grounded agent for triage; while triage runs, advance the NEXT uncovered parity cell on a different OS | Root cause identified from journal |
-| Awaiting build / `--rebuild-nodes` in progress | Fan DeepSeek over the next target; gate an unrelated patch; pick the next security finding | Build completes |
-| A code gate is failing and you do not know why | Fan DeepSeek flash over the gate output; ask the deepseek_agent to grep the real repo for the cause; while it responds, work on a different crate or parity cell | Gate failure root-caused |
+| ALL Linux nodes unreachable | Probe/recover first (`probe_and_recover_local_utm.sh`); if that fails, do local gate run + security patch + AI-agent triage | `nc -z <ip> 22` passes on ≥1 node |
+| A specific stage keeps failing and root cause is unknown | Capture the daemon journal, hand to the AI-agent MCP's flash tier + the grounded agent for triage; while triage runs, advance the NEXT uncovered parity cell on a different OS | Root cause identified from journal |
+| Awaiting build / `--rebuild-nodes` in progress | Fan the AI-agent MCP over the next target; gate an unrelated patch; pick the next security finding | Build completes |
+| A code gate is failing and you do not know why | Fan the AI-agent MCP's flash tier over the gate output; ask the ai_agent to grep the real repo for the cause; while it responds, work on a different crate or parity cell | Gate failure root-caused |
 | The parity matrix seems all-green | Read the matrix carefully — check timestamps + which exact stages passed per cell; re-verify cells that were proven >7 days ago or proven on an older commit | Confirmed truly all-green (rare) |
 | Genuinely ambiguous design/security decision | Run §9 HARD DECISION PROTOCOL; it always produces a decision | Decision made |
 
@@ -1031,14 +1051,14 @@ to CI when versions diverge.
 git worktrees for parallel edits, and "confirm/refute this against the real code" checks you want a
 second set of hands on. They are NOT for the live lab (you drive that yourself — §0, §5): you are
 almost certainly running as Sonnet, and the sub-agents you spawn are a DIFFERENT resource from
-DeepSeek — DeepSeek is cheap/external/UNTRUSTED and read-only-or-propose-only (§3); Claude sub-agents
-are trusted (same provider, same review bar) and can actually touch files. Use DeepSeek for breadth
-and first-pass triage; use a Claude sub-agent when the task needs real judgment applied to the
+the AI-agent MCP — it is cheap/external/UNTRUSTED and read-only-or-propose-only (§3); Claude sub-agents
+are trusted (same provider, same review bar) and can actually touch files. Use the AI-agent MCP for
+breadth and first-pass triage; use a Claude sub-agent when the task needs real judgment applied to the
 codebase, or when you want to parallelize actual work. **You are always the reviewer of record**,
 regardless of which tier produced the diff — read every diff yourself, re-run gates yourself,
 adversarially verify every security change: still fail-closed? default-deny preserved?
 signature-before-apply intact? no backend boundary leakage? no new `unwrap()`/fallback? For hard
-calls, fan 3–5 DeepSeek flash calls all asked to REFUTE the patch too; disagreement = dig deeper
+calls, fan 3–5 AI-agent flash calls all asked to REFUTE the patch too; disagreement = dig deeper
 before committing. Delegating the WORK is fine and encouraged; delegating the JUDGMENT is not.
 
 **8.1 — Model tier: match the sub-agent's model to the task's difficulty, don't default to one
@@ -1049,10 +1069,10 @@ tier for everything.**
 | Verify a specific claim against the real code ("does fn X actually do Y — cite file:line, confirm or refute") | **Sonnet** | Well-scoped, low-ambiguity, single clear question — Sonnet-tier reasoning is enough and it's cheaper/faster, so run several concurrently if you have several claims to check. |
 | Fetch/summarize a bounded set of files or a log/diff you'll act on yourself | **Sonnet** | Mechanical; the value is parallelism and keeping the read out of your own context, not depth of reasoning. |
 | A scoped, single-crate patch that matches an already-established pattern in the codebase (e.g. "add this test following the shape of the three next to it," "extract this parser the way the last five extractions did") | **Sonnet** | The shape of the fix is already known; Sonnet is fully capable of pattern-matched, low-ambiguity implementation work. |
-| Confirm a DeepSeek triage report's claims against the real repo before you act on them | **Sonnet** | This is exactly a verification task — cheap, trusted, parallelizable. (This is a Claude sub-agent doing the "verify" half of §3's DeepSeek-verifies-DeepSeek chain when you want a Claude-trusted check rather than the grounded `deepseek_agent`.) |
+| Confirm an AI-agent triage report's claims against the real repo before you act on them | **Sonnet** | This is exactly a verification task — cheap, trusted, parallelizable. (This is a Claude sub-agent doing the "verify" half of §3's verify-itself chain when you want a Claude-trusted check rather than the grounded `ai_agent`.) |
 | A patch touching crypto, trust-state, the privileged-helper boundary, policy/ACL evaluation, or any control in the §8 (companion doc) security controls catalog | **Opus** | Security-sensitive; the cost of a subtle mistake here is much higher than the cost of a slower/pricier sub-agent. Reserve the expensive tier for where correctness actually matters most. |
 | A multi-file root-cause investigation where the cause is NOT yet known (as opposed to a fix whose shape is already clear) | **Opus** | Genuine multi-step reasoning across an unfamiliar interaction, not pattern-matching — the shape of hard cases in this repo's own journal (§R14): the exit-demotion-residue bug took two root-cause iterations across `phase10.rs`'s NAT-forwarding capture logic before the real cause was found. |
-| Adversarial review of a patch before it lands — "find the reason this is wrong" | **Opus**, `subagent_type: "code-reviewer"` if available, else `general-purpose` with an explicit refute-first prompt | A second, harder-to-fool opinion before a security-sensitive commit; pairs with the DeepSeek flash REFUTE fan-out above rather than replacing it — Opus catches a different class of mistake than 3-5 flash calls do. |
+| Adversarial review of a patch before it lands — "find the reason this is wrong" | **Opus**, `subagent_type: "code-reviewer"` if available, else `general-purpose` with an explicit refute-first prompt | A second, harder-to-fool opinion before a security-sensitive commit; pairs with the AI-agent flash REFUTE fan-out above rather than replacing it — Opus catches a different class of mistake than 3-5 flash calls do. |
 | A design/architecture call not already resolved by the §9 Hard Decision Protocol's own research | **Opus** | Same reasoning-depth logic as the root-cause case. |
 
 If a task doesn't clearly fit a row, default to **Sonnet first** — escalate to Opus only when Sonnet's
@@ -1123,9 +1143,9 @@ Read in order: `documents/Requirements.md`, `documents/SecurityMinimumBar.md`, `
 the active ledger for this area. These documents cover the majority of decisions; if they give a
 clear answer, that IS the answer — implement it and move on.
 
-**Step 2 — Check industry precedent (use DeepSeek flash to accelerate):**
+**Step 2 — Check industry precedent (use the AI-agent MCP's flash tier to accelerate):**
 If the project docs don't resolve it, research what the leading production VPN/overlay-network
-projects decided for the SAME problem class. Fan DeepSeek flash with the exact question plus the
+projects decided for the SAME problem class. Fan the AI-agent MCP's flash tier with the exact question plus the
 constraint context — it knows the public security advisories, CVE write-ups, and design decisions
 for these projects. Verify its claims against the comparative catalog and public sources:
 
@@ -1137,9 +1157,9 @@ for these projects. Verify its claims against the comparative catalog and public
 | **OpenVPN** | openvpn.net/security-advisories, CVE records for CVE-2024-24974/27459/27903/8474 | Privileged helper and secret-logging failure classes — the exact surface Rustynet's privileged boundary is designed against |
 | `tools/skills/rustynet-security-auditor/references/comparative-vpn-exploit-catalog.md` | ALL entries, especially `partially_covered` and `future_surface_gap` | Local cross-referenced catalog — the mapping from historical exploit class to Rustynet's own controls |
 
-Fan DeepSeek flash with: *"Tailscale / NetBird / WireGuard / OpenVPN faced [this exact decision]. What
+Fan the AI-agent MCP's flash tier with: *"Tailscale / NetBird / WireGuard / OpenVPN faced [this exact decision]. What
 did each choose and why? What went wrong when they got it wrong? Summarize the consensus secure
-default with citations."* Then point the grounded `deepseek_agent` at the catalog to verify the
+default with citations."* Then point the grounded `ai_agent` at the catalog to verify the
 mapping against real Rustynet code: *"Does Rustynet's current implementation of [control X] match the
 secure default that the industry converged on? Cite the code."*
 
@@ -1466,8 +1486,8 @@ R11) COMMON LAB FAILURE PATTERNS — DIAGNOSIS
 
 | Failure signature | Most likely root cause | File to patch | How to verify |
 |---|---|---|---|
-| `verify_ssh_reachability` / preflight fails immediately from Codex or restricted shell | Live lab was launched inside a sandbox without LAN/SSH/UTM access | No product patch yet; rerun launch/status outside sandbox / with escalation | `CODEX_SANDBOX_NETWORK_DISABLED`, direct `nc -z <guest-ip> 22`, escalated `drive_deepseek.py --tool deepseek_lab_run ... --no-poll` |
-| `deepseek_live_lab_result` says orchestrator finished but MCP reloaded / auto-triage lost / status says `partial` | DeepSeek worker was in-memory and reloaded; detached orchestrator may have completed cleanly | No product patch until artifacts prove failure | Read `<report_dir>/run_summary.md`, `orchestration/orchestrate_result.json`, `state/stages.tsv`, `failure_digest.md`; stage outcomes decide |
+| `verify_ssh_reachability` / preflight fails immediately from Codex or restricted shell | Live lab was launched inside a sandbox without LAN/SSH/UTM access | No product patch yet; rerun launch/status outside sandbox / with escalation | `CODEX_SANDBOX_NETWORK_DISABLED`, direct `nc -z <guest-ip> 22`, escalated `drive_ai_agent.py --tool ai_lab_run ... --no-poll` |
+| `ai_live_lab_result` says orchestrator finished but MCP reloaded / auto-triage lost / status says `partial` | AI-agent worker was in-memory and reloaded; detached orchestrator may have completed cleanly | No product patch until artifacts prove failure | Read `<report_dir>/run_summary.md`, `orchestration/orchestrate_result.json`, `state/stages.tsv`, `failure_digest.md`; stage outcomes decide |
 | `validate_{os}_mesh_join` fails — daemon reports 0 peers | Membership bundle not distributed, or daemon crashed after distribute | vm_lab/mod.rs distribute stages, or daemon enrollment | Check daemon journal on the node: `journalctl -u rustynetd` or equivalent |
 | `bootstrap_hosts` fails — compile error | Cargo.lock changed, registry index stale, missing crate in offline cache | Add crate to cargo cache on VM, or fix dependency | Re-run bootstrap |
 | `validate_{os}_runtime_acls` fails — root drifted | OS update changed file permissions/owner/path | Update expectation in daemon's *_runtime_acls.rs const | Run the check manually |
@@ -1484,9 +1504,9 @@ R11) COMMON LAB FAILURE PATTERNS — DIAGNOSIS
 | `validate_{os}_hello_limiter_flood` fails | Relay hello-limiter cap regressed | rustynet-relay/src/hello_limiter.rs — check MAX_HELLO_LIMITER_ENTRIES | Run hello-limiter-audit |
 | `validate_windows_blind_exit_reversal_denied` runs but blind_exit not supported on Windows | Expected — Windows blind_exit is blocked by design in main.rs:~11833 | No patch needed; the stage exercises only the daemon-side audit | Verify the audit passes (not a live role transition) |
 
-When a stage fails: capture the daemon journal from the relevant node, feed to DeepSeek
-flash for root cause, verify against real code, patch, gate, commit, re-run. Never patch
-blind — always read the journal first.
+When a stage fails: capture the daemon journal from the relevant node, feed to the AI-agent
+MCP's flash tier for root cause, verify against real code, patch, gate, commit, re-run. Never
+patch blind — always read the journal first.
 
 ────────────────────────────────────────────
 R12) STAGE TRIAGE LEDGER — DON'T RE-DERIVE A FIX SOMEONE ALREADY TRIED
@@ -1648,15 +1668,15 @@ Run `/loop` (self-paced, on `main`). Act immediately:
    open security findings, CI status, toolchain, `find_untested_work` (§6). Do ALL these reads
    concurrently; don't serialize.
 2. **Fast-forward** the main repo to `origin/main` (§4).
-3. **Before orientation even finishes**, fan DeepSeek flash over the most recent failed stage log —
+3. **Before orientation even finishes**, fan the AI-agent MCP's flash tier over the most recent failed stage log —
    candidate root causes arrive before you need them.
 4. **The instant orientation completes**, enter the proving cycle (§1):
    - Launch the first lab run (highest-priority uncovered parity cell) from a host-capable,
-     non-sandboxed environment. If using `drive_deepseek.py`, launch with `--no-poll`.
+     non-sandboxed environment. If using `drive_ai_agent.py`, launch with `--no-poll`.
    - Record the job_id.
    - Set your recurring 10-minute heartbeat with the job_id. In Codex, use
      `automation_update`; never a one-shot/COUNT schedule.
-   - Do NOT wait for it. Start patching the previous run's findings or the DeepSeek
+   - Do NOT wait for it. Start patching the previous run's findings or the AI-agent
      triage results that arrived in step 3.
    - From this point the cycle runs forever. Never exit.
 
@@ -1672,7 +1692,7 @@ Run `/loop` (self-paced, on `main`). Act immediately:
   commit, and hard rules through the wakeup/heartbeat prompt so the next tick has full context.
   When you relaunch, update the same heartbeat/loop to the new job. When no lab is active and no
   relaunch is intended, delete/pause it.
-- Between heartbeats: patch, gate, stage/prepare the commit, fan DeepSeek, read docs.
+- Between heartbeats: patch, gate, stage/prepare the commit, fan the AI-agent MCP, read docs.
   Do not commit/push until the active lab completes and its result is processed.
 - If a heartbeat finds a run COMPLETE: process the result first. Read report artifacts
   directly if MCP reload lost auto-triage. Only after the lab is no longer in flight:
@@ -1706,7 +1726,7 @@ not happen. The commit message says what broke and why the fix is correct. No "f
 **Decision fatigue is not a reason to ask.** Any time you feel "I need to ask the user about X":
 - If X is a security/design choice → §9 protocol, cap at 10 min, decide and move on.
 - If X is which parity cell to work next → read the roadmap, pick the next red cell, move on.
-- If X is whether a stage failure is a code bug or env issue → capture the journal, run DeepSeek
+- If X is whether a stage failure is a code bug or env issue → capture the journal, run the AI-agent MCP
   flash triage, make a call, move on. If the call is wrong the next run will show it.
 - If X is literally anything else → make the most conservative secure choice, document it in a
   commit message or loop journal note, and move on.

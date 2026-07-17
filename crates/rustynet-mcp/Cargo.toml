@@ -18,8 +18,8 @@ name = "rustynet-mcp-lab-state"
 path = "src/bin/lab_state.rs"
 
 [[bin]]
-name = "rustynet-mcp-deepseek"
-path = "src/bin/deepseek.rs"
+name = "rustynet-mcp-ai-agent"
+path = "src/bin/ai_agent.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

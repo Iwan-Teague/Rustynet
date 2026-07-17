@@ -442,47 +442,59 @@ Fedora/Ubuntu/Rocky), so do NOT chase it per-VM or "fix" it in the inventory.
 - Interactive wizard: `./start.sh`.
 - Rust-native operator menu: `rustynet operator menu`.
 
-### 12.5 Research & Triage — the DeepSeek MCP (`rustynet-mcp-deepseek`)
+### 12.5 Research & Triage — the AI-Agent MCP (`rustynet-mcp-ai-agent`)
 
-DeepSeek is the **research / triage / summarizing layer**: offload the
+The AI-agent MCP is the **research / triage / summarizing layer**: offload the
 token-heavy *reading* to it and reserve your own (expensive) context for the
 code change, the security call, and the live lab. If you catch yourself reading
-a long log / journal / diff / doc just to understand it, hand it to DeepSeek
-first and act on the distilled output.
+a long log / journal / diff / doc just to understand it, hand it to the model
+first and act on the distilled output. It calls whichever LLM provider is
+configured — **DeepSeek is the default**, with **Grok (xAI), Kimi (Moonshot),
+GLM (Zhipu), and Qwen (Alibaba DashScope)** as additional built-in presets
+(§ provider config below); DeepSeek is used throughout this section's examples
+because it's the default, not because the other tools are DeepSeek-specific.
 
-Twelve tools (`mcp__rustynet-deepseek__*`). The first four take `prompt`, optional
+Fourteen tools (`mcp__rustynet-ai-agent__*`). The first three take `prompt`, optional
 `context`, and `model`:
-- `deepseek_read` — analysis / review / second opinion / risk ID (read-only).
-- `deepseek_write` — generate boilerplate / test scaffolds / doc drafts.
-- `deepseek_read_write` — analyze existing content, then generate (review-then-fix).
-- `deepseek_agent` — **READ-ONLY autonomous agent that GROUNDS against the actual
+- `ai_read` — analysis / review / second opinion / risk ID (read-only).
+- `ai_write` — generate boilerplate / test scaffolds / doc drafts.
+- `ai_read_write` — analyze existing content, then generate (review-then-fix).
+- `ai_agent` — **READ-ONLY autonomous agent that GROUNDS against the actual
   local repo + UTM lab.** Drives a tool-calling loop over ~20 confined read-only
   tools (read_file / grep / find_definition / git / find_files + lab_inventory /
   lab_run_status / lab_stage_log / lab_report_grep / lab_guest_exec /
   utm_vm_status / lab_node_reachable / …) and answers with cited evidence + an
   audit trace. **The three proxies see only what you paste; the agent verifies a
   claim against reality** ("does this fn really do X?", "did that stage fail
-  because Y?", "is this node reachable?"). Prefer it whenever you want DeepSeek
+  because Y?", "is this node reachable?"). Prefer it whenever you want the model
   to check the real code/lab, not opine on a pasted snippet.
 
+Two READ-ONLY discovery tools, no args:
+- `ai_list_models` — the active provider's LIVE model list via its models
+  endpoint, not hardcoded. Flags which two ids are currently aliased
+  `"flash"`/`"pro"`.
+- `ai_check_balance` — the active provider's account balance/credit, when it
+  has a `balance_url` configured. Confirmed live for DeepSeek; not every
+  provider exposes a balance API (§ provider config below).
+
 The live-lab family is standardized for simple agents. The **default loop step** is
-`deepseek_autonomous_live_lab_loop`: it reconciles stale/interrupted lab jobs,
-chooses the next run-matrix target, launches `deepseek_lab_run`, and on failure the
-run auto-triages. Use `deepseek_next_live_lab_target` when you only want to see the
-chosen target and exact `deepseek_lab_run` JSON. Use `deepseek_recover_lab_environment`
+`ai_autonomous_live_lab_loop`: it reconciles stale/interrupted lab jobs,
+chooses the next run-matrix target, launches `ai_lab_run`, and on failure the
+run auto-triages. Use `ai_next_live_lab_target` when you only want to see the
+chosen target and exact `ai_lab_run` JSON. Use `ai_recover_lab_environment`
 after an interrupted lab when the environment may be stale; it runs a stop-after-ready
-recovery job and polls through `deepseek_live_lab_result`. Use
-`deepseek_reconcile_jobs` when a stale running record blocks the singleton gate.
-Set `triage_on_failure=false` for a real lab run when external DeepSeek API triage
+recovery job and polls through `ai_live_lab_result`. Use
+`ai_reconcile_jobs` when a stale running record blocks the singleton gate.
+Set `triage_on_failure=false` for a real lab run when external LLM API triage
 has not been explicitly approved; the run returns local report/log pointers instead.
 
 The lower-level **loop driver** is:
-- `deepseek_lab_run` — **one call runs the WHOLE pipeline.** Give it an `area`
+- `ai_lab_run` — **one call runs the WHOLE pipeline.** Give it an `area`
   (e.g. "macOS relay") + optional selectors (`macos`/`windows`/`macos_vm`/
   `windows_vm`/`exit_vm`/`client_vm`/`rebuild_nodes`); a DETERMINISTIC worker
   launches the hardened orchestrator (NO LLM in the deploy/monitor path), waits,
   and on FAILURE runs the rigid triage below. Async: returns a `job_id`, poll
-  `deepseek_live_lab_result`. Singleton by default; `allow_concurrent: true` +
+  `ai_live_lab_result`. Singleton by default; `allow_concurrent: true` +
   disjoint guests (a separate `exit_vm` per run) runs the macOS↔Windows pipeline
   (≤3 overlapping). `dry_run` is a fast wiring check. On a green run, ZERO LLM
   calls — you just get PASS + evidence. To drive a FOCUSED mac/win role cell (not
@@ -510,26 +522,26 @@ The lower-level **loop driver** is:
   is spawned detached (own process group, stdout→a log file, no pipe to the MCP
   server) so an MCP-server recycle mid-run no longer SIGPIPE-kills it, and async
   jobs persist to `state/deepseek-mcp-jobs/{job_id}.json` (ids
-  `labrun-{millis}-{pid}-{seq}`) so `deepseek_live_lab_result` recovers the job
+  `labrun-{millis}-{pid}-{seq}`) so `ai_live_lab_result` recovers the job
   after a reload.
-- `deepseek_live_lab` — **the rigid, non-negotiable failure-triage pipeline** on a
+- `ai_live_lab` — **the rigid, non-negotiable failure-triage pipeline** on a
   failure you ALREADY have (hand it `target` + `failure_context`). Three grounded
-  read-only sub-agents in fixed order — v4-flash research (why/where/what) →
-  v4-flash verify-every-claim-against-the-repo/lab → v4-pro at MAX reasoning
+  read-only sub-agents in fixed order — flash-tier research (why/where/what) →
+  flash-tier verify-every-claim-against-the-repo/lab → pro-tier at MAX reasoning
   re-verify + judge-the-best-fix — into ONE evidence-cited report (root cause,
-  file:line, suspected fix). Async (job_id → poll). `deepseek_lab_run` calls this
+  file:line, suspected fix). Async (job_id → poll). `ai_lab_run` calls this
   internally on failure; call it directly when you already have the evidence.
-- `deepseek_live_lab_result` — poll either of the above by `job_id` (non-blocking:
+- `ai_live_lab_result` — poll either of the above by `job_id` (non-blocking:
   the report when done, else "still running Ns").
-- `deepseek_reconcile_jobs` — repair stale `labrun-*` records after an MCP reload,
+- `ai_reconcile_jobs` — repair stale `labrun-*` records after an MCP reload,
   killed worker, or interrupted lab so the singleton gate stops blocking.
 
 After a lab-verified fix, the **docs-sync proposer**:
-- `deepseek_doc_sync` — **PROPOSE-ONLY, READ-ONLY docs-sync.** Give it
+- `ai_doc_sync` — **PROPOSE-ONLY, READ-ONLY docs-sync.** Give it
   `change_summary` (REQUIRED: what was fixed/patched/verified) + optional `commit`
   / `evidence` (the verifying lab run id / run-matrix row / stage) / `doc_hints`
   (likely-affected docs, e.g. "CrossPlatformRoleParityPlan") / `model` / `max_steps`.
-  It runs the SAME grounded agent loop as `deepseek_agent` but on the
+  It runs the SAME grounded agent loop as `ai_agent` but on the
   **repo-reads-only** subset (read_file/list_dir/grep/find_files/find_definition/
   find_references + read-only git — NO lab/guest/cargo tools): it reads the CURRENT
   docs (active ledgers, CODE_MAP, README/AGENTS/CLAUDE, the doc indexes, the
@@ -539,11 +551,11 @@ After a lab-verified fix, the **docs-sync proposer**:
   (`documents/**` + root `README.md`/`AGENTS.md`/`CLAUDE.md`); enforces the
   AGENTS.md↔CLAUDE.md mirror + index-sync, and never invents evidence/status/dates/
   SHAs. It writes NOTHING — a human applies the edits. Async like the others:
-  returns a `job_id`; poll `deepseek_live_lab_result` for the proposal. UNTRUSTED
+  returns a `job_id`; poll `ai_live_lab_result` for the proposal. UNTRUSTED
   output — review before applying.
 
-No live-lab step writes the repo, runs gates, or makes the security call — DeepSeek
-proposes, you verify each cited claim against the real code and dispose.
+No live-lab step writes the repo, runs gates, or makes the security call — the
+model proposes, you verify each cited claim against the real code and dispose.
 
 Use it for: digesting CI logs / daemon journals / nft-pf dumps / large diffs;
 per-finding root-cause triage (one call each); researching unfamiliar errors +
@@ -553,43 +565,76 @@ platform-cfg cases"); drafting test scaffolds; and — before committing a
 security-sensitive patch — 3–5 concurrent "REFUTE this patch" cross-checks
 (disagreement = dig deeper first).
 
-Model: `model: "flash"` (deepseek-v4-flash — fast, cheap; the DEFAULT, fan
-liberally and concurrently for breadth). `model: "pro"` (deepseek-v4-pro at max
-reasoning effort — chain-of-thought, slow; reserve for genuinely hard multi-step
-root-cause / protocol-logic reasoning where flash keeps giving conflicting
-answers).
+Model: `model: "flash"` (the active provider's fast/cheap tier — DeepSeek:
+deepseek-v4-flash; the DEFAULT, fan liberally and concurrently for breadth).
+`model: "pro"` (the active provider's deep-reasoning tier — DeepSeek:
+deepseek-v4-pro at max reasoning effort — chain-of-thought, slow; reserve for
+genuinely hard multi-step root-cause / protocol-logic reasoning where flash
+keeps giving conflicting answers). Not just those two shortcuts: `model`
+accepts ANY literal model id (§ model discovery below).
 
-**Hard limits — DeepSeek output is UNTRUSTED.** It never makes the security call,
+**Hard limits — this output is UNTRUSTED.** It never makes the security call,
 never writes the repo, never runs gates. It *proposes*; you verify against the
-real code and *dispose*. A grounded "DeepSeek-verifies-DeepSeek" chain (flash
-proxy finds candidates → `deepseek_agent` confirms each against the repo/lab → you
-do the final security check) cuts false positives but **certifies nothing** — for
-any claim driving a security or code change, YOUR verification against the real
-code stays mandatory. If the server is down, proceed without it.
+real code and *dispose*. A grounded "verifies-itself" chain (flash proxy finds
+candidates → `ai_agent` confirms each against the repo/lab → you do the final
+security check) cuts false positives but **certifies nothing** — for any claim
+driving a security or code change, YOUR verification against the real code
+stays mandatory. If the server is down, proceed without it.
 
 Operational: the servers run pre-built binaries at `bin/rustynet-mcp-*` (config in
-`mcp/mcp.json`). If `deepseek_agent`/`deepseek_live_lab` is absent or stale,
-rebuild (`cargo build --release --bin rustynet-mcp-deepseek`) and install via an
+`mcp/mcp.json`). If `ai_agent`/`ai_live_lab` is absent or stale,
+rebuild (`cargo build --release --bin rustynet-mcp-ai-agent`) and install via an
 atomic **`mv`, NOT in-place `cp`** — the client keeps the running binary mmap'd,
 so `cp` truncates it in place and CORRUPTS it (symptom: the server starts but
 emits nothing). Use `cp … bin/x.new && mv -f bin/x.new bin/x`. Then reconnect the
 server (`/mcp` → reconnect, or restart the client — killing the process does NOT
 auto-respawn, and there is no `claude mcp` reconnect subcommand). When you can't
 reconnect (e.g. a remote client), drive the freshly built binary **directly over
-stdio** instead — `scripts/mcp/drive_deepseek.py --tool <name> --args '<json>'`
+stdio** instead — `scripts/mcp/drive_ai_agent.py --tool <name> --args '<json>'`
 spawns the latest binary, does the JSON-RPC handshake, calls the tool, and
-auto-polls `deepseek_live_lab_result` for the async run/triage tools, so the
-newest tools are reachable with NO client reconnect. The API key resolves from `DEEPSEEK_API_KEY` or
-`~/Desktop/deepseek_api.md`; **never commit, log, or write it into the repo or any
-artifact.**
+auto-polls `ai_live_lab_result` for the async run/triage tools, so the
+newest tools are reachable with NO client reconnect. By default it launches
+`bin/rustynet-mcp-ai-agent-launcher.sh` (override `--bin` for the raw binary or
+a `target/debug`/`target/release` build) — see the Keychain paragraph next for
+what the launcher does and why.
 
-**Provider is configurable — DeepSeek is the default, not the only option.** The two model
-tiers (`"flash"`/`"pro"`) and the API endpoint are resolved from an `LlmProvider`
-(`crates/rustynet-mcp/src/bin/deepseek.rs`), not hardcoded — DeepSeek's IDs (`deepseek-v4-flash`/
-`deepseek-v4-pro`) are the built-in default (zero configuration needed, today's behavior
-unchanged), overridable via an optional, non-secret registry file at
+**API keys live in macOS Keychain, not a plaintext file.**
+`bin/rustynet-mcp-ai-agent-launcher.sh` (the `command` the Desktop client
+actually launches — gitignored, holds no secret itself) reads each configured
+provider's key from a Keychain item named `rustynet-<provider>-api-key`
+(account = the current user) and exports it as that provider's env var before
+exec'ing the raw binary. Add/update a key:
+`security add-generic-password -a "$(whoami)" -s "rustynet-deepseek-api-key" -w -U`
+(swap the service suffix + paste the right key for grok/kimi/glm/qwen). A
+provider with no Keychain item simply has no key exported — harmless unless
+it's the active one. DeepSeek ADDITIONALLY falls back to `DEEPSEEK_API_KEY` env
+var or the legacy `~/Desktop/deepseek_api.md`/`~/.deepseek_api_key` files for
+backward compatibility; every other provider is Keychain/env-var only. **Never
+commit, log, or write a key into the repo or any artifact.**
+
+**Provider is configurable — DeepSeek is the default, not the only option.**
+The model-tier ids, API endpoint, models-list endpoint, and balance-check
+endpoint are all resolved from an `LlmProvider`
+(`crates/rustynet-mcp/src/bin/ai_agent.rs`), never hardcoded inline. **Five
+built-in presets work with zero registry file** — just set
+`RUSTYNET_LLM_PROVIDER=<name>` + that provider's key (see `built_in_provider`
+for the exact ids/endpoints; verify current ids via `ai_list_models` once a key
+is configured, since the non-DeepSeek presets are a best-effort pick, not
+independently confirmed live the way DeepSeek's are):
+
+| Provider | `RUSTYNET_LLM_PROVIDER` | API key env var | Balance check |
+|---|---|---|---|
+| DeepSeek (default) | `deepseek` | `DEEPSEEK_API_KEY` | ✅ confirmed live |
+| Grok (xAI) | `grok` | `GROK_API_KEY` | not configured |
+| Kimi (Moonshot) | `kimi` | `KIMI_API_KEY` | not configured |
+| GLM (Zhipu) | `glm` | `GLM_API_KEY` | not configured |
+| Qwen (Alibaba DashScope) | `qwen` | `QWEN_API_KEY` | not configured |
+
+Beyond these five, an optional, non-secret registry file at
 `~/.config/rustynet/llm_providers.json` (override the path with
-`RUSTYNET_LLM_PROVIDERS_FILE`):
+`RUSTYNET_LLM_PROVIDERS_FILE`) adds any other OpenAI-Chat-Completions-compatible
+provider, or overrides one of the five built-in presets (e.g. to repoint at a
+new model generation without a rebuild):
 ```json
 {
   "active": "deepseek",
@@ -606,25 +651,31 @@ unchanged), overridable via an optional, non-secret registry file at
 Switch the active provider without editing the file via `RUSTYNET_LLM_PROVIDER=<name>`. Because
 DeepSeek's Chat Completions API is OpenAI-compatible, any other OpenAI-compatible provider (Groq,
 Together, Fireworks, OpenAI itself, a local Ollama shim, ...) slots in as a registry entry — no
-code change — since the request/response shape in `DeepSeekServer::chat` is shared by all of
+code change — since the request/response shape in `AiAgentServer::chat` is shared by all of
 them; only a structurally different API (e.g. native Anthropic Messages) would need its own
 request/response mapper. **The registry file holds no secrets** — only `base_url` and the name of
-the env var holding that provider's key (`api_key_env`, defaulting to `{NAME}_API_KEY`); the key
-itself still resolves from that env var (DeepSeek additionally falls back to
-`~/Desktop/deepseek_api.md`/`~/.deepseek_api_key` for backward compatibility). An unresolvable
-`RUSTYNET_LLM_PROVIDER` value is a hard, logged error — it never silently reuses the wrong
-provider's key against the wrong URL.
+the env var holding that provider's key (`api_key_env`, defaulting to `{NAME}_API_KEY`). An
+unresolvable `RUSTYNET_LLM_PROVIDER` value is a hard, logged error — it never silently reuses the
+wrong provider's key against the wrong URL.
 
-**Models are discoverable live, not just the two hardcoded shortcuts.** `deepseek_list_models`
+**Models are discoverable live, not just the two hardcoded shortcuts.** `ai_list_models`
 calls the active provider's OpenAI-compatible `GET {models_url}` (derived by convention from
 `base_url`, or set explicitly in a registry entry) and returns every model id it currently
 reports, flagging which two are aliased `"flash"`/`"pro"`. The `model` parameter on every other
-`deepseek_*` tool is a plain string, not a restricted enum: `"flash"`/`""` and `"pro"`/`"reasoner"`
+`ai_*` tool is a plain string, not a restricted enum: `"flash"`/`""` and `"pro"`/`"reasoner"`
 remain shortcuts for the configured tiers, but ANY other string is sent to the API exactly as
-given — call `deepseek_list_models` first, then pass whichever id actually fits the task. (This
+given — call `ai_list_models` first, then pass whichever id actually fits the task. (This
 also fixed a real bug: `resolve_model` used to silently substitute the flash tier for any
 unrecognized string, so a caller that already knew a real model id got a different model with no
 error — it now passes an unrecognized string through unchanged instead.)
+
+**Balance checking, where a provider exposes it.** `ai_check_balance` calls the active
+provider's `balance_url` (no derivation convention exists for this one, unlike models_url — it
+must be set explicitly, either in `built_in_provider` or a registry entry) and returns a
+best-effort one-line summary plus the raw response. Only DeepSeek's is confirmed live
+(`GET https://api.deepseek.com/user/balance`); the other four built-ins report clearly that
+balance checking isn't configured rather than guessing at a URL. Add `balance_url` to a registry
+entry once you've confirmed the right endpoint for another provider.
 
 ## 13) Operating Checklists
 

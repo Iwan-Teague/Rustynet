@@ -188,7 +188,7 @@ section is the layer-level orientation.
 | `rustynet-operator` | Operator wizards/config (`rustynet operator menu`). |
 | `rustynet-advisor` | FIS-0005 role-placement decision support: pure MCDA scorer over per-candidate observations (`rustynet role recommend`). Domain layer; collectors live in the CLI. |
 | `rustynet-cli` | The main `rustynet` binary (`default-run = "rustynet-cli"`): `ops`, role/anchor/llm subcommands. **The lab robot — `vm-lab`, the live-lab orchestrator, and the e2e/cross-network/fresh-install `ops` surface — compiles only under the DEFAULT-OFF `vm-lab` cargo feature** (RNQ-17): the shipped release binary carries none of it, CI gates run `--all-features`, lab hosts/guests build with `--features vm-lab`. `src/bin/` also holds the large family of `live_*`, `*_gates`, `phase*`, `check_*` evidence/gate binaries the `scripts/ci/` wrappers dispatch to. |
-| `rustynet-mcp` | MCP servers: `rustynet-mcp-repo-context`, `rustynet-mcp-gate-runner`, `rustynet-mcp-lab-state`, `rustynet-mcp-deepseek`. |
+| `rustynet-mcp` | MCP servers: `rustynet-mcp-repo-context`, `rustynet-mcp-gate-runner`, `rustynet-mcp-lab-state`, `rustynet-mcp-ai-agent`. |
 | `rustynet-xtask` | The `xtask` dev runner (§10). |
 | `rustynet-netns-probe` | LAB TOOLING (not shipped): the Rust-native STUN responder + NAT mapping/filtering probes the `--node` cross-network netns simulator runs on-guest. `std`-only, offline-buildable. STUN wire is byte-pinned to `rustynetd`'s `stun_client.rs`. |
 | `rustynet-lab-monitor` | The pixelated TUI live-lab monitor. Excluded from the main workspace; build separately. |

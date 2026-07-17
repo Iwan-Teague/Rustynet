@@ -7,13 +7,17 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && /bin/pwd -P)"
-DRIVER="$REPO/scripts/mcp/drive_deepseek.py"
+DRIVER="$REPO/scripts/mcp/drive_ai_agent.py"
 if [ -n "${RUSTYNET_MCP_BIN:-}" ]; then
     BIN="$RUSTYNET_MCP_BIN"
-elif [ -x "$REPO/target/debug/rustynet-mcp-deepseek" ]; then
-    BIN="$REPO/target/debug/rustynet-mcp-deepseek"
+elif [ -x "$REPO/target/debug/rustynet-mcp-ai-agent" ]; then
+    # Development-time direct path: no Keychain injection here, so the
+    # provider's API key must already be exported in this shell.
+    BIN="$REPO/target/debug/rustynet-mcp-ai-agent"
 else
-    BIN="$REPO/bin/rustynet-mcp-deepseek"
+    # Installed path: prefer the Keychain-aware launcher over the raw binary
+    # so this works with no key exported in the shell.
+    BIN="$REPO/bin/rustynet-mcp-ai-agent-launcher.sh"
 fi
 JOBS_DIR="$REPO/state/deepseek-mcp-jobs"
 STATE_DIR="$REPO/state/opencode-loop"
@@ -255,9 +259,9 @@ poll_until_done() {
         local elapsed r
         elapsed=$(($(date +%s) - t0))
         if [ "$elapsed" -gt "$MAX_RUN_WAIT" ]; then
-            "$DRIVER" --bin "$BIN" --tool deepseek_reconcile_jobs \
+            "$DRIVER" --bin "$BIN" --tool ai_reconcile_jobs \
                 --args "{\"job_id\":\"$jid\"}" --no-poll >/dev/null 2>&1 || true
-            r=$("$DRIVER" --bin "$BIN" --tool deepseek_live_lab_result \
+            r=$("$DRIVER" --bin "$BIN" --tool ai_live_lab_result \
                 --args "{\"job_id\":\"$jid\"}" --no-poll 2>/dev/null || true)
             if [ -n "$r" ] && ! echo "$r" | grep -qi "still running"; then
                 echo "$r"; return 0
@@ -265,10 +269,10 @@ poll_until_done() {
             return 1
         fi
         if [ "$elapsed" -gt 0 ] && [ $((elapsed % 180)) -lt "$POLL" ]; then
-            "$DRIVER" --bin "$BIN" --tool deepseek_reconcile_jobs \
+            "$DRIVER" --bin "$BIN" --tool ai_reconcile_jobs \
                 --args "{\"job_id\":\"$jid\"}" --no-poll >/dev/null 2>&1 || true
         fi
-        r=$("$DRIVER" --bin "$BIN" --tool deepseek_live_lab_result \
+        r=$("$DRIVER" --bin "$BIN" --tool ai_live_lab_result \
             --args "{\"job_id\":\"$jid\"}" --no-poll 2>/dev/null) || { sleep "$POLL"; continue; }
         [ -z "$r" ] && { sleep "$POLL"; continue; }
         if echo "$r" | grep -qi "still running"; then
@@ -336,8 +340,8 @@ PY
 
 run_lab() {
     local args_json="$1" report jid
-    log "launching deepseek_lab_run: $args_json"
-    report=$("$DRIVER" --bin "$BIN" --tool deepseek_lab_run \
+    log "launching ai_lab_run: $args_json"
+    report=$("$DRIVER" --bin "$BIN" --tool ai_lab_run \
         --args "$args_json" --poll-timeout "$MAX_RUN_WAIT" 2>&1) || {
         log "initial lab command failed"
         printf '%s\n' "$report" >&2
@@ -457,14 +461,14 @@ write_main_prompt() {
 You are the main Rustynet live-lab loop agent running in OpenCode with DeepSeek
 v4 Pro max reasoning. The shell loop owns lab launch/poll/review orchestration.
 You own code changes, security judgment, gates, commits, and relaunching the next
-focused `deepseek_lab_run`.
+focused `ai_lab_run`.
 
 ## Hard Rules
 - Do not ask the user. The user is asleep.
 - Verify every claim against repo/log evidence before patching.
 - Security first: fail closed, default deny, no control weakening, no custom crypto.
 - Patch root cause, not symptom.
-- Run focused gates. Commit. Then relaunch `deepseek_lab_run`.
+- Run focused gates. Commit. Then relaunch `ai_lab_run`.
 - Use `triage_on_failure=false`; OpenCode Flash review handles report summarizing.
 - Stay focused: read listed artifacts first, then patch smallest verified root cause.
 - Do not run host-only probes (`sudo`, `pfctl`, GUI commands) from the main agent.
@@ -486,7 +490,7 @@ focused `deepseek_lab_run`.
 
 EOF
 
-        echo "## Original deepseek_lab_run Args"
+        echo "## Original ai_lab_run Args"
         printf '```json\n%s\n```\n\n' "$(printf '%s' "$args_json" | python3 -m json.tool 2>/dev/null || printf '%s' "$args_json")"
 
         echo "## Lab Report"
@@ -505,15 +509,15 @@ EOF
 ## Required Action: PASS
 1. Verify live_lab_run_matrix.csv row exists and this cell is actually green.
 2. Apply docs sync if needed.
-3. Pick next unproven role x OS cell using `deepseek_next_live_lab_target`.
-4. Launch the next `deepseek_lab_run` with `triage_on_failure=false`.
+3. Pick next unproven role x OS cell using `ai_next_live_lab_target`.
+4. Launch the next `ai_lab_run` with `triage_on_failure=false`.
 EOF
                 ;;
             dryrun)
                 cat <<'EOF'
 ## Required Action: DRY-RUN
 Dry-run proves the launch/poll/report wiring only. It is not live evidence.
-Launch the real focused `deepseek_lab_run` for the same area with
+Launch the real focused `ai_lab_run` for the same area with
 `dry_run=false` and `triage_on_failure=false`, or pick the next required live
 cell if this was only a harness smoke.
 EOF
@@ -537,8 +541,8 @@ EOF
             timeout|unknown)
                 cat <<EOF
 ## Required Action: $result
-1. Call deepseek_reconcile_jobs(job_id="$jid").
-2. If lab env is stuck, call deepseek_recover_lab_environment(force=true).
+1. Call ai_reconcile_jobs(job_id="$jid").
+2. If lab env is stuck, call ai_recover_lab_environment(force=true).
 3. Relaunch or switch cells only after evidence says it is safe.
 EOF
                 ;;
@@ -646,7 +650,7 @@ Previous OpenCode main-agent attempt ended without a timely edit or lab relaunch
 Do not restart broad discovery. Use the failure report, review, and listed
 artifacts already below. Within the first 12 tool calls, do one of:
 - edit the verified root-cause file,
-- or relaunch the focused `deepseek_lab_run` with the provided JSON and
+- or relaunch the focused `ai_lab_run` with the provided JSON and
   `rebuild_nodes` if evidence says the guest binary was stale.
 
 EOF
@@ -678,7 +682,7 @@ with open(path, "w", encoding="utf-8") as f:
     f.write("\n")
 PY
     : > "$MAIN_EVENTS"
-    local args=(run "Continue the Rustynet live-lab loop using the attached prompt. Patch/gate/commit, then launch the next focused deepseek_lab_run. Do not stop at analysis." --model "$OPENCODE_MAIN_MODEL" --variant "$OPENCODE_MAIN_VARIANT" --format json --file "$PROMPT")
+    local args=(run "Continue the Rustynet live-lab loop using the attached prompt. Patch/gate/commit, then launch the next focused ai_lab_run. Do not stop at analysis." --model "$OPENCODE_MAIN_MODEL" --variant "$OPENCODE_MAIN_VARIANT" --format json --file "$PROMPT")
     [ -n "$OPENCODE_SESSION_ID" ] && args+=(--session "$OPENCODE_SESSION_ID")
     [ -n "$OPENCODE_MAIN_AGENT" ] && args+=(--agent "$OPENCODE_MAIN_AGENT")
     [ -n "$OPENCODE_ATTACH" ] && args+=(--attach "$OPENCODE_ATTACH")
@@ -859,7 +863,7 @@ main() {
             fi
             jid="$new_jid"
             if ! report="$(poll_until_done "$jid")"; then
-                report=$(printf '# Live-lab run `%s` — POLL TIMEOUT.\n\nRun deepseek_reconcile_jobs and recover before relaunching.' "$jid")
+                report=$(printf '# Live-lab run `%s` — POLL TIMEOUT.\n\nRun ai_reconcile_jobs and recover before relaunching.' "$jid")
             fi
         done
     done
