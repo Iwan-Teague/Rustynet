@@ -269,9 +269,11 @@ evidence.
 - `scripts/ci/check_backend_boundary_leakage.sh` — PRE-EXISTING failure in
   `rustynet-control/src/credential_unwrap.rs` (WireGuard tokens in DPAPI doc
   comments, from installer commit `6f46a90`; not touched by this program).
-- `scripts/ci/secrets_hygiene_gates.sh` — PRE-EXISTING failure
-  (`Bootstrap-RustyNetMacos.sh:907` `rm -f` on a passphrase artifact; known
-  RSA-0080, owner decision pending; not touched by this program).
+- `scripts/ci/secrets_hygiene_gates.sh` — was a PRE-EXISTING failure
+  (`Bootstrap-RustyNetMacos.sh:907` `rm -f` on a passphrase artifact; RSA-0080).
+  **Resolved 2026-07-17** — not by this program: `secure_remove_file` now covers
+  all four sensitive removals and the scanner no longer misses variable-named
+  ones. The gate exits 0.
 
 End-to-end enforcement proof (2026-07-10): launching
 `vm-lab-orchestrate-live-lab --network-profile isolated_multivm_v1` against

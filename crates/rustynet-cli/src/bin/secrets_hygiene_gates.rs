@@ -73,6 +73,36 @@ fn main() {
     std::process::exit(code);
 }
 
+/// One failed check, kept so the run can continue and report the rest.
+struct GateFailure {
+    name: String,
+    code: i32,
+}
+
+/// Pick the exit code for a run that had several distinct failures.
+///
+/// Order matters for CI, which branches on the code rather than the log:
+/// `PolicyReject` (78) must win over everything, because a CI loop that retries
+/// on `TransientFailure` (70) would otherwise retry a run containing a real
+/// fail-closed verdict and could eventually "pass" it. `ConfigError` (65) outranks
+/// transient for the same reason in miniature: retrying never fixes a config
+/// error. Anything unrecognised is treated as at least as severe as transient.
+fn worst_exit_code(failures: &[GateFailure]) -> i32 {
+    fn severity(code: i32) -> u8 {
+        match code {
+            c if c == ExitCode::PolicyReject.as_i32() => 3,
+            c if c == ExitCode::ConfigError.as_i32() => 2,
+            c if c == ExitCode::TransientFailure.as_i32() => 1,
+            _ => 1,
+        }
+    }
+    failures
+        .iter()
+        .map(|failure| failure.code)
+        .max_by_key(|code| severity(*code))
+        .unwrap_or_else(|| ExitCode::GenericFailure.as_i32())
+}
+
 fn run() -> Result<(), i32> {
     let _args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = match find_root_dir() {
@@ -83,19 +113,63 @@ fn run() -> Result<(), i32> {
         }
     };
 
+    // Prerequisites still short-circuit, and should: without cargo or git every
+    // check below fails for the same uninteresting reason, and reporting sixteen
+    // copies of "cargo is missing" is noise, not signal.
     for command in REQUIRED_COMMANDS {
         require_command(command)?;
     }
 
+    // Everything past here accumulates. Previously each check ran with `?`, so the
+    // first failure ended the run and hid every check after it — a single
+    // long-standing finding (a plain `rm -f` on a passphrase in the macOS
+    // bootstrap) meant newly added checks never executed at all, and the gate
+    // reported one problem while saying nothing about the rest of the repo. A gate
+    // that stops at the first red tells you what broke first, not what is broken.
+    let mut failures: Vec<GateFailure> = Vec::new();
+    let mut checks_run: usize = 0;
+
     for (package, test_filter) in REQUIRED_TESTS {
-        run_required_test(package, test_filter)?;
+        checks_run += 1;
+        if let Err(code) = run_required_test(package, test_filter) {
+            failures.push(GateFailure {
+                name: format!("required test: {package} :: {test_filter}"),
+                code,
+            });
+        }
     }
 
-    run_check_secrets_hygiene(&root_dir)?;
-    run_check_no_tracked_lab_passwords(&root_dir)?;
+    checks_run += 1;
+    if let Err(code) = run_check_secrets_hygiene(&root_dir) {
+        failures.push(GateFailure {
+            name: "repo scan: check-secrets-hygiene".to_owned(),
+            code,
+        });
+    }
 
-    println!("Secrets hygiene gate: PASS");
-    Ok(())
+    checks_run += 1;
+    if let Err(code) = run_check_no_tracked_lab_passwords(&root_dir) {
+        failures.push(GateFailure {
+            name: "repo scan: no inline ssh_password in tracked inventories".to_owned(),
+            code,
+        });
+    }
+
+    if failures.is_empty() {
+        println!("Secrets hygiene gate: PASS ({checks_run} checks)");
+        return Ok(());
+    }
+
+    eprintln!();
+    eprintln!(
+        "Secrets hygiene gate: FAIL — {} of {checks_run} checks failed:",
+        failures.len()
+    );
+    for failure in &failures {
+        eprintln!("  [{}] {}", failure.code, failure.name);
+    }
+    eprintln!("Each failure is reported above in full, in the order it ran.");
+    Err(worst_exit_code(failures.as_slice()))
 }
 
 /// Fail if any tracked VM-lab inventory carries an inline `ssh_password`.
@@ -495,4 +569,86 @@ fn dump_file_to_stderr(path: &Path) -> Result<(), i32> {
         );
         ExitCode::TransientFailure.as_i32()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GateFailure, worst_exit_code};
+    use rustynetd::exit_codes::ExitCode;
+
+    fn failure(code: ExitCode) -> GateFailure {
+        GateFailure {
+            name: "check".to_owned(),
+            code: code.as_i32(),
+        }
+    }
+
+    #[test]
+    fn a_policy_reject_outranks_a_transient_failure() {
+        // The severity order exists for CI, which branches on the code. A loop
+        // that retries on 70 must never retry a run that also contains a real
+        // fail-closed verdict, or it can eventually "pass" a leaking repo.
+        let failures = vec![
+            failure(ExitCode::TransientFailure),
+            failure(ExitCode::PolicyReject),
+        ];
+        assert_eq!(worst_exit_code(&failures), ExitCode::PolicyReject.as_i32());
+    }
+
+    #[test]
+    fn a_config_error_outranks_a_transient_failure() {
+        // Retrying never fixes a config error.
+        let failures = vec![
+            failure(ExitCode::TransientFailure),
+            failure(ExitCode::ConfigError),
+        ];
+        assert_eq!(worst_exit_code(&failures), ExitCode::ConfigError.as_i32());
+    }
+
+    #[test]
+    fn a_policy_reject_outranks_a_config_error() {
+        let failures = vec![
+            failure(ExitCode::ConfigError),
+            failure(ExitCode::PolicyReject),
+        ];
+        assert_eq!(worst_exit_code(&failures), ExitCode::PolicyReject.as_i32());
+    }
+
+    #[test]
+    fn severity_does_not_depend_on_the_order_checks_happened_to_run() {
+        let ascending = vec![
+            failure(ExitCode::TransientFailure),
+            failure(ExitCode::ConfigError),
+            failure(ExitCode::PolicyReject),
+        ];
+        let descending = vec![
+            failure(ExitCode::PolicyReject),
+            failure(ExitCode::ConfigError),
+            failure(ExitCode::TransientFailure),
+        ];
+        assert_eq!(worst_exit_code(&ascending), worst_exit_code(&descending));
+        assert_eq!(worst_exit_code(&ascending), ExitCode::PolicyReject.as_i32());
+    }
+
+    #[test]
+    fn a_single_failure_keeps_its_own_code() {
+        for code in [
+            ExitCode::PolicyReject,
+            ExitCode::ConfigError,
+            ExitCode::TransientFailure,
+        ] {
+            assert_eq!(worst_exit_code(&[failure(code)]), code.as_i32());
+        }
+    }
+
+    #[test]
+    fn an_unknown_code_is_never_reported_as_success() {
+        // Defensive: a check returning something outside the taxonomy must still
+        // produce a non-zero exit.
+        let failures = vec![GateFailure {
+            name: "odd".to_owned(),
+            code: 42,
+        }];
+        assert_ne!(worst_exit_code(&failures), 0);
+    }
 }

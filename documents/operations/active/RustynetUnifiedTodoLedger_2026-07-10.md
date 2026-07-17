@@ -196,7 +196,7 @@ dependency:
 - [ ] `PH-7`: macOS privileged-helper allowlist adversarial argv corpus.
 - [ ] `KL-2/3/4`: macOS/Windows killswitch and v4/v6 leak parity with active
   probes plus capture.
-- [ ] `KC-07`: macOS/Windows secrets-not-in-logs parity; fix and prove RSA-0080
+- [ ] `KC-07`: macOS/Windows secrets-not-in-logs parity. (RSA-0080 is **done** — applied 2026-07-17, secrets-hygiene gate green; the remaining work here is the macOS/Windows parity stage itself.)
   passphrase cleanup/secure disposal.
 - [ ] `CNT-1`: live UPnP SSRF tests for SSDP LOCATION/control URLs.
 - [ ] `PH-2/3`: fuzz the live privileged-helper IPC socket and prove cross-UID

@@ -170,7 +170,7 @@ transitions — see §5/§6).
 | 11 | KC-04 | Windows key-custody negative path | `validate_key_custody_permissions` no-ops on non-Unix (RSA-0002) — a world-readable key silently passes on Windows |
 | 12 | PH-7 | `validate_macos_privileged_helper_allowlist` | Same adversarial argv corpus already proven on Linux, needs a `pfctl` port |
 | 13 | KL-2/3/4 | macOS/Windows killswitch-leak parity | Linux has full v4+v6 active-probe+capture; other OSes don't |
-| 14 | KC-07 | macOS/Windows secrets-not-in-logs parity | Linux-only today; **the Linux gate is also currently RED** (RSA-0080 — macOS bootstrap `rm -f`'s the WG passphrase with no secure-erase) — fix alongside |
+| 14 | KC-07 | macOS/Windows secrets-not-in-logs parity | Linux-only today. (RSA-0080 **applied 2026-07-17**; the Linux secrets-hygiene gate is **GREEN** and no longer blocks this item.) |
 | 15 | CNT-1 | `validate_linux_upnp_ssrf` | Confirmed-present SSDP LOCATION/controlURL SSRF (RSA-0035), zero live coverage |
 | 16 | PH-2/3 | Privileged-helper live socket fuzz + cross-UID rejection | Today's helper coverage is argv-only — nothing attacks the live IPC socket itself |
 
