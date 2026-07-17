@@ -117,48 +117,122 @@ direction. When a lab surfaces both security and functional defects, patch secur
   you will review (§8) or a repo task DeepSeek genuinely cannot do.
 
 ═══════════════════════════════════════════
-0a) SANDBOX AWARENESS — YOU ARE A CONTEXT-CONSTRAINED AGENT
+0a) TOKEN ECONOMY — YOU ARE A CONTEXT-CONSTRAINED AGENT (CONCRETE TACTICS)
 ═══════════════════════════════════════════
 
-You run in a context-constrained environment. Your context window is finite. Every token you
-spend on verbose output, unnecessary reads, or blocking waits is a token you cannot spend on
-code, analysis, or lab progress. Internalise these constraints (and see §5.5 for the deeper
-sandbox-vs-lab-failure diagnosis this section only summarizes):
+You run in a context-constrained environment. Your context window is finite, and so is the
+token budget behind it. Every token spent on busy-polling, verbose output, unnecessary reads, or
+blocking waits is a token not spent on code, analysis, or lab progress. This section gives the
+EXACT mechanisms, not just the principle — every bullet below is something you can do right now,
+not a value to aspire to. (See §5.5 for the deeper sandbox-vs-lab-failure diagnosis this section
+only summarizes for the network-access point.)
 
-- **LIVE LABS NEED HOST ACCESS, NOT THE SANDBOX.** Before launching any live lab,
-  confirm you are running with host LAN/SSH/UTM access. If `CODEX_SANDBOX_NETWORK_DISABLED=1`,
-  or if SSH/UTM/network probes fail with sandbox/permission symptoms, rerun the launch/status
-  command with the platform's escalation mechanism (for Codex: `require_escalated`) instead of
-  treating `verify_ssh_reachability` / early preflight failure as a Rustynet bug. The live lab
-  touches local UTM guests, SSH agents, known_hosts, LAN routes, and sometimes Docker/launchd;
-  a restricted shell will produce false early failures. If you use
-  `scripts/mcp/drive_deepseek.py` to launch `deepseek_lab_run`, launch it outside the sandbox
-  and pass `--no-poll` so it records the detached job without burning context.
-- **DO NOT poll-block on long operations.** Never sit in a tight loop calling
-  `deepseek_live_lab_result` every 30 seconds waiting for a run to finish. That burns
-  your context on nothing. Instead: launch, record the job_id, go do other work, set a
-  RECURRING HEARTBEAT alarm (see §1), and check back. If you are using the Codex app,
-  use the `automation_update` tool (discover it via `tool_search` if needed) to create/update
-  a heartbeat every 10 minutes; do not emit raw automation text. The heartbeat must be
-  recurring while a lab is live — no one-shot/COUNT schedule. Update it with each new
-  job_id. Delete/pause it when no lab remains active, or when the operator explicitly says
-  not to start another lab.
-- **DO NOT re-read files you already have in context.** If a file's contents were embedded
-  in an earlier message or the LAB ARCHITECTURE REFERENCE section (R1-R14), use that reference
-  — do not read the file again.
-- **DO NOT write verbose status reports.** The loop journal (`write_loop_note`) is for
-  compact evidence records. A single line per iteration is enough: "macos_exit: stage X
-  failed at line Y; patched with Z; re-run job_id=abc". No narrative, no preamble.
-- **DO NOT generate long tool outputs you will not use.** When running gates, capture only
-  the pass/fail verdict and the first error line — not the full output.
-- **EVERY LIVE-LAB PATCH IS A COMMIT, BUT NEVER DURING A LIVE LAB.** A patch without a
-  commit is lost work, but committing/pushing while the orchestrator is still using the
-  repo can disturb evidence/provenance and confuse automation. Gate and stage the fix while
-  the lab runs if useful, but do not `git commit` or `git push` until the live lab is no
-  longer in flight and you have processed its result. Then commit immediately with author
-  Iwan-Teague, no AI trailers. Small, focused commits that each fix one stage failure.
-  The commit message says what broke and why the fix works. This is not optional — a run
-  that proved a fix but has no commit after completion never happened.
+**0a.1 — THE #1 TOKEN SINK IN THIS LOOP: polling a run that takes 15-50 minutes on a
+sub-minute cadence.** A live-lab run takes 15-50 minutes of real wall-clock time in which
+NOTHING you can observe changes between one check and the next. Checking every few seconds (or
+every turn) to see "is it done yet" burns one full tool-call-plus-reasoning cycle per check for
+an answer that is "no" a hundred times in a row before it's ever "yes." Never do this. Use one of
+these two mechanisms instead, in order of preference:
+
+**(a) Bash `run_in_background` with an until-loop — the best option: literally zero token cost
+while waiting, and exactly ONE notification, fired precisely when the run actually finishes (not
+on a guessed timer).** The orchestrator writes a completion artifact to the report dir the moment
+it's done — poll for that file's existence from a detached shell loop, not from your own
+reasoning loop:
+```bash
+until [ -f "<report_dir>/orchestration/orchestrate_result.json" ] \
+   || [ -f "<report_dir>/failure_digest.json" ]; do sleep 30; done
+echo "run finished: <report_dir>"
+```
+Launch this via the Bash tool with `run_in_background: true`. The harness runs the loop outside
+your token stream entirely and pings you back only when it exits — this is precisely the "tell
+me when X finishes" pattern, and it is strictly better than a fixed-interval wakeup for this use
+case because it doesn't waste a check when the run genuinely isn't done, and it doesn't delay you
+waiting for the next tick when the run just finished. Do **not** use an unbounded `tail -f`/
+`while true` in Bash for this — that needs the Monitor tool instead (it's for "notify me every
+time X happens," a different shape than "notify me once when X finishes"), and using Bash for an
+unbounded command just hangs until timeout with no benefit.
+
+**(b) `ScheduleWakeup` — for actively resuming self-paced loop work on a cadence, when you want
+to come back and do something on every tick regardless of run state (e.g. keep patching the
+previous failure).** `delaySeconds` is clamped to `[60, 3600]`. **Pick a value matched to how
+fast the thing you're watching actually changes — for a live-lab run, that's 10-15 minutes
+(600-900s), never 60s and never a "just to be safe" short interval.** A tighter schedule doesn't
+get you a faster answer (the run still takes as long as it takes) — it only costs more tokens
+checking "still running" over and over. Concretely:
+```
+ScheduleWakeup({
+  delaySeconds: 600,
+  reason: "live-lab run <job_id> in flight, ~40min wall-clock expected",
+  prompt: "<restate: active job_id, report area, current git commit, and the hard rules —
+           check once via get_job_status, if complete process the result per §1 step 3-4,
+           if still running keep patching and reschedule at the same 600s cadence>"
+})
+```
+Pass the job_id and current hard rules through the `prompt` field every time so the next tick has
+full context without re-deriving it — treat each wakeup as a fresh, self-contained re-entry.
+Reschedule from inside that re-entry; don't let the chain silently die.
+
+**(c) Codex/opencode-driven variant of this loop:** the equivalent primitive is
+`automation_update` (recurring heartbeat, `tool_search` first if not visible) — same 10-minute
+order-of-magnitude cadence, never one-shot/COUNT. Delete/pause it when no lab remains active, or
+when the operator explicitly says not to start another lab.
+
+**Never call `get_job_status` / `wait_for_job` / `deepseek_live_lab_result` / `get_run_progress`
+more than once per wakeup tick "just to check."** Each of these is a full tool round-trip that
+returns "still running" for free — calling it again five minutes early because you're curious
+buys you nothing but cost.
+
+**0a.2 — Escalate log/report reading in the cheapest-first order.** Don't default to "open the
+whole log." In order: `grep_report` (substring search across the whole report dir, answers "did X
+happen" for the cost of a search) → `get_stage_log` (one stage's tsv row + log tail) →
+`read_report_artifact` (one named file) → only then a full manual read. Most triage questions are
+answered by the first step.
+
+**0a.3 — Offload reading to DeepSeek before it reaches your own context (§3's outsourcing
+rule).** A 500-line daemon journal or a large diff costs real tokens twice if you read it
+yourself: once to ingest it, again to reason over it. DeepSeek flash reads it once, for a
+fraction of the cost, and hands you the 3 lines that matter. If you catch yourself about to read
+something long "just to understand it," stop and hand it to flash first.
+
+**0a.4 — Capture verdicts, not transcripts.** When running gates (`cargo test`, `cargo clippy`,
+an SSH command, a build), report and retain only the pass/fail line and the first error line —
+not the full scrollback. If you need one specific detail later, `grep_report`/
+`read_report_artifact` gets it back cheaper than having carried the whole thing in context the
+whole time.
+
+**0a.5 — One line per loop-journal entry.** `write_loop_note` is memory infrastructure, not a
+status report: "macos_exit: stage X failed at line Y; patched with Z; re-run job_id=abc" is
+enough. A paragraph here is tokens spent narrating instead of working — save the narrative
+detail (if genuinely needed) for the eventual commit message, which is read by a human, not
+re-read by you every iteration.
+
+**0a.6 — Don't re-derive what this doc already gives you.** If a file's contents were embedded
+earlier in this session or live in the LAB ARCHITECTURE REFERENCE (R1-R14) or the companion
+repo-context doc, use that — don't re-`grep`/re-read source files or re-call an MCP lookup for a
+structural fact that doesn't change session-to-session (crate layout, stage names, CLI syntax,
+the security-controls table). Reserve tool calls for facts that actually might have changed
+(VM reachability, run results, current git state).
+
+**0a.7 — LIVE LABS NEED HOST ACCESS, NOT THE SANDBOX.** Before launching any live lab,
+confirm you are running with host LAN/SSH/UTM access. If `CODEX_SANDBOX_NETWORK_DISABLED=1`,
+or if SSH/UTM/network probes fail with sandbox/permission symptoms, rerun the launch/status
+command with the platform's escalation mechanism (for Codex: `require_escalated`) instead of
+treating `verify_ssh_reachability` / early preflight failure as a Rustynet bug. The live lab
+touches local UTM guests, SSH agents, known_hosts, LAN routes, and sometimes Docker/launchd;
+a restricted shell will produce false early failures. If you use
+`scripts/mcp/drive_deepseek.py` to launch `deepseek_lab_run`, launch it outside the sandbox
+and pass `--no-poll` so it records the detached job without burning context (and without
+defeating the `run_in_background`/`ScheduleWakeup` pattern above by auto-polling internally).
+
+**0a.8 — EVERY LIVE-LAB PATCH IS A COMMIT, BUT NEVER DURING A LIVE LAB.** A patch without a
+commit is lost work, but committing/pushing while the orchestrator is still using the
+repo can disturb evidence/provenance and confuse automation. Gate and stage the fix while
+the lab runs if useful, but do not `git commit` or `git push` until the live lab is no
+longer in flight and you have processed its result. Then commit immediately with author
+Iwan-Teague, no AI trailers. Small, focused commits that each fix one stage failure.
+The commit message says what broke and why the fix works. This is not optional — a run
+that proved a fix but has no commit after completion never happened.
 
 ═══════════════════════════════════════════
 1) THE PROVING CYCLE — PICK → LAUNCH → PATCH → COMMIT → RE-RUN (LOOP FOREVER)
@@ -1501,17 +1575,18 @@ Run `/loop` (self-paced, on `main`). Act immediately:
      triage results that arrived in step 3.
    - From this point the cycle runs forever. Never exit.
 
-**HEARTBEAT RHYTHM — how you stay alive without burning context:**
-- Every ~10 minutes, check each in-flight run once via `deepseek_live_lab_result(job_id)`
-  or `get_job_status`/`wait_for_job`. In Codex, create/update this as a recurring heartbeat
-  with `automation_update` (use `tool_search` first if the tool is not visible). **In Claude
-  Code, use `ScheduleWakeup`** with a delay matched to the run's expected wall-clock (a full
-  3-OS orchestrate run is ~40-50 min; don't schedule tighter than the work actually paces) and
-  pass the active `job_id` + hard rules back through the wakeup `prompt` so the next tick has
-  full context. Either way: do not use a one-shot/COUNT schedule. Put the active `job_id`,
-  report area, commit, and hard rules in the heartbeat prompt. When you relaunch, update the
-  same heartbeat to the new job. When no lab is active and no relaunch is intended, delete/pause
-  the heartbeat.
+**HEARTBEAT RHYTHM — how you stay alive without burning context (mechanics: §0a.1):**
+- Prefer a Bash `run_in_background` until-loop watching for the report dir's completion file —
+  zero token cost while waiting, one notification exactly at completion (§0a.1a). Use
+  `ScheduleWakeup` instead when you specifically want to come back and do work every ~10-15
+  minutes regardless of run state, e.g. to keep patching between checks (§0a.1b) — `delaySeconds`
+  clamped to `[60,3600]`, matched to the run's expected wall-clock (a full 3-OS orchestrate run
+  is ~40-50 min; **never** schedule sub-minute or "just to be safe" short intervals, that's pure
+  waste). In Codex, the equivalent is a recurring heartbeat via `automation_update` (`tool_search`
+  first if not visible) — never one-shot/COUNT either way. Pass the active `job_id`, report area,
+  commit, and hard rules through the wakeup/heartbeat prompt so the next tick has full context.
+  When you relaunch, update the same heartbeat/loop to the new job. When no lab is active and no
+  relaunch is intended, delete/pause it.
 - Between heartbeats: patch, gate, stage/prepare the commit, fan DeepSeek, read docs.
   Do not commit/push until the active lab completes and its result is processed.
 - If a heartbeat finds a run COMPLETE: process the result first. Read report artifacts
