@@ -45,12 +45,13 @@
 //! string is sent to the API exactly as given — call `ai_list_models` to
 //! discover what else is available. See `resolve_model`.
 //!
-//! API key resolution order (per provider; DeepSeek shown, others are
-//! `{NAME}_API_KEY`-env-var-only unless a registry entry overrides
-//! `api_key_env`):
+//! API key resolution order (per provider; DeepSeek shown, others stop after
+//! step 2 unless a registry entry overrides `api_key_env`):
 //! 1. DEEPSEEK_API_KEY env var
-//! 2. ~/Desktop/deepseek_api.md
-//! 3. ~/.deepseek_api_key
+//! 2. macOS Keychain item `rustynet-deepseek-api-key` (login keychain,
+//!    current user; read in-process via `/usr/bin/security`, argv-only)
+//! 3. ~/Desktop/deepseek_api.md
+//! 4. ~/.deepseek_api_key
 
 #![forbid(unsafe_code)]
 
@@ -725,11 +726,13 @@ impl AiAgentServer {
     fn chat(&self, messages: Value, tools: Option<&Value>, model: &str) -> Result<Value, String> {
         if self.provider.api_key.is_empty() {
             return Err(format!(
-                "No API key configured for LLM provider '{}'. For the default 'deepseek' \
-                 provider: set DEEPSEEK_API_KEY env var, or create ~/Desktop/deepseek_api.md \
-                 or ~/.deepseek_api_key with the key as the only content. For any other \
-                 provider: set its api_key_env (see ~/.config/rustynet/llm_providers.json).",
-                self.provider.name
+                "No API key configured for LLM provider '{}'. Set a macOS Keychain item named \
+                 rustynet-{}-api-key (security add-generic-password -a \"$(whoami)\" -s \
+                 rustynet-{}-api-key -w -U), or export its api_key_env var directly. The \
+                 default 'deepseek' provider additionally falls back to \
+                 ~/Desktop/deepseek_api.md or ~/.deepseek_api_key. Custom providers: see \
+                 ~/.config/rustynet/llm_providers.json.",
+                self.provider.name, self.provider.name, self.provider.name
             ));
         }
         let mut body = json!({
@@ -4306,18 +4309,46 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     fields
 }
 
-/// Resolve `provider_name`'s API key via its `api_key_env` var. For the
-/// built-in `"deepseek"` provider specifically, preserves the original
-/// resolution order by also falling back to the two legacy file locations —
-/// every other provider is env-var-only (consistent with how a Keychain- or
-/// secret-manager-backed launch wrapper is expected to inject the var, rather
-/// than a provider-specific file convention proliferating per provider).
+/// Reads `service`'s password from the current user's macOS login Keychain via
+/// `/usr/bin/security` (argv-only, no shell — §4). Returns `None` on any
+/// failure (item absent, denied, non-macOS host, `security` missing) so the
+/// caller falls through to the next resolution step rather than erroring.
+fn load_keychain_secret(service: &str) -> Option<String> {
+    let user = std::env::var("USER").ok()?;
+    let output = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-a", &user, "-s", service, "-w"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let key = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if key.is_empty() { None } else { Some(key) }
+}
+
+/// Resolve `provider_name`'s API key via its `api_key_env` var, then macOS
+/// Keychain item `rustynet-{provider_name}-api-key`. For the built-in
+/// `"deepseek"` provider specifically, preserves the original resolution
+/// order by also falling back to the two legacy file locations after that —
+/// every other provider stops at env var + Keychain.
+///
+/// The Keychain read happens in-process (a direct child of this already-
+/// running binary), deliberately NOT via a `command`-launched shell wrapper
+/// script: the Desktop client's MCP sandbox exec-approves only the literal
+/// `command` path it was configured with, and a shebang-interpreted script at
+/// that path re-execs `/bin/bash` as a second process image the sandbox never
+/// approved, which fails closed with `Operation not permitted` before the
+/// script's first line runs (observed live — see git history for the
+/// launcher-script approach this replaced).
 fn load_api_key(provider_name: &str, api_key_env: &str) -> Result<String, String> {
     if let Ok(key) = std::env::var(api_key_env) {
         let key = key.trim().to_string();
         if !key.is_empty() {
             return Ok(key);
         }
+    }
+    if let Some(key) = load_keychain_secret(&format!("rustynet-{provider_name}-api-key")) {
+        return Ok(key);
     }
     if provider_name == "deepseek" {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -4336,12 +4367,13 @@ fn load_api_key(provider_name: &str, api_key_env: &str) -> Result<String, String
             }
         }
         return Err(format!(
-            "No DeepSeek API key found (checked provider env var {api_key_env}, ~/Desktop/deepseek_api.md, \
-             ~/.deepseek_api_key)"
+            "No DeepSeek API key found (checked provider env var {api_key_env}, macOS Keychain \
+             item rustynet-deepseek-api-key, ~/Desktop/deepseek_api.md, ~/.deepseek_api_key)"
         ));
     }
     Err(format!(
-        "No API key found for LLM provider '{provider_name}' (checked env var {api_key_env})"
+        "No API key found for LLM provider '{provider_name}' (checked env var {api_key_env}, \
+         macOS Keychain item rustynet-{provider_name}-api-key)"
     ))
 }
 
@@ -6223,6 +6255,17 @@ mod tests {
         assert_ne!(
             s.resolve_model("some-custom-model-id"),
             s.provider.flash_model
+        );
+    }
+
+    #[test]
+    fn load_keychain_secret_returns_none_for_nonexistent_service() {
+        // Must fail closed to "try the next resolution step", never panic or
+        // error out, when the Keychain item doesn't exist (the common case on
+        // a fresh checkout, or for a provider the user never configured).
+        assert_eq!(
+            load_keychain_secret("rustynet-nonexistent-test-service-xyz123"),
+            None
         );
     }
 

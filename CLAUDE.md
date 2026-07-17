@@ -594,23 +594,41 @@ stdio** instead — `scripts/mcp/drive_ai_agent.py --tool <name> --args '<json>'
 spawns the latest binary, does the JSON-RPC handshake, calls the tool, and
 auto-polls `ai_live_lab_result` for the async run/triage tools, so the
 newest tools are reachable with NO client reconnect. By default it launches
-`bin/rustynet-mcp-ai-agent-launcher.sh` (override `--bin` for the raw binary or
-a `target/debug`/`target/release` build) — see the Keychain paragraph next for
-what the launcher does and why.
+`bin/rustynet-mcp-ai-agent` (override `--bin` for a `target/debug`/
+`target/release` build) — see the Keychain paragraph next for how it resolves
+its API key with no separate wrapper needed.
 
-**API keys live in macOS Keychain, not a plaintext file.**
-`bin/rustynet-mcp-ai-agent-launcher.sh` (the `command` the Desktop client
-actually launches — gitignored, holds no secret itself) reads each configured
-provider's key from a Keychain item named `rustynet-<provider>-api-key`
-(account = the current user) and exports it as that provider's env var before
-exec'ing the raw binary. Add/update a key:
+**API keys live in macOS Keychain, not a plaintext file.** `rustynet-mcp-ai-agent`
+reads each configured provider's key **in-process**, via `/usr/bin/security`
+(argv-only, no shell), from a Keychain item named `rustynet-<provider>-api-key`
+(account = the current user). Add/update a key:
 `security add-generic-password -a "$(whoami)" -s "rustynet-deepseek-api-key" -w -U`
 (swap the service suffix + paste the right key for grok/kimi/glm/qwen). A
-provider with no Keychain item simply has no key exported — harmless unless
-it's the active one. DeepSeek ADDITIONALLY falls back to `DEEPSEEK_API_KEY` env
-var or the legacy `~/Desktop/deepseek_api.md`/`~/.deepseek_api_key` files for
-backward compatibility; every other provider is Keychain/env-var only. **Never
-commit, log, or write a key into the repo or any artifact.**
+provider with no Keychain item simply has no key resolved — harmless unless
+it's the active one. Resolution order: env var (`{NAME}_API_KEY`) first, then
+Keychain; DeepSeek ADDITIONALLY falls back to the legacy
+`~/Desktop/deepseek_api.md`/`~/.deepseek_api_key` files for backward
+compatibility. **Never commit, log, or write a key into the repo or any
+artifact.**
+
+Point every MCP client's `command` at the raw binary directly (`bin/rustynet-mcp-ai-agent`),
+never at a shell-script wrapper. An earlier version of this Keychain integration used a
+gitignored `bin/rustynet-mcp-ai-agent-launcher.sh` that read Keychain and exported the env
+var before exec'ing the real binary — it looked identical to the raw binary in a manual
+shell test, but failed **every time** the Desktop client itself spawned it, with
+`/bin/bash: <path>: Operation not permitted` (confirmed live in
+`~/Library/Logs/Claude/mcp-server-rustynet-ai-agent.log`) even though the other three
+servers, spawned as plain compiled binaries with no shell involved, worked fine. Root
+cause: Claude Desktop launches MCP servers through a sandbox wrapper (§12.3.1) that
+exec-approves only the literal configured `command` path; a shebang-interpreted script at
+that path makes the kernel re-exec `/bin/bash` as a second, unapproved process image, which
+the sandbox denies before the script's first line runs. Reading Keychain in-process (a
+normal child spawn of `/usr/bin/security` from the already-approved, already-running Rust
+binary, not a second top-level process image) has no such restriction and was verified live
+end-to-end (`ai_check_balance` returning a real balance) both from a bare shell and through
+the Desktop client after this fix. If you ever reach for a `command`-launched wrapper script
+for ANY sandboxed MCP client again, expect the same failure — do the privileged work
+in-process instead.
 
 **Provider is configurable — DeepSeek is the default, not the only option.**
 The model-tier ids, API endpoint, models-list endpoint, and balance-check

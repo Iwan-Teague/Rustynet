@@ -15,9 +15,12 @@ Usage:
       --args '{"target":"x","failure_context":"...","max_steps":8}'
   scripts/mcp/drive_ai_agent.py --tool ai_read \
       --args '{"prompt":"...","model":"flash"}' --no-poll
-  # --bin defaults to the Keychain-aware launcher; override to the raw binary
-  # only if you've already exported the provider's key yourself:
-  DEEPSEEK_API_KEY=... scripts/mcp/drive_ai_agent.py --bin bin/rustynet-mcp-ai-agent \
+  # The binary reads its provider's API key from macOS Keychain itself
+  # (in-process, via /usr/bin/security) or from the env var if already
+  # exported — no separate launcher wrapper needed. --bin defaults to
+  # bin/rustynet-mcp-ai-agent; override for a target/debug or target/release
+  # dev build:
+  scripts/mcp/drive_ai_agent.py --bin target/debug/rustynet-mcp-ai-agent \
       --tool ai_read --args '{"prompt":"...","model":"flash"}' --no-poll
 
 Exit code 0 on a delivered result; non-zero on transport/timeout failure.
@@ -59,12 +62,11 @@ def refuse_sandboxed_live_lab(tool: str) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bin", default="bin/rustynet-mcp-ai-agent-launcher.sh",
-                    help="MCP server binary or launch wrapper, repo-relative or absolute "
-                    "(default: bin/rustynet-mcp-ai-agent-launcher.sh, which injects each "
-                    "provider's API key from Keychain before exec'ing the raw binary — pass "
-                    "the raw bin/rustynet-mcp-ai-agent path instead only if DEEPSEEK_API_KEY "
-                    "or another provider's key is already exported in this shell)")
+    ap.add_argument("--bin", default="bin/rustynet-mcp-ai-agent",
+                    help="MCP server binary, repo-relative or absolute (default: "
+                    "bin/rustynet-mcp-ai-agent). The binary reads its provider's API key "
+                    "from macOS Keychain itself, or from the env var if already exported — "
+                    "no separate launch wrapper needed.")
     ap.add_argument("--tool", required=True, help="tool name to call")
     ap.add_argument("--args", default="{}", help="tool arguments as a JSON object")
     ap.add_argument("--poll-interval", type=int, default=20)

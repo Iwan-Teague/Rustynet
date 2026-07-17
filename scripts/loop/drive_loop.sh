@@ -26,14 +26,13 @@ STATE_FILE="$REPO/state/loop-cycle-state.json"
 if [ -n "${RUSTYNET_MCP_BIN:-}" ]; then
     DEEPSEEK_BIN="$RUSTYNET_MCP_BIN"
 elif [ -x "$REPO/target/debug/rustynet-mcp-ai-agent" ]; then
-    # Development-time direct path: no Keychain injection here, so the
-    # provider's API key (DEEPSEEK_API_KEY or another provider's) must
-    # already be exported in this shell.
+    # Development-time direct path. The binary reads its provider's API key
+    # from macOS Keychain itself (in-process); an exported env var still
+    # overrides it if set.
     DEEPSEEK_BIN="$REPO/target/debug/rustynet-mcp-ai-agent"
 else
-    # Installed path: prefer the Keychain-aware launcher over the raw binary
-    # so this works with no key exported in the shell.
-    DEEPSEEK_BIN="$REPO/bin/rustynet-mcp-ai-agent-launcher.sh"
+    # Installed path — same Keychain-or-env-var key resolution, in-process.
+    DEEPSEEK_BIN="$REPO/bin/rustynet-mcp-ai-agent"
 fi
 
 log() { printf '[loop %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
