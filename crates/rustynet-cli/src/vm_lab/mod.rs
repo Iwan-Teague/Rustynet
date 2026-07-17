@@ -4419,10 +4419,23 @@ pub fn execute_ops_vm_lab_provision_guest(
     }
 
     Err(format!(
-        "vm-lab-provision-guest: execution path is implemented but UNVERIFIED against a live host \
-         (the lab host was offline when it was written). Re-run with --dry-run to inspect the plan, \
-         and remove this guard only once it has been proven on {}. Plan:\n  {}",
+        "vm-lab-provision-guest: the CREATE steps are NOT IMPLEMENTED yet — only the checks are.\n\
+         \n\
+         What DID run just now (and passed) against {}:\n  \
+         - the disk guard: resolved the pool's backing disk and matched the declared model\n  \
+         - the collision check: no domain named {} exists\n  \
+         - name/image validation\n\
+         \n\
+         What is still missing: qemu-img overlay create, the cloud-init seed, and virt-install.\n\
+         Those need a privilege decision first — the image pool is root-owned, and this command \
+         will NOT embed a sudo password. The clean route is libvirt's own APIs over the existing \
+         connection (`virsh vol-create-as` + `vol-upload`, then `virt-install --connect`), which \
+         work through the libvirt group with no sudo at all.\n\
+         \n\
+         Until then use `--dry-run` for the plan, or the scratchpad `provision_guest.sh`.\n\
+         Plan:\n  {}",
         host.host_id,
+        config.name,
         plan.join("\n  ")
     ))
 }
@@ -34826,20 +34839,55 @@ fn run_output_with_timeout_preserve(
     let mut child = command
         .spawn()
         .map_err(|err| format!("spawn failed: {err}"))?;
+
+    // Drain stdout/stderr on their own threads WHILE we wait.
+    //
+    // Without this the poll loop below never drains the pipes, so a child that
+    // writes more than the OS pipe buffer (~64 KiB) blocks forever on write:
+    // `try_wait()` then never reports an exit and the call "times out" no matter
+    // how fast the command or link actually is. The symptom is deeply
+    // misleading — small commands work, large ones look like a network problem.
+    // Piping is set by the caller, so `take()` yielding None (inherited stdio)
+    // is normal and must stay supported.
+    let stdout_reader = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
+            buffer
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut buffer);
+            buffer
+        })
+    });
+    let collect = |reader: Option<thread::JoinHandle<Vec<u8>>>| -> Vec<u8> {
+        reader
+            .map(|handle| handle.join().unwrap_or_default())
+            .unwrap_or_default()
+    };
+
     let started_at = Instant::now();
     loop {
-        if child
+        if let Some(status) = child
             .try_wait()
             .map_err(|err| format!("wait failed: {err}"))?
-            .is_some()
         {
-            return child
-                .wait_with_output()
-                .map_err(|err| format!("collect output failed: {err}"));
+            return Ok(std::process::Output {
+                status,
+                stdout: collect(stdout_reader),
+                stderr: collect(stderr_reader),
+            });
         }
         if started_at.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            // Join after the kill so the reader threads observe EOF and exit
+            // rather than being leaked.
+            let _ = collect(stdout_reader);
+            let _ = collect(stderr_reader);
             return Err(format!("timed out after {} seconds", timeout.as_secs()));
         }
         thread::sleep(Duration::from_millis(POLL_INTERVAL_MILLIS));
