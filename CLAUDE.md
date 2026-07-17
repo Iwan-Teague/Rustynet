@@ -467,8 +467,20 @@ GLM (Zhipu), and Qwen (Alibaba DashScope)** as additional built-in presets
 (§ provider config below); DeepSeek is used throughout this section's examples
 because it's the default, not because the other tools are DeepSeek-specific.
 
+**Provider, model, and permission are three INDEPENDENT axes — nothing is bound
+to anything.** The permission level of a call comes from WHICH TOOL you invoke
+(the read-only tools here vs. the edit tier's `mode` in §12.6), never from the
+provider or model. So every provider works read-only, and no model is ever
+"green-lit" for writes by being configured — e.g. you can run `kimi-k2.7-code`
+read-only via `ai_agent`, and separately choose it for a `full`-mode edit only
+when YOU decide that's warranted. The read-only tools take an optional per-call
+`provider` (default = the server's configured one): pass `provider: "kimi"` on
+one call and `"deepseek"` on the next in the SAME running server, no restart, no
+`RUSTYNET_LLM_PROVIDER` change. The key comes from that provider's Keychain/env
+item; an unknown name is a hard error, never a silent fallback.
+
 Fourteen tools (`mcp__rustynet-ai-agent__*`). The first three take `prompt`, optional
-`context`, and `model`:
+`context`, `model`, and optional `provider`:
 - `ai_read` — analysis / review / second opinion / risk ID (read-only).
 - `ai_write` — generate boilerplate / test scaffolds / doc drafts.
 - `ai_read_write` — analyze existing content, then generate (review-then-fix).
@@ -733,13 +745,17 @@ OpenCode's own `provider/model` naming (e.g. `deepseek/deepseek-v4-pro`,
 `kimi/kimi-k2.7-code`, `opencode/deepseek-v4-flash-free`), **not** this server's
 `LlmProvider` registry or `flash`/`pro` shortcuts — two different harnesses, two
 different model routers. Providers usable here are the ones in
-`.opencode/opencode.json`'s `provider` block (currently `deepseek` and `kimi`;
-`kimi-k2.7-code` is the code-tuned pick for a `full`-mode agent). The spawned
-`opencode serve` gets each provider's API key injected from Keychain
-in-process (`opencode_provider_env` reads `rustynet-<provider>-api-key` and
-passes it as the `{env:..._API_KEY}` the provider config expects), so no key
-needs to be exported in the shell — the same Keychain items `ai_read`/`ai_agent`
-already use.
+`.opencode/opencode.json`'s `provider` block (currently `deepseek` and `kimi`).
+`model` and `mode` are independent: ANY of those models runs at EITHER
+permission level — `ai_edit_run(model="kimi/kimi-k2.7-code", mode="restricted")`
+supervises Kimi edit-by-edit, `mode="full"` lets it run unattended. Being listed
+as a provider here green-lights nothing on its own; the permission is the `mode`
+YOU pass per call (`kimi-k2.7-code` is merely the code-tuned option when you do
+choose `full`). The spawned `opencode serve` gets each provider's API key
+injected from Keychain in-process (`opencode_provider_env` reads
+`rustynet-<provider>-api-key` and passes it as the `{env:..._API_KEY}` the
+provider config expects), so no key needs to be exported in the shell — the same
+Keychain items `ai_read`/`ai_agent` already use.
 
 **The isolation is the whole safety model.** Every `ai_edit_run` job:
 - creates its own **git worktree** under `state/edit-worktrees/<job_id>` on a

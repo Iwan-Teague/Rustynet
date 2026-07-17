@@ -328,26 +328,37 @@ fn read_provider_registry() -> ProviderRegistryFile {
 /// fail loudly, not silently reuse one provider's key against another's URL.
 fn load_provider() -> Result<LlmProvider, String> {
     let file = read_provider_registry();
-
     let active_name = std::env::var("RUSTYNET_LLM_PROVIDER")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| file.active.clone())
         .unwrap_or_else(|| "deepseek".to_string());
+    resolve_provider_named(&active_name)
+}
 
-    match file.providers.get(&active_name) {
+/// Resolve a provider by explicit `name` — a registry entry (which overrides a
+/// built-in of the same name) else a built-in preset (deepseek/grok/kimi/glm/
+/// qwen), with its api key from env/Keychain. This is the by-name core shared by
+/// `load_provider` (name from `RUSTYNET_LLM_PROVIDER`) and the per-call
+/// `provider` argument on the read-only tools, so switching provider at server
+/// startup and switching it per invocation resolve through EXACTLY the same
+/// path. An unknown name is a hard error — never a silent fallback to another
+/// provider's key against the wrong URL.
+fn resolve_provider_named(name: &str) -> Result<LlmProvider, String> {
+    let file = read_provider_registry();
+    match file.providers.get(name) {
         Some(entry) => {
             let api_key_env = entry
                 .api_key_env
                 .clone()
-                .unwrap_or_else(|| format!("{}_API_KEY", active_name.to_uppercase()));
-            let api_key = load_api_key(&active_name, &api_key_env)?;
+                .unwrap_or_else(|| format!("{}_API_KEY", name.to_uppercase()));
+            let api_key = load_api_key(name, &api_key_env)?;
             let models_url = entry
                 .models_url
                 .clone()
                 .unwrap_or_else(|| derive_models_url(&entry.base_url));
             Ok(LlmProvider {
-                name: active_name,
+                name: name.to_string(),
                 base_url: entry.base_url.clone(),
                 models_url,
                 balance_url: entry.balance_url.clone(),
@@ -357,15 +368,14 @@ fn load_provider() -> Result<LlmProvider, String> {
                 pro_reasoning_effort: entry.pro_reasoning_effort.clone(),
             })
         }
-        None => match built_in_provider(&active_name) {
+        None => match built_in_provider(name) {
             Some(preset) => {
-                let api_key = load_api_key(&active_name, preset.api_key_env)?;
-                Ok(LlmProvider::from_preset(&active_name, &preset, api_key))
+                let api_key = load_api_key(name, preset.api_key_env)?;
+                Ok(LlmProvider::from_preset(name, &preset, api_key))
             }
             None => Err(format!(
-                "unknown LLM provider '{active_name}' (from RUSTYNET_LLM_PROVIDER or the \
-                 registry's \"active\" field) — not one of the built-ins (deepseek/grok/kimi/glm/\
-                 qwen) and not defined in {}",
+                "unknown LLM provider '{name}' — not one of the built-ins \
+                 (deepseek/grok/kimi/glm/qwen) and not defined in {}",
                 provider_registry_path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "<no HOME>".to_string())
@@ -2605,6 +2615,31 @@ impl AiAgentServer {
         ToolCallResult {
             content: text_content(s),
             is_error: None,
+        }
+    }
+
+    /// The server instance to use for THIS read-only call: if the caller passed
+    /// a `provider` argument, a clone with that provider swapped in (its key
+    /// resolved from env/Keychain exactly like startup); otherwise `self` with
+    /// the server-default provider. This is what makes provider an independent,
+    /// per-call axis for the read-only tier — a driver can point one call at
+    /// `kimi` and the next at `deepseek` in the same server, without restarting
+    /// it or touching `RUSTYNET_LLM_PROVIDER`. Model choice (the `model` arg) and
+    /// permission level (read-only here vs. the edit tier's `mode`) stay
+    /// orthogonal to it — no provider or model is bound to a permission level.
+    fn worker_for_call(&self, args: &Value) -> Result<AiAgentServer, String> {
+        match get_str(args, "provider")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => Ok(self.clone()),
+            Some(name) => {
+                let provider = resolve_provider_named(name)?;
+                Ok(AiAgentServer {
+                    provider,
+                    ..self.clone()
+                })
+            }
         }
     }
 
@@ -6548,6 +6583,18 @@ fn context_schema() -> Value {
     )
 }
 
+/// Schema for the optional per-call `provider` override on the read-only tools.
+fn provider_schema() -> Value {
+    json_schema_string(
+        "OPTIONAL. Which LLM provider to use for THIS call — 'deepseek' (default), \
+         'kimi', 'grok', 'glm', 'qwen', or a registry-defined provider. Omit to use the \
+         server's configured default. This is independent of `model` and of the tool's \
+         permission level: any provider works read-only here, and you pick its key from the \
+         same Keychain items the server already uses. An unknown name is a hard error, not a \
+         silent fallback.",
+    )
+}
+
 impl McpServer for AiAgentServer {
     fn server_info(&self) -> ServerInfo {
         ServerInfo {
@@ -6571,6 +6618,7 @@ impl McpServer for AiAgentServer {
                         "prompt":  json_schema_string("The question or analysis request."),
                         "model":   model_schema(&self.provider),
                         "context": context_schema(),
+                        "provider": provider_schema(),
                     }),
                     vec!["prompt"],
                 ),
@@ -6589,6 +6637,7 @@ impl McpServer for AiAgentServer {
                         "prompt":  json_schema_string("The generation instruction — what to write and any constraints."),
                         "model":   model_schema(&self.provider),
                         "context": context_schema(),
+                        "provider": provider_schema(),
                     }),
                     vec!["prompt"],
                 ),
@@ -6607,6 +6656,7 @@ impl McpServer for AiAgentServer {
                         "prompt":  json_schema_string("Combined instruction — what to analyze and what to produce."),
                         "model":   model_schema(&self.provider),
                         "context": context_schema(),
+                        "provider": provider_schema(),
                     }),
                     vec!["prompt"],
                 ),
@@ -6632,6 +6682,7 @@ impl McpServer for AiAgentServer {
                     json!({
                         "prompt":    json_schema_string("The research question to investigate against the local repo/lab."),
                         "model":     model_schema(&self.provider),
+                        "provider":  provider_schema(),
                         "max_steps": json!({
                             "type": "integer",
                             "description": "Max tool-calling steps before forcing a final answer (default 12, cap 20).",
@@ -6856,9 +6907,13 @@ impl McpServer for AiAgentServer {
                     ids. Reflects whichever provider is currently active — deepseek (default), \
                     grok, kimi, glm, qwen, or a registry-configured provider (see the `model` \
                     parameter's description on any other tool, or CLAUDE.md/AGENTS.md §12.5) \
-                    — not necessarily DeepSeek specifically."
+                    — not necessarily DeepSeek specifically. Pass `provider` to query a \
+                    specific provider for this call instead of the server default."
                     .into(),
-                input_schema: json_schema_object(json!({}), Vec::<&str>::new()),
+                input_schema: json_schema_object(
+                    json!({ "provider": provider_schema() }),
+                    Vec::<&str>::new(),
+                ),
             },
             Tool {
                 name: "ai_check_balance".into(),
@@ -6873,9 +6928,13 @@ impl McpServer for AiAgentServer {
                     provider's registry entry once you find the right endpoint in its docs). \
                     Returns a best-effort one-line summary PLUS the raw provider response, since \
                     balance response shapes are far less standardized than /models — read the \
-                    raw JSON if the summary looks off."
+                    raw JSON if the summary looks off. Pass `provider` to check a specific \
+                    provider for this call instead of the server default."
                     .into(),
-                input_schema: json_schema_object(json!({}), Vec::<&str>::new()),
+                input_schema: json_schema_object(
+                    json!({ "provider": provider_schema() }),
+                    Vec::<&str>::new(),
+                ),
             },
             Tool {
                 name: "ai_edit_run".into(),
@@ -6995,7 +7054,11 @@ impl McpServer for AiAgentServer {
             return self.call_edit_deny(&args);
         }
         if name == "ai_list_models" {
-            return match self.list_models() {
+            let worker = match self.worker_for_call(&args) {
+                Ok(w) => w,
+                Err(e) => return tool_error(&e),
+            };
+            return match worker.list_models() {
                 Ok(text) => ToolCallResult {
                     content: text_content(text),
                     is_error: None,
@@ -7004,7 +7067,11 @@ impl McpServer for AiAgentServer {
             };
         }
         if name == "ai_check_balance" {
-            return match self.check_balance() {
+            let worker = match self.worker_for_call(&args) {
+                Ok(w) => w,
+                Err(e) => return tool_error(&e),
+            };
+            return match worker.check_balance() {
                 Ok(text) => ToolCallResult {
                     content: text_content(text),
                     is_error: None,
@@ -7017,8 +7084,15 @@ impl McpServer for AiAgentServer {
             Some(p) if !p.trim().is_empty() => p,
             _ => return tool_error("'prompt' is required and must not be empty"),
         };
+        // Resolve the per-call provider (the `provider` arg, else the server
+        // default). Model is resolved AGAINST that provider, so "flash"/"pro"
+        // map to the chosen provider's tiers.
+        let worker = match self.worker_for_call(&args) {
+            Ok(w) => w,
+            Err(e) => return tool_error(&e),
+        };
         let model_str = get_str(&args, "model").unwrap_or("flash");
-        let model = self.resolve_model(model_str);
+        let model = worker.resolve_model(model_str);
 
         // The autonomous agent has its own loop + system prompt.
         if name == "ai_agent" {
@@ -7027,11 +7101,11 @@ impl McpServer for AiAgentServer {
                 .and_then(|v| v.as_u64())
                 .map(|n| n.clamp(1, AGENT_HARD_MAX_STEPS))
                 .unwrap_or(AGENT_DEFAULT_MAX_STEPS);
-            return match self.run_agent(prompt, &model, max_steps) {
+            return match worker.run_agent(prompt, &model, max_steps) {
                 Ok(answer) => {
                     let header = format!(
                         "[{}/{model} | AGENT | budget={max_steps}]\n\n",
-                        self.provider.name
+                        worker.provider.name
                     );
                     ToolCallResult {
                         content: text_content(format!("{header}{answer}")),
@@ -7076,9 +7150,9 @@ impl McpServer for AiAgentServer {
 
         let user_prompt = build_user_prompt(intent_label, prompt, context);
 
-        match self.call(system, &user_prompt, &model) {
+        match worker.call(system, &user_prompt, &model) {
             Ok(response) => {
-                let header = format!("[{}/{model} | {intent_label}]\n\n", self.provider.name);
+                let header = format!("[{}/{model} | {intent_label}]\n\n", worker.provider.name);
                 ToolCallResult {
                     content: text_content(format!("{header}{response}")),
                     is_error: None,
@@ -7135,6 +7209,57 @@ mod tests {
                 built_in_provider(name).unwrap().balance_url.is_none(),
                 "{name} balance_url should be None until confirmed live, not guessed"
             );
+        }
+    }
+
+    #[test]
+    fn kimi_preset_uses_international_endpoint_and_live_models() {
+        // Regression: the preset originally pointed at api.moonshot.cn with stale
+        // moonshot-v1-* ids, which 401s an international key. These values are
+        // verified live against a real key.
+        let p = built_in_provider("kimi").unwrap();
+        assert!(p.base_url.contains("api.moonshot.ai"));
+        assert_eq!(p.flash_model, "kimi-k2.6");
+        assert_eq!(p.pro_model, "kimi-k2.7-code");
+        assert_eq!(
+            p.balance_url,
+            Some("https://api.moonshot.ai/v1/users/me/balance")
+        );
+    }
+
+    #[test]
+    fn worker_for_call_defaults_to_server_provider_and_overrides_per_call() {
+        let s = server();
+        // No `provider` arg → the server's own provider. Provider is an
+        // independent axis: this call didn't touch model or permission level.
+        assert_eq!(
+            s.worker_for_call(&json!({})).unwrap().provider.name,
+            s.provider.name
+        );
+
+        // An unknown provider is a hard error, never a silent fallback to the
+        // default's key against the wrong URL. (No key needed to reach this —
+        // the name fails to resolve before key lookup.)
+        assert!(
+            s.worker_for_call(&json!({ "provider": "nonesuch-xyz" }))
+                .is_err()
+        );
+
+        // A known override resolves through the SAME path as startup, so it
+        // needs that provider's key present. Where it IS configured (a real
+        // key in env/Keychain), the switch lands on that provider's real
+        // endpoint; where it isn't (e.g. CI), resolution errors on the missing
+        // key rather than silently using the default — either way, never the
+        // wrong endpoint. Assert only the branch the environment supports.
+        match s.worker_for_call(&json!({ "provider": "kimi" })) {
+            Ok(w) => {
+                assert_eq!(w.provider.name, "kimi");
+                assert!(w.provider.base_url.contains("api.moonshot.ai"));
+            }
+            Err(e) => assert!(
+                e.contains("key") || e.contains("API"),
+                "a resolvable-name failure must be about the missing key, not the name: {e}"
+            ),
         }
     }
 
