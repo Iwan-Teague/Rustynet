@@ -4498,13 +4498,20 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "bootstrap_vm".into(),
-                description: "Run a bootstrap phase on a VM (sync-source, build-release, install-release, restart-runtime, verify-runtime, tunnel-smoke, killswitch-smoke, dns-smoke, ipv6-smoke, all). `ops vm-lab-bootstrap-phase`. Can be slow.".into(),
+                description: "Install/build Rustynet on one or MORE lab VMs. Phases: sync-source (ship the source), build-release (cargo build ON the guest), install-release, restart-runtime, verify-runtime, tunnel-smoke, killswitch-smoke, dns-smoke, ipv6-smoke, or `all` for the full chain. Pass `aliases` for several VMs in one call (they are handled by the same run, so a pair stays on identical source) or `select_all` for every include_in_all VM. Works for any inventory VM regardless of host — libvirt guests on a remote KVM box and local UTM guests alike, because the whole path is SSH. The guest must already have the toolchain rn_bootstrap verifies (rustup+cargo, clang/llvm, nft, wg, pkg-config openssl+sqlite3, passwordless sudo). SLOW: build-release compiles the workspace on the guest. `ops vm-lab-bootstrap-phase`.".into(),
                 input_schema: json_schema_object(
                     json!({
-                        "alias": json_schema_string("VM alias"),
-                        "phase": json_schema_string("Bootstrap phase"),
+                        "aliases": {"type": "array", "items": {"type": "string"}, "description": "VM aliases to bootstrap, e.g. [\"linux-x86-exit-1\",\"linux-x86-client-1\"]. One call keeps them on identical source."},
+                        "alias": json_schema_string("Single VM alias (legacy; prefer `aliases`)"),
+                        "select_all": {"type": "boolean", "description": "Every include_in_all VM instead of a list."},
+                        "phase": json_schema_string("sync-source | build-release | install-release | restart-runtime | verify-runtime | all"),
+                        "local_source_dir": {"type": "string", "description": "Ship source from this local path instead of cloning a repo. Default: the repo working tree."},
+                        "repo_url": {"type": "string", "description": "Clone from this URL on the guest instead of shipping local source."},
+                        "branch": {"type": "string"},
+                        "dest_dir": {"type": "string", "description": "Absolute path on the guest. Default: the entry's rustynet_src_dir."},
+                        "timeout_secs": {"type": "integer", "description": "build-release on a cold guest can take many minutes; raise this."}
                     }),
-                    vec!["alias", "phase"],
+                    vec!["phase"],
                 ),
             },
             Tool {
@@ -5343,16 +5350,80 @@ impl McpServer for LabStateServer {
             }
 
             "bootstrap_vm" => {
-                let alias = arg_str(args, "alias").unwrap_or("");
                 let phase = arg_str(args, "phase").unwrap_or("");
-                if alias.is_empty() || phase.is_empty() {
-                    return tool_error("Missing required parameters: alias and phase");
+                if phase.is_empty() {
+                    return tool_error("Missing required parameter: phase");
                 }
-                self.run_ops(
-                    "vm-lab-bootstrap-phase",
-                    &["--vm", alias, "--phase", phase],
-                    2400,
-                )
+
+                // Accept a list, a single legacy alias, or select_all — but exactly
+                // one selector. Guessing between an empty `aliases` and a stray
+                // `alias` is how a "bootstrap both" call silently does one.
+                let mut aliases = string_array(args, "aliases");
+                if let Some(single) = arg_str(args, "alias") {
+                    if !single.is_empty() {
+                        aliases.push(single.to_owned());
+                    }
+                }
+                let select_all = arg_bool(args, "select_all");
+                if aliases.is_empty() && !select_all {
+                    return tool_error(
+                        "Provide `aliases` (e.g. [\"linux-x86-exit-1\",\"linux-x86-client-1\"]), \
+                         or `alias` for one, or select_all:true",
+                    );
+                }
+                if !aliases.is_empty() && select_all {
+                    return tool_error("Pass either `aliases`/`alias` or select_all, not both");
+                }
+
+                let mut extra: Vec<&str> = Vec::new();
+                // one --vm per alias: the CLI collects repeats, and passing them in a
+                // single invocation keeps the set on identical source
+                for alias in &aliases {
+                    extra.push("--vm");
+                    extra.push(alias.as_str());
+                }
+                if select_all {
+                    extra.push("--all");
+                }
+                extra.push("--phase");
+                extra.push(phase);
+
+                let source_owned;
+                if let Some(dir) = arg_str(args, "local_source_dir") {
+                    source_owned = dir.to_owned();
+                    extra.push("--local-source-dir");
+                    extra.push(&source_owned);
+                }
+                let repo_owned;
+                if let Some(url) = arg_str(args, "repo_url") {
+                    repo_owned = url.to_owned();
+                    extra.push("--repo-url");
+                    extra.push(&repo_owned);
+                }
+                let branch_owned;
+                if let Some(branch) = arg_str(args, "branch") {
+                    branch_owned = branch.to_owned();
+                    extra.push("--branch");
+                    extra.push(&branch_owned);
+                }
+                let dest_owned;
+                if let Some(dest) = arg_str(args, "dest_dir") {
+                    dest_owned = dest.to_owned();
+                    extra.push("--dest-dir");
+                    extra.push(&dest_owned);
+                }
+
+                // build-release compiles the workspace ON the guest; the default is
+                // generous but a cold guest over a slow link can still exceed it.
+                let timeout = args
+                    .and_then(|a| a.get("timeout_secs"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(2400);
+                let timeout_owned = timeout.to_string();
+                extra.push("--timeout-secs");
+                extra.push(&timeout_owned);
+
+                self.run_ops("vm-lab-bootstrap-phase", &extra, timeout + 120)
             }
 
             "get_vm_diagnostics" => {
