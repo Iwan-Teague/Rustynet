@@ -1739,15 +1739,10 @@ predates the fix.
       inventory but is not UTM-backed (controller.type=libvirt,
       host_id=ubuntu-kvm-1)"* and points at the controller-aware CLI, instead of
       the old binary's flat lie that the alias was absent.
-- [ ] **Owner action: reconnect the client** (`/mcp` → reconnect, or restart it;
-      killing the process does **not** respawn it). Nothing else in Step 0 can be
-      confirmed from here — see the next item for why that matters.
-- [ ] **Then re-verify through the client, not over stdio.** `mcp_call.sh` runs the
-      binary from Bash, which is **unsandboxed**, so the probe above does NOT prove
-      the Desktop-spawned server can reach the box (§12.3.1 / §12.9). Calling
-      `discover_hosts` through the reconnected client is the test that settles it:
-      `ubuntu-kvm-1 probe=ok` through the client ⇒ the sandbox does not block the
-      tailnet path; `EHOSTUNREACH` ⇒ the launchd/unsandboxed fix is mandatory.
+- [x] **Client reconnected** (owner, 2026-07-17) — the 8 tools are live.
+- [x] **Re-verified through the client, not just over stdio.** `discover_hosts` via
+      the Desktop-spawned server: `ubuntu-kvm-1 probe=ok (QEMU 8.2.2)`, both guests
+      + IPs. **Step 0 is complete.**
 
 ### 12.4 Step 1 — close the fail-opens
 
@@ -1781,14 +1776,20 @@ These make every other result untrustworthy, so they come before new features.
       tests + the gate were run, not the full suite (AGENTS/CLAUDE §13.1 says run it
       before landing). The assertion is now the stronger one: secure removal, and
       *no* plain `rm -f` on that path.
-- [ ] **`discover_hosts` fails open off-macOS.** Run on the box it reports
-      `host mac-utm-1 … probe=ok` and lists the Mac's 7 domains as **"shut off"** —
-      but the UTM paths and `utmctl` do not exist there, so those names came from
-      the *inventory*, not a probe. An agent on the box would conclude the Mac's
-      VMs are all powered off. Truth is "cannot determine from here". Same class of
-      defect already fixed in `host_net_status` (`classify_ssh_probe_failure`) and
-      §6.8.3 — a `local_utm` host that is not *this* machine must report
-      `unavailable`, not a fabricated state.
+- [x] **DONE 2026-07-17.** `discover_hosts` failed open off-macOS: on the box it
+      reported `host mac-utm-1 … probe=ok` and listed the Mac's 7 domains as
+      **"shut off"**. Root cause: the bundle scan **tolerates a missing root** and
+      falls back to entries read from the *inventory*, so the existing
+      `if scanned.is_empty()` fail-closed guard never fired — utmctl and the roots
+      do not exist on the box and nothing was ever contacted. Fixed with
+      `ensure_local_utm_host_is_this_machine` (a `local_utm` host IS this machine:
+      refuse off-macOS, and refuse when utmctl is absent) plus a per-root existence
+      check so a typo'd root on macOS cannot fabricate either.
+      Proven on the box: `mac-utm-1 probe=FAILED (… this machine is linux …
+      Reporting VM states from here would be a fabrication, not an observation.)`
+      with **zero guests**, and the Mac's own output unchanged. 3 tests (the
+      off-macOS one is `cfg(not(target_os = "macos"))`, so it runs on the box/CI —
+      where the bug actually lived).
 
 ### 12.5 Step 2 — locality: let the box drive itself (blocks run-on-host)
 
@@ -1847,12 +1848,21 @@ These make every other result untrustworthy, so they come before new features.
       SHA. As of 2026-07-17 the box is pinned at `49f5f9f` while `2c306b4`,
       `02deff8`, `5b814c3`, `3d950d1` are local-only. This is deliberate (evidence
       must name a commit others can fetch), not a bug — but it gates §12.7.
-- [ ] **Verify the MCP sandbox can reach the box.** §12.3.1 documents macOS Local
-      Network Privacy silently blocking MCP-opened LAN sockets (`EHOSTUNREACH`)
-      while the Bash tool is unsandboxed. The box is reached over **Tailscale
-      (utun10)**, which may not count as "local network" — but this is
-      **unverified**, and if it is blocked, the MCP must run unsandboxed via
-      launchd (§12.3.1's permanent fix) regardless of Step 0.
+- [x] **SETTLED 2026-07-17 — the sandbox is NOT blocking anything, and §12.3.1 was
+      stale.** This mattered more than a checklist tick: §12.3.1 told every agent to
+      do reachability/SSH from Bash rather than the MCP, and a whole session was
+      driven that way before it was re-tested. Four probes through the
+      Desktop-spawned server say otherwise — `check_vm_reachable` → `192.168.64.20:22`
+      **in-process TCP** `reachable: true`; `host_net_status` → LAN `172.23.56.5`
+      reachable; `discover_hosts` → `qemu+ssh` `probe=ok`; `validate_inventory`'s
+      only failure is `connection timed out` against a **powered-off** VM, which is
+      the correct answer. The `EHOSTUNREACH` / "No route to host (os error 65)"
+      signature appears nowhere. Both halves work — in-process sockets AND
+      shelled-out children, over LAN AND Tailscale. No launchd workaround needed.
+      **CLAUDE.md/AGENTS.md §12.3.1 rewritten** (mirrored per §14) to lead with
+      "use the MCP", keeping the original finding as a recurrence guide — Local
+      Network Privacy is a *permission*, so it can be revoked as easily as granted;
+      `EHOSTUNREACH` against a private-range IP is the tell that it is back.
 - [ ] `eno1` is `NO-CARRIER` (box is on WiFi; WiFi cannot bridge), so guests are
       NAT-only behind `virbr0` — fine for a box-local lab, but it violates ADR-004's
       dual-NIC target (§6.5.3) and keeps cross-machine on Tailscale.

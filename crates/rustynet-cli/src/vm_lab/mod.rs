@@ -6457,10 +6457,54 @@ fn discover_one_host(
 ///
 /// The probe here is "the bundle scan ran and produced a report" — the macOS
 /// analogue of `virsh version` proving a libvirt host is what it claims.
+/// Refuse to answer for a `local_utm` host from a machine that is not it.
+///
+/// `local_utm` means **this machine**: utmctl and the bundle roots are local
+/// paths, so from anywhere else there is nothing to probe. Without this guard the
+/// answer is not an error but a *fabrication* — the underlying bundle scan
+/// tolerates a missing root and falls back to inventory-derived entries, so on the
+/// Linux box `discover_hosts` reported `host mac-utm-1 … probe=ok` and listed the
+/// Mac's seven VMs as **"shut off"**. Those names came from the inventory; utmctl
+/// and the roots do not exist there and nothing was ever contacted. An agent
+/// reading that would conclude the whole UTM fleet was powered off.
+///
+/// That breaks this command's stated contract — *"an unreachable host reports
+/// probe=FAILED and contributes no guests, so 'no VMs' never looks like 'could not
+/// ask'"* — and it is the same fail-open already fixed in `host_net_status`
+/// (`classify_ssh_probe_failure`) and §6.8.3. "Cannot determine from here" is the
+/// honest answer; "shut off" is a claim we have no basis for.
+fn ensure_local_utm_host_is_this_machine(host: &LabHost) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err(format!(
+            "host {} is kind=local_utm (macOS/UTM-backed) but this machine is {}. \
+             Its VMs can only be enumerated from the machine that hosts them — \
+             run this there, or ask about a libvirt host instead. Reporting VM \
+             states from here would be a fabrication, not an observation.",
+            host.host_id,
+            std::env::consts::OS
+        ));
+    }
+    let utmctl = default_utmctl_path();
+    if !utmctl.is_file() {
+        return Err(format!(
+            "host {} is kind=local_utm but utmctl is not present at {}. \
+             Without it, power state cannot be observed and any VM state reported \
+             would be inferred from the inventory rather than measured.",
+            host.host_id,
+            utmctl.display()
+        ));
+    }
+    Ok(())
+}
+
 fn discover_local_utm_host(
     host: &LabHost,
     inventory_path: &Path,
 ) -> (Result<String, String>, Vec<DiscoveredGuest>) {
+    if let Err(reason) = ensure_local_utm_host_is_this_machine(host) {
+        return (Err(reason), Vec::new());
+    }
+
     // Empty ⇒ scan the default UTM container root (None). Otherwise scan every
     // declared root: a split fleet must not be silently half-discovered.
     let roots: Vec<Option<PathBuf>> = if host.utm_documents_roots.is_empty() {
@@ -6479,6 +6523,20 @@ fn discover_local_utm_host(
             .as_ref()
             .map(|root| root.display().to_string())
             .unwrap_or_else(|| "default UTM documents root".to_owned());
+        // A declared root that is not there is an error, not an empty scan. The
+        // bundle scan would otherwise return the inventory's own entries and this
+        // host would report `probe=ok` with fabricated states — the same failure as
+        // asking about it off-macOS, just with a typo'd path instead of a wrong
+        // machine. `scanned` staying empty is what makes the fail-closed check
+        // below fire.
+        if let Some(declared) = root.as_ref()
+            && !declared.is_dir()
+        {
+            errors.push(format!(
+                "{label}: declared utm_documents_root does not exist"
+            ));
+            continue;
+        }
         match scan_one_utm_root(root, inventory_path) {
             Ok(found) => {
                 scanned.push(label);
@@ -53285,5 +53343,73 @@ mod secrets_sidecar_tests {
             derived,
             PathBuf::from("/lab/documents/vm_lab_inventory.secrets.json")
         );
+    }
+}
+
+#[cfg(test)]
+mod local_utm_locality_tests {
+    use super::{LabHost, LabHostKind, discover_local_utm_host};
+    use std::path::{Path, PathBuf};
+
+    fn utm_host(roots: Vec<PathBuf>) -> LabHost {
+        LabHost {
+            host_id: "mac-utm-1".to_owned(),
+            kind: LabHostKind::LocalUtm,
+            connect_uri: None,
+            utm_documents_roots: roots,
+            guest_subnet: None,
+            alt_ssh_endpoints: Vec::new(),
+            pool_disk_model: None,
+            repo_dir: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn a_missing_declared_root_fails_closed_instead_of_reporting_inventory_state() {
+        // The bundle scan tolerates a missing root and falls back to entries read
+        // from the INVENTORY, so without the existence check this returned
+        // `probe=ok` plus every VM confidently reported "shut off" — states for
+        // machines nothing ever contacted. `probe=FAILED` with no guests is the
+        // honest answer; a fabricated state is worse than an error because it
+        // looks like an observation.
+        let host = utm_host(vec![PathBuf::from("/definitely/not/a/utm/root")]);
+        let (probe, guests) = discover_local_utm_host(&host, Path::new("/tmp/whatever.json"));
+        let err = probe.expect_err("a missing root must not report a healthy scan");
+        assert!(
+            err.contains("does not exist"),
+            "must say the root is absent: {err}"
+        );
+        assert!(
+            guests.is_empty(),
+            "a host we could not scan must contribute NO guests, got {}",
+            guests.len()
+        );
+    }
+
+    #[test]
+    fn every_root_missing_still_fails_closed_and_names_them_all() {
+        let host = utm_host(vec![PathBuf::from("/nope/one"), PathBuf::from("/nope/two")]);
+        let (probe, guests) = discover_local_utm_host(&host, Path::new("/tmp/whatever.json"));
+        let err = probe.expect_err("must fail closed");
+        assert!(err.contains("/nope/one"), "names the first: {err}");
+        assert!(err.contains("/nope/two"), "names the second: {err}");
+        assert!(guests.is_empty());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_local_utm_host_cannot_be_answered_from_another_machine() {
+        // The case that started this: on the Linux box, `discover_hosts` reported
+        // `mac-utm-1 probe=ok` and listed the Mac's seven VMs as "shut off".
+        // local_utm means THIS machine — utmctl and the roots are local paths.
+        let host = utm_host(Vec::new());
+        let (probe, guests) = discover_local_utm_host(&host, Path::new("/tmp/whatever.json"));
+        let err = probe.expect_err("must refuse to answer for another machine's UTM host");
+        assert!(
+            err.contains("fabrication"),
+            "must be explicit about why: {err}"
+        );
+        assert!(guests.is_empty());
     }
 }

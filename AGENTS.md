@@ -408,35 +408,48 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
 - After every evidence run, verify the appended row in
   `documents/operations/live_lab_node_run_matrix.csv` (§2, §10.9).
 
-### 12.3.1 macOS MCP LAN Sandbox — do reachability/SSH from Bash, not MCP
-On the macOS host, the Claude desktop app launches the MCP servers through a
-sandbox wrapper (`Claude.app/Contents/Helpers/disclaimer`), so they are subject
-to **macOS Local Network Privacy**. Any MCP tool that opens a TCP/SSH socket to
-a lab guest (a LAN / private-range IP) is silently blocked and returns
-**`EHOSTUNREACH` — "No route to host (os error 65)"**. This affects
-`check_vm_reachable` (TCP probe), `validate_inventory` (`ssh_port_status`), and
-any SSH-driven MCP step. It is **environmental** — not a code, routing, or
-inventory bug — and hits **every** node identically (Debian/macOS/Windows/
-Fedora/Ubuntu/Rocky), so do NOT chase it per-VM or "fix" it in the inventory.
+### 12.3.1 macOS MCP LAN reachability — NOT currently blocked (re-verified 2026-07-17)
+**Status: the MCP reaches the lab fine. Use it.** This section used to instruct
+agents to do all reachability/SSH from Bash because the sandbox blocked the MCP.
+**That is no longer true, and following it wastes real effort** (a whole session
+was driven from Bash on this advice before it was re-tested). Re-verified through
+the Desktop-spawned server on 2026-07-17:
+
+| Probe | Kind | Result |
+| --- | --- | --- |
+| `check_vm_reachable` → `192.168.64.20:22` | **in-process TCP**, LAN | `reachable: true` |
+| `host_net_status` → `172.23.56.5` | shelled-out, LAN | `reachable` |
+| `discover_hosts` → `qemu+ssh://…/system` | shelled-out, tailnet | `probe=ok (QEMU 8.2.2)` |
+| `validate_inventory` → a powered-OFF VM | in-process TCP | `connection timed out` — the correct answer, not a block |
+
+Both halves work — in-process sockets *and* shelled-out children, over LAN *and*
+Tailscale. The `EHOSTUNREACH` signature below appears nowhere.
+
+**The original finding, kept because it can come back.** macOS Local Network
+Privacy is a *permission*, so it can be revoked as easily as it was granted. If an
+MCP tool ever returns **`EHOSTUNREACH` — "No route to host (os error 65)"** against
+a LAN / private-range IP, that is this problem returning, not a code, routing, or
+inventory bug — it hits **every** node identically (Debian/macOS/Windows/Fedora/
+Ubuntu/Rocky), so do NOT chase it per-VM or "fix" it in the inventory. It happens
+because the desktop app launches MCP servers through a sandbox wrapper
+(`Claude.app/Contents/Helpers/disclaimer`). Symptoms and workarounds, if it recurs:
 
 - **Trust the `utmctl`-based half, distrust the TCP/SSH half.** Power state and
-  live-IP resolution (utmctl / arp-by-mac) are accurate; the reachability /
-  `ssh_port` verdict is a false negative.
-- **The Bash tool is NOT sandboxed** (it runs directly under the shell, no
-  container) and reaches the lab LAN fine. Do reachability, SSH, scp, deploy,
-  and live-lab orchestration **from Bash**, e.g.:
+  live-IP resolution (utmctl / arp-by-mac) stay accurate; the reachability /
+  `ssh_port` verdict is the false negative.
+- **The Bash tool is NOT sandboxed** and reaches the lab LAN fine — the fallback:
   - probe: `nc -z -G5 <ip> 22`, or `ssh` / `sshpass -p <pw> ssh …`
-  - full toolset unsandboxed: `cargo run -q -p rustynet-cli --features vm-lab
-    -- ops vm-lab-…` (reaches guests where the sandboxed MCP wrappers can't;
-    the `vm-lab` feature is required — lab commands are compiled out of
-    default builds).
-- The host login shell is **zsh**: an unquoted `$VAR` does NOT word-split — pass
-  multi-flag SSH options inline, or use `${=VAR}` / an array, or the probe will
-  error `keyword stricthostkeychecking extra arguments`.
-- Permanent fix (make the MCP tools themselves reach the LAN with no prompt):
-  run `rustynet-mcp-lab-state` as your own **unsandboxed** process (launchd) and
-  connect Claude to it over a URL transport instead of letting Claude spawn it
-  under `disclaimer`.
+  - full toolset: `cargo run -q -p rustynet-cli --features vm-lab -- ops vm-lab-…`
+    (the `vm-lab` feature is required — lab commands are compiled out of default
+    builds).
+- Permanent fix: grant Local Network permission, or run `rustynet-mcp-lab-state`
+  as your own **unsandboxed** process (launchd) and connect Claude to it over a
+  URL transport instead of letting Claude spawn it under `disclaimer`.
+
+**Still true regardless of the sandbox:** the host login shell is **zsh** — an
+unquoted `$VAR` does NOT word-split, so pass multi-flag SSH options inline or use
+`${=VAR}` / an array, or the probe errors with
+`keyword stricthostkeychecking extra arguments`.
 
 ### 12.4 Operator UX
 - Interactive wizard: `./start.sh`.
