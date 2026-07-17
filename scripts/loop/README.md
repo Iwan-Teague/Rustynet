@@ -50,7 +50,7 @@ When the agent starts, read `state/loop-wake.json` and `state/loop-wake-prompt.m
 
 ## Autonomous Loop (`drive_loop.sh`)
 
-`drive_loop.sh` wraps the full deepseek pipeline into one command:
+`drive_loop.sh` wraps the full AI-agent MCP pipeline into one command:
 
 ```bash
 # macOS exit cell
@@ -66,10 +66,10 @@ When the agent starts, read `state/loop-wake.json` and `state/loop-wake-prompt.m
 ```
 
 **Cycle:**
-1. Calls `deepseek_lab_run` → auto-polls for report (~50min blocking)
+1. Calls `ai_lab_run` → auto-polls for report (~50min blocking)
 2. Writes `state/loop-cycle-prompt.md` with report + patch instructions
 3. You invoke the Zed agent, paste the prompt file as context
-4. Agent verifies claims, patches, gates, commits, relaunches deepseek_lab_run
+4. Agent verifies claims, patches, gates, commits, relaunches ai_lab_run
 5. You re-run `drive_loop.sh` to capture the next cycle
 
 ## Fully Autonomous Loop (`auto_loop.sh`)
@@ -102,13 +102,13 @@ against the singleton gate.
   `skip_linux_live_suite=true` + `rebuild_nodes=<patched_node>` — redeploy only
   the patched node and run only the cell that proves the fix (~10-15min).
 - The **PASS** prompt tells the agent to sync docs/matrix, pick the next unproven
-  cell via `deepseek_next_live_lab_target`, and launch it (again skipping the
+  cell via `ai_next_live_lab_target`, and launch it (again skipping the
   Linux suite for mac/win), so the loop always progresses to the next area.
 - For a **Linux cell** the suite is NOT skipped — there the Linux suite is the
   test.
 
 **Cycle:**
-1. Loop launches the first `deepseek_lab_run` (blocking poll keeps the MCP server
+1. Loop launches the first `ai_lab_run` (blocking poll keeps the MCP server
    alive so the detached orchestrator spawns — never `--no-poll` to launch).
 2. Classifies the report (anchored on the report header: PASS / FAIL → triage /
    TIMED OUT / DRY-RUN), writes `state/loop-cycle-prompt.md`, pastes into Zed.
@@ -128,10 +128,10 @@ Accessibility/Automation permission to whatever runs the script.
 opens a separate tmux window, runs an OpenCode worker over a completed live-lab
 report, writes a durable review, then optionally wakes the main OpenCode session.
 Use this with live-lab runs launched as `triage_on_failure=false` so paid
-DeepSeek MCP triage is not called automatically.
+AI-agent MCP triage is not called automatically.
 
 `auto_loop.sh` now does this automatically on failed runs when
-`OPENCODE_REVIEW_ON_FAIL=1` (default): it launches `deepseek_lab_run` with
+`OPENCODE_REVIEW_ON_FAIL=1` (default): it launches `ai_lab_run` with
 `triage_on_failure=false`, calls this review worker when the run fails, waits for
 the review, inlines the review into the next action prompt, and writes
 `state/opencode-main-wake-prompt.md`. If `OPENCODE_MAIN_SESSION_ID` is set, the
@@ -179,7 +179,7 @@ Run in foreground instead of tmux:
 The review worker is read-only by prompt contract. It must not patch, gate,
 commit, or launch another lab. The main v4-pro loop agent remains reviewer of
 record: it reads the review, verifies claims against repo/log evidence, patches,
-gates, commits, then relaunches the focused `deepseek_lab_run`.
+gates, commits, then relaunches the focused `ai_lab_run`.
 
 ## OpenCode `/loop`
 
@@ -250,7 +250,7 @@ Main-agent stall controls:
   `state/opencode-loop/main-agent-events.jsonl` on stderr from the shell
   function. This keeps command substitution stdout clean so only the detected
   `labrun-*` id is captured by the parent state machine.
-- Lab polling has a local artifact fallback: if `deepseek_live_lab_result` still
+- Lab polling has a local artifact fallback: if `ai_live_lab_result` still
   says a job is running but `orchestration/orchestrate_result.json` exists, the
   loop treats that artifact as terminal, extracts `overall_status` plus the first
   failed stage, and advances into Flash review / Pro patching instead of sleeping

@@ -11458,7 +11458,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     // / `run_macos_orchestration_stages`), NOT on the live suite, so the
     // targeted cell is still fully exercised against the freshly-set-up mesh.
     // This mirrors the run-Ok arm below minus the `execute_ops_vm_lab_run_live_lab`
-    // invocation. Used for fast mac/win cell iteration (e.g. deepseek_lab_run
+    // invocation. Used for fast mac/win cell iteration (e.g. ai_lab_run
     // with a role-platform selector).
     if config.skip_linux_live_suite {
         let skip_outcome = stage_outcome(

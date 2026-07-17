@@ -79,7 +79,7 @@ allow = [
   "Unicode-3.0",
   "BSD-3-Clause",
   # Permissive (non-copyleft) licenses required by the rustls-based HTTPS stack
-  # that the rustynet-mcp-deepseek dev tool uses to reach the DeepSeek API:
+  # that the rustynet-mcp-ai-agent dev tool uses to reach its configured LLM provider:
   #   ISC                  -> ring, rustls, rustls-webpki, untrusted
   #   CDLA-Permissive-2.0  -> webpki-roots (Mozilla CA root bundle)
   "ISC",
