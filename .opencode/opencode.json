@@ -113,9 +113,9 @@
       "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-lab-state"],
       "enabled": true
     },
-    "rustynet-deepseek": {
+    "rustynet-ai-agent": {
       "type": "local",
-      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-deepseek"],
+      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-ai-agent"],
       "enabled": true
     }
   }

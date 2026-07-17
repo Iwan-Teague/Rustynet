@@ -70,7 +70,7 @@ pub fn build_loop_args(config: &MonitorConfig) -> Vec<String> {
 }
 
 /// Build orchestrator args matching `build_orchestrator_args` in
-/// `crates/rustynet-mcp/src/bin/deepseek.rs`.
+/// `crates/rustynet-mcp/src/bin/ai_agent.rs`.
 #[allow(dead_code)]
 pub fn build_orchestrator_args(
     config: &MonitorConfig,

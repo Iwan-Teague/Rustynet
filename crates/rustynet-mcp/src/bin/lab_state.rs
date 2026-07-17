@@ -3981,7 +3981,7 @@ fn arg_bool(args: Option<&Value>, key: &str) -> bool {
 /// `--node` engine instead of the legacy bash arm whenever a selector is used
 /// without explicit `nodes`. Bash is slated for removal once Rust parity
 /// evidence is complete, so a selector-driven run should exercise Rust by
-/// default. Role priority mirrors deepseek_lab_run's `synthesize_rust_node_args`:
+/// default. Role priority mirrors ai_lab_run's `synthesize_rust_node_args`:
 /// `admin`/`blind_exit` are first-class `--node` role tokens (Bucket 1.5;
 /// `NodeRole::parse` accepts both, and `is_lab_assignable_for_platform` allows
 /// any OS for lab-evidence purposes) so each selector maps to its own real
@@ -5933,7 +5933,7 @@ impl LabStateServer {
                 // for removal once Rust parity evidence is complete, so — unlike the
                 // raw `--exit-platform` etc. CLI flags, which only the legacy bash
                 // arm honors — a selector-driven run here AUTO-SYNTHESIZES a full
-                // `--node alias:role` topology (mirrors deepseek_lab_run's default
+                // `--node alias:role` topology (mirrors ai_lab_run's default
                 // `rust_engine: true` behavior) instead of falling to bash. The
                 // earlier mutual-exclusivity check guarantees `explicit_nodes` is
                 // empty whenever a selector is present, so this and the

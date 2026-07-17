@@ -30,7 +30,7 @@ STEP 0 — READ FIRST
 1. CLAUDE.md + AGENTS.md (contract, constraints)
 2. documents/operations/active/LabMonitorTUIDesign_2026-06-29.md (design spec)
 3. Cargo.toml (workspace members list — you will add to it)
-4. crates/rustynet-mcp/src/bin/deepseek.rs lines around `build_orchestrator_args`
+4. crates/rustynet-mcp/src/bin/ai_agent.rs lines around `build_orchestrator_args`
    (to see the exact CLI args the orchestrator takes — match them exactly)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -164,7 +164,7 @@ Build in this order so `cargo check` passes at each step:
    or on demand.
 
 8. `src/control/launcher.rs` — build the orchestrator args from `MonitorConfig`
-   (match `build_orchestrator_args` in `crates/rustynet-mcp/src/bin/deepseek.rs`
+   (match `build_orchestrator_args` in `crates/rustynet-mcp/src/bin/ai_agent.rs`
    EXACTLY — same binary path, same flags), spawn via `tokio::process::Command`
    with `process_group(0)` so it gets its own pgid, record pgid in
    `state/monitor-launch.json`. Check for a running singleton first.
@@ -266,7 +266,7 @@ DESIGN CONSTRAINTS (DO NOT VIOLATE)
   `Vec<&str>` / `Vec<String>`, never passed to a shell.
 - The orchestrator binary path: `target/debug/rustynet-cli` (or release path
   if `--release` flag is in config). Match the exact invocation from
-  `build_orchestrator_args` in `crates/rustynet-mcp/src/bin/deepseek.rs`.
+  `build_orchestrator_args` in `crates/rustynet-mcp/src/bin/ai_agent.rs`.
 - Do not add new features to other crates as part of this task — this is
   a new crate only.
 - Keep AGENTS.md and CLAUDE.md byte-mirrored if you touch them.

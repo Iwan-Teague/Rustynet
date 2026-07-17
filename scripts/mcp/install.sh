@@ -6,7 +6,7 @@
 #   ./scripts/mcp/install.sh --release       # release build → ./bin
 #   ./scripts/mcp/install.sh --print-configs # only print config snippets
 #
-# Builds the three server binaries and copies them to ./bin (repo-local,
+# Builds the four server binaries and copies them to ./bin (repo-local,
 # gitignored — this is what the committed .zed/settings.json references). The
 # repo root is baked into each binary at compile time (build.rs), so the
 # servers work regardless of the client's working directory.
@@ -26,7 +26,7 @@ for arg in "$@"; do
     esac
 done
 
-BINARIES=(rustynet-mcp-repo-context rustynet-mcp-gate-runner rustynet-mcp-lab-state rustynet-mcp-deepseek)
+BINARIES=(rustynet-mcp-repo-context rustynet-mcp-gate-runner rustynet-mcp-lab-state rustynet-mcp-ai-agent)
 
 if [ "$PRINT_ONLY" = false ]; then
     echo "==> Building MCP server binaries..."
@@ -62,6 +62,7 @@ fi
 RC="${BIN_DIR}/rustynet-mcp-repo-context"
 GR="${BIN_DIR}/rustynet-mcp-gate-runner"
 LS="${BIN_DIR}/rustynet-mcp-lab-state"
+AA="${BIN_DIR}/rustynet-mcp-ai-agent-launcher.sh"
 
 cat <<EOF
 ========================================
@@ -71,7 +72,8 @@ cat <<EOF
   "context_servers": {
     "rustynet-repo-context": { "command": "${RC}", "args": [], "env": {} },
     "rustynet-gate-runner":  { "command": "${GR}", "args": [], "env": {} },
-    "rustynet-lab-state":    { "command": "${LS}", "args": [], "env": {} }
+    "rustynet-lab-state":    { "command": "${LS}", "args": [], "env": {} },
+    "rustynet-ai-agent":     { "command": "${AA}", "args": [], "env": {} }
   }
 }
 
@@ -83,7 +85,8 @@ cat <<EOF
   "mcpServers": {
     "rustynet-repo-context": { "command": "${RC}" },
     "rustynet-gate-runner":  { "command": "${GR}" },
-    "rustynet-lab-state":    { "command": "${LS}" }
+    "rustynet-lab-state":    { "command": "${LS}" },
+    "rustynet-ai-agent":     { "command": "${AA}" }
   }
 }
 
@@ -94,7 +97,8 @@ cat <<EOF
   "servers": {
     "rustynet-repo-context": { "command": "${RC}" },
     "rustynet-gate-runner":  { "command": "${GR}" },
-    "rustynet-lab-state":    { "command": "${LS}" }
+    "rustynet-lab-state":    { "command": "${LS}" },
+    "rustynet-ai-agent":     { "command": "${AA}" }
   }
 }
 
@@ -123,9 +127,26 @@ cat <<EOF
                                 (write_loop_note / get_loop_journal) that survives context
                                 compaction, prune_jobs, run matrix. Built for unattended
                                 24h+ loops.
+  rustynet-mcp-ai-agent      — 14 tools. Research/triage/run-driver layer calling whichever
+                                LLM provider is configured (DeepSeek default; Grok/Kimi/GLM/
+                                Qwen built in; any other OpenAI-Chat-Completions-compatible
+                                provider via a registry file — see CLAUDE.md/AGENTS.md
+                                §12.5). ai_lab_run/ai_live_lab drive + triage the live lab;
+                                ai_agent is a grounded read-only research agent; ai_read/
+                                ai_write/ai_read_write are paste-in-context proxies;
+                                ai_list_models/ai_check_balance are read-only discovery.
 
 The repo root is baked into each binary (build.rs); no working_directory needed.
 Override with RUSTYNET_REPO_ROOT if running a binary built from a different checkout.
+
+The printed configs above point rustynet-ai-agent at the LAUNCHER script
+(${AA}), not the raw binary — the launcher reads each
+provider's API key from macOS Keychain and exports it before exec'ing the
+real binary (CLAUDE.md/AGENTS.md §12.5). This install script builds and
+atomically installs the raw binary only; the launcher is a small,
+hand-authored, gitignored wrapper that must already exist at that path (or
+be recreated) for the printed configs to work — it does not itself need
+rebuilding when the binary changes.
 
 ========================================
  IMPORTANT: reconnect after reinstalling
