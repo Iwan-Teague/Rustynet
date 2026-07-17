@@ -4332,6 +4332,36 @@ impl McpServer for LabStateServer {
                 ),
             },
             Tool {
+                name: "launch_live_lab_on_host".into(),
+                description: "Start a live-lab run ON a remote host, DETACHED, and return immediately with a pid — the one action that was still a manual SSH. The orchestrator runs 30-45 min; this does NOT wait for it. It launches under setsid+nohup with all fds off the SSH channel, so the run survives the connection dropping, records its own pid for a later stop, and refuses to start if one is already in flight on that host. Poll it with host_run_status and stop it with stop_host_run. report_dir is RELATIVE to the host's repo_dir (the orchestrator refuses a non-empty one, so use a fresh name). Pass orchestrator_args as the exact flags you would give `ops vm-lab-orchestrate-live-lab` (node selectors, platform/skip flags) — each is single-quoted into the remote script, so none may contain a single quote or shell metacharacter. dry_run renders the launcher without running it. `ops vm-lab-launch-on-host`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory."},
+                        "host": {"type": "string", "description": "host_id of a remote host from hosts[]."},
+                        "report_dir": {"type": "string", "description": "Report directory ON the host, relative to its repo_dir (e.g. artifacts/live_lab/run-2026-07-17). Must be fresh: the orchestrator refuses a non-empty one."},
+                        "orchestrator_args": {"type": "array", "items": {"type": "string"}, "description": "Flags forwarded verbatim to vm-lab-orchestrate-live-lab, e.g. [\"--client-vm\",\"linux-x86-client-1\",\"--exit-vm\",\"linux-x86-exit-1\",\"--skip-cross-network\"]. No single quotes or shell metacharacters."},
+                        "host_ssh_identity": {"type": "string", "description": "Path ON THE HOST to the key the orchestrator uses to reach its guests. Default $HOME/.ssh/id_ed25519 (verified on ubuntu-kvm-1)."},
+                        "dry_run": {"type": "boolean", "description": "Render the launcher + runner and return them without launching."},
+                        "format": {"type": "string", "enum": ["table", "json"]},
+                        "ssh_identity_file": {"type": "string"}
+                    }),
+                    vec!["host", "report_dir"],
+                ),
+            },
+            Tool {
+                name: "stop_host_run".into(),
+                description: "Stop an in-flight live-lab run on a remote host. Signals the run's whole PROCESS GROUP (cargo -> rustynet-cli -> the guest-SSH children), not just the leader, so nothing is orphaned to keep hammering the guests; TERM first, then KILL after a grace period. Uses the pid the launch recorded (reload-proof) and falls back to pgrep. Idempotent: if nothing is running it says so rather than erroring, and it retires the handle files so a later host_run_status does not report a dead pid as live. `ops vm-lab-stop-host-run`.".into(),
+                input_schema: json_schema_object(
+                    json!({
+                        "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory."},
+                        "host": {"type": "string", "description": "host_id of a remote host from hosts[]."},
+                        "format": {"type": "string", "enum": ["table", "json"]},
+                        "ssh_identity_file": {"type": "string"}
+                    }),
+                    vec!["host"],
+                ),
+            },
+            Tool {
                 name: "compare_runs_at_commit".into(),
                 description: "STEP 6 of the multi-machine loop: collapse every run recorded at ONE commit into a single verdict, so you read a conclusion instead of two report trees. Per-platform pass/fail/no-verdict rollup + the failing stages + which machine each run came from (alias -> host_id join). SURFACES CONFLICTS: the same node+stage answering differently across runs at one commit invalidates the comparison and is reported loudly, never silently resolved. An absent result (skip/not_run/reused/unknown) is NEVER counted as pass — that is how a two-machine split would otherwise manufacture parity that was never tested. Refuses runs recorded from a dirty worktree, and refuses to call one run a comparison (--expect-runs, default 2). `ops vm-lab-run-matrix-compare`.".into(),
                 input_schema: json_schema_object(
@@ -5047,6 +5077,96 @@ impl McpServer for LabStateServer {
                         inventory.as_deref(),
                         &extra,
                         DISCOVERY_TIMEOUT_SECS,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
+            }
+
+            "launch_live_lab_on_host" => {
+                let Some(host) = arg_str(args, "host") else {
+                    return tool_error("launch_live_lab_on_host requires `host`");
+                };
+                let Some(report_dir) = arg_str(args, "report_dir") else {
+                    return tool_error("launch_live_lab_on_host requires `report_dir`");
+                };
+                let mut extra: Vec<&str> = vec!["--host", host, "--report-dir", report_dir];
+                let identity_owned;
+                if let Some(identity) = arg_str(args, "host_ssh_identity") {
+                    identity_owned = identity.to_owned();
+                    extra.push("--host-ssh-identity");
+                    extra.push(&identity_owned);
+                }
+                let ssh_owned;
+                if let Some(ssh) = arg_str(args, "ssh_identity_file") {
+                    ssh_owned = ssh.to_owned();
+                    extra.push("--ssh-identity-file");
+                    extra.push(&ssh_owned);
+                }
+                if args
+                    .and_then(|v| v.get("dry_run"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    extra.push("--dry-run");
+                }
+                let format_owned;
+                if let Some(format) = arg_str(args, "format") {
+                    format_owned = format.to_owned();
+                    extra.push("--format");
+                    extra.push(&format_owned);
+                }
+                // The `--` separator and the forwarded orchestrator args go LAST,
+                // so everything after `--` reaches the orchestrator, not the launch
+                // parser. Own the strings first, then borrow.
+                let orch_owned: Vec<String> = args
+                    .and_then(|v| v.get("orchestrator_args"))
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                extra.push("--");
+                extra.extend(orch_owned.iter().map(String::as_str));
+
+                // Launch returns in ~2s; give SSH generous headroom but nowhere near
+                // the run's own length — this call does not wait for the run.
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-launch-on-host",
+                        inventory.as_deref(),
+                        &extra,
+                        120,
+                    ),
+                    Err(err) => tool_error(&err),
+                }
+            }
+
+            "stop_host_run" => {
+                let Some(host) = arg_str(args, "host") else {
+                    return tool_error("stop_host_run requires `host`");
+                };
+                let mut extra: Vec<&str> = vec!["--host", host];
+                let ssh_owned;
+                if let Some(ssh) = arg_str(args, "ssh_identity_file") {
+                    ssh_owned = ssh.to_owned();
+                    extra.push("--ssh-identity-file");
+                    extra.push(&ssh_owned);
+                }
+                let format_owned;
+                if let Some(format) = arg_str(args, "format") {
+                    format_owned = format.to_owned();
+                    extra.push("--format");
+                    extra.push(&format_owned);
+                }
+                match self.arg_inventory(args) {
+                    Ok(inventory) => self.run_ops_with_inventory(
+                        "vm-lab-stop-host-run",
+                        inventory.as_deref(),
+                        &extra,
+                        90,
                     ),
                     Err(err) => tool_error(&err),
                 }
