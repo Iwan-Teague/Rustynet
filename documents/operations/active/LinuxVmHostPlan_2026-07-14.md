@@ -1648,3 +1648,188 @@ but IP discovery + readiness still fail closed until increment 3.
 **Intersection watch:** all of this lives in the 49k-line `vm_lab/mod.rs`, which
 RNQ-15 is extracting and RNQ-17 is splitting out. Keep the libvirt code cohesive
 so it moves wholesale; cross-reference in the RNQ ledger when increment 2 lands.
+
+---
+
+## 12. THE CHECKLIST — make the MCP actually usable against `ubuntu-kvm-1`
+
+**Owner ask (2026-07-17):** *"a usable MCP that can run and do other useful things
+like setup and resets, on/off, etc on the ubuntu server."* This section is the
+live, ordered execution checklist for that. It lives **here**, in the owning
+ledger, rather than in a new doc, because §6.7.4f (agent-surface gaps), §6.8.2
+(the delegation refactor) and §11 (increments) already track the same items — a
+second document would diverge from them within a day (AGENTS/CLAUDE §5: no
+parallel checklist that drifts from repository state). Those sections stay the
+rationale; this is the state.
+
+**Mark items here as they land, in the same change that lands them.**
+
+### 12.1 Verified working — measured live 2026-07-17, not read off the code
+
+Everything below was exercised against the running box, because §6.8.1a's matrix
+was compiled by *reading* the code path and two of its "✅ yes" rows turned out to
+hide real defects (§12.3). Re-verify rather than trust this table once it ages.
+
+| Capability | Evidence |
+| --- | --- |
+| Power **off/on** a box guest from the Mac | `ops vm-lab-stop`/`-start` on `linux-x86-exit-1`: `running → shut off → running`, exit 0, `via libvirt domain=… connect_uri=qemu+ssh://…` |
+| **Status/diagnostics** on box guests | `ops vm-lab-status` resolved both guests through the libvirt ladder (`192.168.121.137`/`.26`), SSHed in, returned hostname/ip/service state |
+| `virsh` over `qemu+ssh` **from the Mac** | `virsh -c qemu+ssh://ubuntu-server@ubuntu-headless/system list --all` → both guests running (Mac has virsh via homebrew) |
+| **Toolchain on the box** | rustc/cargo **1.88.0** (pinned), clippy, rustfmt — reachable over a *non-login* SSH after §12.2's shim fix; `cargo check -p rustynet-cli --features vm-lab` → exit 0 |
+| **Image fetch** into the pool | `virtio-win.iso` (754M) installed unprivileged; sha256 pin verified/refused/rejected (§6.1) |
+| CLI multi-host surface | `discover_hosts`, `sync_host`, `host_preflight`, `compare`, `host_run_status`, `host_net_status`, `provision-toolchain` all run **from the CLI** |
+
+**Guest reachability rides Tailscale.** `route -n get 192.168.121.137` → `utun10`.
+The Mac reaches the box's NAT subnet only because the box advertises
+`192.168.121.0/24` as a tailnet subnet route — i.e. the same Tailscale that
+collides with the Rustynet overlay (§6.5.2). Removing Tailscale (§6.6) removes
+this path too; plan for it.
+
+### 12.2 ✅ DONE — box toolchain (2026-07-17)
+
+- [x] Rust on the box. **The premise was wrong:** rust was installed 2026-07-16
+      09:18 and had already built `rustynet-cli --features vm-lab` at 12:58 that
+      day (7.2G `target/`, real x86-64 ELF with the vm-lab subcommands). It looked
+      absent because `command -v cargo` over SSH returns nothing — the non-login
+      PATH is `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:…`
+      with **no `~/.cargo/bin`**. That is the documented sbin/PATH trap wearing a
+      different hat. **The tracker's §11 increment 0/6 "Linux-host build check"
+      was therefore already satisfied; only the PATH hid it.**
+- [x] Shims linked into `/usr/local/bin` (one sudo; same approach as
+      `GUEST_TOOLCHAIN_SCRIPT`, keeping rustup so `rust-toolchain.toml`'s 1.88.0
+      pin still governs). Proven over a fresh non-login SSH.
+- [x] **No apt/build-deps needed.** `clang`/`libclang`/`libsqlite3-dev` are all
+      absent from the box and none are required: `rusqlite = { features =
+      ["bundled"] }` vendors SQLite (proof: a compiled `sqlite3.o` under
+      `target/debug/build/libsqlite3-sys-*/out/`). The guest script installs them
+      because it targets `rn_bootstrap`'s **node** prerequisites; a host is not a
+      node. Do not copy the guest script wholesale onto a host.
+
+### 12.3 Step 0 — rebuild the MCP binary (minutes; unblocks 8 tools)
+
+**This is why the MCP feels broken. The capability is built; it is not loaded.**
+`bin/rustynet-mcp-lab-state` is dated **2026-07-09 00:36**; `lab_state.rs` is from
+**2026-07-17**. Every multi-host tool added on the 16th–17th exists in source and
+is **absent from the running server**: `discover_hosts`, `sync_host`,
+`host_preflight`, `provision_guest`, `compare_runs_at_commit`, `host_run_status`,
+`host_net_status`, `provision_guest_toolchain`.
+
+Live proof of the staleness: `check_vm_reachable("linux-x86-client-1")` returns
+`Unknown alias … (not in inventory)` — it **is** in the inventory. That is exactly
+the lie §6.8.3 records as fixed by `utm_resolution_error()`; the running binary
+predates the fix.
+
+- [x] `cargo build --release --bin rustynet-mcp-lab-state` (2026-07-17)
+- [x] Install with an **atomic `mv`, never `cp`** — the client keeps the running
+      binary mmap'd, so `cp` truncates it in place and corrupts it (symptom: the
+      server starts and emits nothing). `cp … bin/x.new && mv -f bin/x.new bin/x`.
+      Done; installed sha256 matches the build output byte-for-byte.
+- [x] **All three servers were stale, not just this one** — a systemic problem with
+      hand-built binaries in `bin/`, since nothing rebuilds them:
+      `gate-runner` bin 2026-06-12 vs src 2026-06-26; `repo-context` bin 2026-06-12
+      vs src **2026-07-12** (a month). All rebuilt + installed 2026-07-17.
+      **Worth a follow-up:** a staleness check (bin mtime vs src, or a `--version`
+      the client asserts) so this cannot rot silently again.
+- [x] Verified over **stdio** (`state/mcp_call.sh`, which needs no client
+      reconnect): all 8 tools present in the new binary and absent from the old;
+      `discover_hosts` probes **both** hosts for real —
+      `mac-utm-1 probe=ok, 10 domains/5 ready` (real utmctl state, live IPs) and
+      `ubuntu-kvm-1 probe=ok (QEMU 8.2.2)` with both guests + IPs. And the §6.8.3
+      fix is live: `check_vm_reachable` on a libvirt guest now says *"IS in the
+      inventory but is not UTM-backed (controller.type=libvirt,
+      host_id=ubuntu-kvm-1)"* and points at the controller-aware CLI, instead of
+      the old binary's flat lie that the alias was absent.
+- [ ] **Owner action: reconnect the client** (`/mcp` → reconnect, or restart it;
+      killing the process does **not** respawn it). Nothing else in Step 0 can be
+      confirmed from here — see the next item for why that matters.
+- [ ] **Then re-verify through the client, not over stdio.** `mcp_call.sh` runs the
+      binary from Bash, which is **unsandboxed**, so the probe above does NOT prove
+      the Desktop-spawned server can reach the box (§12.3.1 / §12.9). Calling
+      `discover_hosts` through the reconnected client is the test that settles it:
+      `ubuntu-kvm-1 probe=ok` through the client ⇒ the sandbox does not block the
+      tailnet path; `EHOSTUNREACH` ⇒ the launchd/unsandboxed fix is mandatory.
+
+### 12.4 Step 1 — close the fail-opens
+
+These make every other result untrustworthy, so they come before new features.
+
+- [ ] **`ops <unknown-subcommand>` exits 0** and prints usage, so the MCP's
+      `format_lab_outcome` (which trusts the exit code) reports **`✅ PASSED` for a
+      command that never ran**. Hit live via `get_vm_diagnostics` on 2026-07-17.
+      An unknown subcommand must exit `BadArgs (64)`. (An unknown *flag* correctly
+      exits 1 — it is only the subcommand path that is wrong.)
+- [ ] **`discover_hosts` fails open off-macOS.** Run on the box it reports
+      `host mac-utm-1 … probe=ok` and lists the Mac's 7 domains as **"shut off"** —
+      but the UTM paths and `utmctl` do not exist there, so those names came from
+      the *inventory*, not a probe. An agent on the box would conclude the Mac's
+      VMs are all powered off. Truth is "cannot determine from here". Same class of
+      defect already fixed in `host_net_status` (`classify_ssh_probe_failure`) and
+      §6.8.3 — a `local_utm` host that is not *this* machine must report
+      `unavailable`, not a fabricated state.
+
+### 12.5 Step 2 — locality: let the box drive itself (blocks run-on-host)
+
+- [ ] On the box, the inventory's `qemu+ssh://ubuntu-server@ubuntu-headless/system`
+      is an **SSH loopback to itself** → `Host key verification failed` →
+      `probe=FAILED`. Local `qemu:///system` works fine (both guests listed). The
+      `connect_uri` is written from the **Mac's** viewpoint and the code has no
+      notion of "this host is me". Run-on-host (§11's ratified architecture) cannot
+      work until it does.
+- [ ] **Open design decision.** Hostname-match is automatic but collision-prone,
+      and a false match would point the orchestrator at the **wrong machine's
+      libvirt** — the dangerous direction. An explicit marker
+      (`RUSTYNET_LAB_HOST_ID` env or an inventory field) is unambiguous and fails
+      safe: unset simply degrades to today's loud self-SSH failure. Recommend
+      explicit, with hostname as a convenience fallback only if it cannot
+      false-positive.
+
+### 12.6 Step 3 — §6.8.2 delegation refactor (kill the second, weaker path)
+
+- [ ] Route the 5 `utmctl`-direct tools through the controller-aware CLI:
+      `get_vm_power_state`, `get_vm_network_info`, `reset_vm_network`,
+      `utm_power_status`, `utm_status_map`. libvirt support arrives for free and
+      the duplicate path disappears (§3: one hardened execution path).
+- [ ] `recover_stuck_vms` — UTM/`arp`-shaped internally; unverified on libvirt.
+- [ ] `host_disk_status --host <id>` — always reports **this** machine's disk. With
+      11G of images already on the 870, "how much room is left" is a real question
+      it cannot answer.
+
+### 12.7 Step 4 — run labs on the box (the point of the whole program)
+
+- [ ] **`--host` on `orchestrate-live-lab` / `start_live_lab_run`** — detached
+      launch (own process group, log file, survives the SSH dropping — the
+      `nohup setsid` pattern already used elsewhere), returning a run_id to poll
+      with `host_run_status`. **The biggest hole**; today this is a manual SSH.
+- [ ] Fetch a report artifact off a host (`host_run_status` returns a `report_dir`
+      and nothing can read it).
+- [ ] Stop a runaway remote run.
+- [ ] `sync_host --all`.
+
+### 12.8 Step 5 — setup / reset
+
+- [ ] **`provision_guest`'s create steps are not implemented** — only validation and
+      guards exist. Clean route: `virsh vol-create-as` + `vol-upload` +
+      `virt-install --connect` (no sudo, now that the pool is group-writable).
+- [ ] Its cloud-init seeds the **box's** key, not the fleet's lab key
+      (`~/.ssh/rustynet_lab_ed25519`) — the root fix that removes the
+      `authorize_*.sh` scratchpad workarounds.
+- [ ] Port `renumber_net.sh` (per-host subnet collision avoidance).
+- [ ] Both guests have `mesh_ip` unset and `include_in_all: false` — present in the
+      inventory, in no run's topology. Config, not code.
+
+### 12.9 Prerequisites that will bite
+
+- [ ] **Push the commits.** `sync_remote_host` runs `git fetch --depth=1 origin
+      <sha>` **on the box**, so it physically cannot advance a host to an unpushed
+      SHA. As of 2026-07-17 the box is pinned at `49f5f9f` while `2c306b4`,
+      `02deff8`, `5b814c3`, `3d950d1` are local-only. This is deliberate (evidence
+      must name a commit others can fetch), not a bug — but it gates §12.7.
+- [ ] **Verify the MCP sandbox can reach the box.** §12.3.1 documents macOS Local
+      Network Privacy silently blocking MCP-opened LAN sockets (`EHOSTUNREACH`)
+      while the Bash tool is unsandboxed. The box is reached over **Tailscale
+      (utun10)**, which may not count as "local network" — but this is
+      **unverified**, and if it is blocked, the MCP must run unsandboxed via
+      launchd (§12.3.1's permanent fix) regardless of Step 0.
+- [ ] `eno1` is `NO-CARRIER` (box is on WiFi; WiFi cannot bridge), so guests are
+      NAT-only behind `virbr0` — fine for a box-local lab, but it violates ADR-004's
+      dual-NIC target (§6.5.3) and keeps cross-machine on Tailscale.
