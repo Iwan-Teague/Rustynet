@@ -1825,10 +1825,44 @@ These make every other result untrustworthy, so they come before new features.
 
 ### 12.6 Step 3 — §6.8.2 delegation refactor (kill the second, weaker path)
 
-- [ ] Route the 5 `utmctl`-direct tools through the controller-aware CLI:
-      `get_vm_power_state`, `get_vm_network_info`, `reset_vm_network`,
-      `utm_power_status`, `utm_status_map`. libvirt support arrives for free and
-      the duplicate path disappears (§3: one hardened execution path).
+- [x] **PARTLY DONE 2026-07-17 — and "route all 5 through the CLI" was the wrong
+      scope for 3 of them.** Audited against what each actually does:
+  - [x] **`get_vm_power_state` — delegated.** *The* "show me all VMs" tool parsed
+        `utmctl list` itself, so it was **structurally incapable of seeing a second
+        host**: every box guest was silently missing from an answer that read as
+        complete. Now calls `ops vm-lab-discover-hosts --format json` and renders
+        every host, with a `host` column and an explicit ⚠️ section for hosts it
+        could not probe. Live: 12 VMs across both hosts in one table.
+  - [x] **`utm_status_map` — replaced by `controller_status_map`, then deleted.**
+        Its only consumer is `preflight_check` — the **go/no-go gate** — which was
+        reporting every box guest as `power=unknown`. Honest, but useless exactly
+        when it matters: a *stopped* box guest showed `power=unknown, TCP=false`,
+        which reads as a network fault and hides that the fix is `power_on_vm`.
+        Live: both box guests now `power=started`; `macos-utm-1` still correctly
+        `stopped`, so the map is measured, not defaulted.
+        **Second bug found while fixing it:** the lookup keyed on
+        `controller.utm_name`, which is *empty* for a libvirt guest (it has a
+        `domain`), so the first fix silently changed nothing. The alias is the one
+        identity spanning both controller kinds; it now keys on that.
+  - [x] **Deleting the duplicate path deleted code, it did not add it** (§3's
+        payoff): `utm_scope_note`, `non_utm_hosts` and `utm_name_alias_map` all
+        lost their last caller and went with it. `utm_scope_note` in particular was
+        a *mitigation* for the very defect now fixed properly — it appended a
+        footer admitting the listing was UTM-only. The real fix supersedes the
+        apology.
+  - [ ] **`get_vm_network_info` / `reset_vm_network` — NOT delegatable; leaving
+        them UTM-only is correct.** `get_vm_network_info` drives `utmctl exec`,
+        i.e. **out-of-band guest execution with no SSH** — that is its whole value
+        (diagnosing a guest whose network is down), and libvirt has no equivalent
+        without a qemu-guest-agent channel the guests deliberately do not run
+        (§11). `reset_vm_network` mutates UTM plists, and ADR-004 makes network
+        mutation a UTM-only transaction anyway (§6.5.4). Both already **fail loud**
+        for a libvirt alias via `utm_resolution_error` (§6.8.3), which is the
+        correct behaviour. Forcing them through the CLI would buy nothing and cost
+        the out-of-band channel.
+  - [ ] `utm_power_status` — a per-VM precondition probe with 5 callers, all of
+        which already reject non-UTM aliases upstream via `alias_to_utm`. Lower
+        value than the two above; revisit only if a caller starts serving libvirt.
 - [ ] `recover_stuck_vms` — UTM/`arp`-shaped internally; unverified on libvirt.
 - [ ] `host_disk_status --host <id>` — always reports **this** machine's disk. With
       11G of images already on the 870, "how much room is left" is a real question
