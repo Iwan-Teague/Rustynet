@@ -443,3 +443,411 @@ them liberally rather than re-deriving structure by hand with `grep`/`find`.
   directory is added/moved/renamed, update §2/§11/§12 there (and the mirror) plus
   `documents/CODE_MAP.md` so the structure map does not drift from the code.
 - Remove dead links, stale index entries, and prompt-only guidance when you find them.
+
+═══════════════════════════════════════════
+13) FULL CLI COMMAND SURFACE (`rustynet` binary, `ops vm-lab-*`/lab-only verbs excluded — see the
+live-lab-loop doc for those)
+═══════════════════════════════════════════
+This is the complete `rustynet` subcommand surface as of this doc's last update (source: `rustynet
+status`/help dump). Structural, low-churn — read once, don't re-derive with `--help` every session.
+Verify against a live `rustynet --help` / `rustynet <verb> --help` if a flag looks off; this is a
+snapshot, not a substitute for `--help` on the exact flags of a command you're about to run.
+
+```
+status [--json]
+login
+netcheck [--json]
+version
+info
+doctor
+logs [--follow] [--level <level>] [--lines <n>]
+config show
+debug
+peer-list
+tunnel-info
+exit-node-list
+role [show|set <admin|client|blind_exit>]
+role pin-port-mapping-authority [--node <id> | --clear [--node <id>]] --output <path> [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]
+role recommend [--role anchor|relay|exit] [--snapshot <path>] [--log <path>]
+llm allow <node:id|group:name> [--models a,b] [--quota <tokens>] [--rate <req/min>]
+llm deny <node:id|group:name>
+llm access list
+connectivity-test
+peer-stats
+bandwidth
+metrics
+dns-test [<domain>]
+state refresh
+install [--role node|relay|exit|anchor] [--dry-run] [--unattended] [--from-dir <abs> | --build-from-source] [--owner-key-file <abs>] [--owner-key-thumbprint <hex>] [--uninstall]
+operator menu
+exit-node select <node>
+exit-node off
+lan-access on|off
+dns inspect
+dns zone issue --signing-secret <path> --signing-secret-passphrase-file <path> --subject-node-id <id> --nodes <node_specs> --allow <allow_specs> --records-manifest <path> --output <path> [--zone-name <name>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]
+dns zone verify --bundle <path> --verifier-key <path> [--expected-zone-name <name>] [--expected-subject-node-id <id>]
+traversal issue --signing-secret <path> --signing-secret-passphrase-file <path> --source-node-id <id> --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --candidates <type|endpoint|priority[|relay_id];...> --output <path> [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>] [--verifier-key-output <path>]
+traversal verify --bundle <path> --verifier-key <path> --watermark <path> [--expected-source-node-id <id>] [--max-age-secs <secs>] [--max-clock-skew-secs <secs>]
+route advertise <cidr>
+key rotate
+key revoke
+assignment issue --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --signing-secret <path> --signing-secret-passphrase-file <path> --output <path> [--verifier-key-output <path>] [--mesh-cidr <cidr>] [--exit-node-id <id>] [--lan-routes <csv>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>]
+assignment verify --bundle <path> --verifier-key <path> --watermark <path> [--expected-node-id <id>] [--max-age-secs <secs>] [--max-clock-skew-secs <secs>]
+assignment init-signing-secret --output <path> --signing-secret-passphrase-file <path> [--length-bytes <n>] [--force]
+  node_specs format: node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv|capabilities_csv];...
+  allow_specs format: source_node_id|destination_node_id;...
+membership status [--snapshot <path>] [--log <path>]
+membership list [--snapshot <path>] [--log <path>]
+membership propose --operation <add-node|remove-node|revoke-node|restore-node|rotate-node-key|set-node-capabilities|set-quorum|rotate-approver> --output <path> [operation flags] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]
+membership propose-add --node-id <id> --node-pubkey <hex> --owner <owner> --output <path> [--roles <csv>] [--capabilities <csv>] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]
+membership propose-remove --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]
+membership propose-revoke --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]
+membership propose-restore --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]
+membership propose-rotate-key --node-id <id> --new-pubkey <hex> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]
+membership propose-set-capabilities --node-id <id> --capabilities <csv> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]
+membership propose-set-quorum --threshold <n> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]
+membership propose-rotate-approver --approver-id <id> --approver-pubkey <hex> --role <owner|guardian> --status <active|revoked> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]
+membership sign-update --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]
+membership sign --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]
+membership verify-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]
+membership apply-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run] [--daemon]
+membership apply --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run] [--daemon]
+membership verify-log [--snapshot <path>] [--log <path>] [--audit-output <path>] [--now <unix>]
+membership verify [--snapshot <path>] [--log <path>] [--audit-output <path>] [--now <unix>]
+membership generate-evidence [--snapshot <path>] [--log <path>] [--output-dir <dir>] [--environment <label>] [--now <unix>]
+trust keygen --signing-key-output <path> --signing-key-passphrase-file <path> --verifier-key-output <path> [--force]
+trust export-verifier-key --signing-key <path> --signing-key-passphrase-file <path> --output <path>
+trust issue --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--updated-at-unix <unix>] [--nonce <n>]
+trust verify --evidence <path> --verifier-key <path> --watermark <path> [--max-age-secs <secs>] [--max-clock-skew-secs <secs>]
+ops refresh-trust
+ops verify-runtime-binary-custody
+ops refresh-signed-trust
+ops bootstrap-wireguard-custody
+ops refresh-assignment
+ops state-refresh-if-socket-present
+ops collect-phase1-measured-input
+ops run-phase1-baseline
+ops generate-attack-matrix --attacks <csv> --nodes <csv> --output <path> [--format <md|json>]
+ops generate-assessment-from-matrix --project <name> --matrix-json <path> --output <path> [--topology <text>] [--authorization <text>]
+ops check-no-unsafe-rust-sources [--root <path>]
+ops check-dependency-exceptions [--path <path>]
+ops check-perf-regression [--phase1-report <path>] [--phase3-report <path>]
+ops check-secrets-hygiene [--root <path>]
+ops collect-phase9-raw-evidence
+ops generate-phase9-artifacts
+ops verify-phase9-readiness
+ops verify-phase9-evidence
+ops generate-phase10-artifacts
+ops verify-phase10-readiness
+ops verify-phase10-provenance
+ops write-phase10-hp2-traversal-reports --source-dir <path> --environment <label> --path-selection-log <path> --probe-security-log <path>
+ops verify-phase6-platform-readiness
+ops verify-phase6-parity-evidence
+ops verify-required-test-output --output <path> --package <name> --test-filter <pattern>
+ops validate-network-discovery-bundle [--bundle <path>]... [--bundles <path[,path...]>] [--max-age-seconds <secs>] [--require-verifier-keys] [--require-daemon-active] [--require-socket-present] [--output <path>]
+ops write-unsigned-release-provenance --input <path> --output <path>
+ops sign-release-artifact
+ops verify-release-artifact
+ops collect-platform-probe
+ops generate-platform-parity-report
+ops collect-platform-parity-bundle
+ops install-systemd
+ops prepare-system-dirs
+ops restart-runtime-service
+ops stop-runtime-service
+ops show-runtime-service-status
+ops start-assignment-refresh-service
+ops check-assignment-refresh-availability
+ops install-trust-material --verifier-source <absolute-path> --trust-source <absolute-path> --verifier-dest <absolute-path> --trust-dest <absolute-path> [--daemon-group <group>]
+ops create-release-manifest --artifact <name>:<target>:<path> [--artifact ...] --signing-seed-file <path> --output <path> [--release-track <track>] [--key-id <id>] [--generated-at-unix <secs>]
+ops verify-release-manifest --manifest <path> (--pinned-verifier-key-hex <hex> | --pinned-verifier-key-file <path>) [--artifacts-dir <dir>]
+ops apply-managed-dns-routing
+ops clear-managed-dns-routing
+ops disconnect-cleanup
+ops apply-blind-exit-lockdown
+ops init-membership
+ops secure-remove --path <absolute-path>
+ops ensure-signing-passphrase-material
+ops ensure-local-trust-material --signing-key-passphrase-file <absolute-path>
+ops materialize-signing-passphrase --output <absolute-path>
+ops materialize-signing-passphrase-temp
+ops set-assignment-refresh-exit-node [--env-path <absolute-path>] [--exit-node-id <id>]
+ops force-local-assignment-refresh-now
+ops apply-lan-access-coupling --enable <true|false> [--lan-routes <cidr[,cidr...]>] [--env-path <absolute-path>]
+ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <id>] [--enable-exit-advertise <true|false>] [--env-path <absolute-path>] [--skip-client-exit-route-convergence-wait]
+ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>
+ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]
+```
+The `ops vm-lab-*` family (orchestrate/run/setup/sync-host/host-preflight/run-matrix-compare/
+discover/etc.) is deliberately omitted here — it only exists under `--features vm-lab` and is fully
+documented in the companion `rustynet_live_lab_loop_prompt.md`.
+
+═══════════════════════════════════════════
+14) PLATFORM SUPPORT MATRIX (mirrored from the live code gate — `is_supported_for_platform` /
+`is_blind_exit_supported_host`)
+═══════════════════════════════════════════
+Snapshot as of this doc's last update. Re-verify with `mcp__rustynet-repo-context__get_platform_support()`
+before relying on it for a release decision — this is exactly the kind of fact that changes when a
+parity cell lands.
+
+**Roles × OS** (✅ supported/live-evidence · ⛔ fail-closed — implemented + lab-assignable, pending
+live evidence · 📋 planned · 🚫 blocked by design):
+| Role | linux | macos | windows | ios | android |
+|---|---|---|---|---|---|
+| client | ✅ | ✅ | ✅ | 📋 (mobile client-only, adapter not shipped) | 📋 (same) |
+| admin | ✅ | ✅ | ✅ | 🚫 | 🚫 |
+| exit | ✅ | ✅ | ⛔ (gated until W5.4 WinNAT/HNS live evidence) | 🚫 | 🚫 |
+| blind_exit | ✅ | ✅ | 🚫 (not a supported blind_exit host) | 🚫 | 🚫 |
+| relay | ✅ | ⛔ (lab-assignable; pending Phase-8 cross-OS green run) | ⛔ (same) | 🚫 | 🚫 |
+| anchor | ✅ | ⛔ (same) | ⛔ (same) | 🚫 | 🚫 |
+| nas | ⛔ (D13.c/D13.d in progress; pending Linux live-lab evidence row) | ⛔ (secondary host; pending cross-OS green run) | ⛔ (gated on D7/D9 Windows dataplane parity) | 🚫 | 🚫 |
+| llm | ⛔ (same as nas) | ⛔ (same) | ⛔ (same) | 🚫 | 🚫 |
+
+**Features × OS:**
+| Feature | Status |
+|---|---|
+| killswitch (linux) | ✅ supported — nftables pre-start and post-start |
+| killswitch (macos) | ⛔ fail-closed — pf anchor available; pre-killswitch not yet mandatory |
+| killswitch (windows) | ⛔ fail-closed — netsh-based; IPv4 LAN egress allow-all is RN-06 (open); WFP migration planned |
+| wireguard-kernel (linux) | ✅ in-kernel `wireguard.ko` |
+| wireguard-userspace (macos) | ✅ boringtun userspace backend |
+| wireguard-nt (windows) | ✅ WireGuard-NT kernel driver |
+| dpapi-secrets (windows) | ✅ DPAPI-protected blobs under `ProgramData\RustyNet\secrets` |
+| keychain-secrets (macos) | ✅ macOS keychain key custody |
+| ipv6-dataplane (linux) | ✅ dual-stack with v6 candidate gathering |
+| upnp-natpmp-pcp (linux) | ✅ gateway detection via `/proc/net/route` |
+
+**The single biggest structural gap driving the Linux-VM-host program (companion doc §5.6):**
+Windows exit/blind_exit is fail-closed/blocked specifically because Apple-Silicon UTM/QEMU exposes
+no nested virtualization, so a Windows guest on the Mac lab can never run WinNAT — this is why
+`ubuntu-kvm-1` (real x86 KVM nested virt) exists.
+
+═══════════════════════════════════════════
+15) CURRENT STANDING SECURITY POSTURE (dated snapshot — cross-check before treating as current)
+═══════════════════════════════════════════
+Three overlapping audit generations exist; newest supersedes older on any conflict, but none formally
+retires the last — cross-check the ledger, not just the newest date, when the stakes are high.
+
+**Newest, broadest: `documents/operations/active/SecurityAuditLedger_2026-06-18.md`** — file-by-file
+audit against `SecurityMinimumBar.md`, coverage-complete (594/594 tracked files). **76 findings raised
+→ 2 withdrawn as false-positive → 74 standing: 0 Critical / 2 High / 15 Medium / 34 Low / 19 Info / 4
+Question.** The two standing Highs:
+- **RSA-0009** — membership reducer non-determinism → revoke/key-rotation updates can fail to apply
+  (AUDIT-040 cross-reference).
+- **RSA-0063** — macOS bootstrap can leave `NOPASSWD: ALL` in sudoers on a failed run → local
+  privilege escalation (AUDIT-045/RN-32 cross-reference).
+Both survived an adversarial re-verification pass. All findings here are proposals awaiting human
+approval — no production code/crypto/config has been changed by the audit itself.
+
+**Prior full-repo pass: `documents/operations/active/SecurityAndQualityAudit_2026-06-10.md`** — 14
+independent deep reviews, first-hand verified. **53 net-new findings (AUDIT-001..053): 0 Critical /
+11 High / 19 Medium / 16 Low / 7 Info.** Verdict at the time: **NO-SHIP until the P0 set closes.** Top
+risks flagged: the fail-closed killswitch could fail open (RN-03/04/10 — since fixed per the ledger
+above), the (now-superseded, do-not-run-without-`--dry-run`) uncommitted overnight driver's live path
+was destructive, `lab_state` MCP `report_dir` was unconfined (AUDIT-006 — since remediated), the
+membership reducer non-determinism (AUDIT-040 = RSA-0009, still open), Windows encrypted-key custody
+ACL was a no-op (AUDIT-027/RN-33), a relay pre-auth DoS (AUDIT-031), and the macOS bootstrap
+`NOPASSWD: ALL` sudoers residue (AUDIT-045/RN-32 = RSA-0063, still open).
+
+**Sequencing:** `documents/operations/active/SecurityRemediationPlan_2026-06-19.md` sequences the
+audit ledger's findings into waves (P0 = the 2 standing Highs; P1 = Mediums by 7 systemic themes; P2 =
+Low/Info by category) with per-item fix + verification test + effort estimate.
+
+**Original firm-grade review (older, narrower, still referenced): `documents/operations/active/
+SecurityReview_2026-05-24.md`** (RN-* namespace, 38 findings across 6 domains) — most Highs/Mediums
+here have since been fixed (tracked via `RL-#` remediation-log entries); `RN-02/06/07` remained open
+as of the newer audits' cross-reference. Use `mcp__rustynet-repo-context__get_security_findings()` for
+the machine-parsed live version of this specific file — it does NOT cover the newer RSA-*/AUDIT-*
+findings above, so don't treat its "all fixed" rows as the whole security picture.
+
+**Practical rule:** before touching crypto/auth/policy/trust-state code, check RSA-0009 and RSA-0063
+status first (they're the two P0s), then grep the relevant crate's findings across all three ledgers
+by RN-*/AUDIT-*/RSA-* number rather than trusting any single doc's "current" framing.
+
+═══════════════════════════════════════════
+16) FULL CI GATE SCRIPT CATALOG (`scripts/ci/*.sh`, 50 scripts)
+═══════════════════════════════════════════
+From `mcp__rustynet-gate-runner__list_gate_scripts()`. Run the curated security set with
+`run_security_gates`; run any hand-picked set with `run_gate_scripts([...])`; lab-dependent ones need
+a live VM lab (drive them via the live-lab-loop doc's tooling, not directly).
+
+**security (10):** `active_network_security_gates.sh`, `anchor_secret_redaction_gates.sh`,
+`check_backend_boundary_leakage.sh`, `check_dependency_exceptions.sh`, `no_leak_dataplane_gate.sh`,
+`role_auth_matrix_gates.sh`, `secrets_hygiene_gates.sh`, `security_regression_gates.sh` (Rust-based;
+supersedes the historical grep-based secret scan), `supply_chain_integrity_gates.sh`,
+`traversal_adversarial_gates.sh`.
+
+**role / platform (8):** `anchor_downgrade_gates.sh`, `anchor_role_gates.sh`,
+`llm_exit_coexistence_gates.sh` (D13.d LLM↔exit coexistence), `phase10_cross_network_exit_gates.sh`,
+`role_taxonomy_gates.sh` (eight-preset taxonomy, D12+D13), `role_transition_audit_gates.sh`,
+`service_hosting_role_gates.sh` (D13.e), `test_validate_cross_network_remote_exit_reports.sh`.
+
+**phase (13):** `check_phase10_readiness.sh`, `check_phase6_platform_parity.sh`,
+`check_phase9_readiness.sh`, `phase10_gates.sh`, `phase10_hp2_gates.sh`, `phase1_gates.sh`,
+`phase3_gates.sh`, `phase4_gates.sh`, `phase5_gates.sh`, `phase6_gates.sh`, `phase7_gates.sh`,
+`phase8_gates.sh`, `phase9_gates.sh`.
+
+**release / readiness (6):** `check_fresh_install_os_matrix_readiness.sh`,
+`fresh_install_os_matrix_release_gate.sh`, `perf_regression_gate.sh`,
+`regression_coverage_gates.sh` (X7, per-platform regression-coverage floor), `release_readiness_gates.sh`,
+`test_check_fresh_install_os_matrix_readiness.sh`.
+
+**lab-dependent, needs VMs (6):** `anchor_live_lab_gates.sh`, `chaos_gates.sh`,
+`cross_platform_role_gates.sh` (Track B: B1.4/B1.5/M1/M2/W1/W4), `linux_exit_role_gates.sh`
+(hermetic — validates without necessarily running live), `orchestrator_engine_gates.sh` (Rust-native
+orchestrator engine gates), `windows_cross_compile_gate.sh`.
+
+**other (7):** `bootstrap_ci_tools.sh` (dispatches to the Rust `bootstrap_ci_tools` binary),
+`lab_monitor_gates.sh` (standalone gate for the excluded `rustynet-lab-monitor` crate),
+`llm_default_deny_gates.sh` (D13.d §9), `membership_gates.sh`, `nas_default_deny_gates.sh` (D13.c
+§7), `run_required_test.sh`, `windows_compile_check.sh` (local Windows compile gate, readiness plan
+E1).
+
+═══════════════════════════════════════════
+17) FULL ACTIVE-LEDGER INDEX — SNAPSHOT (dated; the file itself is the live source)
+═══════════════════════════════════════════
+This is a captured copy of `documents/operations/active/README.md`'s annotated ledger list — the
+single richest "what's currently being worked and why" index in the repo — embedded here so a fresh
+agent doesn't have to spend a tool call reading it before getting oriented. **It WILL drift**: ledgers
+move to `done/`, new ones appear, statuses change. Treat every annotation below as "true as of this
+doc's last update" and re-read `documents/operations/active/README.md` directly (one file read, not a
+tool round-trip) before making any claim that depends on current status. Paths below are repo-relative
+under `documents/operations/active/` unless otherwise noted.
+
+**Primary execution ledgers (start here for current status):**
+- `RustynetUnifiedTodoLedger_2026-07-10.md` — dated repository-wide TODO roll-up covering
+  security/release blockers, the full live-lab verification ladder, completion of the Rust `--node`
+  engine, canonical dual-plane VM networking and MCP behavior, desktop role parity, cross-network
+  dataplane, Android/iOS client programs, NAS/LLM evidence, testing/fuzzing, serialization,
+  CI/supply chain, performance, operations, platform expansion, external decisions, and one shared
+  Definition of Done. Focused ledgers remain authoritative; both get updated as work lands.
+- `ParallelAgentWorkPlan_2026-07-01.md` — partitions the backlog into independent big jobs for
+  concurrent agents (HP-3 real relay packet-forwarding proof; cross-OS role transitions + Windows
+  anchor live bundle-serving; a Tier-1 security-hardening batch); documents the git-worktree-per-job
+  mechanics. Ready-to-paste prompts in `ParallelAgentPrompts_2026-07-01/`.
+- `NonSecurityParallelHandoff_2026-07-13.md` — stand-alone multi-model dispatch prompt for the
+  guardrail-safe NON-security backlog (durability, refactor, tests, tooling, diagnostics, docs),
+  explicitly excluding the crypto/trust-state/killswitch/exit-NAT/DNS-failclosed/privileged-helper/ACL
+  surfaces (those stay on the Opus + §13.2 path). Tiers work by model.
+- `LabMonitorTUIDesign_2026-06-29.md` — design spec for `rustynet-lab-monitor`: the pixelated
+  terminal TUI live GUI for the parity campaign. New crate `crates/rustynet-lab-monitor/`; ratatui
+  0.28 + crossterm + tokio; reads state files directly, no MCP dependency at runtime.
+- `LiveLabMonitorTUIAccuracyImprovements_2026-07-10.md` — implemented monitor truth/freshness
+  hardening: active TSV precedence, invocation-correct resume manifests, fail-loud manifest/data
+  errors, schema-v2 fetched test counts, source-age display, complete UTM discovery, explicit VM
+  power/online/readiness/run-use columns, canonical cross-platform toolchain preflight, run-backed
+  roles only.
+- `DeepSeekLiveLabOrchestrationPipeline_2026-06-27.md` — the DESIGN doc behind the whole DeepSeek
+  live-lab MCP layer (companion doc §3/§5.6 covers the built/live version of this).
+- `LiveLabSecurityTestCoverage_2026-06-22.md` — threat-coverage map for the adversarial live-lab
+  security suite: 18 vulnerability classes × `SecurityMinimumBar` controls × existing coverage, the
+  two CRITICAL trust-path bugs (now code-fixed, verified 2026-07-01) but still needing live-lab
+  proof at the time of writing, the corrected relay-forwarding status, and the 111-item full backlog
+  by surface. Its priority section is noted stale as of 2026-07-04 — see the status-check doc.
+- `SecurityStageBacklogStatusCheck_2026-07-04.md` — read-only status check confirming 6
+  previously-called-unbuilt items are in fact done, confirming 2 lab-monitor GUI backlog items are
+  still open, and flagging 2 gaps in the stage-contract program.
+- `CrossPlatformRoleParityPlan_2026-06-21.md` — **RELEASE-BLOCKING COMPLETENESS MANDATE**: every
+  node role + capability must work and be LIVE-LAB-PROVEN on macOS AND Windows, not just Linux. The
+  single source of truth for the live-proven status matrix per role × OS (companion §14 mirrors the
+  code-level version of this).
+- `LiveLabStageContractPlan_2026-07-03.md` — the live-lab stage-contract program: one data registry
+  owns the stage vocabulary, every run emits a run-scoped stage manifest, the run matrix upserts by
+  run key, a closed terminal-state taxonomy prevents planned stages from evaporating silently.
+- `LiveLabFindings_2026-07-03.md` — the 2026-07-03 end-to-end live-lab findings pass; implemented by
+  the StageContractPlan above.
+- `LiveLabStageTriageLedgerPlan_2026-07-16.md` — the stage triage ledger design (companion doc R12
+  covers the built mechanism).
+- `LiveLabFindings_2026-07-12.md` — findings from driving `live_managed_dns_validation` to green;
+  records three problems it unmasked (reboot-recovery missing assignment-refresh.env in focused
+  setup; Linux exit daemon-role stale-env; a latent client-less exit spec).
+- `TrackC_BashOrchestratorDefects_2026-07-13.md` — legacy bash-orchestrator defects found pairing it
+  against the Rust `--node` engine. Per owner decision the retiring bash path is DOCUMENTED, not
+  fixed.
+- `RustNativeNodeOrchestratorQualityAudit_2026-07-10.md` — the 2026-07-10 quality audit +
+  implementation ledger for the Rust `--node` engine: 17 source-verified findings, most now
+  core-code-fixed with remaining live/fault-injection proof where applicable.
+- `RustNodeOrchestratorCompletionBrief_2026-07-12.md` — completion brief for the Rust `--node`
+  orchestrator: Definition of Done across Track A (structural) / B (parity gate) / C (evidence) / D
+  (promotion/retirement).
+- `MacWinStageParityPlan_2026-07-02.md` — cross-platform stage parity plan: macOS/Windows have 14
+  fewer one-off validators than Linux; the Tier 0-4 roadmap to close it.
+- `TrackC_Pair1_Linux_2026-07-13.md` — first paired bash↔Rust functional-parity run (2-node Linux
+  exit+client): G1-G8 scorecard, NOT yet full PASS at the time, one finding since resolved.
+- `LiveLabExecutionEfficiencyPlan_2026-06-20.md` — the operating method for the "drive defects to
+  zero" live-lab loop (companion doc §1 and §5 embed this method directly).
+- `CrossPlatformRoleParityRoadmap_2026-06-22.md` — the execution roadmap operationalizing the parity
+  mandate: remaining work + effort per mac/win role cell, ordered implementation program, the
+  FAIL-LOUD live-stage spec, the optimized concurrent Windows+macOS test pipeline.
+- `AutonomousSecurityParityPassLog_2026-06-24.md` — progress log for a 2026-06-24 code-only
+  security+parity pass, including a HIGH killswitch-bypass found and fixed.
+- `LiveLabCoverageAndHonestyAudit_2026-06-25.md` — cross-OS live-lab coverage + capture-honesty gap
+  map: the role × OS coverage matrix, the security-surface × OS matrix (every adversarial surface at
+  the time was Linux-only), ranked capture-honesty findings, a Wave 0-5 remediation plan.
+- `FocusedLiveLabRoleGapAnalysis_2026-07-02.md` — focused static analysis of Linux `blind_exit`,
+  macOS `admin`, Windows `anchor.bundle_pull` (no live labs run for this doc).
+- `LiveLabWave0_LinuxHonestyFixes_2026-06-25.md` through `LiveLabWave5Chaos_InertScaffolds_2026-06-25.md`
+  — the Wave 0/1/2/5 implementation specs from the coverage audit (honesty fixes, integrated-pipeline
+  honest skips, core-role cross-OS parity port, the 3 real chaos scaffolds).
+- `LinuxBlindExitDataplane_2026-06-25.md` — closed the fail-OPEN `blind_exit`-on-Linux gap (new
+  `linux_blind_exit` nftables module).
+- `CrossPlatformCiHealth_2026-06-25.md` — cross-platform-CI breakage cleanup + the windows-gnu
+  cross-clippy runbook; cleared ~80+ pre-existing Windows clippy errors; fixed a real Windows
+  trust-state persist bug.
+- `CrossOsRoleSwitchPlan_2026-06-24.md` — design for the live cross-OS role-transition parity cell.
+- `RustynetDataplaneExecutionPlan_2026-05-18.md` — source-of-truth for the cross-network dataplane
+  track (D2-D13): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE,
+  enrollment-token onboarding, anchor-role formalisation, 8-role user-selectable surface.
+- `CrossNetworkSubstrateIntegrationSpec_2026-06-21.md` — makes the cross-network live-lab stages
+  actually run: substrate↔validator mapping (netns Tier A, vxlan Tier B, slirp Tier C), orchestrator
+  wiring, phased plan.
+- `LiveLabVmConnectivityImplementation_2026-07-10.md` — execution ledger for the VM connectivity
+  rulebook (dual-plane lab-network program, slices A-E).
+- `DataplanePerfBacklog_2026-06-12.md` — remaining hot-path performance items with expected impact,
+  approach, invariant pins, and criterion bench targets.
+- `NodeRoleTaxonomy_2026-05-21.md` — canonical taxonomy for the six user-selectable node roles.
+- `AnchorNodeRoleDesign_2026-05-21.md` — canonical design for the anchor role.
+- `NodeRoleTaxonomyExtension_2026-06-11.md` — extends the taxonomy to eight roles by adding `nas`/`llm`.
+- `NasNodeRoleDesign_2026-06-11.md` / `LlmNodeRoleDesign_2026-06-11.md` — deep dives for the two
+  service-hosting roles.
+- `ServiceHostingRolesDeltaPlan_2026-06-11.md` / `ServiceHostingRolesRoadmap_2026-06-11.md` — the D13
+  delta ledger + program roadmap (milestones M0-M6).
+- `MasterWorkPlan_2026-03-22.md`, `PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md`,
+  `OpenWorkIndex_2026-04-17.md` — long-standing cross-cutting work plans.
+
+**Active phase checklists (still open — Phase 1/2/3/5 finished, archived in `done/`):**
+`Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md` (fresh-install + canonical cross-network
+evidence regeneration for a clean HEAD), `Phase5ReleaseReadinessSummary_2026-04-12.md` (operator-facing
+readiness picture; records remaining full release-gate blockers), `Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md`
+(code-side done; canonical cross-network + extended-soak evidence still to regenerate).
+
+**Active plans and backlogs (selected — full list in the live file):**
+`LinuxVmHostPlan_2026-07-14.md` (companion doc §5.6 — the `ubuntu-kvm-1` host), the node-role design
+docs above, `CrossNetworkRemoteExitNodePlan_2026-03-16.md`, `CrossPlatformSecurityGapRemediationPlan_2026-03-05.md`,
+`DiagnosticFunctionsRoadmap.md`, `HeterogeneousLiveLabEvidence_2026-04-28.md`,
+`LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md`, `MagicDnsSignedZoneSchema_2026-03-09.md`,
+`OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md`, `RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md`,
+the VM Lab Capability trio (`Cookbook`/`ReportingPlan`/`Sources`, all `2026-04-14`),
+`WindowsExitAndRelayDeltaPlan_2026-05-10.md`, `WindowsExitNodeRunbook_2026-06-04.md` (how to run +
+prove a successful active full-tunnel Windows exit — the ONLY remaining gate is a WinNAT-capable
+guest, i.e. `ubuntu-kvm-1`), `WindowsLabVmStabilityAndSessionModel_2026-04-30.md`,
+`WindowsLiveLabReadinessPlan_2026-05-31.md`, `WindowsUtmTransportArchitecture_2026-04-30.md`,
+`WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`, `WindowsWorkingNodePlan_2026-04-17.md`,
+`MacosUserspaceSharedBackendPlan_2026-05-08.md`, `OvernightAutonomousBugHuntProposal_2026-06-08.md`
+(the "Overnight Autonomous Verified-Plane March" v2 design — see companion doc §14's journal digest
+for its v3/actual-execution successor pattern that's been running since), `ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md`,
+`RustyfinExtensionTrustPlan_2026-05-10.md`, `RustynetComparativeVpnExploitCoverage_2026-03-14.md`,
+the security-audit trio (§15 above), `FullRepoAnalysis_2026-05-24.md` (66 findings, 9-agent two-pass
+review), `TestCoverageImprovementPlan_2026-05-24.md`, `SerializationFormatHardeningPlan_2026-03-25.md`,
+`ShellToRustMigrationPlan_2026-03-06.md`, `StartShOperatorUxRustMigrationPlan_2026-05-24.md` (includes
+ready-to-paste reference Rust ports of the remaining shell logic), the UDP-hole-punching trio
+(`AndRelayTraversalPlan`/`HP2IngestionPlan`/`ImplementationBlueprint`, all `2026-03-07`), and the two
+"SPECULATIVE R&D — UNSCHEDULED" Fable-5 deep-dives (`FableForkConsistentMembershipTransparency_2026-07-01.md`,
+`FableIntelligentSystemsProposals_2026-07-01.md`) — explicitly NOT in-flight work, not in the
+live-lab acceptance matrix, read only if researching those specific topics.
+
+**Active lab assets:** `UTMVirtualMachineInventory_2026-03-31.md` (VM list, SSH key fingerprints,
+probe-and-recover runbook), `../LiveLabRunMatrix.md` + the two CSVs (aggregate run ledger — see
+companion doc §5.6/R11 for the two-ledger split), `vm_lab_inventory.json` (VM topology — companion doc
+§5.6 has the live snapshot), and several dated JSON evidence files (rule: these are point-in-time,
+add a new dated file for new evidence, never edit one in place).

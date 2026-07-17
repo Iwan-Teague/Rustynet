@@ -144,7 +144,7 @@ sandbox-vs-lab-failure diagnosis this section only summarizes):
   job_id. Delete/pause it when no lab remains active, or when the operator explicitly says
   not to start another lab.
 - **DO NOT re-read files you already have in context.** If a file's contents were embedded
-  in an earlier message or the ARCHITECTURE REFERENCE section (R1-R12), use that reference
+  in an earlier message or the LAB ARCHITECTURE REFERENCE section (R1-R14), use that reference
   — do not read the file again.
 - **DO NOT write verbose status reports.** The loop journal (`write_loop_note`) is for
   compact evidence records. A single line per iteration is enough: "macos_exit: stage X
@@ -446,7 +446,7 @@ ops vm-lab-...` CLI verb directly over Bash/SSH rather than assuming the wrapper
 | `get_run_trend` | One-line loop-convergence verdict over the last N matrix rows: GREEN (stable) / JUST GREEN / STUCK at `<stage>` (keep patching it) / MOVING (each fix advanced the run). Cheaper than `get_run_matrix` for "is my patch working." |
 | `diff_runs` | Did the last patch HELP or REGRESS? Diffs two runs' per-stage outcomes (old vs new, by job_id or report_dir) — which stages flipped and the first divergent stage. The direct answer after every re-verify run. |
 | `get_run_result` | Structured result of one finished run: pass/fail, first_failed_stage, per-OS/per-stage summary, failure digest, git commit + dirty state. |
-| `get_run_matrix` | Read the CSV evidence ledger — recent rows, OS/role/stage coverage. |
+| `get_run_matrix` | Read the CSV evidence ledger — recent rows, OS/role/stage coverage. **Observed gotcha:** as wired, this appears to read the run-matrix in a way that can surface legacy/bash-orchestrator rows (e.g. "549 total runs" with the most recent returned rows dated well before the actual latest activity) rather than the freshest `--node` engine evidence. Cross-check `documents/operations/live_lab_node_run_matrix.csv` directly (the ledger CLAUDE.md §2 calls "the live one — current work appends here") if this tool's output looks stale relative to what you know is happening. Never read a `--node` stage result from the legacy `live_lab_run_matrix.csv`/this tool's possibly-legacy view, or vice versa — the two engines' stage vocabularies diverge (R10). |
 | `explain_stage` | What a stage (e.g. `first_failed_stage`) checks, its owning file/crate, and the most common failure causes. Call this immediately after any `get_run_result` that names a failed stage. |
 | `get_stage_log` | The fast path from a stage name to its actual evidence: `stages.tsv` row(s) (status/rc/description) + that stage's log tail. Use right after `explain_stage`. |
 | `diagnose_live_lab_failure` | Deep triage of a failed run. For a `--node` run it reads the evidence artifacts directly (`orchestrate_result.json` + `stages.tsv` + `failure_digest.json`) and returns log pointers with no SSH needed; `collect_artifacts:true` for a bash/profile run to pull per-VM SSH artifacts. |
@@ -919,7 +919,9 @@ cargo deny check bans licenses sources advisories
 Fast loop: `cargo run -p rustynet-xtask -- gates` (fmt→check→clippy→test, fail-fast, timeout
 watchdog). Or via `rustynet-mcp-gate-runner` MCP (`run_gates`, `run_security_gates` — full
 tool table: companion doc §11). Scope scripts live under `scripts/ci/` — run the one matching
-your active scope document.
+your active scope document; the full 50-script catalog by category (security / role-platform /
+phase / release / lab-dependent / other) is in the companion doc §16, so you know which exist
+without calling `list_gate_scripts` first.
 
 **Toolchain:** verify at session start (§2g) that your local `cargo`/clippy version matches
 `rust-toolchain.toml`. On this host the Homebrew `cargo` may shadow the toolchain pin and
@@ -1368,6 +1370,115 @@ so a blended history would be meaningless (same reasoning as the run-matrix spli
   before relying on them; if absent, read the JSONL directly (`grep '"stage":"<name>"'
   documents/operations/live_lab_stage_triage.jsonl`) and cross-reference
   `live_lab_node_stage_results.csv` by hand for the same join.
+
+────────────────────────────────────────────
+R13) CURRENT LAB SNAPSHOT — DATED REFERENCE (verify freshness, but start here)
+────────────────────────────────────────────
+
+A real snapshot as of this doc's last update, so a fresh session can orient from this file alone
+before spending a tool call. **Re-verify with `preflight_check` before trusting any reachability
+verdict** — VM power state and network drift constantly; this is a starting hypothesis, not ground
+truth.
+
+**Lab topology** (`get_lab_topology` at last update — 10 inventory entries):
+| alias | platform | lab_role | exit | relay | mesh_ip |
+|---|---|---|---|---|---|
+| debian-headless-2 | linux | client | no | no | 100.64.0.2 |
+| debian-headless-4 | linux | client | no | no | 100.64.0.4 |
+| debian-lan-11 | linux | (unset) | - | - | - |
+| macos-utm-1 | macos | macos_client | no | no | 100.64.0.7 |
+| windows-utm-1 | windows | windows_client | - | - | 100.64.0.6 |
+| fedora-utm-1 | linux | fedora_client | no | no | 100.64.0.8 |
+| ubuntu-utm-1 | linux | ubuntu_client | no | no | 100.64.0.9 |
+| rocky-utm-1 | linux | rocky_client | no | no | 100.64.0.10 |
+| linux-x86-client-1 | linux | linux_client | - | - | (on `ubuntu-kvm-1`, §5.6) |
+| linux-x86-exit-1 | linux | linux_exit | **yes** | no | (on `ubuntu-kvm-1`, §5.6) |
+
+Note `linux-x86-exit-1` — a second guest now exists on the `ubuntu-kvm-1` host with the exit role,
+alongside `linux-x86-client-1`; §5.6's own inventory excerpt only showed the host, not yet this
+guest, so treat the multi-host guest set as still growing.
+
+**Preflight verdict at last update:** ⚠️ GO WITH CAUTION, 7/10 nodes reachable. Reachable: both
+Debian headless nodes, fedora-utm-1, ubuntu-utm-1, rocky-utm-1, and both `ubuntu-kvm-1` guests.
+**Unreachable at that moment:** `debian-lan-11` (power=unknown — likely a real physical/LAN box, not
+a UTM guest, so `power_on_vm`/`restart_vm` won't help it), `macos-utm-1` (power=stopped —
+`power_on_vm(["macos-utm-1"])` or `restart_vm` fixes this), `windows-utm-1` (power=stopped, same
+fix). Host disk was at 60% used, no untracked `crates/` deploy hazard.
+
+**What this tells you as a starting hypothesis:** if you need a mac/win cell, expect to power on
+first (2 tool calls, not a mystery to diagnose). If you need Linux-only work, 7 nodes were already
+warm. Always re-run `preflight_check` once at session start regardless — this table exists to set
+expectations, not to skip the check.
+
+────────────────────────────────────────────
+R14) RECENT LOOP JOURNAL DIGEST — DATED (continuity context; `get_loop_journal` for the true latest)
+────────────────────────────────────────────
+
+The loop journal (`state/mcp-loop-journal.jsonl`, gitignored, machine-local) had 367 entries at last
+update, growing roughly hourly across concurrent sessions. Reading it cold costs real context. This
+digest of the most recent threads exists so a fresh session has continuity without that cost — but it
+is a snapshot, not the journal itself; call `get_loop_journal` for anything you're about to act on.
+
+**Most recent major threads (newest first, condensed):**
+- **Wave-2 rustynet-cli package dispatch (in progress at last update):** 5 disjoint-ownership
+  packages (A/B/C/D/G) targeting `rustynet-cli` hardening/diagnostics/feature-gating work; a
+  visibility problem was found and solved in-flight — `vm_lab` is private to the binary crate
+  (`mod vm_lab;`, not re-exported via `lib.rs`), so a package needing SIGTERM test coverage
+  (RNQ-09) had to be reordered *after* the package that adds a `#[cfg(feature = "vm-lab")]`-gated
+  `lib.rs` re-export (RNQ-17), rather than widening the shipped surface to unblock it.
+- **Non-security parallel handoff — COMPLETE, 4 worktree-isolated agents landed on `main`:** docs
+  drift fixes (3 orphan docs indexed + 3 missing CODE_MAP crates), 12 new MCDA property tests for
+  `rustynet-advisor` (no bug found), 13 pure parsers extracted from `rustynet-sysinfo` I/O (fixed 2
+  latent bugs: a UTF-8-boundary panic in `hex_to_ip`, a `/proc/net/tcp` tuple-index error), and a
+  `rustynet-lab-monitor` fail-safe-parsing hardening pass (+48 tests) with a new
+  `scripts/ci/lab_monitor_gates.sh` wired into CI. 5 more `rustynet-cli` packages were staged but
+  not yet dispatched pending owner review (this became Wave-2 above).
+- **Pair-3 functional-parity re-run — G3 CONFIRMED PASS:** the `sbin`-PATH fail-closed fix (commit
+  `20bca19`) verified clean on both bash and Rust engines; independent out-of-band residue probe
+  showed both guests fully clean post-teardown (no nft tables, no tunnel iface, `ip_forward=0`,
+  daemon inactive). Bonus: `cross_network_nat_classification` passed on the Rust engine with the
+  Python NAT probe fully replaced by the Rust `rustynet-netns-probe` crate.
+- **A ~2-day overnight autonomous coverage-hardening sweep (23-28 commits, zero collision with a
+  concurrent managed-DNS fix session working the same tree):** systematically extracted and
+  unit-tested pure parsers/validators across `rustynet-sysinfo`, `rustynet-dns-zone`,
+  `rustynet-crypto`, `rustynet-relay`, `rustynet-nas`, `rustynet-operator`, `rustynet-control`, and
+  `rustynetd`'s `privileged_helper` argv allowlists (the highest-security-value part — direct
+  boundary tests for every privileged-exec token allowlist). Found and fixed one real bug in the
+  process: a subtraction-underflow panic in `key_age_days` (sysinfo) on a future-dated key-file
+  mtime (clock skew/tamper scenario) — then ran a full §10.2 timestamp-underflow sweep across the
+  rest of the codebase and found it clean (every other now-minus-timestamp site already guarded).
+  Concluded the "clean, low-risk, disjoint-from-lab" coverage vein was thoroughly mined; Windows-only
+  validators remain uncoverable from this Mac host without `ubuntu-kvm-1`-class cross-compile/test.
+- **`live_managed_dns_validation` driven to green** — two real bugs fixed: (1) SSH target strings
+  carried an explicit `:22` suffix that broke `known_hosts` pin lookups and the actual `ssh`/`scp`
+  calls (fixed in `live_lab_support/mod.rs`: strip the port before lookup, thread it separately);
+  (2) the Linux Exit role's granted capability set omitted `Client`, so `load_verified_auto_tunnel`
+  rejected the daemon's own `RUSTYNET_NODE_ROLE=client` runtime intent (fixed in
+  `vm_lab/orchestrator/role.rs`). This unblocked a downstream stage that had never run before —
+  `live_reboot_recovery_validation` — which surfaced a THIRD, separate, still-open gap: the focused
+  2-node lab doesn't provision `/etc/rustynet/assignment-refresh.env`, so the post-reboot assignment
+  refresh has nothing to read.
+- **`exit_demotion_residue_validation` root-caused through two iterations:** the first fix (a
+  reconcile-time override) was insufficient; the real bug was that `apply_nat_forwarding` on Linux
+  unconditionally re-captured `prior_ipv4_forwarding` on every periodic re-enforce, so a second
+  capture while already-enabled clobbered the true baseline. Fixed by guarding the capture to
+  first-time-only. Fixing it unmasked a second, separate bug: `blind_exit_dataplane_validation` ran
+  on every Linux node regardless of role instead of filtering to `NodeRole::BlindExit`, causing a
+  false failure on exit/client nodes with no `mesh_scoped_forward_allow` rule.
+- **A recurring lab-setup gotcha surfaced repeatedly this period:** `discover_local_utm` scans the
+  DEFAULT UTM documents root by default and finds only a stale unrelated VM there — the real lab
+  bundles live at a non-default path. Pass `--utm-documents-root '/Users/iwan/Desktop/OS_images/UTM
+  images'` explicitly or the orchestrator reports "did not report the selected aliases" even though
+  the guests are fine.
+
+**Reading this digest tells you:** the loop has been running near-continuously across multiple
+concurrent sessions/agents on this one working tree, with real discipline around disjoint file
+ownership to avoid collisions (see §4's dirty-tree handling and §5.6's per-host evidence rules for
+the same discipline applied to git state and multi-host evidence respectively). Expect other
+sessions to be active; check `git log --oneline -10` and `git status --short` at orientation (§2a)
+before assuming you have the tree to yourself, and never `git add -A` / `git commit -a` — stage only
+the specific paths you touched (see §8, and the concrete collision-avoidance protocol recorded in
+the journal entries above).
 
 ═══════════════════════════════════════════
 START NOW
