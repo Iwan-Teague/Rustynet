@@ -360,6 +360,45 @@ KVM, not TCG); `virsh` works **unprivileged** as `ubuntu-server` (libvirt group)
 built/started/autostart. Verified on-rule: that path resolves to `/dev/sdb2` →
 `Samsung SSD 870 EVO 500GB`.
 
+**Pool write access — group-writable, no stored credential (2026-07-17).** The
+pool shipped `drwx--x--x root root`, so staging an image needed `sudo`, and
+`sudo -n` on this box needs a password. Rather than store a sudo password (this
+repo is public — see the secrets sidecar in `CLAUDE.md` §12.3), the pool is
+group-owned by `kvm`:
+
+```
+sudo chgrp kvm /var/lib/libvirt/images
+sudo chmod 2771 /var/lib/libvirt/images     # -> drwxrws--x root kvm
+```
+
+`ubuntu-server` **and** `libvirt-qemu` are both already in `kvm` (gid 993), so the
+writer and qemu's reader are both covered by the group, and `2771` leaves the
+world bits at `--x` — **identical to the original `711`**, not the looser `2775`.
+The setgid bit makes new images inherit group `kvm` so qemu can read them without
+a chown. One privileged command, once; every image fetch after it is unprivileged.
+`vm-lab-fetch-image` tries the unprivileged `install` first, falls back to
+`sudo -n`, and prints this exact remediation if both fail.
+
+**Image integrity.** `vm-lab-fetch-image` takes an optional `--sha256 <hex>`,
+verified on the host **before** the image is installed into the pool and
+re-verified against an image already in the pool (the `.done` marker records that
+some past run finished; it is not evidence the bytes are still right). A mismatch
+refuses and does not overwrite. The 64-hex validation is also the shell-injection
+boundary, since the value is interpolated into the host script.
+
+Caveat worth knowing before pinning: **Fedora publishes no digest for
+`virtio-win.iso`** — the `CHECKSUM` file beside it covers only the four RPMs, in
+MD5. So a pin for that ISO is trust-on-first-use: it detects drift or corruption
+after the first fetch but cannot establish first-fetch authenticity. The transport
+is sound (verified: one connection, `:443`, TLS 1.3, `scheme=HTTPS`; the
+`Location: http://` hops it advertises are followed on the *existing* TLS socket,
+and `--proto-redir =https` provably refuses a real cross-host downgrade with
+`Protocol "http" not supported or disabled in libcurl`).
+
+Installed 2026-07-17: `virtio-win.iso`, 789645312 bytes,
+`sha256 e14cf2b94492c3e925f0070ba7fdfedeb2048c91eea9c5a5afb30232a3976331`
+(virtio-win-0.1.285), `ubuntu-server:kvm 0644`.
+
 ### 6.2 Guest provisioning — cloud-image + cloud-init (works; one hard gotcha)
 
 Guests are provisioned from Debian cloud images + cloud-init (§4 Tier-2.6), not

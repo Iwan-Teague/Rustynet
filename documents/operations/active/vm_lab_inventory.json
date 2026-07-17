@@ -52,7 +52,6 @@
       "parent_device": "iwan's MacBook Pro",
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_password": "tempo",
       "ssh_target": "192.168.64.4",
       "ssh_user": "debian"
     },
@@ -85,7 +84,6 @@
       "parent_device": "iwan's MacBook Pro",
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_password": "tempo",
       "ssh_target": "192.168.64.10",
       "ssh_user": "debian"
     },
@@ -98,7 +96,6 @@
       "os": "Debian/Linux",
       "parent_device": "Debian device on 192.168.0.0/24",
       "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_password": "tempo",
       "ssh_target": "debian-lan-11",
       "ssh_user": "debian"
     },
@@ -128,7 +125,6 @@
       "platform": "macos",
       "relay_capable": false,
       "rustynet_src_dir": "/Users/mac/Rustynet",
-      "ssh_password": "tempo",
       "ssh_target": "192.168.65.101",
       "ssh_user": "mac"
     },
@@ -153,7 +149,6 @@
       "remote_shell": "powershell",
       "rustynet_src_dir": "C:\\Rustynet",
       "service_manager": "windows_service",
-      "ssh_password": "tempo",
       "ssh_target": "192.168.64.25",
       "ssh_user": "windows",
       "utm_staging_dir": "C:\\Users\\windows\\rustynet-utm-stage",
@@ -182,7 +177,6 @@
       "platform": "linux",
       "relay_capable": false,
       "rustynet_src_dir": "/home/fedora/Rustynet",
-      "ssh_password": "password",
       "ssh_target": "192.168.64.20",
       "ssh_user": "fedora"
     },
@@ -208,7 +202,6 @@
       "platform": "linux",
       "relay_capable": false,
       "rustynet_src_dir": "/home/ubuntu/Rustynet",
-      "ssh_password": "password",
       "ssh_target": "192.168.64.21",
       "ssh_user": "ubuntu"
     },
@@ -235,7 +228,6 @@
       "platform": "linux",
       "relay_capable": false,
       "rustynet_src_dir": "/home/rocky/Rustynet",
-      "ssh_password": "password",
       "ssh_target": "192.168.64.105",
       "ssh_user": "rocky"
     },

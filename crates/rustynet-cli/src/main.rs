@@ -1010,6 +1010,14 @@ enum OpsCommand {
         config: vm_lab::VmLabProvisionToolchainConfig,
     },
     #[cfg(feature = "vm-lab")]
+    VmLabFetchImage {
+        config: vm_lab::VmLabFetchImageConfig,
+    },
+    #[cfg(feature = "vm-lab")]
+    VmLabGuestConsole {
+        config: vm_lab::VmLabGuestConsoleConfig,
+    },
+    #[cfg(feature = "vm-lab")]
     VmLabNetworkAudit {
         config: vm_lab::network_audit::VmLabNetworkAuditConfig,
     },
@@ -3709,6 +3717,42 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-fetch-image" => Ok(OpsCommand::VmLabFetchImage {
+            config: vm_lab::VmLabFetchImageConfig {
+                inventory_path: parser.optional_path("--inventory"),
+                host_id: parser
+                    .value("--host")
+                    .ok_or_else(|| "vm-lab-fetch-image requires --host <host_id>".to_owned())?,
+                name: parser
+                    .value("--name")
+                    .ok_or_else(|| "vm-lab-fetch-image requires --name <file.qcow2>".to_owned())?,
+                url: parser
+                    .value("--url")
+                    .ok_or_else(|| "vm-lab-fetch-image requires --url <https://...>".to_owned())?,
+                sha256: parser.value("--sha256"),
+                pool: parser.value("--pool"),
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 3600)?,
+            },
+        }),
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-guest-console" => Ok(OpsCommand::VmLabGuestConsole {
+            config: vm_lab::VmLabGuestConsoleConfig {
+                inventory_path: parser.optional_path("--inventory"),
+                host_id: parser
+                    .value("--host")
+                    .ok_or_else(|| "vm-lab-guest-console requires --host <host_id>".to_owned())?,
+                domain: parser
+                    .value("--domain")
+                    .ok_or_else(|| "vm-lab-guest-console requires --domain <guest>".to_owned())?,
+                seconds: u32::try_from(parser.parse_u64_or_default("--seconds", 40)?)
+                    .map_err(|_| "invalid value for --seconds".to_owned())?,
+                ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                known_hosts_path: parser.optional_path("--known-hosts-file"),
+            },
+        }),
         #[cfg(feature = "vm-lab")]
         "vm-lab-network-audit" => Ok(OpsCommand::VmLabNetworkAudit {
             config: vm_lab::network_audit::VmLabNetworkAuditConfig {
@@ -8211,6 +8255,12 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabProvisionToolchain { config } => {
             vm_lab::execute_ops_vm_lab_provision_toolchain(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabFetchImage { config } => vm_lab::execute_ops_vm_lab_fetch_image(config),
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabGuestConsole { config } => {
+            vm_lab::execute_ops_vm_lab_guest_console(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabNetworkAudit { config } => {
@@ -19623,6 +19673,8 @@ fn help_text() -> String {
         "  ops vm-lab-host-run-status --host <host_id> [--run-id <id>] [--stage <substring>] [--inventory <path>] [--ssh-identity-file <path>] [--format table|json]",
         "  ops vm-lab-host-net-status [--host <host_id>] [--inventory <path>] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-provision-toolchain [--inventory <path>] [--vm <alias>]... [--vms <a,b>] [--all] [--verify-only] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
+        "  ops vm-lab-fetch-image --host <host_id> --name <file> --url <https://...> [--sha256 <hex>] [--pool <path>] [--inventory <path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-guest-console --host <host_id> --domain <guest> [--seconds <n>] [--inventory <path>]",
         "  ops vm-lab-network-audit [--inventory <path>] [--profile-dir <path>] [--profile <id>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only: observes UTM/host/guest network state, validates profile manifests, writes redacted evidence; never mutates)",
         "  ops vm-lab-network-preflight --profile <id> [--inventory <path>] [--profile-dir <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only fail-closed gate: errors unless the observed fleet satisfies the profile)",
         "  ops vm-lab-network-prepare --profile <id> [--inventory <path>] [--profile-dir <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--state-dir <path>] [--dry-run] [--approve-reconfigure]  (the ONLY VM network mutation path; without --approve-reconfigure prints the plan and changes nothing; atomic lease + stopped-VM-only apply + verified rollback)",
