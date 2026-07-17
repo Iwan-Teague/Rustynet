@@ -1911,6 +1911,79 @@ fn line_contains_forbidden_inline_passphrase_flag(line: &str) -> bool {
     false
 }
 
+/// True when a shell line unlinks key/passphrase material with plain `rm`.
+///
+/// Matching only literal filenames (the original rule) is trivially defeated by
+/// the ordinary way shell scripts are written — putting the path in a variable.
+/// The macOS bootstrap had four such deletions and the literal-only rule caught
+/// exactly one, the single line that spelled `wireguard.passphrase` out. The three
+/// it missed included `rm -f "${runtime_key}"`, which unlinks the plaintext
+/// WireGuard private key. A check that a normal refactor silently disarms is worse
+/// than no check, because it reads as coverage.
+///
+/// So a line trips this if it runs `rm` with `-f` AND mentions a secret-ish token
+/// either literally or through a variable name. Comments are skipped — prose about
+/// `rm -f` is not a deletion, and flagging it would train people to phrase comments
+/// around the linter.
+fn line_removes_secret_artifact(line: &str, sensitive_names: &[&str]) -> bool {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    if !line_runs_forced_rm(trimmed) {
+        return false;
+    }
+    if sensitive_names.iter().any(|name| trimmed.contains(name)) {
+        return true;
+    }
+    // Variable-name tokens. Deliberately narrow: `_key`/`.key` rather than bare
+    // "key", so `keyboard.conf` or `keychain-account` do not trip it.
+    const SECRET_TOKENS: &[&str] = &[
+        "passphrase",
+        "secret",
+        "private_key",
+        "privatekey",
+        "signing_key",
+        "runtime_key",
+        "owner_key",
+        "keys_dir",
+        "_key}",
+        "_key\"",
+        ".key}",
+        ".key\"",
+    ];
+    let lower = trimmed.to_ascii_lowercase();
+    SECRET_TOKENS.iter().any(|token| lower.contains(token))
+}
+
+/// True when the line invokes `rm` with a force flag, in any of the spellings a
+/// shell script actually uses (`rm -f`, `rm -rf`, `rm -fr`, `rm --force`).
+fn line_runs_forced_rm(line: &str) -> bool {
+    for (index, _) in line.match_indices("rm ") {
+        // Require `rm` to start a word: not `confirm `, `perform `, `$FIRM `.
+        let preceded_by_word_char = line[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if preceded_by_word_char {
+            continue;
+        }
+        // Scan the flags that follow, stopping at the first operand.
+        for word in line[index + 3..].split_whitespace() {
+            if word == "--" {
+                break;
+            }
+            if !word.starts_with('-') {
+                break;
+            }
+            if word == "--force" || (!word.starts_with("--") && word.contains('f')) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn parse_mktemp_secret_variable(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let assignment = trimmed.strip_prefix("local ").unwrap_or(trimmed);
@@ -2144,7 +2217,7 @@ pub fn execute_ops_check_secrets_hygiene(
         let text = read_text_lossy(absolute.as_path())?;
         for (line_index, line) in text.lines().enumerate() {
             let line_number = line_index + 1;
-            if line.contains("rm -f") && sensitive_names.iter().any(|name| line.contains(name)) {
+            if line_removes_secret_artifact(line, sensitive_names.as_slice()) {
                 rm_violations.push(format!(
                     "{}:{line_number} -> {}",
                     relative.display(),
@@ -2267,6 +2340,93 @@ pub fn execute_ops_run_phase1_baseline() -> Result<String, String> {
         metrics.source_path.display(),
         collected_note
     ))
+}
+
+#[cfg(test)]
+mod secret_removal_rule_tests {
+    use super::{line_removes_secret_artifact, line_runs_forced_rm};
+
+    const SENSITIVE: &[&str] = &[
+        "membership.owner.key",
+        "trust-evidence.key",
+        "assignment.signing.secret",
+        "wireguard.passphrase",
+        "wireguard.key",
+    ];
+
+    fn flags(line: &str) -> bool {
+        line_removes_secret_artifact(line, SENSITIVE)
+    }
+
+    #[test]
+    fn catches_every_deletion_the_macos_bootstrap_actually_had() {
+        // These are the four real lines. The old literal-only rule caught only the
+        // first; the other three hid behind variables, including the one that
+        // unlinks the plaintext WireGuard private key.
+        assert!(flags(r#"    rm -f "${KEYS_DIR}/wireguard.passphrase""#));
+        assert!(flags(r#"  trap 'rm -f "${passphrase_tmp}"' EXIT"#));
+        assert!(flags(r#"    rm -f "${runtime_key}""#));
+        assert!(flags(r#"    rm -f "${passphrase_file}""#));
+    }
+
+    #[test]
+    fn the_secure_helper_is_not_flagged_as_its_own_violation() {
+        // secure_remove_file ends in `rm -f -- "${target}"`. That is the approved
+        // path and names no secret, so the rule must leave it alone or the fix
+        // could never pass its own gate.
+        assert!(!flags(r#"  rm -f -- "${target}""#));
+        assert!(!flags(r#"  secure_remove_file "${passphrase_file}""#));
+        assert!(!flags(
+            r#"  trap 'secure_remove_file "${passphrase_tmp}"' EXIT"#
+        ));
+    }
+
+    #[test]
+    fn prose_about_rm_f_is_not_a_deletion() {
+        // Flagging comments would only teach people to reword comments.
+        assert!(!flags(
+            "# same reason: `rm -f` on a secret is two separate hazards."
+        ));
+        assert!(!flags(
+            "  # rm -f \"${passphrase_file}\" would be unsafe here"
+        ));
+    }
+
+    #[test]
+    fn near_miss_names_do_not_trip_the_rule() {
+        // Narrow tokens (_key/.key, not bare "key") keep these clean.
+        assert!(!flags(r#"  rm -f "${tmp}/keyboard.conf""#));
+        assert!(!flags(r#"  rm -f "${BUILD_DIR}/monkey.txt""#));
+        assert!(!flags(r#"  rm -f "${cache}/donkey""#));
+    }
+
+    #[test]
+    fn other_force_spellings_are_caught_too() {
+        // A rule that only knows `rm -f` is one refactor from silence.
+        assert!(flags(r#"  rm -rf "${passphrase_dir}""#));
+        assert!(flags(r#"  rm -fr "${passphrase_dir}""#));
+        assert!(flags(r#"  rm --force "${passphrase_file}""#));
+    }
+
+    #[test]
+    fn non_forced_rm_is_out_of_scope_for_this_rule() {
+        assert!(!line_runs_forced_rm(r#"rm "${passphrase_file}""#));
+        assert!(!line_runs_forced_rm(r#"rm -i "${passphrase_file}""#));
+    }
+
+    #[test]
+    fn rm_must_be_a_word_not_a_suffix() {
+        assert!(!line_runs_forced_rm("confirm -f something"));
+        assert!(!line_runs_forced_rm("perform -f action"));
+        assert!(line_runs_forced_rm("rm -f x"));
+        assert!(line_runs_forced_rm("sudo rm -f x"));
+    }
+
+    #[test]
+    fn flags_stop_at_the_first_operand() {
+        // `rm -- -f` deletes a file literally named "-f"; that is not a force flag.
+        assert!(!line_runs_forced_rm("rm -- -f"));
+    }
 }
 
 #[cfg(test)]

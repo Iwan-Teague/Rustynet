@@ -1318,8 +1318,9 @@ scoped gate suite green at commit time (fmt / workspace check / workspace
 clippy `-D warnings` / owning-crate tests; full `--all-targets --all-features`
 workspace suites batched periodically per the recorded test-cadence
 discipline). Two pre-existing gate failures documented at handoff remain and
-were NOT introduced or touched here: `secrets_hygiene_gates.sh` (RSA-0080,
-owner decision) and `check_backend_boundary_leakage.sh` (WireGuard-referencing
+were NOT introduced or touched here: `secrets_hygiene_gates.sh` (RSA-0080 —
+since **resolved 2026-07-17**, that gate is now green) and
+`check_backend_boundary_leakage.sh` (WireGuard-referencing
 comments in crypto/control, none of which this work touches).
 
 ## Landed

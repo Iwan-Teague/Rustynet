@@ -69,6 +69,68 @@ readonly BUILD_DIR="/private/var/tmp/rustynet-build-$$"
 # On Apple Silicon brew lives at /opt/homebrew; on Intel at /usr/local.
 BREW_PREFIX=""
 
+# ── Secure removal of key/passphrase artifacts ─────────────────────────────────
+# Shell counterpart of rustynetd's key_material::remove_file_if_present, for the
+# same reason: `rm -f` on a secret is two separate hazards.
+#
+#   1. Path/type confusion. `rm -f "$f"` will happily unlink whatever $f names.
+#      If an attacker who can write the parent directory plants a symlink there,
+#      a naive scrub-then-delete would zero the symlink's TARGET. We therefore
+#      stat WITHOUT following (`-L` before `-f`), unlink a symlink as a symlink
+#      and never write through it, and fail closed on anything that is not a
+#      regular file rather than guessing.
+#   2. Content remanence. Unlink only drops the directory entry; the bytes stay
+#      until reused. We overwrite with zeros first.
+#
+# The zero-fill is BEST-EFFORT and deliberately not advertised as more: on
+# APFS/SSD (copy-on-write, wear levelling, snapshots) an in-place overwrite may
+# land on fresh blocks and leave the originals readable. macOS dropped `srm` and
+# deprecated `rm -P` for exactly this reason. The load-bearing protection here is
+# (1); the scrub is defence in depth. This matches what the Rust helper does, so
+# the two sides of the codebase make the same promise.
+secure_remove_file() {
+  local target="${1:-}"
+
+  # Empty is a no-op, NOT an error. This is load-bearing for the EXIT trap that
+  # guards the passphrase tmpfile: the trap is armed BEFORE mktemp assigns the
+  # variable, so it can legitimately fire with an empty path if mktemp fails.
+  # `rm -f ""` exits 0 silently, so erroring here would turn a clean failure exit
+  # into a confusing trap error under `set -e`.
+  if [[ -z "${target}" ]]; then
+    return 0
+  fi
+
+  # Absent is success — callers use this for "remove if present" cleanup.
+  # -e is false for a dangling symlink, hence the explicit -L.
+  if [[ ! -e "${target}" && ! -L "${target}" ]]; then
+    return 0
+  fi
+
+  # -L first: a symlink must be unlinked as a symlink, never scrubbed through.
+  if [[ -L "${target}" ]]; then
+    rm -f -- "${target}"
+    return 0
+  fi
+
+  if [[ ! -f "${target}" ]]; then
+    echo "[bootstrap] secure remove requires a regular file: ${target}" >&2
+    return 1
+  fi
+
+  local size
+  size="$(stat -f %z "${target}" 2>/dev/null || echo 0)"
+  # Overwrite EXACTLY the file's length: bs=<size> count=1 writes size bytes and
+  # conv=notrunc keeps dd from truncating first. Rounding up to a block instead
+  # (bs=8192 count=ceil) would EXTEND a short file — a 32-byte passphrase became
+  # 8192 bytes — allocating blocks we are about to unlink anyway. Safe as a single
+  # buffer because every caller here passes a key/passphrase file (tens of bytes).
+  if [[ "${size}" -gt 0 ]]; then
+    dd if=/dev/zero of="${target}" bs="${size}" count=1 conv=notrunc 2>/dev/null || true
+    sync
+  fi
+  rm -f -- "${target}"
+}
+
 # ── Privilege separation ───────────────────────────────────────────────────────
 # Homebrew and the Rust toolchain refuse to run as root. When invoked via
 # `sudo bash`, $SUDO_USER holds the original unprivileged user.
@@ -904,7 +966,7 @@ generate_wireguard_keys() {
     echo "[bootstrap] migrated wireguard.passphrase from keys/ to bootstrap/ (Phase E)"
   elif [[ -f "${KEYS_DIR}/wireguard.passphrase" && -f "${passphrase_file}" ]]; then
     # Both exist (edge case: partial prior migration). Remove the stale keys/ copy.
-    rm -f "${KEYS_DIR}/wireguard.passphrase"
+    secure_remove_file "${KEYS_DIR}/wireguard.passphrase"
     echo "[bootstrap] removed stale wireguard.passphrase from keys/ (Phase E cleanup)"
   fi
 
@@ -947,7 +1009,7 @@ generate_wireguard_keys() {
   # Same protocol as provision_enrollment_secret above.
   local passphrase_tmp=""
   # shellcheck disable=SC2064
-  trap 'rm -f "${passphrase_tmp}"' EXIT
+  trap 'secure_remove_file "${passphrase_tmp}"' EXIT
   passphrase_tmp="$(mktemp "${BOOTSTRAP_DIR}/wireguard.passphrase.tmp.XXXXXX")"
   if [[ -z "${passphrase_tmp}" || ! -f "${passphrase_tmp}" ]]; then
     echo "[bootstrap] failed to create wireguard.passphrase tmpfile under ${BOOTSTRAP_DIR}" >&2
@@ -1053,7 +1115,7 @@ generate_wireguard_keys() {
   # wireguard.key.enc + the keychain passphrase into the ephemeral runtime dir
   # (/private/var/run/rustynet/wireguard.key, the --wg-private-key plist arg) on
   # every start, so the at-rest copy is unnecessary and must not linger.
-  rm -f "${runtime_key}"
+  secure_remove_file "${runtime_key}"
 
   echo "[bootstrap] WireGuard keys generated (encrypted=${encrypted_key} public=${public_key}); runtime key re-derived by daemon into the ephemeral runtime dir"
   echo "[bootstrap] WireGuard passphrase stored in macOS keychain (account=${keychain_account})"
@@ -1125,7 +1187,7 @@ seed_trust_evidence() {
     exit 1
   fi
 
-  rm -f "${passphrase_file}"
+  secure_remove_file "${passphrase_file}"
 
   # Secure the signing key owner-only (0600). `rustynet ops refresh-signed-trust`
   # (run as root to re-sign trust evidence after a role switch) requires the

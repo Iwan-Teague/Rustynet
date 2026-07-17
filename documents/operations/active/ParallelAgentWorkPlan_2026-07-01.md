@@ -247,13 +247,12 @@ non-Unix, RSA-0002, a world-readable key silently passes on Windows), **PH-7**
 (port the Linux privileged-helper allowlist audit to macOS `pfctl`), **KL-2/3/4**
 (macOS/Windows killswitch-leak parity — Linux has full v4+v6 active-probe
 coverage, others don't), **KC-07** (macOS/Windows secrets-not-in-logs parity —
-also fix RSA-0080 along the way, the macOS bootstrap script currently `rm -f`'s
-the WireGuard passphrase with no secure-erase; the ledger reported the Linux
-secrets-hygiene gate RED because of this as of 2026-06-21 — a scoped run of
-`scripts/ci/secrets_hygiene_gates.sh` during this doc's 2026-07-01 review
-passed cleanly, but that run may not exercise the specific macOS-passphrase
-check; confirm current status before assuming either that it's still broken
-or that it's already fixed).
+RSA-0080 is **no longer part of this job — applied 2026-07-17**. The
+open question this doc correctly flagged (was the gate really red, or did the
+2026-07-01 scoped run just miss the check?) is now settled: it WAS red, and the
+scanner was additionally catching only 1 of the 4 sensitive `rm -f` sites. Both
+are fixed — `secure_remove_file` covers all four, the scanner no longer misses
+variable-named ones, and `secrets_hygiene_gates.sh` exits 0).
 This is the job most likely to collide with Job 3 (same daemon-audit-module
 pattern, same wiring files) — run it only if 4-way parallelism is genuinely
 wanted; otherwise fold RSA-0063 into a follow-up after Job 3 lands.

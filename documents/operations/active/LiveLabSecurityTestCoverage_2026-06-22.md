@@ -57,7 +57,7 @@ In rough priority order; all IDs already carry full spec + bite-test in §2.4:
 | 11 | KC-04 | Windows key-custody negative path | `validate_key_custody_permissions` no-ops on non-Unix (RSA-0002) — a world-readable key silently passes on Windows |
 | 12 | PH-7 | `validate_macos_privileged_helper_allowlist` | Same adversarial argv corpus already proven on Linux, ported to `pfctl` |
 | 13 | KL-2/KL-3/KL-4 | macOS/Windows killswitch-leak parity | Linux now has full v4+v6 active-probe+capture; other OSes don't |
-| 14 | KC-07 | macOS/Windows secrets-not-in-logs parity | Linux-only today; the Linux gate is also currently RED (RSA-0080 — macOS bootstrap `rm -f`'s the WG passphrase, no secure-erase) — fix alongside |
+| 14 | KC-07 | macOS/Windows secrets-not-in-logs parity | Linux-only today. (RSA-0080 **applied 2026-07-17** — the macOS bootstrap now uses `secure_remove_file` at all four sensitive removals and the Linux secrets-hygiene gate is GREEN, so it no longer blocks this item.) |
 | 15 | CNT-1 | `validate_linux_upnp_ssrf` | Confirmed-present SSDP LOCATION/controlURL SSRF (RSA-0035), zero live coverage |
 | 16 | PH-2/PH-3 | Privileged-helper live socket fuzz + cross-UID rejection | Today's helper coverage is argv-only — nothing attacks the live IPC socket itself |
 
@@ -730,7 +730,7 @@ first within each surface.
 | medium | medium | RSA-0025 | Windows regression test + optional extension to … | Encrypted-at-rest key custody with strict permissions on Windows (SecMinBar §3.4/§5; CWE-7… |
 | low | small | RSA-0033 | PRIMARY unit regression. Live: extend the existi… ✅DONE | Privileged-helper least privilege (SecMinBar §3.7; CWE-250). Root helper's kill builtin mu… |
 | low | medium | RSA-0008 | Regression unit ONLY (no live stage). Give Contr… | Membership-gated signed-artifact issuance (SecMinBar §3.6/§3.2; CWE-863). |
-| low | medium | RSA-0080 | No live stage. Owner decision: define a real sec… | Secret hygiene / secure deletion of key material + mandatory gate must pass (SecMinBar §4;… |
+| low | medium | RSA-0080 | APPLIED 2026-07-17: helper defined + all 4 sites converted, scanner tightened, gate green. Originally: no live stage; owner decision: define a real sec… | Secret hygiene / secure deletion of key material + mandatory gate must pass (SecMinBar §4;… |
 | info | small | RSA-0011 | Regression unit only (no live stage at Info). Pe… | Anti-rollback floor on MAC-protected TrustState (SecMinBar §3.2/§3.3; CWE-294). |
 
 ### Backdoor/infeasible findings (NOT auto-implementable)
