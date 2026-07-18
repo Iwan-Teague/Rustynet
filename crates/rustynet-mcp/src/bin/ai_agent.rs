@@ -6546,6 +6546,44 @@ fn build_user_prompt(intent_label: &str, prompt: &str, context: Option<&str>) ->
     }
 }
 
+/// Repo-root brief prepended to a hard-reasoning call: the fixed rules an
+/// external model must follow here (fail-closed, grounding/evidence standard,
+/// decision protocol, house style, limits of its authority) plus a TASK slot
+/// the CALLER fills with the specific question.
+const HARD_PROBLEM_BRIEF_FILE: &str = "rustynet_hard_problem_prompt.md";
+/// Heading that separates the fixed policy above from the caller-supplied task
+/// below. Everything from this line to the end of the file is replaced.
+const HARD_PROBLEM_TASK_MARKER: &str = "\n## TASK\n";
+
+impl AiAgentServer {
+    /// Compose the hard-problem brief with `task` substituted into its TASK
+    /// slot. Returns `None` when the brief cannot be read or has no TASK marker,
+    /// so a missing or malformed file degrades to the plain prompt rather than
+    /// failing the call — losing the brief is worse than losing nothing, but far
+    /// better than losing the user's request.
+    fn hard_problem_prompt(&self, task: &str) -> Option<String> {
+        let path = self.repo_root.join(HARD_PROBLEM_BRIEF_FILE);
+        let brief = std::fs::read_to_string(path).ok()?;
+        let head = brief.split(HARD_PROBLEM_TASK_MARKER).next()?;
+        if head.len() == brief.len() {
+            // Marker absent — refuse to guess where the task belongs.
+            return None;
+        }
+        Some(format!("{head}{HARD_PROBLEM_TASK_MARKER}\n{task}\n"))
+    }
+
+    /// Whether THIS call should carry the brief. Defaults differ by tool because
+    /// the brief is not free: it is tokens on every call, charged against the
+    /// job's ceiling. The deep-reasoning paths get it by default (that is where
+    /// a wrong-but-confident answer is expensive); the cheap proxies, which are
+    /// mostly "summarise this pasted log", must opt in.
+    fn wants_brief(&self, args: &Value, default_on: bool) -> bool {
+        args.get("brief")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default_on)
+    }
+}
+
 fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)?.as_str()
 }
@@ -7093,6 +7131,7 @@ impl McpServer for AiAgentServer {
                         "model":   model_schema(&self.provider),
                         "context": context_schema(),
                         "provider": provider_schema(),
+                        "brief":   json_schema_boolean("Prepend the repo hard-problem brief (rules, evidence standard, decision protocol). Default FALSE here — these proxies usually just digest pasted material. Set true when you want the model held to the repo's full standard."),
                     }),
                     vec!["prompt"],
                 ),
@@ -7112,6 +7151,7 @@ impl McpServer for AiAgentServer {
                         "model":   model_schema(&self.provider),
                         "context": context_schema(),
                         "provider": provider_schema(),
+                        "brief":   json_schema_boolean("Prepend the repo hard-problem brief (rules, evidence standard, decision protocol). Default FALSE here — these proxies usually just digest pasted material. Set true when you want the model held to the repo's full standard."),
                     }),
                     vec!["prompt"],
                 ),
@@ -7131,6 +7171,7 @@ impl McpServer for AiAgentServer {
                         "model":   model_schema(&self.provider),
                         "context": context_schema(),
                         "provider": provider_schema(),
+                        "brief":   json_schema_boolean("Prepend the repo hard-problem brief (rules, evidence standard, decision protocol). Default FALSE here — these proxies usually just digest pasted material. Set true when you want the model held to the repo's full standard."),
                     }),
                     vec!["prompt"],
                 ),
@@ -7150,16 +7191,24 @@ impl McpServer for AiAgentServer {
                     Good for: 'where/how is X implemented', 'does the code actually do Y', \
                     grounded cross-file investigations, lab-state and live-lab-run drill-in questions. \
                     Use the proxy tools (ai_read/write/read_write) when you want to hand the model \
-                    material directly instead of having it explore."
+                    material directly instead of having it explore. \
+                    The repo's hard-problem brief (rustynet_hard_problem_prompt.md — fail-closed \
+                    rules, the evidence/grounding standard, the decision protocol, house style) is \
+                    prepended AUTOMATICALLY. Because of that, spend your effort on `prompt`: write \
+                    a specific, self-contained task — what is wrong, what you already tried, which \
+                    files/stages are implicated, and what a satisfactory answer must contain. The \
+                    brief is generic; your prompt is what makes the call precise. Set brief=false \
+                    to omit it for a trivial question."
                     .into(),
                 input_schema: json_schema_object(
                     json!({
-                        "prompt":    json_schema_string("The research question to investigate against the local repo/lab."),
+                        "prompt":    json_schema_string("The research question, as a specific self-contained brief — what is wrong, what was already tried, which files/stages are implicated, what a good answer must contain."),
                         "model":     model_schema(&self.provider),
                         "provider":  provider_schema(),
+                        "brief":     json_schema_boolean("Prepend the repo hard-problem brief (default TRUE for this tool). Set false for a trivial lookup where the rules preamble is wasted tokens."),
                         "max_steps": json!({
                             "type": "integer",
-                            "description": "Max tool-calling steps before forcing a final answer (default 12, cap 20).",
+                            "description": "Max tool-calling steps before forcing a final answer (default 12, cap 40).",
                         }),
                     }),
                     vec!["prompt"],
@@ -7576,18 +7625,25 @@ impl McpServer for AiAgentServer {
         let model_str = get_str(&args, "model").unwrap_or("flash");
         let model = worker.resolve_model(model_str);
 
-        // The autonomous agent has its own loop + system prompt.
+        // The autonomous agent has its own loop + system prompt. It is the
+        // deep-reasoning path, so the hard-problem brief is ON by default here.
         if name == "ai_agent" {
             let max_steps = args
                 .get("max_steps")
                 .and_then(|v| v.as_u64())
                 .map(|n| n.clamp(1, AGENT_HARD_MAX_STEPS))
                 .unwrap_or(AGENT_DEFAULT_MAX_STEPS);
-            return match worker.run_agent(prompt, &model, max_steps) {
+            let briefed = worker
+                .wants_brief(&args, true)
+                .then(|| worker.hard_problem_prompt(prompt))
+                .flatten();
+            let effective = briefed.as_deref().unwrap_or(prompt);
+            return match worker.run_agent(effective, &model, max_steps) {
                 Ok(answer) => {
                     let header = format!(
-                        "[{}/{model} | AGENT | budget={max_steps}]\n\n",
-                        worker.provider.name
+                        "[{}/{model} | AGENT | budget={max_steps}{}]\n\n",
+                        worker.provider.name,
+                        if briefed.is_some() { " | briefed" } else { "" }
                     );
                     ToolCallResult {
                         content: text_content(format!("{header}{answer}")),
@@ -7630,11 +7686,22 @@ impl McpServer for AiAgentServer {
             _ => return tool_error(&format!("unknown tool: {name}")),
         };
 
-        let user_prompt = build_user_prompt(intent_label, prompt, context);
+        // Proxies are opt-in: they are usually "summarise this pasted log",
+        // where the rules preamble would be pure overhead on every call.
+        let briefed = worker
+            .wants_brief(&args, false)
+            .then(|| worker.hard_problem_prompt(prompt))
+            .flatten();
+        let user_prompt =
+            build_user_prompt(intent_label, briefed.as_deref().unwrap_or(prompt), context);
 
         match worker.call(system, &user_prompt, &model) {
             Ok(response) => {
-                let header = format!("[{}/{model} | {intent_label}]\n\n", worker.provider.name);
+                let header = format!(
+                    "[{}/{model} | {intent_label}{}]\n\n",
+                    worker.provider.name,
+                    if briefed.is_some() { " | briefed" } else { "" }
+                );
                 ToolCallResult {
                     content: text_content(format!("{header}{response}")),
                     is_error: None,
@@ -7977,6 +8044,67 @@ mod tests {
         let show = git(&["show", "--stat", "HEAD"]);
         assert!(show.stdout.contains("unsaved.txt"), "{}", show.stdout);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hard_problem_brief_substitutes_the_task_and_keeps_the_rules() {
+        // The brief is only worth injecting if the caller's task actually
+        // replaces the placeholder AND the fixed policy above it survives.
+        let s = server();
+        let composed = s
+            .hard_problem_prompt("Explain why stage X fails on macOS only.")
+            .expect("brief should load from the repo root");
+        assert!(
+            composed.contains("Explain why stage X fails on macOS only."),
+            "caller task must land in the TASK slot"
+        );
+        assert!(
+            !composed.contains("no task supplied"),
+            "the placeholder must be replaced, not appended to: {}",
+            &composed[composed.len().saturating_sub(200)..]
+        );
+        // Load-bearing rules the external model must still receive.
+        for rule in ["Fail closed", "file.rs:line", "could NOT verify"] {
+            assert!(composed.contains(rule), "brief lost its '{rule}' rule");
+        }
+        assert!(composed.contains("## TASK"), "marker must remain");
+    }
+
+    #[test]
+    fn hard_problem_brief_degrades_instead_of_failing_the_call() {
+        // A missing/renamed brief must never break a request — losing the
+        // preamble is recoverable, losing the user's call is not.
+        let root = std::env::temp_dir().join(format!(
+            "rustynet_nobrief_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            server_rooted(&root)
+                .hard_problem_prompt("anything")
+                .is_none(),
+            "no brief file => None, so the caller falls back to the plain prompt"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn brief_defaults_differ_by_tool_and_are_overridable() {
+        // Deep-reasoning path on by default; cheap proxies off. Either can be
+        // overridden explicitly, which is the whole point of the flag.
+        let s = server();
+        assert!(s.wants_brief(&json!({}), true), "ai_agent default on");
+        assert!(!s.wants_brief(&json!({}), false), "proxy default off");
+        assert!(
+            !s.wants_brief(&json!({"brief": false}), true),
+            "explicit off wins"
+        );
+        assert!(
+            s.wants_brief(&json!({"brief": true}), false),
+            "explicit on wins"
+        );
     }
 
     #[test]
