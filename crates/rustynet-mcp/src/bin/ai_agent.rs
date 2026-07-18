@@ -2972,9 +2972,59 @@ impl AiAgentServer {
         }
     }
 
+    /// Commit whatever is uncommitted in the worktree to the job's own branch
+    /// before the job ends, so the BRANCH is the complete deliverable.
+    ///
+    /// Without this the "hard stop keeps your work" promise is false in exactly
+    /// the case that matters most: a job halted on budget mid-edit has usually
+    /// NOT reached its own commit step, so the change exists only as untracked
+    /// files in a worktree nobody will look at, and the advertised resume
+    /// (`base_ref=<branch>`) branches from a tip that never saw it — silently
+    /// discarding the work. Verified by doing exactly that before this existed.
+    ///
+    /// Safe to do on the agent's behalf: this is a throwaway branch that a human
+    /// reviews before merging, and the alternative is losing the work outright.
+    /// The message marks it as an automatic checkpoint so no one mistakes it for
+    /// the agent's own considered commit.
+    fn checkpoint_edit_worktree(&self, worktree: &Path, state: &str) {
+        let dirty = run_with_timeout(
+            "git",
+            &["status", "--porcelain"],
+            worktree,
+            &[],
+            Duration::from_secs(30),
+        );
+        match dirty {
+            Ok(o) if o.success && o.stdout.trim().is_empty() => return, // nothing to save
+            Ok(o) if o.success => o,
+            _ => return, // not a worktree, or git unavailable — nothing to do
+        };
+        let _ = run_with_timeout(
+            "git",
+            &["add", "-A"],
+            worktree,
+            &[],
+            Duration::from_secs(60),
+        );
+        let msg = format!(
+            "WIP: automatic checkpoint ({state})\n\nCommitted by the delegated-edit tier because \
+             the job ended before the agent committed. Review before merging."
+        );
+        let _ = run_with_timeout(
+            "git",
+            &["commit", "--no-verify", "-m", &msg],
+            worktree,
+            &[],
+            Duration::from_secs(120),
+        );
+    }
+
     /// Capture the worktree's diff-vs-base into the record so the terminal
     /// summary can show it without the serve/worktree still being live.
+    /// Checkpoints first so the diff and the branch agree.
     fn persist_edit_diff(&self, rec: &mut Value, worktree: &Path, base_ref: &str) {
+        let state = rec["state"].as_str().unwrap_or("ended").to_string();
+        self.checkpoint_edit_worktree(worktree, &state);
         let diff = self.edit_job_diff(worktree, base_ref);
         if let Some(o) = rec.as_object_mut() {
             o.insert("diff".into(), json!(truncate_output(&diff, 4000, 200_000)));
@@ -7880,6 +7930,79 @@ mod tests {
             !summary.contains("$0.0000"),
             "must not print a bogus $0 cost: {summary}"
         );
+    }
+
+    #[test]
+    fn checkpoint_commits_uncommitted_work_so_the_branch_is_the_deliverable() {
+        // Regression: a job halted on budget usually has NOT reached its own
+        // commit step, so its change existed only as untracked files in a dead
+        // worktree — and the advertised resume (base_ref=<branch>) branched from
+        // a tip that never saw it, silently discarding the work. Verified
+        // live before this existed; this pins the fix.
+        let root = std::env::temp_dir().join(format!(
+            "rustynet_ckpt_dirty_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = root.as_path();
+        let git = |args: &[&str]| {
+            run_with_timeout("git", args, repo, &[], Duration::from_secs(30)).expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        std::fs::write(repo.join("unsaved.txt"), b"work the agent never committed").unwrap();
+
+        let before = git(&["status", "--porcelain"]);
+        assert!(!before.stdout.trim().is_empty(), "precondition: dirty tree");
+
+        server().checkpoint_edit_worktree(repo, "halted_budget");
+
+        let after = git(&["status", "--porcelain"]);
+        assert!(
+            after.stdout.trim().is_empty(),
+            "checkpoint must leave the tree clean: {}",
+            after.stdout
+        );
+        let log = git(&["log", "--oneline", "-1"]);
+        assert!(
+            log.stdout.contains("halted_budget") || log.stdout.contains("WIP"),
+            "checkpoint commit must be identifiable: {}",
+            log.stdout
+        );
+        // And the content is actually in the commit, not just staged away.
+        let show = git(&["show", "--stat", "HEAD"]);
+        assert!(show.stdout.contains("unsaved.txt"), "{}", show.stdout);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkpoint_is_a_noop_on_a_clean_worktree() {
+        // Must not manufacture empty commits on jobs that finished tidily.
+        let root = std::env::temp_dir().join(format!(
+            "rustynet_ckpt_clean_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = root.as_path();
+        let git = |args: &[&str]| {
+            run_with_timeout("git", args, repo, &[], Duration::from_secs(30)).expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+
+        let before = git(&["rev-parse", "HEAD"]).stdout;
+        server().checkpoint_edit_worktree(repo, "done");
+        let after = git(&["rev-parse", "HEAD"]).stdout;
+        assert_eq!(before, after, "clean worktree must not gain a commit");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
