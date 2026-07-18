@@ -897,6 +897,27 @@ ready-to-run resume call (`ai_edit_run(base_ref="ai-edit/<job_id>", …)`). The
 agent is also *told* its budget in its preamble and instructed not to fan out
 speculatively — the ceiling is the backstop, not the plan.
 
+**Any terminal state checkpoints the worktree to its branch first**
+(`checkpoint_edit_worktree`). This is what makes the branch the complete
+deliverable rather than a half-truth: a job halted on budget has usually not
+reached its own commit step, so without this its change lives only as untracked
+files in a worktree nobody opens — and the resume call above, which branches
+from the tip, silently discards them. (Confirmed by running that resume verbatim
+before the checkpoint existed: the prior work simply was not there.) The commit
+is labelled an automatic checkpoint so it is not mistaken for the agent's own,
+and a clean worktree gains no empty commit.
+
+**What a sub-agent can reach beyond its OpenCode tools.** Measured, not assumed:
+a `rustynet-subagent-verify` session sees exactly seven tools — `bash`, `glob`,
+`grep`, `read`, and the three MCP *resource* readers (`list_mcp_resources`,
+`list_mcp_resource_templates`, `read_mcp_resource`). **No `mcp__*` tool is
+callable**, so the blanket `"*": "deny"` does gate MCP tools and a cheap
+verifier cannot reach, say, `rustynet-lab-state` and power a VM. It CAN read MCP
+*resources* (it successfully read `README.md` from `rustynet-mcp-repo-context`) —
+read-only documents it already has `read` access to anyway, so this is benign.
+Note `bash` is by far the wider surface here and is granted deliberately, for
+gates.
+
 **House style is mandatory for every agent.** `CAVEMAN_STYLE_DIRECTIVE` (Rust)
 and the matching `prompt` on every agent in `.opencode/opencode.json` force
 terse, high-density prose: no greetings, no meta-commentary, code-first, over 30
