@@ -879,6 +879,19 @@ Note also that a sub-agent's permissions come from **its own config**, not the
 parent's (parent `allow` does not propagate; only parent *denies* do), so a
 restrictive parent is never a substitute for a restrictive sub-agent config.
 
+**The session walk fails closed.** Enumerating a job's sessions can itself fail
+(transport error, non-2xx, unexpected shape). That must not read as "this job has
+no sub-agents", because the two are the same list and the wrong conclusion
+re-creates every bug the walk exists to prevent. `oc_session_subtree` therefore
+returns a `complete` flag and each caller errs safe: an incomplete walk reports
+**busy** (never finishing a job and killing the serve under a working
+sub-agent), surfaces pending approvals from unverified sessions rather than
+dropping them (a dropped one is invisible to the human *and* never arms the
+watchdog, since that only arms on an observed pending), and marks spend as a
+lower bound (`≥`) so a ceiling is never read as "safely under" on missing data.
+An unreadable `/session/status` is treated the same way. The overall wall-clock
+cap still bounds a job whose server has genuinely gone away.
+
 **Budget.** Every job carries hard ceilings, checked on each `ai_edit_result`
 poll and summed across the whole session subtree so a sub-agent's spend counts
 against the same budget as its parent:

@@ -559,6 +559,20 @@ fn budget_env_u64(var: &str, default: u64, allow_zero: bool) -> u64 {
         .unwrap_or(default)
 }
 
+/// The set of OpenCode sessions belonging to one job, plus whether that set is
+/// known to be exhaustive. `complete == false` means at least one children
+/// lookup failed, so sub-agent sessions may be missing from `ids`.
+struct SessionSubtree {
+    ids: Vec<String>,
+    complete: bool,
+}
+
+impl SessionSubtree {
+    fn contains(&self, session_id: &str) -> bool {
+        self.ids.iter().any(|s| s == session_id)
+    }
+}
+
 /// Accumulated spend for one delegated-edit job, summed over its session subtree.
 #[derive(Default, Clone, Copy)]
 struct EditSpend {
@@ -566,6 +580,9 @@ struct EditSpend {
     cost: f64,
     /// Sessions in the subtree BEYOND the root — i.e. spawned sub-agents.
     subagents: usize,
+    /// False when the session walk could not be completed, so these figures are
+    /// a LOWER BOUND — some sub-agent's spend may be missing.
+    complete: bool,
 }
 
 impl EditSpend {
@@ -578,8 +595,15 @@ impl EditSpend {
             String::new()
         };
         format!(
-            "{} tokens{cost}, {} sub-agent(s)",
-            self.tokens, self.subagents
+            "{}{} tokens{cost}, {} sub-agent(s){}",
+            if self.complete { "" } else { "≥" },
+            self.tokens,
+            self.subagents,
+            if self.complete {
+                ""
+            } else {
+                " (INCOMPLETE — a session walk failed, so real spend may be higher)"
+            }
         )
     }
 }
@@ -2203,26 +2227,50 @@ impl AiAgentServer {
     /// sub-agent. Walk `/session/{id}/children` breadth-first so the whole job
     /// is one unit. Depth is bounded in practice (sub-agents cannot spawn
     /// sub-agents), and `seen` makes the walk cycle-proof regardless.
-    fn oc_session_subtree(&self, port: u16, root_session_id: &str) -> Vec<String> {
+    ///
+    /// `complete` is false when ANY children lookup failed, so callers can tell
+    /// "this job genuinely has no sub-agents" apart from "I could not find
+    /// out". Those are the same list but must NOT lead to the same conclusion:
+    /// treating a failed walk as an empty one re-creates exactly the bugs the
+    /// walk exists to prevent — a job declared finished while a sub-agent is
+    /// mid-edit, a pending approval that reaches nobody, ceilings that never
+    /// trip. Every caller here fails closed on `!complete`.
+    fn oc_session_subtree(&self, port: u16, root_session_id: &str) -> SessionSubtree {
         let mut seen: Vec<String> = vec![root_session_id.to_string()];
         let mut queue: Vec<String> = vec![root_session_id.to_string()];
+        let mut complete = true;
         while let Some(id) = queue.pop() {
-            let Ok(Value::Array(children)) = self.oc_get(port, &format!("/session/{id}/children"))
-            else {
-                continue;
-            };
-            for child in children {
-                // Tolerate both a bare array of sessions and a {data:[…]} wrap.
-                let Some(cid) = child["id"].as_str() else {
-                    continue;
-                };
-                if !seen.iter().any(|s| s == cid) {
-                    seen.push(cid.to_string());
-                    queue.push(cid.to_string());
+            match self.oc_get(port, &format!("/session/{id}/children")) {
+                Ok(Value::Array(children)) => {
+                    for child in children {
+                        let Some(cid) = child["id"].as_str() else {
+                            continue;
+                        };
+                        if !seen.iter().any(|s| s == cid) {
+                            seen.push(cid.to_string());
+                            queue.push(cid.to_string());
+                        }
+                    }
+                }
+                // Transport error, non-2xx, or a shape we do not recognise. All
+                // mean "unknown", never "none".
+                other => {
+                    complete = false;
+                    eprintln!(
+                        "[edit] children lookup failed for session {id}; treating job subtree as \
+                         INCOMPLETE and failing closed{}",
+                        match other {
+                            Err(e) => format!(": {e}"),
+                            Ok(_) => " (unexpected response shape)".to_string(),
+                        }
+                    );
                 }
             }
         }
-        seen
+        SessionSubtree {
+            ids: seen,
+            complete,
+        }
     }
 
     /// Human label for whichever session a pending request came from: the root
@@ -2270,10 +2318,15 @@ impl AiAgentServer {
         let subtree = self.oc_session_subtree(port, session_id);
         let mut spend = EditSpend {
             // Everything past the root session is a spawned sub-agent.
-            subagents: subtree.len().saturating_sub(1),
+            subagents: subtree.ids.len().saturating_sub(1),
+            // An incomplete walk undercounts BOTH tokens and sub-agents, so a
+            // ceiling silently stops tripping — the budget fails OPEN, which is
+            // the wrong direction for the one control that bounds spend. Mark it
+            // so the poll can report the number as a floor rather than a total.
+            complete: subtree.complete,
             ..Default::default()
         };
-        for id in &subtree {
+        for id in &subtree.ids {
             let Ok(s) = self.oc_get(port, &format!("/session/{id}")) else {
                 continue;
             };
@@ -2308,9 +2361,28 @@ impl AiAgentServer {
             Ok(Value::Array(items)) => items
                 .into_iter()
                 .filter(|it| {
-                    it["sessionID"]
-                        .as_str()
-                        .is_some_and(|s| subtree.iter().any(|k| k == s))
+                    let Some(sid) = it["sessionID"].as_str() else {
+                        return false;
+                    };
+                    if subtree.contains(sid) {
+                        return true;
+                    }
+                    // Subtree incomplete: this request may belong to a sub-agent
+                    // we failed to enumerate. Dropping it would hide the
+                    // approval from the human AND stop the watchdog ever arming
+                    // (it only arms on an OBSERVED pending), leaving the
+                    // sub-agent blocked until the whole job times out. Claiming
+                    // it is the safe error: at worst the human is shown a
+                    // request from another job on this server, which they can
+                    // deny — versus silently losing one of ours.
+                    if !subtree.complete {
+                        eprintln!(
+                            "[edit] subtree incomplete — surfacing pending request from \
+                             unverified session {sid} rather than dropping it"
+                        );
+                        return true;
+                    }
+                    false
                 })
                 .collect(),
             _ => Vec::new(),
@@ -2330,14 +2402,23 @@ impl AiAgentServer {
     /// was still working.
     fn oc_session_busy(&self, port: u16, session_id: &str) -> bool {
         let subtree = self.oc_session_subtree(port, session_id);
+        // Could not enumerate the sub-agents → cannot prove nothing is running.
+        // Report BUSY: the caller's only reaction to "not busy" is to finish the
+        // job and kill the serve, which would cut off a sub-agent mid-edit. A
+        // job that runs slightly too long is recoverable; one killed mid-write
+        // is not. The overall wall-clock cap still bounds this.
+        if !subtree.complete {
+            return true;
+        }
         match self.oc_get(port, "/session/status") {
-            Ok(v) => subtree.iter().any(|id| {
+            Ok(v) => subtree.ids.iter().any(|id| {
                 v.get(id)
                     .and_then(|s| s["type"].as_str())
                     // "retry" = provider-level retry in progress; still working.
                     .is_some_and(|t| t == "busy" || t == "retry")
             }),
-            Err(_) => false,
+            // Same reasoning: an unreadable status map is unknown, not idle.
+            Err(_) => true,
         }
     }
 
@@ -8092,6 +8173,55 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_server_never_reads_as_idle() {
+        // The whole hazard: "not busy" is the ONLY signal that finishes a job
+        // and kills the serve. If an unreachable or stalled server answered
+        // "not busy", a job would be torn down under a working sub-agent.
+        // Port 1 is reserved and never listening, so every call fails.
+        let s = server();
+        assert!(
+            s.oc_session_busy(1, "ses_does_not_exist"),
+            "an unreachable OpenCode server must read as BUSY, never idle"
+        );
+    }
+
+    #[test]
+    fn failed_subtree_walk_is_marked_incomplete_and_spend_is_a_lower_bound() {
+        let s = server();
+        let subtree = s.oc_session_subtree(1, "ses_root");
+        assert!(
+            !subtree.complete,
+            "a failed children lookup must mark the subtree INCOMPLETE, not empty"
+        );
+        assert!(
+            subtree.contains("ses_root"),
+            "the root is still known even when the walk fails"
+        );
+        // Spend derived from an incomplete walk must advertise itself as a floor
+        // so a ceiling is never read as "safely under" on missing data.
+        let spend = s.oc_job_spend(1, "ses_root");
+        assert!(!spend.complete);
+        assert!(
+            spend.summary().contains("INCOMPLETE"),
+            "{}",
+            spend.summary()
+        );
+        assert!(spend.summary().starts_with('≥'), "{}", spend.summary());
+    }
+
+    #[test]
+    fn complete_subtree_reports_exact_spend_without_the_floor_marker() {
+        let complete = EditSpend {
+            tokens: 42,
+            cost: 0.0,
+            subagents: 1,
+            complete: true,
+        };
+        assert!(complete.summary().starts_with("42 tokens"));
+        assert!(!complete.summary().contains("INCOMPLETE"));
+    }
+
+    #[test]
     fn hard_problem_brief_substitutes_the_task_and_keeps_the_rules() {
         // The brief is only worth injecting if the caller's task actually
         // replaces the placeholder AND the fixed policy above it survives.
@@ -8194,6 +8324,7 @@ mod tests {
             tokens: 1000,
             cost: 0.25,
             subagents: 2,
+            complete: true,
         };
         assert!(priced.summary().contains("1000 tokens"));
         assert!(priced.summary().contains("$0.2500"));
@@ -8201,6 +8332,7 @@ mod tests {
             tokens: 1000,
             cost: 0.0,
             subagents: 0,
+            complete: true,
         };
         assert!(unpriced.summary().contains("1000 tokens"));
         assert!(
