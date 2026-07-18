@@ -178,17 +178,22 @@ fn built_in_provider(name: &str) -> Option<BuiltInPreset> {
         // against a real key: /models 200s and /v1/users/me/balance 200s. The
         // separate China platform (api.moonshot.cn) uses different keys and 401s
         // an international key, so a .cn user must override base_url/models_url/
-        // balance_url via a registry entry. flash/pro map to the two models this
-        // account exposes — kimi-k2.6 (general) and kimi-k2.7-code (code-tuned,
-        // the natural pick for the delegated-edit tier); both are 256K-context
-        // reasoning models. Verify current ids with ai_list_models, since
-        // Moonshot rotates model generations.
+        // balance_url via a registry entry.
+        //
+        // `pro` is kimi-k3, the flagship — this tier exists for genuinely hard
+        // multi-step reasoning (see the hard-problem brief), and that is what it
+        // should reach for. The code-tuned kimi-k2.7-code and its -highspeed
+        // variant stay reachable by passing their id explicitly, which is the
+        // better pick for mechanical editing work. This account's catalog grew
+        // from 2 ids to 4 between one session and the next, so treat these as a
+        // snapshot: run `ai_list_models` and correct them rather than trusting
+        // this comment.
         "kimi" => Some(BuiltInPreset {
             base_url: "https://api.moonshot.ai/v1/chat/completions",
             models_url: "https://api.moonshot.ai/v1/models",
             balance_url: Some("https://api.moonshot.ai/v1/users/me/balance"),
             flash_model: "kimi-k2.6",
-            pro_model: "kimi-k2.7-code",
+            pro_model: "kimi-k3",
             pro_reasoning_effort: "",
             api_key_env: "KIMI_API_KEY",
         }),
@@ -7769,7 +7774,7 @@ mod tests {
         let p = built_in_provider("kimi").unwrap();
         assert!(p.base_url.contains("api.moonshot.ai"));
         assert_eq!(p.flash_model, "kimi-k2.6");
-        assert_eq!(p.pro_model, "kimi-k2.7-code");
+        assert_eq!(p.pro_model, "kimi-k3");
         assert_eq!(
             p.balance_url,
             Some("https://api.moonshot.ai/v1/users/me/balance")

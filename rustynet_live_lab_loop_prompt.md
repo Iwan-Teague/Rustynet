@@ -485,7 +485,7 @@ write access (writes come from the §8 edit tier's `mode`, not from which model 
 | Provider | `RUSTYNET_LLM_PROVIDER` / `provider` | API key env var | flash / pro | Balance check |
 |---|---|---|---|---|
 | DeepSeek (default) | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-v4-flash / -pro | confirmed live |
-| Kimi (Moonshot, intl.) | `kimi` | `KIMI_API_KEY` | kimi-k2.6 / kimi-k2.7-code | confirmed live |
+| Kimi (Moonshot, intl.) | `kimi` | `KIMI_API_KEY` | kimi-k2.6 / kimi-k3 | confirmed live |
 | Grok (xAI) | `grok` | `GROK_API_KEY` | best-effort — verify | not configured |
 | GLM (Zhipu) | `glm` | `GLM_API_KEY` | best-effort — verify | not configured |
 | Qwen (Alibaba DashScope) | `qwen` | `QWEN_API_KEY` | best-effort — verify | not configured |

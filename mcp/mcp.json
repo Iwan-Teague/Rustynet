@@ -142,7 +142,7 @@
     "active_provider_env_override": "RUSTYNET_LLM_PROVIDER",
     "built_in_presets": {
       "deepseek": {"api_key_env": "DEEPSEEK_API_KEY", "balance_check": "confirmed live", "flash": "deepseek-v4-flash", "pro": "deepseek-v4-pro"},
-      "kimi": {"api_key_env": "KIMI_API_KEY", "balance_check": "confirmed live (api.moonshot.ai international platform)", "flash": "kimi-k2.6", "pro": "kimi-k2.7-code"},
+      "kimi": {"api_key_env": "KIMI_API_KEY", "balance_check": "confirmed live (api.moonshot.ai international platform)", "flash": "kimi-k2.6", "pro": "kimi-k3"},
       "grok": {"api_key_env": "GROK_API_KEY", "balance_check": "not configured — no confirmed endpoint yet", "flash": "best-effort — verify via ai_list_models", "pro": "best-effort — verify via ai_list_models"},
       "glm": {"api_key_env": "GLM_API_KEY", "balance_check": "not configured — no confirmed endpoint yet", "flash": "best-effort — verify via ai_list_models", "pro": "best-effort — verify via ai_list_models"},
       "qwen": {"api_key_env": "QWEN_API_KEY", "balance_check": "not configured — no confirmed endpoint yet", "flash": "best-effort — verify via ai_list_models", "pro": "best-effort — verify via ai_list_models"}
