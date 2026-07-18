@@ -493,9 +493,10 @@ const EDIT_SESSION_START_GRACE_SECS: u64 = 90;
 // branch survive, the diff is captured, and the result carries a ready-to-run
 // resume invocation. Nothing is lost — it just stops spending.
 
-/// Default total-token ceiling for one delegated-edit job, summed across its
-/// whole session subtree (root agent + every sub-agent it spawned).
-/// Override per-environment with `RUSTYNET_EDIT_TOKEN_CEILING`.
+/// Default billable-equivalent token ceiling for one delegated-edit job, summed
+/// across its whole session subtree (root agent + every sub-agent it spawned).
+/// "Billable-equivalent" because cached input is discounted — see
+/// `oc_job_spend`. Override per-environment with `RUSTYNET_EDIT_TOKEN_CEILING`.
 const EDIT_JOB_TOKEN_CEILING: u64 = 2_000_000;
 /// Default cap on how many sub-agent sessions one job may spawn. Bounds fan-out
 /// directly — the "don't let it spawn 50 sub-agents" guard.
@@ -2200,10 +2201,20 @@ impl AiAgentServer {
     /// the SAME budget as its parent — otherwise delegation would be a way to
     /// spend without limit.
     ///
-    /// Cache reads/writes are counted: they are billed (usually at a discount,
-    /// which is exactly why the dollar figure is advisory and the token count is
-    /// the gate).
+    /// The figure is a BILLABLE-EQUIVALENT token count, not a raw sum: cached
+    /// input is billed at roughly a tenth of fresh input, so counting it at full
+    /// weight would make the ceiling fire far too early on exactly the workload
+    /// we want (a long agent turn re-reading a cached prompt). Measured: a
+    /// trivial one-file job reported ~275k raw tokens, overwhelmingly cache
+    /// reads. Fresh input, output, reasoning and cache WRITES count fully;
+    /// cache reads are discounted. This keeps the ceiling proportional to money
+    /// rather than to raw traffic.
     fn oc_job_spend(&self, port: u16, session_id: &str) -> EditSpend {
+        /// Cached input is ~10x cheaper than fresh input across the providers
+        /// used here; divide rather than drop it so it still counts for
+        /// something.
+        const CACHE_READ_DISCOUNT: f64 = 10.0;
+
         let subtree = self.oc_session_subtree(port, session_id);
         let mut spend = EditSpend {
             // Everything past the root session is a spawned sub-agent.
@@ -2216,12 +2227,13 @@ impl AiAgentServer {
             };
             spend.cost += s["cost"].as_f64().unwrap_or(0.0);
             let t = &s["tokens"];
+            let mut billable = 0.0;
             for key in ["input", "output", "reasoning"] {
-                spend.tokens += t[key].as_f64().unwrap_or(0.0) as u64;
+                billable += t[key].as_f64().unwrap_or(0.0);
             }
-            for key in ["read", "write"] {
-                spend.tokens += t["cache"][key].as_f64().unwrap_or(0.0) as u64;
-            }
+            billable += t["cache"]["write"].as_f64().unwrap_or(0.0);
+            billable += t["cache"]["read"].as_f64().unwrap_or(0.0) / CACHE_READ_DISCOUNT;
+            spend.tokens += billable as u64;
         }
         spend
     }
