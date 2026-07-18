@@ -391,9 +391,14 @@ const TOOL_RESULT_MAX_BYTES: usize = 16 * 1024;
 /// Default / hard-max bytes for `read_file`.
 const READ_FILE_DEFAULT_BYTES: usize = 64 * 1024;
 const READ_FILE_HARD_MAX_BYTES: usize = 256 * 1024;
-/// Default agent step budget and its hard cap.
+/// Default agent step budget and its hard cap. The cap is deliberately well
+/// above the default: an expensive edit agent delegating a real verification
+/// question to a cheap model (§ delegated-edit preamble) needs room to actually
+/// chase it down — grep, read the call sites, then `cargo_check` to confirm — and
+/// a 20-step ceiling truncated that mid-investigation. Callers still pass their
+/// own `max_steps`; this only widens what they may ask for.
 const AGENT_DEFAULT_MAX_STEPS: u64 = 12;
-const AGENT_HARD_MAX_STEPS: u64 = 20;
+const AGENT_HARD_MAX_STEPS: u64 = 40;
 /// Timeout for any local subprocess the agent tools spawn (grep/git/uname/utmctl).
 const SUBPROC_TIMEOUT_SECS: u64 = 30;
 /// Wall-clock cap for a full live-lab orchestration launched by ai_lab_run.
@@ -470,6 +475,95 @@ const EDIT_APPROVAL_TIMEOUT_SECS: u64 = 1800;
 /// Without this, a poll landing in the gap between `prompt_async` returning and
 /// the model actually streaming would read as "done" against an empty diff.
 const EDIT_SESSION_START_GRACE_SECS: u64 = 90;
+
+// ── Delegated-edit budget ceilings ───────────────────────────────────────────
+//
+// A `full`-permission job may delegate to cheap sub-agents (see the subagent
+// entries in `.opencode/opencode.json`). That is the point — but it is also how
+// a bill runs away, so every job carries hard ceilings and reports its spend on
+// every poll.
+//
+// Enforcement is on TOKENS, not dollars, on purpose: our providers are declared
+// to OpenCode as custom `@ai-sdk/openai-compatible` entries, which carry no
+// pricing metadata, so `Session.cost` can legitimately read 0.00 while real
+// tokens burn. Token counts are always reported. Cost is surfaced when non-zero
+// as a convenience, never as the gate.
+//
+// Breaching a ceiling is a HARD STOP that keeps the work: the worktree and
+// branch survive, the diff is captured, and the result carries a ready-to-run
+// resume invocation. Nothing is lost — it just stops spending.
+
+/// Default total-token ceiling for one delegated-edit job, summed across its
+/// whole session subtree (root agent + every sub-agent it spawned).
+/// Override per-environment with `RUSTYNET_EDIT_TOKEN_CEILING`.
+const EDIT_JOB_TOKEN_CEILING: u64 = 2_000_000;
+/// Default cap on how many sub-agent sessions one job may spawn. Bounds fan-out
+/// directly — the "don't let it spawn 50 sub-agents" guard.
+/// Override with `RUSTYNET_EDIT_MAX_SUBAGENTS`.
+const EDIT_MAX_SUBAGENTS: usize = 8;
+
+/// House communication style, applied to EVERY agent this server drives — the
+/// grounded read-only agent, the delegated-edit agents, and any sub-agent they
+/// spawn. Non-negotiable and deliberately duplicated into
+/// `.opencode/opencode.json`'s agent prompts, because an agent config we do not
+/// own (an OpenCode built-in) would otherwise answer in default prose.
+///
+/// Scope is PROSE ONLY. Artifacts that outlive the conversation — commit
+/// messages, code, code comments, documentation — stay normal, because they are
+/// read later by people without this context and because the repo's own commit
+/// convention requires a readable imperative subject explaining what AND why.
+/// Safety-critical text is also exempt: a terse security warning or an
+/// irreversible-action confirmation is exactly where ambiguity costs the most.
+const CAVEMAN_STYLE_DIRECTIVE: &str = "\
+COMMUNICATION STYLE (mandatory, every turn): shortest possible. No greetings, \
+closings, 'sure'/'okay'/'let me'. No pleasantries. No meta-commentary — do not \
+say what you are about to do, just do it. No verbose error wrapping: one line \
+error + fix, next. Code-first — show the edit, not a paragraph about the edit. \
+No tables or diagrams unless asked; inline code only. Truncate quoted tool \
+output to the 1-2 relevant lines. Default to denying detail; give more only \
+when asked. Over 30 words of prose means cut it in half; over 60 means you got \
+it wrong. Keep all technical substance — exact identifiers, file:line \
+references, error strings verbatim, numbers. \
+OVERRIDES (write normal, complete prose): anything you write INTO the repo — \
+commit messages, code, code comments, documentation; any security warning or \
+irreversible-action confirmation; and when explicitly asked to explain or for \
+detail. Those are read later by people without this context.";
+
+/// Read a `u64` budget knob from the environment, falling back to `default`.
+/// An unparseable or zero value falls back too — a malformed override must not
+/// silently disable a ceiling.
+fn budget_env_u64(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// Accumulated spend for one delegated-edit job, summed over its session subtree.
+#[derive(Default, Clone, Copy)]
+struct EditSpend {
+    tokens: u64,
+    cost: f64,
+    /// Sessions in the subtree BEYOND the root — i.e. spawned sub-agents.
+    subagents: usize,
+}
+
+impl EditSpend {
+    /// One-line human summary. Cost is shown only when the provider actually
+    /// priced it (see the module note above on why it can be 0.00).
+    fn summary(&self) -> String {
+        let cost = if self.cost > 0.0 {
+            format!(", ~${:.4}", self.cost)
+        } else {
+            String::new()
+        };
+        format!(
+            "{} tokens{cost}, {} sub-agent(s)",
+            self.tokens, self.subagents
+        )
+    }
+}
 
 /// State of an async triage job: still running (with its start time, for elapsed
 /// reporting) or finished with its assembled report.
@@ -864,7 +958,8 @@ impl AiAgentServer {
         // Telling them the budget up front makes them synthesize a real conclusion
         // before they run out.
         let system_with_budget = format!(
-            "{system}\n\nSTEP BUDGET: you have at most {max_steps} tool-calling steps. Investigate \
+            "{system}\n\n{CAVEMAN_STYLE_DIRECTIVE}\
+             \n\nSTEP BUDGET: you have at most {max_steps} tool-calling steps. Investigate \
              efficiently, then write your FINAL answer as plain prose well before the budget runs \
              out — a grounded conclusion from what you have already gathered beats spending every \
              step on more tools. In a final answer, output prose ONLY: never emit tool-call or \
@@ -1982,7 +2077,17 @@ impl AiAgentServer {
         // re-exec, so the Desktop MCP sandbox that blocked the shebang launcher
         // (§12.5) does not apply. A provider with no Keychain item is simply
         // omitted; an env var already set in this process still wins.
-        let key_env = opencode_provider_env();
+        let mut key_env = opencode_provider_env();
+        // Depth-1 marker. The `mcp` block in .opencode/opencode.json is global
+        // and the edit agents declare no `tools` map, so an edit agent inherits
+        // this very MCP server — including `ai_edit_run`. Without a guard it
+        // could launch a NESTED edit job (another worktree, another serve,
+        // another full timeout budget) with nothing counting the depth. The
+        // agent's own OpenCode config cannot prevent that, because the MCP tool
+        // is not an OpenCode tool. So mark the environment here and refuse in
+        // `call_edit_run` when the marker is present: harness-independent, and
+        // immune to someone loosening a permission map later.
+        key_env.push(("RUSTYNET_EDIT_DEPTH".to_string(), "1".to_string()));
         let env_refs: Vec<(&str, &str)> = key_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -2037,35 +2142,137 @@ impl AiAgentServer {
             .map_err(|e| format!("opencode POST {path} read failed: {e}"))
     }
 
-    /// Pending approval requests for a job's session, if any.
+    /// Every session belonging to a job: its root session plus all descendants.
+    ///
+    /// A `task`-spawned sub-agent runs in its OWN child session (created with
+    /// `parentID`), so ANY per-session view — pending approvals, busy state,
+    /// token spend — that keys only on the root session silently ignores every
+    /// sub-agent. Walk `/session/{id}/children` breadth-first so the whole job
+    /// is one unit. Depth is bounded in practice (sub-agents cannot spawn
+    /// sub-agents), and `seen` makes the walk cycle-proof regardless.
+    fn oc_session_subtree(&self, port: u16, root_session_id: &str) -> Vec<String> {
+        let mut seen: Vec<String> = vec![root_session_id.to_string()];
+        let mut queue: Vec<String> = vec![root_session_id.to_string()];
+        while let Some(id) = queue.pop() {
+            let Ok(Value::Array(children)) = self.oc_get(port, &format!("/session/{id}/children"))
+            else {
+                continue;
+            };
+            for child in children {
+                // Tolerate both a bare array of sessions and a {data:[…]} wrap.
+                let Some(cid) = child["id"].as_str() else {
+                    continue;
+                };
+                if !seen.iter().any(|s| s == cid) {
+                    seen.push(cid.to_string());
+                    queue.push(cid.to_string());
+                }
+            }
+        }
+        seen
+    }
+
+    /// Human label for whichever session a pending request came from: the root
+    /// agent, or a named sub-agent it spawned.
+    ///
+    /// Matters because with sub-agent delegation the human is no longer always
+    /// approving the expensive parent's own edit — it may be a cheap sub-model's.
+    /// Approving blind, unable to tell which, would defeat the point of
+    /// supervising sub-model writes at all. `Session.agent` carries the name.
+    fn oc_session_origin(&self, port: u16, root_session_id: &str, session_id: &str) -> String {
+        if session_id == root_session_id {
+            return "primary agent".to_string();
+        }
+        match self.oc_get(port, &format!("/session/{session_id}")) {
+            Ok(s) => match s["agent"].as_str().filter(|a| !a.is_empty()) {
+                Some(agent) => format!("SUB-AGENT `{agent}`"),
+                None => format!("sub-agent session {session_id}"),
+            },
+            Err(_) => format!("sub-agent session {session_id}"),
+        }
+    }
+
+    /// Total spend for a job across its whole session subtree.
+    ///
+    /// `GET /session/{id}` returns a bare `Session` carrying `cost` and
+    /// `tokens{input,output,reasoning,cache{read,write}}` (schema-verified). We
+    /// sum every session in the subtree so a sub-agent's spend counts against
+    /// the SAME budget as its parent — otherwise delegation would be a way to
+    /// spend without limit.
+    ///
+    /// Cache reads/writes are counted: they are billed (usually at a discount,
+    /// which is exactly why the dollar figure is advisory and the token count is
+    /// the gate).
+    fn oc_job_spend(&self, port: u16, session_id: &str) -> EditSpend {
+        let subtree = self.oc_session_subtree(port, session_id);
+        let mut spend = EditSpend {
+            // Everything past the root session is a spawned sub-agent.
+            subagents: subtree.len().saturating_sub(1),
+            ..Default::default()
+        };
+        for id in &subtree {
+            let Ok(s) = self.oc_get(port, &format!("/session/{id}")) else {
+                continue;
+            };
+            spend.cost += s["cost"].as_f64().unwrap_or(0.0);
+            let t = &s["tokens"];
+            for key in ["input", "output", "reasoning"] {
+                spend.tokens += t[key].as_f64().unwrap_or(0.0) as u64;
+            }
+            for key in ["read", "write"] {
+                spend.tokens += t["cache"][key].as_f64().unwrap_or(0.0) as u64;
+            }
+        }
+        spend
+    }
+
+    /// Pending approval requests for a job, across its whole session subtree.
     ///
     /// Reads the LEGACY `/permission` endpoint, not the newer-looking
     /// `/api/permission/request`: verified against a live server, the runtime
     /// actually publishes pending requests on the legacy path — the v2 path
     /// stayed empty while a request was genuinely pending on the legacy one.
+    ///
+    /// The endpoint is global (every session on this server), so filtering is
+    /// ours to do. It must match the SUBTREE, not just the root: a sub-agent's
+    /// edit lands on a child session id, and filtering to the root alone would
+    /// drop it — the request would never reach the human and would sit until the
+    /// approval watchdog auto-rejected it.
     fn oc_pending_permissions(&self, port: u16, session_id: &str) -> Vec<Value> {
+        let subtree = self.oc_session_subtree(port, session_id);
         match self.oc_get(port, "/permission") {
             Ok(Value::Array(items)) => items
                 .into_iter()
-                .filter(|it| it["sessionID"].as_str() == Some(session_id))
+                .filter(|it| {
+                    it["sessionID"]
+                        .as_str()
+                        .is_some_and(|s| subtree.iter().any(|k| k == s))
+                })
                 .collect(),
             _ => Vec::new(),
         }
     }
 
-    /// Whether a job's session is currently executing.
+    /// Whether a job is currently executing ANYWHERE in its session subtree.
     ///
     /// `/session/status` omits a session once its turn finishes, so absence is
     /// "not running" — NOT necessarily "finished" (a session that has not
     /// started yet is equally absent). Callers must disambiguate with
     /// `observed_busy` + `EDIT_SESSION_START_GRACE_SECS`.
+    ///
+    /// Subtree-wide because a parent waiting on a `task` sub-agent is itself
+    /// idle: keying on the root alone would read "not running" mid-delegation
+    /// and let the caller finish the job — killing the serve while the sub-agent
+    /// was still working.
     fn oc_session_busy(&self, port: u16, session_id: &str) -> bool {
+        let subtree = self.oc_session_subtree(port, session_id);
         match self.oc_get(port, "/session/status") {
-            Ok(v) => v
-                .get(session_id)
-                .and_then(|s| s["type"].as_str())
-                // "retry" = provider-level retry in progress; still working.
-                .is_some_and(|t| t == "busy" || t == "retry"),
+            Ok(v) => subtree.iter().any(|id| {
+                v.get(id)
+                    .and_then(|s| s["type"].as_str())
+                    // "retry" = provider-level retry in progress; still working.
+                    .is_some_and(|t| t == "busy" || t == "retry")
+            }),
             Err(_) => false,
         }
     }
@@ -2119,6 +2326,20 @@ impl AiAgentServer {
     /// Returns a `job_id` immediately; the worktree/serve/session setup runs on
     /// a background thread (serve boot is a few seconds). Poll `ai_edit_result`.
     fn call_edit_run(&self, args: &Value) -> ToolCallResult {
+        // Depth-1 enforcement (see the marker injection in `spawn_opencode_serve`).
+        // An edit agent inherits this MCP server through OpenCode's global `mcp`
+        // block, so without this a job could recursively launch jobs. Refuse
+        // BEFORE creating a worktree or a serve so a nested attempt costs nothing.
+        if std::env::var("RUSTYNET_EDIT_DEPTH").is_ok_and(|v| !v.trim().is_empty()) {
+            return tool_error(
+                "ai_edit_run is not available from inside a delegated-edit job (depth limit 1). \
+                 You are already running as an edit agent in an isolated worktree. To delegate \
+                 smaller work, spawn a SUB-AGENT with the `task` tool \
+                 (`rustynet-subagent-verify` for read-only checks, `rustynet-subagent-edit` for \
+                 supervised edits) — those run in THIS worktree and cost far less. For grounded \
+                 read-only research, call `ai_agent` with a cheap provider/model instead.",
+            );
+        }
         let task = match get_str(args, "task")
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -2296,6 +2517,9 @@ impl AiAgentServer {
         // Preamble makes the deliverable durable: the agent commits to its
         // branch so the work survives even if we later remove the worktree,
         // and it knows editing is worktree-local (not the real repo).
+        let token_ceiling = budget_env_u64("RUSTYNET_EDIT_TOKEN_CEILING", EDIT_JOB_TOKEN_CEILING);
+        let subagent_ceiling =
+            budget_env_u64("RUSTYNET_EDIT_MAX_SUBAGENTS", EDIT_MAX_SUBAGENTS as u64);
         let full_prompt = format!(
             "You are working in an ISOLATED git worktree on branch `{branch}`. All your edits \
              stay on this branch and are reviewed by a human before merging — you cannot affect \
@@ -2303,6 +2527,30 @@ impl AiAgentServer {
              with a clear message so the change is durable. Run the repo's gates \
              (`cargo fmt --all -- --check`, `cargo check`, `cargo clippy`, `cargo test` as \
              appropriate) before committing.\n\n\
+             {CAVEMAN_STYLE_DIRECTIVE}\n\n\
+             DELEGATE THE CHEAP WORK — you are an expensive model; do not spend your own context \
+             on things a small one can do:\n\
+             - Grounded read-only research (does this compile, is this claim true, where is X \
+             used, what did this commit change): call the `ai_agent` MCP tool with a cheap \
+             provider/model, e.g. provider=\"deepseek\", model=\"flash\". It has its own \
+             repo+lab tool harness (read/grep/find_definition/find_references/git/cargo_check/\
+             cargo_test) and returns cited evidence. It CANNOT write, so it is always safe.\n\
+             - A small, well-specified chunk of work in THIS worktree: spawn a sub-agent with the \
+             `task` tool — `rustynet-subagent-verify` (read-only checks, gates) or \
+             `rustynet-subagent-edit` (can edit, but every edit pauses for HUMAN approval, which \
+             costs wall-clock; use it only when the change is genuinely separable).\n\
+             Give a sub-agent a self-contained brief: it starts with NO context from your \
+             conversation.\n\n\
+             BUDGET — be sensible, this is real money:\n\
+             - Hard ceiling {token_ceiling} tokens for this whole job, counting every sub-agent \
+             you spawn. Breaching it STOPS the job; your branch survives but unfinished work is \
+             left for a human to resume.\n\
+             - At most {subagent_ceiling} sub-agents. Do not fan out speculatively — spawn one \
+             when it clearly saves you more than it costs, not by reflex.\n\
+             - Prefer one well-scoped sub-agent call over several vague ones. Re-read what you \
+             already have before asking for it again.\n\
+             - If you are running low, stop and summarise precisely what remains rather than \
+             starting something you cannot finish.\n\n\
              TASK:\n{task}"
         );
         if let Err(e) = self.oc_post(
@@ -2349,17 +2597,17 @@ impl AiAgentServer {
             Ok(r) => r,
             Err(e) => return tool_error(&e),
         };
-        let state = rec["state"].as_str().unwrap_or("unknown");
+        let state = rec["state"].as_str().unwrap_or("unknown").to_string();
 
         // Terminal states: report and stop.
-        match state {
+        match state.as_str() {
             "failed" => {
                 return self.edit_text(format!(
                     "Edit job `{job_id}` FAILED during setup: {}",
                     rec["error"].as_str().unwrap_or("(no detail)")
                 ));
             }
-            "done" | "timed_out" => {
+            "done" | "timed_out" | "halted_budget" => {
                 return self.edit_text(self.edit_terminal_summary(&rec));
             }
             "launching" => {
@@ -2390,6 +2638,41 @@ impl AiAgentServer {
         if now_unix().saturating_sub(started) > EDIT_JOB_TIMEOUT_SECS {
             kill_pid_group(serve_pid);
             self.mark_edit_terminal(&mut rec, "timed_out", Some("overall job timeout"));
+            self.persist_edit_diff(&mut rec, &worktree, &base_ref);
+            self.write_job_record(&job_id, &rec);
+            return self.edit_text(self.edit_terminal_summary(&rec));
+        }
+
+        // Budget ceilings. Checked on every poll and recorded so the caller sees
+        // running spend even while the job is healthy. A breach is a HARD STOP
+        // that keeps the work (worktree + branch + diff + resume hint survive).
+        let spend = self.oc_job_spend(port, &session_id);
+        let token_ceiling = budget_env_u64("RUSTYNET_EDIT_TOKEN_CEILING", EDIT_JOB_TOKEN_CEILING);
+        let subagent_ceiling =
+            budget_env_u64("RUSTYNET_EDIT_MAX_SUBAGENTS", EDIT_MAX_SUBAGENTS as u64) as usize;
+        if let Some(o) = rec.as_object_mut() {
+            o.insert("spend_tokens".into(), json!(spend.tokens));
+            o.insert("spend_cost".into(), json!(spend.cost));
+            o.insert("subagents".into(), json!(spend.subagents));
+        }
+        let breach = if spend.tokens > token_ceiling {
+            Some(format!(
+                "token ceiling exceeded — {} > {token_ceiling} (override with \
+                 RUSTYNET_EDIT_TOKEN_CEILING)",
+                spend.tokens
+            ))
+        } else if spend.subagents > subagent_ceiling {
+            Some(format!(
+                "sub-agent ceiling exceeded — {} > {subagent_ceiling} (override with \
+                 RUSTYNET_EDIT_MAX_SUBAGENTS)",
+                spend.subagents
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = breach {
+            kill_pid_group(serve_pid);
+            self.mark_edit_terminal(&mut rec, "halted_budget", Some(&reason));
             self.persist_edit_diff(&mut rec, &worktree, &base_ref);
             self.write_job_record(&job_id, &rec);
             return self.edit_text(self.edit_terminal_summary(&rec));
@@ -2429,10 +2712,11 @@ impl AiAgentServer {
                 _ => {}
             }
             let expires = ask_expires.unwrap_or(now + EDIT_APPROVAL_TIMEOUT_SECS);
+            let req_id = req["id"].as_str().unwrap_or_default().to_string();
             if let Some(o) = rec.as_object_mut() {
                 o.insert("state".into(), json!("awaiting_approval"));
                 o.insert("ask_expires_unix".into(), json!(expires));
-                o.insert("pending_request_id".into(), json!(req["id"].as_str()));
+                o.insert("pending_request_id".into(), json!(req_id));
             }
             self.write_job_record(&job_id, &rec);
             let diff = req["metadata"]["diff"]
@@ -2442,13 +2726,55 @@ impl AiAgentServer {
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
+            let origin = self.oc_session_origin(
+                port,
+                &session_id,
+                req["sessionID"].as_str().unwrap_or_default(),
+            );
+            // With more than one request outstanding (parent AND a sub-agent, or
+            // two sub-agents), the caller must say WHICH — approving "the first"
+            // silently would be approving something they were not shown.
+            let ambiguity = if pending.len() > 1 {
+                let others: Vec<String> = pending
+                    .iter()
+                    .skip(1)
+                    .map(|p| {
+                        format!(
+                            "  - `{}` from {} ({})",
+                            p["id"].as_str().unwrap_or("?"),
+                            self.oc_session_origin(
+                                port,
+                                &session_id,
+                                p["sessionID"].as_str().unwrap_or_default()
+                            ),
+                            p["patterns"]
+                                .as_array()
+                                .map(|a| a
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect();
+                format!(
+                    "\n\n**{} OTHER request(s) also pending** — pass `request_id` to choose:\n{}",
+                    pending.len() - 1,
+                    others.join("\n")
+                )
+            } else {
+                String::new()
+            };
             return self.edit_text(format!(
                 "Edit job `{job_id}` is AWAITING APPROVAL.\n\
+                 - requested by: **{origin}**\n\
                  - action: {} ({})\n\
+                 - request_id: `{req_id}`\n\
                  - approve with `ai_edit_approve {{\"job_id\":\"{job_id}\"}}`\n\
                  - deny with `ai_edit_deny {{\"job_id\":\"{job_id}\",\"reason\":\"...\"}}`\n\
                  - watchdog auto-rejects at unix {expires} if unanswered\n\n\
-                 Proposed change:\n```diff\n{diff}\n```",
+                 Proposed change:\n```diff\n{diff}\n```{ambiguity}",
                 req["permission"].as_str().unwrap_or("edit"),
                 files.join(", "),
             ));
@@ -2477,7 +2803,10 @@ impl AiAgentServer {
         if busy {
             self.write_job_record(&job_id, &rec);
             return self.edit_text(format!(
-                "Edit job `{job_id}` is RUNNING (agent working in worktree). Poll again."
+                "Edit job `{job_id}` is RUNNING (agent working in worktree). Poll again.\n\
+                 - spend so far: {} (ceilings: {token_ceiling} tokens, \
+                 {subagent_ceiling} sub-agents)",
+                spend.summary()
             ));
         }
 
@@ -2525,12 +2854,51 @@ impl AiAgentServer {
         let port = rec["serve_port"].as_u64().unwrap_or(0) as u16;
         let session_id = rec["session_id"].as_str().unwrap_or("").to_string();
         let pending = self.oc_pending_permissions(port, &session_id);
-        let req = match pending.first() {
-            Some(r) => r,
+        if pending.is_empty() {
+            return tool_error(&format!(
+                "edit job `{job_id}` has no pending approval right now (state: {})",
+                rec["state"].as_str().unwrap_or("unknown")
+            ));
+        }
+        // Select the request. With sub-agent delegation several can be pending at
+        // once (parent + sub-agents), so answering "the first" would risk
+        // approving a change the caller was never shown — require `request_id`
+        // whenever it is ambiguous.
+        let wanted = get_str(args, "request_id")
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let req = match wanted {
+            Some(id) => match pending.iter().find(|p| p["id"].as_str() == Some(id)) {
+                Some(r) => r,
+                None => {
+                    return tool_error(&format!(
+                        "no pending approval with request_id `{id}` in job `{job_id}` — it may \
+                         have already been answered or expired. Poll `ai_edit_result` for the \
+                         current pending request(s)."
+                    ));
+                }
+            },
+            None if pending.len() == 1 => &pending[0],
             None => {
+                let list: Vec<String> = pending
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "  - `{}` from {}",
+                            p["id"].as_str().unwrap_or("?"),
+                            self.oc_session_origin(
+                                port,
+                                &session_id,
+                                p["sessionID"].as_str().unwrap_or_default()
+                            )
+                        )
+                    })
+                    .collect();
                 return tool_error(&format!(
-                    "edit job `{job_id}` has no pending approval right now (state: {})",
-                    rec["state"].as_str().unwrap_or("unknown")
+                    "job `{job_id}` has {} pending approvals — pass `request_id` to say which \
+                     one you mean:\n{}",
+                    pending.len(),
+                    list.join("\n")
                 ));
             }
         };
@@ -2596,17 +2964,46 @@ impl AiAgentServer {
         let verdict = match state {
             "done" => "COMPLETE",
             "timed_out" => "TIMED OUT",
+            "halted_budget" => "HALTED — BUDGET",
             other => other,
         };
         let reason = rec["reason"]
             .as_str()
             .map(|r| format!(" ({r})"))
             .unwrap_or_default();
+        let spend = match rec["spend_tokens"].as_u64() {
+            Some(t) => {
+                let cost = rec["spend_cost"].as_f64().unwrap_or(0.0);
+                let cost = if cost > 0.0 {
+                    format!(", ~${cost:.4}")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "\n- spend: {t} tokens{cost}, {} sub-agent(s)",
+                    rec["subagents"].as_u64().unwrap_or(0)
+                )
+            }
+            None => String::new(),
+        };
+        // A budget/timeout stop is not a dead end — the branch holds the work, so
+        // hand back the exact call that picks it up from where it stopped.
+        let resume = if state == "halted_budget" || state == "timed_out" {
+            format!(
+                "\n\nTo CONTINUE this work (the branch keeps everything done so far):\n\
+                 `ai_edit_run(task=\"continue the prior task; review the branch's existing \
+                 changes first\", base_ref=\"{branch}\", mode=…, model=…)`\n\
+                 Raise the ceiling for the follow-up with RUSTYNET_EDIT_TOKEN_CEILING / \
+                 RUSTYNET_EDIT_MAX_SUBAGENTS if the stop was premature."
+            )
+        } else {
+            String::new()
+        };
         format!(
             "Edit job `{job_id}` — {verdict}{reason}.\n\
              - branch: `{branch}` (review + merge this yourself; nothing here merges it)\n\
-             - worktree: `{worktree}`\n\n\
-             Changes on the branch:\n```diff\n{diff}\n```"
+             - worktree: `{worktree}`{spend}\n\n\
+             Changes on the branch:\n```diff\n{diff}\n```{resume}"
         )
     }
 
@@ -6984,10 +7381,15 @@ impl McpServer for AiAgentServer {
                     Approve the pending file edit in a RESTRICTED delegated-edit job (only valid \
                     when ai_edit_result reports `awaiting_approval`). The agent applies the edit \
                     and continues; poll ai_edit_result again. Approves ONE edit — the next edit \
-                    pauses again."
+                    pauses again. NOTE the edit may come from the primary agent OR from a cheap \
+                    sub-agent it delegated to — ai_edit_result names which. When more than one \
+                    request is pending you MUST pass `request_id` to choose."
                     .into(),
                 input_schema: json_schema_object(
-                    json!({ "job_id": json_schema_string("The job_id awaiting approval.") }),
+                    json!({
+                        "job_id": json_schema_string("The job_id awaiting approval."),
+                        "request_id": json_schema_string("Which pending request to approve (from ai_edit_result). Optional when exactly one is pending; REQUIRED when several are."),
+                    }),
                     vec!["job_id"],
                 ),
             },
@@ -6997,12 +7399,15 @@ impl McpServer for AiAgentServer {
                     Reject the pending file edit in a RESTRICTED delegated-edit job. The `reason` \
                     is fed back to the agent as context so it can adjust — a rejection does NOT \
                     kill the job, the agent incorporates the feedback and continues. Poll \
-                    ai_edit_result again after."
+                    ai_edit_result again after. NOTE the edit may come from the primary agent OR \
+                    a cheap sub-agent it delegated to — ai_edit_result names which. When more \
+                    than one request is pending you MUST pass `request_id` to choose."
                     .into(),
                 input_schema: json_schema_object(
                     json!({
                         "job_id": json_schema_string("The job_id awaiting approval."),
                         "reason": json_schema_string("Why you're rejecting — guidance the agent should use to adjust."),
+                        "request_id": json_schema_string("Which pending request to reject (from ai_edit_result). Optional when exactly one is pending; REQUIRED when several are."),
                     }),
                     vec!["job_id"],
                 ),
@@ -7389,7 +7794,7 @@ mod tests {
         // The whole safety model is "review + merge the branch yourself" — the
         // summary must always surface the branch, in every terminal state.
         let s = server();
-        for state in ["done", "timed_out"] {
+        for state in ["done", "timed_out", "halted_budget"] {
             let rec = json!({
                 "job_id": "edit-1-2-3",
                 "state": state,
@@ -7407,6 +7812,100 @@ mod tests {
                 "summary for state '{state}' must state the human-merge rule"
             );
         }
+    }
+
+    #[test]
+    fn budget_halt_summary_is_resumable_and_reports_spend() {
+        // A budget stop must never read as a dead end: the whole point of
+        // stopping (rather than running the bill up) is that the work is picked
+        // back up cheaply, so the summary has to carry the branch AND the exact
+        // call that continues from it.
+        let s = server();
+        let rec = json!({
+            "job_id": "edit-9-9-9",
+            "state": "halted_budget",
+            "branch": "ai-edit/edit-9-9-9",
+            "worktree": "state/edit-worktrees/edit-9-9-9",
+            "diff": "+ some work",
+            "reason": "token ceiling exceeded — 12 > 10",
+            "spend_tokens": 12u64,
+            "spend_cost": 0.0,
+            "subagents": 3u64,
+        });
+        let summary = s.edit_terminal_summary(&rec);
+        assert!(summary.contains("HALTED — BUDGET"), "{summary}");
+        assert!(summary.contains("token ceiling exceeded"), "{summary}");
+        assert!(
+            summary.contains("12 tokens"),
+            "spend must be reported: {summary}"
+        );
+        assert!(
+            summary.contains("3 sub-agent(s)"),
+            "fan-out must be reported: {summary}"
+        );
+        assert!(
+            summary.contains("ai_edit_run(") && summary.contains("base_ref=\"ai-edit/edit-9-9-9\""),
+            "must hand back a runnable resume call: {summary}"
+        );
+        // Cost is 0.00 for providers with no pricing metadata — show tokens, not
+        // a misleading "$0.0000".
+        assert!(
+            !summary.contains("$0.0000"),
+            "must not print a bogus $0 cost: {summary}"
+        );
+    }
+
+    #[test]
+    fn budget_env_overrides_are_fail_safe() {
+        // A malformed or zero override must fall back to the compiled default
+        // rather than silently disabling a ceiling.
+        assert_eq!(budget_env_u64("RUSTYNET_NO_SUCH_VAR_XYZ", 123), 123);
+        assert_eq!(EDIT_MAX_SUBAGENTS, 8);
+        assert!(EDIT_JOB_TOKEN_CEILING > 0);
+    }
+
+    #[test]
+    fn edit_spend_summary_hides_zero_cost_but_always_shows_tokens() {
+        let priced = EditSpend {
+            tokens: 1000,
+            cost: 0.25,
+            subagents: 2,
+        };
+        assert!(priced.summary().contains("1000 tokens"));
+        assert!(priced.summary().contains("$0.2500"));
+        let unpriced = EditSpend {
+            tokens: 1000,
+            cost: 0.0,
+            subagents: 0,
+        };
+        assert!(unpriced.summary().contains("1000 tokens"));
+        assert!(
+            !unpriced.summary().contains('$'),
+            "unpriced providers must not show a dollar figure: {}",
+            unpriced.summary()
+        );
+    }
+
+    #[test]
+    fn edit_run_refuses_when_already_inside_an_edit_job() {
+        // Depth-1: the edit agent inherits this MCP server through OpenCode's
+        // global `mcp` block, so the guard is what stops a job launching jobs.
+        // Only assert when the marker is actually set in this process (the test
+        // binary cannot set env vars — the crate forbids unsafe).
+        if std::env::var("RUSTYNET_EDIT_DEPTH").is_ok_and(|v| !v.trim().is_empty()) {
+            let s = server();
+            let r = s.call_edit_run(&json!({ "task": "x" }));
+            assert_eq!(r.is_error, Some(true));
+        }
+    }
+
+    #[test]
+    fn caveman_directive_is_terse_but_exempts_repo_artifacts_and_security() {
+        // The style is mandatory for prose, but must never apply to things read
+        // later out of context — commits/code/docs — or to safety-critical text.
+        assert!(CAVEMAN_STYLE_DIRECTIVE.contains("commit messages"));
+        assert!(CAVEMAN_STYLE_DIRECTIVE.contains("security warning"));
+        assert!(CAVEMAN_STYLE_DIRECTIVE.to_lowercase().contains("shortest"));
     }
 
     #[test]

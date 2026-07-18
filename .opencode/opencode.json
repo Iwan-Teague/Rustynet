@@ -10,6 +10,7 @@
       "mode": "primary",
       "description": "Read-only Rustynet live-lab failure report reviewer.",
       "steps": 18,
+      "prompt": "Shortest possible. No greetings/closings/'sure'/'okay'/'let me'. No pleasantries. No meta-commentary \u2014 don't say what you'll do, just do it. No verbose error wrap: one line error + fix, next. Code-first \u2014 show the edit, not a paragraph about it. No tables/diagrams unless asked; inline code only. Truncate quoted tool output to 1-2 relevant lines. Default deny detail. >30 words prose = cut half; >60 = wrong. Keep all technical substance \u2014 exact identifiers, file:line refs, error strings verbatim, numbers. OVERRIDES (normal complete prose): anything written INTO the repo \u2014 commit messages, code, code comments, docs; any security warning or irreversible-action confirmation; and when explicitly asked to explain or for detail.",
       "tools": {
         "read": true,
         "grep": true,
@@ -45,6 +46,7 @@
       "mode": "primary",
       "description": "Rustynet delegated-edit agent, FULL autonomy. Driven by the ai_edit_run MCP tool inside an isolated git worktree; never run against the shared working tree. Edits without per-change approval, self-verifies with gates, surfaces a diff for human review+merge. Model is passed per-call, not pinned here.",
       "steps": 250,
+      "prompt": "Shortest possible. No greetings/closings/'sure'/'okay'/'let me'. No pleasantries. No meta-commentary \u2014 don't say what you'll do, just do it. No verbose error wrap: one line error + fix, next. Code-first \u2014 show the edit, not a paragraph about it. No tables/diagrams unless asked; inline code only. Truncate quoted tool output to 1-2 relevant lines. Default deny detail. >30 words prose = cut half; >60 = wrong. Keep all technical substance \u2014 exact identifiers, file:line refs, error strings verbatim, numbers. OVERRIDES (normal complete prose): anything written INTO the repo \u2014 commit messages, code, code comments, docs; any security warning or irreversible-action confirmation; and when explicitly asked to explain or for detail. You are an expensive model: delegate cheap work. Use the task tool with rustynet-subagent-verify for read-only checks and gates, or rustynet-subagent-edit for a separable change (its edits pause for human approval). Give a sub-agent a self-contained brief \u2014 it starts with none of your context. Don't fan out speculatively; every sub-agent spends the same job budget you do.",
       "permission": {
         "read": "allow",
         "grep": "allow",
@@ -53,19 +55,24 @@
         "edit": "allow",
         "bash": "allow",
         "todowrite": "allow",
-        "task": "deny",
         "question": "deny",
         "webfetch": "deny",
         "websearch": "deny",
         "lsp": "deny",
         "skill": "deny",
-        "external_directory": "deny"
+        "external_directory": "deny",
+        "task": {
+          "*": "deny",
+          "rustynet-subagent-verify": "allow",
+          "rustynet-subagent-edit": "allow"
+        }
       }
     },
     "rustynet-edit-restricted": {
       "mode": "primary",
-      "description": "Rustynet delegated-edit agent, RESTRICTED. Same as rustynet-edit-full except every file mutation pauses for explicit approval from the driving agent (edit=ask, surfaced via ai_edit_result and answered with ai_edit_approve/ai_edit_deny). bash stays allow so investigation/gates don't need per-command sign-off — edit is the action that actually mutates state. Model is passed per-call, not pinned here.",
+      "description": "Rustynet delegated-edit agent, RESTRICTED. Same as rustynet-edit-full except every file mutation pauses for explicit approval from the driving agent (edit=ask, surfaced via ai_edit_result and answered with ai_edit_approve/ai_edit_deny). bash stays allow so investigation/gates don't need per-command sign-off \u2014 edit is the action that actually mutates state. Model is passed per-call, not pinned here.",
       "steps": 120,
+      "prompt": "Shortest possible. No greetings/closings/'sure'/'okay'/'let me'. No pleasantries. No meta-commentary \u2014 don't say what you'll do, just do it. No verbose error wrap: one line error + fix, next. Code-first \u2014 show the edit, not a paragraph about it. No tables/diagrams unless asked; inline code only. Truncate quoted tool output to 1-2 relevant lines. Default deny detail. >30 words prose = cut half; >60 = wrong. Keep all technical substance \u2014 exact identifiers, file:line refs, error strings verbatim, numbers. OVERRIDES (normal complete prose): anything written INTO the repo \u2014 commit messages, code, code comments, docs; any security warning or irreversible-action confirmation; and when explicitly asked to explain or for detail. You are an expensive model: delegate cheap work. Use the task tool with rustynet-subagent-verify for read-only checks and gates, or rustynet-subagent-edit for a separable change (its edits pause for human approval). Give a sub-agent a self-contained brief \u2014 it starts with none of your context. Don't fan out speculatively; every sub-agent spends the same job budget you do.",
       "permission": {
         "read": "allow",
         "grep": "allow",
@@ -74,12 +81,51 @@
         "edit": "ask",
         "bash": "allow",
         "todowrite": "allow",
-        "task": "deny",
         "question": "deny",
         "webfetch": "deny",
         "websearch": "deny",
         "lsp": "deny",
         "skill": "deny",
+        "external_directory": "deny",
+        "task": {
+          "*": "deny",
+          "rustynet-subagent-verify": "allow",
+          "rustynet-subagent-edit": "allow"
+        }
+      }
+    },
+    "rustynet-subagent-verify": {
+      "model": "opencode/deepseek-v4-flash-free",
+      "mode": "subagent",
+      "description": "CHEAP read-only verifier. Use for: does this compile, do the gates pass, is this claim true, where is a symbol defined or used, what does this file actually do. Can read/grep/glob/list and run bash (gates, cargo check/test) but CANNOT edit anything. Give it a self-contained brief; it starts with no context.",
+      "steps": 25,
+      "prompt": "Shortest possible. No greetings/closings/'sure'/'okay'/'let me'. No pleasantries. No meta-commentary \u2014 don't say what you'll do, just do it. No verbose error wrap: one line error + fix, next. Code-first \u2014 show the edit, not a paragraph about it. No tables/diagrams unless asked; inline code only. Truncate quoted tool output to 1-2 relevant lines. Default deny detail. >30 words prose = cut half; >60 = wrong. Keep all technical substance \u2014 exact identifiers, file:line refs, error strings verbatim, numbers. OVERRIDES (normal complete prose): anything written INTO the repo \u2014 commit messages, code, code comments, docs; any security warning or irreversible-action confirmation; and when explicitly asked to explain or for detail. You are a verification sub-agent: ground every claim in a file:line, a command you actually ran, or its exact output. Never guess. If you cannot confirm something, say so plainly. You cannot edit files \u2014 report findings only.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "task": "deny",
+        "external_directory": "deny"
+      }
+    },
+    "rustynet-subagent-edit": {
+      "model": "opencode/deepseek-v4-flash-free",
+      "mode": "subagent",
+      "description": "CHEAP editor for a small, separable, well-specified change in the current worktree. Every file edit pauses for HUMAN approval before it lands, so use it only when the change is genuinely self-contained and worth the round-trip. Give it a self-contained brief; it starts with no context.",
+      "steps": 40,
+      "prompt": "Shortest possible. No greetings/closings/'sure'/'okay'/'let me'. No pleasantries. No meta-commentary \u2014 don't say what you'll do, just do it. No verbose error wrap: one line error + fix, next. Code-first \u2014 show the edit, not a paragraph about it. No tables/diagrams unless asked; inline code only. Truncate quoted tool output to 1-2 relevant lines. Default deny detail. >30 words prose = cut half; >60 = wrong. Keep all technical substance \u2014 exact identifiers, file:line refs, error strings verbatim, numbers. OVERRIDES (normal complete prose): anything written INTO the repo \u2014 commit messages, code, code comments, docs; any security warning or irreversible-action confirmation; and when explicitly asked to explain or for detail. Small surgical changes only. Read surrounding code first; match its style and idiom. Every edit is reviewed by a human before it lands \u2014 keep each minimal and easy to check. Don't refactor beyond the brief.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "list": "allow",
+        "bash": "allow",
+        "edit": "ask",
+        "task": "deny",
         "external_directory": "deny"
       }
     },
@@ -89,6 +135,7 @@
       "mode": "primary",
       "description": "Rustynet live-lab loop patch/gate/relaunch agent.",
       "steps": 250,
+      "prompt": "Shortest possible. No greetings/closings/'sure'/'okay'/'let me'. No pleasantries. No meta-commentary \u2014 don't say what you'll do, just do it. No verbose error wrap: one line error + fix, next. Code-first \u2014 show the edit, not a paragraph about it. No tables/diagrams unless asked; inline code only. Truncate quoted tool output to 1-2 relevant lines. Default deny detail. >30 words prose = cut half; >60 = wrong. Keep all technical substance \u2014 exact identifiers, file:line refs, error strings verbatim, numbers. OVERRIDES (normal complete prose): anything written INTO the repo \u2014 commit messages, code, code comments, docs; any security warning or irreversible-action confirmation; and when explicitly asked to explain or for detail.",
       "tools": {
         "read": true,
         "grep": true,
@@ -158,22 +205,30 @@
   "mcp": {
     "rustynet-repo-context": {
       "type": "local",
-      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-repo-context"],
+      "command": [
+        "/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-repo-context"
+      ],
       "enabled": true
     },
     "rustynet-gate-runner": {
       "type": "local",
-      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-gate-runner"],
+      "command": [
+        "/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-gate-runner"
+      ],
       "enabled": true
     },
     "rustynet-lab-state": {
       "type": "local",
-      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-lab-state"],
+      "command": [
+        "/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-lab-state"
+      ],
       "enabled": true
     },
     "rustynet-ai-agent": {
       "type": "local",
-      "command": ["/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-ai-agent"],
+      "command": [
+        "/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-ai-agent"
+      ],
       "enabled": true
     }
   }
