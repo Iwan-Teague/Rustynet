@@ -531,13 +531,20 @@ irreversible-action confirmation; and when explicitly asked to explain or for \
 detail. Those are read later by people without this context.";
 
 /// Read a `u64` budget knob from the environment, falling back to `default`.
-/// An unparseable or zero value falls back too — a malformed override must not
+///
+/// `allow_zero` distinguishes two genuinely different knobs. For the sub-agent
+/// cap, `0` is a MEANINGFUL setting — "this job may not delegate at all" — and
+/// must be honoured: silently treating it as "use the default" would hand back
+/// the opposite of what was asked for (found exactly that way: setting the cap
+/// to 0 still permitted delegation). For the token ceiling, `0` would halt every
+/// job on its first poll and is far more likely a mistake than an intent, so it
+/// falls back. An unparseable value always falls back — a typo must never
 /// silently disable a ceiling.
-fn budget_env_u64(var: &str, default: u64) -> u64 {
+fn budget_env_u64(var: &str, default: u64, allow_zero: bool) -> u64 {
     std::env::var(var)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|n| *n > 0)
+        .filter(|n| allow_zero || *n > 0)
         .unwrap_or(default)
 }
 
@@ -2529,9 +2536,13 @@ impl AiAgentServer {
         // Preamble makes the deliverable durable: the agent commits to its
         // branch so the work survives even if we later remove the worktree,
         // and it knows editing is worktree-local (not the real repo).
-        let token_ceiling = budget_env_u64("RUSTYNET_EDIT_TOKEN_CEILING", EDIT_JOB_TOKEN_CEILING);
-        let subagent_ceiling =
-            budget_env_u64("RUSTYNET_EDIT_MAX_SUBAGENTS", EDIT_MAX_SUBAGENTS as u64);
+        let token_ceiling =
+            budget_env_u64("RUSTYNET_EDIT_TOKEN_CEILING", EDIT_JOB_TOKEN_CEILING, false);
+        let subagent_ceiling = budget_env_u64(
+            "RUSTYNET_EDIT_MAX_SUBAGENTS",
+            EDIT_MAX_SUBAGENTS as u64,
+            true,
+        );
         let full_prompt = format!(
             "You are working in an ISOLATED git worktree on branch `{branch}`. All your edits \
              stay on this branch and are reviewed by a human before merging — you cannot affect \
@@ -2659,9 +2670,13 @@ impl AiAgentServer {
         // running spend even while the job is healthy. A breach is a HARD STOP
         // that keeps the work (worktree + branch + diff + resume hint survive).
         let spend = self.oc_job_spend(port, &session_id);
-        let token_ceiling = budget_env_u64("RUSTYNET_EDIT_TOKEN_CEILING", EDIT_JOB_TOKEN_CEILING);
-        let subagent_ceiling =
-            budget_env_u64("RUSTYNET_EDIT_MAX_SUBAGENTS", EDIT_MAX_SUBAGENTS as u64) as usize;
+        let token_ceiling =
+            budget_env_u64("RUSTYNET_EDIT_TOKEN_CEILING", EDIT_JOB_TOKEN_CEILING, false);
+        let subagent_ceiling = budget_env_u64(
+            "RUSTYNET_EDIT_MAX_SUBAGENTS",
+            EDIT_MAX_SUBAGENTS as u64,
+            true,
+        ) as usize;
         if let Some(o) = rec.as_object_mut() {
             o.insert("spend_tokens".into(), json!(spend.tokens));
             o.insert("spend_cost".into(), json!(spend.cost));
@@ -7871,7 +7886,8 @@ mod tests {
     fn budget_env_overrides_are_fail_safe() {
         // A malformed or zero override must fall back to the compiled default
         // rather than silently disabling a ceiling.
-        assert_eq!(budget_env_u64("RUSTYNET_NO_SUCH_VAR_XYZ", 123), 123);
+        assert_eq!(budget_env_u64("RUSTYNET_NO_SUCH_VAR_XYZ", 123, false), 123);
+        assert_eq!(budget_env_u64("RUSTYNET_NO_SUCH_VAR_XYZ", 123, true), 123);
         assert_eq!(EDIT_MAX_SUBAGENTS, 8);
         assert!(EDIT_JOB_TOKEN_CEILING > 0);
     }
