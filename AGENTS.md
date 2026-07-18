@@ -830,6 +830,88 @@ diff is durable, but clean up merged/abandoned worktrees yourself with
 `git worktree remove state/edit-worktrees/<job_id>` (the branch ref survives the
 worktree removal for later inspection).
 
+### 12.7 Sub-model delegation, budget ceilings, and house style
+
+An edit job runs one agent on one model. When that model is expensive, spending
+it on "does this compile" or "where is X used" is waste. A `full`- or
+`restricted`-mode job can therefore hand cheap, well-scoped work to a cheap
+model — with the same isolation guarantees, and a hard bill ceiling.
+
+**Two ways to delegate, and they are not interchangeable:**
+
+| Need | Use | Can it write? |
+|---|---|---|
+| Grounded read-only research — does it compile, is this claim true, where is a symbol used, what did that commit change | `ai_agent` (this MCP), with a cheap `provider`/`model` | No, structurally — none of its 23 tools invokes a model or writes |
+| A small separable change *in the job's own worktree* | OpenCode `task` → `rustynet-subagent-edit` | Yes, but **every edit pauses for a human** |
+| Read-only checks/gates inside the worktree | OpenCode `task` → `rustynet-subagent-verify` | No (`edit` denied) |
+
+`ai_agent` is the default choice for verification: it is cheaper, cannot write
+at all, and its per-call `provider` argument (§12.5) is what makes "expensive
+parent, cheap verifier" work without touching config.
+
+**Sub-model edits are supervised, not autonomous.** A `rustynet-subagent-edit`
+write surfaces through the same `ai_edit_result` → `ai_edit_approve` /
+`ai_edit_deny` flow as the primary agent's, and the result names **which agent
+is asking** (`requested by: SUB-AGENT \`…\``). When more than one request is
+pending at once, approve/deny require an explicit `request_id` rather than
+silently answering the first — approving a change you were not shown would
+defeat the point of supervising sub-models at all.
+
+This is load-bearing on a detail OpenCode does not document: a `task` sub-agent
+runs in its **own child session**, so anything keyed on the job's root session id
+misses it entirely. `oc_session_subtree` walks `/session/{id}/children` and the
+pending-approval, busy, and spend views all operate on that subtree.
+
+**Depth is 1, enforced twice.** Both sub-agents carry `task: "deny"`, so they
+cannot spawn further sub-agents. Separately, `spawn_opencode_serve` injects
+`RUSTYNET_EDIT_DEPTH=1` into the serve environment and `call_edit_run` refuses
+when it is set — because the `mcp` block is global, an edit agent inherits *this
+server* and could otherwise call `ai_edit_run` recursively, which no OpenCode
+permission can prevent.
+
+**Which sub-agents may be spawned is an allow-list.** The edit agents grant
+`task` only to `rustynet-subagent-verify` and `rustynet-subagent-edit`, with
+`"*": "deny"` first (OpenCode evaluates **last matching rule wins**, so the
+blanket deny must come *before* the specific allows). This is not cosmetic:
+OpenCode's built-in `general` sub-agent ships `"*": "allow"` and can edit, write
+and run bash — spawning it would hand a cheap model unsupervised write access.
+Note also that a sub-agent's permissions come from **its own config**, not the
+parent's (parent `allow` does not propagate; only parent *denies* do), so a
+restrictive parent is never a substitute for a restrictive sub-agent config.
+
+**Budget.** Every job carries hard ceilings, checked on each `ai_edit_result`
+poll and summed across the whole session subtree so a sub-agent's spend counts
+against the same budget as its parent:
+
+- `RUSTYNET_EDIT_TOKEN_CEILING` (default `EDIT_JOB_TOKEN_CEILING`) — total tokens.
+- `RUSTYNET_EDIT_MAX_SUBAGENTS` (default `EDIT_MAX_SUBAGENTS`) — fan-out cap.
+
+Enforcement is on **tokens, not dollars**, deliberately: our providers are
+declared to OpenCode as custom `@ai-sdk/openai-compatible` entries with no
+pricing metadata, so `Session.cost` can read `0.00` while real tokens burn. A
+dollar figure is shown only when the provider actually priced it.
+
+A breach is a **hard stop that keeps the work**: the serve is killed, but the
+worktree and branch survive, the diff is captured, and the result carries a
+ready-to-run resume call (`ai_edit_run(base_ref="ai-edit/<job_id>", …)`). The
+agent is also *told* its budget in its preamble and instructed not to fan out
+speculatively — the ceiling is the backstop, not the plan.
+
+**House style is mandatory for every agent.** `CAVEMAN_STYLE_DIRECTIVE` (Rust)
+and the matching `prompt` on every agent in `.opencode/opencode.json` force
+terse, high-density prose: no greetings, no meta-commentary, code-first, over 30
+words of prose means cut it in half. It applies to the grounded agent, both edit
+agents, and both sub-agents — denying the built-in sub-agents by name (above) is
+part of what makes "every spawned agent" true rather than aspirational, since we
+do not control their prompts.
+
+The style is **prose only**. Anything written *into* the repo — commit messages,
+code, code comments, documentation — stays normal complete prose, because it is
+read later by people without this context and the commit convention requires a
+readable imperative subject explaining what and why. Security warnings and
+irreversible-action confirmations are likewise exempt: terseness is worth least
+exactly where ambiguity costs most.
+
 ## 13) Operating Checklists
 
 ### 13.1 Live-Lab Hardening Loop
