@@ -193,6 +193,9 @@
         "apiKey": "{env:KIMI_API_KEY}"
       },
       "models": {
+        "kimi-k3": {
+          "name": "Kimi K3"
+        },
         "kimi-k2.7-code": {
           "name": "Kimi K2.7 Code"
         },
