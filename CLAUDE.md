@@ -904,6 +904,18 @@ declared to OpenCode as custom `@ai-sdk/openai-compatible` entries with no
 pricing metadata, so `Session.cost` can read `0.00` while real tokens burn. A
 dollar figure is shown only when the provider actually priced it.
 
+**Two token figures are reported, and they answer different questions.** The
+**billable-equivalent** figure discounts cached input (~10x cheaper) and tracks
+money — the ceiling enforces on it. The **raw** figure is every token the
+provider counted, and that is what provider RATE LIMITS are measured in. They
+diverge by an order of magnitude on cached workloads: two jobs reported ~223k
+and ~103k billable while Moonshot counted 1508288 raw against a 1500000/day
+organisation cap and began refusing requests — the money ceiling never came
+close to tripping while the constraint that actually stopped the work was
+already blown. A per-job ceiling cannot enforce a per-DAY organisation quota
+(that is shared across every job and every other client on the key), so raw is
+reported to inform, not to gate.
+
 A breach is a **hard stop that keeps the work**: the serve is killed, but the
 worktree and branch survive, the diff is captured, and the result carries a
 ready-to-run resume call (`ai_edit_run(base_ref="ai-edit/<job_id>", …)`). The

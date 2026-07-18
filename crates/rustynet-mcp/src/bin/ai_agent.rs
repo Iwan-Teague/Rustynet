@@ -574,9 +574,29 @@ impl SessionSubtree {
 }
 
 /// Accumulated spend for one delegated-edit job, summed over its session subtree.
+///
+/// TWO token figures, because they answer different questions and confusing them
+/// is actively misleading:
+///
+/// - `tokens` is BILLABLE-EQUIVALENT (cache reads discounted, see `oc_job_spend`)
+///   and tracks money. The job ceiling enforces on this.
+/// - `raw` is every token the provider counted, undiscounted. This is what
+///   provider RATE LIMITS are measured in.
+///
+/// They diverge by an order of magnitude on cached workloads, and reporting only
+/// the billable figure hid a real failure: two jobs reported ~223k and ~103k
+/// while Moonshot counted 1.5M+ against a 1.5M/day organisation cap and started
+/// refusing requests. The money ceiling never came close to tripping while the
+/// constraint that actually stopped the work was already blown. Both are shown
+/// so the number that will bite first is visible.
+///
+/// Note a per-job ceiling cannot enforce a per-DAY organisation quota — that is
+/// shared across every job and every other client on the key. Raw is reported to
+/// inform, not to gate.
 #[derive(Default, Clone, Copy)]
 struct EditSpend {
     tokens: u64,
+    raw: u64,
     cost: f64,
     /// Sessions in the subtree BEYOND the root — i.e. spawned sub-agents.
     subagents: usize,
@@ -594,10 +614,12 @@ impl EditSpend {
         } else {
             String::new()
         };
+        let floor = if self.complete { "" } else { "≥" };
         format!(
-            "{}{} tokens{cost}, {} sub-agent(s){}",
-            if self.complete { "" } else { "≥" },
+            "{floor}{} billable-equiv tokens{cost} ({floor}{} raw — provider rate limits count \
+             THIS one), {} sub-agent(s){}",
             self.tokens,
+            self.raw,
             self.subagents,
             if self.complete {
                 ""
@@ -2332,13 +2354,16 @@ impl AiAgentServer {
             };
             spend.cost += s["cost"].as_f64().unwrap_or(0.0);
             let t = &s["tokens"];
-            let mut billable = 0.0;
-            for key in ["input", "output", "reasoning"] {
-                billable += t[key].as_f64().unwrap_or(0.0);
-            }
-            billable += t["cache"]["write"].as_f64().unwrap_or(0.0);
-            billable += t["cache"]["read"].as_f64().unwrap_or(0.0) / CACHE_READ_DISCOUNT;
-            spend.tokens += billable as u64;
+            let fresh: f64 = ["input", "output", "reasoning"]
+                .iter()
+                .map(|k| t[*k].as_f64().unwrap_or(0.0))
+                .sum();
+            let cache_write = t["cache"]["write"].as_f64().unwrap_or(0.0);
+            let cache_read = t["cache"]["read"].as_f64().unwrap_or(0.0);
+            // Money proxy: cached input is billed at roughly a tenth.
+            spend.tokens += (fresh + cache_write + cache_read / CACHE_READ_DISCOUNT) as u64;
+            // Rate-limit proxy: providers count every token, undiscounted.
+            spend.raw += (fresh + cache_write + cache_read) as u64;
         }
         spend
     }
@@ -2805,6 +2830,7 @@ impl AiAgentServer {
         ) as usize;
         if let Some(o) = rec.as_object_mut() {
             o.insert("spend_tokens".into(), json!(spend.tokens));
+            o.insert("spend_raw_tokens".into(), json!(spend.raw));
             o.insert("spend_cost".into(), json!(spend.cost));
             o.insert("subagents".into(), json!(spend.subagents));
         }
@@ -3182,8 +3208,15 @@ impl AiAgentServer {
                 } else {
                     String::new()
                 };
+                // Raw is shown because it, not the billable figure, is what a
+                // provider's rate limit counts — a job can look cheap here and
+                // still exhaust a daily quota.
+                let raw = match rec["spend_raw_tokens"].as_u64() {
+                    Some(r) => format!(" ({r} raw — provider rate limits count THIS one)"),
+                    None => String::new(),
+                };
                 format!(
-                    "\n- spend: {t} tokens{cost}, {} sub-agent(s)",
+                    "\n- spend: {t} billable-equiv tokens{raw}{cost}, {} sub-agent(s)",
                     rec["subagents"].as_u64().unwrap_or(0)
                 )
             }
@@ -8106,7 +8139,7 @@ mod tests {
         assert!(summary.contains("HALTED — BUDGET"), "{summary}");
         assert!(summary.contains("token ceiling exceeded"), "{summary}");
         assert!(
-            summary.contains("12 tokens"),
+            summary.contains("12 billable-equiv"),
             "spend must be reported: {summary}"
         );
         assert!(
@@ -8210,14 +8243,40 @@ mod tests {
     }
 
     #[test]
-    fn complete_subtree_reports_exact_spend_without_the_floor_marker() {
-        let complete = EditSpend {
-            tokens: 42,
+    fn spend_reports_raw_alongside_billable_because_rate_limits_count_raw() {
+        // The two figures answer different questions and diverge by an order of
+        // magnitude on cached workloads. Reporting only the billable one hid a
+        // real failure: jobs read as ~223k and ~103k while the provider counted
+        // 1.5M+ against a daily organisation cap and began refusing requests.
+        let heavily_cached = EditSpend {
+            tokens: 100_000, // money proxy, cache reads discounted
+            raw: 1_000_000,  // what a provider rate limit counts
             cost: 0.0,
             subagents: 1,
             complete: true,
         };
-        assert!(complete.summary().starts_with("42 tokens"));
+        let s = heavily_cached.summary();
+        assert!(s.contains("100000 billable-equiv"), "{s}");
+        assert!(
+            s.contains("1000000 raw"),
+            "raw must be visible, not just billable: {s}"
+        );
+        assert!(
+            s.contains("rate limits count"),
+            "the summary must say WHY raw matters, or it reads as noise: {s}"
+        );
+    }
+
+    #[test]
+    fn complete_subtree_reports_exact_spend_without_the_floor_marker() {
+        let complete = EditSpend {
+            tokens: 42,
+            raw: 42,
+            cost: 0.0,
+            subagents: 1,
+            complete: true,
+        };
+        assert!(complete.summary().starts_with("42 billable-equiv"));
         assert!(!complete.summary().contains("INCOMPLETE"));
     }
 
@@ -8322,19 +8381,21 @@ mod tests {
     fn edit_spend_summary_hides_zero_cost_but_always_shows_tokens() {
         let priced = EditSpend {
             tokens: 1000,
+            raw: 1000,
             cost: 0.25,
             subagents: 2,
             complete: true,
         };
-        assert!(priced.summary().contains("1000 tokens"));
+        assert!(priced.summary().contains("1000 billable-equiv"));
         assert!(priced.summary().contains("$0.2500"));
         let unpriced = EditSpend {
             tokens: 1000,
+            raw: 1000,
             cost: 0.0,
             subagents: 0,
             complete: true,
         };
-        assert!(unpriced.summary().contains("1000 tokens"));
+        assert!(unpriced.summary().contains("1000 billable-equiv"));
         assert!(
             !unpriced.summary().contains('$'),
             "unpriced providers must not show a dollar figure: {}",
