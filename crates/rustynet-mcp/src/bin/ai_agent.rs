@@ -404,6 +404,12 @@ const READ_FILE_HARD_MAX_BYTES: usize = 256 * 1024;
 /// own `max_steps`; this only widens what they may ask for.
 const AGENT_DEFAULT_MAX_STEPS: u64 = 12;
 const AGENT_HARD_MAX_STEPS: u64 = 40;
+/// How many times a chat completion is retried on a transient rejection (429 /
+/// 5xx) before giving up, and the base backoff it doubles from. Sized for a
+/// per-minute rate limit: 1s, 2s, 4s, 8s ≈ 15s of patience, enough to ride out a
+/// window without stalling a job for minutes.
+const CHAT_MAX_RETRIES: u32 = 4;
+const CHAT_RETRY_BASE_MS: u64 = 1000;
 /// Timeout for any local subprocess the agent tools spawn (grep/git/uname/utmctl).
 const SUBPROC_TIMEOUT_SECS: u64 = 30;
 /// Wall-clock cap for a full live-lab orchestration launched by ai_lab_run.
@@ -916,16 +922,50 @@ impl AiAgentServer {
         if let Some(tools) = tools {
             body["tools"] = tools.clone();
         }
-        let response = self
-            .agent
-            .post(&self.provider.base_url)
-            .set(
-                "Authorization",
-                &format!("Bearer {}", self.provider.api_key),
-            )
-            .set("Content-Type", "application/json")
-            .send_json(body)
-            .map_err(|e| format!("{} API request failed: {e}", self.provider.name))?;
+        // Retry transient rejections with backoff. A grounded agent run fires
+        // one request per step with no pause between them, which rate-limited
+        // providers answer with 429 — and without this a single 429 aborted the
+        // WHOLE multi-step investigation, losing every step already paid for.
+        // Observed against Moonshot: the same request succeeded on its own but
+        // 429'd inside an agent loop. Only 429 and 5xx are retried; a 4xx like
+        // 401/400 is a real error and must surface immediately rather than being
+        // hammered.
+        let mut attempt = 0u32;
+        let response = loop {
+            let result = self
+                .agent
+                .post(&self.provider.base_url)
+                .set(
+                    "Authorization",
+                    &format!("Bearer {}", self.provider.api_key),
+                )
+                .set("Content-Type", "application/json")
+                .send_json(body.clone());
+            match result {
+                Ok(r) => break r,
+                Err(ureq::Error::Status(code, r))
+                    if (code == 429 || code >= 500) && attempt < CHAT_MAX_RETRIES =>
+                {
+                    // Honour Retry-After when the provider sends one; otherwise
+                    // exponential backoff from CHAT_RETRY_BASE_MS.
+                    let wait_ms = r
+                        .header("Retry-After")
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map(|secs| secs.saturating_mul(1000))
+                        .unwrap_or_else(|| CHAT_RETRY_BASE_MS << attempt);
+                    eprintln!(
+                        "[{}] HTTP {code} — retrying in {wait_ms}ms (attempt {}/{CHAT_MAX_RETRIES})",
+                        self.provider.name,
+                        attempt + 1
+                    );
+                    std::thread::sleep(Duration::from_millis(wait_ms));
+                    attempt += 1;
+                }
+                Err(e) => {
+                    return Err(format!("{} API request failed: {e}", self.provider.name));
+                }
+            }
+        };
 
         response
             .into_json()
