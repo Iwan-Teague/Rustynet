@@ -1009,21 +1009,27 @@ enum OpsCommand {
     VmLabHostRunStatus {
         config: vm_lab::VmLabHostRunStatusConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabLaunchOnHost {
         config: vm_lab::VmLabLaunchOnHostConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabStopHostRun {
         config: vm_lab::VmLabStopHostRunConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabFetchHostArtifact {
         config: vm_lab::VmLabFetchHostArtifactConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabRenumberGuestNetwork {
         config: vm_lab::VmLabRenumberGuestNetworkConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabHostDiskStatus {
         config: vm_lab::VmLabHostDiskStatusConfig,
     },
+    #[cfg(feature = "vm-lab")]
     VmLabRecoverHostVms {
         config: vm_lab::VmLabRecoverHostVmsConfig,
     },
@@ -3738,6 +3744,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-recover-host-vms" => {
             let mut domains = collect_repeated_option_values(&args[1..], "--vm");
             if let Some(csv) = parser.value("--vms") {
@@ -3766,6 +3773,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
         "vm-lab-host-disk-status" => Ok(OpsCommand::VmLabHostDiskStatus {
             config: vm_lab::VmLabHostDiskStatusConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -3787,6 +3795,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-renumber-guest-network" => Ok(OpsCommand::VmLabRenumberGuestNetwork {
             config: vm_lab::VmLabRenumberGuestNetworkConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -3808,6 +3817,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-fetch-host-artifact" => Ok(OpsCommand::VmLabFetchHostArtifact {
             config: vm_lab::VmLabFetchHostArtifactConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -3824,6 +3834,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 60)?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-stop-host-run" => Ok(OpsCommand::VmLabStopHostRun {
             config: vm_lab::VmLabStopHostRunConfig {
                 inventory_path: parser.optional_path("--inventory"),
@@ -3844,6 +3855,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             },
         }),
+        #[cfg(feature = "vm-lab")]
         "vm-lab-host-run-status" => Ok(OpsCommand::VmLabHostRunStatus {
             config: vm_lab::VmLabHostRunStatusConfig {
                 inventory_path: parser.optional_path("--inventory"),
