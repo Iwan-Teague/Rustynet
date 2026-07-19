@@ -12,6 +12,17 @@ const PINNED_TOOLCHAIN: &str = "1.85.0";
 const DEFAULT_SECURITY_TOOLCHAIN: &str = "1.88.0";
 const REQUIRED_AUDIT_VERSION_PREFIX: &str = "cargo-audit 0.22.";
 const REQUIRED_DENY_VERSION_PREFIX: &str = "cargo-deny 0.19.";
+/// The pinned cargo-nextest version (BLD-2: nextest is the test *runner*;
+/// `cargo test` remains the authoritative gate definition). 0.9.114 is the
+/// newest nextest whose MSRV (1.88) the security toolchain (1.88.0) used for
+/// `cargo install` below can compile — 0.9.115+ requires 1.89+. Keep in sync
+/// with `PINNED_NEXTEST_VERSION` in `rustynet-xtask/src/main.rs` and the
+/// inline Windows-leg pin in `.github/workflows/cross-platform-ci.yml`.
+const PINNED_NEXTEST_VERSION: &str = "0.9.114";
+/// First stdout line of `cargo nextest --version` is
+/// `cargo-nextest 0.9.114 (<commit> <date>)`; the trailing space keeps the
+/// match exact (0.9.114 can never prefix-match a longer version number).
+const REQUIRED_NEXTEST_VERSION_PREFIX: &str = "cargo-nextest 0.9.114 ";
 
 fn main() {
     let code = match run() {
@@ -118,6 +129,33 @@ fn run() -> Result<(), i32> {
                 "install",
                 "cargo-deny",
                 "--locked",
+                "--force",
+            ],
+            cargo_bin.as_deref(),
+            None,
+            &[],
+        )?;
+    }
+
+    // Probe through `cargo nextest` (not the bare binary) so the check
+    // exercises exactly the invocation the gates use; any other installed
+    // version is force-replaced with the pin.
+    if !version_starts_with(
+        "cargo",
+        &["nextest", "--version"],
+        REQUIRED_NEXTEST_VERSION_PREFIX,
+        cargo_bin.as_deref(),
+    ) {
+        let toolchain = format!("+{security_toolchain}");
+        run_command(
+            "cargo",
+            &[
+                toolchain.as_str(),
+                "install",
+                "cargo-nextest",
+                "--locked",
+                "--version",
+                PINNED_NEXTEST_VERSION,
                 "--force",
             ],
             cargo_bin.as_deref(),
