@@ -16,17 +16,17 @@
 //!   cargo run -p rustynet-xtask -- gates                  # full workspace
 //!   cargo run -p rustynet-xtask -- gates -p rustynet-cli  # scope to a crate
 //!   cargo run -p rustynet-xtask -- gates --skip-test      # gates without tests
-//!   cargo run -p rustynet-xtask -- gates --affected       # only changed crates + 1-hop dependents
+//!   cargo run -p rustynet-xtask -- gates --affected       # changed crates + all dependents
 //!   cargo run -p rustynet-xtask -- gates --affected --base origin/main
 //!
 //! `--affected` scopes check/clippy/test to the workspace crates touched
 //! since `--base` (default `origin/main`, including uncommitted and
-//! untracked changes) plus their direct reverse-dependents (one hop).
-//! This catches the vast majority of breakage a change can cause while
-//! skipping unrelated crates. If a root build file (`Cargo.toml`,
-//! `Cargo.lock`, `rust-toolchain*`) changed, or no workspace crate is
-//! affected, it falls back to the full workspace to stay safe. `fmt`
-//! always runs workspace-wide (it is cheap).
+//! untracked changes) plus the full transitive closure of their
+//! reverse-dependents, so every crate whose build a change can break is
+//! covered while unrelated crates are skipped. If a root build file
+//! (`Cargo.toml`, `Cargo.lock`, `rust-toolchain*`) changed, or no
+//! workspace crate is affected, it falls back to the full workspace to
+//! stay safe. `fmt` always runs workspace-wide (it is cheap).
 //!
 //! Per-stage timeouts (seconds) are overridable via env:
 //!   XTASK_FMT_TIMEOUT (default 120)
@@ -334,7 +334,7 @@ fn print_tail(tail: &Arc<Mutex<VecDeque<String>>>) {
 }
 
 /// Compute `-p <pkg>` args for workspace crates changed since `base`
-/// plus their one-hop reverse-dependents. Returns `Ok(None)` to signal
+/// plus their full transitive reverse-dependents. Returns `Ok(None)` to signal
 /// "run the full workspace" — used when a root build file changed or no
 /// workspace crate is affected, so we never under-test.
 fn affected_scope(base: &str) -> Result<Option<Vec<String>>, String> {
@@ -413,7 +413,10 @@ fn affected_scope(base: &str) -> Result<Option<Vec<String>>, String> {
 /// (`dir_of`: repo-relative dir → package name), the intra-workspace
 /// dependency graph (`deps_of`: package → its workspace deps), and the
 /// list of changed files, return the set of directly-changed crates
-/// plus their one-hop reverse-dependents.
+/// plus the full transitive closure of their reverse-dependents —
+/// every crate that depends on a changed crate directly or through
+/// intermediaries. One hop would silently under-test: a change to a
+/// low crate can break a consumer two or more hops up.
 fn compute_affected_set(
     dir_of: &[(String, String)],
     deps_of: &std::collections::BTreeMap<String, Vec<String>>,
@@ -430,12 +433,19 @@ fn compute_affected_set(
     if affected.is_empty() {
         return affected;
     }
-    // One hop: add every workspace crate that directly depends on a
-    // directly-changed crate.
-    let direct: Vec<String> = affected.iter().cloned().collect();
-    for (name, deps) in deps_of {
-        if deps.iter().any(|dep| direct.contains(dep)) {
-            affected.insert(name.clone());
+    // Fixpoint: keep adding every workspace crate that depends on an
+    // already-affected crate until the set stops growing, so transitive
+    // dependents (leaf -> daemon -> cli) are all reached.
+    loop {
+        let mut grew = false;
+        for (name, deps) in deps_of {
+            if !affected.contains(name) && deps.iter().any(|dep| affected.contains(dep)) {
+                affected.insert(name.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
         }
     }
     affected
@@ -682,10 +692,12 @@ mod tests {
     }
 
     #[test]
-    fn one_hop_only_no_transitive_explosion() {
-        // A change to a crate whose only dependent is `daemon` must NOT
-        // transitively pull in `cli` (which depends on daemon) — we stop
-        // at one hop. Model: leaf -> daemon -> cli.
+    fn transitive_closure_reaches_all_dependents() {
+        // A change to a crate whose only direct dependent is `daemon`
+        // MUST also pull in `cli` (which depends on daemon): `cli` links
+        // the changed code transitively, so skipping it would let
+        // `--affected` report PASS while the shipped binary no longer
+        // compiles. Model: leaf -> daemon -> cli.
         let dirs = vec![
             ("crates/leaf".to_owned(), "leaf".to_owned()),
             ("crates/daemon".to_owned(), "daemon".to_owned()),
@@ -700,8 +712,8 @@ mod tests {
         assert!(affected.contains("leaf"));
         assert!(affected.contains("daemon"));
         assert!(
-            !affected.contains("cli"),
-            "one-hop must not reach transitive dependents"
+            affected.contains("cli"),
+            "closure must reach transitive dependents"
         );
     }
 
