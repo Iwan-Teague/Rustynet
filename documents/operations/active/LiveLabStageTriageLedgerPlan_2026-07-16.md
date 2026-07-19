@@ -65,6 +65,16 @@ At evidence finalization — the same point the `--node` engine writes
 `patch: null`. Idempotent on `stub_id`: re-finalizing a run must never duplicate
 a stub.
 
+**Hook point:** `write_node_stage_result_ledgers`
+(`crates/rustynet-cli/src/live_lab_run_matrix.rs:551`). It already has
+everything the stub needs and nothing else does: `report_dir`, the run values
+(`run_id`, `git_commit`), the parsed node-stage plan, and the per-node rows
+carrying `status` + `error_detail`. It is invoked from
+`append_live_lab_run_matrix_row` only when
+`row_role == Final && is_node_run` — exactly the `--node`-only, once-per-run
+condition the ledger wants, so the engine gating comes for free rather than
+needing a second check.
+
 ### 3.3 Filler — agent, before the verification run
 
 The agent logs the patch it is about to test, in 2–3 sentences, via
