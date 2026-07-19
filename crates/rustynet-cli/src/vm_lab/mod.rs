@@ -3845,37 +3845,77 @@ fn resolve_discovery_bundle_paths(
     inventory_bundle_paths: Vec<PathBuf>,
     documents_root: &Path,
 ) -> Result<(Vec<PathBuf>, Option<String>), String> {
-    match scan_result {
-        Ok(paths) if !paths.is_empty() => Ok((paths, None)),
-        Ok(_) => {
-            if inventory_bundle_paths.is_empty() {
-                return Err(format!(
-                    "no UTM bundle directories found under {} and the inventory \
-                     provides no local UTM bundle paths to fall back to",
-                    documents_root.display()
-                ));
-            }
-            let note = format!(
+    let (scan_paths, scan_error) = match scan_result {
+        Ok(paths) => (paths, None),
+        Err(err) => (Vec::new(), Some(err)),
+    };
+    let scan_was_empty = scan_paths.is_empty();
+
+    // A name the scan already found is authoritative for that name — a bundle
+    // can move within the scanned root, and the scan's fresher path must win
+    // over a stale inventory record for the SAME node. But a fleet can also be
+    // genuinely split across roots (LabHost::utm_documents_roots): a node whose
+    // bundle lives under a root this scan never looked at, at all. For those,
+    // the inventory-recorded path is the only source of truth, so it is
+    // unioned in rather than discarded just because SOME scan succeeded.
+    // (2026-07-19: a scan pinned at one declared root found 6 of 7 lab nodes
+    // and silently dropped the 7th — windows-utm-1 — whose bundle lives under
+    // this Mac's other declared root. The prior "non-empty scan wins outright"
+    // rule made that failure invisible until the run tried to use the node.)
+    let scan_stems: HashSet<String> = scan_paths
+        .iter()
+        .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
+        .map(str::to_owned)
+        .collect();
+    let mut paths = scan_paths;
+    let supplemented: Vec<PathBuf> = inventory_bundle_paths
+        .into_iter()
+        .filter(|inv_path| {
+            !inv_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| scan_stems.contains(stem))
+        })
+        .collect();
+    paths.extend(supplemented.iter().cloned());
+
+    if paths.is_empty() {
+        return Err(match scan_error {
+            Some(err) => format!(
+                "UTM bundle scan failed ({err}) and the inventory provides no \
+                 local UTM bundle paths to fall back to"
+            ),
+            None => format!(
+                "no UTM bundle directories found under {} and the inventory \
+                 provides no local UTM bundle paths to fall back to",
+                documents_root.display()
+            ),
+        });
+    }
+
+    let note = if supplemented.is_empty() {
+        None
+    } else if scan_was_empty {
+        match scan_error {
+            Some(err) => Some(format!(
+                "{err}; degraded to {} inventory-recorded bundle path(s)",
+                supplemented.len()
+            )),
+            None => Some(format!(
                 "no UTM bundles under {}; degraded to {} inventory-recorded bundle path(s)",
                 documents_root.display(),
-                inventory_bundle_paths.len()
-            );
-            Ok((inventory_bundle_paths, Some(note)))
+                supplemented.len()
+            )),
         }
-        Err(scan_err) => {
-            if inventory_bundle_paths.is_empty() {
-                return Err(format!(
-                    "UTM bundle scan failed ({scan_err}) and the inventory provides no \
-                     local UTM bundle paths to fall back to"
-                ));
-            }
-            let note = format!(
-                "{scan_err}; degraded to {} inventory-recorded bundle path(s)",
-                inventory_bundle_paths.len()
-            );
-            Ok((inventory_bundle_paths, Some(note)))
-        }
-    }
+    } else {
+        Some(format!(
+            "{} inventory-recorded bundle path(s) not found under {}; supplemented from \
+             inventory (split UTM fleet across multiple documents roots)",
+            supplemented.len(),
+            documents_root.display()
+        ))
+    };
+    Ok((paths, note))
 }
 
 /// Why did an SSH probe fail? "Unreachable" must mean unreachable.
@@ -42281,6 +42321,41 @@ mod tests {
         let err = resolve_discovery_bundle_paths(Err("boom".to_owned()), Vec::new(), root)
             .expect_err("scan error + empty inventory must fail closed");
         assert!(err.contains("UTM bundle scan failed"), "{err}");
+    }
+
+    #[test]
+    fn resolve_discovery_bundle_paths_unions_inventory_only_nodes_from_a_split_fleet() {
+        // The 2026-07-19 regression: a scan pinned at one declared root found
+        // 6 of 7 lab nodes' bundles; the 7th (windows-utm-1) lives under this
+        // Mac's OTHER declared root and was silently dropped because the old
+        // rule let any non-empty scan fully replace the inventory list. A
+        // fleet split across multiple UTM documents roots must union, not
+        // choose one source over the other.
+        let root = Path::new("/roots/custom");
+        let scan = vec![
+            PathBuf::from("/roots/custom/fedora-utm-1.utm"),
+            PathBuf::from("/roots/custom/macOS.utm"),
+        ];
+        let inv = vec![
+            PathBuf::from("/roots/container/Windows11.utm"),
+            // Same stem as a scan hit (moved-bundle case) — must NOT duplicate.
+            PathBuf::from("/stale/fedora-utm-1.utm"),
+        ];
+        let (paths, note) = resolve_discovery_bundle_paths(Ok(scan.clone()), inv, root)
+            .expect("scan + disjoint inventory entry must union");
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/roots/custom/fedora-utm-1.utm"),
+                PathBuf::from("/roots/custom/macOS.utm"),
+                PathBuf::from("/roots/container/Windows11.utm"),
+            ],
+            "scan paths stay authoritative per-name; the inventory-only name is added, \
+             the stale same-name inventory path is not"
+        );
+        let note = note.expect("a supplemented union must be surfaced, not silent");
+        assert!(note.contains("1 inventory-recorded"), "note: {note}");
+        assert!(note.contains("split UTM fleet"), "note: {note}");
     }
 
     #[test]
