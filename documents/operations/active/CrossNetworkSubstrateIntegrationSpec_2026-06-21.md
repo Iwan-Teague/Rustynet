@@ -65,6 +65,122 @@ criteria. Never weaken a security control to make a stage pass (see §10).
 
 ---
 
+## 0. RESOLVED ARCHITECTURE (proposal, 2026-07-19) — answers the §⚠️ brainstorm agenda
+
+**Status: DESIGN PROPOSAL, not yet built.** This section resolves the five brainstorm-agenda points
+above and supersedes the §4–§5 phased plan as the integration approach, per the owner directive's
+instruction to "brainstorm the architecture BEFORE building." No redesign code has been written; this is
+the plan to review before any is. Grounded in the real seams: `OrchestrationStage`
+(`stage/mod.rs:207`), `CrossNetworkSubstrate` enum + `run_cross_network_stage`
+(`stage/cross_network.rs:38,257`), the `RemoteShellHost` seam, and `rustynet-netns-probe`.
+
+### 0.1 The core insight — separate the three axes the current code fuses
+
+Today one `CrossNetworkStageKind` value fuses three independent decisions: **what** to prove (direct path,
+relay fallback, roaming, DNS…), **where** the NAT lives (netns on one host / vxlan across two / slirp
+cross-OS), and **how** leaf ops run (in-process `Command` vs scp'd bash vs `cargo run` subprocess). That
+fusion is why adding a substrate means editing every stage, and why "8 stages are already Rust" is hollow
+— they are `cargo run --bin` shims onto bash (a 4-layer chain: Rust stage → `cargo run --bin` 8-line shim
+→ `bash …_test.sh` → more `cargo run … ops …` + raw ssh). Split the three axes into three traits and each
+varies independently:
+
+```rust
+// WHERE the NAT topology lives. Owns setup/teardown + the leaf-op executor bound to it.
+// Provisioned ONCE by a first-class cross_network_substrate_setup stage, torn down by an
+// always_run() teardown stage (mirrors the FinalCleanupStage contract), handle stashed on ctx.
+pub trait CrossNetworkSubstrate: Send + Sync {
+    fn id(&self) -> CrossNetworkSubstrateId;                // Netns | Vxlan | Slirp
+    fn provision(&self, topo: &CrossNetworkTopology, ev: &SubstrateEvidence)
+        -> Result<Box<dyn SubstrateHandle>, StageError>;
+    fn supports(&self, profile: &NatProfileId) -> Support;  // Supported | UnsupportedByDesign(reason)
+}
+
+// A live topology. The ONLY thing a scenario stage touches — it never knows netns vs vxlan.
+pub trait SubstrateHandle: Send + Sync {
+    fn leaf(&self) -> &dyn NetLeafRunner;                   // run `ip`/`nft`/`ip netns exec …`
+    fn endpoint(&self, node: SubstrateNodeRef) -> ResolvedEndpoint;   // where a scenario node lives
+    fn apply_nat_profile(&self, site: SiteRef, p: &NatProfileId, m: &NatModifiers) -> Result<(),StageError>;
+    fn teardown(self: Box<Self>) -> Result<(), StageError>; // fail-closed; idempotent
+}
+
+// HOW leaf ops run — the one place shell-out is allowed (unsafe netlink is forbidden, so this
+// is `ip`/`nft` as argv, never a shell string). Backends: LocalCommand (netns, same host) and
+// RemoteShell (vxlan, over the existing RemoteShellHost seam). Argv-only; no shell interpolation.
+pub trait NetLeafRunner: Send + Sync {
+    fn run(&self, argv: &[&str]) -> Result<LeafOutput, StageError>;
+    fn in_netns(&self, ns: &str, argv: &[&str]) -> Result<LeafOutput, StageError>;
+}
+```
+
+A **scenario** (direct/relay/roaming/dns/adversarial/soak) then becomes one in-process function over
+`&dyn SubstrateHandle` + `&mut OrchestrationContext`, written once and run under any substrate the
+`supports()` gate allows — exactly the "write the stage once, swap the substrate" the agenda asks for.
+
+### 0.2 Agenda point-by-point resolution
+
+1. **Substrate abstraction** → the three traits above. The existing `CrossNetworkSubstrate` *enum*
+   becomes the `id()` discriminant that selects a `Box<dyn CrossNetworkSubstrate>` impl; the trait is
+   the new surface. `supports()` is where `double_nat_cgnat`-on-netns returns
+   `UnsupportedByDesign("needs a two-router chain")` instead of the current `netns_internet_sim.sh:189`
+   `exit 2` — a *typed, honest* skip, not a shell error.
+2. **In-process stage integration** → delete the 8 `crates/rustynet-cli/src/bin/live_linux_cross_network_*_test.rs`
+   shims and the `cargo run --bin` fan in `run_script_stage` (`cross_network.rs:418`). Port each
+   `scripts/e2e/live_linux_cross_network_*_test.sh` validator (≈3.9k lines total) into a
+   `scenario::<name>(handle, ctx) -> StageOutcome` fn in a new `stage/cross_network/scenario/` module.
+   They share the runner's `ctx`, the realtime `RustNativeStageRecorder`, and the SIGTERM
+   `shutdown_flag` — no subprocess boundary, so cancellation and evidence "just work" (today a
+   `cargo run` child ignores the parent's shutdown flag entirely).
+3. **Rust netns orchestration** → port `netns_internet_sim.sh` (244 ln) + `netns_nat_classify.sh` +
+   `netns_nat_filter.sh` into a typed `NetnsSubstrate` whose `provision()` builds the wan-bridge / svc /
+   edge-site topology through `NetLeafRunner::run(["ip","netns",…])` / `["nft",…]`. `rustynet-netns-probe`
+   stays the STUN/NAT leaf tool (already Rust, byte-pinned to `stun_client.rs`) invoked via the same
+   runner. This is the biggest de-bolt-on **and** the only part provable now on one host.
+4. **Provability & sequencing** → **NetnsSubstrate first** (Tier A, runnable today, becomes the
+   deterministic CI NAT-matrix gate). `VxlanSubstrate`/`SlirpSubstrate` implement the SAME traits but
+   `provision()` returns a typed `Blocked("requires second network")` until the owner's 2nd network /
+   cross-OS host exists — the code lands and unit-tests against a mock `NetLeafRunner` now, live-proof
+   defers. **No silent skip:** a blocked substrate is a recorded `Skipped` with the reason in evidence.
+5. **What to keep** → `rustynet-netns-probe`, the §D5.1 NAT-profile vocabulary (now the `NatProfileId`
+   newtype), the fail-closed evidence contract, and `apply_nat_profile.sh`'s audited profile semantics
+   (ported into `SubstrateHandle::apply_nat_profile`, preserving `--enable-upnp`/`--enable-v6` as
+   `NatModifiers` — closing the `vxlan_tier_b.sh` gap where they are dropped today).
+
+### 0.3 First-class lifecycle stages (the seam that does not exist today)
+
+Add two typed stages to the catalog (`stage/mod.rs::define_stage_catalog!`), replacing the ad-hoc setup
+buried inside `run_nat_classification`:
+
+- `CrossNetworkSubstrateSetup` — `provision()`s the selected substrate, stashes `Box<dyn SubstrateHandle>`
+  on `OrchestrationContext` (new field), records substrate id + topology digest to evidence. A scenario
+  stage whose substrate failed to provision cascade-skips (dependency contract, already enforced).
+- `CrossNetworkSubstrateTeardown` — `always_run() == true` (the `FinalCleanupStage` pattern,
+  `native.rs:657`), so netns/vxlan residue is torn down even when a scenario failed. Leaving a netns or
+  an `nft` table behind is release-blocking residue, exactly like exit-NAT residue.
+
+### 0.4 Migration path (each step independently shippable, gate-green, on `main`)
+
+- **CN-1** Introduce the three traits + `NetLeafRunner{LocalCommand,RemoteShell}` + a `MockLeafRunner`;
+  no behavior change (existing enum path still runs). Pure additive, unit-tested against the mock.
+- **CN-2** `NetnsSubstrate::provision`/`teardown` + the two lifecycle stages; port classify/filter onto
+  the runner. Netns path now in-process; delete the scp of `netns_*.sh`. Live-provable on one host.
+- **CN-3** Port the 8 scenario validators to `scenario::*` fns; delete the 8 bins + `run_script_stage`'s
+  `cargo run` fan. Vxlan scenarios run in-process (still gated `Blocked` until the 2nd network).
+- **CN-4** `VxlanSubstrate` + `SlirpSubstrate` provision over `RemoteShellHost`; wire `NatModifiers`
+  (uPnP/v6) through. Live-proof deferred to when the hardware exists.
+- **CN-5** Retire the legacy-bash orchestrator's duplicate `stage_run_cross_network_*` set
+  (`live_linux_lab_orchestrator.sh`) once CN-1..4 are the single path — coordinated with the §5.3
+  bash-retirement window, not before.
+
+**Risk read:** ~13k LOC surface, but the trait seam makes it *additive-then-subtractive* (land the
+abstraction, migrate one substrate at a time, delete the old path last) rather than a big-bang rewrite.
+The `unsafe_code = "forbid"` constraint is honored — leaf ops are `ip`/`nft` argv through the runner, no
+netlink FFI. The one genuinely new design risk is `SubstrateHandle` lifetime across the stage boundary
+(it must outlive every scenario stage yet be torn down deterministically): resolved by owning it in
+`OrchestrationContext` and draining it in the `always_run` teardown, never in a `Drop` impl (a panic in
+`Drop` cannot report a residue failure as a stage outcome).
+
+---
+
 ## 1. Problem statement
 
 Everything cross-network is built **except the one thing that makes it run**: the orchestrator never
