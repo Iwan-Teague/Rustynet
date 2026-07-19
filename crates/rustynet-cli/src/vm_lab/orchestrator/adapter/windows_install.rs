@@ -1130,7 +1130,7 @@ fn relay_create_service_script(
 pub(crate) fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     let short_timeout = Duration::from_secs(30);
 
-    let assignment_pub_path = format!(r"{}\trust\assignment.pub", WINDOWS_STATE_ROOT);
+    let assignment_pub_path = format!(r"{WINDOWS_STATE_ROOT}\trust\assignment.pub");
     let read_script = format!(
         "Get-Content -LiteralPath {} -Raw",
         ps_quote(&assignment_pub_path)?,
@@ -1164,7 +1164,7 @@ pub(crate) fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterE
 
     // 2. Ship + install the verifier key under the reviewed root, then harden.
     let tmp = write_temp_file("rn_relay_verifier_", ".pub", &verifier_bytes)?;
-    let remote_tmp = format!(r"{}\rn-relay-verifier.pub", WINDOWS_STAGING_DIR);
+    let remote_tmp = format!(r"{WINDOWS_STAGING_DIR}\rn-relay-verifier.pub");
     let ship = ssh::scp_to(
         conn,
         tmp.as_path(),
@@ -1207,7 +1207,7 @@ pub(crate) fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterE
     let args_json = relay_windows_service_args_json()?;
     let env_file_contents = format!("{WINDOWS_RELAY_ARGS_ENV_KEY}={args_json}\r\n");
     let tmp_env = write_temp_file("rn_relay_env_", ".env", env_file_contents.as_bytes())?;
-    let remote_tmp_env = format!(r"{}\rn-relay-service.env", WINDOWS_STAGING_DIR);
+    let remote_tmp_env = format!(r"{WINDOWS_STAGING_DIR}\rn-relay-service.env");
     let ship_env = ssh::scp_to(
         conn,
         tmp_env.as_path(),

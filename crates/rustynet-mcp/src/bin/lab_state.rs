@@ -9657,7 +9657,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
     /// A UTM-only listing must never read as "the whole lab" once a second host
     /// is declared: a partial answer that looks total is worse than an error.
-
     /// A libvirt guest IS in the inventory; saying "not in inventory" would send
     /// an operator hunting a phantom inventory bug. The two cases must differ.
     #[test]

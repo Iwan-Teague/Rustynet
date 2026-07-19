@@ -29,6 +29,12 @@
 //! See `documents/operations/active/LiveLabStageTriageLedgerPlan_2026-07-16.md`.
 //!
 //! [`live_lab_node_stage_results.csv`]: ../../../documents/operations/live_lab_node_stage_results.csv
+//!
+//! The `stage_triage_history`/`record_stage_patch` MCP tools that call into
+//! this module are still pending (see the plan doc); until that wiring
+//! lands, several `pub fn`s here have no caller anywhere in the workspace.
+//! They are real, tested, working code — not placeholders — so `#[allow]`
+//! them individually rather than deleting or silently stubbing them.
 
 use std::fs;
 use std::io::Write as _;
@@ -73,6 +79,7 @@ pub struct StageTriageRecord {
 impl StageTriageRecord {
     /// Whether this record still needs a patch description. The launch gate
     /// refuses to start a run while a stub for a planned stage is unfilled.
+    #[allow(dead_code)] // pending MCP wiring, see module docs
     pub fn is_unfilled(&self) -> bool {
         self.patch
             .as_deref()
@@ -170,6 +177,7 @@ pub fn append_stub(path: &Path, record: &StageTriageRecord) -> Result<bool, Stri
 
 /// Record the patch attempted against a stub. Rewrites the ledger in place;
 /// this is the one non-append mutation, and it only ever fills a `null`.
+#[allow(dead_code)] // pending MCP wiring, see module docs
 pub fn fill_patch(path: &Path, stub_id: &str, patch: &str) -> Result<(), String> {
     if patch.trim().is_empty() {
         return Err(
@@ -203,13 +211,14 @@ pub fn fill_patch(path: &Path, stub_id: &str, patch: &str) -> Result<(), String>
 ///
 /// Scoped to the stages a run actually plans, so an unfilled stub for a stage
 /// this run does not exercise never blocks it.
+#[allow(dead_code)] // pending MCP wiring, see module docs
 pub fn unfilled_for_planned_stages<'a>(
     records: &'a [StageTriageRecord],
     planned_stages: &[String],
 ) -> Vec<&'a StageTriageRecord> {
     records
         .iter()
-        .filter(|record| record.is_unfilled() && planned_stages.iter().any(|s| *s == record.stage))
+        .filter(|record| record.is_unfilled() && planned_stages.contains(&record.stage))
         .collect()
 }
 
@@ -286,6 +295,7 @@ pub fn append_stubs_for_failed_stages(
 /// Every record for a stage, oldest first — the read path behind
 /// `stage_triage_history`. `os` filters to records where that family observed
 /// the failure.
+#[allow(dead_code)] // pending MCP wiring, see module docs
 pub fn history_for_stage<'a>(
     records: &'a [StageTriageRecord],
     stage: &str,

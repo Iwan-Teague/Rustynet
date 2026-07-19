@@ -8374,7 +8374,7 @@ mod tests {
         assert_eq!(budget_env_u64("RUSTYNET_NO_SUCH_VAR_XYZ", 123, false), 123);
         assert_eq!(budget_env_u64("RUSTYNET_NO_SUCH_VAR_XYZ", 123, true), 123);
         assert_eq!(EDIT_MAX_SUBAGENTS, 8);
-        assert!(EDIT_JOB_TOKEN_CEILING > 0);
+        assert_eq!(EDIT_JOB_TOKEN_CEILING, 2_000_000);
     }
 
     #[test]

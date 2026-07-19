@@ -2590,7 +2590,6 @@ mod tests {
         populate_role_result_values, populate_stage_values, render_csv_row,
         set_special_stage_values, validate_target_evidence,
     };
-    use super::{default_live_lab_node_run_matrix_path, default_live_lab_run_matrix_path};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 

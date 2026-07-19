@@ -190,7 +190,7 @@ impl TryFrom<&str> for StageId {
             .iter()
             .find(|s| s.as_str() == value)
             .cloned()
-            .ok_or_else(|| format!("unknown Rust-native stage: '{}'", value))
+            .ok_or_else(|| format!("unknown Rust-native stage: '{value}'"))
     }
 }
 

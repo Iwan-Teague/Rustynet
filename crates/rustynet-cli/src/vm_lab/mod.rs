@@ -4690,20 +4690,20 @@ pub fn execute_ops_vm_lab_host_net_status(
 
         // Ask the machine what it actually has — only meaningful if something answered.
         let mut actual_addrs: Vec<String> = Vec::new();
-        if let Some(endpoint) = reachable_via.as_deref() {
-            if let Ok(out) = run_host_cmd(endpoint, &["ip", "-4", "-br", "addr"], &ssh, timeout) {
-                for line in out.lines() {
-                    let mut parts = line.split_whitespace();
-                    let (Some(iface), Some(_state)) = (parts.next(), parts.next()) else {
-                        continue;
-                    };
-                    if iface == "lo" {
-                        continue;
-                    }
-                    for token in parts {
-                        if token.contains('/') {
-                            actual_addrs.push(format!("{iface}={token}"));
-                        }
+        if let Some(endpoint) = reachable_via.as_deref()
+            && let Ok(out) = run_host_cmd(endpoint, &["ip", "-4", "-br", "addr"], &ssh, timeout)
+        {
+            for line in out.lines() {
+                let mut parts = line.split_whitespace();
+                let (Some(iface), Some(_state)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                if iface == "lo" {
+                    continue;
+                }
+                for token in parts {
+                    if token.contains('/') {
+                        actual_addrs.push(format!("{iface}={token}"));
                     }
                 }
             }
@@ -6829,7 +6829,7 @@ pub fn execute_ops_vm_lab_host_preflight(
     }
 
     // ---- gate 5: every host is ON the pinned commit ------------------------
-    let mut host_heads: Vec<(String, Result<(String, bool), String>)> = Vec::new();
+    let mut host_heads: Vec<(String, HostHeadResult)> = Vec::new();
     for host in &selected {
         host_heads.push((
             host.host_id.clone(),
@@ -6911,7 +6911,7 @@ pub fn execute_ops_vm_lab_host_preflight(
         gates.push(PreflightGate {
             name: "hosts_agree",
             status: PreflightStatus::Fail,
-            detail: format!("hosts are on DIFFERENT commits: {:?}", heads),
+            detail: format!("hosts are on DIFFERENT commits: {heads:?}"),
             next: Some("sync every host to one pinned SHA before comparing runs".to_owned()),
         });
         push_not_run(&mut gates, &["guests_ready"]);
@@ -6997,11 +6997,15 @@ fn push_not_run(gates: &mut Vec<PreflightGate>, names: &[&'static str]) {
 }
 
 /// HEAD + dirty for a host, local or remote.
+/// A host's resolved HEAD sha + working-tree dirty flag, or the reason it
+/// could not be determined (unreachable, non-git checkout, etc).
+type HostHeadResult = Result<(String, bool), String>;
+
 fn host_head_and_dirty(
     host: &LabHost,
     config: &VmLabHostPreflightConfig,
     timeout: Duration,
-) -> Result<(String, bool), String> {
+) -> HostHeadResult {
     match host.kind {
         LabHostKind::LocalUtm => Ok((git_resolve_ref("HEAD")?, git_local_dirty()?)),
         LabHostKind::Libvirt => {
@@ -7224,10 +7228,7 @@ pub fn execute_ops_vm_lab_sync_host(config: VmLabSyncHostConfig) -> Result<Strin
         LabHostKind::Libvirt => sync_remote_host(host, sha.as_str(), &config, timeout),
     };
 
-    let record = match outcome {
-        Ok(record) => record,
-        Err(err) => return Err(err),
-    };
+    let record = outcome?;
 
     let rendered = if config.json {
         serde_json::to_string_pretty(&serde_json::json!({
@@ -16548,8 +16549,7 @@ fn wait_for_relay_forward_test_relay_routing(
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out after {}s waiting for both peers to report a relay-routed session; last sender status: {last_sender_status:?}; last receiver status: {last_receiver_status:?}",
-                RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS
+                "timed out after {RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS}s waiting for both peers to report a relay-routed session; last sender status: {last_sender_status:?}; last receiver status: {last_receiver_status:?}"
             ));
         }
         thread::sleep(Duration::from_secs(
@@ -29142,10 +29142,7 @@ fn iso8601_utc_from_unix(unix_secs: u64) -> String {
     let h = secs_of_day / 3600;
     let min = (secs_of_day % 3600) / 60;
     let s = secs_of_day % 60;
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y_final, m, d, h, min, s
-    )
+    format!("{y_final:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
 }
 
 fn collected_at_utc_now() -> String {
