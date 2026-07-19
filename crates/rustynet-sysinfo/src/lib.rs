@@ -1333,103 +1333,40 @@ fn get_kernel_version() -> Option<String> {
 /// "is up" flag. Only the exact `up` operstate (after trimming) counts as up;
 /// `down`, `unknown`, `dormant`, `UP` (wrong case), empty, or malformed all
 /// read as not-up (fail-closed toward "down"). Split out from
-/// [`network_interfaces_internal`] so it is unit-testable on any host; only
-/// called under `target_os = "linux"`.
+/// [`wireguard_interface_info_internal`] so it is unit-testable on any host;
+/// only called under `target_os = "linux"`.
 #[allow(dead_code)]
 fn parse_linux_operstate(content: &str) -> bool {
     content.trim() == "up"
 }
 
-/// Parse macOS/BSD `ifconfig` stdout into `(name, up)` interfaces. An interface
-/// header begins at column 0 with an alphabetic char (never a tab-indented
-/// detail line); the name is the text before the first `:`, and `UP` in the
-/// flags marks it up. Nameless or malformed header lines are skipped. Split out
-/// from [`network_interfaces_internal`] for cross-platform unit testing; only
-/// called under `target_os = "macos"`.
-#[allow(dead_code)]
-fn parse_macos_ifconfig_interfaces(stdout: &str) -> Vec<NetworkInterface> {
-    let mut interfaces = Vec::new();
-    for line in stdout.lines() {
-        if line.starts_with(char::is_alphabetic) && !line.starts_with('\t') {
-            let name = line.split(':').next().unwrap_or("").trim();
-            if !name.is_empty() {
-                interfaces.push(NetworkInterface {
-                    name: name.to_owned(),
-                    up: line.contains("UP"),
-                    addresses: vec![],
-                });
-            }
-        }
+/// Convert one [`InterfaceDetail`] (the crate's canonical enumeration shape,
+/// produced by `diagnostics::observe_interfaces`) into the coarser
+/// [`NetworkInterface`] shape `network_interfaces` reports.
+fn network_interface_from_detail(detail: InterfaceDetail) -> NetworkInterface {
+    NetworkInterface {
+        name: detail.name,
+        up: detail.up,
+        addresses: detail.ip_addresses,
     }
-    interfaces
 }
 
-/// Parse Windows `ipconfig` stdout into interface names. Adapter header lines
-/// contain "Ethernet adapter" or "Wireless LAN adapter"; the name is the text
-/// before the first `:`. `ipconfig` exposes no reliable operational state at
-/// this layer, so every listed adapter is reported `up` (behavior unchanged).
-/// Split out from [`network_interfaces_internal`] for cross-platform unit
-/// testing; only called under `target_os = "windows"`.
-#[allow(dead_code)]
-fn parse_windows_ipconfig_interfaces(stdout: &str) -> Vec<NetworkInterface> {
-    let mut interfaces = Vec::new();
-    for line in stdout.lines() {
-        if line.contains("Ethernet adapter") || line.contains("Wireless LAN adapter") {
-            let name = line.split(':').next().unwrap_or("").trim();
-            if !name.is_empty() {
-                interfaces.push(NetworkInterface {
-                    name: name.to_string(),
-                    up: true,
-                    addresses: vec![],
-                });
-            }
-        }
-    }
-    interfaces
-}
-
+/// Interface enumeration, delegated to the diagnostics module's single
+/// implementation (`diagnostics::observe_interfaces`): Linux reads
+/// `/sys/class/net` directly (no subprocess), macOS runs allowlisted
+/// `ifconfig`, Windows runs allowlisted `netsh interface ipv4 show
+/// interfaces` — every external tool bounded by
+/// [`diagnostics::DEFAULT_COMMAND_TIMEOUT`] instead of the unbounded
+/// `Command::output()` calls the previous per-function copies used. The
+/// Windows enumeration tool deliberately changed from `ipconfig` (which
+/// reported every adapter as up) to `netsh` (which reports real
+/// connected/disconnected state) as part of consolidating the crate's three
+/// drifted enumeration copies onto one implementation.
 fn network_interfaces_internal() -> Vec<NetworkInterface> {
-    let mut interfaces = vec![];
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(entries) = fs::read_dir("/sys/class/net") {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    let name_str = name.to_string();
-                    let up = fs::read_to_string(format!("/sys/class/net/{name_str}/operstate"))
-                        .map(|state| parse_linux_operstate(&state))
-                        .unwrap_or(false);
-
-                    interfaces.push(NetworkInterface {
-                        name: name_str,
-                        up,
-                        addresses: vec![],
-                    });
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = std::process::Command::new("ifconfig").output() {
-            if let Ok(stdout) = String::from_utf8(output.stdout) {
-                interfaces.extend(parse_macos_ifconfig_interfaces(&stdout));
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = std::process::Command::new("ipconfig").output() {
-            if let Ok(stdout) = String::from_utf8(output.stdout) {
-                interfaces.extend(parse_windows_ipconfig_interfaces(&stdout));
-            }
-        }
-    }
-
-    interfaces
+    diagnostics::observe_interfaces(&SystemCommandRunner)
+        .into_iter()
+        .map(network_interface_from_detail)
+        .collect()
 }
 
 fn security_checks_internal(_config_path: &str) -> SecurityCheckResult {
@@ -3219,124 +3156,17 @@ fn process_list_internal() -> Vec<ProcessListEntry> {
     procs
 }
 
-#[cfg(target_os = "linux")]
+/// Interface enumeration, delegated to the diagnostics module's single
+/// implementation (see [`network_interfaces_internal`] — same rationale).
+/// Behavior changes accepted with the consolidation: macOS now reports real
+/// MAC addresses (the previous copy scanned for a `HWaddr ` token macOS
+/// `ifconfig` never emits, so its `mac_address` was silently always
+/// `None`); a missing/unparseable MTU degrades to an explicit `0` instead
+/// of a fabricated `1500`; and Windows enumerates via allowlisted, bounded
+/// `netsh` instead of an unbounded `powershell -Command Get-NetAdapter`
+/// spawn (`netsh` reports no MAC/IPs for this query — a documented gap).
 fn iface_list_internal() -> Vec<InterfaceDetail> {
-    let mut ifaces = Vec::new();
-
-    if let Ok(entries) = fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let path = entry.path();
-
-            let up = fs::read_to_string(path.join("operstate"))
-                .ok()
-                .map(|s| s.trim() == "up")
-                .unwrap_or(false);
-
-            let mac_address = fs::read_to_string(path.join("address"))
-                .ok()
-                .map(|s| s.trim().to_string());
-            let mtu = fs::read_to_string(path.join("mtu"))
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(1500);
-
-            ifaces.push(InterfaceDetail {
-                name,
-                up,
-                mac_address,
-                ip_addresses: Vec::new(),
-                mtu,
-            });
-        }
-    }
-
-    ifaces
-}
-
-#[cfg(target_os = "macos")]
-fn iface_list_internal() -> Vec<InterfaceDetail> {
-    let mut ifaces = Vec::new();
-
-    if let Ok(output) = std::process::Command::new("ifconfig").output()
-        && let Ok(s) = String::from_utf8(output.stdout)
-    {
-        let mut current_iface: Option<InterfaceDetail> = None;
-
-        for line in s.lines() {
-            if !line.starts_with('\t') && !line.starts_with(' ') && !line.is_empty() {
-                if let Some(iface) = current_iface.take() {
-                    ifaces.push(iface);
-                }
-
-                let name = line.split(':').next().unwrap_or("").to_owned();
-                current_iface = Some(InterfaceDetail {
-                    name,
-                    up: line.contains("UP"),
-                    mac_address: None,
-                    ip_addresses: Vec::new(),
-                    mtu: 1500,
-                });
-            } else if let Some(ref mut iface) = current_iface {
-                if line.contains("HWaddr ") {
-                    if let Some(mac) = line.split("HWaddr ").nth(1) {
-                        iface.mac_address = Some(mac.trim().to_owned());
-                    }
-                } else if line.contains("inet ")
-                    && let Some(ip) = line.split_whitespace().nth(1)
-                {
-                    iface.ip_addresses.push(ip.to_owned());
-                } else if line.contains("mtu ")
-                    && let Some(mtu_str) = line.split("mtu ").nth(1)
-                    && let Some(mtu) = mtu_str.split_whitespace().next()
-                {
-                    iface.mtu = mtu.parse::<u32>().unwrap_or(1500);
-                }
-            }
-        }
-
-        if let Some(iface) = current_iface {
-            ifaces.push(iface);
-        }
-    }
-
-    ifaces
-}
-
-#[cfg(target_os = "windows")]
-fn iface_list_internal() -> Vec<InterfaceDetail> {
-    let mut ifaces = Vec::new();
-
-    if let Ok(output) = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-NetAdapter | Select-Object Name,Status,MacAddress,InterfaceDescription,MTUSize",
-        ])
-        .output()
-    {
-        if let Ok(s) = String::from_utf8(output.stdout) {
-            for line in s.lines().skip(2) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    let name = parts[0].to_string();
-                    let up = parts[1].to_lowercase().contains("up");
-                    let mac = Some(parts[2].to_string());
-                    let mtu = parts[4].parse::<u32>().unwrap_or(1500);
-
-                    ifaces.push(InterfaceDetail {
-                        name,
-                        up,
-                        mac_address: mac,
-                        ip_addresses: Vec::new(),
-                        mtu,
-                    });
-                }
-            }
-        }
-    }
-
-    ifaces
+    diagnostics::observe_interfaces(&SystemCommandRunner)
 }
 
 #[cfg(target_os = "linux")]
@@ -7305,10 +7135,7 @@ fn pkg_family_for(distro_id: Option<&str>, distro_like: &[String]) -> Option<Pkg
 mod tests {
     use super::parse_arp_n_row;
     use super::performance_regression_detection_internal;
-    use super::{
-        parse_linux_operstate, parse_macos_ifconfig_interfaces, parse_proc_version_release,
-        parse_windows_ipconfig_interfaces,
-    };
+    use super::{parse_linux_operstate, parse_proc_version_release};
 
     #[test]
     fn proc_version_release_extracts_third_token_of_first_line() {
@@ -7478,59 +7305,23 @@ Inter-|   Receive                                    |  Transmit
         assert!(!parse_linux_operstate("up down"));
     }
 
+    /// Pins the edge conversion `network_interfaces` applies to the shared
+    /// enumeration's `InterfaceDetail` results: name/up carry over and the
+    /// detail's IP addresses become `NetworkInterface::addresses` (the old
+    /// per-function macOS copy always reported empty addresses; the shared
+    /// implementation populates them from `inet ` lines).
     #[test]
-    fn macos_ifconfig_parses_headers_and_up_flag() {
-        let sample = "\
-lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
-\tinet 127.0.0.1 netmask 0xff000000
-en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
-\tinet 192.168.0.5 netmask 0xffffff00 broadcast 192.168.0.255
-gif0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280
-";
-        let ifaces = parse_macos_ifconfig_interfaces(sample);
-        let by_name: std::collections::HashMap<_, _> =
-            ifaces.iter().map(|i| (i.name.as_str(), i.up)).collect();
-        assert_eq!(by_name.get("lo0"), Some(&true));
-        assert_eq!(by_name.get("en0"), Some(&true));
-        // gif0 header has no UP flag -> reported down.
-        assert_eq!(by_name.get("gif0"), Some(&false));
-        // Tab-indented detail lines never become interfaces.
-        assert_eq!(ifaces.len(), 3);
-        assert!(ifaces.iter().all(|i| i.addresses.is_empty()));
-    }
-
-    #[test]
-    fn macos_ifconfig_skips_malformed_and_empty() {
-        assert!(parse_macos_ifconfig_interfaces("").is_empty());
-        // A leading ':' yields an empty name -> skipped.
-        assert!(parse_macos_ifconfig_interfaces(": flags=<UP>").is_empty());
-        // Non-alphabetic / indented lines are ignored.
-        assert!(parse_macos_ifconfig_interfaces("\ten0: flags=<UP>\n123: x").is_empty());
-    }
-
-    #[test]
-    fn windows_ipconfig_parses_adapter_headers() {
-        let sample = "\
-Windows IP Configuration
-
-Ethernet adapter Ethernet:
-
-   Connection-specific DNS Suffix  . :
-   IPv4 Address. . . . . . . . . . . : 192.168.0.7
-Wireless LAN adapter Wi-Fi:
-
-   Media State . . . . . . . . . . . : Media disconnected
-Some unrelated line: value
-";
-        let ifaces = parse_windows_ipconfig_interfaces(sample);
-        let names: Vec<&str> = ifaces.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["Ethernet adapter Ethernet", "Wireless LAN adapter Wi-Fi"]
-        );
-        assert!(ifaces.iter().all(|i| i.up)); // ipconfig layer reports all up
-        assert!(parse_windows_ipconfig_interfaces("").is_empty());
-        assert!(parse_windows_ipconfig_interfaces("No adapters here: x").is_empty());
+    fn network_interface_from_detail_maps_all_fields() {
+        let converted = super::network_interface_from_detail(super::InterfaceDetail {
+            name: "en0".to_owned(),
+            up: true,
+            mac_address: Some("ac:de:48:00:11:22".to_owned()),
+            ip_addresses: vec!["192.168.1.23".to_owned()],
+            mtu: 1500,
+        });
+        assert_eq!(converted.name, "en0");
+        assert!(converted.up);
+        assert_eq!(converted.addresses, vec!["192.168.1.23".to_owned()]);
     }
 
     fn samples(name: &str, values: &[u64]) -> Vec<(String, u64)> {
@@ -8041,10 +7832,10 @@ short
     // deliberately NOT `#[cfg(target_os = "...")]`-gated even though their
     // production callers are — they are plain `&str -> T` string parsers
     // with no OS-specific API dependency, so gating only the IO wrapper
-    // (matching the pre-existing `parse_macos_ifconfig_iface_up` /
-    // `parse_windows_ipconfig_interfaces` convention) lets every one of
-    // them be compiled and exercised on any dev/CI host, regardless of
-    // which OS variant would call it in production.
+    // (matching the pre-existing `parse_macos_ifconfig_iface_up`
+    // convention) lets every one of them be compiled and exercised on any
+    // dev/CI host, regardless of which OS variant would call it in
+    // production.
 
     #[test]
     fn getfacl_output_extracts_owner_group_and_documents_base_entry_quirk() {
