@@ -447,13 +447,30 @@ fn build_windows_release_script(
     workdir: &str,
     remote_bootstrap: &str,
 ) -> Result<String, AdapterError> {
+    // Bootstrap-RustyNetWindows.ps1 is SCP'd standalone into the ephemeral
+    // staging dir (see `install_daemon` above) — it does NOT carry its
+    // `scripts\bootstrap\windows\` sibling files with it. Its winget/vsconfig
+    // dependency-install step resolves those siblings relative to
+    // `$PSScriptRoot` by default, which is the staging dir, so an unqualified
+    // invocation fails with "WinGet configuration file not found". The
+    // extracted source archive at `workdir` DOES have both files (they are
+    // git-tracked), so point the script at that copy explicitly via its
+    // `-WingetConfigPath`/`-VsConfigPath` parameters instead of relying on
+    // the default same-directory lookup.
+    let winget_config_path =
+        format!(r"{workdir}\scripts\bootstrap\windows\RustyNetBootstrap.winget.yml");
+    let vs_config_path =
+        format!(r"{workdir}\scripts\bootstrap\windows\RustyNetBuildTools.vsconfig");
     Ok(format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
          Set-Location -LiteralPath {workdir_q}; \
-         & {bootstrap_q} -Phase build-release -RustyNetRoot {workdir_q} -ResultPath {result_q}",
+         & {bootstrap_q} -Phase build-release -RustyNetRoot {workdir_q} \
+           -WingetConfigPath {winget_q} -VsConfigPath {vsconfig_q} -ResultPath {result_q}",
         workdir_q = ps_quote(workdir)?,
         bootstrap_q = ps_quote(remote_bootstrap)?,
+        winget_q = ps_quote(&winget_config_path)?,
+        vsconfig_q = ps_quote(&vs_config_path)?,
         result_q = ps_quote(WINDOWS_BUILD_RELEASE_REPORT_PATH)?,
     ))
 }
@@ -1708,6 +1725,20 @@ mod tests {
         assert!(
             !script.contains("-AllowInteractiveTaskFallback"),
             "Rust-native live lab must not silently fall back to interactive scheduled-task builds"
+        );
+        // Bootstrap-RustyNetWindows.ps1 is SCP'd standalone into the staging
+        // dir without its scripts\bootstrap\windows\ siblings, so its default
+        // $PSScriptRoot-relative winget/vsconfig lookup can never find them —
+        // the call must point at the extracted source tree explicitly.
+        assert!(
+            script.contains(r"-WingetConfigPath 'C:\Rustynet\scripts\bootstrap\windows\RustyNetBootstrap.winget.yml'"),
+            "must point WingetConfigPath at the extracted source tree, not $PSScriptRoot: {script}"
+        );
+        assert!(
+            script.contains(
+                r"-VsConfigPath 'C:\Rustynet\scripts\bootstrap\windows\RustyNetBuildTools.vsconfig'"
+            ),
+            "must point VsConfigPath at the extracted source tree, not $PSScriptRoot: {script}"
         );
     }
 
