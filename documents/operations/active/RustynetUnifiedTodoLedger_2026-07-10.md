@@ -217,6 +217,21 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
 - [ ] RNQ-05: fault-inject every evidence writer and finalizer; implement one
   fsync-backed multi-artifact finalization transaction or equivalent recovery
   protocol. No partial pass may survive power/process failure.
+  - 2026-07-19: CODE COMPLETE, live re-proof pending. The
+    `finalize_rust_native_run` transaction is now WIRED into production —
+    `native.rs`'s inline finalization block (marker-before-matrix ordering,
+    discarded-`Result` demotion) is deleted, so the tested transaction is the
+    single finalization path and `run_passed=true` is the strictly-last
+    fsync'd write. Added a pass-path **durability barrier**
+    (`evidence.rs::sync_report_dir_tree`): after the matrix append and before
+    the marker, every file+directory under the report dir is fsync'd, closing
+    the power-loss window where the marker's own fsync left the other
+    (plain/rename-only) evidence writers' pages flushable — the literal
+    "partial pass survives power failure" this item forbids. New
+    `DurabilityBarrier` fault-injection test; 12/12 finalize tests green;
+    scoped check green. Owning detail in the RNQ audit ledger's 2026-07-19
+    status. Remaining: live green `--node` run re-proof, and real OS-level
+    fault injection (disk-full/short-write) stays with the §14 item.
 - [ ] RNQ-07: implement real process-isolated, cancellable stage deadlines.
   Timed-out privileged work must stop before cleanup; no detached worker.
 - [ ] RNQ-09: real subprocess SIGTERM/SIGINT test proving diagnostics, cleanup,
