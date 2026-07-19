@@ -74,6 +74,7 @@ finished Phase 1/2/3/5 checklists are archived in
 Cross-platform code-quality ledger:
 - [active/PlatformImprovementBacklog_2026-05-14.md](./active/PlatformImprovementBacklog_2026-05-14.md) — most recently updated cross-platform improvement backlog (X1-X7 numbered tracks are the cleanest current path for code-only quality work)
 - [active/DataplanePerfBacklog_2026-06-12.md](./active/DataplanePerfBacklog_2026-06-12.md) — active hot-path performance backlog with measured baselines and bench commands for the userspace-shared engine, relay forward path, utun I/O, and endpoint indexing
+- [active/EfficiencyAndAdvancedTechniqueOpportunityCatalog_2026-07-19.md](./active/EfficiencyAndAdvancedTechniqueOpportunityCatalog_2026-07-19.md) — unscheduled research catalog of 31 verified efficiency/architecture findings across the control plane (key custody, ACL, trust-state, enrollment, serialization, NAT traversal, relay, concurrency) and dev tooling (build/test speed, CLI startup, Windows/service data paths), each with multiple candidate technique families and no chosen fix
 - [active/SecurityHardeningAudit_2026-04-28.md](./active/SecurityHardeningAudit_2026-04-28.md) — current cross-platform security-hardening audit set
 
 ## High-Value Evergreen References
