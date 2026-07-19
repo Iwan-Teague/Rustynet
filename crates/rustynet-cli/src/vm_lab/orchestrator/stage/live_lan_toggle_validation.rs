@@ -98,7 +98,7 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
         match cmd.status() {
             Ok(status) if status.success() => StageOutcome::Passed,
             Ok(status) => {
-                StageOutcome::Failed(format!("live_linux_lan_toggle_test exited with {}", status))
+                StageOutcome::Failed(format!("live_linux_lan_toggle_test exited with {status}"))
             }
             Err(e) => {
                 StageOutcome::Failed(format!("failed to run live_linux_lan_toggle_test: {e}"))

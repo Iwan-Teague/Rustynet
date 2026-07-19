@@ -114,8 +114,7 @@ impl OrchestrationStage for LiveMixedTopologyValidationStage {
         match cmd.status() {
             Ok(status) if status.success() => StageOutcome::Passed,
             Ok(status) => StageOutcome::Failed(format!(
-                "live_linux_mixed_topology_test exited with {}",
-                status
+                "live_linux_mixed_topology_test exited with {status}"
             )),
             Err(e) => {
                 StageOutcome::Failed(format!("failed to run live_linux_mixed_topology_test: {e}"))

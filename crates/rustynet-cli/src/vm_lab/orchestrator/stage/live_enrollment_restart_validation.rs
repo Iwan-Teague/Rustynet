@@ -87,10 +87,9 @@ impl OrchestrationStage for LiveEnrollmentRestartValidationStage {
 
         match cmd.status() {
             Ok(status) if status.success() => StageOutcome::Passed,
-            Ok(status) => StageOutcome::Failed(format!(
-                "live_enrollment_restart_test exited with {}",
-                status
-            )),
+            Ok(status) => {
+                StageOutcome::Failed(format!("live_enrollment_restart_test exited with {status}"))
+            }
             Err(e) => {
                 StageOutcome::Failed(format!("failed to run live_enrollment_restart_test: {e}"))
             }

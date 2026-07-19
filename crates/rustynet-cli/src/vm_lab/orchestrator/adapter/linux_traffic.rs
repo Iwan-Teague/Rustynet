@@ -286,8 +286,7 @@ fn parse_ping_result(peer_mesh_ip: &str, output: &str) -> Result<TrafficTestResu
     let status = status.trim();
     let exit_code = status.parse::<i32>().map_err(|_| AdapterError::Protocol {
         message: format!(
-            "ping diagnostic protocol has invalid exit status {:?} for {peer_mesh_ip} (fail closed)",
-            status
+            "ping diagnostic protocol has invalid exit status {status:?} for {peer_mesh_ip} (fail closed)"
         ),
     })?;
     if exit_code == 0 {

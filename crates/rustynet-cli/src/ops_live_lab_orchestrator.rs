@@ -575,10 +575,7 @@ fn iso8601_utc_from_unix(unix_secs: u64) -> String {
     let h = secs_of_day / 3600;
     let min = (secs_of_day % 3600) / 60;
     let s = secs_of_day % 60;
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y_final, m, d, h, min, s
-    )
+    format!("{y_final:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
 }
 
 fn collected_at_utc_now() -> String {
