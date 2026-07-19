@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -207,11 +207,6 @@ impl fmt::Display for TraversalError {
 
 impl std::error::Error for TraversalError {}
 
-const STUN_BINDING_REQUEST_TYPE: u16 = 0x0001;
-const STUN_BINDING_RESPONSE_TYPE: u16 = 0x0101;
-const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
-const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
-
 fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -279,156 +274,32 @@ impl CandidateGatherer {
         )
     }
 
-    /// FIS-0011: fire-all-then-collect srflx gathering with an
-    /// RFC 5389 §7.2.1-shaped retransmission ladder.
-    ///
-    /// All binding requests go out up front (own transaction id each; a
-    /// retransmission reuses its original id per the RFC), then one receive
-    /// loop demuxes responses by source address + transaction-id echo until
-    /// the shared gather deadline. An unanswered request retransmits on its
-    /// RTO ladder (250ms initial, doubling, at most
-    /// [`STUN_MAX_REQUEST_ATTEMPTS`] sends — sized down from the RFC's 7
-    /// because this is a short-budget candidate discovery, not a control
-    /// transaction). This simultaneously fixes the old serial path's
-    /// starvation bug (server 1's full-budget `recv_from` blanked servers
-    /// 2..N) and its single-shot fragility (one lost datagram cost the whole
-    /// gather cycle). Results are per-server, in server order.
+    /// FIS-0011 fire-all-then-collect srflx gathering with the RFC 5389
+    /// §7.2.1-shaped retransmission ladder, delegated to the NAT-3 shared
+    /// gather core in `stun_client`
+    /// ([`crate::stun_client::gather_stun_mappings`]). That module is the
+    /// canonical STUN wire-format home (`rustynet-netns-probe` is
+    /// byte-pinned to it), which fixed the direction of the consolidation:
+    /// this file's former duplicate wire format and receive-loop scheduler
+    /// were deleted in favor of the core. Results are per-server, in
+    /// server order.
     fn query_stun_servers_batched(&self) -> Vec<Result<SocketEndpoint, TraversalError>> {
-        let timed_out = || TraversalError::Stun("stun response timed out".to_owned());
-        let mut results: Vec<Result<SocketEndpoint, TraversalError>> =
-            self.stun_servers.iter().map(|_| Err(timed_out())).collect();
-        if self.stun_servers.is_empty() {
-            return results;
-        }
-        if let Err(err) = self.local_socket.set_write_timeout(Some(self.timeout)) {
-            let message = format!("failed to set stun write timeout: {err}");
-            for slot in &mut results {
-                *slot = Err(TraversalError::Stun(message.clone()));
-            }
-            return results;
-        }
-
-        let deadline = Instant::now() + self.timeout;
-        let mut outstanding: Vec<OutstandingStunQuery> = Vec::new();
-        for (server_index, server) in self.stun_servers.iter().enumerate() {
-            let mut transaction_id = [0u8; 12];
-            if let Err(err) = rand::rngs::OsRng.try_fill_bytes(transaction_id.as_mut_slice()) {
-                results[server_index] = Err(TraversalError::Stun(format!(
-                    "os randomness unavailable: {err}"
-                )));
-                continue;
-            }
-            let request = build_stun_binding_request(transaction_id);
-            if let Err(err) = self.local_socket.send_to(request.as_slice(), *server) {
-                results[server_index] = Err(TraversalError::Stun(format!(
-                    "failed to send stun request: {err}"
-                )));
-                continue;
-            }
-            outstanding.push(OutstandingStunQuery {
-                server_index,
-                server: *server,
-                transaction_id,
-                next_retransmit_at: Instant::now() + STUN_INITIAL_RTO,
-                rto: STUN_INITIAL_RTO,
-                attempts: 1,
-            });
-        }
-
-        let mut buffer = [0u8; 1500];
-        while !outstanding.is_empty() {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            // Wake at the earliest pending retransmit (or the deadline when
-            // every ladder is exhausted); floor 1ms so a due-now retransmit
-            // cannot busy-spin the receive.
-            let wake_at = outstanding
-                .iter()
-                .filter(|query| query.attempts < STUN_MAX_REQUEST_ATTEMPTS)
-                .map(|query| query.next_retransmit_at)
-                .min()
-                .map_or(deadline, |at| at.min(deadline));
-            let wait = wake_at
-                .saturating_duration_since(now)
-                .max(Duration::from_millis(1));
-            if self.local_socket.set_read_timeout(Some(wait)).is_err() {
-                break;
-            }
-            match self.local_socket.recv_from(&mut buffer) {
-                Ok((received, source)) => {
-                    let Some(position) =
-                        outstanding.iter().position(|query| query.server == source)
-                    else {
-                        // Response from an unqueried source: reject.
-                        continue;
-                    };
-                    match parse_stun_xor_mapped_address(
-                        buffer[..received].as_ref(),
-                        outstanding[position].transaction_id,
-                    ) {
-                        Ok(addr) => {
-                            let query = outstanding.swap_remove(position);
-                            results[query.server_index] = Ok(SocketEndpoint {
-                                addr: addr.ip(),
-                                port: addr.port(),
-                            });
-                        }
-                        // Malformed or wrong transaction id from a real
-                        // target: drop the datagram, keep the query pending.
-                        Err(_) => continue,
-                    }
-                }
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::WouldBlock
-                        || err.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    // Receive window elapsed: fall through to the
-                    // retransmit sweep below.
-                }
-                Err(_) => break,
-            }
-            let now = Instant::now();
-            for query in &mut outstanding {
-                if query.attempts < STUN_MAX_REQUEST_ATTEMPTS && now >= query.next_retransmit_at {
-                    let request = build_stun_binding_request(query.transaction_id);
-                    if self
-                        .local_socket
-                        .send_to(request.as_slice(), query.server)
-                        .is_ok()
-                    {
-                        query.attempts += 1;
-                        query.rto = query.rto.saturating_mul(2);
-                        query.next_retransmit_at = now + query.rto;
-                    } else {
-                        // Send failure mid-gather: stop retransmitting this
-                        // query; an earlier send may still be answered.
-                        query.attempts = STUN_MAX_REQUEST_ATTEMPTS;
-                    }
-                }
-            }
-        }
-        results
+        crate::stun_client::gather_stun_mappings(
+            &self.local_socket,
+            self.stun_servers.as_slice(),
+            self.timeout,
+        )
+        .into_iter()
+        .map(|outcome| {
+            outcome
+                .map(|mapped| SocketEndpoint {
+                    addr: mapped.ip(),
+                    port: mapped.port(),
+                })
+                .map_err(|err| TraversalError::Stun(err.to_string()))
+        })
+        .collect()
     }
-}
-
-/// Initial retransmission timeout for the FIS-0011 STUN ladder
-/// (RFC 5389 §7.2.1 default is 500ms; halved because the whole gather
-/// budget defaults to 2s and this is candidate discovery).
-const STUN_INITIAL_RTO: Duration = Duration::from_millis(250);
-/// Total sends per server per gather (initial + retransmits) — the RFC's
-/// `Rc`, sized down from 7 for the short gather budget.
-const STUN_MAX_REQUEST_ATTEMPTS: u8 = 3;
-
-/// One in-flight binding request awaiting its response or next retransmit.
-struct OutstandingStunQuery {
-    server_index: usize,
-    server: SocketAddr,
-    transaction_id: [u8; 12],
-    next_retransmit_at: Instant,
-    rto: Duration,
-    attempts: u8,
 }
 
 fn collect_gathered_candidates(
@@ -535,120 +406,6 @@ fn dedup_candidates(mut candidates: Vec<TraversalCandidate>) -> Vec<TraversalCan
         }
     }
     deduped
-}
-
-fn build_stun_binding_request(transaction_id: [u8; 12]) -> [u8; 20] {
-    let mut request = [0u8; 20];
-    request[0..2].copy_from_slice(&STUN_BINDING_REQUEST_TYPE.to_be_bytes());
-    request[2..4].copy_from_slice(&0u16.to_be_bytes());
-    request[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    request[8..20].copy_from_slice(transaction_id.as_slice());
-    request
-}
-
-fn parse_stun_xor_mapped_address(
-    message: &[u8],
-    transaction_id: [u8; 12],
-) -> Result<SocketAddr, TraversalError> {
-    if message.len() < 20 {
-        return Err(TraversalError::Stun(
-            "stun message is shorter than header".to_owned(),
-        ));
-    }
-    let message_type = u16::from_be_bytes([message[0], message[1]]);
-    if message_type != STUN_BINDING_RESPONSE_TYPE {
-        return Err(TraversalError::Stun(
-            "stun message is not a binding response".to_owned(),
-        ));
-    }
-    let declared_len = usize::from(u16::from_be_bytes([message[2], message[3]]));
-    let expected_len = 20usize.saturating_add(declared_len);
-    if expected_len > message.len() {
-        return Err(TraversalError::Stun("stun message is truncated".to_owned()));
-    }
-    let cookie = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
-    if cookie != STUN_MAGIC_COOKIE {
-        return Err(TraversalError::Stun(
-            "stun magic cookie mismatch".to_owned(),
-        ));
-    }
-    if message[8..20] != transaction_id {
-        return Err(TraversalError::Stun(
-            "stun transaction id mismatch".to_owned(),
-        ));
-    }
-
-    let cookie_bytes = STUN_MAGIC_COOKIE.to_be_bytes();
-    let mut offset = 20usize;
-    while offset.saturating_add(4) <= expected_len {
-        let attr_type = u16::from_be_bytes([message[offset], message[offset + 1]]);
-        let attr_len = usize::from(u16::from_be_bytes([
-            message[offset + 2],
-            message[offset + 3],
-        ]));
-        offset = offset.saturating_add(4);
-        let attr_end = offset.saturating_add(attr_len);
-        if attr_end > expected_len {
-            return Err(TraversalError::Stun(
-                "stun attribute exceeds message boundary".to_owned(),
-            ));
-        }
-        let value = &message[offset..attr_end];
-        if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
-            if attr_len < 8 {
-                return Err(TraversalError::Stun(
-                    "xor-mapped-address attribute too short".to_owned(),
-                ));
-            }
-            let family = value[1];
-            let x_port = u16::from_be_bytes([value[2], value[3]]);
-            let port_mask = u16::from_be_bytes([cookie_bytes[0], cookie_bytes[1]]);
-            let port = x_port ^ port_mask;
-            let endpoint = match family {
-                0x01 => {
-                    if attr_len < 8 {
-                        return Err(TraversalError::Stun(
-                            "xor-mapped-address ipv4 attribute too short".to_owned(),
-                        ));
-                    }
-                    let mut addr = [0u8; 4];
-                    for (index, slot) in addr.iter_mut().enumerate() {
-                        *slot = value[4 + index] ^ cookie_bytes[index];
-                    }
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr)), port)
-                }
-                0x02 => {
-                    if attr_len < 20 {
-                        return Err(TraversalError::Stun(
-                            "xor-mapped-address ipv6 attribute too short".to_owned(),
-                        ));
-                    }
-                    let mut addr = [0u8; 16];
-                    for (index, slot) in addr.iter_mut().enumerate() {
-                        let mask = if index < 4 {
-                            cookie_bytes[index]
-                        } else {
-                            transaction_id[index - 4]
-                        };
-                        *slot = value[4 + index] ^ mask;
-                    }
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::from(addr)), port)
-                }
-                _ => {
-                    return Err(TraversalError::Stun(
-                        "xor-mapped-address has unsupported address family".to_owned(),
-                    ));
-                }
-            };
-            return Ok(endpoint);
-        }
-        let padded_len = (attr_len + 3) & !3;
-        offset = offset.saturating_add(padded_len);
-    }
-
-    Err(TraversalError::Stun(
-        "stun response does not contain xor-mapped-address".to_owned(),
-    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2266,7 +2023,7 @@ mod tests {
         SimultaneousOpenWaiter, TransitionReason, TraversalCandidate, TraversalDecision,
         TraversalDecisionReason, TraversalEngine, TraversalEngineConfig, TraversalError,
         TraversalSession, collect_gathered_candidates, direct_udp_viable,
-        parse_stun_xor_mapped_address, schedule_proactive_refresh,
+        schedule_proactive_refresh,
     };
     use rustynet_backend_api::{NodeId, SocketEndpoint};
     use rustynet_control::roles::RoleCapability;
@@ -2685,47 +2442,11 @@ mod tests {
         assert!(matches!(err, TraversalError::NoDirectCandidates));
     }
 
-    // Additional tests for STUN parsing and gather behavior
-    #[test]
-    fn parse_stun_xor_mapped_address_ipv4_valid() {
-        let transaction_id: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        let port: u16 = 51820;
-        let ip = Ipv4Addr::new(203, 0, 113, 5);
-        let mut message = Vec::new();
-        message.extend_from_slice(&0x0101u16.to_be_bytes());
-        message.extend_from_slice(&0u16.to_be_bytes());
-        message.extend_from_slice(&0x2112_A442u32.to_be_bytes());
-        message.extend_from_slice(&transaction_id);
-        let attr_type = 0x0020u16.to_be_bytes();
-        let attr_len = 8u16.to_be_bytes();
-        message.extend_from_slice(&attr_type);
-        message.extend_from_slice(&attr_len);
-        message.push(0x00);
-        message.push(0x01);
-        let cookie_bytes = 0x2112_A442u32.to_be_bytes();
-        let port_mask = u16::from_be_bytes([cookie_bytes[0], cookie_bytes[1]]);
-        let x_port = port ^ port_mask;
-        message.extend_from_slice(&x_port.to_be_bytes());
-        let ip_bytes = ip.octets();
-        for i in 0..4 {
-            message.push(ip_bytes[i] ^ cookie_bytes[i]);
-        }
-        let declared_len = (message.len() - 20) as u16;
-        message[2..4].copy_from_slice(&declared_len.to_be_bytes());
-        let parsed =
-            parse_stun_xor_mapped_address(message.as_slice(), transaction_id).expect("parse");
-        assert_eq!(parsed.port(), port);
-        assert_eq!(parsed.ip(), IpAddr::V4(ip));
-    }
-
-    #[test]
-    fn parse_stun_xor_mapped_address_malformed_rejected() {
-        let bad = vec![0u8; 10];
-        let tid = [0u8; 12];
-        let err = parse_stun_xor_mapped_address(bad.as_slice(), tid).expect_err("malformed");
-        assert!(matches!(err, TraversalError::Stun(_)));
-    }
-
+    // The STUN parser fixture tests that lived here moved to
+    // `stun_client.rs` with the NAT-3 wire-format consolidation (see
+    // `canonical_parser_accepts_traversal_ipv4_fixture` and
+    // `parse_binding_response_never_panics_on_arbitrary_input` there);
+    // the gather tests below exercise the delegated path end-to-end.
     #[test]
     fn candidate_gatherer_query_and_timeout_and_filter_and_dedup() {
         let rustynet_if_ips = [IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))];
@@ -2920,9 +2641,42 @@ mod tests {
         let requests_seen = handle.join().expect("server joins");
         assert_eq!(
             requests_seen,
-            usize::from(super::STUN_MAX_REQUEST_ATTEMPTS),
+            usize::from(crate::stun_client::STUN_MAX_REQUEST_ATTEMPTS),
             "ladder must stop at Rc sends"
         );
+    }
+
+    #[test]
+    fn stun_gather_all_responsive_fixture_is_deterministic() {
+        // NAT-3 determinism pin: on an all-responsive fixture the
+        // consolidated (delegated-to-core) gather must produce the same
+        // candidate set as the pre-consolidation implementation — one
+        // srflx candidate per distinct mapped endpoint, assembled in
+        // server order.
+        let (server_a, handle_a) = spawn_stun_ladder_server(0, true, Duration::from_secs(4));
+        let (server_b, handle_b) = spawn_stun_ladder_server(0, true, Duration::from_secs(4));
+        let gatherer = ladder_test_gatherer(vec![server_a, server_b], Duration::from_secs(2));
+
+        let candidates = gatherer.gather();
+        let srflx: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.source == CandidateSource::ServerReflexive)
+            .collect();
+        // Both loopback echoes observe the same client socket, so both
+        // report the identical mapped endpoint; dedup keeps exactly one.
+        assert_eq!(srflx.len(), 1, "identical mappings must dedup to one");
+        assert_eq!(
+            srflx[0].endpoint.port,
+            gatherer
+                .local_socket
+                .local_addr()
+                .expect("local addr")
+                .port(),
+            "loopback srflx endpoint must mirror the bound socket port"
+        );
+        let requests_a = handle_a.join().expect("server a joins");
+        let requests_b = handle_b.join().expect("server b joins");
+        assert_eq!((requests_a, requests_b), (1, 1), "no retransmit needed");
     }
 
     fn rerank_pair(
@@ -4108,60 +3862,6 @@ mod tests {
 
         index.prune_expired(200);
         assert_eq!(index.len(), 0);
-    }
-
-    fn valid_stun_xor_mapped_message(transaction_id: [u8; 12]) -> Vec<u8> {
-        let mut message = Vec::new();
-        message.extend_from_slice(&0x0101u16.to_be_bytes());
-        message.extend_from_slice(&0u16.to_be_bytes());
-        message.extend_from_slice(&0x2112_A442u32.to_be_bytes());
-        message.extend_from_slice(&transaction_id);
-        message.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
-        message.extend_from_slice(&8u16.to_be_bytes()); // attr len
-        message.push(0x00);
-        message.push(0x01); // IPv4 family
-        let cookie = 0x2112_A442u32.to_be_bytes();
-        let port_mask = u16::from_be_bytes([cookie[0], cookie[1]]);
-        message.extend_from_slice(&(51820u16 ^ port_mask).to_be_bytes());
-        for (i, octet) in Ipv4Addr::new(203, 0, 113, 5).octets().iter().enumerate() {
-            message.push(octet ^ cookie[i]);
-        }
-        let declared_len = (message.len() - 20) as u16;
-        message[2..4].copy_from_slice(&declared_len.to_be_bytes());
-        message
-    }
-
-    #[test]
-    fn parse_stun_xor_mapped_address_never_panics_on_arbitrary_input() {
-        // Parser-never-panics invariant: the STUN binding-response decoder runs
-        // on untrusted network bytes, so on any input — truncated mid-attribute,
-        // bit-flipped, or random — it must return Err, never panic.
-        let tid: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        let valid = valid_stun_xor_mapped_message(tid);
-
-        for len in 0..=valid.len() {
-            let _ = parse_stun_xor_mapped_address(&valid[..len], tid);
-        }
-        for i in 0..valid.len() {
-            let mut corrupted = valid.clone();
-            corrupted[i] ^= 0xFF;
-            let _ = parse_stun_xor_mapped_address(&corrupted, tid);
-        }
-        for len in [0usize, 1, 19, 20, 21, 64, 512, 4096] {
-            let _ = parse_stun_xor_mapped_address(&vec![0u8; len], tid);
-            let _ = parse_stun_xor_mapped_address(&vec![0xFFu8; len], tid);
-        }
-        let mut seed = 0xDEAD_BEEF_CAFE_F00Du64;
-        for len in 0..384usize {
-            let mut bytes = Vec::with_capacity(len);
-            for _ in 0..len {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                bytes.push((seed >> 33) as u8);
-            }
-            let _ = parse_stun_xor_mapped_address(&bytes, tid);
-        }
     }
 
     #[test]
