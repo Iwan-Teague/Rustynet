@@ -14,18 +14,15 @@ use serde_json::Value;
 
 use crate::vm_lab::orchestrator;
 use crate::vm_lab::orchestrator::evidence::{
-    RustNativeStageRecorder, rust_native_vm_lab_stage_outcome, validate_collected_os_version,
-    validate_rust_native_reuse_evidence, write_rust_native_failure_digest,
-    write_rust_native_node_stage_plan, write_rust_native_report_state_final,
-    write_rust_native_report_state_initial, write_rust_native_reuse_evidence_seal,
-    write_rust_native_run_summary,
+    RustNativeFinalizeInputs, RustNativeStageRecorder, finalize_rust_native_run,
+    validate_collected_os_version, validate_rust_native_reuse_evidence,
+    write_rust_native_node_stage_plan, write_rust_native_report_state_initial,
 };
 use crate::vm_lab::{
     VmGuestPlatform, VmInventoryEntry, VmLabOrchestrateLiveLabConfig, collected_at_utc_now,
     ensure_local_regular_file_path, ensure_report_dir_fresh, file_sha256_hex,
     finalize_vm_lab_orchestration_result_with_inventory, load_inventory, network_audit,
-    network_profile, normalize_manifest_path, resolve_absolute_path,
-    validate_live_lab_run_artifacts, write_orchestration_artifact,
+    network_profile, normalize_manifest_path, resolve_absolute_path, write_orchestration_artifact,
 };
 
 pub(crate) fn execute_rust_native_orchestration(
@@ -697,8 +694,6 @@ pub(crate) fn execute_rust_native_orchestration(
         ));
     }
 
-    let mut evidence_errors = recorder.take_errors();
-
     let passed = results
         .iter()
         .filter(|(_, o)| matches!(o, StageOutcome::Passed))
@@ -717,183 +712,72 @@ pub(crate) fn execute_rust_native_orchestration(
         })
         .count();
 
-    // Bucket 2 (evidence parity): write run_summary.json/.md (+ state/nodes.tsv)
-    // so validate_live_lab_run_artifacts passes and the run-matrix run_note is
-    // populated for --node runs, at parity with the bash path. Mandatory: a
-    // missing summary prevents evidence finalization.
-    if let Err(err) = write_rust_native_run_summary(
-        report_dir.as_path(),
-        &node_targets,
-        &ctx.node_ids,
-        ctx.network_id.as_str(),
-        passed,
-        failed,
-        skipped,
-        results.len(),
-        run_started_unix,
-        run_started_utc.as_str(),
-        config.source_mode.as_deref().unwrap_or("working-tree"),
-        config.repo_ref.as_deref(),
-        &os_versions,
-    ) {
-        evidence_errors.push(format!("write run summary failed: {err}"));
-    }
-    if failed > 0 {
-        let run_id = format!("rust-{run_started_unix}");
-        if let Err(err) = write_rust_native_failure_digest(
-            report_dir.as_path(),
-            run_id.as_str(),
-            ctx.network_id.as_str(),
-            "fail",
-        ) {
-            evidence_errors.push(format!("write failure digest failed: {err}"));
-        }
-    }
-
-    // Emit the parity-input JSON snapshot used by the W5.5 cross-orchestrator
-    // diff harness. Failure to write it does not fail the run; it is
-    // surfaced to the operator log so they know to re-run before claiming
-    // parity evidence.
-    let parity_path = report_dir.join("parity_input.json");
-    let timestamp_utc = format!(
-        "{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    );
-    let run_id = format!("rust-{timestamp_utc}");
-    let live_lab_report =
-        orchestrator::parity::build_live_lab_run_report(run_id, timestamp_utc, &ctx, &results);
-    match serde_json::to_vec_pretty(&live_lab_report) {
-        Ok(bytes) => {
-            if let Err(err) = fs::write(&parity_path, &bytes) {
-                evidence_errors.push(format!(
-                    "write parity input snapshot at {} failed: {err}",
-                    parity_path.display()
-                ));
-            }
-        }
-        Err(err) => {
-            evidence_errors.push(format!("serialize parity input snapshot failed: {err}"));
-        }
-    }
-
     eprintln!(
         "rust orchestrator: {} node(s), {} stage(s); passed={passed} failed={failed} \
          skipped={skipped}; parity_input: {}",
         ctx.assignments.len(),
         results.len(),
-        parity_path.display()
+        report_dir.join("parity_input.json").display()
     );
 
-    // Complete the run's own outcome record through the SAME shared recorder
-    // the bash/wrapper path uses (Finding 4): one run-matrix writer (finalize's
-    // upsert — NOT a second bespoke append, which the degenerate no-stages.tsv
-    // run key would have turned into a duplicate row), the
-    // orchestrate_result.json the monitor renders, and the barrier-exempt
-    // completeness reconcile. The realtime stages.tsv rows were emitted live by
-    // the observer above; finalize's verdict (Fail iff any stage Failed) equals
-    // the previous `failed > 0 => Err`.
-    let orchestration_dir = report_dir.join("orchestration");
-    let mut vm_lab_outcomes = readiness_outcomes;
-    vm_lab_outcomes.extend(
-        results
-            .iter()
-            .map(|(id, outcome)| {
-                rust_native_vm_lab_stage_outcome(report_dir.as_path(), &parity_path, id, outcome)
-            })
-            .collect::<Vec<_>>(),
-    );
-    // Enforce the SAME artifact-completeness contract the bash path checks
-    // (run_summary.json/.md + state/{stages,nodes}.tsv present, every recorded
-    // stage log exists, and a failure digest exists when a stage failed). Run
-    // after the Rust summary/digest writer and finalize. Best-effort: a gap is
-    // surfaced to the operator log, not turned into a false pass/fail, so the
-    // finalize verdict still governs.
-    if let Err(err) = validate_live_lab_run_artifacts(report_dir.as_path()) {
-        evidence_errors.push(format!("artifact completeness check failed: {err}"));
-    }
-    // Persist the run's orchestration context so (a) a later
-    // `--rerun-stage`/`--resume-from` can reload+reuse it and (b) the
-    // reuse-evidence seal below can bind it into the run's digest. A fresh
-    // full run never wrote it (only `--setup-only` did, at the earlier persist
-    // block; `--run-only` loaded it), so without this a fully-green full run
-    // fails the seal with "state/orchestration_context.json: No such file" and
-    // never records a matrix row — no green `--node` run could produce
-    // evidence. Failure demotes the run (evidence_errors), never a fake pass.
-    if !setup_only && !run_only {
+    // RNQ-05: finalize this run's evidence as ONE transaction owned by
+    // `finalize_rust_native_run` — run summary, failure digest, parity
+    // snapshot, artifact completeness, context persist, reuse seal, the
+    // fail-closed gate, the matrix append, the report-dir durability barrier,
+    // and the commit marker STRICTLY LAST. The inline sequence this replaces
+    // wrote `run_passed=true` BEFORE the matrix append and demoted on a
+    // discarded Result — a crash in that window left a durable pass marker
+    // with no matrix row. The transaction (with its per-writer
+    // fault-injection tests) is now the single finalization path.
+    let mut prior_evidence_errors = recorder.take_errors();
+    // A full run persists its context inside the transaction (sealed into the
+    // reuse digest); `--setup-only` persisted it above and `--run-only`
+    // loaded it, so neither carries a binding here. A binding that cannot be
+    // built is an evidence error: the run demotes rather than sealing
+    // evidence that omits the context.
+    let context_binding_for_finalize = if !setup_only && !run_only {
         match context_binding() {
-            Ok(binding) => {
-                if let Err(err) = ctx.save_bound(context_path.as_path(), &binding) {
-                    evidence_errors.push(format!("persist orchestration context failed: {err}"));
-                }
-            }
+            Ok(binding) => Some(binding),
             Err(err) => {
-                evidence_errors.push(format!("build orchestration context binding failed: {err}"));
+                prior_evidence_errors
+                    .push(format!("build orchestration context binding failed: {err}"));
+                None
             }
         }
-    }
-    let has_not_run = results
-        .iter()
-        .any(|(_, outcome)| matches!(outcome, StageOutcome::NotRun));
-    let candidate_pass = failed == 0 && !has_not_run && evidence_errors.is_empty();
-    if let Err(err) = write_rust_native_report_state_final(
-        report_dir.as_path(),
-        candidate_pass,
-        config.source_mode.as_deref().unwrap_or("working-tree"),
-        config.repo_ref.as_deref(),
-        skip_live_suite,
-        config.skip_soak,
-        config.skip_cross_network,
-    ) {
-        evidence_errors.push(format!("write final report_state.json failed: {err}"));
-    }
-    if candidate_pass
-        && evidence_errors.is_empty()
-        && let Err(err) = write_rust_native_reuse_evidence_seal(report_dir.as_path())
-    {
-        evidence_errors.push(format!("write reuse evidence seal failed: {err}"));
-    }
-    if !evidence_errors.is_empty() {
-        // Best-effort demotion: if the candidate final-state write succeeded
-        // before a later evidence error was discovered, never leave it as pass.
-        let _ = write_rust_native_report_state_final(
-            report_dir.as_path(),
-            false,
-            config.source_mode.as_deref().unwrap_or("working-tree"),
-            config.repo_ref.as_deref(),
-            skip_live_suite,
-            config.skip_soak,
-            config.skip_cross_network,
-        );
-        return Err(format!(
-            "Rust --node evidence finalization failed: {}",
-            evidence_errors.join("; ")
-        ));
-    }
+    } else {
+        None
+    };
 
-    let finalized = finalize_vm_lab_orchestration_result_with_inventory(
-        "vm-lab-orchestrate-live-lab",
-        report_dir.as_path(),
-        orchestration_dir.as_path(),
-        Some(inventory_path.as_path()),
-        vm_lab_outcomes,
-        Vec::new(),
-        Vec::new(),
-    );
-    if finalized.is_err() && candidate_pass {
-        let _ = write_rust_native_report_state_final(
-            report_dir.as_path(),
-            false,
-            config.source_mode.as_deref().unwrap_or("working-tree"),
-            config.repo_ref.as_deref(),
+    let orchestration_dir = report_dir.join("orchestration");
+    finalize_rust_native_run(
+        RustNativeFinalizeInputs {
+            ctx: &ctx,
+            results: &results,
+            node_targets: &node_targets,
+            os_versions: &os_versions,
+            readiness_outcomes,
+            context_binding: context_binding_for_finalize,
+            prior_evidence_errors,
+            run_started_unix,
+            run_started_utc: run_started_utc.as_str(),
+            source_mode: config.source_mode.as_deref().unwrap_or("working-tree"),
+            repo_ref: config.repo_ref.as_deref(),
             skip_live_suite,
-            config.skip_soak,
-            config.skip_cross_network,
-        );
-    }
-    finalized
+            skip_soak: config.skip_soak,
+            skip_cross_network: config.skip_cross_network,
+        },
+        |vm_lab_outcomes| {
+            finalize_vm_lab_orchestration_result_with_inventory(
+                "vm-lab-orchestrate-live-lab",
+                report_dir.as_path(),
+                orchestration_dir.as_path(),
+                Some(inventory_path.as_path()),
+                vm_lab_outcomes,
+                Vec::new(),
+                Vec::new(),
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

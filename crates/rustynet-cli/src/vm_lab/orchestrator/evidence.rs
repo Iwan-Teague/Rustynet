@@ -758,7 +758,6 @@ pub(crate) fn validate_collected_os_version(
 /// demotes the run (no matrix pass row, no `run_passed=true` marker). The
 /// [`EvidenceWriter`] tag lets a test inject a fault at exactly one writer and
 /// prove that demotion (see [`set_evidence_fault`]).
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum EvidenceWriter {
     RunSummary,
@@ -768,6 +767,7 @@ pub(crate) enum EvidenceWriter {
     ContextPersist,
     ReuseSeal,
     MatrixAppend,
+    DurabilityBarrier,
     CommitMarker,
 }
 
@@ -788,7 +788,6 @@ pub(crate) fn set_evidence_fault(writer: Option<EvidenceWriter>) {
 /// Fault seam consulted at every evidence-writer call site in the finalizer.
 /// In a non-test build this is a zero-cost `Ok(())`; under `cfg(test)` it
 /// returns an injected error when its tag matches the armed writer.
-#[allow(dead_code)]
 fn evidence_fault_gate(writer: EvidenceWriter) -> Result<(), String> {
     #[cfg(test)]
     {
@@ -802,7 +801,6 @@ fn evidence_fault_gate(writer: EvidenceWriter) -> Result<(), String> {
 
 /// Inputs to [`finalize_rust_native_run`]. Borrowed from the executor's live
 /// state so the finalizer owns only the write sequence, not the run.
-#[allow(dead_code)]
 pub(crate) struct RustNativeFinalizeInputs<'a> {
     /// The run's orchestration context (source of `report_dir`, `node_ids`,
     /// `network_id`, and the persisted-context payload).
@@ -833,7 +831,6 @@ pub(crate) struct RustNativeFinalizeInputs<'a> {
     pub skip_cross_network: bool,
 }
 
-#[allow(dead_code)]
 fn write_report_state_marker(
     report_dir: &Path,
     run_passed: bool,
@@ -850,6 +847,64 @@ fn write_report_state_marker(
     )
 }
 
+/// RNQ-05 durability barrier: force every evidence artifact under the report
+/// directory durable before the pass marker itself becomes durable. The
+/// commit marker's own fsync makes only `report_state.json` durable — most
+/// evidence writers (stage logs, `nodes.tsv`, run summaries, the stage
+/// manifest/rows, `orchestrate_result.json`) are plain or rename-only writes
+/// whose pages a power loss can still drop, which would leave a durable
+/// `run_passed=true` vouching for torn or vanished evidence — exactly the
+/// partial pass RNQ-05 forbids. Walks the tree syncing regular files, then
+/// syncs every directory. Symlinks are never followed: an evidence tree
+/// contains none, and following one could traverse outside the report dir.
+/// Unix-only, matching the directory-fsync precedent in
+/// [`orchestrator::context::atomic_write_fsync`] (the orchestrator host is
+/// macOS/Linux; Windows guests never drive a `--node` run).
+fn sync_report_dir_tree(root: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut pending = vec![root.to_path_buf()];
+        let mut directories = Vec::new();
+        while let Some(dir) = pending.pop() {
+            let entries = fs::read_dir(&dir)
+                .map_err(|err| format!("read evidence directory '{}': {err}", dir.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|err| {
+                    format!(
+                        "read evidence directory entry in '{}': {err}",
+                        dir.display()
+                    )
+                })?;
+                let file_type = entry.file_type().map_err(|err| {
+                    format!("stat evidence entry '{}': {err}", entry.path().display())
+                })?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if file_type.is_file() {
+                    let path = entry.path();
+                    fs::File::open(&path)
+                        .and_then(|file| file.sync_all())
+                        .map_err(|err| format!("sync evidence file '{}': {err}", path.display()))?;
+                }
+            }
+            directories.push(dir);
+        }
+        for dir in directories {
+            fs::File::open(&dir)
+                .and_then(|handle| handle.sync_all())
+                .map_err(|err| format!("sync evidence directory '{}': {err}", dir.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+    }
+    Ok(())
+}
+
 /// Finalize a `--node` run's evidence as one transaction whose LAST fsync'd
 /// write is `report_state.json` with `run_passed=true` — the run's single
 /// durable commit marker (RNQ-05).
@@ -864,14 +919,16 @@ fn write_report_state_marker(
 /// 7. **fail-closed gate** — if ANY of 1-6 errored, write the not-passed marker
 ///    and return `Err` WITHOUT appending a matrix row (no pass row is produced)
 /// 8. matrix append + `orchestrate_result.json` (`matrix_finalize`)
-/// 9. **commit marker LAST** — `report_state.json run_passed = candidate_pass
-///    && matrix_finalize succeeded`
+/// 9. **durability barrier** (pass path only) — fsync every artifact under the
+///    report dir so nothing the marker vouches for can be lost to power fail
+/// 10. **commit marker LAST** — `report_state.json run_passed = candidate_pass
+///     && matrix_finalize succeeded && barrier held`
 ///
-/// A crash anywhere before step 9 leaves `run_passed=false`, so an interrupted
-/// run is never mistaken for a pass. `matrix_finalize` is injected so the real
-/// run-matrix append (which mutates the repo CSV) stays out of unit tests, and
-/// so tests can observe that the marker is written strictly after it.
-#[allow(dead_code)]
+/// A crash anywhere before step 10 leaves `run_passed=false`, so an
+/// interrupted run is never mistaken for a pass. `matrix_finalize` is injected
+/// so the real run-matrix append (which mutates the repo CSV) stays out of
+/// unit tests, and so tests can observe that the marker is written strictly
+/// after it.
 pub(crate) fn finalize_rust_native_run<F>(
     mut inputs: RustNativeFinalizeInputs<'_>,
     matrix_finalize: F,
@@ -1023,9 +1080,24 @@ where
     };
     let committed = candidate_pass && finalized.is_ok();
 
-    // 9. Commit marker LAST: report_state.json run_passed=committed is the final
-    // durable fsync'd write. If it fails, the prior not-passed state persists
-    // (fail-closed) and we return Err rather than claim a pass.
+    // 9. Durability barrier, pass path only: the marker's own fsync makes only
+    // report_state.json durable, so every artifact it vouches for — stage
+    // logs, nodes.tsv, summaries, the manifest/rows, orchestrate_result.json —
+    // must be forced durable FIRST, or a power cut after the marker could keep
+    // a durable run_passed=true over torn evidence. A demoting run skips the
+    // barrier: its marker is written false, which the initial state already
+    // holds durably.
+    if committed
+        && let Err(err) = evidence_fault_gate(EvidenceWriter::DurabilityBarrier)
+            .and_then(|()| sync_report_dir_tree(report_dir))
+    {
+        let _ = write_report_state_marker(report_dir, false, &inputs);
+        return Err(format!("evidence durability barrier failed: {err}"));
+    }
+
+    // 10. Commit marker LAST: report_state.json run_passed=committed is the
+    // final durable fsync'd write. If it fails, the prior not-passed state
+    // persists (fail-closed) and we return Err rather than claim a pass.
     if let Err(err) = evidence_fault_gate(EvidenceWriter::CommitMarker)
         .and_then(|()| write_report_state_marker(report_dir, committed, &inputs))
     {
@@ -1223,10 +1295,18 @@ mod finalize_tests {
             "fault at {writer:?} must leave run_passed=false (no commit marker)"
         );
         // Any writer that runs before the matrix append must abort before it,
-        // so no matrix pass row is ever produced. Only a CommitMarker fault
-        // happens after the append (that row is reconciled to non-pass by the
-        // false marker, RNQ-06).
-        if !matches!(writer, EvidenceWriter::CommitMarker) {
+        // so no matrix pass row is ever produced. Only the DurabilityBarrier
+        // and CommitMarker faults happen after the append (that row is
+        // reconciled to non-pass by the false marker, RNQ-06).
+        if matches!(
+            writer,
+            EvidenceWriter::DurabilityBarrier | EvidenceWriter::CommitMarker
+        ) {
+            assert!(
+                matrix_called.get(),
+                "fault at {writer:?} occurs after the matrix append"
+            );
+        } else {
             assert!(
                 !matrix_called.get(),
                 "fault at {writer:?} must abort before the matrix append (no pass row)"
@@ -1275,6 +1355,18 @@ mod finalize_tests {
     #[test]
     fn fault_at_matrix_append_demotes() {
         assert_fault_demotes(EvidenceWriter::MatrixAppend, false, "MatrixAppend");
+    }
+
+    /// The barrier runs only on the pass path (after a successful matrix
+    /// append); a barrier failure means durability of the evidence the marker
+    /// would vouch for cannot be guaranteed, so the run demotes.
+    #[test]
+    fn fault_at_durability_barrier_demotes() {
+        assert_fault_demotes(
+            EvidenceWriter::DurabilityBarrier,
+            false,
+            "durability barrier",
+        );
     }
 
     #[test]
