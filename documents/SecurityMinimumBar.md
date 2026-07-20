@@ -19,10 +19,23 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
 - Mesh control traffic rides the WireGuard tunnel's authenticated encryption
   (Noise IK handshake, ChaCha20-Poly1305); there is no separate TLS stack and
   no TLS library is a workspace dependency.
-- Any control state fetched outside the tunnel (e.g. anchor bundle pull over
-  plain TCP) is authenticated by ed25519 signature verification against a
-  pinned verifier key before it is applied or persisted — fail closed on any
-  verification error, never on transport trust.
+- Signed membership updates (gossip convergence, `membership apply-update`)
+  are authenticated by ed25519 signature verification against the current
+  approver set before being applied — fail closed on any verification error,
+  never on transport trust.
+- **Known gap:** the anchor bundle-pull endpoint (`anchor pull-bundle`) fetches
+  a bare membership-state snapshot over plain loopback TCP, gated only by a
+  bearer access token and a self-consistency digest — it is not yet
+  cryptographically bound to the signed update chain. No root-of-trust pin
+  (state-root commitment or verifier public key) currently exists for a
+  device pulling a snapshot with no prior local state, so this path cannot
+  reuse the existing delta-signature pipeline (`apply_signed_update`, which
+  validates a chain of signed operations against an already-trusted prior
+  state, not a bare snapshot) without a new signed-attestation schema or a
+  protocol extension to also serve the update log. Treat a pulled bundle as
+  provisional until independently corroborated via gossip convergence from an
+  already-trusted peer. Tracked as a High-severity open item pending a
+  reviewed design, not silently accepted.
 - Signed peer/control data validated by clients before application.
 
 3. Auth and enrollment hardening:
