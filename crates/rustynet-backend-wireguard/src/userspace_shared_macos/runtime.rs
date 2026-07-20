@@ -16,8 +16,8 @@ use rustynet_backend_api::{
 use super::socket::{AUTHORITATIVE_TRANSPORT_LABEL, AuthoritativeSocket};
 use super::tun::{MacosTunDevice, SharedMacosTunLifecycle};
 use crate::userspace_shared::engine::{
-    ConfigurePeerDisposition, RecordedPeerCiphertextIngress, RecordedTunnelPlaintextPacket,
-    UserspaceEngine,
+    ConfigurePeerDisposition, EngineIoSink, RecordedPeerCiphertextIngress,
+    RecordedTunnelPlaintextPacket, UserspaceEngine,
 };
 use crate::userspace_shared::handshake::HandshakeTelemetry;
 
@@ -53,6 +53,56 @@ pub(crate) struct RecordedPeerCiphertextEgress {
     pub(crate) remote_addr: SocketAddr,
     pub(crate) payload: Vec<u8>,
     pub(crate) transport_generation: u64,
+}
+
+/// Concrete [`EngineIoSink`] wired to the real authoritative UDP socket and
+/// TUN device: ciphertext is sent via [`AuthoritativeSocket::send_to`],
+/// plaintext is written via [`MacosTunDevice::send_packet`], both
+/// immediately and borrowed — no per-frame copy or allocation. `local_addr` /
+/// `transport_generation` are captured once per engine call (matching the
+/// single snapshot the previous `apply_engine_processing_outcome` took
+/// before its two apply loops) rather than re-queried per frame. Mirrors
+/// `userspace_shared::runtime::RuntimeIoSink`.
+struct RuntimeIoSink<'a> {
+    authoritative_socket: &'a AuthoritativeSocket,
+    tun_device: &'a MacosTunDevice,
+    local_addr: SocketAddr,
+    transport_generation: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    recorded_peer_ciphertext_egress: &'a mut Vec<RecordedPeerCiphertextEgress>,
+}
+
+impl EngineIoSink for RuntimeIoSink<'_> {
+    fn send_ciphertext(
+        &mut self,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(), BackendError> {
+        // Unbounded-growth guard: `recorded_peer_ciphertext_egress` is read only
+        // by `DebugRecordedPeerCiphertextEgress` (cfg(test)). Persisting every
+        // outbound ciphertext frame in production would grow without bound and
+        // keep a peer's ciphertext history in memory for the process lifetime.
+        // Record BEFORE attempting the send (matching the previous
+        // `apply_engine_processing_outcome` ordering) so a packet whose send
+        // fails is still visible in the test recording.
+        #[cfg(test)]
+        self.recorded_peer_ciphertext_egress
+            .push(RecordedPeerCiphertextEgress {
+                local_addr: self.local_addr,
+                remote_addr,
+                payload: payload.to_vec(),
+                transport_generation: self.transport_generation,
+            });
+        #[cfg(not(test))]
+        {
+            let _ = (self.local_addr, self.transport_generation);
+        }
+        self.authoritative_socket.send_to(remote_addr, payload)
+    }
+
+    fn write_plaintext(&mut self, payload: &[u8]) -> Result<(), BackendError> {
+        self.tun_device.send_packet(payload)
+    }
 }
 
 #[derive(Debug)]
@@ -617,12 +667,29 @@ impl RuntimeState {
         node_id: &NodeId,
         force_resend: bool,
     ) -> Result<(), BackendError> {
-        let outcome = self.engine.initiate_handshake(
-            node_id,
-            self.authoritative_socket.transport_generation(),
-            force_resend,
-        )?;
-        self.apply_engine_processing_outcome(outcome)
+        let local_addr = self.authoritative_socket.local_addr()?;
+        let transport_generation = self.authoritative_socket.transport_generation();
+        let Self {
+            engine,
+            authoritative_socket,
+            tun_device,
+            recorded_peer_ciphertext_egress,
+            handshake_telemetry,
+            ..
+        } = self;
+        let mut sink = RuntimeIoSink {
+            authoritative_socket: &*authoritative_socket,
+            tun_device: &*tun_device,
+            local_addr,
+            transport_generation,
+            recorded_peer_ciphertext_egress,
+        };
+        let observed_handshake =
+            engine.initiate_handshake(node_id, transport_generation, force_resend, &mut sink)?;
+        if let Some((node_id, observed_unix)) = observed_handshake {
+            handshake_telemetry.record_authenticated_handshake(&node_id, observed_unix);
+        }
+        Ok(())
     }
 
     fn apply_routes(&mut self, routes: Vec<Route>) -> Result<(), BackendError> {
@@ -831,13 +898,32 @@ impl RuntimeState {
             }
 
             let local_addr = self.authoritative_socket.local_addr()?;
-            let outcome = self.engine.process_inbound_ciphertext(
+            let transport_generation = self.authoritative_socket.transport_generation();
+            let Self {
+                engine,
+                authoritative_socket,
+                tun_device,
+                recorded_peer_ciphertext_egress,
+                handshake_telemetry,
+                ..
+            } = &mut *self;
+            let mut sink = RuntimeIoSink {
+                authoritative_socket: &*authoritative_socket,
+                tun_device: &*tun_device,
+                local_addr,
+                transport_generation,
+                recorded_peer_ciphertext_egress,
+            };
+            let observed_handshake = engine.process_inbound_ciphertext(
                 remote_addr,
                 local_addr,
                 payload,
-                self.authoritative_socket.transport_generation(),
+                transport_generation,
+                &mut sink,
             )?;
-            self.apply_engine_processing_outcome(outcome)?;
+            if let Some((node_id, observed_unix)) = observed_handshake {
+                handshake_telemetry.record_authenticated_handshake(&node_id, observed_unix);
+            }
         }
         self.udp_budget_exhausted = drained == budget;
         Ok(())
@@ -871,15 +957,32 @@ impl RuntimeState {
             };
             drained += 1;
             let packet = &scratch[..len];
-            let outcome = match self
-                .engine
-                .inject_plaintext_packet(packet, self.authoritative_socket.transport_generation())
-            {
-                Ok(outcome) => outcome,
-                Err(err) if should_drop_tun_plaintext_packet_error(&err) => continue,
-                Err(err) => return Err(err),
+            let transport_generation = self.authoritative_socket.transport_generation();
+            let Self {
+                engine,
+                authoritative_socket,
+                tun_device,
+                recorded_peer_ciphertext_egress,
+                handshake_telemetry,
+                ..
+            } = &mut *self;
+            let local_addr = authoritative_socket.local_addr()?;
+            let mut sink = RuntimeIoSink {
+                authoritative_socket: &*authoritative_socket,
+                tun_device: &*tun_device,
+                local_addr,
+                transport_generation,
+                recorded_peer_ciphertext_egress,
             };
-            self.apply_engine_processing_outcome(outcome)?;
+            let observed_handshake =
+                match engine.inject_plaintext_packet(packet, transport_generation, &mut sink) {
+                    Ok(observed) => observed,
+                    Err(err) if should_drop_tun_plaintext_packet_error(&err) => continue,
+                    Err(err) => return Err(err),
+                };
+            if let Some((node_id, observed_unix)) = observed_handshake {
+                handshake_telemetry.record_authenticated_handshake(&node_id, observed_unix);
+            }
         }
         self.tun_budget_exhausted = drained == MAX_TUN_PACKETS_PER_TICK;
         Ok(())
@@ -946,10 +1049,29 @@ impl RuntimeState {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn inject_plaintext_packet_for_test(&mut self, packet: Vec<u8>) -> Result<(), BackendError> {
-        let outcome = self
-            .engine
-            .inject_plaintext_packet(&packet, self.authoritative_socket.transport_generation())?;
-        self.apply_engine_processing_outcome(outcome)
+        let local_addr = self.authoritative_socket.local_addr()?;
+        let transport_generation = self.authoritative_socket.transport_generation();
+        let Self {
+            engine,
+            authoritative_socket,
+            tun_device,
+            recorded_peer_ciphertext_egress,
+            handshake_telemetry,
+            ..
+        } = self;
+        let mut sink = RuntimeIoSink {
+            authoritative_socket: &*authoritative_socket,
+            tun_device: &*tun_device,
+            local_addr,
+            transport_generation,
+            recorded_peer_ciphertext_egress,
+        };
+        let observed_handshake =
+            engine.inject_plaintext_packet(&packet, transport_generation, &mut sink)?;
+        if let Some((node_id, observed_unix)) = observed_handshake {
+            handshake_telemetry.record_authenticated_handshake(&node_id, observed_unix);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -960,42 +1082,6 @@ impl RuntimeState {
     #[cfg(test)]
     fn recorded_tun_outbound_packets(&self) -> Result<Vec<Vec<u8>>, BackendError> {
         self.tun_device.recorded_outbound_packets_for_test()
-    }
-
-    fn apply_engine_processing_outcome(
-        &mut self,
-        outcome: crate::userspace_shared::engine::EngineProcessingOutcome,
-    ) -> Result<(), BackendError> {
-        let local_addr = self.authoritative_socket.local_addr()?;
-        let transport_generation = self.authoritative_socket.transport_generation();
-        for packet in outcome.outbound_ciphertext_packets {
-            // Unbounded-growth guard: `recorded_peer_ciphertext_egress` is read only
-            // by `DebugRecordedPeerCiphertextEgress` (cfg(test)). Persisting every
-            // outbound ciphertext frame in production would grow without bound and
-            // keep a peer's ciphertext history in memory for the process lifetime.
-            #[cfg(test)]
-            self.recorded_peer_ciphertext_egress
-                .push(RecordedPeerCiphertextEgress {
-                    local_addr,
-                    remote_addr: packet.remote_addr,
-                    payload: packet.payload.clone(),
-                    transport_generation,
-                });
-            self.authoritative_socket
-                .send_to(packet.remote_addr, &packet.payload)?;
-        }
-        #[cfg(not(test))]
-        {
-            let _ = (local_addr, transport_generation);
-        }
-        for packet in outcome.tunnel_plaintext_packets {
-            self.tun_device.send_packet(&packet)?;
-        }
-        if let Some((node_id, observed_unix)) = outcome.authenticated_handshake {
-            self.handshake_telemetry
-                .record_authenticated_handshake(&node_id, observed_unix);
-        }
-        Ok(())
     }
 }
 

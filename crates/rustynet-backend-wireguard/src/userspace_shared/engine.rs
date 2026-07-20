@@ -31,17 +31,24 @@ pub(crate) struct RecordedTunnelPlaintextPacket {
     pub(crate) transport_generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OutboundCiphertextPacket {
-    pub(crate) remote_addr: SocketAddr,
-    pub(crate) payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct EngineProcessingOutcome {
-    pub(crate) outbound_ciphertext_packets: Vec<OutboundCiphertextPacket>,
-    pub(crate) tunnel_plaintext_packets: Vec<Vec<u8>>,
-    pub(crate) authenticated_handshake: Option<(NodeId, u64)>,
+/// Sink for immediately dispatching per-frame engine processing results —
+/// outbound ciphertext (network send) and inbound plaintext (TUN write) —
+/// as boringtun produces them, instead of collecting them into an owned
+/// outcome buffer that the caller copies out of and applies later. The
+/// slice handed to each method is BORROWED from the engine's own scratch
+/// buffers (`decrypt_scratch` / `decrypt_follow_up_scratch` /
+/// `encrypt_scratch`); implementations must not retain it past the call.
+/// Generic (not `dyn`) at every call site so dispatch monomorphizes into a
+/// direct call on this per-packet hot path.
+pub(crate) trait EngineIoSink {
+    /// Send one outbound WireGuard ciphertext datagram to `remote_addr`.
+    fn send_ciphertext(
+        &mut self,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(), BackendError>;
+    /// Write one decrypted plaintext packet to the local TUN device.
+    fn write_plaintext(&mut self, payload: &[u8]) -> Result<(), BackendError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,12 +289,13 @@ impl UserspaceEngine {
         Ok(())
     }
 
-    pub(crate) fn initiate_handshake(
+    pub(crate) fn initiate_handshake<S: EngineIoSink>(
         &mut self,
         node_id: &NodeId,
         transport_generation: u64,
         force_resend: bool,
-    ) -> Result<EngineProcessingOutcome, BackendError> {
+        sink: &mut S,
+    ) -> Result<Option<(NodeId, u64)>, BackendError> {
         let Some(peer_state) = self.peer_states.get_mut(node_id) else {
             return Err(BackendError::invalid_input("peer is not configured"));
         };
@@ -295,13 +303,14 @@ impl UserspaceEngine {
         let initial_result = peer_state
             .tunnel
             .format_handshake_initiation(&mut encrypt_buf, force_resend);
-        Ok(drive_outbound_result(
+        drive_outbound_result(
             node_id,
             peer_state,
             transport_generation,
             initial_result,
             &mut self.recorded_tunnel_plaintext_packets,
-        ))
+            sink,
+        )
     }
 
     pub(crate) fn current_peer_endpoint(&self, node_id: &NodeId) -> Option<SocketEndpoint> {
@@ -328,13 +337,14 @@ impl UserspaceEngine {
         self.peer_states.remove(node_id).is_some()
     }
 
-    pub(crate) fn process_inbound_ciphertext(
+    pub(crate) fn process_inbound_ciphertext<S: EngineIoSink>(
         &mut self,
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
         payload: &[u8],
         transport_generation: u64,
-    ) -> Result<EngineProcessingOutcome, BackendError> {
+        sink: &mut S,
+    ) -> Result<Option<(NodeId, u64)>, BackendError> {
         // Dispatch by the canonical WireGuard receiver index first (handshake
         // responses, cookie replies, and data packets carry it) and fall back to
         // the source-address/endpoint match for handshake inits (which carry no
@@ -367,7 +377,7 @@ impl UserspaceEngine {
         }
 
         let Some(node_id) = matched_node_id else {
-            return Ok(EngineProcessingOutcome::default());
+            return Ok(None);
         };
 
         let Self {
@@ -384,7 +394,7 @@ impl UserspaceEngine {
             peer_state
                 .tunnel
                 .decapsulate(Some(remote_addr.ip()), payload, decrypt_scratch);
-        Ok(drive_inbound_result(
+        drive_inbound_result(
             &node_id,
             peer_state,
             remote_addr,
@@ -392,15 +402,17 @@ impl UserspaceEngine {
             initial_result,
             recorded_tunnel_plaintext_packets,
             decrypt_follow_up_scratch,
-        ))
+            sink,
+        )
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn inject_plaintext_packet(
+    pub(crate) fn inject_plaintext_packet<S: EngineIoSink>(
         &mut self,
         packet: &[u8],
         transport_generation: u64,
-    ) -> Result<EngineProcessingOutcome, BackendError> {
+        sink: &mut S,
+    ) -> Result<Option<(NodeId, u64)>, BackendError> {
         let Some(dst_addr) = Tunn::dst_address(packet) else {
             return Err(BackendError::invalid_input(
                 "plaintext packet does not contain a valid IPv4/IPv6 destination address",
@@ -430,13 +442,14 @@ impl UserspaceEngine {
             encrypt_scratch.resize(needed, 0);
         }
         let initial_result = peer_state.tunnel.encapsulate(packet, encrypt_scratch);
-        Ok(drive_outbound_result(
+        drive_outbound_result(
             &node_id,
             peer_state,
             transport_generation,
             initial_result,
             recorded_tunnel_plaintext_packets,
-        ))
+            sink,
+        )
     }
 
     pub(crate) fn stats(&self) -> EngineStats {
@@ -585,7 +598,8 @@ impl UserspaceEngine {
     }
 }
 
-fn drive_inbound_result(
+#[allow(clippy::too_many_arguments)]
+fn drive_inbound_result<S: EngineIoSink>(
     node_id: &NodeId,
     peer_state: &mut PeerEngineState,
     remote_addr: SocketAddr,
@@ -593,86 +607,130 @@ fn drive_inbound_result(
     initial_result: TunnResult<'_>,
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
     follow_up_scratch: &mut [u8],
-) -> EngineProcessingOutcome {
+    sink: &mut S,
+) -> Result<Option<(NodeId, u64)>, BackendError> {
     let should_drain_follow_ups = !matches!(initial_result, TunnResult::Err(_));
-    let mut outcome = handle_single_tunn_result(
+    // The initial result's plaintext (if any) is DEFERRED rather than written
+    // immediately: today's emission order is "all ciphertext sends, then
+    // plaintext writes" per call (see `apply_engine_processing_outcome`'s two
+    // separate loops), and the only way a single `process_inbound_ciphertext`
+    // call can ever produce a plaintext followed by more ciphertext is exactly
+    // this case — a data packet (initial = WriteToTunnelV4/V6) whose follow-up
+    // drain flushes queued outbound packets that only just became sendable
+    // (initial = WriteToNetwork triggering `set_current_session`). Deferring
+    // preserves that order with zero extra copy: `decrypt_scratch` (the
+    // initial result's buffer) is never touched by the follow-up loop below,
+    // which writes only into the distinct `follow_up_scratch`, so the
+    // borrowed slice stays valid until flushed after the loop.
+    let mut deferred_plaintext = handle_single_tunn_result(
         node_id,
         remote_addr,
         transport_generation,
         initial_result,
         recorded_tunnel_plaintext_packets,
-    );
+        sink,
+    )?;
 
     if should_drain_follow_ups {
         loop {
-            // Reuse the long-lived drain buffer; each iteration's result is
-            // copied out by `handle_single_tunn_result` before the next reuse.
+            // Reuse the long-lived drain buffer; each iteration's ciphertext
+            // result is sent (borrowed, no copy) before the next reuse.
             let follow_up = peer_state.tunnel.decapsulate(None, &[], follow_up_scratch);
             if matches!(follow_up, TunnResult::Done) {
                 break;
             }
-            let next = handle_single_tunn_result(
+            let follow_up_plaintext = handle_single_tunn_result(
                 node_id,
                 remote_addr,
                 transport_generation,
                 follow_up,
                 recorded_tunnel_plaintext_packets,
-            );
-            merge_engine_processing_outcomes(&mut outcome, next);
+                sink,
+            )?;
+            if follow_up_plaintext.is_some() {
+                // Structurally unreachable: boringtun's empty-datagram
+                // decapsulate path (`Tunn::send_queued_packet`) only ever
+                // re-encapsulates queued OUTBOUND packets, which can only
+                // yield WriteToNetwork/Done/Err — never WriteToTunnelV4/V6.
+                // A plaintext frame here would mean that contract changed
+                // underneath us; fail closed (this is the engine's only
+                // caller path that already tears down the worker on error,
+                // per the invariant pins) instead of silently misordering it
+                // relative to the ciphertext-then-plaintext application order
+                // every caller relies on.
+                return Err(BackendError::internal(
+                    "linux userspace-shared engine follow-up decapsulate unexpectedly produced a tunnel plaintext packet",
+                ));
+            }
         }
     }
 
-    let observed_handshake = authenticated_handshake_unix(&peer_state.tunnel);
-    if let Some(observed_handshake) = observed_handshake {
-        outcome.authenticated_handshake = Some((node_id.clone(), observed_handshake));
+    if let Some(plaintext) = deferred_plaintext.take() {
+        sink.write_plaintext(plaintext)?;
     }
-    outcome
+
+    Ok(
+        authenticated_handshake_unix(&peer_state.tunnel)
+            .map(|observed| (node_id.clone(), observed)),
+    )
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn drive_outbound_result(
+fn drive_outbound_result<S: EngineIoSink>(
     node_id: &NodeId,
     peer_state: &mut PeerEngineState,
     transport_generation: u64,
     initial_result: TunnResult<'_>,
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
-) -> EngineProcessingOutcome {
-    let mut outcome = handle_single_tunn_result(
+    sink: &mut S,
+) -> Result<Option<(NodeId, u64)>, BackendError> {
+    // `encapsulate`/`format_handshake_initiation` (the only sources of an
+    // outbound `initial_result`) never produce WriteToTunnelV4/V6 — that
+    // variant is exclusively an inbound/decapsulate concern — but
+    // `handle_single_tunn_result` is shared, so handle it defensively rather
+    // than assume: write it immediately (there is no drain loop here to
+    // reorder around).
+    if let Some(plaintext) = handle_single_tunn_result(
         node_id,
         peer_state.endpoint,
         transport_generation,
         initial_result,
         recorded_tunnel_plaintext_packets,
-    );
-    let observed_handshake = authenticated_handshake_unix(&peer_state.tunnel);
-    if let Some(observed_handshake) = observed_handshake {
-        outcome.authenticated_handshake = Some((node_id.clone(), observed_handshake));
+        sink,
+    )? {
+        sink.write_plaintext(plaintext)?;
     }
-    outcome
+    Ok(
+        authenticated_handshake_unix(&peer_state.tunnel)
+            .map(|observed| (node_id.clone(), observed)),
+    )
 }
 
-fn handle_single_tunn_result(
+/// Dispatches a single boringtun `TunnResult`: an outbound ciphertext frame
+/// is sent through `sink` immediately (borrowed, no copy — it must not
+/// outlive this call, since the next drain iteration reuses the same scratch
+/// buffer). An inbound plaintext frame is NOT written here — it is returned
+/// (still borrowed) so the caller can sequence it relative to any ciphertext
+/// that a subsequent drain iteration produces, matching the
+/// ciphertext-then-plaintext application order the runtime has always used.
+fn handle_single_tunn_result<'result, S: EngineIoSink>(
     node_id: &NodeId,
     remote_addr: SocketAddr,
     transport_generation: u64,
-    result: TunnResult<'_>,
+    result: TunnResult<'result>,
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
-) -> EngineProcessingOutcome {
+    sink: &mut S,
+) -> Result<Option<&'result [u8]>, BackendError> {
     // `node_id` is consumed only by the `cfg(test)` plaintext-recording fixtures
     // below; in production builds it is otherwise unused now that the redundant
     // per-result handshake observation has moved to the drive functions.
     #[cfg(not(test))]
     let _ = node_id;
-    let mut outcome = EngineProcessingOutcome::default();
     match result {
-        TunnResult::Done | TunnResult::Err(_) => {}
+        TunnResult::Done | TunnResult::Err(_) => Ok(None),
         TunnResult::WriteToNetwork(packet) => {
-            outcome
-                .outbound_ciphertext_packets
-                .push(OutboundCiphertextPacket {
-                    remote_addr,
-                    payload: packet.to_vec(),
-                });
+            sink.send_ciphertext(remote_addr, packet)?;
+            Ok(None)
         }
         TunnResult::WriteToTunnelV4(packet, _src_addr) => {
             // Unbounded-growth guard: production code never reads
@@ -692,7 +750,7 @@ fn handle_single_tunn_result(
             {
                 let _ = (&recorded_tunnel_plaintext_packets, transport_generation);
             }
-            outcome.tunnel_plaintext_packets.push(packet.to_vec());
+            Ok(Some(packet))
         }
         TunnResult::WriteToTunnelV6(packet, _src_addr) => {
             #[cfg(test)]
@@ -708,18 +766,9 @@ fn handle_single_tunn_result(
             {
                 let _ = (&recorded_tunnel_plaintext_packets, transport_generation);
             }
-            outcome.tunnel_plaintext_packets.push(packet.to_vec());
+            Ok(Some(packet))
         }
     }
-
-    // The observed-handshake timestamp is computed once per drive (at the end
-    // of `drive_inbound_result` / `drive_outbound_result`), which always
-    // overwrites this outcome's value. Computing it per result here is pure
-    // redundancy (an extra `Tunn::stats()` + clock read per Tunn result), so it
-    // is intentionally omitted — `authenticated_handshake` stays `None` here and
-    // is filled in by the drive function. Handshake time is monotonic, so the
-    // end-of-drive value is always >= any per-result observation.
-    outcome
 }
 
 fn authenticated_handshake_unix(tunnel: &Tunn) -> Option<u64> {
@@ -730,31 +779,6 @@ fn authenticated_handshake_unix(tunnel: &Tunn) -> Option<u64> {
         .ok()
         .map(|duration| duration.as_secs())?;
     Some(now_unix.saturating_sub(duration.as_secs()))
-}
-
-fn merge_engine_processing_outcomes(
-    current: &mut EngineProcessingOutcome,
-    next: EngineProcessingOutcome,
-) {
-    current
-        .outbound_ciphertext_packets
-        .extend(next.outbound_ciphertext_packets);
-    current
-        .tunnel_plaintext_packets
-        .extend(next.tunnel_plaintext_packets);
-    match (
-        &current.authenticated_handshake,
-        next.authenticated_handshake,
-    ) {
-        (_, None) => {}
-        (None, Some(observed)) => current.authenticated_handshake = Some(observed),
-        (Some((current_node_id, current_unix)), Some((next_node_id, next_unix)))
-            if current_node_id == &next_node_id && next_unix > *current_unix =>
-        {
-            current.authenticated_handshake = Some((next_node_id, next_unix));
-        }
-        _ => {}
-    }
 }
 
 fn socket_addr_from_endpoint(endpoint: SocketEndpoint) -> SocketAddr {

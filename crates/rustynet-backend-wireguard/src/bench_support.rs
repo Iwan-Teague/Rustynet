@@ -17,13 +17,40 @@ use std::io::Write;
 use std::net::SocketAddr;
 
 use base64::prelude::*;
-use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
+use rustynet_backend_api::{BackendError, NodeId, PeerConfig, SocketEndpoint};
 
-use crate::userspace_shared::engine::UserspaceEngine;
+use crate::userspace_shared::engine::{EngineIoSink, UserspaceEngine};
 
 /// MTU-ish plaintext sample size used by the bench (typical
 /// 1400-byte tunneled IP packet).
 pub const SAMPLE_PLAINTEXT_LEN: usize = 1400;
+
+/// Bench/test-only [`EngineIoSink`] with no real socket or TUN device behind
+/// it: it captures dispatched ciphertext (the harness needs the actual bytes
+/// to feed into the next hop) and counts dispatched plaintext (the harness
+/// only ever needs the count, so — unlike the ciphertext side — capturing it
+/// costs no copy, matching production's zero-copy plaintext path).
+#[derive(Default)]
+struct CapturingIoSink {
+    ciphertext: Vec<Vec<u8>>,
+    plaintext_count: usize,
+}
+
+impl EngineIoSink for CapturingIoSink {
+    fn send_ciphertext(
+        &mut self,
+        _remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(), BackendError> {
+        self.ciphertext.push(payload.to_vec());
+        Ok(())
+    }
+
+    fn write_plaintext(&mut self, _payload: &[u8]) -> Result<(), BackendError> {
+        self.plaintext_count += 1;
+        Ok(())
+    }
+}
 
 fn write_key_file(bytes: &[u8; 32]) -> std::path::PathBuf {
     let encoded = BASE64_STANDARD.encode(bytes);
@@ -126,31 +153,38 @@ impl DataplaneEnginePair {
 
     fn drive_handshake(&mut self) {
         // Sender → receiver handshake initiation.
-        let init = self
-            .sender
-            .initiate_handshake(&self.sender_node_of_receiver, 1, true)
+        let mut init_sink = CapturingIoSink::default();
+        self.sender
+            .initiate_handshake(&self.sender_node_of_receiver, 1, true, &mut init_sink)
             .expect("handshake initiation");
-        let init_ct = init
-            .outbound_ciphertext_packets
-            .first()
-            .expect("handshake init ciphertext")
-            .payload
-            .clone();
+        let init_ct = init_sink
+            .ciphertext
+            .into_iter()
+            .next()
+            .expect("handshake init ciphertext");
 
         // Receiver consumes init, emits response.
-        let response = self
-            .receiver
-            .process_inbound_ciphertext(self.sender_addr, self.receiver_addr, &init_ct, 1)
+        let mut response_sink = CapturingIoSink::default();
+        self.receiver
+            .process_inbound_ciphertext(
+                self.sender_addr,
+                self.receiver_addr,
+                &init_ct,
+                1,
+                &mut response_sink,
+            )
             .expect("receiver processes handshake init");
-        if let Some(resp_ct) = response.outbound_ciphertext_packets.first() {
+        if let Some(resp_ct) = response_sink.ciphertext.into_iter().next() {
             // Sender consumes the response → handshake complete.
+            let mut ack_sink = CapturingIoSink::default();
             let _ = self
                 .sender
                 .process_inbound_ciphertext(
                     self.receiver_addr,
                     self.sender_addr,
-                    &resp_ct.payload,
+                    &resp_ct,
                     1,
+                    &mut ack_sink,
                 )
                 .expect("sender processes handshake response");
         }
@@ -162,26 +196,28 @@ impl DataplaneEnginePair {
     /// (e.g. mid-handshake) — the bench drives a completed handshake
     /// so steady state yields `Some`.
     pub fn encrypt_sample(&mut self) -> Option<Vec<u8>> {
-        let outcome = self
-            .sender
-            .inject_plaintext_packet(&self.sample, 1)
+        let mut sink = CapturingIoSink::default();
+        self.sender
+            .inject_plaintext_packet(&self.sample, 1, &mut sink)
             .expect("inject plaintext");
-        outcome
-            .outbound_ciphertext_packets
-            .into_iter()
-            .next()
-            .map(|p| p.payload)
+        sink.ciphertext.into_iter().next()
     }
 
     /// Decrypt one ciphertext datagram through the receiver engine
     /// (inbound hot path). Returns the number of plaintext packets
     /// delivered to the tunnel (1 for a data frame).
     pub fn decrypt(&mut self, ciphertext: Vec<u8>) -> usize {
-        let outcome = self
-            .receiver
-            .process_inbound_ciphertext(self.sender_addr, self.receiver_addr, &ciphertext, 1)
+        let mut sink = CapturingIoSink::default();
+        self.receiver
+            .process_inbound_ciphertext(
+                self.sender_addr,
+                self.receiver_addr,
+                &ciphertext,
+                1,
+                &mut sink,
+            )
             .expect("process inbound ciphertext");
-        outcome.tunnel_plaintext_packets.len()
+        sink.plaintext_count
     }
 
     /// Forward one packet end to end: encrypt on the sender, decrypt

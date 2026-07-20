@@ -782,8 +782,34 @@ mod tests {
     use boringtun::x25519::{PublicKey, StaticSecret};
     use rustynet_backend_api::RouteKind;
 
-    use crate::userspace_shared::engine::{ConfigurePeerDisposition, UserspaceEngine};
+    use crate::userspace_shared::engine::{
+        ConfigurePeerDisposition, EngineIoSink, UserspaceEngine,
+    };
     use crate::userspace_shared::handshake::HandshakeTelemetry;
+
+    /// Test-only [`EngineIoSink`] that just records what would have been
+    /// dispatched — mirrors `bench_support`'s private `CapturingIoSink`,
+    /// duplicated here rather than reused because that type is not `pub`
+    /// (module-private, not reachable from this crate-local test module).
+    #[derive(Default)]
+    struct RecordingIoSink {
+        ciphertext: Vec<(SocketAddr, Vec<u8>)>,
+    }
+
+    impl EngineIoSink for RecordingIoSink {
+        fn send_ciphertext(
+            &mut self,
+            remote_addr: SocketAddr,
+            payload: &[u8],
+        ) -> Result<(), BackendError> {
+            self.ciphertext.push((remote_addr, payload.to_vec()));
+            Ok(())
+        }
+
+        fn write_plaintext(&mut self, _payload: &[u8]) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn macos_userspace_shared_backend_name_matches_mode_constant() {
@@ -2575,12 +2601,13 @@ mod tests {
                 .expect("peer configure should succeed"),
             ConfigurePeerDisposition::Added
         );
-        let outcome = engine
-            .initiate_handshake(&peer.node_id, 42, true)
+        let mut sink = RecordingIoSink::default();
+        engine
+            .initiate_handshake(&peer.node_id, 42, true, &mut sink)
             .expect("handshake initiation should succeed");
-        assert_eq!(outcome.outbound_ciphertext_packets.len(), 1);
+        assert_eq!(sink.ciphertext.len(), 1);
         assert_eq!(
-            outcome.outbound_ciphertext_packets[0].remote_addr,
+            sink.ciphertext[0].0,
             SocketAddr::new(peer.endpoint.addr, peer.endpoint.port)
         );
     }
