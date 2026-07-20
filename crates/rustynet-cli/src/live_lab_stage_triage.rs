@@ -311,6 +311,103 @@ pub fn history_for_stage<'a>(
         .collect()
 }
 
+/// The **push** half of the triage ledger: for every stage that FAILED in this
+/// run's `rows`, render a human-facing block naming the prior fix attempts
+/// already on file against that stage, so the agent picking the failure up is
+/// made aware of them automatically instead of having to remember to query
+/// `stage_triage_history`. Returns `None` when no prior *filled* attempt exists
+/// for any failed stage (so the caller prints nothing).
+///
+/// "Prior attempt" = a ledger record for the same stage, from a *different*
+/// run than the one that just failed, whose `patch` field is filled (a bare
+/// unfilled stub is a prior failure with no recorded remedy — not an attempt to
+/// surface). Records are shown oldest-first (ledger order).
+///
+/// This never fails a run: the caller treats an `Err` as a warning, matching
+/// the ledger's "diagnostic aid, not evidence" invariant.
+#[allow(dead_code)] // wired at the run-matrix finalization call site
+pub fn render_prior_attempts_for_failed_stages(
+    ledger_path: &Path,
+    rows: &[std::collections::BTreeMap<String, String>],
+) -> Result<Option<String>, String> {
+    use std::collections::BTreeMap;
+
+    let get = |row: &BTreeMap<String, String>, key: &str| row.get(key).cloned().unwrap_or_default();
+
+    // stage -> the run_id it failed under in THIS run (first seen), so we can
+    // exclude this run's own freshly-written stubs from "prior".
+    let mut failed_stage_run: BTreeMap<String, String> = BTreeMap::new();
+    for row in rows {
+        if get(row, "status") != "fail" {
+            continue;
+        }
+        let stage = get(row, "stage");
+        if stage.is_empty() {
+            continue;
+        }
+        let run_id = get(row, "run_id");
+        failed_stage_run.entry(stage).or_insert(run_id);
+    }
+    if failed_stage_run.is_empty() {
+        return Ok(None);
+    }
+
+    // A missing/unreadable ledger is not an error here — it just means no prior
+    // history exists yet.
+    if !ledger_path.exists() {
+        return Ok(None);
+    }
+    let records = load_ledger(ledger_path)?;
+
+    let mut blocks: Vec<String> = Vec::new();
+    for (stage, this_run_id) in &failed_stage_run {
+        let priors: Vec<&StageTriageRecord> = history_for_stage(&records, stage, None)
+            .into_iter()
+            .filter(|record| &record.run_id != this_run_id)
+            .filter(|record| {
+                record
+                    .patch
+                    .as_deref()
+                    .is_some_and(|patch| !patch.trim().is_empty())
+            })
+            .collect();
+        if priors.is_empty() {
+            continue;
+        }
+        let mut block = format!(
+            "  stage `{stage}` — {} prior fix attempt(s) already on file:\n",
+            priors.len()
+        );
+        for record in &priors {
+            let commit = record.run_commit.get(..12).unwrap_or(&record.run_commit);
+            let os = if record.os_family.is_empty() {
+                "?".to_owned()
+            } else {
+                record.os_family.join(",")
+            };
+            let error = record.error.trim();
+            let patch = record.patch.as_deref().unwrap_or_default().trim();
+            block.push_str(&format!(
+                "    - [{commit} {os}] error: {error}\n      tried:  {patch}\n"
+            ));
+        }
+        blocks.push(block);
+    }
+
+    if blocks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut out = String::from(
+        "\n\u{2500}\u{2500} PRIOR TRIAGE ATTEMPTS \u{2500}\u{2500} do not repeat a failed fix; \
+         see the `stage_triage_history` MCP tool for the full record \u{2500}\u{2500}\n",
+    );
+    for block in blocks {
+        out.push_str(&block);
+    }
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +636,76 @@ mod tests {
         // Skipping unparseable rows would let the launch gate report "nothing
         // unfilled" exactly when the ledger is corrupt.
         assert!(load_ledger(path.as_path()).is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prior_filled_attempts_are_pushed_for_a_refailed_stage() {
+        let path = temp_ledger("prior-push");
+        // A prior run recorded a FILLED attempt against stage `s`.
+        assert!(
+            append_stub(
+                path.as_path(),
+                &record("prior-run", "s", Some("granted Entry exit_server")),
+            )
+            .expect("append prior")
+        );
+        // An unrelated stage with only an unfilled stub must never surface.
+        assert!(
+            append_stub(path.as_path(), &record("prior-run", "other", None)).expect("append other")
+        );
+
+        // This run re-fails stage `s` (node_row's run_id differs from "prior-run").
+        let rows = vec![
+            node_row("s", "fail", "debian"),
+            node_row("t", "pass", "debian"),
+        ];
+        let block = render_prior_attempts_for_failed_stages(path.as_path(), &rows)
+            .expect("render ok")
+            .expect("a prior filled attempt must be surfaced");
+        assert!(
+            block.contains("stage `s`"),
+            "names the failed stage: {block}"
+        );
+        assert!(
+            block.contains("granted Entry exit_server"),
+            "shows the prior patch verbatim: {block}"
+        );
+        assert!(
+            !block.contains("`other`"),
+            "an unfilled/unrelated stage is not surfaced: {block}"
+        );
+
+        // A failed stage with no prior attempt on file surfaces nothing.
+        assert!(
+            render_prior_attempts_for_failed_stages(
+                path.as_path(),
+                &[node_row("brand_new_stage", "fail", "debian")],
+            )
+            .expect("render ok")
+            .is_none(),
+            "no prior attempt -> nothing pushed"
+        );
+
+        // Exclusion: a filled record from THIS SAME run is the current attempt,
+        // not prior history, and must not be echoed back.
+        assert!(
+            append_stub(
+                path.as_path(),
+                &record("livelab-1784216363-17b11ab", "u", Some("current-attempt")),
+            )
+            .expect("append same-run")
+        );
+        assert!(
+            render_prior_attempts_for_failed_stages(
+                path.as_path(),
+                &[node_row("u", "fail", "debian")],
+            )
+            .expect("render ok")
+            .is_none(),
+            "a filled record from this run is the current attempt, not prior history"
+        );
+
         let _ = fs::remove_file(&path);
     }
 }

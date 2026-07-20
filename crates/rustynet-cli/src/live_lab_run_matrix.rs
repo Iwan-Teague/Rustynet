@@ -699,6 +699,21 @@ fn write_node_stage_result_ledgers(
     {
         eprintln!("warning: stage triage stub append failed: {err}");
     }
+
+    // Push the read side too: as soon as a stage fails, surface any prior fix
+    // attempts already recorded against it, so the agent is made aware of them
+    // automatically rather than having to remember to query
+    // `stage_triage_history`. Like the append above, a lookup problem is a
+    // warning — never a run failure (the ledger is a diagnostic aid, not
+    // evidence).
+    match crate::live_lab_stage_triage::render_prior_attempts_for_failed_stages(
+        triage_path.as_path(),
+        &rows,
+    ) {
+        Ok(Some(block)) => eprintln!("{block}"),
+        Ok(None) => {}
+        Err(err) => eprintln!("warning: stage triage prior-attempt lookup failed: {err}"),
+    }
     Ok(())
 }
 
