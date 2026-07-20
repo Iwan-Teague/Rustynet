@@ -932,7 +932,7 @@ fn generate_local_trust_material() -> Result<(String, String), String> {
     let signing_key = SigningKey::from_bytes(&seed);
     let verifier_hex = encode_hex(signing_key.verifying_key().as_bytes());
     let payload = format!(
-        "version=2\ntls13_valid=true\nsigned_control_valid=true\
+        "version=3\nsigned_control_valid=true\
          \nsigned_data_age_secs=0\nclock_skew_secs=0\
          \nupdated_at_unix={now}\nnonce={nonce}\n"
     );

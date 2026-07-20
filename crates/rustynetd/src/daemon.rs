@@ -11855,7 +11855,6 @@ fn load_trust_evidence(
 
     Ok(TrustEvidenceEnvelope {
         evidence: TrustEvidence {
-            tls13_valid: record.tls13_valid,
             signed_control_valid: record.signed_control_valid,
             signed_data_age_secs: record.signed_data_age_secs,
             clock_skew_secs: record.clock_skew_secs,
@@ -11866,7 +11865,6 @@ fn load_trust_evidence(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TrustEvidenceRecord {
-    tls13_valid: bool,
     signed_control_valid: bool,
     signed_data_age_secs: u64,
     clock_skew_secs: u64,
@@ -11876,8 +11874,7 @@ struct TrustEvidenceRecord {
 
 fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
     format!(
-        "version=2\ntls13_valid={}\nsigned_control_valid={}\nsigned_data_age_secs={}\nclock_skew_secs={}\nupdated_at_unix={}\nnonce={}\n",
-        if record.tls13_valid { "true" } else { "false" },
+        "version=3\nsigned_control_valid={}\nsigned_data_age_secs={}\nclock_skew_secs={}\nupdated_at_unix={}\nnonce={}\n",
         if record.signed_control_valid {
             "true"
         } else {
@@ -16289,7 +16286,10 @@ mod tests {
         // client drops its connection and the loop continues — mirroring the
         // response-write side's log-and-continue disposition.
         let source = include_str!("daemon.rs");
-        let fatal_pattern = concat!("read_command_envelope(&stream)", ".map_err(DaemonError::Io)?");
+        let fatal_pattern = concat!(
+            "read_command_envelope(&stream)",
+            ".map_err(DaemonError::Io)?"
+        );
         assert!(
             !source.contains(fatal_pattern),
             "a per-connection IPC read failure must not kill the daemon"
@@ -16321,7 +16321,22 @@ mod tests {
         writer
             .write_all(b"this-is-not-a-command\n")
             .expect("garbage write should succeed");
-        read_command_envelope(&reader).expect_err("garbage payload must be rejected");
+        // Unrecognized commands parse fail-closed to `Unknown` (ipc.rs) and are
+        // rejected at dispatch with an explicit error; the read itself must stay
+        // bounded and must not error or hang the accept loop.
+        let started = Instant::now();
+        let envelope = read_command_envelope(&reader)
+            .expect("garbage payload should parse to a bounded Unknown envelope");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "garbage read should be bounded by the socket read timeout plus slack"
+        );
+        match envelope {
+            CommandEnvelope::Local(IpcCommand::Unknown(raw)) => {
+                assert_eq!(raw, "this-is-not-a-command");
+            }
+            other => panic!("garbage payload must classify as Local(Unknown), got {other:?}"),
+        }
     }
 
     #[test]
@@ -17480,7 +17495,6 @@ mod tests {
 
     fn write_trust_file(path: &Path, verifier_path: &Path, nonce: u64) {
         let record = TrustEvidenceRecord {
-            tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 0,
             clock_skew_secs: 0,
@@ -19615,7 +19629,6 @@ mod tests {
         let trust_path = test_dir.join("trust.evidence");
         let verifier_path = test_dir.join("trust.verifier.pub");
         let record = TrustEvidenceRecord {
-            tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 0,
             clock_skew_secs: 0,
@@ -19645,7 +19658,6 @@ mod tests {
         let trust_path = test_dir.join("trust.evidence");
         let verifier_path = test_dir.join("trust.verifier.pub");
         let record = TrustEvidenceRecord {
-            tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 0,
             clock_skew_secs: 0,
@@ -19687,7 +19699,6 @@ mod tests {
         let verifier_path = test_dir.join("trust.verifier.pub");
         let now = unix_now();
         let record = TrustEvidenceRecord {
-            tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 0,
             clock_skew_secs: 0,
@@ -19723,7 +19734,6 @@ mod tests {
         let verifier_path = test_dir.join("trust.verifier.pub");
         let now = unix_now();
         let record = TrustEvidenceRecord {
-            tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 0,
             clock_skew_secs: 0,
@@ -19757,7 +19767,6 @@ mod tests {
         let verifier_path = test_dir.join("trust.verifier.pub");
         let now = unix_now();
         let record = TrustEvidenceRecord {
-            tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 0,
             clock_skew_secs: 0,
@@ -19792,7 +19801,6 @@ mod tests {
         let verifier_path = test_dir.join("trust.verifier.pub");
         let now = unix_now();
         let record = TrustEvidenceRecord {
-            tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 0,
             clock_skew_secs: 0,
@@ -19822,7 +19830,6 @@ mod tests {
         let trust_path = test_dir.join("trust.evidence");
         let verifier_path = test_dir.join("trust.verifier.pub");
         let record = TrustEvidenceRecord {
-            tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 0,
             clock_skew_secs: 0,
@@ -29239,7 +29246,6 @@ mod tests {
             .controller
             .apply_dataplane_generation(
                 TrustEvidence {
-                    tls13_valid: true,
                     signed_control_valid: true,
                     signed_data_age_secs: 20,
                     clock_skew_secs: 10,
@@ -29336,7 +29342,6 @@ mod tests {
             .controller
             .apply_dataplane_generation(
                 TrustEvidence {
-                    tls13_valid: true,
                     signed_control_valid: true,
                     signed_data_age_secs: 20,
                     clock_skew_secs: 10,

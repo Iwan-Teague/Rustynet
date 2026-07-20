@@ -16,7 +16,13 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
 - Tunnel encryption uses WireGuard-style authenticated encryption.
 
 2. Control-plane transport security:
-- TLS 1.3 enforced for control-plane APIs.
+- Mesh control traffic rides the WireGuard tunnel's authenticated encryption
+  (Noise IK handshake, ChaCha20-Poly1305); there is no separate TLS stack and
+  no TLS library is a workspace dependency.
+- Any control state fetched outside the tunnel (e.g. anchor bundle pull over
+  plain TCP) is authenticated by ed25519 signature verification against a
+  pinned verifier key before it is applied or persisted — fail closed on any
+  verification error, never on transport trust.
 - Signed peer/control data validated by clients before application.
 
 3. Auth and enrollment hardening:
