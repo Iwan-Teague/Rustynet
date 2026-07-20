@@ -97,10 +97,11 @@ use rustynet_control::membership::{
     MAX_MEMBERSHIP_SNAPSHOT_BYTES, MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS, MembershipApprover,
     MembershipApproverRole, MembershipApproverStatus, MembershipHeadAttestation, MembershipNode,
     MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipState,
-    MembershipUpdateRecord, SignedMembershipUpdate, append_membership_log_entry,
-    apply_signed_update, decode_signed_update, decode_update_record, encode_signed_update,
-    encode_update_record, head_attestation_from_signed_update, load_membership_log,
-    load_membership_snapshot, persist_membership_snapshot_with_attestation,
+    MembershipUpdateRecord, MembershipWatermark, SignedMembershipUpdate,
+    append_membership_log_entry, apply_signed_update, decode_signed_update, decode_update_record,
+    encode_signed_update, encode_update_record, head_attestation_from_signed_update,
+    load_membership_log, load_membership_snapshot, load_membership_watermark,
+    persist_membership_snapshot_with_attestation, persist_membership_watermark,
     replay_membership_snapshot_and_log, sign_head_attestation, sign_update_record,
     snapshot_bytes_head_attestation, verify_attested_snapshot, write_membership_audit_log,
 };
@@ -438,6 +439,14 @@ enum AnchorCommand {
         /// bundle must verify against. Defaults to the platform trust-
         /// anchor path; there is no way to skip verification.
         owner_key_pub_path: PathBuf,
+        /// Persistent, monotonic anti-rollback watermark path — deliberately
+        /// independent of `--output`'s existence, freshness, or deletion.
+        /// Defaults to the SAME file `rustynetd`'s own membership
+        /// bootstrap/apply paths already maintain
+        /// (`DEFAULT_MEMBERSHIP_WATERMARK_PATH`), so this device's
+        /// highest-verified epoch stays consistent whether it advanced via
+        /// `anchor pull-bundle` or ordinary gossip-driven daemon applies.
+        watermark_path: PathBuf,
         /// Freshness window for the bundle's head attestation. Bounded by
         /// `MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS` — the flag can only
         /// tighten the default, never widen or disable it.
@@ -6154,6 +6163,9 @@ fn parse_anchor_command(args: &[String]) -> Result<AnchorCommand, String> {
                 owner_key_pub_path: parser
                     .optional_path("--owner-key-pub")
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_MEMBERSHIP_OWNER_KEY_PUB_PATH)),
+                watermark_path: parser.optional_path("--watermark-path").unwrap_or_else(|| {
+                    PathBuf::from(rustynetd::daemon::DEFAULT_MEMBERSHIP_WATERMARK_PATH)
+                }),
                 max_attestation_age_secs,
             })
         }
@@ -7542,6 +7554,7 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             token,
             output_path,
             owner_key_pub_path,
+            watermark_path,
             max_attestation_age_secs,
         } => {
             // A4: load the §6.B pinned membership owner public key BEFORE
@@ -7550,6 +7563,18 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             // error up front.
             let pinned_owner_pubkey_hex = load_membership_owner_key_pub(&owner_key_pub_path)?;
             let now_unix = unix_now();
+            // Rollback-vector fix: the anti-rollback floor is sourced from
+            // the PERSISTENT watermark, never from `--output`. A device with
+            // no watermark yet (the primary bootstrap scenario) has nothing
+            // to check a newly-offered epoch against — that is irreducible
+            // trust-on-first-use, not a bug — but every pull AFTER the first
+            // is protected regardless of whether `--output` exists, is
+            // stale, or was deleted, because this floor does not depend on
+            // it. See the watermark_path field doc and
+            // documents/operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md.
+            let rollback_floor: Option<(u64, String)> = load_membership_watermark(&watermark_path)
+                .map_err(|err| format!("read anchor bundle-pull watermark failed: {err}"))?
+                .map(|watermark| (watermark.epoch, watermark.state_root));
             let mut resolved = addr
                 .to_socket_addrs()
                 .map_err(|err| format!("resolve anchor bundle-pull addr failed: {err}"))?;
@@ -7567,8 +7592,13 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             // A4 interlock (a): the LOCAL file earns FIS-0020 `have` /
             // UNCHANGED privileges only when it independently passes the
             // SAME attestation verification a pulled bundle must pass. An
-            // unverified legacy local file never earns the shortcut, and
-            // its identity never becomes the epoch-regression floor.
+            // unverified legacy local file never earns the shortcut. NOTE:
+            // this identity feeds ONLY the `have`/UNCHANGED optimization
+            // below — it is NOT the epoch-regression floor (that is
+            // `rollback_floor`, sourced from the persistent watermark
+            // above). Conflating the two was the rollback-vector bug: a
+            // fresh device or a stale `--output` cache used to make the
+            // regression check disappear along with this value.
             let local_verified_identity: Option<(u64, String)> =
                 std::fs::read(&output_path).ok().and_then(|bytes| {
                     let state = verify_attested_snapshot(
@@ -7644,21 +7674,46 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             }
             // A4 enforcement: the pulled bytes must pass full head-
             // attestation verification against the pinned owner key BEFORE
-            // a single byte reaches disk. `local_verified_identity` (the
-            // identity of the verified prior bundle) is the epoch-
-            // regression / fork floor — this also enforces FIS-0020
-            // interlock (b): an OK response whose epoch is below the
-            // `have` epoch we sent is rejected as a regression.
+            // a single byte reaches disk. `rollback_floor` (this device's
+            // persistent watermark, NOT `--output`) is the epoch-regression
+            // / fork floor — this also enforces FIS-0020 interlock (b): an
+            // OK response whose epoch is below the `have` epoch we sent is
+            // rejected as a regression (the watermark and the verified
+            // local file necessarily agree once both are established, since
+            // the watermark only ever advances alongside a successful local
+            // verification below).
             let verified_state = verify_attested_snapshot(
                 bundle,
                 &pinned_owner_pubkey_hex,
                 now_unix,
-                local_verified_identity.as_ref(),
+                rollback_floor.as_ref(),
                 max_attestation_age_secs,
             )
             .map_err(|err| {
                 format!("anchor bundle-pull verification failed (no bytes written): {err}")
             })?;
+            // Advance the persistent watermark BEFORE writing --output, not
+            // after: the security property this protects is "this device
+            // has now cryptographically confirmed epoch N is real," which
+            // must stay durable even if the subsequent local-cache write
+            // fails (disk full, permissions, etc). Reuses the exact file and
+            // format rustynetd's own daemon bootstrap/apply paths already
+            // maintain, so a pull-bundle run correctly refuses to accept
+            // anything below whatever the daemon has already established via
+            // gossip, and vice versa.
+            let new_state_root = verified_state.state_root_hex().map_err(|err| {
+                format!(
+                    "anchor bundle-pull watermark update failed: state root compute failed: {err}"
+                )
+            })?;
+            persist_membership_watermark(
+                &watermark_path,
+                &MembershipWatermark {
+                    epoch: verified_state.epoch,
+                    state_root: new_state_root,
+                },
+            )
+            .map_err(|err| format!("anchor bundle-pull watermark update failed: {err}"))?;
             write_bytes_file(&output_path, bundle)?;
             Ok(format!(
                 "anchor bundle pulled and verified: {} bytes written to {} (network_id={} epoch={})",
@@ -23217,14 +23272,21 @@ mod tests {
             CliCommand::Anchor(command) => match *command {
                 AnchorCommand::PullBundle {
                     owner_key_pub_path,
+                    watermark_path,
                     max_attestation_age_secs,
                     ..
                 } => {
                     // A4 defaults: the §6.B platform pin path and the hard
-                    // maximum freshness window.
+                    // maximum freshness window. Rollback-vector fix: the
+                    // watermark path defaults to the SAME file rustynetd's
+                    // daemon bootstrap/apply paths already maintain.
                     assert_eq!(
                         owner_key_pub_path,
                         PathBuf::from(super::DEFAULT_MEMBERSHIP_OWNER_KEY_PUB_PATH)
+                    );
+                    assert_eq!(
+                        watermark_path,
+                        PathBuf::from(rustynetd::daemon::DEFAULT_MEMBERSHIP_WATERMARK_PATH)
                     );
                     assert_eq!(
                         max_attestation_age_secs,
@@ -23382,6 +23444,48 @@ mod tests {
         std::fs::read(&path).expect("read snapshot bytes")
     }
 
+    /// Same fixture as `a4_pull_state()` but at an explicit epoch — the
+    /// rollback-vector regression tests need to distinguish an "old,"
+    /// superseded epoch from a "current" one, both signed by the same
+    /// well-known owner key.
+    fn a4_pull_state_at_epoch(epoch: u64) -> rustynet_control::membership::MembershipState {
+        let mut state = a4_pull_state();
+        state.epoch = epoch;
+        state
+    }
+
+    /// Persist attested, owner-signed snapshot bytes for an explicit state
+    /// (unlike `a4_snapshot_bytes`, not hardcoded to `a4_pull_state()`'s
+    /// fixed epoch) and return them.
+    fn a4_attested_snapshot_bytes_for(
+        dir: &Path,
+        state: &rustynet_control::membership::MembershipState,
+    ) -> Vec<u8> {
+        use rustynet_control::membership;
+        let path = dir.join(format!("served-epoch-{}.snapshot", state.epoch));
+        let state_root = state.state_root_hex().expect("state root");
+        let attested_at = unix_now();
+        let signature = membership::sign_head_attestation(
+            &state.network_id,
+            state.epoch,
+            &state_root,
+            attested_at,
+            "owner-1",
+            &a4_owner_signing_key(),
+        )
+        .expect("sign head attestation");
+        let attestation = membership::MembershipHeadAttestation {
+            network_id: state.network_id.clone(),
+            epoch: state.epoch,
+            state_root_hex: state_root,
+            attested_at_unix: attested_at,
+            approver_signatures: vec![signature],
+        };
+        membership::persist_membership_snapshot_with_attestation(&path, state, Some(&attestation))
+            .expect("persist snapshot");
+        std::fs::read(&path).expect("read snapshot bytes")
+    }
+
     /// One-shot loopback bundle-pull server: accepts a single connection,
     /// captures the raw request (returned through the channel), replies
     /// with `response`, and closes.
@@ -23441,6 +23545,7 @@ mod tests {
             token: "0123456789abcdef0123456789abcdef".to_owned(),
             output_path: output_path.clone(),
             owner_key_pub_path: pin_path,
+            watermark_path: dir.join("membership.watermark"),
             max_attestation_age_secs:
                 rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
         })
@@ -23478,6 +23583,7 @@ mod tests {
             token: "0123456789abcdef0123456789abcdef".to_owned(),
             output_path: output_path.clone(),
             owner_key_pub_path: pin_path,
+            watermark_path: dir.join("membership.watermark"),
             max_attestation_age_secs:
                 rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
         })
@@ -23518,6 +23624,7 @@ mod tests {
             token: "0123456789abcdef0123456789abcdef".to_owned(),
             output_path: output_path.clone(),
             owner_key_pub_path: pin_path,
+            watermark_path: dir.join("membership.watermark"),
             max_attestation_age_secs:
                 rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
         })
@@ -23547,6 +23654,7 @@ mod tests {
             token: "0123456789abcdef0123456789abcdef".to_owned(),
             output_path: output_path.clone(),
             owner_key_pub_path: dir.join("missing.owner.key.pub"),
+            watermark_path: dir.join("membership.watermark"),
             max_attestation_age_secs:
                 rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
         })
@@ -23556,6 +23664,193 @@ mod tests {
             "expected actionable missing-pin error, got: {err}"
         );
         assert!(!output_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_bundle_accepts_first_ever_pull_with_no_watermark_and_establishes_one() {
+        // Rollback-vector fix, TOFU case: a genuinely fresh device (no
+        // watermark, no --output) has nothing to check a newly-offered
+        // epoch against — that is irreducible trust-on-first-use — but it
+        // must immediately remember what it accepted so every SUBSEQUENT
+        // pull is protected.
+        let dir = a4_temp_dir("watermark-establish");
+        let pin_path = a4_write_pin(&dir);
+        let state = a4_pull_state_at_epoch(5);
+        let bundle = a4_attested_snapshot_bytes_for(&dir, &state);
+        let mut response = format!("OK {}\n", bundle.len()).into_bytes();
+        response.extend_from_slice(&bundle);
+        let (addr, _request_rx, handle) = a4_serve_once(response);
+
+        let output_path = dir.join("pulled.snapshot");
+        let watermark_path = dir.join("membership.watermark");
+        assert!(!watermark_path.exists(), "no watermark should exist yet");
+        let message = execute_anchor(AnchorCommand::PullBundle {
+            addr: addr.to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: pin_path,
+            watermark_path: watermark_path.clone(),
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect("first-ever pull with no watermark must succeed (TOFU)");
+        assert!(message.contains("pulled and verified"));
+        let established = rustynet_control::membership::load_membership_watermark(&watermark_path)
+            .expect("read watermark")
+            .expect("watermark must now exist after a successful pull");
+        assert_eq!(established.epoch, 5);
+        assert_eq!(
+            established.state_root,
+            state.state_root_hex().expect("root")
+        );
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_bundle_rejects_epoch_regression_on_brand_new_device_after_first_watermark_established()
+    {
+        // The exact vulnerability this fix closes: a device that has
+        // already established a watermark at epoch 5 must reject a
+        // resurrected old epoch-3 bundle EVEN WHEN --output no longer
+        // exists (simulating a fresh device / reset local cache) — because
+        // the regression floor now comes from the persistent watermark,
+        // never from --output.
+        let dir = a4_temp_dir("watermark-rollback");
+        let pin_path = a4_write_pin(&dir);
+        let output_path = dir.join("pulled.snapshot");
+        let watermark_path = dir.join("membership.watermark");
+
+        let current_state = a4_pull_state_at_epoch(5);
+        let current_bundle = a4_attested_snapshot_bytes_for(&dir, &current_state);
+        let mut response = format!("OK {}\n", current_bundle.len()).into_bytes();
+        response.extend_from_slice(&current_bundle);
+        let (addr, _request_rx, handle) = a4_serve_once(response);
+        execute_anchor(AnchorCommand::PullBundle {
+            addr: addr.to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: pin_path.clone(),
+            watermark_path: watermark_path.clone(),
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect("establishing pull at epoch 5 must succeed");
+        handle.join().expect("server thread");
+
+        // Simulate a fresh device / reset cache: delete --output and its
+        // FIS-0020 pull counter, but NOT the watermark.
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(output_path.with_extension("pulls"));
+        assert!(!output_path.exists());
+        assert!(
+            watermark_path.exists(),
+            "watermark must survive --output deletion"
+        );
+
+        let old_state = a4_pull_state_at_epoch(3);
+        let old_bundle = a4_attested_snapshot_bytes_for(&dir, &old_state);
+        let mut old_response = format!("OK {}\n", old_bundle.len()).into_bytes();
+        old_response.extend_from_slice(&old_bundle);
+        let (addr2, _request_rx2, handle2) = a4_serve_once(old_response);
+        let err = execute_anchor(AnchorCommand::PullBundle {
+            addr: addr2.to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: pin_path,
+            watermark_path: watermark_path.clone(),
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect_err("resurrected old epoch must be rejected even with --output missing");
+        assert!(
+            err.contains("epoch regression"),
+            "expected an epoch-regression rejection, got: {err}"
+        );
+        assert!(
+            !output_path.exists(),
+            "no bytes may reach disk on rejection"
+        );
+        handle2.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_bundle_watermark_survives_output_deletion_but_not_watermark_deletion() {
+        // Documents, rather than hides, the honest residual limit: the
+        // rollback floor survives deleting --output (that is the whole
+        // point of this fix), but NOT deleting the watermark file itself —
+        // an attacker or operator with write access to the watermark's own
+        // storage location can still force a TOFU reset. A real,
+        // acknowledged boundary (see
+        // AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md §5),
+        // pinned here rather than left implicit.
+        let dir = a4_temp_dir("watermark-residual-limit");
+        let pin_path = a4_write_pin(&dir);
+        let output_path = dir.join("pulled.snapshot");
+        let watermark_path = dir.join("membership.watermark");
+
+        let current_state = a4_pull_state_at_epoch(5);
+        let current_bundle = a4_attested_snapshot_bytes_for(&dir, &current_state);
+        let mut response = format!("OK {}\n", current_bundle.len()).into_bytes();
+        response.extend_from_slice(&current_bundle);
+        let (addr, _request_rx, handle) = a4_serve_once(response);
+        execute_anchor(AnchorCommand::PullBundle {
+            addr: addr.to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: pin_path.clone(),
+            watermark_path: watermark_path.clone(),
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect("establishing pull at epoch 5 must succeed");
+        handle.join().expect("server thread");
+
+        let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(output_path.with_extension("pulls"));
+
+        let old_state = a4_pull_state_at_epoch(3);
+        let old_bundle = a4_attested_snapshot_bytes_for(&dir, &old_state);
+
+        // Watermark intact, --output gone: still rejected.
+        let mut old_response = format!("OK {}\n", old_bundle.len()).into_bytes();
+        old_response.extend_from_slice(&old_bundle);
+        let (addr2, _request_rx2, handle2) = a4_serve_once(old_response);
+        execute_anchor(AnchorCommand::PullBundle {
+            addr: addr2.to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: pin_path.clone(),
+            watermark_path: watermark_path.clone(),
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect_err("must still reject the old epoch with the watermark intact");
+        handle2.join().expect("server thread");
+
+        // Delete the watermark too: the documented TOFU-reset boundary —
+        // the same old bundle is now accepted, because there is nothing
+        // left on this device to check it against.
+        std::fs::remove_file(&watermark_path).expect("remove watermark");
+        let mut old_response2 = format!("OK {}\n", old_bundle.len()).into_bytes();
+        old_response2.extend_from_slice(&old_bundle);
+        let (addr3, _request_rx3, handle3) = a4_serve_once(old_response2);
+        let message = execute_anchor(AnchorCommand::PullBundle {
+            addr: addr3.to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: pin_path,
+            watermark_path: watermark_path.clone(),
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect(
+            "with the watermark itself deleted this is the documented TOFU-reset boundary, not a bug",
+        );
+        assert!(message.contains("pulled and verified"));
+        handle3.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

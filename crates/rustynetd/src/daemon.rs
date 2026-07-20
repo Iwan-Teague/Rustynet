@@ -137,8 +137,10 @@ use rustynet_backend_wireguard::{MacosUserspaceSharedBackend, MacosWireguardBack
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
 use rustynet_control::membership::{
-    MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipNodeStatus, MembershipState, load_membership_log,
-    load_membership_snapshot, replay_membership_snapshot_and_log,
+    MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipNodeStatus, MembershipState, MembershipWatermark,
+    load_membership_log, load_membership_snapshot, load_membership_watermark,
+    membership_watermark_is_replay, persist_membership_watermark,
+    replay_membership_snapshot_and_log,
 };
 use rustynet_control::roles::{RoleCapability, parse_role_capability_csv};
 use rustynet_control::{
@@ -2554,12 +2556,6 @@ impl fmt::Display for MembershipBootstrapError {
 }
 
 impl std::error::Error for MembershipBootstrapError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MembershipWatermark {
-    epoch: u64,
-    state_root: String,
-}
 
 enum DaemonBackend {
     #[allow(dead_code)]
@@ -12432,110 +12428,11 @@ fn persist_trust_watermark(
     Ok(())
 }
 
-/// Pure check: is `incoming` a replay relative to `previous`?
-///
-/// Replay rules for membership snapshots:
-/// - strictly older epoch → replay (rolling back the membership view)
-/// - same epoch but different `state_root` → replay (forging an alternative
-///   history at the same epoch — only one canonical state can exist per epoch)
-///
-/// Equal epoch + same `state_root` is NOT a replay (idempotent re-load is fine).
-/// Strictly newer epoch is NOT a replay regardless of `state_root` (progress).
-fn membership_watermark_is_replay(
-    incoming: &MembershipWatermark,
-    previous: &MembershipWatermark,
-) -> bool {
-    incoming.epoch < previous.epoch
-        || (incoming.epoch == previous.epoch && incoming.state_root != previous.state_root)
-}
-
-fn load_membership_watermark(path: &Path) -> Result<Option<MembershipWatermark>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
-    let mut version: Option<u8> = None;
-    let mut epoch: Option<u64> = None;
-    let mut state_root: Option<String> = None;
-    for line in content.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            return Err("membership watermark line missing key/value separator".to_owned());
-        };
-        match key {
-            "version" => {
-                version = value.parse::<u8>().ok();
-            }
-            "epoch" => {
-                epoch = value.parse::<u64>().ok();
-            }
-            "state_root" => {
-                state_root = Some(value.to_owned());
-            }
-            _ => return Err(format!("unknown membership watermark key {key}")),
-        }
-    }
-    if version != Some(1) {
-        return Err("unsupported membership watermark version".to_owned());
-    }
-    Ok(Some(MembershipWatermark {
-        epoch: epoch.ok_or_else(|| "missing membership watermark epoch".to_owned())?,
-        state_root: state_root
-            .ok_or_else(|| "missing membership watermark state_root".to_owned())?,
-    }))
-}
-
-fn persist_membership_watermark(
-    path: &Path,
-    watermark: &MembershipWatermark,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                .map_err(|err| err.to_string())?;
-        }
-    }
-    let payload = format!(
-        "version=1\nepoch={}\nstate_root={}\n",
-        watermark.epoch, watermark.state_root
-    );
-    let temp_path = path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    ));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600)
-    };
-    let mut temp = options.open(&temp_path).map_err(|err| err.to_string())?;
-    if let Err(err) = temp.write_all(payload.as_bytes()) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err.to_string());
-    }
-    if let Err(err) = temp.sync_all() {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err.to_string());
-    }
-    if let Err(err) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err.to_string());
-    }
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        let parent_dir = fs::File::open(parent).map_err(|err| err.to_string())?;
-        parent_dir.sync_all().map_err(|err| err.to_string())?;
-    }
-    Ok(())
-}
+// MembershipWatermark and its replay-check/load/persist functions moved to
+// rustynet_control::membership (2026-07-20, imported above) so `anchor
+// pull-bundle` in rustynet-cli can share the exact same watermark file
+// instead of re-deriving a weaker, --output-scoped notion of prior state.
+// See documents/operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md.
 
 fn load_auto_tunnel_bundle(
     path: &Path,
