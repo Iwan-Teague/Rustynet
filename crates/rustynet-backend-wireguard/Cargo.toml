@@ -11,6 +11,12 @@ rustynet-windows-native = { path = "../rustynet-windows-native" }
 base64 = "0.22"
 boringtun = { path = "../../third_party/boringtun" }
 rustynet-tun = { path = "../../third_party/rustynet-tun" }
+# NEW dependency (flagged): FIS-0028 Phase 1 — safe socket wrapper used by the
+# read-only UDP offload capability probe (`udp_offload_probe`). Already in the
+# workspace lockfile via rustynet-cli (vm-lab) and rustynet-mcp; this makes it
+# available to the backend for the eventual batched send/recv path. Phase 1
+# performs detection only — no packet send/receive path uses it.
+socket2 = "0.6"
 zeroize = "1"
 
 [features]
