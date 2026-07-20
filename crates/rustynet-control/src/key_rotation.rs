@@ -4,7 +4,7 @@
 //!
 //! The rotation lifecycle is the daemon's hardened workflow for replacing
 //! the long-lived per-node identity material that signs gossip / membership
-//! bundles and drives the WireGuard noise handshake. The lifecycle is
+//! bundles and drives the backend transport noise handshake. The lifecycle is
 //! deliberately strict:
 //!
 //! * Each rotation produces a monotonic [`RotationEpoch`] which is
@@ -23,7 +23,7 @@
 //!   cannot trust an epoch tag it never issued.
 //!
 //! The types in this module are transport-free and have no IO. The
-//! daemon-side state machine that ties them to actual file IO + WireGuard
+//! daemon-side state machine that ties them to actual file IO + tunnel
 //! interface operations lives in `rustynetd::key_rotation`.
 
 use std::collections::BTreeMap;
@@ -528,7 +528,7 @@ pub enum RotationError {
     KeyWriteFailed(String),
     ArchiveWriteFailed(String),
     WatermarkWriteFailed(String),
-    WgApplyFailed(String),
+    BackendApplyFailed(String),
     LedgerCorrupt(String),
     FaultInjected(RotationFaultPoint),
     /// The rotation entered a state from which the daemon cannot
@@ -584,8 +584,8 @@ impl fmt::Display for RotationError {
             RotationError::WatermarkWriteFailed(message) => {
                 write!(f, "rotation watermark write failed: {message}")
             }
-            RotationError::WgApplyFailed(message) => {
-                write!(f, "rotation wireguard apply failed: {message}")
+            RotationError::BackendApplyFailed(message) => {
+                write!(f, "rotation backend apply failed: {message}")
             }
             RotationError::LedgerCorrupt(message) => {
                 write!(f, "rotation ledger corrupt: {message}")

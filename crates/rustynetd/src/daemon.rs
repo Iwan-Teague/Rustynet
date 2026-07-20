@@ -9205,7 +9205,7 @@ impl<'a> RotationIo for DaemonRotationIo<'a> {
     fn apply_wg_interface(&mut self) -> Result<(), rustynet_control::key_rotation::RotationError> {
         self.daemon
             .rotation_apply_active_runtime_key()
-            .map_err(rustynet_control::key_rotation::RotationError::WgApplyFailed)
+            .map_err(rustynet_control::key_rotation::RotationError::BackendApplyFailed)
     }
 
     fn rollback_wg_apply(&mut self) -> Result<(), rustynet_control::key_rotation::RotationError> {
@@ -9214,7 +9214,7 @@ impl<'a> RotationIo for DaemonRotationIo<'a> {
         // private key AND re-applies it to the interface.
         self.daemon
             .restore_key_backups(self.old_runtime_backup.as_deref(), None, None)
-            .map_err(rustynet_control::key_rotation::RotationError::WgApplyFailed)
+            .map_err(rustynet_control::key_rotation::RotationError::BackendApplyFailed)
     }
 
     fn persist_ledger(

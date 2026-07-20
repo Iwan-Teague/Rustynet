@@ -15,7 +15,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 #[cfg(target_os = "windows")]
 use rustynet_windows_native::{
-    WindowsDpapiScope, dpapi_protect, dpapi_unprotect, inspect_file_sddl,
+    dpapi_protect, dpapi_unprotect, inspect_file_sddl, WindowsDpapiScope,
 };
 #[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::SecKeychain;
@@ -697,7 +697,7 @@ fn store_macos_generic_password_system_keychain_via_security_cli(
     }
     // Read-back verification, fail-closed. On macOS 26 `add-generic-password`
     // can exit 0 without leaving a *readable* System.keychain item — the daemon
-    // (launchd, no user session) then fails its WG-key decrypt at startup with
+    // (launchd, no user session) then fails its tunnel-key decrypt at startup with
     // `os secure store unavailable` and crash-loops, with no signal at
     // provisioning time. Confirm the secret reads back through the SAME CLI path
     // the daemon's loader uses (`security find-generic-password -w … System.keychain`)
@@ -780,7 +780,7 @@ pub fn load_macos_generic_password(service: &str, account: &str) -> Result<Vec<u
 /// no other binary — not even `/usr/bin/security` — can read it.
 ///
 /// This is the correct, tightest custody for a secret that is both written and
-/// read by `rustynetd`: the WireGuard key passphrase is stored at bootstrap by
+/// read by `rustynetd`: the tunnel key passphrase is stored at bootstrap by
 /// `rustynetd key store-passphrase` (running as root) and read at daemon startup
 /// by the same `rustynetd` binary (running as the uid-500 service account).
 /// Rust binaries are ad-hoc linker-signed on macOS arm64, giving `rustynetd` a
@@ -964,7 +964,7 @@ fn store_in_windows_dpapi(key_id: &str, key_material: &[u8]) -> Result<(), Crypt
         // user or an interactive admin). CurrentUser scope ties the blob
         // to the encrypting user's master key, which is inaccessible to
         // LocalSystem and causes CryptoError::DecryptionFailed at service
-        // startup (prepare_runtime_wireguard_key_material). NTFS ACLs on
+        // startup (the daemon's runtime tunnel-key material preparation). NTFS ACLs on
         // the key-custody directory (set by windows-runtime-acls-check and
         // validated by validate_windows_dpapi_root/file) are the access
         // boundary; DPAPI LocalMachine encryption provides at-rest
@@ -1723,12 +1723,12 @@ pub fn validate_key_custody_permissions(
 #[cfg(test)]
 mod tests {
     use super::{
-        AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
-        Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
-        NodeKeyPair, SigningProvider, SigningProviderKind, SigningProviderPolicy,
         create_provider_attestation, decrypt_private_key_envelope, encrypt_private_key_envelope,
         generate_key_custody_material, try_generate_key_custody_material,
-        validate_signing_provider_policy, verify_provider_attestation,
+        validate_signing_provider_policy, verify_provider_attestation, AlgorithmPolicy,
+        CompatibilityException, CryptoAlgorithm, CryptoError, Ed25519SigningProvider,
+        KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore, NodeKeyPair,
+        SigningProvider, SigningProviderKind, SigningProviderPolicy,
     };
     // The encrypted-key-file custody helpers and the OS-store fallback policy are
     // only exercised by `#[cfg(unix)]` tests below (they rely on unix permission
@@ -1736,8 +1736,8 @@ mod tests {
     // them as unused.
     #[cfg(unix)]
     use super::{
-        OsStoreFallbackPolicy, read_encrypted_key_file, validate_key_custody_permissions,
-        write_encrypted_key_file,
+        read_encrypted_key_file, validate_key_custody_permissions, write_encrypted_key_file,
+        OsStoreFallbackPolicy,
     };
 
     #[test]
@@ -2435,16 +2435,20 @@ mod tests {
     #[test]
     fn validate_macos_keychain_label_accepts_canonical_descriptors() {
         use super::validate_macos_keychain_label;
-        // Canonical service/account pairs the daemon and ops verbs hand to
-        // the keychain backend. Pinning these so a tightening of the
-        // allow-list cannot silently break the bootstrap.
+        // Canonical service/account shapes the daemon and ops verbs hand to
+        // the keychain backend. The validator is format-only (charset +
+        // length), so these format-equivalent examples pin the same
+        // behavior as the daemon's real labels — a tightening of the
+        // allow-list cannot silently break the bootstrap. The daemon's
+        // literal label constants are pinned by key_material.rs's own
+        // tests in rustynetd.
         for good in [
-            // WireGuard key custody (key_material.rs).
-            "rustynet.wg-private-deadbeef01234567",
+            // Tunnel key custody shape (dotted service, hex suffix).
+            "rustynet.tunnel-private-deadbeef01234567",
             "rustynet",
-            // WireGuard passphrase service (key_material.rs:43).
-            "net.rustynet.wg-key-passphrase",
-            "wg-passphrase-node-001",
+            // Tunnel passphrase service/account shape.
+            "net.rustynet.tunnel-key-passphrase",
+            "tunnel-passphrase-node-001",
             // Membership-owner signing-key passphrase (ops_e2e.rs:1026).
             "signing_key_passphrase",
             "membership-owner-signing-key",
@@ -2626,7 +2630,7 @@ mod tests {
     }
 
     /// Pin the security properties of the owned-identity custody path:
-    /// the WireGuard passphrase is stored and read by the *same* signed
+    /// the tunnel passphrase is stored and read by the *same* signed
     /// `rustynetd` binary, so it uses `SecItemAdd`/`SecItemCopyMatching`
     /// (framework) bound to that binary's code-signing identity — NOT the
     /// `-A` `security`-CLI path, whose item is unreadable by the launchd

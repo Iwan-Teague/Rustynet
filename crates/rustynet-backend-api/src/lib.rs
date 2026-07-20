@@ -74,7 +74,7 @@ pub struct PeerConfig {
     pub endpoint: SocketEndpoint,
     pub public_key: [u8; 32],
     pub allowed_ips: Vec<String>,
-    /// FIS-0015: WireGuard-native persistent keepalive, seconds. `None`
+    /// FIS-0015: backend-native persistent keepalive, seconds. `None`
     /// (today's production default) sends nothing — command backends only
     /// append `persistent-keepalive <n>` when `Some`. To be populated from
     /// the keepalive estimator's operating interval at (re)configure time
@@ -116,7 +116,7 @@ pub struct TunnelStats {
 }
 
 /// FIS-0004: coarse per-peer path health for reprobe acceleration.
-/// Advisory, never authoritative — the WireGuard handshake stays the
+/// Advisory, never authoritative — the backend transport handshake stays the
 /// reachability gate. Only this 3-state primitive crosses the backend
 /// boundary; the richer loss/RTT estimator state stays inside the
 /// backend crate.
@@ -216,7 +216,7 @@ pub trait TunnelBackend: Send + Sync {
     ) -> Result<Option<SocketEndpoint>, BackendError>;
 
     fn peer_latest_handshake_unix(&mut self, node_id: &NodeId)
-    -> Result<Option<u64>, BackendError>;
+        -> Result<Option<u64>, BackendError>;
 
     /// FIS-0004: coarse per-peer path health. Backends without per-peer
     /// quality data (command-based) return `Ok(None)` — no data is no
