@@ -23,19 +23,34 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
   are authenticated by ed25519 signature verification against the current
   approver set before being applied — fail closed on any verification error,
   never on transport trust.
-- **Known gap:** the anchor bundle-pull endpoint (`anchor pull-bundle`) fetches
-  a bare membership-state snapshot over plain loopback TCP, gated only by a
-  bearer access token and a self-consistency digest — it is not yet
-  cryptographically bound to the signed update chain. No root-of-trust pin
-  (state-root commitment or verifier public key) currently exists for a
-  device pulling a snapshot with no prior local state, so this path cannot
-  reuse the existing delta-signature pipeline (`apply_signed_update`, which
-  validates a chain of signed operations against an already-trusted prior
-  state, not a bare snapshot) without a new signed-attestation schema or a
-  protocol extension to also serve the update log. Treat a pulled bundle as
-  provisional until independently corroborated via gossip convergence from an
-  already-trusted peer. Tracked as a High-severity open item pending a
-  reviewed design, not silently accepted.
+- Anchor bundle-pull is cryptographically authenticated via the **membership
+  head attestation**: ed25519 signatures over the snapshot's exact
+  `(network_id, epoch, state_root)` identity plus a freshness timestamp,
+  minted in the same signing session as every membership update signature and
+  materialized into the persisted snapshot at apply time (anchors stay
+  trust-inert — they never mint, they only re-serve what a signing session
+  produced). A device pulling a bundle accepts it only when: the §6.B pinned
+  membership owner public key is an Owner in the attested approver set AND
+  its private-key holder actually signed the attestation (roster presence
+  alone is rejected); valid signatures from the attested state's active
+  approvers meet its quorum threshold; the attestation is fresh within a
+  bounded window (default 7 days, tighten-only — there is no bypass flag)
+  and not future-dated beyond clock-skew tolerance; and the epoch does not
+  regress against the previously verified local bundle (same-epoch
+  different-root is surfaced verbatim as fork evidence, never silently
+  resolved). Every failure mode rejects BEFORE any byte is written to disk.
+  Enforcement point: `rustynet_control::membership::verify_attested_snapshot`,
+  invoked by `anchor pull-bundle` ahead of any output write. Verification:
+  `verify_attested_snapshot_rejects_missing_attestation` and its sibling
+  negative tests in `crates/rustynet-control/src/membership.rs`, plus the
+  enforcement-ordering integration test
+  `pull_bundle_never_writes_unverified_bytes` in
+  `crates/rustynet-cli/src/main.rs`. Remaining adjacent gap (tracked
+  separately, out of this control's scope): the bundle-pull endpoint still
+  authenticates the CLIENT with a static long-lived bearer token rather than
+  the single-use enrollment token `Requirements.md` specifies — that token
+  gates roster confidentiality only; bundle authenticity no longer depends
+  on it.
 - Signed peer/control data validated by clients before application.
 
 3. Auth and enrollment hardening:
