@@ -1381,6 +1381,142 @@ pub fn verify_attested_snapshot(
     Ok(state)
 }
 
+/// A device's persistent, monotonic high-water mark for membership state:
+/// the `(epoch, state_root)` of the most recent state this device has
+/// itself verified. Distinct from `verify_attested_snapshot`'s
+/// `prior_identity` parameter in one crucial way: `prior_identity` is
+/// whatever the CALLER decides to pass in, while `MembershipWatermark` is
+/// this crate's canonical on-disk representation of "what has this device
+/// already established," meant to be sourced independently of any
+/// ephemeral, deletable, or freshness-bounded artifact (e.g. a cached
+/// bundle file) so that anti-rollback protection survives an empty or
+/// reset local cache. Originally implemented only in `rustynetd`'s daemon
+/// bootstrap/apply paths; moved here so `rustynet-cli`'s `anchor
+/// pull-bundle` can share the exact same file and format rather than
+/// re-deriving its rollback floor from `--output` on every invocation
+/// (which is what let a stale-cache rollback go unnoticed — see
+/// `documents/operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipWatermark {
+    pub epoch: u64,
+    pub state_root: String,
+}
+
+/// `true` iff accepting `incoming` after `previous` would be a rollback:
+/// either the epoch has decreased (an old, superseded epoch resurfacing —
+/// the anti-rollback property), or the epoch is unchanged but the root
+/// differs (two different histories claiming the same epoch — fork
+/// detection; only one canonical state can exist per epoch). Equal epoch
+/// with the SAME root is not a replay (idempotent re-verification is
+/// fine); a strictly newer epoch is never a replay regardless of root
+/// (forward progress).
+pub fn membership_watermark_is_replay(
+    incoming: &MembershipWatermark,
+    previous: &MembershipWatermark,
+) -> bool {
+    incoming.epoch < previous.epoch
+        || (incoming.epoch == previous.epoch && incoming.state_root != previous.state_root)
+}
+
+/// Load the persisted watermark, if any. `Ok(None)` (not an error) means
+/// no watermark has ever been established at `path` — the correct,
+/// honest trust-on-first-use state for a genuinely fresh device, which
+/// callers must treat as "nothing to check a newly-offered epoch
+/// against" rather than a failure.
+pub fn load_membership_watermark(path: &Path) -> Result<Option<MembershipWatermark>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let mut version: Option<u8> = None;
+    let mut epoch: Option<u64> = None;
+    let mut state_root: Option<String> = None;
+    for line in content.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err("membership watermark line missing key/value separator".to_owned());
+        };
+        match key {
+            "version" => {
+                version = value.parse::<u8>().ok();
+            }
+            "epoch" => {
+                epoch = value.parse::<u64>().ok();
+            }
+            "state_root" => {
+                state_root = Some(value.to_owned());
+            }
+            _ => return Err(format!("unknown membership watermark key {key}")),
+        }
+    }
+    if version != Some(1) {
+        return Err("unsupported membership watermark version".to_owned());
+    }
+    Ok(Some(MembershipWatermark {
+        epoch: epoch.ok_or_else(|| "missing membership watermark epoch".to_owned())?,
+        state_root: state_root
+            .ok_or_else(|| "missing membership watermark state_root".to_owned())?,
+    }))
+}
+
+/// Persist the watermark atomically (temp file + fsync + rename +
+/// parent-directory fsync), `0700` parent directory, `0600` file. The
+/// same integrity level as every other trust watermark in this codebase
+/// (trust/traversal/DNS-zone/relay-fleet) — this does not lower or raise
+/// that bar, it extends it to a path (anchor bundle-pull) that previously
+/// had none at all.
+pub fn persist_membership_watermark(
+    path: &Path,
+    watermark: &MembershipWatermark,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    let payload = format!(
+        "version=1\nepoch={}\nstate_root={}\n",
+        watermark.epoch, watermark.state_root
+    );
+    let temp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600)
+    };
+    let mut temp = options.open(&temp_path).map_err(|err| err.to_string())?;
+    if let Err(err) = temp.write_all(payload.as_bytes()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.to_string());
+    }
+    if let Err(err) = temp.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.to_string());
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err.to_string());
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let parent_dir = fs::File::open(parent).map_err(|err| err.to_string())?;
+        parent_dir.sync_all().map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn append_membership_log_entry(
     path: impl AsRef<Path>,
     signed_update: &SignedMembershipUpdate,
