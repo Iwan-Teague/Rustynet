@@ -2980,6 +2980,96 @@ mod tests {
         let _ = MAX_MEMBERSHIP_LOG_BYTES;
     }
 
+    /// Prove the digest self-consistency check on the persisted membership
+    /// snapshot is actually enforced: `persist_membership_snapshot` writes a
+    /// SHA-256 digest over `version=` + `state_hex=`, and
+    /// `load_membership_snapshot` must reject the file with
+    /// `MembershipError::IntegrityMismatch` when either the payload or the
+    /// stored digest is tampered on disk.
+    ///
+    /// Scope honesty: this digest is a self-consistency check against on-disk
+    /// corruption and casual tampering only. It is NOT a signature — anyone
+    /// who can rewrite `state_hex=` can recompute a matching `digest=`. It is
+    /// therefore NOT a substitute for the signature verification the anchor
+    /// bundle-pull path still lacks (tracked as a High-severity open item in
+    /// documents/SecurityMinimumBar.md).
+    #[cfg(unix)]
+    #[test]
+    fn load_membership_snapshot_rejects_tampered_digest_or_payload() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "membership-snapshot-tamper-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("temp dir creation");
+        let snapshot = temp_dir.join("membership.snapshot");
+
+        let state = base_state();
+        persist_membership_snapshot(&snapshot, &state).expect("snapshot should persist");
+
+        // Baseline (anti-vacuous): the untampered file loads.
+        let loaded = load_membership_snapshot(&snapshot).expect("intact snapshot should load");
+        assert_eq!(
+            loaded.state_root_hex().expect("loaded root"),
+            state.state_root_hex().expect("original root")
+        );
+
+        let original = std::fs::read_to_string(&snapshot).expect("snapshot readable");
+
+        // Flip one character of a field's value while leaving the rest of the
+        // file intact, rewrite with the same 0o600 permissions the persister
+        // used, and assert the loader fails closed with IntegrityMismatch.
+        let tamper_field = |field_prefix: &str| {
+            let mut lines: Vec<String> = original.lines().map(str::to_owned).collect();
+            let line = lines
+                .iter_mut()
+                .find(|l| l.starts_with(field_prefix))
+                .unwrap_or_else(|| panic!("snapshot must contain a {field_prefix} line"));
+            let value_start = field_prefix.len();
+            let first = line[value_start..]
+                .chars()
+                .next()
+                .expect("field value must be non-empty");
+            let flipped = if first == '0' { '1' } else { '0' };
+            line.replace_range(
+                value_start..value_start + first.len_utf8(),
+                &flipped.to_string(),
+            );
+            let mut body = lines.join("\n");
+            body.push('\n');
+            std::fs::write(&snapshot, body).expect("rewrite tampered snapshot");
+            std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o600))
+                .expect("0o600 perms");
+            let err = load_membership_snapshot(&snapshot)
+                .expect_err("tampered snapshot must be rejected");
+            assert_eq!(
+                err,
+                MembershipError::IntegrityMismatch,
+                "tampering {field_prefix} must surface as IntegrityMismatch"
+            );
+        };
+
+        // Case 1: corrupt the state payload; the stored digest no longer
+        // matches the recomputed one.
+        tamper_field("state_hex=");
+
+        // Restore the intact file between cases so each tamper is isolated.
+        std::fs::write(&snapshot, &original).expect("restore snapshot");
+        std::fs::set_permissions(&snapshot, std::fs::Permissions::from_mode(0o600))
+            .expect("0o600 perms");
+
+        // Case 2: corrupt the stored digest itself; the payload is intact but
+        // the recorded digest no longer matches.
+        tamper_field("digest=");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[test]
     fn loading_empty_membership_log_is_supported() {
         let unique = format!(
