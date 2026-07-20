@@ -3568,6 +3568,25 @@ impl DaemonBackend {
     }
 }
 
+/// Memoized result of `compute_runtime_endpoint_fingerprint` (perf: the main
+/// loop asks for the fingerprint every iteration, but its only mutable inputs
+/// are the traversal-hint state — tracked by `traversal_hint_generation` — and,
+/// on Linux, the live default-gateway probe, which is re-probed on every call
+/// because it is external state the fingerprint exists to observe). The cache
+/// is served only when every input provably matches, so the returned string is
+/// byte-identical to a from-scratch recompute.
+struct RuntimeEndpointFingerprintCache {
+    /// `DaemonRuntime::traversal_hint_generation` at compute time.
+    traversal_hint_generation: u64,
+    /// The live gateway probe result the cached fingerprint was computed
+    /// from. Compared against a fresh probe on every lookup so an external
+    /// gateway change (DHCP renew, router failover) still invalidates the
+    /// cache even though no daemon-internal state mutated.
+    #[cfg(target_os = "linux")]
+    gateway_probe: Result<Ipv4Addr, String>,
+    fingerprint: String,
+}
+
 struct DaemonRuntime {
     controller: Phase10Controller<DaemonBackend, RuntimeSystem>,
     policy: ContextualPolicySet,
@@ -3685,6 +3704,20 @@ struct DaemonRuntime {
     traversal_endpoint_change_events: u64,
     traversal_last_endpoint_fingerprint: Option<String>,
     traversal_last_endpoint_change_unix: Option<u64>,
+    /// Generation counter for the memoized runtime-endpoint fingerprint.
+    /// Bumped unconditionally at the top of `refresh_traversal_hint_state`
+    /// — the single function that mutates `traversal_hints` /
+    /// `traversal_hint_error`, which are the only mutable fingerprint
+    /// inputs besides the live Linux gateway probe (the four remaining
+    /// inputs are set once at construction and never reassigned). Any NEW
+    /// mutation site for those two fields must either live inside
+    /// `refresh_traversal_hint_state` or bump this counter itself;
+    /// otherwise `runtime_endpoint_fingerprint` can serve a stale hash and
+    /// endpoint-change detection silently stops firing.
+    traversal_hint_generation: u64,
+    /// Memoized fingerprint (see `RuntimeEndpointFingerprintCache`).
+    /// `None` until the first computation.
+    runtime_endpoint_fingerprint_cache: Option<RuntimeEndpointFingerprintCache>,
     _endpoint_monitor: EndpointMonitor,
     auto_port_forward_exit: bool,
     #[cfg(target_os = "linux")]
@@ -4082,6 +4115,8 @@ impl DaemonRuntime {
             traversal_endpoint_change_events: 0,
             traversal_last_endpoint_fingerprint: None,
             traversal_last_endpoint_change_unix: None,
+            traversal_hint_generation: 0,
+            runtime_endpoint_fingerprint_cache: None,
             _endpoint_monitor: EndpointMonitor::new(vec![config.wg_interface.clone()]),
             auto_port_forward_exit: config.auto_port_forward_exit,
             #[cfg(target_os = "linux")]
@@ -4673,6 +4708,13 @@ impl DaemonRuntime {
     }
 
     fn refresh_traversal_hint_state(&mut self, force_reprobe: bool) {
+        // Every path through this function may mutate `traversal_hints` /
+        // `traversal_hint_error` (including the trailing sync-error
+        // overwrite), so bump the fingerprint generation unconditionally at
+        // entry. Over-invalidation — a refresh that happens to reload
+        // byte-identical state still forces one fingerprint recompute — is
+        // the safe direction; a missed bump would serve a stale hash.
+        self.traversal_hint_generation = self.traversal_hint_generation.wrapping_add(1);
         let previous_watermark = match load_traversal_watermark(&self.traversal_watermark_path) {
             Ok(value) => value,
             Err(err) => {
@@ -4906,14 +4948,24 @@ impl DaemonRuntime {
         }
     }
 
-    fn compute_runtime_endpoint_fingerprint(&self) -> String {
+    /// Pure fingerprint computation. On Linux the caller supplies the live
+    /// default-gateway probe result so the probe runs exactly once per
+    /// lookup — probing here as well as in the memo key would open a
+    /// window where the cached key and the hashed value came from two
+    /// different probes. Callers outside `runtime_endpoint_fingerprint`
+    /// must pass a probe of `self.egress_interface` taken in the same
+    /// call, or the hash no longer reflects the live route table.
+    fn compute_runtime_endpoint_fingerprint(
+        &self,
+        #[cfg(target_os = "linux")] gateway_probe: &Result<Ipv4Addr, String>,
+    ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.local_node_id.as_bytes());
         hasher.update(self.wg_interface.as_bytes());
         #[cfg(target_os = "linux")]
         {
             hasher.update(self.egress_interface.as_bytes());
-            match detect_ipv4_default_gateway_for_interface(self.egress_interface.as_str()) {
+            match gateway_probe {
                 Ok(gateway) => hasher.update(gateway.octets()),
                 Err(err) => hasher.update(format!("gateway-error:{err}").as_bytes()),
             }
@@ -4941,8 +4993,47 @@ impl DaemonRuntime {
         encode_hex(&hasher.finalize())
     }
 
-    fn maybe_trigger_endpoint_change_refresh(&mut self) {
+    /// Memoizing front-end for `compute_runtime_endpoint_fingerprint`. The
+    /// main loop calls this every iteration (up to ~40 Hz when idle) while
+    /// the hint inputs mutate at most once per reconcile tick, so the full
+    /// SHA-256 walk over every traversal bundle/candidate (with its
+    /// per-candidate string allocations) is skipped whenever no input has
+    /// changed. Inputs are matched exactly: the traversal-hint generation
+    /// counter (bumped by `refresh_traversal_hint_state`, the sole mutator
+    /// of the hint fields) and, on Linux, a fresh default-gateway probe —
+    /// re-run on EVERY call, never cached, because it reads external state
+    /// (`/proc/net/route`) that this fingerprint exists to observe. A hit
+    /// therefore returns a string byte-identical to a full recompute.
+    fn runtime_endpoint_fingerprint(&mut self) -> String {
+        #[cfg(target_os = "linux")]
+        let gateway_probe =
+            detect_ipv4_default_gateway_for_interface(self.egress_interface.as_str());
+        if let Some(cache) = self.runtime_endpoint_fingerprint_cache.as_ref() {
+            let generation_matches =
+                cache.traversal_hint_generation == self.traversal_hint_generation;
+            #[cfg(target_os = "linux")]
+            let inputs_match = generation_matches && cache.gateway_probe == gateway_probe;
+            #[cfg(not(target_os = "linux"))]
+            let inputs_match = generation_matches;
+            if inputs_match {
+                return cache.fingerprint.clone();
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let fingerprint = self.compute_runtime_endpoint_fingerprint(&gateway_probe);
+        #[cfg(not(target_os = "linux"))]
         let fingerprint = self.compute_runtime_endpoint_fingerprint();
+        self.runtime_endpoint_fingerprint_cache = Some(RuntimeEndpointFingerprintCache {
+            traversal_hint_generation: self.traversal_hint_generation,
+            #[cfg(target_os = "linux")]
+            gateway_probe,
+            fingerprint: fingerprint.clone(),
+        });
+        fingerprint
+    }
+
+    fn maybe_trigger_endpoint_change_refresh(&mut self) {
+        let fingerprint = self.runtime_endpoint_fingerprint();
         match self.traversal_last_endpoint_fingerprint.as_deref() {
             Some(previous) if previous == fingerprint.as_str() => {}
             Some(_) => {
@@ -5188,6 +5279,18 @@ impl DaemonRuntime {
                 }
             }
         }
+    }
+
+    /// True only when both gossip runtime halves are attached, i.e. when
+    /// `maybe_run_gossip_mint` would actually consume a CandidateSet. The
+    /// main loop checks this BEFORE building the set so the build (host +
+    /// STUN candidate classification and its Vec pushes) is skipped
+    /// entirely in the unattached default, instead of being constructed
+    /// every iteration only for `maybe_run_gossip_mint`'s internal
+    /// `Some`-gates to discard it. Those internal gates stay in place as
+    /// defense in depth; this predicate must mirror them exactly.
+    fn gossip_mint_attached(&self) -> bool {
+        self.gossip_node.is_some() && self.gossip_transport.is_some()
     }
 
     /// Periodic hook: if the local CandidateSet has changed since
@@ -9866,10 +9969,14 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             // reconcile cadence, mint a fresh bundle if the local
             // CandidateSet has drifted or the heartbeat timer has
             // elapsed. Both calls are no-ops when the gossip
-            // subsystem hasn't been attached (fail-closed default).
+            // subsystem hasn't been attached (fail-closed default),
+            // so the CandidateSet build is gated on attachment first
+            // rather than built every iteration only to be discarded.
             runtime.drain_gossip_inbound();
-            let cached_candidates = runtime.build_candidate_set_from_cache();
-            runtime.maybe_run_gossip_mint(cached_candidates);
+            if runtime.gossip_mint_attached() {
+                let cached_candidates = runtime.build_candidate_set_from_cache();
+                runtime.maybe_run_gossip_mint(cached_candidates);
+            }
 
             if config
                 .max_requests
@@ -10098,10 +10205,14 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             // reconcile cadence, mint a fresh bundle if the local
             // CandidateSet has drifted or the heartbeat timer has
             // elapsed. Both calls are no-ops when the gossip
-            // subsystem hasn't been attached (fail-closed default).
+            // subsystem hasn't been attached (fail-closed default),
+            // so the CandidateSet build is gated on attachment first
+            // rather than built every iteration only to be discarded.
             runtime.drain_gossip_inbound();
-            let cached_candidates = runtime.build_candidate_set_from_cache();
-            runtime.maybe_run_gossip_mint(cached_candidates);
+            if runtime.gossip_mint_attached() {
+                let cached_candidates = runtime.build_candidate_set_from_cache();
+                runtime.maybe_run_gossip_mint(cached_candidates);
+            }
 
             if config
                 .max_requests
@@ -24591,6 +24702,161 @@ mod tests {
         let _ = std::fs::remove_file(traversal_path);
         let _ = std::fs::remove_file(traversal_verifier_path);
         let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// Perf regression guard for the memoized runtime-endpoint fingerprint:
+    /// unchanged state must serve the cached value, and — the part that
+    /// matters for safety — a real traversal-hint change driven through
+    /// `refresh_traversal_hint_state` (the single production mutation path
+    /// for the hint inputs) must invalidate the cache. A cache that kept
+    /// serving the old hash would make the daemon think nothing changed
+    /// when it did, silently disabling endpoint-change refreshes.
+    #[test]
+    fn runtime_endpoint_fingerprint_memo_invalidates_on_traversal_hint_change() {
+        let relay_addr: SocketAddr = "203.0.113.61:40061".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-endpoint-fingerprint-memo",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+
+        runtime.refresh_traversal_hint_state(false);
+        assert!(
+            runtime.traversal_hints.is_some(),
+            "test precondition: the signed traversal bundle must load"
+        );
+
+        let first = runtime.runtime_endpoint_fingerprint();
+        let cached_generation = runtime
+            .runtime_endpoint_fingerprint_cache
+            .as_ref()
+            .expect("first fingerprint call must populate the cache")
+            .traversal_hint_generation;
+        assert_eq!(
+            cached_generation, runtime.traversal_hint_generation,
+            "cache must be keyed on the current traversal-hint generation"
+        );
+        let second = runtime.runtime_endpoint_fingerprint();
+        assert_eq!(
+            first, second,
+            "unchanged state must produce an identical fingerprint"
+        );
+
+        // Prove the unchanged-state path really serves the cache (rather
+        // than silently recomputing): poison the cached string and observe
+        // it round-trip. Adjacent-call gateway stability is already an
+        // assumption of the neighbouring endpoint-change tests.
+        if let Some(cache) = runtime.runtime_endpoint_fingerprint_cache.as_mut() {
+            cache.fingerprint = "poisoned-cache-sentinel".to_owned();
+        }
+        let poisoned = runtime.runtime_endpoint_fingerprint();
+        assert_eq!(
+            poisoned, "poisoned-cache-sentinel",
+            "unchanged inputs must be served from the cache"
+        );
+
+        // Mutate the signed hint state on disk (advanced nonce, new
+        // candidate endpoints, fresh signing key) and reload through the
+        // production path. The generation bump must invalidate the cache:
+        // the poisoned entry must NOT survive, and the new fingerprint must
+        // equal a from-scratch recompute.
+        let changed_generated = unix_now();
+        let changed_expires = changed_generated.saturating_add(60);
+        let changed_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={changed_generated}\nexpires_at_unix={changed_expires}\nnonce=3\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.9.9\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.99\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-2\ncandidate.1.priority=20\n"
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [29u8; 32],
+            changed_payload.as_str(),
+        );
+        let generation_before_reload = runtime.traversal_hint_generation;
+        runtime.refresh_traversal_hint_state(false);
+        assert_ne!(
+            runtime.traversal_hint_generation, generation_before_reload,
+            "refresh_traversal_hint_state must bump the fingerprint generation"
+        );
+        let after_change = runtime.runtime_endpoint_fingerprint();
+        assert_ne!(
+            after_change, "poisoned-cache-sentinel",
+            "a traversal-hint change must invalidate the cached fingerprint"
+        );
+        assert_ne!(
+            after_change, first,
+            "changed hint content must produce a different fingerprint"
+        );
+        #[cfg(target_os = "linux")]
+        let expected_fresh = {
+            let gateway_probe =
+                detect_ipv4_default_gateway_for_interface(runtime.egress_interface.as_str());
+            runtime.compute_runtime_endpoint_fingerprint(&gateway_probe)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let expected_fresh = runtime.compute_runtime_endpoint_fingerprint();
+        assert_eq!(
+            after_change, expected_fresh,
+            "the post-invalidation fingerprint must be byte-identical to a from-scratch recompute"
+        );
+
+        // A hints-present -> hints-missing transition is a mutation too:
+        // removing the bundle takes the Missing arm (hints and error both
+        // cleared) and must again invalidate.
+        std::fs::remove_file(&traversal_path).expect("traversal bundle should be removable");
+        runtime.refresh_traversal_hint_state(false);
+        assert!(runtime.traversal_hints.is_none());
+        let after_missing = runtime.runtime_endpoint_fingerprint();
+        assert_ne!(
+            after_missing, after_change,
+            "losing the traversal hints must change the fingerprint, not serve the cached one"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// Perf guard for the gossip mint gate: the main loop must be able to
+    /// tell whether `maybe_run_gossip_mint` would consume a CandidateSet
+    /// before paying for the build. The predicate must mirror the mint
+    /// hook's internal `Some`-gates exactly: false until BOTH gossip halves
+    /// are attached, true afterwards.
+    #[test]
+    fn gossip_mint_attached_requires_both_gossip_halves() {
+        let relay_addr: SocketAddr = "203.0.113.62:40062".parse().expect("relay addr");
+        let (runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-gossip-mint-attached-gate",
+            relay_addr,
+            "relay-eu-1",
+        );
+        #[cfg(not(unix))]
+        let runtime = runtime;
+        #[cfg(unix)]
+        let mut runtime = runtime;
+        assert!(
+            !runtime.gossip_mint_attached(),
+            "a fresh runtime must report the gossip mint as unattached so the \
+             main loop skips the CandidateSet build"
+        );
+        // The real transport only binds on Unix (the Windows path is a
+        // stub that refuses to construct), so the attached half of the
+        // assertion is Unix-only.
+        #[cfg(unix)]
+        {
+            let node =
+                crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
+                    .expect("gossip node should build");
+            let transport = crate::gossip_transport::GossipTransport::bind(
+                "127.0.0.1:0".parse().expect("bind addr should parse"),
+            )
+            .expect("gossip transport should bind");
+            runtime.attach_gossip_runtime(node, transport);
+            assert!(
+                runtime.gossip_mint_attached(),
+                "after attach_gossip_runtime the main loop must build and pass the CandidateSet"
+            );
+        }
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
