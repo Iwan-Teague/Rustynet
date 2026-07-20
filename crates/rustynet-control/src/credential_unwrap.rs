@@ -323,7 +323,7 @@ pub const WINDOWS_DEFAULT_SECRET_DIR: &str = r"C:\ProgramData\RustyNet\secrets";
 ///
 /// The blob is expected to live at
 /// `<secret_dir>\<service>.dpapi`, encoded with the
-/// `RNYDPAPI` reviewed-blob magic (matching the existing WireGuard
+/// `RNYDPAPI` reviewed-blob magic (matching the existing tunnel-key
 /// passphrase blob shape in `crates/rustynetd/src/key_material.rs`).
 /// DPAPI scope is `LocalMachine`, so a blob written by the operator
 /// during install can be unwrapped both by the daemon service
@@ -450,7 +450,7 @@ fn unwrap_dpapi_blob(blob_path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, 
     Ok(zeroizing)
 }
 
-/// Verify the reviewed DPAPI envelope (matches the WireGuard passphrase
+/// Verify the reviewed DPAPI envelope (matches the tunnel-key passphrase
 /// blob in `crates/rustynetd/src/key_material.rs`) and return the inner
 /// CryptProtectData blob. Layout:
 ///   magic    : 8 bytes = b"RNYDPAPI"
