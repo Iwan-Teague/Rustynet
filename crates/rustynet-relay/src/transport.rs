@@ -676,10 +676,15 @@ impl RelayTransport {
         // steady churn of distinct `node_id`s would grow the bucket map
         // without bound (memory-exhaustion DoS). Tying bucket lifetime to
         // session lifetime caps the bucket count by `max_total_sessions`.
-        let active_nodes: std::collections::HashSet<String> = self
+        // Borrowed keys: this runs on the cleanup tick, but there is no need
+        // to clone every session's node_id just to build a membership set —
+        // disjoint field borrows let the set of `&str` views over
+        // `self.sessions` coexist with the mutable borrow of
+        // `self.rate_limiter`.
+        let active_nodes: std::collections::HashSet<&str> = self
             .sessions
             .values()
-            .map(|session| session.node_id.clone())
+            .map(|session| session.node_id.as_str())
             .collect();
         self.rate_limiter
             .retain_active_nodes(|node_id| active_nodes.contains(node_id));
