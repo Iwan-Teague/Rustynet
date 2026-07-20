@@ -330,14 +330,43 @@ pub fn observe_system_diagnostics() -> DiagnosticsReport {
 /// (rather than kept test-only) so any future caller that wants to inject
 /// its own bounded runner (e.g. a different timeout policy) can do so
 /// without duplicating the orchestration.
-pub fn observe_with(runner: &dyn CommandRunner) -> DiagnosticsReport {
-    DiagnosticsReport {
-        interfaces: observe_interfaces(runner),
-        routes: observe_routes(runner),
-        dns: observe_dns(runner),
-        listening_sockets: observe_listening_sockets(runner),
-        firewall: observe_firewall(runner),
-        service: observe_service(runner),
+///
+/// The six probes are independent — no report field depends on another —
+/// so they run concurrently, one scoped thread per probe, and the report
+/// is assembled from the joined results. Wall-clock cost is therefore
+/// bounded by the slowest single probe rather than the sum of all six,
+/// while each probe keeps its own [`DEFAULT_COMMAND_TIMEOUT`] bound and
+/// the exact same allowlisted command set as before. The runner must be
+/// `Sync` because every probe thread shares the same `&dyn CommandRunner`;
+/// [`SystemCommandRunner`] is stateless and trivially satisfies this.
+pub fn observe_with(runner: &(dyn CommandRunner + Sync)) -> DiagnosticsReport {
+    thread::scope(|scope| {
+        let interfaces = scope.spawn(|| observe_interfaces(runner));
+        let routes = scope.spawn(|| observe_routes(runner));
+        let dns = scope.spawn(|| observe_dns(runner));
+        let listening_sockets = scope.spawn(|| observe_listening_sockets(runner));
+        let firewall = scope.spawn(|| observe_firewall(runner));
+        let service = scope.spawn(|| observe_service(runner));
+        DiagnosticsReport {
+            interfaces: join_probe(interfaces),
+            routes: join_probe(routes),
+            dns: join_probe(dns),
+            listening_sockets: join_probe(listening_sockets),
+            firewall: join_probe(firewall),
+            service: join_probe(service),
+        }
+    })
+}
+
+/// Join one probe thread. Every probe is documented fail-safe (it degrades
+/// to a conservative default instead of panicking), so `Err` here means a
+/// bug inside this module; re-raising the panic payload preserves exactly
+/// the behavior the previous sequential composition had (a probe panic
+/// propagated to the caller) rather than fabricating a report field.
+fn join_probe<T>(handle: thread::ScopedJoinHandle<'_, T>) -> T {
+    match handle.join() {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
@@ -383,8 +412,12 @@ fn interface_details_from_sysfs_root(root: &std::path::Path) -> Vec<InterfaceDet
     ifaces
 }
 
+// The three `observe_interfaces` variants are `pub(crate)`: they are the
+// crate's single interface-enumeration implementation, shared by the
+// diagnostics report and by `lib.rs`'s `iface_list` / `network_interfaces`
+// wrappers (which previously each carried their own drifted copy).
 #[cfg(target_os = "linux")]
-fn observe_interfaces(_runner: &dyn CommandRunner) -> Vec<InterfaceDetail> {
+pub(crate) fn observe_interfaces(_runner: &dyn CommandRunner) -> Vec<InterfaceDetail> {
     interface_details_from_sysfs_root(std::path::Path::new("/sys/class/net"))
 }
 
@@ -445,7 +478,7 @@ fn parse_ifconfig_interface_details(stdout: &str) -> Vec<InterfaceDetail> {
 }
 
 #[cfg(target_os = "macos")]
-fn observe_interfaces(runner: &dyn CommandRunner) -> Vec<InterfaceDetail> {
+pub(crate) fn observe_interfaces(runner: &dyn CommandRunner) -> Vec<InterfaceDetail> {
     match run_read_only(runner, "ifconfig", &[], DEFAULT_COMMAND_TIMEOUT) {
         CommandOutcome::Completed {
             stdout,
@@ -500,7 +533,7 @@ fn parse_netsh_show_interfaces(stdout: &str) -> Vec<InterfaceDetail> {
 }
 
 #[cfg(target_os = "windows")]
-fn observe_interfaces(runner: &dyn CommandRunner) -> Vec<InterfaceDetail> {
+pub(crate) fn observe_interfaces(runner: &dyn CommandRunner) -> Vec<InterfaceDetail> {
     match run_read_only(
         runner,
         "netsh",
@@ -1281,8 +1314,8 @@ pub fn render_report(report: &DiagnosticsReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     // ------------------------------------------------------------------
     // Allowlist / by-construction observation-only enforcement
@@ -1393,16 +1426,18 @@ mod tests {
     // Recording fake: capture-seam for "no mutation" + fail-safe tests
     // ------------------------------------------------------------------
 
+    // `Mutex` rather than `RefCell` because `observe_with` fans the probes
+    // out across scoped threads, so the shared runner must be `Sync`.
     struct RecordingRunner {
         responses: HashMap<(String, Vec<String>), CommandOutcome>,
-        calls: RefCell<Vec<(String, Vec<String>)>>,
+        calls: Mutex<Vec<(String, Vec<String>)>>,
     }
 
     impl RecordingRunner {
         fn new() -> Self {
             Self {
                 responses: HashMap::new(),
-                calls: RefCell::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -1418,7 +1453,7 @@ mod tests {
         }
 
         fn invocations(&self) -> Vec<(String, Vec<String>)> {
-            self.calls.borrow().clone()
+            self.calls.lock().expect("calls mutex poisoned").clone()
         }
     }
 
@@ -1428,12 +1463,64 @@ mod tests {
                 program.to_owned(),
                 args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             );
-            self.calls.borrow_mut().push(key.clone());
+            self.calls
+                .lock()
+                .expect("calls mutex poisoned")
+                .push(key.clone());
             self.responses
                 .get(&key)
                 .cloned()
                 .unwrap_or(CommandOutcome::Unavailable)
         }
+    }
+
+    /// A runner that sleeps on every invocation, for proving the probe
+    /// fan-out is actually concurrent (see
+    /// `probes_run_concurrently_not_sequentially`).
+    struct SlowRunner {
+        delay: Duration,
+        calls: Mutex<u32>,
+    }
+
+    impl CommandRunner for SlowRunner {
+        fn run(&self, _program: &str, _args: &[&str], _timeout: Duration) -> CommandOutcome {
+            *self.calls.lock().expect("calls mutex poisoned") += 1;
+            thread::sleep(self.delay);
+            CommandOutcome::Unavailable
+        }
+    }
+
+    /// Guards the concurrency mechanism itself: with a runner that sleeps
+    /// `delay` per invocation, a sequential composition of the probes
+    /// takes at least `calls * delay` wall-clock, while the scoped-thread
+    /// fan-out is bounded by the slowest single probe (at most two runner
+    /// invocations within one probe — the Linux firewall nft→iptables
+    /// fallback). Asserting strictly under `(calls - 1) * delay` therefore
+    /// fails if anyone reverts `observe_with` to sequential composition,
+    /// with a comfortable margin over the concurrent case on every OS.
+    #[test]
+    fn probes_run_concurrently_not_sequentially() {
+        let delay = Duration::from_millis(200);
+        let runner = SlowRunner {
+            delay,
+            calls: Mutex::new(0),
+        };
+        let start = Instant::now();
+        let _report = observe_with(&runner);
+        let elapsed = start.elapsed();
+
+        let calls = *runner.calls.lock().expect("calls mutex poisoned");
+        assert!(
+            calls >= 4,
+            "expected several probes to reach the runner, got {calls}"
+        );
+        let sequential_floor = delay * calls;
+        let bound = delay * (calls - 1);
+        assert!(
+            elapsed < bound,
+            "observe_with took {elapsed:?} for {calls} runner calls; sequential \
+             composition would take >= {sequential_floor:?}, concurrent bound is {bound:?}"
+        );
     }
 
     /// The seam-based "no mutation" proof required by the PKG-G contract:
