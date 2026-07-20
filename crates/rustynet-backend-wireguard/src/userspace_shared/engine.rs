@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -62,6 +62,21 @@ pub(crate) struct UserspaceEngine {
     local_static_public: PublicKey,
     next_tunnel_index: u32,
     peer_states: BTreeMap<NodeId, PeerEngineState>,
+    /// Reverse index for inbound dispatch: configured endpoint → the ordered
+    /// set of peers currently pinned to that endpoint. Maintained in exact
+    /// lockstep with `peer_states` by `configure_peer` /
+    /// `update_peer_endpoint` / `remove_peer` (`link_endpoint` /
+    /// `unlink_endpoint`), replacing the former per-packet linear scan.
+    ///
+    /// Duplicate-endpoint tie-break parity: the old scan iterated
+    /// `peer_states` (a `BTreeMap` in ascending `NodeId` order) and took the
+    /// FIRST match, so peers sharing an endpoint resolved to the LOWEST
+    /// `NodeId`. Storing the full `BTreeSet<NodeId>` per endpoint and reading
+    /// `.first()` reproduces that tie-break by construction — including after
+    /// the winning peer is removed, when the next-lowest sharer becomes the
+    /// answer exactly as a fresh scan would find. Empty sets are removed so
+    /// index keys are precisely the endpoints with at least one peer.
+    endpoint_index: BTreeMap<SocketAddr, BTreeSet<NodeId>>,
     path_quality: BTreeMap<NodeId, PeerPathQuality>,
     recorded_peer_ciphertext_ingress: Vec<RecordedPeerCiphertextIngress>,
     recorded_tunnel_plaintext_packets: Vec<RecordedTunnelPlaintextPacket>,
@@ -222,6 +237,7 @@ impl UserspaceEngine {
             local_static_public,
             next_tunnel_index: 1,
             peer_states: BTreeMap::new(),
+            endpoint_index: BTreeMap::new(),
             path_quality: BTreeMap::new(),
             recorded_peer_ciphertext_ingress: Vec::new(),
             recorded_tunnel_plaintext_packets: Vec::new(),
@@ -252,7 +268,13 @@ impl UserspaceEngine {
             None,
         );
 
-        let disposition = if self.peer_states.contains_key(&peer.node_id) {
+        // All fallible steps are done; from here the peer table and the
+        // endpoint reverse index mutate together so they can never diverge.
+        let previous_endpoint = self
+            .peer_states
+            .get(&peer.node_id)
+            .map(|existing| existing.endpoint);
+        let disposition = if previous_endpoint.is_some() {
             ConfigurePeerDisposition::Replaced
         } else {
             ConfigurePeerDisposition::Added
@@ -267,6 +289,10 @@ impl UserspaceEngine {
                 tunnel_index,
             },
         );
+        if let Some(previous_endpoint) = previous_endpoint {
+            self.unlink_endpoint(previous_endpoint, &peer.node_id);
+        }
+        self.link_endpoint(endpoint, peer.node_id.clone());
         Ok(disposition)
     }
 
@@ -275,10 +301,14 @@ impl UserspaceEngine {
         node_id: &NodeId,
         endpoint: SocketEndpoint,
     ) -> Result<(), BackendError> {
+        let new_endpoint = socket_addr_from_endpoint(endpoint);
         let Some(peer_state) = self.peer_states.get_mut(node_id) else {
             return Err(BackendError::invalid_input("peer is not configured"));
         };
-        peer_state.endpoint = socket_addr_from_endpoint(endpoint);
+        let previous_endpoint = peer_state.endpoint;
+        peer_state.endpoint = new_endpoint;
+        self.unlink_endpoint(previous_endpoint, node_id);
+        self.link_endpoint(new_endpoint, node_id.clone());
         Ok(())
     }
 
@@ -317,15 +347,48 @@ impl UserspaceEngine {
         self.peer_states.contains_key(node_id)
     }
 
+    /// Fail-closed-adjacent check feeding `reject_round_trip_target`: true iff
+    /// at least one configured peer's endpoint equals `remote_addr`. Backed
+    /// by `endpoint_index`, which is maintained in lockstep with
+    /// `peer_states` by every mutator, so `contains_key` here is exactly
+    /// equivalent to the former `peer_states.values().any(..)` scan — same
+    /// answer, O(log n) instead of O(peers).
     pub(crate) fn has_endpoint(&self, remote_addr: SocketAddr) -> bool {
-        self.peer_states
-            .values()
-            .any(|peer_state| peer_state.endpoint == remote_addr)
+        self.endpoint_index.contains_key(&remote_addr)
     }
 
     pub(crate) fn remove_peer(&mut self, node_id: &NodeId) -> bool {
         self.path_quality.remove(node_id);
-        self.peer_states.remove(node_id).is_some()
+        match self.peer_states.remove(node_id) {
+            Some(removed_state) => {
+                // If this peer was the lowest-NodeId holder of a shared
+                // endpoint, dropping it from the per-endpoint set promotes
+                // the next-lowest sharer — the same answer a fresh linear
+                // scan over the remaining peers would produce.
+                self.unlink_endpoint(removed_state.endpoint, node_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Add `node_id` to the reverse-index entry for `endpoint`.
+    fn link_endpoint(&mut self, endpoint: SocketAddr, node_id: NodeId) {
+        self.endpoint_index
+            .entry(endpoint)
+            .or_default()
+            .insert(node_id);
+    }
+
+    /// Remove `node_id` from the reverse-index entry for `endpoint`,
+    /// dropping the entry entirely once no peer uses that endpoint.
+    fn unlink_endpoint(&mut self, endpoint: SocketAddr, node_id: &NodeId) {
+        if let Some(nodes) = self.endpoint_index.get_mut(&endpoint) {
+            nodes.remove(node_id);
+            if nodes.is_empty() {
+                self.endpoint_index.remove(&endpoint);
+            }
+        }
     }
 
     pub(crate) fn process_inbound_ciphertext(
@@ -341,19 +404,31 @@ impl UserspaceEngine {
         // receiver index) and any packet whose index has no live tunnel. This is
         // what lets a non-exit peer's handshake response reach the tunnel that
         // initiated it even before that peer's endpoint is authoritatively pinned.
-        let matched_node_id = self
-            .find_node_id_by_receiver_index(payload)
-            .or_else(|| self.find_node_id_by_endpoint(remote_addr));
+        //
+        // `receiver_index_match` is unavoidably owned — `find_node_id_by_receiver_index`
+        // does its own linear scan-and-clone and is out of scope for this change (P4
+        // only replaces the endpoint-keyed lookup). The endpoint fallback below is
+        // resolved separately, after the split-borrow, as a `&NodeId` straight out of
+        // `endpoint_index` — no clone on that path.
+        let receiver_index_match = self.find_node_id_by_receiver_index(payload);
+
         // Unbounded-growth guard: `recorded_peer_ciphertext_ingress` is a test-only
         // observability buffer; persisting every datagram in production would let an
         // attacker exhaust memory via a packet flood and would also retain a
-        // long-lived plaintext+ciphertext history that the runtime never reads.
+        // long-lived plaintext+ciphertext history that the runtime never reads. The
+        // match this records is recomputed with its own (test-only, cfg'd-out of
+        // release builds) endpoint lookup + clone; nothing mutates `peer_states` or
+        // `endpoint_index` between here and the production dispatch below, so it is
+        // guaranteed to agree with the production match.
         #[cfg(test)]
         {
             let _ = local_addr;
+            let recorded_match = receiver_index_match
+                .clone()
+                .or_else(|| self.find_node_id_by_endpoint(remote_addr));
             self.recorded_peer_ciphertext_ingress
                 .push(RecordedPeerCiphertextIngress {
-                    node_id: matched_node_id.clone(),
+                    node_id: recorded_match,
                     local_addr,
                     remote_addr,
                     payload: payload.to_vec(),
@@ -366,26 +441,39 @@ impl UserspaceEngine {
             let _ = transport_generation;
         }
 
-        let Some(node_id) = matched_node_id else {
-            return Ok(EngineProcessingOutcome::default());
-        };
-
+        // Split-borrow: `peer_states` (mutable) and `endpoint_index` (read-only here)
+        // are disjoint fields of `Self`, so borrowing them independently lets the
+        // endpoint-reverse-index fallback hand back a `&NodeId` that feeds
+        // `peer_states.get_mut` directly, with no clone — the split-borrow this
+        // backlog item asks for.
         let Self {
             peer_states,
+            endpoint_index,
             recorded_tunnel_plaintext_packets,
             decrypt_scratch,
             decrypt_follow_up_scratch,
             ..
         } = self;
+
+        let node_id: &NodeId = match &receiver_index_match {
+            Some(node_id) => node_id,
+            None => {
+                let Some(node_id) = Self::endpoint_index_lookup(endpoint_index, remote_addr) else {
+                    return Ok(EngineProcessingOutcome::default());
+                };
+                node_id
+            }
+        };
+
         let peer_state = peer_states
-            .get_mut(&node_id)
+            .get_mut(node_id)
             .expect("matched peer state should exist");
         let initial_result =
             peer_state
                 .tunnel
                 .decapsulate(Some(remote_addr.ip()), payload, decrypt_scratch);
         Ok(drive_inbound_result(
-            &node_id,
+            node_id,
             peer_state,
             remote_addr,
             transport_generation,
@@ -526,11 +614,30 @@ impl UserspaceEngine {
         self.select_peer_for_destination(dst_addr)
     }
 
-    fn find_node_id_by_endpoint(&self, remote_addr: SocketAddr) -> Option<NodeId> {
-        self.peer_states
-            .iter()
-            .find(|(_node_id, peer_state)| peer_state.endpoint == remote_addr)
-            .map(|(node_id, _peer_state)| node_id.clone())
+    /// Duplicate-endpoint tie-break: `.first()` on the per-endpoint
+    /// `BTreeSet<NodeId>` is the LOWEST NodeId currently pinned to
+    /// `remote_addr`, matching what the former linear scan over the
+    /// `BTreeMap<NodeId, _>`-ordered `peer_states` found (first match in
+    /// ascending NodeId order). Free function over the bare index (rather
+    /// than a `&self` method) so `process_inbound_ciphertext` can call it on
+    /// a split-borrowed `endpoint_index` field simultaneously with a
+    /// mutable borrow of the disjoint `peer_states` field, returning a
+    /// borrow instead of cloning.
+    fn endpoint_index_lookup(
+        endpoint_index: &BTreeMap<SocketAddr, BTreeSet<NodeId>>,
+        remote_addr: SocketAddr,
+    ) -> Option<&NodeId> {
+        endpoint_index
+            .get(&remote_addr)
+            .and_then(|nodes| nodes.first())
+    }
+
+    // `pub(crate)` (rather than private) so `bench_support` — a sibling
+    // module gated behind `cfg(any(test, feature = "test-harness"))` — can
+    // probe this lookup directly for the P4 microbenchmark below; no wider
+    // exposure than that (still unreachable outside this crate).
+    pub(crate) fn find_node_id_by_endpoint(&self, remote_addr: SocketAddr) -> Option<NodeId> {
+        Self::endpoint_index_lookup(&self.endpoint_index, remote_addr).cloned()
     }
 
     /// Canonical WireGuard inbound demux: handshake responses, cookie replies,
@@ -862,8 +969,8 @@ mod tests {
     use super::{AllowedIpNetwork, UserspaceEngine};
     use base64::Engine as _;
     use base64::prelude::BASE64_STANDARD;
-    use rustynet_backend_api::BackendErrorKind;
-    use std::net::{IpAddr, Ipv4Addr};
+    use rustynet_backend_api::{BackendErrorKind, NodeId};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn peer_path_quality_hysteresis_and_rfc6298_tracking() {
@@ -1096,6 +1203,249 @@ mod tests {
         // remove_peer clears the estimator state.
         assert!(engine.remove_peer(&node_id));
         assert!(!engine.path_quality.contains_key(&node_id));
+    }
+
+    // ---- P4: endpoint reverse index — duplicate-endpoint tie-break parity ----
+    //
+    // CRITICAL invariant (DataplanePerfBacklog_2026-06-12.md P4): when two or
+    // more peers share one endpoint, dispatch must resolve to the LOWEST
+    // NodeId — the behavior of the old linear scan over the NodeId-ordered
+    // `peer_states` BTreeMap, which returned the first match in ascending
+    // NodeId order. The `endpoint_index` reverse map must reproduce that
+    // exact tie-break, including after the winning peer is removed.
+
+    /// Configure a peer with an explicit node id / endpoint / allowed-ips so
+    /// tests can construct duplicate-endpoint scenarios precisely.
+    fn configure_peer_at(
+        engine: &mut UserspaceEngine,
+        name: &str,
+        endpoint: SocketAddr,
+        pubkey: u8,
+        allowed_ip: &str,
+    ) -> NodeId {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let node_id = NodeId::new(name).expect("node id");
+        engine
+            .configure_peer(&PeerConfig {
+                node_id: node_id.clone(),
+                endpoint: SocketEndpoint {
+                    addr: endpoint.ip(),
+                    port: endpoint.port(),
+                },
+                public_key: [pubkey; 32],
+                allowed_ips: vec![allowed_ip.to_owned()],
+                persistent_keepalive_secs: None,
+            })
+            .expect("peer configures");
+        node_id
+    }
+
+    fn fresh_engine(seed: u8) -> UserspaceEngine {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([seed; 32])).expect("write key");
+        // `from_private_key_file` reads the file synchronously before
+        // returning, so the engine is fully constructed before `dir` (and
+        // the key file inside it) is dropped at the end of this function.
+        UserspaceEngine::from_private_key_file(&path).expect("engine")
+    }
+
+    #[test]
+    fn duplicate_endpoint_resolves_to_lowest_node_id_insertion_order_high_then_low() {
+        let shared_endpoint: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 51820);
+        let mut engine = fresh_engine(11);
+
+        // Insertion order: HIGH node id first, then LOW.
+        let peer_b = configure_peer_at(
+            &mut engine,
+            "peer-b",
+            shared_endpoint,
+            0x11,
+            "100.64.1.0/24",
+        );
+        let peer_a = configure_peer_at(
+            &mut engine,
+            "peer-a",
+            shared_endpoint,
+            0x22,
+            "100.64.2.0/24",
+        );
+        assert!(peer_a < peer_b, "test fixture sanity: 'peer-a' < 'peer-b'");
+
+        assert_eq!(
+            engine.find_node_id_by_endpoint(shared_endpoint),
+            Some(peer_a),
+            "lowest NodeId must win regardless of insertion order (high-then-low)"
+        );
+        assert!(engine.has_endpoint(shared_endpoint));
+        let _ = peer_b;
+    }
+
+    #[test]
+    fn duplicate_endpoint_resolves_to_lowest_node_id_insertion_order_low_then_high() {
+        let shared_endpoint: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 51)), 51820);
+        let mut engine = fresh_engine(12);
+
+        // Insertion order: LOW node id first, then HIGH — the opposite order
+        // from the sibling test. The answer must be identical either way.
+        let peer_a = configure_peer_at(
+            &mut engine,
+            "peer-a",
+            shared_endpoint,
+            0x22,
+            "100.64.2.0/24",
+        );
+        let _peer_b = configure_peer_at(
+            &mut engine,
+            "peer-b",
+            shared_endpoint,
+            0x11,
+            "100.64.1.0/24",
+        );
+
+        assert_eq!(
+            engine.find_node_id_by_endpoint(shared_endpoint),
+            Some(peer_a),
+            "lowest NodeId must win regardless of insertion order (low-then-high)"
+        );
+        assert!(engine.has_endpoint(shared_endpoint));
+    }
+
+    #[test]
+    fn duplicate_endpoint_removal_of_winner_promotes_next_lowest_node_id() {
+        let shared_endpoint: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 52)), 51820);
+        let mut engine = fresh_engine(13);
+
+        // Three peers sharing one endpoint, configured out of NodeId order to
+        // rule out any insertion-order dependence, matching what a fresh
+        // linear scan over `peer_states` (ordered by NodeId) would find at
+        // each step.
+        let peer_b = configure_peer_at(
+            &mut engine,
+            "peer-b",
+            shared_endpoint,
+            0x11,
+            "100.64.1.0/24",
+        );
+        let peer_c = configure_peer_at(
+            &mut engine,
+            "peer-c",
+            shared_endpoint,
+            0x33,
+            "100.64.3.0/24",
+        );
+        let peer_a = configure_peer_at(
+            &mut engine,
+            "peer-a",
+            shared_endpoint,
+            0x22,
+            "100.64.2.0/24",
+        );
+
+        // Initial winner: peer-a (lowest).
+        assert_eq!(
+            engine.find_node_id_by_endpoint(shared_endpoint),
+            Some(peer_a.clone())
+        );
+
+        // Remove the current winner: peer-b becomes the new lowest among the
+        // remaining {peer-b, peer-c}.
+        assert!(engine.remove_peer(&peer_a));
+        assert_eq!(
+            engine.find_node_id_by_endpoint(shared_endpoint),
+            Some(peer_b.clone()),
+            "removing the winner must promote the next-lowest sharer, not fall through to \
+             the peer with no live tunnel or leave the stale winner cached"
+        );
+        assert!(
+            engine.has_endpoint(shared_endpoint),
+            "endpoint is still shared by peer-b and peer-c"
+        );
+
+        // Remove the new winner: only peer-c is left.
+        assert!(engine.remove_peer(&peer_b));
+        assert_eq!(
+            engine.find_node_id_by_endpoint(shared_endpoint),
+            Some(peer_c.clone())
+        );
+        assert!(engine.has_endpoint(shared_endpoint));
+
+        // Remove the last sharer: the endpoint must resolve to nothing and
+        // the reverse-index entry itself must be gone (not merely empty),
+        // matching a fresh scan over now-zero matching peers.
+        assert!(engine.remove_peer(&peer_c));
+        assert_eq!(engine.find_node_id_by_endpoint(shared_endpoint), None);
+        assert!(!engine.has_endpoint(shared_endpoint));
+        assert!(
+            !engine.endpoint_index.contains_key(&shared_endpoint),
+            "empty per-endpoint sets must be pruned, not left as empty entries"
+        );
+    }
+
+    #[test]
+    fn update_peer_endpoint_moves_peer_between_reverse_index_entries() {
+        let endpoint_1: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 60)), 51820);
+        let endpoint_2: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 61)), 51820);
+        let mut engine = fresh_engine(14);
+
+        let peer = configure_peer_at(&mut engine, "peer-move", endpoint_1, 0x44, "100.64.4.0/24");
+        assert!(engine.has_endpoint(endpoint_1));
+        assert!(!engine.has_endpoint(endpoint_2));
+        assert_eq!(
+            engine.find_node_id_by_endpoint(endpoint_1),
+            Some(peer.clone())
+        );
+
+        engine
+            .update_peer_endpoint(
+                &peer,
+                rustynet_backend_api::SocketEndpoint {
+                    addr: endpoint_2.ip(),
+                    port: endpoint_2.port(),
+                },
+            )
+            .expect("endpoint update succeeds");
+
+        // The old endpoint's index entry must be fully retired, not just
+        // unwinnable — a stale entry would be a use-after-move correctness
+        // bug even though it happens to be unreachable from packet dispatch
+        // today.
+        assert!(
+            !engine.has_endpoint(endpoint_1),
+            "old endpoint must be unlinked on move"
+        );
+        assert!(engine.has_endpoint(endpoint_2));
+        assert_eq!(engine.find_node_id_by_endpoint(endpoint_2), Some(peer));
+    }
+
+    #[test]
+    fn reconfiguring_existing_peer_at_new_endpoint_unlinks_the_old_endpoint() {
+        let endpoint_1: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 70)), 51820);
+        let endpoint_2: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 71)), 51820);
+        let mut engine = fresh_engine(15);
+
+        let peer = configure_peer_at(&mut engine, "peer-re", endpoint_1, 0x55, "100.64.5.0/24");
+        assert!(engine.has_endpoint(endpoint_1));
+
+        // Re-configure the SAME node id at a different endpoint (the
+        // `ConfigurePeerDisposition::Replaced` path), as happens on a
+        // control-plane peer-config update.
+        let replaced = configure_peer_at(&mut engine, "peer-re", endpoint_2, 0x55, "100.64.5.0/24");
+        assert_eq!(replaced, peer);
+
+        assert!(
+            !engine.has_endpoint(endpoint_1),
+            "reconfiguring a peer at a new endpoint must unlink the old endpoint entry"
+        );
+        assert!(engine.has_endpoint(endpoint_2));
+        assert_eq!(engine.find_node_id_by_endpoint(endpoint_2), Some(peer));
     }
 
     #[test]
