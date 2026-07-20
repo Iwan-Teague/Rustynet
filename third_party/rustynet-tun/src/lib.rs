@@ -178,14 +178,25 @@ mod imp {
         }
 
         pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-            let mut framed = vec![0u8; buf.len().saturating_add(UTUN_HEADER_LEN)];
-            let result = unsafe {
-                libc::read(
-                    self.fd,
-                    framed.as_mut_ptr().cast::<libc::c_void>(),
-                    framed.len(),
-                )
-            };
+            let mut header = [0u8; UTUN_HEADER_LEN];
+            let iov = [
+                libc::iovec {
+                    iov_base: header.as_mut_ptr().cast::<libc::c_void>(),
+                    iov_len: header.len(),
+                },
+                libc::iovec {
+                    iov_base: buf.as_mut_ptr().cast::<libc::c_void>(),
+                    iov_len: buf.len(),
+                },
+            ];
+            // SAFETY: `self.fd` is a valid open descriptor owned by `self`. Both
+            // iovec entries point into live, exclusively borrowed buffers
+            // (`header` and `buf`) with `iov_len` set to each buffer's exact
+            // length, so the kernel scatter-read writes at most
+            // `UTUN_HEADER_LEN + buf.len()` bytes and cannot write out of
+            // bounds. Neither buffer is accessed through another reference
+            // while the call runs, and the iovec array outlives the call.
+            let result = unsafe { libc::readv(self.fd, iov.as_ptr(), iov.len() as libc::c_int) };
             if result < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -200,23 +211,28 @@ mod imp {
                     "utun payload exceeded caller buffer",
                 ));
             }
-            buf[..payload_len]
-                .copy_from_slice(&framed[UTUN_HEADER_LEN..UTUN_HEADER_LEN + payload_len]);
             Ok(payload_len)
         }
 
         pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
             let family = packet_address_family(buf)?;
-            let mut framed = Vec::with_capacity(UTUN_HEADER_LEN + buf.len());
-            framed.extend_from_slice(&[0, 0, 0, family]);
-            framed.extend_from_slice(buf);
-            let result = unsafe {
-                libc::write(
-                    self.fd,
-                    framed.as_ptr().cast::<libc::c_void>(),
-                    framed.len(),
-                )
-            };
+            let header = [0u8, 0, 0, family];
+            let iov = [
+                libc::iovec {
+                    iov_base: header.as_ptr().cast_mut().cast::<libc::c_void>(),
+                    iov_len: header.len(),
+                },
+                libc::iovec {
+                    iov_base: buf.as_ptr().cast_mut().cast::<libc::c_void>(),
+                    iov_len: buf.len(),
+                },
+            ];
+            // SAFETY: `self.fd` is a valid open descriptor owned by `self`. Both
+            // iovec entries point into live buffers (`header` and `buf`) with
+            // `iov_len` set to each buffer's exact length. `writev` only reads
+            // through `iov_base`, so casting away const is sound and neither
+            // buffer is mutated. The iovec array outlives the call.
+            let result = unsafe { libc::writev(self.fd, iov.as_ptr(), iov.len() as libc::c_int) };
             if result < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -338,7 +354,130 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{packet_address_family, parse_utun_unit};
+        use super::{SyncDevice, UTUN_HEADER_LEN, packet_address_family, parse_utun_unit};
+        use std::io;
+        use std::os::fd::RawFd;
+
+        /// Datagram socketpair standing in for the utun control socket: it
+        /// preserves message boundaries the same way, so the readv/writev
+        /// framing can be exercised end-to-end without a real utun device.
+        fn datagram_socketpair() -> (SyncDevice, RawFd) {
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `fds` is a live 2-element array; socketpair writes
+            // exactly two descriptors into it on success.
+            let rc =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "socketpair failed: {}", io::Error::last_os_error());
+            let device = SyncDevice::from_raw_fd(fds[0]).expect("wrap socketpair fd");
+            (device, fds[1])
+        }
+
+        fn close_peer(fd: RawFd) {
+            // SAFETY: `fd` is a live descriptor owned by the test.
+            unsafe {
+                libc::close(fd);
+            }
+        }
+
+        fn set_peer_nonblocking(fd: RawFd) {
+            // SAFETY: `fd` is a live descriptor owned by the test; fcntl with
+            // F_GETFL/F_SETFL only manipulates its status flags.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                assert!(flags >= 0, "F_GETFL failed: {}", io::Error::last_os_error());
+                let rc = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                assert!(rc >= 0, "F_SETFL failed: {}", io::Error::last_os_error());
+            }
+        }
+
+        fn read_peer_datagram(fd: RawFd, buf: &mut [u8]) -> isize {
+            // SAFETY: `buf` is a live, exclusively borrowed buffer and the
+            // read is bounded by its length.
+            unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) }
+        }
+
+        fn write_peer_datagram(fd: RawFd, buf: &[u8]) {
+            // SAFETY: `buf` is a live buffer and the write is bounded by its
+            // length; `write` does not mutate it.
+            let written =
+                unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+            assert_eq!(written, buf.len() as isize, "peer datagram write failed");
+        }
+
+        #[test]
+        fn send_prepends_utun_header_and_returns_payload_length() {
+            let (device, peer) = datagram_socketpair();
+            let payload = [0x45u8, 0xaa, 0xbb, 0xcc];
+            let written = device.send(&payload).expect("send should succeed");
+            assert_eq!(written, payload.len());
+
+            let mut framed = [0u8; 64];
+            let len = read_peer_datagram(peer, &mut framed);
+            assert_eq!(len as usize, UTUN_HEADER_LEN + payload.len());
+            assert_eq!(&framed[..UTUN_HEADER_LEN], &[0, 0, 0, libc::AF_INET as u8]);
+            assert_eq!(&framed[UTUN_HEADER_LEN..len as usize], &payload);
+            close_peer(peer);
+        }
+
+        #[test]
+        fn send_marks_ipv6_packets_with_inet6_family() {
+            let (device, peer) = datagram_socketpair();
+            let payload = [0x60u8, 0, 0, 0];
+            let written = device.send(&payload).expect("send should succeed");
+            assert_eq!(written, payload.len());
+
+            let mut framed = [0u8; 64];
+            let len = read_peer_datagram(peer, &mut framed);
+            assert_eq!(len as usize, UTUN_HEADER_LEN + payload.len());
+            assert_eq!(&framed[..UTUN_HEADER_LEN], &[0, 0, 0, libc::AF_INET6 as u8]);
+            close_peer(peer);
+        }
+
+        #[test]
+        fn send_rejects_non_ip_frames_before_writing() {
+            let (device, peer) = datagram_socketpair();
+            let err = device
+                .send(&[0x10, 1, 2])
+                .expect_err("non-IP frame must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let err = device.send(&[]).expect_err("empty frame must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+            // Nothing may have reached the wire: a nonblocking read on the
+            // peer end must report an empty socket, not a stray datagram.
+            set_peer_nonblocking(peer);
+            let mut probe = [0u8; 8];
+            let result = read_peer_datagram(peer, &mut probe);
+            let read_err = io::Error::last_os_error();
+            assert_eq!(result, -1, "rejected send must not emit a datagram");
+            assert_eq!(read_err.kind(), io::ErrorKind::WouldBlock);
+            close_peer(peer);
+        }
+
+        #[test]
+        fn recv_strips_utun_header() {
+            let (device, peer) = datagram_socketpair();
+            let framed = [0u8, 0, 0, libc::AF_INET as u8, 0x45, 1, 2, 3];
+            write_peer_datagram(peer, &framed);
+
+            let mut buf = [0u8; 64];
+            let len = device.recv(&mut buf).expect("recv should succeed");
+            assert_eq!(&buf[..len], &[0x45, 1, 2, 3]);
+            close_peer(peer);
+        }
+
+        #[test]
+        fn recv_returns_zero_for_header_only_datagram() {
+            let (device, peer) = datagram_socketpair();
+            write_peer_datagram(peer, &[0u8, 0, 0, libc::AF_INET as u8]);
+
+            let mut buf = [0u8; 64];
+            let len = device
+                .recv(&mut buf)
+                .expect("header-only datagram should not error");
+            assert_eq!(len, 0);
+            close_peer(peer);
+        }
 
         #[test]
         fn parses_named_utun_unit() {
