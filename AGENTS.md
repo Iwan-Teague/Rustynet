@@ -108,6 +108,14 @@ Fast-fail convenience runner (recommended for local iteration):
   pass a cargo scope such as `-p rustynet-cli`. Per-stage timeouts are
   overridable via `XTASK_{FMT,CHECK,CLIPPY,TEST}_TIMEOUT` (seconds). The
   individual commands above remain the authoritative gate definitions.
+- The test stage (xtask and all three CI legs) *executes* through
+  **cargo-nextest** (`cargo nextest run`, version pinned in
+  `bootstrap_ci_tools`), which runs the workspace's ~100 test binaries against
+  one global concurrent pool instead of `cargo test`'s one-binary-at-a-time
+  scheduling. Retries are off (`--retries 0`) so flaky tests fail loudly.
+  `cargo test --workspace --all-targets --all-features` **remains the
+  authoritative gate definition** — nextest is only the runner the tooling
+  uses, exactly as `xtask gates` wraps the authoritative commands.
 
 Run scope-specific scripts when present:
 - `./scripts/ci/phase9_gates.sh`

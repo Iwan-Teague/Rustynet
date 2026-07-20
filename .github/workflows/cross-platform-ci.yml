@@ -25,7 +25,13 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo test --workspace --all-targets --all-features --locked
+          # cargo-nextest (pinned via bootstrap_ci_tools, BLD-2) schedules the
+          # workspace's ~100 test binaries against one concurrent pool instead
+          # of cargo test's one-binary-at-a-time run. `cargo test --workspace
+          # --all-targets --all-features` remains the authoritative gate
+          # definition; --retries 0 (the default) is explicit so retries can
+          # never silently mask a flaky test.
+          cargo nextest run --workspace --all-targets --all-features --locked --retries 0
       - name: Lab monitor standalone gates
         # rustynet-lab-monitor is EXCLUDED from the workspace (see root
         # Cargo.toml + crate README), so the workspace validation above never
@@ -55,7 +61,9 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo test --workspace --all-targets --all-features --locked
+          # nextest as the runner, cargo test as the authoritative definition —
+          # see the macOS leg's comment (BLD-2).
+          cargo nextest run --workspace --all-targets --all-features --locked --retries 0
       - name: Lab monitor standalone gates
         # Excluded from the workspace; gate it explicitly on the Linux leg
         # too (macOS/Linux only crate). See scripts/ci/lab_monitor_gates.sh.
@@ -98,7 +106,7 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Pin toolchain + install cargo-audit / cargo-deny
+      - name: Pin toolchain + install cargo-audit / cargo-deny / cargo-nextest
         run: |
           # The bash bootstrap wrapper invokes `cargo run -p
           # rustynet-cli --bin bootstrap_ci_tools`; rustynet-cli
@@ -106,12 +114,16 @@ jobs:
           # here. Pin the same versions inline, mirroring the
           # bootstrap binary's contract (PINNED_TOOLCHAIN=1.85.0,
           # security toolchain=1.88.0, cargo-audit=0.22.1,
-          # cargo-deny=0.19.1).
+          # cargo-deny=0.19.1, cargo-nextest=0.9.114). nextest's
+          # MSRV is 1.88, above this leg's 1.85.0 default, so it
+          # installs via the 1.88.0 toolchain like the bootstrap
+          # binary does.
           rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.85.0
           rustup toolchain install 1.88.0 --profile minimal
           cargo install cargo-audit --locked --version 0.22.1 --force
           cargo install cargo-deny --locked --version 0.19.1 --force
+          cargo +1.88.0 install cargo-nextest --locked --version 0.9.114 --force
       - name: Build + test Windows-portable crates
         run: |
           # Crate selection is intentional. rustynetd carries every
@@ -143,12 +155,14 @@ jobs:
           # passes); a separate `cargo check` of the same package set was a
           # pure duplicate compile.
           cargo clippy "${PKGS[@]}" --all-targets --all-features --locked -- -D warnings
-          # --no-fail-fast: run EVERY package's test binary even after one fails,
-          # so a single run surfaces the complete Windows failure set instead of
-          # stopping at the first failing crate (Windows tests cannot be run
-          # locally on the macOS lab host, so each masked failure would otherwise
-          # cost a full ~12-min CI round-trip to discover).
-          cargo test "${PKGS[@]}" --all-targets --all-features --locked --no-fail-fast
+          # --no-fail-fast: run EVERY test even after one fails, so a single
+          # run surfaces the complete Windows failure set instead of stopping
+          # at the first failure (Windows tests cannot be run locally on the
+          # macOS lab host, so each masked failure would otherwise cost a full
+          # ~12-min CI round-trip to discover). nextest is the runner (BLD-2);
+          # `cargo test` remains the authoritative gate definition, and
+          # --retries 0 keeps flaky-test retries structurally off.
+          cargo nextest run "${PKGS[@]}" --all-targets --all-features --locked --no-fail-fast --retries 0
       - name: Security gates
         run: |
           # Check out the cargo-audit / cargo-deny advisory-db clones with LF.
