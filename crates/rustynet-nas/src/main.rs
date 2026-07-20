@@ -111,6 +111,12 @@ fn run() -> Result<(), String> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Disable Nagle so small control-plane frames are not held
+                // back on delayed ACKs. A failed setsockopt is logged but
+                // must not kill the session.
+                if let Err(err) = stream.set_nodelay(true) {
+                    eprintln!("[rustynet-nas] set_nodelay failed (continuing): {err}");
+                }
                 let store = Arc::clone(&store);
                 let access_dir = Arc::clone(&access_dir);
                 std::thread::spawn(move || {
@@ -411,11 +417,29 @@ fn read_frame(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, String> {
     Ok(Some(body))
 }
 
-fn write_frame(stream: &mut TcpStream, body: &[u8]) -> Result<(), String> {
-    stream
-        .write_all(&(body.len() as u32).to_be_bytes())
-        .and_then(|_| stream.write_all(body))
-        .map_err(|err| format!("frame write failed: {err}"))
+/// Frames with bodies at or below this size are coalesced with their 4-byte
+/// length prefix into a single `write_all`, so with `TCP_NODELAY` enabled the
+/// prefix never departs as its own segment. This covers every control-plane
+/// frame; bulk data chunks (up to `MAX_CHUNK_LEN`, 4 MiB) keep the
+/// header-then-body write pair, where copying megabytes to save one 4-byte
+/// segment would be a net loss.
+const FRAME_COALESCE_MAX: usize = 8 * 1024;
+
+fn write_frame(stream: &mut impl Write, body: &[u8]) -> Result<(), String> {
+    let header = (body.len() as u32).to_be_bytes();
+    if body.len() <= FRAME_COALESCE_MAX {
+        let mut frame = Vec::with_capacity(header.len() + body.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(body);
+        stream
+            .write_all(&frame)
+            .map_err(|err| format!("frame write failed: {err}"))
+    } else {
+        stream
+            .write_all(&header)
+            .and_then(|_| stream.write_all(body))
+            .map_err(|err| format!("frame write failed: {err}"))
+    }
 }
 
 #[cfg(test)]
@@ -622,5 +646,73 @@ mod tests {
             assert!(USAGE.contains(token), "usage text missing {token}");
         }
         assert!(USAGE.contains("one of --at-rest-key-credential / --at-rest-key-file"));
+    }
+
+    /// Records every `write` call so tests can assert both the exact wire
+    /// bytes and how many writes produced them.
+    #[derive(Default)]
+    struct CountingSink {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_frame_bytes_identical_across_coalesce_boundary() {
+        use super::{FRAME_COALESCE_MAX, write_frame};
+        for len in [0, 1, FRAME_COALESCE_MAX, FRAME_COALESCE_MAX + 1] {
+            let body = vec![0xA5u8; len];
+            let mut sink = CountingSink::default();
+            write_frame(&mut sink, &body).expect("write_frame");
+            let mut expected = (len as u32).to_be_bytes().to_vec();
+            expected.extend_from_slice(&body);
+            assert_eq!(
+                sink.bytes, expected,
+                "wire bytes must not depend on the coalescing path (len {len})"
+            );
+            if len <= FRAME_COALESCE_MAX {
+                assert_eq!(
+                    sink.writes, 1,
+                    "coalesced path must issue exactly one write (len {len})"
+                );
+            } else {
+                assert_eq!(
+                    sink.writes, 2,
+                    "large-frame path keeps the header-then-body pair (len {len})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_frame_round_trips_through_read_frame_across_boundary() {
+        use super::{FRAME_COALESCE_MAX, read_frame, write_frame};
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let (mut server, _) = listener.accept().expect("accept");
+        for len in [0, FRAME_COALESCE_MAX, FRAME_COALESCE_MAX + 1] {
+            let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            write_frame(&mut client, &body).expect("write_frame");
+            let read = read_frame(&mut server)
+                .expect("read_frame")
+                .expect("frame present");
+            assert_eq!(
+                read, body,
+                "round-trip must be lossless across the coalesce boundary (len {len})"
+            );
+        }
     }
 }
