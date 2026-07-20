@@ -8,6 +8,21 @@ use rustynet_backend_api::{
 
 pub(crate) const WG_LATEST_HANDSHAKES_MAX_BYTES: usize = 64 * 1024;
 
+/// FIS-0027 Phase 2: the safe bring-up tunnel MTU the per-OS command adapters
+/// set explicitly at interface configuration time.
+///
+/// Rustynet previously never set the tunnel MTU on any OS, leaving the value
+/// to whatever the platform default happened to be (1500 on some kernels and
+/// TUN paths — the never-set-MTU bug band-aided by a manual `ExecStartPost
+/// ip link set mtu 1420` in the embedded-support runbook). 1420 is the widely
+/// used WireGuard convention: 1500-byte Ethernet minus 80 bytes of worst-case
+/// IPv6 + UDP + WireGuard encapsulation overhead, so a full-size inner packet
+/// never fragments the outer frame on a clean 1500 underlay. FIS-0027's later
+/// phases replace this static bring-up value with the per-path measured MTU
+/// from the `rustynetd::path_mtu` DPLPMTUD search; until then this constant
+/// makes bring-up deterministic instead of platform-default-dependent.
+pub const SAFE_BRINGUP_TUNNEL_MTU: u16 = 1420;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireguardCommandOutput {
     pub stdout: String,
@@ -169,6 +184,23 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                 "address".to_owned(),
                 "add".to_owned(),
                 context.local_cidr.clone(),
+                "dev".to_owned(),
+                self.interface_name.clone(),
+            ],
+        ) {
+            let _ = self.remove_interface();
+            return Err(err);
+        }
+        // FIS-0027 Phase 2: pin the tunnel MTU explicitly (wg-quick order —
+        // before link-up) instead of trusting the platform default, closing
+        // the never-set-MTU gap.
+        if let Err(err) = self.runner.run(
+            "ip",
+            &[
+                "link".to_owned(),
+                "set".to_owned(),
+                "mtu".to_owned(),
+                SAFE_BRINGUP_TUNNEL_MTU.to_string(),
                 "dev".to_owned(),
                 self.interface_name.clone(),
             ],
@@ -811,6 +843,90 @@ mod tests {
                         .any(|pair| pair[0] == "persistent-keepalive" && pair[1] == "21")
             }),
             "Some(21) must emit `persistent-keepalive 21`"
+        );
+    }
+
+    #[test]
+    fn linux_backend_sets_safe_bringup_mtu_before_link_up() {
+        let runner = RecordingRunner::default();
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+
+        let expected_mtu_args = vec![
+            "link".to_owned(),
+            "set".to_owned(),
+            "mtu".to_owned(),
+            SAFE_BRINGUP_TUNNEL_MTU.to_string(),
+            "dev".to_owned(),
+            "rustynet0".to_owned(),
+        ];
+        let mtu_index = backend
+            .runner
+            .calls
+            .iter()
+            .position(|(program, args)| program == "ip" && args == &expected_mtu_args)
+            .expect("start must set the safe bring-up MTU explicitly");
+        let up_index = backend
+            .runner
+            .calls
+            .iter()
+            .position(|(program, args)| program == "ip" && args.iter().any(|arg| arg == "up"))
+            .expect("start must bring the link up");
+        assert!(
+            mtu_index < up_index,
+            "MTU must be pinned before the link comes up (wg-quick order)"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct MtuSetFailureRunner {
+        calls: Vec<(String, Vec<String>)>,
+    }
+
+    impl WireguardCommandRunner for MtuSetFailureRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+            self.calls.push((program.to_owned(), args.to_vec()));
+            if program == "ip" && args.iter().any(|arg| arg == "mtu") {
+                return Err(BackendError::internal("injected mtu set failure"));
+            }
+            Ok(())
+        }
+
+        fn run_capture(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<WireguardCommandOutput, BackendError> {
+            self.run(program, args)?;
+            Ok(WireguardCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn linux_backend_start_rolls_back_interface_when_mtu_set_fails() {
+        let runner = MtuSetFailureRunner::default();
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+
+        let err = backend
+            .start(runtime_context())
+            .expect_err("mtu set failure must fail the start");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(!backend.running, "backend must not report running");
+        assert!(
+            backend.runner.calls.iter().any(|(program, args)| {
+                program == "ip"
+                    && args.first().map(String::as_str) == Some("link")
+                    && args.get(1).map(String::as_str) == Some("del")
+            }),
+            "failed mtu set must tear the interface back down"
         );
     }
 
