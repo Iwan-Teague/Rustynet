@@ -281,8 +281,11 @@ Full gate suite (fmt, workspace check, workspace clippy excluding the known pre-
 
 ## 8) Branch state as of this document
 
-`security/a4-membership-head-attestation`, 5 commits on top of the audit branch tip
-(`42901a0`): `bba9983`, `f5d528f`, `3e41ea6`, `a5675a4`, `3c1ae84`. Clean working tree, not
-pushed, not merged. Blocking issue before this should be considered mergeable: §6 (stale-cache
-rollback) needs a decision — implement a real fix, or formally accept the risk per
-`SecurityMinimumBar.md` §2's High-control rule and document that acceptance explicitly.
+`security/a4-membership-head-attestation` merged to `main` (fast-forward, `e1d2a8b`), followed
+by three independent adversarial reviews (§5) which found and this branch's follow-up fixed one
+real defect (quorum counted by signer slot, closed in `3c1ae84`) and surfaced §6's stale-cache
+rollback as a separate open item. §6 has since been investigated and CLOSED — see
+[`AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md`](./AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md)
+and `SecurityMinimumBar.md` control 2, both updated 2026-07-20 (commit `e0cc8e5`). This review
+trail document is kept as-written for the historical record of what the three reviewers found and
+why each finding was disposed the way it was.
