@@ -10151,7 +10151,20 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                         .map_err(|err| {
                             DaemonError::Io(format!("socket read-timeout failed: {err}"))
                         })?;
-                    let response = match read_command_envelope(&stream).map_err(DaemonError::Io)? {
+                    // Per-request read failures (garbage payload, an empty
+                    // connect-then-hangup, a read timeout on a stalled
+                    // writer) are logged and the connection dropped: one
+                    // malformed or disconnected local client must not kill
+                    // the daemon. Mirrors the log-and-continue disposition
+                    // of the response-write side below.
+                    let envelope = match read_command_envelope(&stream) {
+                        Ok(envelope) => envelope,
+                        Err(err) => {
+                            log::warn!("ipc_command_read_failed reason={err}");
+                            continue;
+                        }
+                    };
+                    let response = match envelope {
                         CommandEnvelope::Local(parsed) => {
                             // Defense-in-depth: enforce peer-credential
                             // authorisation on EVERY local IPC command —
@@ -16278,6 +16291,49 @@ mod tests {
 
         let err = read_command_envelope(&reader).expect_err("null-byte payload must be rejected");
         assert!(err.to_string().contains("command contains null byte"));
+    }
+
+    #[test]
+    fn ipc_read_failure_is_non_fatal_in_accept_loop() {
+        // Regression guard for the whole-daemon kill: the Unix admin-IPC
+        // accept block must not `?`-propagate a per-connection read failure
+        // out of run_daemon. One garbage, empty, or disconnected local
+        // client drops its connection and the loop continues — mirroring the
+        // response-write side's log-and-continue disposition.
+        let source = include_str!("daemon.rs");
+        let fatal_pattern = concat!("read_command_envelope(&stream)", ".map_err(DaemonError::Io)?");
+        assert!(
+            !source.contains(fatal_pattern),
+            "a per-connection IPC read failure must not kill the daemon"
+        );
+        assert!(
+            source.contains("ipc_command_read_failed"),
+            "IPC read failures must be logged and the connection dropped"
+        );
+    }
+
+    #[test]
+    fn read_command_envelope_empty_hangup_and_garbage_error_promptly() {
+        // The two client misbehaviors the accept loop now survives: a client
+        // that connects and hangs up without writing, and one that sends an
+        // unparseable command. Both must surface as bounded errors (never a
+        // hang and never a daemon exit).
+        let (writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
+        drop(writer);
+        let started = Instant::now();
+        let err = read_command_envelope(&reader)
+            .expect_err("empty connect-then-hangup must error, not hang");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "read should be bounded by the socket read timeout plus slack"
+        );
+        drop(err);
+
+        let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
+        writer
+            .write_all(b"this-is-not-a-command\n")
+            .expect("garbage write should succeed");
+        read_command_envelope(&reader).expect_err("garbage payload must be rejected");
     }
 
     #[test]
