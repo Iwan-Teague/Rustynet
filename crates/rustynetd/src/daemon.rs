@@ -15582,8 +15582,8 @@ mod tests {
 
     // ── FIS-0020: conditional bundle-pull (have/UNCHANGED) ──────────────────
 
-    fn conditional_pull_snapshot_bytes() -> Vec<u8> {
-        let state = MembershipState {
+    fn conditional_pull_snapshot_state() -> MembershipState {
+        MembershipState {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
             network_id: "net-pull".to_owned(),
             epoch: 7,
@@ -15610,7 +15610,11 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
-        };
+        }
+    }
+
+    fn conditional_pull_snapshot_bytes() -> Vec<u8> {
+        let state = conditional_pull_snapshot_state();
         let dir = std::env::temp_dir().join(format!(
             "rustynet-cond-pull-{}-{}",
             std::process::id(),
@@ -15625,6 +15629,113 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read snapshot");
         let _ = std::fs::remove_dir_all(&dir);
         bytes
+    }
+
+    /// A4 end-to-end: an anchor serving an ATTESTED snapshot through the
+    /// real response writer produces bytes a pull client accepts through
+    /// the real enforcement point; a tampered payload and a legacy
+    /// (unattested) anchor file are both rejected before acceptance.
+    #[test]
+    fn anchor_bundle_pull_serves_attested_snapshot_that_client_verifies() {
+        use rustynet_control::membership::{
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS, MembershipError, MembershipHeadAttestation,
+            persist_membership_snapshot_with_attestation, sign_head_attestation,
+            verify_attested_snapshot,
+        };
+
+        let owner_signing = SigningKey::from_bytes(&[1u8; 32]);
+        let pinned_owner_hex = hex_encode(owner_signing.verifying_key().as_bytes());
+        let state = conditional_pull_snapshot_state();
+        let state_root = state.state_root_hex().expect("state root");
+        let attested_at = unix_now();
+        let head_signature = sign_head_attestation(
+            &state.network_id,
+            state.epoch,
+            &state_root,
+            attested_at,
+            "owner-1",
+            &owner_signing,
+        )
+        .expect("sign head attestation");
+        let attestation = MembershipHeadAttestation {
+            network_id: state.network_id.clone(),
+            epoch: state.epoch,
+            state_root_hex: state_root,
+            attested_at_unix: attested_at,
+            approver_signatures: vec![head_signature],
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-a4-daemon-serve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("snapshot dir");
+        let path = dir.join("snapshot.v1");
+        persist_membership_snapshot_with_attestation(&path, &state, Some(&attestation))
+            .expect("persist attested snapshot");
+        let bundle = std::fs::read(&path).expect("read attested snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Serve through the real response writer, then verify the served
+        // payload exactly as the pull client does.
+        let mut out = Vec::new();
+        write_anchor_bundle_pull_response(&mut out, "tok", "tok", &bundle)
+            .expect("serve attested bundle");
+        let header_end = out
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("response header");
+        assert!(out.starts_with(b"OK "));
+        let served = &out[header_end + 1..];
+        let verified = verify_attested_snapshot(
+            served,
+            &pinned_owner_hex,
+            attested_at,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect("served attested bundle must verify");
+        assert_eq!(verified.epoch, state.epoch);
+
+        // Tampered payload (flip one byte of the served body): rejected.
+        let mut tampered = served.to_vec();
+        let flip_index = tampered.len() / 2;
+        tampered[flip_index] = tampered[flip_index].wrapping_add(1);
+        verify_attested_snapshot(
+            &tampered,
+            &pinned_owner_hex,
+            attested_at,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("tampered served bundle must be rejected");
+
+        // Legacy anchor file (no attestation): rejected with the
+        // actionable AttestationMissing error.
+        let legacy = conditional_pull_snapshot_bytes();
+        let mut out = Vec::new();
+        write_anchor_bundle_pull_response(&mut out, "tok", "tok", &legacy)
+            .expect("serve legacy bundle");
+        let header_end = out
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("response header");
+        let err = verify_attested_snapshot(
+            &out[header_end + 1..],
+            &pinned_owner_hex,
+            attested_at,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("legacy anchor bundle must be rejected");
+        assert_eq!(err, MembershipError::AttestationMissing);
+        assert!(
+            format!("{err}").contains("no head attestation"),
+            "rejection must name the missing attestation: {err}"
+        );
     }
 
     #[test]

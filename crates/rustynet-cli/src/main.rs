@@ -94,15 +94,15 @@ use nix::unistd::{Gid, Group, Uid, User, chown};
 use rand::{TryRngCore, rngs::OsRng};
 use rustynet_cli::role_cli;
 use rustynet_control::membership::{
-    MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipApprover, MembershipApproverRole,
-    MembershipApproverStatus, MembershipHeadAttestation, MembershipNode, MembershipNodeStatus,
-    MembershipOperation, MembershipReplayCache, MembershipState, MembershipUpdateRecord,
-    SignedMembershipUpdate, append_membership_log_entry, apply_signed_update, decode_signed_update,
-    decode_update_record, encode_signed_update, encode_update_record,
-    head_attestation_from_signed_update, load_membership_log, load_membership_snapshot,
-    persist_membership_snapshot_with_attestation, replay_membership_snapshot_and_log,
-    sign_head_attestation, sign_update_record, snapshot_bytes_head_attestation,
-    write_membership_audit_log,
+    MAX_MEMBERSHIP_SNAPSHOT_BYTES, MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS, MembershipApprover,
+    MembershipApproverRole, MembershipApproverStatus, MembershipHeadAttestation, MembershipNode,
+    MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipState,
+    MembershipUpdateRecord, SignedMembershipUpdate, append_membership_log_entry,
+    apply_signed_update, decode_signed_update, decode_update_record, encode_signed_update,
+    encode_update_record, head_attestation_from_signed_update, load_membership_log,
+    load_membership_snapshot, persist_membership_snapshot_with_attestation,
+    replay_membership_snapshot_and_log, sign_head_attestation, sign_update_record,
+    snapshot_bytes_head_attestation, verify_attested_snapshot, write_membership_audit_log,
 };
 use rustynet_control::roles::{
     ANCHOR_CAPABILITIES, RoleCapability, parse_role_capability_csv, role_capability_csv,
@@ -434,6 +434,14 @@ enum AnchorCommand {
         addr: String,
         token: String,
         output_path: PathBuf,
+        /// Path of the pinned §6.B membership owner public key the pulled
+        /// bundle must verify against. Defaults to the platform trust-
+        /// anchor path; there is no way to skip verification.
+        owner_key_pub_path: PathBuf,
+        /// Freshness window for the bundle's head attestation. Bounded by
+        /// `MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS` — the flag can only
+        /// tighten the default, never widen or disable it.
+        max_attestation_age_secs: u64,
     },
     Init {
         config: AnchorInitConfig,
@@ -6122,13 +6130,33 @@ fn parse_anchor_command(args: &[String]) -> Result<AnchorCommand, String> {
             }))
         }
         "list" => Ok(AnchorCommand::List { paths }),
-        "pull-bundle" => Ok(AnchorCommand::PullBundle {
-            addr: parser
-                .value("--addr")
-                .unwrap_or_else(|| DEFAULT_ANCHOR_BUNDLE_PULL_ADDR.to_owned()),
-            token: parser.required("--token")?,
-            output_path: parser.required_path("--output")?,
-        }),
+        "pull-bundle" => {
+            let max_attestation_age_secs = parser.parse_u64_or_default(
+                "--max-attestation-age-secs",
+                MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+            )?;
+            // Tighten-only: the freshness window can never be disabled or
+            // widened past the hard default.
+            if max_attestation_age_secs == 0
+                || max_attestation_age_secs > MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS
+            {
+                return Err(format!(
+                    "--max-attestation-age-secs can only tighten the default: value must be \
+                     within 1..={MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS}"
+                ));
+            }
+            Ok(AnchorCommand::PullBundle {
+                addr: parser
+                    .value("--addr")
+                    .unwrap_or_else(|| DEFAULT_ANCHOR_BUNDLE_PULL_ADDR.to_owned()),
+                token: parser.required("--token")?,
+                output_path: parser.required_path("--output")?,
+                owner_key_pub_path: parser
+                    .optional_path("--owner-key-pub")
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_MEMBERSHIP_OWNER_KEY_PUB_PATH)),
+                max_attestation_age_secs,
+            })
+        }
         "init" => {
             let defaults = AnchorInitConfig::default();
             Ok(AnchorCommand::Init {
@@ -7513,7 +7541,15 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             addr,
             token,
             output_path,
+            owner_key_pub_path,
+            max_attestation_age_secs,
         } => {
+            // A4: load the §6.B pinned membership owner public key BEFORE
+            // any network I/O. Without a usable pin no pulled bundle can
+            // ever be accepted, so a missing or malformed pin is a hard
+            // error up front.
+            let pinned_owner_pubkey_hex = load_membership_owner_key_pub(&owner_key_pub_path)?;
+            let now_unix = unix_now();
             let mut resolved = addr
                 .to_socket_addrs()
                 .map_err(|err| format!("resolve anchor bundle-pull addr failed: {err}"))?;
@@ -7528,21 +7564,37 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             stream
                 .set_write_timeout(Some(Duration::from_secs(5)))
                 .map_err(|err| format!("set anchor bundle-pull write timeout failed: {err}"))?;
-            // FIS-0020: conditional pull. When a previous bundle exists at
-            // the output path AND the forced-full counter permits, send
-            // `have <epoch> <root>` so an unchanged server replies with a
-            // hash-sized UNCHANGED instead of the full bundle. The counter
-            // is pure client-local monotonic state that no server response
-            // can reset or influence: every Nth pull is unconditionally
-            // full, bounding silent staleness from a lying UNCHANGED to
-            // <= N cycles.
+            // A4 interlock (a): the LOCAL file earns FIS-0020 `have` /
+            // UNCHANGED privileges only when it independently passes the
+            // SAME attestation verification a pulled bundle must pass. An
+            // unverified legacy local file never earns the shortcut, and
+            // its identity never becomes the epoch-regression floor.
+            let local_verified_identity: Option<(u64, String)> =
+                std::fs::read(&output_path).ok().and_then(|bytes| {
+                    let state = verify_attested_snapshot(
+                        &bytes,
+                        &pinned_owner_pubkey_hex,
+                        now_unix,
+                        None,
+                        max_attestation_age_secs,
+                    )
+                    .ok()?;
+                    let root = state.state_root_hex().ok()?;
+                    Some((state.epoch, root))
+                });
+            // FIS-0020: conditional pull. When a VERIFIED previous bundle
+            // exists at the output path AND the forced-full counter
+            // permits, send `have <epoch> <root>` so an unchanged server
+            // replies with a hash-sized UNCHANGED instead of the full
+            // bundle. The counter is pure client-local monotonic state
+            // that no server response can reset or influence: every Nth
+            // pull is unconditionally full, bounding silent staleness from
+            // a lying UNCHANGED to <= N cycles.
             let pull_count = increment_anchor_bundle_pull_counter(&output_path);
             let have_identity = if anchor_bundle_pull_must_force_full(pull_count) {
                 None
             } else {
-                std::fs::read(&output_path).ok().and_then(|bytes| {
-                    rustynet_control::membership::snapshot_bytes_state_identity(&bytes)
-                })
+                local_verified_identity.clone()
             };
             let mut request = format!("{token}\n");
             if let Some((epoch, root)) = &have_identity {
@@ -7590,11 +7642,30 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
                     bundle.len()
                 ));
             }
+            // A4 enforcement: the pulled bytes must pass full head-
+            // attestation verification against the pinned owner key BEFORE
+            // a single byte reaches disk. `local_verified_identity` (the
+            // identity of the verified prior bundle) is the epoch-
+            // regression / fork floor — this also enforces FIS-0020
+            // interlock (b): an OK response whose epoch is below the
+            // `have` epoch we sent is rejected as a regression.
+            let verified_state = verify_attested_snapshot(
+                bundle,
+                &pinned_owner_pubkey_hex,
+                now_unix,
+                local_verified_identity.as_ref(),
+                max_attestation_age_secs,
+            )
+            .map_err(|err| {
+                format!("anchor bundle-pull verification failed (no bytes written): {err}")
+            })?;
             write_bytes_file(&output_path, bundle)?;
             Ok(format!(
-                "anchor bundle pulled: {} bytes written to {}",
+                "anchor bundle pulled and verified: {} bytes written to {} (network_id={} epoch={})",
                 bundle.len(),
-                output_path.display()
+                output_path.display(),
+                verified_state.network_id,
+                verified_state.epoch
             ))
         }
         AnchorCommand::Init { config } => {
@@ -7602,6 +7673,38 @@ fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
             Ok(render_anchor_init_plan(&plan))
         }
     }
+}
+
+/// Canonical platform path of the pinned membership owner public key
+/// (SecurityMinimumBar §6.B) — the out-of-band trust anchor every pulled
+/// bundle must verify against.
+#[cfg(windows)]
+const DEFAULT_MEMBERSHIP_OWNER_KEY_PUB_PATH: &str =
+    r"C:\ProgramData\RustyNet\trust\membership.owner.key.pub";
+#[cfg(not(windows))]
+const DEFAULT_MEMBERSHIP_OWNER_KEY_PUB_PATH: &str = "/etc/rustynet/membership.owner.key.pub";
+
+/// Load the pinned §6.B membership owner public key (hex, one line).
+/// Hard error when absent or empty: without a pin no pulled bundle can
+/// ever be accepted, so failing before any network I/O is the only
+/// honest outcome. Hex validity is enforced inside
+/// `verify_attested_snapshot` (the enforcement point).
+fn load_membership_owner_key_pub(path: &Path) -> Result<String, String> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        format!(
+            "read membership owner public key {} failed: {err} (the SecurityMinimumBar §6.B \
+             trust anchor must be delivered out of band before pull-bundle can verify a bundle)",
+            path.display()
+        )
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "membership owner public key {} is empty",
+            path.display()
+        ));
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// FIS-0020: every Nth pull is unconditionally full — the counter is
@@ -23110,11 +23213,52 @@ mod tests {
             "--output".to_owned(),
             "/tmp/membership.snapshot".to_owned(),
         ]);
-        assert!(matches!(
-            pull,
-            CliCommand::Anchor(command)
-                if matches!(*command, AnchorCommand::PullBundle { .. })
-        ));
+        match pull {
+            CliCommand::Anchor(command) => match *command {
+                AnchorCommand::PullBundle {
+                    owner_key_pub_path,
+                    max_attestation_age_secs,
+                    ..
+                } => {
+                    // A4 defaults: the §6.B platform pin path and the hard
+                    // maximum freshness window.
+                    assert_eq!(
+                        owner_key_pub_path,
+                        PathBuf::from(super::DEFAULT_MEMBERSHIP_OWNER_KEY_PUB_PATH)
+                    );
+                    assert_eq!(
+                        max_attestation_age_secs,
+                        rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS
+                    );
+                }
+                other => panic!("expected anchor pull-bundle, got {other:?}"),
+            },
+            other => panic!("expected Anchor command, got {other:?}"),
+        }
+
+        // A4: the freshness window can only be tightened, never disabled
+        // (0) or widened past the hard default.
+        for bad_value in ["0", "604801", "18446744073709551615"] {
+            let rejected = parse_command(&[
+                "anchor".to_owned(),
+                "pull-bundle".to_owned(),
+                "--token".to_owned(),
+                "0123456789abcdef0123456789abcdef".to_owned(),
+                "--output".to_owned(),
+                "/tmp/membership.snapshot".to_owned(),
+                "--max-attestation-age-secs".to_owned(),
+                bad_value.to_owned(),
+            ]);
+            match rejected {
+                CliCommand::UsageError(message) => {
+                    assert!(
+                        message.contains("can only tighten"),
+                        "expected tighten-only rejection for {bad_value}, got: {message}"
+                    );
+                }
+                other => panic!("expected usage error for {bad_value}, got {other:?}"),
+            }
+        }
 
         let init = parse_command(&[
             "anchor".to_owned(),
@@ -23128,6 +23272,291 @@ mod tests {
             CliCommand::Anchor(command)
                 if matches!(*command, AnchorCommand::Init { .. })
         ));
+    }
+
+    // ── A4: anchor pull-bundle head-attestation enforcement ─────────────
+
+    use super::execute_anchor;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    fn a4_owner_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[1; 32])
+    }
+
+    fn a4_hex_lower(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// Minimal valid mesh whose single Owner approver is the well-known
+    /// A4 test owner key; quorum 1.
+    fn a4_pull_state() -> rustynet_control::membership::MembershipState {
+        use rustynet_control::membership;
+        membership::MembershipState {
+            schema_version: membership::MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-pull-a4".to_owned(),
+            epoch: 3,
+            nodes: vec![membership::MembershipNode {
+                node_id: "anchor-a".to_owned(),
+                node_pubkey_hex: "11".repeat(32),
+                owner: "ops".to_owned(),
+                status: membership::MembershipNodeStatus::Active,
+                roles: vec!["tag:members".to_owned()],
+                capabilities: vec![RoleCapability::Client],
+                joined_at_unix: 100,
+                updated_at_unix: 100,
+            }],
+            approver_set: vec![membership::MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: a4_hex_lower(
+                    a4_owner_signing_key().verifying_key().as_bytes(),
+                ),
+                role: membership::MembershipApproverRole::Owner,
+                status: membership::MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        }
+    }
+
+    fn a4_temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-a4-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Write the §6.B pin file for the A4 test owner key.
+    fn a4_write_pin(dir: &Path) -> PathBuf {
+        let pin_path = dir.join("membership.owner.key.pub");
+        std::fs::write(
+            &pin_path,
+            format!(
+                "{}\n",
+                a4_hex_lower(a4_owner_signing_key().verifying_key().as_bytes())
+            ),
+        )
+        .expect("write pin");
+        pin_path
+    }
+
+    /// Persist snapshot bytes (attested when `attest` is true) for the A4
+    /// fixture state and return them.
+    fn a4_snapshot_bytes(dir: &Path, attest: bool) -> Vec<u8> {
+        use rustynet_control::membership;
+        let state = a4_pull_state();
+        let path = dir.join("served.snapshot");
+        let attestation = attest.then(|| {
+            let state_root = state.state_root_hex().expect("state root");
+            let attested_at = unix_now();
+            let signature = membership::sign_head_attestation(
+                &state.network_id,
+                state.epoch,
+                &state_root,
+                attested_at,
+                "owner-1",
+                &a4_owner_signing_key(),
+            )
+            .expect("sign head attestation");
+            membership::MembershipHeadAttestation {
+                network_id: state.network_id.clone(),
+                epoch: state.epoch,
+                state_root_hex: state_root,
+                attested_at_unix: attested_at,
+                approver_signatures: vec![signature],
+            }
+        });
+        membership::persist_membership_snapshot_with_attestation(
+            &path,
+            &state,
+            attestation.as_ref(),
+        )
+        .expect("persist snapshot");
+        std::fs::read(&path).expect("read snapshot bytes")
+    }
+
+    /// One-shot loopback bundle-pull server: accepts a single connection,
+    /// captures the raw request (returned through the channel), replies
+    /// with `response`, and closes.
+    fn a4_serve_once(
+        response: Vec<u8>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 256];
+            loop {
+                match socket.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        request.extend_from_slice(&buf[..count]);
+                        if request.len() > 4096 {
+                            break;
+                        }
+                    }
+                    // Timeout: the client has sent everything it intends to.
+                    Err(_) => break,
+                }
+            }
+            let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
+            let _ = socket.write_all(&response);
+        });
+        (addr, receiver, handle)
+    }
+
+    #[test]
+    fn pull_bundle_never_writes_unverified_bytes() {
+        // A forged-but-self-consistent LEGACY bundle (valid digest, no
+        // attestation) served by a local listener must be rejected BEFORE
+        // the output file is ever created — this pins the enforcement
+        // ordering, not merely that verification exists somewhere.
+        let dir = a4_temp_dir("unverified");
+        let pin_path = a4_write_pin(&dir);
+        let bundle = a4_snapshot_bytes(&dir, false);
+        let mut response = format!("OK {}\n", bundle.len()).into_bytes();
+        response.extend_from_slice(&bundle);
+        let (addr, _request_rx, handle) = a4_serve_once(response);
+
+        let output_path = dir.join("pulled.snapshot");
+        let err = execute_anchor(AnchorCommand::PullBundle {
+            addr: addr.to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: pin_path,
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect_err("unattested bundle must be rejected");
+        assert!(
+            err.contains("verification failed") && err.contains("no head attestation"),
+            "expected attestation-missing rejection, got: {err}"
+        );
+        assert!(
+            !output_path.exists(),
+            "no bytes may reach disk on a failed verification"
+        );
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_bundle_rejects_unchanged_shortcut_for_unverified_local_file() {
+        // A4 interlock (a): a LEGACY (unverified) local file must never
+        // earn the FIS-0020 `have`/UNCHANGED shortcut. The client sends no
+        // `have` line, so a server UNCHANGED reply is a protocol violation.
+        let dir = a4_temp_dir("unchanged-interlock");
+        let pin_path = a4_write_pin(&dir);
+        let output_path = dir.join("membership.snapshot");
+        rustynet_control::membership::persist_membership_snapshot(&output_path, &a4_pull_state())
+            .expect("persist legacy local file");
+        let legacy_bytes = std::fs::read(&output_path).expect("read local file");
+        // Pull counter at 3 → this pull is #4, which the force-full rule
+        // would PERMIT to be conditional — only the interlock stops it.
+        std::fs::write(output_path.with_extension("pulls"), "3").expect("seed counter");
+
+        let (addr, request_rx, handle) = a4_serve_once(b"UNCHANGED\n".to_vec());
+        let err = execute_anchor(AnchorCommand::PullBundle {
+            addr: addr.to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: pin_path,
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect_err("UNCHANGED against a full pull must be rejected");
+        assert!(
+            err.contains("UNCHANGED to a full pull"),
+            "expected protocol-violation rejection, got: {err}"
+        );
+        let request = request_rx.recv().expect("captured request");
+        assert!(
+            !request.contains("have "),
+            "an unverified local file must not earn the have shortcut; request was: {request:?}"
+        );
+        assert_eq!(
+            std::fs::read(&output_path).expect("re-read local file"),
+            legacy_bytes,
+            "the local file must be untouched"
+        );
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_bundle_accepts_attested_bundle_end_to_end() {
+        // Positive baseline through the REAL client path: an owner-signed,
+        // fresh, quorum-satisfying attested bundle is verified and only
+        // then written.
+        let dir = a4_temp_dir("accept");
+        let pin_path = a4_write_pin(&dir);
+        let bundle = a4_snapshot_bytes(&dir, true);
+        let mut response = format!("OK {}\n", bundle.len()).into_bytes();
+        response.extend_from_slice(&bundle);
+        let (addr, _request_rx, handle) = a4_serve_once(response);
+
+        let output_path = dir.join("pulled.snapshot");
+        let message = execute_anchor(AnchorCommand::PullBundle {
+            addr: addr.to_string(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: pin_path,
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect("attested bundle must verify and persist");
+        assert!(
+            message.contains("pulled and verified"),
+            "expected verified-pull message, got: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&output_path).expect("read pulled bundle"),
+            bundle,
+            "the verified bytes must be written exactly"
+        );
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pull_bundle_fails_before_network_without_owner_key_pin() {
+        // No pin ⇒ no bundle can ever be accepted ⇒ hard error before any
+        // network I/O (no listener exists at the addr, and we must NOT see
+        // a connect error).
+        let dir = a4_temp_dir("no-pin");
+        let output_path = dir.join("pulled.snapshot");
+        let err = execute_anchor(AnchorCommand::PullBundle {
+            addr: "127.0.0.1:1".to_owned(),
+            token: "0123456789abcdef0123456789abcdef".to_owned(),
+            output_path: output_path.clone(),
+            owner_key_pub_path: dir.join("missing.owner.key.pub"),
+            max_attestation_age_secs:
+                rustynet_control::membership::MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        })
+        .expect_err("missing pin must fail");
+        assert!(
+            err.contains("membership owner public key") && err.contains("out of band"),
+            "expected actionable missing-pin error, got: {err}"
+        );
+        assert!(!output_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
