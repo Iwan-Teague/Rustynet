@@ -15,7 +15,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 #[cfg(target_os = "windows")]
 use rustynet_windows_native::{
-    dpapi_protect, dpapi_unprotect, inspect_file_sddl, WindowsDpapiScope,
+    WindowsDpapiScope, dpapi_protect, dpapi_unprotect, inspect_file_sddl,
 };
 #[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::SecKeychain;
@@ -1723,12 +1723,12 @@ pub fn validate_key_custody_permissions(
 #[cfg(test)]
 mod tests {
     use super::{
+        AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
+        Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
+        NodeKeyPair, SigningProvider, SigningProviderKind, SigningProviderPolicy,
         create_provider_attestation, decrypt_private_key_envelope, encrypt_private_key_envelope,
         generate_key_custody_material, try_generate_key_custody_material,
-        validate_signing_provider_policy, verify_provider_attestation, AlgorithmPolicy,
-        CompatibilityException, CryptoAlgorithm, CryptoError, Ed25519SigningProvider,
-        KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore, NodeKeyPair,
-        SigningProvider, SigningProviderKind, SigningProviderPolicy,
+        validate_signing_provider_policy, verify_provider_attestation,
     };
     // The encrypted-key-file custody helpers and the OS-store fallback policy are
     // only exercised by `#[cfg(unix)]` tests below (they rely on unix permission
@@ -1736,8 +1736,8 @@ mod tests {
     // them as unused.
     #[cfg(unix)]
     use super::{
-        read_encrypted_key_file, validate_key_custody_permissions, write_encrypted_key_file,
-        OsStoreFallbackPolicy,
+        OsStoreFallbackPolicy, read_encrypted_key_file, validate_key_custody_permissions,
+        write_encrypted_key_file,
     };
 
     #[test]
