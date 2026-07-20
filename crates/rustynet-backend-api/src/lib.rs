@@ -216,7 +216,7 @@ pub trait TunnelBackend: Send + Sync {
     ) -> Result<Option<SocketEndpoint>, BackendError>;
 
     fn peer_latest_handshake_unix(&mut self, node_id: &NodeId)
-        -> Result<Option<u64>, BackendError>;
+    -> Result<Option<u64>, BackendError>;
 
     /// FIS-0004: coarse per-peer path health. Backends without per-peer
     /// quality data (command-based) return `Ok(None)` — no data is no
