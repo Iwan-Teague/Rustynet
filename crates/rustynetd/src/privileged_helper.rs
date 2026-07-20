@@ -2070,6 +2070,23 @@ fn validate_ifconfig_args(args: &[&str]) -> Result<(), String> {
 fn validate_route_args(args: &[&str]) -> Result<(), String> {
     match args {
         ["-n", "get", "default"] => Ok(()),
+        // Read-only per-endpoint route lookup issued by the macOS WireGuard
+        // backend's on-link/off-link probe
+        // (`macos_endpoint_needs_gateway_bypass`): `route -n get
+        // -inet|-inet6 <endpoint>`. It installs no state; it only reads the
+        // current routing decision for a literal IP so the backend can tell
+        // whether a peer's underlay endpoint is reached via the default
+        // gateway (off-subnet — needs a /32 bypass installed BEFORE the
+        // split-default halves capture it) or on-link (reachable via the
+        // intact connected route — bypass must be skipped). Without this
+        // schema the helper rejects the probe; the backend then treated
+        // every endpoint as on-link and installed the `0.0.0.0/1` +
+        // `128.0.0.0/1` halves with no bypass routes at all, which
+        // blackholed the WireGuard underlay for every off-subnet peer
+        // (observed live: a macOS node in full-tunnel exit mode could not
+        // complete a single handshake to its Linux exit peer on a
+        // neighbouring UTM subnet).
+        ["-n", "get", "-inet" | "-inet6", target] if is_ipv4_or_ipv6(target) => Ok(()),
         [
             "-n",
             "add" | "change",
@@ -3122,6 +3139,37 @@ mod tests {
             .expect_err("oversized privileged helper request must be rejected");
         writer.join().expect("writer thread should complete");
         assert!(err.contains("frame payload exceeds maximum size"));
+    }
+
+    #[test]
+    fn validate_request_accepts_macos_endpoint_route_get_schema() {
+        // Regression coverage for the live-lab-verified full-tunnel
+        // blackhole: the macOS WireGuard backend probes `route -n get
+        // -inet|-inet6 <endpoint>` to decide whether a peer underlay
+        // endpoint needs a /32 bypass before the split-default halves are
+        // installed. When the helper rejected this schema, the probe's
+        // error arm classified every endpoint as on-link and no bypass was
+        // ever installed.
+        validate_request(
+            PrivilegedCommandProgram::Route,
+            &["-n", "get", "-inet", "192.168.64.4"],
+        )
+        .expect("ipv4 endpoint route get schema should be accepted");
+        validate_request(
+            PrivilegedCommandProgram::Route,
+            &["-n", "get", "-inet6", "fd7a:115c:a1e0::1"],
+        )
+        .expect("ipv6 endpoint route get schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_rejects_macos_endpoint_route_get_non_ip_target() {
+        let err = validate_request(
+            PrivilegedCommandProgram::Route,
+            &["-n", "get", "-inet", "default;sudo"],
+        )
+        .expect_err("non-IP endpoint route get target must be rejected");
+        assert!(err.contains("unsupported route argument schema"));
     }
 
     #[test]

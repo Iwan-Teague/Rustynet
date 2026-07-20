@@ -1422,16 +1422,24 @@ fn apply_macos_endpoint_bypass_delta(
 /// one; an on-link (same-subnet) endpoint is delivered directly by the intact
 /// connected route, and a via-gateway bypass would actively break it. Decided
 /// from the pre-enforce routing table: a `gateway:` line in `route -n get`
-/// output means the endpoint is reached via a gateway (off-subnet). On any query
-/// failure, default to NOT needing a bypass (skip) — the safe choice for the
-/// common same-subnet topology, since a wrongly-added gateway bypass breaks the
-/// underlay whereas a missing one merely leaves a genuinely off-subnet peer to
-/// the tunnel halves.
+/// output means the endpoint is reached via a gateway (off-subnet).
+///
+/// A query FAILURE is propagated, not swallowed: the previous `Err(_) ->
+/// Ok(false)` arm silently classified every endpoint as on-link whenever the
+/// probe could not run (in production the probe argv must pass the privileged
+/// helper's route-argument allowlist — a missing schema rejected every probe),
+/// so the split-default halves were installed with no bypass routes at all and
+/// the WireGuard underlay was blackholed for every off-subnet peer. Failing
+/// closed here aborts the exit-mode transition instead of installing a
+/// full-tunnel route set whose underlay cannot reach its peers; the caller's
+/// reconcile rollback then restores the previous routing state. The on-link
+/// skip remains, but ONLY as the outcome of a successful probe that shows no
+/// `gateway:` line — never as the default for an unknown routing state.
 fn macos_endpoint_needs_gateway_bypass(
     runner: &mut dyn WireguardCommandRunner,
     endpoint: IpAddr,
 ) -> Result<bool, BackendError> {
-    match runner.run_capture(
+    let output = runner.run_capture(
         "route",
         &[
             "-n".to_owned(),
@@ -1439,13 +1447,11 @@ fn macos_endpoint_needs_gateway_bypass(
             macos_route_family_arg(endpoint),
             endpoint.to_string(),
         ],
-    ) {
-        Ok(output) => Ok(output
-            .stdout
-            .lines()
-            .any(|line| line.trim().starts_with("gateway:"))),
-        Err(_) => Ok(false),
-    }
+    )?;
+    Ok(output
+        .stdout
+        .lines()
+        .any(|line| line.trim().starts_with("gateway:")))
 }
 
 fn add_macos_endpoint_bypass_route(
@@ -1964,6 +1970,60 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_macos_exit_mode_full_tunnel_fails_closed_when_endpoint_probe_fails() {
+        // Regression test for the live-lab-verified blackhole: when the
+        // per-endpoint `route -n get -inet <endpoint>` probe cannot run
+        // (production: the privileged helper rejected the argv schema), the
+        // transition must fail closed — no split-default halves may be
+        // installed, because without the probe the backend cannot know
+        // which peers need an underlay bypass. The previous swallow-and-skip
+        // arm installed the halves with zero bypasses and blackholed every
+        // off-subnet peer's WireGuard underlay.
+        let mut runner = EndpointProbeFailureRunner::default();
+        let peers = vec![peer("peer-a", "203.0.113.10")];
+        let mut default_route = None;
+        let mut endpoint_bypass_hosts = BTreeSet::new();
+
+        let err = reconcile_macos_exit_mode(
+            &mut runner,
+            "utun9",
+            ExitMode::Off,
+            ExitMode::FullTunnel,
+            &peers,
+            &mut default_route,
+            &mut endpoint_bypass_hosts,
+        )
+        .expect_err("endpoint probe failure must abort the full-tunnel transition");
+
+        assert!(err.message.contains("unsupported route argument schema"));
+        assert!(
+            !runner.calls.iter().any(|call| {
+                let is_install = call
+                    .get(2)
+                    .map(String::as_str)
+                    .map(|verb| verb == "add" || verb == "change")
+                    .unwrap_or(false);
+                is_install
+                    && call
+                        .iter()
+                        .any(|arg| arg == "0.0.0.0/1" || arg == "128.0.0.0/1")
+            }),
+            "split-default halves must not be installed when the endpoint probe fails: {:?}",
+            runner.calls
+        );
+        assert!(
+            !runner
+                .calls
+                .iter()
+                .any(|call| call.iter().any(|arg| arg == "-host")),
+            "no bypass route may be installed from a failed probe: {:?}",
+            runner.calls
+        );
+        assert!(endpoint_bypass_hosts.is_empty());
+        assert_eq!(default_route, None);
+    }
+
+    #[test]
     fn parse_macos_default_route_output_rejects_non_ipv4_gateway() {
         let output = WireguardCommandOutput {
             stdout: "gateway: 192.0.2.1; route delete default\ninterface: en0\n".to_owned(),
@@ -2306,6 +2366,48 @@ mod tests {
             self.calls.push(call);
             Ok(WireguardCommandOutput {
                 stdout: self.capture_stdout.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct EndpointProbeFailureRunner {
+        calls: Vec<Vec<String>>,
+    }
+
+    /// Simulates the production failure behind the live-lab-verified
+    /// full-tunnel blackhole: the privileged helper's route-argument
+    /// allowlist accepted `route -n get default` but rejected the
+    /// per-endpoint probe `route -n get -inet|-inet6 <endpoint>`.
+    impl WireguardCommandRunner for EndpointProbeFailureRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+            let mut call = Vec::with_capacity(args.len() + 1);
+            call.push(program.to_owned());
+            call.extend(args.iter().cloned());
+            self.calls.push(call);
+            Ok(())
+        }
+
+        fn run_capture(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<WireguardCommandOutput, BackendError> {
+            let mut call = Vec::with_capacity(args.len() + 1);
+            call.push(program.to_owned());
+            call.extend(args.iter().cloned());
+            self.calls.push(call);
+            let endpoint_probe = args.get(1).map(String::as_str) == Some("get")
+                && matches!(
+                    args.get(2).map(String::as_str),
+                    Some("-inet") | Some("-inet6")
+                );
+            if endpoint_probe {
+                return Err(BackendError::internal("unsupported route argument schema"));
+            }
+            Ok(WireguardCommandOutput {
+                stdout: "gateway: 192.0.2.1\ninterface: en0\n".to_owned(),
                 stderr: String::new(),
             })
         }
