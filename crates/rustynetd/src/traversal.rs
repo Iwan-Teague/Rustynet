@@ -1697,22 +1697,12 @@ impl TraversalEngine {
 
         let mut observed_latest = runtime.latest_handshake_unix()?;
         let mut total_attempts = 0usize;
-        let mut elapsed = Duration::ZERO;
         for round in 0..self.config.simultaneous_open_rounds {
-            let round_delay = Duration::from_millis(
-                self.config
-                    .round_spacing_ms
-                    .saturating_mul(u64::from(round)),
-            );
-            if round_delay > elapsed {
-                waiter.wait(round_delay - elapsed);
-                elapsed = round_delay;
-            }
-            // Fire ALL pairs of this round before polling — this is
-            // the core of the "parallel" race. Each probe is one
-            // outbound datagram; sending them back-to-back lets the
-            // remote side observe simultaneous binding requests, which
-            // is what marginal-NAT topologies need to succeed.
+            // Fire ALL pairs of this round back-to-back — this is the
+            // core of the "parallel" race. Each probe is one outbound
+            // datagram; sending them back-to-back lets the remote side
+            // observe simultaneous binding requests, which is what
+            // marginal-NAT topologies need to succeed.
             for pair in &pairs {
                 runtime.send_probe(
                     crate::ice_priority::socket_addr_to_socket_endpoint(pair.remote.addr),
@@ -1720,6 +1710,14 @@ impl TraversalEngine {
                 )?;
                 total_attempts = total_attempts.saturating_add(1);
             }
+            // Then wait one round spacing BEFORE checking, so the
+            // probes just sent get a real observation window. This
+            // ordering (send → wait → check) matters most for the
+            // final round: checking immediately after the sends would
+            // give the last round's probes zero time to complete a
+            // handshake before falling through to the relay /
+            // fail-closed fallback below.
+            waiter.wait(Duration::from_millis(self.config.round_spacing_ms));
             let latest = runtime.latest_handshake_unix()?;
             if handshake_advanced(observed_latest, latest)
                 && handshake_is_fresh(latest, now_unix, handshake_freshness_secs)
@@ -3259,6 +3257,133 @@ mod tests {
                 Duration::from_millis(engine.config.round_spacing_ms)
             ]
         );
+    }
+
+    /// NAT-2: every ICE race round — including the FINAL one — must get a
+    /// real observation window before the handshake check. The round loop
+    /// runs send → wait(round_spacing_ms) → check, so a handshake that only
+    /// becomes observable after the final round's post-send wait still
+    /// yields a Direct decision. Before the reorder the final check ran
+    /// immediately after the final sends and this exact case fell through
+    /// to the relay fallback, discarding an entire round of probes
+    /// unobserved.
+    #[test]
+    fn ice_pair_race_final_round_observation_window_yields_direct() {
+        #[derive(Clone, Default)]
+        struct SharedWaitCount {
+            nonzero_waits: std::rc::Rc<std::cell::Cell<u32>>,
+        }
+
+        struct FinalRoundHandshakeRuntime {
+            state: SharedWaitCount,
+            /// The handshake becomes observable only once this many
+            /// non-zero waits have elapsed.
+            waits_required: u32,
+            handshake_unix: u64,
+            sent: Vec<(SocketEndpoint, u8)>,
+        }
+        impl SimultaneousOpenRuntime for FinalRoundHandshakeRuntime {
+            fn send_probe(
+                &mut self,
+                endpoint: SocketEndpoint,
+                round: u8,
+            ) -> Result<(), TraversalError> {
+                self.sent.push((endpoint, round));
+                Ok(())
+            }
+
+            fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError> {
+                Ok((self.state.nonzero_waits.get() >= self.waits_required)
+                    .then_some(self.handshake_unix))
+            }
+        }
+
+        struct CountingWaiter {
+            state: SharedWaitCount,
+            waits: Vec<Duration>,
+        }
+        impl SimultaneousOpenWaiter for CountingWaiter {
+            fn wait(&mut self, duration: Duration) {
+                self.waits.push(duration);
+                if !duration.is_zero() {
+                    self.state
+                        .nonzero_waits
+                        .set(self.state.nonzero_waits.get().saturating_add(1));
+                }
+            }
+        }
+
+        let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
+        let rounds = u32::from(engine.config.simultaneous_open_rounds);
+        assert!(
+            rounds >= 2,
+            "test needs at least two rounds to discriminate"
+        );
+        let now = 1_700_000_100u64;
+        let shared_state = SharedWaitCount::default();
+        let mut runtime = FinalRoundHandshakeRuntime {
+            state: shared_state.clone(),
+            // One non-zero wait per round: requiring all of them means the
+            // handshake is observable only after the FINAL round's
+            // post-send wait — the window the pre-reorder loop never gave.
+            waits_required: rounds,
+            handshake_unix: now,
+            sent: Vec::new(),
+        };
+        let mut waiter = CountingWaiter {
+            state: shared_state,
+            waits: Vec::new(),
+        };
+        let schedule = CoordinationSchedule {
+            session_id: [3u8; 16],
+            nonce: [4u8; 16],
+            probe_start_unix: now,
+            wait_duration: Duration::ZERO,
+        };
+        let local_candidates = vec![candidate([10, 0, 0, 10], 51820, CandidateSource::Host, 900)];
+        let remote_candidates = vec![candidate([10, 0, 0, 1], 51820, CandidateSource::Host, 900)];
+        let relay_endpoint = SocketEndpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+            port: 60000,
+        };
+
+        let result = engine
+            .execute_ice_pair_race(
+                &mut runtime,
+                &mut waiter,
+                schedule,
+                local_candidates.as_slice(),
+                remote_candidates.as_slice(),
+                &[1u8; 32],
+                &[2u8; 32],
+                Some(relay_endpoint),
+                now,
+                120,
+                None,
+                None,
+            )
+            .expect("race runs");
+
+        match result.decision {
+            TraversalDecision::Direct { endpoint, reason } => {
+                assert_eq!(endpoint, remote_candidates[0].endpoint);
+                assert_eq!(
+                    reason,
+                    TraversalDecisionReason::IcePairRaceHandshakeObserved
+                );
+            }
+            other => panic!("final-round handshake must yield Direct, got {other:?}"),
+        }
+        // Every round sent its probe and got exactly one observation
+        // window of one round spacing: entry wait (zero here) followed by
+        // `rounds` post-send spacing waits.
+        assert_eq!(runtime.sent.len(), rounds as usize);
+        let mut expected_waits = vec![Duration::ZERO];
+        expected_waits.extend(std::iter::repeat_n(
+            Duration::from_millis(engine.config.round_spacing_ms),
+            rounds as usize,
+        ));
+        assert_eq!(waiter.waits, expected_waits);
     }
 
     // ── A4: Adversarial traversal hardening tests ─────────────────────────
