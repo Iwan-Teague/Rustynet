@@ -2,12 +2,22 @@
 //!
 //! Currently provides one subcommand, `gates`, a fail-fast replacement
 //! for chaining the mandatory Rust gates by hand. It runs them in
-//! dependency order (fmt → check → clippy → test) and STOPS at the
-//! first failure, so a compile or lint error surfaces in minutes
-//! instead of after the whole test suite. Each stage runs under a
-//! timeout watchdog: if a stage hangs past its budget it is killed
-//! (whole process group) and the tail of its output is printed, so a
-//! stuck test names itself instead of stalling the loop indefinitely.
+//! dependency order (fmt → clippy → test) and STOPS at the first
+//! failure, so a compile or lint error surfaces in minutes instead of
+//! after the whole test suite. Clippy is the single compile-correctness
+//! AND lint pass: clippy is rustc plus lint passes, so a compile error
+//! fails the clippy stage at essentially the same wall-clock point a
+//! standalone `cargo check` stage would have — while a separate check
+//! stage would duplicate the entire compile (check and clippy share no
+//! incremental cache: different `RUSTC_WORKSPACE_WRAPPER`, different
+//! fingerprint bucket). `--with-check` restores the old
+//! fmt → check → clippy → test order as the escape hatch for a
+//! broken/poisoned clippy toolchain; `cargo check` also remains an
+//! authoritative individually-invocable gate command (CLAUDE.md §7).
+//! Each stage runs under a timeout watchdog: if a stage hangs past its
+//! budget it is killed (whole process group) and the tail of its
+//! output is printed, so a stuck test names itself instead of stalling
+//! the loop indefinitely.
 //!
 //! All output is streamed live (tee) so progress is visible while the
 //! gate runs; the last lines are also retained for the failure report.
@@ -16,10 +26,11 @@
 //!   cargo run -p rustynet-xtask -- gates                  # full workspace
 //!   cargo run -p rustynet-xtask -- gates -p rustynet-cli  # scope to a crate
 //!   cargo run -p rustynet-xtask -- gates --skip-test      # gates without tests
+//!   cargo run -p rustynet-xtask -- gates --with-check     # restore the standalone check stage
 //!   cargo run -p rustynet-xtask -- gates --affected       # changed crates + all dependents
 //!   cargo run -p rustynet-xtask -- gates --affected --base origin/main
 //!
-//! `--affected` scopes check/clippy/test to the workspace crates touched
+//! `--affected` scopes clippy/test (and check, under `--with-check`) to the workspace crates touched
 //! since `--base` (default `origin/main`, including uncommitted and
 //! untracked changes) plus the full transitive closure of their
 //! reverse-dependents, so every crate whose build a change can break is
@@ -30,7 +41,7 @@
 //!
 //! Per-stage timeouts (seconds) are overridable via env:
 //!   XTASK_FMT_TIMEOUT (default 120)
-//!   XTASK_CHECK_TIMEOUT (default 1200)
+//!   XTASK_CHECK_TIMEOUT (default 1200 — stage only runs under --with-check)
 //!   XTASK_CLIPPY_TIMEOUT (default 1500)
 //!   XTASK_TEST_TIMEOUT (default 5400 — full --all-targets suite is ~48-60min)
 //!
@@ -62,11 +73,11 @@ fn main() {
         Some("gates") => run_gates(&args[1..]),
         Some(other) => {
             eprintln!("xtask: unknown subcommand: {other}");
-            eprintln!("usage: xtask gates [--skip-test] [cargo scope args...]");
+            eprintln!("usage: xtask gates [--skip-test] [--with-check] [cargo scope args...]");
             2
         }
         None => {
-            eprintln!("usage: xtask gates [--skip-test] [cargo scope args...]");
+            eprintln!("usage: xtask gates [--skip-test] [--with-check] [cargo scope args...]");
             2
         }
     };
@@ -81,6 +92,7 @@ struct Stage {
 
 fn run_gates(rest: &[String]) -> i32 {
     let mut skip_test = false;
+    let mut with_check = false;
     let mut affected = false;
     let mut base = "origin/main".to_owned();
     let mut scope: Vec<String> = Vec::new();
@@ -88,6 +100,7 @@ fn run_gates(rest: &[String]) -> i32 {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--skip-test" => skip_test = true,
+            "--with-check" => with_check = true,
             "--affected" => affected = true,
             "--base" => match iter.next() {
                 Some(value) => base = value.clone(),
@@ -142,34 +155,40 @@ fn run_gates(rest: &[String]) -> i32 {
         v
     };
 
-    let mut stages = vec![
-        Stage {
-            label: "fmt",
-            timeout: timeout_from_env("XTASK_FMT_TIMEOUT", 120),
-            args: vec![
-                "fmt".to_owned(),
-                "--all".to_owned(),
-                "--".to_owned(),
-                "--check".to_owned(),
-            ],
-        },
-        Stage {
+    let mut stages = vec![Stage {
+        label: "fmt",
+        timeout: timeout_from_env("XTASK_FMT_TIMEOUT", 120),
+        args: vec![
+            "fmt".to_owned(),
+            "--all".to_owned(),
+            "--".to_owned(),
+            "--check".to_owned(),
+        ],
+    }];
+    // The standalone check stage is off by default: clippy is rustc plus
+    // lint passes, so it already provides the compile-correctness gate at
+    // ~the same wall-clock cost as check alone, and running both doubles
+    // the full compile (no shared incremental cache across the clippy
+    // wrapper). `--with-check` restores it as the fallback for a
+    // broken/poisoned clippy toolchain.
+    if with_check {
+        stages.push(Stage {
             label: "check",
             timeout: timeout_from_env("XTASK_CHECK_TIMEOUT", 1200),
             args: with_scope(&["check"]),
+        });
+    }
+    stages.push(Stage {
+        label: "clippy",
+        timeout: timeout_from_env("XTASK_CLIPPY_TIMEOUT", 1500),
+        args: {
+            let mut a = with_scope(&["clippy"]);
+            a.push("--".to_owned());
+            a.push("-D".to_owned());
+            a.push("warnings".to_owned());
+            a
         },
-        Stage {
-            label: "clippy",
-            timeout: timeout_from_env("XTASK_CLIPPY_TIMEOUT", 1500),
-            args: {
-                let mut a = with_scope(&["clippy"]);
-                a.push("--".to_owned());
-                a.push("-D".to_owned());
-                a.push("warnings".to_owned());
-                a
-            },
-        },
-    ];
+    });
     if !skip_test {
         stages.push(Stage {
             label: "test",
