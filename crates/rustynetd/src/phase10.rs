@@ -4926,6 +4926,12 @@ pub struct Phase10Controller<B: TunnelBackend, S: DataplaneSystem> {
     pub relay_stability_window_ms: u64,
     /// Membership directory used to gate peer provisioning and ACL evaluation.
     membership: MembershipDirectory,
+    /// Test-only fault injection: when set, `apply_revocation` fails the way a
+    /// backend/system teardown error would, so callers' fail-closed handling
+    /// of a revocation teardown failure is exercisable in tests. Never
+    /// compiled into production builds.
+    #[cfg(test)]
+    fail_revocation_teardown_for_test: bool,
 }
 
 impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
@@ -4971,6 +4977,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             direct_stability_window_ms: 3_000,
             relay_stability_window_ms: 5_000,
             membership,
+            #[cfg(test)]
+            fail_revocation_teardown_for_test: false,
         }
     }
 
@@ -5606,6 +5614,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     /// Apply a peer revocation immediately: remove from backend and dataplane.
     /// Does not wait for the next generation cycle.
     pub fn apply_revocation(&mut self, node_id: &NodeId) -> Result<(), Phase10Error> {
+        #[cfg(test)]
+        if self.fail_revocation_teardown_for_test {
+            return Err(Phase10Error::Backend(BackendError::internal(
+                "injected revocation teardown failure",
+            )));
+        }
         self.backend.remove_peer(node_id)?;
         self.managed_peers.remove(node_id);
         self.refresh_peer_endpoint_routes_and_attest()?;
@@ -5624,6 +5638,14 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     ) {
         self.direct_stability_window_ms = direct_stability_window_ms;
         self.relay_stability_window_ms = relay_stability_window_ms;
+    }
+
+    /// For testing: make the next `apply_revocation` fail as if the backend or
+    /// route-refresh teardown had errored, so fail-closed revocation handling
+    /// in callers is exercisable.
+    #[cfg(test)]
+    pub fn fail_revocation_teardown_for_test(&mut self) {
+        self.fail_revocation_teardown_for_test = true;
     }
 
     /// For testing: back-date a peer's `pending_since` by `elapsed` so tests
