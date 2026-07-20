@@ -10,8 +10,9 @@ use rustynet_backend_api::{
 };
 
 use crate::linux_command::{
-    WireguardCommandRunner, encode_wg_public_key_base64, parse_peer_latest_handshake_unix,
-    validate_interface_name, validate_listen_port, validate_private_key_path,
+    SAFE_BRINGUP_TUNNEL_MTU, WireguardCommandRunner, encode_wg_public_key_base64,
+    parse_peer_latest_handshake_unix, validate_interface_name, validate_listen_port,
+    validate_private_key_path,
 };
 
 const MACOS_PS_BINARY: &str = "/bin/ps";
@@ -177,6 +178,23 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
 
         let ifconfig_addr_args = ifconfig_address_args(&self.interface_name, &local_cidr);
         if let Err(err) = self.runner.run("ifconfig", &ifconfig_addr_args) {
+            return Err(match self.remove_interface() {
+                Ok(()) => err,
+                Err(cleanup_err) => combine_interface_cleanup_error(err, cleanup_err),
+            });
+        }
+
+        // FIS-0027 Phase 2: pin the tunnel MTU explicitly (before interface-up,
+        // wg-quick order) instead of trusting the wireguard-go/platform
+        // default, closing the never-set-MTU gap.
+        if let Err(err) = self.runner.run(
+            "ifconfig",
+            &[
+                self.interface_name.clone(),
+                "mtu".to_owned(),
+                SAFE_BRINGUP_TUNNEL_MTU.to_string(),
+            ],
+        ) {
             return Err(match self.remove_interface() {
                 Ok(()) => err,
                 Err(cleanup_err) => combine_interface_cleanup_error(err, cleanup_err),
@@ -1557,6 +1575,75 @@ mod tests {
             }])
             .expect("route apply should work");
         backend.shutdown().expect("shutdown should work");
+    }
+
+    #[test]
+    fn macos_backend_sets_safe_bringup_mtu_before_interface_up() {
+        let mut backend = MacosWireguardBackend::new_for_test(
+            ScriptedRunner::default(),
+            "utun9",
+            "/tmp/wg.key",
+            "en0",
+            51820,
+        )
+        .expect("backend should be constructed");
+
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+
+        let expected_mtu_call = vec![
+            "ifconfig".to_owned(),
+            "utun9".to_owned(),
+            "mtu".to_owned(),
+            SAFE_BRINGUP_TUNNEL_MTU.to_string(),
+        ];
+        let expected_up_call = vec!["ifconfig".to_owned(), "utun9".to_owned(), "up".to_owned()];
+        let mtu_index = backend
+            .runner
+            .calls
+            .iter()
+            .position(|call| call == &expected_mtu_call)
+            .expect("start must set the safe bring-up MTU explicitly");
+        let up_index = backend
+            .runner
+            .calls
+            .iter()
+            .position(|call| call == &expected_up_call)
+            .expect("start must bring the interface up");
+        assert!(
+            mtu_index < up_index,
+            "MTU must be pinned before the interface comes up (wg-quick order)"
+        );
+    }
+
+    #[test]
+    fn macos_backend_start_cleans_up_interface_when_mtu_set_fails() {
+        let mut backend = MacosWireguardBackend::new_for_test(
+            ScriptedRunner {
+                fail_on_arg_always: Some("mtu".to_owned()),
+                ..ScriptedRunner::default()
+            },
+            "utun9",
+            "/tmp/wg.key",
+            "en0",
+            51820,
+        )
+        .expect("backend should be constructed");
+
+        backend
+            .start(runtime_context())
+            .expect_err("mtu set failure must fail the start");
+        assert!(!backend.running, "backend must not report running");
+        assert!(
+            backend
+                .runner
+                .calls
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("ifconfig")
+                    && call.iter().any(|arg| arg == "down")),
+            "failed mtu set must run the interface cleanup path"
+        );
     }
 
     #[test]
