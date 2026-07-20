@@ -300,6 +300,7 @@ mod tests {
             approver_signatures: vec![MembershipSignature {
                 approver_id: "owner-1".to_owned(),
                 signature_hex: hex_lower(&signature.to_bytes()),
+                head_signature_hex: None,
             }],
         };
 

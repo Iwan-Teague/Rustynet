@@ -82,6 +82,7 @@ fn admit_signed(state: &MembershipState, node_id: &str, now_unix: u64) -> Signed
         approver_signatures: vec![MembershipSignature {
             approver_id: "owner-1".to_owned(),
             signature_hex: hex_lower(&sig.to_bytes()),
+            head_signature_hex: None,
         }],
     }
 }

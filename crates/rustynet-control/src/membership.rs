@@ -22,6 +22,21 @@ use crate::roles::{
 pub const MEMBERSHIP_SCHEMA_VERSION: u8 = 1;
 pub const MEMBERSHIP_CLOCK_SKEW_SECS: u64 = 90;
 
+/// Domain-separation prefix for the membership head-attestation canonical
+/// payload. The first payload line pins the artifact type and version so an
+/// update signature (whose payload starts `version=`) can never be replayed
+/// as a head signature or vice versa.
+pub const MEMBERSHIP_HEAD_ATTESTATION_DOMAIN: &str = "rustynet:membership-head:v1";
+
+/// Schema version of the persisted `attestation.*` snapshot fields.
+pub const MEMBERSHIP_HEAD_ATTESTATION_VERSION: u8 = 1;
+
+/// Default (and hard maximum) freshness window for a membership head
+/// attestation: 7 days. `verify_attested_snapshot` rejects any window
+/// outside `1..=` this value, so callers can only tighten the bound —
+/// there is no way to disable the staleness check.
+pub const MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Upper bound on a single on-disk membership snapshot.
 ///
 /// The snapshot is a hex-encoded `MembershipState` blob — a roster of
@@ -513,6 +528,36 @@ impl MembershipUpdateRecord {
 pub struct MembershipSignature {
     pub approver_id: String,
     pub signature_hex: String,
+    /// Optional ed25519 signature by the SAME approver key over the
+    /// membership head-attestation canonical payload derived from the
+    /// enclosing update record (`head_attestation_canonical_payload` with
+    /// `epoch = record.epoch_new`, `state_root = record.new_state_root`,
+    /// `attested_at_unix = record.created_at_unix`). Minted alongside the
+    /// update signature wherever signing keys are already in hand, and
+    /// materialized into the persisted snapshot at apply time so a
+    /// bundle-pull client can authenticate a bare snapshot against the
+    /// pinned §6.B owner public key. `None` on legacy entries; when
+    /// present, the field participates in the canonical envelope, so
+    /// pre-upgrade decoders fail closed on the changed `entry_hash`
+    /// (intentional — FIS-0014 precedent for additive-but-gating fields).
+    pub head_signature_hex: Option<String>,
+}
+
+/// Signed commitment to a membership head: the exact `(network_id, epoch,
+/// state_root)` identity of a snapshot plus a freshness timestamp, signed by
+/// the approver set. This is what lets `anchor pull-bundle` authenticate a
+/// bare snapshot on a device whose only prior trust is the out-of-band
+/// membership owner public key (SecurityMinimumBar §6.B): the pinned key must
+/// be an Owner in the attested state AND must have actually signed this
+/// attestation. Anchors never mint attestations — they only materialize the
+/// head signatures that arrived inside an applied `SignedMembershipUpdate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipHeadAttestation {
+    pub network_id: String,
+    pub epoch: u64,
+    pub state_root_hex: String,
+    pub attested_at_unix: u64,
+    pub approver_signatures: Vec<MembershipSignature>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -537,6 +582,14 @@ impl SignedMembershipUpdate {
         for (index, signature) in signatures.iter().enumerate() {
             let _ = writeln!(out, "sig.{index}.approver_id={}", signature.approver_id);
             let _ = writeln!(out, "sig.{index}.signature_hex={}", signature.signature_hex);
+            // Optional per-signer head signature (membership head
+            // attestation). Legacy entries without the field encode
+            // byte-identically to the pre-attestation format, so their
+            // `entry_hash` values are unchanged; entries WITH the field
+            // fail closed on pre-upgrade decoders via the chain hash.
+            if let Some(head_signature_hex) = &signature.head_signature_hex {
+                let _ = writeln!(out, "sig.{index}.head_signature_hex={head_signature_hex}");
+            }
         }
         Ok(out)
     }
@@ -588,6 +641,33 @@ pub enum MembershipError {
     Internal(String),
     Io(String),
     IntegrityMismatch,
+    /// The snapshot carries no head attestation. A bundle-pull client
+    /// must reject such a snapshot outright — an unattested snapshot is
+    /// unauthenticated data.
+    AttestationMissing,
+    /// The head attestation is older than the caller's freshness window.
+    AttestationStale,
+    /// The head attestation's timestamp is beyond the clock-skew
+    /// tolerance in the future.
+    AttestationFutureDated,
+    /// The pinned §6.B membership owner public key is absent from the
+    /// attested approver set, is not an Owner there, or did not actually
+    /// sign the attestation. The reason string is operator-actionable.
+    PinnedOwnerKeyMismatch(String),
+    /// The offered snapshot's epoch is below the epoch of the prior
+    /// verified local bundle.
+    EpochRegression {
+        prior_epoch: u64,
+        offered_epoch: u64,
+    },
+    /// Same epoch, different state root, between the prior verified
+    /// local bundle and the offered snapshot: fork evidence. Never pick
+    /// a side silently — surface both roots verbatim.
+    ForkDetected {
+        epoch: u64,
+        prior_root: String,
+        offered_root: String,
+    },
 }
 
 impl fmt::Display for MembershipError {
@@ -621,6 +701,33 @@ impl fmt::Display for MembershipError {
             MembershipError::Internal(message) => write!(f, "internal error: {message}"),
             MembershipError::Io(message) => write!(f, "i/o error: {message}"),
             MembershipError::IntegrityMismatch => f.write_str("integrity mismatch"),
+            MembershipError::AttestationMissing => {
+                f.write_str("membership snapshot carries no head attestation")
+            }
+            MembershipError::AttestationStale => {
+                f.write_str("membership head attestation is stale")
+            }
+            MembershipError::AttestationFutureDated => {
+                f.write_str("membership head attestation is future dated")
+            }
+            MembershipError::PinnedOwnerKeyMismatch(reason) => {
+                write!(f, "pinned owner key mismatch: {reason}")
+            }
+            MembershipError::EpochRegression {
+                prior_epoch,
+                offered_epoch,
+            } => write!(
+                f,
+                "membership epoch regression: offered epoch {offered_epoch} is below prior verified epoch {prior_epoch}"
+            ),
+            MembershipError::ForkDetected {
+                epoch,
+                prior_root,
+                offered_root,
+            } => write!(
+                f,
+                "membership fork detected at epoch {epoch}: prior verified state root {prior_root} != offered state root {offered_root}"
+            ),
         }
     }
 }
@@ -687,6 +794,99 @@ pub fn sign_update_record(
     Ok(MembershipSignature {
         approver_id: approver_id.to_owned(),
         signature_hex: hex_encode(&signature.to_bytes()),
+        head_signature_hex: None,
+    })
+}
+
+/// Canonical signed payload of a membership head attestation.
+///
+/// Line 1 is the domain-separation tag; the remaining lines are `key=value`
+/// pairs in sorted key order. Byte-pinned by
+/// `head_attestation_canonical_payload_is_byte_pinned` — any change to this
+/// format invalidates every existing head signature.
+pub fn head_attestation_canonical_payload(
+    network_id: &str,
+    epoch: u64,
+    state_root_hex: &str,
+    attested_at_unix: u64,
+) -> String {
+    format!(
+        "{MEMBERSHIP_HEAD_ATTESTATION_DOMAIN}\n\
+         attested_at_unix={attested_at_unix}\n\
+         epoch={epoch}\n\
+         network_id={network_id}\n\
+         state_root={state_root_hex}\n"
+    )
+}
+
+/// Sign a membership head attestation payload. Mirrors `sign_update_record`:
+/// the returned `MembershipSignature.signature_hex` is the head signature
+/// (its own `head_signature_hex` slot stays `None` — that slot only carries
+/// meaning inside a `SignedMembershipUpdate`'s per-signer entries).
+pub fn sign_head_attestation(
+    network_id: &str,
+    epoch: u64,
+    state_root_hex: &str,
+    attested_at_unix: u64,
+    approver_id: &str,
+    signing_key: &SigningKey,
+) -> Result<MembershipSignature, MembershipError> {
+    if approver_id.trim().is_empty() {
+        return Err(MembershipError::InvalidFormat(
+            "approver_id must not be empty".to_owned(),
+        ));
+    }
+    if network_id.trim().is_empty() || network_id.contains('\n') {
+        return Err(MembershipError::InvalidFormat(
+            "head attestation network id must be a non-empty single line".to_owned(),
+        ));
+    }
+    // The state root is a sha256 hex digest; refuse to sign anything else so
+    // a malformed root can never smuggle payload-line structure.
+    decode_hex_to_fixed::<32>(state_root_hex)?;
+    let payload =
+        head_attestation_canonical_payload(network_id, epoch, state_root_hex, attested_at_unix);
+    let signature = signing_key.sign(payload.as_bytes());
+    Ok(MembershipSignature {
+        approver_id: approver_id.to_owned(),
+        signature_hex: hex_encode(&signature.to_bytes()),
+        head_signature_hex: None,
+    })
+}
+
+/// Materialize the head attestation that traveled inside a signed update's
+/// per-signer `head_signature_hex` fields. Returns `None` when no signer
+/// carried one (a legacy update) — the caller then persists the snapshot
+/// without an attestation, which is NOT an error at the anchor (anchors are
+/// trust-inert: they never mint, and an unattested snapshot simply fails
+/// client-side verification later, which is the correct fail-closed outcome).
+pub fn head_attestation_from_signed_update(
+    signed_update: &SignedMembershipUpdate,
+) -> Option<MembershipHeadAttestation> {
+    let approver_signatures: Vec<MembershipSignature> = signed_update
+        .approver_signatures
+        .iter()
+        .filter_map(|signature| {
+            signature
+                .head_signature_hex
+                .as_ref()
+                .map(|head_signature_hex| MembershipSignature {
+                    approver_id: signature.approver_id.clone(),
+                    signature_hex: head_signature_hex.clone(),
+                    head_signature_hex: None,
+                })
+        })
+        .collect();
+    if approver_signatures.is_empty() {
+        return None;
+    }
+    let record = &signed_update.record;
+    Some(MembershipHeadAttestation {
+        network_id: record.network_id.clone(),
+        epoch: record.epoch_new,
+        state_root_hex: record.new_state_root.clone(),
+        attested_at_unix: record.created_at_unix,
+        approver_signatures,
     })
 }
 
@@ -740,12 +940,89 @@ pub fn persist_membership_snapshot(
     path: impl AsRef<Path>,
     state: &MembershipState,
 ) -> Result<(), MembershipError> {
+    persist_membership_snapshot_with_attestation(path, state, None)
+}
+
+/// Persist a membership snapshot, optionally with its head attestation.
+///
+/// The attestation fields ride AFTER the legacy `digest=` line so the
+/// existing self-consistency digest (over `version=` + `state_hex=` only)
+/// and every legacy loader keep working unchanged; the attestation's own
+/// integrity comes from its ed25519 signatures, not from the digest. The
+/// attestation must structurally bind to exactly this state — a mismatched
+/// attestation is a programming error and is refused rather than persisted.
+pub fn persist_membership_snapshot_with_attestation(
+    path: impl AsRef<Path>,
+    state: &MembershipState,
+    attestation: Option<&MembershipHeadAttestation>,
+) -> Result<(), MembershipError> {
+    use std::fmt::Write as _;
     let state_payload = state.canonical_payload()?;
     let state_hex = hex_encode(state_payload.as_bytes());
     let body_without_digest =
         format!("version={MEMBERSHIP_SCHEMA_VERSION}\nstate_hex={state_hex}\n");
     let digest = sha256_hex(body_without_digest.as_bytes());
-    let body = format!("{body_without_digest}digest={digest}\n");
+    let mut body = format!("{body_without_digest}digest={digest}\n");
+    if let Some(attestation) = attestation {
+        if attestation.network_id != state.network_id
+            || attestation.epoch != state.epoch
+            || attestation.state_root_hex != state.state_root_hex()?
+        {
+            return Err(MembershipError::InvalidFormat(
+                "head attestation does not bind to the snapshot state".to_owned(),
+            ));
+        }
+        if attestation.approver_signatures.is_empty() {
+            return Err(MembershipError::InvalidFormat(
+                "head attestation must carry at least one signature".to_owned(),
+            ));
+        }
+        if attestation.approver_signatures.len() > MAX_MEMBERSHIP_SIGNATURE_COUNT {
+            return Err(MembershipError::InvalidFormat(format!(
+                "head attestation signature count exceeds maximum {MAX_MEMBERSHIP_SIGNATURE_COUNT}"
+            )));
+        }
+        let mut signatures: Vec<&MembershipSignature> =
+            attestation.approver_signatures.iter().collect();
+        signatures.sort_by(|left, right| left.approver_id.cmp(&right.approver_id));
+        for pair in signatures.windows(2) {
+            if pair[0].approver_id == pair[1].approver_id {
+                return Err(MembershipError::InvalidFormat(format!(
+                    "duplicate approver id {} in head attestation",
+                    pair[0].approver_id
+                )));
+            }
+        }
+        let _ = writeln!(
+            body,
+            "attestation.version={MEMBERSHIP_HEAD_ATTESTATION_VERSION}"
+        );
+        let _ = writeln!(body, "attestation.network_id={}", attestation.network_id);
+        let _ = writeln!(body, "attestation.epoch={}", attestation.epoch);
+        let _ = writeln!(
+            body,
+            "attestation.state_root={}",
+            attestation.state_root_hex
+        );
+        let _ = writeln!(
+            body,
+            "attestation.attested_at_unix={}",
+            attestation.attested_at_unix
+        );
+        let _ = writeln!(body, "attestation.sig_count={}", signatures.len());
+        for (index, signature) in signatures.iter().enumerate() {
+            let _ = writeln!(
+                body,
+                "attestation.sig.{index}.approver_id={}",
+                signature.approver_id
+            );
+            let _ = writeln!(
+                body,
+                "attestation.sig.{index}.signature_hex={}",
+                signature.signature_hex
+            );
+        }
+    }
     atomic_write(path.as_ref(), body.as_bytes(), 0o600)
 }
 
@@ -817,6 +1094,274 @@ pub fn snapshot_bytes_state_identity(bytes: &[u8]) -> Option<(u64, String)> {
     let state = parse_snapshot_content(content).ok()?;
     let root = state.state_root_hex().ok()?;
     Some((state.epoch, root))
+}
+
+/// Parse the optional `attestation.*` block of a snapshot's key/value map.
+/// `Ok(None)` when the block is absent (legacy snapshot); `Err` when the
+/// block is present but malformed — the two must stay distinguishable so
+/// verification can report `AttestationMissing` vs a format error.
+fn parse_snapshot_attestation_fields(
+    fields: &HashMap<&str, &str>,
+) -> Result<Option<MembershipHeadAttestation>, MembershipError> {
+    let Some(version_raw) = fields.get("attestation.version").copied() else {
+        return Ok(None);
+    };
+    let version = version_raw.parse::<u8>().map_err(|_| {
+        MembershipError::InvalidFormat("invalid u8 field attestation.version".to_owned())
+    })?;
+    if version != MEMBERSHIP_HEAD_ATTESTATION_VERSION {
+        return Err(MembershipError::UnsupportedVersion(version));
+    }
+    let network_id = required_field(fields, "attestation.network_id")?.to_owned();
+    let epoch = parse_u64_field(fields, "attestation.epoch")?;
+    let state_root_hex = required_field(fields, "attestation.state_root")?.to_owned();
+    let attested_at_unix = parse_u64_field(fields, "attestation.attested_at_unix")?;
+    let sig_count = bounded_count(
+        "attestation.sig_count",
+        parse_usize_field(fields, "attestation.sig_count")?,
+        MAX_MEMBERSHIP_SIGNATURE_COUNT,
+        fields.len(),
+    )?;
+    if sig_count == 0 {
+        return Err(MembershipError::InvalidFormat(
+            "head attestation must carry at least one signature".to_owned(),
+        ));
+    }
+    let mut approver_signatures = Vec::with_capacity(sig_count);
+    for index in 0..sig_count {
+        approver_signatures.push(MembershipSignature {
+            approver_id: required_field(fields, &format!("attestation.sig.{index}.approver_id"))?
+                .to_owned(),
+            signature_hex: required_field(
+                fields,
+                &format!("attestation.sig.{index}.signature_hex"),
+            )?
+            .to_owned(),
+            head_signature_hex: None,
+        });
+    }
+    Ok(Some(MembershipHeadAttestation {
+        network_id,
+        epoch,
+        state_root_hex,
+        attested_at_unix,
+        approver_signatures,
+    }))
+}
+
+/// Best-effort head-attestation extraction from raw snapshot bytes.
+/// `None` on any malformed input, mirroring `snapshot_bytes_state_identity`.
+/// This is a convenience reader (e.g. for `membership attest` merge logic) —
+/// enforcement lives in `verify_attested_snapshot`.
+pub fn snapshot_bytes_head_attestation(bytes: &[u8]) -> Option<MembershipHeadAttestation> {
+    let content = std::str::from_utf8(bytes).ok()?;
+    if content.len() > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+        return None;
+    }
+    let fields = parse_key_values(content).ok()?;
+    parse_snapshot_attestation_fields(&fields).ok().flatten()
+}
+
+/// THE enforcement point for anchor bundle-pull authentication
+/// (SecurityMinimumBar §3 control 2): accept raw snapshot bytes only when
+/// their head attestation cryptographically binds them to the pinned §6.B
+/// membership owner public key. Fail-closed rule, in order:
+///
+/// 1. structural parse + legacy digest self-consistency (corruption check);
+/// 2. attestation present — absent ⇒ `AttestationMissing`;
+/// 3. the attestation's `(network_id, epoch, state_root)` must equal the
+///    RECOMPUTED identity of the parsed state;
+/// 4. every attestation signature must verify (`verify_strict`) against the
+///    named approver's key from the ATTESTED state's approver set — an
+///    unknown signer or an invalid signature is a hard reject, and the
+///    pinned key must be an Owner there whose signature is among the
+///    verifying set (listing the real owner key in a hostile roster without
+///    that key's actual signature is NOT sufficient);
+/// 5. valid signatures from the attested state's ACTIVE approvers must meet
+///    that state's `quorum_threshold`;
+/// 6. freshness: `attested_at_unix` within `max_age_secs` (which itself must
+///    lie in `1..=MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS` — the window can
+///    only be tightened, never disabled);
+/// 7. not future-dated beyond `MEMBERSHIP_CLOCK_SKEW_SECS`;
+/// 8. against `prior_identity` (the identity of a PREVIOUSLY VERIFIED local
+///    bundle): epoch must not regress, and same-epoch-different-root is
+///    fork evidence (`ForkDetected`), never silently resolved.
+///
+/// Rotation grace: a pinned key matching a REVOKED former Owner is accepted
+/// only when a current ACTIVE Owner also signed the same attestation;
+/// otherwise the caller is told to re-deliver the pin out of band. Known
+/// limit (inherent to pin rotation without a new pin): a compromised
+/// old owner key can still satisfy this grace path on devices that never
+/// received the new pin — key compromise itself is out of scope here and is
+/// covered by the separate membership-transparency track.
+pub fn verify_attested_snapshot(
+    bytes: &[u8],
+    pinned_owner_pubkey_hex: &str,
+    now_unix: u64,
+    prior_identity: Option<&(u64, String)>,
+    max_age_secs: u64,
+) -> Result<MembershipState, MembershipError> {
+    // An unusable pin or freshness window can never accept anything —
+    // reject before touching the payload.
+    let pinned_key_bytes = decode_hex_to_fixed::<32>(pinned_owner_pubkey_hex.trim())?;
+    if max_age_secs == 0 || max_age_secs > MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS {
+        return Err(MembershipError::InvalidFormat(format!(
+            "attestation max age must be within 1..={MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS} seconds"
+        )));
+    }
+    if bytes.len() > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+        return Err(MembershipError::InvalidFormat(
+            "membership snapshot exceeds maximum size".to_owned(),
+        ));
+    }
+    let content = std::str::from_utf8(bytes)
+        .map_err(|_| MembershipError::InvalidFormat("snapshot is not utf8".to_owned()))?;
+
+    // 1) structural parse + digest self-consistency + state.validate().
+    let state = parse_snapshot_content(content)?;
+
+    // 2) attestation present?
+    let fields = parse_key_values(content)?;
+    let attestation =
+        parse_snapshot_attestation_fields(&fields)?.ok_or(MembershipError::AttestationMissing)?;
+
+    // 3) the attestation must attest exactly this state.
+    let state_root = state.state_root_hex()?;
+    if attestation.state_root_hex != state_root || attestation.epoch != state.epoch {
+        return Err(MembershipError::InvalidFormat(
+            "attestation does not attest this snapshot state (epoch/state_root mismatch)"
+                .to_owned(),
+        ));
+    }
+    if attestation.network_id != state.network_id {
+        return Err(MembershipError::InvalidFormat(
+            "attestation network id does not match snapshot state".to_owned(),
+        ));
+    }
+
+    // 4) verify EVERY signature against the attested approver set (any
+    // status — a revoked former owner's signature must still verify for
+    // rotation grace, it just never counts toward quorum).
+    let payload = head_attestation_canonical_payload(
+        &attestation.network_id,
+        attestation.epoch,
+        &attestation.state_root_hex,
+        attestation.attested_at_unix,
+    );
+    let approvers_by_id: HashMap<&str, &MembershipApprover> = state
+        .approver_set
+        .iter()
+        .map(|approver| (approver.approver_id.as_str(), approver))
+        .collect();
+    let mut signer_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut active_signer_count: usize = 0;
+    let mut active_owner_signed = false;
+    let mut pinned_key_signed = false;
+    for signature in &attestation.approver_signatures {
+        if !signer_ids.insert(signature.approver_id.as_str()) {
+            return Err(MembershipError::InvalidFormat(
+                "duplicate signer id in attestation signatures".to_owned(),
+            ));
+        }
+        let approver = approvers_by_id
+            .get(signature.approver_id.as_str())
+            .ok_or_else(|| MembershipError::SignerNotAuthorized(signature.approver_id.clone()))?;
+        let approver_key_bytes = decode_hex_to_fixed::<32>(&approver.approver_pubkey_hex)?;
+        let verifying_key = VerifyingKey::from_bytes(&approver_key_bytes)
+            .map_err(|_| MembershipError::SignatureInvalid)?;
+        let signature_bytes = decode_hex_to_fixed::<64>(&signature.signature_hex)?;
+        let signature_obj = Signature::from_bytes(&signature_bytes);
+        verifying_key
+            .verify_strict(payload.as_bytes(), &signature_obj)
+            .map_err(|_| MembershipError::SignatureInvalid)?;
+        if approver.status == MembershipApproverStatus::Active {
+            active_signer_count += 1;
+            if approver.role == MembershipApproverRole::Owner {
+                active_owner_signed = true;
+            }
+        }
+        if approver_key_bytes == pinned_key_bytes {
+            pinned_key_signed = true;
+        }
+    }
+
+    // 5) pin enforcement. The pinned key must be an Owner in the attested
+    // approver set AND its private-key holder must have actually signed
+    // this attestation — roster presence alone proves nothing.
+    let mut pinned_active_owner = false;
+    let mut pinned_revoked_owner = false;
+    let mut pinned_in_roster = false;
+    for approver in &state.approver_set {
+        if decode_hex_to_fixed::<32>(&approver.approver_pubkey_hex)? != pinned_key_bytes {
+            continue;
+        }
+        pinned_in_roster = true;
+        if approver.role == MembershipApproverRole::Owner {
+            match approver.status {
+                MembershipApproverStatus::Active => pinned_active_owner = true,
+                MembershipApproverStatus::Revoked => pinned_revoked_owner = true,
+            }
+        }
+    }
+    if !pinned_in_roster {
+        return Err(MembershipError::PinnedOwnerKeyMismatch(
+            "pinned membership owner key is not in the attested approver set".to_owned(),
+        ));
+    }
+    if !pinned_active_owner && !pinned_revoked_owner {
+        return Err(MembershipError::PinnedOwnerKeyMismatch(
+            "pinned membership owner key is not an owner approver in the attested state".to_owned(),
+        ));
+    }
+    if !pinned_key_signed {
+        return Err(MembershipError::PinnedOwnerKeyMismatch(
+            "attestation carries no signature from the pinned membership owner key".to_owned(),
+        ));
+    }
+    if !pinned_active_owner && !active_owner_signed {
+        // Rotation grace failed: the pin names a rotated-out owner and no
+        // current active owner co-signed the attestation.
+        return Err(MembershipError::PinnedOwnerKeyMismatch(
+            "pinned membership owner key was rotated (revoked in the attested state) and no \
+             current active owner co-signed the attestation; re-deliver the membership owner \
+             public key out of band"
+                .to_owned(),
+        ));
+    }
+
+    // 6) quorum among ACTIVE approvers of the attested state.
+    if active_signer_count < usize::from(state.quorum_threshold) {
+        return Err(MembershipError::ThresholdNotMet);
+    }
+
+    // 7) freshness window (no bypass — max_age_secs was bounds-checked above).
+    if now_unix > attestation.attested_at_unix.saturating_add(max_age_secs) {
+        return Err(MembershipError::AttestationStale);
+    }
+
+    // 8) future-dating beyond the shared clock-skew tolerance.
+    if attestation.attested_at_unix > now_unix.saturating_add(MEMBERSHIP_CLOCK_SKEW_SECS) {
+        return Err(MembershipError::AttestationFutureDated);
+    }
+
+    // 9) epoch monotonicity against the prior VERIFIED local identity.
+    if let Some((prior_epoch, prior_root)) = prior_identity {
+        if state.epoch < *prior_epoch {
+            return Err(MembershipError::EpochRegression {
+                prior_epoch: *prior_epoch,
+                offered_epoch: state.epoch,
+            });
+        }
+        if state.epoch == *prior_epoch && state_root != *prior_root {
+            return Err(MembershipError::ForkDetected {
+                epoch: state.epoch,
+                prior_root: prior_root.clone(),
+                offered_root: state_root,
+            });
+        }
+    }
+
+    Ok(state)
 }
 
 pub fn append_membership_log_entry(
@@ -1376,6 +1921,10 @@ fn parse_signed_update_envelope(value: &str) -> Result<SignedMembershipUpdate, M
             approver_id: required_field(&fields, &format!("sig.{index}.approver_id"))?.to_owned(),
             signature_hex: required_field(&fields, &format!("sig.{index}.signature_hex"))?
                 .to_owned(),
+            head_signature_hex: fields
+                .get(format!("sig.{index}.head_signature_hex").as_str())
+                .copied()
+                .map(ToOwned::to_owned),
         });
     }
     Ok(SignedMembershipUpdate {
@@ -3496,6 +4045,790 @@ mod tests {
         let err = super::decode_signed_update(&envelope)
             .expect_err("oversized sig_count must be rejected");
         assert!(matches!(err, MembershipError::InvalidFormat(_)));
+    }
+
+    // ── Membership head attestation (A4: authenticated anchor bundle-pull) ──
+
+    use super::{
+        MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS, MembershipHeadAttestation,
+        head_attestation_canonical_payload, head_attestation_from_signed_update,
+        persist_membership_snapshot_with_attestation, sign_head_attestation,
+        snapshot_bytes_head_attestation, snapshot_bytes_state_identity, verify_attested_snapshot,
+    };
+
+    /// Signing key of `base_state()`'s `owner-1` approver.
+    fn owner_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[1; 32])
+    }
+
+    /// Signing key of `base_state()`'s `guardian-1` approver.
+    fn guardian_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[2; 32])
+    }
+
+    fn pinned_owner_hex() -> String {
+        hex_encode(owner_signing_key().verifying_key().as_bytes())
+    }
+
+    fn head_attestation_for_state(
+        state: &MembershipState,
+        attested_at_unix: u64,
+        signers: &[(&str, &SigningKey)],
+    ) -> MembershipHeadAttestation {
+        let state_root_hex = state.state_root_hex().expect("state root");
+        let approver_signatures = signers
+            .iter()
+            .map(|(approver_id, signing_key)| {
+                sign_head_attestation(
+                    &state.network_id,
+                    state.epoch,
+                    &state_root_hex,
+                    attested_at_unix,
+                    approver_id,
+                    signing_key,
+                )
+                .expect("sign head attestation")
+            })
+            .collect();
+        MembershipHeadAttestation {
+            network_id: state.network_id.clone(),
+            epoch: state.epoch,
+            state_root_hex,
+            attested_at_unix,
+            approver_signatures,
+        }
+    }
+
+    fn snapshot_bytes(
+        state: &MembershipState,
+        attestation: Option<&MembershipHeadAttestation>,
+    ) -> Vec<u8> {
+        let unique = format!(
+            "membership-attested-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        let path = temp_dir.join("membership.snapshot");
+        persist_membership_snapshot_with_attestation(&path, state, attestation)
+            .expect("persist attested snapshot");
+        let bytes = std::fs::read(&path).expect("read snapshot bytes");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        bytes
+    }
+
+    /// Standard positive fixture: base_state (quorum 2) attested by
+    /// owner-1 + guardian-1 at t=1000.
+    fn attested_base_snapshot() -> (MembershipState, Vec<u8>, u64) {
+        let state = base_state();
+        let attested_at = 1_000u64;
+        let attestation = head_attestation_for_state(
+            &state,
+            attested_at,
+            &[
+                ("owner-1", &owner_signing_key()),
+                ("guardian-1", &guardian_signing_key()),
+            ],
+        );
+        let bytes = snapshot_bytes(&state, Some(&attestation));
+        (state, bytes, attested_at)
+    }
+
+    #[test]
+    fn head_attestation_canonical_payload_is_byte_pinned() {
+        // Any change to this format invalidates every existing head
+        // signature — the expected value is a LITERAL, not derived.
+        let root = "aa".repeat(32);
+        let payload = head_attestation_canonical_payload("net-1", 7, &root, 1234);
+        let expected = format!(
+            "rustynet:membership-head:v1\nattested_at_unix=1234\nepoch=7\nnetwork_id=net-1\nstate_root={root}\n"
+        );
+        assert_eq!(payload, expected);
+        // Domain separation: a head payload can never parse as an update
+        // payload (those start `version=`).
+        assert!(payload.starts_with("rustynet:membership-head:v1\n"));
+    }
+
+    #[test]
+    fn verify_attested_snapshot_accepts_owner_signed_current_head() {
+        // Positive baseline — guards against a vacuous always-reject (or
+        // always-pass) implementation.
+        let (state, bytes, attested_at) = attested_base_snapshot();
+        let verified = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            attested_at,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect("owner-signed current head must verify");
+        // Canonical encode/decode sorts rosters, so compare the
+        // order-insensitive identity rather than raw struct order.
+        assert_eq!(verified.network_id, state.network_id);
+        assert_eq!(verified.epoch, state.epoch);
+        assert_eq!(
+            verified.state_root_hex().expect("root"),
+            state.state_root_hex().expect("root")
+        );
+
+        // The same bytes also verify against a matching prior identity.
+        let root = state.state_root_hex().expect("root");
+        verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            attested_at,
+            Some(&(state.epoch, root)),
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect("same-identity prior must verify");
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_missing_attestation() {
+        let state = base_state();
+        let bytes = snapshot_bytes(&state, None);
+        let err = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            1_000,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("legacy unattested snapshot must be rejected");
+        assert_eq!(err, MembershipError::AttestationMissing);
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_tampered_state() {
+        // The attacker swaps the roster (state_hex) and RECOMPUTES the
+        // legacy self-consistency digest — only the recomputed-state-root
+        // vs attestation binding can catch this.
+        let (_, attested_bytes, attested_at) = attested_base_snapshot();
+        let mut tampered_state = base_state();
+        tampered_state.nodes.push(active_node("node-evil", 66));
+        let tampered_plain = snapshot_bytes(&tampered_state, None);
+
+        // Splice: tampered version/state_hex/digest lines + original
+        // attestation lines.
+        let attested_text = String::from_utf8(attested_bytes).expect("utf8");
+        let attestation_block: String = attested_text
+            .lines()
+            .filter(|line| line.starts_with("attestation."))
+            .fold(String::new(), |mut out, line| {
+                out.push_str(line);
+                out.push('\n');
+                out
+            });
+        let tampered_text = format!(
+            "{}{attestation_block}",
+            String::from_utf8(tampered_plain).expect("utf8")
+        );
+        let err = verify_attested_snapshot(
+            tampered_text.as_bytes(),
+            &pinned_owner_hex(),
+            attested_at,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("tampered roster must be rejected");
+        assert!(
+            format!("{err}").contains("does not attest this snapshot state"),
+            "expected attestation binding rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_wrong_pinned_key() {
+        // A fully self-consistent attacker mesh signed by an attacker
+        // "owner" verifies internally but must fail the §6.B pin.
+        let attacker_owner = SigningKey::from_bytes(&[77; 32]);
+        let mut state = base_state();
+        state.approver_set = vec![MembershipApprover {
+            approver_id: "evil-owner".to_owned(),
+            approver_pubkey_hex: hex_encode(attacker_owner.verifying_key().as_bytes()),
+            role: MembershipApproverRole::Owner,
+            status: MembershipApproverStatus::Active,
+            created_at_unix: 100,
+        }];
+        state.quorum_threshold = 1;
+        let attestation =
+            head_attestation_for_state(&state, 1_000, &[("evil-owner", &attacker_owner)]);
+        let bytes = snapshot_bytes(&state, Some(&attestation));
+        let err = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            1_000,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("attacker mesh must fail the pin");
+        assert!(
+            matches!(&err, MembershipError::PinnedOwnerKeyMismatch(reason)
+                if reason.contains("not in the attested approver set")),
+            "expected pin-not-in-roster rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_roster_listing_pinned_key_without_its_signature() {
+        // THE critical subtlety: the hostile state LISTS the real owner
+        // key as an active Owner, but the attestation's actual signatures
+        // come only from attacker-controlled approvers that meet quorum.
+        // Roster presence without the pinned key's own signature must be
+        // rejected.
+        let attacker_owner = SigningKey::from_bytes(&[77; 32]);
+        let attacker_guardian = SigningKey::from_bytes(&[78; 32]);
+        let mut state = base_state();
+        state.approver_set = vec![
+            MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: pinned_owner_hex(),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            },
+            MembershipApprover {
+                approver_id: "evil-owner".to_owned(),
+                approver_pubkey_hex: hex_encode(attacker_owner.verifying_key().as_bytes()),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            },
+            MembershipApprover {
+                approver_id: "evil-guardian".to_owned(),
+                approver_pubkey_hex: hex_encode(attacker_guardian.verifying_key().as_bytes()),
+                role: MembershipApproverRole::Guardian,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            },
+        ];
+        state.quorum_threshold = 2;
+        let attestation = head_attestation_for_state(
+            &state,
+            1_000,
+            &[
+                ("evil-owner", &attacker_owner),
+                ("evil-guardian", &attacker_guardian),
+            ],
+        );
+        let bytes = snapshot_bytes(&state, Some(&attestation));
+        let err = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            1_000,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("roster listing without the pinned key's signature must be rejected");
+        assert!(
+            matches!(&err, MembershipError::PinnedOwnerKeyMismatch(reason)
+                if reason.contains("no signature from the pinned membership owner key")),
+            "expected missing-pinned-signature rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_quorum_below_attested_threshold() {
+        // base_state quorum is 2; an attestation signed only by the owner
+        // passes the pin but fails quorum.
+        let state = base_state();
+        let attestation =
+            head_attestation_for_state(&state, 1_000, &[("owner-1", &owner_signing_key())]);
+        let bytes = snapshot_bytes(&state, Some(&attestation));
+        let err = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            1_000,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("sub-quorum attestation must be rejected");
+        assert_eq!(err, MembershipError::ThresholdNotMet);
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_stale_attestation() {
+        let (_, bytes, attested_at) = attested_base_snapshot();
+        let now = attested_at + MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS + 1;
+        let err = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            now,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("stale attestation must be rejected");
+        assert_eq!(err, MembershipError::AttestationStale);
+
+        // Boundary: exactly at the window edge still verifies.
+        verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            attested_at + MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect("attestation at the window boundary must verify");
+
+        // A tightened window is honored.
+        let err = verify_attested_snapshot(&bytes, &pinned_owner_hex(), attested_at + 61, None, 60)
+            .expect_err("attestation outside a tightened window must be rejected");
+        assert_eq!(err, MembershipError::AttestationStale);
+
+        // The window can never be disabled: zero or beyond the hard cap
+        // is rejected outright.
+        for bad_window in [0u64, MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS + 1, u64::MAX] {
+            let err = verify_attested_snapshot(
+                &bytes,
+                &pinned_owner_hex(),
+                attested_at,
+                None,
+                bad_window,
+            )
+            .expect_err("out-of-bounds freshness window must be rejected");
+            assert!(
+                format!("{err}").contains("attestation max age"),
+                "expected max-age bounds rejection, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_future_dated_attestation() {
+        let state = base_state();
+        let now = 1_000u64;
+        let attested_at = now + MEMBERSHIP_CLOCK_SKEW_SECS + 1;
+        let attestation = head_attestation_for_state(
+            &state,
+            attested_at,
+            &[
+                ("owner-1", &owner_signing_key()),
+                ("guardian-1", &guardian_signing_key()),
+            ],
+        );
+        let bytes = snapshot_bytes(&state, Some(&attestation));
+        let err = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            now,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("future-dated attestation must be rejected");
+        assert_eq!(err, MembershipError::AttestationFutureDated);
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_network_id_mismatch() {
+        // A rewritten attestation.network_id is caught by the binding
+        // check (before signature verification can even be confused).
+        let (_, bytes, attested_at) = attested_base_snapshot();
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("attestation.network_id=net-1\n"));
+        let tampered = text.replacen(
+            "attestation.network_id=net-1\n",
+            "attestation.network_id=net-2\n",
+            1,
+        );
+        let err = verify_attested_snapshot(
+            tampered.as_bytes(),
+            &pinned_owner_hex(),
+            attested_at,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("network id mismatch must be rejected");
+        assert!(
+            format!("{err}").contains("network id does not match"),
+            "expected network-id binding rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_epoch_or_root_mismatch_between_attestation_and_state() {
+        let (state, bytes, attested_at) = attested_base_snapshot();
+        let text = String::from_utf8(bytes).expect("utf8");
+
+        let epoch_line = format!("attestation.epoch={}\n", state.epoch);
+        let tampered_epoch = text.replacen(
+            epoch_line.as_str(),
+            &format!("attestation.epoch={}\n", state.epoch + 1),
+            1,
+        );
+        assert_ne!(tampered_epoch, text, "fixture must contain the epoch line");
+        let err = verify_attested_snapshot(
+            tampered_epoch.as_bytes(),
+            &pinned_owner_hex(),
+            attested_at,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("attestation epoch mismatch must be rejected");
+        assert!(
+            format!("{err}").contains("does not attest this snapshot state"),
+            "expected epoch binding rejection, got: {err}"
+        );
+
+        let root = state.state_root_hex().expect("root");
+        let tampered_root = text.replacen(
+            &format!("attestation.state_root={root}\n"),
+            &format!("attestation.state_root={}\n", "00".repeat(32)),
+            1,
+        );
+        assert_ne!(tampered_root, text, "fixture must contain the root line");
+        let err = verify_attested_snapshot(
+            tampered_root.as_bytes(),
+            &pinned_owner_hex(),
+            attested_at,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("attestation root mismatch must be rejected");
+        assert!(
+            format!("{err}").contains("does not attest this snapshot state"),
+            "expected root binding rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_epoch_regression_against_prior_identity() {
+        let (state, bytes, attested_at) = attested_base_snapshot();
+        assert_eq!(state.epoch, 1);
+
+        // Prior verified bundle at a higher epoch: regression.
+        let prior = (5u64, "ab".repeat(32));
+        let err = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            attested_at,
+            Some(&prior),
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("epoch regression must be rejected");
+        assert_eq!(
+            err,
+            MembershipError::EpochRegression {
+                prior_epoch: 5,
+                offered_epoch: 1,
+            }
+        );
+
+        // Same epoch, different root: fork evidence, never silently
+        // resolved.
+        let fork_prior = (state.epoch, "cd".repeat(32));
+        let err = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            attested_at,
+            Some(&fork_prior),
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("same-epoch fork must be rejected");
+        let root = state.state_root_hex().expect("root");
+        assert_eq!(
+            err,
+            MembershipError::ForkDetected {
+                epoch: state.epoch,
+                prior_root: "cd".repeat(32),
+                offered_root: root,
+            }
+        );
+    }
+
+    /// Rotation fixture: old owner (pinned key) revoked in the state, new
+    /// owner active, one active guardian; quorum 1.
+    fn rotated_owner_state(new_owner: &SigningKey) -> MembershipState {
+        let mut state = base_state();
+        state.approver_set = vec![
+            MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: pinned_owner_hex(),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Revoked,
+                created_at_unix: 100,
+            },
+            MembershipApprover {
+                approver_id: "owner-2".to_owned(),
+                approver_pubkey_hex: hex_encode(new_owner.verifying_key().as_bytes()),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 200,
+            },
+            approver("guardian-1", 2, MembershipApproverRole::Guardian),
+        ];
+        state.quorum_threshold = 1;
+        state.epoch = 2;
+        state
+    }
+
+    #[test]
+    fn verify_attested_snapshot_accepts_rotated_pin_with_active_owner_cosignature() {
+        // Rotation grace: a device still pinning the OLD owner key accepts
+        // the post-rotation head as long as the old key signed AND a
+        // current active owner co-signed the same attestation.
+        let new_owner = SigningKey::from_bytes(&[4; 32]);
+        let state = rotated_owner_state(&new_owner);
+        let attestation = head_attestation_for_state(
+            &state,
+            1_000,
+            &[("owner-1", &owner_signing_key()), ("owner-2", &new_owner)],
+        );
+        let bytes = snapshot_bytes(&state, Some(&attestation));
+
+        // Old pin: accepted through rotation grace.
+        verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            1_000,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect("old pin with active-owner co-signature must verify");
+
+        // New pin: accepted directly.
+        verify_attested_snapshot(
+            &bytes,
+            &hex_encode(new_owner.verifying_key().as_bytes()),
+            1_000,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect("new pin must verify directly");
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_rotated_pin_without_active_owner_cosignature() {
+        // Negative rotation grace: old-owner + guardian signatures meet
+        // quorum, but no ACTIVE owner signed — the old pin must be told to
+        // re-deliver the trust anchor, not silently accept.
+        let new_owner = SigningKey::from_bytes(&[4; 32]);
+        let state = rotated_owner_state(&new_owner);
+        let attestation = head_attestation_for_state(
+            &state,
+            1_000,
+            &[
+                ("owner-1", &owner_signing_key()),
+                ("guardian-1", &guardian_signing_key()),
+            ],
+        );
+        let bytes = snapshot_bytes(&state, Some(&attestation));
+        let err = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            1_000,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect_err("rotated pin without active-owner co-signature must be rejected");
+        assert!(
+            matches!(&err, MembershipError::PinnedOwnerKeyMismatch(reason)
+                if reason.contains("re-deliver the membership owner public key")),
+            "expected rotation-grace rejection with re-delivery guidance, got: {err}"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_attestation_fields_round_trips_through_legacy_loader() {
+        let (state, bytes, attested_at) = attested_base_snapshot();
+
+        // Legacy loader: parses the same state, digest unchanged, ignores
+        // the trailing attestation fields.
+        let unique = format!(
+            "membership-attested-legacy-load-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        let path = temp_dir.join("membership.snapshot");
+        let attestation = head_attestation_for_state(
+            &state,
+            attested_at,
+            &[
+                ("owner-1", &owner_signing_key()),
+                ("guardian-1", &guardian_signing_key()),
+            ],
+        );
+        persist_membership_snapshot_with_attestation(&path, &state, Some(&attestation))
+            .expect("persist");
+        let loaded = load_membership_snapshot(&path).expect("legacy loader must still parse");
+        // Canonical encode/decode sorts rosters; compare the
+        // order-insensitive state identity.
+        assert_eq!(loaded.network_id, state.network_id);
+        assert_eq!(loaded.epoch, state.epoch);
+        assert_eq!(
+            loaded.state_root_hex().expect("root"),
+            state.state_root_hex().expect("root")
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // FIS-0020 identity extraction is unaffected.
+        let root = state.state_root_hex().expect("root");
+        assert_eq!(
+            snapshot_bytes_state_identity(&bytes),
+            Some((state.epoch, root))
+        );
+
+        // The attestation reader round-trips the persisted block
+        // (signatures are persisted in sorted approver_id order).
+        let parsed = snapshot_bytes_head_attestation(&bytes).expect("attestation present");
+        let mut expected = attestation.clone();
+        expected
+            .approver_signatures
+            .sort_by(|left, right| left.approver_id.cmp(&right.approver_id));
+        assert_eq!(parsed, expected);
+
+        // A legacy snapshot has no attestation to read.
+        let legacy = snapshot_bytes(&state, None);
+        assert_eq!(snapshot_bytes_head_attestation(&legacy), None);
+    }
+
+    #[test]
+    fn signed_update_envelope_with_head_signature_round_trips_and_chains() {
+        let (state, record, mut signatures) = signed_add_node_fixture();
+
+        // Legacy envelope (no head signatures) is byte-stable: the field
+        // never appears, so pre-existing entry hashes are unchanged.
+        let legacy_signed = SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: signatures.clone(),
+        };
+        let legacy_envelope = legacy_signed.canonical_envelope().expect("envelope");
+        assert!(!legacy_envelope.contains("head_signature_hex"));
+
+        // Mint head signatures for both signers, deterministic from the
+        // record (epoch_new / new_state_root / created_at_unix).
+        for (signature, key) in signatures
+            .iter_mut()
+            .zip([owner_signing_key(), guardian_signing_key()])
+        {
+            let head = sign_head_attestation(
+                &record.network_id,
+                record.epoch_new,
+                &record.new_state_root,
+                record.created_at_unix,
+                &signature.approver_id,
+                &key,
+            )
+            .expect("sign head attestation");
+            signature.head_signature_hex = Some(head.signature_hex);
+        }
+        let signed = SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: signatures,
+        };
+
+        // Wire round-trip preserves the per-signer head signatures. The
+        // envelope sorts signatures by approver_id, so compare against the
+        // sorted expectation.
+        let envelope = signed.canonical_envelope().expect("envelope");
+        assert!(envelope.contains("sig.0.head_signature_hex="));
+        let decoded = super::decode_signed_update(&envelope).expect("decode");
+        let mut expected = signed.clone();
+        expected
+            .approver_signatures
+            .sort_by(|left, right| left.approver_id.cmp(&right.approver_id));
+        assert_eq!(decoded, expected);
+
+        // The update still applies (head signatures never weaken the
+        // update-signature gate), and the log chain round-trips with the
+        // new field present.
+        apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect("head-signed update must still apply");
+        let unique = format!(
+            "membership-head-sig-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        let log = temp_dir.join("membership.log");
+        let entry = append_membership_log_entry(&log, &signed).expect("append");
+        let entries = load_membership_log(&log).expect("chain must verify with head signatures");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entry_hash, entry.entry_hash);
+        // Loaded entries carry the canonical (sorted-signature) form.
+        assert_eq!(entries[0].signed_update, expected);
+        assert!(
+            entries[0]
+                .signed_update
+                .approver_signatures
+                .iter()
+                .all(|signature| signature.head_signature_hex.is_some()),
+            "head signatures must survive the log chain round-trip"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // The materialized attestation binds to the record's new head.
+        let attestation =
+            head_attestation_from_signed_update(&signed).expect("head signatures present");
+        assert_eq!(attestation.network_id, record.network_id);
+        assert_eq!(attestation.epoch, record.epoch_new);
+        assert_eq!(attestation.state_root_hex, record.new_state_root);
+        assert_eq!(attestation.attested_at_unix, record.created_at_unix);
+        assert_eq!(attestation.approver_signatures.len(), 2);
+
+        // ... and verifies against the applied next state through the
+        // real enforcement point.
+        let next = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect("apply");
+        let bytes = snapshot_bytes(&next, Some(&attestation));
+        let verified = verify_attested_snapshot(
+            &bytes,
+            &pinned_owner_hex(),
+            record.created_at_unix,
+            None,
+            MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+        )
+        .expect("materialized attestation must verify against the applied state");
+        assert_eq!(verified.epoch, next.epoch);
+        assert_eq!(
+            verified.state_root_hex().expect("root"),
+            next.state_root_hex().expect("root")
+        );
+
+        // A legacy update materializes no attestation.
+        assert_eq!(head_attestation_from_signed_update(&legacy_signed), None);
+    }
+
+    #[test]
+    fn persist_with_attestation_refuses_unbound_attestation() {
+        // A mismatched attestation is a programming error at the persist
+        // site, not something to write and let clients reject later.
+        let state = base_state();
+        let mut other = base_state();
+        other.epoch = 9;
+        let attestation =
+            head_attestation_for_state(&other, 1_000, &[("owner-1", &owner_signing_key())]);
+        let unique = format!(
+            "membership-attest-unbound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        let path = temp_dir.join("membership.snapshot");
+        let err = persist_membership_snapshot_with_attestation(&path, &state, Some(&attestation))
+            .expect_err("unbound attestation must be refused");
+        assert!(
+            format!("{err}").contains("does not bind"),
+            "expected binding refusal, got: {err}"
+        );
+        assert!(!path.exists(), "no snapshot may be written on refusal");
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 

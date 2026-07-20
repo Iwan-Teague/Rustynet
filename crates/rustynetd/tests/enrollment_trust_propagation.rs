@@ -117,6 +117,7 @@ fn admit_under_approver(
         approver_signatures: vec![MembershipSignature {
             approver_id: approver_id.to_owned(),
             signature_hex: hex_lower(&signature.to_bytes()),
+            head_signature_hex: None,
         }],
     })
 }

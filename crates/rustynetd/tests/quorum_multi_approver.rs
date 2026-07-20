@@ -110,6 +110,7 @@ fn build_signed_update(
             MembershipSignature {
                 approver_id: (*id).to_owned(),
                 signature_hex: hex_lower(&sig.to_bytes()),
+                head_signature_hex: None,
             }
         })
         .collect();
