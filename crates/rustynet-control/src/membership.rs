@@ -224,6 +224,17 @@ impl MembershipState {
         }
 
         let mut approver_ids: HashSet<&str> = HashSet::new();
+        // Security-critical, not cosmetic: quorum and pin checks throughout
+        // this crate (verify_membership_signatures, verify_attested_snapshot)
+        // count DISTINCT SIGNERS by approver_id, trusting that one key can
+        // never sit behind two ids. Without this check, an operator mistake
+        // (or a deliberately crafted, quorum-signed roster) that assigns the
+        // same pubkey to two approver_ids lets a single real signature be
+        // duplicated under the second id, inflating the apparent number of
+        // independent signers satisfying quorum_threshold. Reject the shape
+        // here, once, so every downstream signer-counting site is sound by
+        // construction rather than needing its own dedup-by-key logic.
+        let mut approver_keys: HashSet<[u8; 32]> = HashSet::new();
         let active_approvers = self
             .approver_set
             .iter()
@@ -241,7 +252,13 @@ impl MembershipState {
                     approver.approver_id
                 )));
             }
-            decode_hex_to_fixed::<32>(&approver.approver_pubkey_hex)?;
+            let approver_key_bytes = decode_hex_to_fixed::<32>(&approver.approver_pubkey_hex)?;
+            if !approver_keys.insert(approver_key_bytes) {
+                return Err(MembershipError::InvalidFormat(format!(
+                    "approver pubkey reused across multiple approver ids (approver {})",
+                    approver.approver_id
+                )));
+            }
         }
 
         if active_approvers == 0 {
@@ -3322,6 +3339,27 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_duplicate_approver_pubkeys() {
+        let mut state = base_state();
+        // Same underlying key (byte 1) as "owner-1", filed under a second
+        // approver_id — this is the exact shape an adversarial review found
+        // exploitable: one real signature, once produced, can be copied
+        // verbatim under the alias id to inflate apparent quorum, since
+        // ed25519 signing here is deterministic and nothing previously
+        // stopped two ids from sharing a key.
+        state
+            .approver_set
+            .push(approver("owner-1-alias", 1, MembershipApproverRole::Owner));
+        let err = state
+            .validate()
+            .expect_err("duplicate approver pubkey under a second id must be rejected");
+        assert!(
+            matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("approver pubkey reused")),
+            "expected pubkey-reuse rejection, got {err:?}"
+        );
+    }
+
+    #[test]
     fn validate_rejects_quorum_exceeding_active_approvers() {
         let mut state = base_state();
         // Three active approvers in the base fixture; demand four.
@@ -4185,6 +4223,43 @@ mod tests {
             MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
         )
         .expect("same-identity prior must verify");
+    }
+
+    #[test]
+    fn verify_attested_snapshot_rejects_quorum_inflation_via_duplicate_approver_pubkey() {
+        // Regression for an adversarial-review finding (proven live with a
+        // standalone PoC against this exact function before the fix): a
+        // roster where two approver_ids share one underlying key let a
+        // single real key's signature satisfy quorum_threshold=2 by
+        // presenting a (deterministically reproducible) signature under
+        // both ids — no second private key required.
+        //
+        // The fix (MembershipState::validate, see
+        // validate_rejects_duplicate_approver_pubkeys) runs even earlier
+        // than "reject the forged attestation": canonical_payload() calls
+        // self.validate()? (membership.rs:285), and state_root_hex() /
+        // sign_head_attestation / persist_membership_snapshot_with_attestation
+        // all depend on canonical_payload(). So the vulnerable roster shape
+        // cannot produce a state root — and therefore cannot be signed or
+        // persisted — through ANY path in this crate, not just at the final
+        // verify_attested_snapshot check. Assert that stronger guarantee
+        // directly: root derivation itself fails closed, which is what
+        // actually blocks the attacker's construction attempt end to end
+        // (there is no reachable byte sequence a legitimate signer could
+        // ever produce for this roster to hand to verify_attested_snapshot).
+        let mut state = base_state();
+        state.approver_set.push(approver(
+            "owner-1-alias",
+            1, // same key byte as "owner-1" — the vulnerable shape
+            MembershipApproverRole::Owner,
+        ));
+        let err = state
+            .state_root_hex()
+            .expect_err("a duplicate-pubkey roster must never yield a state root");
+        assert!(
+            matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("approver pubkey reused")),
+            "expected pubkey-reuse rejection, got {err:?}"
+        );
     }
 
     #[test]
