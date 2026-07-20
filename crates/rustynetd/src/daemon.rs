@@ -10068,7 +10068,13 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                         }
                     };
 
-                    write_response(stream, response).map_err(DaemonError::Io)?;
+                    // Per-request write failures (timeout on a wedged reader,
+                    // peer hangup) are logged and swallowed: one stalled or
+                    // disconnected local client must not kill the daemon. The
+                    // connection is simply dropped; the client retries.
+                    if let Err(err) = write_response(stream, response) {
+                        log::warn!("ipc_response_write_failed reason={err}");
+                    }
                     processed = processed.saturating_add(1);
                     processed_io = true;
                 }
@@ -14804,6 +14810,13 @@ fn read_command_envelope(stream: &UnixStream) -> Result<CommandEnvelope, String>
 
 #[cfg(not(windows))]
 fn write_response(mut stream: UnixStream, response: IpcResponse) -> Result<(), String> {
+    // Bound the response write so a local client that stops reading cannot
+    // stall the single-threaded daemon loop (and with it DNS drain, reconcile,
+    // and gossip) unboundedly. Mirrors the 2s write-timeout discipline of the
+    // anchor bundle-pull stream and the NAT-PMP socket.
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| format!("ipc response write-timeout setup failed: {err}"))?;
     stream
         .write_all(format!("{}\n", response.to_wire()).as_bytes())
         .map_err(|err| format!("write failed: {err}"))
@@ -15334,7 +15347,7 @@ mod tests {
         validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
         validate_daemon_config, validate_file_security, validate_node_role_membership_alignment,
         write_anchor_bundle_pull_response, write_anchor_bundle_pull_response_with_have,
-        zeroize_optional_bytes,
+        write_response, zeroize_optional_bytes,
     };
     use crate::phase10::{
         DataplaneState, PathMode, RuntimeSystem, TraversalProbeDecision, TraversalProbeReason,
@@ -16085,6 +16098,31 @@ mod tests {
             )),
             0o077
         );
+    }
+
+    #[test]
+    fn write_response_times_out_on_stalled_reader_instead_of_hanging() {
+        // A local client that connects and then never reads its response used
+        // to stall the single-threaded daemon loop unboundedly once the
+        // response outgrew the socket send buffer. The write must now fail
+        // within the 2s write timeout (plus slack) instead of hanging.
+        let (writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
+        // Keep `reader` alive but never read from it, so the kernel send
+        // buffer fills and the write genuinely blocks.
+        let large_message = "x".repeat(8 * 1024 * 1024);
+        let started = Instant::now();
+        let err = write_response(writer, IpcResponse::ok(large_message))
+            .expect_err("write to a stalled reader must time out, not hang");
+        let elapsed = started.elapsed();
+        assert!(
+            err.contains("write failed"),
+            "unexpected error variant: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "write should be bounded by the 2s timeout plus slack, took {elapsed:?}"
+        );
+        drop(reader);
     }
 
     #[test]
