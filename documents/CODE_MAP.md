@@ -83,6 +83,12 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | `TransportSocket` | `src/lib.rs` | The shared UDP socket for direct + relay paths |
 | `PeerEndpoint` | `src/lib.rs` | Candidate endpoint (v4/v6 host/srflx/relay) |
 
+### WireGuard Backend (`rustynet-backend-wireguard`)
+
+| Type | Location | Purpose |
+|---|---|---|
+| `UdpOffloadCapabilities` / `probe_udp_offload_capabilities` | `src/udp_offload_probe.rs` | FIS-0028 Phase 1: read-only detection of `sendmmsg`/`recvmmsg`/`UDP_SEGMENT`/`UDP_GRO` support (kernel-release gate + socket2 plumbing smoke-check); not called from any packet path |
+
 ### Daemon (`rustynetd`)
 
 | Type | Location | Purpose |
