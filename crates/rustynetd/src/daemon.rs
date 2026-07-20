@@ -2286,7 +2286,6 @@ pub struct SignedTrustVerificationReport {
     pub updated_at_unix: u64,
     pub nonce: u64,
     pub payload_digest_sha256: String,
-    pub tls13_valid: bool,
     pub signed_control_valid: bool,
     pub signed_data_age_secs: u64,
     pub clock_skew_secs: u64,
@@ -2342,9 +2341,6 @@ pub fn verify_signed_trust_state_artifact(
         Some(previous_watermark),
     )
     .map_err(|err| err.to_string())?;
-    if !envelope.evidence.tls13_valid {
-        return Err("trust evidence tls13_valid=false".to_owned());
-    }
     if !envelope.evidence.signed_control_valid {
         return Err("trust evidence signed_control_valid=false".to_owned());
     }
@@ -2369,7 +2365,6 @@ pub fn verify_signed_trust_state_artifact(
         updated_at_unix: envelope.watermark.updated_at_unix,
         nonce: envelope.watermark.nonce,
         payload_digest_sha256: encode_hex(&payload_digest),
-        tls13_valid: envelope.evidence.tls13_valid,
         signed_control_valid: envelope.evidence.signed_control_valid,
         signed_data_age_secs: envelope.evidence.signed_data_age_secs,
         clock_skew_secs: envelope.evidence.clock_skew_secs,
@@ -11721,7 +11716,6 @@ fn load_trust_evidence(
     let content = read_text_artifact_bounded(path, "trust evidence", MAX_TRUST_EVIDENCE_BYTES)
         .map_err(TrustBootstrapError::InvalidFormat)?;
     let mut version: Option<u8> = None;
-    let mut tls13_valid: Option<bool> = None;
     let mut signed_control_valid: Option<bool> = None;
     let mut signed_data_age_secs: Option<u64> = None;
     let mut clock_skew_secs: Option<u64> = None;
@@ -11755,7 +11749,6 @@ fn load_trust_evidence(
         if !matches!(
             key,
             "version"
-                | "tls13_valid"
                 | "signed_control_valid"
                 | "signed_data_age_secs"
                 | "clock_skew_secs"
@@ -11771,9 +11764,6 @@ fn load_trust_evidence(
         match key {
             "version" => {
                 version = value.parse::<u8>().ok();
-            }
-            "tls13_valid" => {
-                tls13_valid = parse_bool(value);
             }
             "signed_control_valid" => {
                 signed_control_valid = parse_bool(value);
@@ -11801,15 +11791,13 @@ fn load_trust_evidence(
         }
     }
 
-    if version != Some(2) {
+    if version != Some(3) {
         return Err(TrustBootstrapError::InvalidFormat(
             "unsupported trust evidence version".to_owned(),
         ));
     }
 
     let record = TrustEvidenceRecord {
-        tls13_valid: tls13_valid
-            .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing tls13_valid".to_owned()))?,
         signed_control_valid: signed_control_valid.ok_or_else(|| {
             TrustBootstrapError::InvalidFormat("missing signed_control_valid".to_owned())
         })?,
