@@ -1028,37 +1028,14 @@ fn git_version_internal() -> Option<String> {
         .map(|_| "git (system)".to_string())
 }
 
-#[cfg(target_os = "linux")]
+/// The rustc version embedded at build time by `build.rs`
+/// (`RUSTYNET_BUILD_RUSTC_VERSION`): reports the toolchain that built this
+/// artifact rather than whatever `rustc` happens to be on the host running the
+/// CLI, and costs no subprocess spawn at runtime. The constant is embedded
+/// empty when the build script could not run the compiler; that maps to `None`.
 fn rustc_version_internal() -> Option<String> {
-    let output = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .ok()?;
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn rustc_version_internal() -> Option<String> {
-    let output = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .ok()?;
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|s| s.trim().to_owned())
-}
-
-#[cfg(target_os = "windows")]
-fn rustc_version_internal() -> Option<String> {
-    let output = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .ok()?;
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|s| s.trim().to_string())
+    let embedded = env!("RUSTYNET_BUILD_RUSTC_VERSION");
+    (!embedded.is_empty()).then(|| embedded.to_owned())
 }
 
 /// Whether a single-interface `ifconfig <iface>` stdout indicates the interface
@@ -7309,6 +7286,18 @@ mod tests {
         parse_linux_operstate, parse_macos_ifconfig_interfaces, parse_proc_version_release,
         parse_windows_ipconfig_interfaces,
     };
+
+    #[test]
+    fn rustc_version_returns_embedded_nonempty_toolchain_string() {
+        // build.rs embeds the building toolchain's `rustc --version`; since
+        // this test binary was necessarily built by a working rustc, the
+        // embedded constant must be present and carry the standard prefix.
+        let version = super::rustc_version().expect("build-time rustc version embedded");
+        assert!(
+            version.starts_with("rustc "),
+            "embedded rustc version has unexpected shape: {version:?}"
+        );
+    }
 
     #[test]
     fn proc_version_release_extracts_third_token_of_first_line() {
