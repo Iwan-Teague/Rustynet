@@ -39,8 +39,8 @@ mod daemon {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
     use std::time::{Duration, Instant};
 
     use ed25519_dalek::VerifyingKey;
@@ -238,7 +238,20 @@ mod daemon {
     /// Maps allocated ports to session IDs for ciphertext forwarding.
     struct PortAllocation {
         session_id: SessionId,
+        /// Handle to this port's forward task (see `spawn_forward_task`),
+        /// which blocks on `socket.recv_from().await`. An awaited recv has
+        /// no way to notice this entry being removed from `allocated_sockets`
+        /// on its own — nothing wakes it — so whoever removes the entry
+        /// (`prune_inactive_allocated_sockets`) must abort the task
+        /// explicitly. Without this, the task leaks forever, blocked on a
+        /// socket nobody else can reach.
+        forward_task: tokio::task::JoinHandle<()>,
     }
+
+    /// Ports the daemon has bound for ciphertext relaying, keyed by
+    /// allocated port number. Each socket is `Arc`-shared between the
+    /// port's own forward task and this map (see `RelayDaemon::allocated_sockets`).
+    type AllocatedSockets = HashMap<u16, (Arc<UdpSocket>, PortAllocation)>;
 
     /// Forwarded-frame counters, surfaced read-only via `/healthz` and
     /// `/metrics`. This is the ONLY observability the relay exposes about
@@ -270,15 +283,50 @@ mod daemon {
     /// Relay daemon state.
     pub struct RelayDaemon {
         config: RelayConfig,
-        transport: Arc<RwLock<RelayTransport>>,
+        /// Session/rate-limit/replay state, guarded by a synchronous
+        /// `std::sync::Mutex` rather than `tokio::sync::RwLock`. Every
+        /// caller of this lock (`forward_packet`, `touch_session_from_tuple`,
+        /// `cleanup_idle_sessions`, `session_count`, `validate_hello_from_tuple`,
+        /// `handle_hello_from_tuple_with_allocated_port`) does its work
+        /// synchronously with no `.await` inside the critical section — that
+        /// invariant is what makes a sync lock safe to use from async code
+        /// here. **Never hold this guard across an `.await` point.** The
+        /// per-frame hot path (the forward task's keepalive touch and
+        /// packet forward) is the reason for this choice: those critical
+        /// sections are short, and a plain sync mutex acquisition is
+        /// cheaper than `tokio::sync::RwLock`'s async wake/schedule
+        /// machinery on every single frame — see `lock_transport`.
+        transport: Arc<Mutex<RelayTransport>>,
         control_socket: UdpSocket,
         pre_auth_hello_limiter: Arc<RwLock<PreAuthHelloLimiter>>,
-        /// Allocated port sockets indexed by port number.
-        allocated_sockets: Arc<RwLock<HashMap<u16, (UdpSocket, PortAllocation)>>>,
+        /// Allocated port sockets indexed by port number. `Arc<UdpSocket>`
+        /// because each socket is owned by two places at once: the port's
+        /// own forward task (which blocks on `recv_from` on its clone) and
+        /// this map (so a *different* port's forward task can look up the
+        /// peer socket to `send_to` when forwarding).
+        allocated_sockets: Arc<RwLock<AllocatedSockets>>,
         /// Next port to try allocating.
         next_port: Arc<RwLock<u16>>,
         /// Forwarded-frame/byte counters (see `ForwardStats`).
         forward_stats: Arc<ForwardStats>,
+    }
+
+    /// Locks `transport`, recovering from mutex poisoning rather than
+    /// propagating it.
+    ///
+    /// `std::sync::Mutex` poisons if a thread panics while holding the
+    /// guard; the previous `tokio::sync::RwLock` had no poisoning concept
+    /// at all, so every lock attempt always succeeded regardless of what
+    /// happened on a prior critical section. Recovering here preserves
+    /// that same "always available" behavior instead of turning one
+    /// incidental panic into a permanent relay outage (every forward task,
+    /// hello handler, and health check would otherwise start erroring on
+    /// every subsequent lock attempt for the lifetime of the process).
+    /// Poisoning is purely mutex bookkeeping, not a data-validity signal —
+    /// recovering does not bypass or weaken any security check performed
+    /// by the methods called through the returned guard.
+    fn lock_transport(transport: &Mutex<RelayTransport>) -> MutexGuard<'_, RelayTransport> {
+        transport.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     impl RelayDaemon {
@@ -305,7 +353,7 @@ mod daemon {
 
             Ok(Self {
                 config: config.clone(),
-                transport: Arc::new(RwLock::new(transport)),
+                transport: Arc::new(Mutex::new(transport)),
                 control_socket,
                 pre_auth_hello_limiter: Arc::new(RwLock::new(PreAuthHelloLimiter::new(
                     MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
@@ -316,8 +364,12 @@ mod daemon {
             })
         }
 
-        /// Allocates a new port for a session.
-        async fn allocate_port(&self) -> Result<(u16, UdpSocket), String> {
+        /// Allocates a new port for a session. Returns the socket wrapped in
+        /// an `Arc` — the caller shares one clone with the port's forward
+        /// task (which owns it for the lifetime of the task) and keeps
+        /// another in `allocated_sockets` (so other ports can look it up to
+        /// forward to it).
+        async fn allocate_port(&self) -> Result<(u16, Arc<UdpSocket>), String> {
             let mut next = self.next_port.write().await;
             let sockets = self.allocated_sockets.read().await;
 
@@ -345,7 +397,7 @@ mod daemon {
                 // Try to bind
                 let addr = SocketAddr::new(self.config.bind_addr.ip(), port);
                 match UdpSocket::bind(addr).await {
-                    Ok(socket) => return Ok((port, socket)),
+                    Ok(socket) => return Ok((port, Arc::new(socket))),
                     Err(_) => {
                         attempts += 1;
                         continue;
@@ -378,7 +430,7 @@ mod daemon {
                 loop {
                     ticker.tick().await;
                     {
-                        let mut transport = transport_cleanup.write().await;
+                        let mut transport = lock_transport(&transport_cleanup);
                         let _ = transport.cleanup_idle_sessions();
                     }
                     Self::prune_inactive_allocated_sockets(&allocated_cleanup, &transport_cleanup)
@@ -479,7 +531,7 @@ mod daemon {
             let hello = parse_relay_hello(data)?;
 
             if let Err(reason) = {
-                let mut transport = self.transport.write().await;
+                let mut transport = lock_transport(&self.transport);
                 transport.validate_hello_from_tuple(&hello, from_addr)
             } {
                 let reject_bytes = serialize_relay_reject();
@@ -499,7 +551,7 @@ mod daemon {
             let (allocated_port, socket) = self.allocate_port().await?;
 
             let response = {
-                let mut transport = self.transport.write().await;
+                let mut transport = lock_transport(&self.transport);
                 transport.handle_hello_from_tuple_with_allocated_port(
                     hello,
                     from_addr,
@@ -515,6 +567,20 @@ mod daemon {
                     )
                     .await;
 
+                    // Spawn the forward task before publishing the
+                    // allocation: the task needs its own socket handle and
+                    // the JoinHandle it returns is stored alongside the
+                    // socket so a later removal can abort it (see
+                    // `PortAllocation::forward_task` and
+                    // `prune_inactive_allocated_sockets`).
+                    let forward_task = Self::spawn_forward_task(
+                        &self.allocated_sockets,
+                        &self.transport,
+                        &self.forward_stats,
+                        Arc::clone(&socket),
+                        ack.session_id,
+                    );
+
                     // Store the allocation
                     {
                         let mut sockets = self.allocated_sockets.write().await;
@@ -524,6 +590,7 @@ mod daemon {
                                 socket,
                                 PortAllocation {
                                     session_id: ack.session_id,
+                                    forward_task,
                                 },
                             ),
                         );
@@ -535,9 +602,6 @@ mod daemon {
                         .send_to(&ack_bytes, from_addr)
                         .await
                         .map_err(|e| format!("failed to send ack: {e}"))?;
-
-                    // Spawn task to forward packets on the allocated port
-                    self.spawn_forward_task(allocated_port).await;
 
                     eprintln!(
                         "session established: {:02x?} -> port {} from {}",
@@ -562,104 +626,138 @@ mod daemon {
         }
 
         /// Spawns a task to forward packets on an allocated port.
-        async fn spawn_forward_task(&self, port: u16) {
-            let allocated_sockets = Arc::clone(&self.allocated_sockets);
-            let transport = Arc::clone(&self.transport);
-            let forward_stats = Arc::clone(&self.forward_stats);
+        ///
+        /// Takes the port's socket by value — the task owns it directly for
+        /// its entire lifetime (no per-iteration map lookup to find it) and
+        /// blocks on `socket.recv_from().await`, so it is woken immediately
+        /// by an arriving frame instead of polling `try_recv_from` on a
+        /// timer. The caller is expected to keep a second `Arc` clone of the
+        /// same socket in `allocated_sockets` (see the `RelayDaemon::allocated_sockets`
+        /// doc comment) so other ports can still look it up to forward to it.
+        ///
+        /// A free function taking its dependencies explicitly (rather than a
+        /// `&self` method) so it can be spawned before the port's map entry
+        /// exists and so it is directly callable from tests without
+        /// constructing a full `RelayDaemon`.
+        ///
+        /// Returns the task's `JoinHandle`. The caller MUST store it in the
+        /// port's `PortAllocation` — an awaited `recv_from` never notices its
+        /// own map entry disappearing, so `prune_inactive_allocated_sockets`
+        /// aborts this handle explicitly when it evicts the entry. Without
+        /// that, the task leaks forever, blocked on a socket nobody else can
+        /// reach.
+        fn spawn_forward_task(
+            allocated_sockets: &Arc<RwLock<AllocatedSockets>>,
+            transport: &Arc<Mutex<RelayTransport>>,
+            forward_stats: &Arc<ForwardStats>,
+            socket: Arc<UdpSocket>,
+            session_id: SessionId,
+        ) -> tokio::task::JoinHandle<()> {
+            let allocated_sockets = Arc::clone(allocated_sockets);
+            let transport = Arc::clone(transport);
+            let forward_stats = Arc::clone(forward_stats);
 
             tokio::spawn(async move {
                 let mut buf = [0u8; 65536];
 
                 loop {
-                    // Recv on the socket. Socket existence is checked here
-                    // (the map lookup) — the previous separate existence
-                    // probe added a redundant RwLock read + getsockname
-                    // syscall per 100µs tick and is intentionally gone.
-                    let recv_result = {
-                        let sockets = allocated_sockets.read().await;
-                        if let Some((socket, alloc)) = sockets.get(&port) {
-                            let session_id = alloc.session_id;
-                            match socket.try_recv_from(&mut buf) {
-                                Ok((len, from_addr)) => Some((len, from_addr, session_id)),
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
-                                Err(_) => None,
-                            }
-                        } else {
-                            // Socket no longer exists
-                            break;
-                        }
+                    // Block until a frame actually arrives on this port's
+                    // own socket — no poll/sleep tick, no map lookup to find
+                    // the socket (the task owns it directly). A transient
+                    // recv error is absorbed exactly as the previous
+                    // `try_recv_from` loop absorbed every non-`WouldBlock`
+                    // error (`Err(_) => None`, keep polling): e.g. a delayed
+                    // ICMP port-unreachable from an earlier forward can
+                    // surface as `ECONNREFUSED` on a later recv on some
+                    // platforms, and that must not kill this port's ability
+                    // to keep serving.
+                    let (len, from_addr) = match socket.recv_from(&mut buf).await {
+                        Ok(pair) => pair,
+                        Err(_) => continue,
                     };
 
-                    if let Some((len, from_addr, session_id)) = recv_result {
-                        // Check for keepalive packet (5 bytes: msg_type + 4 bytes session prefix)
-                        // Keepalives refresh session activity but don't forward to peer
-                        if len == 5 && buf[0] == RELAY_KEEPALIVE_MSG_TYPE {
-                            let mut t = transport.write().await;
-                            let _ = t.touch_session_from_tuple(session_id, from_addr);
-                            continue;
-                        }
-
-                        // Forward packet through transport
-                        let forward_result = {
-                            let mut t = transport.write().await;
-                            t.forward_packet(session_id, &buf[..len], from_addr)
-                        };
-
-                        match forward_result {
-                            Ok(Some(target)) => {
-                                let sockets = allocated_sockets.read().await;
-                                if let Some((peer_socket, _)) =
-                                    sockets.get(&target.peer_allocated_port)
-                                {
-                                    // Zero-copy forward: send the exact
-                                    // received bytes (the transport never
-                                    // copies or inspects the payload).
-                                    let sent =
-                                        peer_socket.send_to(&buf[..len], target.peer_addr).await;
-                                    if sent.is_ok() {
-                                        record_forward(&forward_stats, len);
-                                    }
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(_) => {
-                                Self::prune_inactive_allocated_sockets(
-                                    &allocated_sockets,
-                                    &transport,
-                                )
-                                .await;
-                            }
-                        }
+                    // Check for keepalive packet (5 bytes: msg_type + 4 bytes session prefix)
+                    // Keepalives refresh session activity but don't forward to peer
+                    if len == 5 && buf[0] == RELAY_KEEPALIVE_MSG_TYPE {
+                        let mut t = lock_transport(&transport);
+                        let _ = t.touch_session_from_tuple(session_id, from_addr);
+                        continue;
                     }
 
-                    // Small delay to avoid busy-spinning
-                    tokio::time::sleep(Duration::from_micros(100)).await;
+                    // Forward packet through transport
+                    let forward_result = {
+                        let mut t = lock_transport(&transport);
+                        t.forward_packet(session_id, &buf[..len], from_addr)
+                    };
+
+                    match forward_result {
+                        Ok(Some(target)) => {
+                            let sockets = allocated_sockets.read().await;
+                            if let Some((peer_socket, _)) = sockets.get(&target.peer_allocated_port)
+                            {
+                                // Zero-copy forward: send the exact
+                                // received bytes (the transport never
+                                // copies or inspects the payload).
+                                let sent = peer_socket.send_to(&buf[..len], target.peer_addr).await;
+                                if sent.is_ok() {
+                                    record_forward(&forward_stats, len);
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            Self::prune_inactive_allocated_sockets(&allocated_sockets, &transport)
+                                .await;
+                        }
+                    }
                 }
-            });
+            })
         }
 
         async fn prune_inactive_allocated_sockets(
-            allocated_sockets: &Arc<RwLock<HashMap<u16, (UdpSocket, PortAllocation)>>>,
-            transport: &Arc<RwLock<RelayTransport>>,
+            allocated_sockets: &Arc<RwLock<AllocatedSockets>>,
+            transport: &Arc<Mutex<RelayTransport>>,
         ) {
-            let active_sessions = {
-                let transport = transport.read().await;
+            // Two independent snapshots, taken sequentially rather than
+            // under both locks at once: `std::sync::MutexGuard` is not
+            // `Send`, so it must never be held across an `.await` point in
+            // code reachable from a `tokio::spawn`'d future (both callers of
+            // this function are) — and `allocated_sockets.read().await`
+            // would be exactly that if it ran while the transport guard was
+            // still in scope. This has the same snapshot-then-retain race
+            // window as before (a port inserted between the snapshot and the
+            // final `retain` was already possible under the prior two-lock
+            // version too, since that also released both locks before
+            // reacquiring `allocated_sockets` for the write); reordering
+            // which lock is read first does not widen it.
+            let port_sessions: Vec<(u16, SessionId)> = {
                 let sockets = allocated_sockets.read().await;
                 sockets
                     .iter()
-                    .filter_map(|(port, (_socket, alloc))| {
-                        transport
-                            .has_session(alloc.session_id)
-                            .then_some((*port, alloc.session_id))
-                    })
-                    .collect::<HashMap<_, _>>()
+                    .map(|(port, (_socket, alloc))| (*port, alloc.session_id))
+                    .collect()
+            };
+            let active_sessions: HashMap<u16, SessionId> = {
+                let transport = lock_transport(transport);
+                port_sessions
+                    .into_iter()
+                    .filter(|(_, session_id)| transport.has_session(*session_id))
+                    .collect()
             };
 
             let mut sockets = allocated_sockets.write().await;
             sockets.retain(|port, (_socket, alloc)| {
-                active_sessions.get(port).is_some_and(|session_id| {
+                let keep = active_sessions.get(port).is_some_and(|session_id| {
                     bool::from(session_id.as_bytes().ct_eq(alloc.session_id.as_bytes()))
-                })
+                });
+                if !keep {
+                    // The entry is being evicted: its forward task is
+                    // blocked in `socket.recv_from().await` and has no way
+                    // to notice this removal on its own. Abort it explicitly
+                    // so it actually stops instead of leaking forever.
+                    alloc.forward_task.abort();
+                }
+                keep
             });
         }
     }
@@ -957,8 +1055,8 @@ mod daemon {
 
     async fn serve_health_endpoint(
         listener: TcpListener,
-        transport: Arc<RwLock<RelayTransport>>,
-        allocated_sockets: Arc<RwLock<HashMap<u16, (UdpSocket, PortAllocation)>>>,
+        transport: Arc<Mutex<RelayTransport>>,
+        allocated_sockets: Arc<RwLock<AllocatedSockets>>,
         forward_stats: Arc<ForwardStats>,
         max_sessions_per_node: usize,
         max_total_sessions: usize,
@@ -981,9 +1079,18 @@ mod daemon {
                     }
                 };
                 let path = http_request_path(&request[..read]).unwrap_or("/");
+                // Each field computed in its own statement, not inline in
+                // the struct literal: a `std::sync::MutexGuard` temporary
+                // inside an aggregate expression lives until the end of the
+                // *whole* statement (not just its own sub-expression), so an
+                // inline `lock_transport(&transport).session_count()` here
+                // would still be holding the (non-`Send`) guard when the
+                // next field's `.await` runs, which `tokio::spawn` rejects.
+                let active_sessions = lock_transport(&transport).session_count();
+                let allocated_ports = allocated_sockets.read().await.len();
                 let snapshot = HealthSnapshot {
-                    active_sessions: transport.read().await.session_count(),
-                    allocated_ports: allocated_sockets.read().await.len(),
+                    active_sessions,
+                    allocated_ports,
                     max_sessions_per_node,
                     max_total_sessions,
                     frames_forwarded_total: forward_stats
@@ -2446,8 +2553,9 @@ mod daemon {
     #[cfg(test)]
     mod tests {
         use super::{
-            ForwardStats, HealthSnapshot, MAX_PRE_AUTH_HELLO_SOURCE_IPS, PreAuthHelloLimiter,
-            RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE, RelayConfig,
+            ForwardStats, HealthSnapshot, MAX_PRE_AUTH_HELLO_SOURCE_IPS, PortAllocation,
+            PreAuthHelloLimiter, RELAY_KEEPALIVE_MSG_TYPE, RELAY_REJECT_GENERIC_REASON,
+            RELAY_REJECT_MSG_TYPE, RelayConfig, RelayDaemon, RelayHelloResponse,
             RelayHostEntrySelection, RelayTransport, WindowsRelayServiceHardeningSnapshot,
             WindowsRelayServiceOptions, bind_health_listener,
             build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
@@ -2469,13 +2577,16 @@ mod daemon {
         #[cfg(not(windows))]
         use super::load_windows_relay_service_args;
         use ed25519_dalek::SigningKey;
+        use rustynet_control::RelaySessionToken;
+        use rustynet_relay::session::SessionId;
+        use rustynet_relay::transport::RelayHello;
         use std::collections::HashMap;
         use std::fs;
         use std::net::{IpAddr, Ipv4Addr};
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex};
         use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpStream, UdpSocket};
@@ -3655,13 +3766,14 @@ mod daemon {
             };
             let health_addr = listener.local_addr().expect("health addr should exist");
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(RwLock::new(RelayTransport::new(
+            let transport = Arc::new(Mutex::new(RelayTransport::new(
                 [1u8; 16],
                 signing_key.verifying_key(),
                 8,
                 90,
             )));
-            let allocated_sockets = Arc::new(RwLock::new(HashMap::<u16, (UdpSocket, _)>::new()));
+            let allocated_sockets =
+                Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
             let health_task = tokio::spawn(serve_health_endpoint(
@@ -3714,13 +3826,14 @@ mod daemon {
             };
             let health_addr = listener.local_addr().expect("health addr should exist");
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(RwLock::new(RelayTransport::new(
+            let transport = Arc::new(Mutex::new(RelayTransport::new(
                 [1u8; 16],
                 signing_key.verifying_key(),
                 8,
                 90,
             )));
-            let allocated_sockets = Arc::new(RwLock::new(HashMap::<u16, (UdpSocket, _)>::new()));
+            let allocated_sockets =
+                Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
             let health_task = tokio::spawn(serve_health_endpoint(
@@ -3765,6 +3878,385 @@ mod daemon {
                 .await
                 .expect("health response should read");
             response
+        }
+
+        // ── P2: forward-task recv loop + task-shutdown semantics ──────────
+
+        fn make_signed_hello(
+            signing_key: &SigningKey,
+            relay_id: [u8; 16],
+            node_id: &str,
+            peer_node_id: &str,
+        ) -> RelayHello {
+            RelayHello {
+                node_id: node_id.to_owned(),
+                peer_node_id: peer_node_id.to_owned(),
+                session_token: RelaySessionToken::sign(
+                    signing_key,
+                    node_id,
+                    peer_node_id,
+                    relay_id,
+                    90,
+                ),
+            }
+        }
+
+        /// Hard requirement: an awaited `recv_from` never notices its own
+        /// map entry disappearing on its own — nothing wakes it. Whoever
+        /// removes the entry must cancel the task explicitly, and a
+        /// cancelled task must actually stop rather than leak forever
+        /// blocked on a socket nobody else can reach. This test proves the
+        /// second half directly: abort a forward task while it is genuinely
+        /// blocked mid-`recv_from` (nothing is ever sent to the socket) and
+        /// confirm it resolves as cancelled, not hung.
+        #[tokio::test]
+        async fn forward_task_stops_when_aborted_mid_recv() {
+            let socket = UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind test socket");
+            let socket = Arc::new(socket);
+
+            let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+            let transport = Arc::new(Mutex::new(RelayTransport::new(
+                [1u8; 16],
+                signing_key.verifying_key(),
+                8,
+                90,
+            )));
+            let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
+            let forward_stats = Arc::new(ForwardStats::default());
+
+            let handle = RelayDaemon::spawn_forward_task(
+                &allocated_sockets,
+                &transport,
+                &forward_stats,
+                socket,
+                SessionId::from([3u8; 16]),
+            );
+
+            // Let it actually reach and block on `recv_from().await` before
+            // aborting — this proves we are cancelling genuinely in-flight
+            // work, not a task that never started.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !handle.is_finished(),
+                "task should still be blocked awaiting recv"
+            );
+
+            handle.abort();
+
+            let result = tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("aborted task should resolve promptly, not hang forever");
+            let join_err = result.expect_err("aborted task must resolve as cancelled, not Ok(())");
+            assert!(join_err.is_cancelled());
+        }
+
+        /// End-to-end through the real production path: allocate a port,
+        /// spawn its real forward task, then let the owning session be
+        /// absent from `transport` so the very next prune pass evicts the
+        /// port. The socket's `Arc` strong count is the observable proxy for
+        /// "the task actually tore down": besides the map entry (removed by
+        /// `retain`) and this test's own kept clone, only the running task
+        /// holds a third reference — if the task is genuinely cancelled and
+        /// dropped, that reference goes away too.
+        #[tokio::test]
+        async fn prune_inactive_allocated_sockets_aborts_forward_task_and_releases_socket() {
+            let socket = UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind test socket");
+            let socket = Arc::new(socket);
+            let port = socket.local_addr().expect("local addr").port();
+
+            let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+            let transport = Arc::new(Mutex::new(RelayTransport::new(
+                [1u8; 16],
+                signing_key.verifying_key(),
+                8,
+                90,
+            )));
+            let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
+            let forward_stats = Arc::new(ForwardStats::default());
+
+            // A session id never established in `transport`: `has_session`
+            // is false immediately, so this port is inactive from prune's
+            // very first look.
+            let session_id = SessionId::from([4u8; 16]);
+            let forward_task = RelayDaemon::spawn_forward_task(
+                &allocated_sockets,
+                &transport,
+                &forward_stats,
+                Arc::clone(&socket),
+                session_id,
+            );
+
+            {
+                let mut sockets = allocated_sockets.write().await;
+                sockets.insert(
+                    port,
+                    (
+                        Arc::clone(&socket),
+                        PortAllocation {
+                            session_id,
+                            forward_task,
+                        },
+                    ),
+                );
+            }
+
+            // test's own clone + map's clone + the running task's clone = 3.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(Arc::strong_count(&socket), 3);
+
+            RelayDaemon::prune_inactive_allocated_sockets(&allocated_sockets, &transport).await;
+
+            assert!(
+                !allocated_sockets.read().await.contains_key(&port),
+                "inactive port must be removed from the map"
+            );
+
+            // Poll briefly: `abort()` schedules cancellation, it does not
+            // block until the task has actually finished dropping its
+            // locals.
+            let mut strong_count = Arc::strong_count(&socket);
+            for _ in 0..50 {
+                if strong_count == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                strong_count = Arc::strong_count(&socket);
+            }
+            assert_eq!(
+                strong_count, 1,
+                "forward task must actually drop its socket handle after \
+                 being aborted by prune, not leak it"
+            );
+        }
+
+        /// `prune_inactive_allocated_sockets`'s constant-time-equality
+        /// retention check must still retain a port whose session IS active
+        /// — this is the positive counterpart to the eviction test above,
+        /// pinning that the ct_eq comparison isn't accidentally inverted or
+        /// broken by the lock-type change.
+        #[tokio::test]
+        async fn prune_inactive_allocated_sockets_retains_ports_with_active_sessions() {
+            let socket = UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind test socket");
+            let socket = Arc::new(socket);
+            let port = socket.local_addr().expect("local addr").port();
+
+            let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+            let relay_id = [1u8; 16];
+            let mut transport_inner =
+                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+            let from_addr: std::net::SocketAddr = "127.0.0.1:41000".parse().unwrap();
+            let hello = make_signed_hello(&signing_key, relay_id, "a", "b");
+            transport_inner
+                .validate_hello_from_tuple(&hello, from_addr)
+                .expect("hello should validate");
+            let ack = match transport_inner
+                .handle_hello_from_tuple_with_allocated_port(hello, from_addr, port)
+            {
+                RelayHelloResponse::Accepted(ack) => ack,
+                other => panic!("expected accepted hello, got {other:?}"),
+            };
+
+            let transport = Arc::new(Mutex::new(transport_inner));
+            let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
+            let forward_stats = Arc::new(ForwardStats::default());
+
+            let forward_task = RelayDaemon::spawn_forward_task(
+                &allocated_sockets,
+                &transport,
+                &forward_stats,
+                Arc::clone(&socket),
+                ack.session_id,
+            );
+            {
+                let mut sockets = allocated_sockets.write().await;
+                sockets.insert(
+                    port,
+                    (
+                        Arc::clone(&socket),
+                        PortAllocation {
+                            session_id: ack.session_id,
+                            forward_task,
+                        },
+                    ),
+                );
+            }
+
+            RelayDaemon::prune_inactive_allocated_sockets(&allocated_sockets, &transport).await;
+
+            assert!(
+                allocated_sockets.read().await.contains_key(&port),
+                "a port whose session is still active must survive prune"
+            );
+        }
+
+        /// The core hot-path regression test: through the real
+        /// `spawn_forward_task` and a real paired relay session, a
+        /// ciphertext frame sent to node A's allocated port must arrive
+        /// byte-for-byte at node B's real address, and a
+        /// `RELAY_KEEPALIVE_MSG_TYPE` frame must be silently absorbed —
+        /// never forwarded to the peer — exactly as before this refactor.
+        #[tokio::test]
+        async fn forward_task_forwards_ciphertext_and_silently_drops_keepalives() {
+            let socket_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind port a"));
+            let socket_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind port b"));
+            let port_a = socket_a.local_addr().expect("addr a").port();
+            let port_b = socket_b.local_addr().expect("addr b").port();
+
+            let node_a_real = UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind node a real");
+            let node_b_real = UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind node b real");
+            let node_a_addr = node_a_real.local_addr().expect("node a addr");
+            let node_b_addr = node_b_real.local_addr().expect("node b addr");
+
+            let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+            let relay_id = [1u8; 16];
+            let mut transport_inner =
+                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+
+            let hello_a = make_signed_hello(&signing_key, relay_id, "a", "b");
+            transport_inner
+                .validate_hello_from_tuple(&hello_a, node_a_addr)
+                .expect("hello a should validate");
+            let ack_a = match transport_inner.handle_hello_from_tuple_with_allocated_port(
+                hello_a,
+                node_a_addr,
+                port_a,
+            ) {
+                RelayHelloResponse::Accepted(ack) => ack,
+                other => panic!("hello a rejected: {other:?}"),
+            };
+
+            let hello_b = make_signed_hello(&signing_key, relay_id, "b", "a");
+            transport_inner
+                .validate_hello_from_tuple(&hello_b, node_b_addr)
+                .expect("hello b should validate");
+            let ack_b = match transport_inner.handle_hello_from_tuple_with_allocated_port(
+                hello_b,
+                node_b_addr,
+                port_b,
+            ) {
+                RelayHelloResponse::Accepted(ack) => ack,
+                other => panic!("hello b rejected: {other:?}"),
+            };
+
+            let transport = Arc::new(Mutex::new(transport_inner));
+            let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
+            let forward_stats = Arc::new(ForwardStats::default());
+
+            let task_a = RelayDaemon::spawn_forward_task(
+                &allocated_sockets,
+                &transport,
+                &forward_stats,
+                Arc::clone(&socket_a),
+                ack_a.session_id,
+            );
+            let task_b = RelayDaemon::spawn_forward_task(
+                &allocated_sockets,
+                &transport,
+                &forward_stats,
+                Arc::clone(&socket_b),
+                ack_b.session_id,
+            );
+            {
+                let mut sockets = allocated_sockets.write().await;
+                sockets.insert(
+                    port_a,
+                    (
+                        Arc::clone(&socket_a),
+                        PortAllocation {
+                            session_id: ack_a.session_id,
+                            forward_task: task_a,
+                        },
+                    ),
+                );
+                sockets.insert(
+                    port_b,
+                    (
+                        Arc::clone(&socket_b),
+                        PortAllocation {
+                            session_id: ack_b.session_id,
+                            forward_task: task_b,
+                        },
+                    ),
+                );
+            }
+
+            let relay_addr_a: std::net::SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
+            let relay_addr_b: std::net::SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
+
+            // Prime both source tuples: the first packet from each real
+            // address binds `bound_peer_addr` on its session (mirrors the
+            // transport benchmark's own paired-session setup). Whether
+            // either priming packet itself gets forwarded depends on
+            // binding order and is not asserted here — only that both
+            // sides end up bound.
+            node_b_real
+                .send_to(&[0u8; 8], relay_addr_b)
+                .await
+                .expect("prime b");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            node_a_real
+                .send_to(&[0u8; 8], relay_addr_a)
+                .await
+                .expect("prime a");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut drain_buf = [0u8; 128];
+            let _ = tokio::time::timeout(
+                Duration::from_millis(50),
+                node_b_real.recv_from(&mut drain_buf),
+            )
+            .await;
+            let _ = tokio::time::timeout(
+                Duration::from_millis(50),
+                node_a_real.recv_from(&mut drain_buf),
+            )
+            .await;
+
+            // Real ciphertext frame, A -> B.
+            let payload = vec![0xABu8; 40];
+            node_a_real
+                .send_to(&payload, relay_addr_a)
+                .await
+                .expect("send ciphertext");
+
+            let mut recv_buf = [0u8; 128];
+            let (len, from) =
+                tokio::time::timeout(Duration::from_secs(2), node_b_real.recv_from(&mut recv_buf))
+                    .await
+                    .expect("ciphertext should be forwarded to node b within timeout")
+                    .expect("recv should succeed");
+            assert_eq!(&recv_buf[..len], payload.as_slice());
+            assert_eq!(
+                from, relay_addr_b,
+                "forwarded frame must originate from b's allocated port"
+            );
+
+            // Keepalive frame, A -> relay: must be silently absorbed, never
+            // forwarded to B.
+            let keepalive = [RELAY_KEEPALIVE_MSG_TYPE, 0, 0, 0, 0];
+            node_a_real
+                .send_to(&keepalive, relay_addr_a)
+                .await
+                .expect("send keepalive");
+
+            let result = tokio::time::timeout(
+                Duration::from_millis(300),
+                node_b_real.recv_from(&mut recv_buf),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "keepalive must never be forwarded to the peer"
+            );
         }
 
         #[test]
