@@ -8106,8 +8106,9 @@ impl DaemonRuntime {
     fn handle_membership_apply(&mut self, signed_update_wire: &[u8]) -> Result<String, String> {
         use rustynet_control::membership::{
             MembershipReplayCache, append_membership_log_entry, apply_signed_update,
-            decode_signed_update, load_membership_log, load_membership_snapshot,
-            persist_membership_snapshot, replay_membership_snapshot_and_log,
+            decode_signed_update, head_attestation_from_signed_update, load_membership_log,
+            load_membership_snapshot, persist_membership_snapshot_with_attestation,
+            replay_membership_snapshot_and_log,
         };
 
         let payload = std::str::from_utf8(signed_update_wire)
@@ -8163,7 +8164,20 @@ impl DaemonRuntime {
         // canonical source of truth between persist and next bootstrap.
         append_membership_log_entry(&self.membership_log_path, &signed)
             .map_err(|err| format!("membership apply persist failed: log append failed: {err}"))?;
-        persist_membership_snapshot(&self.membership_snapshot_path, &next).map_err(|err| {
+        // A4: materialize the head attestation that traveled inside the
+        // applied update's per-signer head signatures. This site holds NO
+        // approver keys — the anchor stays trust-inert: it never mints an
+        // attestation, it only re-persists what a signing session already
+        // produced. A legacy update without head signatures persists
+        // without attestation (NOT an error here; such a snapshot simply
+        // fails client-side bundle-pull verification, which is correct).
+        let head_attestation = head_attestation_from_signed_update(&signed);
+        persist_membership_snapshot_with_attestation(
+            &self.membership_snapshot_path,
+            &next,
+            head_attestation.as_ref(),
+        )
+        .map_err(|err| {
             format!("membership apply persist failed: snapshot persist failed: {err}")
         })?;
 
