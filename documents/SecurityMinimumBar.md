@@ -33,24 +33,50 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
   membership owner public key is an Owner in the attested approver set AND
   its private-key holder actually signed the attestation (roster presence
   alone is rejected); valid signatures from the attested state's active
-  approvers meet its quorum threshold; the attestation is fresh within a
-  bounded window (default 7 days, tighten-only — there is no bypass flag)
-  and not future-dated beyond clock-skew tolerance; and the epoch does not
-  regress against the previously verified local bundle (same-epoch
-  different-root is surfaced verbatim as fork evidence, never silently
-  resolved). Every failure mode rejects BEFORE any byte is written to disk.
-  Enforcement point: `rustynet_control::membership::verify_attested_snapshot`,
-  invoked by `anchor pull-bundle` ahead of any output write. Verification:
-  `verify_attested_snapshot_rejects_missing_attestation` and its sibling
-  negative tests in `crates/rustynet-control/src/membership.rs`, plus the
-  enforcement-ordering integration test
+  approvers, one per DISTINCT signing key (no two approver ids may share a
+  key — `MembershipState::validate` rejects that roster shape outright, so it
+  can never even acquire a state root, let alone be signed or persisted), meet
+  its quorum threshold; the attestation is fresh within a bounded window
+  (default 7 days, tighten-only — there is no bypass flag) and not
+  future-dated beyond clock-skew tolerance; and the epoch does not regress
+  against the previously verified local bundle (same-epoch different-root is
+  surfaced verbatim as fork evidence, never silently resolved). Every failure
+  mode rejects BEFORE any byte is written to disk. Enforcement points:
+  `rustynet_control::membership::verify_attested_snapshot` (invoked by
+  `anchor pull-bundle` ahead of any output write) and
+  `MembershipState::validate` (the pubkey-uniqueness gate, invoked
+  transitively by every state-root/signing/persist path in the crate).
+  Verification: `verify_attested_snapshot_rejects_missing_attestation` and its
+  sibling negative tests in `crates/rustynet-control/src/membership.rs`
+  (including `validate_rejects_duplicate_approver_pubkeys` and
+  `verify_attested_snapshot_rejects_quorum_inflation_via_duplicate_approver_pubkey`),
+  plus the enforcement-ordering integration test
   `pull_bundle_never_writes_unverified_bytes` in
-  `crates/rustynet-cli/src/main.rs`. Remaining adjacent gap (tracked
-  separately, out of this control's scope): the bundle-pull endpoint still
-  authenticates the CLIENT with a static long-lived bearer token rather than
-  the single-use enrollment token `Requirements.md` specifies — that token
-  gates roster confidentiality only; bundle authenticity no longer depends
-  on it.
+  `crates/rustynet-cli/src/main.rs`. Full review trail — original design,
+  implementation, three independent adversarial reviews, and the fix each
+  produced — recorded in
+  [`operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md).
+
+  **Known gap — stale-cache rollback (High, unresolved, requires risk
+  acceptance per §2 before release):** epoch-regression protection above is
+  bounded by the client's OWN local cache, re-derived fresh on every pull and
+  discarded the moment it ages past the 7-day freshness window or is simply
+  absent. A brand-new device — the primary bundle-pull scenario — has no
+  cache at all, so the regression check is skipped entirely and the offered
+  snapshot is judged solely on its own embedded roster. Nothing binds an
+  attestation's signing timestamp to the real historical time of the epoch it
+  covers, so a holder of an old, already-revoked-in-later-epochs signing key
+  can mint a freshly-timestamped attestation resurrecting that old,
+  superseded state, and it passes every other check clean. Closing this needs
+  a persistent, monotonic anti-rollback watermark independent of attestation
+  freshness — a real design decision, deliberately not implemented
+  unreviewed. See the review trail doc above for the full finding.
+
+  **Remaining adjacent gap (tracked separately, out of this control's
+  scope):** the bundle-pull endpoint still authenticates the CLIENT with a
+  static long-lived bearer token rather than the single-use enrollment token
+  `Requirements.md` specifies — that token gates roster confidentiality only;
+  bundle authenticity no longer depends on it.
 - Signed peer/control data validated by clients before application.
 
 3. Auth and enrollment hardening:
