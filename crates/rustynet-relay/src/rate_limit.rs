@@ -26,11 +26,26 @@ impl Default for RateLimiter {
 
 impl RateLimiter {
     pub fn check_packet(&mut self, node_id: &str, packet_size_bytes: usize) -> bool {
+        // Two-phase borrowed-key lookup, deliberately NOT the `entry()` idiom:
+        // `HashMap::entry` takes its key by value, so the previous
+        // `entry(node_id.to_owned())` form paid a `&str -> String` heap
+        // allocation on every forwarded frame, whether or not the bucket
+        // already existed. `get_mut(node_id)` looks the bucket up through
+        // `Borrow<str>` with zero allocation, so the per-frame hot path is
+        // allocation-free; only the cold path below (the first frame of a new
+        // `node_id`, once per bucket lifetime) builds the owned key. Do not
+        // "simplify" this back to a single `entry(to_owned())` call — that
+        // reintroduces the per-frame allocation.
+        if let Some(bucket) = self.buckets.get_mut(node_id) {
+            return bucket.check_and_consume(1, packet_size_bytes * 8);
+        }
+
+        // Cold path: first packet for this node_id — allocate the owned key
+        // once and insert a fresh bucket.
         let bucket = self
             .buckets
             .entry(node_id.to_owned())
             .or_insert_with(|| TokenBucket::new(self.max_pps, self.max_bps));
-
         bucket.check_and_consume(1, packet_size_bytes * 8)
     }
 
@@ -159,6 +174,28 @@ mod tests {
 
         // Should accept again
         assert!(limiter.check_packet("node-a", 100));
+    }
+
+    #[test]
+    fn test_rate_limiter_reuses_bucket_via_borrowed_key_lookup() {
+        // Regression guard for the zero-allocation hot path: repeated
+        // `check_packet` calls with the same node_id must find the existing
+        // bucket through the borrowed-key `get_mut(&str)` lookup rather than
+        // inserting a fresh bucket each time. The bucket count must therefore
+        // stay at one per distinct node_id no matter how many packets flow.
+        let mut limiter = RateLimiter::default();
+
+        assert!(limiter.check_packet("node-a", 100));
+        assert_eq!(limiter.bucket_count(), 1);
+
+        for _ in 0..50 {
+            assert!(limiter.check_packet("node-a", 100));
+        }
+        assert_eq!(limiter.bucket_count(), 1);
+
+        // A distinct node_id takes the cold path and gets its own bucket.
+        assert!(limiter.check_packet("node-b", 100));
+        assert_eq!(limiter.bucket_count(), 2);
     }
 
     #[test]
