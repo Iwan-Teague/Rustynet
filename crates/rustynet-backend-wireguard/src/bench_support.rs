@@ -74,6 +74,18 @@ impl DataplaneEnginePair {
     /// and drive the Noise handshake to completion so transport data
     /// can flow. Panics on any setup error (bench-only).
     pub fn handshaken() -> Self {
+        Self::handshaken_with_extra_peers(0)
+    }
+
+    /// Like [`Self::handshaken`], but additionally configures
+    /// `extra_peers` inert filler peers on BOTH engines before the
+    /// handshake, so the per-packet dispatch paths (inbound
+    /// endpoint/receiver-index resolution, outbound longest-prefix
+    /// selection) run against a populated peer table. The fillers use
+    /// distinct endpoints and allowed-IP ranges that never match the
+    /// benchmarked traffic, so the forwarded packets still resolve to
+    /// the real peer — only the lookup cost scales with `extra_peers`.
+    pub fn handshaken_with_extra_peers(extra_peers: usize) -> Self {
         let sender_secret = [7u8; 32];
         let receiver_secret = [9u8; 32];
         let sender_key_path = write_key_file(&sender_secret);
@@ -111,6 +123,35 @@ impl DataplaneEnginePair {
                 persistent_keepalive_secs: None,
             })
             .expect("configure sender as receiver's peer");
+
+        // Inert filler peers: distinct node ids, endpoints, and public keys,
+        // with allowed-IP ranges (172.16.0.0/12 space) that never contain the
+        // benchmarked 10.0.0.2 destination, so outbound longest-prefix
+        // selection and inbound dispatch scan past them without matching.
+        for filler in 0..extra_peers {
+            let filler_node = NodeId::new(format!("filler-{filler:04}")).expect("filler node id");
+            let mut filler_public = [0u8; 32];
+            filler_public[0] = 0x55;
+            filler_public[1] = (filler & 0xff) as u8;
+            filler_public[2] = ((filler >> 8) & 0xff) as u8;
+            let filler_config = PeerConfig {
+                node_id: filler_node,
+                public_key: filler_public,
+                endpoint: endpoint(filler_endpoint(filler)),
+                allowed_ips: vec![format!(
+                    "172.{}.{}.0/24",
+                    16 + (filler / 256) % 16,
+                    filler % 256
+                )],
+                persistent_keepalive_secs: None,
+            };
+            sender
+                .configure_peer(&filler_config)
+                .expect("configure filler peer on sender");
+            receiver
+                .configure_peer(&filler_config)
+                .expect("configure filler peer on receiver");
+        }
 
         let mut pair = Self {
             sender,
@@ -194,6 +235,32 @@ impl DataplaneEnginePair {
             None => 0,
         }
     }
+
+    /// P4 (DataplanePerfBacklog): direct probe of the endpoint reverse-index
+    /// miss path on the receiver engine. `forward_one`'s steady-state data
+    /// packets resolve via the (unaffected, out-of-scope) receiver-index
+    /// dispatch and never reach the endpoint lookup at all, so it does not
+    /// isolate this backlog item's actual change — this probe does, calling
+    /// straight through to `UserspaceEngine::has_endpoint`, the same check
+    /// `reject_round_trip_target`'s fail-closed path uses.
+    pub fn probe_has_endpoint(&self, addr: SocketAddr) -> bool {
+        self.receiver.has_endpoint(addr)
+    }
+
+    /// P4: direct probe of `UserspaceEngine::find_node_id_by_endpoint`
+    /// (the function this backlog item's reverse index replaces the linear
+    /// scan inside), independent of the receiver-index fast path.
+    pub fn probe_find_node_id_by_endpoint(&self, addr: SocketAddr) -> Option<NodeId> {
+        self.receiver.find_node_id_by_endpoint(addr)
+    }
+
+    /// The endpoint address of filler peer `index`, as configured by
+    /// [`Self::handshaken_with_extra_peers`] — lets a bench address a
+    /// specific configured (hit) or the highest-sorting (worst-case-for-the-
+    /// old-scan) filler endpoint without duplicating the generation formula.
+    pub fn filler_endpoint(index: usize) -> SocketAddr {
+        filler_endpoint(index)
+    }
 }
 
 fn endpoint(addr: SocketAddr) -> SocketEndpoint {
@@ -201,6 +268,17 @@ fn endpoint(addr: SocketAddr) -> SocketEndpoint {
         addr: addr.ip(),
         port: addr.port(),
     }
+}
+
+/// Deterministic endpoint address for filler peer `index`: distinct
+/// `203.0.113.0/24`-space addresses with wrapping ports, matching the
+/// `172.16.0.0/12` allowed-ips fillers configured in
+/// `handshaken_with_extra_peers`.
+fn filler_endpoint(index: usize) -> SocketAddr {
+    SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, (index % 251) as u8)),
+        50_000 + (index as u16 % 10_000),
+    )
 }
 
 fn x25519_public(secret: &[u8; 32]) -> [u8; 32] {
