@@ -95,11 +95,13 @@ use rand::{TryRngCore, rngs::OsRng};
 use rustynet_cli::role_cli;
 use rustynet_control::membership::{
     MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipApprover, MembershipApproverRole,
-    MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipOperation,
-    MembershipReplayCache, MembershipState, MembershipUpdateRecord, SignedMembershipUpdate,
-    append_membership_log_entry, apply_signed_update, decode_signed_update, decode_update_record,
-    encode_signed_update, encode_update_record, load_membership_log, load_membership_snapshot,
-    persist_membership_snapshot, replay_membership_snapshot_and_log, sign_update_record,
+    MembershipApproverStatus, MembershipHeadAttestation, MembershipNode, MembershipNodeStatus,
+    MembershipOperation, MembershipReplayCache, MembershipState, MembershipUpdateRecord,
+    SignedMembershipUpdate, append_membership_log_entry, apply_signed_update, decode_signed_update,
+    decode_update_record, encode_signed_update, encode_update_record,
+    head_attestation_from_signed_update, load_membership_log, load_membership_snapshot,
+    persist_membership_snapshot_with_attestation, replay_membership_snapshot_and_log,
+    sign_head_attestation, sign_update_record, snapshot_bytes_head_attestation,
     write_membership_audit_log,
 };
 use rustynet_control::roles::{
@@ -510,6 +512,21 @@ enum MembershipCommand {
         now_unix: u64,
         output_dir: PathBuf,
         environment: String,
+    },
+    /// `rustynet membership attest` — re-mint a fresh membership head
+    /// attestation for the CURRENT head (snapshot + log replay) using the
+    /// local approver signing key, and re-persist the snapshot with it.
+    /// The operator tool for backfilling already-deployed meshes and for
+    /// refreshing attestation freshness on quiet meshes. `--attested-at`
+    /// pins the timestamp so further approvers (including a rotated-out
+    /// former owner during rotation grace) can co-sign the SAME
+    /// attestation payload — signatures merge only over identical fields.
+    Attest {
+        paths: MembershipPaths,
+        approver_id: String,
+        signing_key_path: PathBuf,
+        signing_key_passphrase_path: PathBuf,
+        attested_at_unix: Option<u64>,
     },
 }
 
@@ -5908,6 +5925,19 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
             dry_run: parser.has_flag("--dry-run"),
             via_daemon: parser.has_flag("--daemon"),
         }),
+        "attest" => Ok(MembershipCommand::Attest {
+            paths,
+            approver_id: parser.required("--approver-id")?,
+            signing_key_path: parser.required_path("--signing-key")?,
+            signing_key_passphrase_path: parser.required_path("--signing-key-passphrase-file")?,
+            attested_at_unix: match parser.value("--attested-at") {
+                Some(raw) => Some(
+                    raw.parse::<u64>()
+                        .map_err(|err| format!("invalid value for --attested-at: {err}"))?,
+                ),
+                None => None,
+            },
+        }),
         _ => Err(format!("unknown membership subcommand: {subcommand}")),
     }
 }
@@ -7667,8 +7697,22 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
                 .map_err(|err| format!("read record failed: {err}"))?;
             let record = decode_update_record(&record_payload).map_err(|err| err.to_string())?;
             let signing_key = load_signing_key(&signing_key_path, &signing_key_passphrase_path)?;
-            let signature = sign_update_record(&record, approver_id.as_str(), &signing_key)
+            let mut signature = sign_update_record(&record, approver_id.as_str(), &signing_key)
                 .map_err(|err| format!("sign update failed: {err}"))?;
+            // A4: mint the membership head attestation signature in the SAME
+            // signing session, deterministically derived from the record
+            // (epoch_new / new_state_root / created_at_unix), so the applied
+            // snapshot can be served with a client-verifiable attestation.
+            let head_signature = sign_head_attestation(
+                &record.network_id,
+                record.epoch_new,
+                &record.new_state_root,
+                record.created_at_unix,
+                approver_id.as_str(),
+                &signing_key,
+            )
+            .map_err(|err| format!("sign head attestation failed: {err}"))?;
+            signature.head_signature_hex = Some(head_signature.signature_hex);
 
             let mut signatures = if let Some(path) = merge_from {
                 let signed_payload = fs::read_to_string(&path)
@@ -7699,10 +7743,16 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
             };
             let envelope = encode_signed_update(&signed).map_err(|err| err.to_string())?;
             write_text_file(&output_path, &envelope)?;
+            let head_signature_count = signed
+                .approver_signatures
+                .iter()
+                .filter(|entry| entry.head_signature_hex.is_some())
+                .count();
             Ok(format!(
-                "membership signed update written: {} signatures={}",
+                "membership signed update written: {} signatures={} head_signatures={}",
                 output_path.display(),
-                signed.approver_signatures.len()
+                signed.approver_signatures.len(),
+                head_signature_count
             ))
         }
         MembershipCommand::VerifyUpdate {
@@ -7783,8 +7833,18 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
                 }
                 append_membership_log_entry(&paths.log_path, &signed)
                     .map_err(|err| err.to_string())?;
-                persist_membership_snapshot(&paths.snapshot_path, &next)
-                    .map_err(|err| err.to_string())?;
+                // A4: materialize the head attestation that traveled inside
+                // the applied update. A legacy update without head
+                // signatures persists without attestation (not an error —
+                // the snapshot then simply fails client-side bundle-pull
+                // verification, which is the correct fail-closed outcome).
+                let attestation = head_attestation_from_signed_update(&signed);
+                persist_membership_snapshot_with_attestation(
+                    &paths.snapshot_path,
+                    &next,
+                    attestation.as_ref(),
+                )
+                .map_err(|err| err.to_string())?;
                 Ok(format!(
                     "membership update applied: snapshot={} log={} epoch_new={}",
                     paths.snapshot_path.display(),
@@ -7814,6 +7874,74 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
             output_dir,
             environment,
         } => emit_membership_evidence(paths, now_unix, output_dir, environment),
+        MembershipCommand::Attest {
+            paths,
+            approver_id,
+            signing_key_path,
+            signing_key_passphrase_path,
+            attested_at_unix,
+        } => {
+            let now_unix = unix_now();
+            let (_, _, state) = load_current_membership_state(&paths, now_unix)?;
+            let state_root = state.state_root_hex().map_err(|err| err.to_string())?;
+            let attested_at = attested_at_unix.unwrap_or(now_unix);
+            let signing_key = load_signing_key(&signing_key_path, &signing_key_passphrase_path)?;
+            let head_signature = sign_head_attestation(
+                &state.network_id,
+                state.epoch,
+                &state_root,
+                attested_at,
+                approver_id.as_str(),
+                &signing_key,
+            )
+            .map_err(|err| format!("sign head attestation failed: {err}"))?;
+            // Merge: keep existing signatures only when they cover the
+            // IDENTICAL payload (same head identity AND timestamp) —
+            // signatures over any other payload cannot co-verify, so they
+            // are replaced rather than mixed.
+            let existing = fs::read(&paths.snapshot_path)
+                .ok()
+                .and_then(|bytes| snapshot_bytes_head_attestation(&bytes));
+            let mut approver_signatures = match existing {
+                Some(attestation)
+                    if attestation.network_id == state.network_id
+                        && attestation.epoch == state.epoch
+                        && attestation.state_root_hex == state_root
+                        && attestation.attested_at_unix == attested_at =>
+                {
+                    attestation.approver_signatures
+                }
+                _ => Vec::new(),
+            };
+            if approver_signatures
+                .iter()
+                .any(|entry| entry.approver_id == approver_id)
+            {
+                return Err(format!(
+                    "attestation already carries a signature from approver {approver_id}"
+                ));
+            }
+            approver_signatures.push(head_signature);
+            let signature_count = approver_signatures.len();
+            let attestation = MembershipHeadAttestation {
+                network_id: state.network_id.clone(),
+                epoch: state.epoch,
+                state_root_hex: state_root.clone(),
+                attested_at_unix: attested_at,
+                approver_signatures,
+            };
+            persist_membership_snapshot_with_attestation(
+                &paths.snapshot_path,
+                &state,
+                Some(&attestation),
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(format!(
+                "membership head attestation persisted: snapshot={} epoch={} state_root={state_root} attested_at_unix={attested_at} signatures={signature_count}",
+                paths.snapshot_path.display(),
+                state.epoch,
+            ))
+        }
     }
 }
 
@@ -7973,8 +8101,20 @@ fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
         &config.signing_key_path,
         &config.signing_key_passphrase_path,
     )?;
-    let signature = sign_update_record(&record, config.approver_id.as_str(), &signing_key)
+    let mut signature = sign_update_record(&record, config.approver_id.as_str(), &signing_key)
         .map_err(|err| format!("sign update failed: {err}"))?;
+    // A4: mint the head attestation signature in the same signing session
+    // so an admit-applied snapshot stays bundle-pull verifiable.
+    let head_signature = sign_head_attestation(
+        &record.network_id,
+        record.epoch_new,
+        &record.new_state_root,
+        record.created_at_unix,
+        config.approver_id.as_str(),
+        &signing_key,
+    )
+    .map_err(|err| format!("sign head attestation failed: {err}"))?;
+    signature.head_signature_hex = Some(head_signature.signature_hex);
     let signed = SignedMembershipUpdate {
         record,
         approver_signatures: vec![signature],
@@ -8012,7 +8152,9 @@ fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
     let next = apply_signed_update(&state, &signed, now_unix, &mut replay_cache)
         .map_err(|err| format!("apply_signed_update failed: {err}"))?;
     append_membership_log_entry(&paths.log_path, &signed).map_err(|err| err.to_string())?;
-    persist_membership_snapshot(&paths.snapshot_path, &next).map_err(|err| err.to_string())?;
+    let attestation = head_attestation_from_signed_update(&signed);
+    persist_membership_snapshot_with_attestation(&paths.snapshot_path, &next, attestation.as_ref())
+        .map_err(|err| err.to_string())?;
     Ok(format!(
         "admit applied: snapshot={} log={} epoch_new={} target={}",
         paths.snapshot_path.display(),

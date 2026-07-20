@@ -3564,8 +3564,9 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
     use rustynet_control::membership::{
         MembershipNode, MembershipNodeStatus, MembershipOperation, MembershipReplayCache,
         MembershipUpdateRecord, SignedMembershipUpdate, append_membership_log_entry,
-        apply_signed_update, load_membership_log, load_membership_snapshot,
-        persist_membership_snapshot, preview_next_state, sign_update_record,
+        apply_signed_update, head_attestation_from_signed_update, load_membership_log,
+        load_membership_snapshot, persist_membership_snapshot_with_attestation, preview_next_state,
+        sign_head_attestation, sign_update_record,
     };
     use rustynet_control::roles::{RoleCapability, parse_role_capability_csv};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3755,8 +3756,20 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
         policy_context: None,
     };
 
-    let signature = sign_update_record(&record, &approver_id, &signing_key)
+    let mut signature = sign_update_record(&record, &approver_id, &signing_key)
         .map_err(|e| format!("sign update record failed: {e}"))?;
+    // A4: mint the head attestation signature in the same signing session
+    // so the persisted snapshot stays bundle-pull verifiable.
+    let head_signature = sign_head_attestation(
+        &record.network_id,
+        record.epoch_new,
+        &record.new_state_root,
+        record.created_at_unix,
+        &approver_id,
+        &signing_key,
+    )
+    .map_err(|e| format!("sign head attestation failed: {e}"))?;
+    signature.head_signature_hex = Some(head_signature.signature_hex);
     let signed = SignedMembershipUpdate {
         record,
         approver_signatures: vec![signature],
@@ -3783,8 +3796,13 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
 
     append_membership_log_entry(&log_path, &signed)
         .map_err(|e| format!("append membership log entry failed: {e}"))?;
-    persist_membership_snapshot(&snapshot_path, &new_state)
-        .map_err(|e| format!("persist membership snapshot failed: {e}"))?;
+    let head_attestation = head_attestation_from_signed_update(&signed);
+    persist_membership_snapshot_with_attestation(
+        &snapshot_path,
+        &new_state,
+        head_attestation.as_ref(),
+    )
+    .map_err(|e| format!("persist membership snapshot failed: {e}"))?;
 
     println!(
         "membership add-peer complete: node_id={node_id} snapshot={snapshot_path} log={log_path} epoch_new={}",
@@ -3797,8 +3815,8 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     use ed25519_dalek::SigningKey;
     use rustynet_control::membership::{
         MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
-        MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
-        persist_membership_snapshot,
+        MembershipApproverStatus, MembershipHeadAttestation, MembershipNode, MembershipNodeStatus,
+        MembershipState, persist_membership_snapshot_with_attestation, sign_head_attestation,
     };
     use rustynet_control::roles::RoleCapability;
     use std::io::Write;
@@ -3990,8 +4008,34 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
             metadata_hash: None,
         };
 
-        persist_membership_snapshot(&snapshot_path, &state)
-            .map_err(|e| format!("failed to write membership snapshot: {e}"))?;
+        // A4: mint the genesis head attestation immediately — the owner
+        // signing key is in hand at init time, so the very first snapshot
+        // is already bundle-pull verifiable against the delivered pin.
+        let genesis_state_root = state
+            .state_root_hex()
+            .map_err(|e| format!("failed to compute genesis state root: {e}"))?;
+        let genesis_head_signature = sign_head_attestation(
+            &network_id,
+            state.epoch,
+            &genesis_state_root,
+            now,
+            &owner_approver_id,
+            &approver_signing,
+        )
+        .map_err(|e| format!("failed to sign genesis head attestation: {e}"))?;
+        let genesis_attestation = MembershipHeadAttestation {
+            network_id: network_id.clone(),
+            epoch: state.epoch,
+            state_root_hex: genesis_state_root,
+            attested_at_unix: now,
+            approver_signatures: vec![genesis_head_signature],
+        };
+        persist_membership_snapshot_with_attestation(
+            &snapshot_path,
+            &state,
+            Some(&genesis_attestation),
+        )
+        .map_err(|e| format!("failed to write membership snapshot: {e}"))?;
 
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
