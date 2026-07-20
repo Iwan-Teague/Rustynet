@@ -185,7 +185,6 @@ fn broad_allow_policy() -> ContextualPolicySet {
 
 fn trust_ok() -> TrustEvidence {
     TrustEvidence {
-        tls13_valid: true,
         signed_control_valid: true,
         signed_data_age_secs: 20,
         clock_skew_secs: 10,

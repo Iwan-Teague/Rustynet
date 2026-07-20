@@ -268,7 +268,7 @@ fn trust_issue(
 ) -> Result<String, String> {
     let signing_key = load_signing_key(&signing_key_path, &signing_key_passphrase_path)?;
     let payload = format!(
-        "version=2\ntls13_valid=true\nsigned_control_valid=true\nsigned_data_age_secs=0\nclock_skew_secs=0\nupdated_at_unix={updated_at_unix}\nnonce={nonce}\n"
+        "version=3\nsigned_control_valid=true\nsigned_data_age_secs=0\nclock_skew_secs=0\nupdated_at_unix={updated_at_unix}\nnonce={nonce}\n"
     );
     let signature = signing_key.sign(payload.as_bytes());
     write_text_file(

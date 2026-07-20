@@ -8072,7 +8072,7 @@ fn execute_trust(command: TrustCommand) -> Result<String, String> {
         } => {
             let signing_key = load_signing_key(&signing_key_path, &signing_key_passphrase_path)?;
             let payload = format!(
-                "version=2\ntls13_valid=true\nsigned_control_valid=true\nsigned_data_age_secs=0\nclock_skew_secs=0\nupdated_at_unix={updated_at_unix}\nnonce={nonce}\n"
+                "version=3\nsigned_control_valid=true\nsigned_data_age_secs=0\nclock_skew_secs=0\nupdated_at_unix={updated_at_unix}\nnonce={nonce}\n"
             );
             let signature = signing_key.sign(payload.as_bytes());
             let body = format!("{payload}signature={}\n", hex_bytes(&signature.to_bytes()));
@@ -8119,10 +8119,9 @@ fn execute_trust_verify(
         max_clock_skew_secs,
     )?;
     Ok(format!(
-        "trust verification passed: updated_at_unix={} nonce={} tls13_valid={} signed_control_valid={} signed_data_age_secs={} clock_skew_secs={} payload_digest_sha256={}",
+        "trust verification passed: updated_at_unix={} nonce={} signed_control_valid={} signed_data_age_secs={} clock_skew_secs={} payload_digest_sha256={}",
         report.updated_at_unix,
         report.nonce,
-        report.tls13_valid,
         report.signed_control_valid,
         report.signed_data_age_secs,
         report.clock_skew_secs,
