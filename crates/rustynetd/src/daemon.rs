@@ -3692,19 +3692,20 @@ struct DaemonRuntime {
     exit_port_forward_last_error: Option<String>,
     #[cfg(target_os = "linux")]
     exit_port_forward_lease: Option<ExitPortForwardLease>,
-    // D2.5 — peer-distributed signed-bundle gossip. Direct fields
-    // for the local sequence counter and the per-source replay
-    // watermark (mirroring the user spec verbatim), plus the
-    // encapsulated runtime that owns the signing key, the registered
-    // peer routing entries, and the spool I/O. The wrapping
-    // `Option<GossipNode>` is `None` when the daemon is launched
-    // without a configured gossip signing key — fail-closed default
-    // so production paths that haven't been migrated yet are
+    // D2.5 — peer-distributed signed-bundle gossip. The
+    // encapsulated runtime owns the signing key, the registered
+    // peer routing entries, the spool I/O, and the canonical gossip
+    // state (the spec's `gossip_sequence`, `seen_gossip_sequences`,
+    // `last_minted_bundle`, and `next_gossip_mint_at` all live on
+    // `GossipNode` — `DaemonRuntime` used to keep manually-resynced
+    // shadow copies of those four fields, but they had zero readers
+    // and were deleted deliberately; if a status/IPC read is wanted
+    // later, add an accessor delegating to
+    // `self.gossip_node.as_ref()` rather than re-growing a mirror).
+    // The wrapping `Option<GossipNode>` is `None` when the daemon is
+    // launched without a configured gossip signing key — fail-closed
+    // default so production paths that haven't been migrated yet are
     // unaffected.
-    gossip_sequence: u64,
-    seen_gossip_sequences: crate::peer_gossip::SeenSequenceState,
-    last_minted_bundle: Option<crate::peer_gossip::GossipBundle>,
-    next_gossip_mint_at: Option<Instant>,
     gossip_node: Option<crate::gossip_runtime::GossipNode>,
     gossip_transport: Option<crate::gossip_transport::GossipTransport>,
     /// D2.7 — paths into which the enrollment-token IPC handler
@@ -4088,10 +4089,6 @@ impl DaemonRuntime {
             exit_port_forward_last_error: None,
             #[cfg(target_os = "linux")]
             exit_port_forward_lease: None,
-            gossip_sequence: 0,
-            seen_gossip_sequences: crate::peer_gossip::SeenSequenceState::new(),
-            last_minted_bundle: None,
-            next_gossip_mint_at: None,
             // D2.5: the runtime fields are wired in by
             // `attach_gossip_runtime`; we leave them None at
             // construction so daemon paths that haven't been
@@ -5153,10 +5150,6 @@ impl DaemonRuntime {
         node: crate::gossip_runtime::GossipNode,
         transport: crate::gossip_transport::GossipTransport,
     ) {
-        self.gossip_sequence = node.gossip_sequence;
-        self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
-        self.last_minted_bundle = node.last_minted_bundle.clone();
-        self.next_gossip_mint_at = node.next_gossip_mint_at;
         self.gossip_node = Some(node);
         self.gossip_transport = Some(transport);
     }
@@ -5195,13 +5188,6 @@ impl DaemonRuntime {
                 }
             }
         }
-        // Mirror the canonical state back onto DaemonRuntime so
-        // status queries and other call sites that read these
-        // fields see the latest values.
-        self.gossip_sequence = node.gossip_sequence;
-        self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
-        self.last_minted_bundle = node.last_minted_bundle.clone();
-        self.next_gossip_mint_at = node.next_gossip_mint_at;
     }
 
     /// Periodic hook: if the local CandidateSet has changed since
@@ -5229,10 +5215,6 @@ impl DaemonRuntime {
                 log::warn!("gossip_mint_failed reason={err}");
             }
         }
-        self.gossip_sequence = node.gossip_sequence;
-        self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
-        self.last_minted_bundle = node.last_minted_bundle.clone();
-        self.next_gossip_mint_at = node.next_gossip_mint_at;
     }
 
     /// D2.3 follow-up / D11 port-mapping authority: own the router
@@ -7890,7 +7872,6 @@ impl DaemonRuntime {
                     .take(8)
                     .map(|b| format!("{b:02x}"))
                     .collect();
-                self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
                 Ok(format!(
                     "gossip accepted source={id_prefix} seq={}",
                     summary.sequence
@@ -7980,10 +7961,6 @@ impl DaemonRuntime {
                 "enrollment push address scope rejected".to_owned()
             }
         })?;
-        // Mirror the canonical state back so any subsequent IPC
-        // call sees the updated peer table.
-        self.gossip_sequence = node.gossip_sequence;
-        self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
         // 8-byte hex prefix of the enrollee's node id — fixed-vocab
         // identifier, no PII.
         let prefix: String = outcome
