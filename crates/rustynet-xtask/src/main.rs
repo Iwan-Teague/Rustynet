@@ -39,6 +39,15 @@
 //! workspace crate is affected, it falls back to the full workspace to
 //! stay safe. `fmt` always runs workspace-wide (it is cheap).
 //!
+//! The test stage executes through cargo-nextest (`cargo nextest run`,
+//! version pinned in `bootstrap_ci_tools`), which runs the workspace's
+//! ~100 test binaries against one global concurrent pool instead of
+//! `cargo test`'s one-binary-at-a-time scheduling. Retries are off
+//! (`--retries 0`) so a flaky test fails loudly instead of being masked.
+//! `cargo test --workspace --all-targets --all-features` remains the
+//! authoritative gate definition (CLAUDE.md §7); nextest is only the
+//! runner this tooling uses.
+//!
 //! Per-stage timeouts (seconds) are overridable via env:
 //!   XTASK_FMT_TIMEOUT (default 120)
 //!   XTASK_CHECK_TIMEOUT (default 1200 — stage only runs under --with-check)
@@ -66,6 +75,12 @@ use nix::unistd::Pid;
 const TIMEOUT_EXIT_CODE: i32 = 124;
 /// Lines of tee'd output retained for the failure/timeout report.
 const TAIL_LINES: usize = 40;
+/// The cargo-nextest version the repo pins (BLD-2). Keep in sync with
+/// `PINNED_NEXTEST_VERSION` in `rustynet-cli/src/bin/bootstrap_ci_tools.rs`
+/// and the inline Windows-leg pin in `.github/workflows/cross-platform-ci.yml`.
+/// 0.9.114 is the newest nextest whose MSRV (1.88) the pinned security
+/// toolchain (1.88.0) can compile.
+const PINNED_NEXTEST_VERSION: &str = "0.9.114";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -190,16 +205,41 @@ fn run_gates(rest: &[String]) -> i32 {
         },
     });
     if !skip_test {
+        // The test stage executes through cargo-nextest (BLD-2): the workspace
+        // is ~100 small test binaries and `cargo test` runs them strictly one
+        // at a time, while nextest schedules them against one global concurrent
+        // pool. `cargo test --workspace --all-targets --all-features` remains
+        // the authoritative gate definition (CLAUDE.md §7); nextest is the
+        // runner this tooling uses. `--retries 0` is nextest's default, but it
+        // is passed explicitly so a future nextest config file can never
+        // silently enable flaky-test retries (FAIL-LOUD: a retry would mask a
+        // real regression). Fail fast here — before ~20min of fmt/check/clippy
+        // — if the runner is missing, with the pinned install command.
+        if !cargo_nextest_available() {
+            eprintln!(
+                "xtask: cargo-nextest is required for the test stage but is not installed.\n\
+                 install it with: cargo install cargo-nextest --locked --version {PINNED_NEXTEST_VERSION}\n\
+                 (CI installs it via scripts/ci/bootstrap_ci_tools.sh; `cargo test` remains\n\
+                 the authoritative gate definition and can still be run by hand.)"
+            );
+            return 2;
+        }
         stages.push(Stage {
             label: "test",
             // The full --all-targets workspace suite (compile + run) is ~48min
-            // warm and tips past 60min on a cold cache, so 3600 was too tight —
-            // a slightly-slow run had the whole process group killed mid-suite
-            // (the binary "Running" at the cutoff, e.g. the 0-test
-            // real_wireguard_exitnode_e2e harness, looked like the culprit but
-            // wasn't). 5400 (90min) gives headroom while still catching a hang.
+            // warm and tips past 60min on a cold cache under `cargo test`, so
+            // 3600 was too tight — a slightly-slow run had the whole process
+            // group killed mid-suite (the binary "Running" at the cutoff, e.g.
+            // the 0-test real_wireguard_exitnode_e2e harness, looked like the
+            // culprit but wasn't). 5400 (90min) gives headroom while still
+            // catching a hang; nextest should only bring the wall-clock down.
             timeout: timeout_from_env("XTASK_TEST_TIMEOUT", 5400),
-            args: with_scope(&["test"]),
+            args: {
+                let mut a = with_scope(&["nextest", "run"]);
+                a.push("--retries".to_owned());
+                a.push("0".to_owned());
+                a
+            },
         });
     }
 
@@ -292,6 +332,21 @@ fn run_stage(stage: &Stage) -> (StageOutcome, u64) {
             (StageOutcome::Fail(1), elapsed)
         }
     }
+}
+
+/// True when `cargo nextest --version` runs successfully, i.e. the
+/// cargo-nextest subcommand binary is installed and on PATH. Probed the
+/// same way the test stage will invoke it (through `cargo`), so a pass
+/// here means the stage's spawn cannot fail on a missing runner.
+fn cargo_nextest_available() -> bool {
+    Command::new("cargo")
+        .args(["nextest", "--version"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Poll the child until it exits or the timeout elapses. On timeout,
