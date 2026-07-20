@@ -321,7 +321,6 @@ pub struct TransitionEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustEvidence {
-    pub tls13_valid: bool,
     pub signed_control_valid: bool,
     pub signed_data_age_secs: u64,
     pub clock_skew_secs: u64,
@@ -6114,9 +6113,6 @@ fn check_peer_membership_active(
 }
 
 fn validate_trust(policy: &TrustPolicy, evidence: TrustEvidence) -> Result<(), Phase10Error> {
-    if !evidence.tls13_valid {
-        return Err(Phase10Error::TrustRejected("tls13_not_valid"));
-    }
     if !evidence.signed_control_valid {
         return Err(Phase10Error::TrustRejected("signed_control_invalid"));
     }
@@ -7821,7 +7817,6 @@ mod tests {
 
     fn trust_ok() -> TrustEvidence {
         TrustEvidence {
-            tls13_valid: true,
             signed_control_valid: true,
             signed_data_age_secs: 20,
             clock_skew_secs: 10,
@@ -8159,7 +8154,7 @@ mod tests {
         );
 
         let err = controller.establish_control_trust(TrustEvidence {
-            tls13_valid: false,
+            signed_control_valid: false,
             ..trust_ok()
         });
         assert!(matches!(err, Err(Phase10Error::TrustRejected(_))));
