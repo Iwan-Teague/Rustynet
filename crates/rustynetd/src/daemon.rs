@@ -29127,6 +29127,227 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    fn build_node_membership_record(
+        state: &MembershipState,
+        operation: rustynet_control::membership::MembershipOperation,
+        target: &str,
+        update_id: &str,
+        now_unix: u64,
+    ) -> rustynet_control::membership::MembershipUpdateRecord {
+        use rustynet_control::membership::{MembershipUpdateRecord, preview_next_state};
+        let next = preview_next_state(state, &operation, now_unix).expect("preview next state");
+        MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: update_id.to_owned(),
+            operation,
+            target: target.to_owned(),
+            prev_state_root: state.state_root_hex().expect("state root"),
+            new_state_root: next.state_root_hex().expect("next root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: now_unix,
+            expires_at_unix: now_unix + 600,
+            reason_code: "test-status-change".to_owned(),
+            policy_context: None,
+        }
+    }
+
+    #[test]
+    fn membership_apply_via_ipc_revokes_managed_peer_and_tears_down_tunnel() {
+        use crate::phase10::{ApplyOptions, TrustEvidence};
+        use rustynet_backend_api::{NodeId, PeerConfig, RuntimeContext, SocketEndpoint};
+        use rustynet_control::membership::MembershipOperation;
+
+        let test_dir = secure_test_dir("rustynetd-gap2-apply-revoke-teardown");
+        let (mut runtime, state, keys) = build_multi_approver_membership_runtime(&test_dir);
+        let now_unix = unix_now();
+
+        // Commit a second node through the signed apply path so the
+        // controller's membership directory lists it Active.
+        let add_record =
+            build_add_node_record(&state, "node-revokee", 22, "update-add-revokee", now_unix);
+        let signed_add = sign_record(
+            &add_record,
+            &[("owner-1", &keys[0]), ("guardian-1", &keys[1])],
+        );
+        let add_response = runtime.handle_command(encode_apply_command(&signed_add));
+        assert!(
+            add_response.ok,
+            "add apply must succeed: {}",
+            add_response.message
+        );
+
+        // Bring the peer under live controller management — the state a real
+        // daemon is in once the dataplane generation serving that peer has
+        // been applied.
+        let peer_id = NodeId::new("node-revokee").expect("node id should parse");
+        let peer = PeerConfig {
+            node_id: peer_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.10".parse().expect("ip should parse"),
+                port: 51820,
+            },
+            public_key: [22u8; 32],
+            allowed_ips: vec!["100.100.22.2/32".to_owned()],
+            persistent_keepalive_secs: None,
+        };
+        runtime
+            .controller
+            .apply_dataplane_generation(
+                TrustEvidence {
+                    tls13_valid: true,
+                    signed_control_valid: true,
+                    signed_data_age_secs: 20,
+                    clock_skew_secs: 10,
+                },
+                RuntimeContext {
+                    local_node: NodeId::new("daemon-local").expect("node id should parse"),
+                    interface_name: "rustynet0".to_owned(),
+                    mesh_cidr: "100.64.0.0/10".to_owned(),
+                    local_cidr: "100.64.0.1/32".to_owned(),
+                },
+                vec![peer],
+                Vec::new(),
+                ApplyOptions::default(),
+            )
+            .expect("dataplane generation apply must succeed");
+        assert!(
+            runtime.controller.managed_peer_ids().contains(&peer_id),
+            "peer must be managed before revocation"
+        );
+
+        // Revoke through the same signed apply path and assert the live
+        // tunnel is torn down as part of the apply, not at some later
+        // dataplane generation or restart.
+        let state_after_add = runtime
+            .membership_state
+            .clone()
+            .expect("membership state must refresh after add");
+        let revoke_record = build_node_membership_record(
+            &state_after_add,
+            MembershipOperation::RevokeNode {
+                node_id: "node-revokee".to_owned(),
+            },
+            "node-revokee",
+            "update-revoke-revokee",
+            now_unix,
+        );
+        let signed_revoke = sign_record(
+            &revoke_record,
+            &[("owner-1", &keys[0]), ("guardian-2", &keys[2])],
+        );
+        let revoke_response = runtime.handle_command(encode_apply_command(&signed_revoke));
+        assert!(
+            revoke_response.ok,
+            "revoke apply must succeed: {}",
+            revoke_response.message
+        );
+        assert!(
+            !runtime.controller.managed_peer_ids().contains(&peer_id),
+            "revoked peer must be removed from the live dataplane during membership apply"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn membership_apply_via_ipc_revocation_teardown_failure_returns_err() {
+        use crate::phase10::{ApplyOptions, TrustEvidence};
+        use rustynet_backend_api::{NodeId, PeerConfig, RuntimeContext, SocketEndpoint};
+        use rustynet_control::membership::MembershipOperation;
+
+        let test_dir = secure_test_dir("rustynetd-gap2-apply-revoke-failclosed");
+        let (mut runtime, state, keys) = build_multi_approver_membership_runtime(&test_dir);
+        let now_unix = unix_now();
+
+        // Add + manage a peer, then revoke it while the controller's
+        // teardown path is fault-injected to fail. The apply must surface
+        // the teardown failure as an error — a silent success would leave
+        // the revoked peer's live tunnel served with nobody alerted.
+        let add_record =
+            build_add_node_record(&state, "node-revokee", 22, "update-add-revokee", now_unix);
+        let signed_add = sign_record(
+            &add_record,
+            &[("owner-1", &keys[0]), ("guardian-1", &keys[1])],
+        );
+        let add_response = runtime.handle_command(encode_apply_command(&signed_add));
+        assert!(
+            add_response.ok,
+            "add apply must succeed: {}",
+            add_response.message
+        );
+
+        let peer_id = NodeId::new("node-revokee").expect("node id should parse");
+        let peer = PeerConfig {
+            node_id: peer_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.10".parse().expect("ip should parse"),
+                port: 51820,
+            },
+            public_key: [22u8; 32],
+            allowed_ips: vec!["100.100.22.2/32".to_owned()],
+            persistent_keepalive_secs: None,
+        };
+        runtime
+            .controller
+            .apply_dataplane_generation(
+                TrustEvidence {
+                    tls13_valid: true,
+                    signed_control_valid: true,
+                    signed_data_age_secs: 20,
+                    clock_skew_secs: 10,
+                },
+                RuntimeContext {
+                    local_node: NodeId::new("daemon-local").expect("node id should parse"),
+                    interface_name: "rustynet0".to_owned(),
+                    mesh_cidr: "100.64.0.0/10".to_owned(),
+                    local_cidr: "100.64.0.1/32".to_owned(),
+                },
+                vec![peer],
+                Vec::new(),
+                ApplyOptions::default(),
+            )
+            .expect("dataplane generation apply must succeed");
+        runtime.controller.fail_revocation_teardown_for_test();
+
+        let state_after_add = runtime
+            .membership_state
+            .clone()
+            .expect("membership state must refresh after add");
+        let revoke_record = build_node_membership_record(
+            &state_after_add,
+            MembershipOperation::RevokeNode {
+                node_id: "node-revokee".to_owned(),
+            },
+            "node-revokee",
+            "update-revoke-revokee",
+            now_unix,
+        );
+        let signed_revoke = sign_record(
+            &revoke_record,
+            &[("owner-1", &keys[0]), ("guardian-2", &keys[2])],
+        );
+        let revoke_response = runtime.handle_command(encode_apply_command(&signed_revoke));
+        assert!(
+            !revoke_response.ok,
+            "revocation teardown failure must fail the apply, not silently succeed"
+        );
+        assert!(
+            revoke_response
+                .message
+                .contains("revocation teardown failed"),
+            "error must name the teardown failure: {}",
+            revoke_response.message
+        );
+        assert!(
+            revoke_response.message.contains("node-revokee"),
+            "error must identify the affected node: {}",
+            revoke_response.message
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     #[test]
     fn membership_apply_via_ipc_rejects_sub_quorum_and_leaves_files_unchanged() {
         let test_dir = secure_test_dir("rustynetd-gap2-apply-subquorum");
