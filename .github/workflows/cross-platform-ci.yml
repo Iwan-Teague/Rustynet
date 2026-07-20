@@ -18,10 +18,13 @@ jobs:
         run: |
           RUSTYNET_CI_BOOTSTRAP_SYSTEM=0 ./scripts/ci/bootstrap_ci_tools.sh
       - name: Workspace validation
+        # clippy is the single compile-correctness + lint pass: it is rustc
+        # plus lint passes, so a separate `cargo check` here was a pure
+        # duplicate full compile (no shared incremental cache across the
+        # clippy wrapper).
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo check --workspace --all-targets --all-features --locked
           cargo test --workspace --all-targets --all-features --locked
       - name: Lab monitor standalone gates
         # rustynet-lab-monitor is EXCLUDED from the workspace (see root
@@ -47,10 +50,11 @@ jobs:
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
       - name: Workspace validation
+        # clippy is the single compile-correctness + lint pass (see the
+        # macOS leg's note); no separate `cargo check` duplicate.
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo check --workspace --all-targets --all-features --locked
           cargo test --workspace --all-targets --all-features --locked
       - name: Lab monitor standalone gates
         # Excluded from the workspace; gate it explicitly on the Linux leg
@@ -135,8 +139,10 @@ jobs:
             -p rustynet-local-security
           )
           cargo fmt "${PKGS[@]}" -- --check
+          # clippy doubles as the compile-correctness gate (rustc plus lint
+          # passes); a separate `cargo check` of the same package set was a
+          # pure duplicate compile.
           cargo clippy "${PKGS[@]}" --all-targets --all-features --locked -- -D warnings
-          cargo check "${PKGS[@]}" --all-targets --all-features --locked
           # --no-fail-fast: run EVERY package's test binary even after one fails,
           # so a single run surfaces the complete Windows failure set instead of
           # stopping at the first failing crate (Windows tests cannot be run
