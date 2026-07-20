@@ -8194,6 +8194,56 @@ impl DaemonRuntime {
         self.membership_directory = membership_directory_from_state(&next, &self.local_node_id);
         self.controller
             .set_membership(self.membership_directory.clone());
+        // Revocation enforcement (fail-closed): any node that flipped to a
+        // non-Active status — or was removed from membership entirely —
+        // must lose its live tunnel NOW, not at the next dataplane
+        // generation or daemon restart. `apply_revocation` removes the
+        // peer from the backend and the dataplane; without this a revoked
+        // peer's WireGuard session stays live indefinitely
+        // (Requirements §5 "key rotation and rapid revocation/offboarding",
+        // SecurityMinimumBar §3 control 2). Teardown failures are surfaced
+        // to the caller even though the signed state is already persisted:
+        // silent enforcement failure would leave the revoked peer served.
+        let new_epoch = next.epoch;
+        let mut revocation_failures: Vec<String> = Vec::new();
+        {
+            let new_status_by_id: BTreeMap<&str, MembershipNodeStatus> = next
+                .nodes
+                .iter()
+                .map(|node| (node.node_id.as_str(), node.status))
+                .collect();
+            for old_node in &state.nodes {
+                if old_node.node_id == self.local_node_id {
+                    continue;
+                }
+                let newly_revoked = match new_status_by_id.get(old_node.node_id.as_str()) {
+                    Some(new_status) => {
+                        old_node.status == MembershipNodeStatus::Active
+                            && *new_status != MembershipNodeStatus::Active
+                    }
+                    None => true,
+                };
+                if !newly_revoked {
+                    continue;
+                }
+                let peer_id = match NodeId::new(old_node.node_id.clone()) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        revocation_failures
+                            .push(format!("{}: unparseable node id: {err}", old_node.node_id));
+                        continue;
+                    }
+                };
+                // Only tear down peers the controller actually manages; a
+                // revoked node that never had a tunnel has nothing to sever.
+                if !self.controller.managed_peer_ids().contains(&peer_id) {
+                    continue;
+                }
+                if let Err(err) = self.controller.apply_revocation(&peer_id) {
+                    revocation_failures.push(format!("{}: {err}", old_node.node_id));
+                }
+            }
+        }
         self.membership_state = Some(next);
         // D13: a membership apply is the revocation path — refresh the
         // materialised service grants immediately. No verified
@@ -8201,6 +8251,12 @@ impl DaemonRuntime {
         // (`peers.v1`) keeps the last verified contents (see
         // `materialize_service_access_state`).
         self.materialize_service_access_state(None);
+        if !revocation_failures.is_empty() {
+            return Err(format!(
+                "membership update applied (epoch_new={new_epoch}) but revocation teardown failed for: {}",
+                revocation_failures.join(", ")
+            ));
+        }
         Ok(summary)
     }
 
