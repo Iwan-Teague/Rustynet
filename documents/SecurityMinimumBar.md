@@ -70,7 +70,11 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
   superseded state, and it passes every other check clean. Closing this needs
   a persistent, monotonic anti-rollback watermark independent of attestation
   freshness — a real design decision, deliberately not implemented
-  unreviewed. See the review trail doc above for the full finding.
+  unreviewed. See the review trail doc above for the full finding; the
+  investigation of what closing it requires — including that this codebase
+  already has an unwired, production-tested `MembershipWatermark` mechanism
+  in `rustynetd` built for exactly this property — is in
+  [`operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md`](./operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md).
 
   **Remaining adjacent gap (tracked separately, out of this control's
   scope):** the bundle-pull endpoint still authenticates the CLIENT with a
