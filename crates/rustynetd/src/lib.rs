@@ -57,6 +57,7 @@ pub mod macos_utun_helper_server;
 pub(crate) mod macos_utun_helper_unsafe;
 pub mod membership_revoke_audit;
 pub mod membership_signature_audit;
+pub mod path_mtu;
 pub mod perf;
 pub mod phase10;
 pub mod platform;

@@ -12,8 +12,8 @@ use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect};
 use zeroize::Zeroizing;
 
 use crate::linux_command::{
-    WireguardCommandOutput, WireguardCommandRunner, encode_wg_public_key_base64,
-    parse_peer_latest_handshake_unix, validate_listen_port,
+    SAFE_BRINGUP_TUNNEL_MTU, WireguardCommandOutput, WireguardCommandRunner,
+    encode_wg_public_key_base64, parse_peer_latest_handshake_unix, validate_listen_port,
 };
 
 pub const DEFAULT_WINDOWS_WIREGUARD_EXE_PATH: &str = r"C:\Program Files\WireGuard\wireguard.exe";
@@ -279,6 +279,14 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         rendered.push('\n');
         rendered.push_str("ListenPort = ");
         rendered.push_str(&self.listen_port.to_string());
+        rendered.push('\n');
+        // FIS-0027 Phase 2: pin the tunnel MTU explicitly instead of trusting
+        // the platform default, closing the never-set-MTU gap. The `MTU` key
+        // is the wireguard-windows-native mechanism (applied when the tunnel
+        // service creates the adapter) and — unlike an imperative
+        // `netsh ... store=active` — survives tunnel-service restarts.
+        rendered.push_str("MTU = ");
+        rendered.push_str(&SAFE_BRINGUP_TUNNEL_MTU.to_string());
         rendered.push('\n');
         rendered.push('\n');
 
@@ -1093,6 +1101,45 @@ mod tests {
         assert_eq!(
             recorded[1].1,
             vec!["show".to_owned(), "rustynet0".to_owned()]
+        );
+    }
+
+    #[test]
+    fn windows_backend_rendered_config_pins_safe_bringup_mtu_in_interface_section() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .configure_peer(sample_peer("peer-a"))
+            .expect("peer configure should work");
+
+        let written = fs::read_to_string(&config_path).expect("config should be written");
+        let expected_line = format!("MTU = {SAFE_BRINGUP_TUNNEL_MTU}");
+        let mtu_offset = written
+            .find(&expected_line)
+            .expect("rendered config must pin the safe bring-up MTU");
+        let peer_offset = written
+            .find("[Peer]")
+            .expect("rendered config must contain the configured peer");
+        assert!(
+            mtu_offset < peer_offset,
+            "MTU key must live in the [Interface] section; config: {written}"
         );
     }
 
