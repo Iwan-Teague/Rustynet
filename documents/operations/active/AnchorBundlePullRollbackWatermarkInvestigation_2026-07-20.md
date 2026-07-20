@@ -1,6 +1,18 @@
 # Investigation: Anchor Bundle-Pull Stale-Cache Rollback (§6 of AnchorBundlePullAttestationSecurityReview_2026-07-20.md)
 
-**Status: investigation only. No code written, no decision made. This is the input to that decision, not the decision itself.**
+**Status: IMPLEMENTED (2026-07-20, commit `e0cc8e5`, merged to `main`).** The recommended
+Candidate A design below (§4) was accepted and built essentially as specified: `MembershipWatermark`
+and its load/persist/replay-check functions moved from `rustynetd::daemon` into
+`rustynet_control::membership`, and `anchor pull-bundle` now consults and advances the same
+on-disk watermark file the daemon's own bootstrap/apply paths already maintain. Three tests
+(`pull_bundle_accepts_first_ever_pull_with_no_watermark_and_establishes_one`,
+`pull_bundle_rejects_epoch_regression_on_brand_new_device_after_first_watermark_established`,
+`pull_bundle_watermark_survives_output_deletion_but_not_watermark_deletion`) in
+`crates/rustynet-cli/src/main.rs` prove the TOFU case, the exact vulnerability's closure, and the
+honest residual limit from §5 respectively. Full gate suite (fmt, workspace clippy, full workspace
+test, audit, deny) passed before merge. `SecurityMinimumBar.md` control 2 updated accordingly. The
+rest of this document is kept as-written — the investigation and design reasoning that led to the
+fix, useful for anyone auditing the decision later — rather than rewritten in past tense.
 
 All line numbers below are from the `security/a4-membership-head-attestation` implementation
 (now merged to `main`, commit `1a786dc`) and were read directly against the code, not taken

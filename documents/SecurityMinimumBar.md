@@ -57,24 +57,32 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
   produced — recorded in
   [`operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md).
 
-  **Known gap — stale-cache rollback (High, unresolved, requires risk
-  acceptance per §2 before release):** epoch-regression protection above is
-  bounded by the client's OWN local cache, re-derived fresh on every pull and
-  discarded the moment it ages past the 7-day freshness window or is simply
-  absent. A brand-new device — the primary bundle-pull scenario — has no
-  cache at all, so the regression check is skipped entirely and the offered
-  snapshot is judged solely on its own embedded roster. Nothing binds an
-  attestation's signing timestamp to the real historical time of the epoch it
-  covers, so a holder of an old, already-revoked-in-later-epochs signing key
-  can mint a freshly-timestamped attestation resurrecting that old,
-  superseded state, and it passes every other check clean. Closing this needs
-  a persistent, monotonic anti-rollback watermark independent of attestation
-  freshness — a real design decision, deliberately not implemented
-  unreviewed. See the review trail doc above for the full finding; the
-  investigation of what closing it requires — including that this codebase
-  already has an unwired, production-tested `MembershipWatermark` mechanism
-  in `rustynetd` built for exactly this property — is in
-  [`operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md`](./operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md).
+  **Stale-cache rollback — CLOSED (2026-07-20).** Epoch-regression
+  protection previously read its floor fresh from the client's OWN local
+  cache on every pull, so a brand-new device (the primary bundle-pull
+  scenario) or one whose cache had aged past the freshness window skipped
+  the check entirely, letting a holder of an old, already-revoked signing
+  key resurrect a superseded epoch with a freshly-timestamped attestation.
+  Fixed by relocating `rustynetd`'s existing, already-production-tested
+  `MembershipWatermark` mechanism (persistent, monotonic, TOFU-on-absence —
+  previously wired only into the daemon's own bootstrap/apply paths) into
+  `rustynet_control::membership` and wiring `anchor pull-bundle` to consult
+  and advance the SAME on-disk watermark file the daemon already maintains,
+  independent of `--output`'s existence, freshness, or deletion. Enforcement
+  point: the `prior_identity` argument to `verify_attested_snapshot` is now
+  sourced from `load_membership_watermark`, not from `--output`.
+  Verification:
+  `pull_bundle_rejects_epoch_regression_on_brand_new_device_after_first_watermark_established`
+  (the exact vulnerability, reproduced and closed),
+  `pull_bundle_accepts_first_ever_pull_with_no_watermark_and_establishes_one`
+  (TOFU case), and
+  `pull_bundle_watermark_survives_output_deletion_but_not_watermark_deletion`
+  (the honest residual limit — deleting the watermark's own storage, not
+  just `--output`, is a real, acknowledged TOFU-reset boundary, pinned by
+  test rather than left implicit) in `crates/rustynet-cli/src/main.rs`.
+  Investigation, design rationale, and the full residual-risk discussion:
+  [`operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md`](./operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md)
+  and the review trail doc above.
 
   **Remaining adjacent gap (tracked separately, out of this control's
   scope):** the bundle-pull endpoint still authenticates the CLIENT with a
