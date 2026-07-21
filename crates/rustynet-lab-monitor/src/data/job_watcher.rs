@@ -132,11 +132,34 @@ fn find_running_jobs_with_live_processes(
                 continue;
             };
             match serde_json::from_str::<JobState>(&raw) {
+                // A live-lab run always records its report_dir. A job JSON with
+                // an empty report_dir is some OTHER tool's record that happens to
+                // live in the same state dir -- most commonly an OpenCode
+                // `edit-*` job written by the delegated-edit tier, which has no
+                // report_dir and no pid and is never transitioned out of
+                // `state:"running"` when abandoned. Adopting one as the active
+                // job made the monitor render a phantom RUNNING /
+                // WAITING-FOR-MANIFEST state on an idle host, and flip straight
+                // back to it the instant a real run finished (the stale pidless
+                // "running" record reads as alive via is_running's
+                // unwrap_or(true)). It can never be a displayable live-lab run
+                // regardless, so never treat one as active.
+                Ok(job) if job.report_dir.trim().is_empty() => continue,
                 Ok(job) => jobs.push(job),
                 Err(_) => continue,
             }
         }
     }
+
+    // A job JSON that still says "running" but whose report dir already carries
+    // a completion marker belongs to a run that has actually FINISHED (its owner
+    // never rewrote the state field -- an MCP labrun record, or an externally-
+    // launched run). is_running() trusts a pidless "running" record as alive
+    // indefinitely (unwrap_or(true)), so without this an old finished run
+    // re-surfaces as a phantom active run -- notably the instant a real run ends
+    // and leaves the scan, snapping the UI onto a months-old labrun instead of
+    // going idle. A run with a completion marker is never "running".
+    jobs.retain(|job| !has_completion_marker(&repo_root.join(&job.report_dir)));
 
     // Track which report dirs are already known, from job-state JSONs first
     // and growing as orphan/process-discovered ones are added below, so the
@@ -646,6 +669,98 @@ mod tests {
 
         assert_eq!(running.len(), 1, "{running:?}");
         assert_eq!(running[0].job_id, "labrun-good");
+    }
+
+    #[test]
+    fn an_edit_job_with_no_report_dir_is_never_adopted_as_a_live_lab_job() {
+        // Regression (phantom live-run): an OpenCode `edit-*` job written by the
+        // delegated-edit tier lives in the same state dir, has state:"running",
+        // no pid, and an empty report_dir. is_running()'s pid `unwrap_or(true)`
+        // reads a pidless "running" job as alive, so the monitor used to pick
+        // the newest such edit job as the active job and render a phantom
+        // RUNNING / WAITING-FOR-MANIFEST state -- on an idle host, and again the
+        // instant a real run finished and left the active scan.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = dir.path().join("state/deepseek-mcp-jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        // Abandoned edit job: running, no pid, no report_dir. Deliberately far
+        // newer than the real run so it would win the most-recent sort if it
+        // were ever eligible.
+        std::fs::write(
+            jobs_dir.join("edit-1784573455814-92435-4.json"),
+            r#"{"job_id":"edit-1784573455814-92435-4","state":"running","started_unix":9999999999,"area":"","report_dir":""}"#,
+        )
+        .expect("edit job json");
+        // A real, genuinely-running live-lab job sitting right next to it.
+        std::fs::write(
+            jobs_dir.join("labrun-real.json"),
+            format!(
+                r#"{{"job_id":"labrun-real","state":"running","started_unix":1,"area":"x","report_dir":"state/tracked","orchestrator_pid":{}}}"#,
+                std::process::id()
+            ),
+        )
+        .expect("real job json");
+
+        let running = find_running_jobs_with_live_processes(dir.path(), Vec::new()).expect("scan");
+
+        assert_eq!(
+            running.len(),
+            1,
+            "only the real live-lab job survives, not the pidless edit job: {running:?}"
+        );
+        assert_eq!(running[0].job_id, "labrun-real");
+    }
+
+    #[test]
+    fn an_idle_host_with_only_a_stale_edit_job_reports_no_active_job() {
+        // The exact phantom in isolation: the ONLY "running" record on the host
+        // is an abandoned pidless edit job. The scan must report idle (empty),
+        // never adopt it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = dir.path().join("state/deepseek-mcp-jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        std::fs::write(
+            jobs_dir.join("edit-abandoned.json"),
+            r#"{"job_id":"edit-abandoned","state":"running","started_unix":9999999999,"area":"","report_dir":""}"#,
+        )
+        .expect("edit job json");
+
+        let running = find_running_jobs_with_live_processes(dir.path(), Vec::new()).expect("scan");
+        assert!(
+            running.is_empty(),
+            "an abandoned edit job must not read as an active live-lab run: {running:?}"
+        );
+    }
+
+    #[test]
+    fn a_finished_run_whose_json_still_says_running_is_not_active() {
+        // Regression (phantom, second cause): an MCP labrun record (or any
+        // externally-launched run) can be left at state:"running" with no live
+        // pid after it finished -- is_running() reads it as alive forever. Its
+        // report dir carries a completion marker, so it must not be adopted as
+        // an active run; otherwise the UI snaps onto a months-old run the moment
+        // a real run ends, instead of going idle.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jobs_dir = dir.path().join("state/deepseek-mcp-jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("jobs dir");
+        let report = dir.path().join("state/finished-run");
+        std::fs::create_dir_all(report.join("orchestration")).expect("report dir");
+        std::fs::write(
+            report.join("orchestration/orchestrate_result.json"),
+            r#"{"overall_status":"fail"}"#,
+        )
+        .expect("completion marker");
+        std::fs::write(
+            jobs_dir.join("labrun-finished.json"),
+            r#"{"job_id":"labrun-finished","state":"running","started_unix":9999999999,"area":"x","report_dir":"state/finished-run"}"#,
+        )
+        .expect("finished job json");
+
+        let running = find_running_jobs_with_live_processes(dir.path(), Vec::new()).expect("scan");
+        assert!(
+            running.is_empty(),
+            "a finished run's stale running JSON must not read as active: {running:?}"
+        );
     }
 
     #[test]
