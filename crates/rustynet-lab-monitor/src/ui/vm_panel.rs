@@ -114,7 +114,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::DarkGray)
             };
             let alias_style = if selected {
-                alias_style.add_modifier(Modifier::BOLD).bg(Color::DarkGray)
+                // The selection background is DarkGray. An OFFLINE VM's alias fg
+                // is ALSO DarkGray, so a selected offline row would render its
+                // name DarkGray-on-DarkGray -- invisible. Since the cursor
+                // defaults to row 0 (frequently a stopped host-only VM), the
+                // selected VM's name routinely vanished. Lift the offline fg to
+                // Gray (still dimmer than an online White row, but readable on
+                // the highlight) so a selected row's name is never fg == bg.
+                let fg = if vm.ssh_ok { Color::White } else { Color::Gray };
+                Style::default()
+                    .fg(fg)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Color::DarkGray)
             } else {
                 alias_style
             };
@@ -360,5 +371,46 @@ mod tests {
         );
         assert_eq!(app.actual_role_for_vm("debian-headless-9"), "—");
         assert_eq!(app.run_use_for_vm("windows-utm-1"), "PREVIOUS");
+    }
+
+    #[test]
+    fn a_selected_offline_vm_alias_is_not_rendered_invisibly() {
+        // Regression: a selected row uses bg=DarkGray; an OFFLINE VM's alias fg
+        // was also DarkGray, so the selected offline row rendered its name
+        // DarkGray-on-DarkGray (invisible). The cursor defaults to row 0 --
+        // frequently a stopped host-only VM -- so the selected name vanished.
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.focused_panel = Panel::VmStatus;
+        app.selected_vm = 0;
+        app.vm_statuses = vec![VmStatus {
+            alias: "stopped-guest".into(),
+            ip: "-".into(),
+            platform: "unknown".into(),
+            ssh_ok: false,
+            power_state: "stopped".into(),
+            inventory_registered: true,
+            lab_readiness: LabReadiness {
+                state: LabReadinessState::Unknown,
+                detail: String::new(),
+            },
+        }];
+
+        let backend = TestBackend::new(150, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, f.area(), &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let data_row = 2;
+        let x = col_of(&buf, data_row, "stopped-guest").expect("selected alias is rendered");
+        assert_ne!(
+            buf[(x, data_row)].fg,
+            buf[(x, data_row)].bg,
+            "a selected offline VM's alias must not render fg == bg (invisible)"
+        );
+        assert_ne!(
+            buf[(x, data_row)].fg,
+            Color::DarkGray,
+            "selected offline alias fg must be lifted off the DarkGray selection bg"
+        );
     }
 }
