@@ -1555,33 +1555,8 @@ impl App {
             Err(err) => self.data_errors.push(format!("job state: {err}")),
         }
 
-        // Reload log for active stage, falling back to monitor stdout/stderr during launch.
-        if let Some(ref job) = self.active_job {
-            let report_dir = self.repo_root.join(&job.report_dir);
-            let mut loaded = false;
-            if let Some(ref stage) = self.active_stage
-                && let Ok(lines) = crate::data::log_tailer::summarize_stage_lines(
-                    &self.repo_root,
-                    &report_dir,
-                    stage,
-                )
-                && !lines.is_empty()
-            {
-                self.log_lines = lines;
-                loaded = true;
-            }
-            if !loaded {
-                for name in ["monitor_stderr.log", "monitor_stdout.log"] {
-                    let log_path = report_dir.join(name);
-                    if let Ok(lines) = crate::data::log_tailer::tail_lines(&log_path, 200)
-                        && !lines.is_empty()
-                    {
-                        self.log_lines = lines;
-                        break;
-                    }
-                }
-            }
-        }
+        // Reload the LOG pane for the active stage (see `reload_active_stage_log`).
+        self.reload_active_stage_log();
 
         // Active lab: 5s reachability freshness. Idle: 30s to avoid needless
         // LAN traffic. Stage state remains on the independent 2s cadence.
@@ -1749,6 +1724,46 @@ impl App {
         self.agents_view = crate::ui::agents_panel::AgentsView::load(&self.repo_root);
         if self.active_job.is_none() {
             self.advance_if_current_target_proven();
+        }
+    }
+
+    /// Refresh the LOG pane for the active stage: its own log first, then the
+    /// run's `monitor_stdout/stderr` during launch, then a stage-keyed
+    /// placeholder. The placeholder is load-bearing: `self.log_lines` doubles as
+    /// the buffer for transient action messages (the drain confirmation set by
+    /// `handle_stop_after_current`, the "VM roles locked to active live lab"
+    /// notices, ...). When the active stage has not written its log yet and there
+    /// is no monitor fallback, an unrelated stale message would otherwise linger
+    /// in the LOG pane labelled as that stage's output. Show what the pane is
+    /// actually waiting on instead.
+    fn reload_active_stage_log(&mut self) {
+        let Some(job) = self.active_job.as_ref() else {
+            return;
+        };
+        let report_dir = self.repo_root.join(&job.report_dir);
+        let mut loaded = false;
+        if let Some(ref stage) = self.active_stage
+            && let Ok(lines) =
+                crate::data::log_tailer::summarize_stage_lines(&self.repo_root, &report_dir, stage)
+            && !lines.is_empty()
+        {
+            self.log_lines = lines;
+            loaded = true;
+        }
+        if !loaded {
+            for name in ["monitor_stderr.log", "monitor_stdout.log"] {
+                let log_path = report_dir.join(name);
+                if let Ok(lines) = crate::data::log_tailer::tail_lines(&log_path, 200)
+                    && !lines.is_empty()
+                {
+                    self.log_lines = lines;
+                    loaded = true;
+                    break;
+                }
+            }
+        }
+        if !loaded && let Some(ref stage) = self.active_stage {
+            self.log_lines = vec![format!("waiting for {stage} output…")];
         }
     }
 
@@ -5438,6 +5453,101 @@ mod tests {
                 ("BOOT", "0s".to_owned()),
                 ("LAB", "0s".to_owned())
             ]
+        );
+    }
+
+    fn job_with_report_dir(report_dir: &str) -> JobState {
+        JobState {
+            job_id: "labrun-log-test".to_owned(),
+            state: "running".to_owned(),
+            pid: Some(1),
+            started_unix: Some(1),
+            area: "test".to_owned(),
+            report_dir: report_dir.to_owned(),
+            request_args: None,
+        }
+    }
+
+    // Finding #5: `self.log_lines` doubles as the transient action-message buffer
+    // (drain confirmation, "VM roles locked", ...) AND the active-stage log tail.
+    // When the active stage has not written its log yet, a stale action message
+    // must not linger in the LOG pane masquerading as that stage's output.
+    #[test]
+    fn active_stage_with_no_log_shows_a_waiting_placeholder_not_a_stale_action_message() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state/live-lab-test/logs")).unwrap();
+
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        app.active_job = Some(job_with_report_dir("state/live-lab-test"));
+        app.active_stage = Some("live_managed_dns_validation".to_owned());
+        // Exactly what leaked into the LOG pane live: the drain confirmation left
+        // behind by a prior `d` keypress (`handle_stop_after_current`).
+        app.log_lines = vec![
+            "stop-after-current requested".to_owned(),
+            "current live lab will finish; loop exits before next patch/relaunch".to_owned(),
+        ];
+
+        app.reload_active_stage_log();
+
+        assert_eq!(
+            app.log_lines,
+            vec!["waiting for live_managed_dns_validation output…".to_owned()],
+            "an active stage with no log yet must show a stage-keyed placeholder, \
+             not retain an unrelated stale action message"
+        );
+    }
+
+    // The monitor stdout/stderr launch fallback must still win over the
+    // placeholder -- otherwise pre-first-stage launch output would be hidden.
+    #[test]
+    fn monitor_stderr_launch_fallback_wins_over_the_waiting_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_dir = dir.path().join("state/live-lab-test");
+        std::fs::create_dir_all(report_dir.join("logs")).unwrap();
+        std::fs::write(
+            report_dir.join("monitor_stderr.log"),
+            "booting orchestrator\n",
+        )
+        .unwrap();
+
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        app.active_job = Some(job_with_report_dir("state/live-lab-test"));
+        app.active_stage = Some("bootstrap_hosts".to_owned());
+        app.log_lines = vec!["stale".to_owned()];
+
+        app.reload_active_stage_log();
+
+        assert!(
+            app.log_lines
+                .iter()
+                .any(|l| l.contains("booting orchestrator")),
+            "monitor_stderr fallback must load: {:?}",
+            app.log_lines
+        );
+        assert!(
+            !app.log_lines.iter().any(|l| l.contains("waiting for")),
+            "placeholder must not clobber a real monitor fallback: {:?}",
+            app.log_lines
+        );
+    }
+
+    // Guard: without an active stage (pure launch / idle), the shared buffer is
+    // left untouched -- the placeholder is keyed to a stage and must not fire.
+    #[test]
+    fn no_active_stage_leaves_the_log_buffer_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state/live-lab-test")).unwrap();
+
+        let mut app = App::new(dir.path().to_path_buf()).expect("app");
+        app.active_job = Some(job_with_report_dir("state/live-lab-test"));
+        app.active_stage = None;
+        app.log_lines = vec!["OpenCode main agent patching".to_owned()];
+
+        app.reload_active_stage_log();
+
+        assert_eq!(
+            app.log_lines,
+            vec!["OpenCode main agent patching".to_owned()]
         );
     }
 }
