@@ -15,7 +15,8 @@ pub use in_memory::{
     WireguardBackend,
 };
 pub use linux_command::{
-    LinuxCommandRunner, LinuxWireguardBackend, WireguardCommandOutput, WireguardCommandRunner,
+    LinuxCommandRunner, LinuxWireguardBackend, SAFE_BRINGUP_TUNNEL_MTU, WireguardCommandOutput,
+    WireguardCommandRunner,
 };
 pub use macos_command::MacosWireguardBackend;
 pub use udp_offload_probe::{

@@ -1884,6 +1884,22 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
         }
         ["link", "set", "up", "dev", interface] if is_interface_name(interface) => Ok(()),
         ["link", "set", "down", "dev", interface] if is_interface_name(interface) => Ok(()),
+        // FIS-0027 Phase 2 (fef40bb) made the Linux WireGuard bring-up set a safe
+        // tunnel MTU (`ip link set mtu <SAFE_BRINGUP_TUNNEL_MTU> dev <iface>`)
+        // right after interface creation. Match the value as an EXACT LITERAL,
+        // not any numeric MTU: an allowlist entry is a capability grant to
+        // whatever code might one day call the helper, so widening it to any u16
+        // would hand a compromised daemon a real (if narrow) capability for zero
+        // present-day benefit -- the only caller sends this one constant today.
+        // When FIS-0027 Phase 3 replaces the static value with a dynamically
+        // measured per-path MTU, widen this to a validated bounded range AT THAT
+        // TIME, not now.
+        ["link", "set", "mtu", mtu, "dev", interface]
+            if *mtu == rustynet_backend_wireguard::SAFE_BRINGUP_TUNNEL_MTU.to_string()
+                && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
         ["link", "del", "dev", interface] if is_interface_name(interface) => Ok(()),
         ["address", "add", cidr, "dev", interface]
             if is_cidr_token(cidr) && is_interface_name(interface) =>
@@ -3170,6 +3186,42 @@ mod tests {
         )
         .expect_err("non-IP endpoint route get target must be rejected");
         assert!(err.contains("unsupported route argument schema"));
+    }
+
+    #[test]
+    fn validate_request_accepts_the_fis0027_bring_up_mtu_set_but_only_the_exact_literal() {
+        // Regression coverage for the live-lab-verified enforce_baseline_runtime
+        // failure: FIS-0027 Phase 2 (fef40bb) made the Linux WireGuard bring-up
+        // run `ip link set mtu <SAFE_BRINGUP_TUNNEL_MTU> dev <iface>`, but the
+        // schema was never added to validate_ip_args, so the helper rejected it
+        // on every Linux host -> reconcile-failure cascade -> rustynet0 never
+        // appeared -> the managed-DNS unit's 20s wait timed out.
+
+        // The exact schema linux_command.rs sends must be accepted.
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["link", "set", "mtu", "1420", "dev", "rustynet0"],
+        )
+        .expect("the bring-up MTU-set schema linux_command sends must be accepted");
+
+        // A DIFFERENT, still-valid u16 MTU must be REJECTED -- this is the
+        // assertion that proves the entry is an exact literal match on
+        // SAFE_BRINGUP_TUNNEL_MTU rather than a lazy `parse::<u16>().is_ok()`
+        // that would over-grant the capability.
+        let err = validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["link", "set", "mtu", "9999", "dev", "rustynet0"],
+        )
+        .expect_err("any MTU other than the exact bring-up constant must be rejected");
+        assert!(err.contains("unsupported ip argument schema"));
+
+        // A non-interface-name `dev` target must also be rejected.
+        let err = validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["link", "set", "mtu", "1420", "dev", "rustynet0;sudo"],
+        )
+        .expect_err("a non-interface-name dev target must be rejected");
+        assert!(err.contains("unsupported ip argument schema"));
     }
 
     #[test]
