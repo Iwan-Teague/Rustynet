@@ -506,29 +506,43 @@ impl App {
         Ok(app)
     }
 
-    pub fn stage_timer_labels(&self) -> Vec<(&'static str, String)> {
+    /// Finish-of-phase wall-clock labels for the three group timers
+    /// (PRE / BOOTSTRAP / LIVE LAB), e.g. `"14:32"` -- the estimated local clock
+    /// time each phase COMPLETES, rather than a minutes-remaining countdown.
+    /// The phases run in series, so the labels are cumulative: BOOTSTRAP's
+    /// finish already includes the PRE remainder ahead of it, and LIVE LAB's
+    /// finish is therefore the estimated OVERALL run-completion time. A phase
+    /// with no pending work reads `"done"`; the group holding an over-budget
+    /// active stage reads `"OVERDUE +Xm"` (no reliable finish time while a stage
+    /// is stuck). `now` is injected so the mapping is deterministic under test.
+    pub fn stage_finish_labels(
+        &self,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> Vec<(&'static str, String)> {
         if self.pipeline_phase_index() >= 4 {
             return ["PRE", "BOOTSTRAP", "LIVE LAB"]
                 .into_iter()
-                .map(|name| (timer_short_name(name), "0s".to_owned()))
+                .map(|name| (timer_short_name(name), "done".to_owned()))
                 .collect();
         }
         let overdue_secs = self.active_stage_overdue_secs();
+        let mut cumulative_secs: u64 = 0;
         ["PRE", "BOOTSTRAP", "LIVE LAB"]
             .into_iter()
             .map(|name| {
+                let group_remaining = self.estimated_group_remaining_secs(name);
+                cumulative_secs = cumulative_secs.saturating_add(group_remaining);
                 let label = match overdue_secs {
                     // Once the active stage has genuinely run past its own
-                    // estimated budget, say so explicitly instead of the
-                    // group total, whose active-stage term was otherwise
-                    // floored at a flat 60s no matter how far past the
-                    // estimate elapsed climbed -- silently showing "~1m
-                    // left" forever on a stage stuck for 20+ minutes past
-                    // its budget.
+                    // estimated budget, say so explicitly instead of quoting a
+                    // finish time built on a remainder we no longer trust.
                     Some(over) if self.group_contains_active_stage(name) => {
                         format!("OVERDUE +{}", format_duration(over))
                     }
-                    _ => format_duration(self.estimated_group_remaining_secs(name)),
+                    // No pending work in this phase -- it is (or is treated as)
+                    // complete, so a finish clock time would be in the past.
+                    _ if group_remaining == 0 => "done".to_owned(),
+                    _ => finish_clock(now, cumulative_secs),
                 };
                 (timer_short_name(name), label)
             })
@@ -3020,6 +3034,14 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+/// Local wall-clock `"HH:MM"` for `now + secs`, used by the phase-finish timers
+/// (see `App::stage_finish_labels`). `secs` is an ETA remainder, always small
+/// enough that the `i64` cast is lossless.
+fn finish_clock(now: chrono::DateTime<chrono::Local>, secs: u64) -> String {
+    let finish = now + chrono::Duration::seconds(secs as i64);
+    finish.format("%H:%M").to_string()
+}
+
 fn human_age(secs: u64) -> String {
     match secs {
         0..=4 => "now".to_owned(),
@@ -5234,10 +5256,8 @@ mod tests {
             },
         ];
 
-        let labels = app.stage_timer_labels();
-
-        assert_eq!(labels[0], ("PRE", "0s".to_owned()));
-        assert_ne!(labels[1].1, "0s");
+        assert_eq!(app.estimated_group_remaining_secs("PRE"), 0);
+        assert!(app.estimated_group_remaining_secs("BOOTSTRAP") > 0);
     }
 
     #[test]
@@ -5247,15 +5267,13 @@ mod tests {
         app.config.macos_promote_exit = true;
         app.config.skip_linux_live_suite = true;
 
-        let labels = app.stage_timer_labels();
-
         // 21m, not the pre-catalog-expansion 18m: validate_macos_key_custody
         // is now a real, always-listed LIVE LAB stage (previously missing
         // from macos_live_lab_catalog entirely), and it's enabled here via
         // macos_promote_exit -> wants_macos().
         // 21m of role-cell stages + the 13 macOS audit stages (180s
-        // defaults each) that really run on a macOS-guest lab: 1h0m.
-        assert_eq!(labels[2], ("LAB", "1h0m".to_owned()));
+        // defaults each) that really run on a macOS-guest lab: 1h0m = 3600s.
+        assert_eq!(app.estimated_group_remaining_secs("LIVE LAB"), 3600);
     }
 
     #[test]
@@ -5270,11 +5288,11 @@ mod tests {
         app.stage_timings.clear();
         app.config.area = "Linux exit".to_owned();
         app.config.macos_promote_exit = false;
-        let linux_only_boot = app.stage_timer_labels()[1].1.clone();
+        let linux_only_boot = app.estimated_group_remaining_secs("BOOTSTRAP");
 
         app.config.area = "macOS exit".to_owned();
         app.config.macos_promote_exit = true;
-        let with_macos_boot = app.stage_timer_labels()[1].1.clone();
+        let with_macos_boot = app.estimated_group_remaining_secs("BOOTSTRAP");
 
         assert_ne!(
             linux_only_boot, with_macos_boot,
@@ -5312,11 +5330,9 @@ mod tests {
             },
         ];
 
-        let labels = app.stage_timer_labels();
-
-        assert_ne!(labels[0].1, "0s");
-        assert_ne!(labels[1].1, "0s");
-        assert_ne!(labels[2].1, "0s");
+        assert!(app.estimated_group_remaining_secs("PRE") > 0);
+        assert!(app.estimated_group_remaining_secs("BOOTSTRAP") > 0);
+        assert!(app.estimated_group_remaining_secs("LIVE LAB") > 0);
     }
 
     #[test]
@@ -5371,7 +5387,7 @@ mod tests {
         app.active_stage_start =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
 
-        let labels = app.stage_timer_labels();
+        let labels = app.stage_finish_labels(fixed_now());
 
         assert!(
             labels[0].1.starts_with("OVERDUE"),
@@ -5433,7 +5449,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_timers_are_zero_while_acting_on_report() {
+    fn stage_timers_show_done_while_acting_on_report() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
         app.active_job = Some(JobState {
             job_id: "monitor-1".to_owned(),
@@ -5446,14 +5462,26 @@ mod tests {
         });
         app.log_lines = vec!["OpenCode main agent patching".to_owned()];
 
+        // Past the run's stages (acting on the report) -> no phase has pending
+        // work, so every finish-time timer reads "done", never a clock time.
         assert_eq!(
-            app.stage_timer_labels(),
+            app.stage_finish_labels(fixed_now()),
             vec![
-                ("PRE", "0s".to_owned()),
-                ("BOOT", "0s".to_owned()),
-                ("LAB", "0s".to_owned())
+                ("PRE", "done".to_owned()),
+                ("BOOT", "done".to_owned()),
+                ("LAB", "done".to_owned())
             ]
         );
+    }
+
+    // A fixed, unambiguous local wall-clock (12:00:00) so finish-time labels are
+    // deterministic under test: now + N seconds maps to a known HH:MM.
+    fn fixed_now() -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone;
+        chrono::Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("unambiguous fixed local time")
     }
 
     fn job_with_report_dir(report_dir: &str) -> JobState {
@@ -5548,6 +5576,40 @@ mod tests {
         assert_eq!(
             app.log_lines,
             vec!["OpenCode main agent patching".to_owned()]
+        );
+    }
+
+    #[test]
+    fn finish_clock_maps_now_plus_secs_to_local_hh_mm() {
+        let now = fixed_now(); // 12:00:00 local
+        assert_eq!(finish_clock(now, 0), "12:00");
+        assert_eq!(finish_clock(now, 90), "12:01"); // 1m30s past 12:00
+        assert_eq!(finish_clock(now, 60 * 32), "12:32");
+        assert_eq!(finish_clock(now, 3600), "13:00");
+        assert_eq!(finish_clock(now, 3600 + 60 * 5), "13:05");
+    }
+
+    #[test]
+    fn stage_finish_labels_are_cumulative_and_reach_a_run_finish_time() {
+        // Fresh run, nothing completed: all three phases have pending work, so
+        // each timer is a clock time. The phases run in series, so the labels
+        // are cumulative and non-decreasing -- LIVE LAB is the overall finish.
+        let app = App::new(PathBuf::from("/tmp")).expect("app");
+        let labels = app.stage_finish_labels(fixed_now());
+        let times: Vec<&String> = labels.iter().map(|(_, t)| t).collect();
+        for t in &times {
+            assert!(
+                t.len() == 5 && t.as_bytes()[2] == b':',
+                "expected an HH:MM finish time, got {t:?}"
+            );
+        }
+        assert!(
+            times[0] <= times[1],
+            "PRE finish must be <= BOOTSTRAP: {times:?}"
+        );
+        assert!(
+            times[1] <= times[2],
+            "BOOTSTRAP finish must be <= LIVE LAB (the overall run finish): {times:?}"
         );
     }
 }
