@@ -549,6 +549,31 @@ impl App {
             .collect()
     }
 
+    /// Wall-clock seconds the active run has been going, or `None` when no run
+    /// is currently running or its start time is unknown. The start is the
+    /// run's recorded `report_state.json` `created_at_unix` (surfaced as
+    /// `JobState::started_unix`); `now_unix` is injected so the elapsed value is
+    /// deterministic under test.
+    fn run_elapsed_secs(&self, now_unix: u64) -> Option<u64> {
+        let job = self.active_job.as_ref()?;
+        if job.state != "running" {
+            return None;
+        }
+        let started = job.started_unix?;
+        Some(now_unix.saturating_sub(started))
+    }
+
+    /// Formatted "how long this run has been going" label (e.g. `"12m34s"`) for
+    /// the header run timer, or `None` when no run is running. Reads the real
+    /// wall clock; the underlying elapsed math is tested via `run_elapsed_secs`.
+    pub fn run_elapsed_label(&self) -> Option<String> {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        self.run_elapsed_secs(now_unix).map(format_elapsed)
+    }
+
     /// How far past its own estimated budget the currently active stage has
     /// run, or `None` while it's within budget (or there's no active stage /
     /// no elapsed-time signal yet).
@@ -3040,6 +3065,21 @@ fn format_duration(secs: u64) -> String {
 fn finish_clock(now: chrono::DateTime<chrono::Local>, secs: u64) -> String {
     let finish = now + chrono::Duration::seconds(secs as i64);
     finish.format("%H:%M").to_string()
+}
+
+/// Elapsed-duration label for the header run timer, e.g. `"45s"`, `"12m34s"`,
+/// `"1h02m34s"`. Keeps seconds granularity (unlike `format_duration`, which
+/// drops them past a minute) so the running timer visibly ticks, and uses unit
+/// letters so it never reads like the `"HH:MM"` phase-finish clock times.
+fn format_elapsed(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn human_age(secs: u64) -> String {
@@ -5611,5 +5651,35 @@ mod tests {
             times[1] <= times[2],
             "BOOTSTRAP finish must be <= LIVE LAB (the overall run finish): {times:?}"
         );
+    }
+
+    #[test]
+    fn run_elapsed_only_ticks_for_a_running_job() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        // No active job -> no run timer.
+        assert_eq!(app.run_elapsed_secs(1000), None);
+
+        let mut job = job_with_report_dir("state/live-lab-x");
+        job.started_unix = Some(1000);
+        app.active_job = Some(job);
+        // Running, started at 1000, now 1754 -> 754s (12m34s).
+        assert_eq!(app.run_elapsed_secs(1754), Some(754));
+        // A clock that somehow reads before the start must not underflow.
+        assert_eq!(app.run_elapsed_secs(500), Some(0));
+
+        // Once the job is no longer running, the live timer stops.
+        if let Some(j) = app.active_job.as_mut() {
+            j.state = "done".to_owned();
+        }
+        assert_eq!(app.run_elapsed_secs(1754), None);
+    }
+
+    #[test]
+    fn format_elapsed_keeps_seconds_and_uses_unit_letters() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(45), "45s");
+        assert_eq!(format_elapsed(754), "12m34s");
+        assert_eq!(format_elapsed(3600), "1h00m00s");
+        assert_eq!(format_elapsed(3754), "1h02m34s");
     }
 }
