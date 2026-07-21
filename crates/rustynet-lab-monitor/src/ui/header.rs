@@ -45,11 +45,19 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .current_run_check_progress()
         .map(|(done, total)| format!("{done}/{total}"))
         .unwrap_or_else(|| "n/a".to_owned());
-    let top = Line::from(vec![
-        Span::styled("RUSTYNET", title),
-        Span::styled(" │ ", sep),
+    // Lead with STATUS (the old "RUSTYNET" title just duplicated the window
+    // title and ate header width). When a run is live, follow it with how long
+    // that run has been going.
+    let mut top_spans = vec![
         Span::styled("STATUS:", title),
         Span::styled(format!("{status:<8}"), value),
+    ];
+    if let Some(elapsed) = app.run_elapsed_label() {
+        top_spans.push(Span::styled(" │ ", sep));
+        top_spans.push(Span::styled("RUN ", title));
+        top_spans.push(Span::styled(elapsed, value));
+    }
+    top_spans.extend([
         Span::styled(" │ ", sep),
         Span::styled(format!("{}:", timers[0].0), title),
         Span::styled(format!("{:<6}", fixed(timers[0].1.as_str(), 6)), value),
@@ -85,6 +93,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Yellow),
         ),
     ]);
+    let top = Line::from(top_spans);
     let job_area_line = Line::from(vec![
         Span::styled("JOB:", title),
         Span::styled(format!(" {}", fixed(job, 46)), value),
