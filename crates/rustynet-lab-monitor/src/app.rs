@@ -380,6 +380,12 @@ pub struct App {
     /// edits; replaced when a run with a different report dir starts.
     run_manifest: Option<crate::data::stage_manifest::RunStageManifest>,
     run_manifest_dir: Option<PathBuf>,
+    /// `(finished, total)` node count for an in-flight `bootstrap_hosts` stage,
+    /// refreshed on the 2s poll (not per render frame). Drives the node-aware
+    /// BOOTSTRAP timer: nodes bootstrap in series, so each completed node drops
+    /// its whole per-node slice off the estimate. `None` when bootstrap_hosts
+    /// isn't the active stage or the per-node signals aren't readable.
+    bootstrap_progress: Option<(usize, usize)>,
     /// The previous run ended without a recorded ending: its job JSON
     /// still claims `running` but the PID is dead. Rendered as CRASHED in
     /// the header while idle (finding 3's monitor half) — previously
@@ -493,6 +499,7 @@ impl App {
             vm_readiness_task: None,
             run_manifest: None,
             run_manifest_dir: None,
+            bootstrap_progress: None,
             last_run_crashed: false,
         };
         app.prune_unknown_disabled_stages();
@@ -685,9 +692,10 @@ impl App {
             .filter(|stage| self.stage_enabled(stage))
             .filter(|stage| !completed.contains(stage.as_str()))
             .map(|stage| {
-                let estimate = self.estimate_stage_secs(&stage);
+                // ETA basis is the EXPECTED duration, not the OVERDUE budget.
+                let estimate = self.eta_stage_secs(&stage);
                 if active == Some(stage.as_str()) {
-                    estimate.saturating_sub(active_elapsed).max(60)
+                    self.active_stage_remaining_secs(&stage, estimate, active_elapsed)
                 } else {
                     estimate
                 }
@@ -724,6 +732,90 @@ impl App {
             .map(|p90| p90.saturating_mul(6) / 5)
             .unwrap_or(0);
         floor.max(history)
+    }
+
+    /// Expected (typical) duration of a stage, for the "time remaining" ETA --
+    /// deliberately distinct from `estimate_stage_secs`, which is the generous
+    /// OVERDUE ceiling. The ETA wants how long a HEALTHY run usually takes, not
+    /// the per-stage cold-start TIMEOUT budget. Summing the timeout budget over
+    /// every pending stage is what produced a `LAB:2h41m` estimate for a live
+    /// phase that actually finishes in ~3 minutes: 33 enabled live stages ×
+    /// their 300s timeout = 161m, even though each validation really runs in
+    /// tens of seconds. So: use real measured history (P90 of past terminal
+    /// durations) when a stage has any, and otherwise a realistic expected
+    /// default -- crucially NOT floored by the manifest budget the way
+    /// `estimate_stage_secs` is (`floor.max(history)` there let the 300s budget
+    /// always win over a real ~30s measurement).
+    fn eta_stage_secs(&self, stage: &str) -> u64 {
+        self.stage_timings
+            .get(stage)
+            .copied()
+            .filter(|secs| *secs > 0)
+            .unwrap_or_else(|| eta_default_stage_secs(stage))
+    }
+
+    /// Remaining seconds for the currently-active stage. Most stages are just
+    /// "expected duration minus how long it has already run". `bootstrap_hosts`
+    /// is special: it bootstraps each node in SERIES (one on-guest `cargo build`
+    /// at a time, ~2 min each), so instead of a flat wall-clock countdown we
+    /// drop a whole per-node slice off the estimate as each node reports
+    /// complete -- the BOOTSTRAP timer then tracks real node-by-node progress
+    /// (and self-corrects when nodes finish faster or slower than the per-node
+    /// average). Falls back to the wall-clock form whenever the per-node counts
+    /// aren't available.
+    fn active_stage_remaining_secs(&self, stage: &str, estimate: u64, active_elapsed: u64) -> u64 {
+        if stage == "bootstrap_hosts"
+            && let Some((finished, total)) = self.bootstrap_progress
+            && total > 0
+        {
+            let per_node = (estimate / total as u64).max(1);
+            let remaining_nodes = total.saturating_sub(finished) as u64;
+            // The node currently building ticks down within its own slice;
+            // capping at one slice means a node running long parks at its
+            // slice floor rather than eating the following nodes' time (a
+            // genuinely stuck build is surfaced by OVERDUE on the budget path).
+            let within_node = active_elapsed
+                .saturating_sub(finished as u64 * per_node)
+                .min(per_node);
+            return (remaining_nodes * per_node)
+                .saturating_sub(within_node)
+                .max(15);
+        }
+        estimate.saturating_sub(active_elapsed).max(15)
+    }
+
+    /// `(finished, total)` nodes for the in-flight `bootstrap_hosts` stage, or
+    /// `None` when the signals aren't available (caller falls back to a
+    /// wall-clock estimate). `total` = the run manifest's `node_assignments`
+    /// count -- it is written BEFORE any stage runs and is already parsed into
+    /// memory, whereas `state/nodes.tsv` only appears at finalize (too late for
+    /// a live bootstrap timer). `finished` = the per-node
+    /// `logs/bootstrap_node_<alias>.log` files that have recorded the
+    /// `e2e bootstrap host complete` marker the bootstrap adapter writes on
+    /// success (these appear one at a time as the series reaches each node).
+    /// Best-effort and read-only: any I/O error degrades to `None`, never a
+    /// panic. Called on the 2s refresh, not per render frame (see
+    /// `App::bootstrap_progress`).
+    fn bootstrap_node_progress(&self) -> Option<(usize, usize)> {
+        let total = self.run_manifest.as_ref()?.node_assignments.len();
+        if total == 0 {
+            return None;
+        }
+        let report_dir = self.run_manifest_dir.as_ref()?;
+        let mut finished = 0usize;
+        for entry in std::fs::read_dir(report_dir.join("logs")).ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("bootstrap_node_")
+                && name.ends_with(".log")
+                && std::fs::read_to_string(entry.path())
+                    .map(|body| body.contains("e2e bootstrap host complete"))
+                    .unwrap_or(false)
+            {
+                finished += 1;
+            }
+        }
+        Some((finished.min(total), total))
     }
 
     fn ensure_active_stage_visible(&mut self) {
@@ -1645,6 +1737,15 @@ impl App {
                 }
             }
         }
+        // Refresh the node-aware bootstrap progress cache once per poll (not per
+        // render frame -- reading nodes.tsv + the per-node logs every ~100ms
+        // draw would be needless I/O). Only meaningful while bootstrap_hosts is
+        // active; cleared otherwise so a stale count can't leak into a later run.
+        self.bootstrap_progress = if self.active_stage.as_deref() == Some("bootstrap_hosts") {
+            self.bootstrap_node_progress()
+        } else {
+            None
+        };
         self.agents_view = crate::ui::agents_panel::AgentsView::load(&self.repo_root);
         if self.active_job.is_none() {
             self.advance_if_current_target_proven();
@@ -3004,6 +3105,43 @@ fn default_stage_secs(stage: &str) -> u64 {
     }
 }
 
+/// Realistic EXPECTED per-stage durations for the ETA (see `App::eta_stage_secs`),
+/// used only when a stage has no measured history. Deliberately much smaller than
+/// the cold-start TIMEOUT budgets in `default_stage_secs` / the manifest (which
+/// remain the OVERDUE ceiling): these reflect how long a stage USUALLY occupies a
+/// healthy run, drawn from `live_lab_stage_timings.csv` medians -- bootstrap is
+/// genuinely slow (~11m), but a validation stage typically finishes in tens of
+/// seconds, not its 300s timeout. Keeping this separate is what stops the ETA
+/// summing 33 live timeouts into a multi-hour "remaining".
+fn eta_default_stage_secs(stage: &str) -> u64 {
+    match stage {
+        "bootstrap_hosts" => 660,
+        "bootstrap_macos_host" | "bootstrap_windows_host" => 480,
+        "linux_live_suite" => 1_800,
+        "prepare_source_archive" => 20,
+        "preflight" | "macos_preflight_check" | "verify_ssh_reachability" => 20,
+        "prime_remote_access" | "cleanup_hosts" | "cleanup" => 30,
+        // macOS/Windows role-cell operations are genuinely slower and have no
+        // measured history to lower them -- keep their existing hand-tuned
+        // estimate rather than the fast-Linux-validation default below.
+        _ if stage.starts_with("validate_macos_")
+            || stage.starts_with("validate_windows_")
+            || stage.starts_with("activate_macos_")
+            || stage.starts_with("capture_macos_")
+            || stage.starts_with("deploy_macos_") =>
+        {
+            180
+        }
+        _ if stage.contains("bootstrap") => 300,
+        _ if stage.contains("collect") || stage.contains("distribute") => 20,
+        _ if stage.contains("membership") || stage.contains("assignment") => 40,
+        _ if stage.contains("baseline") => 90,
+        // Linux validation / live stages: measured medians are tens of seconds,
+        // far below their 300s cold-start timeout.
+        _ => 45,
+    }
+}
+
 fn timer_short_name(group_name: &str) -> &'static str {
     match group_name {
         "PRE" => "PRE",
@@ -3552,6 +3690,147 @@ mod tests {
             before, run,
             "an unresolvable stage name must leave the CSV-column-based approximation intact"
         );
+    }
+
+    #[test]
+    fn eta_uses_expected_durations_not_the_timeout_budget() {
+        // Finding #2: the "time remaining" summed per-stage cold-start TIMEOUT
+        // budgets (300s each), so ~33 enabled live stages read as ~2h41m
+        // remaining for a live phase that finishes in ~3 minutes. The ETA basis
+        // must be the realistic EXPECTED duration, kept separate from the
+        // OVERDUE ceiling (estimate_stage_secs).
+
+        // A validation stage's ETA default is tens of seconds, well below its
+        // 300s timeout default (which stays the overdue ceiling).
+        assert_eq!(eta_default_stage_secs("live_network_flap_validation"), 45);
+        assert_eq!(eta_default_stage_secs("relay_validation"), 45);
+        assert!(
+            eta_default_stage_secs("live_managed_dns_validation")
+                < default_stage_secs("live_managed_dns_validation"),
+            "ETA default must be below the timeout/overdue default"
+        );
+        // Bootstrap is genuinely slow; its ETA default stays large.
+        assert_eq!(eta_default_stage_secs("bootstrap_hosts"), 660);
+
+        // Measured history is used DIRECTLY for the ETA -- not floored by the
+        // budget the way estimate_stage_secs is (`floor.max(history)`, where the
+        // 300s floor always beat a real ~28s measurement).
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.stage_timings.insert("relay_validation".to_owned(), 28);
+        assert_eq!(
+            app.eta_stage_secs("relay_validation"),
+            28,
+            "ETA must follow real measured history, not the timeout budget"
+        );
+        assert!(
+            app.estimate_stage_secs("relay_validation") >= 300,
+            "the OVERDUE ceiling must stay the generous budget, distinct from the ETA"
+        );
+    }
+
+    #[test]
+    fn bootstrap_remaining_drops_a_per_node_slice_as_each_node_completes() {
+        // bootstrap_hosts bootstraps nodes in SERIES, so the BOOTSTRAP timer
+        // must drop a whole per-node slice as each node reports complete, not
+        // just count down wall time. 5 nodes / 660s estimate => 132s per node.
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        let est = 660;
+
+        // No node finished, 60s elapsed: identical to the wall-clock form.
+        app.bootstrap_progress = Some((0, 5));
+        assert_eq!(
+            app.active_stage_remaining_secs("bootstrap_hosts", est, 60),
+            600
+        );
+
+        // 2 of 5 finished: remaining reflects the 3 nodes left, correcting for
+        // the actual completion rate (within_node saturates to 0 here).
+        app.bootstrap_progress = Some((2, 5));
+        assert_eq!(
+            app.active_stage_remaining_secs("bootstrap_hosts", est, 250),
+            396
+        );
+
+        // 4 of 5 done: ~1 node's slice left, regardless of wall time.
+        app.bootstrap_progress = Some((4, 5));
+        assert_eq!(
+            app.active_stage_remaining_secs("bootstrap_hosts", est, 500),
+            132
+        );
+
+        // A node running long parks at its slice floor (132 cap) rather than
+        // eating the remaining nodes' time: 2 done + a stuck 3rd at 600s ->
+        // 3*132 - min(600-264,132) = 396 - 132 = 264.
+        app.bootstrap_progress = Some((2, 5));
+        assert_eq!(
+            app.active_stage_remaining_secs("bootstrap_hosts", est, 600),
+            264
+        );
+
+        // No per-node signal -> graceful fallback to the wall-clock estimate.
+        app.bootstrap_progress = None;
+        assert_eq!(
+            app.active_stage_remaining_secs("bootstrap_hosts", est, 100),
+            560
+        );
+
+        // Non-bootstrap stages always use the wall-clock form.
+        app.bootstrap_progress = Some((1, 5));
+        assert_eq!(
+            app.active_stage_remaining_secs("relay_validation", 45, 10),
+            35
+        );
+    }
+
+    #[test]
+    fn bootstrap_node_progress_reads_total_from_manifest_and_finished_from_logs() {
+        // total MUST come from the manifest node_assignments (present the whole
+        // run), not state/nodes.tsv which only lands at finalize -- reading the
+        // latter live returned None and silently disabled the node-aware timer.
+        // finished counts the per-node bootstrap logs carrying the completion
+        // marker (they appear one at a time as the series reaches each node).
+        use crate::data::stage_manifest::{ManifestNodeAssignment, RunStageManifest};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("bootstrap_node_a.log"),
+            "Compiling\ne2e bootstrap host complete: role=client node_id=a\n",
+        )
+        .unwrap();
+        std::fs::write(
+            logs.join("bootstrap_node_b.log"),
+            "e2e bootstrap host complete: role=exit node_id=b\n",
+        )
+        .unwrap();
+        // Third node still building -- no completion marker yet.
+        std::fs::write(logs.join("bootstrap_node_c.log"), "Compiling rustynet...\n").unwrap();
+
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.run_manifest_dir = Some(dir.path().to_path_buf());
+        app.run_manifest = Some(RunStageManifest {
+            node_assignments: vec![
+                ManifestNodeAssignment {
+                    alias: "a".into(),
+                    role: "client".into(),
+                },
+                ManifestNodeAssignment {
+                    alias: "b".into(),
+                    role: "exit".into(),
+                },
+                ManifestNodeAssignment {
+                    alias: "c".into(),
+                    role: "anchor".into(),
+                },
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(app.bootstrap_node_progress(), Some((2, 3)));
+
+        // Without a manifest there is no node total -> fall back to wall-clock.
+        app.run_manifest = None;
+        assert_eq!(app.bootstrap_node_progress(), None);
     }
 
     #[test]
