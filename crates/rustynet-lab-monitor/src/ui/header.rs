@@ -39,7 +39,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let title = Style::default().fg(Color::Blue);
     let value = Style::default().fg(Color::White);
     let sep = Style::default().fg(Color::DarkGray);
-    let timers = app.stage_timer_labels();
+    let timers = app.stage_finish_labels(chrono::Local::now());
     let (run_done, run_total) = app.current_run_stage_progress();
     let run_checks = app
         .current_run_check_progress()
