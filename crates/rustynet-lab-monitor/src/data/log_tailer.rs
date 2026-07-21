@@ -39,6 +39,17 @@ pub fn summarize_stage_lines(
         return Ok(lines);
     }
 
+    // bootstrap_hosts is a per-node SERIES stage: `logs/bootstrap_hosts.log`
+    // holds only a one-line end-of-stage marker (written when the whole stage
+    // finishes), and the --node engine writes no `state/parallel-bootstrap_hosts/`
+    // dir, so the generic path below shows "No log output" for the entire
+    // ~10-minute bootstrap. Surface the live per-node build instead.
+    if stage == "bootstrap_hosts"
+        && let Some(node_lines) = summarize_bootstrap_active_node(report_dir)
+    {
+        return Ok(node_lines);
+    }
+
     let log_path = report_dir.join("logs").join(format!("{stage}.log"));
     let raw = tail_lines(&log_path, 250)?;
     let summarized = summarize_raw_lines(&raw);
@@ -48,6 +59,40 @@ pub fn summarize_stage_lines(
         lines.extend(summarized);
         Ok(lines)
     }
+}
+
+/// Live build output for the node `bootstrap_hosts` is currently working on.
+/// The per-node `logs/bootstrap_node_<alias>.log` files stream a real
+/// `cargo build`; the newest by mtime is the node being built right now (the
+/// stage is serial). Returns its tail with a header naming the node, or `None`
+/// when no per-node log exists yet or is unreadable (caller falls back to the
+/// generic path). Best-effort and read-only: any I/O error yields `None`.
+fn summarize_bootstrap_active_node(report_dir: &Path) -> Option<Vec<String>> {
+    let logs_dir = report_dir.join("logs");
+    let (_, newest) = std::fs::read_dir(&logs_dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("bootstrap_node_") && name.ends_with(".log")
+        })
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .max_by_key(|(modified, _)| *modified)?;
+
+    let alias = newest
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("bootstrap_node_"))
+        .unwrap_or("node")
+        .to_owned();
+    let raw = tail_lines(&newest, 200).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let mut lines = vec![format!("bootstrap_hosts — building {alias} (live):")];
+    lines.extend(raw);
+    Some(lines)
 }
 
 fn summarize_parallel_stage(
@@ -276,6 +321,41 @@ fn load_inventory_aliases(repo_root: &Path) -> Result<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_hosts_surfaces_the_live_per_node_build_log() {
+        // Regression: bootstrap_hosts' own logs/bootstrap_hosts.log holds only a
+        // one-line end-of-stage marker and the --node engine writes no parallel
+        // dir, so the LOG panel showed "No log output" for the whole ~10-minute
+        // bootstrap. The live per-node build log must be surfaced instead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // The end-of-stage marker the generic path would (unhelpfully) show.
+        std::fs::write(
+            logs.join("bootstrap_hosts.log"),
+            "[stage:bootstrap_hosts] pass (rust --node engine)\n",
+        )
+        .unwrap();
+        // The live per-node build output that should be surfaced.
+        std::fs::write(
+            logs.join("bootstrap_node_ubuntu-utm-1.log"),
+            "Compiling rustynet-relay v0.1.0\n    Finished `release` profile in 7.07s\n",
+        )
+        .unwrap();
+
+        let out =
+            summarize_stage_lines(dir.path(), dir.path(), "bootstrap_hosts").expect("summarize");
+        let joined = out.join("\n");
+        assert!(
+            joined.contains("building ubuntu-utm-1"),
+            "names the node being built: {joined}"
+        );
+        assert!(
+            joined.contains("Compiling rustynet-relay"),
+            "shows the live build output, not the one-line end marker: {joined}"
+        );
+    }
 
     #[test]
     fn summarize_parallel_bootstrap_hides_compile_spam() {
