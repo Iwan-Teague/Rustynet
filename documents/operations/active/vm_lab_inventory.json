@@ -163,9 +163,10 @@
       },
       "exit_capable": false,
       "lab_role": "fedora_client",
-      "last_known_ip": "192.168.64.20",
+      "last_known_ip": "192.168.64.103",
       "last_known_network": "lan-10.230.76.0/24",
       "live_ips": [
+        "192.168.64.103",
         "192.168.64.20",
         "10.230.76.59"
       ],
@@ -177,7 +178,7 @@
       "platform": "linux",
       "relay_capable": false,
       "rustynet_src_dir": "/home/fedora/Rustynet",
-      "ssh_target": "192.168.64.20",
+      "ssh_target": "192.168.64.103",
       "ssh_user": "fedora"
     },
     {
