@@ -6,31 +6,45 @@ pub fn admin_issue_runtime_implemented(_platform: crate::vm_lab::VmGuestPlatform
 }
 
 pub fn validate_admin_issue(shell: &dyn RemoteShellHost, alias: &str) -> Result<(), String> {
-    let status_out = shell
-        .run_argv(&["rustynet", "status"], &[], &[])
-        .map_err(|e| format!("{alias}: failed to run rustynet status: {e}"))?;
-    let status_str = String::from_utf8_lossy(&status_out.stdout);
-    if !status_out.is_success() {
-        return Err(format!(
-            "{alias}: rustynet status exited non-zero: {}",
-            status_str.trim()
-        ));
-    }
-    // The daemon status IPC renders a single line of space-separated
-    // `key=value` pairs (see rustynetd's `IpcCommand::Status` handler, the
-    // format string starting `node_id={} node_role={} ...`), so the admin
-    // role appears as the substring `node_role=admin` — equals sign, no
-    // colon. A `key: value` pattern can never match real daemon output.
-    let has_admin_role = status_str.lines().any(|l| l.contains("node_role=admin"));
-    if !has_admin_role {
-        return Err(format!(
-            "{alias}: daemon does not report admin role; status={}",
-            status_str.trim()
-        ));
+    const MAX_ATTEMPTS: usize = 4;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match shell.run_argv(&["/usr/local/bin/rustynet", "status"], &[], &[]) {
+            Ok(out) if out.is_success() => {
+                let status_str = String::from_utf8_lossy(&out.stdout);
+                if status_str.lines().any(|l| l.contains("node_role=admin")) {
+                    break;
+                }
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(format!(
+                        "{alias}: daemon does not report admin role after {MAX_ATTEMPTS} attempts; status={}",
+                        status_str.trim()
+                    ));
+                }
+            }
+            Ok(out) => {
+                if attempt >= MAX_ATTEMPTS {
+                    let status_str = String::from_utf8_lossy(&out.stdout);
+                    return Err(format!(
+                        "{alias}: rustynet status exited non-zero after {MAX_ATTEMPTS} attempts: {}",
+                        status_str.trim()
+                    ));
+                }
+            }
+            Err(e) => {
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(format!(
+                        "{alias}: failed to run rustynet status after {MAX_ATTEMPTS} attempts: {e}"
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(RETRY_DELAY);
     }
 
     let peers_out = shell
-        .run_argv(&["rustynet", "peer-list"], &[], &[])
+        .run_argv(&["/usr/local/bin/rustynet", "peer-list"], &[], &[])
         .map_err(|e| format!("{alias}: failed to list peers: {e}"))?;
     if !peers_out.is_success() {
         return Err(format!(
@@ -74,7 +88,12 @@ mod tests {
     #[test]
     fn fails_closed_when_status_command_errors() {
         let shell = MockShellHost::new();
-        shell.program_run_response(&["rustynet", "status"], err("daemon unreachable"));
+        for _ in 0..4 {
+            shell.program_run_response(
+                &["/usr/local/bin/rustynet", "status"],
+                err("daemon unreachable"),
+            );
+        }
         let e = validate_admin_issue(&shell, "node1")
             .expect_err("non-zero status exit should fail closed");
         assert!(e.contains("exited non-zero"), "{e}");
@@ -83,10 +102,12 @@ mod tests {
     #[test]
     fn fails_closed_when_role_not_reported() {
         let shell = MockShellHost::new();
-        shell.program_run_response(
-            &["rustynet", "status"],
-            ok("node_id=node1 node_role=client state=Running\n"),
-        );
+        for _ in 0..4 {
+            shell.program_run_response(
+                &["/usr/local/bin/rustynet", "status"],
+                ok("node_id=node1 node_role=client state=Running\n"),
+            );
+        }
         let e = validate_admin_issue(&shell, "node1")
             .expect_err("missing admin role should fail closed");
         assert!(e.contains("does not report admin role"), "{e}");
@@ -96,11 +117,11 @@ mod tests {
     fn fails_closed_when_list_peers_errors() {
         let shell = MockShellHost::new();
         shell.program_run_response(
-            &["rustynet", "status"],
+            &["/usr/local/bin/rustynet", "status"],
             ok("node_id=node1 node_role=admin state=Running\n"),
         );
         shell.program_run_response(
-            &["rustynet", "peer-list"],
+            &["/usr/local/bin/rustynet", "peer-list"],
             err("membership state unavailable"),
         );
         let e = validate_admin_issue(&shell, "node1")
@@ -112,11 +133,11 @@ mod tests {
     fn passes_when_admin_role_and_peers_list_succeed() {
         let shell = MockShellHost::new();
         shell.program_run_response(
-            &["rustynet", "status"],
+            &["/usr/local/bin/rustynet", "status"],
             ok("node_id=node1 node_role=admin state=Running exit_node=\n"),
         );
         shell.program_run_response(
-            &["rustynet", "peer-list"],
+            &["/usr/local/bin/rustynet", "peer-list"],
             ok("peer1\tclient\npeer2\texit\n"),
         );
         validate_admin_issue(&shell, "node1").expect("admin role + peers list should pass");

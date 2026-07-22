@@ -28,6 +28,7 @@ const DNS_POLICY_INVALID_BUNDLE_REMOTE: &str =
 const DNS_RECORDS_REMOTE: &str = "/tmp/rn-dns-records.manifest";
 const TRAVERSAL_ENV_REMOTE: &str = "/tmp/rn_issue_dns_traversal.env";
 const TRAVERSAL_PUB_REMOTE: &str = "/run/rustynet/traversal-issue/rn-traversal.pub";
+const RUSTYNET_CLI: &str = "/usr/local/bin/rustynet";
 const REPLAY_PROBE_ALIAS: &str = "gatewayreplay";
 // 20 attempts × 15 s = 5 min window; tolerates UTM VM transient network
 // glitches and slower-than-expected SSH restarts during the extended soak.
@@ -126,7 +127,7 @@ fn run() -> Result<(), String> {
         &[
             "env",
             "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
-            "rustynet",
+            RUSTYNET_CLI,
             "status",
         ],
     )?;
@@ -245,7 +246,7 @@ fn run() -> Result<(), String> {
     ctx.run_root(
         &config.signer_host,
         &[
-            "rustynet",
+            RUSTYNET_CLI,
             "ops",
             "materialize-signing-passphrase",
             "--output",
@@ -393,7 +394,7 @@ fn run() -> Result<(), String> {
     ctx.run_root(
         &config.signer_host,
         &[
-            "rustynet",
+            RUSTYNET_CLI,
             "dns",
             "zone",
             "verify",
@@ -410,7 +411,7 @@ fn run() -> Result<(), String> {
     ctx.run_root(
         &config.signer_host,
         &[
-            "rustynet",
+            RUSTYNET_CLI,
             "dns",
             "zone",
             "verify",
@@ -427,7 +428,7 @@ fn run() -> Result<(), String> {
     ctx.run_root(
         &config.signer_host,
         &[
-            "rustynet",
+            RUSTYNET_CLI,
             "dns",
             "zone",
             "verify",
@@ -444,7 +445,7 @@ fn run() -> Result<(), String> {
     ctx.run_root(
         &config.signer_host,
         &[
-            "rustynet",
+            RUSTYNET_CLI,
             "dns",
             "zone",
             "verify",
@@ -1112,7 +1113,7 @@ fn issue_dns_bundle(issue: DnsIssueContext<'_>, bundle: DnsBundleSpec<'_>) -> Re
     let generated_at_string = bundle.timing.generated_at.map(|value| value.to_string());
     let nonce_string = bundle.timing.nonce.map(|value| value.to_string());
     let mut args = vec![
-        "rustynet",
+        RUSTYNET_CLI,
         "dns",
         "zone",
         "issue",
@@ -1282,7 +1283,7 @@ fn refresh_traversal_bundles(
             ctx.run_root(
                 &config.signer_host,
                 &[
-                    "rustynet",
+                    RUSTYNET_CLI,
                     "ops",
                     "e2e-issue-traversal-bundles-from-env",
                     "--env-file",
@@ -1504,7 +1505,7 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
         &[
             "env",
             "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
-            "rustynet",
+            RUSTYNET_CLI,
             "state",
             "refresh",
         ],
@@ -1530,7 +1531,7 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
 fn refresh_signer_trust_evidence(ctx: &LiveLabContext, signer_host: &str) -> Result<(), String> {
     ctx.retry_root(
         signer_host,
-        &["rustynet", "ops", "refresh-signed-trust"],
+        &[RUSTYNET_CLI, "ops", "refresh-signed-trust"],
         5,
         2,
     )
@@ -2035,7 +2036,7 @@ fn wait_for_dns_inspect_state(
             &[
                 "env",
                 "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
-                "rustynet",
+                RUSTYNET_CLI,
                 "dns",
                 "inspect",
             ],
@@ -2130,35 +2131,6 @@ fn capture_remote_text(
     write_secure_text(local_path, &body)
 }
 
-fn run_cargo_ops_capture(
-    root_dir: &Path,
-    subcommand: &str,
-    args: &[&str],
-) -> Result<String, String> {
-    let output = Command::new("cargo")
-        .current_dir(root_dir)
-        .args([
-            "run",
-            "--quiet",
-            "-p",
-            "rustynet-cli",
-            "--",
-            "ops",
-            subcommand,
-        ])
-        .args(args)
-        .output()
-        .map_err(|err| format!("failed to run cargo ops {subcommand}: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "cargo ops {subcommand} failed with status {}: {}",
-            live_lab_support::status_code(output.status),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
 fn remote_dns_query_capture(
     ctx: &LiveLabContext,
     host: &str,
@@ -2168,7 +2140,7 @@ fn remote_dns_query_capture(
     ctx.capture_root(
         host,
         &[
-            "rustynet",
+            RUSTYNET_CLI,
             "ops",
             "e2e-dns-query",
             "--server",
@@ -2192,7 +2164,7 @@ fn remote_dns_query_capture_allow_failure(
     let output = ctx.run_root_allow_failure_with_retry(
         host,
         &[
-            "rustynet",
+            RUSTYNET_CLI,
             "ops",
             "e2e-dns-query",
             "--server",
@@ -2686,26 +2658,71 @@ fn render_remote_output(output: &Output) -> String {
     }
 }
 
-fn json_field(root_dir: &Path, payload: &str, field: &str) -> Result<String, String> {
-    run_cargo_ops_capture(
-        root_dir,
-        "read-json-field",
-        &["--payload", payload, "--field", field],
-    )
-    .map(|value| value.trim().to_owned())
+fn json_field(_root_dir: &Path, payload: &str, field: &str) -> Result<String, String> {
+    use serde_json::Value;
+    let payload_val = serde_json::from_str::<Value>(payload)
+        .map_err(|e| format!("parse --payload JSON failed: {e}"))?;
+    let object = payload_val
+        .as_object()
+        .ok_or_else(|| "--payload must be a JSON object".to_owned())?;
+    let value = object.get(field);
+    let result = match value {
+        None => String::new(),
+        Some(Value::Null) => String::new(),
+        Some(Value::Bool(true)) => "true".to_owned(),
+        Some(Value::Bool(false)) => "false".to_owned(),
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(other) => {
+            serde_json::to_string(other).map_err(|e| format!("serialize field failed: {e}"))?
+        }
+    };
+    Ok(result.trim().to_owned())
 }
 
 fn extract_managed_dns_expected_ip(
-    root_dir: &Path,
+    _root_dir: &Path,
     fqdn: &str,
     inspect_output: &str,
 ) -> Result<String, String> {
-    run_cargo_ops_capture(
-        root_dir,
-        "extract-managed-dns-expected-ip",
-        &["--fqdn", fqdn, "--inspect-output", inspect_output],
-    )
-    .map(|value| value.trim().to_owned())
+    let fqdn = fqdn.trim().to_owned();
+    if fqdn.is_empty() {
+        return Err("--fqdn must be non-empty".to_owned());
+    }
+    let fqdn_token = format!("fqdn={fqdn}");
+    for line in inspect_output.lines() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        if tokens.contains(&fqdn_token.as_str()) {
+            for token in &tokens {
+                if let Some(value) = token.strip_prefix("expected_ip=") {
+                    return Ok(value.trim().to_owned());
+                }
+            }
+        }
+        for (index, token) in tokens.iter().enumerate() {
+            let Some(record_token) = token.strip_prefix("record.") else {
+                continue;
+            };
+            let Some((record_index, token_fqdn)) = record_token.split_once(".fqdn=") else {
+                continue;
+            };
+            if token_fqdn != fqdn {
+                continue;
+            }
+            let expected_ip_prefix = format!("record.{record_index}.expected_ip=");
+            for candidate in &tokens {
+                if let Some(value) = candidate.strip_prefix(expected_ip_prefix.as_str()) {
+                    return Ok(value.trim().to_owned());
+                }
+            }
+            for candidate in tokens.iter().skip(index + 1) {
+                if let Some(value) = candidate.strip_prefix("expected_ip=") {
+                    return Ok(value.trim().to_owned());
+                }
+            }
+        }
+    }
+    Ok(String::new())
 }
 
 fn write_env_file(path: &Path, entries: &[(&str, &str)]) -> Result<(), String> {

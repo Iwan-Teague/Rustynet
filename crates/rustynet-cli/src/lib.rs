@@ -79,6 +79,9 @@ mod vm_lab;
 /// into a private module path.
 #[cfg(feature = "vm-lab")]
 pub mod orchestrator_test_surface {
+    pub use crate::ops_live_lab_orchestrator::{
+        ExtractManagedDnsExpectedIpConfig, execute_ops_extract_managed_dns_expected_ip,
+    };
     pub use crate::vm_lab::orchestrator::context::OrchestrationContext;
     pub use crate::vm_lab::orchestrator::diagnostics::{
         register_shutdown_handlers, register_shutdown_handlers_with,
