@@ -186,6 +186,18 @@ Start there when you need:
 Release-signoff guardrail:
 - [operations/ReleaseReadinessGuardrails.md](./operations/ReleaseReadinessGuardrails.md)
 
+## Reference Material (general, not Rustynet-specific)
+
+Generalized engineering write-ups distilled from work on this repo but deliberately scrubbed
+of Rustynet specifics for reuse on other projects. Not active execution guidance, not part of
+the read order above, and not something implementation work depends on.
+
+- [reference/LiveLabOrchestrationBlueprint.md](./reference/LiveLabOrchestrationBlueprint.md) —
+  a project-agnostic blueprint for building an automated, evidence-grade, multi-environment
+  live-lab test orchestrator, distilled from this repo's `--node` orchestrator + TUI + CI
+  experience: the pipeline phases, the data/ledger model, a 19-item pitfalls catalog for
+  writing trustworthy validators, and the commit/patch/run operating rhythm.
+
 ## Formal Verification Artifacts
 
 Machine-checkable models of trust-sensitive protocols (FIS-0019). The `.tla`
