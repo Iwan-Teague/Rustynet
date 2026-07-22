@@ -67,19 +67,13 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize, grou
     };
 
     // Progress bar: width = column width minus brackets and count text.
-    // "{passed}/{in-scope} │ {catalog}" -- all three from the run's OWN
-    // manifest (see App::run_plan_summary), so they're always coherent
-    // (passed <= in-scope <= catalog). The main fraction is scoped to what
-    // this run's topology actually intended to run; the number after the
-    // divider is the full planned catalog, for reference. Historically the
-    // left came from the manifest plan and the right from CSV columns -- two
-    // different universes that could read e.g. "28/165 | 100" (in-scope
-    // larger than the "total").
+    // "{passed}/{in-scope}" from the run's OWN manifest (see
+    // App::run_plan_summary), so they stay coherent (passed <= in-scope). The
+    // fraction is scoped to what this run's topology actually intended to run.
+    // (The full planned-catalog size used to be appended as "│ catalog N" but
+    // was dropped as noise.)
     let count_str = if run.counts_exact {
-        format!(
-            " {}/{} │ catalog {}",
-            run.subset_passed_stages, run.subset_total_stages, run.total_stages
-        )
+        format!(" {}/{}", run.subset_passed_stages, run.subset_total_stages)
     } else {
         format!(
             " CSV {}/{} (plan unavailable)",
@@ -111,8 +105,14 @@ fn render_run_card(f: &mut Frame, area: Rect, run: &RunSummary, idx: usize, grou
     };
 
     let lines: Vec<Line> = vec![
-        // 1: run label
-        Line::from(Span::styled(label, Style::default().fg(Color::Cyan))),
+        // 1: run label + when the run finished (local wall clock)
+        Line::from(vec![
+            Span::styled(label, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("  {}", format_finished(&run.finished_utc)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
         // 2: status + commit
         Line::from(vec![
             Span::styled(result_sym, Style::default().fg(result_color)),
@@ -246,6 +246,23 @@ fn bar_spans_by_section(
     spans
 }
 
+/// Format a run's `run_finished_utc` (ISO-8601 UTC, e.g. `2026-07-22T07:15:33Z`)
+/// as a compact local `"MM-DD HH:MM"` for the Previous Runs panel -- when each
+/// run actually completed. Returns `"—"` when the timestamp is missing and the
+/// raw value if it can't be parsed (never panics on a malformed CSV cell).
+fn format_finished(utc: &str) -> String {
+    if utc.is_empty() {
+        return "—".to_owned();
+    }
+    match chrono::DateTime::parse_from_rfc3339(utc) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string(),
+        Err(_) => utc.to_owned(),
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_owned()
@@ -292,6 +309,18 @@ mod tests {
 
     fn glyphs<'a>(spans: &'a [Span<'static>]) -> Vec<&'a str> {
         spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn format_finished_renders_local_time_or_degrades_gracefully() {
+        assert_eq!(format_finished(""), "—");
+        // Parses RFC-3339 UTC; the exact local HH:MM depends on the runner's
+        // timezone, so assert the "MM-DD HH:MM" shape rather than the value.
+        let s = format_finished("2026-07-22T07:15:33Z");
+        assert_eq!(s.chars().count(), 11, "MM-DD HH:MM, got {s:?}");
+        assert!(s.contains('-') && s.contains(':'), "got {s:?}");
+        // A malformed cell is passed through verbatim, never a panic.
+        assert_eq!(format_finished("not-a-timestamp"), "not-a-timestamp");
     }
 
     #[test]
