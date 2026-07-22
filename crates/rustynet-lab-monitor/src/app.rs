@@ -526,10 +526,25 @@ impl App {
         }
         let overdue_secs = self.active_stage_overdue_secs();
         let mut cumulative_secs: u64 = 0;
-        ["PRE", "BOOTSTRAP", "LIVE LAB"]
-            .into_iter()
-            .map(|name| {
-                let group_remaining = self.estimated_group_remaining_secs(name);
+        let phases = ["PRE", "BOOTSTRAP", "LIVE LAB"];
+        // Phases run strictly in series, so a phase is complete the moment a
+        // LATER one has started — even if one of its own stages never recorded
+        // a terminal outcome (some setup steps, e.g. preflight, emit none).
+        // Without this, a not-yet-recorded PRE stage keeps PRE showing a
+        // perpetual now+Xm finish estimate long after BOOTSTRAP/LIVE LAB are
+        // underway (observed: "PRE: 13:02" ticking up while BOOT read "done").
+        let progressed: Vec<bool> = phases.iter().map(|n| self.phase_has_progress(n)).collect();
+        phases
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| {
+                let later_started =
+                    progressed.get(i + 1..).is_some_and(|rest| rest.iter().any(|&p| p));
+                let group_remaining = if later_started {
+                    0
+                } else {
+                    self.estimated_group_remaining_secs(name)
+                };
                 cumulative_secs = cumulative_secs.saturating_add(group_remaining);
                 let label = match overdue_secs {
                     // Once the active stage has genuinely run past its own
@@ -538,8 +553,9 @@ impl App {
                     Some(over) if self.group_contains_active_stage(name) => {
                         format!("OVERDUE +{}", format_duration(over))
                     }
-                    // No pending work in this phase -- it is (or is treated as)
-                    // complete, so a finish clock time would be in the past.
+                    // No pending work in this phase (or a later phase has already
+                    // started, forcing remaining to 0 above) -- it is complete,
+                    // so a finish clock time would be in the past.
                     _ if group_remaining == 0 => "done".to_owned(),
                     _ => finish_clock(now, cumulative_secs),
                 };
@@ -591,6 +607,29 @@ impl App {
             .into_iter()
             .find(|group| group.name == group_name)
             .is_some_and(|group| group.stages.iter().any(|stage| stage == active))
+    }
+
+    /// Whether a pipeline phase (PRE / BOOTSTRAP / LIVE LAB) has started: it
+    /// holds the active stage, or at least one of its stages has recorded a
+    /// terminal outcome. Used to mark an EARLIER phase done once a later one
+    /// begins, since the phases run strictly in series — this is what stops a
+    /// setup stage that emits no outcome from keeping its phase "pending".
+    fn phase_has_progress(&self, group_name: &str) -> bool {
+        if self.group_contains_active_stage(group_name) {
+            return true;
+        }
+        let completed: HashSet<&str> = self
+            .stage_outcomes
+            .iter()
+            .filter(|o| crate::data::stage_reader::StageStatus::parse(&o.status).is_terminal())
+            .map(|o| o.stage.as_str())
+            .collect();
+        self.planned_stage_groups()
+            .into_iter()
+            .find(|group| group.name == group_name)
+            .into_iter()
+            .flat_map(|group| group.stages)
+            .any(|stage| completed.contains(stage.as_str()))
     }
 
     /// Terminal pipeline stages over this run's manifest-enabled plan.
@@ -5356,6 +5395,33 @@ mod tests {
 
         assert_eq!(app.estimated_group_remaining_secs("PRE"), 0);
         assert!(app.estimated_group_remaining_secs("BOOTSTRAP") > 0);
+    }
+
+    #[test]
+    fn earlier_phase_reads_done_once_a_later_phase_has_started() {
+        // Regression: a PRE setup stage that records no terminal outcome left
+        // PRE with nonzero estimated remaining, so PRE showed a perpetual
+        // now+Xm finish estimate even after BOOTSTRAP was underway (observed
+        // live: "PRE: 13:02" ticking up while BOOT read "done"). Phases run in
+        // series, so PRE must read "done" the moment BOOTSTRAP has any recorded
+        // progress.
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.stage_outcomes = vec![
+            outcome("preflight", "pass"),
+            outcome("prepare_source_archive", "pass"),
+            // verify_ssh_reachability / prime_remote_access / cleanup_hosts are
+            // deliberately left unrecorded, so PRE's estimated remaining is > 0.
+            outcome("bootstrap_hosts", "pass"), // BOOTSTRAP has begun.
+        ];
+        assert!(
+            app.estimated_group_remaining_secs("PRE") > 0,
+            "precondition: PRE must have phantom pending work, else this proves nothing"
+        );
+        let labels = app.stage_finish_labels(chrono::Local::now());
+        assert_eq!(
+            labels[0].1, "done",
+            "PRE must read done once BOOTSTRAP has started (series phases): {labels:?}"
+        );
     }
 
     #[test]
