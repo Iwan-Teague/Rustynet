@@ -284,6 +284,30 @@ fn validate_tcp_addr_extracts_host_and_port() {
 }
 
 #[test]
+fn tcp_send_recv_body_prefers_nc_and_falls_back_to_bash_dev_tcp() {
+    let body = build_tcp_send_recv_body("127.0.0.1", 51822, "cGF5bG9hZA==", 5);
+    // The nc primary path is preserved verbatim for guests that ship it.
+    assert!(
+        body.contains("command -v nc") && body.contains("nc -w 5 -- '127.0.0.1' 51822"),
+        "nc path missing or altered: {body}"
+    );
+    // Minimal guests (Rocky/RHEL — no nc, no egress to install one) fall back
+    // to bash's /dev/tcp, bounded by `timeout` exactly as `nc -w` was.
+    assert!(
+        body.contains("command -v bash")
+            && body.contains("/dev/tcp/")
+            && body.contains("timeout 5 bash -c"),
+        "bash /dev/tcp fallback missing: {body}"
+    );
+    // The validated port is present and the base64 payload is single-quoted.
+    assert!(body.contains("51822"), "port missing: {body}");
+    assert!(
+        body.contains("'cGF5bG9hZA=='"),
+        "payload not single-quote-escaped: {body}"
+    );
+}
+
+#[test]
 fn validate_tcp_addr_supports_ipv6_bracket_form_rsplit() {
     // We rsplit on ':' so the last segment is the port — IPv6
     // bracketed addresses round-trip correctly.
