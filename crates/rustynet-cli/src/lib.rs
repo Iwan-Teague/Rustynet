@@ -37,6 +37,15 @@ mod env_file;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
 mod live_lab_results;
+// Un-gated: pure JSON-field / managed-dns-expected-ip parsers shared by the
+// vm-lab ops commands AND the always-built live_* test binaries (see the module
+// docs). Re-exported below so `rustynet_cli::execute_ops_*` resolves without the
+// `vm-lab` feature.
+mod live_lab_extract;
+pub use crate::live_lab_extract::{
+    ExtractManagedDnsExpectedIpConfig, ReadJsonFieldConfig,
+    execute_ops_extract_managed_dns_expected_ip, execute_ops_read_json_field,
+};
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
 mod live_lab_run_matrix;
@@ -79,9 +88,6 @@ mod vm_lab;
 /// into a private module path.
 #[cfg(feature = "vm-lab")]
 pub mod orchestrator_test_surface {
-    pub use crate::ops_live_lab_orchestrator::{
-        ExtractManagedDnsExpectedIpConfig, execute_ops_extract_managed_dns_expected_ip,
-    };
     pub use crate::vm_lab::orchestrator::context::OrchestrationContext;
     pub use crate::vm_lab::orchestrator::diagnostics::{
         register_shutdown_handlers, register_shutdown_handlers_with,
