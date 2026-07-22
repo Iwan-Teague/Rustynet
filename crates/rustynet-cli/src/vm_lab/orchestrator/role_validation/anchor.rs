@@ -92,7 +92,13 @@ const MACOS_MEMBERSHIP_SNAPSHOT_PATH: &str =
 const MACOS_MEMBERSHIP_LOG_PATH: &str = "/usr/local/var/rustynet/membership/membership.log";
 
 /// Per-OS `(rustynet program, snapshot path, log path)` for the
-/// `anchor list` probe. The Windows row references the reviewed
+/// `anchor list` probe. The POSIX backend runs this under `sudo -n`, and
+/// RHEL-family `sudo` (e.g. Rocky) ships a `secure_path` that omits
+/// `/usr/local/bin`, so a bare `rustynet` program name resolves on Debian but
+/// fails "command not found" on Rocky. Name the CLI by its absolute install
+/// path (`/usr/local/bin/rustynet` on both Linux and macOS — the same path
+/// admin_issue.rs / exit_demotion_residue.rs already use) so the probe is
+/// PATH-independent. The Windows row references the reviewed
 /// `rustynetd::windows_paths` constants so a canonical-layout rename
 /// surfaces at compile time; Linux + macOS use module constants pinned
 /// to the orchestrator install defaults (and host-build-independent).
@@ -101,12 +107,12 @@ fn anchor_list_invocation(
 ) -> Result<(&'static str, String, String), String> {
     match platform {
         VmGuestPlatform::Linux => Ok((
-            "rustynet",
+            "/usr/local/bin/rustynet",
             LINUX_MEMBERSHIP_SNAPSHOT_PATH.to_owned(),
             LINUX_MEMBERSHIP_LOG_PATH.to_owned(),
         )),
         VmGuestPlatform::Macos => Ok((
-            "rustynet",
+            "/usr/local/bin/rustynet",
             MACOS_MEMBERSHIP_SNAPSHOT_PATH.to_owned(),
             MACOS_MEMBERSHIP_LOG_PATH.to_owned(),
         )),
@@ -776,12 +782,12 @@ mod tests {
     #[test]
     fn anchor_list_invocation_uses_per_os_paths_and_program() {
         let (prog, snap, log) = anchor_list_invocation(VmGuestPlatform::Linux).unwrap();
-        assert_eq!(prog, "rustynet");
+        assert_eq!(prog, "/usr/local/bin/rustynet");
         assert_eq!(snap, "/var/lib/rustynet/membership.snapshot");
         assert_eq!(log, "/var/lib/rustynet/membership.log");
 
         let (prog, snap, log) = anchor_list_invocation(VmGuestPlatform::Macos).unwrap();
-        assert_eq!(prog, "rustynet");
+        assert_eq!(prog, "/usr/local/bin/rustynet");
         assert_eq!(
             snap,
             "/usr/local/var/rustynet/membership/membership.snapshot"
