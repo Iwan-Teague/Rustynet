@@ -538,8 +538,9 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, &name)| {
-                let later_started =
-                    progressed.get(i + 1..).is_some_and(|rest| rest.iter().any(|&p| p));
+                let later_started = progressed
+                    .get(i + 1..)
+                    .is_some_and(|rest| rest.iter().any(|&p| p));
                 let group_remaining = if later_started {
                     0
                 } else {
@@ -3583,9 +3584,13 @@ mod tests {
             .draw(|f| crate::ui::header::render(f, Rect::new(0, 0, 200, 4), &app))
             .expect("draw");
         let buf = terminal.backend().buffer();
-        let this_run = (0..200u16)
-            .map(|x| buf[(x, 1)].symbol())
-            .collect::<String>();
+        let row = |y: u16| {
+            (0..200u16)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let top = row(0);
+        let this_run = row(1);
         let trimmed = this_run.trim_end();
         eprintln!("THIS RUN ({} cols): [{trimmed}]", trimmed.chars().count());
         assert!(
@@ -3596,6 +3601,27 @@ mod tests {
             trimmed.chars().count() <= 125,
             "THIS RUN line must fit a 125-col terminal, got {} cols: [{trimmed}]",
             trimmed.chars().count()
+        );
+
+        // The third wall must line up too: the top row's PLAN│COVERAGE
+        // separator and the middle row's SETTLED/TESTS│STOP separator sit at
+        // the same column (COL3 == the SETTLED/TESTS width == 27).
+        let sep_cols = |s: &str| {
+            s.chars()
+                .enumerate()
+                .filter(|(_, c)| *c == '│')
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        };
+        let (pt, pr) = (sep_cols(&top), sep_cols(&this_run));
+        eprintln!("sep cols  top={pt:?}  run={pr:?}");
+        assert!(
+            pt.len() == 3 && pr.len() == 3,
+            "both rows carry three walls here: top={pt:?} run={pr:?}"
+        );
+        assert_eq!(
+            pt[2], pr[2],
+            "COVERAGE wall must align with STOP wall: top={top:?} run={this_run:?}"
         );
     }
 

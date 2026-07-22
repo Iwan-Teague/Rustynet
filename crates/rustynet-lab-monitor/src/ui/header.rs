@@ -33,7 +33,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     };
     let title = Style::default().fg(Color::Blue);
     let value = Style::default().fg(Color::White);
-    let sep = Style::default().fg(Color::DarkGray);
+    // Section separators match the parity panel's `[ n/a ]` magenta so the
+    // header reads as one visual system.
+    let sep = Style::default().fg(Color::Magenta);
     let timers = app.stage_finish_labels(chrono::Local::now());
     let (run_done, run_total) = app.current_run_stage_progress();
     let run_checks = app
@@ -41,10 +43,26 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .map(|(done, total)| format!("{done}/{total}"))
         .unwrap_or_else(|| "n/a".to_owned());
 
-    // Every value between two "│" separators is padded to a FIXED width with
-    // `cell()` so a separator holds its column as the value's own width changes
-    // frame to frame (e.g. the elapsed timer or the settled count ticking), and
-    // the sub-values inside a multi-value field stay evenly spaced.
+    // Fixed column widths so the "│" separators line up vertically across all
+    // three rows, forming a wall. Each column's (label + value) content is
+    // padded to its width; the first two walls are common to every row, the
+    // third exists only on the top line (PLAN | COVERAGE). Values are already
+    // `cell()`-clamped, so a wall holds as they change frame to frame. The
+    // trade-off of a grid over heterogeneous fields is visible padding on the
+    // narrow rows (e.g. VMS) — the cost of an aligned wall.
+    const COL1: usize = 24;
+    const COL2: usize = 36;
+    // COL3 matches the middle row's SETTLED/TESTS column width (27) so the top
+    // row's PLAN│COVERAGE wall lines up with the middle row's │STOP separator.
+    const COL3: usize = 27;
+
+    // A "LABEL: value" column body (label in `title`, value in `value`).
+    let col = |label: String, val: String| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(label, title),
+            Span::styled(format!(" {val}"), value),
+        ]
+    };
 
     // Top line — overall posture: status, which run this is, its plan, and
     // history-wide coverage last. (JOB alone identifies the run; the former AREA
@@ -57,83 +75,127 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     } else {
         String::new()
     };
-    let top = Line::from(vec![
-        Span::styled("STATUS:", title),
-        Span::styled(format!(" {}", cell(status, 8)), value),
-        Span::styled(" │ ", sep),
-        Span::styled("JOB:", title),
-        Span::styled(format!(" {}", cell(job, 24)), value),
-        Span::styled(" │ ", sep),
-        Span::styled("PLAN:", title),
-        Span::styled(format!(" {}", app.plan_source_label()), value),
-        Span::styled(" │ ", sep),
-        Span::styled("COVERAGE:", title),
-        Span::styled(
-            format!(
-                " {}",
-                cell(
-                    &format!("{}/{}", app.stage_progress.passed, app.stage_progress.total),
-                    8,
-                )
-            ),
-            value,
+    let mut top: Vec<Span> = Vec::new();
+    push_column(
+        &mut top,
+        col("STATUS:".to_owned(), cell(status, 8)),
+        COL1,
+        sep,
+    );
+    push_column(&mut top, col("JOB:".to_owned(), cell(job, 24)), COL2, sep);
+    push_column(
+        &mut top,
+        col("PLAN:".to_owned(), app.plan_source_label().to_owned()),
+        COL3,
+        sep,
+    );
+    top.push(Span::styled("COVERAGE:", title));
+    top.push(Span::styled(
+        format!(
+            " {}",
+            cell(
+                &format!("{}/{}", app.stage_progress.passed, app.stage_progress.total),
+                8,
+            )
         ),
-        Span::styled(cell(&flaky_slot, 9), Style::default().fg(Color::Yellow)),
-    ]);
+        value,
+    ));
+    top.push(Span::styled(
+        cell(&flaky_slot, 9),
+        Style::default().fg(Color::Yellow),
+    ));
+    let top = Line::from(top);
 
     // Middle line — everything about the run happening right now: how long it
     // has been going, when each phase is estimated to finish, and how many
     // stages/checks have settled so far.
     let elapsed = app.run_elapsed_label().unwrap_or_else(|| "—".to_owned());
-    let mut run_spans = vec![
-        Span::styled("THIS RUN:", title),
-        Span::styled(format!(" {}", cell(&elapsed, 8)), value),
-        Span::styled(" │ ", sep),
+    let mut run: Vec<Span> = Vec::new();
+    push_column(
+        &mut run,
+        col("THIS RUN:".to_owned(), cell(&elapsed, 8)),
+        COL1,
+        sep,
+    );
+    // The three phase-ETA timers are one multi-value column.
+    let timers_col = vec![
         Span::styled(format!("{}:", timers[0].0), title),
         Span::styled(format!(" {}", cell(timers[0].1.as_str(), 6)), value),
         Span::styled(format!(" {}:", timers[1].0), title),
         Span::styled(format!(" {}", cell(timers[1].1.as_str(), 6)), value),
         Span::styled(format!(" {}:", timers[2].0), title),
         Span::styled(format!(" {}", cell(timers[2].1.as_str(), 6)), value),
-        Span::styled(" │ ", sep),
-        Span::styled("SETTLED:", title),
-        Span::styled(
-            format!(" {}", cell(&format!("{run_done}/{run_total}"), 6)),
-            value,
-        ),
-        Span::styled(" TESTS:", title),
-        Span::styled(format!(" {}", cell(&run_checks, 6)), value),
     ];
+    push_column(&mut run, timers_col, COL2, sep);
+    // SETTLED / TESTS is the tail column (no wall after) unless the stop-on-fail
+    // indicator follows. Counts use a width-5 cell to keep the row inside a
+    // 125-col terminal once the indicator is appended.
+    run.push(Span::styled("SETTLED:", title));
+    run.push(Span::styled(
+        format!(" {}", cell(&format!("{run_done}/{run_total}"), 5)),
+        value,
+    ));
+    run.push(Span::styled(" TESTS:", title));
+    run.push(Span::styled(format!(" {}", cell(&run_checks, 5)), value));
     // Stop-on-stage-failure mode: the --node engine runs the whole plan and
     // never halts at the first failed stage, so this reads `false`. Stated
     // explicitly (true/false) so a run that keeps going after a failure is not
-    // misread as stuck/over — the exact confusion this indicator resolves.
-    // Shown only for --node runs; the bash path's policy is not asserted.
+    // misread as stuck/over. Shown only for --node runs.
     if let Some(stops) = app.run_stops_on_stage_failure() {
-        run_spans.push(Span::styled(" │ ", sep));
-        run_spans.push(Span::styled("STOP ON STAGE FAILURE:", title));
-        run_spans.push(Span::styled(
+        run.push(Span::styled(" │ ", sep));
+        run.push(Span::styled("STOP ON STAGE FAILURE:", title));
+        run.push(Span::styled(
             format!(" {stops}"),
             Style::default().fg(if stops { Color::Yellow } else { Color::Green }),
         ));
     }
-    let run_line = Line::from(run_spans);
+    let run_line = Line::from(run);
 
     // Bottom line — provenance and environment: the data source (live vs
     // previous run, and its age), how many VMs are visible, refresh cadences.
-    let bottom_line = Line::from(vec![
-        Span::styled(format!("{}:", app.stage_source_title()), title),
-        Span::styled(format!(" {}", cell(&app.stage_source_value(), 14)), value),
-        Span::styled(" │ ", sep),
-        Span::styled("VMS:", title),
-        Span::styled(format!(" {}", cell(&vms.to_string(), 3)), value),
-        Span::styled(" │ ", sep),
-        Span::styled("REFRESH:", title),
-        Span::styled(" 2s stages / 5s active VMs", value),
-    ]);
+    let mut bottom: Vec<Span> = Vec::new();
+    push_column(
+        &mut bottom,
+        col(
+            format!("{}:", app.stage_source_title()),
+            app.stage_source_value(),
+        ),
+        COL1,
+        sep,
+    );
+    push_column(
+        &mut bottom,
+        col("VMS:".to_owned(), vms.to_string()),
+        COL2,
+        sep,
+    );
+    bottom.push(Span::styled("REFRESH:", title));
+    bottom.push(Span::styled(" 2s stages / 5s active VMs", value));
+    let bottom_line = Line::from(bottom);
 
     let p = Paragraph::new(vec![top, run_line, bottom_line, Line::from("")]);
     f.render_widget(p, area);
+}
+
+/// Push a fixed-width header column: its `content` spans, then space padding to
+/// `width` (clamped), then the magenta " │ " separator. Padding every row's
+/// column to the SAME width is what makes the separators line up into a
+/// vertical wall down the header.
+fn push_column(
+    out: &mut Vec<Span<'static>>,
+    content: Vec<Span<'static>>,
+    width: usize,
+    sep: Style,
+) {
+    let used: usize = content
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    out.extend(content);
+    if width > used {
+        out.push(Span::raw(" ".repeat(width - used)));
+    }
+    out.push(Span::styled(" │ ", sep));
 }
 
 fn fixed(value: &str, max: usize) -> String {
@@ -218,6 +280,37 @@ mod tests {
                 "{label} must be followed by exactly one space: [{top}]"
             );
         }
+    }
+
+    #[test]
+    fn header_separators_align_into_a_vertical_wall_across_rows() {
+        let (top, run, bottom) = render_header_lines();
+        // Char positions (not byte — "│" is multi-byte) of every separator.
+        let seps = |s: &str| {
+            s.chars()
+                .enumerate()
+                .filter(|(_, c)| *c == '│')
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        };
+        let (pt, pr, pb) = (seps(&top), seps(&run), seps(&bottom));
+        eprintln!("sep cols  top={pt:?}  run={pr:?}  bottom={pb:?}");
+        // Every row has at least the first two walls; they must sit at the same
+        // column on all three rows (that alignment is the whole point).
+        assert!(
+            pt.len() >= 2 && pr.len() >= 2 && pb.len() >= 2,
+            "each row needs two separators: {pt:?} {pr:?} {pb:?}"
+        );
+        assert_eq!(
+            (pt[0], pt[1]),
+            (pr[0], pr[1]),
+            "top vs run walls: {top}|{run}"
+        );
+        assert_eq!(
+            (pt[0], pt[1]),
+            (pb[0], pb[1]),
+            "top vs bottom walls: {top}|{bottom}"
+        );
     }
 
     #[test]
