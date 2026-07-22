@@ -302,6 +302,24 @@ The host is stood up and live. As-built, verified on the box:
 | Root | `/dev/sdb2` ext4 464.8 G (427 G free), ESP `/dev/sdb1` 1 G, 4 G swapfile |
 | Network | WiFi `wlp7s0` up (DHCP 10.230.76.5); wired `eno1` **DOWN / NO-CARRIER** |
 
+**Boot kernel — PINNED to `6.8.0-134` (2026-07-18).** The host is GRUB-pinned to
+kernel `6.8.0-134-generic` via `GRUB_DEFAULT="1>2"` in `/etc/default/grub`. This
+matters because the box is a **headless lab host reached only over the network**:
+an upgrade to `6.8.0-136` once landed without its network-driver module package
+(`linux-modules-extra-6.8.0-136-generic`), so `-136` booted with **no network at
+all** (WiFi + USB-net drivers absent) and stranded the box — no SSH, console-only
+recovery. `-134` is the known-good reference. `-136` was later given its
+`linux-modules-extra`, so both kernels now have network, but `-134` stays the
+pinned default.
+- **GOTCHA — the pin is index-based.** `1>2` means "Advanced options → 3rd entry",
+  which resolves to `-134` only while exactly `-136` and `-134` are installed. A
+  future kernel install shifts that index, so **after any kernel change confirm the
+  box still boots `-134` with `uname -r`**, and re-pin if not.
+- **Recovery if the box is unreachable after a reboot:** it may have booted the
+  wrong kernel. Force `-134` from the physical console — note the GRUB *graphical*
+  menu can render blank on this box, so set `GRUB_TERMINAL=console` for a visible
+  text menu, or set `GRUB_DEFAULT` to the `-134` entry.
+
 **DISK SCOPE — HARD RULE (closes §8 #7, non-negotiable):**
 
 | Disk | Device | Contents | Rule |
