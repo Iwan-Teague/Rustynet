@@ -6,13 +6,26 @@ pub fn blind_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
 }
 
+/// The `rustynet` CLI by absolute install path per OS. The POSIX backend runs
+/// `ops status` under `sudo -n`, and RHEL-family `sudo` (Rocky) ships a
+/// `secure_path` that omits `/usr/local/bin`, so a bare `rustynet` name fails
+/// "command not found". Name it absolutely (mirrors anchor.rs). Windows uses
+/// the `.exe` on PATH; blind_exit is blocked on Windows in production, but the
+/// code path stays correct.
+fn rustynet_program(platform: VmGuestPlatform) -> &'static str {
+    match platform {
+        VmGuestPlatform::Windows => "rustynet.exe",
+        _ => "/usr/local/bin/rustynet",
+    }
+}
+
 pub fn validate_blind_exit_runtime(
     shell: &dyn RemoteShellHost,
     platform: VmGuestPlatform,
     alias: &str,
 ) -> Result<(), String> {
     let status_out = shell
-        .run_argv(&["rustynet", "ops", "status"], &[], &[])
+        .run_argv(&[rustynet_program(platform), "ops", "status"], &[], &[])
         .map_err(|e| format!("{alias}: failed to run rustynet ops status: {e}"))?;
     let status_str = String::from_utf8_lossy(&status_out.stdout);
     if !status_out.is_success() {
@@ -83,14 +96,20 @@ mod tests {
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
 
     fn program_status(shell: &MockShellHost, role_line: &str, code: i32) {
-        shell.program_run_response(
-            &["rustynet", "ops", "status"],
-            RemoteExitStatus {
-                code,
-                stdout: role_line.as_bytes().to_vec(),
-                stderr: Vec::new(),
-            },
-        );
+        // Register the status response under every per-OS program name so the
+        // helper stays platform-agnostic — validate_blind_exit_runtime resolves
+        // the program from the platform under test (absolute path on POSIX,
+        // .exe on Windows) and will match whichever key it uses.
+        for program in ["/usr/local/bin/rustynet", "rustynet.exe"] {
+            shell.program_run_response(
+                &[program, "ops", "status"],
+                RemoteExitStatus {
+                    code,
+                    stdout: role_line.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                },
+            );
+        }
     }
 
     #[test]
