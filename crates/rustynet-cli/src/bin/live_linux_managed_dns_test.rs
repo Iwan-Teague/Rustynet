@@ -2658,26 +2658,17 @@ fn render_remote_output(output: &Output) -> String {
     }
 }
 
+// Both delegate to the ONE canonical implementation in the un-gated
+// `rustynet_cli::live_lab_extract` module (re-exported at the crate root) --
+// in-process, so no `cargo run` subprocess rebuilds/clobbers the orchestrator
+// binary, and no logic is duplicated. `_root_dir` is retained for call-site
+// compatibility (the parsers no longer need it).
 fn json_field(_root_dir: &Path, payload: &str, field: &str) -> Result<String, String> {
-    use serde_json::Value;
-    let payload_val = serde_json::from_str::<Value>(payload)
-        .map_err(|e| format!("parse --payload JSON failed: {e}"))?;
-    let object = payload_val
-        .as_object()
-        .ok_or_else(|| "--payload must be a JSON object".to_owned())?;
-    let value = object.get(field);
-    let result = match value {
-        None => String::new(),
-        Some(Value::Null) => String::new(),
-        Some(Value::Bool(true)) => "true".to_owned(),
-        Some(Value::Bool(false)) => "false".to_owned(),
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(other) => {
-            serde_json::to_string(other).map_err(|e| format!("serialize field failed: {e}"))?
-        }
-    };
-    Ok(result.trim().to_owned())
+    rustynet_cli::execute_ops_read_json_field(rustynet_cli::ReadJsonFieldConfig {
+        payload: payload.to_owned(),
+        field: field.to_owned(),
+    })
+    .map(|value| value.trim().to_owned())
 }
 
 fn extract_managed_dns_expected_ip(
@@ -2685,44 +2676,13 @@ fn extract_managed_dns_expected_ip(
     fqdn: &str,
     inspect_output: &str,
 ) -> Result<String, String> {
-    let fqdn = fqdn.trim().to_owned();
-    if fqdn.is_empty() {
-        return Err("--fqdn must be non-empty".to_owned());
-    }
-    let fqdn_token = format!("fqdn={fqdn}");
-    for line in inspect_output.lines() {
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        if tokens.contains(&fqdn_token.as_str()) {
-            for token in &tokens {
-                if let Some(value) = token.strip_prefix("expected_ip=") {
-                    return Ok(value.trim().to_owned());
-                }
-            }
-        }
-        for (index, token) in tokens.iter().enumerate() {
-            let Some(record_token) = token.strip_prefix("record.") else {
-                continue;
-            };
-            let Some((record_index, token_fqdn)) = record_token.split_once(".fqdn=") else {
-                continue;
-            };
-            if token_fqdn != fqdn {
-                continue;
-            }
-            let expected_ip_prefix = format!("record.{record_index}.expected_ip=");
-            for candidate in &tokens {
-                if let Some(value) = candidate.strip_prefix(expected_ip_prefix.as_str()) {
-                    return Ok(value.trim().to_owned());
-                }
-            }
-            for candidate in tokens.iter().skip(index + 1) {
-                if let Some(value) = candidate.strip_prefix("expected_ip=") {
-                    return Ok(value.trim().to_owned());
-                }
-            }
-        }
-    }
-    Ok(String::new())
+    rustynet_cli::execute_ops_extract_managed_dns_expected_ip(
+        rustynet_cli::ExtractManagedDnsExpectedIpConfig {
+            fqdn: fqdn.to_owned(),
+            inspect_output: inspect_output.to_owned(),
+        },
+    )
+    .map(|value| value.trim().to_owned())
 }
 
 fn write_env_file(path: &Path, entries: &[(&str, &str)]) -> Result<(), String> {

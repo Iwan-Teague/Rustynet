@@ -312,17 +312,17 @@ pub struct E2eHttpProbeClientConfig {
     pub expect_marker: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReadJsonFieldConfig {
-    pub payload: String,
-    pub field: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtractManagedDnsExpectedIpConfig {
-    pub fqdn: String,
-    pub inspect_output: String,
-}
+// The JSON-field / managed-dns-expected-ip parsers moved to the un-gated
+// `crate::live_lab_extract` module so the always-built live-lab test bins can
+// call them in-process (no `cargo run` subprocess, no copy). Re-exported here so
+// the `ops_live_lab_orchestrator::` paths in the ops-command dispatch keep
+// resolving unchanged. `unused_imports` allowed because the consumer is the
+// binary's ops dispatch (main.rs), not seen by the library compilation.
+#[allow(unused_imports)]
+pub use crate::live_lab_extract::{
+    ExtractManagedDnsExpectedIpConfig, ReadJsonFieldConfig,
+    execute_ops_extract_managed_dns_expected_ip, execute_ops_read_json_field,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteActiveNetworkSignedStateTamperReportConfig {
@@ -3757,77 +3757,6 @@ pub fn execute_ops_e2e_http_probe_client(
     Ok(config.expect_marker)
 }
 
-pub fn execute_ops_read_json_field(config: ReadJsonFieldConfig) -> Result<String, String> {
-    let payload = serde_json::from_str::<Value>(config.payload.as_str())
-        .map_err(|err| format!("parse --payload JSON failed: {err}"))?;
-    let object = payload
-        .as_object()
-        .ok_or_else(|| "--payload must be a JSON object".to_owned())?;
-    let value = object.get(config.field.as_str());
-    match value {
-        None => Ok(String::new()),
-        Some(Value::Null) => Ok(String::new()),
-        Some(Value::Bool(flag)) => {
-            if *flag {
-                Ok("true".to_owned())
-            } else {
-                Ok("false".to_owned())
-            }
-        }
-        Some(Value::String(text)) => Ok(text.clone()),
-        Some(Value::Number(number)) => Ok(number.to_string()),
-        Some(other) => {
-            serde_json::to_string(other).map_err(|err| format!("serialize field failed: {err}"))
-        }
-    }
-}
-
-pub fn execute_ops_extract_managed_dns_expected_ip(
-    config: ExtractManagedDnsExpectedIpConfig,
-) -> Result<String, String> {
-    let fqdn = config.fqdn.trim().to_owned();
-    if fqdn.is_empty() {
-        return Err("--fqdn must be non-empty".to_owned());
-    }
-    let fqdn_token = format!("fqdn={fqdn}");
-    for line in config.inspect_output.lines() {
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        if tokens.contains(&fqdn_token.as_str()) {
-            for token in &tokens {
-                if let Some(value) = token.strip_prefix("expected_ip=") {
-                    return Ok(value.to_owned());
-                }
-            }
-        }
-
-        for (index, token) in tokens.iter().enumerate() {
-            let Some(record_token) = token.strip_prefix("record.") else {
-                continue;
-            };
-            let Some((record_index, token_fqdn)) = record_token.split_once(".fqdn=") else {
-                continue;
-            };
-            if token_fqdn != fqdn {
-                continue;
-            }
-
-            let expected_ip_prefix = format!("record.{record_index}.expected_ip=");
-            for candidate in &tokens {
-                if let Some(value) = candidate.strip_prefix(expected_ip_prefix.as_str()) {
-                    return Ok(value.to_owned());
-                }
-            }
-
-            for candidate in tokens.iter().skip(index + 1) {
-                if let Some(value) = candidate.strip_prefix("expected_ip=") {
-                    return Ok(value.to_owned());
-                }
-            }
-        }
-    }
-    Ok(String::new())
-}
-
 /// Typed view for the per-check verdicts inside the active-network
 /// signed-state tamper report. Five pass/fail slots, one per
 /// adversarial step.
@@ -4117,7 +4046,7 @@ mod tests {
         ActiveNetworkRoguePathHijackHostsView, ActiveNetworkRoguePathHijackReportView,
         ActiveNetworkSignedStateTamperChecksView, ActiveNetworkSignedStateTamperEvidenceView,
         ActiveNetworkSignedStateTamperHostsView, ActiveNetworkSignedStateTamperReportView,
-        CheckLocalFileModeConfig, E2eDnsQueryResultView, ExtractManagedDnsExpectedIpConfig,
+        CheckLocalFileModeConfig, E2eDnsQueryResultView,
         LiveLinuxControlSurfaceAggregateChecksView, LiveLinuxControlSurfaceEvidenceView,
         LiveLinuxControlSurfaceHostChecksView, LiveLinuxControlSurfaceHostEvidenceView,
         LiveLinuxControlSurfaceHostResultView, LiveLinuxControlSurfaceReportView,
@@ -4135,8 +4064,7 @@ mod tests {
         WriteLiveLinuxServerIpBypassReportConfig, WriteRealWireguardExitnodeE2eReportConfig,
         WriteRoleSwitchMatrixReportConfig, count_no_leak_cleartext_packets,
         count_no_leak_tunnel_packets, dns_query_bind_addr, execute_ops_check_local_file_mode,
-        execute_ops_extract_managed_dns_expected_ip, execute_ops_rewrite_assignment_mesh_cidr,
-        execute_ops_rewrite_assignment_peer_endpoint_ip,
+        execute_ops_rewrite_assignment_mesh_cidr, execute_ops_rewrite_assignment_peer_endpoint_ip,
         execute_ops_update_role_switch_host_result,
         execute_ops_validate_cross_network_forensics_bundle,
         execute_ops_write_active_network_rogue_path_hijack_report,
@@ -5574,32 +5502,6 @@ mod tests {
         assert_eq!(count_no_leak_tunnel_packets(&load_lines), 1);
         assert_eq!(count_no_leak_cleartext_packets(&load_lines), 1);
         assert_eq!(count_no_leak_cleartext_packets(&down_lines), 1);
-    }
-
-    #[test]
-    fn extract_managed_dns_expected_ip_supports_legacy_tokens() {
-        let output = "dns inspect: state=valid fqdn=exit.rustynet expected_ip=100.64.0.1";
-        let expected =
-            execute_ops_extract_managed_dns_expected_ip(ExtractManagedDnsExpectedIpConfig {
-                fqdn: "exit.rustynet".to_owned(),
-                inspect_output: output.to_owned(),
-            })
-            .expect("extract expected ip");
-        assert_eq!(expected, "100.64.0.1");
-    }
-
-    #[test]
-    fn extract_managed_dns_expected_ip_supports_record_indexed_tokens() {
-        let output = "dns inspect: state=valid record_count=2 \
-record.0.fqdn=client.rustynet record.0.expected_ip=100.68.223.117 \
-record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
-        let expected =
-            execute_ops_extract_managed_dns_expected_ip(ExtractManagedDnsExpectedIpConfig {
-                fqdn: "exit.rustynet".to_owned(),
-                inspect_output: output.to_owned(),
-            })
-            .expect("extract expected ip");
-        assert_eq!(expected, "100.109.33.213");
     }
 
     #[test]

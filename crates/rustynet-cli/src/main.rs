@@ -41,6 +41,11 @@ mod ops_install_systemd;
 mod ops_install_systemd_exit;
 mod ops_install_systemd_relay;
 mod ops_install_systemd_service;
+// Shared parsers (see crate::live_lab_extract). This binary only reaches them
+// through the vm-lab ops dispatch, so the declaration is gated to match; the
+// library keeps an UN-gated copy so the always-built live_* test bins can use it.
+#[cfg(feature = "vm-lab")]
+mod live_lab_extract;
 #[cfg(feature = "vm-lab")]
 mod ops_live_lab_failure_digest;
 #[cfg(feature = "vm-lab")]
