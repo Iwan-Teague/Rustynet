@@ -36,6 +36,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let sep = Style::default().fg(Color::DarkGray);
     let timers = app.stage_finish_labels(chrono::Local::now());
     let (run_done, run_total) = app.current_run_stage_progress();
+    let run_failed = app.current_run_failed_count();
     let run_checks = app
         .current_run_check_progress()
         .map(|(done, total)| format!("{done}/{total}"))
@@ -59,7 +60,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     };
     let top = Line::from(vec![
         Span::styled("STATUS:", title),
-        Span::styled(cell(status, 8), value),
+        Span::styled(format!(" {}", cell(status, 8)), value),
         Span::styled(" │ ", sep),
         Span::styled("JOB:", title),
         Span::styled(format!(" {}", cell(job, 24)), value),
@@ -69,9 +70,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" │ ", sep),
         Span::styled("COVERAGE:", title),
         Span::styled(
-            cell(
-                &format!("{}/{}", app.stage_progress.passed, app.stage_progress.total),
-                8,
+            format!(
+                " {}",
+                cell(
+                    &format!("{}/{}", app.stage_progress.passed, app.stage_progress.total),
+                    8,
+                )
             ),
             value,
         ),
@@ -82,31 +86,46 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     // has been going, when each phase is estimated to finish, and how many
     // stages/checks have settled so far.
     let elapsed = app.run_elapsed_label().unwrap_or_else(|| "—".to_owned());
-    let run_line = Line::from(vec![
+    let mut run_spans = vec![
         Span::styled("THIS RUN:", title),
         Span::styled(format!(" {}", cell(&elapsed, 8)), value),
         Span::styled(" │ ", sep),
         Span::styled(format!("{}:", timers[0].0), title),
-        Span::styled(cell(timers[0].1.as_str(), 6), value),
-        Span::styled(format!("{}:", timers[1].0), title),
-        Span::styled(cell(timers[1].1.as_str(), 6), value),
-        Span::styled(format!("{}:", timers[2].0), title),
-        Span::styled(cell(timers[2].1.as_str(), 6), value),
+        Span::styled(format!(" {}", cell(timers[0].1.as_str(), 6)), value),
+        Span::styled(format!(" {}:", timers[1].0), title),
+        Span::styled(format!(" {}", cell(timers[1].1.as_str(), 6)), value),
+        Span::styled(format!(" {}:", timers[2].0), title),
+        Span::styled(format!(" {}", cell(timers[2].1.as_str(), 6)), value),
         Span::styled(" │ ", sep),
         Span::styled("SETTLED:", title),
-        Span::styled(cell(&format!("{run_done}/{run_total}"), 6), value),
+        Span::styled(
+            format!(" {}", cell(&format!("{run_done}/{run_total}"), 6)),
+            value,
+        ),
         Span::styled(" TESTS:", title),
-        Span::styled(cell(&run_checks, 6), value),
-    ]);
+        Span::styled(format!(" {}", cell(&run_checks, 6)), value),
+    ];
+    // Fail indicator: the --node engine keeps running after a stage fails, so a
+    // red count on the THIS RUN line surfaces a failure at a glance while the
+    // run legitimately still shows RUNNING. Hidden entirely at zero so it never
+    // adds a gap to a clean run.
+    if run_failed > 0 {
+        run_spans.push(Span::styled(" │ ", sep));
+        run_spans.push(Span::styled(
+            format!("FAILED: {run_failed}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let run_line = Line::from(run_spans);
 
     // Bottom line — provenance and environment: the data source (live vs
     // previous run, and its age), how many VMs are visible, refresh cadences.
     let bottom_line = Line::from(vec![
-        Span::styled(cell(&format!("{}:", app.stage_source_title()), 13), title),
+        Span::styled(format!("{}:", app.stage_source_title()), title),
         Span::styled(format!(" {}", cell(&app.stage_source_value(), 14)), value),
         Span::styled(" │ ", sep),
         Span::styled("VMS:", title),
-        Span::styled(cell(&vms.to_string(), 3), value),
+        Span::styled(format!(" {}", cell(&vms.to_string(), 3)), value),
         Span::styled(" │ ", sep),
         Span::styled("REFRESH:", title),
         Span::styled(" 2s stages / 5s active VMs", value),
@@ -140,6 +159,65 @@ fn cell(value: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render the header to an in-memory buffer and return its first three
+    /// lines (top / THIS RUN / source) as trimmed strings.
+    fn render_header_lines() -> (String, String, String) {
+        use crate::app::App;
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+        let app = App::new(std::path::PathBuf::from("/tmp")).expect("app");
+        let backend = TestBackend::new(220, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render(f, Rect::new(0, 0, 220, 4), &app))
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        let line = |y: u16| {
+            (0..220u16)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+        (line(0), line(1), line(2))
+    }
+
+    #[test]
+    fn header_source_label_is_followed_by_exactly_one_space_not_a_padded_gap() {
+        // Regression guard for the "LIVE RUN weird spacing": the bottom-line
+        // source-title label used to be padded to a fixed 13 columns AND carry
+        // a leading space on its value, so "LIVE RUN:" sat 5 columns before its
+        // value while every other label used one. The label is now rendered at
+        // its natural width with a single trailing space, like STATUS/JOB/etc.
+        let (top, run, bottom) = render_header_lines();
+        // Visible when run with --nocapture, to eyeball the spacing.
+        eprintln!("TOP:    [{top}]");
+        eprintln!("THISRUN:[{run}]");
+        eprintln!("BOTTOM: [{bottom}]");
+
+        let label = "RUN DATA:"; // App::new with no data → stage_source_title() == "RUN DATA"
+        let idx = bottom
+            .find(label)
+            .unwrap_or_else(|| panic!("source-title label missing on bottom line: [{bottom}]"));
+        let after = &bottom[idx + label.len()..];
+        assert!(
+            after.starts_with(' ') && !after.starts_with("  "),
+            "source label must be followed by exactly one space (no padded gap): [{bottom}]"
+        );
+
+        // And the top-line labels keep the same single-space convention.
+        for label in ["STATUS:", "JOB:", "COVERAGE:"] {
+            let idx = top
+                .find(label)
+                .unwrap_or_else(|| panic!("{label} missing on top line: [{top}]"));
+            let after = &top[idx + label.len()..];
+            assert!(
+                after.starts_with(' ') && !after.starts_with("  "),
+                "{label} must be followed by exactly one space: [{top}]"
+            );
+        }
+    }
 
     #[test]
     fn cell_pads_short_values_and_truncates_long_ones_to_exact_width() {

@@ -614,6 +614,30 @@ impl App {
         (completed, enabled.len())
     }
 
+    /// How many distinct enabled stages have FAILED in the current run so far.
+    /// Mirrors `current_run_stage_progress` (same enabled-stage filter) but
+    /// counts failures instead of completions. The `--node` engine keeps
+    /// running the remaining stages after a stage fails, so this feeds the
+    /// header's fail indicator — a mid-run failure is visible at a glance even
+    /// while the run legitimately shows RUNNING.
+    pub fn current_run_failed_count(&self) -> usize {
+        let enabled: HashSet<String> = self
+            .planned_stage_groups()
+            .into_iter()
+            .flat_map(|group| group.stages)
+            .filter(|stage| self.stage_enabled(stage))
+            .collect();
+        self.stage_outcomes
+            .iter()
+            .filter(|outcome| {
+                enabled.contains(&outcome.stage)
+                    && crate::data::stage_reader::StageStatus::parse(&outcome.status).is_failure()
+            })
+            .map(|outcome| outcome.stage.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
     /// Selected validation/check executions. `None` for schema-v1 manifests:
     /// old evidence did not carry this fact, so guessing would violate the
     /// monitor's emit-don't-infer contract.
