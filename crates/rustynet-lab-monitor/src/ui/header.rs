@@ -36,7 +36,6 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let sep = Style::default().fg(Color::DarkGray);
     let timers = app.stage_finish_labels(chrono::Local::now());
     let (run_done, run_total) = app.current_run_stage_progress();
-    let run_failed = app.current_run_failed_count();
     let run_checks = app
         .current_run_check_progress()
         .map(|(done, total)| format!("{done}/{total}"))
@@ -105,15 +104,17 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" TESTS:", title),
         Span::styled(format!(" {}", cell(&run_checks, 6)), value),
     ];
-    // Fail indicator: the --node engine keeps running after a stage fails, so a
-    // red count on the THIS RUN line surfaces a failure at a glance while the
-    // run legitimately still shows RUNNING. Hidden entirely at zero so it never
-    // adds a gap to a clean run.
-    if run_failed > 0 {
+    // Stop-on-stage-failure mode: the --node engine runs the whole plan and
+    // never halts at the first failed stage, so this reads `false`. Stated
+    // explicitly (true/false) so a run that keeps going after a failure is not
+    // misread as stuck/over — the exact confusion this indicator resolves.
+    // Shown only for --node runs; the bash path's policy is not asserted.
+    if let Some(stops) = app.run_stops_on_stage_failure() {
         run_spans.push(Span::styled(" │ ", sep));
+        run_spans.push(Span::styled("STOP ON STAGE FAILURE:", title));
         run_spans.push(Span::styled(
-            format!("FAILED: {run_failed}"),
-            Style::default().fg(Color::Red),
+            format!(" {stops}"),
+            Style::default().fg(if stops { Color::Yellow } else { Color::Green }),
         ));
     }
     let run_line = Line::from(run_spans);

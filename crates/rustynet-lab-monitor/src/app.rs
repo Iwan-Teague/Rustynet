@@ -614,28 +614,20 @@ impl App {
         (completed, enabled.len())
     }
 
-    /// How many distinct enabled stages have FAILED in the current run so far.
-    /// Mirrors `current_run_stage_progress` (same enabled-stage filter) but
-    /// counts failures instead of completions. The `--node` engine keeps
-    /// running the remaining stages after a stage fails, so this feeds the
-    /// header's fail indicator — a mid-run failure is visible at a glance even
-    /// while the run legitimately shows RUNNING.
-    pub fn current_run_failed_count(&self) -> usize {
-        let enabled: HashSet<String> = self
-            .planned_stage_groups()
-            .into_iter()
-            .flat_map(|group| group.stages)
-            .filter(|stage| self.stage_enabled(stage))
-            .collect();
-        self.stage_outcomes
-            .iter()
-            .filter(|outcome| {
-                enabled.contains(&outcome.stage)
-                    && crate::data::stage_reader::StageStatus::parse(&outcome.status).is_failure()
-            })
-            .map(|outcome| outcome.stage.as_str())
-            .collect::<HashSet<_>>()
-            .len()
+    /// Whether the active/most-recent run stops at the first failed stage.
+    /// The `--node` engine records each stage's result and runs the ENTIRE
+    /// plan, so it never stops on a stage failure — it returns `Some(false)`.
+    /// The header surfaces this so a run that legitimately keeps going after a
+    /// failure is not misread as stuck or over. `None` when it can't be
+    /// determined: no `--node` manifest is loaded (the bash path's policy is
+    /// deliberately not asserted here, since its behavior differs).
+    pub fn run_stops_on_stage_failure(&self) -> Option<bool> {
+        let manifest = self.run_manifest.as_ref()?;
+        if manifest.node_assignments.is_empty() {
+            None
+        } else {
+            Some(false)
+        }
     }
 
     /// Selected validation/check executions. `None` for schema-v1 manifests:
@@ -3521,6 +3513,52 @@ fn load_available_models(repo_root: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn run_stops_on_stage_failure_is_false_for_node_runs_and_absent_otherwise() {
+        use crate::data::stage_manifest::{ManifestNodeAssignment, RunStageManifest};
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+        let mut app = App::new(std::path::PathBuf::from("/tmp")).expect("app");
+        // No manifest loaded → cannot assert a policy.
+        assert_eq!(app.run_stops_on_stage_failure(), None);
+        // A bash/wrapper run (empty node_assignments) is not asserted either.
+        app.run_manifest = Some(RunStageManifest::default());
+        assert_eq!(app.run_stops_on_stage_failure(), None);
+        // A --node run runs the whole plan → never stops on a stage failure.
+        app.run_manifest = Some(RunStageManifest {
+            node_assignments: vec![ManifestNodeAssignment {
+                alias: "rocky-utm-1".to_owned(),
+                role: "anchor".to_owned(),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(app.run_stops_on_stage_failure(), Some(false));
+
+        // Render the header and confirm the indicator shows on the THIS RUN
+        // line, spelled out true/false, and that the line fits a 125-col
+        // terminal (the observed real width) without clipping.
+        let backend = TestBackend::new(200, 4);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::header::render(f, Rect::new(0, 0, 200, 4), &app))
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        let this_run = (0..200u16)
+            .map(|x| buf[(x, 1)].symbol())
+            .collect::<String>();
+        let trimmed = this_run.trim_end();
+        eprintln!("THIS RUN ({} cols): [{trimmed}]", trimmed.chars().count());
+        assert!(
+            trimmed.contains("STOP ON STAGE FAILURE: false"),
+            "indicator must render for a --node run: [{trimmed}]"
+        );
+        assert!(
+            trimmed.chars().count() <= 125,
+            "THIS RUN line must fit a 125-col terminal, got {} cols: [{trimmed}]",
+            trimmed.chars().count()
+        );
+    }
 
     #[test]
     fn position_based_failure_breakdown_places_a_bootstrap_windows_failure_correctly() {
