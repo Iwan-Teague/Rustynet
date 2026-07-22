@@ -24921,7 +24921,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         let expected_fresh = {
             let gateway_probe =
-                detect_ipv4_default_gateway_for_interface(runtime.egress_interface.as_str());
+                super::detect_ipv4_default_gateway_for_interface(runtime.egress_interface.as_str());
             runtime.compute_runtime_endpoint_fingerprint(&gateway_probe)
         };
         #[cfg(not(target_os = "linux"))]
