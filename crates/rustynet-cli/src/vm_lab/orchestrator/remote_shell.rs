@@ -759,6 +759,27 @@ fn posix_run_argv(
     parse_run_argv_envelope(&stdout)
 }
 
+/// Remote shell body for a TCP send-recv probe. Prefers `nc` (the historical
+/// path, unchanged), and falls back to bash's `/dev/tcp` when nc is absent so
+/// the probe works on minimal guests — e.g. Rocky/RHEL, which ship no `nc` and
+/// have no egress to `dnf install` one. The callers' requests are
+/// newline-delimited (the server responds on the delimiter), so the reply
+/// arrives without a TCP half-close — which `cat >&3; cat <&3` over `/dev/tcp`
+/// does not perform but does not need here. `timeout` bounds the read exactly
+/// as `nc -w` does. `host` is single-quote-escaped and `port` is a validated
+/// u16, so neither can break out of the command.
+fn build_tcp_send_recv_body(host: &str, port: u16, payload_b64: &str, timeout_secs: u64) -> String {
+    let payload_b64_quoted = shell_quote(payload_b64);
+    let host_quoted = shell_quote(host);
+    format!(
+        "if command -v nc >/dev/null 2>&1; then \
+         printf %s {payload_b64_quoted} | base64 -d | nc -w {timeout_secs} -- {host_quoted} {port} | base64 | tr -d '\\n\\r '; \
+         elif command -v bash >/dev/null 2>&1; then \
+         printf %s {payload_b64_quoted} | base64 -d | timeout {timeout_secs} bash -c 'exec 3<>/dev/tcp/'{host_quoted}'/'{port}' || exit 1; cat >&3; cat <&3' | base64 | tr -d '\\n\\r '; \
+         else echo 'tcp probe needs nc or bash; neither found' >&2; exit 127; fi"
+    )
+}
+
 fn posix_tcp_send_recv(
     conn: &NodeConnection,
     addr: &str,
@@ -768,13 +789,7 @@ fn posix_tcp_send_recv(
     let (host, port) = validate_tcp_addr(addr)?;
     let timeout_secs = std::cmp::max(1, timeout.as_secs());
     let payload_b64 = encode_base64_standard(payload);
-    let body = format!(
-        "command -v nc >/dev/null || {{ echo 'nc not installed' >&2; exit 127; }}; \
-         printf %s {payload_b64_quoted} | base64 -d | nc -w {timeout_secs} -- {host} {port} | base64 | tr -d '\\n\\r '",
-        payload_b64_quoted = shell_quote(&payload_b64),
-        host = shell_quote(host),
-        port = port,
-    );
+    let body = build_tcp_send_recv_body(host, port, &payload_b64, timeout_secs);
     let stdout =
         transport_capture(conn, body.as_str()).map_err(|err| RemoteShellError::Network {
             message: format!("tcp_send_recv to {addr} failed: {err}"),
