@@ -83,8 +83,14 @@ jobs:
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
       - name: Run real dataplane E2E harness
+        # sudo -E preserves env vars but NOT PATH/HOME: most sudo configs
+        # (including this runner's) force PATH to a secure_path default and
+        # HOME to root's home regardless of -E, so the cargo bootstrap_ci_tools
+        # just installed on $GITHUB_PATH becomes invisible ("cargo: not
+        # found") the moment this step elevates. Pass both through explicitly
+        # instead of relying on -E's exact semantics.
         run: |
-          sudo -E ./scripts/e2e/real_wireguard_exitnode_e2e.sh
+          sudo env "PATH=$PATH" "HOME=$HOME" ./scripts/e2e/real_wireguard_exitnode_e2e.sh
 
   windows:
     name: Windows build+security (rustynetd + windows-native)
