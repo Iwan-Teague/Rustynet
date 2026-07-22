@@ -1123,7 +1123,18 @@ fn find_wireguard_go_pids(interface_name: &str) -> Result<Vec<u32>, BackendError
         .output()
     {
         Ok(output) => output,
-        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+        // If we cannot execute `ps` at all we cannot enumerate processes, so
+        // there are none we can discover to terminate: return an empty set
+        // rather than failing. PermissionDenied and NotFound are the same
+        // "the enumerator is unavailable" situation and must be handled
+        // identically. On the only production target for this backend (macOS)
+        // /bin/ps is a base-system binary that always exists, so neither arm
+        // is reachable in production — this only keeps the macOS backend's
+        // best-effort orphan-reaper from hard-failing when the module's tests
+        // run on a host without /bin/ps (e.g. a minimal Linux CI container).
+        Err(err)
+            if matches!(err.kind(), ErrorKind::PermissionDenied | ErrorKind::NotFound) =>
+        {
             return Ok(Vec::new());
         }
         Err(err) => {
