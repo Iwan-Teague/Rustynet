@@ -7708,6 +7708,16 @@ fn ensure_local_utm_host_is_this_machine(host: &LabHost) -> Result<(), String> {
             std::env::consts::OS
         ));
     }
+    Ok(())
+}
+
+/// utmctl is only needed to actually scan a root that exists — checking its
+/// presence unconditionally (before even looking at the declared roots) meant
+/// a host whose every root is missing failed on "utmctl absent" instead of
+/// "root absent", which is both the wrong diagnostic and untestable on any
+/// macOS machine without UTM.app installed (e.g. CI). Callers check this only
+/// once a candidate root has passed its own existence check.
+fn ensure_utmctl_is_present(host: &LabHost) -> Result<(), String> {
     let utmctl = default_utmctl_path();
     if !utmctl.is_file() {
         return Err(format!(
@@ -7759,6 +7769,10 @@ fn discover_local_utm_host(
             errors.push(format!(
                 "{label}: declared utm_documents_root does not exist"
             ));
+            continue;
+        }
+        if let Err(reason) = ensure_utmctl_is_present(host) {
+            errors.push(format!("{label}: {reason}"));
             continue;
         }
         match scan_one_utm_root(root, inventory_path) {
@@ -54620,6 +54634,11 @@ mod local_utm_locality_tests {
         }
     }
 
+    // Exercises discover_local_utm_host's root-scanning fail-closed path,
+    // which is only reachable on macOS (any other OS fails closed earlier,
+    // on the "wrong machine" check in ensure_local_utm_host_is_this_machine —
+    // see the cfg(not(macos)) test below for that path).
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_missing_declared_root_fails_closed_instead_of_reporting_inventory_state() {
         // The bundle scan tolerates a missing root and falls back to entries read
@@ -54642,6 +54661,7 @@ mod local_utm_locality_tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn every_root_missing_still_fails_closed_and_names_them_all() {
         let host = utm_host(vec![PathBuf::from("/nope/one"), PathBuf::from("/nope/two")]);
