@@ -764,19 +764,27 @@ fn posix_run_argv(
 /// the probe works on minimal guests — e.g. Rocky/RHEL, which ship no `nc` and
 /// have no egress to `dnf install` one. The callers' requests are
 /// newline-delimited (the server responds on the delimiter), so the reply
-/// arrives without a TCP half-close — which `cat >&3; cat <&3` over `/dev/tcp`
-/// does not perform but does not need here. `timeout` bounds the read exactly
-/// as `nc -w` does. `host` is single-quote-escaped and `port` is a validated
-/// u16, so neither can break out of the command.
+/// arrives without a TCP half-close — which `cat >&3` over `/dev/tcp` does not
+/// perform but does not need here.
+///
+/// The response read is `timeout {t} cat <&3` — the timeout is on the READ
+/// `cat` itself, not on bash. That matters: a blocked `cat` reading a socket
+/// the server has not closed does not respond to a SIGTERM sent to its parent
+/// bash (bash is waiting on the child), so wrapping bash in `timeout` escalates
+/// to SIGKILL and loses the buffered reply (observed live as a signal exit).
+/// SIGTERM to the `cat` directly interrupts its blocked read (EINTR), so it
+/// exits cleanly with the bytes it already read — mirroring `nc -w`. `host` is
+/// single-quote-escaped and `port` is a validated u16, so neither can break out
+/// of the command.
 fn build_tcp_send_recv_body(host: &str, port: u16, payload_b64: &str, timeout_secs: u64) -> String {
     let payload_b64_quoted = shell_quote(payload_b64);
     let host_quoted = shell_quote(host);
     format!(
         "if command -v nc >/dev/null 2>&1; then \
          printf %s {payload_b64_quoted} | base64 -d | nc -w {timeout_secs} -- {host_quoted} {port} | base64 | tr -d '\\n\\r '; \
-         elif command -v bash >/dev/null 2>&1; then \
-         printf %s {payload_b64_quoted} | base64 -d | timeout {timeout_secs} bash -c 'exec 3<>/dev/tcp/'{host_quoted}'/'{port}' || exit 1; cat >&3; cat <&3' | base64 | tr -d '\\n\\r '; \
-         else echo 'tcp probe needs nc or bash; neither found' >&2; exit 127; fi"
+         elif command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then \
+         printf %s {payload_b64_quoted} | base64 -d | bash -c 'exec 3<>/dev/tcp/'{host_quoted}'/'{port}' || exit 1; cat >&3; timeout '{timeout_secs}' cat <&3' | base64 | tr -d '\\n\\r '; \
+         else echo 'tcp probe needs nc, or bash+timeout; none found' >&2; exit 127; fi"
     )
 }
 

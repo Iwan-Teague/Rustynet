@@ -292,12 +292,16 @@ fn tcp_send_recv_body_prefers_nc_and_falls_back_to_bash_dev_tcp() {
         "nc path missing or altered: {body}"
     );
     // Minimal guests (Rocky/RHEL — no nc, no egress to install one) fall back
-    // to bash's /dev/tcp, bounded by `timeout` exactly as `nc -w` was.
+    // to bash's /dev/tcp, requiring both bash and timeout. The read is bounded
+    // by `timeout` on the READ cat (not on bash), so a blocked read is
+    // interrupted cleanly instead of escalating to SIGKILL and losing the reply.
     assert!(
         body.contains("command -v bash")
+            && body.contains("command -v timeout")
             && body.contains("/dev/tcp/")
-            && body.contains("timeout 5 bash -c"),
-        "bash /dev/tcp fallback missing: {body}"
+            && body.contains("cat >&3")
+            && body.contains("timeout '5' cat <&3"),
+        "bash /dev/tcp fallback missing or mis-timed: {body}"
     );
     // The validated port is present and the base64 payload is single-quoted.
     assert!(body.contains("51822"), "port missing: {body}");
