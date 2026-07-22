@@ -75,13 +75,12 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn respects_limit_and_preserves_order() {
         let active = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
-        let started = Instant::now();
         let values = bounded_parallel_map(&[0, 1, 2, 3], 2, |value| {
             let now = active.fetch_add(1, Ordering::SeqCst) + 1;
             peak.fetch_max(now, Ordering::SeqCst);
@@ -90,8 +89,14 @@ mod tests {
             value * 2
         });
         assert_eq!(values, vec![0, 2, 4, 6]);
+        // `peak == 2` is the deterministic proof that the concurrency limit
+        // held: fetch_max over the live-active count means two operations were
+        // simultaneously in flight at some instant, and never more. A
+        // wall-clock upper bound (elapsed < serial time) was a weaker, flaky
+        // proxy for the same property — on a loaded virtualized CI runner even
+        // correctly-parallel execution overran the bound (observed 360ms), so
+        // it was removed. The peak gauge below is strictly stronger.
         assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert!(started.elapsed() < Duration::from_millis(110));
     }
 
     #[test]
