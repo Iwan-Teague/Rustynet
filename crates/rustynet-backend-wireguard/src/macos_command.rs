@@ -1133,7 +1133,10 @@ fn find_wireguard_go_pids(interface_name: &str) -> Result<Vec<u32>, BackendError
         // best-effort orphan-reaper from hard-failing when the module's tests
         // run on a host without /bin/ps (e.g. a minimal Linux CI container).
         Err(err)
-            if matches!(err.kind(), ErrorKind::PermissionDenied | ErrorKind::NotFound) =>
+            if matches!(
+                err.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::NotFound
+            ) =>
         {
             return Ok(Vec::new());
         }
