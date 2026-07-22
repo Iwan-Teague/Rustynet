@@ -289,6 +289,10 @@ pub struct RunSummary {
     /// Empty when the CSV has no `report_dir` column (older schema).
     pub report_dir: String,
     pub overall_result: String,
+    /// The run's completion timestamp, verbatim from the `run_finished_utc` CSV
+    /// column (ISO-8601 UTC, e.g. `2026-07-22T07:15:33Z`). Empty when the column
+    /// is absent (older schema) or blank. Rendered by the Previous Runs panel.
+    pub finished_utc: String,
     /// Name of the first stage that failed (from the `first_failed_stage` CSV column).
     pub first_failed_stage: String,
     /// Number of fetched check columns with outcome `pass`. Not currently
@@ -505,6 +509,7 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
     let first_failed_idx = col_idx("first_failed_stage");
     let run_id_idx = col_idx("run_id");
     let report_dir_idx = col_idx("report_dir");
+    let finished_utc_idx = col_idx("run_finished_utc");
 
     // Ordered list of (column_index, header_name) for every real check column
     // -- is_full_stage_matrix_column, the same "what counts as a check"
@@ -557,6 +562,12 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
             let run_id = run_id_idx.and_then(|i| row.get(i)).unwrap_or("").to_owned();
 
             let report_dir = report_dir_idx
+                .and_then(|i| row.get(i))
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+
+            let finished_utc = finished_utc_idx
                 .and_then(|i| row.get(i))
                 .unwrap_or("")
                 .trim()
@@ -622,6 +633,7 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
                 git_commit,
                 report_dir,
                 overall_result,
+                finished_utc,
                 first_failed_stage,
                 passed_stages: passed,
                 total_stages: total,

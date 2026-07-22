@@ -21,7 +21,6 @@ pub enum Panel {
     VmStatus,
     Parity,
     Log,
-    Jobs,
     StageMatrix,
     Agents,
 }
@@ -1911,10 +1910,6 @@ impl App {
                 self.page = Page::Run;
                 self.focused_panel = Panel::Log;
             }
-            KeyCode::Char('6') => {
-                self.page = Page::Run;
-                self.focused_panel = Panel::Jobs;
-            }
             KeyCode::Char('7') => {
                 self.page = Page::Matrix;
                 self.focused_panel = Panel::StageMatrix;
@@ -3432,12 +3427,10 @@ pub fn render_ui(f: &mut Frame, app: &App) {
                 Constraint::Percentage(22),
             ])
             .split(body_area);
-            let lower =
-                Layout::horizontal([Constraint::Percentage(72), Constraint::Percentage(28)])
-                    .split(rows[1]);
             crate::ui::stage_grid::render(f, rows[0], app);
-            crate::ui::log_panel::render(f, lower[0], app);
-            crate::ui::jobs_panel::render(f, lower[1], app);
+            // LOG spans the full width now that the JOBS side-panel is gone (its
+            // job/state/area/report fields duplicated the header).
+            crate::ui::log_panel::render(f, rows[1], app);
             crate::ui::prev_runs_panel::render(f, rows[2], app);
         }
         Page::Matrix => {
@@ -3597,6 +3590,7 @@ mod tests {
             // the CSV/pipeline-position fallback path they were written for.
             report_dir: String::new(),
             overall_result: "fail".to_owned(),
+            finished_utc: "2026-07-22T07:15:33Z".to_owned(),
             first_failed_stage: "bootstrap_windows_host".to_owned(),
             passed_stages: 5,
             total_stages: 97,
@@ -5028,9 +5022,11 @@ mod tests {
         assert_eq!(app.page, Page::Run);
         assert_eq!(app.focused_panel, Panel::Log);
 
+        // '6' used to focus the JOBS panel, which was removed — the key is now
+        // inert and leaves focus where it was (Run / Log from the '5' press).
         app.handle_key(KeyCode::Char('6'), KeyModifiers::NONE);
         assert_eq!(app.page, Page::Run);
-        assert_eq!(app.focused_panel, Panel::Jobs);
+        assert_eq!(app.focused_panel, Panel::Log);
 
         app.handle_key(KeyCode::Char('7'), KeyModifiers::NONE);
         assert_eq!(app.page, Page::Matrix);

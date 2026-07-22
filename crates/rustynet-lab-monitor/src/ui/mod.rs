@@ -1,7 +1,6 @@
 pub mod agents_panel;
 pub mod header;
 pub mod help_overlay;
-pub mod jobs_panel;
 pub mod log_panel;
 pub mod parity_panel;
 pub mod pipeline_panel;
