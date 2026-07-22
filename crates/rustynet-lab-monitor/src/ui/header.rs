@@ -10,7 +10,7 @@ use crate::app::App;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let vms = app.vm_statuses.len();
-    let (job, area_name, status) = match &app.active_job {
+    let (job, status) = match &app.active_job {
         Some(job) => {
             let status = match job.state.as_str() {
                 "running" => "RUNNING",
@@ -18,14 +18,9 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 "crashed" => "CRASHED",
                 _ => "IDLE",
             };
-            (job.job_id.as_str(), job.area.as_str(), status)
+            (job.job_id.as_str(), status)
         }
         None => {
-            let area = if app.config.area.is_empty() {
-                "-"
-            } else {
-                app.config.area.as_str()
-            };
             // A dead-PID job whose JSON still claims `running` ended
             // abnormally — say so instead of a clean IDLE.
             let status = if app.last_run_crashed {
@@ -33,7 +28,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 "IDLE"
             };
-            ("-", area, status)
+            ("-", status)
         }
     };
     let title = Style::default().fg(Color::Blue);
@@ -45,19 +40,47 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .current_run_check_progress()
         .map(|(done, total)| format!("{done}/{total}"))
         .unwrap_or_else(|| "n/a".to_owned());
-    // Lead with STATUS (the old "RUSTYNET" title just duplicated the window
-    // title and ate header width). When a run is live, follow it with how long
-    // that run has been going.
+
+    // Top line — overall posture: status, history-wide coverage, which run this
+    // is, and the plan it came from. (JOB alone identifies the run; the former
+    // AREA field was a near-duplicate of the job name, so it was dropped.)
     let mut top_spans = vec![
         Span::styled("STATUS:", title),
         Span::styled(format!("{status:<8}"), value),
+        Span::styled(" │ ", sep),
+        Span::styled("COVERAGE:", title),
+        Span::styled(
+            format!("{}/{}", app.stage_progress.passed, app.stage_progress.total),
+            value,
+        ),
     ];
-    if let Some(elapsed) = app.run_elapsed_label() {
-        top_spans.push(Span::styled(" │ ", sep));
-        top_spans.push(Span::styled("RUN ", title));
-        top_spans.push(Span::styled(elapsed, value));
+    // Green-but-unstable checks (latest pass, flake classifier not yet Proven)
+    // — a warning sidecar, deliberately not subtracted from the fraction.
+    if app.stage_progress.flaky > 0 {
+        top_spans.push(Span::styled(
+            format!(" ~{} flaky", app.stage_progress.flaky),
+            Style::default().fg(Color::Yellow),
+        ));
     }
     top_spans.extend([
+        Span::styled(" │ ", sep),
+        Span::styled("JOB:", title),
+        Span::styled(format!(" {}", fixed(job, 46)), value),
+        Span::styled(" │ ", sep),
+        Span::styled("PLAN:", title),
+        Span::styled(format!(" {}", app.plan_source_label()), value),
+    ]);
+    let top = Line::from(top_spans);
+
+    // Middle line — everything about the run happening right now: how long it
+    // has been going, when each phase is estimated to finish, and how many
+    // stages/checks have settled so far.
+    let mut run_spans = vec![Span::styled("THIS RUN:", title)];
+    match app.run_elapsed_label() {
+        Some(elapsed) => run_spans.push(Span::styled(format!(" {elapsed}"), value)),
+        None => run_spans.push(Span::styled(" —", value)),
+    }
+    run_spans.extend([
         Span::styled(" │ ", sep),
         Span::styled(format!("{}:", timers[0].0), title),
         Span::styled(format!("{:<6}", fixed(timers[0].1.as_str(), 6)), value),
@@ -66,53 +89,27 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("{}:", timers[2].0), title),
         Span::styled(format!("{:<6}", fixed(timers[2].1.as_str(), 6)), value),
         Span::styled(" │ ", sep),
-        Span::styled("VMS:", title),
-        Span::styled(format!("{vms:<3}"), value),
-        Span::styled(" │ ", sep),
         Span::styled("SETTLED:", title),
         Span::styled(format!("{run_done}/{run_total}"), value),
         Span::styled(" TESTS:", title),
         Span::styled(run_checks, value),
-        Span::styled(" │ ", sep),
-        // History-wide coverage, discovered from matrix schema. Separate
-        // from this invocation's stage/test totals above.
-        Span::styled("COVERAGE:", title),
-        Span::styled(
-            format!("{}/{}", app.stage_progress.passed, app.stage_progress.total),
-            value,
-        ),
-        // Green-but-unstable checks (latest pass, flake classifier not yet
-        // Proven) — a warning sidecar, deliberately not subtracted from
-        // the fraction.
-        Span::styled(
-            if app.stage_progress.flaky > 0 {
-                format!(" ~{} flaky", app.stage_progress.flaky)
-            } else {
-                String::new()
-            },
-            Style::default().fg(Color::Yellow),
-        ),
     ]);
-    let top = Line::from(top_spans);
-    let job_area_line = Line::from(vec![
-        Span::styled("JOB:", title),
-        Span::styled(format!(" {}", fixed(job, 46)), value),
-        Span::styled(" │ ", sep),
-        Span::styled("AREA:", title),
-        Span::styled(format!(" {}", fixed(area_name, 46)), value),
-    ]);
-    let source_line = Line::from(vec![
-        Span::styled("PLAN:", title),
-        Span::styled(format!(" {}", app.plan_source_label()), value),
-        Span::styled(" │ ", sep),
+    let run_line = Line::from(run_spans);
+
+    // Bottom line — provenance and environment: the data source (live vs
+    // previous run, and its age), how many VMs are visible, refresh cadences.
+    let bottom_line = Line::from(vec![
         Span::styled(format!("{}:", app.stage_source_title()), title),
         Span::styled(format!(" {}", app.stage_source_value()), value),
+        Span::styled(" │ ", sep),
+        Span::styled("VMS:", title),
+        Span::styled(format!("{vms}"), value),
         Span::styled(" │ ", sep),
         Span::styled("REFRESH:", title),
         Span::styled(" 2s stages / 5s active VMs", value),
     ]);
 
-    let p = Paragraph::new(vec![top, job_area_line, source_line, Line::from("")]);
+    let p = Paragraph::new(vec![top, run_line, bottom_line, Line::from("")]);
     f.render_widget(p, area);
 }
 
