@@ -674,7 +674,7 @@ pub fn gossip_peer_registrations_from_membership(
             push_addr: SocketAddr::new(*overlay_addr, RUSTYNET_GOSSIP_PORT),
         });
     }
-    out.sort_unstable_by(|a, b| a.peer_node_id.cmp(&b.peer_node_id));
+    out.sort_unstable_by_key(|registration| registration.peer_node_id);
     out.dedup_by(|a, b| a.peer_node_id == b.peer_node_id);
     out
 }
