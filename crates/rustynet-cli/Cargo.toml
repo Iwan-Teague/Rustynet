@@ -37,6 +37,17 @@ name = "rnq09_signal_harness"
 path = "src/bin/rnq09_signal_harness.rs"
 required-features = ["vm-lab"]
 
+# The §4.8 independent evidence verifier (NodeEngineAcceptanceSpec, increment
+# A2): recomputes a `--node` run's evidence properties from the raw report
+# artifacts and is the authority on "valid run" — the orchestrator's
+# self-report is advisory. Same gating rationale as rnq09 above:
+# `required-features` is what keeps the default no-feature `cargo check`
+# from building this target at all.
+[[bin]]
+name = "live_lab_evidence_verifier"
+path = "src/bin/live_lab_evidence_verifier.rs"
+required-features = ["vm-lab"]
+
 [dependencies]
 base64 = "0.22"
 rustynet-advisor = { path = "../rustynet-advisor" }
