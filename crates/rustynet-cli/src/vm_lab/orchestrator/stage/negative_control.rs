@@ -687,13 +687,18 @@ pub(crate) mod signed_bundle {
     /// REJECTED when verified against a *different* `expected_node_id`
     /// (substituted node) and ACCEPTED against its own id (positive control).
     ///
-    /// NOTE (orchestrator-threading gap — flagged for a follow-on increment):
-    /// `expected_node_id` is threaded only through the CLI/verify layer
-    /// (`assignment verify --expected-node-id`), NOT through the orchestrator's
-    /// validator stages. This control therefore adjudicates at the verify-path
-    /// level. Wiring `expected_node_id` into a live validator STAGE (so a real
-    /// substituted-node run fails the validator) is a larger orchestrator
-    /// change and is deliberately NOT undertaken here.
+    /// NOTE (orchestrator threading — now landed; live proof deferred): this
+    /// control adjudicates the assignment-VERIFY path
+    /// (`assignment verify --expected-node-id`). The complementary
+    /// orchestrator-level §4.7 challenge is now wired into every typed role
+    /// validator (`node_adapter::enforce_identity_challenge`), so a substituted
+    /// node also fails the validator itself — proven at the dispatch level by
+    /// `node_adapter::tests::challenge_gate_rejects_substituted_node_*` and
+    /// bound to this classifier by
+    /// `classifier_binds_to_the_orchestrator_identity_challenge_error`. The
+    /// remaining follow-on is the LIVE substituted-node stage run on a real
+    /// guest (deferred to the Step-B live-verification phase, alongside the
+    /// other T5 live proofs).
     pub(crate) fn run_wrong_node_control(dir: &Path) -> StageOutcome {
         let fixture = match write_genuine(dir, BUNDLE_NODE_ID) {
             Ok(fixture) => fixture,
@@ -881,6 +886,31 @@ pub(crate) mod signed_bundle {
                 ),
                 WrongNodeCheck::MatchRejected { .. }
             ));
+        }
+
+        #[test]
+        fn classifier_binds_to_the_orchestrator_identity_challenge_error() {
+            // The wrong-node control adjudicates the assignment-VERIFY path. The
+            // orchestrator's §4.7 role-validator challenge is a SECOND mechanism
+            // (see node_adapter::enforce_identity_challenge): a substituted node
+            // makes the live daemon report its own id, which the adjudicator
+            // rejects. Prove that challenge error, as a string, is classified as
+            // a correct substitution rejection here too — so the two mechanisms
+            // stay bound and a future rename of either error cannot silently
+            // downgrade the T5 verdict to RejectedWrongReason.
+            use crate::vm_lab::orchestrator::role_validation::identity_challenge::{
+                IdentityEvidence, adjudicate_identity,
+            };
+            let substituted = adjudicate_identity(
+                Some("nc-node-substituted-imposter"),
+                &IdentityEvidence::live("real-node"),
+            )
+            .map_err(|e| e.to_string());
+            assert!(substituted.is_err());
+            assert_eq!(
+                classify_wrong_node(substituted, Ok(())),
+                WrongNodeCheck::RejectedSubstitutionAcceptedMatch
+            );
         }
     }
 }
