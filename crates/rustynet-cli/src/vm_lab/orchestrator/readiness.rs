@@ -57,8 +57,15 @@ pub(in crate::vm_lab) fn run(
     let initial_discovery = execute_ops_vm_lab_discover_local_utm(discover_config.clone())?;
     let initial_discovery_path = orchestration_dir.join("discover_initial.json");
     write_orchestration_artifact(initial_discovery_path.as_path(), initial_discovery.as_str())?;
-    let initial_readiness =
-        selected_local_utm_readiness_from_report(initial_discovery.as_str(), selected_aliases)?;
+    // Controller-aware: UTM aliases are read from the discovery report; libvirt
+    // aliases (which the UTM bundle-scan does not enumerate) are probed live
+    // through the same observer at the same readiness bar. See mod.rs.
+    let initial_readiness = selected_nodes_readiness_with_libvirt(
+        initial_discovery.as_str(),
+        selected_aliases,
+        inventory_path,
+        &discover_config,
+    )?;
     let unready_aliases = not_execution_ready_aliases(&initial_readiness);
     let discovery_outcome = stage_outcome(
         "discover_local_utm",
@@ -162,11 +169,15 @@ pub(in crate::vm_lab) fn run(
                 }
             }
 
-            let rediscovery = execute_ops_vm_lab_discover_local_utm(discover_config)?;
+            let rediscovery = execute_ops_vm_lab_discover_local_utm(discover_config.clone())?;
             let rediscovery_path = orchestration_dir.join("discover_post_restart.json");
             write_orchestration_artifact(rediscovery_path.as_path(), rediscovery.as_str())?;
-            let post_restart_readiness =
-                selected_local_utm_readiness_from_report(rediscovery.as_str(), selected_aliases)?;
+            let post_restart_readiness = selected_nodes_readiness_with_libvirt(
+                rediscovery.as_str(),
+                selected_aliases,
+                inventory_path,
+                &discover_config,
+            )?;
             let still_unready = not_execution_ready_aliases(&post_restart_readiness);
             let rediscovery_status = if still_unready.is_empty() {
                 VmLabStageStatus::Pass

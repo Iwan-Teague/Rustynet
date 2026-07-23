@@ -3767,6 +3767,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     })?,
                     orchestrator_args: passthrough,
                     host_ssh_identity: own.value("--host-ssh-identity"),
+                    host_known_hosts: own.value("--host-known-hosts"),
                     dry_run: own.has_flag("--dry-run"),
                     ssh_identity_file: own.optional_path("--ssh-identity-file"),
                     known_hosts_path: own.optional_path("--known-hosts-file"),

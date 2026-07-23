@@ -4342,6 +4342,7 @@ impl McpServer for LabStateServer {
                         "report_dir": {"type": "string", "description": "Report directory ON the host, relative to its repo_dir (e.g. artifacts/live_lab/run-2026-07-17). Must be fresh: the orchestrator refuses a non-empty one."},
                         "orchestrator_args": {"type": "array", "items": {"type": "string"}, "description": "Flags forwarded verbatim to vm-lab-orchestrate-live-lab, e.g. [\"--client-vm\",\"linux-x86-client-1\",\"--exit-vm\",\"linux-x86-exit-1\",\"--skip-cross-network\"]. No single quotes or shell metacharacters."},
                         "host_ssh_identity": {"type": "string", "description": "Path ON THE HOST to the key the orchestrator uses to reach its guests. Default $HOME/.ssh/id_ed25519 (verified on ubuntu-kvm-1)."},
+                        "host_known_hosts": {"type": "string", "description": "Path ON THE HOST to the known_hosts pinning its guests' host keys. Default $HOME/.ssh/known_hosts. Injected unconditionally because a --node run REQUIRES it; ensure every selected guest's key is pinned there or SSH fails mid-run."},
                         "dry_run": {"type": "boolean", "description": "Render the launcher + runner and return them without launching."},
                         "format": {"type": "string", "enum": ["table", "json"]},
                         "ssh_identity_file": {"type": "string"}
@@ -4628,7 +4629,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "bootstrap_vm".into(),
-                description: "Install/build Rustynet on one or MORE lab VMs. Phases: sync-source (ship the source), build-release (cargo build ON the guest), install-release, restart-runtime, verify-runtime, tunnel-smoke, killswitch-smoke, dns-smoke, ipv6-smoke, or `all` for the full chain. Pass `aliases` for several VMs in one call (they are handled by the same run, so a pair stays on identical source) or `select_all` for every include_in_all VM. Works for any inventory VM regardless of host — libvirt guests on a remote KVM box and local UTM guests alike, because the whole path is SSH. The guest must already have the toolchain rn_bootstrap verifies (rustup+cargo, clang/llvm, nft, wg, pkg-config openssl+sqlite3, passwordless sudo). SLOW: build-release compiles the workspace on the guest. `ops vm-lab-bootstrap-phase`.".into(),
+                description: "Install/build Rustynet on one or MORE lab VMs. Phases: sync-source (ship the source), build-release (cargo build ON the guest), install-release, restart-runtime, verify-runtime, tunnel-smoke, killswitch-smoke, dns-smoke, ipv6-smoke, or `all` for the full chain. Pass `aliases` for several VMs in one call (they are handled by the same run, so a pair stays on identical source) or `select_all` for every include_in_all VM. Works for any inventory VM regardless of host — libvirt guests on a remote KVM box and local UTM guests alike, because the whole path is SSH. The guest must already have the toolchain rn_bootstrap verifies (rustup+cargo, clang/llvm, nft, wg, pkg-config openssl+sqlite3, passwordless sudo). SLOW: build-release compiles the workspace on the guest and can take many minutes — LONGER than the MCP client's ~60s request timeout, which will report a timeout while the CLI keeps running to completion. For a real build, prefer driving `ops vm-lab-bootstrap-phase` directly via a shell (backgrounded) and polling, rather than treating an MCP timeout as failure. `ops vm-lab-bootstrap-phase`.".into(),
                 input_schema: json_schema_object(
                     json!({
                         "inventory": {"type": "string", "description": "Inventory path (repo-relative). Default: the lab inventory. Use to target a different fleet or a scratch inventory."},
@@ -5138,6 +5139,12 @@ impl McpServer for LabStateServer {
                     identity_owned = identity.to_owned();
                     extra.push("--host-ssh-identity");
                     extra.push(&identity_owned);
+                }
+                let known_hosts_owned;
+                if let Some(known_hosts) = arg_str(args, "host_known_hosts") {
+                    known_hosts_owned = known_hosts.to_owned();
+                    extra.push("--host-known-hosts");
+                    extra.push(&known_hosts_owned);
                 }
                 let ssh_owned;
                 if let Some(ssh) = arg_str(args, "ssh_identity_file") {
@@ -5888,7 +5895,9 @@ impl McpServer for LabStateServer {
                     };
                 let artifacts = self.run_ops(
                     "vm-lab-collect-artifacts",
-                    &["--vm", alias, "--report-dir", &report_dir],
+                    // The CLI parser requires --output-dir; passing --report-dir made
+                    // this fail with exit 64 on every guest (BUG-BOX-1).
+                    &["--vm", alias, "--output-dir", &report_dir],
                     600,
                 );
                 if let Some(c) = artifacts.content.first() {
