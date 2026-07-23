@@ -918,6 +918,7 @@ mod tests {
             role_switch_platform: None,
             macos_promote_exit: false,
             enable_chaos_suite: false,
+            enable_negative_control: false,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
         }

@@ -81,6 +81,10 @@ use crate::vm_lab::orchestrator::stage::live_secrets_not_in_logs_validation::Liv
 use crate::vm_lab::orchestrator::stage::live_two_hop_validation::LiveTwoHopValidationStage;
 use crate::vm_lab::orchestrator::stage::membership_init::MembershipInitStage;
 use crate::vm_lab::orchestrator::stage::mesh_status_validation::MeshStatusValidationStage;
+use crate::vm_lab::orchestrator::stage::negative_control::{
+    NegativeControlDaemonKillMidStageStage, NegativeControlPlantedResidueStage,
+    NegativeControlSignedBundleRejectionStage, NegativeControlWrongNodeSubstitutionStage,
+};
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
 use crate::vm_lab::orchestrator::stage::relay_validation::RelayValidationStage;
 use crate::vm_lab::orchestrator::stage::role_switch_matrix::RoleSwitchMatrixStage;
@@ -110,6 +114,10 @@ pub struct PlanBuilder {
     /// `--enable-chaos-suite`: append the opt-in chaos stages. They remain
     /// outside the default plan so a normal live lab does not inject faults.
     enable_chaos_suite: bool,
+    /// `--enable-negative-control`: append the opt-in T5 negative-control /
+    /// adjudication stages. Like chaos they stay outside the default plan so a
+    /// normal live lab never injects the negative-control faults.
+    enable_negative_control: bool,
     /// `--skip-soak`: drop the long-running extended soak composite.
     skip_soak: bool,
     /// `--skip-cross-network`: when false, run the Rust-owned cross-network
@@ -135,6 +143,10 @@ impl PlanBuilder {
 
     pub fn chaos_suite_stages() -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
         Self::stages_in_suite(crate::vm_lab::orchestrator::stage::StageSuite::Chaos)
+    }
+
+    pub fn negative_control_suite_stages() -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
+        Self::stages_in_suite(crate::vm_lab::orchestrator::stage::StageSuite::NegativeControl)
     }
 
     pub fn cross_network_suite_stages() -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
@@ -181,6 +193,12 @@ impl PlanBuilder {
         self
     }
 
+    /// Append the opt-in T5 negative-control / adjudication stages to the plan.
+    pub fn with_enable_negative_control(mut self, enable_negative_control: bool) -> Self {
+        self.enable_negative_control = enable_negative_control;
+        self
+    }
+
     pub fn with_skip_soak(mut self, skip_soak: bool) -> Self {
         self.skip_soak = skip_soak;
         self
@@ -211,6 +229,7 @@ impl PlanBuilder {
             source_mode,
             skip_live_suite,
             enable_chaos_suite,
+            enable_negative_control,
             skip_soak,
             cross_network,
             max_parallel_node_workers,
@@ -229,6 +248,7 @@ impl PlanBuilder {
                 StageSuite::Soak => !skip_live_suite && !skip_soak,
                 StageSuite::CrossNetwork => !skip_live_suite && cross_network.enable_suite,
                 StageSuite::Chaos => !skip_live_suite && enable_chaos_suite,
+                StageSuite::NegativeControl => !skip_live_suite && enable_negative_control,
             }
         };
 
@@ -387,6 +407,18 @@ impl PlanBuilder {
                     StageId::ChaosSignedStateAdversarial => {
                         Box::new(ChaosSignedStateAdversarialStage)
                     }
+                    StageId::NegativeControlSignedBundleRejection => {
+                        Box::new(NegativeControlSignedBundleRejectionStage)
+                    }
+                    StageId::NegativeControlPlantedResidue => {
+                        Box::new(NegativeControlPlantedResidueStage)
+                    }
+                    StageId::NegativeControlWrongNodeSubstitution => {
+                        Box::new(NegativeControlWrongNodeSubstitutionStage)
+                    }
+                    StageId::NegativeControlDaemonKillMidStage => {
+                        Box::new(NegativeControlDaemonKillMidStageStage)
+                    }
                     StageId::Cleanup => Box::new(FinalCleanupStage::new(rebuild_only.clone())),
                 }
             })
@@ -422,6 +454,74 @@ mod tests {
                     .iter()
                     .position(|id| id == &StageId::LiveMixedTopologyValidation)
         );
+        assert_eq!(ids.last(), Some(&StageId::Cleanup));
+    }
+
+    #[test]
+    fn negative_control_opt_in_appends_4_control_stages() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new()
+            .with_enable_negative_control(true)
+            .build();
+        let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
+        // Opt-in and out of the default plan (like chaos): default 58 + 4.
+        assert_eq!(
+            ids.len(),
+            62,
+            "negative-control-enabled plan must contain 62 stages"
+        );
+        for control_id in PlanBuilder::negative_control_suite_stages() {
+            assert!(
+                ids.contains(&control_id),
+                "negative-control-enabled plan must include {control_id:?}"
+            );
+        }
+        // The suite is out of the default plan.
+        let default_ids: Vec<StageId> = PlanBuilder::new().build().iter().map(|s| s.id()).collect();
+        for control_id in PlanBuilder::negative_control_suite_stages() {
+            assert!(
+                !default_ids.contains(&control_id),
+                "negative-control stage {control_id:?} must NOT be in the default plan"
+            );
+        }
+        // Controls run after the live pipeline and before cleanup.
+        assert!(
+            ids.iter()
+                .position(|id| id == &StageId::NegativeControlSignedBundleRejection)
+                > ids
+                    .iter()
+                    .position(|id| id == &StageId::LiveMixedTopologyValidation)
+        );
+        assert_eq!(ids.last(), Some(&StageId::Cleanup));
+    }
+
+    #[test]
+    fn negative_control_and_chaos_stack_to_71_stages() {
+        let stages = PlanBuilder::new()
+            .with_enable_chaos_suite(true)
+            .with_enable_negative_control(true)
+            .build();
+        assert_eq!(
+            stages.len(),
+            71,
+            "58 default + 9 chaos + 4 negative-control"
+        );
+    }
+
+    #[test]
+    fn skip_live_suite_drops_negative_control_too() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new()
+            .with_enable_negative_control(true)
+            .with_skip_live_suite(true)
+            .build();
+        let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
+        for dropped in PlanBuilder::negative_control_suite_stages() {
+            assert!(
+                !ids.contains(&dropped),
+                "skip-live-suite must drop opt-in negative-control stage {dropped:?}"
+            );
+        }
         assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }
 

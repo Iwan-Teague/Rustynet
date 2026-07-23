@@ -42,6 +42,7 @@ pub mod live_secrets_not_in_logs_validation;
 pub mod live_two_hop_validation;
 pub mod membership_init;
 pub mod mesh_status_validation;
+pub mod negative_control;
 pub mod preflight;
 pub mod relay_validation;
 pub mod role_switch_matrix;
@@ -76,6 +77,12 @@ pub enum StageSuite {
     /// Chaos suite. Opt-in via `--enable-chaos-suite` (and dropped by
     /// `--skip-linux-live-suite`).
     Chaos,
+    /// T5 negative-control / adjudication suite. Opt-in via
+    /// `--enable-negative-control` (and dropped by `--skip-linux-live-suite`),
+    /// exactly mirroring the chaos suite's opt-in guarantee: it stays OUT of
+    /// the default plan so a normal live lab never injects the negative-control
+    /// faults. See `stage/negative_control.rs`.
+    NegativeControl,
     /// Final teardown. Always included; `always_run`-exempt from
     /// skip-cascade.
     Cleanup,
@@ -227,6 +234,15 @@ define_stage_catalog! {
     // impairment than to a trust-control bypass — resilience tier.
     ChaosResourceExhaustion => "chaos_resource_exhaustion" @ Chaos / T2Resilience,
     ChaosSignedStateAdversarial => "chaos_signed_state_adversarial" @ Chaos / T4Security,
+    // T5 negative-control / adjudication suite (spec §3-T5 / §5) — the four
+    // injected-fault controls, each of which PASSES iff its targeted operation
+    // fails for the specific named reason (the inversion). All T5NegativeControl
+    // by definition; opt-in, out of the default plan (like chaos). Impl +
+    // adjudication in `stage/negative_control.rs`.
+    NegativeControlSignedBundleRejection => "negative_control_signed_bundle_rejection" @ NegativeControl / T5NegativeControl,
+    NegativeControlPlantedResidue => "negative_control_planted_residue" @ NegativeControl / T5NegativeControl,
+    NegativeControlWrongNodeSubstitution => "negative_control_wrong_node_substitution" @ NegativeControl / T5NegativeControl,
+    NegativeControlDaemonKillMidStage => "negative_control_daemon_kill_mid_stage" @ NegativeControl / T5NegativeControl,
     // Clean teardown, residue-asserted — named in spec §3's T0 list.
     Cleanup => "cleanup" @ Cleanup / T0Core,
 }

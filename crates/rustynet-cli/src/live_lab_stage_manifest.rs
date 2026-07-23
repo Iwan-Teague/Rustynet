@@ -363,6 +363,7 @@ mod tests {
             cross_network_suite: true,
             soak_suite: true,
             local_gate_suite: true,
+            negative_control_suite: true,
         }
     }
 

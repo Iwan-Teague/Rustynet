@@ -2130,7 +2130,11 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 64 | `chaos_privileged_boundary` | Opt-in privileged-boundary chaos stage, delegated to `live_chaos_privileged_boundary_test` | `stage/chaos.rs` |
 | 65 | `chaos_resource_exhaustion` | Opt-in resource-exhaustion chaos stage, delegated to `live_chaos_resource_exhaustion_test` | `stage/chaos.rs` |
 | 66 | `chaos_signed_state_adversarial` | Opt-in signed-state adversarial chaos stage, delegated to `live_chaos_signed_state_adversarial_test` | `stage/chaos.rs` |
-| 67 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 67 | `negative_control_signed_bundle_rejection` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` against a forged assignment-bundle corpus; PASSES iff every forgery is rejected fail-closed for its named reason AND a genuine bundle is accepted (runs locally) | `stage/negative_control.rs` |
+| 68 | `negative_control_planted_residue` | Opt-in T5 negative control: adjudicates that planted `rustynet*` residue drives the pure `parse_node_clean_probe` clean-assert to `Err` (live guest planting deferred to live-verify) | `stage/negative_control.rs` |
+| 69 | `negative_control_wrong_node_substitution` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` with a mismatched `expected_node_id`; PASSES iff the substitution is rejected AND the matching id accepted (verify-path level) | `stage/negative_control.rs` |
+| 70 | `negative_control_daemon_kill_mid_stage` | Opt-in T5 negative control: adjudicates that a targeted stage's recorded outcome is NOT a pass under a mid-stage daemon kill (live kill reuses `live_chaos_daemon_fault_test`, deferred to live-verify) | `stage/negative_control.rs` |
+| 71 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2253,6 +2257,10 @@ mod tests {
             "chaos_privileged_boundary",
             "chaos_resource_exhaustion",
             "chaos_signed_state_adversarial",
+            "negative_control_signed_bundle_rejection",
+            "negative_control_planted_residue",
+            "negative_control_wrong_node_substitution",
+            "negative_control_daemon_kill_mid_stage",
             "cleanup",
         ];
         // Parse the numbered "| N | `stage` | ... |" rows out of the doc table.
