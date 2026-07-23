@@ -508,6 +508,21 @@ impl GossipNode {
             self.bump_reject_counter("self_origin");
             return Err(GossipNodeError::Bundle(GossipError::UnknownSource));
         }
+        // I2 fail-closed: without a VERIFIED membership epoch there is
+        // no reference point for the epoch-skew window, so no inbound
+        // bundle can be accepted at all. Unreachable in the daemon —
+        // bundles only arrive once the transport is attached, which
+        // happens strictly after the first verified membership commit
+        // stamps the epoch (`sync_gossip_data_plane`).
+        let Some(local_epoch) = self.local_membership_epoch else {
+            self.bump_reject_counter("membership_epoch_unknown");
+            log::warn!(
+                "gossip_reject_membership_epoch_unknown source={} sender={:?}",
+                short_id(&bundle.source_node_id),
+                sender
+            );
+            return Err(GossipNodeError::MembershipEpochUnknown);
+        };
         let known_peers = self.known_peer_keys();
         let mut probe_seen = self.seen_gossip_sequences.clone();
         if let Err(err) = accept_bundle_with_now(
@@ -515,6 +530,7 @@ impl GossipNode {
             &known_peers,
             &mut probe_seen,
             DEFAULT_FRESHNESS_WINDOW_SECS,
+            local_epoch,
             now_unix,
         ) {
             let kind = error_kind(&err);
@@ -812,6 +828,7 @@ pub fn error_kind(err: &GossipError) -> &'static str {
         GossipError::SignatureInvalid => "signature_invalid",
         GossipError::TimestampOutsideWindow { .. } => "timestamp_outside_window",
         GossipError::SequenceNotMonotonic { .. } => "sequence_not_monotonic",
+        GossipError::EpochOutsideWindow { .. } => "epoch_outside_window",
         GossipError::TooManyCandidates { .. } => "too_many_candidates",
         GossipError::UnreachableCandidate { .. } => "unreachable_candidate",
         GossipError::TimestampUnavailable => "timestamp_unavailable",
@@ -1904,5 +1921,148 @@ mod tests {
         node.ingest_inbound_bundle(None, bundle, &transport, 1_700_000_000)
             .expect("a non-revoked known peer's bundle must be accepted");
         assert!(node.applied_endpoints.contains_key(&sender_id));
+    }
+
+    #[test]
+    fn local_membership_epoch_setter_never_regresses() {
+        // I2 defense-in-depth: the membership verifier already rejects
+        // epoch rollback on the snapshot; the setter refuses regression
+        // too, so a caller bug can never widen the accept window
+        // backwards.
+        let node_key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut node = GossipNode::new(node_key, None).expect("node ctor");
+        assert_eq!(node.local_membership_epoch(), None);
+        node.set_local_membership_epoch(5);
+        assert_eq!(node.local_membership_epoch(), Some(5));
+        node.set_local_membership_epoch(3);
+        assert_eq!(
+            node.local_membership_epoch(),
+            Some(5),
+            "regression attempt must be ignored"
+        );
+        node.set_local_membership_epoch(5);
+        assert_eq!(node.local_membership_epoch(), Some(5), "equal is a no-op");
+        node.set_local_membership_epoch(9);
+        assert_eq!(node.local_membership_epoch(), Some(9), "advance applies");
+    }
+
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
+    #[test]
+    fn mint_refuses_without_membership_epoch() {
+        // I2 fail-closed: a node with no verified membership epoch must
+        // refuse to mint (the epoch is a signed field of every bundle)
+        // and must not advance any mint bookkeeping.
+        let dir = TempDir::new().expect("tempdir");
+        let signing_key = SigningKey::from_bytes(&[10u8; 32]);
+        let path = dir.path().join("gossip-no-epoch.watermark");
+        let mut node = GossipNode::new(signing_key, Some(path)).expect("node ctor");
+        let transport = GossipTransport::bind(loopback_bind()).expect("transport");
+        let mut candidates = CandidateSet::default();
+        candidates
+            .v4_host
+            .push(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
+        let err = node
+            .maybe_mint_and_broadcast(Instant::now(), 1_700_000_000, candidates, &transport)
+            .expect_err("mint without a verified membership epoch must fail closed");
+        assert!(matches!(err, GossipNodeError::MembershipEpochUnknown));
+        assert_eq!(node.gossip_sequence, 0, "sequence must not advance");
+        assert!(node.last_minted_bundle.is_none(), "no bundle recorded");
+        assert_eq!(node.minted_count, 0, "mint count must not advance");
+    }
+
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
+    #[test]
+    fn minted_bundle_carries_local_membership_epoch() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(11, dir.path());
+        let transport = GossipTransport::bind(loopback_bind()).expect("transport");
+        let mut candidates = CandidateSet::default();
+        candidates
+            .v4_host
+            .push(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 11)));
+        let bundle = node
+            .maybe_mint_and_broadcast(Instant::now(), 1_700_000_000, candidates, &transport)
+            .expect("mint ok")
+            .expect("first mint emits");
+        assert_eq!(
+            bundle.epoch, TEST_EPOCH,
+            "minted bundle must carry the node's verified membership epoch"
+        );
+    }
+
+    #[test]
+    fn ingest_refuses_without_membership_epoch() {
+        // I2 fail-closed on the inbound side: with no verified epoch
+        // there is no reference point for the skew window, so nothing
+        // is accepted. Uses the rebroadcast-free local-audit path so
+        // the pin runs on every platform (no transport needed).
+        let receiver_key = SigningKey::from_bytes(&[12u8; 32]);
+        let mut node = GossipNode::new(receiver_key, None).expect("node ctor");
+        let sender_key = SigningKey::from_bytes(&[13u8; 32]);
+        let sender_id = sender_key.verifying_key().to_bytes();
+        node.register_peer(
+            sender_id,
+            sender_key.verifying_key(),
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1),
+        );
+        let bundle = mint_bundle_with_timestamp(
+            &sender_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            CandidateSet::default(),
+        )
+        .expect("mint");
+        let err = node
+            .ingest_inbound_bundle_without_rebroadcast_for_local_audit(None, bundle, 1_700_000_000)
+            .expect_err("ingest without a verified membership epoch must fail closed");
+        assert!(matches!(err, GossipNodeError::MembershipEpochUnknown));
+        assert_eq!(
+            node.rejected_counts.get("membership_epoch_unknown"),
+            Some(&1)
+        );
+        assert!(
+            !node.applied_endpoints.contains_key(&sender_id),
+            "no endpoints may be admitted without a verified epoch"
+        );
+    }
+
+    #[test]
+    fn ingest_rejects_epoch_outside_window_through_node_path() {
+        // I2 end-to-end through GossipNode: a validly-signed bundle
+        // whose epoch is beyond the forward tolerance is rejected, the
+        // epoch_outside_window counter increments, and no state is
+        // admitted. Uses the rebroadcast-free local-audit path so the
+        // pin runs on every platform.
+        let receiver_key = SigningKey::from_bytes(&[14u8; 32]);
+        let mut node = GossipNode::new(receiver_key, None).expect("node ctor");
+        node.set_local_membership_epoch(TEST_EPOCH);
+        let sender_key = SigningKey::from_bytes(&[15u8; 32]);
+        let sender_id = sender_key.verifying_key().to_bytes();
+        node.register_peer(
+            sender_id,
+            sender_key.verifying_key(),
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1),
+        );
+        let bundle = mint_bundle_with_timestamp(
+            &sender_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH + crate::peer_gossip::GOSSIP_EPOCH_FUTURE_TOLERANCE + 1,
+            CandidateSet::default(),
+        )
+        .expect("mint");
+        let err = node
+            .ingest_inbound_bundle_without_rebroadcast_for_local_audit(None, bundle, 1_700_000_000)
+            .expect_err("wildly-future epoch must be rejected");
+        assert!(matches!(
+            err,
+            GossipNodeError::Bundle(GossipError::EpochOutsideWindow { .. })
+        ));
+        assert_eq!(node.rejected_counts.get("epoch_outside_window"), Some(&1));
+        assert!(
+            !node.applied_endpoints.contains_key(&sender_id),
+            "an out-of-window bundle's endpoints must never be admitted"
+        );
     }
 }

@@ -25599,6 +25599,12 @@ mod tests {
         runtime.sync_gossip_data_plane(None);
         {
             let node = runtime.gossip_node.as_ref().expect("gossip node present");
+            assert_eq!(
+                node.local_membership_epoch(),
+                Some(1),
+                "I2: the seam must stamp the verified membership epoch \
+                 (fixture epoch = 1) into the gossip node"
+            );
             assert!(
                 node.revoked_peer_ids.contains(&revoked_key.to_bytes()),
                 "revoked membership status must enter the gossip reject set"
