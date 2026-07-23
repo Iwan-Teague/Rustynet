@@ -28,6 +28,28 @@ Tailscale (`100.117.1.47`). Guests: `linux-x86-client-1` (192.168.121.137),
   *orchestrating a lab to completion on box guests does not yet* — this is the
   one headline capability still blocked.
 
+## RESOLVED — all five fixed + proven live (2026-07-23)
+
+All five bugs are fixed and the parallel-lab workflow is proven end-to-end.
+Fix commit `b689cd6` (+ review-follow-up `caeff99`), full workspace gates green
+(fmt + clippy + `cargo test --workspace --all-targets --all-features` = 0 fail).
+Design + adversarial review: `UbuntuHostLabControlRemediationPlan_2026-07-23.md`.
+
+Live proof at `b689cd6`:
+- **BUG-BOX-5**: box run `livelab-1784825618-b689cd6` logged
+  `PASS discover_local_utm: ready=linux-x86-client-1, linux-x86-exit-1; unready=none`
+  — the gate that previously errored *"did not report the selected aliases"* now
+  probes and passes both libvirt guests. **27 `linux-x86` stage rows** landed in the
+  box's ledger (previously zero). Run: 14 pass / 3 skip / **0 fail**.
+- **BUG-BOX-4**: the box launcher auto-injected `--known-hosts-file` (I omitted it);
+  the run survived the arg-gate that killed the pre-fix attempts.
+- **Concurrency + BUG-BOX-1 tooling**: a Mac UTM run (`livelab-...5418`, 14 pass /
+  3 skip / 0 fail) ran **simultaneously** with the box run on disjoint guests, and
+  `vm-lab-run-matrix-compare --commit b689cd6 --include-hosts ubuntu-kvm-1` merged
+  both ledgers → **54 linux stages, 0 fail, 0 conflict, VERDICT: PASS**.
+- The `lab-state` MCP binary was rebuilt + atomically installed for BUG-BOX-1/3/4;
+  it needs a client reconnect (`/mcp` → reconnect) to go live server-side.
+
 ## Bugs found — labelled by severity
 
 All five are **pre-existing** and **not Ubuntu-specific**; the box work merely
