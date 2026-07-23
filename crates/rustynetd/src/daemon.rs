@@ -3768,6 +3768,11 @@ struct DaemonRuntime {
     /// parallel test runs never contend for the fixed port. Not an
     /// operator surface — deliberately absent from `DaemonConfig`.
     gossip_bind_addr: SocketAddr,
+    /// I1c: one-shot latch for the signer/verifier consistency warning.
+    /// When our own membership entry's pubkey differs from the daemon's
+    /// gossip verifying key, peers will reject every mint we send; that
+    /// is warned once per daemon run instead of once per reconcile tick.
+    gossip_identity_mismatch_warned: bool,
     /// D2.7 — paths into which the enrollment-token IPC handler
     /// reads the HMAC secret and writes the consumed-token ledger.
     /// `None` disables the `enrollment consume` verb entirely.
@@ -4214,6 +4219,7 @@ impl DaemonRuntime {
                 IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 crate::gossip_transport::RUSTYNET_GOSSIP_PORT,
             ),
+            gossip_identity_mismatch_warned: false,
             enrollment_secret_path: config.enrollment_secret_path.clone(),
             enrollment_ledger_path: config.enrollment_ledger_path.clone(),
             rotation_ledger: load_rotation_ledger(config.wg_private_key_path.as_deref())
@@ -4930,7 +4936,7 @@ impl DaemonRuntime {
         self.membership_directory = membership_directory;
         self.refresh_dns_zone_state(auto_bundle.as_ref());
         self.materialize_service_access_state(auto_bundle.as_ref());
-        self.sync_gossip_data_plane();
+        self.sync_gossip_data_plane(auto_bundle.as_ref().map(|envelope| &envelope.bundle));
         self.refresh_traversal_hint_state(force_reprobe);
 
         if self.traversal_authority_mode().is_enforced()
@@ -5329,32 +5335,59 @@ impl DaemonRuntime {
         self.gossip_transport = Some(transport);
     }
 
-    /// I1b — post-commit hook for the D2.5 gossip data plane. Invoked at
-    /// the same four signed-state commit seams as
+    /// I1b/I1c — post-commit hook for the D2.5 gossip data plane. Invoked
+    /// at the same four signed-state commit seams as
     /// `materialize_service_access_state` (`bootstrap`,
     /// `refresh_signed_state_with_reason`, `reconcile`,
     /// `handle_membership_apply`), always AFTER `self.membership_state`
-    /// has been refreshed from a verified snapshot.
+    /// has been refreshed from a verified snapshot. `auto_tunnel` is the
+    /// verified assignment bundle when the seam has one in scope; the
+    /// membership-apply seam passes `None` (exactly like the service
+    /// access-state materialisation).
     ///
-    /// Attach guard: the transport is bound only when BOTH halves of the
-    /// gossip prerequisite exist — the gossip signing sub-key was loaded at
-    /// construction (`build_gossip_node`) AND a verified membership
-    /// snapshot has been committed. Until then `gossip_mint_attached()`
-    /// stays false, so the main loop neither builds candidate sets nor
-    /// mints, and `drain_gossip_inbound` stays inert. A bind failure is
-    /// logged and retried at the next commit seam — a transient
-    /// EADDRINUSE from a daemon-restart race must not permanently disable
-    /// gossip, and the retry path is loud, never silent. On non-unix
-    /// platforms this is unreachable: `validate_daemon_config` rejects a
-    /// configured gossip signing secret because the transport is
-    /// unix-only, so `gossip_node` is always `None` there.
-    fn sync_gossip_data_plane(&mut self) {
-        if self.gossip_node.is_none() {
+    /// Attach guard (I1b): the transport is bound only when BOTH halves
+    /// of the gossip prerequisite exist — the gossip signing sub-key was
+    /// loaded at construction (`build_gossip_node`) AND a verified
+    /// membership snapshot has been committed. Until then
+    /// `gossip_mint_attached()` stays false, so the main loop neither
+    /// builds candidate sets nor mints, and `drain_gossip_inbound` stays
+    /// inert. A bind failure is logged and retried at the next commit
+    /// seam — a transient EADDRINUSE from a daemon-restart race must not
+    /// permanently disable gossip, and the retry path is loud, never
+    /// silent. On non-unix platforms this is unreachable:
+    /// `validate_daemon_config` rejects a configured gossip signing
+    /// secret because the transport is unix-only, so `gossip_node` is
+    /// always `None` there.
+    ///
+    /// Trust view (I1c): everything the gossip node trusts is derived
+    /// from the VERIFIED membership snapshot just committed — never from
+    /// the wire:
+    ///
+    /// * Revocation is applied FIRST and unconditionally (also at the
+    ///   bundle-less membership-apply seam — revocation must not wait):
+    ///   the revoked-source set is replaced (GM-1/RSA-0034) and every
+    ///   revoked peer's routing/verification entry is unregistered so it
+    ///   stops being a re-push destination.
+    /// * The anchor gossip-seed set is replaced from signed membership
+    ///   capabilities.
+    /// * Active members are (re)registered with their membership pubkey
+    ///   as BOTH peer id and verifying key, pushing to their overlay
+    ///   address on the gossip port (I1d,
+    ///   `gossip_peer_registrations_from_membership`) — only when the
+    ///   verified assignment bundle proves the overlay address. A member
+    ///   without one is omitted this tick, never guessed.
+    /// * Peers absent from membership are NOT unregistered: an in-flight
+    ///   D2.7 enrollee is consume-registered before its membership admit
+    ///   lands, and dropping it here would break the enrollment
+    ///   bootstrap ordering. Absence is not revocation; explicit
+    ///   revocation is what removes a peer.
+    fn sync_gossip_data_plane(&mut self, auto_tunnel: Option<&AutoTunnelBundle>) {
+        let Some(node) = self.gossip_node.as_mut() else {
             return;
-        }
-        if self.membership_state.is_none() {
+        };
+        let Some(membership_state) = self.membership_state.as_ref() else {
             return;
-        }
+        };
         if self.gossip_transport.is_none() {
             match crate::gossip_transport::GossipTransport::bind(self.gossip_bind_addr) {
                 Ok(transport) => {
@@ -5366,6 +5399,60 @@ impl DaemonRuntime {
                         "gossip transport bind failed; retrying on next signed-state commit: {err}"
                     );
                 }
+            }
+        }
+
+        // Revocation first: replace the reject set, then remove routing
+        // entries, so a revoked peer is out of the epidemic in the same
+        // tick its revocation commits.
+        let revoked = crate::gossip_runtime::revoked_peer_ids_from_membership(membership_state);
+        node.set_revoked_peer_ids(revoked.iter().copied());
+        for peer_id in &revoked {
+            node.unregister_peer(peer_id);
+        }
+        node.set_anchor_gossip_seed_peer_ids(
+            crate::gossip_runtime::anchor_gossip_seed_peer_ids_from_membership(membership_state),
+        );
+
+        // Signer/verifier consistency (local half of the I1c contract):
+        // membership must publish OUR gossip verifying key as our node
+        // pubkey, or every peer verifies our mints against the wrong key
+        // and rejects them. Warn once — loudly visible, but inbound
+        // verification of peers keeps working either way. No key material
+        // is logged.
+        let local_gossip_node_id = node.local_node_id;
+        if !self.gossip_identity_mismatch_warned
+            && let Some(self_entry) = membership_state
+                .nodes
+                .iter()
+                .find(|member| member.node_id == self.local_node_id)
+            && crate::gossip_runtime::decode_hex32(self_entry.node_pubkey_hex.as_str())
+                != Some(local_gossip_node_id)
+        {
+            self.gossip_identity_mismatch_warned = true;
+            log::warn!(
+                "gossip identity mismatch: local membership pubkey is not this daemon's gossip \
+                 verifying key; peers will reject this node's gossip mints until enrollment \
+                 publishes the derive_gossip_signing_key verifying key as its membership pubkey"
+            );
+        }
+
+        // Additive registration needs the verified assignment bundle for
+        // overlay addresses; without one this seam only applied the
+        // revocation/seed updates above.
+        if let Some(bundle) = auto_tunnel {
+            let overlay_addr_of = overlay_addresses_from_bundle_peers(bundle);
+            for registration in crate::gossip_runtime::gossip_peer_registrations_from_membership(
+                membership_state,
+                &overlay_addr_of,
+                &self.local_node_id,
+                &local_gossip_node_id,
+            ) {
+                node.register_peer(
+                    registration.peer_node_id,
+                    registration.verifying_key,
+                    registration.push_addr,
+                );
             }
         }
     }
@@ -7438,7 +7525,7 @@ impl DaemonRuntime {
         self.membership_directory = membership_directory;
         self.refresh_dns_zone_state(auto_bundle.as_ref());
         self.materialize_service_access_state(auto_bundle.as_ref());
-        self.sync_gossip_data_plane();
+        self.sync_gossip_data_plane(auto_bundle.as_ref().map(|envelope| &envelope.bundle));
 
         if self.auto_tunnel_enforce {
             if self.node_role.is_blind_exit() {
@@ -8391,7 +8478,7 @@ impl DaemonRuntime {
         // (`peers.v1`) keeps the last verified contents (see
         // `materialize_service_access_state`).
         self.materialize_service_access_state(None);
-        self.sync_gossip_data_plane();
+        self.sync_gossip_data_plane(None);
         if !revocation_failures.is_empty() {
             return Err(format!(
                 "membership update applied (epoch_new={new_epoch}) but revocation teardown failed for: {}",
@@ -8953,7 +9040,9 @@ impl DaemonRuntime {
                     self.membership_directory = membership_directory;
                     self.refresh_dns_zone_state(auto_bundle.as_ref());
                     self.materialize_service_access_state(auto_bundle.as_ref());
-                    self.sync_gossip_data_plane();
+                    self.sync_gossip_data_plane(
+                        auto_bundle.as_ref().map(|envelope| &envelope.bundle),
+                    );
                     if self.auto_tunnel_enforce {
                         if self.node_role.is_blind_exit() {
                             self.selected_exit_node = None;
@@ -25383,7 +25472,7 @@ mod tests {
         runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
 
         // Neither key nor membership: inert.
-        runtime.sync_gossip_data_plane();
+        runtime.sync_gossip_data_plane(None);
         assert!(
             runtime.gossip_transport.is_none(),
             "no gossip identity configured: transport must stay unattached"
@@ -25394,7 +25483,7 @@ mod tests {
             crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
                 .expect("gossip node should build"),
         );
-        runtime.sync_gossip_data_plane();
+        runtime.sync_gossip_data_plane(None);
         assert!(
             runtime.gossip_transport.is_none(),
             "gossip identity without verified membership must not attach the transport"
@@ -25409,7 +25498,7 @@ mod tests {
             "node-a",
             vec![RoleCapability::Client],
         ));
-        runtime.sync_gossip_data_plane();
+        runtime.sync_gossip_data_plane(None);
         assert!(
             runtime.gossip_transport.is_some(),
             "gossip identity + verified membership must attach the transport"
@@ -25426,7 +25515,7 @@ mod tests {
             .expect("transport attached")
             .local_addr()
             .expect("local addr");
-        runtime.sync_gossip_data_plane();
+        runtime.sync_gossip_data_plane(None);
         let addr_after = runtime
             .gossip_transport
             .as_ref()
@@ -25437,6 +25526,136 @@ mod tests {
             addr_before, addr_after,
             "sync must not rebind an already-attached gossip transport"
         );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// I1c: the gossip trust view is driven from the VERIFIED membership
+    /// snapshot at each commit seam — revocation applies immediately (also
+    /// without an assignment bundle in scope), the anchor-seed set follows
+    /// signed capabilities, active members register with their membership
+    /// pubkey + overlay address, and an in-flight enrollee registered by
+    /// the D2.7 consume path survives (absence from membership is not
+    /// revocation).
+    #[cfg(unix)]
+    #[test]
+    fn sync_gossip_data_plane_applies_membership_trust_view() {
+        let relay_addr: SocketAddr = "203.0.113.64:40064".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-gossip-sync-trust-view",
+            relay_addr,
+            "relay-eu-1",
+        );
+        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+
+        let revoked_key = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let enrollee_key = SigningKey::from_bytes(&[11u8; 32]).verifying_key();
+        let active_key = SigningKey::from_bytes(&[13u8; 32]).verifying_key();
+        let loopback: SocketAddr = "127.0.0.1:51821".parse().expect("addr");
+        {
+            let node = runtime.gossip_node.as_mut().expect("gossip node injected");
+            // Pre-registered peers: one about to be revoked in membership,
+            // one in-flight D2.7 enrollee not yet present in membership.
+            node.register_peer(revoked_key.to_bytes(), revoked_key, loopback);
+            node.register_peer(enrollee_key.to_bytes(), enrollee_key, loopback);
+        }
+
+        let member = |node_id: &str, key: &ed25519_dalek::VerifyingKey| MembershipNode {
+            node_id: node_id.to_owned(),
+            node_pubkey_hex: hex_encode(key.as_bytes()),
+            owner: "owner@test.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![RoleCapability::Client],
+            joined_at_unix: 1,
+            updated_at_unix: 1,
+        };
+        let mut revoked_member = member("node-revoked", &revoked_key);
+        revoked_member.status = MembershipNodeStatus::Revoked;
+        let mut seed_member = member("node-seed", &active_key);
+        seed_member
+            .capabilities
+            .push(RoleCapability::AnchorGossipSeed);
+        runtime.membership_state = Some(make_membership_state_with_nodes(vec![
+            revoked_member,
+            seed_member,
+        ]));
+
+        // Bundle-less seam (membership apply): revocation + seed set apply
+        // immediately; no additive registration happens.
+        runtime.sync_gossip_data_plane(None);
+        {
+            let node = runtime.gossip_node.as_ref().expect("gossip node present");
+            assert!(
+                node.revoked_peer_ids.contains(&revoked_key.to_bytes()),
+                "revoked membership status must enter the gossip reject set"
+            );
+            assert!(
+                !node.peers.contains_key(&revoked_key.to_bytes()),
+                "a revoked peer's routing entry must be unregistered immediately"
+            );
+            assert!(
+                node.peers.contains_key(&enrollee_key.to_bytes()),
+                "an in-flight enrollee absent from membership must stay registered"
+            );
+            assert!(
+                node.anchor_gossip_seed_peer_ids
+                    .contains(&active_key.to_bytes()),
+                "anchor gossip seed capability must enter the seed set"
+            );
+            assert!(
+                !node.peers.contains_key(&active_key.to_bytes()),
+                "no assignment bundle in scope: additive registration must wait"
+            );
+        }
+
+        // Bundle-carrying seam: the active member registers with its
+        // overlay address on the gossip port.
+        let bundle = AutoTunnelBundle {
+            node_id: "daemon-local".to_owned(),
+            node_capabilities: vec![RoleCapability::Client],
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            assigned_cidr: "100.64.0.1/32".to_owned(),
+            peers: vec![rustynet_backend_api::PeerConfig {
+                node_id: NodeId::new("node-seed".to_owned()).expect("node id"),
+                endpoint: SocketEndpoint {
+                    addr: "203.0.113.40".parse().expect("ip"),
+                    port: 51820,
+                },
+                public_key: [0u8; 32],
+                allowed_ips: vec!["100.64.0.40/32".to_owned()],
+                persistent_keepalive_secs: None,
+            }],
+            routes: vec![],
+            signed_exit_node_id: None,
+            signed_exit_node_capabilities: vec![],
+            selected_exit_node: None,
+        };
+        runtime.sync_gossip_data_plane(Some(&bundle));
+        {
+            let node = runtime.gossip_node.as_ref().expect("gossip node present");
+            let registered = node
+                .peers
+                .get(&active_key.to_bytes())
+                .expect("active member with overlay address must be registered");
+            assert_eq!(
+                registered.push_addr,
+                SocketAddr::new(
+                    "100.64.0.40".parse().expect("ip"),
+                    crate::gossip_transport::RUSTYNET_GOSSIP_PORT
+                ),
+                "push address must be the overlay address on the gossip port"
+            );
+            assert_eq!(
+                registered.verifying_key.to_bytes(),
+                active_key.to_bytes(),
+                "verifying key must be the membership pubkey"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(test_dir);
     }

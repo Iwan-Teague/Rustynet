@@ -46,10 +46,10 @@
 //!   the source node id. The full candidate list is NEVER written to
 //!   shared logs — it is PII per the privacy retention policy.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -58,7 +58,7 @@ use rustynet_control::membership::{MembershipNode, MembershipNodeStatus, Members
 use rustynet_control::roles::RoleCapability;
 
 use crate::dataplane_candidates::CandidateSet;
-use crate::gossip_transport::{GossipTransport, TransportError};
+use crate::gossip_transport::{GossipTransport, RUSTYNET_GOSSIP_PORT, TransportError};
 use crate::peer_gossip::{
     DEFAULT_FRESHNESS_WINDOW_SECS, GossipBundle, GossipError, MAX_GOSSIP_DATAGRAM_BYTES,
     SeenSequenceState, accept_bundle_with_now, deserialise_bundle, mint_bundle_with_timestamp,
@@ -603,6 +603,82 @@ pub fn revoked_peer_ids_from_membership(state: &MembershipState) -> Vec<[u8; 32]
     ids
 }
 
+/// I1c/I1d — one desired gossip peer registration, derived from VERIFIED
+/// membership plus the verified assignment bundle's overlay address map.
+/// Consumed by `DaemonRuntime::sync_gossip_data_plane` via
+/// [`GossipNode::register_peer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GossipPeerRegistration {
+    pub peer_node_id: [u8; 32],
+    pub verifying_key: VerifyingKey,
+    pub push_addr: SocketAddr,
+}
+
+/// I1c/I1d — compute the gossip peer registrations for the current
+/// verified membership snapshot.
+///
+/// Trust and addressing rules (all fail-closed by OMISSION — an entry that
+/// cannot be derived from verified state is skipped, never guessed):
+///
+/// * Only `Active` members are candidates; Revoked/Quarantined/unknown
+///   entries never produce a registration (they are additionally rejected
+///   inbound via the revoked set, GM-1/RSA-0034).
+/// * The peer id AND the verifying key are the member's 32-byte
+///   `node_pubkey_hex` from signed membership. That value is the contract:
+///   membership publishes each node's GOSSIP verifying key (the
+///   `derive_gossip_signing_key` sub-key, I1a), exactly as the D2.7
+///   enrollment flow registers the enrollee-presented key. An entry whose
+///   pubkey is not a canonical Ed25519 point is skipped.
+/// * The push address is the peer's OVERLAY (tunnel) address from the
+///   verified assignment bundle's `allowed_ips` host CIDRs, on
+///   [`RUSTYNET_GOSSIP_PORT`] — gossip rides the encrypted mesh. A member
+///   with no overlay address in the current bundle is skipped this tick
+///   (never a raw-Internet fallback: a public address would not traverse
+///   NAT and must never be invented from unsigned inputs).
+/// * The local node never registers itself (matched by membership node id
+///   AND by gossip node id, so a membership entry claiming our key is
+///   also excluded).
+///
+/// Output is sorted by peer id and deduplicated on it (first occurrence
+/// wins) so the registration pass is deterministic even against a
+/// pathological snapshot carrying the same pubkey twice.
+pub fn gossip_peer_registrations_from_membership(
+    state: &MembershipState,
+    overlay_addr_of: &BTreeMap<String, IpAddr>,
+    local_membership_node_id: &str,
+    local_gossip_node_id: &[u8; 32],
+) -> Vec<GossipPeerRegistration> {
+    let mut out = Vec::new();
+    for member in &state.nodes {
+        if member.status != MembershipNodeStatus::Active {
+            continue;
+        }
+        if member.node_id == local_membership_node_id {
+            continue;
+        }
+        let Some(peer_node_id) = decode_hex32(member.node_pubkey_hex.as_str()) else {
+            continue;
+        };
+        if &peer_node_id == local_gossip_node_id {
+            continue;
+        }
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&peer_node_id) else {
+            continue;
+        };
+        let Some(overlay_addr) = overlay_addr_of.get(member.node_id.as_str()) else {
+            continue;
+        };
+        out.push(GossipPeerRegistration {
+            peer_node_id,
+            verifying_key,
+            push_addr: SocketAddr::new(*overlay_addr, RUSTYNET_GOSSIP_PORT),
+        });
+    }
+    out.sort_unstable_by(|a, b| a.peer_node_id.cmp(&b.peer_node_id));
+    out.dedup_by(|a, b| a.peer_node_id == b.peer_node_id);
+    out
+}
+
 /// Pin-then-Seniority: pinned nodes (via `AnchorPortMappingPinned`) sort
 /// first; among pinned or among unpinned nodes, longest membership
 /// (`joined_at_unix` ascending) wins, node_id as final deterministic
@@ -706,7 +782,7 @@ fn short_id(id: &[u8; 32]) -> String {
     out
 }
 
-fn decode_hex32(value: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_hex32(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64 {
         return None;
     }
@@ -1515,6 +1591,126 @@ mod tests {
         ]);
         let revoked = revoked_peer_ids_from_membership(&state);
         assert_eq!(revoked, vec![[0x22u8; 32], [0x33u8; 32]]);
+    }
+
+    /// Membership fixture whose pubkey is a REAL Ed25519 verifying key
+    /// (derived from a seed byte), as the I1c registration path requires —
+    /// an arbitrary repeated-byte pattern is not guaranteed to decode as a
+    /// canonical curve point.
+    fn membership_node_with_real_key(node_id: &str, seed_byte: u8) -> (MembershipNode, [u8; 32]) {
+        let verifying = SigningKey::from_bytes(&[seed_byte; 32]).verifying_key();
+        let key_bytes = verifying.to_bytes();
+        let mut hex = String::with_capacity(64);
+        for byte in key_bytes {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        let mut node = membership_node(node_id, 0, vec![RoleCapability::Client]);
+        node.node_pubkey_hex = hex;
+        (node, key_bytes)
+    }
+
+    fn overlay_map(entries: &[(&str, &str)]) -> BTreeMap<String, IpAddr> {
+        entries
+            .iter()
+            .map(|(node_id, ip)| {
+                (
+                    (*node_id).to_owned(),
+                    ip.parse::<IpAddr>().expect("test ip parses"),
+                )
+            })
+            .collect()
+    }
+
+    /// I1c: an Active member with a canonical Ed25519 membership pubkey and
+    /// a verified overlay address becomes exactly one registration — peer
+    /// id and verifying key are both the membership pubkey, and the push
+    /// address is the overlay address on the gossip port. Inactive members
+    /// and non-decodable pubkeys are omitted (fail closed), never guessed.
+    #[test]
+    fn gossip_peer_registrations_map_active_members_only() {
+        let (peer_a, key_a) = membership_node_with_real_key("node-a", 0x11);
+        let (mut peer_revoked, key_revoked) = membership_node_with_real_key("node-revoked", 0x22);
+        peer_revoked.status = MembershipNodeStatus::Revoked;
+        // Not valid hex at all: must be omitted, not guessed.
+        let mut peer_bad_key = membership_node("node-bad-key", 0x33, vec![RoleCapability::Client]);
+        peer_bad_key.node_pubkey_hex = "not-hex".to_owned();
+        let state = membership_state(vec![peer_a, peer_revoked, peer_bad_key]);
+
+        let overlay = overlay_map(&[
+            ("node-a", "100.64.0.10"),
+            ("node-revoked", "100.64.0.11"),
+            ("node-bad-key", "100.64.0.12"),
+        ]);
+        let regs = gossip_peer_registrations_from_membership(
+            &state,
+            &overlay,
+            "node-local",
+            &[0xfeu8; 32],
+        );
+        assert_eq!(
+            regs.len(),
+            1,
+            "only the active well-formed member registers"
+        );
+        assert_eq!(regs[0].peer_node_id, key_a);
+        assert_eq!(regs[0].verifying_key.to_bytes(), key_a);
+        assert_eq!(
+            regs[0].push_addr,
+            SocketAddr::new("100.64.0.10".parse().expect("ip"), RUSTYNET_GOSSIP_PORT),
+            "push address must be the overlay address on the fixed gossip port"
+        );
+        assert!(
+            !regs.iter().any(|reg| reg.peer_node_id == key_revoked),
+            "a revoked member must never be registered"
+        );
+    }
+
+    /// I1c: the local node never registers itself — matched by membership
+    /// node id AND by gossip node id, so a snapshot entry that claims our
+    /// key under another name is excluded too.
+    #[test]
+    fn gossip_peer_registrations_never_register_self() {
+        let (self_entry, self_key) = membership_node_with_real_key("node-local", 0x44);
+        let (imposter, _imposter_key) = {
+            // Different node id, same pubkey as the local gossip identity.
+            let (mut node, key) = membership_node_with_real_key("node-imposter", 0x44);
+            node.node_id = "node-imposter".to_owned();
+            (node, key)
+        };
+        let state = membership_state(vec![self_entry, imposter]);
+        let overlay = overlay_map(&[
+            ("node-local", "100.64.0.20"),
+            ("node-imposter", "100.64.0.21"),
+        ]);
+        let regs =
+            gossip_peer_registrations_from_membership(&state, &overlay, "node-local", &self_key);
+        assert!(
+            regs.is_empty(),
+            "neither our own entry nor an entry claiming our gossip key may register"
+        );
+    }
+
+    /// I1c: a pathological snapshot carrying the same pubkey under two
+    /// node ids collapses deterministically to one registration.
+    #[test]
+    fn gossip_peer_registrations_dedup_duplicate_pubkeys_deterministically() {
+        let (first, shared_key) = membership_node_with_real_key("node-one", 0x55);
+        let (mut second, _) = membership_node_with_real_key("node-two", 0x55);
+        second.node_id = "node-two".to_owned();
+        let state = membership_state(vec![first, second]);
+        let overlay = overlay_map(&[("node-one", "100.64.0.30"), ("node-two", "100.64.0.31")]);
+        let regs = gossip_peer_registrations_from_membership(
+            &state,
+            &overlay,
+            "node-local",
+            &[0xfeu8; 32],
+        );
+        assert_eq!(
+            regs.len(),
+            1,
+            "duplicate pubkeys must collapse to one entry"
+        );
+        assert_eq!(regs[0].peer_node_id, shared_key);
     }
 
     #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
