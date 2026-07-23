@@ -1,6 +1,16 @@
 # Cross-Platform Role Parity — `--node`-Native Refresh — 2026-07-23
 
-**Status:** DRAFT (grounded 2026-07-23; adversarial review pending). This refresh
+**Status:** DRAFT (grounded + **adversarially reviewed** 2026-07-23; verdict
+"sound-with-fixes," all folded in). The reframe (bash-proven ≢ G2-proven; mac/win
+~0% on `--node`) was verified clean against both ledgers. Fixes folded: B1 (CP-1
+restated macOS-scoped — Linux `two_hop` is 35-pass, not a blocker — and its cause
+flagged UNVERIFIED, first action = triage not fix), B2 (stability = §5.4
+flake-sized N-of-N at a single clean commit, not the replaced "two consecutive"),
+B3 (program restructured into 3 parallel tracks joining at cross-OS, not a false
+serial), S1 (cross-OS is 0/88 because never *attempted* — first step is run+triage),
+S2 (macOS exit `pf` divergence does NOT waive the end-to-end egress proof), S3
+(`SignedMembership` transitions restored to scope), S4 (`network_flap` G1 =
+"correctly adjudicated," not "must be RED"). This refresh
 re-scopes the release-blocking parity mandate to the **engine of record** — the
 Rust `--node` orchestrator, which the `NodeEngineAcceptanceSpec_2026-07-23.md`
 **G2 (parity attainment → release)** gate reads. It supersedes the *status* half of
@@ -25,8 +35,9 @@ not count toward release.** On the engine of record:
 - `--node` ledger: **88 rows, zero overall `pass`** (81 fail / 7 partial).
 - **Cross-OS is 0-proven:** `live_mixed_topology_validation` (the `--node` cross-OS
   carrier per AcceptanceSpec §3-T3) has **never gone green** (0/88).
-- **Windows is 0-proven and cannot even bootstrap on `--node`** (every
-  `windows_stage_bootstrap` row = fail).
+- **Windows is 0-proven and has not bootstrapped on `--node`** (every
+  `windows_stage_bootstrap` row *where it ran* failed — n=3, all 2026-07-19; the
+  other 85 rows are `not_run`, so this is a thin single-day signal, see CP-4).
 - **macOS is partially stage-green** (admin, relay-lifecycle, core, security stages
   pass in isolation) but **no macOS run passes overall** — `two_hop` fails every
   time, and exit/blind_exit/anchor were never elected onto a macOS `--node`.
@@ -67,51 +78,74 @@ gap is **running them green**, not missing stages — which is why the critical 
 Nothing macOS/Windows can be G2-proven until these clear. Two are code, one is
 hardware; a fourth (Windows bootstrap) must be triaged.
 
-- **CP-1 (code) — `two_hop` / client↔client on `--node`.** `two_hop` fails on macOS
-  **and** Linux → `traffic_test_matrix=fail`, so no macOS run passes overall and the
-  macOS `client` cell is red. Diagnosed (see the client↔client memory) as a
-  **userspace shared-socket WireGuard transport-handshake** bug
-  (`path_live_peer_count=0`), NOT an ACL/policy problem. **Highest-value code
-  blocker for the whole macOS column** — it cascades into every macOS run's overall
-  verdict. Owning fix is core-dataplane (`rustynet-backend-userspace` shared socket
-  / daemon `initiate_peer_handshake`), §13.2 security-sensitive.
+- **CP-1 (code) — macOS `two_hop` (client↔client).** On macOS `--node`, `two_hop`
+  fails **8/8 where it ran** → `traffic_test_matrix=fail`, so no macOS run passes
+  overall and the macOS `client` cell is red. **On Linux this is NOT a blocker** —
+  `linux_stage_two_hop` is 35 pass including all four most recent runs; the sole
+  Linux `--node` fail is `network_flap` (CP-2). **Diagnosis is UNVERIFIED on current
+  code (review B1):** the "userspace shared-socket WG transport-handshake" hypothesis
+  is imported from a 2026-07-15 memory about the `traffic_test_matrix` client↔client
+  cell — a *different* stage — and no shared-socket/handshake fix appears in the
+  `rustynet-backend-userspace`/`rustynetd` commits since 2026-07-14, so it may never
+  have explained macOS `two_hop` or has stopped applying. **First action is a fresh
+  triage of a current macOS `two_hop` report**, not a fix on the stale hypothesis. It
+  is *probably* the highest-value macOS-column lever (it caps every macOS run's
+  overall verdict), but that ranking is provisional pending triage. Owning area is
+  core-dataplane, §13.2 security-sensitive.
 - **CP-2 (code) — `network_flap` / traversal self-sustenance.** The sole Linux
   `--node` fail and a real production gap (mesh fail-closes ~120 s after the last
   distribution). Approved design + in-flight implementation in
   `TraversalSelfSustenancePlan_2026-07-23.md` (I1/I2 merged; I3-I6 remain). Per
-  AcceptanceSpec §6/B6 it must be RED-for-the-right-reason for **G1** (already true)
+  AcceptanceSpec §6/B6 it must be **correctly adjudicated** for **G1** — RED-for-the-
+  right-reason today, *or* genuinely GREEN once the fix lands (both satisfy G1) —
   and GREEN for **G2**. Gates the resilience tier on every OS.
 - **CP-3 (hardware) — Windows exit WinNAT.** `promote_windows_exit_active` is
   code-complete but needs `MSFT_NetNat`/HNS, which **cannot run in UTM on Apple
   Silicon** — requires a physical Windows-11-Pro/Ent-on-ARM device (CompletionBrief
   §8.1). External blocker; owner task. Blocks only the Windows *exit* cell.
 - **CP-4 (triage) — Windows `--node` bootstrap fails.** Every `windows_stage_
-  bootstrap` row (2026-07-19) failed, which blocks **all** Windows `--node` cells
-  (not just exit). Root cause **unverified** — code vs guest health. Must be
-  triaged first; it is the single gate in front of the entire Windows column.
+  bootstrap` row **where it ran failed (n=3, all 2026-07-19; the other 85 rows are
+  `not_run`)**, which blocks **all** Windows `--node` cells (not just exit). Root
+  cause **unverified** — code vs guest health, on a thin single-day signal. It is the
+  single gate in front of the entire Windows column, so triage it **first among the
+  Windows work** (it can run in parallel with the macOS/Linux tracks — see §3).
 
-## 3. Ordered program (dependency-sequenced)
+## 3. Program — three PARALLEL tracks joining at cross-OS (revised per review B3)
 
-1. **Clear CP-1 (`two_hop` client↔client handshake).** Unblocks the macOS column's
-   overall verdict and the Linux client-mesh. Core-dataplane, security-sensitive —
-   the single biggest lever for macOS parity.
-2. **Land CP-2 (`network_flap`/traversal).** Finish `TraversalSelfSustenancePlan`
-   I3-I6, live-verify green. Unblocks the resilience tier on all OSes.
-3. **Triage + fix CP-4 (Windows `--node` bootstrap).** Determine code vs guest;
-   until this is green, the Windows column cannot be exercised at all.
-4. **Elect + prove the macOS roles on `--node`.** Stages exist; admin/relay already
-   stage-green. Add election + green runs for macOS `exit`, `blind_exit`, `anchor`,
-   and `role-transition` (drive them onto a macOS `--node` via the role-platform
-   selectors / `--macos-promote-exit`). Two-consecutive-valid-green per
-   AcceptanceSpec §5.4.
-5. **Prove cross-OS on `--node`.** Get `live_mixed_topology_validation` green
-   (Linux + macOS + Windows all present) — currently 0/88; the whole cross-OS bar
-   rides on it.
-6. **Prove the Windows roles on `--node`** (once CP-4 clears): admin, anchor,
-   relay-lifecycle, role-transition. Windows `exit` waits on CP-3 (hardware).
-7. **Parked, tracked as deferred-with-reason** (AcceptanceSpec §6.1): relay
-   frame-forwarding (HP-3, all OS), Windows `blind_exit` (design-excluded), nas/llm
-   (D13 program).
+The blockers share no cross-dependencies, so this is **not** a serial 1→7 list —
+that falsely serialized independent work (CP-4 marked "triage first" yet placed
+third behind two unrelated code fixes with different owners). Three tracks run in
+parallel and converge only at the cross-OS join. **Stability throughout:** a cell is
+"proven" only under the AcceptanceSpec **§5.4 flake-sized N-of-N-at-a-single-clean-
+commit** rule (default 3-of-3, 5-of-5 for a flake-recorded stage) — *not* "two
+consecutive" (which §5.4 explicitly replaced as arithmetically too weak).
+
+- **Track M — macOS.** Two sub-streams that DON'T block each other: (a) **triage
+  then fix CP-1** (macOS `two_hop`) — needed for the macOS `client` cell and any
+  *overall*-green macOS run; (b) **elect + prove the other macOS roles** (`exit`,
+  `blind_exit`, `anchor`, `role-transition`) via the role-platform selectors /
+  `--macos-promote-exit`. Sub-stream (b) does **not** wait on CP-1: the ledger shows
+  per-CELL stage-greens accrue even in overall-*failed* runs (that is exactly how
+  `macos_admin`/`macos_relay` earned their green cells while `two_hop` failed). So
+  role-cell greens can be harvested in parallel; only the `client` cell + a fully-
+  green macOS run gate on CP-1.
+- **Track L — Linux / traversal.** Land **CP-2** (`network_flap`) —
+  `TraversalSelfSustenancePlan` I3-I6, live-verify green. Independent of Tracks
+  M/W; unblocks the resilience tier everywhere.
+- **Track W — Windows.** **CP-4 first** (triage the bootstrap failure, code vs
+  guest) — it gates the entire Windows column, so it leads *this track* but runs in
+  parallel with M and L. Then prove Windows `admin`, `anchor`, `relay`-lifecycle,
+  `role-transition`. Windows `exit` waits on **CP-3** (WinNAT hardware); Windows
+  `blind_exit` is design-excluded (§6).
+- **JOIN — cross-OS.** `live_mixed_topology_validation` needs Linux + macOS +
+  Windows all present and healthy, so it depends on Tracks M and W (and L for a
+  clean mesh). **First sub-step is "run it once and triage," not "make it green"
+  (review S1):** it is **0-for-88 because it has NEVER been attempted** — every row
+  is `skip`/`not_run`, zero `fail`, zero `pass` — so there is no triage signal yet;
+  the first execution is an unknown-unknown and deserves its own diagnosis step.
+- **Parked, deferred-with-reason** (AcceptanceSpec §6.1 fenced disposition): relay
+  frame-forwarding (HP-3, all OS), Windows `blind_exit` (design-excluded), nas/llm
+  (D13 program).
 
 ## 4. Blockers — environmental vs code
 
@@ -138,6 +172,12 @@ hardware; a fourth (Windows bootstrap) must be triaged.
   **unverified** whether the gossip-runtime work touched it — triage before scoping.
 - **Windows authoritative port mapping:** still open (no `windows_membership_
   capabilities` equivalent).
+- **`SignedMembership`-kind role transitions (both OS) — dropped scope, restored
+  (review S3).** ParityPlan §3 tracked capability-*changing* transitions as an
+  explicit follow-up to the LocalOnly-flip proofs (the §1 matrix's role-transition
+  row covers only the LocalOnly flips). They are unproven on `--node` on either OS —
+  either add them to Track M / Track W as role-transition sub-cells, or park them
+  via §6.1 (owner sign-off + expiry). Do not silently omit them.
 
 ## 6. Intended OS divergence — NOT parity holes (drift-direction rule)
 
@@ -145,11 +185,16 @@ These are legitimate per-OS differences; do not force uniformity or treat as gap
 (AcceptanceSpec §8 — bash is never the oracle, and neither is Linux):
 
 - **Windows `blind_exit`** — hard-excluded by design (`main.rs` hard-error). 🚫.
-- **macOS exit ≡ blind_exit dataplane** — macOS Exit maps to enforce-time `pf` NAT
-  (anchor hard-locked), so the activate→assert→NAT-session shape doesn't apply;
-  macOS keeps a fail-closed default for the client-egress NAT-session assertion
-  (ParityPlan §11). Lifecycle proven; per-session translation is a scoped
-  macOS-model follow-up, not a bash-parity failure.
+- **macOS exit — `pf` NAT *mechanism* divergence, but the egress PROOF is NOT waived
+  (review S2).** macOS Exit maps to enforce-time `pf` NAT (anchor hard-locked), so
+  the Linux activate→assert→NAT-*session* shape doesn't apply (ParityPlan §11). That
+  is a legitimate *mechanism* difference — but NOT a licence to skip proof. A macOS
+  exit cell must **not** reach G2-green without an **equivalent-strength end-to-end
+  egress assertion** — a client's packets provably egress through the macOS exit to
+  an external target — just expressed via the `pf` model rather than the nft
+  NAT-session assertion. Lifecycle-proven ≠ egress-proven; waiving the egress
+  assertion would be exactly the "excuse a real gap as intended divergence" error
+  the drift rule warns against (§8).
 - **Custody / dataplane / service-manager**: DPAPI vs Keychain vs encrypted-file;
   WFP + WinNAT vs `pf` vs nft; SCM vs launchd vs systemd. All intended.
 - **Windows admin custody verbs** — `trust keygen`/`trust issue` (DPAPI) vs unix
@@ -180,8 +225,10 @@ These are legitimate per-OS differences; do not force uniformity or treat as gap
 - This refresh **is** the G2 (parity attainment) work; G2 gates **release**, not the
   lab default flip (that's G1, the flip track).
 - Each cell's "proven" means green under a **valid `--node` run** (AcceptanceSpec §4
-  evidence properties, recomputed by the independent verifier / §4.8) with the
-  **two-consecutive-valid-green** stability rule (§5.4).
+  evidence properties, recomputed by the independent verifier / §4.8) under the
+  **§5.4 flake-sized N-of-N-at-a-single-clean-commit** stability rule (default
+  3-of-3, 5-of-5 for a flake-recorded stage) — the rule that *replaced* the
+  arithmetically-refuted "two consecutive."
 - `network_flap` (CP-2) is the one cell explicitly allowed RED for G1 and required
   GREEN for G2 (§6/B6).
 - Parked cells (§3 step 7) use the fenced disposition process (AcceptanceSpec §6.1):
