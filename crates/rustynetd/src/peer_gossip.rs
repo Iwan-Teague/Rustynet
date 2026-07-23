@@ -8,6 +8,12 @@
 //! * its node ID (Ed25519 verifying-key fingerprint),
 //! * a strictly-increasing sequence number (per-source anti-replay),
 //! * a Unix timestamp (drift-bounded freshness),
+//! * the minter's VERIFIED membership epoch (I2 — binds the bundle to
+//!   the signed-membership timeline so revocation is reinforced: once
+//!   the mesh advances past the epoch a revoked peer last saw, that
+//!   peer's self-signed bundles fall out of the acceptance window;
+//!   freshness alone cannot expire them because the revoked peer
+//!   itself is the signer and can keep re-stamping timestamps),
 //! * its full [`CandidateSet`] (v4/v6 host + srflx endpoints from
 //!   [`crate::dataplane_candidates`]),
 //! * an Ed25519 signature over the canonical pre-image of all of the
@@ -58,7 +64,17 @@ use crate::dataplane_candidates::CandidateSet;
 /// Wire-format version byte for [`serialise_bundle`] / [`deserialise_bundle`].
 /// A bundle whose first byte does not equal this constant is rejected hard;
 /// future protocol changes must bump this byte and add a new branch.
-pub const GOSSIP_BUNDLE_WIRE_VERSION: u8 = 1;
+///
+/// Version history:
+/// * 1 — initial D2.5 layout (source, sequence, timestamp, counts,
+///   candidates, signature).
+/// * 2 — I2 epoch binding: a `u64` membership epoch inserted between the
+///   timestamp and the candidate counts, covered by the signature. v1
+///   bundles are rejected hard (no downgrade branch), and the signing
+///   domain prefix was bumped in lockstep so a v1 signature can never
+///   verify against a v2 pre-image even if the raw bytes were
+///   reinterpreted.
+pub const GOSSIP_BUNDLE_WIRE_VERSION: u8 = 2;
 
 /// Hard cap on a single gossip datagram (header + candidates +
 /// signature). With the strictest layout this fits comfortably in a
@@ -74,8 +90,9 @@ const WIRE_VERSION_OFFSET: usize = 0;
 const WIRE_SOURCE_OFFSET: usize = 1;
 const WIRE_SEQUENCE_OFFSET: usize = 33;
 const WIRE_TIMESTAMP_OFFSET: usize = 41;
-const WIRE_COUNTS_OFFSET: usize = 49;
-const WIRE_CANDIDATES_OFFSET: usize = 65;
+const WIRE_EPOCH_OFFSET: usize = 49;
+const WIRE_COUNTS_OFFSET: usize = 57;
+const WIRE_CANDIDATES_OFFSET: usize = 73;
 const WIRE_CANDIDATE_STRIDE: usize = 18;
 const WIRE_SIGNATURE_LEN: usize = 64;
 
@@ -83,7 +100,15 @@ const WIRE_SIGNATURE_LEN: usize = 64;
 /// guarantees that a signature on a gossip bundle cannot be replayed
 /// as a signature on some other Ed25519-signed artifact (relay
 /// session token, traversal bundle, etc.).
-pub const GOSSIP_BUNDLE_DOMAIN: &[u8] = b"rustynet:peer_gossip:v1";
+///
+/// Bumped `v1` → `v2` together with [`GOSSIP_BUNDLE_WIRE_VERSION`]
+/// when the I2 epoch field entered the pre-image: with a distinct
+/// domain string, a signature minted over the v1 pre-image layout can
+/// NEVER verify against a v2 pre-image, even for a hypothetical byte
+/// string that parses under both layouts. Cross-version signature
+/// confusion is thereby excluded categorically instead of relying on
+/// the decoder's structural checks alone.
+pub const GOSSIP_BUNDLE_DOMAIN: &[u8] = b"rustynet:peer_gossip:v2";
 
 /// Bundle freshness window. A bundle whose timestamp is more than this
 /// many seconds in the past OR future relative to the receiver's
@@ -107,6 +132,12 @@ pub struct GossipBundle {
     pub source_node_id: [u8; 32],
     pub sequence: u64,
     pub timestamp_unix: u64,
+    /// I2 — the minter's VERIFIED membership epoch at mint time.
+    /// Covered by the signature (part of [`signing_preimage`]), so a
+    /// forwarding peer cannot rewrite it. The accept path enforces a
+    /// bounded skew window around the receiver's own verified epoch;
+    /// see `accept_bundle_with_now` for the exact semantics.
+    pub epoch: u64,
     pub candidates: CandidateSet,
     pub signature: Signature,
 }
@@ -285,6 +316,9 @@ pub fn current_unix_seconds() -> Result<u64, GossipError> {
 /// * Source node ID (32 bytes).
 /// * Sequence (u64 BE).
 /// * Timestamp Unix seconds (u64 BE).
+/// * Membership epoch (u64 BE) — I2; MUST be inside the pre-image so
+///   the signature covers it (an unsigned epoch would be trivially
+///   forgeable by any forwarding peer).
 /// * Candidate count u32 BE for each of v4_host, v6_host,
 ///   v4_srflx, v6_srflx (4 lengths total).
 /// * Candidates in canonical order: v4_host[..], v6_host[..],
@@ -296,11 +330,13 @@ pub fn signing_preimage(
     source_node_id: &[u8; 32],
     sequence: u64,
     timestamp_unix: u64,
+    epoch: u64,
     candidates: &CandidateSet,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         2 + GOSSIP_BUNDLE_DOMAIN.len()
             + 32
+            + 8
             + 8
             + 8
             + 16
@@ -315,6 +351,7 @@ pub fn signing_preimage(
     out.extend_from_slice(source_node_id);
     out.extend_from_slice(&sequence.to_be_bytes());
     out.extend_from_slice(&timestamp_unix.to_be_bytes());
+    out.extend_from_slice(&epoch.to_be_bytes());
     out.extend_from_slice(&(candidates.v4_host.len() as u32).to_be_bytes());
     out.extend_from_slice(&(candidates.v6_host.len() as u32).to_be_bytes());
     out.extend_from_slice(&(candidates.v4_srflx.len() as u32).to_be_bytes());
@@ -354,14 +391,17 @@ fn ip_to_v6_octets(ip: IpAddr) -> [u8; 16] {
 /// Mint a signed gossip bundle from local state. The caller supplies
 /// the signing key (the WG-identity key, exposed via
 /// `rustynet-crypto`), the next sequence number (caller is responsible
-/// for monotonicity), and the freshly-gathered [`CandidateSet`].
+/// for monotonicity), the local VERIFIED membership epoch (I2 — must
+/// come from a verified membership snapshot, never from the wire),
+/// and the freshly-gathered [`CandidateSet`].
 pub fn mint_bundle(
     signing_key: &SigningKey,
     sequence: u64,
+    epoch: u64,
     candidates: CandidateSet,
 ) -> Result<GossipBundle, GossipError> {
     let timestamp_unix = current_unix_seconds()?;
-    mint_bundle_with_timestamp(signing_key, sequence, timestamp_unix, candidates)
+    mint_bundle_with_timestamp(signing_key, sequence, timestamp_unix, epoch, candidates)
 }
 
 /// Test-friendly variant taking an explicit timestamp. Production
@@ -370,6 +410,7 @@ pub fn mint_bundle_with_timestamp(
     signing_key: &SigningKey,
     sequence: u64,
     timestamp_unix: u64,
+    epoch: u64,
     candidates: CandidateSet,
 ) -> Result<GossipBundle, GossipError> {
     let candidate_count = candidates.v4_host.len()
@@ -383,12 +424,19 @@ pub fn mint_bundle_with_timestamp(
         });
     }
     let source_node_id = signing_key.verifying_key().to_bytes();
-    let preimage = signing_preimage(&source_node_id, sequence, timestamp_unix, &candidates);
+    let preimage = signing_preimage(
+        &source_node_id,
+        sequence,
+        timestamp_unix,
+        epoch,
+        &candidates,
+    );
     let signature = signing_key.sign(&preimage);
     Ok(GossipBundle {
         source_node_id,
         sequence,
         timestamp_unix,
+        epoch,
         candidates,
         signature,
     })
@@ -406,6 +454,7 @@ pub fn verify_signature(
         &bundle.source_node_id,
         bundle.sequence,
         bundle.timestamp_unix,
+        bundle.epoch,
         &bundle.candidates,
     );
     verifying_key
@@ -526,15 +575,16 @@ pub fn accept_bundle_with_now(
 ///
 /// Layout (big-endian numbers):
 ///
-/// * `[0]` — version byte (=1)
+/// * `[0]` — version byte (=2)
 /// * `[1..33]` — source node id (32 bytes)
 /// * `[33..41]` — sequence (u64)
 /// * `[41..49]` — timestamp unix seconds (u64)
-/// * `[49..53]` — v4_host count (u32)
-/// * `[53..57]` — v6_host count (u32)
-/// * `[57..61]` — v4_srflx count (u32)
-/// * `[61..65]` — v6_srflx count (u32)
-/// * `[65..]` — candidate slots, 18 bytes each: 16-byte v6-mapped
+/// * `[49..57]` — membership epoch (u64) — I2
+/// * `[57..61]` — v4_host count (u32)
+/// * `[61..65]` — v6_host count (u32)
+/// * `[65..69]` — v4_srflx count (u32)
+/// * `[69..73]` — v6_srflx count (u32)
+/// * `[73..]` — candidate slots, 18 bytes each: 16-byte v6-mapped
 ///   octets + 2-byte port (BE). For host slots the port field is
 ///   always zero; for srflx slots it carries the observed port.
 /// * `[end-64..end]` — 64-byte Ed25519 signature (separated from the
@@ -557,6 +607,7 @@ pub fn serialise_bundle(bundle: &GossipBundle) -> Vec<u8> {
     out.extend_from_slice(&bundle.source_node_id);
     out.extend_from_slice(&bundle.sequence.to_be_bytes());
     out.extend_from_slice(&bundle.timestamp_unix.to_be_bytes());
+    out.extend_from_slice(&bundle.epoch.to_be_bytes());
     out.extend_from_slice(&(bundle.candidates.v4_host.len() as u32).to_be_bytes());
     out.extend_from_slice(&(bundle.candidates.v6_host.len() as u32).to_be_bytes());
     out.extend_from_slice(&(bundle.candidates.v4_srflx.len() as u32).to_be_bytes());
@@ -613,6 +664,11 @@ pub fn deserialise_bundle(bytes: &[u8]) -> Result<GossipBundle, GossipError> {
     );
     let timestamp_unix = u64::from_be_bytes(
         bytes[WIRE_TIMESTAMP_OFFSET..WIRE_TIMESTAMP_OFFSET + 8]
+            .try_into()
+            .expect("slice length is 8"),
+    );
+    let epoch = u64::from_be_bytes(
+        bytes[WIRE_EPOCH_OFFSET..WIRE_EPOCH_OFFSET + 8]
             .try_into()
             .expect("slice length is 8"),
     );
@@ -697,6 +753,7 @@ pub fn deserialise_bundle(bytes: &[u8]) -> Result<GossipBundle, GossipError> {
         source_node_id,
         sequence,
         timestamp_unix,
+        epoch,
         candidates: CandidateSet {
             v4_host,
             v6_host,
@@ -768,6 +825,11 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::net::Ipv6Addr;
 
+    /// Membership epoch stamped into test bundles. Arbitrary but fixed;
+    /// the epoch-window tests derive their local/presented epochs from it
+    /// so boundary assertions stay readable.
+    const TEST_EPOCH: u64 = 7;
+
     fn deterministic_signing_key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
     }
@@ -791,8 +853,8 @@ mod tests {
     fn signing_preimage_is_deterministic_for_same_inputs() {
         let candidates = sample_candidates();
         let source = [7u8; 32];
-        let p1 = signing_preimage(&source, 42, 1_700_000_000, &candidates);
-        let p2 = signing_preimage(&source, 42, 1_700_000_000, &candidates);
+        let p1 = signing_preimage(&source, 42, 1_700_000_000, TEST_EPOCH, &candidates);
+        let p2 = signing_preimage(&source, 42, 1_700_000_000, TEST_EPOCH, &candidates);
         assert_eq!(p1, p2, "pre-image must be deterministic");
     }
 
@@ -800,7 +862,7 @@ mod tests {
     fn signing_preimage_carries_domain_separation_prefix() {
         let candidates = sample_candidates();
         let source = [7u8; 32];
-        let preimage = signing_preimage(&source, 0, 0, &candidates);
+        let preimage = signing_preimage(&source, 0, 0, TEST_EPOCH, &candidates);
         // Length-prefixed domain prefix.
         assert_eq!(
             u16::from_be_bytes([preimage[0], preimage[1]]),
@@ -813,12 +875,50 @@ mod tests {
     }
 
     #[test]
+    fn signing_preimage_binds_the_epoch() {
+        // I2: two pre-images identical except for the epoch must
+        // differ — the epoch is covered by the signature. An unsigned
+        // epoch would be trivially rewritable by any forwarding peer.
+        let candidates = sample_candidates();
+        let source = [7u8; 32];
+        let p1 = signing_preimage(&source, 42, 1_700_000_000, TEST_EPOCH, &candidates);
+        let p2 = signing_preimage(&source, 42, 1_700_000_000, TEST_EPOCH + 1, &candidates);
+        assert_ne!(p1, p2, "epoch must be part of the signed pre-image");
+    }
+
+    #[test]
+    fn verify_signature_rejects_tampered_epoch() {
+        // I2: flipping the epoch after signing must fail signature
+        // verification — the epoch-window accept rule is meaningless
+        // if a man-in-the-epidemic can restamp the epoch.
+        let signing_key = deterministic_signing_key(40);
+        let verifying_key = signing_key.verifying_key();
+        let mut bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .expect("mint succeeds");
+        bundle.epoch = bundle.epoch.wrapping_add(1);
+        let err = verify_signature(&bundle, &verifying_key)
+            .expect_err("tampered epoch must invalidate the signature");
+        assert!(matches!(err, GossipError::SignatureInvalid));
+    }
+
+    #[test]
     fn mint_and_verify_round_trip_against_known_peer_key() {
         let signing_key = deterministic_signing_key(1);
         let verifying_key = signing_key.verifying_key();
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .expect("mint succeeds");
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .expect("mint succeeds");
         verify_signature(&bundle, &verifying_key).expect("signature verifies under signer's key");
     }
 
@@ -826,9 +926,14 @@ mod tests {
     fn verify_signature_fails_under_wrong_key() {
         let signing_key = deterministic_signing_key(2);
         let other = deterministic_signing_key(3);
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .expect("mint succeeds");
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .expect("mint succeeds");
         let err = verify_signature(&bundle, &other.verifying_key())
             .expect_err("must reject under wrong verifying key");
         assert!(matches!(err, GossipError::SignatureInvalid));
@@ -842,15 +947,25 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(verifying_key.to_bytes(), verifying_key);
 
-        let bundle1 =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .unwrap();
+        let bundle1 = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         accept_bundle_with_now(&bundle1, &known, &mut state, 300, 1_700_000_000).expect("ok");
         assert_eq!(state.highest_accepted(&verifying_key.to_bytes()), Some(1));
 
-        let bundle2 =
-            mint_bundle_with_timestamp(&signing_key, 2, 1_700_000_100, CandidateSet::default())
-                .unwrap();
+        let bundle2 = mint_bundle_with_timestamp(
+            &signing_key,
+            2,
+            1_700_000_100,
+            TEST_EPOCH,
+            CandidateSet::default(),
+        )
+        .unwrap();
         accept_bundle_with_now(&bundle2, &known, &mut state, 300, 1_700_000_100)
             .expect("strictly larger sequence accepted");
         assert_eq!(state.highest_accepted(&verifying_key.to_bytes()), Some(2));
@@ -868,9 +983,14 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(verifying_key.to_bytes(), verifying_key);
 
-        let max_bundle =
-            mint_bundle_with_timestamp(&signing_key, u64::MAX, 1_700_000_000, sample_candidates())
-                .unwrap();
+        let max_bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            u64::MAX,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         accept_bundle_with_now(&max_bundle, &known, &mut state, 300, 1_700_000_000)
             .expect("u64::MAX sequence accepted once");
         assert_eq!(
@@ -883,6 +1003,7 @@ mod tests {
                 &signing_key,
                 wrapped,
                 1_700_000_050,
+                TEST_EPOCH,
                 CandidateSet::default(),
             )
             .unwrap();
@@ -912,9 +1033,14 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(verifying_key.to_bytes(), verifying_key);
 
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 7, 1_700_000_000, sample_candidates())
-                .unwrap();
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            7,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000).expect("ok");
         // Same bundle replayed must be rejected.
         let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
@@ -939,12 +1065,23 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(verifying_key.to_bytes(), verifying_key);
 
-        let high =
-            mint_bundle_with_timestamp(&signing_key, 100, 1_700_000_000, sample_candidates())
-                .unwrap();
+        let high = mint_bundle_with_timestamp(
+            &signing_key,
+            100,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         accept_bundle_with_now(&high, &known, &mut state, 300, 1_700_000_000).expect("ok");
-        let low = mint_bundle_with_timestamp(&signing_key, 50, 1_700_000_000, sample_candidates())
-            .unwrap();
+        let low = mint_bundle_with_timestamp(
+            &signing_key,
+            50,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         let err = accept_bundle_with_now(&low, &known, &mut state, 300, 1_700_000_000)
             .expect_err("rewind must be rejected");
         assert!(matches!(err, GossipError::SequenceNotMonotonic { .. }));
@@ -959,9 +1096,14 @@ mod tests {
         known.insert(verifying_key.to_bytes(), verifying_key);
 
         // 1000s in the past, window is 300s.
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .unwrap();
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_001_000)
             .expect_err("stale timestamp must be rejected");
         match err {
@@ -981,9 +1123,14 @@ mod tests {
         known.insert(verifying_key.to_bytes(), verifying_key);
 
         // 1000s in the future, window is 300s.
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_001_000, sample_candidates())
-                .unwrap();
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_001_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
             .expect_err("future timestamp must be rejected");
         match err {
@@ -999,9 +1146,14 @@ mod tests {
         let signing_key = deterministic_signing_key(9);
         let mut state = SeenSequenceState::new();
         let known: HashMap<[u8; 32], VerifyingKey> = HashMap::new();
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .unwrap();
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
             .expect_err("unknown source must be rejected");
         assert!(matches!(err, GossipError::UnknownSource));
@@ -1017,9 +1169,14 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(verifying_key.to_bytes(), verifying_key);
 
-        let mut bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .unwrap();
+        let mut bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         // Tamper: inject an attacker-controlled endpoint.
         bundle.candidates.v4_srflx.push(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
@@ -1037,8 +1194,9 @@ mod tests {
         for i in 0..(MAX_CANDIDATES_PER_BUNDLE as u32 + 1) {
             candidates.v4_host.push(IpAddr::V4(Ipv4Addr::from(i)));
         }
-        let err = mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, candidates)
-            .expect_err("too many candidates");
+        let err =
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, TEST_EPOCH, candidates)
+                .expect_err("too many candidates");
         match err {
             GossipError::TooManyCandidates { presented, max } => {
                 assert_eq!(presented, MAX_CANDIDATES_PER_BUNDLE + 1);
@@ -1051,9 +1209,14 @@ mod tests {
     #[test]
     fn flatten_endpoints_returns_all_kinds_in_canonical_order() {
         let signing_key = deterministic_signing_key(12);
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .unwrap();
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         let flat = flatten_endpoints(&bundle);
         assert_eq!(flat.len(), 4);
         // v4_host first
@@ -1097,7 +1260,8 @@ mod tests {
             51820,
         ));
         let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, candidates).unwrap();
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, TEST_EPOCH, candidates)
+                .unwrap();
         let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
             .expect_err("loopback srflx must be rejected");
         match err {
@@ -1127,7 +1291,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
             5353,
         ));
-        let bundle = mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, multi).unwrap();
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, TEST_EPOCH, multi).unwrap();
         let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
             .expect_err("multicast must be rejected");
         assert!(matches!(err, GossipError::UnreachableCandidate { .. }));
@@ -1136,7 +1301,8 @@ mod tests {
         // remote peer and could leak interface naming.
         let mut ll = CandidateSet::default();
         ll.v4_host.push(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)));
-        let bundle = mint_bundle_with_timestamp(&signing_key, 2, 1_700_000_000, ll).unwrap();
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 2, 1_700_000_000, TEST_EPOCH, ll).unwrap();
         let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
             .expect_err("link-local must be rejected");
         assert!(matches!(err, GossipError::UnreachableCandidate { .. }));
@@ -1145,7 +1311,8 @@ mod tests {
         let mut ll6 = CandidateSet::default();
         ll6.v6_host
             .push(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
-        let bundle = mint_bundle_with_timestamp(&signing_key, 3, 1_700_000_000, ll6).unwrap();
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 3, 1_700_000_000, TEST_EPOCH, ll6).unwrap();
         let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
             .expect_err("v6 link-local must be rejected");
         assert!(matches!(err, GossipError::UnreachableCandidate { .. }));
@@ -1162,9 +1329,14 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(verifying_key.to_bytes(), verifying_key);
 
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .unwrap();
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
             .expect("sample (private + global) candidates accepted");
     }
@@ -1180,14 +1352,25 @@ mod tests {
         let mut known = HashMap::new();
         known.insert(verifying_key.to_bytes(), verifying_key);
 
-        let past = mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-            .unwrap();
+        let past = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         accept_bundle_with_now(&past, &known, &mut state, 300, 1_700_000_300)
             .expect("boundary past timestamp accepted");
 
-        let future =
-            mint_bundle_with_timestamp(&signing_key, 2, 1_700_000_600, sample_candidates())
-                .unwrap();
+        let future = mint_bundle_with_timestamp(
+            &signing_key,
+            2,
+            1_700_000_600,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .unwrap();
         accept_bundle_with_now(&future, &known, &mut state, 300, 1_700_000_300)
             .expect("boundary future timestamp accepted");
     }
@@ -1200,9 +1383,14 @@ mod tests {
         // succeeds after the round trip).
         let signing_key = deterministic_signing_key(30);
         let verifying_key = signing_key.verifying_key();
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 42, 1_700_000_000, sample_candidates())
-                .expect("mint succeeds");
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            42,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .expect("mint succeeds");
         let wire = serialise_bundle(&bundle);
         assert_eq!(
             wire[WIRE_VERSION_OFFSET], GOSSIP_BUNDLE_WIRE_VERSION,
@@ -1212,6 +1400,7 @@ mod tests {
         assert_eq!(decoded.source_node_id, bundle.source_node_id);
         assert_eq!(decoded.sequence, bundle.sequence);
         assert_eq!(decoded.timestamp_unix, bundle.timestamp_unix);
+        assert_eq!(decoded.epoch, bundle.epoch, "I2: epoch survives the wire");
         assert_eq!(decoded.candidates, bundle.candidates);
         assert_eq!(decoded.signature.to_bytes(), bundle.signature.to_bytes());
         // Defense-in-depth: a round-tripped bundle must still pass
@@ -1223,9 +1412,14 @@ mod tests {
     #[test]
     fn deserialise_rejects_wrong_version_byte() {
         let signing_key = deterministic_signing_key(31);
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .expect("mint succeeds");
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .expect("mint succeeds");
         let mut wire = serialise_bundle(&bundle);
         wire[WIRE_VERSION_OFFSET] = GOSSIP_BUNDLE_WIRE_VERSION.wrapping_add(1);
         let err = deserialise_bundle(&wire).expect_err("must reject unknown version");
@@ -1244,9 +1438,14 @@ mod tests {
     #[test]
     fn deserialise_rejects_truncated_bundle() {
         let signing_key = deterministic_signing_key(32);
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .expect("mint succeeds");
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .expect("mint succeeds");
         let wire = serialise_bundle(&bundle);
         // Lop off the last byte of the signature — must report a
         // strictly-typed truncation error, not panic.
@@ -1285,7 +1484,8 @@ mod tests {
                 .push(IpAddr::V4(Ipv4Addr::new(10, 0, a, b)));
         }
         let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, candidates).expect("mint");
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, TEST_EPOCH, candidates)
+                .expect("mint");
         let wire = serialise_bundle(&bundle);
         assert!(
             wire.len() <= MAX_GOSSIP_DATAGRAM_BYTES,
@@ -1323,9 +1523,14 @@ mod tests {
         // strict check a producer could sneak an arbitrary v6 address
         // into a v4 slot and bypass downstream family-typed logic.
         let signing_key = deterministic_signing_key(34);
-        let bundle =
-            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
-                .expect("mint");
+        let bundle = mint_bundle_with_timestamp(
+            &signing_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            sample_candidates(),
+        )
+        .expect("mint");
         let mut wire = serialise_bundle(&bundle);
         // sample_candidates() puts one v4_host first; corrupt its
         // octets so the v4-mapped prefix bytes are wrong.
@@ -1346,8 +1551,14 @@ mod tests {
         // panic propagates and fails the test.
         let signing_key = deterministic_signing_key(11);
         let valid = serialise_bundle(
-            &mint_bundle_with_timestamp(&signing_key, 5, 1_700_000_000, sample_candidates())
-                .unwrap(),
+            &mint_bundle_with_timestamp(
+                &signing_key,
+                5,
+                1_700_000_000,
+                TEST_EPOCH,
+                sample_candidates(),
+            )
+            .unwrap(),
         );
 
         // Every prefix of a valid wire — catches index/slice panics when a

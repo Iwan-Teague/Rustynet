@@ -43,6 +43,13 @@ use rustynetd::peer_gossip::{
     GossipError, MAX_GOSSIP_DATAGRAM_BYTES, mint_bundle_with_timestamp, serialise_bundle,
 };
 
+/// Membership epoch shared by every peer in these mesh tests (I2 —
+/// bundles carry the minter's verified epoch and receivers enforce a
+/// skew window around their own; a uniform value keeps the mesh
+/// propagation pins orthogonal to the epoch-window pins, which live in
+/// `peer_gossip`'s unit tests).
+const TEST_EPOCH: u64 = 7;
+
 fn loopback() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
@@ -65,7 +72,8 @@ struct Peer {
 impl Peer {
     fn new(label: &'static str, key_byte: u8) -> Self {
         let signing_key = SigningKey::from_bytes(&[key_byte; 32]);
-        let node = GossipNode::new(signing_key, None).expect("node ctor");
+        let mut node = GossipNode::new(signing_key, None).expect("node ctor");
+        node.set_local_membership_epoch(TEST_EPOCH);
         let transport = GossipTransport::bind(loopback()).expect("transport bind");
         let local_addr = transport.local_addr().expect("local_addr");
         Self {
@@ -313,7 +321,8 @@ fn tampered_signature_is_dropped() {
         .push(IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7)));
     let signing_key = SigningKey::from_bytes(&[0x44u8; 32]);
     let mut bundle =
-        mint_bundle_with_timestamp(&signing_key, 1, unix_now(), candidates).expect("mint");
+        mint_bundle_with_timestamp(&signing_key, 1, unix_now(), TEST_EPOCH, candidates)
+            .expect("mint");
     // Tamper the candidate AFTER signing.
     bundle
         .candidates
@@ -356,7 +365,8 @@ fn loopback_candidate_is_dropped() {
         51820,
     ));
     let signing_key = SigningKey::from_bytes(&[0x66u8; 32]);
-    let bundle = mint_bundle_with_timestamp(&signing_key, 1, unix_now(), candidates).expect("mint");
+    let bundle = mint_bundle_with_timestamp(&signing_key, 1, unix_now(), TEST_EPOCH, candidates)
+        .expect("mint");
     a.transport
         .push_bundle(b.local_addr, &bundle)
         .expect("push loopback");
