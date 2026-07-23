@@ -5004,7 +5004,7 @@ cat > "$RUNNER" <<'RUNNER_EOF'
 #!/bin/bash
 cd '__REPO_DIR__' || exit 1
 echo $$ > 'state/host-lab-runs/__LAUNCH_ID__.pid'
-exec cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab --report-dir '__REPORT_DIR__' --ssh-identity-file __ORCH_IDENTITY__ __ORCH_ARGS__
+exec cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab --report-dir '__REPORT_DIR__' --ssh-identity-file __ORCH_IDENTITY__ --known-hosts-file __ORCH_KNOWN_HOSTS__ __ORCH_ARGS__
 RUNNER_EOF
 
 setsid nohup bash "$RUNNER" > "$LOG" 2>&1 < /dev/null &
@@ -5038,6 +5038,13 @@ pub struct VmLabLaunchOnHostConfig {
     /// host uses to reach its libvirt guests (verified on `ubuntu-kvm-1`). This is
     /// distinct from the key the launcher uses to reach the host itself.
     pub host_ssh_identity: Option<String>,
+    /// Path ON THE HOST to the SSH known_hosts file pinning ITS guests' host keys.
+    /// Absent ⇒ `$HOME/.ssh/known_hosts`. The `--node` orchestrator REQUIRES a
+    /// known-hosts file when node selectors are present, so this is injected
+    /// unconditionally; without it a run compiled and then died at arg-validation
+    /// ("--known-hosts-file is required when --node flags are present"), leaving no
+    /// report dir. Like `host_ssh_identity`, this is a HOST path, not the launcher's.
+    pub host_known_hosts: Option<String>,
     /// Render the launcher + runner and return them without launching.
     pub dry_run: bool,
     pub ssh_identity_file: Option<PathBuf>,
@@ -5715,6 +5722,7 @@ fn render_host_launch_script(
     report_dir: &str,
     launch_id: &str,
     orch_identity: &str,
+    orch_known_hosts: &str,
     orch_args: &[String],
 ) -> String {
     let joined = orch_args
@@ -5727,6 +5735,7 @@ fn render_host_launch_script(
         .replace("__REPORT_DIR__", report_dir)
         .replace("__LAUNCH_ID__", launch_id)
         .replace("__ORCH_IDENTITY__", orch_identity)
+        .replace("__ORCH_KNOWN_HOSTS__", orch_known_hosts)
         .replace("__ORCH_ARGS__", joined.as_str())
 }
 
@@ -5805,12 +5814,27 @@ pub fn execute_ops_vm_lab_launch_on_host(
             format!("'{path}'")
         }
     };
+    // The --node orchestrator REQUIRES --known-hosts-file when node selectors are
+    // present, so it is always injected. Same quoting contract as the identity:
+    // default double-quoted so $HOME expands on the host; an override is a literal
+    // host path, single-quoted and validated, so it cannot inject.
+    let orch_known_hosts = match config.host_known_hosts.as_deref() {
+        None => "\"$HOME/.ssh/known_hosts\"".to_owned(),
+        Some(path) => {
+            ensure_script_safe_value("host_known_hosts", path)?;
+            if path.contains('\'') {
+                return Err("--host-known-hosts must not contain a single quote".to_owned());
+            }
+            format!("'{path}'")
+        }
+    };
 
     let script = render_host_launch_script(
         repo_dir.as_str(),
         config.report_dir.as_str(),
         launch_id.as_str(),
         orch_identity.as_str(),
+        orch_known_hosts.as_str(),
         config.orchestrator_args.as_slice(),
     );
 
@@ -9719,6 +9743,112 @@ fn selected_local_utm_readiness_from_report(
         ready_aliases,
         unready_entries,
     })
+}
+
+/// Controller-aware readiness for the selected orchestrate aliases.
+///
+/// The UTM bundle-scan discovery (`execute_ops_vm_lab_discover_local_utm`) does
+/// not enumerate libvirt guests, so a Rust `--node` run selecting libvirt-backed
+/// aliases used to abort at `selected_local_utm_readiness_from_report` with
+/// "local UTM discovery did not report the selected aliases". This splits the
+/// selected aliases by inventory controller kind: UTM-backed (and controller-less
+/// SSH-only) aliases are read from the discovery `report_text` exactly as before
+/// (still fail-closed on a genuinely missing UTM alias), while libvirt-backed
+/// aliases are probed live through the same `observe_local_utm_target_ready`
+/// observer + `local_utm_ready_state_is_ready` predicate the standalone lifecycle
+/// commands use — so both kinds are held to the IDENTICAL execution-readiness bar
+/// (powered + live IP + a real ssh-auth probe for Linux/macOS), never a weaker
+/// "running + has IP" check.
+pub(in crate::vm_lab) fn selected_nodes_readiness_with_libvirt(
+    report_text: &str,
+    selected_aliases: &[String],
+    inventory_path: &Path,
+    discover_config: &VmLabDiscoverLocalUtmConfig,
+) -> Result<LocalUtmSelectedReadinessSummary, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let mut utm_aliases = Vec::new();
+    let mut libvirt_aliases = Vec::new();
+    for alias in selected_aliases {
+        let entry = inventory
+            .iter()
+            .find(|entry| &entry.alias == alias)
+            .ok_or_else(|| format!("selected alias {alias} is not in the inventory"))?;
+        match entry.controller.as_ref() {
+            Some(VmController::Libvirt { .. }) => libvirt_aliases.push(alias.clone()),
+            // LocalUtm, or a controller-less SSH-only entry: read from the UTM
+            // discovery report exactly as before. A controller-less entry that the
+            // UTM scan did not match still fails closed here (unchanged behaviour).
+            _ => utm_aliases.push(alias.clone()),
+        }
+    }
+
+    // UTM-backed aliases: unchanged path (fail-closed on a missing UTM alias).
+    let utm_summary = selected_local_utm_readiness_from_report(report_text, &utm_aliases)?;
+    let mut ready_aliases = utm_summary.ready_aliases;
+    let mut unready_entries = utm_summary.unready_entries;
+
+    // Libvirt-backed aliases: probe live via the shared observer, same bar.
+    if !libvirt_aliases.is_empty() {
+        let ssh_port = if discover_config.ssh_port == 0 {
+            22
+        } else {
+            discover_config.ssh_port
+        };
+        let utmctl_path = discover_config
+            .utmctl_path
+            .clone()
+            .unwrap_or_else(default_utmctl_path);
+        let probe_timeout = Duration::from_secs(5);
+        let targets = resolve_start_targets(inventory_path, &libvirt_aliases, false)?;
+        for target in &targets {
+            let state = observe_local_utm_target_ready(
+                target,
+                utmctl_path.as_path(),
+                ssh_port,
+                discover_config.ssh_identity_file.as_deref(),
+                discover_config.known_hosts_path.as_deref(),
+                probe_timeout,
+            );
+            if local_utm_ready_state_is_ready(&state) {
+                ready_aliases.push(target.alias.clone());
+            } else {
+                unready_entries.push(LocalUtmSelectedReadinessEntry {
+                    alias: target.alias.clone(),
+                    reason_codes: libvirt_ready_state_reason_codes(&state),
+                });
+            }
+        }
+    }
+
+    Ok(LocalUtmSelectedReadinessSummary {
+        ready_aliases,
+        unready_entries,
+    })
+}
+
+/// Reason codes for a libvirt target that failed `local_utm_ready_state_is_ready`,
+/// mirroring the readiness bar that predicate applies so the operator sees WHY a
+/// node is unready rather than a bare "not ready".
+fn libvirt_ready_state_reason_codes(state: &LocalUtmReadyState) -> Vec<String> {
+    let mut reason_codes = Vec::new();
+    if !state.process_present {
+        push_unique_reason_code(&mut reason_codes, "vm-not-running");
+    }
+    if state.live_ip.is_none() {
+        push_unique_reason_code(&mut reason_codes, "live-ip-not-authoritative");
+    }
+    if matches!(
+        state.platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos
+    ) && state.ssh_auth_status != "ok"
+    {
+        push_unique_reason_code(&mut reason_codes, "ssh-auth-not-ready");
+    }
+    if reason_codes.is_empty() {
+        // Defensive: predicate said unready but no specific cause matched.
+        push_unique_reason_code(&mut reason_codes, "not-execution-ready");
+    }
+    reason_codes
 }
 
 fn render_selected_local_utm_readiness(summary: &LocalUtmSelectedReadinessSummary) -> String {
@@ -40191,21 +40321,41 @@ $SUDO install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet",
             }
         }
         bootstrap::BootstrapPhase::RestartRuntime => {
+            // Guard: the manual bootstrap chain (install-release) installs the
+            // binaries but NOT the systemd unit — that unit is installed by the
+            // full `vm-lab-orchestrate-live-lab` deploy path. On a fresh guest
+            // `systemctl restart rustynetd.service` then fails with an opaque
+            // status 5 ("unit not found"). Detect the missing unit up front and
+            // exit 90 so we can return an actionable message instead (BUG-BOX-2).
             let status = run_remote_shell_command_for_target(
                 target,
                 context.ssh_user,
                 context.ssh_identity_file,
                 context.known_hosts_path,
-                "set -eu; if sudo -n true >/dev/null 2>&1; then sudo -n systemctl restart rustynetd.service; else systemctl restart rustynetd.service; fi",
+                "set -eu; \
+                 if ! systemctl cat rustynetd.service >/dev/null 2>&1; then exit 90; fi; \
+                 if sudo -n true >/dev/null 2>&1; then sudo -n systemctl restart rustynetd.service; else systemctl restart rustynetd.service; fi",
                 context.timeout,
             )
             .map_err(|err| format!("{} failed for {}: {err}", phase.as_str(), target.label))?;
             if !status.success() {
+                let code = status_code(status);
+                if code == 90 {
+                    return Err(format!(
+                        "{} failed for {}: rustynetd.service is not installed on the guest \
+                         (or systemd is unavailable). The manual bootstrap chain installs the \
+                         binaries but not the systemd unit — run a full \
+                         `ops vm-lab-orchestrate-live-lab`, which installs and starts the unit, \
+                         or install scripts/systemd/rustynetd.service on the guest first.",
+                        phase.as_str(),
+                        target.label,
+                    ));
+                }
                 return Err(format!(
                     "{} failed for {} with status {}",
                     phase.as_str(),
                     target.label,
-                    status_code(status)
+                    code
                 ));
             }
         }
@@ -40275,12 +40425,12 @@ mod tests {
     use super::{
         DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, DiscoveredGuest, GUEST_TOOLCHAIN_SCRIPT,
         LabHost, LabHostKind, LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary,
-        PlatformRollup, PortStatus, PreflightGate, PreflightStatus, ProbeState, RemoteExec as _,
-        RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _,
-        ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs, VmController,
-        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus,
-        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
-        VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
+        LocalUtmReadyState, PlatformRollup, PortStatus, PreflightGate, PreflightStatus, ProbeState,
+        RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision,
+        RuntimePaths as _, ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs,
+        VmController, VmGuestExecMode, VmGuestPlatform, VmInventoryEntry,
+        VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
+        VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
         VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
         VmServiceManager, WindowsSshReadinessProbe, alias_to_host_map,
         append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
@@ -40301,8 +40451,9 @@ mod tests {
         execute_ops_vm_lab_discover_local_utm, execute_ops_vm_lab_discover_local_utm_summary,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         extract_ip_candidates_for_macs_from_ip_neigh_output, extract_ip_for_mac_from_arp_output,
-        is_macos_metadata_artifact_name, live_lab_stage_forensics_notes, load_inventory,
-        load_inventory_with_hosts, load_live_lab_profile, local_utm_process_present_in_ps_output,
+        is_macos_metadata_artifact_name, libvirt_ready_state_reason_codes,
+        live_lab_stage_forensics_notes, load_inventory, load_inventory_with_hosts,
+        load_live_lab_profile, local_utm_process_present_in_ps_output,
         local_utm_process_present_with_ps, mac_address_from_utm_config_plist,
         macos_peer_list_indicates_mesh_join, materialize_orchestration_staging_dir,
         normalize_mac_address, parse_libvirt_domifaddr_candidates, parse_libvirt_domiflist_macs,
@@ -40321,7 +40472,8 @@ mod tests {
         resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
         select_inventory_entries, select_live_ssh_host_from_utm_output,
         select_preferred_live_ssh_ip, selected_local_utm_readiness_from_report,
-        should_skip_local_source_path, ssh_auth_probe_command, summarize_live_lab_report,
+        selected_nodes_readiness_with_libvirt, should_skip_local_source_path,
+        ssh_auth_probe_command, summarize_live_lab_report,
         transition_local_utm_vm_with_process_probe, validate_collected_os_version,
         validate_live_lab_run_artifacts, windows_bootstrap_helper_script_local_path,
         windows_diagnostics_helper_script_local_path, windows_helper_script_remote_path,
@@ -41624,6 +41776,102 @@ mod tests {
                 ..base.clone()
             }
             .ready()
+        );
+    }
+
+    #[test]
+    fn libvirt_ready_state_reason_codes_reflect_failure() {
+        let base = LocalUtmReadyState {
+            alias: "linux-x86-exit-1".to_owned(),
+            utm_name: "linux-x86-exit-1".to_owned(),
+            process_present: true,
+            live_ip: Some("192.168.121.26".to_owned()),
+            ssh_port_status: "open".to_owned(),
+            ssh_auth_status: "ok".to_owned(),
+            platform: VmGuestPlatform::Linux,
+        };
+        // Powered off: no process, no IP.
+        let off = LocalUtmReadyState {
+            process_present: false,
+            live_ip: None,
+            ..base.clone()
+        };
+        let codes = libvirt_ready_state_reason_codes(&off);
+        assert!(
+            codes.contains(&"vm-not-running".to_owned()),
+            "got: {codes:?}"
+        );
+        assert!(
+            codes.contains(&"live-ip-not-authoritative".to_owned()),
+            "got: {codes:?}"
+        );
+        // Running with an IP but ssh-auth did not succeed → the exact bar
+        // local_utm_ready_state_is_ready enforces for Linux/macOS.
+        let no_auth = LocalUtmReadyState {
+            ssh_auth_status: "failed-exit-255".to_owned(),
+            ..base.clone()
+        };
+        assert_eq!(
+            libvirt_ready_state_reason_codes(&no_auth),
+            vec!["ssh-auth-not-ready".to_owned()]
+        );
+    }
+
+    /// Regression for BUG-BOX-5: a libvirt-backed selected alias (which the UTM
+    /// bundle-scan never enumerates) must be PROBED, not rejected with "local UTM
+    /// discovery did not report the selected aliases". The probe verdict depends on
+    /// whether a real guest answers; the invariant under test is that the alias is
+    /// accounted for in the summary rather than aborting the run.
+    #[test]
+    fn selected_nodes_readiness_probes_libvirt_alias_instead_of_erroring_missing() {
+        let path = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "linux-x86-exit-1",
+      "ssh_target": "192.168.121.26",
+      "ssh_user": "debian",
+      "os": "Debian/Linux (x86_64)",
+      "platform": "linux",
+      "controller": { "type": "libvirt", "domain": "linux-x86-exit-1", "connect_uri": "qemu:///system" }
+    }
+  ]
+}"#,
+        );
+        // An EMPTY UTM discovery report — exactly what the bundle-scan produces for
+        // a libvirt-only selection. Before the fix this errored on the missing alias.
+        let report = r#"{"entries":[]}"#;
+        let discover_config = VmLabDiscoverLocalUtmConfig {
+            inventory_path: Some(path.clone()),
+            utm_documents_root: None,
+            utmctl_path: None,
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            ssh_port: 22,
+            timeout_secs: 1,
+            update_inventory_live_ips: false,
+            report_dir: None,
+        };
+        let selected = vec!["linux-x86-exit-1".to_owned()];
+        let summary = selected_nodes_readiness_with_libvirt(
+            report,
+            &selected,
+            path.as_path(),
+            &discover_config,
+        )
+        .expect("libvirt alias must be probed, not rejected as missing");
+        let accounted = summary
+            .ready_aliases
+            .iter()
+            .any(|a| a == "linux-x86-exit-1")
+            || summary
+                .unready_entries
+                .iter()
+                .any(|e| e.alias == "linux-x86-exit-1");
+        assert!(
+            accounted,
+            "libvirt alias must appear in the readiness summary, not error out"
         );
     }
 
@@ -54804,8 +55052,21 @@ mod launch_on_host_tests {
             "artifacts/live_lab/x",
             "launch-1-2",
             "\"$HOME/.ssh/id_ed25519\"",
+            "\"$HOME/.ssh/known_hosts\"",
             &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
         )
+    }
+
+    /// BUG-BOX-4: the --node orchestrator requires --known-hosts-file, so the
+    /// launcher must inject it (default expanding $HOME on the host). Without this
+    /// a --node run compiled then died at arg-validation with no report dir.
+    #[test]
+    fn known_hosts_file_is_injected_for_the_orchestrator() {
+        let script = render(&["--node", "linux-x86-client-1:client"]);
+        assert!(
+            script.contains("--known-hosts-file \"$HOME/.ssh/known_hosts\""),
+            "launcher must pass --known-hosts-file; script was:\n{script}"
+        );
     }
 
     #[test]
