@@ -60,7 +60,12 @@ struct Peer {
 impl Peer {
     fn new(key_byte: u8) -> Self {
         let signing_key = SigningKey::from_bytes(&[key_byte; 32]);
-        let node = GossipNode::new(signing_key, None).expect("ctor");
+        let mut node = GossipNode::new(signing_key, None).expect("ctor");
+        // I2: mint and inbound accept both require a verified
+        // membership epoch (fail closed without one); a fixed value
+        // shared by both ends keeps this test about enrollment, not
+        // the epoch window.
+        node.set_local_membership_epoch(1);
         let transport = GossipTransport::bind(loopback()).expect("transport bind");
         let local_addr = transport.local_addr().expect("local_addr");
         Self {
