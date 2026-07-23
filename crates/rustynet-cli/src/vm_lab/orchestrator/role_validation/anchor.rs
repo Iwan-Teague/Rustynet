@@ -353,6 +353,56 @@ impl AnchorRuntimeParams {
 /// Prove the anchor bundle-pull listener returns the signed membership
 /// snapshot byte-for-byte for an authorised token. Copied from the bin's
 /// `validate_bundle_pull_loopback`, re-keyed onto `AnchorRuntimeParams`.
+/// Bundle-pull TCP probe retry budget and back-off. The daemon is restarted
+/// repeatedly during setup, so a probe can legitimately land mid-restart.
+const BUNDLE_PULL_PROBE_ATTEMPTS: u32 = 3;
+const BUNDLE_PULL_PROBE_RETRY_SLEEP: Duration = Duration::from_secs(2);
+
+/// Drive the anchor bundle-pull TCP probe with bounded retries, returning the
+/// split `(header, body)` on success.
+///
+/// Two transient failure classes are retried within the same budget — both
+/// occur while the orchestrator is restarting the daemon during setup:
+///  1. an empty/malformed response (`split_bundle_pull_response` error) — the
+///     listener wasn't ready (port not yet bound, or the daemon briefly between
+///     restart cycles);
+///  2. a transport-level probe error (`tcp_send_recv` `Err`) — a probe landing
+///     mid-restart can be signal-killed ("exit None") when its bash `/dev/tcp`
+///     connect hangs and the outer SSH timeout reaps it, or reset by a listener
+///     socket that closed under it. This class was previously un-retried (a bare
+///     `?`), which is the observed intermittent `anchor_validation` flake.
+///
+/// Fail-closed is preserved: the final attempt propagates whichever error it
+/// hit — a listener that is genuinely down for the whole budget still fails.
+fn probe_bundle_pull_response(
+    shell: &dyn RemoteShellHost,
+    addr: &str,
+    request: &[u8],
+    attempts: u32,
+    retry_sleep: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let outcome = match shell.tcp_send_recv(addr, request, Duration::from_secs(5)) {
+            Ok(response) => split_bundle_pull_response(&response)
+                .map(|(header, body)| (header.to_vec(), body.to_vec())),
+            Err(err) => Err(format!(
+                "anchor bundle-pull loopback: tcp probe failed: {err}"
+            )),
+        };
+        match outcome {
+            Ok(pair) => return Ok(pair),
+            Err(err) => {
+                if attempt >= attempts {
+                    return Err(err);
+                }
+                std::thread::sleep(retry_sleep);
+            }
+        }
+    }
+}
+
 pub fn validate_bundle_pull_loopback(
     shell: &dyn RemoteShellHost,
     params: &AnchorRuntimeParams,
@@ -369,31 +419,13 @@ pub fn validate_bundle_pull_loopback(
         })?;
     let mut request = token.clone();
     request.push(b'\n');
-    // Retry the TCP probe up to 3 times with a 2s sleep between attempts.
-    // An empty response means the listener wasn't ready (port not yet
-    // bound or daemon briefly between restart cycles) — not a hard failure.
-    let max_attempts = 3u32;
-    let sleep_secs = 2u64;
-    let mut attempt = 0u32;
-    let (header_vec, body_vec) = loop {
-        attempt += 1;
-        let response = shell
-            .tcp_send_recv(
-                &params.anchor_bundle_pull_addr,
-                &request,
-                Duration::from_secs(5),
-            )
-            .map_err(|err| format!("anchor bundle-pull loopback: tcp probe failed: {err}"))?;
-        match split_bundle_pull_response(&response) {
-            Ok((header, body)) => break (header.to_vec(), body.to_vec()),
-            Err(err) => {
-                if attempt >= max_attempts {
-                    return Err(err);
-                }
-                std::thread::sleep(Duration::from_secs(sleep_secs));
-            }
-        }
-    };
+    let (header_vec, body_vec) = probe_bundle_pull_response(
+        shell,
+        &params.anchor_bundle_pull_addr,
+        &request,
+        BUNDLE_PULL_PROBE_ATTEMPTS,
+        BUNDLE_PULL_PROBE_RETRY_SLEEP,
+    )?;
     if !header_vec.starts_with(b"OK ") {
         return Err(format!(
             "anchor bundle-pull loopback: unexpected header {:?}",
@@ -630,7 +662,9 @@ fn parse_nc_addr(value: &str) -> Result<NcAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
+    use crate::vm_lab::orchestrator::remote_shell::{
+        MockShellHost, RemoteExitStatus, RemoteShellError,
+    };
 
     fn ok(stdout: &str) -> RemoteExitStatus {
         RemoteExitStatus {
@@ -1035,6 +1069,87 @@ mod tests {
         let err =
             validate_bundle_pull_loopback(&mock, &params).expect_err("body mismatch must fail");
         assert!(err.contains("does not match snapshot"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_bundle_pull_loopback_retries_transient_transport_error() {
+        // A probe that lands while the daemon is mid-restart can be
+        // signal-killed ("exit None"). The prior code hit a bare `?` and
+        // hard-failed on the first such error — the observed flake. It must
+        // now be retried like an empty response.
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        mock.write_file(&params.anchor_token_path, &[b'a'; 64], 0o600)
+            .unwrap();
+        let snapshot = b"signed-membership-snapshot-bytes";
+        mock.write_file(&params.membership_snapshot_path, snapshot, 0o600)
+            .unwrap();
+        // First attempt: signal-killed transport error. Second: success.
+        mock.program_tcp_error(
+            &params.anchor_bundle_pull_addr,
+            RemoteShellError::Network {
+                message:
+                    "tcp_send_recv to 127.0.0.1:51822 failed: remote command failed (exit None)"
+                        .to_owned(),
+            },
+        );
+        let mut resp = b"OK 32\n".to_vec();
+        resp.extend_from_slice(snapshot);
+        mock.program_tcp_response(&params.anchor_bundle_pull_addr, resp);
+        let summary = validate_bundle_pull_loopback(&mock, &params)
+            .expect("transient probe error must retry");
+        assert!(summary.contains("bundle_digest="), "got: {summary}");
+        assert_eq!(mock.tcp_log().len(), 2, "expected exactly one retry");
+    }
+
+    #[test]
+    fn probe_bundle_pull_response_fails_closed_when_transport_error_persists() {
+        // Fail-closed: a listener that is down for the whole retry budget
+        // still surfaces the error rather than being silently tolerated.
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        for _ in 0..3 {
+            mock.program_tcp_error(
+                &params.anchor_bundle_pull_addr,
+                RemoteShellError::Network {
+                    message: "exit None".to_owned(),
+                },
+            );
+        }
+        let err = probe_bundle_pull_response(
+            &mock,
+            &params.anchor_bundle_pull_addr,
+            b"token\n",
+            3,
+            Duration::ZERO,
+        )
+        .expect_err("persistent transport error must fail closed");
+        assert!(err.contains("tcp probe failed"), "got: {err}");
+        assert_eq!(mock.tcp_log().len(), 3, "must exhaust the full budget");
+    }
+
+    #[test]
+    fn probe_bundle_pull_response_retries_empty_then_succeeds() {
+        // The pre-existing empty/malformed-response retry class still works
+        // through the extracted helper.
+        let params = linux_params();
+        let mock = MockShellHost::new();
+        // First attempt: empty response (listener not yet bound). Second: OK.
+        mock.program_tcp_response(&params.anchor_bundle_pull_addr, Vec::new());
+        let mut resp = b"OK 3\n".to_vec();
+        resp.extend_from_slice(b"abc");
+        mock.program_tcp_response(&params.anchor_bundle_pull_addr, resp);
+        let (header, body) = probe_bundle_pull_response(
+            &mock,
+            &params.anchor_bundle_pull_addr,
+            b"token\n",
+            3,
+            Duration::ZERO,
+        )
+        .expect("empty response must retry then succeed");
+        assert_eq!(header, b"OK 3");
+        assert_eq!(body, b"abc");
+        assert_eq!(mock.tcp_log().len(), 2);
     }
 
     #[test]

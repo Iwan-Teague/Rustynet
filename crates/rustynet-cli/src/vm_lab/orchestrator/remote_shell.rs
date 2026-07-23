@@ -1219,8 +1219,11 @@ struct MockShellState {
     default_run_response: Option<RemoteExitStatus>,
     /// Recording of every run_argv call, for assertion in tests.
     run_log: Vec<MockRunInvocation>,
-    /// Programmed TCP responses keyed by address, FIFO.
-    tcp_responses: BTreeMap<String, Vec<Vec<u8>>>,
+    /// Programmed TCP outcomes keyed by address, FIFO. Each entry is either a
+    /// success body or an explicit transport error, so a test can script a
+    /// transient probe failure followed by a success (the anchor bundle-pull
+    /// retry path).
+    tcp_responses: BTreeMap<String, Vec<Result<Vec<u8>, RemoteShellError>>>,
     /// Recording of every tcp_send_recv call.
     tcp_log: Vec<MockTcpInvocation>,
     /// Optional override for stat — when present takes priority over
@@ -1270,7 +1273,19 @@ impl MockShellHost {
             .tcp_responses
             .entry(addr.to_owned())
             .or_default()
-            .push(response);
+            .push(Ok(response));
+    }
+
+    /// Queue an explicit transport error as the next FIFO outcome for `addr`.
+    /// Lets a test drive a transient probe failure (e.g. a signal-killed
+    /// `/dev/tcp` probe) followed by a programmed success.
+    pub fn program_tcp_error(&self, addr: &str, error: RemoteShellError) {
+        let mut state = self.inner.lock().expect("mock shell mutex poisoned");
+        state
+            .tcp_responses
+            .entry(addr.to_owned())
+            .or_default()
+            .push(Err(error));
     }
 
     pub fn set_stat_override(&self, remote_path: &str, stat: RemoteStat) {
@@ -1396,7 +1411,7 @@ impl RemoteShellHost for MockShellHost {
         });
         let entry = state.tcp_responses.get_mut(addr);
         match entry {
-            Some(queue) if !queue.is_empty() => Ok(queue.remove(0)),
+            Some(queue) if !queue.is_empty() => queue.remove(0),
             _ => Err(RemoteShellError::Network {
                 message: format!("mock backend has no programmed tcp response for {addr}"),
             }),
