@@ -368,6 +368,11 @@ pub struct App {
     active_stage_start: Option<std::time::Instant>,
     last_vm_probe: Option<std::time::Instant>,
     last_vm_readiness_probe: Option<std::time::Instant>,
+    /// mtime of the run-matrix CSV at the last parse. The six derived views
+    /// (parity/roles/sparklines/coverage/full-matrix/recent) are re-read only
+    /// when this changes, so the ~235 KB file is not re-parsed six times every
+    /// 2 s refresh for data that changes only when a run appends its final row.
+    run_matrix_mtime: Option<std::time::SystemTime>,
     vm_readiness_task:
         Option<tokio::task::JoinHandle<HashMap<String, crate::data::vm_prober::LabReadiness>>>,
     /// The active (or most recently seen) run's own resolved plan, read
@@ -495,6 +500,7 @@ impl App {
             active_stage_start: None,
             last_vm_probe: None,
             last_vm_readiness_probe: None,
+            run_matrix_mtime: None,
             vm_readiness_task: None,
             run_manifest: None,
             run_manifest_dir: None,
@@ -1721,54 +1727,70 @@ impl App {
             }
         }
 
-        match crate::data::run_matrix::load_parity_matrix(&self.repo_root) {
-            Ok(matrix) => self.parity_matrix = matrix,
-            Err(err) => self.data_errors.push(format!("parity matrix: {err}")),
-        }
-        match crate::data::run_matrix::load_latest_run_roles(&self.repo_root) {
-            Ok(roles) => self.latest_run_roles = roles,
-            Err(err) => self.data_errors.push(format!("run roles: {err}")),
-        }
-        match crate::data::run_matrix::load_sparklines(&self.repo_root, 8) {
-            Ok(sparklines) => self.parity_sparklines = sparklines,
-            Err(err) => self.data_errors.push(format!("sparklines: {err}")),
-        }
-        match crate::data::run_matrix::load_stage_progress(&self.repo_root) {
-            Ok(progress) => self.stage_progress = progress,
-            Err(err) => self.data_errors.push(format!("coverage: {err}")),
-        }
         match crate::data::timings::load_stage_timings(&self.repo_root) {
             Ok(stage_timings) => self.stage_timings = stage_timings,
             Err(err) => self.data_errors.push(format!("timings: {err}")),
         }
-        match crate::data::run_matrix::load_full_stage_matrix(&self.repo_root) {
-            Ok(full_stage_matrix) => self.full_stage_matrix = full_stage_matrix,
-            Err(err) => self.data_errors.push(format!("stage matrix: {err}")),
-        }
-        match crate::data::run_matrix::load_recent_runs(&self.repo_root, 3) {
-            Ok(runs) => {
-                self.recent_runs = runs;
-                // load_recent_runs computes section_stages/failing_section from
-                // CSV CHECK COLUMNS, a coarser, differently-shaped vocabulary
-                // than the pipeline STEP names Stage Grid uses (e.g. BOOTSTRAP
-                // is 12 CSV columns -- 4 suffixes x 3 OS -- vs 19 named pipeline
-                // steps) -- and `first_failed_stage` is always a pipeline step
-                // name (e.g. "bootstrap_windows_host"), which never matches a
-                // CSV column pattern, so the failing section silently defaulted
-                // to LIVE LAB every time regardless of where the failure
-                // actually was. Prefer the pipeline-position breakdown instead,
-                // wherever it resolves.
-                let repo_root = self.repo_root.clone();
-                for run in &mut self.recent_runs {
-                    // Only a run's OWN manifest can produce exact pipeline
-                    // counts. With pruned evidence, keep the CSV-only summary
-                    // explicitly inexact; never substitute today's catalog.
-                    if let Some(counts) = run_plan_summary(&repo_root, run) {
-                        apply_plan_counts(run, counts);
+        // The run-matrix CSV changes only when a run appends its final row --
+        // never mid-run. Re-reading + re-parsing its ~235 KB (six derived views)
+        // on every 2 s refresh, inline on the render thread, was ~1.4 MB of CSV
+        // parsing per tick for unchanged data -- the visible TUI hitch. Gate the
+        // whole block on the file's mtime: parse once when the ledger actually
+        // changes, skip it otherwise. (These views are history-wide aggregates,
+        // static during a run, so nothing goes stale between appends.)
+        let run_matrix_mtime = std::fs::metadata(
+            self.repo_root
+                .join("documents/operations/live_lab_node_run_matrix.csv"),
+        )
+        .and_then(|meta| meta.modified())
+        .ok();
+        if run_matrix_mtime != self.run_matrix_mtime {
+            self.run_matrix_mtime = run_matrix_mtime;
+            match crate::data::run_matrix::load_parity_matrix(&self.repo_root) {
+                Ok(matrix) => self.parity_matrix = matrix,
+                Err(err) => self.data_errors.push(format!("parity matrix: {err}")),
+            }
+            match crate::data::run_matrix::load_latest_run_roles(&self.repo_root) {
+                Ok(roles) => self.latest_run_roles = roles,
+                Err(err) => self.data_errors.push(format!("run roles: {err}")),
+            }
+            match crate::data::run_matrix::load_sparklines(&self.repo_root, 8) {
+                Ok(sparklines) => self.parity_sparklines = sparklines,
+                Err(err) => self.data_errors.push(format!("sparklines: {err}")),
+            }
+            match crate::data::run_matrix::load_stage_progress(&self.repo_root) {
+                Ok(progress) => self.stage_progress = progress,
+                Err(err) => self.data_errors.push(format!("coverage: {err}")),
+            }
+            match crate::data::run_matrix::load_full_stage_matrix(&self.repo_root) {
+                Ok(full_stage_matrix) => self.full_stage_matrix = full_stage_matrix,
+                Err(err) => self.data_errors.push(format!("stage matrix: {err}")),
+            }
+            match crate::data::run_matrix::load_recent_runs(&self.repo_root, 3) {
+                Ok(runs) => {
+                    self.recent_runs = runs;
+                    // load_recent_runs computes section_stages/failing_section from
+                    // CSV CHECK COLUMNS, a coarser, differently-shaped vocabulary
+                    // than the pipeline STEP names Stage Grid uses (e.g. BOOTSTRAP
+                    // is 12 CSV columns -- 4 suffixes x 3 OS -- vs 19 named pipeline
+                    // steps) -- and `first_failed_stage` is always a pipeline step
+                    // name (e.g. "bootstrap_windows_host"), which never matches a
+                    // CSV column pattern, so the failing section silently defaulted
+                    // to LIVE LAB every time regardless of where the failure
+                    // actually was. Prefer the pipeline-position breakdown instead,
+                    // wherever it resolves.
+                    let repo_root = self.repo_root.clone();
+                    for run in &mut self.recent_runs {
+                        // Only a run's OWN manifest can produce exact pipeline
+                        // counts. With pruned evidence, keep the CSV-only summary
+                        // explicitly inexact; never substitute today's catalog.
+                        if let Some(counts) = run_plan_summary(&repo_root, run) {
+                            apply_plan_counts(run, counts);
+                        }
                     }
                 }
+                Err(err) => self.data_errors.push(format!("recent runs: {err}")),
             }
-            Err(err) => self.data_errors.push(format!("recent runs: {err}")),
         }
         // Idle (no active job): render the NEWEST run's OWN manifest + outcomes so
         // the stage grid + counts reflect a finished / jobless run (e.g. a
