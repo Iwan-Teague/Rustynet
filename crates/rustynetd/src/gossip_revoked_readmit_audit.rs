@@ -44,6 +44,11 @@ use crate::peer_gossip::{GossipError, mint_bundle_with_timestamp};
 
 const GOSSIP_REVOKED_READMIT_AUDIT_SCHEMA_VERSION: u32 = 1;
 const AUDIT_NOW_UNIX: u64 = 1_700_000_000;
+/// Synthetic membership epoch for the audit's in-process scenario
+/// (I2): stamped into the minted bundle AND set as the receiver's
+/// verified epoch, so the audit exercises the revoked-source rejection
+/// specifically, not the epoch-window rejection.
+const AUDIT_EPOCH: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GossipRevokedReadmitAuditReport {
@@ -101,6 +106,7 @@ fn run_case(
     };
     let sender_key = SigningKey::from_bytes(&[sender_key_byte; 32]);
     let sender_id = sender_key.verifying_key().to_bytes();
+    receiver.set_local_membership_epoch(AUDIT_EPOCH);
     receiver.register_peer(sender_id, sender_key.verifying_key(), loopback_bind());
     if revoke_sender {
         receiver.set_revoked_peer_ids([sender_id]);
@@ -109,12 +115,13 @@ fn run_case(
     candidates
         .v4_host
         .push(IpAddr::V4(Ipv4Addr::new(10, 0, 0, sender_key_byte)));
-    let bundle = match mint_bundle_with_timestamp(&sender_key, 1, AUDIT_NOW_UNIX, candidates) {
-        Ok(bundle) => bundle,
-        Err(err) => {
-            return build_failed_result(id, revoke_sender, format!("mint failed: {err}"));
-        }
-    };
+    let bundle =
+        match mint_bundle_with_timestamp(&sender_key, 1, AUDIT_NOW_UNIX, AUDIT_EPOCH, candidates) {
+            Ok(bundle) => bundle,
+            Err(err) => {
+                return build_failed_result(id, revoke_sender, format!("mint failed: {err}"));
+            }
+        };
     let expectation = if revoke_sender { "reject" } else { "accept" };
     match receiver.ingest_inbound_bundle_without_rebroadcast_for_local_audit(
         None,

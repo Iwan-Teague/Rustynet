@@ -100,6 +100,15 @@ pub enum GossipNodeError {
     Bundle(GossipError),
     /// Transport-level failure (oversized datagram, socket I/O).
     Transport(TransportError),
+    /// I2: the node has no verified membership epoch yet
+    /// (`set_local_membership_epoch` has never been called from a
+    /// verified snapshot). Minting would stamp an invented epoch and
+    /// accepting would have no reference point for the skew window, so
+    /// both refuse — the fail-closed default for missing trust state.
+    /// Unreachable in the production daemon: the transport is only
+    /// attached at a signed-state commit seam, which stamps the epoch
+    /// in the same call (`sync_gossip_data_plane`).
+    MembershipEpochUnknown,
 }
 
 impl std::fmt::Display for GossipNodeError {
@@ -111,6 +120,10 @@ impl std::fmt::Display for GossipNodeError {
             }
             GossipNodeError::Bundle(err) => write!(f, "gossip bundle rejected: {err}"),
             GossipNodeError::Transport(err) => write!(f, "gossip transport: {err}"),
+            GossipNodeError::MembershipEpochUnknown => write!(
+                f,
+                "gossip refused: local verified membership epoch is unknown (fail closed)"
+            ),
         }
     }
 }
@@ -167,6 +180,17 @@ pub struct GossipNode {
     /// Last endpoints accepted from each remote source. Read by the
     /// connect path; the integration test asserts against this.
     pub applied_endpoints: HashMap<[u8; 32], Vec<SocketAddr>>,
+    /// I2: the local node's VERIFIED membership epoch — stamped into
+    /// every minted bundle (covered by the signature) and the reference
+    /// point for the inbound epoch-skew window. `None` until the first
+    /// verified membership snapshot commits
+    /// (`set_local_membership_epoch`, driven from
+    /// `sync_gossip_data_plane` exactly like `set_revoked_peer_ids`);
+    /// while `None`, mint and inbound accept both fail closed with
+    /// [`GossipNodeError::MembershipEpochUnknown`]. Private so the
+    /// monotonic setter is the ONLY mutation path — never populated
+    /// from the wire.
+    local_membership_epoch: Option<u64>,
     pub gossip_sequence: u64,
     pub seen_gossip_sequences: SeenSequenceState,
     pub last_minted_bundle: Option<GossipBundle>,
@@ -199,6 +223,7 @@ impl GossipNode {
             anchor_gossip_seed_peer_ids: HashSet::new(),
             revoked_peer_ids: HashSet::new(),
             applied_endpoints: HashMap::new(),
+            local_membership_epoch: None,
             gossip_sequence: 0,
             seen_gossip_sequences: SeenSequenceState::new(),
             last_minted_bundle: None,
@@ -263,6 +288,34 @@ impl GossipNode {
         self.revoked_peer_ids = peer_ids.into_iter().collect();
     }
 
+    /// I2: record the local VERIFIED membership epoch. Driven from the
+    /// signed-state commit seams (`sync_gossip_data_plane`) with
+    /// `MembershipState.epoch` — the same provenance rule as
+    /// `set_revoked_peer_ids`: verified membership only, never the wire.
+    ///
+    /// Never regresses: the membership verifier already rejects epoch
+    /// rollback on the snapshot itself (`MembershipReplayIndicator`),
+    /// so a lower value here can only be caller error — keep the higher
+    /// epoch and log, rather than silently widening the accept window
+    /// backwards (which would re-admit bundles the previous epoch had
+    /// already aged out).
+    pub fn set_local_membership_epoch(&mut self, epoch: u64) {
+        match self.local_membership_epoch {
+            Some(current) if epoch < current => {
+                log::warn!(
+                    "gossip_membership_epoch_regression_ignored current={current} presented={epoch}"
+                );
+            }
+            _ => self.local_membership_epoch = Some(epoch),
+        }
+    }
+
+    /// Read-only view of the verified membership epoch (None until the
+    /// first verified snapshot commits).
+    pub fn local_membership_epoch(&self) -> Option<u64> {
+        self.local_membership_epoch
+    }
+
     /// Snapshot of all currently-registered peers' verifying keys
     /// keyed by node id. Used by `accept_bundle` to find the
     /// verifying key for an incoming bundle's claimed source.
@@ -302,15 +355,30 @@ impl GossipNode {
         if !candidates_changed && !timer_elapsed {
             return Ok(None);
         }
+        // I2 fail-closed: minting requires the VERIFIED membership epoch
+        // (it is bound into the signed bundle). No epoch, no mint —
+        // stamping an invented value would let peers accept a bundle
+        // whose epoch claim nothing verified. Unreachable in the daemon
+        // (the transport attaches only after a verified membership
+        // commit, which stamps the epoch first), so this is the
+        // library-misuse belt.
+        let Some(epoch) = self.local_membership_epoch else {
+            return Err(GossipNodeError::MembershipEpochUnknown);
+        };
         let next_sequence =
             self.gossip_sequence
                 .checked_add(1)
                 .ok_or(GossipNodeError::WatermarkCorrupt(
                     "local gossip sequence overflowed u64::MAX",
                 ))?;
-        let bundle =
-            mint_bundle_with_timestamp(&self.signing_key, next_sequence, now_unix, candidates)
-                .map_err(GossipNodeError::Bundle)?;
+        let bundle = mint_bundle_with_timestamp(
+            &self.signing_key,
+            next_sequence,
+            now_unix,
+            epoch,
+            candidates,
+        )
+        .map_err(GossipNodeError::Bundle)?;
         // Persist BEFORE updating in-memory state so a torn write
         // can't leave the daemon claiming a sequence it never
         // committed to disk.
@@ -1031,10 +1099,18 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
     }
 
+    /// Membership epoch used by these tests (mirrors the peer_gossip
+    /// test const). `make_node` stamps it so mint/ingest work; tests
+    /// that pin the missing-epoch fail-closed path construct their
+    /// node directly instead.
+    const TEST_EPOCH: u64 = 7;
+
     fn make_node(byte: u8, watermark_dir: &Path) -> GossipNode {
         let signing_key = SigningKey::from_bytes(&[byte; 32]);
         let path = watermark_dir.join(format!("gossip-{byte}.watermark"));
-        GossipNode::new(signing_key, Some(path)).expect("node ctor")
+        let mut node = GossipNode::new(signing_key, Some(path)).expect("node ctor");
+        node.set_local_membership_epoch(TEST_EPOCH);
+        node
     }
 
     fn hex32(byte: u8) -> String {
@@ -1562,7 +1638,8 @@ mod tests {
         let mut node = make_node(3, dir.path());
         let key = SigningKey::from_bytes(&[3u8; 32]); // same as node
         let bundle =
-            mint_bundle_with_timestamp(&key, 1, 1_700_000_000, CandidateSet::default()).unwrap();
+            mint_bundle_with_timestamp(&key, 1, 1_700_000_000, TEST_EPOCH, CandidateSet::default())
+                .unwrap();
         let transport = GossipTransport::bind(loopback_bind()).expect("transport");
         let err = node
             .ingest_inbound_bundle(None, bundle, &transport, 1_700_000_000)
@@ -1781,9 +1858,14 @@ mod tests {
         let sender_id = sender_key.verifying_key().to_bytes();
         node.register_peer(sender_id, sender_key.verifying_key(), loopback_bind());
         node.set_revoked_peer_ids([sender_id]);
-        let bundle =
-            mint_bundle_with_timestamp(&sender_key, 1, 1_700_000_000, CandidateSet::default())
-                .unwrap();
+        let bundle = mint_bundle_with_timestamp(
+            &sender_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            CandidateSet::default(),
+        )
+        .unwrap();
         let transport = GossipTransport::bind(loopback_bind()).expect("transport");
         let err = node
             .ingest_inbound_bundle(None, bundle, &transport, 1_700_000_000)
@@ -1810,9 +1892,14 @@ mod tests {
         let sender_key = SigningKey::from_bytes(&[8u8; 32]);
         let sender_id = sender_key.verifying_key().to_bytes();
         node.register_peer(sender_id, sender_key.verifying_key(), loopback_bind());
-        let bundle =
-            mint_bundle_with_timestamp(&sender_key, 1, 1_700_000_000, CandidateSet::default())
-                .unwrap();
+        let bundle = mint_bundle_with_timestamp(
+            &sender_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            CandidateSet::default(),
+        )
+        .unwrap();
         let transport = GossipTransport::bind(loopback_bind()).expect("transport");
         node.ingest_inbound_bundle(None, bundle, &transport, 1_700_000_000)
             .expect("a non-revoked known peer's bundle must be accepted");

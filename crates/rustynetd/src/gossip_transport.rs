@@ -258,6 +258,10 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// Membership epoch stamped into the sample bundle (I2 — the wire
+    /// format carries it; any fixed value works for transport tests).
+    const TEST_EPOCH: u64 = 7;
+
     fn loopback_bind() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
     }
@@ -268,7 +272,8 @@ mod tests {
         candidates
             .v4_host
             .push(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
-        mint_bundle_with_timestamp(&key, 1, 1_700_000_000, candidates).expect("mint sample bundle")
+        mint_bundle_with_timestamp(&key, 1, 1_700_000_000, TEST_EPOCH, candidates)
+            .expect("mint sample bundle")
     }
 
     #[test]
@@ -373,7 +378,10 @@ mod tests {
     #[test]
     fn wire_version_constant_is_stable() {
         // Defense against accidental version bump: callers depend on
-        // GOSSIP_BUNDLE_WIRE_VERSION = 1 to identify v1 wires.
-        assert_eq!(GOSSIP_BUNDLE_WIRE_VERSION, 1);
+        // GOSSIP_BUNDLE_WIRE_VERSION = 2 to identify v2 wires
+        // (v1 → v2 was the deliberate I2 epoch-binding layout change;
+        // any further bump must be equally deliberate and update this
+        // pin in the same commit).
+        assert_eq!(GOSSIP_BUNDLE_WIRE_VERSION, 2);
     }
 }

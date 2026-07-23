@@ -5388,6 +5388,15 @@ impl DaemonRuntime {
         let Some(membership_state) = self.membership_state.as_ref() else {
             return;
         };
+        // I2: stamp the VERIFIED membership epoch into the gossip node
+        // FIRST, before the transport can attach — every mint binds this
+        // epoch into its signed bundle and every inbound accept measures
+        // the epoch-skew window against it. `self.membership_state` is
+        // only ever replaced by a verified snapshot (the membership
+        // verifier enforces epoch monotonicity/anti-rollback), so this
+        // is verified-provenance by construction; the setter itself
+        // additionally refuses regression.
+        node.set_local_membership_epoch(membership_state.epoch);
         if self.gossip_transport.is_none() {
             match crate::gossip_transport::GossipTransport::bind(self.gossip_bind_addr) {
                 Ok(transport) => {
