@@ -46,6 +46,11 @@ pub use crate::live_lab_extract::{
     ExtractManagedDnsExpectedIpConfig, ReadJsonFieldConfig,
     execute_ops_extract_managed_dns_expected_ip, execute_ops_read_json_field,
 };
+// The §4.8 independent evidence verifier (increment A2). `pub` because the
+// `live_lab_evidence_verifier` binary under `src/bin/` is its CLI shell — a
+// separate crate that can only reach the library's public surface.
+#[cfg(feature = "vm-lab")]
+pub mod live_lab_evidence_verifier;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
 mod live_lab_run_matrix;
