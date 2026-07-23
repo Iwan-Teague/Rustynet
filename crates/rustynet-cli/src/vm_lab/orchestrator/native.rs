@@ -45,6 +45,7 @@ pub(crate) fn execute_rust_native_orchestration(
     let dry_run = config.dry_run;
     let skip_live_suite = config.skip_linux_live_suite;
     let enable_chaos_suite = config.enable_chaos_suite;
+    let enable_negative_control = config.enable_negative_control;
     let enable_cross_network_suite = !config.skip_cross_network;
     let cross_network_options = orchestrator::stage::cross_network::CrossNetworkOptions::from_cli(
         enable_cross_network_suite,
@@ -302,6 +303,7 @@ pub(crate) fn execute_rust_native_orchestration(
             source_mode,
             skip_live_suite,
             enable_chaos_suite,
+            enable_negative_control,
             config.skip_soak,
             cross_network_options,
             config.max_parallel_node_workers.unwrap_or(1),
@@ -514,6 +516,7 @@ pub(crate) fn execute_rust_native_orchestration(
         cross_network_suite: enable_cross_network_suite && !skip_live_suite,
         soak_suite: !config.skip_soak && !skip_live_suite,
         local_gate_suite: false,
+        negative_control_suite: enable_negative_control && !skip_live_suite,
     };
 
     // Finding 1/4 (recorder-first): emit the run-scoped stage manifest that
@@ -786,6 +789,7 @@ fn build_rust_native_orchestration_stages(
     source_mode: orchestrator::stage::source_archive::ArchiveSourceMode,
     skip_live_suite: bool,
     enable_chaos_suite: bool,
+    enable_negative_control: bool,
     skip_soak: bool,
     cross_network: orchestrator::stage::cross_network::CrossNetworkOptions,
     max_parallel_node_workers: usize,
@@ -796,6 +800,7 @@ fn build_rust_native_orchestration_stages(
         .with_source_mode(source_mode)
         .with_skip_live_suite(skip_live_suite)
         .with_enable_chaos_suite(enable_chaos_suite)
+        .with_enable_negative_control(enable_negative_control)
         .with_skip_soak(skip_soak)
         .with_cross_network_options(cross_network)
         .with_max_parallel_node_workers(max_parallel_node_workers)
@@ -892,6 +897,7 @@ pub(crate) fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::
         false,
         false,
         false,
+        false,
         orchestrator::stage::cross_network::CrossNetworkOptions::default(),
         1,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -910,6 +916,7 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
         build_rust_native_orchestration_stages(
             None,
             orchestrator::stage::source_archive::ArchiveSourceMode::Head,
+            false,
             false,
             false,
             false,

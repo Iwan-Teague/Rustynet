@@ -34,6 +34,8 @@ pub enum StageGroup {
     Bootstrap,
     Live,
     Chaos,
+    /// T5 negative-control / adjudication suite (opt-in).
+    NegativeControl,
     Job,
 }
 
@@ -45,6 +47,7 @@ impl StageGroup {
             StageGroup::Bootstrap => "bootstrap",
             StageGroup::Live => "live",
             StageGroup::Chaos => "chaos",
+            StageGroup::NegativeControl => "negative_control",
             StageGroup::Job => "job",
         }
     }
@@ -274,6 +277,9 @@ pub enum EnableRule {
     ChaosSuite,
     /// Opt-in cross-network suite.
     CrossNetworkSuite,
+    /// Opt-in T5 negative-control / adjudication suite
+    /// (`--enable-negative-control`).
+    NegativeControlSuite,
 }
 
 /// The run selectors that resolve [`EnableRule`]s into an actual plan.
@@ -295,6 +301,7 @@ pub struct TargetSelectors {
     pub cross_network_suite: bool,
     pub soak_suite: bool,
     pub local_gate_suite: bool,
+    pub negative_control_suite: bool,
 }
 
 impl TargetSelectors {
@@ -314,6 +321,7 @@ impl TargetSelectors {
             EnableRule::LinuxLiveSuite => !self.skip_linux_live_suite,
             EnableRule::ChaosSuite => self.chaos_suite,
             EnableRule::CrossNetworkSuite => self.cross_network_suite,
+            EnableRule::NegativeControlSuite => self.negative_control_suite,
             // extended_soak only ever dispatches as part of the Linux
             // live-validation suite (`execute_ops_vm_lab_run_live_lab`); when
             // that suite is skipped the soak sub-stage never runs either, so
@@ -343,6 +351,7 @@ impl TargetSelectors {
             EnableRule::LinuxLiveSuite => "linux live suite skipped for this run",
             EnableRule::ChaosSuite => "chaos suite not selected",
             EnableRule::CrossNetworkSuite => "cross-network suite not selected",
+            EnableRule::NegativeControlSuite => "negative-control suite not selected",
             // extended_soak only dispatches inside the Linux live suite; when
             // that suite is skipped, say so even though soak_suite itself may
             // be selected — matches the AND in `resolves()` above.
@@ -2038,6 +2047,43 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::ChaosSuite,
         ..DEFAULT_SPEC
     },
+    // ── T5 negative-control / adjudication suite ────────────────────────
+    // Opt-in (like chaos). Each control PASSES iff its targeted operation
+    // FAILS for the specific named reason (the inversion, spec §3-T5 / §5).
+    StageSpec {
+        name: "negative_control_signed_bundle_rejection",
+        group: StageGroup::NegativeControl,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::NegativeControlSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "negative_control_planted_residue",
+        group: StageGroup::NegativeControl,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::NegativeControlSuite,
+        // Live guest fault-injection deferred to live-verify; the enablement
+        // selectors cannot see that the live planting half is not yet wired.
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "negative_control_wrong_node_substitution",
+        group: StageGroup::NegativeControl,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::NegativeControlSuite,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "negative_control_daemon_kill_mid_stage",
+        group: StageGroup::NegativeControl,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::NegativeControlSuite,
+        // Live mid-stage kill deferred to live-verify (reuses the existing
+        // live_chaos_daemon_fault_test kill primitive).
+        conditional_dispatch: true,
+        ..DEFAULT_SPEC
+    },
     // ── cross-network + job-level ───────────────────────────────────────
     StageSpec {
         name: "cross_network_nat_classification",
@@ -2810,6 +2856,10 @@ mod tests {
             ("t2_resilience", 13),
             ("t3_cross_os", 1),
             ("t4_security", 16),
+            // A3a: the four T5 negative-control / adjudication stages
+            // (signed-bundle rejection, planted residue, wrong-node
+            // substitution, daemon-killed-mid-stage).
+            ("t5_negative_control", 4),
         ]
         .into_iter()
         .collect();
@@ -2823,14 +2873,16 @@ mod tests {
             StageId::ALL.len(),
             "tier population must account for every stage exactly once"
         );
+        // The T5 tier is now populated by the A3a negative-control suite. It
+        // must stay non-empty: the adjudication half of the G1 trust bar
+        // (spec §3-T5 / §5) would silently vanish from the map otherwise.
         assert_eq!(
             StageId::ALL
                 .iter()
                 .filter(|s| s.tier() == Tier::T5NegativeControl)
                 .count(),
-            0,
-            "T5 negative-control stages land in a later increment; if one \
-             just landed, move it into the expected map above"
+            4,
+            "the four T5 negative-control stages must all be tiered T5NegativeControl"
         );
     }
 

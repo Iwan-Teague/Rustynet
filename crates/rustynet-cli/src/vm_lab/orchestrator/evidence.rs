@@ -149,6 +149,7 @@ pub(crate) fn orchestrate_manifest_selectors(
         cross_network_suite: !config.skip_cross_network,
         soak_suite: !config.skip_soak,
         local_gate_suite: !config.skip_gates,
+        negative_control_suite: config.enable_negative_control,
     }
 }
 

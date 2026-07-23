@@ -127,7 +127,7 @@ const LINUX_NODE_CLEAN_PROBE: &str = "export PATH=\"/usr/sbin:/sbin:$PATH\"; \
 /// (e.g. SSH noise prepended) therefore fails the assertion rather than passing
 /// a node whose true state is unknown — exactly the posture `assert_node_clean`
 /// is meant to enforce.
-fn parse_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
+pub(crate) fn parse_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
     // The probe prints a single result line; tolerate leading log/banner lines
     // by scanning for the line that carries the three expected tokens.
     let line = raw

@@ -1285,6 +1285,10 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// topology rewrite.
     pub macos_promote_exit: bool,
     pub enable_chaos_suite: bool,
+    /// `--enable-negative-control`: opt-in T5 negative-control / adjudication
+    /// suite (the `--node`-native adjudication half of the G1 trust bar). Like
+    /// `enable_chaos_suite`, out of the default plan.
+    pub enable_negative_control: bool,
     /// Per-stage watchdog timeout in seconds, forwarded to the bash
     /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
     /// `0` (the default) disables the watchdog and preserves the historical
@@ -53706,6 +53710,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             role_switch_platform: None,
             macos_promote_exit: false,
             enable_chaos_suite: false,
+            enable_negative_control: false,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
         }
