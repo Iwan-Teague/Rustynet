@@ -240,13 +240,42 @@ Fail-closed posture preserved throughout (missing/stale/unverifiable → deny).
 All applied at gossip ingestion / to the verified candidate index, before any
 enforcement consumes it. Each independently testable with programming still off.
 
-- **ACL-scope.** Apply/re-push a peer's candidates only to nodes with a
-  `rustynet-policy` default-deny ACL right to reach it (netmap-style). A node with
-  no ACL path to P neither indexes, programs, nor re-pushes P's candidates —
-  prevents epidemic disclosure of every member's endpoints.
-- **Plausibility.** Reject a candidate whose endpoint is loopback / unspecified /
-  reserved / link-local as a *reachable* endpoint (reuse
-  `dataplane_candidates::AddressScope`).
+> **Audit 2026-07-23 (before building — direction-diagnosed, not assumed).** Two of
+> these four guards are already present or infra-ready; only ACL-scope and the
+> per-origin rate limit are genuinely new I3 work:
+> - **Plausibility — ALREADY IMPLEMENTED, and STRICTER than this plan proposed.**
+>   `reject_unreachable_candidates` (`peer_gossip.rs:560`) is called with `?` inside
+>   `accept_bundle` (`:615`), so a bundle carrying ANY loopback/unspecified/
+>   link-local/multicast/broadcast/reserved candidate is rejected **whole**, not
+>   filtered per-candidate. Whole-bundle rejection is the stricter secure default
+>   (CLAUDE.md §2); a per-candidate filter would *weaken* it. Pinned by
+>   `accept_bundle_rejects_loopback_candidate` (`:1496`). **No code needed** — a
+>   per-candidate rewrite was scoped, prototyped, and reverted on this finding.
+> - **Return-routability — infra exists; the wiring is I4, not I3.** It gates
+>   *programming* an endpoint, which does not happen until I4; the attesting path
+>   (`traversal_probe_statuses`) is already there. Kept in the list as the I4
+>   programming gate (below), not a separate I3 build.
+
+- **ACL-scope (genuine I3 work — absent from the gossip path today).** Apply/re-push
+  a peer's candidates only to nodes with a `rustynet-policy` default-deny ACL right
+  to reach it (netmap-style). A node with no ACL path to P neither indexes,
+  programs, nor re-pushes P's candidates — prevents epidemic disclosure of every
+  member's endpoints. **Design grounding (2026-07-23):** the ACL lives in the
+  daemon (`self.policy: ContextualPolicySet`, evaluated via
+  `evaluate_with_membership`, `daemon.rs:~4375`); the `GossipNode` is a separate
+  subsystem that does NOT hold it. Wire it the same way revocation already is —
+  the daemon computes the scoped sets in `sync_gossip_data_plane` and pushes them
+  via a setter (mirror `set_revoked_peer_ids`). **Two scopes, and they differ:**
+  (a) INDEX scope is simple — the local node R indexes P's candidates only if R may
+  reach P (one direction, R→P); (b) RE-PUSH scope is the hard part — R may re-push
+  P's candidates to peer Q only if **Q** may reach P (Q→P), so R must evaluate the
+  ACL from each re-push target's perspective. R has the full `ContextualPolicySet`,
+  so it *can* evaluate any pair, but the gossip runtime needs either a precomputed
+  per-target allow-matrix or a callback. Decide index-vs-re-push scoping explicitly
+  before building; do not conflate them. This is a deliberate build, not a gap task.
+- **Plausibility — DONE (pre-existing, stricter).** See the audit note above:
+  `reject_unreachable_candidates` already rejects an implausible bundle whole. Left
+  as-is.
 - **Return-routability (per review S3 — mandatory, not optional).** A member may
   self-assert a **victim's** public IP as its own endpoint, which a pure
   plausibility check passes (it is a "valid" public IP) — turning every peer into a
