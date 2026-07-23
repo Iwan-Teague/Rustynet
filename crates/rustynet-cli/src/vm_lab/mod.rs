@@ -29489,7 +29489,9 @@ fn git_worktree_is_dirty() -> Result<bool, String> {
         "--",
         ".",
         ":(exclude)documents/operations/live_lab_run_matrix.csv",
+        ":(exclude)documents/operations/live_lab_node_run_matrix.csv",
         ":(exclude)documents/operations/live_lab_node_stage_results.csv",
+        ":(exclude)documents/operations/live_lab_stage_triage.jsonl",
         ":(exclude)documents/operations/gate_timings.csv",
         ":(exclude)documents/operations/live_lab_stage_timings.csv",
     ]);
