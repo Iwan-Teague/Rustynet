@@ -393,6 +393,32 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     ) -> Result<(), AdapterError>;
 }
 
+/// The §4.7 node-identity challenge gate applied before any typed role
+/// validator's own check. Extracted from [`run_typed_role_validator`] so the
+/// fail-closed adjudication + error mapping is unit-testable directly, without a
+/// full mock [`NodeAdapter`]. `evidence` is the result of
+/// `adapter.collect_live_identity()`; a gather error propagates (fail-closed),
+/// and any adjudication failure maps to a `Protocol` error naming the specific
+/// reason (the substituted-node case carries the `node_id mismatch` substring
+/// the T5 wrong-node classifier binds to).
+fn enforce_identity_challenge(
+    evidence: Result<IdentityEvidence, AdapterError>,
+    expected_node_id: Option<&str>,
+    kind: RoleValidatorKind,
+    alias: &str,
+) -> Result<(), AdapterError> {
+    use crate::vm_lab::orchestrator::role_validation::identity_challenge::adjudicate_identity;
+    let evidence = evidence?;
+    if let Err(challenge_err) = adjudicate_identity(expected_node_id, &evidence) {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "§4.7 node-identity challenge rejected {kind:?} on {alias:?}: {challenge_err}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
     adapter: &T,
     kind: RoleValidatorKind,
@@ -436,17 +462,12 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
     // whose control CLI has no `status` subcommand, a KNOWN deferred §4.7 gap
     // per the acceptance spec) all reject the validator rather than let it earn
     // a green it has not proven.
-    {
-        use crate::vm_lab::orchestrator::role_validation::identity_challenge::adjudicate_identity;
-        let evidence = adapter.collect_live_identity()?;
-        if let Err(challenge_err) = adjudicate_identity(expected_node_id, &evidence) {
-            return Err(AdapterError::Protocol {
-                message: format!(
-                    "§4.7 node-identity challenge rejected {kind:?} on {alias:?}: {challenge_err}"
-                ),
-            });
-        }
-    }
+    enforce_identity_challenge(
+        adapter.collect_live_identity(),
+        expected_node_id,
+        kind,
+        alias,
+    )?;
 
     let result = match (kind, platform) {
         (RoleValidatorKind::RuntimeAcls, VmGuestPlatform::Linux) => {
@@ -542,5 +563,95 @@ mod tests {
     fn extract_reason_none_when_no_markers() {
         let log = "[INFO] entering reconcile loop\n[INFO] all good\n";
         assert!(extract_daemon_failure_reason(log).is_none());
+    }
+
+    // ── §4.7 identity-challenge gate (the wiring in run_typed_role_validator) ──
+
+    use super::{RoleValidatorKind, enforce_identity_challenge};
+    use crate::vm_lab::orchestrator::error::AdapterError;
+    use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
+
+    fn protocol_message(err: AdapterError) -> String {
+        match err {
+            AdapterError::Protocol { message } => message,
+            other => panic!("expected Protocol error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn challenge_gate_rejects_substituted_node_with_mismatch_reason() {
+        // The live daemon self-reports its OWN id; the orchestrator expected a
+        // DIFFERENT (substituted) id → the validator must be rejected here,
+        // BEFORE its own check runs (the §3-T5 wrong-node control at the
+        // role-validator level, the historical MeshStatus false-green class).
+        let err = enforce_identity_challenge(
+            Ok(IdentityEvidence::live("real-node")),
+            Some("nc-node-substituted-imposter"),
+            RoleValidatorKind::MeshStatus,
+            "deb-1",
+        )
+        .expect_err("substituted node must be rejected");
+        let msg = protocol_message(err);
+        // Binds to the T5 wrong-node classifier substring.
+        assert!(msg.contains("node_id mismatch"), "got: {msg}");
+        assert!(msg.contains("§4.7"), "got: {msg}");
+    }
+
+    #[test]
+    fn challenge_gate_fails_closed_when_no_expected_id() {
+        let err = enforce_identity_challenge(
+            Ok(IdentityEvidence::live("real-node")),
+            None,
+            RoleValidatorKind::KeyCustody,
+            "deb-1",
+        )
+        .expect_err("missing expected id must fail closed");
+        assert!(protocol_message(err).contains("unverifiable"));
+    }
+
+    #[test]
+    fn challenge_gate_rejects_non_live_config_file_identity() {
+        // A matching id read from a config file is not a live assertion (§4.7);
+        // the gate must reject rather than let it pass. This is the Windows
+        // outcome today (no status subcommand).
+        let err = enforce_identity_challenge(
+            Ok(IdentityEvidence::config_file("real-node")),
+            Some("real-node"),
+            RoleValidatorKind::DnsFailclosed,
+            "win-1",
+        )
+        .expect_err("config-file identity must not satisfy a live challenge");
+        assert!(protocol_message(err).contains("not a live assertion"));
+    }
+
+    #[test]
+    fn challenge_gate_propagates_evidence_gather_error_fail_closed() {
+        // If the live identity cannot even be gathered, the validator must fail
+        // closed — never proceed to its own check on an unproven node.
+        let err = enforce_identity_challenge(
+            Err(AdapterError::Ssh {
+                message: "daemon socket unreachable".to_owned(),
+            }),
+            Some("real-node"),
+            RoleValidatorKind::RuntimeAcls,
+            "deb-1",
+        )
+        .expect_err("gather failure must propagate");
+        assert!(matches!(err, AdapterError::Ssh { .. }));
+    }
+
+    #[test]
+    fn challenge_gate_admits_matching_live_identity() {
+        // The positive control: a live self-report matching the expected id
+        // passes the gate, so the validator's own check proceeds.
+        assert!(
+            enforce_identity_challenge(
+                Ok(IdentityEvidence::live("real-node")),
+                Some("real-node"),
+                RoleValidatorKind::ServiceHardening,
+                "deb-1",
+            )
+            .is_ok()
+        );
     }
 }
