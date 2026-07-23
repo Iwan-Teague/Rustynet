@@ -41,17 +41,19 @@ pub const STAGES_TSV_RELATIVE_PATH: &str = "state/stages.tsv";
 /// is the live one the realtime contract adds.
 pub const STATUS_RUNNING: &str = "running";
 
-/// One `stages.tsv` row in the 8-column v1-positional layout.
+/// One `stages.tsv` row in the 8-column v1-positional layout. `pub(crate)`
+/// (fields included) so the §4.8 evidence verifier reads the raw rows through
+/// this one canonical parser instead of forking a second TSV reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StageRow {
-    stage: String,
-    severity: String,
-    status: String,
-    rc: String,
-    log_path: String,
-    summary: String,
-    started_at: String,
-    finished_at: String,
+pub(crate) struct StageRow {
+    pub(crate) stage: String,
+    pub(crate) severity: String,
+    pub(crate) status: String,
+    pub(crate) rc: String,
+    pub(crate) log_path: String,
+    pub(crate) summary: String,
+    pub(crate) started_at: String,
+    pub(crate) finished_at: String,
 }
 
 impl StageRow {
@@ -109,7 +111,9 @@ fn sanitize(value: &str) -> String {
         .collect()
 }
 
-fn read_rows(report_dir: &Path) -> Vec<StageRow> {
+/// Read every parseable row of `<report_dir>/state/stages.tsv` (missing file
+/// = no rows). Shared with the §4.8 evidence verifier as a pure parser.
+pub(crate) fn read_rows(report_dir: &Path) -> Vec<StageRow> {
     let path = report_dir.join(STAGES_TSV_RELATIVE_PATH);
     match fs::read_to_string(&path) {
         Ok(body) => body.lines().filter_map(StageRow::parse).collect(),

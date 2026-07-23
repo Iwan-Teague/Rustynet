@@ -2968,13 +2968,16 @@ fn normalize_manifest_path(path: &Path) -> String {
         .to_string()
 }
 
-fn sha256_hex_bytes(bytes: &[u8]) -> String {
+// `pub(crate)`: shared with the §4.8 evidence verifier
+// (`crate::live_lab_evidence_verifier`) so it digest-binds verdicts without a
+// second sha2 wrapper.
+pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
 }
 
-fn file_sha256_hex(path: &Path) -> Result<String, String> {
+pub(crate) fn file_sha256_hex(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path)
         .map_err(|err| format!("read for sha256 failed ({}): {err}", path.display()))?;
     Ok(sha256_hex_bytes(bytes.as_slice()))
