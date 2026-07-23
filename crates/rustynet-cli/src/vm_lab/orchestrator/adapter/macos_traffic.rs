@@ -7,6 +7,7 @@ use crate::vm_lab::orchestrator::adapter::macos_install::{MACOS_KEYS_DIR, MACOS_
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
+use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -289,6 +290,30 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
         });
     }
     Ok(trimmed)
+}
+
+/// Gather a LIVE node-identity for the §4.7 challenge: query the running daemon
+/// over its control socket and tag the result `LiveDaemonSocket`. Unlike
+/// [`collect_node_id`], this deliberately does NOT prefer the launchd plist —
+/// a config-file read proves a file exists, not the live daemon's identity — so
+/// it queries `rustynet status` only. At validator time the daemon is up, so a
+/// single short-timeout query is correct.
+pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, AdapterError> {
+    let status = ssh::run_remote(
+        conn,
+        "sudo -n env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
+         /usr/local/bin/rustynet status",
+        SHORT_TIMEOUT,
+    )?;
+    match ssh::parse_status_node_id(&status) {
+        Some(node_id) => Ok(IdentityEvidence::live(node_id)),
+        None => Err(AdapterError::Protocol {
+            message: format!(
+                "live identity challenge: node_id not in rustynet status output: {}",
+                &status[..status.len().min(200)]
+            ),
+        }),
+    }
 }
 
 /// Ping `peer_mesh_ip` 3 times. Returns `Reachable` on success.

@@ -9,6 +9,7 @@ use crate::vm_lab::orchestrator::adapter::windows_install::{
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
+use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -53,6 +54,18 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
         });
     }
     Ok(node_id)
+}
+
+/// Gather a node-identity for the §4.7 challenge. The Windows control CLI has
+/// NO `status` subcommand (see [`collect_node_id`]), so no live daemon
+/// self-report is available; the only identity source is the config env-file.
+/// The result is tagged `ConfigFile` so the adjudicator correctly treats it as
+/// a non-live assertion — §4.7 is not satisfiable on Windows until a live
+/// status surface exists, and the challenge must say so honestly rather than
+/// let a config-file read pass as a live proof.
+pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, AdapterError> {
+    let node_id = collect_node_id(conn)?;
+    Ok(IdentityEvidence::config_file(node_id))
 }
 
 /// Ping `peer_mesh_ip` 3 times via `Test-Connection`. Returns `Reachable` on success.
