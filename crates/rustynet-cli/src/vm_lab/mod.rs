@@ -1614,11 +1614,11 @@ pub fn legacy_role_flags_deprecation_warnings(
          --fifth-client-vm/--windows-vm are transitional aliases; prefer \
          repeated --node <alias>:<role> flags for the same role assignment."
             .to_owned(),
-        "the bash orchestrator remains the default execution path; once \
-         W5.5 cross-orchestrator parity evidence is captured the Rust \
-         orchestrator becomes default and the legacy flags will translate \
-         to --node automatically. Pass --legacy-bash-orchestrator to lock \
-         in the bash path explicitly."
+        "the Rust --node orchestrator is now the default execution path for \
+         standard Linux role-flag runs (W5.6); runs using platform selectors, \
+         --macos-vm/--windows-vm, or --topology-profile still use the bash path \
+         for now. Pass --legacy-bash-orchestrator to force the legacy bash path \
+         explicitly (transitional, removed in W5.7)."
             .to_owned(),
     ]
 }
@@ -12223,19 +12223,95 @@ use orchestrator::native::{
     rust_native_setup_stage_ids,
 };
 
+/// The W5.6 default-flip decision: when a run has no explicit `--node` and is not
+/// locked to bash, translate the legacy `--*-vm` role flags into
+/// `node_assignments` and signal that the run should route to the native
+/// `--node` engine. Returns `None` when the flip does not apply (routing is left
+/// unchanged → bash). Pure + unit-testable.
+///
+/// The flip is deliberately NARROW: it fires only for a run driven purely by the
+/// legacy Linux role flags (`--exit-vm/--client-vm/--entry-vm/--aux-vm/
+/// --extra-vm/--fifth-client-vm`), because that is the only shape the native path
+/// reproduces byte-for-byte today. It is WITHHELD (→ bash, routing unchanged) in
+/// every other case:
+///  - `node_assignments` already non-empty (an explicit `--node` run);
+///  - `--legacy-bash-orchestrator` (the observable, time-bounded rollback lever);
+///  - `--topology-profile` — the native path does not resolve profiles;
+///  - any platform selector (`--exit-platform` etc.) — native's
+///    `augment_assignments_from_platform_selectors` has different alias/role
+///    precedence than bash's `apply_topology_overrides` (an explicit alias + a
+///    same-role selector yields ONE node on bash but a DUPLICATE on native);
+///  - `--macos-vm` / `--macos-promote-exit` — native's translation drops the
+///    macOS suite node entirely (it reads neither field);
+///  - `--windows-vm` — bash treats it as the dedicated Windows-suite node; the
+///    native `client`-role translation of it is not yet verified to reproduce
+///    that suite;
+///  - a run that names no role at all (nothing for native to run).
+///
+/// These withheld cases are native-fidelity work (a G2 item), NOT a silent gap —
+/// they keep running on bash with unchanged behavior until native reproduces
+/// them. Because a fired flip always yields a NON-EMPTY assignment vec, the
+/// caller's `!node_assignments.is_empty()` routing check correctly sends it to
+/// native, and the "routed to --node" log never fires for a run that stays bash.
+fn w56_flip_legacy_to_node(
+    config: &VmLabOrchestrateLiveLabConfig,
+) -> Option<Vec<orchestrator::role_assignment::NodeRoleAssignment>> {
+    let any_platform_selector = config.exit_platform.is_some()
+        || config.relay_platform.is_some()
+        || config.anchor_platform.is_some()
+        || config.admin_platform.is_some()
+        || config.blind_exit_platform.is_some();
+    if !config.node_assignments.is_empty()
+        || config.legacy_bash_orchestrator
+        || config.topology_profile.is_some()
+        || config.macos_vm.is_some()
+        || config.macos_promote_exit
+        || config.windows_vm.is_some()
+        || any_platform_selector
+    {
+        return None;
+    }
+    let translated = orchestrator::role_assignment::translate_legacy_role_flags(
+        config.exit_vm.as_deref(),
+        config.client_vm.as_deref(),
+        config.entry_vm.as_deref(),
+        config.aux_vm.as_deref(),
+        config.extra_vm.as_deref(),
+        config.fifth_client_vm.as_deref(),
+        // windows_vm is withheld above, so it is always None here.
+        None,
+    );
+    if translated.is_empty() {
+        return None;
+    }
+    Some(translated)
+}
+
 pub fn execute_ops_vm_lab_orchestrate_live_lab(
-    config: VmLabOrchestrateLiveLabConfig,
+    mut config: VmLabOrchestrateLiveLabConfig,
 ) -> Result<String, String> {
     validate_orchestrate_live_lab_config(&config)?;
     for warning in legacy_role_flags_deprecation_warnings(&config) {
         eprintln!("warning: {warning}");
     }
+    // W5.6 default flip: a run with no explicit `--node` that is not locked to
+    // bash routes to the Rust `--node` engine (see `w56_flip_legacy_to_node`).
+    if let Some(translated) = w56_flip_legacy_to_node(&config) {
+        eprintln!(
+            "engine: default routed to the Rust --node orchestrator (W5.6 flip); \
+             translated {} legacy role flag(s) to --node assignments. Pass \
+             --legacy-bash-orchestrator to run the legacy bash path instead.",
+            translated.len()
+        );
+        config.node_assignments = translated;
+    }
     if !config.node_assignments.is_empty() || config.run_only {
         return execute_rust_native_orchestration(config);
     }
-    // legacy_bash_orchestrator (when set) and the absence of --node both
-    // route to the bash orchestrator below. The flag itself stays
-    // transitional until W5.7 removes the bash path entirely.
+    // Reaching here means bash: either --legacy-bash-orchestrator was set, a
+    // --topology-profile run was left on bash (see the W5.6-flip note above), or
+    // the run specified no roles at all. The flag itself stays transitional until
+    // W5.7 removes the bash path entirely.
     let _ = config.legacy_bash_orchestrator;
     ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
     ensure_local_regular_file_path(config.ssh_identity_file.as_path(), "SSH identity file")?;
@@ -53978,6 +54054,107 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         }
     }
 
+    // ── W5.6 default-flip routing (`w56_flip_legacy_to_node`) ─────────────
+    #[test]
+    fn w56_flip_translates_legacy_role_flags_to_node_by_default() {
+        // The flip: a default run with legacy role flags and no --node routes
+        // to the native engine with the translated assignments.
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.exit_vm = Some("deb-exit".to_owned());
+        cfg.client_vm = Some("deb-client".to_owned());
+        let assignments =
+            super::w56_flip_legacy_to_node(&cfg).expect("default run must flip to --node");
+        let roles: Vec<_> = assignments
+            .iter()
+            .map(|a| (a.alias.as_str(), &a.role))
+            .collect();
+        assert!(roles.contains(&("deb-exit", &super::orchestrator::role::NodeRole::Exit)));
+        assert!(roles.contains(&("deb-client", &super::orchestrator::role::NodeRole::Client)));
+    }
+
+    #[test]
+    fn w56_flip_withheld_when_bash_lock_set() {
+        // --legacy-bash-orchestrator is the rollback lever: no flip.
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.exit_vm = Some("deb-exit".to_owned());
+        cfg.legacy_bash_orchestrator = true;
+        assert!(super::w56_flip_legacy_to_node(&cfg).is_none());
+    }
+
+    #[test]
+    fn w56_flip_withheld_for_topology_profile_run() {
+        // Native cannot resolve profiles yet — such a run stays on bash.
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.exit_vm = Some("deb-exit".to_owned());
+        cfg.topology_profile = Some(PathBuf::from("/some/profile.json"));
+        assert!(super::w56_flip_legacy_to_node(&cfg).is_none());
+    }
+
+    #[test]
+    fn w56_flip_withheld_when_node_already_explicit() {
+        // An explicit --node run has nothing to translate.
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.node_assignments =
+            vec![super::orchestrator::role_assignment::parse_node_role_arg("a:exit").unwrap()];
+        assert!(super::w56_flip_legacy_to_node(&cfg).is_none());
+    }
+
+    #[test]
+    fn w56_flip_withheld_for_empty_run_with_no_roles() {
+        // No role flags and no platform selector: nothing for native to run.
+        let cfg = empty_orchestrate_live_lab_config();
+        assert!(super::w56_flip_legacy_to_node(&cfg).is_none());
+    }
+
+    #[test]
+    fn w56_flip_withheld_when_platform_selector_set() {
+        // Native's selector augmentation has different alias/role precedence
+        // than bash's topology override, so a selector run stays on bash until
+        // that fidelity is proven (G2). Withhold even alongside role flags, so
+        // the `--exit-vm A --exit-platform linux` duplicate-exit divergence
+        // cannot arise under the flip.
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.exit_vm = Some("deb-exit".to_owned());
+        cfg.exit_platform = Some("linux".to_owned());
+        assert!(super::w56_flip_legacy_to_node(&cfg).is_none());
+
+        let mut selector_only = empty_orchestrate_live_lab_config();
+        selector_only.anchor_platform = Some("macos".to_owned());
+        assert!(super::w56_flip_legacy_to_node(&selector_only).is_none());
+    }
+
+    #[test]
+    fn w56_flip_withheld_when_macos_or_windows_node_set() {
+        // Native drops the macOS suite node and its windows handling is
+        // unverified, so these stay on bash (they would silently change the run).
+        let mut mac = empty_orchestrate_live_lab_config();
+        mac.exit_vm = Some("deb-exit".to_owned());
+        mac.macos_vm = Some("mac-1".to_owned());
+        assert!(super::w56_flip_legacy_to_node(&mac).is_none());
+
+        let mut promote = empty_orchestrate_live_lab_config();
+        promote.exit_vm = Some("deb-exit".to_owned());
+        promote.macos_promote_exit = true;
+        assert!(super::w56_flip_legacy_to_node(&promote).is_none());
+
+        let mut win = empty_orchestrate_live_lab_config();
+        win.client_vm = Some("deb-client".to_owned());
+        win.windows_vm = Some("win-1".to_owned());
+        assert!(super::w56_flip_legacy_to_node(&win).is_none());
+    }
+
+    #[test]
+    fn w56_flip_yields_non_empty_so_routing_reaches_native() {
+        // Regression for the selector-only no-op: a fired flip must be non-empty
+        // so the caller's `!node_assignments.is_empty()` routing sends it to
+        // native (an empty vec would fall through to bash while the log claimed
+        // native).
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.exit_vm = Some("deb-exit".to_owned());
+        let assignments = super::w56_flip_legacy_to_node(&cfg).expect("must flip");
+        assert!(!assignments.is_empty());
+    }
+
     #[test]
     fn validate_orchestrate_live_lab_config_rejects_legacy_flag_with_node_assignments() {
         let mut cfg = empty_orchestrate_live_lab_config();
@@ -54137,8 +54314,11 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             warnings[0]
         );
         assert!(
-            warnings[1].contains("--legacy-bash-orchestrator") && warnings[1].contains("W5.5"),
-            "second warning must reference legacy escape hatch + parity gate: {:?}",
+            warnings[1].contains("--legacy-bash-orchestrator")
+                && warnings[1].contains("W5.6")
+                && warnings[1].contains("default"),
+            "second warning must reference the W5.6 default flip + the legacy \
+             escape hatch: {:?}",
             warnings[1]
         );
     }
