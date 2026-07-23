@@ -48,6 +48,7 @@ const ASSIGNMENT_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-assignment-sig
 const DNS_ZONE_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-dns-zone-signing-v1";
 const ACCESS_TOKEN_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-access-token-signing-v1";
 const ENDPOINT_HINT_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-endpoint-hint-signing-v1";
+const GOSSIP_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-gossip-signing-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthRateLimitConfig {
@@ -3532,6 +3533,30 @@ pub fn derive_endpoint_hint_signing_key(mut signing_secret: Vec<u8>) -> SigningK
     signing_key
 }
 
+/// Derive the node's GOSSIP-ONLY signing sub-key from a signing secret.
+///
+/// The D2.5 gossip data plane signs per-node reachability bundles inside the
+/// network-exposed daemon. The daemon must never hold the raw node identity
+/// secret for this purpose — a daemon compromise would then let the attacker
+/// forge the node's core control-plane identity. Instead the daemon derives
+/// this dedicated sub-key and holds ONLY it; the derivation is one-way
+/// (HKDF-SHA256 with a distinct domain-separation info string), so the
+/// sub-key reveals nothing about the input secret or any sibling sub-key.
+///
+/// Domain separation: `GOSSIP_SIGNING_SEED_INFO_V1` is distinct from every
+/// other `*_SIGNING_SEED_INFO_V1` constant, so for the same input secret the
+/// gossip key differs from the endpoint-hint / assignment / dns-zone /
+/// access-token keys and from the raw identity key itself
+/// (`SigningKey::from_bytes(secret)`). Verified by
+/// `derive_gossip_signing_key_is_domain_separated`.
+pub fn derive_gossip_signing_key(mut signing_secret: Vec<u8>) -> SigningKey {
+    let mut seed = derive_signing_seed(GOSSIP_SIGNING_SEED_INFO_V1, &signing_secret);
+    signing_secret.zeroize();
+    let signing_key = SigningKey::from_bytes(&seed);
+    seed.zeroize();
+    signing_key
+}
+
 fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
     let mut seed = [0u8; 32];
     let hkdf = Hkdf::<Sha256>::new(Some(SIGNING_SEED_HKDF_SALT_V1), secret);
@@ -4343,9 +4368,9 @@ mod tests {
         SignedDnsZoneBundleRequest, SignedTokenClaims, ThrowawayCredentialState,
         ThrowawayCredentialStore, TokenClaims, TransportPolicyError, TraversalCoordinationRecord,
         TrustState, auto_tunnel_payload_field_matches, canonical_relay_id_from_label,
-        derive_endpoint_hint_signing_key, derive_signing_seed, hex_bytes, load_trust_state,
-        parse_relay_session_token_wire, parse_signed_relay_fleet_bundle_wire, persist_trust_state,
-        relay_session_token_to_wire,
+        derive_endpoint_hint_signing_key, derive_gossip_signing_key, derive_signing_seed,
+        hex_bytes, load_trust_state, parse_relay_session_token_wire,
+        parse_signed_relay_fleet_bundle_wire, persist_trust_state, relay_session_token_to_wire,
     };
     use ed25519_dalek::SigningKey;
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
@@ -7852,6 +7877,48 @@ mod tests {
         assert_eq!(
             derived.verifying_key().as_bytes(),
             &core.endpoint_hint_verifying_key
+        );
+    }
+
+    /// I1a: the gossip sub-key must be domain-separated from every other key
+    /// derivable from the same secret. A collision here would mean a
+    /// compromised gossip sub-key doubles as (or reveals) the endpoint-hint
+    /// signing key or the raw identity key — the exact blast-radius the
+    /// dedicated derivation exists to prevent.
+    #[test]
+    fn derive_gossip_signing_key_is_domain_separated() {
+        // 32-byte secret so the "raw identity key" comparison (loading the
+        // secret directly as an Ed25519 seed) is well-defined.
+        let secret = vec![9u8; 32];
+        let gossip = derive_gossip_signing_key(secret.clone());
+        let endpoint_hint = derive_endpoint_hint_signing_key(secret.clone());
+        let mut raw_seed = [0u8; 32];
+        raw_seed.copy_from_slice(&secret);
+        let raw_identity = SigningKey::from_bytes(&raw_seed);
+
+        assert_ne!(
+            gossip.verifying_key().as_bytes(),
+            endpoint_hint.verifying_key().as_bytes(),
+            "gossip sub-key must differ from the endpoint-hint sub-key for the same secret"
+        );
+        assert_ne!(
+            gossip.verifying_key().as_bytes(),
+            raw_identity.verifying_key().as_bytes(),
+            "gossip sub-key must differ from the raw identity key for the same secret"
+        );
+        assert_ne!(
+            endpoint_hint.verifying_key().as_bytes(),
+            raw_identity.verifying_key().as_bytes(),
+            "endpoint-hint sub-key must differ from the raw identity key for the same secret"
+        );
+
+        // Deterministic: the same secret always derives the same gossip key,
+        // so a node's gossip identity is stable across restarts.
+        let gossip_again = derive_gossip_signing_key(secret);
+        assert_eq!(
+            gossip.verifying_key().as_bytes(),
+            gossip_again.verifying_key().as_bytes(),
+            "gossip sub-key derivation must be deterministic"
         );
     }
 
