@@ -61,7 +61,10 @@ impl OrchestrationStage for AuthenticodeValidationStage {
                 reported_skips.push((alias.clone(), format!("{platform:?}")));
                 continue;
             }
-            if let Err(e) = adapter.run_role_validator(RoleValidatorKind::Authenticode) {
+            let expected_node_id = ctx.node_ids.get(alias.as_str()).map(String::as_str);
+            if let Err(e) =
+                adapter.run_role_validator(RoleValidatorKind::Authenticode, expected_node_id)
+            {
                 failures.push(format!("{alias}: {e}"));
             }
         }

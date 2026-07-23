@@ -197,8 +197,20 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
 
     fn run_validator(&self, op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError>;
 
-    fn run_role_validator(&self, kind: RoleValidatorKind) -> Result<(), AdapterError> {
-        run_typed_role_validator(self, kind)
+    /// Run a typed role validator, gated by the §4.7 node-identity challenge.
+    ///
+    /// `expected_node_id` is the id the orchestrator recorded for this node slot
+    /// at CollectPubkeys. Before the validator's own check runs, the dispatch
+    /// PROVES (via a live daemon self-report) that the probed connection reaches
+    /// that node — so a passing validator cannot be a right-name/wrong-node
+    /// false-green. Fail-closed: a missing expected id, a mismatch, or an
+    /// un-assertable (non-live) identity all fail the validator.
+    fn run_role_validator(
+        &self,
+        kind: RoleValidatorKind,
+        expected_node_id: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        run_typed_role_validator(self, kind, expected_node_id)
     }
 
     fn supports_role_validator(&self, _kind: RoleValidatorKind) -> bool {
@@ -384,6 +396,7 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
 fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
     adapter: &T,
     kind: RoleValidatorKind,
+    expected_node_id: Option<&str>,
 ) -> Result<(), AdapterError> {
     use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
     use crate::vm_lab::orchestrator::role_validation::{
@@ -409,6 +422,32 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
     };
     let shell = adapter.shell_host()?;
     let alias = adapter.alias();
+
+    // §4.7 node-identity challenge — PROVE this validator exercised the intended
+    // node before trusting its verdict. The live daemon self-report over the
+    // probed connection must match the id the orchestrator recorded for this
+    // slot at CollectPubkeys; a recorded/config-file id is insufficient. This
+    // runs before the validator's own check so a right-name/wrong-node
+    // false-green (the historical MeshStatus class) fails here first.
+    //
+    // Fail-closed across every outcome: a missing expected id
+    // (`Unverifiable`), a live mismatch (`NodeIdMismatch`), or an
+    // un-assertable non-live identity (`NotLiveAssertion` — today only Windows,
+    // whose control CLI has no `status` subcommand, a KNOWN deferred §4.7 gap
+    // per the acceptance spec) all reject the validator rather than let it earn
+    // a green it has not proven.
+    {
+        use crate::vm_lab::orchestrator::role_validation::identity_challenge::adjudicate_identity;
+        let evidence = adapter.collect_live_identity()?;
+        if let Err(challenge_err) = adjudicate_identity(expected_node_id, &evidence) {
+            return Err(AdapterError::Protocol {
+                message: format!(
+                    "§4.7 node-identity challenge rejected {kind:?} on {alias:?}: {challenge_err}"
+                ),
+            });
+        }
+    }
+
     let result = match (kind, platform) {
         (RoleValidatorKind::RuntimeAcls, VmGuestPlatform::Linux) => {
             runtime_acls::validate_linux_runtime_acls(&*shell, daemon_path, alias)
