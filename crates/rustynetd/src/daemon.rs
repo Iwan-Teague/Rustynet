@@ -15662,16 +15662,16 @@ mod tests {
         load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_dns_zone_bundle,
         load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
         load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
-        load_trust_watermark, membership_watermark_is_replay, parse_route_interface_token,
-        parse_windows_default_egress_interface_output, passphrase_disallowed_mode_mask,
-        persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
-        poll_anchor_bundle_pull_once, port_mapping_bring_up_skip_reason,
-        prepare_runtime_wireguard_key_material, resolve_egress_interface_value, run_daemon,
-        run_preflight_checks, sanitize_dataplane_routes_for_node_role,
-        scrub_runtime_wireguard_key_material, select_runtime_relay_candidate,
-        select_runtime_relay_candidate_with_verified_fleet, sha256_digest,
-        snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
-        validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
+        load_trust_watermark, membership_watermark_is_replay, overlay_addresses_from_bundle_peers,
+        parse_route_interface_token, parse_windows_default_egress_interface_output,
+        passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
+        persist_traversal_watermark, persist_trust_watermark, poll_anchor_bundle_pull_once,
+        port_mapping_bring_up_skip_reason, prepare_runtime_wireguard_key_material,
+        resolve_egress_interface_value, run_daemon, run_preflight_checks,
+        sanitize_dataplane_routes_for_node_role, scrub_runtime_wireguard_key_material,
+        select_runtime_relay_candidate, select_runtime_relay_candidate_with_verified_fleet,
+        sha256_digest, snapshot_has_usable_traversal_host_candidates, trust_evidence_payload,
+        unix_now, validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
         validate_daemon_config, validate_file_security, validate_node_role_membership_alignment,
         write_anchor_bundle_pull_response, write_anchor_bundle_pull_response_with_have,
         write_response, zeroize_optional_bytes,
@@ -25658,6 +25658,70 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// I1d — provenance of the gossip push address. The only signed
+    /// per-node overlay-address source is the verified assignment
+    /// bundle's `allowed_ips` HOST CIDRs (/32 and /128): broader route
+    /// prefixes are not identities, and the peer's raw underlay
+    /// `endpoint` must never leak into the overlay identity map — a
+    /// raw-Internet address is not a mesh push destination.
+    #[test]
+    fn overlay_addresses_from_bundle_peers_only_yield_host_cidrs() {
+        let underlay_ip: IpAddr = "203.0.113.50".parse().expect("ip");
+        let make_peer = |name: &str, allowed_ips: Vec<String>| rustynet_backend_api::PeerConfig {
+            node_id: NodeId::new(name.to_owned()).expect("node id"),
+            endpoint: SocketEndpoint {
+                addr: underlay_ip,
+                port: 51820,
+            },
+            public_key: [0u8; 32],
+            allowed_ips,
+            persistent_keepalive_secs: None,
+        };
+        let bundle = AutoTunnelBundle {
+            node_id: "daemon-local".to_owned(),
+            node_capabilities: vec![RoleCapability::Client],
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            assigned_cidr: "100.64.0.1/32".to_owned(),
+            peers: vec![
+                // Exit-style peer: default route plus its mesh host cidr —
+                // only the host cidr is an identity.
+                make_peer(
+                    "node-exit",
+                    vec!["0.0.0.0/0".to_owned(), "100.64.0.2/32".to_owned()],
+                ),
+                // Route-only peer: advertises a subnet, no host cidr — no
+                // overlay identity may be derived.
+                make_peer("node-router", vec!["100.64.10.0/24".to_owned()]),
+                // IPv6 host cidr is a valid overlay identity.
+                make_peer("node-v6", vec!["fd7a:115c::7/128".to_owned()]),
+            ],
+            routes: vec![],
+            signed_exit_node_id: None,
+            signed_exit_node_capabilities: vec![],
+            selected_exit_node: None,
+        };
+
+        let map = overlay_addresses_from_bundle_peers(&bundle);
+        assert_eq!(
+            map.get("node-exit"),
+            Some(&"100.64.0.2".parse::<IpAddr>().expect("ip")),
+            "host cidr must yield the overlay address even next to a default route"
+        );
+        assert!(
+            !map.contains_key("node-router"),
+            "a route prefix is not an identity: no overlay address may be derived"
+        );
+        assert_eq!(
+            map.get("node-v6"),
+            Some(&"fd7a:115c::7".parse::<IpAddr>().expect("ip")),
+            "a /128 host cidr must yield the v6 overlay address"
+        );
+        assert!(
+            !map.values().any(|addr| *addr == underlay_ip),
+            "the raw underlay endpoint must never appear as an overlay identity"
+        );
     }
 
     #[test]

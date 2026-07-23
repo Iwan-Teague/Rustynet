@@ -1713,6 +1713,61 @@ mod tests {
         assert_eq!(regs[0].peer_node_id, shared_key);
     }
 
+    /// I1d — the addressing choice. A member whose overlay (tunnel)
+    /// address is not proven by the verified assignment bundle is omitted
+    /// THIS tick: gossip rides the encrypted mesh, so no other address
+    /// source (a raw-Internet endpoint, a guess, a stale value) may ever
+    /// be substituted. The member re-registers the first tick a verified
+    /// bundle carries its overlay address.
+    #[test]
+    fn gossip_peer_registrations_skip_members_without_overlay_address() {
+        let (peer_with_addr, key_with_addr) = membership_node_with_real_key("node-known", 0x66);
+        let (peer_without_addr, key_without_addr) =
+            membership_node_with_real_key("node-unknown", 0x77);
+        let state = membership_state(vec![peer_with_addr, peer_without_addr]);
+        // Only node-known has a verified overlay address.
+        let overlay = overlay_map(&[("node-known", "100.64.0.50")]);
+        let regs = gossip_peer_registrations_from_membership(
+            &state,
+            &overlay,
+            "node-local",
+            &[0xfeu8; 32],
+        );
+        assert_eq!(
+            regs.len(),
+            1,
+            "the member without a verified overlay address must be omitted, not guessed"
+        );
+        assert_eq!(regs[0].peer_node_id, key_with_addr);
+        assert!(
+            !regs.iter().any(|reg| reg.peer_node_id == key_without_addr),
+            "no registration may exist without a verified overlay push address"
+        );
+    }
+
+    /// I1d — cold-start bootstrap ordering. Before any verified assignment
+    /// bundle exists (a node that has no tunnel yet), the overlay map is
+    /// empty and NOTHING registers: initial signed state still flows over
+    /// the existing control-plane/enrollment path, and the anchor/relay
+    /// seed set only becomes reachable once verified overlay addresses
+    /// exist. Gossip must never invent a pre-tunnel path.
+    #[test]
+    fn gossip_peer_registrations_empty_overlay_map_registers_nothing() {
+        let (peer_a, _) = membership_node_with_real_key("node-a", 0x66);
+        let (peer_b, _) = membership_node_with_real_key("node-b", 0x77);
+        let state = membership_state(vec![peer_a, peer_b]);
+        let regs = gossip_peer_registrations_from_membership(
+            &state,
+            &BTreeMap::new(),
+            "node-local",
+            &[0xfeu8; 32],
+        );
+        assert!(
+            regs.is_empty(),
+            "cold start with no verified assignment bundle must register no gossip peers"
+        );
+    }
+
     #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
     #[test]
     fn ingest_rejects_revoked_source_bundle() {
