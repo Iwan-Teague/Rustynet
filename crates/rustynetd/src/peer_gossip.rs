@@ -365,9 +365,8 @@ pub fn current_unix_seconds() -> Result<u64, GossipError> {
 ///
 /// Wire layout (big-endian everywhere):
 ///
-/// * `[..16]` magic prefix `b"rustynet:peer_gossip:v1"` truncated
-///   to 16 bytes? No — full prefix length-prefixed.
-/// * Domain prefix length (u16 BE) + prefix bytes.
+/// * Domain prefix length (u16 BE) + the full [`GOSSIP_BUNDLE_DOMAIN`]
+///   bytes (length-prefixed, never truncated).
 /// * Source node ID (32 bytes).
 /// * Sequence (u64 BE).
 /// * Timestamp Unix seconds (u64 BE).
