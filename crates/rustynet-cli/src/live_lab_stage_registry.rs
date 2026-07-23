@@ -73,6 +73,81 @@ impl PlatformStream {
     }
 }
 
+/// Acceptance tier — the machine-readable `StageId → Tier` classification
+/// required by the `--node` engine acceptance spec
+/// (`documents/operations/active/NodeEngineAcceptanceSpec_2026-07-23.md`
+/// §3/§9, increment A1). The tier is a REQUIRED field on every
+/// `define_stage_catalog!` row (`vm_lab/orchestrator/stage/mod.rs`), so a
+/// stage without a tier does not compile — totality is enforced by the
+/// compiler, strictly stronger than a runtime gate. This exists because an
+/// earlier PROSE enumeration of the same map drifted: it omitted
+/// `cross_os_membership_convergence`, `cross_os_peer_visibility`,
+/// `cross_os_direct_path`, `cross_os_lan_toggle`, and several per-OS
+/// stages. The spec references this map; it never hand-copies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    /// T0 — Core (every cell must exercise): bootstrap, baseline-runtime
+    /// enforce+validate, signed membership/trust/traversal/dns distribution,
+    /// traffic reachability, clean teardown (residue-asserted).
+    T0Core,
+    /// T1 — Role (the cell's own capability), live: anchor
+    /// validation+bundle-pull+enrollment; exit
+    /// NAT+handoff+dns-failclosed+demotion-residue; relay
+    /// service-lifecycle+frame-forward; blind_exit
+    /// dataplane+irreversibility; admin mint/issue; client
+    /// managed-tunnel+two-hop.
+    T1Role,
+    /// T2 — Resilience (per OS): reboot_recovery, network_flap,
+    /// extended_soak, and the fault/impairment chaos stages — disturbance
+    /// injected, recovery/consistency asserted.
+    T2Resilience,
+    /// T3 — Cross-OS: the full `cross_os_*` set as enumerated in the map
+    /// (bootstrap, relay_path, exit_path, dns, role_switch,
+    /// anchor_bundle_pull, anchor_enrollment, membership_convergence,
+    /// peer_visibility, direct_path, lan_toggle) — stages whose subject is
+    /// Linux↔macOS↔Windows interop, not a single OS's capability.
+    T3CrossOs,
+    /// T4 — Security / adversarial: the security-stage family (ipv6_leak,
+    /// dns_failclosed, killswitch, privileged-helper allowlist, revocation,
+    /// security_audit, …) as tagged in the map — stages where a wrong GREEN
+    /// means fail-open.
+    T4Security,
+    /// T5 — Negative controls / ADJUDICATION: injected-fault runs that MUST
+    /// produce RED-for-the-right-reason (planted residue, corrupted / stale /
+    /// wrong-signer bundle, daemon killed mid-stage, wrong-node
+    /// substitution). This tier is what proves the engine can be believed.
+    /// No such stage exists yet — the variant exists so the map is ready for
+    /// the negative-control increment.
+    T5NegativeControl,
+}
+
+impl Tier {
+    /// Every tier, in bar order.
+    #[allow(dead_code)] // consumed by the tier-map tests (this increment) and the acceptance verifier (later increment)
+    pub const ALL: [Tier; 6] = [
+        Tier::T0Core,
+        Tier::T1Role,
+        Tier::T2Resilience,
+        Tier::T3CrossOs,
+        Tier::T4Security,
+        Tier::T5NegativeControl,
+    ];
+
+    /// Canonical machine-readable name; matches the serde rename.
+    #[allow(dead_code)] // consumed by the tier-map tests (this increment) and the acceptance verifier (later increment)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::T0Core => "t0_core",
+            Tier::T1Role => "t1_role",
+            Tier::T2Resilience => "t2_resilience",
+            Tier::T3CrossOs => "t3_cross_os",
+            Tier::T4Security => "t4_security",
+            Tier::T5NegativeControl => "t5_negative_control",
+        }
+    }
+}
+
 /// How the CSV writer resolves which `{platform}_stage_*` columns a SHARED
 /// stage populates (OS-specific stages carry `direct_platform` instead).
 /// Encodes the arms of the historical `platforms_for_stage`.
