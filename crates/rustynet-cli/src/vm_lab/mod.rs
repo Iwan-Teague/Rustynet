@@ -9756,9 +9756,21 @@ fn selected_local_utm_readiness_from_report(
 /// (still fail-closed on a genuinely missing UTM alias), while libvirt-backed
 /// aliases are probed live through the same `observe_local_utm_target_ready`
 /// observer + `local_utm_ready_state_is_ready` predicate the standalone lifecycle
-/// commands use — so both kinds are held to the IDENTICAL execution-readiness bar
-/// (powered + live IP + a real ssh-auth probe for Linux/macOS), never a weaker
-/// "running + has IP" check.
+/// commands use.
+///
+/// Readiness-bar scope (verified against the two paths, not assumed):
+/// - **Linux/macOS libvirt guests are held to an equal-or-STRICTER bar** than the
+///   UTM report path: both require powered + live IP, and the libvirt predicate
+///   requires a successful ssh-auth probe (`ssh_auth_status == "ok"`), whereas the
+///   UTM report accepts `ssh_port_open || auth`. Never a weaker "running + has IP"
+///   check — a powered-off/unreachable/auth-failing Linux/macOS guest stays unready.
+/// - **Windows libvirt guests are the one asymmetry:** `observe_local_utm_target_ready`
+///   treats Windows as ready once powered + networked (SSH not required), which is
+///   WEAKER than the Windows UTM report path (that also requires SSH tcp+auth). No
+///   Windows libvirt guest exists in the lab today, and the downstream bootstrap/
+///   deploy stages still fail loudly on unreachable SSH, so this only risks wasting
+///   a run — but if a Windows libvirt guest is ever provisioned, bring the observer
+///   to Windows-UTM parity here first.
 pub(in crate::vm_lab) fn selected_nodes_readiness_with_libvirt(
     report_text: &str,
     selected_aliases: &[String],
@@ -9832,7 +9844,9 @@ pub(in crate::vm_lab) fn selected_nodes_readiness_with_libvirt(
 fn libvirt_ready_state_reason_codes(state: &LocalUtmReadyState) -> Vec<String> {
     let mut reason_codes = Vec::new();
     if !state.process_present {
-        push_unique_reason_code(&mut reason_codes, "vm-not-running");
+        // Reuse the UTM path's vocabulary for the same condition (mod.rs
+        // build_*_reason_codes) so tooling parsing reason_codes sees one word.
+        push_unique_reason_code(&mut reason_codes, "process-not-ready");
     }
     if state.live_ip.is_none() {
         push_unique_reason_code(&mut reason_codes, "live-ip-not-authoritative");
@@ -41798,7 +41812,7 @@ mod tests {
         };
         let codes = libvirt_ready_state_reason_codes(&off);
         assert!(
-            codes.contains(&"vm-not-running".to_owned()),
+            codes.contains(&"process-not-ready".to_owned()),
             "got: {codes:?}"
         );
         assert!(
