@@ -125,6 +125,42 @@ pub const DEFAULT_FRESHNESS_WINDOW_SECS: u64 = 300;
 /// verifier memory.
 pub const MAX_CANDIDATES_PER_BUNDLE: usize = 32;
 
+/// I2 — how many membership epochs a bundle's signed epoch may lag
+/// BEHIND the receiver's verified epoch before the bundle is rejected.
+///
+/// Why a window instead of `bundle.epoch >= local_epoch`: the
+/// membership epoch increments by exactly 1 on EVERY membership update
+/// (`rustynet-control::membership` — join, capability change,
+/// revocation, all of them), not only on revocations. A strict
+/// equality/monotonic rule would therefore blackhole every peer's
+/// still-fresh prior-epoch bundle on ANY benign membership change —
+/// a mesh-wide fail-closed churn cliff each time an admin touches
+/// membership. The window tolerates the propagation lag of a few
+/// updates while still guaranteeing the property I2 exists for: a
+/// REVOKED peer stops receiving membership updates, so the epoch it
+/// can truthfully stamp freezes, and once the mesh advances more than
+/// this many epochs past it, its self-signed bundles fall outside the
+/// window everywhere — revocation is reinforced even where the
+/// explicit revoked-source set has not propagated. Staleness within
+/// the window is independently bounded by the signed-timestamp
+/// freshness check ([`DEFAULT_FRESHNESS_WINDOW_SECS`]).
+pub const GOSSIP_EPOCH_SKEW_WINDOW: u64 = 2;
+
+/// I2 — how many membership epochs a bundle's signed epoch may run
+/// AHEAD of the receiver's verified epoch before the bundle is
+/// rejected as implausible.
+///
+/// A modestly-ahead epoch is legitimate: the minter may simply have
+/// verified a newer membership snapshot than we have (we are the ones
+/// lagging). But the tolerance must stay SMALL, because every epoch of
+/// forward tolerance extends the revocation-aging horizon by one: a
+/// still-keyed attacker who pre-stamps `local + F` keeps that bundle
+/// inside receivers' behind-window for `F + GOSSIP_EPOCH_SKEW_WINDOW`
+/// further mesh epochs. A wildly-future epoch has no honest
+/// explanation (epochs only advance by 1 per verified update) and is
+/// rejected outright.
+pub const GOSSIP_EPOCH_FUTURE_TOLERANCE: u64 = 2;
+
 /// A signed peer-endpoint gossip bundle. This is the on-wire shape
 /// (serialised via [`serialise_bundle`]) plus the verifying signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +201,18 @@ pub enum GossipError {
     /// The bundle's sequence number is not strictly greater than the
     /// largest sequence already accepted from this source.
     SequenceNotMonotonic { last_seen: u64, presented: u64 },
+    /// I2: the bundle's signed membership epoch falls outside the
+    /// acceptance window around the receiver's verified epoch — more
+    /// than [`GOSSIP_EPOCH_SKEW_WINDOW`] behind (stale trust view; the
+    /// signature is valid but was minted against a membership timeline
+    /// the mesh has moved past — the property that ages out a revoked
+    /// peer's self-signed bundles) or more than
+    /// [`GOSSIP_EPOCH_FUTURE_TOLERANCE`] ahead (implausible; epochs
+    /// only advance by 1 per verified membership update).
+    EpochOutsideWindow {
+        local_epoch: u64,
+        presented_epoch: u64,
+    },
     /// Too many candidates packed into a single bundle.
     TooManyCandidates { presented: usize, max: usize },
     /// One or more candidate endpoints have non-gossip-worthy scope
@@ -214,6 +262,13 @@ impl std::fmt::Display for GossipError {
             } => write!(
                 f,
                 "gossip bundle sequence not monotonic (last seen {last_seen}, presented {presented})"
+            ),
+            GossipError::EpochOutsideWindow {
+                local_epoch,
+                presented_epoch,
+            } => write!(
+                f,
+                "gossip bundle membership epoch outside acceptance window (local {local_epoch}, presented {presented_epoch})"
             ),
             GossipError::TooManyCandidates { presented, max } => write!(
                 f,
@@ -463,21 +518,32 @@ pub fn verify_signature(
 }
 
 /// Full inbound acceptance check. Returns `Ok(())` if the bundle is
-/// fresh, monotonic, and validly signed under a known peer's key.
-/// Updates `state` to record the new highest sequence on success.
+/// fresh, epoch-plausible, monotonic, and validly signed under a known
+/// peer's key. Updates `state` to record the new highest sequence on
+/// success.
 ///
 /// `known_peers` is a map from node-id (the verifying key bytes) to
 /// the verifying key itself; typically loaded from the signed
-/// membership snapshot.
+/// membership snapshot. `local_epoch` is the receiver's VERIFIED
+/// membership epoch (I2) — the reference point for the epoch-skew
+/// window; it must come from a verified snapshot, never from the wire.
 #[allow(clippy::too_many_arguments)]
 pub fn accept_bundle(
     bundle: &GossipBundle,
     known_peers: &HashMap<[u8; 32], VerifyingKey>,
     state: &mut SeenSequenceState,
     freshness_window_secs: u64,
+    local_epoch: u64,
 ) -> Result<(), GossipError> {
     let now = current_unix_seconds()?;
-    accept_bundle_with_now(bundle, known_peers, state, freshness_window_secs, now)
+    accept_bundle_with_now(
+        bundle,
+        known_peers,
+        state,
+        freshness_window_secs,
+        local_epoch,
+        now,
+    )
 }
 
 /// Reject a gossip bundle whose candidate set includes any address
@@ -521,6 +587,7 @@ pub fn accept_bundle_with_now(
     known_peers: &HashMap<[u8; 32], VerifyingKey>,
     state: &mut SeenSequenceState,
     freshness_window_secs: u64,
+    local_epoch: u64,
     now_unix: u64,
 ) -> Result<(), GossipError> {
     let candidate_count = bundle.candidates.v4_host.len()
@@ -555,6 +622,49 @@ pub fn accept_bundle_with_now(
         // correct either way.
         let drift_secs = drift.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
         return Err(GossipError::TimestampOutsideWindow { drift_secs });
+    }
+    // I2 — membership-epoch skew window. Runs AFTER signature
+    // verification (the epoch is a signed field; an unverified bundle
+    // never reaches policy) and BEFORE the monotonic-sequence record
+    // (a rejected epoch must not advance the per-source anti-replay
+    // watermark).
+    //
+    // Exact semantics — accept iff
+    //   local_epoch - GOSSIP_EPOCH_SKEW_WINDOW
+    //     <= bundle.epoch
+    //     <= local_epoch + GOSSIP_EPOCH_FUTURE_TOLERANCE
+    // (both bounds inclusive, saturating at 0 / u64::MAX):
+    //
+    // * behind by more than the window (e.g. local 10, presented 7
+    //   with window 2) → REJECT: the minter's trust view is a
+    //   membership timeline the mesh has moved past. This is the arm
+    //   that ages out a revoked peer's self-signed bundles — a revoked
+    //   peer stops receiving membership updates, so the newest epoch
+    //   it truthfully saw freezes while the mesh advances.
+    // * equal, or behind within the window → ACCEPT: benign membership
+    //   updates (joins, capability changes) bump the epoch mesh-wide by
+    //   1 each, and bundle re-mints lag by up to the 30 s heartbeat, so
+    //   a small skew is normal operation, not an attack (rejecting it
+    //   would be a mesh-wide churn cliff on every membership change).
+    // * ahead within the tolerance → ACCEPT: the minter verified a
+    //   newer membership snapshot before we did; we are the laggard.
+    // * ahead by more than the tolerance → REJECT as implausible:
+    //   epochs advance by exactly 1 per verified membership update, so
+    //   no honest propagation gap explains a wildly-future stamp, and
+    //   unbounded forward acceptance would let a still-keyed attacker
+    //   pre-stamp far-future epochs to outlive the behind-window.
+    //
+    // The saturating bounds mean: at local epochs <= the window the
+    // floor is 0 (nothing spuriously rejected at genesis), and within
+    // GOSSIP_EPOCH_FUTURE_TOLERANCE of u64::MAX the ceiling pins at
+    // MAX (unreachable in practice; +1 per membership update).
+    let epoch_floor = local_epoch.saturating_sub(GOSSIP_EPOCH_SKEW_WINDOW);
+    let epoch_ceiling = local_epoch.saturating_add(GOSSIP_EPOCH_FUTURE_TOLERANCE);
+    if bundle.epoch < epoch_floor || bundle.epoch > epoch_ceiling {
+        return Err(GossipError::EpochOutsideWindow {
+            local_epoch,
+            presented_epoch: bundle.epoch,
+        });
     }
     if let Some(last) = state.highest_accepted(&bundle.source_node_id)
         && bundle.sequence <= last
@@ -955,7 +1065,8 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        accept_bundle_with_now(&bundle1, &known, &mut state, 300, 1_700_000_000).expect("ok");
+        accept_bundle_with_now(&bundle1, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+            .expect("ok");
         assert_eq!(state.highest_accepted(&verifying_key.to_bytes()), Some(1));
 
         let bundle2 = mint_bundle_with_timestamp(
@@ -966,7 +1077,7 @@ mod tests {
             CandidateSet::default(),
         )
         .unwrap();
-        accept_bundle_with_now(&bundle2, &known, &mut state, 300, 1_700_000_100)
+        accept_bundle_with_now(&bundle2, &known, &mut state, 300, TEST_EPOCH, 1_700_000_100)
             .expect("strictly larger sequence accepted");
         assert_eq!(state.highest_accepted(&verifying_key.to_bytes()), Some(2));
     }
@@ -991,8 +1102,15 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        accept_bundle_with_now(&max_bundle, &known, &mut state, 300, 1_700_000_000)
-            .expect("u64::MAX sequence accepted once");
+        accept_bundle_with_now(
+            &max_bundle,
+            &known,
+            &mut state,
+            300,
+            TEST_EPOCH,
+            1_700_000_000,
+        )
+        .expect("u64::MAX sequence accepted once");
         assert_eq!(
             state.highest_accepted(&verifying_key.to_bytes()),
             Some(u64::MAX)
@@ -1007,8 +1125,9 @@ mod tests {
                 CandidateSet::default(),
             )
             .unwrap();
-            let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_050)
-                .expect_err("post-MAX wraparound must be rejected");
+            let err =
+                accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_050)
+                    .expect_err("post-MAX wraparound must be rejected");
             assert!(
                 matches!(
                     err,
@@ -1041,10 +1160,12 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000).expect("ok");
+        accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+            .expect("ok");
         // Same bundle replayed must be rejected.
-        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
-            .expect_err("replay must be rejected");
+        let err =
+            accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+                .expect_err("replay must be rejected");
         match err {
             GossipError::SequenceNotMonotonic {
                 last_seen,
@@ -1073,7 +1194,8 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        accept_bundle_with_now(&high, &known, &mut state, 300, 1_700_000_000).expect("ok");
+        accept_bundle_with_now(&high, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+            .expect("ok");
         let low = mint_bundle_with_timestamp(
             &signing_key,
             50,
@@ -1082,7 +1204,7 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        let err = accept_bundle_with_now(&low, &known, &mut state, 300, 1_700_000_000)
+        let err = accept_bundle_with_now(&low, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
             .expect_err("rewind must be rejected");
         assert!(matches!(err, GossipError::SequenceNotMonotonic { .. }));
     }
@@ -1104,8 +1226,9 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_001_000)
-            .expect_err("stale timestamp must be rejected");
+        let err =
+            accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_001_000)
+                .expect_err("stale timestamp must be rejected");
         match err {
             GossipError::TimestampOutsideWindow { drift_secs } => {
                 assert_eq!(drift_secs, -1000);
@@ -1131,14 +1254,140 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
-            .expect_err("future timestamp must be rejected");
+        let err =
+            accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+                .expect_err("future timestamp must be rejected");
         match err {
             GossipError::TimestampOutsideWindow { drift_secs } => {
                 assert_eq!(drift_secs, 1000);
             }
             other => panic!("expected TimestampOutsideWindow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn accept_bundle_epoch_window_boundaries_behind_and_ahead() {
+        // I2 exact-boundary matrix around local epoch L with
+        // GOSSIP_EPOCH_SKEW_WINDOW = 2 (behind, inclusive) and
+        // GOSSIP_EPOCH_FUTURE_TOLERANCE = 2 (ahead, inclusive):
+        //   L-3 reject | L-2 .. L+2 accept | L+3 reject.
+        let signing_key = deterministic_signing_key(50);
+        let verifying_key = signing_key.verifying_key();
+        let mut known = HashMap::new();
+        known.insert(verifying_key.to_bytes(), verifying_key);
+        let local = TEST_EPOCH + 10; // comfortably away from the 0 floor
+        let cases = [
+            (local - GOSSIP_EPOCH_SKEW_WINDOW - 1, false),
+            (local - GOSSIP_EPOCH_SKEW_WINDOW, true),
+            (local - 1, true),
+            (local, true),
+            (local + 1, true),
+            (local + GOSSIP_EPOCH_FUTURE_TOLERANCE, true),
+            (local + GOSSIP_EPOCH_FUTURE_TOLERANCE + 1, false),
+        ];
+        for (presented, expect_ok) in cases {
+            // Fresh sequence state per case so the anti-replay check
+            // never interferes with the epoch assertion.
+            let mut state = SeenSequenceState::new();
+            let bundle = mint_bundle_with_timestamp(
+                &signing_key,
+                1,
+                1_700_000_000,
+                presented,
+                sample_candidates(),
+            )
+            .expect("mint succeeds");
+            let res =
+                accept_bundle_with_now(&bundle, &known, &mut state, 300, local, 1_700_000_000);
+            if expect_ok {
+                res.unwrap_or_else(|err| {
+                    panic!("epoch {presented} (local {local}) must be accepted, got {err:?}")
+                });
+            } else {
+                match res.expect_err("epoch outside window must be rejected") {
+                    GossipError::EpochOutsideWindow {
+                        local_epoch,
+                        presented_epoch,
+                    } => {
+                        assert_eq!(local_epoch, local);
+                        assert_eq!(presented_epoch, presented);
+                    }
+                    other => panic!("expected EpochOutsideWindow, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accept_bundle_epoch_floor_saturates_at_genesis() {
+        // Local epoch 1 with window 2: the behind-floor saturates to 0,
+        // so epoch-0 and epoch-1 bundles are accepted (no spurious
+        // rejects at genesis) while the ahead-ceiling (1 + 2 = 3) still
+        // rejects epoch 4.
+        let signing_key = deterministic_signing_key(51);
+        let verifying_key = signing_key.verifying_key();
+        let mut known = HashMap::new();
+        known.insert(verifying_key.to_bytes(), verifying_key);
+        for (presented, expect_ok) in [(0u64, true), (1, true), (3, true), (4, false)] {
+            let mut state = SeenSequenceState::new();
+            let bundle = mint_bundle_with_timestamp(
+                &signing_key,
+                1,
+                1_700_000_000,
+                presented,
+                sample_candidates(),
+            )
+            .expect("mint succeeds");
+            let res = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1, 1_700_000_000);
+            assert_eq!(
+                res.is_ok(),
+                expect_ok,
+                "presented epoch {presented} against local 1: got {res:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_epoch_does_not_advance_sequence_watermark() {
+        // An epoch-window rejection must leave the per-source
+        // anti-replay ledger untouched: the same sequence number must
+        // still be acceptable later from a bundle whose epoch is valid
+        // (otherwise an attacker could burn a victim's sequence space
+        // with out-of-window bundles).
+        let signing_key = deterministic_signing_key(52);
+        let verifying_key = signing_key.verifying_key();
+        let mut state = SeenSequenceState::new();
+        let mut known = HashMap::new();
+        known.insert(verifying_key.to_bytes(), verifying_key);
+        let local = TEST_EPOCH + 10;
+
+        let stale = mint_bundle_with_timestamp(
+            &signing_key,
+            5,
+            1_700_000_000,
+            local - GOSSIP_EPOCH_SKEW_WINDOW - 1,
+            sample_candidates(),
+        )
+        .expect("mint stale-epoch bundle");
+        let err = accept_bundle_with_now(&stale, &known, &mut state, 300, local, 1_700_000_000)
+            .expect_err("stale epoch must be rejected");
+        assert!(matches!(err, GossipError::EpochOutsideWindow { .. }));
+        assert_eq!(
+            state.highest_accepted(&verifying_key.to_bytes()),
+            None,
+            "epoch rejection must not record the sequence"
+        );
+
+        let fresh =
+            mint_bundle_with_timestamp(&signing_key, 5, 1_700_000_000, local, sample_candidates())
+                .expect("mint valid-epoch bundle");
+        accept_bundle_with_now(&fresh, &known, &mut state, 300, local, 1_700_000_000)
+            .expect("same sequence must still be acceptable with a valid epoch");
+        assert_eq!(
+            state.highest_accepted(&verifying_key.to_bytes()),
+            Some(5),
+            "valid bundle records the sequence normally"
+        );
     }
 
     #[test]
@@ -1154,8 +1403,9 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
-            .expect_err("unknown source must be rejected");
+        let err =
+            accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+                .expect_err("unknown source must be rejected");
         assert!(matches!(err, GossipError::UnknownSource));
     }
 
@@ -1182,8 +1432,9 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
             51820,
         ));
-        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
-            .expect_err("tampered candidates must trip signature mismatch");
+        let err =
+            accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+                .expect_err("tampered candidates must trip signature mismatch");
         assert!(matches!(err, GossipError::SignatureInvalid));
     }
 
@@ -1262,8 +1513,9 @@ mod tests {
         let bundle =
             mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, TEST_EPOCH, candidates)
                 .unwrap();
-        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
-            .expect_err("loopback srflx must be rejected");
+        let err =
+            accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+                .expect_err("loopback srflx must be rejected");
         match err {
             GossipError::UnreachableCandidate { addr } => {
                 assert!(
@@ -1293,8 +1545,9 @@ mod tests {
         ));
         let bundle =
             mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, TEST_EPOCH, multi).unwrap();
-        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
-            .expect_err("multicast must be rejected");
+        let err =
+            accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+                .expect_err("multicast must be rejected");
         assert!(matches!(err, GossipError::UnreachableCandidate { .. }));
 
         // Link-local v4 host candidate (169.254/16) — useless to a
@@ -1303,8 +1556,9 @@ mod tests {
         ll.v4_host.push(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)));
         let bundle =
             mint_bundle_with_timestamp(&signing_key, 2, 1_700_000_000, TEST_EPOCH, ll).unwrap();
-        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
-            .expect_err("link-local must be rejected");
+        let err =
+            accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+                .expect_err("link-local must be rejected");
         assert!(matches!(err, GossipError::UnreachableCandidate { .. }));
 
         // Link-local v6 (fe80::/10) too.
@@ -1313,8 +1567,9 @@ mod tests {
             .push(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
         let bundle =
             mint_bundle_with_timestamp(&signing_key, 3, 1_700_000_000, TEST_EPOCH, ll6).unwrap();
-        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
-            .expect_err("v6 link-local must be rejected");
+        let err =
+            accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
+                .expect_err("v6 link-local must be rejected");
         assert!(matches!(err, GossipError::UnreachableCandidate { .. }));
     }
 
@@ -1337,7 +1592,7 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
+        accept_bundle_with_now(&bundle, &known, &mut state, 300, TEST_EPOCH, 1_700_000_000)
             .expect("sample (private + global) candidates accepted");
     }
 
@@ -1360,7 +1615,7 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        accept_bundle_with_now(&past, &known, &mut state, 300, 1_700_000_300)
+        accept_bundle_with_now(&past, &known, &mut state, 300, TEST_EPOCH, 1_700_000_300)
             .expect("boundary past timestamp accepted");
 
         let future = mint_bundle_with_timestamp(
@@ -1371,7 +1626,7 @@ mod tests {
             sample_candidates(),
         )
         .unwrap();
-        accept_bundle_with_now(&future, &known, &mut state, 300, 1_700_000_300)
+        accept_bundle_with_now(&future, &known, &mut state, 300, TEST_EPOCH, 1_700_000_300)
             .expect("boundary future timestamp accepted");
     }
 
