@@ -82,7 +82,7 @@ pub enum StageSuite {
 }
 
 macro_rules! define_stage_catalog {
-    ($($variant:ident => $name:literal @ $suite:ident),+ $(,)?) => {
+    ($($variant:ident => $name:literal @ $suite:ident / $tier:ident),+ $(,)?) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         pub enum StageId { $($variant),+ }
 
@@ -100,80 +100,135 @@ macro_rules! define_stage_catalog {
             pub fn suite(&self) -> StageSuite {
                 match self { $(StageId::$variant => StageSuite::$suite),+ }
             }
+
+            /// Acceptance tier (`NodeEngineAcceptanceSpec_2026-07-23.md`
+            /// §3/§9, increment A1). The tier token is a REQUIRED part of
+            /// every catalog row — a row without one fails to parse — so
+            /// this map is total over `StageId` by construction; the §9
+            /// totality gate is the compiler, and the registry tests only
+            /// pin the classification itself. Purely additive metadata:
+            /// plan inclusion/order stay owned by [`StageId::suite`].
+            pub fn tier(&self) -> crate::live_lab_stage_registry::Tier {
+                use crate::live_lab_stage_registry::Tier;
+                match self { $(StageId::$variant => Tier::$tier),+ }
+            }
         }
     };
 }
 
 // Single authority for the typed ID, canonical pipeline order, wire name,
-// and suite membership (RNQ-16).
+// suite membership (RNQ-16), and acceptance tier (A1). Row shape:
+// `Variant => "wire_name" @ Suite / Tier`. Tier calls that involve judgment
+// carry a one-line comment on the row so a reviewer can check the call.
 define_stage_catalog! {
-    Preflight => "preflight" @ Setup,
-    PrepareSourceArchive => "prepare_source_archive" @ Setup,
-    VerifySshReachability => "verify_ssh_reachability" @ Setup,
-    CleanupHosts => "cleanup_hosts" @ Setup,
-    BootstrapHosts => "bootstrap_hosts" @ Setup,
-    CollectPubkeys => "collect_pubkeys" @ Setup,
-    MembershipInit => "membership_init" @ Setup,
-    DistributeMembership => "distribute_membership" @ Setup,
-    AnchorValidation => "anchor_validation" @ Setup,
-    AdminIssue => "admin_issue" @ Setup,
-    DistributeAssignments => "distribute_assignments" @ Setup,
-    DistributeTraversal => "distribute_traversal" @ Setup,
-    DistributeDnsZone => "distribute_dns_zone" @ Setup,
-    EnforceBaselineRuntime => "enforce_baseline_runtime" @ Setup,
-    BlindExit => "blind_exit" @ Setup,
-    ValidateBaselineRuntime => "validate_baseline_runtime" @ Setup,
-    SecurityAuditValidation => "security_audit_validation" @ Live,
-    DnsFailclosedValidation => "dns_failclosed_validation" @ Live,
-    RuntimeAclsValidation => "runtime_acls_validation" @ Live,
-    ServiceHardeningValidation => "service_hardening_validation" @ Live,
-    KeyCustodyValidation => "key_custody_validation" @ Live,
-    MeshStatusValidation => "mesh_status_validation" @ Live,
-    AuthenticodeValidation => "authenticode_validation" @ Live,
-    Ipv6LeakValidation => "ipv6_leak_validation" @ Live,
-    DeployRelayService => "deploy_relay_service" @ Live,
-    RelayValidation => "relay_validation" @ Live,
-    TrafficTestMatrix => "traffic_test_matrix" @ Live,
-    RoleSwitchMatrix => "role_switch_matrix" @ Live,
-    ExitHandoff => "exit_handoff" @ Live,
-    ActiveExit => "active_exit" @ Live,
-    ExitDnsFailclosedValidation => "exit_dns_failclosed_validation" @ Live,
-    ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live,
-    ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live,
-    BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live,
-    LiveAnchor => "live_anchor" @ Live,
-    LiveTwoHopValidation => "live_two_hop_validation" @ Live,
-    LiveManagedDnsValidation => "live_managed_dns_validation" @ Live,
-    LiveNetworkFlapValidation => "live_network_flap_validation" @ Live,
-    LiveRebootRecoveryValidation => "live_reboot_recovery_validation" @ Live,
-    LiveSecretsNotInLogsValidation => "live_secrets_not_in_logs_validation" @ Live,
-    LiveKeyCustodyValidation => "live_key_custody_validation" @ Live,
-    LiveEnrollmentRestartValidation => "live_enrollment_restart_validation" @ Live,
-    LiveLanToggleValidation => "live_lan_toggle_validation" @ Live,
-    LiveMixedTopologyValidation => "live_mixed_topology_validation" @ Live,
-    LiveHelloLimiterFloodValidation => "live_hello_limiter_flood_validation" @ Live,
-    LiveExtendedSoakValidation => "extended_soak" @ Soak,
-    CrossNetworkPreflight => "cross_network_preflight" @ CrossNetwork,
-    CrossNetworkDirectRemoteExit => "cross_network_direct_remote_exit" @ CrossNetwork,
-    CrossNetworkNodeNetworkSwitch => "cross_network_node_network_switch" @ CrossNetwork,
-    CrossNetworkRelayRemoteExit => "cross_network_relay_remote_exit" @ CrossNetwork,
-    CrossNetworkFailbackRoaming => "cross_network_failback_roaming" @ CrossNetwork,
-    CrossNetworkControllerSwitch => "cross_network_controller_switch" @ CrossNetwork,
-    CrossNetworkTraversalAdversarial => "cross_network_traversal_adversarial" @ CrossNetwork,
-    CrossNetworkRemoteExitDns => "cross_network_remote_exit_dns" @ CrossNetwork,
-    CrossNetworkRemoteExitSoak => "cross_network_remote_exit_soak" @ CrossNetwork,
-    CrossNetworkNatClassification => "cross_network_nat_classification" @ CrossNetwork,
-    CrossNetworkNatMatrix => "cross_network_nat_matrix" @ CrossNetwork,
-    ChaosClockAttack => "chaos_clock_attack" @ Chaos,
-    ChaosCrashRecovery => "chaos_crash_recovery" @ Chaos,
-    ChaosDaemonFault => "chaos_daemon_fault" @ Chaos,
-    ChaosDaemonSigstopSigcont => "chaos_daemon_sigstop_sigcont" @ Chaos,
-    ChaosMembershipAdversarial => "chaos_membership_adversarial" @ Chaos,
-    ChaosNetworkImpairment => "chaos_network_impairment" @ Chaos,
-    ChaosPrivilegedBoundary => "chaos_privileged_boundary" @ Chaos,
-    ChaosResourceExhaustion => "chaos_resource_exhaustion" @ Chaos,
-    ChaosSignedStateAdversarial => "chaos_signed_state_adversarial" @ Chaos,
-    Cleanup => "cleanup" @ Cleanup,
+    Preflight => "preflight" @ Setup / T0Core,
+    PrepareSourceArchive => "prepare_source_archive" @ Setup / T0Core,
+    VerifySshReachability => "verify_ssh_reachability" @ Setup / T0Core,
+    CleanupHosts => "cleanup_hosts" @ Setup / T0Core,
+    BootstrapHosts => "bootstrap_hosts" @ Setup / T0Core,
+    CollectPubkeys => "collect_pubkeys" @ Setup / T0Core,
+    MembershipInit => "membership_init" @ Setup / T0Core,
+    DistributeMembership => "distribute_membership" @ Setup / T0Core,
+    AnchorValidation => "anchor_validation" @ Setup / T1Role,
+    AdminIssue => "admin_issue" @ Setup / T1Role,
+    DistributeAssignments => "distribute_assignments" @ Setup / T0Core,
+    DistributeTraversal => "distribute_traversal" @ Setup / T0Core,
+    DistributeDnsZone => "distribute_dns_zone" @ Setup / T0Core,
+    EnforceBaselineRuntime => "enforce_baseline_runtime" @ Setup / T0Core,
+    // blind_exit ACTIVATES the blind_exit role posture (role capability),
+    // not baseline plumbing — T1 like the other role-lifecycle stages.
+    BlindExit => "blind_exit" @ Setup / T1Role,
+    ValidateBaselineRuntime => "validate_baseline_runtime" @ Setup / T0Core,
+    SecurityAuditValidation => "security_audit_validation" @ Live / T4Security,
+    DnsFailclosedValidation => "dns_failclosed_validation" @ Live / T4Security,
+    // Live default-deny ACL enforcement — a wrong GREEN is fail-open, so
+    // security tier rather than core plumbing.
+    RuntimeAclsValidation => "runtime_acls_validation" @ Live / T4Security,
+    ServiceHardeningValidation => "service_hardening_validation" @ Live / T4Security,
+    KeyCustodyValidation => "key_custody_validation" @ Live / T4Security,
+    // Mesh-status self-check: peers visible, no stale state — core mesh
+    // health / reachability evidence, not a role capability.
+    MeshStatusValidation => "mesh_status_validation" @ Live / T0Core,
+    // Windows binary-signing (Authenticode) verification — binary-trust
+    // control, so security tier.
+    AuthenticodeValidation => "authenticode_validation" @ Live / T4Security,
+    Ipv6LeakValidation => "ipv6_leak_validation" @ Live / T4Security,
+    DeployRelayService => "deploy_relay_service" @ Live / T1Role,
+    RelayValidation => "relay_validation" @ Live / T1Role,
+    TrafficTestMatrix => "traffic_test_matrix" @ Live / T0Core,
+    // Live role-transition matrix (admin<->client flips) — role-capability
+    // lifecycle; the cross-OS half is the bash-dialect cross_os_role_switch
+    // aggregate, not this stage.
+    RoleSwitchMatrix => "role_switch_matrix" @ Live / T1Role,
+    ExitHandoff => "exit_handoff" @ Live / T1Role,
+    ActiveExit => "active_exit" @ Live / T1Role,
+    // Spec §3 places the EXIT-scoped dns-failclosed inside the exit role's
+    // T1 list ("exit→NAT+handoff+dns-failclosed+demotion-residue"); the
+    // standalone dns_failclosed_validation above is the T4 family member.
+    ExitDnsFailclosedValidation => "exit_dns_failclosed_validation" @ Live / T1Role,
+    ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live / T1Role,
+    ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role,
+    BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live / T1Role,
+    LiveAnchor => "live_anchor" @ Live / T1Role,
+    LiveTwoHopValidation => "live_two_hop_validation" @ Live / T1Role,
+    LiveManagedDnsValidation => "live_managed_dns_validation" @ Live / T1Role,
+    LiveNetworkFlapValidation => "live_network_flap_validation" @ Live / T2Resilience,
+    LiveRebootRecoveryValidation => "live_reboot_recovery_validation" @ Live / T2Resilience,
+    LiveSecretsNotInLogsValidation => "live_secrets_not_in_logs_validation" @ Live / T4Security,
+    LiveKeyCustodyValidation => "live_key_custody_validation" @ Live / T4Security,
+    // Daemon killed MID-enrollment, then trust state must be consistent
+    // (token consumed ⟺ member) — restart/fault-recovery family; the
+    // anchor's enrollment-SERVING capability is live_anchor's T1 scope.
+    LiveEnrollmentRestartValidation => "live_enrollment_restart_validation" @ Live / T2Resilience,
+    // Asserts the killswitch + blind-exit posture HOLD through LAN-access
+    // toggling — the map's "killswitch" T4 family member. The bash-dialect
+    // mac/win cross_os_lan_toggle aggregate is a different (cross-OS) cell.
+    LiveLanToggleValidation => "live_lan_toggle_validation" @ Live / T4Security,
+    // Requires Linux+macOS+Windows ALL present (skips otherwise) and proves
+    // one signed membership view + fresh WireGuard handshakes across the
+    // three OSes — the `--node` dialect's carrier of cross-OS
+    // membership-convergence + peer-visibility coverage today.
+    LiveMixedTopologyValidation => "live_mixed_topology_validation" @ Live / T3CrossOs,
+    // HELLO-flood rate-limiter adversarial probe (DOS-1) — security tier.
+    LiveHelloLimiterFloodValidation => "live_hello_limiter_flood_validation" @ Live / T4Security,
+    LiveExtendedSoakValidation => "extended_soak" @ Soak / T2Resilience,
+    // Cross-NETWORK ≠ cross-OS: this suite exercises NAT/netns traversal
+    // between simulated networks (spec §3 has no cross-network tier), so
+    // each stage tiers by its SUBJECT — substrate correctness (T0), role
+    // capability reached across networks (T1), roaming/failover (T2),
+    // adversarial (T4) — never T3CrossOs.
+    CrossNetworkPreflight => "cross_network_preflight" @ CrossNetwork / T0Core,
+    CrossNetworkDirectRemoteExit => "cross_network_direct_remote_exit" @ CrossNetwork / T1Role,
+    CrossNetworkNodeNetworkSwitch => "cross_network_node_network_switch" @ CrossNetwork / T2Resilience,
+    CrossNetworkRelayRemoteExit => "cross_network_relay_remote_exit" @ CrossNetwork / T1Role,
+    CrossNetworkFailbackRoaming => "cross_network_failback_roaming" @ CrossNetwork / T2Resilience,
+    CrossNetworkControllerSwitch => "cross_network_controller_switch" @ CrossNetwork / T2Resilience,
+    CrossNetworkTraversalAdversarial => "cross_network_traversal_adversarial" @ CrossNetwork / T4Security,
+    CrossNetworkRemoteExitDns => "cross_network_remote_exit_dns" @ CrossNetwork / T1Role,
+    CrossNetworkRemoteExitSoak => "cross_network_remote_exit_soak" @ CrossNetwork / T2Resilience,
+    // NAT classification/matrix validate the traversal SUBSTRATE every
+    // cross-network capability rests on (not a role, not a disturbance) —
+    // core-correctness tier.
+    CrossNetworkNatClassification => "cross_network_nat_classification" @ CrossNetwork / T0Core,
+    CrossNetworkNatMatrix => "cross_network_nat_matrix" @ CrossNetwork / T0Core,
+    // The chaos suite splits by SUBJECT: adversarial-input stages targeting
+    // trust/security controls are T4 (spec §3 T4 is "as tagged in the map";
+    // chaos_privileged_boundary IS the map's privileged-helper-allowlist
+    // member); fault/impairment stages are T2 (spec §3 T2 lists "chaos").
+    // Clock rollback vs freshness/anti-replay protection — adversarial.
+    ChaosClockAttack => "chaos_clock_attack" @ Chaos / T4Security,
+    ChaosCrashRecovery => "chaos_crash_recovery" @ Chaos / T2Resilience,
+    ChaosDaemonFault => "chaos_daemon_fault" @ Chaos / T2Resilience,
+    ChaosDaemonSigstopSigcont => "chaos_daemon_sigstop_sigcont" @ Chaos / T2Resilience,
+    ChaosMembershipAdversarial => "chaos_membership_adversarial" @ Chaos / T4Security,
+    ChaosNetworkImpairment => "chaos_network_impairment" @ Chaos / T2Resilience,
+    ChaosPrivilegedBoundary => "chaos_privileged_boundary" @ Chaos / T4Security,
+    // Resource exhaustion = availability disturbance + recovery, closer to
+    // impairment than to a trust-control bypass — resilience tier.
+    ChaosResourceExhaustion => "chaos_resource_exhaustion" @ Chaos / T2Resilience,
+    ChaosSignedStateAdversarial => "chaos_signed_state_adversarial" @ Chaos / T4Security,
+    // Clean teardown, residue-asserted — named in spec §3's T0 list.
+    Cleanup => "cleanup" @ Cleanup / T0Core,
 }
 
 impl std::fmt::Display for StageId {

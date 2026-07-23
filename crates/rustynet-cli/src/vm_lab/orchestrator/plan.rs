@@ -3,13 +3,16 @@
 //!
 //! The stage catalog in `stage/mod.rs` is the single typed authority
 //! (RNQ-16): one catalog row carries the `StageId` variant, its canonical
-//! pipeline position, its wire name, and its suite tag. Plan membership +
+//! pipeline position, its wire name, its suite tag, and its acceptance tier
+//! (A1 — `NodeEngineAcceptanceSpec_2026-07-23.md` §3). Plan membership +
 //! order derive from it, the registry rust-native predicate and the
 //! run-matrix oracle derive from `StageId::try_from`, and the instantiation
 //! match below is compiler-enforced exhaustive. Touch, in order:
 //!
-//! 1. `stage/mod.rs` — ONE catalog row: `Variant => "wire_name" @ Suite`, at
-//!    the stage's true pipeline position, plus `pub mod <file>;`.
+//! 1. `stage/mod.rs` — ONE catalog row:
+//!    `Variant => "wire_name" @ Suite / Tier`, at the stage's true pipeline
+//!    position, plus `pub mod <file>;`. The tier token is REQUIRED — a row
+//!    without one does not compile (the acceptance spec's totality gate).
 //! 2. `stage/<name>.rs` — the `OrchestrationStage` impl (id / dependencies /
 //!    applies_to_roles / fanout / execute; override `always_run` for teardown).
 //! 3. `plan.rs` (this file) — the compiler now FORCES one `Box::new(<Stage>)`
