@@ -145,7 +145,7 @@ use rustynet_control::membership::{
 use rustynet_control::roles::{RoleCapability, parse_role_capability_csv};
 use rustynet_control::{
     RelayFleetNodeDescriptor, SignedRelayFleetBundle, SignedTraversalCoordinationRecord,
-    canonical_relay_id_from_label, derive_endpoint_hint_signing_key,
+    canonical_relay_id_from_label, derive_endpoint_hint_signing_key, derive_gossip_signing_key,
     parse_signed_relay_fleet_bundle_wire, verify_signed_relay_fleet_bundle_with_key,
 };
 use rustynet_dns_zone::{
@@ -261,6 +261,19 @@ const RELAY_FLEET_WATERMARK_PATH_ENV: &str = "RUSTYNET_RELAY_FLEET_WATERMARK_PAT
 /// path, but production deployments must set it via the systemd
 /// unit file).
 pub(crate) const GOSSIP_WATERMARK_PATH_ENV: &str = "RUSTYNET_GOSSIP_WATERMARK";
+/// I1b — env var matching the `--gossip-signing-secret` CLI flag: path to
+/// the encrypted-at-rest gossip signing secret. The daemon decrypts it with
+/// the passphrase file below and immediately one-way-derives the GOSSIP-ONLY
+/// signing sub-key (`derive_gossip_signing_key`); the raw secret is zeroized
+/// and never retained. Both this and
+/// `RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE` must be set together; setting
+/// one without the other is a hard startup config error. Unset ⇒ the gossip
+/// data plane stays dormant (pre-I1 default).
+pub(crate) const GOSSIP_SIGNING_SECRET_PATH_ENV: &str = "RUSTYNET_GOSSIP_SIGNING_SECRET";
+/// I1b — env var matching the `--gossip-signing-secret-passphrase` CLI flag:
+/// path to the passphrase file for the encrypted gossip signing secret.
+pub(crate) const GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV: &str =
+    "RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE";
 /// D2.7 — env var matching the `--enrollment-secret` CLI flag. The
 /// daemon loads a 32-byte HMAC secret from this path at bootstrap
 /// (with strict-permissions verification). Both this and
@@ -1620,6 +1633,16 @@ pub struct DaemonConfig {
     /// production daemons set this via `--gossip-watermark` or
     /// `RUSTYNET_GOSSIP_WATERMARK`.
     pub gossip_watermark_path: Option<PathBuf>,
+    /// I1b: path to the encrypted-at-rest gossip signing secret. When set
+    /// (together with the passphrase path below), the daemon derives the
+    /// GOSSIP-ONLY signing sub-key at construction and activates the D2.5
+    /// gossip data plane once verified membership is committed. `None`
+    /// keeps gossip dormant (the pre-I1 default). The raw secret is
+    /// decrypted, derived, and zeroized at startup — never retained.
+    pub gossip_signing_secret_path: Option<PathBuf>,
+    /// I1b: passphrase file for the encrypted gossip signing secret.
+    /// Required exactly when `gossip_signing_secret_path` is set.
+    pub gossip_signing_secret_passphrase_path: Option<PathBuf>,
     /// D2.7: file holding the 32-byte HMAC enrollment secret. The
     /// daemon mints + verifies tokens against this key. `None`
     /// disables enrollment-token IPC verbs (a daemon launched
@@ -1725,6 +1748,12 @@ impl Default for DaemonConfig {
                 .and_then(|v| parse_bool(v.as_str()))
                 .unwrap_or(false),
             gossip_watermark_path: std::env::var_os(GOSSIP_WATERMARK_PATH_ENV).map(PathBuf::from),
+            gossip_signing_secret_path: std::env::var_os(GOSSIP_SIGNING_SECRET_PATH_ENV)
+                .map(PathBuf::from),
+            gossip_signing_secret_passphrase_path: std::env::var_os(
+                GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV,
+            )
+            .map(PathBuf::from),
             enrollment_secret_path: std::env::var_os(ENROLLMENT_SECRET_PATH_ENV).map(PathBuf::from),
             enrollment_ledger_path: std::env::var_os(ENROLLMENT_LEDGER_PATH_ENV).map(PathBuf::from),
             auto_tunnel_enforce: true,
@@ -3732,6 +3761,13 @@ struct DaemonRuntime {
     // unaffected.
     gossip_node: Option<crate::gossip_runtime::GossipNode>,
     gossip_transport: Option<crate::gossip_transport::GossipTransport>,
+    /// I1b: address the gossip transport binds when it attaches at the
+    /// first verified-membership commit. Production value is
+    /// `0.0.0.0:RUSTYNET_GOSSIP_PORT` (the D2.5 fixed gossip port, one
+    /// above the WG listen port); tests override it to `127.0.0.1:0` so
+    /// parallel test runs never contend for the fixed port. Not an
+    /// operator surface — deliberately absent from `DaemonConfig`.
+    gossip_bind_addr: SocketAddr,
     /// D2.7 — paths into which the enrollment-token IPC handler
     /// reads the HMAC secret and writes the consumed-token ledger.
     /// `None` disables the `enrollment consume` verb entirely.
@@ -3877,6 +3913,54 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
             Ok(Some(relay_client))
         }
     }
+}
+
+/// I1b — construct the gossip runtime half that owns the signing identity.
+///
+/// Key custody mirrors the relay-session signing secret path exactly: the
+/// gossip signing secret lives encrypted-at-rest and is decrypted with a
+/// passphrase file (`decrypt_private_key` enforces strict permissions and
+/// the platform key-custody backend), then immediately one-way-derived into
+/// the GOSSIP-ONLY sub-key via `derive_gossip_signing_key`, which zeroizes
+/// the input. After this returns, the daemon holds only the sub-key — the
+/// raw secret is never retained, so a later daemon compromise cannot
+/// recover the node's identity secret from the gossip path.
+///
+/// Fail-closed: a configured-but-unloadable secret, a one-sided
+/// secret/passphrase pair, or a corrupt gossip watermark spool is a hard
+/// startup error — the daemon refuses to run rather than silently running
+/// without gossip and masking the fault. `Ok(None)` only when the operator
+/// configured no gossip signing secret at all (the pre-I1 dormant default).
+fn build_gossip_node(
+    config: &DaemonConfig,
+) -> Result<Option<crate::gossip_runtime::GossipNode>, DaemonError> {
+    let (secret_path, passphrase_path) = match (
+        config.gossip_signing_secret_path.as_ref(),
+        config.gossip_signing_secret_passphrase_path.as_ref(),
+    ) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(DaemonError::InvalidConfig(format!(
+                "{GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV} is required when {GOSSIP_SIGNING_SECRET_PATH_ENV} is set"
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(DaemonError::InvalidConfig(format!(
+                "{GOSSIP_SIGNING_SECRET_PATH_ENV} is required when {GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV} is set"
+            )));
+        }
+        (Some(secret_path), Some(passphrase_path)) => (secret_path, passphrase_path),
+    };
+    let signing_secret = decrypt_private_key(secret_path, passphrase_path)
+        .map_err(|err| DaemonError::Io(format!("gossip signing secret load failed: {err}")))?;
+    // One-way derivation; `derive_gossip_signing_key` zeroizes the secret.
+    let signing_key = derive_gossip_signing_key(signing_secret);
+    let node = crate::gossip_runtime::GossipNode::new(
+        signing_key,
+        config.gossip_watermark_path.clone(),
+    )
+    .map_err(|err| DaemonError::State(format!("gossip watermark preflight failed: {err}")))?;
+    Ok(Some(node))
 }
 
 fn load_optional_relay_fleet(
@@ -4115,13 +4199,21 @@ impl DaemonRuntime {
             exit_port_forward_last_error: None,
             #[cfg(target_os = "linux")]
             exit_port_forward_lease: None,
-            // D2.5: the runtime fields are wired in by
-            // `attach_gossip_runtime`; we leave them None at
-            // construction so daemon paths that haven't been
-            // migrated yet are unaffected and keep their existing
-            // fail-closed defaults.
-            gossip_node: None,
+            // D2.5 / I1b: the node half is constructed at startup when a
+            // gossip signing secret is configured (fail-closed on any load
+            // or watermark error — see `build_gossip_node`); it stays
+            // `None` when the daemon is launched without one, keeping the
+            // pre-I1 dormant default. The transport half attaches later,
+            // at the first signed-state commit seam with verified
+            // membership present (`sync_gossip_data_plane`), so the mint
+            // gate `gossip_mint_attached()` stays false until BOTH the
+            // gossip identity and verified membership exist.
+            gossip_node: build_gossip_node(config)?,
             gossip_transport: None,
+            gossip_bind_addr: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                crate::gossip_transport::RUSTYNET_GOSSIP_PORT,
+            ),
             enrollment_secret_path: config.enrollment_secret_path.clone(),
             enrollment_ledger_path: config.enrollment_ledger_path.clone(),
             rotation_ledger: load_rotation_ledger(config.wg_private_key_path.as_deref())
@@ -4838,6 +4930,7 @@ impl DaemonRuntime {
         self.membership_directory = membership_directory;
         self.refresh_dns_zone_state(auto_bundle.as_ref());
         self.materialize_service_access_state(auto_bundle.as_ref());
+        self.sync_gossip_data_plane();
         self.refresh_traversal_hint_state(force_reprobe);
 
         if self.traversal_authority_mode().is_enforced()
@@ -5234,6 +5327,47 @@ impl DaemonRuntime {
     ) {
         self.gossip_node = Some(node);
         self.gossip_transport = Some(transport);
+    }
+
+    /// I1b — post-commit hook for the D2.5 gossip data plane. Invoked at
+    /// the same four signed-state commit seams as
+    /// `materialize_service_access_state` (`bootstrap`,
+    /// `refresh_signed_state_with_reason`, `reconcile`,
+    /// `handle_membership_apply`), always AFTER `self.membership_state`
+    /// has been refreshed from a verified snapshot.
+    ///
+    /// Attach guard: the transport is bound only when BOTH halves of the
+    /// gossip prerequisite exist — the gossip signing sub-key was loaded at
+    /// construction (`build_gossip_node`) AND a verified membership
+    /// snapshot has been committed. Until then `gossip_mint_attached()`
+    /// stays false, so the main loop neither builds candidate sets nor
+    /// mints, and `drain_gossip_inbound` stays inert. A bind failure is
+    /// logged and retried at the next commit seam — a transient
+    /// EADDRINUSE from a daemon-restart race must not permanently disable
+    /// gossip, and the retry path is loud, never silent. On non-unix
+    /// platforms this is unreachable: `validate_daemon_config` rejects a
+    /// configured gossip signing secret because the transport is
+    /// unix-only, so `gossip_node` is always `None` there.
+    fn sync_gossip_data_plane(&mut self) {
+        if self.gossip_node.is_none() {
+            return;
+        }
+        if self.membership_state.is_none() {
+            return;
+        }
+        if self.gossip_transport.is_none() {
+            match crate::gossip_transport::GossipTransport::bind(self.gossip_bind_addr) {
+                Ok(transport) => {
+                    log::info!("gossip transport bound; gossip data plane active");
+                    self.gossip_transport = Some(transport);
+                }
+                Err(err) => {
+                    log::error!(
+                        "gossip transport bind failed; retrying on next signed-state commit: {err}"
+                    );
+                }
+            }
+        }
     }
 
     /// Periodic hook: drain any pending gossip datagrams from the
@@ -7304,6 +7438,7 @@ impl DaemonRuntime {
         self.membership_directory = membership_directory;
         self.refresh_dns_zone_state(auto_bundle.as_ref());
         self.materialize_service_access_state(auto_bundle.as_ref());
+        self.sync_gossip_data_plane();
 
         if self.auto_tunnel_enforce {
             if self.node_role.is_blind_exit() {
@@ -8256,6 +8391,7 @@ impl DaemonRuntime {
         // (`peers.v1`) keeps the last verified contents (see
         // `materialize_service_access_state`).
         self.materialize_service_access_state(None);
+        self.sync_gossip_data_plane();
         if !revocation_failures.is_empty() {
             return Err(format!(
                 "membership update applied (epoch_new={new_epoch}) but revocation teardown failed for: {}",
@@ -8817,6 +8953,7 @@ impl DaemonRuntime {
                     self.membership_directory = membership_directory;
                     self.refresh_dns_zone_state(auto_bundle.as_ref());
                     self.materialize_service_access_state(auto_bundle.as_ref());
+                    self.sync_gossip_data_plane();
                     if self.auto_tunnel_enforce {
                         if self.node_role.is_blind_exit() {
                             self.selected_exit_node = None;
@@ -10916,6 +11053,52 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         return Err(DaemonError::InvalidConfig(format!(
             "local relay session token issuer is disabled; set {RELAY_SESSION_LOCAL_TOKEN_ISSUER_ENV}=true only for reviewed lab/control-plane-collocated deployments"
         )));
+    }
+    // I1b — gossip signing secret custody validation. Mirrors the
+    // relay-session signing secret rules: encrypted-at-rest secret and
+    // passphrase file must be configured together, both as absolute paths.
+    if let Some(path) = config.gossip_signing_secret_path.as_ref() {
+        if path.as_os_str().is_empty() {
+            return Err(DaemonError::InvalidConfig(
+                "gossip signing secret path must not be empty".to_owned(),
+            ));
+        }
+        validate_runtime_file_path(path, "gossip signing secret")?;
+    }
+    if let Some(path) = config.gossip_signing_secret_passphrase_path.as_ref() {
+        if path.as_os_str().is_empty() {
+            return Err(DaemonError::InvalidConfig(
+                "gossip signing secret passphrase path must not be empty".to_owned(),
+            ));
+        }
+        validate_runtime_file_path(path, "gossip signing secret passphrase")?;
+    }
+    if config.gossip_signing_secret_path.is_some()
+        && config.gossip_signing_secret_passphrase_path.is_none()
+    {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV} is required when {GOSSIP_SIGNING_SECRET_PATH_ENV} is set"
+        )));
+    }
+    if config.gossip_signing_secret_passphrase_path.is_some()
+        && config.gossip_signing_secret_path.is_none()
+    {
+        return Err(DaemonError::InvalidConfig(format!(
+            "{GOSSIP_SIGNING_SECRET_PATH_ENV} is required when {GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV} is set"
+        )));
+    }
+    // The gossip transport is unix-only (the non-unix `GossipTransport`
+    // stub refuses to construct). A configured gossip signing secret on a
+    // non-unix daemon can never be honored, so reject it loudly at startup
+    // instead of silently running with gossip off and masking the fault.
+    #[cfg(not(unix))]
+    if config.gossip_signing_secret_path.is_some()
+        || config.gossip_signing_secret_passphrase_path.is_some()
+    {
+        return Err(DaemonError::InvalidConfig(
+            "gossip signing secret is not supported on this platform: the gossip transport is unix-only"
+                .to_owned(),
+        ));
     }
     if config.relay_session_refresh_margin_secs.get() >= config.relay_session_token_ttl_secs.get() {
         return Err(DaemonError::InvalidConfig(
@@ -15346,6 +15529,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    #[cfg(not(target_os = "macos"))]
+    use super::derive_gossip_signing_key;
     use crate::daemon::RestrictionMode;
     use crate::ipc::{
         CommandEnvelope, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, IpcCommand, IpcResponse,
@@ -15382,7 +15567,7 @@ mod tests {
         MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole, StateFetcher,
         TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS, TraversalCandidate, TraversalCandidateType,
         TrustEvidenceRecord, TrustPolicy, TrustWatermark, anchor_bundle_pull_token_thumbprint,
-        bind_anchor_bundle_pull_listener, build_dns_response,
+        bind_anchor_bundle_pull_listener, build_dns_response, build_gossip_node,
         collect_traversal_host_candidate_snapshot_with_retry,
         enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
         load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_dns_zone_bundle,
@@ -19391,6 +19576,172 @@ mod tests {
         assert!(err.to_string().contains("relay session token ttl"));
     }
 
+    /// I1b: the gossip signing secret and its passphrase are a custody
+    /// pair — configuring one without the other must be a hard startup
+    /// error in BOTH directions, never a silent fallback.
+    #[test]
+    fn validate_daemon_config_rejects_one_sided_gossip_signing_secret_pair() {
+        let secret_only = DaemonConfig {
+            gossip_signing_secret_path: Some(std::path::PathBuf::from("/tmp/gossip.secret")),
+            gossip_signing_secret_passphrase_path: None,
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&secret_only)
+            .expect_err("gossip secret without passphrase must be rejected");
+        assert!(
+            err.to_string()
+                .contains("RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE is required")
+        );
+
+        let passphrase_only = DaemonConfig {
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: Some(std::path::PathBuf::from(
+                "/tmp/gossip.passphrase",
+            )),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&passphrase_only)
+            .expect_err("gossip passphrase without secret must be rejected");
+        assert!(
+            err.to_string()
+                .contains("RUSTYNET_GOSSIP_SIGNING_SECRET is required")
+        );
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_relative_gossip_signing_secret_paths() {
+        let config = DaemonConfig {
+            gossip_signing_secret_path: Some(std::path::PathBuf::from("relative.gossip.secret")),
+            gossip_signing_secret_passphrase_path: Some(std::path::PathBuf::from(
+                "/tmp/gossip.passphrase",
+            )),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("relative gossip signing secret path must be rejected");
+        assert!(
+            err.to_string()
+                .contains("gossip signing secret path must be absolute")
+        );
+    }
+
+    /// I1b: a complete gossip custody pair is valid daemon config on unix.
+    /// On non-unix the same pair must be rejected loudly — the gossip
+    /// transport cannot bind there, and silently running with gossip off
+    /// would mask the fault.
+    #[test]
+    fn validate_daemon_config_gossip_signing_secret_pair_platform_gate() {
+        let config = DaemonConfig {
+            gossip_signing_secret_path: Some(std::path::PathBuf::from("/tmp/gossip.secret")),
+            gossip_signing_secret_passphrase_path: Some(std::path::PathBuf::from(
+                "/tmp/gossip.passphrase",
+            )),
+            ..DaemonConfig::default()
+        };
+        #[cfg(unix)]
+        validate_daemon_config(&config)
+            .expect("complete gossip signing secret pair should validate on unix");
+        #[cfg(not(unix))]
+        {
+            let err = validate_daemon_config(&config)
+                .expect_err("gossip signing secret must be rejected on non-unix platforms");
+            assert!(err.to_string().contains("unix-only"));
+        }
+    }
+
+    /// I1b: no gossip signing secret configured ⇒ the gossip data plane
+    /// stays dormant (`None`), preserving the pre-I1 default for every
+    /// existing deployment.
+    #[test]
+    fn build_gossip_node_returns_none_when_unconfigured() {
+        let config = DaemonConfig::default();
+        let node = build_gossip_node(&config).expect("unconfigured gossip must not error");
+        assert!(
+            node.is_none(),
+            "gossip node must stay dormant without a configured signing secret"
+        );
+    }
+
+    /// I1b: one-sided custody pair fails closed in `build_gossip_node` as
+    /// well (defense in depth alongside `validate_daemon_config` — the
+    /// builder must not depend on the validator having run).
+    #[test]
+    fn build_gossip_node_rejects_one_sided_pair() {
+        let config = DaemonConfig {
+            gossip_signing_secret_path: Some(std::path::PathBuf::from("/tmp/gossip.secret")),
+            gossip_signing_secret_passphrase_path: None,
+            ..DaemonConfig::default()
+        };
+        assert!(
+            build_gossip_node(&config).is_err(),
+            "one-sided gossip custody pair must fail closed"
+        );
+    }
+
+    /// I1b: the daemon derives its gossip identity by decrypting the
+    /// encrypted-at-rest secret and passing it through
+    /// `derive_gossip_signing_key` — the node's gossip id must equal the
+    /// verifying key of that derivation (signer side of the I1c
+    /// signer/verifier consistency contract) and must NOT equal the raw
+    /// secret used as an Ed25519 seed (the daemon never signs with the
+    /// raw secret). Gated off macOS like the sibling encrypted-custody
+    /// tests: the macOS key-custody backend is the real Keychain.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn build_gossip_node_derives_gossip_only_subkey_from_encrypted_secret() {
+        let test_dir = secure_test_dir("rustynetd-build-gossip-node-derives-subkey");
+        let secret_path = test_dir.join("gossip.secret.enc");
+        let passphrase_path = test_dir.join("gossip.passphrase");
+        // 32-byte plaintext secret; decrypt_private_key appends a trailing
+        // newline when absent, so pin the newline here to make the exact
+        // derivation input explicit.
+        let plaintext_secret = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+
+        std::fs::write(&passphrase_path, b"gossip-test-passphrase\n")
+            .expect("passphrase should be writable");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&passphrase_path, std::fs::Permissions::from_mode(0o600))
+                .expect("passphrase permissions should be restrictive");
+        }
+        encrypt_private_key(
+            plaintext_secret,
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect("encrypted gossip secret should be created");
+
+        let config = DaemonConfig {
+            gossip_signing_secret_path: Some(secret_path),
+            gossip_signing_secret_passphrase_path: Some(passphrase_path),
+            gossip_watermark_path: Some(test_dir.join("gossip.watermark")),
+            ..DaemonConfig::default()
+        };
+        let node = build_gossip_node(&config)
+            .expect("configured gossip custody pair should build")
+            .expect("gossip node should be present");
+
+        let expected = derive_gossip_signing_key(plaintext_secret.to_vec());
+        assert_eq!(
+            node.local_node_id,
+            expected.verifying_key().to_bytes(),
+            "gossip node id must come from derive_gossip_signing_key over the decrypted secret"
+        );
+
+        let raw_identity = SigningKey::from_bytes(&{
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&plaintext_secret[..32]);
+            seed
+        });
+        assert_ne!(
+            node.local_node_id,
+            raw_identity.verifying_key().to_bytes(),
+            "gossip node id must not be the raw secret used directly as a signing key"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     #[test]
     fn validate_daemon_config_rejects_remote_fetch_urls() {
         let config = DaemonConfig {
@@ -21472,6 +21823,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -23242,6 +23595,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -23445,6 +23800,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -23613,6 +23970,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -23769,6 +24128,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -23920,6 +24281,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -24072,6 +24435,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -24234,6 +24599,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -24341,6 +24708,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -24495,6 +24864,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -24670,6 +25041,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -24782,6 +25155,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -24989,6 +25364,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    /// I1b: the production attach path. The transport half binds at a
+    /// signed-state commit seam only when BOTH the gossip signing identity
+    /// (loaded at construction) and a verified membership snapshot are
+    /// present; until then the mint gate stays off. The attach must be
+    /// idempotent — a later seam must not rebind or replace the socket.
+    #[cfg(unix)]
+    #[test]
+    fn sync_gossip_data_plane_attaches_transport_only_with_key_and_membership() {
+        let relay_addr: SocketAddr = "203.0.113.63:40063".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-gossip-sync-attach-gate",
+            relay_addr,
+            "relay-eu-1",
+        );
+        // Loopback + OS-assigned port so parallel test runs never contend
+        // for the fixed production gossip port.
+        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+
+        // Neither key nor membership: inert.
+        runtime.sync_gossip_data_plane();
+        assert!(
+            runtime.gossip_transport.is_none(),
+            "no gossip identity configured: transport must stay unattached"
+        );
+
+        // Key present, membership absent: still unattached, mint gate off.
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        runtime.sync_gossip_data_plane();
+        assert!(
+            runtime.gossip_transport.is_none(),
+            "gossip identity without verified membership must not attach the transport"
+        );
+        assert!(
+            !runtime.gossip_mint_attached(),
+            "mint gate must stay off until verified membership is committed"
+        );
+
+        // Verified membership committed: transport attaches, mint gate on.
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+        runtime.sync_gossip_data_plane();
+        assert!(
+            runtime.gossip_transport.is_some(),
+            "gossip identity + verified membership must attach the transport"
+        );
+        assert!(
+            runtime.gossip_mint_attached(),
+            "mint gate must open once both halves are attached"
+        );
+
+        // Idempotent: a second seam must keep the same bound socket.
+        let addr_before = runtime
+            .gossip_transport
+            .as_ref()
+            .expect("transport attached")
+            .local_addr()
+            .expect("local addr");
+        runtime.sync_gossip_data_plane();
+        let addr_after = runtime
+            .gossip_transport
+            .as_ref()
+            .expect("transport still attached")
+            .local_addr()
+            .expect("local addr");
+        assert_eq!(
+            addr_before, addr_after,
+            "sync must not rebind an already-attached gossip transport"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     #[test]
     fn daemon_runtime_endpoint_change_refresh_debounces_rapid_consecutive_changes() {
         let test_dir = secure_test_dir("rustynetd-runtime-endpoint-change-debounce");
@@ -25037,6 +25489,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -25175,6 +25629,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -25305,6 +25761,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -25393,6 +25851,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -25542,6 +26002,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -25628,6 +26090,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -25747,6 +26211,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -26102,6 +26568,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             traversal_bundle_path: traversal_bundle_path.clone(),
@@ -26156,6 +26624,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             traversal_bundle_path: traversal_bundle_path.clone(),
@@ -26241,6 +26711,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -26325,6 +26797,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -26428,6 +26902,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             traversal_bundle_path: traversal_path.clone(),
@@ -26494,6 +26970,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
@@ -27835,6 +28313,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
@@ -27896,6 +28376,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
@@ -27949,6 +28431,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
@@ -28044,6 +28528,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -28208,6 +28694,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             backend_mode: DaemonBackendMode::InMemory,
@@ -28255,6 +28743,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
@@ -28313,6 +28803,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             backend_mode: DaemonBackendMode::InMemory,
@@ -28383,6 +28875,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -28474,6 +28968,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -28568,6 +29064,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -28673,6 +29171,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -28750,6 +29250,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
@@ -29067,6 +29569,8 @@ mod tests {
             membership_log_path: log_path,
             membership_watermark_path: watermark_path,
             gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
             enrollment_secret_path: None,
             enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
