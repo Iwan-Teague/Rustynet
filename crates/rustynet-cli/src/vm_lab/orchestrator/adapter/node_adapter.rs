@@ -10,6 +10,7 @@ use crate::vm_lab::orchestrator::error::{
     NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
 };
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
 /// Extract the daemon's own failure reason from a tail of its `rustynetd.log`,
@@ -152,6 +153,23 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
 
     fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError>;
     fn collect_node_id(&self) -> Result<NodeId, AdapterError>;
+
+    /// Gather node-identity evidence for the §4.7 challenge, tagged with its
+    /// [`IdentityEvidence::provenance`] so [`adjudicate_identity`] can require a
+    /// LIVE daemon self-report. Distinct from [`collect_node_id`], which prefers
+    /// a static config artifact for bootstrap-tolerance and so cannot, on
+    /// macOS/Windows, prove the running daemon's identity.
+    ///
+    /// The default fails closed (unsupported) — desktop adapters override it,
+    /// and non-desktop platforms are rejected before the challenge runs.
+    ///
+    /// [`adjudicate_identity`]: crate::vm_lab::orchestrator::role_validation::identity_challenge::adjudicate_identity
+    fn collect_live_identity(&self) -> Result<IdentityEvidence, AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message: "live node-identity challenge is not implemented for this platform".to_owned(),
+        })
+    }
 
     // ── Bundle distribution ───────────────────────────────────────
 

@@ -161,6 +161,15 @@ impl NodeAdapter for MacosNodeAdapter {
         Ok(NodeId(id))
     }
 
+    fn collect_live_identity(
+        &self,
+    ) -> Result<
+        crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence,
+        AdapterError,
+    > {
+        macos_traffic::query_live_identity(&self.conn)
+    }
+
     // ── Bundle distribution ───────────────────────────────────────────────────
 
     fn distribute_signed_bundle(
