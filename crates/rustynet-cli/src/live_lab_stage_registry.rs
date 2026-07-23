@@ -2738,6 +2738,102 @@ mod tests {
         }
     }
 
+    /// A1 §9 totality (runtime pin of the compile-time guarantee): the tier
+    /// token is a required part of the `define_stage_catalog!` row grammar,
+    /// so an unmapped `StageId` cannot compile. This test pins the runtime
+    /// face of that: every catalog member yields a tier from the closed
+    /// [`Tier`] vocabulary, and the map covers the whole catalog.
+    #[test]
+    fn every_stage_id_has_a_reachable_tier() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let mut mapped = 0usize;
+        for stage in StageId::ALL {
+            let tier = stage.tier();
+            assert!(
+                Tier::ALL.contains(&tier),
+                "StageId::{stage:?} maps outside the Tier vocabulary: {tier:?}"
+            );
+            mapped += 1;
+        }
+        assert_eq!(
+            mapped,
+            StageId::ALL.len(),
+            "tier map must span StageId::ALL"
+        );
+    }
+
+    /// A1 anti-drift gate for the class the spec §3 records: the earlier
+    /// PROSE tier map omitted cross_os_membership_convergence /
+    /// peer_visibility / direct_path / lan_toggle. Both sides here derive
+    /// from the catalog (no hand-list): every stage whose wire name is in
+    /// the `cross_os_*` family must be tiered T3CrossOs. No `cross_os_*`
+    /// wire name exists in the `--node` dialect TODAY (those are the
+    /// bash/wrapper aggregate cells) — the prefix gate arms the moment one
+    /// lands — so the second assertion keeps T3 alive meanwhile:
+    /// live_mixed_topology_validation (which hard-requires
+    /// Linux+macOS+Windows) carries the cross-OS bar, and re-tiering it away
+    /// without a replacement would silently empty the tier.
+    #[test]
+    fn cross_os_family_stages_are_tiered_t3_cross_os() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        for stage in StageId::ALL {
+            if stage.as_str().starts_with("cross_os_") {
+                assert_eq!(
+                    stage.tier(),
+                    Tier::T3CrossOs,
+                    "cross_os stage {} must be T3CrossOs (spec §3 drift class)",
+                    stage.as_str()
+                );
+            }
+        }
+        assert!(
+            StageId::ALL.iter().any(|s| s.tier() == Tier::T3CrossOs),
+            "the T3CrossOs tier must not be empty: the cross-OS acceptance \
+             bar would silently vanish from the map"
+        );
+    }
+
+    /// A1 characterization: pin the per-tier population so an accidental
+    /// re-tiering (a one-character diff in the catalog) is caught and must
+    /// be consciously re-pinned. T5 is intentionally zero until the
+    /// negative-control increment lands its stages.
+    #[test]
+    fn tier_population_matches_the_reviewed_classification() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for stage in StageId::ALL {
+            *counts.entry(stage.tier().as_str()).or_default() += 1;
+        }
+        let expected: BTreeMap<&'static str, usize> = [
+            ("t0_core", 19),
+            ("t1_role", 18),
+            ("t2_resilience", 13),
+            ("t3_cross_os", 1),
+            ("t4_security", 16),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            counts, expected,
+            "per-tier population changed — re-tiering must be a conscious, \
+             reviewed change (update this pin alongside the catalog row)"
+        );
+        assert_eq!(
+            counts.values().sum::<usize>(),
+            StageId::ALL.len(),
+            "tier population must account for every stage exactly once"
+        );
+        assert_eq!(
+            StageId::ALL
+                .iter()
+                .filter(|s| s.tier() == Tier::T5NegativeControl)
+                .count(),
+            0,
+            "T5 negative-control stages land in a later increment; if one \
+             just landed, move it into the expected map above"
+        );
+    }
+
     #[test]
     fn budget_fallback_matches_monitor_heuristics_for_unknown_names() {
         assert_eq!(default_budget_secs("validate_macos_future_check"), 180);
