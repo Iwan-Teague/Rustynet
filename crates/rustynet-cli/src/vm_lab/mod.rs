@@ -4993,6 +4993,13 @@ fi
 # orchestrator, which refuses to start into a NON-EMPTY one — so the launcher must
 # not seed it (an earlier version put the log inside it and the run refused itself).
 mkdir -p 'state/host-lab-runs' || { echo "LAUNCH-ERROR: cannot create state/host-lab-runs" >&2; exit 1; }
+
+# The pgrep gate above proved no run is in flight, so every pidfile still sitting
+# here is a leftover from an earlier launch that completed naturally (a stop is the
+# only thing that retires them, and this run had none). Retire them now so they do
+# not accumulate across a session and a later stop never has a dead pid to consider.
+rm -f state/host-lab-runs/*.pid 2>/dev/null || true
+
 RUNNER='state/host-lab-runs/__LAUNCH_ID__.run.sh'
 PIDFILE='state/host-lab-runs/__LAUNCH_ID__.pid'
 LOG='state/host-lab-runs/__LAUNCH_ID__.log'
@@ -5599,16 +5606,44 @@ pub fn execute_ops_vm_lab_fetch_host_artifact(
 /// recorded pid IS the session-leader/pgid (the runner wrote it before `exec`), so
 /// `kill -- -<pid>` reaches the group. `pgrep` is a fallback for a run whose handle
 /// file was lost. TERM first, then KILL after a grace period.
+///
+/// Pid-recycling guard: pidfiles are retired at the next launch, not on natural
+/// completion (the runner `exec`s cargo, leaving no shell to clean up), so a stale
+/// pidfile can linger between a run finishing and the next launch — and the OS may
+/// recycle its dead pid to an unrelated live process. So a recorded pid is signaled
+/// ONLY if its argv still contains `vm-lab-orchestrate-live-lab`; a dead or recycled
+/// pid is skipped, never killed. `pgrep -f` matches on argv and only returns live
+/// procs, so those pids are self-verified.
 const HOST_STOP_SCRIPT: &str = r#"#!/bin/bash
 set -uo pipefail
 cd '__REPO_DIR__' 2>/dev/null || true
 
 # Recorded handles first (reload-proof), then anything pgrep still sees.
+#
+# CRITICAL — pid recycling: a recorded pidfile can be stale (its run completed or
+# was killed without a stop, so the pid is dead) and the OS may have recycled that
+# pid to an UNRELATED live process. Signaling it would kill an innocent process. So
+# a recorded pid is signaled ONLY if it is still the orchestrator, verified by its
+# argv. `pgrep -f` already returns only live procs whose argv matches, so those are
+# self-verified and taken as-is.
 pids=""
+skipped=""
 for f in state/host-lab-runs/*.pid; do
   [ -f "$f" ] || continue
   p="$(cat "$f" 2>/dev/null || true)"
-  [ -n "$p" ] && pids="$pids $p"
+  [ -n "$p" ] || continue
+  # The recorded pid IS the runner's pid, which exec'd cargo, so a live one's argv
+  # still contains 'vm-lab-orchestrate-live-lab'. A dead or recycled pid does not.
+  # `-ww` disables ps's COLUMNS width truncation (procps-ng truncates to COLUMNS
+  # even down a pipe): the marker sits ~60 cols into the argv, so a leaked COLUMNS
+  # would otherwise sever it and divert a LIVE run's pid to `skipped`. `pgrep -f`
+  # below reads the untruncated /proc cmdline and is the authoritative matcher;
+  # this pidfile check is the reload-proof advisory that also feeds `skipped`.
+  if ps -ww -o args= -p "$p" 2>/dev/null | grep -q 'vm-lab-orchestrate-live-lab'; then
+    pids="$pids $p"
+  else
+    skipped="$skipped $p"
+  fi
 done
 pgrep_pids="$(pgrep -f 'vm-lab-orchestrate-live-lab' 2>/dev/null || true)"
 pids="$pids $pgrep_pids"
@@ -5616,9 +5651,14 @@ pids="$pids $pgrep_pids"
 # de-dup + drop blanks
 pids="$(printf '%s\n' $pids | sort -u | tr '\n' ' ')"
 pids="$(echo $pids)"
+skipped="$(echo $skipped)"
+
+[ -n "$skipped" ] && echo "STOP-RESULT: ignoring stale/recycled recorded pid(s): $skipped"
 
 if [ -z "$pids" ]; then
-  echo "STOP-RESULT: no run in flight (no recorded pid, nothing matched pgrep)"
+  # Nothing live to signal; clear any stale handle files so status stays honest.
+  rm -f state/host-lab-runs/*.pid 2>/dev/null || true
+  echo "STOP-RESULT: no run in flight (no live recorded pid, nothing matched pgrep)"
   exit 0
 fi
 
@@ -55305,6 +55345,30 @@ mod launch_on_host_tests {
     }
 
     #[test]
+    fn stale_pidfiles_are_retired_at_launch_so_they_do_not_accumulate() {
+        // The pgrep gate proved no run is in flight, so any leftover pidfile is
+        // stale (a run retires its handle only via a stop). Pruning here keeps
+        // pidfiles from accumulating across a session and stops a later stop from
+        // ever seeing a dead recorded pid. The prune must sit AFTER mkdir and
+        // BEFORE the new runner writes this launch's pidfile.
+        let script = render(&[]);
+        let prune = script
+            .find("rm -f state/host-lab-runs/*.pid")
+            .expect("launcher must prune stale pidfiles");
+        let mkdir = script
+            .find("mkdir -p 'state/host-lab-runs'")
+            .expect("launcher must create the run-handle dir");
+        let write_pid = script
+            .find("echo $$ >")
+            .expect("runner must record its own pid");
+        assert!(mkdir < prune, "prune must run after mkdir");
+        assert!(
+            prune < write_pid,
+            "prune must run before the new pidfile is written"
+        );
+    }
+
+    #[test]
     fn the_log_lives_outside_the_report_dir() {
         // The orchestrator refuses a non-empty report dir, so the launcher's log
         // must not be seeded inside it (that made a run refuse itself once).
@@ -55361,6 +55425,24 @@ mod stop_host_run_tests {
         assert!(script.contains("no run in flight"));
         // Handle files removed so a later status cannot report a dead pid as live.
         assert!(script.contains("rm -f state/host-lab-runs/*.pid"));
+    }
+
+    #[test]
+    fn stop_verifies_a_recorded_pid_is_still_the_orchestrator_before_signaling() {
+        // Pid-recycling guard: a recorded pid is signaled ONLY if its argv still
+        // matches the orchestrator, so a dead pid the OS recycled to an unrelated
+        // live process is never sent SIGTERM/SIGKILL.
+        let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", "/home/u/Rustynet");
+        assert!(
+            script.contains(
+                r#"ps -ww -o args= -p "$p" 2>/dev/null | grep -q 'vm-lab-orchestrate-live-lab'"#
+            ),
+            "each recorded pid must be argv-verified (COLUMNS-proof via -ww) before it is signaled"
+        );
+        // Verified pids are collected; unverified ones are diverted, not signaled.
+        assert!(script.contains(r#"pids="$pids $p""#));
+        assert!(script.contains(r#"skipped="$skipped $p""#));
+        assert!(script.contains("ignoring stale/recycled recorded pid(s)"));
     }
 }
 
