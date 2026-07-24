@@ -43,10 +43,23 @@ engine-trust failure; each is a product/tooling gap the engine correctly surface
   (traffic_test_matrix, live_managed_dns) is GREEN 5-of-5.
 - **Owner sign-off:** APPROVED 2026-07-24 (owner chose "disposition two_hop, flip
   now" over a ~4h full re-prove).
-- **Expiry / re-review:** land the one-line `run_cargo_ops` `--features vm-lab`
-  fix and re-run the two-hop topology to obtain a real `two_hop` verdict
-  (GREEN, or the client↔client dataplane red — a distinct, separately-tracked
-  item) as a **G2 follow-on**, before release. NOT a permanent exemption.
+- **UPDATE 2026-07-24 (tooling fixed → real root cause revealed).** The
+  `run_cargo_ops` `--features vm-lab` fix landed (`553f92d`, post-flip G2 item).
+  With it, the two-hop topology re-run got *past* the pre-check and exercised the
+  actual dataplane proof, which now fails for a **genuine, distinct reason** —
+  **NOT tooling:** `[two-hop] data-plane proof summary end_to_end_reachable=false
+  per_hop_ttl_decrement=none`. The second client has a live *direct* path to the
+  exit (`path_live_proven=true`, `path_live_direct_peers=1`), but end-to-end
+  reachability across the two-hop / client↔client path does not complete. This is
+  the known **client↔client WireGuard-transport gap** (userspace shared-socket
+  handshake; hard-gates the multi-hop path), a real **product** gap of the same
+  class as D3 `network_flap` — the engine adjudicates it correctly (loud, detailed
+  RED, no false-green), so G1 engine-trust is unaffected. So `two_hop` is now
+  **re-characterised from a tooling gap to a dataplane product gap**, tracked as a
+  distinct dataplane item for **G2/release** (the client↔client fullmesh fix).
+- **Expiry / re-review:** resolve the client↔client dataplane gap and prove
+  `two_hop` GREEN as a **G2/release** item. NOT a permanent exemption; NOT a flip
+  blocker (G1 = engine-trust, satisfied).
 
 ### D2 — T5 negative controls `negative_control_planted_residue` + `negative_control_daemon_kill_mid_stage`: live proof deferred
 - **Status:** built as opt-in T5 stages (A3a, `1b9e2c0`) with unit-tested pure
