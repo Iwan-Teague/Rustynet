@@ -53,7 +53,7 @@ tailnet-reachable box, so it inherits `SecurityMinimumBar.md` and AGENTS.md §4:
 |---|---|---|---|
 | **0** | Journal-read enablement: add `ubuntu-server` to `systemd-journal` + assert persistent journal. **No wrapper, no sudoers** (see §3 — the adversarial review collapsed it to this) | No — one group grant + a config assert | — |
 | **1** | Read-only MCP tools over the now-readable journal: `host_stability_report` (boot cadence/gap-analysis, prev-boot kernel tail, panic/watchdog state), `host_thermal_status` (hwmon, no root) | Yes (read-only, grounded) | Layer 0 |
-| **2** | Active MCP tools: `host_install_diagnostics` (lm-sensors/mcelog/pstore-ramoops/`kernel.panic=10`) + `host_crash_forensics` (pstore/dmidecode read — needs the reviewed root path deferred from L0) + `host_thermal_stress_probe` (reproduce under load) | Yes (state-changing) | Layer 0 |
+| **2** | **Install → C1/operator, NOT an agent MCP tool** (operational-review F1): `host_install_diagnostics` (lm-sensors/mcelog/pstore-ramoops/`kernel.panic=10`) is one-time privileged stand-up that folds into the first-boot bootstrap. What stays an agent MCP tool is **`host_crash_forensics` as a pure UNPRIVILEGED read** — C1 enables `systemd-pstore` (auto-archives `/sys/fs/pstore` → group-readable) + dumps `dmidecode` once to a group-readable file + `mcelog`→journal (covered by the Layer-0 group), so no Layer-2 tool needs root. `host_thermal_stress_probe` (reproduce under load) | Yes — read-only agent tool over C1-provisioned sinks | Layer 0 + C1 |
 | **3** | Physical/firmware checklist: PSU headroom, UPS, reseat, wired eno1, **BIOS hardware-event log** (UEFI UI — consumer AM5 board exposes no SMBIOS Type-15 SEL) | No — human hands + firmware UI | independent |
 
 Sequencing: **plan → adversarial fable review → implement, one layer at a
@@ -274,12 +274,13 @@ once). Secrets always to the mode-600 sidecar, never the tracked file.
 - **Per-host distinct credentials** (or distinct authorized principal) — one key
   across N boxes is a fleet skeleton key. Private keys live only on the driving
   workstation; prefer short-lived SSH certs.
-- **Privilege is time-bounded, not standing (my decision, §7.7).** onboard-host
-  installs a temporary sudoers for the privileged phase and **removes it at the
-  end**; ongoing operation uses only non-privileged surfaces (systemd-journal
-  group, `kvm`-group unprivileged virsh, sudoless pool). Do not leave broad
-  standing sudo reachable from the overlay. (The pre-existing libvirt
-  root-equivalence, §6, is a separate follow-up, not licence to add more.)
+- **Privilege = narrow standing polkit capabilities, no agent sudo (FINAL, §7.10).**
+  Superseded the earlier "time-bounded sudo" framing after two adversarial reviews
+  converged on polkit capability-narrowing. The agent identity gets **no sudo at
+  all** (C1 strips `sudo` from it and creates a distinct operator account); steady
+  state runs on a fixed set of per-action polkit grants baked in C1 (libvirt API
+  narrowed to sub-root + libvirtd/virtqemud-restart + reboot). Full rationale and
+  must-fixes in §7.10.
 - **Remote management path must be named and NOT the overlay-being-removed.**
   "LAN-first, tailnet-fallback" is not separable for a non-LAN box (the Rustynet
   overlay isn't up on a box you're onboarding — chicken-and-egg). v1 scope:
@@ -333,10 +334,11 @@ using a box, and a silent skip is equally wrong — recorded-skip is the middle.
 Layer 1 MCP tools stay host-agnostic (work on any onboarded box, zero new code).
 
 ## 7.7 Decisions I made (per "you decide") — two are reversible, flagged
-1. **Privilege = time-bounded + reverted** (not standing root-equiv). More secure,
-   still automatable, honest. *Reversible:* if you'd rather accept standing
-   root-equiv (you effectively have it via libvirt anyway) and just document it,
-   say so — simpler, less machinery.
+1. **Privilege = narrow standing polkit, no agent sudo** (FINALIZED post-review —
+   see §7.10; supersedes the earlier "time-bounded + reverted" call). Both
+   adversarial reviews converged: capability-narrowing beats time-bounding against
+   the real threat (a confused-deputy agent misusing its own valid credentials).
+   *No longer flagged reversible — the two-review convergence settled it.*
 2. **macOS = E-opt-0 full parity** (UPDATED post-spike — the AppleScript-headless
    spike passed, §7.5, so semi-manual is no longer the v1 fallback). Still **one
    Mac** until a `remote_utm` kind exists (`local_utm` = this-machine-only). The
@@ -353,8 +355,14 @@ Layer 1 MCP tools stay host-agnostic (work on any onboarded box, zero new code).
   ✓; "in inventory ≠ usable" → done-ness contract ✓; add `fleet-status`/
   `fleet-converge` ✓; cut `--revert-privileged` ✓.
 - **Security (unsafe→acceptable-with-changes):** kill `curl|sudo bash` ✓;
-  time-bound privilege ✓; per-host keys ✓; in-band pubkey ✓; secrets→sidecar
-  proven-by-test ✓; fail-open recreate window gated ✓; remote path named ✓.
+  privilege → polkit-narrowed sub-root, no agent sudo (§7.10, replaced time-bound)
+  ✓; per-host keys ✓; in-band pubkey ✓; secrets→sidecar proven-by-test ✓;
+  fail-open recreate window gated ✓; remote path named ✓.
+- **Privilege (2nd-round, two reviews — see §7.10):** security review refuted
+  "libvirt-root immovable" (polkit narrowing → genuinely sub-root) ✓; operational
+  review confirmed no shipped steady-state op needs host root, found 3 stand-up
+  gaps folded to C1 (Layer-2 sinks, GRUB pin, operator account) + 1 genuine narrow
+  standing grant (service-restart) ✓.
 - **Teardown (safe-with-changes):** three-outcome/`|| true` trap ✓; backing-file
   check, drop `--remove-all-storage` ✓; unreachable-guest policy ✓; inventory
   flock ✓; prune known_hosts, mesh RemoveNode first, evidence untouched ✓;
@@ -370,10 +378,96 @@ Layer 1 MCP tools stay host-agnostic (work on any onboarded box, zero new code).
    validation (real ARM cloud image + seed → cloud-init → SSH) during step 3.
 1. Image catalog (`lab_image_catalog.json`, name→url+sha256+os+arch) + arch gate.
 2. `onboard-host --new` (entry authoring + allocator + manifest + observability
-   fold-in) — Ubuntu path; time-bounded privilege.
+   fold-in) — Ubuntu path. C1 provisioning per §7.10: polkit rules (libvirt
+   narrowed + service-restart), strip agent `sudo` + operator account, GRUB
+   pin-by-id + `apt-mark hold`, Layer-2 sinks, privilege-shape readback assert.
 3. `add-guest` (per-stage verify + done-ness contract + sidecar-proven secrets).
 4. `remove-guest` + `offboard-host` (backing-file-safe teardown, `--yes`/dry-run).
 5. `fleet-status` + additive `fleet-converge`.
 6. Layer 1 MCP tools (`host_stability_report`, `host_thermal_status`) — host-agnostic.
 7. Portability scrub (resolvable connect_uri, tailnet literals, hardcoded paths).
 Each step: plan → adversarial review → implement, per the standing method.
+
+## 7.10 Privilege model — FINAL (decided after two adversarial reviews)
+
+**The question posed:** for the lab-driving agent identity, is *time-bounded*
+privilege (onboard installs a temp sudoers, does the privileged phase, reverts it)
+or *standing* privilege the better long-term model? Both a security-axis and an
+operational-axis adversarial review were run. **They converged, and the answer is
+neither of those two framings — it is narrow, standing, per-action polkit
+capabilities with no agent sudo at any point.**
+
+### The decision
+1. **The agent identity holds no sudo — ever.** Not standing, not time-bounded.
+   C1 (the first-boot, image-baked/console bootstrap — never the agent) does all
+   one-time privileged stand-up, and C1 **strips the `sudo` group from the agent
+   identity** and creates a **distinct operator account** (password + sudo, for the
+   rare human console maintenance). "No standing agent sudo" is false today —
+   `ubuntu-server` is in `sudo,libvirt,kvm` — so this strip is a required C1 step,
+   not a description of the status quo.
+2. **Steady-state agent privilege = a fixed set of narrow polkit rules baked in C1**
+   (auditable, per-action, not shell-reachable — unlike any sudoers entry):
+   - **libvirt API narrowed** via `org.libvirt.api.*`: allow
+     `domain.start/stop/getattr/read` + guest `undefine`; **deny**
+     `domain.define`-with-host-disk / `save` / `core-dump`. This is what makes the
+     agent **genuinely sub-root** — it removes the domain-define-arbitrary-disk path
+     that is the libvirt-group root-equivalence. (Requires C1 to flip
+     `auth_unix_rw` from `"none"` to `"polkit"` — verified: the box currently runs
+     `auth_unix_rw = "none"`, polkit 124 + granular `org.libvirt.api.domain.*`
+     actions are present.)
+   - **service-restart + reboot** via `org.freedesktop.systemd1.manage-units`
+     scoped to `libvirtd`/`virtqemud`, plus optionally `org.freedesktop.login1.reboot`
+     — the genuinely-needed standing grant for the hypervisor-wedge recovery class
+     (proven to happen: the 16-min UTM VM-reset hang has a libvirt equivalent).
+     Never resurrect `run_host_reboot`'s `sudo -n systemctl reboot`.
+3. **The one escalation — `add-guest` needs `domain.define`** — is isolated as a
+   single broker-mediated / vetted-template-only define, not a general capability.
+
+### Why this beats both original framings (the load-bearing argument)
+The **dominant threat for an AI-agent identity is not credential theft — it is the
+confused deputy**: prompt-injection reaches the agent through the very lab data it
+reads (guest logs, journal text, stage reports — all attacker-influenceable from
+inside a guest), or plain agent error, causing it to act destructively with its
+own **valid** credentials. Against that, per-host keys, SSH-cert TTLs, and a
+time-bounded sudo window are all irrelevant — the confused deputy never needs a
+stolen credential, and a full-root time-window is a full-root window whether or not
+it is short. **Only shrinking the capability surface bounds a confused deputy**, and
+that is exactly what the polkit narrowing does and what time-bounding does not.
+Time-bounding also adds a revert step that can *fail* — leaving standing sudo, the
+worst outcome — whereas a rule set once in C1 has nothing to revert.
+
+### Must-fixes folded in (from the two reviews)
+- **Layer-2 forensics must not need agent root** (operational F1): C1 provisions the
+  sinks (`systemd-pstore` archive + group-readable ACL, one-shot `dmidecode` dump,
+  `mcelog`→journal) so `host_crash_forensics` is a pure unprivileged read.
+  `host_install_diagnostics` is reclassified from an agent MCP tool to C1/operator
+  (§2 table updated) — the two were contradictory before.
+- **GRUB kernel-pin time bomb** (operational F4): C1 pins by menu-entry id (or
+  `GRUB_DEFAULT=saved` + `grub-set-default`) and `apt-mark hold`s kernels / disables
+  unattended kernel upgrades — the index-drift strand is a *dead host*, not a stall.
+- **Privilege-shape readback assertion** (security F7): `onboard-host` finalization
+  reads back `id <agent>` and `sudo -ln` and **fails closed** if groups ≠ the
+  intended set or any sudo is reachable — the sha256-pin authenticates C1's bytes,
+  not the correctness of the privilege they provision.
+- **Stop counting SSH certs as a current control** (security F4): none exist in-repo;
+  they are future work, not part of today's posture.
+- **Delete the `fetch-image` `sudo -n` fallback** (operational F5) once this lands —
+  on a C1-correct host the unprivileged pool write always succeeds; the fallback is
+  dead code that only rewards keeping passwordless sudo around.
+- **Name the residual concentrations** (security F1/F6): the driving workstation is
+  the concentrated trust root (holds all per-host keys / any future CA); the broker
+  is the only control that bounds even a workstation-origin confused deputy.
+
+### Scope (why this is not routed through SecurityMinimumBar §2 paperwork)
+This identity is **lab/orchestrator scope, not shipped-product surface** — it lives
+behind the `vm-lab` cargo feature (RNQ-17), compiled out of every released binary;
+CI gates run `--all-features` but the shipped release carries none of it. So the
+residual accepted risk (the `add-guest` define escalation; workstation-as-trust-root)
+sits **outside the product release gate**, and is documented here rather than filed
+as a SecurityMinimumBar §2 High-control risk-acceptance. The narrowing above is
+nonetheless applied because it is cheap at C1 build time and bounds the confused
+deputy regardless of scope. **Pre-implementation validation owed on `ubuntu-kvm-1`:**
+define the polkit rule, confirm `virsh start/stop/destroy` + the lab's bridge/pool
+ops still work while `virsh define <host-disk-xml>` is denied without a password, and
+grep the vm-lab orchestrator's libvirt call sites to confirm no allowed steady-state
+op secretly needs a define/save-class API.
