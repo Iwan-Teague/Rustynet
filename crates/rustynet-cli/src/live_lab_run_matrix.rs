@@ -1309,7 +1309,27 @@ fn current_git_branch() -> Option<String> {
 }
 
 fn current_git_dirty_state() -> Option<String> {
-    git_stdout(["status", "--porcelain"]).map(|stdout| {
+    // Exclude the orchestrator's OWN evidence ledgers, exactly as
+    // `vm_lab::git_worktree_is_dirty` does: this run appends to them by design
+    // (the run-matrix row, per-stage results, triage and gate/stage timings), so
+    // their churn must not make a clean-tree run record ITSELF as
+    // `dirty:worktree`. Without this, no `--node` run can satisfy the
+    // NodeEngineAcceptanceSpec §5.4 clean-flip-candidate stability bar. Any real
+    // code (or other tracked-file) change still surfaces and still reads dirty.
+    // Keep this exclude list in sync with `vm_lab::git_worktree_is_dirty`.
+    git_stdout([
+        "status",
+        "--porcelain",
+        "--",
+        ".",
+        ":(exclude)documents/operations/live_lab_run_matrix.csv",
+        ":(exclude)documents/operations/live_lab_node_run_matrix.csv",
+        ":(exclude)documents/operations/live_lab_node_stage_results.csv",
+        ":(exclude)documents/operations/live_lab_stage_triage.jsonl",
+        ":(exclude)documents/operations/gate_timings.csv",
+        ":(exclude)documents/operations/live_lab_stage_timings.csv",
+    ])
+    .map(|stdout| {
         if stdout.trim().is_empty() {
             "clean".to_owned()
         } else {
