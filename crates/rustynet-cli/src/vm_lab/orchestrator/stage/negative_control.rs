@@ -247,7 +247,12 @@ pub(crate) fn select_linux_control_target<'a>(
     assignments: &'a [NodeRoleAssignment],
     platform_of: &dyn Fn(&str) -> Option<VmGuestPlatform>,
 ) -> Result<&'a str, String> {
-    let mut first_linux: Option<&NodeRoleAssignment> = None;
+    // Prefer a Client; else a non-disruptive Linux role; fall back to a
+    // disruptive role (Exit/Anchor/BlindExit/Entry — killing or dirtying one
+    // tears down exit NAT / authority, a wider blast radius) only if nothing
+    // else is available. (§8 M2)
+    let mut preferred: Option<&NodeRoleAssignment> = None;
+    let mut last_resort: Option<&NodeRoleAssignment> = None;
     for assignment in assignments {
         if platform_of(&assignment.alias) != Some(VmGuestPlatform::Linux) {
             continue;
@@ -255,16 +260,27 @@ pub(crate) fn select_linux_control_target<'a>(
         if assignment.role == NodeRole::Client {
             return Ok(assignment.alias.as_str());
         }
-        if first_linux.is_none() {
-            first_linux = Some(assignment);
+        let disruptive = matches!(
+            assignment.role,
+            NodeRole::Exit | NodeRole::Anchor | NodeRole::BlindExit | NodeRole::Entry
+        );
+        if disruptive {
+            if last_resort.is_none() {
+                last_resort = Some(assignment);
+            }
+        } else if preferred.is_none() {
+            preferred = Some(assignment);
         }
     }
-    first_linux.map(|a| a.alias.as_str()).ok_or_else(|| {
-        "no assigned node has a Linux adapter; a non-Linux target's default \
-         assert_node_clean() is Ok(()) and would silently hide the injected fault \
-         (fail closed)"
-            .to_owned()
-    })
+    preferred
+        .or(last_resort)
+        .map(|a| a.alias.as_str())
+        .ok_or_else(|| {
+            "no assigned node has a Linux adapter; a non-Linux target's default \
+             assert_node_clean() is Ok(()) and would silently hide the injected fault \
+             (fail closed)"
+                .to_owned()
+        })
 }
 
 /// Write one evidence artifact under the control's workdir. The workdir sits
@@ -530,16 +546,21 @@ pub(crate) mod planted_residue {
         /// from `Drop` cannot improve on a verified failure that the control
         /// is already reporting loudly.
         fn teardown_verified(&mut self) -> (String, Result<(), String>) {
-            self.torn_down = true;
             let delete = match run_remote_argv(&self.shell, NFT_DELETE_PLANTED) {
                 Ok(out) => out,
                 Err(err) => {
+                    // §8 M1: transport failure — the delete argv may never have
+                    // run; leave `torn_down` false so Drop still best-effort
+                    // retries the delete on unwind.
                     return (
                         format!("## nft delete table inet {PLANTED_TABLE}\n{err}\n"),
                         Err(format!("teardown unverifiable (fail closed): {err}")),
                     );
                 }
             };
+            // §8 M1: the delete argv executed (any exit code) — mark done; a
+            // Drop retry cannot improve on the verified verdict reported below.
+            self.torn_down = true;
             let relist = run_remote_argv(&self.shell, NFT_LIST_TABLES);
             let relist_result: Result<String, String> = match &relist {
                 Ok(out) if out.code == 0 => Ok(out.stdout.clone()),
@@ -2256,6 +2277,25 @@ mod tests {
         assert_eq!(
             select_linux_control_target(&assignments, &platform_of),
             Ok("exit-1")
+        );
+    }
+
+    #[test]
+    fn target_selection_deprioritizes_disruptive_roles() {
+        // §8 M2: with no Client, prefer a non-disruptive Linux role (Relay)
+        // over a disruptive one (Exit) — smaller blast radius — regardless of
+        // assignment order (disruptive listed first here).
+        let assignments = vec![
+            assignment("exit-1", NodeRole::Exit),
+            assignment("relay-1", NodeRole::Relay),
+        ];
+        let platform_of = |alias: &str| match alias {
+            "exit-1" | "relay-1" => Some(VmGuestPlatform::Linux),
+            _ => None,
+        };
+        assert_eq!(
+            select_linux_control_target(&assignments, &platform_of),
+            Ok("relay-1")
         );
     }
 
