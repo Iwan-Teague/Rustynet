@@ -275,6 +275,31 @@
         "host_id": "ubuntu-kvm-1"
       },
       "mesh_ip": "100.64.0.12"
+    },
+    {
+      "alias": "windows-x86-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.121.108",
+      "ssh_user": "labadmin",
+      "os": "Windows 11 Pro (x86_64, 25H2)",
+      "platform": "windows",
+      "last_known_ip": "192.168.121.108",
+      "last_known_network": "192.168.121.0/24",
+      "network_group": "libvirt-192.168.121.0/24",
+      "node_id": "windows-x86-1",
+      "lab_role": "windows_client",
+      "exit_capable": true,
+      "parent_device": "ubuntu-kvm-1 (x86_64 KVM host)",
+      "rustynet_src_dir": "C:\\Rustynet",
+      "guest_exec_mode": "windows_powershell",
+      "remote_shell": "powershell",
+      "service_manager": "windows_service",
+      "controller": {
+        "type": "libvirt",
+        "domain": "windows-x86-1",
+        "host_id": "ubuntu-kvm-1"
+      },
+      "notes": "Windows 11 Pro 25H2 on the x86-64 KVM box; nested virt (Hyper-V) works so WinNAT/exit-role is capable \u2014 New-NetNat + Get-NetNatSession proven live 2026-07-24 (impossible on the Apple-Silicon UTM guest). SSH user labadmin, password in the untracked secrets sidecar. Key-auth + rustup + rustynet node bootstrap still to do before an active_exit cell run."
     }
   ]
 }
