@@ -35,21 +35,27 @@
 //! `RejectedAsExpected` from `RejectedWrongReason` and from
 //! `AcceptedButMustReject`, and only the first is a control pass.
 //!
-//! ## What runs locally now vs deferred-to-live-verify (increment A3a)
+//! ## What runs locally vs on a live guest (A3a + the D2 live bodies)
 //!
 //! - **(b) signed-bundle rejection** and **(d) wrong-node substitution** drive
 //!   the real `verify_signed_assignment_state_artifact` verifier against forged
 //!   assignment bundles minted in-process — fully local, no guest, so their
 //!   [`OrchestrationStage::execute`] adjudicates for real.
-//! - **(a) planted residue** and **(c) daemon-killed-mid-stage** need a live
-//!   guest to plant the fault; their pure adjudication logic is built and
-//!   unit-tested here, but `execute` returns [`StageOutcome::Skipped`] with a
-//!   deferred-to-live-verify reason (the live fault-injection lands in a later
-//!   live-verify phase, like `network_flap`).
+//! - **(a) planted residue** and **(c) daemon-killed-mid-stage** inject their
+//!   fault on a LIVE Linux guest at execute() time (the D2 bodies in
+//!   [`planted_residue`] / [`daemon_kill`], per
+//!   `LiveT5NegativeControlProofPlan_2026-07-24.md` §2). Their pure
+//!   adjudicators remain the final classifiers; the fail-closed binding
+//!   guards layered around them (plant-took, name-bound `Err`, kill-took,
+//!   socket-bound probe, unreachable/ambiguous → `Failed`) are unit-tested
+//!   here, and the guest-side effects are proven in the live-verify phase.
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::linux_traffic::parse_node_clean_probe;
+use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 use std::path::{Path, PathBuf};
 
@@ -61,9 +67,12 @@ use std::path::{Path, PathBuf};
 /// Runs locally.
 pub struct NegativeControlSignedBundleRejectionStage;
 
-/// (a) Planted residue → Cleanup FAIL — adjudication over the pure
-/// `parse_node_clean_probe`: a dirty probe must drive the clean-assert to
-/// `Err`. Live planting on a guest is deferred to live-verify.
+/// (a) Planted residue → clean-assert FAIL *naming the plant* — plants a
+/// `rustynet_planted` nft table on a live Linux guest, drives the REAL
+/// [`NodeAdapter::assert_node_clean`] path, and passes iff the assert rejects
+/// the node with an error naming that exact table (differential + name-bound,
+/// plan §2a). Teardown is Drop-guarded and verified. Live body in
+/// [`planted_residue`].
 pub struct NegativeControlPlantedResidueStage;
 
 /// (d) Wrong-node substitution → validator FAIL — drives
@@ -73,10 +82,15 @@ pub struct NegativeControlPlantedResidueStage;
 /// orchestrator-threading note on [`NegativeControlWrongNodeSubstitutionStage`]).
 pub struct NegativeControlWrongNodeSubstitutionStage;
 
-/// (c) Daemon-killed-mid-stage → stage not pass — adjudication asserts the
-/// targeted stage's recorded outcome is NOT a pass under a mid-stage kill. The
-/// live kill reuses the existing `live_chaos_daemon_fault_test` kill primitive
-/// (`render_remote_kill_script`) and is deferred to live-verify.
+/// (c) Daemon-killed-mid-stage → daemon-dependent probe not pass — runs ONE
+/// guest-side script on a live Linux guest that proves the daemon-socket
+/// probe answers, SIGKILLs `rustynetd`, immediately re-probes inside the
+/// `RestartSec=2s` self-heal window, and trap-restarts the unit. Passes iff
+/// the probe FAILS under the kill (mapped through the pure
+/// [`adjudicate_daemon_kill_outcome`]); a probe that answers is a false-green
+/// and fails the control. Live body in [`daemon_kill`] (the kill script is
+/// re-rendered inline — `live_chaos_daemon_fault_test`'s
+/// `render_remote_kill_script` is bin-private and unimportable, plan §2c).
 pub struct NegativeControlDaemonKillMidStageStage;
 
 // ── Suite dependency shape ───────────────────────────────────────────────────
@@ -147,11 +161,23 @@ impl OrchestrationStage for NegativeControlPlantedResidueStage {
     fn fanout(&self) -> StageFanout {
         StageFanout::Once
     }
-    fn execute(&self, _ctx: &mut OrchestrationContext) -> StageOutcome {
-        // The pure adjudication ([`adjudicate_planted_residue`]) is built and
-        // unit-tested; planting real `rustynet*` residue on a live guest and
-        // driving `assert_node_clean` is deferred to the live-verify phase.
-        StageOutcome::Skipped
+    fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        let dir = control_workdir(ctx, self.name());
+        let target = match select_linux_control_target(&ctx.assignments, &|alias| {
+            ctx.adapters.get(alias).map(|adapter| adapter.platform())
+        }) {
+            Ok(alias) => alias.to_owned(),
+            Err(reason) => {
+                return StageOutcome::Failed(format!("planted-residue negative control: {reason}"));
+            }
+        };
+        let Some(adapter) = ctx.adapters.get(&target) else {
+            return StageOutcome::Failed(format!(
+                "planted-residue negative control: selected target '{target}' has no adapter \
+                 (fail closed)"
+            ));
+        };
+        planted_residue::run_planted_residue_control(&dir, &target, adapter.as_ref())
     }
 }
 
@@ -171,18 +197,85 @@ impl OrchestrationStage for NegativeControlDaemonKillMidStageStage {
     fn fanout(&self) -> StageFanout {
         StageFanout::Once
     }
-    fn execute(&self, _ctx: &mut OrchestrationContext) -> StageOutcome {
-        // The pure adjudication ([`adjudicate_daemon_kill_outcome`]) is built
-        // and unit-tested; the live mid-stage `systemctl kill -s KILL` reuses
-        // the existing `live_chaos_daemon_fault_test` kill primitive and is
-        // deferred to the live-verify phase.
-        StageOutcome::Skipped
+    fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        let dir = control_workdir(ctx, self.name());
+        let target = match select_linux_control_target(&ctx.assignments, &|alias| {
+            ctx.adapters.get(alias).map(|adapter| adapter.platform())
+        }) {
+            Ok(alias) => alias.to_owned(),
+            Err(reason) => {
+                return StageOutcome::Failed(format!("daemon-kill negative control: {reason}"));
+            }
+        };
+        let Some(adapter) = ctx.adapters.get(&target) else {
+            return StageOutcome::Failed(format!(
+                "daemon-kill negative control: selected target '{target}' has no adapter \
+                 (fail closed)"
+            ));
+        };
+        daemon_kill::run_daemon_kill_control(&dir, &target, adapter.as_ref())
     }
 }
 
 /// Per-control scratch directory under the run's report dir.
 fn control_workdir(ctx: &OrchestrationContext, stage_name: &str) -> PathBuf {
     ctx.report_dir.join("negative_control").join(stage_name)
+}
+
+// ── Live-guest control target selection (shared by (a) and (c)) ─────────────
+
+/// Pick the live-guest target for a fault-injection control: a **Linux** node
+/// (preferring a `Client` role, the smallest blast radius), fail-closed when
+/// none exists.
+///
+/// Linux is load-bearing, not a preference: the [`NodeAdapter`] trait default
+/// for `assert_node_clean` is `Ok(())`, so injecting the fault on a non-Linux
+/// target would silently HIDE it and turn the control into a rubber-stamp
+/// (plan §8 M1). No Linux adapter ⇒ the control cannot prove anything ⇒
+/// `Err` (a control `Failed`), never a skip-to-green.
+///
+/// Rebuild-set caveat (plan §8 S3): `--rebuild-nodes` is threaded into the
+/// cleanup/bootstrap stages at plan-construction time (`plan.rs`), not into
+/// [`OrchestrationContext`], so an execute()-time stage cannot read it.
+/// Every adapter in `ctx.adapters` belongs to a `--node` assignment of THIS
+/// run, and in the default `rebuild_only = None` mode (the mode
+/// negative-control runs use) that set IS the rebuild set. The controls'
+/// own mandatory, verified teardown (Drop-guarded delete + re-list;
+/// trap-restart + restored-unit check) is what protects a node that a
+/// `--rebuild-nodes`-restricted later run would not re-clean.
+pub(crate) fn select_linux_control_target<'a>(
+    assignments: &'a [NodeRoleAssignment],
+    platform_of: &dyn Fn(&str) -> Option<VmGuestPlatform>,
+) -> Result<&'a str, String> {
+    let mut first_linux: Option<&NodeRoleAssignment> = None;
+    for assignment in assignments {
+        if platform_of(&assignment.alias) != Some(VmGuestPlatform::Linux) {
+            continue;
+        }
+        if assignment.role == NodeRole::Client {
+            return Ok(assignment.alias.as_str());
+        }
+        if first_linux.is_none() {
+            first_linux = Some(assignment);
+        }
+    }
+    first_linux.map(|a| a.alias.as_str()).ok_or_else(|| {
+        "no assigned node has a Linux adapter; a non-Linux target's default \
+         assert_node_clean() is Ok(()) and would silently hide the injected fault \
+         (fail closed)"
+            .to_owned()
+    })
+}
+
+/// Write one evidence artifact under the control's workdir. The workdir sits
+/// inside the run's report dir, so the pre/post listings and probe
+/// transcripts land in the collected evidence (§5 acceptance: the bound
+/// strings must be reviewable). A write failure is returned to the caller to
+/// fold into a control FAIL — never silently dropped.
+fn write_control_evidence(dir: &Path, name: &str, contents: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join(name);
+    std::fs::write(&path, contents).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 // ── (a) planted-residue adjudication (pure) ──────────────────────────────────
@@ -251,6 +344,1103 @@ pub(crate) fn adjudicate_daemon_kill_outcome(recorded: &StageOutcome) -> KillCon
         | StageOutcome::Skipped
         | StageOutcome::NotRun
         | StageOutcome::Reused { .. } => KillControlOutcome::StageDidNotPass,
+    }
+}
+
+// ── (a) planted-residue live control ─────────────────────────────────────────
+
+pub(crate) mod planted_residue {
+    //! The live (a) body: differential, name-bound, Drop-guard-torn-down
+    //! (plan §2a, corrected per the §8 review).
+    //!
+    //! The control runs at its catalog position immediately before `Cleanup`,
+    //! when the guest is legitimately DIRTY (daemon up, real `rustynet*`
+    //! tables) — so "any `Err` from the clean-probe" is vacuous (§8 B1).
+    //! Instead the control plants a distinctly-named `rustynet_planted` nft
+    //! table, proves the plant took (differential pre/post listings), drives
+    //! the REAL [`NodeAdapter::assert_node_clean`] path, and passes ONLY when
+    //! the rejection names that exact table (tolerant of co-present real
+    //! dirt, never satisfied by it). Every ambiguous rung — unlistable
+    //! tables, pre-existing plant name, un-plantable fault, wrong-reason
+    //! `Err`, `Ok(())` fail-open, unverified teardown — is a control FAIL.
+    use super::*;
+    use crate::vm_lab::orchestrator::remote_shell::{RemoteExitStatus, RemoteShellHost};
+    use std::sync::Arc;
+
+    /// The planted table name. Matches the clean-probe's `^rustynet` residue
+    /// pattern (so the production probe reports it) while colliding with no
+    /// real runtime table (`rustynet_boot`, `rustynet_g<N>`), so the
+    /// adjudication can bind to THIS plant and nothing else.
+    pub(crate) const PLANTED_TABLE: &str = "rustynet_planted";
+
+    /// `nft` argv for the plant lifecycle. Argv-only via
+    /// [`RemoteShellHost::run_argv`], which runs each command under `sudo -n`
+    /// with the sudoers `secure_path` (where `/usr/sbin/nft` resolves — the
+    /// same trust base as the production reset/probe commands in
+    /// `linux_traffic.rs`). Every element is a fixed literal: no run-time
+    /// value ever reaches the remote argv.
+    const NFT_LIST_TABLES: &[&str] = &["nft", "list", "tables"];
+    const NFT_ADD_PLANTED: &[&str] = &["nft", "add", "table", "inet", PLANTED_TABLE];
+    const NFT_DELETE_PLANTED: &[&str] = &["nft", "delete", "table", "inet", PLANTED_TABLE];
+
+    /// Decoded output of one remote command.
+    pub(crate) struct RemoteCommandOutput {
+        pub(crate) code: i32,
+        pub(crate) stdout: String,
+        pub(crate) stderr: String,
+    }
+
+    impl RemoteCommandOutput {
+        fn from_status(status: RemoteExitStatus) -> Self {
+            RemoteCommandOutput {
+                code: status.code,
+                stdout: String::from_utf8_lossy(&status.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&status.stderr).into_owned(),
+            }
+        }
+
+        fn render(&self, label: &str) -> String {
+            format!(
+                "## {label}\nexit={}\n--- stdout ---\n{}\n--- stderr ---\n{}\n",
+                self.code, self.stdout, self.stderr
+            )
+        }
+    }
+
+    fn run_remote_argv(
+        shell: &Arc<dyn RemoteShellHost>,
+        argv: &[&str],
+    ) -> Result<RemoteCommandOutput, String> {
+        shell
+            .run_argv(argv, &[], &[])
+            .map(RemoteCommandOutput::from_status)
+            .map_err(|err| format!("transport failure running {argv:?}: {err}"))
+    }
+
+    /// Exact-name membership test over `nft list tables` output (lines like
+    /// `table inet rustynet_boot`). Exact name + family so a co-present
+    /// `rustynet_planted_old`-style leftover can never satisfy (or trip) the
+    /// plant checks.
+    pub(crate) fn listing_names_inet_table(listing: &str, table: &str) -> bool {
+        listing.lines().any(|line| {
+            let mut tokens = line.split_whitespace();
+            tokens.next() == Some("table")
+                && tokens.next() == Some("inet")
+                && tokens.next() == Some(table)
+        })
+    }
+
+    /// Exact-token test for the planted name inside a clean-assert error
+    /// message. The probe formatter joins dirty table names with commas
+    /// (`nftables table(s): rustynet_planted,rustynet_boot; …`), so split on
+    /// the formatter's delimiters and require an exact token — `.contains()`
+    /// would let a hypothetical `rustynet_planted_old` leftover satisfy the
+    /// name-binding (§4: never soften what counts as the named rejection).
+    fn message_names_planted_table(message: &str) -> bool {
+        message
+            .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':'))
+            .any(|token| token == PLANTED_TABLE)
+    }
+
+    /// Final classification of the LIVE `assert_node_clean` result under the
+    /// plant — the same layering as [`signed_bundle::classify_rejection`]:
+    /// the pure fail-open taxonomy decides pass/fail shape, the name-binding
+    /// decides *right reason*. Coherence with the pure adjudicator
+    /// [`adjudicate_planted_residue`] (identical fail-open posture; the `Err`
+    /// text classified here is exactly what that adjudicator's parser
+    /// produces) is pinned by
+    /// `live_classifier_binds_to_the_pure_residue_adjudicator`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum PlantedAssertCheck {
+        /// `Err` naming the planted table — RED for the right reason
+        /// (co-present real dirt in the same message is tolerated). The
+        /// control PASSES.
+        DetectedNamingPlant { message: String },
+        /// `Err` NOT naming the plant: the node was rejected only for other
+        /// reasons, so the probe did not demonstrably catch OUR fault. The
+        /// control FAILS (guard: "any error" is never accepted).
+        DetectedWrongReason { actual: String },
+        /// `Ok(())` on a node verifiably carrying the plant — a fail-OPEN,
+        /// the exact Pair-1 false-clean class. The control FAILS.
+        FailOpenPassedPlantedNode,
+    }
+
+    impl PlantedAssertCheck {
+        pub(crate) fn is_control_pass(&self) -> bool {
+            matches!(self, PlantedAssertCheck::DetectedNamingPlant { .. })
+        }
+    }
+
+    pub(crate) fn classify_planted_clean_assert(result: Result<(), String>) -> PlantedAssertCheck {
+        match result {
+            Ok(()) => PlantedAssertCheck::FailOpenPassedPlantedNode,
+            Err(message) if message_names_planted_table(&message) => {
+                PlantedAssertCheck::DetectedNamingPlant { message }
+            }
+            Err(actual) => PlantedAssertCheck::DetectedWrongReason { actual },
+        }
+    }
+
+    /// Adjudicate teardown. Absence in the post-delete re-list is the
+    /// AUTHORITATIVE fact: a missing-table delete error is idempotence, not
+    /// failure, iff the re-list proves the table absent; an unverifiable
+    /// re-list fails closed; a present table is a LEAK named loudly.
+    pub(crate) fn adjudicate_teardown(
+        delete_exit: i32,
+        delete_stderr: &str,
+        relist_after_delete: &Result<String, String>,
+    ) -> Result<(), String> {
+        match relist_after_delete {
+            Err(err) => Err(format!(
+                "teardown unverifiable (fail closed): could not re-list nft tables after \
+                 deleting '{PLANTED_TABLE}': {err}"
+            )),
+            Ok(listing) if listing_names_inet_table(listing, PLANTED_TABLE) => Err(format!(
+                "TEARDOWN LEAK: planted nft table '{PLANTED_TABLE}' is still present after \
+                 delete (delete exit {delete_exit}, stderr: {:?}) — the guest is left dirty",
+                delete_stderr.trim()
+            )),
+            Ok(_) => Ok(()),
+        }
+    }
+
+    /// Deletes the planted table when the control unwinds. `panic = "unwind"`
+    /// (the workspace sets no `panic = "abort"` profile), so `Drop` runs on
+    /// unwind and a panic between plant and teardown still removes the table
+    /// best-effort (§8 S3). The normal path calls [`Self::teardown_verified`]
+    /// — delete + re-list + [`adjudicate_teardown`], folded into the verdict
+    /// — after which `Drop` is a no-op. `Drop` itself must never panic (a
+    /// second panic during unwind aborts the process), so it swallows every
+    /// error.
+    pub(crate) struct PlantedTableGuard {
+        shell: Arc<dyn RemoteShellHost>,
+        torn_down: bool,
+    }
+
+    impl PlantedTableGuard {
+        fn new(shell: Arc<dyn RemoteShellHost>) -> Self {
+            PlantedTableGuard {
+                shell,
+                torn_down: false,
+            }
+        }
+
+        /// Explicit, verified teardown. Marks the guard done regardless of
+        /// the verdict: the delete has been attempted, and re-attempting it
+        /// from `Drop` cannot improve on a verified failure that the control
+        /// is already reporting loudly.
+        fn teardown_verified(&mut self) -> (String, Result<(), String>) {
+            self.torn_down = true;
+            let delete = match run_remote_argv(&self.shell, NFT_DELETE_PLANTED) {
+                Ok(out) => out,
+                Err(err) => {
+                    return (
+                        format!("## nft delete table inet {PLANTED_TABLE}\n{err}\n"),
+                        Err(format!("teardown unverifiable (fail closed): {err}")),
+                    );
+                }
+            };
+            let relist = run_remote_argv(&self.shell, NFT_LIST_TABLES);
+            let relist_result: Result<String, String> = match &relist {
+                Ok(out) if out.code == 0 => Ok(out.stdout.clone()),
+                Ok(out) => Err(format!(
+                    "re-list exited {} (stderr: {:?})",
+                    out.code,
+                    out.stderr.trim()
+                )),
+                Err(err) => Err(err.clone()),
+            };
+            let verdict = adjudicate_teardown(delete.code, &delete.stderr, &relist_result);
+            let mut evidence = delete.render(&format!("nft delete table inet {PLANTED_TABLE}"));
+            match &relist {
+                Ok(out) => evidence.push_str(&out.render("nft list tables (after teardown)")),
+                Err(err) => {
+                    evidence.push_str(&format!("## nft list tables (after teardown)\n{err}\n"))
+                }
+            }
+            evidence.push_str(&format!("## teardown verdict\n{verdict:?}\n"));
+            (evidence, verdict)
+        }
+    }
+
+    impl Drop for PlantedTableGuard {
+        fn drop(&mut self) {
+            if self.torn_down {
+                return;
+            }
+            // Unwind path: best-effort delete; swallow every error — this
+            // Drop must never panic.
+            let _ = self.shell.run_argv(NFT_DELETE_PLANTED, &[], &[]);
+        }
+    }
+
+    /// The (a) control body. See the module doc for the mechanism; the
+    /// verdict inversion (`negative_control.rs` header) means the induced
+    /// clean-assert RED stays inside this control — a working control returns
+    /// [`StageOutcome::Passed`].
+    pub(crate) fn run_planted_residue_control(
+        workdir: &Path,
+        target_alias: &str,
+        adapter: &dyn NodeAdapter,
+    ) -> StageOutcome {
+        let fail = |reason: String| {
+            StageOutcome::Failed(format!(
+                "planted-residue negative control [target {target_alias}]: {reason}"
+            ))
+        };
+
+        // §8 M1: the fault is only observable through the Linux clean-probe;
+        // a non-Linux adapter's default assert_node_clean() is Ok(()) and
+        // would read as a fail-open. The selector already filtered — this
+        // re-assert makes a future selector regression fail loudly instead of
+        // hiding the fault.
+        if adapter.platform() != VmGuestPlatform::Linux {
+            return fail(format!(
+                "target platform {:?} cannot observe the fault: the non-Linux \
+                 assert_node_clean() default is Ok(()) (fail closed)",
+                adapter.platform()
+            ));
+        }
+
+        let shell = match adapter.shell_host() {
+            Ok(shell) => shell,
+            Err(err) => return fail(format!("no remote shell host: {err}")),
+        };
+
+        // 1. Pre-list: the planted name must NOT already exist.
+        let pre = match run_remote_argv(&shell, NFT_LIST_TABLES) {
+            Ok(out) => out,
+            Err(err) => return fail(err),
+        };
+        if let Err(err) = write_control_evidence(
+            workdir,
+            "nft_tables_before_plant.txt",
+            &pre.render("nft list tables (before plant)"),
+        ) {
+            return fail(err);
+        }
+        if pre.code != 0 {
+            return fail(format!(
+                "cannot enumerate nft tables (exit {}, stderr: {:?}) — the guest is \
+                 unverifiable (fail closed)",
+                pre.code,
+                pre.stderr.trim()
+            ));
+        }
+        if listing_names_inet_table(&pre.stdout, PLANTED_TABLE) {
+            return fail(format!(
+                "ambiguous leftover: nft table '{PLANTED_TABLE}' already exists before \
+                 planting (a prior control leaked, or the name is in real use) — refusing \
+                 to adjudicate"
+            ));
+        }
+
+        // 2. Plant — Drop guard registered FIRST, so even an ambiguous
+        //    transport error (or a later panic) still deletes best-effort.
+        let mut guard = PlantedTableGuard::new(Arc::clone(&shell));
+        let plant = match run_remote_argv(&shell, NFT_ADD_PLANTED) {
+            Ok(out) => out,
+            Err(err) => return fail(err),
+        };
+        if plant.code != 0 {
+            return fail(format!(
+                "un-plantable fault: `nft add table inet {PLANTED_TABLE}` exited {} \
+                 (stderr: {:?}) (fail closed)",
+                plant.code,
+                plant.stderr.trim()
+            ));
+        }
+
+        // 3. Re-list: the plant must verifiably be present.
+        let planted = match run_remote_argv(&shell, NFT_LIST_TABLES) {
+            Ok(out) => out,
+            Err(err) => return fail(err),
+        };
+        if let Err(err) = write_control_evidence(
+            workdir,
+            "nft_tables_after_plant.txt",
+            &planted.render("nft list tables (after plant)"),
+        ) {
+            return fail(err);
+        }
+        if planted.code != 0 {
+            return fail(format!(
+                "plant unverifiable: post-plant `nft list tables` exited {} (stderr: {:?}) \
+                 (fail closed)",
+                planted.code,
+                planted.stderr.trim()
+            ));
+        }
+        if !listing_names_inet_table(&planted.stdout, PLANTED_TABLE) {
+            return fail(format!(
+                "un-plantable fault: '{PLANTED_TABLE}' is absent from the post-plant \
+                 listing (fail closed)"
+            ));
+        }
+
+        // 4. Drive the REAL cleanup-time assertion under the plant. From here
+        //    there is NO early return: teardown must run and be verified on
+        //    every path.
+        let mut evidence_errors: Vec<String> = Vec::new();
+        let assert_result = adapter.assert_node_clean().map_err(|e| e.to_string());
+        let assert_rendering = match &assert_result {
+            Ok(()) => "assert_node_clean() = Ok(()) — the probe PASSED a node carrying \
+                       the plant (fail-open)"
+                .to_owned(),
+            Err(err) => format!("assert_node_clean() = Err: {err}"),
+        };
+        if let Err(err) =
+            write_control_evidence(workdir, "clean_assert_under_plant.txt", &assert_rendering)
+        {
+            evidence_errors.push(err);
+        }
+        let check = classify_planted_clean_assert(assert_result);
+
+        // 5. Verified teardown — a leak or an unverifiable delete dominates
+        //    every other verdict (a control that dirties the fleet must never
+        //    pass).
+        let (teardown_evidence, teardown_verdict) = guard.teardown_verified();
+        if let Err(err) = write_control_evidence(workdir, "teardown.txt", &teardown_evidence) {
+            evidence_errors.push(err);
+        }
+        if let Err(err) = teardown_verdict {
+            return fail(format!("{err}; clean-assert adjudication was {check:?}"));
+        }
+        if !evidence_errors.is_empty() {
+            return fail(format!(
+                "evidence not persisted: {} (fail closed; §5 acceptance requires \
+                 reviewable evidence)",
+                evidence_errors.join("; ")
+            ));
+        }
+
+        match check {
+            PlantedAssertCheck::DetectedNamingPlant { .. } => StageOutcome::Passed,
+            PlantedAssertCheck::DetectedWrongReason { actual } => fail(format!(
+                "clean-assert rejected the node for the WRONG reason — the error does not \
+                 name '{PLANTED_TABLE}': {actual:?}"
+            )),
+            PlantedAssertCheck::FailOpenPassedPlantedNode => fail(format!(
+                "FAIL-OPEN — assert_node_clean() returned Ok(()) on a node verifiably \
+                 carrying planted nft table '{PLANTED_TABLE}' (the exact false-clean class \
+                 this control exists to catch)"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // ── listing parser ──────────────────────────────────────────────────
+
+        #[test]
+        fn listing_parser_finds_exact_inet_table() {
+            let listing = "table ip filter\ntable inet rustynet_boot\ntable inet rustynet_planted\ntable ip6 mangle\n";
+            assert!(listing_names_inet_table(listing, PLANTED_TABLE));
+            assert!(listing_names_inet_table(listing, "rustynet_boot"));
+            assert!(!listing_names_inet_table(listing, "filter"));
+        }
+
+        #[test]
+        fn listing_parser_binds_to_the_exact_name_and_family() {
+            // A prefix/suffix cousin or a non-inet family must never satisfy
+            // the plant checks.
+            assert!(!listing_names_inet_table(
+                "table inet rustynet_planted_old\n",
+                PLANTED_TABLE
+            ));
+            assert!(!listing_names_inet_table(
+                "table inet rustynet_plant\n",
+                PLANTED_TABLE
+            ));
+            assert!(!listing_names_inet_table(
+                "table ip rustynet_planted\n",
+                PLANTED_TABLE
+            ));
+            assert!(!listing_names_inet_table("", PLANTED_TABLE));
+        }
+
+        // ── live clean-assert classifier ────────────────────────────────────
+
+        #[test]
+        fn err_naming_the_plant_passes_even_with_co_present_real_dirt() {
+            let message = "node still dirty after cleanup: nftables table(s): \
+                           rustynet_planted,rustynet_boot; rustynetd or rustynet-relay \
+                           still running; interface(s): rustynet0";
+            let check = classify_planted_clean_assert(Err(message.to_owned()));
+            assert!(check.is_control_pass(), "got {check:?}");
+        }
+
+        #[test]
+        fn guard_err_not_naming_the_plant_is_wrong_reason_not_a_pass() {
+            // The control runs on a legitimately dirty guest (§8 B1): a real
+            // rustynet_boot rejection WITHOUT the plant must never satisfy it.
+            let message = "node still dirty after cleanup: nftables table(s): \
+                           rustynet_boot; rustynetd or rustynet-relay still running";
+            let check = classify_planted_clean_assert(Err(message.to_owned()));
+            assert!(
+                matches!(check, PlantedAssertCheck::DetectedWrongReason { .. }),
+                "got {check:?}"
+            );
+            assert!(!check.is_control_pass());
+        }
+
+        #[test]
+        fn guard_name_binding_is_exact_not_substring() {
+            // A message naming only a cousin table carries the planted name as
+            // a SUBSTRING; the classifier must not be satisfied by it.
+            let message = "node still dirty after cleanup: nftables table(s): \
+                           rustynet_planted_old";
+            let check = classify_planted_clean_assert(Err(message.to_owned()));
+            assert!(
+                matches!(check, PlantedAssertCheck::DetectedWrongReason { .. }),
+                "got {check:?}"
+            );
+        }
+
+        #[test]
+        fn guard_ok_on_a_planted_node_is_fail_open_not_a_pass() {
+            let check = classify_planted_clean_assert(Ok(()));
+            assert_eq!(check, PlantedAssertCheck::FailOpenPassedPlantedNode);
+            assert!(!check.is_control_pass());
+        }
+
+        #[test]
+        fn live_classifier_binds_to_the_pure_residue_adjudicator() {
+            // The live path classifies the Err STRING that
+            // `assert_node_clean` surfaces, which is produced by the same
+            // parser the pure adjudicator wraps. Drive the pure adjudicator
+            // with a planted-and-dirty probe line and prove its error is (1)
+            // the documented formatter shape and (2) classified as the named
+            // detection here — so a formatter rename cannot silently
+            // downgrade the live control to DetectedWrongReason.
+            let dirty_probe = "nft=rustynet_planted,rustynet_boot, daemon=up iface=rustynet0,";
+            let outcome = adjudicate_planted_residue(dirty_probe);
+            let ResidueControlOutcome::ResidueDetected(message) = outcome else {
+                panic!("pure adjudicator must detect the planted residue, got {outcome:?}");
+            };
+            assert!(
+                message.contains("node still dirty after cleanup:"),
+                "formatter prefix drifted (§8 M5): {message}"
+            );
+            let check = classify_planted_clean_assert(Err(message));
+            assert!(
+                matches!(check, PlantedAssertCheck::DetectedNamingPlant { .. }),
+                "got {check:?}"
+            );
+        }
+
+        // ── teardown adjudication ───────────────────────────────────────────
+
+        #[test]
+        fn teardown_deleted_and_absent_is_ok() {
+            let relist = Ok("table inet rustynet_boot\n".to_owned());
+            assert_eq!(adjudicate_teardown(0, "", &relist), Ok(()));
+        }
+
+        #[test]
+        fn teardown_missing_table_delete_error_is_idempotent_when_absent() {
+            // `nft delete` on an already-absent table errors; absence in the
+            // authoritative re-list makes that idempotence, not failure.
+            let relist = Ok("table inet rustynet_boot\n".to_owned());
+            assert_eq!(
+                adjudicate_teardown(
+                    1,
+                    "Error: Could not process rule: No such file or directory",
+                    &relist
+                ),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn guard_teardown_leak_fails_naming_the_table() {
+            let relist = Ok(format!("table inet {PLANTED_TABLE}\n"));
+            let err = adjudicate_teardown(0, "", &relist).expect_err("leak must fail");
+            assert!(err.contains("TEARDOWN LEAK"), "got: {err}");
+            assert!(err.contains(PLANTED_TABLE), "got: {err}");
+        }
+
+        #[test]
+        fn guard_unverifiable_teardown_fails_closed() {
+            let relist = Err(
+                "transport failure running [\"nft\", \"list\", \"tables\"]: \
+                              transport error"
+                    .to_owned(),
+            );
+            let err = adjudicate_teardown(0, "", &relist).expect_err("must fail closed");
+            assert!(err.contains("teardown unverifiable"), "got: {err}");
+        }
+    }
+}
+
+// ── (c) daemon-kill live control ─────────────────────────────────────────────
+
+pub(crate) mod daemon_kill {
+    //! The live (c) body: one guest-side kill-window script + a socket-bound
+    //! probe (plan §2c, corrected per the §8 review).
+    //!
+    //! `ctx.outcome_of` only sees stages that already ran with the daemon
+    //! alive (§8 B2), and a mesh ping keeps working with `rustynetd` dead
+    //! (kernel WireGuard) — so the control runs ITS OWN probe whose success
+    //! requires a live daemon: `rustynet status` against the daemon control
+    //! socket (`RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock`), the
+    //! same §4.7 identity-challenge query `query_live_identity` uses, chosen
+    //! precisely because "a hung/absent daemon must FAIL the challenge". Only
+    //! CONNECTIVITY (the probe's exit status) is adjudicated — no status
+    //! field, and explicitly never `path_live_proven` (a shared-transport
+    //! reporting artifact that is false even on healthy tunnels, §8 M3).
+    //!
+    //! The whole sequence is ONE script (baseline-prove → SIGKILL → immediate
+    //! re-probe inside the `Restart=on-failure`/`RestartSec=2s` self-heal
+    //! window → trap-restart) so no SSH round-trip can straddle the window.
+    //! It is re-rendered inline because `live_chaos_daemon_fault_test`'s
+    //! `render_remote_kill_script` is bin-private and unimportable; the trap
+    //! prologue mirrors that audited script.
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Fixed guest-side identities the script binds to. Unit tests pin the
+    /// script text to these consts so they cannot drift apart.
+    pub(crate) const RUSTYNETD_UNIT: &str = "rustynetd";
+    pub(crate) const DAEMON_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
+    pub(crate) const RUSTYNET_CLI_PATH: &str = "/usr/local/bin/rustynet";
+
+    /// The kill-window script. Executed as `sh -c <script>` via
+    /// [`RemoteShellHost::run_argv`] (which wraps it in `sudo -n`, so it runs
+    /// as root: `systemctl` and the root-owned daemon socket need no further
+    /// escalation). Every value is a fixed literal — no run-time value is
+    /// interpolated. The script always exits 0 and reports through `nc_*`
+    /// tokens; a non-zero exit is script infrastructure failure, which the
+    /// parser refuses to adjudicate.
+    ///
+    /// Sequencing invariants (pinned by tests):
+    /// 1. the restart trap is registered BEFORE the fault;
+    /// 2. baseline (`is-active` + socket probe answers) is proven BEFORE the
+    ///    kill — a post-kill probe failure is otherwise unbindable to the
+    ///    kill (§8 S4);
+    /// 3. the re-probe runs IMMEDIATELY after `systemctl kill -s KILL`
+    ///    (inside the 2s `RestartSec` window; a unix-socket connect to a dead
+    ///    listener fails in milliseconds);
+    /// 4. the unit is restarted and awaited at the end regardless of outcome.
+    pub(crate) const KILL_WINDOW_SCRIPT: &str = r#"set -u
+unit=rustynetd
+socket=/run/rustynet/rustynetd.sock
+cli=/usr/local/bin/rustynet
+finish() {
+  systemctl start "$unit" >/dev/null 2>&1 || true
+}
+trap finish EXIT
+printf 'nc_teardown_registered=true\n'
+if [ ! -x "$cli" ]; then
+  printf 'nc_abort=cli_missing\n'
+  exit 0
+fi
+base_state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+printf 'nc_baseline_unit=%s\n' "${base_state:-unknown}"
+if [ "$base_state" != "active" ]; then
+  printf 'nc_abort=baseline_unit_not_active\n'
+  exit 0
+fi
+base_out="$(RUSTYNET_DAEMON_SOCKET="$socket" "$cli" status 2>&1)"
+base_rc=$?
+if [ "$base_rc" -eq 0 ]; then
+  printf 'nc_baseline_probe=answered\n'
+else
+  printf 'nc_baseline_probe=failed\n'
+  printf 'nc_baseline_probe_detail=%s\n' "$(printf '%s' "$base_out" | head -n 1 | tr -d '\r' | cut -c1-200)"
+  printf 'nc_abort=baseline_probe_failed\n'
+  exit 0
+fi
+kill_unix="$(date +%s)"
+systemctl kill -s KILL "$unit"
+kill_rc=$?
+printf 'nc_kill_exit=%s\n' "$kill_rc"
+printf 'nc_kill_unix=%s\n' "$kill_unix"
+if [ "$kill_rc" -ne 0 ]; then
+  printf 'nc_abort=kill_not_taken\n'
+  exit 0
+fi
+probe_out="$(RUSTYNET_DAEMON_SOCKET="$socket" "$cli" status 2>&1)"
+probe_rc=$?
+probe_done_unix="$(date +%s)"
+if [ "$probe_rc" -eq 0 ]; then
+  printf 'nc_probe_under_kill=answered\n'
+else
+  printf 'nc_probe_under_kill=failed\n'
+fi
+printf 'nc_probe_exit=%s\n' "$probe_rc"
+printf 'nc_probe_done_unix=%s\n' "$probe_done_unix"
+printf 'nc_probe_detail=%s\n' "$(printf '%s' "$probe_out" | head -n 1 | tr -d '\r' | cut -c1-200)"
+post_state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+printf 'nc_post_kill_unit=%s\n' "${post_state:-unknown}"
+systemctl start "$unit" >/dev/null 2>&1 || true
+tries=0
+while [ "$tries" -lt 30 ]; do
+  if systemctl is-active --quiet "$unit"; then
+    break
+  fi
+  tries=$((tries+1))
+  sleep 1
+done
+final_state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+printf 'nc_final_unit=%s\n' "${final_state:-unknown}"
+exit 0
+"#;
+
+    /// What the kill-window transcript proves. Only the two probe outcomes
+    /// carry adjudicable meaning; everything else is fail-closed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum KillWindowObservation {
+        /// Baseline proven, kill taken, probe transport-successful and FAILED
+        /// — the daemon was dead when a daemon-dependent operation ran.
+        ProbeFailedUnderKill { detail: String },
+        /// Baseline proven, kill taken, probe ANSWERED under the kill.
+        ProbeAnsweredUnderKill { detail: String },
+        /// Anything else: baseline not applicable, kill not taken, tokens
+        /// missing/garbled, script infra failure, node not restored. NEVER
+        /// fed to the adjudicator (plan §2c: an SSH/transport/ambiguous
+        /// result is a control FAIL, not a stage outcome).
+        NotAdjudicable { reason: String },
+    }
+
+    /// Parse the script's `nc_*` token transcript, fail-closed at every hole.
+    pub(crate) fn parse_kill_window_transcript(
+        exit_code: i32,
+        transcript: &str,
+    ) -> KillWindowObservation {
+        let not_adjudicable = |reason: String| KillWindowObservation::NotAdjudicable { reason };
+        if exit_code != 0 {
+            return not_adjudicable(format!(
+                "kill-window script infrastructure failed (exit {exit_code})"
+            ));
+        }
+        let mut tokens: HashMap<&str, &str> = HashMap::new();
+        for line in transcript.lines() {
+            if let Some((key, value)) = line.trim().split_once('=')
+                && key.starts_with("nc_")
+            {
+                tokens.insert(key, value);
+            }
+        }
+        let tok = |key: &str| tokens.get(key).copied();
+
+        if let Some(abort) = tok("nc_abort") {
+            return not_adjudicable(match abort {
+                "cli_missing" => format!(
+                    "control CLI {RUSTYNET_CLI_PATH} is missing on the guest — the \
+                     daemon-dependent probe cannot run"
+                ),
+                "baseline_unit_not_active" => format!(
+                    "baseline not applicable: {RUSTYNETD_UNIT} is '{}' (must be active for \
+                     the kill to be meaningful, §8 S4)",
+                    tok("nc_baseline_unit").unwrap_or("unknown")
+                ),
+                "baseline_probe_failed" => format!(
+                    "baseline not applicable: the daemon-socket probe failed BEFORE the \
+                     kill ({:?}) — a post-kill probe failure could not be bound to the kill",
+                    tok("nc_baseline_probe_detail").unwrap_or("")
+                ),
+                "kill_not_taken" => format!(
+                    "kill not taken: `systemctl kill -s KILL` exited {}",
+                    tok("nc_kill_exit").unwrap_or("unknown")
+                ),
+                other => format!("script aborted: {other}"),
+            });
+        }
+        if tok("nc_teardown_registered") != Some("true") {
+            return not_adjudicable(
+                "restart trap was not registered before the fault (transcript missing \
+                 nc_teardown_registered=true)"
+                    .to_owned(),
+            );
+        }
+        // Belt-and-braces re-checks: the abort tokens above are the primary
+        // gate; a transcript that skipped them without asserting these is
+        // garbled and must not be adjudicated.
+        if tok("nc_baseline_unit") != Some("active") {
+            return not_adjudicable(format!(
+                "garbled transcript: nc_baseline_unit={:?}",
+                tok("nc_baseline_unit")
+            ));
+        }
+        if tok("nc_baseline_probe") != Some("answered") {
+            return not_adjudicable(format!(
+                "garbled transcript: nc_baseline_probe={:?}",
+                tok("nc_baseline_probe")
+            ));
+        }
+        if tok("nc_kill_exit") != Some("0") {
+            return not_adjudicable(format!(
+                "garbled transcript: nc_kill_exit={:?}",
+                tok("nc_kill_exit")
+            ));
+        }
+        // Restore is mandatory + verified (teardown bar): a control that
+        // leaves the daemon dead must fail even when the probe behaved.
+        if tok("nc_final_unit") != Some("active") {
+            return not_adjudicable(format!(
+                "node not restored: {RUSTYNETD_UNIT} is {:?} after the trap-restart \
+                 (probe result was {:?})",
+                tok("nc_final_unit").unwrap_or("<missing>"),
+                tok("nc_probe_under_kill").unwrap_or("<missing>")
+            ));
+        }
+
+        let Some(probe_exit) = tok("nc_probe_exit") else {
+            return not_adjudicable("garbled transcript: nc_probe_exit missing".to_owned());
+        };
+        let detail = tok("nc_probe_detail")
+            .unwrap_or("(no probe detail captured)")
+            .to_owned();
+        match tok("nc_probe_under_kill") {
+            Some("failed") => {
+                if probe_exit == "0" {
+                    return not_adjudicable(
+                        "garbled transcript: nc_probe_under_kill=failed but nc_probe_exit=0"
+                            .to_owned(),
+                    );
+                }
+                KillWindowObservation::ProbeFailedUnderKill {
+                    detail: format!("probe exit {probe_exit}: {detail}"),
+                }
+            }
+            Some("answered") => {
+                if probe_exit != "0" {
+                    return not_adjudicable(format!(
+                        "garbled transcript: nc_probe_under_kill=answered but \
+                         nc_probe_exit={probe_exit}"
+                    ));
+                }
+                KillWindowObservation::ProbeAnsweredUnderKill { detail }
+            }
+            other => not_adjudicable(format!(
+                "probe result token missing/unrecognised: {other:?}"
+            )),
+        }
+    }
+
+    /// Fold the observation into the control verdict. ONLY the two
+    /// transport-successful probe outcomes are mapped into a [`StageOutcome`]
+    /// and adjudicated by the pure [`adjudicate_daemon_kill_outcome`] (the
+    /// final classifier); every other observation fails the control WITHOUT
+    /// consulting the adjudicator — so a transport failure can never be
+    /// laundered into a `StageDidNotPass` control pass.
+    pub(crate) fn kill_control_verdict(observation: KillWindowObservation) -> StageOutcome {
+        match observation {
+            KillWindowObservation::ProbeFailedUnderKill { detail } => {
+                let recorded = StageOutcome::Failed(format!(
+                    "daemon-socket probe failed under mid-stage SIGKILL ({detail})"
+                ));
+                match adjudicate_daemon_kill_outcome(&recorded) {
+                    KillControlOutcome::StageDidNotPass => StageOutcome::Passed,
+                    // Defensive: unreachable for a Failed input today, but a
+                    // future adjudicator regression must fail the control,
+                    // never panic a live run.
+                    KillControlOutcome::FalseGreenUnderKill => StageOutcome::Failed(
+                        "adjudicator classified a Failed probe outcome as a false-green \
+                         (adjudication regression; fail closed)"
+                            .to_owned(),
+                    ),
+                }
+            }
+            KillWindowObservation::ProbeAnsweredUnderKill { detail } => {
+                match adjudicate_daemon_kill_outcome(&StageOutcome::Passed) {
+                    KillControlOutcome::FalseGreenUnderKill => StageOutcome::Failed(format!(
+                        "FALSE-GREEN — the daemon-socket probe ANSWERED under a mid-stage \
+                         SIGKILL ({detail}); a daemon-dependent stage could record a pass \
+                         with {RUSTYNETD_UNIT} dead"
+                    )),
+                    KillControlOutcome::StageDidNotPass => StageOutcome::Failed(
+                        "adjudicator accepted a Passed-under-kill as a non-pass \
+                         (adjudication regression; fail closed)"
+                            .to_owned(),
+                    ),
+                }
+            }
+            KillWindowObservation::NotAdjudicable { reason } => StageOutcome::Failed(format!(
+                "not adjudicable — {reason}; the fault was not provably injected and \
+                 bound, so no outcome is fed to the adjudicator (fail closed)"
+            )),
+        }
+    }
+
+    /// The (c) control body. A working control returns
+    /// [`StageOutcome::Passed`] (the induced probe-RED stays inside the
+    /// control, §5).
+    pub(crate) fn run_daemon_kill_control(
+        workdir: &Path,
+        target_alias: &str,
+        adapter: &dyn NodeAdapter,
+    ) -> StageOutcome {
+        let fail = |reason: String| {
+            StageOutcome::Failed(format!(
+                "daemon-kill negative control [target {target_alias}]: {reason}"
+            ))
+        };
+
+        // The script's unit/socket/CLI paths are the LINUX daemon contract;
+        // on any other platform the fault would be unbindable.
+        if adapter.platform() != VmGuestPlatform::Linux {
+            return fail(format!(
+                "target platform {:?} cannot run the systemd kill-window script (fail closed)",
+                adapter.platform()
+            ));
+        }
+
+        let shell = match adapter.shell_host() {
+            Ok(shell) => shell,
+            Err(err) => return fail(format!("no remote shell host: {err}")),
+        };
+        if let Err(err) =
+            write_control_evidence(workdir, "kill_window_script.sh", KILL_WINDOW_SCRIPT)
+        {
+            return fail(err);
+        }
+        let status = match shell.run_argv(&["sh", "-c", KILL_WINDOW_SCRIPT], &[], &[]) {
+            Ok(status) => status,
+            Err(err) => {
+                return fail(format!(
+                    "transport failure running the kill-window script: {err} — control \
+                     FAILED without adjudication (a transport failure is never mapped to \
+                     a stage outcome)"
+                ));
+            }
+        };
+        let stdout = String::from_utf8_lossy(&status.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&status.stderr).into_owned();
+        if let Err(err) = write_control_evidence(
+            workdir,
+            "kill_window_transcript.txt",
+            &format!(
+                "exit={}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n",
+                status.code
+            ),
+        ) {
+            return fail(err);
+        }
+        match kill_control_verdict(parse_kill_window_transcript(status.code, &stdout)) {
+            StageOutcome::Failed(reason) => fail(reason),
+            other => other,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // ── script invariants ───────────────────────────────────────────────
+
+        #[test]
+        fn script_binds_to_the_fixed_unit_socket_and_cli() {
+            assert!(KILL_WINDOW_SCRIPT.contains(&format!("unit={RUSTYNETD_UNIT}\n")));
+            assert!(KILL_WINDOW_SCRIPT.contains(&format!("socket={DAEMON_SOCKET_PATH}\n")));
+            assert!(KILL_WINDOW_SCRIPT.contains(&format!("cli={RUSTYNET_CLI_PATH}\n")));
+            // Socket-bound probe (§8 M3): the daemon control socket, never a
+            // status field — path_live_proven must not appear.
+            assert!(
+                KILL_WINDOW_SCRIPT.contains("RUSTYNET_DAEMON_SOCKET=\"$socket\" \"$cli\" status")
+            );
+            assert!(!KILL_WINDOW_SCRIPT.contains("path_live_proven"));
+        }
+
+        #[test]
+        fn script_sequences_trap_baseline_kill_probe_restart() {
+            let idx = |needle: &str| {
+                KILL_WINDOW_SCRIPT
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("script must contain {needle:?}"))
+            };
+            let trap = idx("trap finish EXIT");
+            let baseline_probe = idx("nc_baseline_probe=");
+            let kill = idx("systemctl kill -s KILL");
+            let probe_under_kill = idx("nc_probe_under_kill=");
+            // First occurrence of the restart command is the trap function
+            // body (registered up top); the LAST is the explicit end-of-script
+            // restart.
+            let restart = KILL_WINDOW_SCRIPT
+                .rfind("systemctl start \"$unit\"")
+                .expect("script must contain the explicit restart");
+            assert!(
+                trap < kill,
+                "restart trap must be registered before the fault"
+            );
+            assert!(
+                baseline_probe < kill,
+                "baseline must be proven before the kill (§8 S4)"
+            );
+            assert!(
+                kill < probe_under_kill,
+                "the adjudicated probe must run after the kill"
+            );
+            assert!(probe_under_kill < restart, "explicit restart comes last");
+            // The re-probe is IMMEDIATE: nothing sleeps between the kill and
+            // the probe (the 2s RestartSec window must not be slept away).
+            let window = &KILL_WINDOW_SCRIPT[kill..probe_under_kill];
+            assert!(
+                !window.contains("sleep"),
+                "no sleep may sit inside the kill window: {window}"
+            );
+        }
+
+        // ── transcript parsing ──────────────────────────────────────────────
+
+        fn transcript(probe: &str, probe_exit: &str, final_unit: &str) -> String {
+            format!(
+                "nc_teardown_registered=true\n\
+                 nc_baseline_unit=active\n\
+                 nc_baseline_probe=answered\n\
+                 nc_kill_exit=0\n\
+                 nc_kill_unix=1780000000\n\
+                 nc_probe_under_kill={probe}\n\
+                 nc_probe_exit={probe_exit}\n\
+                 nc_probe_done_unix=1780000001\n\
+                 nc_probe_detail=error: connect to daemon socket \
+                 /run/rustynet/rustynetd.sock: Connection refused\n\
+                 nc_post_kill_unit=activating\n\
+                 nc_final_unit={final_unit}\n"
+            )
+        }
+
+        #[test]
+        fn probe_failed_under_kill_is_adjudicable_and_passes_the_control() {
+            let obs = parse_kill_window_transcript(0, &transcript("failed", "1", "active"));
+            let KillWindowObservation::ProbeFailedUnderKill { detail } = &obs else {
+                panic!("expected ProbeFailedUnderKill, got {obs:?}");
+            };
+            assert!(detail.contains("Connection refused"), "got: {detail}");
+            // The pure adjudicator is the final classifier: a Failed recorded
+            // outcome is StageDidNotPass, so the control passes.
+            assert_eq!(
+                adjudicate_daemon_kill_outcome(&StageOutcome::Failed("probe failed".to_owned())),
+                KillControlOutcome::StageDidNotPass
+            );
+            assert_eq!(kill_control_verdict(obs), StageOutcome::Passed);
+        }
+
+        #[test]
+        fn guard_probe_answered_under_kill_is_a_false_green_control_fails() {
+            let obs = parse_kill_window_transcript(0, &transcript("answered", "0", "active"));
+            assert!(matches!(
+                obs,
+                KillWindowObservation::ProbeAnsweredUnderKill { .. }
+            ));
+            let verdict = kill_control_verdict(obs);
+            let StageOutcome::Failed(reason) = verdict else {
+                panic!("a probe answering under kill must fail the control, got {verdict:?}");
+            };
+            assert!(reason.contains("FALSE-GREEN"), "got: {reason}");
+        }
+
+        #[test]
+        fn guard_transport_and_infra_failures_are_never_adjudicated() {
+            // A non-zero script exit (or any not-adjudicable observation)
+            // must FAIL the control — even though feeding a Failed-shaped
+            // outcome to the adjudicator would have PASSED it. The verdict
+            // message pins that no adjudication happened.
+            let obs = parse_kill_window_transcript(255, &transcript("failed", "1", "active"));
+            assert!(matches!(obs, KillWindowObservation::NotAdjudicable { .. }));
+            let StageOutcome::Failed(reason) = kill_control_verdict(obs) else {
+                panic!("infra failure must fail the control");
+            };
+            assert!(
+                reason.contains("no outcome is fed to the adjudicator"),
+                "got: {reason}"
+            );
+        }
+
+        #[test]
+        fn baseline_not_active_or_probe_dead_before_kill_is_not_adjudicable() {
+            let dead_unit = "nc_teardown_registered=true\n\
+                             nc_baseline_unit=inactive\n\
+                             nc_abort=baseline_unit_not_active\n";
+            let obs = parse_kill_window_transcript(0, dead_unit);
+            let KillWindowObservation::NotAdjudicable { reason } = &obs else {
+                panic!("expected NotAdjudicable, got {obs:?}");
+            };
+            assert!(reason.contains("baseline not applicable"), "got: {reason}");
+
+            let dead_probe = "nc_teardown_registered=true\n\
+                              nc_baseline_unit=active\n\
+                              nc_baseline_probe=failed\n\
+                              nc_baseline_probe_detail=connect refused\n\
+                              nc_abort=baseline_probe_failed\n";
+            let obs = parse_kill_window_transcript(0, dead_probe);
+            let KillWindowObservation::NotAdjudicable { reason } = &obs else {
+                panic!("expected NotAdjudicable, got {obs:?}");
+            };
+            assert!(
+                reason.contains("could not be bound to the kill"),
+                "got: {reason}"
+            );
+        }
+
+        #[test]
+        fn kill_not_taken_is_not_adjudicable() {
+            let t = "nc_teardown_registered=true\n\
+                     nc_baseline_unit=active\n\
+                     nc_baseline_probe=answered\n\
+                     nc_kill_exit=1\n\
+                     nc_abort=kill_not_taken\n";
+            let obs = parse_kill_window_transcript(0, t);
+            let KillWindowObservation::NotAdjudicable { reason } = &obs else {
+                panic!("expected NotAdjudicable, got {obs:?}");
+            };
+            assert!(reason.contains("kill not taken"), "got: {reason}");
+        }
+
+        #[test]
+        fn guard_unrestored_node_fails_even_when_the_probe_behaved() {
+            // Teardown is mandatory + verified: a correct probe-RED with the
+            // daemon left dead must still fail the control.
+            let obs = parse_kill_window_transcript(0, &transcript("failed", "1", "failed"));
+            let KillWindowObservation::NotAdjudicable { reason } = &obs else {
+                panic!("expected NotAdjudicable, got {obs:?}");
+            };
+            assert!(reason.contains("node not restored"), "got: {reason}");
+            assert!(matches!(kill_control_verdict(obs), StageOutcome::Failed(_)));
+        }
+
+        #[test]
+        fn garbled_or_contradictory_transcripts_fail_closed() {
+            // Missing probe token entirely.
+            let missing = "nc_teardown_registered=true\n\
+                           nc_baseline_unit=active\n\
+                           nc_baseline_probe=answered\n\
+                           nc_kill_exit=0\n\
+                           nc_final_unit=active\n";
+            assert!(matches!(
+                parse_kill_window_transcript(0, missing),
+                KillWindowObservation::NotAdjudicable { .. }
+            ));
+            // Contradiction: "failed" with exit 0.
+            assert!(matches!(
+                parse_kill_window_transcript(0, &transcript("failed", "0", "active")),
+                KillWindowObservation::NotAdjudicable { .. }
+            ));
+            // Contradiction: "answered" with a non-zero exit.
+            assert!(matches!(
+                parse_kill_window_transcript(0, &transcript("answered", "1", "active")),
+                KillWindowObservation::NotAdjudicable { .. }
+            ));
+            // Missing trap registration.
+            let no_trap = "nc_baseline_unit=active\n\
+                           nc_baseline_probe=answered\n\
+                           nc_kill_exit=0\n\
+                           nc_probe_under_kill=failed\n\
+                           nc_probe_exit=1\n\
+                           nc_final_unit=active\n";
+            assert!(matches!(
+                parse_kill_window_transcript(0, no_trap),
+                KillWindowObservation::NotAdjudicable { .. }
+            ));
+            // Empty transcript.
+            assert!(matches!(
+                parse_kill_window_transcript(0, ""),
+                KillWindowObservation::NotAdjudicable { .. }
+            ));
+        }
     }
 }
 
@@ -1023,5 +2213,69 @@ mod tests {
         let outcome = adjudicate_daemon_kill_outcome(&StageOutcome::Passed);
         assert_eq!(outcome, KillControlOutcome::FalseGreenUnderKill);
         assert!(!outcome.is_control_pass());
+    }
+
+    // ── live-control target selection (shared by (a) + (c)) ──────────────────
+
+    fn assignment(alias: &str, role: NodeRole) -> NodeRoleAssignment {
+        NodeRoleAssignment {
+            alias: alias.to_owned(),
+            role,
+        }
+    }
+
+    #[test]
+    fn target_selection_prefers_a_linux_client() {
+        let assignments = vec![
+            assignment("exit-1", NodeRole::Exit),
+            assignment("mac-client", NodeRole::Client),
+            assignment("deb-client", NodeRole::Client),
+        ];
+        let platform_of = |alias: &str| match alias {
+            "exit-1" | "deb-client" => Some(VmGuestPlatform::Linux),
+            "mac-client" => Some(VmGuestPlatform::Macos),
+            _ => None,
+        };
+        assert_eq!(
+            select_linux_control_target(&assignments, &platform_of),
+            Ok("deb-client")
+        );
+    }
+
+    #[test]
+    fn target_selection_falls_back_to_any_linux_node() {
+        let assignments = vec![
+            assignment("mac-client", NodeRole::Client),
+            assignment("exit-1", NodeRole::Exit),
+        ];
+        let platform_of = |alias: &str| match alias {
+            "exit-1" => Some(VmGuestPlatform::Linux),
+            "mac-client" => Some(VmGuestPlatform::Macos),
+            _ => None,
+        };
+        assert_eq!(
+            select_linux_control_target(&assignments, &platform_of),
+            Ok("exit-1")
+        );
+    }
+
+    #[test]
+    fn guard_target_selection_fails_closed_without_a_linux_adapter() {
+        // §8 M1: a non-Linux target's default assert_node_clean() is Ok(())
+        // — running the control there would HIDE the fault. An assignment
+        // with no constructed adapter (platform unknown) must not qualify
+        // either.
+        let assignments = vec![
+            assignment("mac-client", NodeRole::Client),
+            assignment("ghost-node", NodeRole::Client),
+        ];
+        let platform_of = |alias: &str| match alias {
+            "mac-client" => Some(VmGuestPlatform::Macos),
+            _ => None,
+        };
+        let err = select_linux_control_target(&assignments, &platform_of)
+            .expect_err("no Linux adapter must fail closed");
+        assert!(err.contains("fail closed"), "got: {err}");
+        assert!(err.contains("assert_node_clean"), "got: {err}");
     }
 }
