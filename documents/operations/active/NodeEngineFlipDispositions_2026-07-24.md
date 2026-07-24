@@ -43,23 +43,34 @@ engine-trust failure; each is a product/tooling gap the engine correctly surface
   (traffic_test_matrix, live_managed_dns) is GREEN 5-of-5.
 - **Owner sign-off:** APPROVED 2026-07-24 (owner chose "disposition two_hop, flip
   now" over a ~4h full re-prove).
-- **UPDATE 2026-07-24 (tooling fixed → real root cause revealed).** The
-  `run_cargo_ops` `--features vm-lab` fix landed (`553f92d`, post-flip G2 item).
-  With it, the two-hop topology re-run got *past* the pre-check and exercised the
-  actual dataplane proof, which now fails for a **genuine, distinct reason** —
-  **NOT tooling:** `[two-hop] data-plane proof summary end_to_end_reachable=false
-  per_hop_ttl_decrement=none`. The second client has a live *direct* path to the
-  exit (`path_live_proven=true`, `path_live_direct_peers=1`), but end-to-end
-  reachability across the two-hop / client↔client path does not complete. This is
-  the known **client↔client WireGuard-transport gap** (userspace shared-socket
-  handshake; hard-gates the multi-hop path), a real **product** gap of the same
-  class as D3 `network_flap` — the engine adjudicates it correctly (loud, detailed
-  RED, no false-green), so G1 engine-trust is unaffected. So `two_hop` is now
-  **re-characterised from a tooling gap to a dataplane product gap**, tracked as a
-  distinct dataplane item for **G2/release** (the client↔client fullmesh fix).
-- **Expiry / re-review:** resolve the client↔client dataplane gap and prove
-  `two_hop` GREEN as a **G2/release** item. NOT a permanent exemption; NOT a flip
-  blocker (G1 = engine-trust, satisfied).
+- **UPDATE 2026-07-24 (tooling fixed → real root cause GROUNDED, and a prior
+  mislabel corrected).** The `run_cargo_ops` `--features vm-lab` fix landed
+  (`553f92d`, post-flip G2 item). With it, the two-hop topology re-run got *past*
+  the pre-check and exercised the actual dataplane proof, which fails as
+  `end_to_end_reachable=false per_hop_ttl_decrement=none`.
+  - **CORRECTION:** an earlier draft of this update called it "the client↔client
+    WireGuard-transport gap." That is **wrong**, grounded out as follows:
+    - **Client↔client direct mesh reachability WORKS on the engine of record.**
+      `traffic_test_matrix` (`stage/traffic_test_matrix.rs:101-160`) is a genuine
+      full cross-node mesh probe (skips self L118; errors on any unreachable pair)
+      and it **PASSED** in the two-hop run, which had **three clients**
+      (debian-2 + fedora-aux + ubuntu-extra) — so every client↔client pair reached
+      each other directly. The 2026-07-15 "client↔client 100% loss" finding is
+      **stale / since-fixed**, not a current bug.
+    - **Not a lab-no-internet artifact either:** the exit guest reaches `1.1.1.1`
+      at baseline (0% loss, via the UTM Shared gateway `192.168.64.1`).
+  - **Actual root cause (narrower):** the **two-hop EXIT-CHAIN internet route**
+    (`client → entry(=client's exit) → final-exit → NAT → internet`) does not
+    complete. The client reaches the *final exit's mesh IP* (two-hop TTL reply 64)
+    but `1.1.1.1` via the chained NAT is unreachable, and the baseline (entry) TTL
+    probe returned None. So this is a **two-hop exit-chaining / forwarding** gap
+    (entry-as-intermediate forwarding to a second exit + chained NAT), a **product**
+    gap of the same class as D3 `network_flap`. The engine adjudicates it correctly
+    (loud, detailed RED, no false-green), so G1 engine-trust is unaffected.
+- **Expiry / re-review:** root-cause and fix the two-hop exit-chain forwarding
+  (needs live-mesh investigation of the entry-forward + final-exit chained NAT) and
+  prove `two_hop` GREEN as a **G2/release** item. NOT a permanent exemption; NOT a
+  flip blocker (G1 = engine-trust, satisfied).
 
 ### D2 — T5 negative controls `negative_control_planted_residue` + `negative_control_daemon_kill_mid_stage`: live proof deferred
 - **Status:** built as opt-in T5 stages (A3a, `1b9e2c0`) with unit-tested pure
