@@ -287,10 +287,27 @@ once). Secrets always to the mode-600 sidecar, never the tracked file.
   host key, or a bastion/jump host, or image-baked cloud-init phoning a fixed
   pinned endpoint. State plainly that remote onboarding needs one of these.
 
-## 7.5 macOS reality (premise corrected)
-The v1 claim "UTM has no programmatic creation" was **wrong**: UTM ships an
-AppleScript API (`make`/`duplicate`/`update configuration`/`import`;
-`UTM.sdef`). So there are three options, decided by a spike (§7.8):
+## 7.5 macOS reality (premise corrected — SPIKE RUN 2026-07-24: E-opt-0 CHOSEN)
+
+**Spike result (run on the Mac, this machine):** headless AppleScript→UTM works
+end-to-end under macOS Automation TCC with **no prompt and no GUI** — proven:
+read-only query (VM list, exit 0); `make new virtual machine {backend:qemu,
+configuration:{name, architecture:"aarch64", memory}}` created a VM from scratch;
+`update configuration … {network interfaces:{{index:0, address:"52:54:00:…"}}}`
+**set the MAC and read it back** (this MOOTS the reviewer's unverified
+clone-MAC-regen risk — the MAC is set explicitly, never inherited); `utmctl
+delete` removed it. The sdef `qemu drive configuration` has a **`source` = "An
+existing file to use as the source image"** property, so a CoW overlay + seed ISO
+attach exactly like libvirt. **Decision: adopt E-opt-0 (full programmatic parity),
+NOT semi-manual.** The macOS guest path mirrors the libvirt flow: `qemu-img` CoW
+overlay + `cloud-localds` seed + AppleScript `make` with drive `source`s + explicit
+MAC. Two caveats stay open: (i) NOT yet validated end-to-end is an actual ARM
+cloud-image + seed → boot → cloud-init first-boot → SSH-up (API capability proven;
+guest bring-up is the next validation, needs a real image); (ii) TCC Automation
+permission is currently granted but **revocable** (cf. the Local-Network-Privacy
+caveat) — onboarding must detect an AppleScript `-1743` and surface it, not hang.
+
+The three options as originally framed (kept for the record; E-opt-0 won):
 - **E-opt-0 (real parity):** `qemu-img` CoW overlay + fresh cloud-localds seed +
   AppleScript `make` — mirrors the libvirt flow.
 - **E-opt-1 (clone):** `utmctl clone` exists but has **zero reconfig knobs** →
@@ -320,9 +337,12 @@ Layer 1 MCP tools stay host-agnostic (work on any onboarded box, zero new code).
    still automatable, honest. *Reversible:* if you'd rather accept standing
    root-equiv (you effectively have it via libvirt anyway) and just document it,
    say so — simpler, less machinery.
-2. **macOS v1 = honest semi-manual (E-opt-2), one Mac**; the AppleScript-headless
-   spike decides whether E-opt-0 (full parity) is worth building. *Reversible:*
-   if you want Mac-scaling sooner, we prioritise the `remote_utm` kind.
+2. **macOS = E-opt-0 full parity** (UPDATED post-spike — the AppleScript-headless
+   spike passed, §7.5, so semi-manual is no longer the v1 fallback). Still **one
+   Mac** until a `remote_utm` kind exists (`local_utm` = this-machine-only). The
+   remaining macOS validation is a real end-to-end guest boot (cloud-init→SSH),
+   not a design question. *Reversible:* if you want Mac-scaling (Mac #2) sooner,
+   we prioritise `remote_utm`.
 3. **Reconcile = idempotent verbs + additive `fleet-converge` + `fleet-status`
    drift report.** No destructive reconcile. (Not reversing this — every review
    agreed.)
@@ -344,9 +364,10 @@ Layer 1 MCP tools stay host-agnostic (work on any onboarded box, zero new code).
   (resolvable connect_uri, scrub tailnet literals, second-operator note) ✓.
 
 ## 7.9 Implementation ordering
-0. **Spike FIRST (macOS):** headless AppleScript `make`/`update configuration`
-   under macOS Automation TCC — its outcome decides E-opt-0 vs corrected-E-opt-1
-   vs semi-manual, and no design review can substitute for running it.
+0. **Spike (macOS) — DONE 2026-07-24, PASSED (§7.5):** headless AppleScript
+   `make`/`update configuration` under TCC works, MAC settable, drive `source`
+   attach available → E-opt-0 chosen. Remaining: one end-to-end guest-boot
+   validation (real ARM cloud image + seed → cloud-init → SSH) during step 3.
 1. Image catalog (`lab_image_catalog.json`, name→url+sha256+os+arch) + arch gate.
 2. `onboard-host --new` (entry authoring + allocator + manifest + observability
    fold-in) — Ubuntu path; time-bounded privilege.
