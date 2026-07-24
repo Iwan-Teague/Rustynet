@@ -192,6 +192,16 @@ Deferred-with-reason today: `nas`/`llm` (separate program); roadmap-parked cells
 (relay frame-forward HP-3, Windows-exit pending WinNAT, Windows `blind_exit`) —
 each mirrored here so a red cell is a *known* deferral, never an unexplained gap.
 
+**W5.6 flip dispositions (owner-signed 2026-07-24, mirrored per rule e):** see
+`NodeEngineFlipDispositions_2026-07-24.md` — D1 `live_two_hop_validation`
+(validator-tooling gap: `run_cargo_ops` drops `--features vm-lab` so the
+vm-lab-gated `check-local-file-mode` pre-check is absent; correctly-adjudicated
+RED, not the dataplane; G2 follow-on), D2 the two live-deferred T5 controls
+(`planted_residue`, `daemon_kill_mid_stage`; the other two T5 classes are
+proven in-pipeline; G2 follow-on), D3 `live_network_flap_validation`
+(correctly-RED per §6, traversal track). These gate the **W5.6 flip only**; G2
+(release) still requires them resolved/green.
+
 ## 7. (reserved)
 
 ## 8. G3 — bash-retirement differential sweep (one-time; gates deletion only)
