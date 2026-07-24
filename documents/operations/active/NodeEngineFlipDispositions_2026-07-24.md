@@ -72,8 +72,17 @@ engine-trust failure; each is a product/tooling gap the engine correctly surface
   prove `two_hop` GREEN as a **G2/release** item. NOT a permanent exemption; NOT a
   flip blocker (G1 = engine-trust, satisfied).
 
-### D2 — T5 negative controls `negative_control_planted_residue` + `negative_control_daemon_kill_mid_stage`: live proof deferred
-- **Status:** built as opt-in T5 stages (A3a, `1b9e2c0`) with unit-tested pure
+### D2 — T5 negative controls `negative_control_planted_residue` + `negative_control_daemon_kill_mid_stage`: live proof COMPLETE (2026-07-24)
+- **RESOLVED 2026-07-24 (D2 satisfied):** the two controls' `execute()` bodies now
+  inject the live fault and adjudicate RED-for-the-right-reason (fable-reviewed build
+  + adversarial code review; plan `LiveT5NegativeControlProofPlan_2026-07-24.md`).
+  Proven live in run `state/live-lab-d2-negctl-1784908669`: both control rows `pass`
+  in `stages.tsv`; residue → clean-assert `Err` naming `rustynet_planted`, then torn
+  down and verified absent; daemon-kill → the daemon-socket probe failed `Connection
+  refused (os error 111)` under the SIGKILL, daemon restarted `active`. A2 independent
+  verifier: **VALID** (§4.1/4.2/4.5/4.6 all PASS), exit 2. All four T5 fault classes
+  now prove RED-for-the-right-reason.
+- **Prior status (history):** built as opt-in T5 stages (A3a, `1b9e2c0`) with unit-tested pure
   adjudication logic, but `execute()` returns `Skipped` pending a live-guest fault
   injection (the deferred half of A3-finish per the CompletionBrief). The other
   two T5 fault classes — `negative_control_signed_bundle_rejection` and
