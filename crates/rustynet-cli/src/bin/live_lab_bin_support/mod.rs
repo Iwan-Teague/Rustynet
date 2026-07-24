@@ -755,11 +755,19 @@ pub fn write_assignment_refresh_env(
 pub fn run_cargo_ops(root_dir: &Path, subcommand: &str, args: &[OsString]) -> Result<(), String> {
     let status = Command::new("cargo")
         .current_dir(root_dir)
+        // `--features vm-lab` is REQUIRED: the `ops` subcommands this helper
+        // drives (e.g. `check-local-file-mode`, used by the two_hop known-hosts
+        // pre-check) are `#[cfg(feature = "vm-lab")]`-gated. Without the flag,
+        // `cargo run` builds a default binary missing them, and the call fails
+        // with "unknown ops subcommand" — which is exactly what made
+        // live_two_hop_validation hard-fail before reaching any routing.
         .args([
             "run",
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--",
             "ops",
             subcommand,
