@@ -14,7 +14,7 @@ refuses to start.
 
 This runbook captures the operator-facing setup. The reviewed
 workflow + helper landed in:
-- [.github/workflows/release-windows.yml](../../.github/workflows/release-windows.yml)
+- [.github/workflows/release.yml](../../.github/workflows/release.yml)
 - [scripts/release/Sign-RustyNetWindowsBinary.ps1](../../scripts/release/Sign-RustyNetWindowsBinary.ps1)
 
 ## 2) Prerequisites
