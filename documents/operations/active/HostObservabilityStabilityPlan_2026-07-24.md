@@ -1,9 +1,16 @@
-# Host Observability & Stability Plan — ubuntu-kvm-1 (2026-07-24)
+# Host Observability, Stability & Fleet-Onboarding Plan (2026-07-24)
 
 Status: ACTIVE. Owner track: lab infrastructure (extends
 `LinuxVmHostPlan_2026-07-14.md`). Trigger: `ubuntu-kvm-1` rebooted ≥2× on
 2026-07-24 under nested-virt load; the box is currently **un-diagnosable** — see
 the memory `ubuntu_kvm1_reboot_investigation_2026-07-24`.
+
+**Scope has two coupled halves:** (1) the observability/stability layers that make
+a host self-diagnosable (§1–§6, Layer 0 done + fable-reviewed), and (2) a
+**first-class fleet-onboarding architecture** so those layers — and the whole
+add/subtract-a-box flow — scale horizontally across Ubuntu + macOS hosts (§7,
+hardened by four independent adversarial reviews). The observability layers are
+steps *inside* onboarding, which is why they share one doc.
 
 ## 0) Problem statement
 
@@ -172,3 +179,180 @@ root-equivalent. The "no passwordless sudo" posture is therefore partly
 illusory. If the agent identity should be genuinely sub-root, that requires
 separating the libvirt-driving identity from a lower-privilege one — a larger
 change, tracked here, out of scope for the observability layers.
+
+---
+
+# FLEET ONBOARDING ARCHITECTURE (first-class requirement)
+
+The observability layers above must not be per-box manual work. They fold into a
+repeatable **add/subtract a box** flow so the fleet scales horizontally
+(Ubuntu + macOS). This section is the design, hardened by **four independent
+adversarial fable reviews** (architecture / security / teardown / macOS). Design
+v1 is superseded; below is v2 (what survived).
+
+## 7.1 What already exists (reuse; do NOT rebuild)
+Host registry `hosts[]` (`kind ∈ {local_utm, libvirt}`, parse-time `VmController`
+resolution, fail-closed validation — b689cd6 on main); idempotent guest lifecycle
+(`fetch-image` sha256-pinned, `provision-guest`, `provision-toolchain`,
+`discover-hosts`, power, `sync-host`, host+guest preflight); node OS bring-up
+`e2e-bootstrap-host`; two-plane split (host-agnostic SSH orchestration vs
+kind-specific VM lifecycle); SSH secrets sidecar. The four gaps to close: host
+**stand-up** automation, composed **add-box**, **teardown/offboarding** (none
+exists today), macOS asymmetry + portability.
+
+## 7.2 Design principle (review-decided)
+**Idempotent composed verbs over declarative catalogs, PLUS the safe half of
+reconcile — never destructive reconcile.** Rejecting a full desired-state control
+loop is correct for a pets-not-cattle lab (a config-diff must never `undefine` a
+VM). But pure verbs leave drift invisible at N hosts, so add read-only
+`fleet-status` (declared-vs-actual drift report) + **additive-only**
+`fleet-converge` (= run the idempotent `onboard-host` across all hosts; never
+deletes). Every verb: check-then-act, three-outcome per step
+(**confirmed-absent / confirmed-done / error** — never the repo's `|| true`
+"absent==error" idiom), verify-by-readback, fail-closed on transport error.
+
+## 7.3 The verbs (hardening baked in)
+
+**`onboard-host --new --ssh <user@ip>`** — probes the fresh box, **auto-allocates
++ writes** its `hosts[]` entry (host_id, guest_subnet from a fleet allocator,
+repo_dir by convention — no hand-edited JSON, which was the fiddliest surviving
+step), records an **onboard manifest** of exactly what it changed, then runs the
+stand-up (KVM stack, `usermod -aG`, rustup pin, PATH shims, pool + `chmod 2771`,
+observability §7.6) and host-preflight. It must NOT blindly compose the
+destructive `e2e-bootstrap-host` against a **live** box: that clears the nft
+killswitch + trust anchor before recreating (`ops_e2e.rs:339-346` — a verified
+**fail-OPEN** window). Gate it behind a "no protected traffic" assertion and keep
+a standalone default-deny killswitch in force across the recreate.
+
+**`add-guest --host H --image <catalog-name> --role R`** — fetch-image (catalog,
+sha256) → **arch gate** (`catalog.arch == host uname -m`, fail closed, else an
+amd64 image silently defines on an ARM host and dies as an opaque SSH timeout) →
+provision-guest → wait-for-SSH → auto-write `entries[]` (non-secret) + sidecar
+(secret, mode-600, **proven-by-test** it never lands in the public tracked file) →
+toolchain → cache-seed + repo-sync + `--features vm-lab` build + known_hosts pin.
+**Per-stage verify-then-skip** (domain exists AND SSH answers AND cloud-init
+finished = skip; exists-but-unhealthy = explicit `--adopt`/`--recreate`) — because
+`provision-guest` refuses an existing domain/overlay, so a naive re-run of a
+half-done add hard-fails and orphans a VM. **Done-ness contract:** "guest passes
+preflight AND is selectable by a `--node` run with zero further steps" — same
+contract across all host kinds.
+
+**`remove-guest --alias A` | `--host H --domain D`** (reality-keyed, so a
+half-provisioned orphan with no inventory record is still removable) — three
+outcomes per step; delete storage **only** from `virsh domblklist` read back
+*before* undefine, pool-prefixed, and only files whose `qemu-img info` shows a
+**backing file** (proves overlay, never the shared base image). **Drop
+`--remove-all-storage`** (zero repo precedent; the existing rollback uses plain
+`undefine` + targeted `rm`). Unreachable guest (the modal removal target — daemon
+uninstall needs SSH into it): powered-off → auto-skip; powered-on-unreachable →
+`--force-unreachable`, recording that trust cleanup was skipped. Emit membership
+`RemoveNode`/`RevokeNode` **before** dropping the record; prune the host's
+`known_hosts` entries (else a future box reusing the IP fails with a key-mismatch);
+leave run-matrix rows untouched (evidence). `--yes`/dry-run default-plan. UTM:
+`utmctl stop` → `utmctl delete` (verified to exist) → deregister, not `rm -rf`
+the bundle.
+
+**`offboard-host`** — offboard its guests (refuse if any remain without
+`--offboard-guests`), deregister, prune known_hosts. `--revert-privileged` is
+**cut from v1** (YAGNI + it strips the human's own access, since `agent_identity`
+== the human account on ubuntu-kvm-1); if ever added, drive it from the onboard
+manifest (replay-in-reverse of recorded additive changes only) and hard-refuse
+while a run is active.
+
+**Inventory writes** (all verbs): advisory `flock` + re-verify target still
+matches before write + preserve key order/formatting + **refuse while a lab run is
+active on the host** (the documented provenance dirty-check already failed runs
+once). Secrets always to the mode-600 sidecar, never the tracked file.
+
+## 7.4 Trust & connection model (security-review must-fixes)
+- **No `curl | sudo bash`.** SecurityMinimumBar §6.B forbids TLS-only trust
+  transfer. First-boot bootstrap is delivered image-baked (Ubuntu autoinstall /
+  cloud-init user-data) or console/sneakernet with an **operator-verified
+  sha256**; the transport is untrusted, the pasted hash is the trust root.
+- **Agent pubkey carried in-band** in that pinned bootstrap, fingerprint verified
+  once (like the §6.B owner pubkey) — never fetched from a URL.
+- **Per-host distinct credentials** (or distinct authorized principal) — one key
+  across N boxes is a fleet skeleton key. Private keys live only on the driving
+  workstation; prefer short-lived SSH certs.
+- **Privilege is time-bounded, not standing (my decision, §7.7).** onboard-host
+  installs a temporary sudoers for the privileged phase and **removes it at the
+  end**; ongoing operation uses only non-privileged surfaces (systemd-journal
+  group, `kvm`-group unprivileged virsh, sudoless pool). Do not leave broad
+  standing sudo reachable from the overlay. (The pre-existing libvirt
+  root-equivalence, §6, is a separate follow-up, not licence to add more.)
+- **Remote management path must be named and NOT the overlay-being-removed.**
+  "LAN-first, tailnet-fallback" is not separable for a non-LAN box (the Rustynet
+  overlay isn't up on a box you're onboarding — chicken-and-egg). v1 scope:
+  onboarding requires a pre-existing reachable transport — LAN SSH to a pinned
+  host key, or a bastion/jump host, or image-baked cloud-init phoning a fixed
+  pinned endpoint. State plainly that remote onboarding needs one of these.
+
+## 7.5 macOS reality (premise corrected)
+The v1 claim "UTM has no programmatic creation" was **wrong**: UTM ships an
+AppleScript API (`make`/`duplicate`/`update configuration`/`import`;
+`UTM.sdef`). So there are three options, decided by a spike (§7.8):
+- **E-opt-0 (real parity):** `qemu-img` CoW overlay + fresh cloud-localds seed +
+  AppleScript `make` — mirrors the libvirt flow.
+- **E-opt-1 (clone):** `utmctl clone` exists but has **zero reconfig knobs** →
+  a byte-duplicate (same machine-id/host-keys/hostname; dup machine-id can grab
+  the same DHCP lease even with a new MAC). Only viable as: cloud-init template +
+  AppleScript `update configuration` to set a generated MAC + attach a fresh seed
+  with a new instance-id; netplan matched by interface name, never MAC.
+- **E-opt-2 (semi-manual):** register + toolchain + bootstrap a GUI-made VM.
+- **Hard ceiling to STATE:** `local_utm` means *this machine* (`mod.rs:7736`
+  refuses driving a remote Mac; no `remote_utm` kind). So multi-Mac scaling is
+  impossible today — v1 is **Ubuntu fully-auto + exactly one Mac**; a
+  `remote_utm` kind (SSH → run `utmctl`/`osascript` on the Mac) or run-on-host is
+  the deferred path for Mac #2. Honesty requires stating this, not implying
+  flow parity.
+
+## 7.6 Observability fold-in (profile-driven, per-step outcomes)
+Layer 0/2 are steps in `onboard-host`, driven by the host's `onboard_profile` /
+`observability` field, each recording **applied / skipped-unsupported / failed**
+— Layer 0 (journal group) mandatory; Layer 2 warn-by-default (`mcelog` is
+x86-only → skipped-unsupported on ARM; `kernel.panic=10` is a behaviour change a
+lean onboard shouldn't silently force). Observability absence must never block
+using a box, and a silent skip is equally wrong — recorded-skip is the middle.
+Layer 1 MCP tools stay host-agnostic (work on any onboarded box, zero new code).
+
+## 7.7 Decisions I made (per "you decide") — two are reversible, flagged
+1. **Privilege = time-bounded + reverted** (not standing root-equiv). More secure,
+   still automatable, honest. *Reversible:* if you'd rather accept standing
+   root-equiv (you effectively have it via libvirt anyway) and just document it,
+   say so — simpler, less machinery.
+2. **macOS v1 = honest semi-manual (E-opt-2), one Mac**; the AppleScript-headless
+   spike decides whether E-opt-0 (full parity) is worth building. *Reversible:*
+   if you want Mac-scaling sooner, we prioritise the `remote_utm` kind.
+3. **Reconcile = idempotent verbs + additive `fleet-converge` + `fleet-status`
+   drift report.** No destructive reconcile. (Not reversing this — every review
+   agreed.)
+
+## 7.8 Four-review disposition (condensed)
+- **Architecture (sound-with-changes):** false idempotency → per-stage
+  verify/adopt/journal ✓; hand-authored `hosts[]` survives → `onboard-host --new`
+  ✓; "in inventory ≠ usable" → done-ness contract ✓; add `fleet-status`/
+  `fleet-converge` ✓; cut `--revert-privileged` ✓.
+- **Security (unsafe→acceptable-with-changes):** kill `curl|sudo bash` ✓;
+  time-bound privilege ✓; per-host keys ✓; in-band pubkey ✓; secrets→sidecar
+  proven-by-test ✓; fail-open recreate window gated ✓; remote path named ✓.
+- **Teardown (safe-with-changes):** three-outcome/`|| true` trap ✓; backing-file
+  check, drop `--remove-all-storage` ✓; unreachable-guest policy ✓; inventory
+  flock ✓; prune known_hosts, mesh RemoveNode first, evidence untouched ✓;
+  dry-run/`--yes` ✓.
+- **macOS (sound-with-changes):** corrected UTM premise ✓; E-opt-1 stall fixed /
+  E-opt-0 surfaced ✓; state one-Mac ceiling ✓; arch gate ✓; portability
+  (resolvable connect_uri, scrub tailnet literals, second-operator note) ✓.
+
+## 7.9 Implementation ordering
+0. **Spike FIRST (macOS):** headless AppleScript `make`/`update configuration`
+   under macOS Automation TCC — its outcome decides E-opt-0 vs corrected-E-opt-1
+   vs semi-manual, and no design review can substitute for running it.
+1. Image catalog (`lab_image_catalog.json`, name→url+sha256+os+arch) + arch gate.
+2. `onboard-host --new` (entry authoring + allocator + manifest + observability
+   fold-in) — Ubuntu path; time-bounded privilege.
+3. `add-guest` (per-stage verify + done-ness contract + sidecar-proven secrets).
+4. `remove-guest` + `offboard-host` (backing-file-safe teardown, `--yes`/dry-run).
+5. `fleet-status` + additive `fleet-converge`.
+6. Layer 1 MCP tools (`host_stability_report`, `host_thermal_status`) — host-agnostic.
+7. Portability scrub (resolvable connect_uri, tailnet literals, hardcoded paths).
+Each step: plan → adversarial review → implement, per the standing method.
