@@ -5269,7 +5269,9 @@ pub fn execute_ops_vm_lab_launch_on_host(
     // — and an override is a `Literal` the renderer `shell_quote`s. Validating the
     // override as well is defence in depth (QH-12), not the control.
     let orch_identity = match config.host_ssh_identity.as_deref() {
-        None => script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_IDENTITY),
+        None => script_template::HostSshPath::Default(
+            script_template::DefaultHostSshPath::ORCH_IDENTITY,
+        ),
         Some(path) => {
             ensure_single_quoted_script_value("host_ssh_identity", path, AllowEmpty::No)?;
             script_template::HostSshPath::Override(path)
@@ -5278,9 +5280,9 @@ pub fn execute_ops_vm_lab_launch_on_host(
     // The --node orchestrator REQUIRES --known-hosts-file when node selectors are
     // present, so it is always injected. Same contract as the identity above.
     let orch_known_hosts = match config.host_known_hosts.as_deref() {
-        None => {
-            script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_KNOWN_HOSTS)
-        }
+        None => script_template::HostSshPath::Default(
+            script_template::DefaultHostSshPath::ORCH_KNOWN_HOSTS,
+        ),
         Some(path) => {
             ensure_single_quoted_script_value("host_known_hosts", path, AllowEmpty::No)?;
             script_template::HostSshPath::Override(path)
@@ -6025,9 +6027,9 @@ pub fn execute_ops_vm_lab_provision_guest(
     // and an override is a `Literal` the renderer `shell_quote`s. It was already
     // validated above the `--dry-run` return.
     let auth_key = match config.authorized_key.as_deref() {
-        None => {
-            script_template::HostSshPath::Default(script_template::DEFAULT_GUEST_AUTHORIZED_KEY)
-        }
+        None => script_template::HostSshPath::Default(
+            script_template::DefaultHostSshPath::GUEST_AUTHORIZED_KEY,
+        ),
         Some(path) => script_template::HostSshPath::Override(path),
     };
     let script = script_template::render_host_provision_guest_script(
@@ -38747,12 +38749,36 @@ fn parse_key_value_output(output: &str) -> BTreeMap<String, String> {
 /// Fence a list of diagnostic probes between sentinels so one remote shell
 /// invocation yields a parseable per-section transcript.
 ///
-/// Same contract as `privileged_rustynet_cli_script`: `format!`-assembled and so
-/// outside `script_template`'s boundary, but **inert today** because both the
-/// section name and its body are `&'static str` — no caller value can reach it.
-/// The bodies that are not plain literals come from
-/// `privileged_rustynet_cli_script`, which is itself literal-only. Pinned by
-/// `format_assembled_scripts_take_only_static_strings`.
+/// `format!`-assembled and so outside `script_template`'s boundary.
+///
+/// # Why this is inert today, stated accurately (S2)
+///
+/// An earlier version of this comment claimed "both the section name and its body
+/// are `&'static str` — no caller value can reach it". **The name is; the body is
+/// not.** The parameter is `&str`, so the compiler does NOT prevent a runtime value
+/// here, and two callers already pass `String::as_str()` (the
+/// `privileged_rustynet_cli_script` outputs). That claim was false in exactly the
+/// way QH-05 describes — a safety assertion naming an enforcement point that does
+/// not exist — so it is corrected rather than restated.
+///
+/// What is actually true: every body passed today is either a literal in this file
+/// or the output of `privileged_rustynet_cli_script`, which takes `&'static str`
+/// and is therefore literal-only. So no *caller-supplied* value reaches the
+/// assembled script — but that is a property of the current call sites, **not** an
+/// invariant the type system holds.
+///
+/// **Consequence a future editor must respect:** adding a section whose body is
+/// derived from caller data, guest output, or inventory would be an injection here
+/// and nothing would stop it compiling. If that is ever needed, give the body a
+/// type that can only be built from `&'static str` (a `ProbeBody::{Literal,
+/// PrivilegedCli}` enum over `&'static str` is the shape — it needs no leaking and
+/// no `String`), or move the assembly behind `script_template`. Tightening the type
+/// is a mechanical change across ~26 entries in three arrays and is deliberately
+/// NOT bundled into this change; it is recorded as owed.
+///
+/// The signature is pinned below by a fn-pointer coercion so the body type cannot
+/// change silently — unlike the previous test, whose locally-annotated
+/// `&[(&'static str, &'static str)]` coerced at the call and pinned nothing.
 fn build_section_capture_script(sections: &[(&'static str, &str)]) -> String {
     let mut script = String::from("set +e; ");
     for (name, body) in sections {
@@ -38763,6 +38789,23 @@ fn build_section_capture_script(sections: &[(&'static str, &str)]) -> String {
     }
     script
 }
+
+/// Signature pins for the two `format!`-assembled script builders.
+///
+/// A fn-pointer coercion is checked at compile time against the *declared* types,
+/// so widening either parameter (e.g. `&'static str` → `&str` on the subcommand)
+/// stops compiling here. This is the mechanism the previous test was reaching for
+/// and missed: annotating a local `&[(&'static str, &'static str)]` and passing it
+/// coerces by covariance, so it asserted nothing about the function at all.
+///
+/// Note what each pin does and does not buy: `privileged_rustynet_cli_script`'s
+/// `&'static str` genuinely confines its input to compile-time data, whereas
+/// `build_section_capture_script`'s body parameter is `&str` — pinning it prevents a
+/// silent change, not a runtime value. See that function's doc comment.
+const _PIN_PRIVILEGED_RUSTYNET_CLI_SCRIPT: fn(&'static str) -> String =
+    privileged_rustynet_cli_script;
+const _PIN_BUILD_SECTION_CAPTURE_SCRIPT: fn(&[(&'static str, &str)]) -> String =
+    build_section_capture_script;
 
 fn parse_section_capture(output: &str) -> BTreeMap<String, String> {
     let mut sections = BTreeMap::new();
@@ -54644,8 +54687,12 @@ mod launch_on_host_tests {
             "/home/u/Rustynet",
             "artifacts/live_lab/x",
             "launch-1-2",
-            &script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_IDENTITY),
-            &script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_KNOWN_HOSTS),
+            &script_template::HostSshPath::Default(
+                script_template::DefaultHostSshPath::ORCH_IDENTITY,
+            ),
+            &script_template::HostSshPath::Default(
+                script_template::DefaultHostSshPath::ORCH_KNOWN_HOSTS,
+            ),
             &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
         )
         .expect("benign launcher values must render")
@@ -54771,8 +54818,12 @@ mod launch_on_host_tests {
             "/home/u/Rustynet",
             "artifacts/live_lab/x",
             "launch-1-2",
-            &script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_IDENTITY),
-            &script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_KNOWN_HOSTS),
+            &script_template::HostSshPath::Default(
+                script_template::DefaultHostSshPath::ORCH_IDENTITY,
+            ),
+            &script_template::HostSshPath::Default(
+                script_template::DefaultHostSshPath::ORCH_KNOWN_HOSTS,
+            ),
             &["--node".to_owned(), "a'; touch /tmp/pwned; '".to_owned()],
         )
         .expect("the renderer quotes rather than refuses");
@@ -54939,7 +54990,7 @@ mod provision_guest_create_tests {
 
     fn render_default() -> String {
         render(&HostSshPath::Default(
-            script_template::DEFAULT_GUEST_AUTHORIZED_KEY,
+            script_template::DefaultHostSshPath::GUEST_AUTHORIZED_KEY,
         ))
     }
 
@@ -55392,16 +55443,23 @@ mod qh01_real_call_path_tests {
     /// The two `format!`-assembled scripts in this file are outside
     /// `script_template`'s newtype boundary, so their inertness rests on their
     /// signatures: both take `&'static str`, which means no caller value can reach
-    /// them. This test is the reminder that the *compiler* is the control — passing
-    /// a `String` here does not compile, and if either ever needs a runtime value it
-    /// must move behind the renderer.
+    /// them.
+    ///
+    /// **Corrected claim (S2).** This test used to say "the compiler is the control
+    /// — passing a `String` here does not compile". That was false for
+    /// `build_section_capture_script`, whose body parameter is `&str`: the local
+    /// `&[(&'static str, &'static str)]` annotation below coerces by covariance at
+    /// the call, so it pinned nothing, and two production callers already pass
+    /// `String::as_str()`. The signature pin now lives in
+    /// `_PIN_BUILD_SECTION_CAPTURE_SCRIPT` (a fn-pointer coercion, checked against
+    /// the declared type), and the honest statement of what is and is not enforced
+    /// is in that function's doc comment. This test covers only the rendering.
     #[test]
-    fn format_assembled_scripts_take_only_static_strings() {
+    fn format_assembled_scripts_render_expected_bodies() {
         let status = super::privileged_rustynet_cli_script("status");
         assert!(status.contains("rustynet status 2>&1"));
         assert!(!status.contains("__"), "no placeholder shape may appear");
-        let sections: &[(&'static str, &'static str)] =
-            &[("hostname", "hostname"), ("uname", "uname -a")];
+        let sections: &[(&'static str, &str)] = &[("hostname", "hostname"), ("uname", "uname -a")];
         assert_eq!(
             super::build_section_capture_script(sections),
             "set +e; printf '%s\\n' '__VM_LAB_SECTION__hostname'; { hostname; } 2>&1 || true; \
