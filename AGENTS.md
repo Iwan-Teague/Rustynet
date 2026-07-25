@@ -416,7 +416,19 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
   the sidecar is absent — that is not an error; recreate it for the guests that
   need one.
 - After every evidence run, verify the appended row in
-  `documents/operations/live_lab_node_run_matrix.csv` (§2, §10.9).
+  `documents/operations/live_lab_node_run_matrix.csv` (§2, §10.9) — **but the row on
+  its own is NOT proof that a stage passed.** Verified 2026-07-25: several distinct
+  stage ids alias onto ONE run-matrix column (`live_lab_run_matrix.rs:3744`, `:3747`
+  and `:3770` all map to `two_hop`), so `linux_stage_two_hop=pass` on 43 of 108 rows
+  is `traffic_test_matrix` (260 lifetime passes) masking `live_two_hop_validation`,
+  whose lifetime record is 263 skip / 116 fail / **0 pass — it has never passed**.
+  So: confirm the row EXISTS and is attributed to the right commit/node, then take
+  the pass/fail claim from the stage's own report artifact in the run's report
+  directory (its `status` plus its data block), never from the column alone.
+  Also parse these CSVs with a **quote-aware** reader — every row carries quoted
+  comma-bearing fields, so `awk -F,` silently reads the wrong column and has already
+  produced a confidently wrong "no pass rows" conclusion. Tracked as QH-07 in
+  `documents/operations/active/QualityHardeningTodo_2026-07-25.md`.
 
 ### 12.3.1 macOS MCP LAN reachability — NOT currently blocked (re-verified 2026-07-17)
 **Status: the MCP reaches the lab fine. Use it.** This section used to instruct
