@@ -1091,6 +1091,10 @@ enum OpsCommand {
         config: vm_lab::VmLabFetchImageConfig,
     },
     #[cfg(feature = "vm-lab")]
+    VmLabImageCatalog {
+        config: vm_lab::image_catalog::VmLabImageCatalogConfig,
+    },
+    #[cfg(feature = "vm-lab")]
     VmLabGuestConsole {
         config: vm_lab::VmLabGuestConsoleConfig,
     },
@@ -3990,6 +3994,35 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 3600)?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-image-catalog" => {
+            // `OptionParser` demotes a value-less `--foo` to a flag and does not
+            // reject unknown options, so `--assume-host-arch` with its value
+            // swallowed would otherwise leave the gate un-run while the command
+            // still exited 0. Reject the demoted form explicitly: for a gate,
+            // "not run" must never be mistakable for "passed".
+            for option in ["--name", "--host", "--assume-host-arch", "--catalog"] {
+                if parser.has_flag(option) {
+                    return Err(format!(
+                        "vm-lab-image-catalog: {option} requires a value (it was given \
+                         with none, which would silently skip the gate)"
+                    ));
+                }
+            }
+            Ok(OpsCommand::VmLabImageCatalog {
+                config: vm_lab::image_catalog::VmLabImageCatalogConfig {
+                    catalog_path: parser.optional_path("--catalog"),
+                    inventory_path: parser.optional_path("--inventory"),
+                    name: parser.value("--name"),
+                    host_id: parser.value("--host"),
+                    assume_host_arch: parser.value("--assume-host-arch"),
+                    list: parser.has_flag("--list"),
+                    ssh_identity_file: parser.optional_path("--ssh-identity-file"),
+                    known_hosts_path: parser.optional_path("--known-hosts-file"),
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 60)?,
+                },
+            })
+        }
         #[cfg(feature = "vm-lab")]
         "vm-lab-guest-console" => Ok(OpsCommand::VmLabGuestConsole {
             config: vm_lab::VmLabGuestConsoleConfig {
@@ -8803,6 +8836,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabFetchImage { config } => vm_lab::execute_ops_vm_lab_fetch_image(config),
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabImageCatalog { config } => {
+            vm_lab::image_catalog::execute_ops_vm_lab_image_catalog(config)
+        }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabGuestConsole { config } => {
             vm_lab::execute_ops_vm_lab_guest_console(config)
@@ -20226,6 +20263,7 @@ fn help_text() -> String {
         "  ops vm-lab-host-net-status [--host <host_id>] [--inventory <path>] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-provision-toolchain [--inventory <path>] [--vm <alias>]... [--vms <a,b>] [--all] [--verify-only] [--ssh-identity-file <path>] [--timeout-secs <secs>] [--format table|json]",
         "  ops vm-lab-fetch-image --host <host_id> --name <file> --url <https://...> [--sha256 <hex>] [--pool <path>] [--inventory <path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-image-catalog (--list | --name <image> (--host <host_id> | --assume-host-arch <token>)) [--catalog <path>] [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]  (validates the tracked base-image catalog; with --name + --host it PROBES the host's arch and fails closed on a mismatch. --assume-host-arch takes an operator-asserted arch instead of a measured one and is labelled as such in the verdict. --list validates without gating and says GATE: NOT RUN)",
         "  ops vm-lab-guest-console --host <host_id> --domain <guest> [--seconds <n>] [--inventory <path>]",
         "  ops vm-lab-network-audit [--inventory <path>] [--profile-dir <path>] [--profile <id>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only: observes UTM/host/guest network state, validates profile manifests, writes redacted evidence; never mutates)",
         "  ops vm-lab-network-preflight --profile <id> [--inventory <path>] [--profile-dir <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--output <path>] [--skip-guests] [--repo-root <path>]  (read-only fail-closed gate: errors unless the observed fleet satisfies the profile)",

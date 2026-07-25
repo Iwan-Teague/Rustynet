@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "images": [
+    {
+      "name": "debian-13-arm64",
+      "os": "debian",
+      "os_version": "13",
+      "arch": "arm64",
+      "kind": "cloud_image_qcow2",
+      "filename": "debian-13-generic-arm64.qcow2",
+      "url": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "digest_provenance": "upstream_published",
+      "notes": "PLACEHOLDER DIGEST — replace with the value from Debian's signed SHA512SUMS/SHA256SUMS before any fetch. The arch gate and every other schema rule are enforced independently of the digest, but this entry must not be used to fetch until the real published digest is recorded here."
+    },
+    {
+      "name": "debian-13-amd64",
+      "os": "debian",
+      "os_version": "13",
+      "arch": "amd64",
+      "kind": "cloud_image_qcow2",
+      "filename": "debian-13-generic-amd64.qcow2",
+      "url": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "digest_provenance": "upstream_published",
+      "notes": "PLACEHOLDER DIGEST — see debian-13-arm64. Targets the x86-64 KVM box (ubuntu-kvm-1)."
+    },
+    {
+      "name": "virtio-win",
+      "os": "windows",
+      "os_version": "any",
+      "arch": "arch_independent",
+      "kind": "iso",
+      "filename": "virtio-win.iso",
+      "url": "https://fedorapeople.org/groups/virt/virtio-win/virtio-win.iso",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "digest_provenance": "local_tofu",
+      "notes": "Paravirtualised Windows guest drivers. digest_provenance is local_tofu on purpose: Fedora publishes no digest for this ISO (the CHECKSUM file beside it covers only the four RPMs, in MD5), so any pin here authenticates continuity from one local fetch, NOT origin. PLACEHOLDER DIGEST — record the digest of the specific local fetch that is adopted. kind=iso, so this is NOT usable as a qcow2 backing file."
+    }
+  ]
+}

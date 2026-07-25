@@ -2,6 +2,7 @@
 
 mod bootstrap;
 pub mod capability;
+pub mod image_catalog;
 pub mod network_audit;
 pub mod network_prepare;
 pub mod network_profile;
