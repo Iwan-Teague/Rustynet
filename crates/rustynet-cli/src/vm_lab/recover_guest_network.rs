@@ -27,6 +27,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::script_template;
 use super::{VmController, VmInventoryEntry};
 
 const RECOVER_SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -256,57 +257,24 @@ pub(crate) fn parse_ipv4_for_interface(ip_addr_output: &str, interface: &str) ->
     None
 }
 
-fn netplan_repair_script(interface: &str) -> String {
-    const TEMPLATE: &str = r#"set -eu
-ts="$(date +%Y%m%dT%H%M%S)"
-mkdir -p /etc/netplan
-for f in /etc/netplan/*.yaml; do
-  [ -e "$f" ] || continue
-  cp -a "$f" "$f.rustynet-recover.$ts.bak"
-  case "$f" in
-    /etc/netplan/00-rustynet-recovery.yaml) ;;
-    *) mv "$f" "$f.rustynet-disabled.$ts" ;;
-  esac
-done
-cat > /etc/netplan/00-rustynet-recovery.yaml <<'RN_NETPLAN_EOF'
-__RN_NETPLAN__RN_NETPLAN_EOF
-chmod 600 /etc/netplan/00-rustynet-recovery.yaml
-netplan apply
-"#;
-    TEMPLATE.replace("__RN_NETPLAN__", &corrected_netplan_yaml(interface))
+/// The netplan repair, rendered through the audited boundary.
+///
+/// These three scripts are piped to **`sudo bash -s`** on the guest (see
+/// `run_ssh_script_with_sudo`), so they are the most privileged interpolation
+/// sites in the tree. The templates live in `vm_lab::script_template`, which is
+/// the only module that can render one (QH-01). The YAML body goes into a quoted
+/// heredoc, so its control is `Binding::HeredocBody` — "no line equal to the
+/// terminator" — not a quoting rule.
+fn netplan_repair_script(interface: &str) -> Result<String, String> {
+    script_template::render_netplan_repair_script(&corrected_netplan_yaml(interface))
 }
 
-fn network_manager_repair_script(interface: &str) -> String {
-    const TEMPLATE: &str = r#"set -eu
-iface="__RN_IFACE__"
-con="$(nmcli -t -f NAME,DEVICE con show 2>/dev/null | awk -F: -v i="$iface" '$2==i{print $1; exit}')"
-if [ -n "${con:-}" ]; then
-  nmcli con mod "$con" 802-3-ethernet.mac-address "" 2>/dev/null || true
-  nmcli con mod "$con" ipv4.method auto ipv6.method auto || true
-  nmcli con up "$con"
-else
-  nmcli con add type ethernet ifname "$iface" con-name "rustynet-recover-$iface" ipv4.method auto ipv6.method auto
-  nmcli con up "rustynet-recover-$iface"
-fi
-"#;
-    TEMPLATE.replace("__RN_IFACE__", interface)
+fn network_manager_repair_script(interface: &str) -> Result<String, String> {
+    script_template::render_network_manager_repair_script(interface)
 }
 
-fn networkd_repair_script(interface: &str) -> String {
-    const TEMPLATE: &str = r#"set -eu
-mkdir -p /etc/systemd/network
-cat > /etc/systemd/network/10-rustynet-recover.network <<'RN_NETWORKD_EOF'
-[Match]
-Name=__RN_IFACE__
-[Network]
-DHCP=yes
-RN_NETWORKD_EOF
-chmod 644 /etc/systemd/network/10-rustynet-recover.network
-systemctl enable --now systemd-networkd 2>/dev/null || true
-networkctl reload
-networkctl reconfigure "__RN_IFACE__"
-"#;
-    TEMPLATE.replace("__RN_IFACE__", interface)
+fn networkd_repair_script(interface: &str) -> Result<String, String> {
+    script_template::render_networkd_repair_script(interface)
 }
 
 // --- Live orchestration (argv-only exec; fail closed) ---
@@ -535,9 +503,9 @@ fn apply_guest_repair(
     guest: &GuestNetInfo,
 ) -> Result<(), String> {
     let script = match guest.config {
-        GuestNetConfig::Netplan => netplan_repair_script(&guest.interface),
-        GuestNetConfig::NetworkManager => network_manager_repair_script(&guest.interface),
-        GuestNetConfig::SystemdNetworkd => networkd_repair_script(&guest.interface),
+        GuestNetConfig::Netplan => netplan_repair_script(&guest.interface)?,
+        GuestNetConfig::NetworkManager => network_manager_repair_script(&guest.interface)?,
+        GuestNetConfig::SystemdNetworkd => networkd_repair_script(&guest.interface)?,
         GuestNetConfig::Unknown => {
             return Err(
                 "guest has no recognized network config system (netplan / NetworkManager / systemd-networkd)"
@@ -748,10 +716,61 @@ network:
         assert!(!corrected.contains("match:"));
         assert!(!corrected.contains("set-name:"));
         // The generated repair script embeds the corrected config, name-matched.
-        let script = netplan_repair_script("enp0s1");
+        let script = netplan_repair_script("enp0s1").expect("a valid interface must render");
         assert!(script.contains("netplan apply"));
         assert!(script.contains("dhcp4: true"));
         assert!(!netplan_yaml_pins_mac(&script));
+        // The heredoc terminator must still start at column 0 after the body.
+        assert!(script.contains("dhcp6: true\nRN_NETPLAN_EOF\n"));
+    }
+
+    /// These three scripts are piped to `sudo bash -s` on the guest, so they run as
+    /// **root**. Rendering goes through `vm_lab::script_template`, which refuses an
+    /// interface name outside `[A-Za-z0-9._-]+` — the same alphabet
+    /// `is_safe_interface_name` enforces when the name is parsed, now also enforced
+    /// at the point of interpolation so a future caller cannot skip it.
+    #[test]
+    fn a_root_repair_script_refuses_an_unsafe_interface_name() {
+        for hostile in [
+            "eth0;id",
+            "eth0 id",
+            "eth0'$(id)'",
+            "eth0`id`",
+            "eth0|id",
+            "eth0&",
+            "eth0>x",
+            "eth*",
+            "$IFS",
+            "eth0\nRN_NETWORKD_EOF",
+            "",
+        ] {
+            assert!(
+                network_manager_repair_script(hostile).is_err(),
+                "NetworkManager repair must refuse {hostile:?}"
+            );
+            assert!(
+                networkd_repair_script(hostile).is_err(),
+                "networkd repair must refuse {hostile:?}"
+            );
+        }
+        assert!(network_manager_repair_script("enp0s1").is_ok());
+        assert!(networkd_repair_script("enp0s1").is_ok());
+    }
+
+    /// The netplan body is YAML inside a `<<'RN_NETPLAN_EOF'` heredoc, so its
+    /// control is "no line equal to the terminator" — not quoting, and not a
+    /// metacharacter rule (YAML needs `:` and newlines).
+    #[test]
+    fn a_netplan_body_cannot_smuggle_the_heredoc_terminator() {
+        // `corrected_netplan_yaml` cannot produce this, but the renderer is the
+        // enforcement point, so assert the rule directly.
+        let hostile = "network:\n  version: 2\nRN_NETPLAN_EOF\nrm -rf /\n";
+        assert!(
+            script_template::render_netplan_repair_script(hostile).is_err(),
+            "a body containing the terminator would close the heredoc early"
+        );
+        // A body that does not end in a newline would put the terminator mid-line.
+        assert!(script_template::render_netplan_repair_script("network:\n  version: 2").is_err());
     }
 
     #[test]
