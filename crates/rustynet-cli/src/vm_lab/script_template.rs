@@ -20,6 +20,42 @@
 //! order-independent is *necessary but not sufficient*. The fix has to be
 //! escape-first.
 //!
+//! # QH-19 — "the renderer owns the quoting" is necessary but NOT sufficient
+//!
+//! **Read this before assuming a value is safe because it went through a
+//! `Binding`.** The lesson people take from QH-01 is "escape at interpolation",
+//! and that is only correct for sinks that parse the script *once*. Six distinct
+//! sink contexts turned up while fixing this class, each needing a **different**
+//! control, and escaping is the right answer in only two of them:
+//!
+//! | Sink context | The control that actually applies |
+//! |---|---|
+//! | Single-quoted position | reject `'` (nothing else can end the word) |
+//! | Double-quoted position | reject `$`, backtick, `\` (`'` is inert here) |
+//! | **Heredoc body** | reject **newline** — quoting the heredoc protects nothing, because a body that emits a line equal to the terminator closes it early and the remainder runs in the OUTER script |
+//! | **Nested command string** (`script -qec`, `sh -c`, `ssh host 'cmd'`) | quote for **two** levels: single-quote the inner string so the outer shell expands nothing into it, and pass the value through the environment so the inner shell expands it as one quoted word |
+//! | **SSH post-host argv** | quote for the **remote login shell** — `ssh(1)` joins post-host arguments with spaces and `sshd` hands the result to a shell, so client-side argv is not remote argv (QH-13) |
+//! | **Path composition** (`"$POOL/$IMAGE"`) | **confinement**, which is orthogonal to quoting — `shell_quote("../../etc/passwd")` is a perfectly safe shell *word* that still traverses out of the pool |
+//!
+//! Two rules generalise from that table:
+//!
+//! 1. **Escaping and validation are complementary layers, not competing answers.**
+//!    An escaper makes a value inert *as syntax*; it cannot make it *semantically*
+//!    acceptable. Path confinement, length, and identifier shape are validator
+//!    jobs and no renderer subsumes them — which is why the `ensure_*` validators
+//!    are still called on values this module also escapes. Deleting one because
+//!    "the renderer handles quoting now" reopens a different hole than the one
+//!    QH-01 closed.
+//! 2. **A renderer cannot be safe context-free.** Which control applies is a
+//!    property of *where the value lands*, so the spelling decision has to be
+//!    carried in the type. That is precisely what [`Binding`]'s variants buy over
+//!    plain string substitution, and why adding a value means choosing a variant
+//!    rather than reaching for `Literal` by default.
+//!
+//! The known exception is documented at [`HOST_GUEST_CONSOLE_SCRIPT`]: it is the
+//! one template where a `Literal`'s escaping is not by itself the control, because
+//! `script -qec` re-parses in a nested shell.
+//!
 //! # The contract
 //!
 //! **The renderer owns the quoting; the caller never does.** A caller hands over
@@ -37,9 +73,16 @@
 //! - [`Binding::QuotedWords`] — a list that becomes several shell words. Each
 //!   element is `shell_quote`d by the renderer and joined with a space, so the
 //!   caller never assembles quotes itself.
-//! - [`Binding::RawFragment`] — verbatim shell syntax. Takes `&'static str`, so
-//!   **it can only ever be a compile-time literal**: caller data cannot reach it
-//!   even by mistake. That is what makes the `$HOME`-bearing defaults safe.
+//! - [`Binding::RawFragment`] — verbatim shell syntax, and therefore the one
+//!   binding with **no validation at all**. It is not made safe by its
+//!   `&'static str` type: `&'static str` is not the same as a literal
+//!   (`String::leak` produces one from arbitrary runtime data), so an earlier
+//!   version of this claim ("it can only ever be a compile-time literal") was
+//!   false. What confines it is that the only values reaching it are the three
+//!   associated constants of [`DefaultHostSshPath`], a type with a private field
+//!   and no constructor. That is what makes the `$HOME`-bearing defaults safe, and
+//!   it is checked by the compiler (verified: constructing one from another module
+//!   fails with `E0603`).
 //! - [`Binding::HeredocBody`] — a multi-line body interpolated into a quoted
 //!   heredoc. Neither escaping nor a metacharacter rule is the right control
 //!   there; the rule is "the body must not contain a line equal to the
