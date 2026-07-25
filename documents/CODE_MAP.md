@@ -162,6 +162,23 @@ as `rustynet_cli::orchestrator_test_surface` (RNQ-09 integration-test hook).
 | `MacosNodeAdapter` | `adapter/macos.rs` | macOS adapter |
 | `node_adapter_for()` | `adapter/factory.rs` | Factory: (platform, connection) → NodeAdapter |
 
+### VM-lab host-script renderer (`rustynet-cli/src/vm_lab/script_template.rs`)
+
+The single audited boundary between a Rust value and a shell script that runs on a
+lab host (QH-01). Host scripts were previously rendered by ordered `str::replace`
+chains at the call site, which carried command-injection breakouts; every render
+site now goes through this module.
+
+| Type | Location | Purpose |
+|---|---|---|
+| `ScriptTemplate` | `script_template.rs` | Newtype over the template text with a **private field and no constructor**, so no other module can build one and `render_script_template` is its only consumer. The boundary is enforced by the compiler, not by a lint or a grep |
+| `Binding` | `script_template.rs` | How one substituted value is spelled: `Literal` (`shell_quote`d), `Bare` (`[A-Za-z0-9._-]+`, unquoted positions), `QuotedWords`, `RawFragment` (verbatim syntax; confined to `DefaultHostSshPath`'s constants), `HeredocBody` (terminator/newline rule), `PowerShellLiteral`. **The variant is the safety argument** — which control applies depends on the sink context, so it has to be carried in the type (QH-19) |
+| `render_script_template` | `script_template.rs` | Single-pass substitution that never re-scans emitted bytes, so substitution order cannot matter and a token appearing inside a value is inert literal text |
+| `DefaultHostSshPath` | `script_template.rs` | The only inhabitants are three associated constants (private field, no constructor), which is what confines `RawFragment` — the one binding with no validation. `&'static str` alone does **not** mean "literal" (`String::leak`); verified by negative compile (`E0603`) |
+| `render_host_*_script` / `render_*_repair_script` | `script_template.rs` | The named per-template render functions — the only way to reach a template. Includes the three `sudo bash -s` guest-repair scripts used by `recover_guest_network.rs` |
+| `HOST_GUEST_CONSOLE_SCRIPT` | `script_template.rs` | The documented exception: `script -qec` re-parses its argument in a nested shell, so escaping at interpolation is **not** sufficient there — the nested command string is single-quoted and the value passed via the environment |
+| `no_script_template_is_declared_outside_this_module` | `script_template.rs` | Backstop test for a second renderer appearing elsewhere. Its known holes (only `r#"…"#` raw strings, uppercase tokens, literal `.replace`/`.replacen` text) are enumerated in its doc — the type boundary is the control, this is a net |
+
 ### VM-lab network profile + audit (`rustynet-cli/src/vm_lab/`)
 
 Read-only Slice A of the VM connectivity rulebook
