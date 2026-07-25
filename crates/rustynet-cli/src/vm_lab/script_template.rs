@@ -445,6 +445,27 @@ exit 1
 ///
 /// Destructive to the guest's uptime: it force-stops the domain to catch the boot
 /// from the start, because attaching afterwards shows nothing on a hung guest.
+///
+/// # Enforcement point for `__DOMAIN__` (S1 — read before editing the template)
+///
+/// This is the **only** template where `Binding::Literal`'s escaping is not by
+/// itself the control, because `script -qec` re-parses its argument as a command
+/// string in a nested shell (see the inline comment at that line). Two controls
+/// carry it, and neither is visible from the token site:
+///
+/// 1. **In the template:** the nested command string is single-quoted and `DOM` is
+///    exported, so the value is expanded by the inner shell as one quoted word.
+///    Proven by `guest_console_nested_command_string_is_single_quoted`.
+/// 2. **At the caller:** `execute_ops_vm_lab_guest_console` validates the domain
+///    with [`super::ensure_provision_guest_name`] (`[A-Za-z0-9_-]`, `1..=60`),
+///    which admits nothing a shell would treat as syntax in the first place.
+///
+/// **Honest gap (S6):** `guest_console` has no `dry_run` path, so no test goes red
+/// if that caller-side validation call is deleted — unlike the nine calls covered
+/// by `provision_guest_enforcement_tests`. Control 1 is therefore the one that is
+/// mechanically proven; control 2 is defence in depth that a reader must preserve
+/// deliberately. If a `dry_run` is ever added to this command, add the negative
+/// test that binds it.
 const HOST_GUEST_CONSOLE_SCRIPT: ScriptTemplate = ScriptTemplate(
     r#"#!/bin/bash
 set -uo pipefail
@@ -453,7 +474,21 @@ SECS=__SECONDS__
 virsh -c qemu:///system destroy "$DOM" >/dev/null 2>&1 || true
 sleep 2
 # `script` supplies the pty that `virsh console` requires over a non-tty ssh session.
-timeout "$SECS" script -qec "virsh -c qemu:///system start --console $DOM" /dev/null 2>&1 | head -120
+#
+# THE ONE PLACE ESCAPING AT INTERPOLATION IS NOT SUFFICIENT (S1).
+# `script -qec <string>` hands <string> to `$SHELL -c`, so it is re-parsed as a
+# COMMAND STRING by a nested shell. `shell_quote`ing the `DOM=` assignment above
+# protects that assignment and nothing else: with the command string
+# double-quoted, the OUTER shell would expand `$DOM` into it and the INNER shell
+# would then re-parse the expanded value, so a `;` in the value would run.
+#
+# Two changes make the nested parse safe, and both are load-bearing:
+#   1. the command string is SINGLE-quoted, so the outer shell does not expand
+#      anything into it;
+#   2. `DOM` is exported for this command, so the INNER shell expands `"$DOM"`
+#      itself, as one already-quoted word.
+# Do not "simplify" this back to interpolating $DOM into a double-quoted string.
+DOM="$DOM" timeout "$SECS" script -qec 'virsh -c qemu:///system start --console "$DOM"' /dev/null 2>&1 | head -120
 echo
 echo "--- capture ended ---"
 echo "domstate: $(virsh -c qemu:///system domstate "$DOM" 2>&1)"
@@ -1391,33 +1426,68 @@ pub(crate) fn render_host_stop_script(repo_dir: &str) -> Result<String, String> 
     )
 }
 
+/// A sanctioned unquoted shell fragment for an SSH-path default.
+///
+/// Exists to close S3. The field is private and there is **no constructor**, so the
+/// only values that exist anywhere in the crate are the three associated constants
+/// below. That is what actually confines [`Binding::RawFragment`] — the one binding
+/// with zero validation — rather than the type `&'static str`, which does not mean
+/// "literal" (`String::leak` yields `&'static str` from arbitrary runtime data, so
+/// a `pub(crate)` variant taking `&'static str` was constructible crate-wide with
+/// unvalidated content).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DefaultHostSshPath(&'static str);
+
+impl DefaultHostSshPath {
+    /// The orchestrator's guest SSH key, expanded on the host.
+    pub(crate) const ORCH_IDENTITY: Self = Self("\"$HOME/.ssh/id_ed25519\"");
+    /// The orchestrator's known_hosts file, expanded on the host.
+    pub(crate) const ORCH_KNOWN_HOSTS: Self = Self("\"$HOME/.ssh/known_hosts\"");
+    /// The public key seeded into a provisioned guest, expanded on the host.
+    pub(crate) const GUEST_AUTHORIZED_KEY: Self = Self("\"$HOME/.ssh/id_ed25519.pub\"");
+
+    fn fragment(self) -> &'static str {
+        self.0
+    }
+}
+
 /// Which SSH file the launched orchestrator should use on the host.
 ///
-/// The `Default` arm is a [`Binding::RawFragment`] because it is deliberately
-/// shell syntax: a **double-quoted `$HOME` expansion that must expand on the
-/// host**, not on the launcher. It takes no caller value at all — the fragment
-/// is a compile-time literal, which `RawFragment(&'static str)` enforces at the
-/// type level. An `Override` is caller data and is quoted by the renderer.
-/// Proven by `the_default_orchestrator_paths_expand_home_on_the_host` and
+/// The `Default` arm is a [`Binding::RawFragment`] because it is deliberately shell
+/// syntax: a **double-quoted `$HOME` expansion that must expand on the host**, not
+/// on the launcher. So it cannot be escaped, and it is the only binding with no
+/// validation at all.
+///
+/// **Corrected claim (S3).** This previously read "the fragment is a compile-time
+/// literal, which `RawFragment(&'static str)` enforces at the type level". That was
+/// false twice over: `&'static str` is not the same as a literal (`String::leak`),
+/// and this variant was `pub(crate)`, so any code in the crate could put arbitrary
+/// unvalidated content into a `RawFragment`. The enforcement is now real but comes
+/// from a different place — [`DefaultHostSshPath`] has a private field and no
+/// constructor, so the only inhabitants are its three constants.
+///
+/// An `Override` is caller data and is quoted by the renderer. Proven by
+/// `the_default_orchestrator_paths_expand_home_on_the_host` and
 /// `an_overridden_orchestrator_path_is_quoted_by_the_renderer`.
 pub(crate) enum HostSshPath<'a> {
-    Default(&'static str),
+    Default(DefaultHostSshPath),
     Override(&'a str),
 }
 
 impl<'a> HostSshPath<'a> {
     fn binding(&self) -> Binding<'a> {
         match self {
-            HostSshPath::Default(fragment) => Binding::RawFragment(fragment),
+            HostSshPath::Default(default) => Binding::RawFragment(default.fragment()),
             HostSshPath::Override(path) => Binding::Literal(path),
         }
     }
 }
 
-/// The default host path for the orchestrator's guest SSH key.
-pub(crate) const DEFAULT_HOST_ORCH_IDENTITY: &str = "\"$HOME/.ssh/id_ed25519\"";
-/// The default host path for the orchestrator's guest known_hosts file.
-pub(crate) const DEFAULT_HOST_ORCH_KNOWN_HOSTS: &str = "\"$HOME/.ssh/known_hosts\"";
+// The former `DefaultHostSshPath::ORCH_IDENTITY` / `DefaultHostSshPath::ORCH_KNOWN_HOSTS`
+// `pub(crate) const &str`s are gone: a loose `&'static str` constant invites a
+// caller to pass some OTHER `&'static str` to `HostSshPath::Default`, which is
+// exactly the S3 hole. The values now live as `DefaultHostSshPath` associated
+// constants, which are the only inhabitants of that type.
 
 /// Render the detached live-lab launcher.
 ///
@@ -1452,8 +1522,10 @@ pub(crate) fn render_host_launch_script(
     )
 }
 
-/// The default host path for the key seeded into a provisioned guest.
-pub(crate) const DEFAULT_GUEST_AUTHORIZED_KEY: &str = "\"$HOME/.ssh/id_ed25519.pub\"";
+// The default host path for the key seeded into a provisioned guest was a loose
+// `pub(crate) const &str` here. It is now `DefaultHostSshPath::GUEST_AUTHORIZED_KEY`
+// — see the note on the retired orchestrator path constants above for why a loose
+// `&'static str` constant next to a `&'static str`-taking variant was the S3 hole.
 
 /// Render the guest-provisioning script — the QH-01 site.
 ///
@@ -1893,6 +1965,14 @@ mod tests {
             let mut matched = None;
             let mut end = index + 3;
             while end + 2 <= bytes.len() {
+                // `&body[a..b]` panics unless both ends sit on char boundaries, so a
+                // `__` followed by a multi-byte character used to abort the scan with
+                // a panic instead of reporting no token. Token names are ASCII, so a
+                // non-boundary index cannot be part of one — skip it.
+                if !body.is_char_boundary(index + 2) || !body.is_char_boundary(end) {
+                    end += 1;
+                    continue;
+                }
                 let middle = &body[index + 2..end];
                 if !middle
                     .bytes()
@@ -2001,7 +2081,7 @@ echo "PROVISION-RESULT: created domain $NAME (state=$st, overlay=$OVERLAY, seed=
             6,
             1024,
             1,
-            &HostSshPath::Default(DEFAULT_GUEST_AUTHORIZED_KEY),
+            &HostSshPath::Default(DefaultHostSshPath::GUEST_AUTHORIZED_KEY),
         )
         .expect("renders");
         assert_eq!(rendered, EXPECTED);
@@ -2067,8 +2147,8 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             "/home/u/Rustynet",
             "artifacts/live_lab/x",
             "launch-1-2",
-            &HostSshPath::Default(DEFAULT_HOST_ORCH_IDENTITY),
-            &HostSshPath::Default(DEFAULT_HOST_ORCH_KNOWN_HOSTS),
+            &HostSshPath::Default(DefaultHostSshPath::ORCH_IDENTITY),
+            &HostSshPath::Default(DefaultHostSshPath::ORCH_KNOWN_HOSTS),
             &["--node".to_owned(), "linux-x86-client-1:client".to_owned()],
         )
         .expect("renders");
@@ -2155,7 +2235,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             6,
             1024,
             1,
-            &HostSshPath::Default(DEFAULT_GUEST_AUTHORIZED_KEY),
+            &HostSshPath::Default(DefaultHostSshPath::GUEST_AUTHORIZED_KEY),
         )
         .expect("the renderer escapes rather than refuses");
         assert_eq!(
@@ -2210,8 +2290,8 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             hostile,
             "artifacts/live_lab/x",
             "launch-1-2",
-            &HostSshPath::Default(DEFAULT_HOST_ORCH_IDENTITY),
-            &HostSshPath::Default(DEFAULT_HOST_ORCH_KNOWN_HOSTS),
+            &HostSshPath::Default(DefaultHostSshPath::ORCH_IDENTITY),
+            &HostSshPath::Default(DefaultHostSshPath::ORCH_KNOWN_HOSTS),
             &[],
         )
         .expect_err("a newline in a heredoc-embedded value must be refused");
@@ -2222,8 +2302,8 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
                 "/home/u/Rustynet",
                 "artifacts\nRUNNER_EOF\nid",
                 "launch-1-2",
-                &HostSshPath::Default(DEFAULT_HOST_ORCH_IDENTITY),
-                &HostSshPath::Default(DEFAULT_HOST_ORCH_KNOWN_HOSTS),
+                &HostSshPath::Default(DefaultHostSshPath::ORCH_IDENTITY),
+                &HostSshPath::Default(DefaultHostSshPath::ORCH_KNOWN_HOSTS),
                 &[],
             )
             .is_err()
@@ -2233,8 +2313,8 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             "/home/u/Rustynet",
             "artifacts/live_lab/x",
             "launch-1-2",
-            &HostSshPath::Default(DEFAULT_HOST_ORCH_IDENTITY),
-            &HostSshPath::Default(DEFAULT_HOST_ORCH_KNOWN_HOSTS),
+            &HostSshPath::Default(DefaultHostSshPath::ORCH_IDENTITY),
+            &HostSshPath::Default(DefaultHostSshPath::ORCH_KNOWN_HOSTS),
             &[],
         )
         .expect("renders");
@@ -2293,17 +2373,53 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
         assert!(render_netplan_repair_script("network: 2").is_err());
     }
 
+    /// S1: `script -qec` re-parses its argument as a command string in a nested
+    /// shell, so `shell_quote`ing the `DOM=` assignment is not the control here.
+    ///
+    /// The two properties that make the nested parse safe are asserted directly,
+    /// because neither is visible from the token site and the adjacency invariant
+    /// cannot see them: the nested command string must be SINGLE-quoted (so the
+    /// outer shell expands nothing into it) and `DOM` must be exported for the
+    /// command (so the inner shell expands `"$DOM"` itself as one quoted word).
+    #[test]
+    fn guest_console_nested_command_string_is_single_quoted() {
+        let script = render_host_guest_console_script("alpha", 30).expect("renders");
+
+        assert!(
+            script.contains(
+                "DOM=\"$DOM\" timeout \"$SECS\" script -qec \
+                 'virsh -c qemu:///system start --console \"$DOM\"'"
+            ),
+            "the nested command string must be single-quoted with DOM exported:\n{script}"
+        );
+        // The pre-fix form interpolated $DOM into a DOUBLE-quoted command string, so
+        // the outer shell expanded the value into text the inner shell then re-parsed.
+        assert!(
+            !script.contains("script -qec \"virsh"),
+            "the nested command string must not be double-quoted:\n{script}"
+        );
+        // The value still reaches the script as a quoted assignment.
+        assert!(script.contains("DOM='alpha'"), "{script}");
+    }
+
     /// The `$HOME`-bearing defaults are the reason `RawFragment` exists: they must
-    /// expand ON THE HOST, so they cannot be escaped. `RawFragment(&'static str)`
-    /// is what keeps that from becoming a hole — caller data cannot reach it.
+    /// expand ON THE HOST, so they cannot be escaped — which makes `RawFragment` the
+    /// one binding with no validation at all.
+    ///
+    /// **Corrected claim (S3):** this used to say `RawFragment(&'static str)` is what
+    /// keeps that from becoming a hole because caller data cannot reach it. That was
+    /// false — `&'static str` is not a literal (`String::leak`), and the variant
+    /// feeding it was `pub(crate)`. The control is [`DefaultHostSshPath`], which has
+    /// a private field and no constructor, so its three associated constants are the
+    /// only values in existence.
     #[test]
     fn the_default_orchestrator_paths_expand_home_on_the_host() {
         let script = render_host_launch_script(
             "/home/u/Rustynet",
             "artifacts/live_lab/x",
             "launch-1-2",
-            &HostSshPath::Default(DEFAULT_HOST_ORCH_IDENTITY),
-            &HostSshPath::Default(DEFAULT_HOST_ORCH_KNOWN_HOSTS),
+            &HostSshPath::Default(DefaultHostSshPath::ORCH_IDENTITY),
+            &HostSshPath::Default(DefaultHostSshPath::ORCH_KNOWN_HOSTS),
             &[],
         )
         .expect("renders");
@@ -2333,7 +2449,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             "artifacts/live_lab/x",
             "launch-1-2",
             &HostSshPath::Override("/home/u/k';id;'"),
-            &HostSshPath::Default(DEFAULT_HOST_ORCH_KNOWN_HOSTS),
+            &HostSshPath::Default(DefaultHostSshPath::ORCH_KNOWN_HOSTS),
             &[],
         )
         .expect("renders");
@@ -2362,9 +2478,32 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
     ///    why `KILL_WINDOW_SCRIPT` is correctly not flagged; and matching on
     ///    placeholders rather than on the name `…SCRIPT…` avoids the several
     ///    `const …SCRIPT…: &str` values that are just remote *paths*.)
-    /// 2. a new ordered `.replace("__` chain — **including in a test**, which is
-    ///    how the original defect stayed green: six test modules re-implemented
-    ///    the render chain locally, so production could change underneath them.
+    /// 2. a new ordered `.replace("__` / `.replacen("__` chain — **including in a
+    ///    test**, which is how the original defect stayed green: six test modules
+    ///    re-implemented the render chain locally, so production could change
+    ///    underneath them.
+    ///
+    /// # What this backstop does NOT catch (S5) — read before trusting it
+    ///
+    /// The type boundary is the control; this is a net with known holes, and they
+    /// are enumerated rather than implied so nobody mistakes a green run for proof:
+    ///
+    /// - **Only `r#"…"#`-style raw strings are scanned.** A plain `r"…"` (no hash)
+    ///   and an ordinary `"…"` literal are both missed. Widening naively is worse
+    ///   than the gap: scanning for `r` + `"` would treat any ordinary string ending
+    ///   in `r"` as a raw-string opener and fail spuriously, so a correct fix needs
+    ///   real lexing (`proc-macro2`/`syn`) rather than a byte scan.
+    /// - **Only UPPERCASE `__TOKEN__` names are recognised** by `scan_tokens`; a
+    ///   lowercase or mixed-case placeholder is invisible to it.
+    /// - **Only literal `.replace("__` text is matched.** A variable token
+    ///   (`.replace(tok, v)`), a `format!`-assembled script, or any other string
+    ///   assembly is not detected — `build_section_capture_script` and
+    ///   `privileged_rustynet_cli_script` in `mod.rs` are exactly that shape and are
+    ///   deliberately outside this boundary (see their doc comments).
+    ///
+    /// So this test proves "no *obvious* second renderer appeared", not "rendering
+    /// cannot happen elsewhere". The latter is held by `ScriptTemplate`'s private
+    /// field, which is checked by the compiler.
     #[test]
     fn no_script_template_is_declared_outside_this_module() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vm_lab");
@@ -2380,10 +2519,13 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
                 .display()
                 .to_string();
             for (index, line) in body.lines().enumerate() {
-                if line.contains(".replace(\"__") {
+                // `replacen` too: it is the same ordered-substitution defect with a
+                // different name, and a deny-list that names only one spelling is the
+                // kind of control that looks green while the pattern walks past it.
+                if line.contains(".replace(\"__") || line.contains(".replacen(\"__") {
                     offenders.push(format!(
-                        "{display}:{}: an ordered `.replace(\"__` chain outside \
-                         script_template.rs — add a render_* function there instead",
+                        "{display}:{}: an ordered `.replace(\"__`/`.replacen(\"__` chain \
+                         outside script_template.rs — add a render_* function there instead",
                         index + 1
                     ));
                 }
