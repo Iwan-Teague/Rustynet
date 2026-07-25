@@ -9,6 +9,7 @@ pub mod orchestrator;
 pub mod overnight;
 pub mod recover_guest_network;
 pub mod run_history;
+mod script_template;
 pub mod topology;
 
 pub use overnight::{VmLabOvernightConfig, execute_ops_vm_lab_overnight};
@@ -3955,281 +3956,6 @@ fn classify_ssh_probe_failure(err: &str) -> &'static str {
     }
 }
 
-/// Fetch a base image into a libvirt host's pool, resumably.
-///
-/// Runs ON the host (the pool is there, and the bytes should not transit the
-/// orchestrator). Shipped over stdin; the only interpolated values are validated
-/// first.
-///
-/// Every choice here is a lesson from a failure that actually happened:
-/// - **No sudo inside the retry loop.** Caching sudo once and calling `sudo curl`
-///   per image meant the 15-minute timestamp expired mid-download, so every later
-///   call hit a passwordless prompt and exited 1 — burning all retries in seconds
-///   and looking exactly like a network failure. Download as the user; one
-///   privileged `install` at the end.
-/// - **`-C -` resume + retry.** Sources are verified to send `Accept-Ranges`, so a
-///   drop resumes at the byte it stopped rather than restarting.
-/// - **`--proto-redir =https`.** A mirror redirector bounced curl to a non-HTTPS
-///   mirror, which curl refuses with rc=1 — indistinguishable from other failures.
-/// - **A stall detector** (`--speed-time`), so a hung transfer dies and resumes
-///   instead of hanging until the outer timeout.
-const HOST_FETCH_IMAGE_SCRIPT: &str = r#"#!/bin/bash
-set -uo pipefail
-POOL="__POOL__"
-NAME="__NAME__"
-URL="__URL__"
-STAGE="$HOME/.rustynet-image-staging"
-mkdir -p "$STAGE"
-
-if [ -f "$POOL/$NAME" ] && [ -f "$POOL/$NAME.done" ]; then
-  # A pinned digest re-verifies what is already there. The .done marker only
-  # records that some past run finished; it is not evidence the bytes on disk are
-  # still the bytes that were fetched.
-  if [ -n "__SHA256__" ]; then
-    POOL_ACTUAL="$(sha256sum "$POOL/$NAME" | cut -d' ' -f1)"
-    if [ "$POOL_ACTUAL" != "__SHA256__" ]; then
-      echo "[image] REFUSING: $NAME is in the pool but its sha256 does not match" >&2
-      echo "[image]   expected __SHA256__" >&2
-      echo "[image]   actual   $POOL_ACTUAL" >&2
-      echo "[image] Not overwriting. Remove $POOL/$NAME and re-run to refetch." >&2
-      exit 1
-    fi
-    echo "[image] $NAME already complete in the pool (sha256 verified)"
-    exit 0
-  fi
-  echo "[image] $NAME already complete in the pool"
-  exit 0
-fi
-
-# Guard BEFORE writing: the pool must sit on the declared disk, matched by MODEL.
-# Device letters are not stable across boots, so a letter is not a guard.
-if [ -n "__EXPECT_MODEL__" ]; then
-  DEV="$(findmnt -n -o SOURCE --target "$POOL" | sed 's/[0-9]*$//')"
-  MODEL="$(lsblk -no MODEL "$DEV" | head -1 | xargs)"
-  if [ "$MODEL" != "__EXPECT_MODEL__" ]; then
-    echo "[image] REFUSING: $POOL is on '$MODEL' ($DEV), not '__EXPECT_MODEL__'. Nothing written." >&2
-    exit 1
-  fi
-  echo "[image] guard: $POOL -> $DEV = $MODEL (ok)"
-fi
-
-# A COMPLETE staged file must skip the transfer entirely.
-#
-# `curl -C -` on an already-complete file asks for `Range: <size>-`, the server
-# answers 416, and curl exits 33/36 — which the loop below reads as "resume
-# rejected" and responds to by DELETING the file and re-downloading from zero.
-# So an interrupted-then-completed run (download succeeded, install failed) would
-# throw away a finished multi-GB transfer on the retry. Compare the staged size
-# against Content-Length up front and jump straight to install when they match.
-# NOTE: no `awk BEGIN{IGNORECASE=1}` here. IGNORECASE is a GAWK extension and the
-# hosts run mawk, which silently ignores it — so /^content-length:/ never matched
-# the real `Content-Length:` header and this probe returned empty, defeating
-# itself without a word. tr+grep -i is portable across both awks.
-REMOTE_SIZE="$(curl -4 -sIL --proto-redir =https --connect-timeout 30 "$URL" 2>/dev/null \
-  | tr -d '\r' | grep -i '^content-length:' | tail -1 | awk '{print $2}')"
-if [ -f "$STAGE/$NAME" ] && [ -n "${REMOTE_SIZE:-}" ]; then
-  LOCAL_SIZE="$(stat -c %s "$STAGE/$NAME" 2>/dev/null || echo 0)"
-  if [ "$LOCAL_SIZE" = "$REMOTE_SIZE" ]; then
-    echo "[image] staged $NAME is already complete ($LOCAL_SIZE bytes) — skipping download"
-    SKIP_DOWNLOAD=1
-  fi
-fi
-
-for attempt in 1 2 3 4 5; do
-  if [ "${SKIP_DOWNLOAD:-0}" = "1" ]; then rc=0; else
-  # NO sudo in this loop, deliberately.
-  curl -4 -L -C - --proto-redir =https \
-       --retry 10 --retry-delay 10 --retry-all-errors --retry-max-time 0 \
-       --connect-timeout 30 --speed-limit 1024 --speed-time 180 \
-       -o "$STAGE/$NAME" "$URL" >/dev/null 2>&1
-  rc=$?
-  fi
-  if [ $rc -eq 0 ]; then
-    echo "[image] downloaded $NAME ($(du -h "$STAGE/$NAME" | cut -f1))"
-    # Integrity gate BEFORE the image is placed where libvirt will boot guests from.
-    # TLS authenticates the transport, not the artifact: these URLs are redirectors
-    # onto mirrors/archives, and this file is a driver ISO that gets injected into
-    # guests. Verify against the caller's pinned digest, and refuse+delete on a
-    # mismatch rather than leave a bad image staged for a later retry to install.
-    if [ -n "__SHA256__" ]; then
-      ACTUAL="$(sha256sum "$STAGE/$NAME" | cut -d' ' -f1)"
-      if [ "$ACTUAL" != "__SHA256__" ]; then
-        echo "[image] REFUSING: sha256 mismatch for $NAME" >&2
-        echo "[image]   expected __SHA256__" >&2
-        echo "[image]   actual   $ACTUAL" >&2
-        rm -f "$STAGE/$NAME"
-        exit 1
-      fi
-      echo "[image] sha256 verified: $ACTUAL"
-    else
-      echo "[image] WARNING: no --sha256 pinned; integrity rests on TLS alone" >&2
-    fi
-    # Unprivileged install first. A pool that is group-writable to kvm with the
-    # setgid bit set (see the remediation below) needs no root at all: the new
-    # file inherits group kvm, and libvirt-qemu is a member, so qemu can read it.
-    # Preferring this path keeps image staging out of the sudo blast radius.
-    if install -m 0644 "$STAGE/$NAME" "$POOL/$NAME" 2>/dev/null; then
-      touch "$POOL/$NAME.done" 2>/dev/null
-      rm -f "$STAGE/$NAME"
-      echo "[image] installed into $POOL/$NAME (unprivileged)"
-      exit 0
-    fi
-    # Root-owned pool: only works where sudo is already passwordless.
-    if sudo -n install -o libvirt-qemu -g kvm -m 0644 "$STAGE/$NAME" "$POOL/$NAME" 2>/dev/null; then
-      sudo -n touch "$POOL/$NAME.done" 2>/dev/null
-      rm -f "$STAGE/$NAME"
-      echo "[image] installed into $POOL/$NAME (via sudo)"
-      exit 0
-    fi
-    echo "[image] downloaded OK but $POOL is not writable by $(id -un)." >&2
-    echo "[image] The download is kept at $STAGE/$NAME — re-run to install, no re-download." >&2
-    echo "[image] Grant write access ONCE on the host (no stored credential, world perms unchanged):" >&2
-    echo "[image]   sudo chgrp kvm $POOL && sudo chmod 2771 $POOL" >&2
-    echo "[image] Requires $(id -un) in group kvm; verify with: id -nG" >&2
-    exit 1
-  fi
-  # 33/36: the server refused the range -> the partial is unusable, restart clean
-  if [ $rc -eq 33 ] || [ $rc -eq 36 ]; then
-    echo "[image] resume rejected (rc=$rc), restarting from zero"
-    rm -f "$STAGE/$NAME"
-  fi
-  echo "[image] attempt $attempt failed rc=$rc, re-resuming"
-  sleep 10
-done
-echo "[image] FAILED after 5 attempts: $NAME" >&2
-exit 1
-"#;
-
-/// Capture a guest's serial console during a fresh boot.
-///
-/// The tool for "the VM will not boot and nothing says why". It is what surfaced
-/// the `--graphics none` GRUB loop: the console showed GRUB re-printing
-/// ``Booting `Debian GNU/Linux'`` forever with no kernel output at all, which no
-/// other signal revealed — `domstate` cheerfully said `running` throughout.
-///
-/// Destructive to the guest's uptime: it force-stops the domain to catch the boot
-/// from the start, because attaching afterwards shows nothing on a hung guest.
-const HOST_GUEST_CONSOLE_SCRIPT: &str = r#"#!/bin/bash
-set -uo pipefail
-DOM="__DOMAIN__"
-SECS="__SECONDS__"
-virsh -c qemu:///system destroy "$DOM" >/dev/null 2>&1 || true
-sleep 2
-# `script` supplies the pty that `virsh console` requires over a non-tty ssh session.
-timeout "$SECS" script -qec "virsh -c qemu:///system start --console $DOM" /dev/null 2>&1 | head -120
-echo
-echo "--- capture ended ---"
-echo "domstate: $(virsh -c qemu:///system domstate "$DOM" 2>&1)"
-"#;
-
-/// The toolchain a Debian-family lab guest needs before `rn_bootstrap.sh` will run.
-///
-/// `rn_bootstrap` **verifies** prerequisites and fails when they are missing — it
-/// does not install them — so a fresh cloud image needs this first. Shipped over
-/// SSH on **stdin**, never argv, and it interpolates exactly one value (the pinned
-/// toolchain channel, validated before use).
-///
-/// Every non-obvious line here is a lesson that cost real time; see the inline
-/// comments before "simplifying" any of them.
-const GUEST_TOOLCHAIN_SCRIPT: &str = r#"#!/bin/bash
-set -uo pipefail
-echo "[toolchain] $(. /etc/os-release; echo "$PRETTY_NAME") on $(uname -m)"
-
-# rn_bootstrap runs `sudo -n`, so passwordless sudo is a hard prerequisite, not a
-# nicety. Fail here with the reason rather than deep inside a build.
-if ! sudo -n true 2>/dev/null; then
-  echo "[toolchain] FATAL: passwordless sudo is required (rn_bootstrap uses 'sudo -n')" >&2
-  exit 1
-fi
-echo "[toolchain] passwordless sudo: ok"
-
-export DEBIAN_FRONTEND=noninteractive
-
-# Retry apt rather than pinning a mirror. An update was observed to stall on a
-# connection that never delivered, while EVERY mirror edge served a full payload
-# in <0.25s when probed directly — including the exact IP apt was stuck on. That
-# is a transient stall on a flaky link, not a broken mirror. The last attempt is
-# verbose because `-qq` is what hid the explanation the first time.
-apt_update() {
-  for attempt in 1 2 3; do
-    if sudo -n timeout 180 apt-get update -qq >/dev/null 2>&1; then
-      echo "[toolchain] apt-get update ok (attempt $attempt)"; return 0
-    fi
-    echo "[toolchain] apt-get update stalled/failed (attempt $attempt), retrying"
-  done
-  echo "[toolchain] apt-get update failing — verbose attempt:" >&2
-  sudo -n timeout 180 apt-get update 2>&1 | tail -5 >&2
-  return 1
-}
-if [ "${VERIFY_ONLY:-0}" != "1" ]; then
-  apt_update || exit 1
-  # nft=nftables, wg=wireguard-tools, ping=iputils-ping; clang+llvm for bindgen
-  sudo -n timeout 1200 apt-get install -y -qq \
-    curl git make pkg-config clang llvm libclang-dev \
-    build-essential \
-    nftables wireguard-tools iproute2 \
-    tar gzip tcpdump iputils-ping \
-    libssl-dev libsqlite3-dev ca-certificates \
-    >/dev/null 2>&1
-  echo "[toolchain] apt packages installed"
-
-  # rustup pinned to the repo's rust-toolchain.toml channel, so the guest builds
-  # with the same compiler as CI instead of whatever is newest.
-  if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain __CHANNEL__ \
-      -c rustfmt -c clippy >/dev/null 2>&1
-    echo "[toolchain] rustup installed (__CHANNEL__)"
-  else
-    echo "[toolchain] rustup already present"
-  fi
-
-  # Put the rustup shims on the DEFAULT PATH.
-  #
-  # rustup installs into ~/.cargo/bin and only adds it via ~/.profile, which a
-  # NON-LOGIN ssh shell never sources — and that is exactly the shell the
-  # orchestrator drives guests over. So `ssh guest cargo build` dies with 127
-  # (command not found) while cargo is sitting there installed. The working UTM
-  # fleet has its shims on /usr/bin for this reason. /usr/local/bin is already on
-  # the default PATH, so link there — keeping rustup, and therefore
-  # rust-toolchain.toml's pin, rather than a distro cargo that would ignore it.
-  for shim in cargo rustc rustup rustfmt cargo-clippy clippy-driver rustdoc; do
-    if [ -x "$HOME/.cargo/bin/$shim" ]; then
-      sudo -n ln -sf "$HOME/.cargo/bin/$shim" "/usr/local/bin/$shim"
-    fi
-  done
-  echo "[toolchain] rustup shims linked into /usr/local/bin (non-login PATH)"
-fi
-
-# Verify with rn_bootstrap's OWN path. A non-login ssh shell has
-# PATH=/usr/local/bin:/usr/bin:/bin:/usr/games — no /usr/sbin — so `command -v nft`
-# reports MISSING for a binary sitting at /usr/sbin/nft. That is this repo's
-# documented "sbin PATH fail-open": checking with a narrower PATH than the consumer
-# uses yields a confident false negative. rn_bootstrap prepends the sbin dirs, so a
-# checker that does not is stricter AND wronger than the thing it checks for.
-export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
-
-echo "--- rn_bootstrap prerequisite check (its list, its PATH) ---"
-missing=0
-for cmd in curl git make pkg-config clang nft wg rustup tar gzip tcpdump ping; do
-  if command -v "$cmd" >/dev/null 2>&1; then printf "  %-12s ok\n" "$cmd"
-  else printf "  %-12s MISSING\n" "$cmd"; missing=1; fi
-done
-if command -v gcc >/dev/null 2>&1 || command -v cc >/dev/null 2>&1; then echo "  C compiler   ok"; else echo "  C compiler   MISSING"; missing=1; fi
-if command -v g++ >/dev/null 2>&1 || command -v c++ >/dev/null 2>&1; then echo "  C++ compiler ok"; else echo "  C++ compiler MISSING"; missing=1; fi
-if command -v llvm-config >/dev/null 2>&1 || ls /usr/bin/llvm-config-* >/dev/null 2>&1; then echo "  llvm-config  ok"; else echo "  llvm-config  MISSING"; missing=1; fi
-if pkg-config --exists openssl; then echo "  pkgcfg openssl  ok"; else echo "  pkgcfg openssl  MISSING"; missing=1; fi
-if pkg-config --exists sqlite3; then echo "  pkgcfg sqlite3  ok"; else echo "  pkgcfg sqlite3  MISSING"; missing=1; fi
-echo "  rust:        $(rustc --version 2>/dev/null || echo MISSING)"
-echo "  cargo:       $(cargo --version 2>/dev/null || echo MISSING)"
-if [ "$missing" -eq 0 ]; then
-  echo "[toolchain] ALL PREREQUISITES SATISFIED"
-  exit 0
-fi
-echo "[toolchain] PREREQUISITES MISSING — rn_bootstrap would fail" >&2
-exit 1
-"#;
-
 /// The toolchain channel pinned by `rust-toolchain.toml`.
 ///
 /// Read from the repo rather than hardcoded, so a guest can never be provisioned
@@ -4262,7 +3988,66 @@ fn pinned_toolchain_channel() -> Result<String, String> {
     Ok(channel)
 }
 
-/// A value interpolated into a host script must not be able to escape its quotes.
+/// Whether a value is allowed to be empty — see [`ensure_single_quoted_script_value`].
+///
+/// Spelled as a type rather than a `bool` because both answers are load-bearing:
+/// three bindings are *legitimately* empty and the script branches on that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowEmpty {
+    Yes,
+    No,
+}
+
+/// The canonical rule for a value that reaches a host script (QH-12).
+///
+/// This is the file's pre-existing composed helper — it used to be called
+/// `ensure_orchestrator_arg_safe` and was scoped to one caller — generalised to
+/// the label + empty-policy form and pointed at the nine sites that hand-rolled
+/// the same `ensure_script_safe_value` + `contains('\'')` pair. Extending the
+/// existing helper (rather than adding a new one beside it) is deliberate: four
+/// competing idioms for this rule are what let the QH-01 defect hide.
+///
+/// Since QH-01 the renderer `shell_quote`s every
+/// [`script_template::Binding::Literal`], so **escaping**, not this rule, is the
+/// load-bearing control. This remains as the defence-in-depth layer, and as the
+/// *only* control for values that are pre-quoted or handed over as a
+/// `RawFragment`, plus for values that also reach the SSH argv sink (QH-13).
+///
+/// `allow_empty` is explicit because `ensure_no_control_chars` refuses empty
+/// while `__EXPECT_MODEL__` (host declares no pool disk), `__SHA256__`
+/// (unpinned) and `__TARGETS__` (every domain) are legitimately empty and render
+/// as `''`. Proven by `single_quoted_value_guard_refuses_by_attack_class` and
+/// `an_absent_pool_disk_model_is_not_an_error`.
+fn ensure_single_quoted_script_value(
+    label: &str,
+    value: &str,
+    allow_empty: AllowEmpty,
+) -> Result<(), String> {
+    if value.is_empty() {
+        return match allow_empty {
+            AllowEmpty::Yes => Ok(()),
+            AllowEmpty::No => Err(format!("{label} must not be empty")),
+        };
+    }
+    ensure_script_safe_value(label, value)?;
+    if value.contains('\'') {
+        return Err(format!(
+            "{label} contains a single quote and is refused (it is single-quoted into the remote script): {value:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The metacharacter half of [`ensure_single_quoted_script_value`] — refuses `"`,
+/// `$`, backtick and `\`, and (via `ensure_no_control_chars`) empty and `\0\n\r`.
+///
+/// **It is deliberately NOT a complete injection rule and must not be read as one:**
+/// it permits `'`, `;`, `|`, `&`, `<`, `>`, `*`, `?` and a space. Composing it with
+/// the single-quote refusal is what makes it usable, which is why callers should
+/// reach for `ensure_single_quoted_script_value` instead of this directly; where a
+/// value reaches a real shell (the SSH argv sink, QH-13) an **allowlist** is
+/// required, as `ensure_provision_pool_path` and `ensure_provision_image_name` use.
+/// Proven by `single_quoted_value_guard_refuses_by_attack_class`.
 fn ensure_script_safe_value(label: &str, value: &str) -> Result<(), String> {
     ensure_no_control_chars(label, value)?;
     if value.contains('"') || value.contains('$') || value.contains('`') || value.contains('\\') {
@@ -4313,17 +4098,22 @@ pub fn execute_ops_vm_lab_fetch_image(config: VmLabFetchImageConfig) -> Result<S
         .pool
         .clone()
         .unwrap_or_else(|| DEFAULT_LIBVIRT_IMAGE_POOL.to_owned());
-    ensure_script_safe_value("pool", pool.as_str())?;
+    ensure_single_quoted_script_value("pool", pool.as_str(), AllowEmpty::No)?;
     let expect_model = host.pool_disk_model.clone().unwrap_or_default();
-    ensure_script_safe_value("pool_disk_model", expect_model.as_str())?;
+    // Empty means "the host declares no pool disk, so the guard is skipped" — the
+    // script branches on emptiness. Refusing empty here (which the old
+    // `ensure_script_safe_value` call did, via `ensure_no_control_chars`) made
+    // fetch-image fail on every host without a `pool_disk_model`.
+    ensure_single_quoted_script_value("pool_disk_model", expect_model.as_str(), AllowEmpty::Yes)?;
     let sha256 = normalise_pinned_sha256(config.sha256.as_deref())?;
 
-    let script = HOST_FETCH_IMAGE_SCRIPT
-        .replace("__POOL__", pool.as_str())
-        .replace("__NAME__", config.name.as_str())
-        .replace("__URL__", config.url.as_str())
-        .replace("__SHA256__", sha256.as_str())
-        .replace("__EXPECT_MODEL__", expect_model.as_str());
+    let script = script_template::render_host_fetch_image_script(
+        pool.as_str(),
+        config.name.as_str(),
+        config.url.as_str(),
+        sha256.as_str(),
+        expect_model.as_str(),
+    )?;
 
     let timeout = timeout_or_default(config.timeout_secs, 3600);
     let ssh_user = endpoint.split_once('@').map(|(user, _)| user.to_owned());
@@ -4366,9 +4156,8 @@ pub fn execute_ops_vm_lab_guest_console(config: VmLabGuestConsoleConfig) -> Resu
     ensure_script_safe_value("domain", config.domain.as_str())?;
     let seconds = config.seconds.clamp(5, 180);
 
-    let script = HOST_GUEST_CONSOLE_SCRIPT
-        .replace("__DOMAIN__", config.domain.as_str())
-        .replace("__SECONDS__", seconds.to_string().as_str());
+    let script =
+        script_template::render_host_guest_console_script(config.domain.as_str(), seconds)?;
 
     let ssh_user = endpoint.split_once('@').map(|(user, _)| user.to_owned());
     let target = endpoint
@@ -4429,7 +4218,7 @@ pub fn execute_ops_vm_lab_provision_toolchain(
     }
 
     let channel = pinned_toolchain_channel()?;
-    let script = GUEST_TOOLCHAIN_SCRIPT.replace("__CHANNEL__", channel.as_str());
+    let script = script_template::render_guest_toolchain_script(channel.as_str())?;
     let timeout = timeout_or_default(config.timeout_secs, 1800);
 
     let mut results: Vec<Value> = Vec::new();
@@ -4956,80 +4745,6 @@ pub fn execute_ops_vm_lab_host_run_status(
     Ok(out)
 }
 
-/// Launcher shipped to a host to start a live-lab run **detached**.
-///
-/// The problem it solves: `vm-lab-orchestrate-live-lab` runs for 30–45 minutes,
-/// but an SSH invocation that waited for it would die the moment the connection
-/// dropped — and this is the one action the whole multi-host program exists to
-/// remove from manual SSH. So the run must outlive the launching connection.
-///
-/// How it stays alive and stays killable:
-/// - A tiny **runner** script writes its own `$$` to a pidfile and then `exec`s
-///   the orchestrator, so the pid we record IS the orchestrator's pid (an `exec`
-///   keeps the pid). `$!` cannot be used because `setsid` forks and the parent
-///   exits immediately, leaving `$!` pointing at a corpse.
-/// - `setsid` puts the orchestrator in a **new session/process group**, so it is
-///   not killed when this SSH session closes AND `vm-lab-stop-host-run` can signal
-///   the whole group by the recorded pid.
-/// - `nohup` + redirecting all three fds off the SSH channel means the launcher
-///   returns in ~1s (it only waits for the pidfile, written before the slow
-///   `cargo` compile/exec) instead of blocking for the whole run.
-///
-/// Every interpolated value is single-quoted here and the caller forbids a literal
-/// single quote in any of them, so the quoting cannot be escaped — this text
-/// becomes a shell script on the host.
-const HOST_LAUNCH_SCRIPT: &str = r#"#!/bin/bash
-set -uo pipefail
-cd '__REPO_DIR__' || { echo "LAUNCH-ERROR: repo_dir not found: __REPO_DIR__" >&2; exit 1; }
-
-# Refuse a second concurrent run: two orchestrators would fight over the same
-# guests and the same stage ledger. host_run_status reports the one already going.
-if pgrep -f 'vm-lab-orchestrate-live-lab' >/dev/null 2>&1; then
-  echo "LAUNCH-ERROR: a vm-lab-orchestrate-live-lab run is already in flight on this host" >&2
-  exit 2
-fi
-
-# Only the run-handle dir is created here. The report dir is left for the
-# orchestrator, which refuses to start into a NON-EMPTY one — so the launcher must
-# not seed it (an earlier version put the log inside it and the run refused itself).
-mkdir -p 'state/host-lab-runs' || { echo "LAUNCH-ERROR: cannot create state/host-lab-runs" >&2; exit 1; }
-
-# The pgrep gate above proved no run is in flight, so every pidfile still sitting
-# here is a leftover from an earlier launch that completed naturally (a stop is the
-# only thing that retires them, and this run had none). Retire them now so they do
-# not accumulate across a session and a later stop never has a dead pid to consider.
-rm -f state/host-lab-runs/*.pid 2>/dev/null || true
-
-RUNNER='state/host-lab-runs/__LAUNCH_ID__.run.sh'
-PIDFILE='state/host-lab-runs/__LAUNCH_ID__.pid'
-LOG='state/host-lab-runs/__LAUNCH_ID__.log'
-
-# Quoted heredoc: the shell writes this verbatim, so $$ and $HOME survive to
-# runtime rather than expanding now. The __PLACEHOLDERS__ were already substituted
-# in Rust before the script was sent.
-cat > "$RUNNER" <<'RUNNER_EOF'
-#!/bin/bash
-cd '__REPO_DIR__' || exit 1
-echo $$ > 'state/host-lab-runs/__LAUNCH_ID__.pid'
-exec cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab --report-dir '__REPORT_DIR__' --ssh-identity-file __ORCH_IDENTITY__ --known-hosts-file __ORCH_KNOWN_HOSTS__ __ORCH_ARGS__
-RUNNER_EOF
-
-setsid nohup bash "$RUNNER" > "$LOG" 2>&1 < /dev/null &
-
-# The runner writes its pid before exec'ing cargo, so this appears within a moment
-# even though the compile/run that follows takes far longer.
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-  [ -s "$PIDFILE" ] && break
-  sleep 0.3
-done
-PID="$(cat "$PIDFILE" 2>/dev/null || true)"
-if [ -z "${PID:-}" ]; then
-  echo "LAUNCH-ERROR: runner did not report a pid within ~4.5s (see $LOG)" >&2
-  exit 3
-fi
-echo "LAUNCHED launch_id=__LAUNCH_ID__ pid=$PID log=$LOG"
-"#;
-
 /// Config for `ops vm-lab-launch-on-host`: start a detached live-lab run on a host.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VmLabLaunchOnHostConfig {
@@ -5059,67 +4774,6 @@ pub struct VmLabLaunchOnHostConfig {
     pub timeout_secs: u64,
     pub json: bool,
 }
-
-/// A pass-through orchestrator argument is single-quoted into the remote script,
-/// so it must contain no single quote (there is no safe way to embed one inside a
-/// single-quoted shell word) and no shell metacharacter that `ensure_script_safe_value`
-/// already rejects. This is the injection boundary for the forwarded args.
-fn ensure_orchestrator_arg_safe(value: &str) -> Result<(), String> {
-    ensure_script_safe_value("orchestrator arg", value)?;
-    if value.contains('\'') {
-        return Err(format!(
-            "orchestrator arg contains a single quote and is refused (it is single-quoted into the remote script): {value:?}"
-        ));
-    }
-    Ok(())
-}
-
-/// Recover stuck libvirt guests on a host — the counterpart to the UTM
-/// `probe_and_recover_local_utm.sh` for the libvirt/KVM backend.
-///
-/// "Stuck" for a libvirt guest means: **running but with no DHCP lease** (the
-/// network wedged and it never got an address), **paused**, or **shut off** when it
-/// should be up. The fix is a hard `destroy` + `start`, which forces a clean boot
-/// and a fresh lease. A **healthy** guest — running with an IP — is left alone
-/// unless `--force`, so running this against a host with healthy guests is a safe
-/// no-op that reports "skip (healthy)" rather than needlessly bouncing them.
-const HOST_RECOVER_VMS_SCRIPT: &str = r#"#!/bin/bash
-set -uo pipefail
-FORCE='__FORCE__'
-TARGETS='__TARGETS__'
-
-if [ -z "$TARGETS" ]; then
-  TARGETS="$(virsh -c qemu:///system list --name --all 2>/dev/null | grep -v '^$' | tr '\n' ' ')"
-fi
-
-echo "RECOVER-BEGIN"
-for d in $TARGETS; do
-  st="$(virsh -c qemu:///system domstate "$d" 2>/dev/null || echo missing)"
-  if [ "$st" = "missing" ]; then echo "  $d: NOT FOUND on this host"; continue; fi
-  ip="$(virsh -c qemu:///system domifaddr "$d" 2>/dev/null | grep -oE '([0-9]+\.){3}[0-9]+' | grep -v '^127\.' | head -1)"
-  case "$st" in
-    running)
-      if [ "$FORCE" = "1" ] || [ -z "$ip" ]; then
-        virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 || true
-        virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true
-        echo "  $d: RESET (was running${ip:+, ip=$ip}${ip:+, forced}${ip:-, no lease})"
-      else
-        echo "  $d: skip (healthy: running, ip=$ip)"
-      fi
-      ;;
-    paused)
-      virsh -c qemu:///system resume "$d" >/dev/null 2>&1 \
-        || { virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 || true; virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true; }
-      echo "  $d: RECOVERED (was paused)"
-      ;;
-    *)
-      virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true
-      echo "  $d: STARTED (was $st)"
-      ;;
-  esac
-done
-echo "RECOVER-END"
-"#;
 
 /// Config for `ops vm-lab-recover-host-vms`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -5163,9 +4817,7 @@ pub fn execute_ops_vm_lab_recover_host_vms(
             .map_err(|err| format!("--vm {domain:?} is not a valid domain name: {err}"))?;
     }
     let targets = config.domains.join(" ");
-    let script = HOST_RECOVER_VMS_SCRIPT
-        .replace("__FORCE__", if config.force { "1" } else { "0" })
-        .replace("__TARGETS__", targets.as_str());
+    let script = script_template::render_host_recover_vms_script(config.force, targets.as_str())?;
 
     let timeout = timeout_or_default(config.timeout_secs, 300);
     let out = run_guest_script(
@@ -5202,27 +4854,6 @@ pub fn execute_ops_vm_lab_recover_host_vms(
     ))
 }
 
-/// Report a remote host's disk: filesystem headroom on the image pool, plus what
-/// is consuming it (base images + per-guest qcow2 overlays accrue there).
-///
-/// The `du` is capped to one directory level (`--max-depth=1`) and to the pool, so
-/// it stays fast and cannot wander the whole disk. Sizes are listed largest-first
-/// because "what do I delete to reclaim space?" is the question this answers.
-const HOST_DISK_STATUS_SCRIPT: &str = r#"#!/bin/bash
-set -uo pipefail
-POOL='__POOL__'
-echo "DISK-BEGIN"
-echo "-- filesystem holding the pool --"
-df -h "$POOL" 2>/dev/null || echo "(df failed for $POOL)"
-echo "-- pool total --"
-du -sh "$POOL" 2>/dev/null || echo "(du failed)"
-echo "-- largest files in the pool (base images + guest overlays) --"
-ls -1S "$POOL" 2>/dev/null | head -20 | while IFS= read -r f; do
-  [ -e "$POOL/$f" ] && printf '  %s\t%s\n' "$(du -h "$POOL/$f" 2>/dev/null | cut -f1)" "$f"
-done
-echo "DISK-END"
-"#;
-
 /// Config for `ops vm-lab-host-disk-status`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VmLabHostDiskStatusConfig {
@@ -5258,12 +4889,9 @@ pub fn execute_ops_vm_lab_host_disk_status(
         .pool
         .clone()
         .unwrap_or_else(|| DEFAULT_LIBVIRT_IMAGE_POOL.to_owned());
-    ensure_script_safe_value("pool", pool.as_str())?;
-    if pool.contains('\'') {
-        return Err("--pool must not contain a single quote".to_owned());
-    }
+    ensure_single_quoted_script_value("pool", pool.as_str(), AllowEmpty::No)?;
 
-    let script = HOST_DISK_STATUS_SCRIPT.replace("__POOL__", pool.as_str());
+    let script = script_template::render_host_disk_status_script(pool.as_str())?;
     let timeout = timeout_or_default(config.timeout_secs, 60);
     let out = run_guest_script(
         endpoint.as_str(),
@@ -5299,61 +4927,6 @@ pub fn execute_ops_vm_lab_host_disk_status(
         body.trim_end()
     ))
 }
-
-/// Renumber a host's libvirt `default` network off the shared libvirt default
-/// (`192.168.122.0/24`) onto the host's declared `guest_subnet`, so several KVM
-/// hosts can each advertise their guest subnet to the tailnet without colliding.
-///
-/// Two deliberate improvements over the scratchpad it replaces:
-/// - **No sudo.** The scratchpad piped a password into `sudo -S`; a libvirt-group
-///   member can drive `net-define`/`destroy`/`start` on `qemu:///system` directly
-///   (verified on `ubuntu-kvm-1`), so no credential is needed or embedded.
-/// - **Idempotent.** It reads the network's CURRENT prefix and no-ops if it already
-///   matches the target — so re-running it does NOT needlessly destroy the network
-///   and restart every guest. The restart (guests must re-lease) only happens on an
-///   actual change.
-const HOST_RENUMBER_NET_SCRIPT: &str = r#"#!/bin/bash
-set -uo pipefail
-NET=default
-TARGET_PREFIX='__TARGET_PREFIX__'
-
-XML="$(virsh -c qemu:///system net-dumpxml "$NET" 2>/dev/null)" || {
-  echo "RENUMBER-ERROR: cannot read libvirt network '$NET' (is $(id -un) in the libvirt group?)" >&2
-  exit 1
-}
-CUR_IP="$(printf '%s' "$XML" | grep -oE "<ip address='[0-9.]+'" | head -1 | grep -oE '[0-9.]+' | head -1)"
-if [ -z "$CUR_IP" ]; then
-  echo "RENUMBER-ERROR: could not find the current IPv4 in the '$NET' network XML" >&2
-  exit 1
-fi
-CUR_PREFIX="${CUR_IP%.*}."
-
-if [ "$CUR_PREFIX" = "$TARGET_PREFIX" ]; then
-  echo "RENUMBER-RESULT: already on ${TARGET_PREFIX}0/24 — no change, guests untouched"
-  exit 0
-fi
-
-echo "RENUMBER-RESULT: renumbering ${CUR_PREFIX}0/24 -> ${TARGET_PREFIX}0/24"
-TMP="$(mktemp)"
-printf '%s' "$XML" | sed "s/${CUR_PREFIX//./\\.}/${TARGET_PREFIX}/g" > "$TMP"
-virsh -c qemu:///system net-destroy "$NET" >/dev/null 2>&1 || true
-virsh -c qemu:///system net-undefine "$NET" >/dev/null 2>&1 || true
-virsh -c qemu:///system net-define "$TMP" || { echo "RENUMBER-ERROR: net-define failed" >&2; rm -f "$TMP"; exit 1; }
-virsh -c qemu:///system net-start "$NET" || { echo "RENUMBER-ERROR: net-start failed" >&2; rm -f "$TMP"; exit 1; }
-virsh -c qemu:///system net-autostart "$NET" >/dev/null 2>&1 || true
-rm -f "$TMP"
-
-# Running guests must be bounced to pick up a lease on the new subnet.
-for d in $(virsh -c qemu:///system list --name --all | grep -v '^$'); do
-  st="$(virsh -c qemu:///system domstate "$d" 2>/dev/null || echo unknown)"
-  if [ "$st" = "running" ]; then
-    virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 || true
-  fi
-  virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true
-  echo "  restarted: $d"
-done
-echo "RENUMBER-RESULT: done"
-"#;
 
 /// Config for `ops vm-lab-renumber-guest-network`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -5413,7 +4986,7 @@ pub fn execute_ops_vm_lab_renumber_guest_network(
     })?;
     let prefix = guest_subnet_prefix(subnet)?;
 
-    let script = HOST_RENUMBER_NET_SCRIPT.replace("__TARGET_PREFIX__", prefix.as_str());
+    let script = script_template::render_host_renumber_net_script(prefix.as_str())?;
 
     if config.dry_run {
         if config.json {
@@ -5462,29 +5035,6 @@ pub fn execute_ops_vm_lab_renumber_guest_network(
     }
     Ok(format!("host {} — {result}\n", host.host_id))
 }
-
-/// Read one file out of a host's checkout — the missing half of `host_run_status`,
-/// which hands back a `report_dir` nothing could then read.
-///
-/// Read-only and bounded: a size cap keeps a stray path (a multi-GB capture, a core
-/// dump) from being streamed into a tool response. The path is confined to the
-/// host's repo_dir by the caller (relative, no traversal), so this cannot exfiltrate
-/// arbitrary host files.
-const HOST_FETCH_ARTIFACT_SCRIPT: &str = r#"#!/bin/bash
-set -uo pipefail
-cd '__REPO_DIR__' || { echo "FETCH-ERROR: repo_dir not found: __REPO_DIR__" >&2; exit 1; }
-P='__PATH__'
-if [ ! -f "$P" ]; then echo "FETCH-ERROR: not a regular file: $P" >&2; exit 2; fi
-SIZE="$(stat -c %s "$P" 2>/dev/null || echo 0)"
-CAP=__CAP__
-if [ "$SIZE" -gt "$CAP" ]; then
-  echo "FETCH-ERROR: $P is $SIZE bytes, over the $CAP-byte cap; narrow the path or raise --max-bytes" >&2
-  exit 3
-fi
-echo "FETCH-META path=$P size=$SIZE"
-echo "FETCH-BODY-BEGIN"
-cat "$P"
-"#;
 
 /// Config for `ops vm-lab-fetch-host-artifact`: read a report file off a host.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -5537,24 +5087,19 @@ pub fn execute_ops_vm_lab_fetch_host_artifact(
     if config.path.split('/').any(|seg| seg == "..") {
         return Err(format!("--path must not contain '..': {}", config.path));
     }
-    ensure_script_safe_value("path", config.path.as_str())?;
-    if config.path.contains('\'') {
-        return Err("--path must not contain a single quote".to_owned());
-    }
-    ensure_script_safe_value("repo_dir", repo_dir.as_str())?;
-    if repo_dir.contains('\'') {
-        return Err("host repo_dir must not contain a single quote".to_owned());
-    }
+    ensure_single_quoted_script_value("path", config.path.as_str(), AllowEmpty::No)?;
+    ensure_single_quoted_script_value("host repo_dir", repo_dir.as_str(), AllowEmpty::No)?;
     let cap = if config.max_bytes == 0 {
         5 * 1024 * 1024
     } else {
         config.max_bytes
     };
 
-    let script = HOST_FETCH_ARTIFACT_SCRIPT
-        .replace("__REPO_DIR__", repo_dir.as_str())
-        .replace("__PATH__", config.path.as_str())
-        .replace("__CAP__", cap.to_string().as_str());
+    let script = script_template::render_host_fetch_artifact_script(
+        repo_dir.as_str(),
+        config.path.as_str(),
+        cap,
+    )?;
 
     let timeout = timeout_or_default(config.timeout_secs, 60);
     let out = run_guest_script(
@@ -5598,92 +5143,6 @@ pub fn execute_ops_vm_lab_fetch_host_artifact(
     ))
 }
 
-/// Script shipped to a host to stop an in-flight live-lab run.
-///
-/// Signals the run's **process group**, not just the leader, so the whole tree
-/// (`cargo` → `rustynet-cli` → the guest-SSH children) goes down together — a plain
-/// `kill <pid>` would orphan the children to keep running against the guests. The
-/// recorded pid IS the session-leader/pgid (the runner wrote it before `exec`), so
-/// `kill -- -<pid>` reaches the group. `pgrep` is a fallback for a run whose handle
-/// file was lost. TERM first, then KILL after a grace period.
-///
-/// Pid-recycling guard: pidfiles are retired at the next launch, not on natural
-/// completion (the runner `exec`s cargo, leaving no shell to clean up), so a stale
-/// pidfile can linger between a run finishing and the next launch — and the OS may
-/// recycle its dead pid to an unrelated live process. So a recorded pid is signaled
-/// ONLY if its argv still contains `vm-lab-orchestrate-live-lab`; a dead or recycled
-/// pid is skipped, never killed. `pgrep -f` matches on argv and only returns live
-/// procs, so those pids are self-verified.
-const HOST_STOP_SCRIPT: &str = r#"#!/bin/bash
-set -uo pipefail
-cd '__REPO_DIR__' 2>/dev/null || true
-
-# Recorded handles first (reload-proof), then anything pgrep still sees.
-#
-# CRITICAL — pid recycling: a recorded pidfile can be stale (its run completed or
-# was killed without a stop, so the pid is dead) and the OS may have recycled that
-# pid to an UNRELATED live process. Signaling it would kill an innocent process. So
-# a recorded pid is signaled ONLY if it is still the orchestrator, verified by its
-# argv. `pgrep -f` already returns only live procs whose argv matches, so those are
-# self-verified and taken as-is.
-pids=""
-skipped=""
-for f in state/host-lab-runs/*.pid; do
-  [ -f "$f" ] || continue
-  p="$(cat "$f" 2>/dev/null || true)"
-  [ -n "$p" ] || continue
-  # The recorded pid IS the runner's pid, which exec'd cargo, so a live one's argv
-  # still contains 'vm-lab-orchestrate-live-lab'. A dead or recycled pid does not.
-  # `-ww` disables ps's COLUMNS width truncation (procps-ng truncates to COLUMNS
-  # even down a pipe): the marker sits ~60 cols into the argv, so a leaked COLUMNS
-  # would otherwise sever it and divert a LIVE run's pid to `skipped`. `pgrep -f`
-  # below reads the untruncated /proc cmdline and is the authoritative matcher;
-  # this pidfile check is the reload-proof advisory that also feeds `skipped`.
-  if ps -ww -o args= -p "$p" 2>/dev/null | grep -q 'vm-lab-orchestrate-live-lab'; then
-    pids="$pids $p"
-  else
-    skipped="$skipped $p"
-  fi
-done
-pgrep_pids="$(pgrep -f 'vm-lab-orchestrate-live-lab' 2>/dev/null || true)"
-pids="$pids $pgrep_pids"
-
-# de-dup + drop blanks
-pids="$(printf '%s\n' $pids | sort -u | tr '\n' ' ')"
-pids="$(echo $pids)"
-skipped="$(echo $skipped)"
-
-[ -n "$skipped" ] && echo "STOP-RESULT: ignoring stale/recycled recorded pid(s): $skipped"
-
-if [ -z "$pids" ]; then
-  # Nothing live to signal; clear any stale handle files so status stays honest.
-  rm -f state/host-lab-runs/*.pid 2>/dev/null || true
-  echo "STOP-RESULT: no run in flight (no live recorded pid, nothing matched pgrep)"
-  exit 0
-fi
-
-echo "STOP-RESULT: signaling: $pids"
-for p in $pids; do kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true; done
-
-# grace period, then escalate any survivor
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  alive=""
-  for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
-  [ -z "$alive" ] && break
-  sleep 0.5
-done
-survivors=""
-for p in $pids; do kill -0 "$p" 2>/dev/null && survivors="$survivors $p"; done
-if [ -n "$survivors" ]; then
-  echo "STOP-RESULT: escalating to KILL:$survivors"
-  for p in $survivors; do kill -KILL -- "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null || true; done
-fi
-
-# retire the handle files so a later status does not report a dead pid as live
-rm -f state/host-lab-runs/*.pid 2>/dev/null || true
-echo "STOP-RESULT: stopped"
-"#;
-
 /// Config for `ops vm-lab-stop-host-run`: stop a detached run on a host.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VmLabStopHostRunConfig {
@@ -5715,12 +5174,9 @@ pub fn execute_ops_vm_lab_stop_host_run(config: VmLabStopHostRunConfig) -> Resul
         .ok_or_else(|| format!("host {} has no repo_dir declared", host.host_id))?
         .display()
         .to_string();
-    ensure_script_safe_value("repo_dir", repo_dir.as_str())?;
-    if repo_dir.contains('\'') {
-        return Err("host repo_dir must not contain a single quote".to_owned());
-    }
+    ensure_single_quoted_script_value("host repo_dir", repo_dir.as_str(), AllowEmpty::No)?;
 
-    let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", repo_dir.as_str());
+    let script = script_template::render_host_stop_script(repo_dir.as_str())?;
     let timeout = timeout_or_default(config.timeout_secs, 60);
     let out = run_guest_script(
         endpoint.as_str(),
@@ -5749,34 +5205,6 @@ pub fn execute_ops_vm_lab_stop_host_run(config: VmLabStopHostRunConfig) -> Resul
         .unwrap_or_else(|_| "{}".to_owned()));
     }
     Ok(format!("host {} — {result}\n", host.host_id))
-}
-
-/// Render the host launcher with every value substituted.
-///
-/// Pure so the injection boundary is directly testable: `orch_args` are each
-/// single-quoted, and the caller guarantees no single quote is present, so a
-/// single-quoted word cannot be escaped. `orch_identity` is pre-rendered (either
-/// `"$HOME/.ssh/id_ed25519"` or a single-quoted override).
-fn render_host_launch_script(
-    repo_dir: &str,
-    report_dir: &str,
-    launch_id: &str,
-    orch_identity: &str,
-    orch_known_hosts: &str,
-    orch_args: &[String],
-) -> String {
-    let joined = orch_args
-        .iter()
-        .map(|arg| format!("'{arg}'"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    HOST_LAUNCH_SCRIPT
-        .replace("__REPO_DIR__", repo_dir)
-        .replace("__REPORT_DIR__", report_dir)
-        .replace("__LAUNCH_ID__", launch_id)
-        .replace("__ORCH_IDENTITY__", orch_identity)
-        .replace("__ORCH_KNOWN_HOSTS__", orch_known_hosts)
-        .replace("__ORCH_ARGS__", joined.as_str())
 }
 
 /// Start a detached `vm-lab-orchestrate-live-lab` run on a remote host.
@@ -5822,16 +5250,10 @@ pub fn execute_ops_vm_lab_launch_on_host(
             config.report_dir
         ));
     }
-    ensure_script_safe_value("report_dir", config.report_dir.as_str())?;
-    if config.report_dir.contains('\'') {
-        return Err("--report-dir must not contain a single quote".to_owned());
-    }
-    ensure_script_safe_value("repo_dir", repo_dir.as_str())?;
-    if repo_dir.contains('\'') {
-        return Err("host repo_dir must not contain a single quote".to_owned());
-    }
+    ensure_single_quoted_script_value("report_dir", config.report_dir.as_str(), AllowEmpty::No)?;
+    ensure_single_quoted_script_value("host repo_dir", repo_dir.as_str(), AllowEmpty::No)?;
     for arg in &config.orchestrator_args {
-        ensure_orchestrator_arg_safe(arg)?;
+        ensure_single_quoted_script_value("orchestrator arg", arg, AllowEmpty::No)?;
     }
 
     let launch_id = format!(
@@ -5842,41 +5264,37 @@ pub fn execute_ops_vm_lab_launch_on_host(
             .unwrap_or(0),
         std::process::id()
     );
-    // Default expands $HOME on the host (double-quoted). An override is a literal
-    // host path, single-quoted and validated, so it cannot inject.
+    // Neither of these is quoted here: the renderer decides. The default is a
+    // `RawFragment` — a compile-time literal whose `$HOME` must expand ON THE HOST
+    // — and an override is a `Literal` the renderer `shell_quote`s. Validating the
+    // override as well is defence in depth (QH-12), not the control.
     let orch_identity = match config.host_ssh_identity.as_deref() {
-        None => "\"$HOME/.ssh/id_ed25519\"".to_owned(),
+        None => script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_IDENTITY),
         Some(path) => {
-            ensure_script_safe_value("host_ssh_identity", path)?;
-            if path.contains('\'') {
-                return Err("--host-ssh-identity must not contain a single quote".to_owned());
-            }
-            format!("'{path}'")
+            ensure_single_quoted_script_value("host_ssh_identity", path, AllowEmpty::No)?;
+            script_template::HostSshPath::Override(path)
         }
     };
     // The --node orchestrator REQUIRES --known-hosts-file when node selectors are
-    // present, so it is always injected. Same quoting contract as the identity:
-    // default double-quoted so $HOME expands on the host; an override is a literal
-    // host path, single-quoted and validated, so it cannot inject.
+    // present, so it is always injected. Same contract as the identity above.
     let orch_known_hosts = match config.host_known_hosts.as_deref() {
-        None => "\"$HOME/.ssh/known_hosts\"".to_owned(),
+        None => {
+            script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_KNOWN_HOSTS)
+        }
         Some(path) => {
-            ensure_script_safe_value("host_known_hosts", path)?;
-            if path.contains('\'') {
-                return Err("--host-known-hosts must not contain a single quote".to_owned());
-            }
-            format!("'{path}'")
+            ensure_single_quoted_script_value("host_known_hosts", path, AllowEmpty::No)?;
+            script_template::HostSshPath::Override(path)
         }
     };
 
-    let script = render_host_launch_script(
+    let script = script_template::render_host_launch_script(
         repo_dir.as_str(),
         config.report_dir.as_str(),
         launch_id.as_str(),
-        orch_identity.as_str(),
-        orch_known_hosts.as_str(),
+        &orch_identity,
+        &orch_known_hosts,
         config.orchestrator_args.as_slice(),
-    );
+    )?;
 
     if config.dry_run {
         if config.json {
@@ -6319,17 +5737,96 @@ fn ensure_provision_guest_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Base-image filenames are joined onto the pool path; a separator would escape it.
+/// Base-image filenames are joined onto the pool path, so a separator would escape
+/// the pool — and they become `qemu-img`/`virt-install` argv and a shell word.
+///
+/// This used to be **path shape only**, which made it silently under-inclusive: a
+/// compiled copy of the old rule (plus `ensure_no_control_chars`) *accepted* every
+/// one of `x'; id; '`, `a'$(id)'`, ``debian`id`.qcow2``, `deb$USER.qcow2`,
+/// `d\ebian.qcow2`, a Cyrillic-е homoglyph, 500 characters, `x;id`, `x|id`,
+/// `x&id` and `-leading-dash.qcow2`. `--image "d.qcow2';id;'"` was therefore a
+/// QH-01 breakout needing **no** ordering trick and **no** `--authorized-key`.
+///
+/// It is now an **allowlist**: a real base image is `[A-Za-z0-9._+-]+`
+/// (`Rocky-10-GenericCloud.latest.x86_64.qcow2`, `debian-13.qcow2`), and an
+/// allowlist is the only rule that cannot be under-inclusive. The length bound is
+/// also new — there was none at all.
+///
+/// Enforced at `execute_ops_vm_lab_fetch_image` and
+/// `execute_ops_vm_lab_provision_guest`, both above their remote calls; proven by
+/// `provision_guest_refuses_hostile_image_on_the_real_call_path`, whose cases are
+/// attack classes rather than a copy of this rule.
 fn ensure_provision_image_name(image: &str) -> Result<(), String> {
-    if image.is_empty() {
-        return Err("image must not be empty".to_owned());
+    if image.is_empty() || image.len() > 100 {
+        return Err(format!("image must be 1..=100 chars: {image:?}"));
     }
     if image.contains('/') || image.contains("..") {
         return Err(format!(
             "image must be a bare filename inside the pool, not a path: {image:?}"
         ));
     }
-    ensure_no_control_chars("image", image)?;
+    if image.starts_with('-') {
+        return Err(format!(
+            "image must not start with '-' (it becomes an argv word): {image:?}"
+        ));
+    }
+    if let Some(bad) = image
+        .chars()
+        .find(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-')))
+    {
+        return Err(format!(
+            "image must be a filename of [A-Za-z0-9._+-] (it becomes argv and a shell word), but contains {bad:?}: {image:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// A libvirt image pool had **no validator at all** before QH-01, and inside
+/// `execute_ops_vm_lab_provision_guest` it reaches **two** sinks:
+///
+/// 1. **An SSH argv sink** — `run_host_cmd(["findmnt", …, "--target", pool])` on
+///    the `pool_disk_model` guard path. `ssh(1)`: *the arguments are appended to
+///    the command, separated by spaces, before it is sent to the server to be
+///    executed* — so the remote **login shell re-parses** them and `;`, `|`, `&`,
+///    `<`, `>`, `*`, `?` and a space all reach a shell. That path is live: it is
+///    gated on `host.pool_disk_model`, which `ubuntu-kvm-1` declares.
+/// 2. **The host-script sink** — `POOL=__POOL__` in `HOST_PROVISION_GUEST_SCRIPT`,
+///    which the renderer now `shell_quote`s.
+///
+/// This one call therefore runs **before both**, and validates for the *stricter*
+/// context: an allowlist of `[A-Za-z0-9./_-]` on an absolute, traversal-free path,
+/// which subsumes `ensure_no_control_chars` and rules out a leading `-` (the path
+/// must start with `/`). An allowlist rather than a metacharacter deny-list
+/// because sink 1 is a real shell.
+///
+/// **Scope:** this closes the pool exposure for this function only. The
+/// `run_host_cmd` sink itself is unchanged, and `device` at the `lsblk` call
+/// below is derived from the previous command's *remote stdout* — remote output
+/// into remote argv. Both are **QH-13**, tracked separately.
+///
+/// Enforced at `execute_ops_vm_lab_provision_guest` (above both sinks); proven by
+/// `provision_guest_refuses_hostile_pool_on_the_real_call_path`.
+fn ensure_provision_pool_path(pool: &str) -> Result<(), String> {
+    if pool.is_empty() || pool.len() > 200 {
+        return Err(format!("--pool must be 1..=200 chars: {pool:?}"));
+    }
+    ensure_no_control_chars("--pool", pool)?;
+    if !pool.starts_with('/') {
+        return Err(format!(
+            "--pool must be an absolute path on the host: {pool:?}"
+        ));
+    }
+    if pool.split('/').any(|segment| segment == "..") {
+        return Err(format!("--pool must not contain '..': {pool:?}"));
+    }
+    if let Some(bad) = pool
+        .chars()
+        .find(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-')))
+    {
+        return Err(format!(
+            "--pool must be an absolute path of [A-Za-z0-9./_-] (it also becomes argv on the host), but contains {bad:?}: {pool:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -6368,8 +5865,22 @@ pub fn execute_ops_vm_lab_provision_guest(
         ));
     }
 
+    // Every value that reaches the host script is validated HERE — above the
+    // `--dry-run` return below — so `--dry-run` is a real preflight and the
+    // real-call-path negative tests exercise the same code a live run does.
+    // (QH-02: deleting any one of these calls turns a named test red. This
+    // function has no other test coverage reaching it, so a validator-only test
+    // would not notice.)
     ensure_provision_guest_name(config.name.as_str())?;
+    // `ensure_provision_image_name` is now an allowlist, so it is BOTH the
+    // path-shape rule and the injection rule for `image`. A second
+    // `ensure_single_quoted_script_value("image", …)` call would be dead weight —
+    // deleting it turned no test red, and an enforcement call no test can miss is
+    // the QH-02 anti-pattern, so it is deliberately not here.
     ensure_provision_image_name(config.image.as_str())?;
+    if let Some(path) = config.authorized_key.as_deref() {
+        ensure_single_quoted_script_value("authorized_key", path, AllowEmpty::No)?;
+    }
     if config.ram_mb < 512 {
         return Err(format!("--ram-mb must be >= 512 (got {})", config.ram_mb));
     }
@@ -6391,6 +5902,11 @@ pub fn execute_ops_vm_lab_provision_guest(
         .pool
         .clone()
         .unwrap_or_else(|| DEFAULT_LIBVIRT_IMAGE_POOL.to_owned());
+    // Validated here, above BOTH sinks it reaches: the `findmnt` SSH argv below
+    // (whose remote login shell re-parses it) and `POOL=__POOL__` in the host
+    // script. See `ensure_provision_pool_path`; the `run_host_cmd` sink itself and
+    // the stdout-derived `device` value are QH-13.
+    ensure_provision_pool_path(pool.as_str())?;
     let base = format!("{pool}/{}", config.image);
     let overlay = format!("{pool}/{}.qcow2", config.name);
     let seed = format!("{pool}/{}-seed.iso", config.name);
@@ -6504,24 +6020,25 @@ pub fn execute_ops_vm_lab_provision_guest(
     // The Rust-side guards above (disk model + collision) have passed. The pool is
     // group-writable to `kvm` and the host user is in `libvirt`, so the overlay,
     // the cloud-init seed and the domain are all created with NO sudo.
+    // The key path is NOT quoted here — that was the QH-01 breakout. The default is
+    // a `RawFragment` (a compile-time literal whose `$HOME` must expand on the host)
+    // and an override is a `Literal` the renderer `shell_quote`s. It was already
+    // validated above the `--dry-run` return.
     let auth_key = match config.authorized_key.as_deref() {
-        None => "\"$HOME/.ssh/id_ed25519.pub\"".to_owned(),
-        Some(path) => {
-            ensure_script_safe_value("authorized_key", path)?;
-            if path.contains('\'') {
-                return Err("--authorized-key must not contain a single quote".to_owned());
-            }
-            format!("'{path}'")
+        None => {
+            script_template::HostSshPath::Default(script_template::DEFAULT_GUEST_AUTHORIZED_KEY)
         }
+        Some(path) => script_template::HostSshPath::Override(path),
     };
-    let script = HOST_PROVISION_GUEST_SCRIPT
-        .replace("__POOL__", pool.as_str())
-        .replace("__NAME__", config.name.as_str())
-        .replace("__IMAGE__", config.image.as_str())
-        .replace("__DISK_GB__", config.disk_gb.to_string().as_str())
-        .replace("__RAM_MB__", config.ram_mb.to_string().as_str())
-        .replace("__VCPUS__", config.vcpus.to_string().as_str())
-        .replace("__AUTH_KEY__", auth_key.as_str());
+    let script = script_template::render_host_provision_guest_script(
+        pool.as_str(),
+        config.name.as_str(),
+        config.image.as_str(),
+        config.disk_gb,
+        config.ram_mb,
+        config.vcpus,
+        &auth_key,
+    )?;
 
     let out = run_guest_script(
         endpoint.as_str(),
@@ -6554,77 +6071,27 @@ pub fn execute_ops_vm_lab_provision_guest(
     ))
 }
 
-/// Create a libvirt guest on a host: qemu-img overlay + cloud-init seed +
-/// virt-install --import. Runs entirely unprivileged — the pool is group-writable
-/// to `kvm` and the host user is in `libvirt` (see the pool remediation in the
-/// LinuxVmHostPlan). Each interpolated value is single-quoted and the caller
-/// forbids a literal single quote, so the quoting cannot be escaped.
-const HOST_PROVISION_GUEST_SCRIPT: &str = r##"#!/bin/bash
-set -uo pipefail
-POOL='__POOL__'
-NAME='__NAME__'
-IMAGE='__IMAGE__'
-DISK_GB='__DISK_GB__'
-RAM_MB='__RAM_MB__'
-VCPUS='__VCPUS__'
-BASE="$POOL/$IMAGE"
-OVERLAY="$POOL/$NAME.qcow2"
-SEED="$POOL/$NAME-seed.iso"
-
-# TOCTOU re-checks on the box, which is the source of truth for what exists.
-[ -f "$BASE" ] || { echo "PROVISION-ERROR: base image not found: $BASE" >&2; exit 1; }
-if virsh -c qemu:///system dominfo "$NAME" >/dev/null 2>&1; then
-  echo "PROVISION-ERROR: domain $NAME already exists — refusing to overwrite" >&2; exit 2
-fi
-[ -e "$OVERLAY" ] && { echo "PROVISION-ERROR: overlay already exists: $OVERLAY" >&2; exit 3; }
-PUBKEY="$(cat __AUTH_KEY__ 2>/dev/null || true)"
-[ -n "$PUBKEY" ] || { echo "PROVISION-ERROR: no readable public key at __AUTH_KEY__" >&2; exit 4; }
-
-# Copy-on-write overlay on the base image (pool group-writable — no sudo).
-qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$OVERLAY" "${DISK_GB}G" >/dev/null 2>&1 \
-  || { echo "PROVISION-ERROR: qemu-img create failed" >&2; exit 5; }
-
-# cloud-init seed: hostname + the provisioning host's key on the image's default
-# user, so the host can SSH in immediately with no follow-up authorize step.
-WORK="$(mktemp -d)"
-{
-  echo "#cloud-config"
-  echo "hostname: $NAME"
-  echo "ssh_authorized_keys:"
-  echo "  - $PUBKEY"
-} > "$WORK/user-data"
-{
-  echo "instance-id: $NAME"
-  echo "local-hostname: $NAME"
-} > "$WORK/meta-data"
-if ! cloud-localds "$SEED" "$WORK/user-data" "$WORK/meta-data" >/dev/null 2>&1; then
-  echo "PROVISION-ERROR: cloud-localds failed (is cloud-image-utils installed?)" >&2
-  rm -rf "$WORK"; rm -f "$OVERLAY"; exit 6
-fi
-rm -rf "$WORK"
-
-# Create + boot. --noautoconsole so virt-install returns instead of attaching a
-# console; --video vga because a headless Debian cloud image's GRUB needs a
-# framebuffer (a documented lab gotcha).
-# --osinfo is mandatory in modern virt-install; detect=on,require=off auto-detects
-# from the image and falls back to a generic profile (a perf warning, not a fatal
-# error) rather than requiring a per-image OS name.
-if ! virt-install --connect qemu:///system --name "$NAME" \
-     --memory "$RAM_MB" --vcpus "$VCPUS" --cpu host-passthrough \
-     --disk "$OVERLAY" --disk "$SEED",device=cdrom \
-     --network network=default,model=virtio --video vga --graphics none \
-     --osinfo detect=on,require=off --import --noautoconsole >/dev/null 2>&1; then
-  echo "PROVISION-ERROR: virt-install failed (re-run the virt-install by hand for the reason)" >&2
-  virsh -c qemu:///system undefine "$NAME" >/dev/null 2>&1 || true
-  rm -f "$OVERLAY" "$SEED"; exit 7
-fi
-virsh -c qemu:///system autostart "$NAME" >/dev/null 2>&1 || true
-
-st="$(virsh -c qemu:///system domstate "$NAME" 2>/dev/null || echo unknown)"
-echo "PROVISION-RESULT: created domain $NAME (state=$st, overlay=$OVERLAY, seed=$SEED)"
-"##;
-
-/// Run a plain command on a lab host over SSH, argv-only (§4).
+/// Run a command on a lab host over SSH.
+///
+/// **This is NOT an argv-only sink, despite what this comment used to claim.**
+/// The corrected behaviour: `args` are passed as separate *client-side* argv
+/// words, but OpenSSH joins every post-host argument with a single space and the
+/// remote `sshd` hands the result to the login **shell**, which re-parses it. So
+/// a `;`, `|`, `&`, redirection or glob in `args` reaches a remote shell, and a
+/// word containing a space arrives as two words. Client-side argv does not
+/// survive as remote argv.
+///
+/// That is **QH-13**, tracked separately and deliberately NOT fixed here — the
+/// right fix is to build the remote command from `shell_quote`d words. Until then
+/// every caller must validate for a *shell*, not for argv. The two values that
+/// reach this today from `execute_ops_vm_lab_provision_guest` are `pool` (now
+/// narrowed by `ensure_provision_pool_path`, which is why that alphabet is
+/// tighter than a metacharacter rule) and `device`, which is derived from the
+/// **previous command's remote stdout** — remote output into remote argv, the
+/// worse of the two and untouched by QH-01.
+///
+/// The false "argv-only (§4)" claim this replaces is exactly the QH-05 failure
+/// mode: a safety assertion with no named enforcement point and no proving test.
 fn run_host_cmd(
     endpoint: &str,
     args: &[&str],
@@ -21582,242 +21049,11 @@ fn parse_windows_exit_evidence_inventory(raw_json: &str) -> Result<HashSet<Strin
 }
 
 fn build_windows_exit_evidence_capture_script() -> Result<String, String> {
-    let root = powershell_quote(WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT)?;
-    let marker = powershell_quote(WINDOWS_EXIT_KILLSWITCH_PROBE_MARKER)?;
-    let daemon = powershell_quote(WINDOWS_RUSTYNETD_EXE_PATH)?;
-    let template = r#"
-Set-StrictMode -Version Latest;
-$ErrorActionPreference = 'Stop';
-$ProgressPreference = 'SilentlyContinue';
-$ArtifactRoot = __ROOT__;
-$DnsDir = Join-Path -Path $ArtifactRoot -ChildPath 'dns_leak_proof';
-$DaemonPath = __DAEMON__;
-$KillswitchProbeMarker = __MARKER__;
-$TunnelAlias = 'rustynet0';
-$MeshCidr = '100.64.0.0/10';
-$NatName = 'RustyNetExit-rustynet0';
-$ServiceName = 'RustyNet';
-$script:WrittenLabels = @();
-$script:SkippedReasons = @();
-function Add-WrittenLabel {
-    param([string]$Label)
-    $script:WrittenLabels += $Label
-}
-function Add-SkippedReason {
-    param([string]$Reason)
-    $script:SkippedReasons += $Reason
-}
-function Write-JsonFile {
-    param([string]$Path, [object]$Value)
-    $parent = Split-Path -Parent $Path;
-    New-Item -ItemType Directory -Force -Path $parent | Out-Null;
-    $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding UTF8;
-}
-function Get-ForwardingState {
-    param([string]$Alias)
-    try {
-        return [string]((Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding)
-    } catch {
-        return ('Error: ' + $_.Exception.Message)
-    }
-}
-function Get-DefaultEgressAlias {
-    try {
-        return [string](Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
-            Where-Object { $_.InterfaceAlias -ne $TunnelAlias } |
-            Sort-Object -Property RouteMetric,InterfaceMetric |
-            Select-Object -First 1 -ExpandProperty InterfaceAlias)
-    } catch {
-        return ''
-    }
-}
-function Test-NetNatAbsent {
-    # Fail-closed NAT presence (mirrors the RSA-0031 daemon merge in
-    # crates/rustynetd/src/windows_exit_nat_lifecycle.rs): only a query that
-    # SUCCEEDS and returns no matching NetNat proves the NAT was torn down.
-    # `Get-NetNat -ErrorAction SilentlyContinue` conflates "absent" with
-    # "provider/WMI query failed" — both return $null — which would let a query
-    # error be read as a successful teardown (fail-open). The MSFT_NetNat
-    # provider throws a CimException "No MSFT_NetNat objects found ..." for a
-    # genuinely-absent named NAT; that single message is the only error that
-    # counts as absent. Any other failure is indeterminate → treated as PRESENT
-    # (not torn down) so teardown can never be claimed from an error.
-    param([string]$Name)
-    try {
-        $existing = Get-NetNat -Name $Name -ErrorAction Stop;
-        return ($null -eq $existing);
-    } catch {
-        if ($_.Exception.Message -match 'No MSFT_NetNat') {
-            return $true;
-        }
-        return $false;
-    }
-}
-
-New-Item -ItemType Directory -Force -Path $ArtifactRoot | Out-Null;
-
-$egressAlias = Get-DefaultEgressAlias;
-$nat = Get-NetNat -Name $NatName -ErrorAction SilentlyContinue;
-if ($null -eq $nat) {
-    Add-SkippedReason 'NAT lifecycle proof skipped: reviewed NetNat was not present; Windows host is not currently serving exit traffic';
-} elseif ([string]::IsNullOrWhiteSpace($egressAlias)) {
-    Add-SkippedReason 'NAT lifecycle proof skipped: no non-tunnel default egress interface was detected';
-} else {
-    $duringTunnelForwarding = Get-ForwardingState -Alias $TunnelAlias;
-    $duringEgressForwarding = Get-ForwardingState -Alias $egressAlias;
-    $stopError = '';
-    try {
-        Stop-Service -Name $ServiceName -Force -ErrorAction Stop;
-        Start-Sleep -Seconds 4;
-    } catch {
-        $stopError = $_.Exception.Message;
-    }
-    # Fail-closed teardown evaluation (mirror of the RSA-0031 daemon merge):
-    # restoration is proven ONLY when the NAT query succeeds and shows it gone
-    # AND both interfaces report the literal 'Disabled'. A NetNat query error
-    # counts as still-present; a forwarding query error ('Error: ...') is not
-    # 'Disabled' and so cannot be read as restored.
-    $afterNatAbsent = Test-NetNatAbsent -Name $NatName;
-    $afterTunnelForwarding = Get-ForwardingState -Alias $TunnelAlias;
-    $afterEgressForwarding = Get-ForwardingState -Alias $egressAlias;
-    $forwardingRestored = $afterNatAbsent -and
-        ($afterTunnelForwarding -eq 'Disabled') -and
-        ($afterEgressForwarding -eq 'Disabled');
-    # The host WAS serving exit (NAT present during run), so a clean teardown is
-    # MANDATORY. Always emit the lifecycle artifact with the real measured
-    # after-stop state — never skip on a non-restoration. Writing the artifact
-    # only on success would let a genuine residual NAT (a release-blocking open
-    # relay) be masked as a Skip, because the validate stage maps an ABSENT
-    # artifact to Skipped. With the artifact always present, the validator
-    # FAILS on netnat_present=true or forwarding_restored=false.
-    Write-JsonFile -Path (Join-Path -Path $ArtifactRoot -ChildPath 'scm_context_nat_lifecycle.json') -Value ([pscustomobject]@{
-        schema_version = 1;
-        nat_name = $NatName;
-        mesh_cidr = $MeshCidr;
-        during_run = [pscustomobject]@{
-            netnat_present = $true;
-            internal_prefix = [string]$nat.InternalIPInterfaceAddressPrefix;
-            tunnel_forwarding = $duringTunnelForwarding;
-            egress_forwarding = $duringEgressForwarding;
-            egress_alias = $egressAlias;
-        };
-        after_stop = [pscustomobject]@{
-            netnat_present = (-not $afterNatAbsent);
-            forwarding_restored = $forwardingRestored;
-            tunnel_forwarding = $afterTunnelForwarding;
-            egress_forwarding = $afterEgressForwarding;
-            stop_error = $stopError;
-        };
-    });
-    Add-WrittenLabel 'scm_context_nat_lifecycle';
-    if (-not $forwardingRestored) {
-        Add-SkippedReason ('NAT lifecycle teardown did NOT prove restoration (artifact emitted for fail-closed validation); stop_error=' + $stopError + '; after_nat_absent=' + $afterNatAbsent + '; after_tunnel=' + $afterTunnelForwarding + '; after_egress=' + $afterEgressForwarding);
-    }
-    try {
-        Start-Service -Name $ServiceName -ErrorAction Stop;
-        Start-Sleep -Seconds 8;
-    } catch {
-        Add-SkippedReason ('service restart after NAT lifecycle probe failed: ' + $_.Exception.Message);
-    }
-}
-
-$dnsRuleNames = @('RustyNetDNS-BlockLanUdp', 'RustyNetDNS-BlockLanTcp');
-$dnsRules = @();
-foreach ($ruleName in $dnsRuleNames) {
-    $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue;
-    if ($null -ne $rule) {
-        $dnsRules += [pscustomobject]@{
-            name = [string]$rule.Name;
-            action = [string]$rule.Action;
-            direction = [string]$rule.Direction;
-            enabled = [string]$rule.Enabled;
-            profile = [string]$rule.Profile;
-        };
-    }
-}
-$dnsRulesOk = ($dnsRules.Count -eq 2) -and
-    (($dnsRules | Where-Object { $_.action -eq 'Block' -and $_.direction -eq 'Outbound' -and $_.enabled -eq 'True' }).Count -eq 2);
-if ($dnsRulesOk) {
-    New-Item -ItemType Directory -Force -Path $DnsDir | Out-Null;
-    Write-JsonFile -Path (Join-Path -Path $DnsDir -ChildPath 'firewall_block_rules.json') -Value ([pscustomobject]@{
-        schema_version = 1;
-        overall_ok = $true;
-        rules = $dnsRules;
-    });
-    Add-WrittenLabel 'dns_firewall_block_rules';
-    $dnsCheckRaw = (& $DaemonPath windows-dns-failclosed-check --no-fail-on-drift 2>&1) -join [Environment]::NewLine;
-    if ($LASTEXITCODE -eq 0) {
-        Set-Content -LiteralPath (Join-Path -Path $DnsDir -ChildPath 'windows_dns_failclosed_check.json') -Value $dnsCheckRaw -Encoding UTF8;
-        Add-WrittenLabel 'dns_failclosed_check';
-    } else {
-        Add-SkippedReason ('windows-dns-failclosed-check did not exit cleanly: ' + $dnsCheckRaw);
-    }
-} else {
-    Add-SkippedReason 'DNS packet proof precheck skipped: reviewed RustyNet DNS block firewall rules were not both present/enforced';
-}
-
-if (Test-Path -LiteralPath $KillswitchProbeMarker -PathType Leaf) {
-    $baselineRaw = (& $DaemonPath windows-killswitch-assert --no-fail-on-drift 2>&1) -join [Environment]::NewLine;
-    $baselineCode = [int]$LASTEXITCODE;
-    $baselineOk = $false;
-    try {
-        $baselineJson = $baselineRaw | ConvertFrom-Json -ErrorAction Stop;
-        $baselineOk = [bool]$baselineJson.overall_ok;
-    } catch {
-        Add-SkippedReason ('killswitch precedence proof skipped: baseline JSON parse failed: ' + $_.Exception.Message);
-    }
-    if ($baselineCode -eq 0 -and $baselineOk) {
-        $tamperedRaw = '';
-        $tamperedCode = 0;
-        try {
-            Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow -ErrorAction Stop;
-            $tamperedRaw = (& $DaemonPath windows-killswitch-assert 2>&1) -join [Environment]::NewLine;
-            $tamperedCode = [int]$LASTEXITCODE;
-        } finally {
-            try {
-                Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block -ErrorAction SilentlyContinue;
-            } catch {
-            }
-            try {
-                Start-Service -Name $ServiceName -ErrorAction SilentlyContinue;
-                Start-Sleep -Seconds 8;
-            } catch {
-            }
-        }
-        if ($tamperedCode -ne 0) {
-            Write-JsonFile -Path (Join-Path -Path $ArtifactRoot -ChildPath 'killswitch_precedence.json') -Value ([pscustomobject]@{
-                schema_version = 1;
-                baseline_assert = [pscustomobject]@{
-                    overall_ok = $true;
-                };
-                tampered_assert = [pscustomobject]@{
-                    overall_ok = $false;
-                    exit_code = $tamperedCode;
-                    reason = $tamperedRaw.Trim();
-                };
-            });
-            Add-WrittenLabel 'killswitch_precedence';
-        } else {
-            Add-SkippedReason 'killswitch precedence proof skipped: tampered assertion exited zero';
-        }
-    } elseif ($baselineCode -ne 0) {
-        Add-SkippedReason ('killswitch precedence proof skipped: baseline assertion failed: ' + $baselineRaw);
-    }
-} else {
-    Add-SkippedReason ('killswitch precedence proof skipped: marker file not present at ' + $KillswitchProbeMarker);
-}
-
-[pscustomobject]@{
-    schema_version = 1;
-    artifact_root = $ArtifactRoot;
-    written_labels = $script:WrittenLabels;
-    skipped_reasons = $script:SkippedReasons;
-} | ConvertTo-Json -Depth 12
-"#;
-    Ok(template
-        .replace("__ROOT__", root.as_str())
-        .replace("__DAEMON__", daemon.as_str())
-        .replace("__MARKER__", marker.as_str()))
+    script_template::render_windows_exit_evidence_capture_script(
+        WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT,
+        WINDOWS_RUSTYNETD_EXE_PATH,
+        WINDOWS_EXIT_KILLSWITCH_PROBE_MARKER,
+    )
 }
 
 fn parse_windows_exit_evidence_capture_summary(raw_json: &str) -> Result<(usize, String), String> {
@@ -39484,7 +38720,15 @@ if sudo -n true >/dev/null 2>&1; then printf 'sudo_ok=true\\n'; else printf 'sud
     Ok(script)
 }
 
-fn privileged_rustynet_cli_script(subcommand: &str) -> String {
+/// A `rustynet <subcommand>` probe body, run on a guest through a remote shell.
+///
+/// This is the other kind of script assembly in this file: `format!`, not a
+/// `ScriptTemplate`, so `vm_lab::script_template`'s boundary does not cover it.
+/// It is **inert today** because `subcommand` is a `&'static str` and every caller
+/// passes a literal — the compiler is the enforcement point. Pinned by
+/// `format_assembled_scripts_take_only_static_strings`; if this ever needs a
+/// runtime value it must move behind the renderer instead.
+fn privileged_rustynet_cli_script(subcommand: &'static str) -> String {
     format!(
         "if command -v rustynet >/dev/null 2>&1; then if sudo -n true >/dev/null 2>&1; then sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet {subcommand} 2>&1; else RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet {subcommand} 2>&1; fi; else echo rustynet-not-installed; fi"
     )
@@ -39500,7 +38744,16 @@ fn parse_key_value_output(output: &str) -> BTreeMap<String, String> {
     values
 }
 
-fn build_section_capture_script(sections: &[(&str, &str)]) -> String {
+/// Fence a list of diagnostic probes between sentinels so one remote shell
+/// invocation yields a parseable per-section transcript.
+///
+/// Same contract as `privileged_rustynet_cli_script`: `format!`-assembled and so
+/// outside `script_template`'s boundary, but **inert today** because both the
+/// section name and its body are `&'static str` — no caller value can reach it.
+/// The bodies that are not plain literals come from
+/// `privileged_rustynet_cli_script`, which is itself literal-only. Pinned by
+/// `format_assembled_scripts_take_only_static_strings`.
+fn build_section_capture_script(sections: &[(&'static str, &str)]) -> String {
     let mut script = String::from("set +e; ");
     for (name, body) in sections {
         let _ = write!(
@@ -40554,15 +39807,16 @@ fn execute_bootstrap_phase_for_target(
 
 #[cfg(test)]
 mod tests {
+    use super::script_template;
     use super::{
-        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, DiscoveredGuest, GUEST_TOOLCHAIN_SCRIPT,
-        LabHost, LabHostKind, LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary,
-        LocalUtmReadyState, PlatformRollup, PortStatus, PreflightGate, PreflightStatus, ProbeState,
-        RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision,
-        RuntimePaths as _, ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs,
-        VmController, VmGuestExecMode, VmGuestPlatform, VmInventoryEntry,
-        VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep,
-        VmLabRunLiveLabConfig, VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
+        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, DiscoveredGuest, LabHost, LabHostKind,
+        LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary, LocalUtmReadyState,
+        PlatformRollup, PortStatus, PreflightGate, PreflightStatus, ProbeState, RemoteExec as _,
+        RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _,
+        ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs, VmController,
+        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus,
+        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
+        VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
         VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
         VmServiceManager, WindowsSshReadinessProbe, alias_to_host_map,
         append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
@@ -40847,7 +40101,10 @@ mod tests {
         );
     }
 
-    fn write_temp_inventory(body: &str) -> PathBuf {
+    /// `pub(super)` so the QH-01 real-call-path negative tests can build a temp
+    /// inventory too. Those tests are the only way to prove a validation call is
+    /// still wired in (QH-02), and they need a host to resolve.
+    pub(super) fn write_temp_inventory(body: &str) -> PathBuf {
         let unique = super::unique_suffix();
         let dir = std::env::temp_dir().join(format!("rustynet-vm-lab-{unique}.dir"));
         fs::create_dir_all(&dir).expect("temp dir should exist");
@@ -40856,7 +40113,7 @@ mod tests {
         path
     }
 
-    fn cleanup_temp_inventory(path: &Path) {
+    pub(super) fn cleanup_temp_inventory(path: &Path) {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
@@ -41644,9 +40901,14 @@ mod tests {
 
     /// The guest script encodes lessons that each cost real time. Assert the
     /// non-obvious ones survive refactoring.
+    ///
+    /// Goes through the production renderer, not a local copy of the substitution:
+    /// a test that re-implements the render chain stays green while production
+    /// changes underneath it, which is how QH-01 survived (QH-02).
     #[test]
     fn guest_toolchain_script_keeps_the_hard_won_fixes() {
-        let script = GUEST_TOOLCHAIN_SCRIPT;
+        let script = script_template::render_guest_toolchain_script("1.88.0")
+            .expect("the pinned channel must render");
         // 127: rustup's shims are invisible to the non-login shell the orchestrator uses
         assert!(
             script.contains("/usr/local/bin/$shim"),
@@ -41669,10 +40931,14 @@ mod tests {
             script.contains("VERIFY_ONLY"),
             "must support a no-change verify pass"
         );
-        // the channel placeholder must still be there to be substituted
+        // the channel must have been interpolated, not left as a placeholder
         assert!(
-            script.contains("__CHANNEL__"),
+            script.contains("--default-toolchain 1.88.0"),
             "toolchain channel must be interpolated"
+        );
+        assert!(
+            !script.contains("__CHANNEL__"),
+            "no placeholder may survive rendering"
         );
     }
 
@@ -41761,6 +41027,67 @@ mod tests {
                 "must reject image {bad:?}"
             );
         }
+    }
+
+    /// The canonical single-quoted-value guard (QH-12): the file's four competing
+    /// idioms for this rule are now one. Cases are **attack classes**, not a copy
+    /// of the implementation's reject-list — a list mirroring the implementation
+    /// can only confirm what the code already rejects, and both QH-01 findings
+    /// passed exactly such a test.
+    #[test]
+    fn single_quoted_value_guard_refuses_by_attack_class() {
+        let guard = |value: &str| {
+            super::ensure_single_quoted_script_value("value", value, super::AllowEmpty::No)
+        };
+        assert!(guard("/home/u/Rustynet").is_ok());
+        assert!(guard("artifacts/live_lab/x").is_ok());
+        assert!(guard("--skip-cross-network").is_ok());
+        for hostile in [
+            "a';id;'", // quote breakout
+            "a\"b",    // double quote
+            "$(id)",   // command substitution
+            "`id`",    //
+            "$HOME",   // expansion
+            "a\\b",    // backslash
+            "a\nb",    // newline
+            "a\rb",    // carriage return
+            "a\0b",    // NUL
+            "",        // empty, when the caller says non-empty
+            "   ",     // whitespace-only
+        ] {
+            assert!(guard(hostile).is_err(), "must refuse {hostile:?}");
+        }
+    }
+
+    /// `AllowEmpty::Yes` exists because a value can mean something by being empty.
+    /// `pool_disk_model` is absent on any host that declares no pool disk, and
+    /// `ensure_no_control_chars` refuses empty — so the old
+    /// `ensure_script_safe_value("pool_disk_model", "")` call made `fetch_image`
+    /// fail outright on such a host. The empty case must be OK, and the metacharacter
+    /// rule must still apply to a non-empty one.
+    #[test]
+    fn an_absent_pool_disk_model_is_not_an_error() {
+        assert!(
+            super::ensure_single_quoted_script_value("pool_disk_model", "", super::AllowEmpty::Yes)
+                .is_ok()
+        );
+        assert!(
+            super::ensure_single_quoted_script_value(
+                "pool_disk_model",
+                "Samsung SSD 870 EVO 500GB",
+                super::AllowEmpty::Yes
+            )
+            .is_ok()
+        );
+        assert!(
+            super::ensure_single_quoted_script_value(
+                "pool_disk_model",
+                "Samsung';id;'",
+                super::AllowEmpty::Yes
+            )
+            .is_err(),
+            "allow_empty must not weaken the rule for a non-empty value"
+        );
     }
 
     /// The operator hard rule (VM storage stays on one named disk) is inventory
@@ -54875,7 +54202,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
 
 #[cfg(test)]
 mod fetch_image_sha256_tests {
-    use super::{HOST_FETCH_IMAGE_SCRIPT, normalise_pinned_sha256};
+    use super::{normalise_pinned_sha256, script_template};
 
     const VALID: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -54937,9 +54264,18 @@ mod fetch_image_sha256_tests {
         }
     }
 
+    /// Rendered through the production function, not a local substitution copy,
+    /// so production cannot change under this test (QH-02).
     #[test]
     fn script_verifies_before_install_and_refuses_on_mismatch() {
-        let script = HOST_FETCH_IMAGE_SCRIPT;
+        let script = script_template::render_host_fetch_image_script(
+            "/var/lib/libvirt/images",
+            "debian-13.qcow2",
+            "https://example.invalid/debian-13.qcow2",
+            VALID,
+            "Samsung SSD 870 EVO 500GB",
+        )
+        .expect("benign values must render");
         let verify = script
             .find("sha256sum \"$STAGE/$NAME\"")
             .expect("stage verify");
@@ -54951,6 +54287,27 @@ mod fetch_image_sha256_tests {
         assert!(script.contains("REFUSING: sha256 mismatch"));
         // A pinned digest must also re-check an image already sitting in the pool.
         assert!(script.contains("sha256 does not match"));
+        // The pinned digest is bound once and compared through the variable.
+        assert!(script.contains(&format!("SHA256='{VALID}'")));
+    }
+
+    /// An unpinned digest and an unconstrained pool are legitimately EMPTY: the
+    /// script branches on emptiness to mean "no verification" / "no disk guard".
+    /// `Literal("")` must therefore render as `''` rather than being refused —
+    /// `ensure_no_control_chars` rejects empty, which is why the canonical guard
+    /// takes an explicit `AllowEmpty`.
+    #[test]
+    fn an_unpinned_digest_and_absent_pool_model_render_as_empty_words() {
+        let script = script_template::render_host_fetch_image_script(
+            "/var/lib/libvirt/images",
+            "debian-13.qcow2",
+            "https://example.invalid/debian-13.qcow2",
+            "",
+            "",
+        )
+        .expect("empty sha256/model are legitimate, not an error");
+        assert!(script.contains("SHA256=''"));
+        assert!(script.contains("EXPECT_MODEL=''"));
     }
 }
 
@@ -55280,17 +54637,18 @@ mod host_locality_tests {
 
 #[cfg(test)]
 mod launch_on_host_tests {
-    use super::{ensure_orchestrator_arg_safe, render_host_launch_script};
+    use super::{AllowEmpty, ensure_single_quoted_script_value, script_template};
 
     fn render(args: &[&str]) -> String {
-        render_host_launch_script(
+        script_template::render_host_launch_script(
             "/home/u/Rustynet",
             "artifacts/live_lab/x",
             "launch-1-2",
-            "\"$HOME/.ssh/id_ed25519\"",
-            "\"$HOME/.ssh/known_hosts\"",
+            &script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_IDENTITY),
+            &script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_KNOWN_HOSTS),
             &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
         )
+        .expect("benign launcher values must render")
     }
 
     /// BUG-BOX-4: the --node orchestrator requires --known-hosts-file, so the
@@ -55377,12 +54735,20 @@ mod launch_on_host_tests {
         assert!(!script.contains("mkdir -p 'state/host-lab-runs' 'artifacts"));
     }
 
+    /// Since QH-01 the renderer `shell_quote`s each orchestrator arg, so this
+    /// reject-rule is defence in depth rather than the load-bearing control — but
+    /// the arg also has to survive the orchestrator's own arg parsing, so refusing
+    /// the hostile shapes outright stays the right behaviour. This is the canonical
+    /// helper (formerly `ensure_orchestrator_arg_safe`), now shared by all nine
+    /// sites that hand-rolled the same pair (QH-12).
     #[test]
     fn orchestrator_arg_safety_is_the_injection_boundary() {
-        // Anything that could break out of the single-quoted word it becomes.
-        assert!(ensure_orchestrator_arg_safe("--skip-cross-network").is_ok());
-        assert!(ensure_orchestrator_arg_safe("debian-headless-2").is_ok());
-        assert!(ensure_orchestrator_arg_safe("linux:client").is_ok());
+        let ok = |value: &str| {
+            ensure_single_quoted_script_value("orchestrator arg", value, AllowEmpty::No)
+        };
+        assert!(ok("--skip-cross-network").is_ok());
+        assert!(ok("debian-headless-2").is_ok());
+        assert!(ok("linux:client").is_ok());
         for hostile in [
             "--x'; rm -rf / ; '",
             "$(id)",
@@ -55390,22 +54756,52 @@ mod launch_on_host_tests {
             "a\"b",
             "a\\b",
             "a\nb",
+            "",
         ] {
-            assert!(
-                ensure_orchestrator_arg_safe(hostile).is_err(),
-                "must reject {hostile:?}"
-            );
+            assert!(ok(hostile).is_err(), "must reject {hostile:?}");
         }
+    }
+
+    /// Even with the reject-rule deleted, the RENDERER must keep a hostile arg as
+    /// one inert shell word — that is the escape-first half of QH-01, and it is
+    /// what a value-level test cannot show.
+    #[test]
+    fn a_hostile_orchestrator_arg_is_quoted_into_one_word_by_the_renderer() {
+        let script = script_template::render_host_launch_script(
+            "/home/u/Rustynet",
+            "artifacts/live_lab/x",
+            "launch-1-2",
+            &script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_IDENTITY),
+            &script_template::HostSshPath::Default(script_template::DEFAULT_HOST_ORCH_KNOWN_HOSTS),
+            &["--node".to_owned(), "a'; touch /tmp/pwned; '".to_owned()],
+        )
+        .expect("the renderer quotes rather than refuses");
+        assert!(
+            script.contains(r"'--node' 'a'\''; touch /tmp/pwned; '\'''"),
+            "each arg must be POSIX-escaped into a single word; script was:\n{script}"
+        );
+        assert!(
+            !script.contains("; touch /tmp/pwned; '\n"),
+            "the payload must not reach the shell as syntax"
+        );
     }
 }
 
 #[cfg(test)]
 mod stop_host_run_tests {
-    use super::HOST_STOP_SCRIPT;
+    use super::script_template;
+
+    /// All four of these used to substitute `__REPO_DIR__` locally, which meant
+    /// they stayed green no matter what the production render chain did. They now
+    /// call the production renderer (QH-02).
+    fn render() -> String {
+        script_template::render_host_stop_script("/home/u/Rustynet")
+            .expect("a benign repo_dir must render")
+    }
 
     #[test]
     fn stop_signals_the_process_group_not_just_the_leader() {
-        let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", "/home/u/Rustynet");
+        let script = render();
         // Negative pid = whole group. A plain `kill <pid>` would orphan the
         // guest-SSH children to keep running.
         assert!(script.contains(r#"kill -TERM -- "-$p""#));
@@ -55414,14 +54810,14 @@ mod stop_host_run_tests {
 
     #[test]
     fn stop_reads_recorded_pids_then_falls_back_to_pgrep() {
-        let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", "/home/u/Rustynet");
+        let script = render();
         assert!(script.contains("state/host-lab-runs/*.pid"));
         assert!(script.contains("pgrep -f 'vm-lab-orchestrate-live-lab'"));
     }
 
     #[test]
     fn stop_is_idempotent_and_retires_stale_handles() {
-        let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", "/home/u/Rustynet");
+        let script = render();
         assert!(script.contains("no run in flight"));
         // Handle files removed so a later status cannot report a dead pid as live.
         assert!(script.contains("rm -f state/host-lab-runs/*.pid"));
@@ -55432,7 +54828,7 @@ mod stop_host_run_tests {
         // Pid-recycling guard: a recorded pid is signaled ONLY if its argv still
         // matches the orchestrator, so a dead pid the OS recycled to an unrelated
         // live process is never sent SIGTERM/SIGKILL.
-        let script = HOST_STOP_SCRIPT.replace("__REPO_DIR__", "/home/u/Rustynet");
+        let script = render();
         assert!(
             script.contains(
                 r#"ps -ww -o args= -p "$p" 2>/dev/null | grep -q 'vm-lab-orchestrate-live-lab'"#
@@ -55448,19 +54844,22 @@ mod stop_host_run_tests {
 
 #[cfg(test)]
 mod fetch_host_artifact_tests {
-    use super::HOST_FETCH_ARTIFACT_SCRIPT;
+    use super::script_template;
 
+    /// Through the production renderer, not a local substitution copy (QH-02).
     fn render(path: &str, cap: u64) -> String {
-        HOST_FETCH_ARTIFACT_SCRIPT
-            .replace("__REPO_DIR__", "/home/u/Rustynet")
-            .replace("__PATH__", path)
-            .replace("__CAP__", &cap.to_string())
+        script_template::render_host_fetch_artifact_script("/home/u/Rustynet", path, cap)
+            .expect("benign path/cap must render")
     }
 
     #[test]
     fn the_path_and_repo_dir_are_single_quoted() {
         let s = render("artifacts/live_lab/x/summary.json", 1024);
-        assert!(s.contains("cd '/home/u/Rustynet'"));
+        // The repo_dir is bound once and used through the variable: the token used
+        // to appear twice on one line, once inside `'…'` and once inside `"…"`, and
+        // a single value cannot be correctly spelled for both contexts.
+        assert!(s.contains("REPO_DIR='/home/u/Rustynet'"));
+        assert!(s.contains("cd \"$REPO_DIR\""));
         assert!(s.contains("P='artifacts/live_lab/x/summary.json'"));
     }
 
@@ -55480,7 +54879,7 @@ mod fetch_host_artifact_tests {
 
 #[cfg(test)]
 mod renumber_guest_network_tests {
-    use super::{HOST_RENUMBER_NET_SCRIPT, guest_subnet_prefix};
+    use super::{guest_subnet_prefix, script_template};
 
     #[test]
     fn derives_the_prefix_from_a_cidr() {
@@ -55508,7 +54907,8 @@ mod renumber_guest_network_tests {
 
     #[test]
     fn the_script_is_idempotent_and_sudoless() {
-        let s = HOST_RENUMBER_NET_SCRIPT.replace("__TARGET_PREFIX__", "192.168.121.");
+        let s = script_template::render_host_renumber_net_script("192.168.121.")
+            .expect("a dotted-quad prefix must render");
         // No-op when already on target — the guest restart must be gated on a change.
         assert!(s.contains("already on ${TARGET_PREFIX}0/24 — no change"));
         // Every virsh call is on qemu:///system with no sudo.
@@ -55519,31 +54919,44 @@ mod renumber_guest_network_tests {
 
 #[cfg(test)]
 mod provision_guest_create_tests {
-    use super::HOST_PROVISION_GUEST_SCRIPT;
+    use super::script_template::{self, HostSshPath};
 
-    fn render(auth_key: &str) -> String {
-        HOST_PROVISION_GUEST_SCRIPT
-            .replace("__POOL__", "/var/lib/libvirt/images")
-            .replace("__NAME__", "provtest")
-            .replace("__IMAGE__", "debian-13.qcow2")
-            .replace("__DISK_GB__", "6")
-            .replace("__RAM_MB__", "1024")
-            .replace("__VCPUS__", "1")
-            .replace("__AUTH_KEY__", auth_key)
+    /// This helper used to re-implement the whole ordered `.replace` chain — which
+    /// is precisely why the QH-01 breakout lived under a green suite. It now calls
+    /// the production renderer (QH-02).
+    fn render(auth_key: &HostSshPath<'_>) -> String {
+        script_template::render_host_provision_guest_script(
+            "/var/lib/libvirt/images",
+            "provtest",
+            "debian-13.qcow2",
+            6,
+            1024,
+            1,
+            auth_key,
+        )
+        .expect("benign provision values must render")
+    }
+
+    fn render_default() -> String {
+        render(&HostSshPath::Default(
+            script_template::DEFAULT_GUEST_AUTHORIZED_KEY,
+        ))
     }
 
     #[test]
     fn values_are_single_quoted_and_the_default_key_expands_home() {
-        let s = render("\"$HOME/.ssh/id_ed25519.pub\"");
+        let s = render_default();
+        // The RENDERER supplies the quotes now; the template holds a bare token.
         assert!(s.contains("POOL='/var/lib/libvirt/images'"));
         assert!(s.contains("NAME='provtest'"));
-        // Default key path expands $HOME on the host.
-        assert!(s.contains("cat \"$HOME/.ssh/id_ed25519.pub\""));
+        // Default key path is a RawFragment so $HOME expands on the host.
+        assert!(s.contains("PUBKEY_SRC=\"$HOME/.ssh/id_ed25519.pub\""));
+        assert!(s.contains("cat \"$PUBKEY_SRC\""));
     }
 
     #[test]
     fn it_refuses_before_it_writes_and_cleans_up_on_failure() {
-        let s = render("\"$HOME/.ssh/id_ed25519.pub\"");
+        let s = render_default();
         // Collision + base-missing checks precede qemu-img create.
         let dominfo = s.find("dominfo").expect("collision check");
         let create = s.find("qemu-img create").expect("overlay create");
@@ -55560,7 +54973,7 @@ mod provision_guest_create_tests {
 
     #[test]
     fn the_seeded_key_lands_on_the_default_user() {
-        let s = render("\"$HOME/.ssh/id_ed25519.pub\"");
+        let s = render_default();
         // Top-level ssh_authorized_keys adds the key to the image's default user,
         // which works uniformly across debian/ubuntu/rocky bases.
         assert!(s.contains("ssh_authorized_keys:"));
@@ -55570,11 +54983,13 @@ mod provision_guest_create_tests {
 
 #[cfg(test)]
 mod host_disk_status_tests {
-    use super::HOST_DISK_STATUS_SCRIPT;
+    use super::script_template;
 
     #[test]
     fn the_pool_is_single_quoted_and_du_is_depth_bounded() {
-        let s = HOST_DISK_STATUS_SCRIPT.replace("__POOL__", "/var/lib/libvirt/images");
+        // Through the production renderer, not a local substitution copy (QH-02).
+        let s = script_template::render_host_disk_status_script("/var/lib/libvirt/images")
+            .expect("a benign pool must render");
         assert!(s.contains("POOL='/var/lib/libvirt/images'"));
         // Fenced between sentinels the executor splits on.
         assert!(s.contains("DISK-BEGIN"));
@@ -55586,12 +55001,12 @@ mod host_disk_status_tests {
 
 #[cfg(test)]
 mod recover_host_vms_tests {
-    use super::HOST_RECOVER_VMS_SCRIPT;
+    use super::script_template;
 
+    /// Through the production renderer, not a local substitution copy (QH-02).
     fn render(force: bool, targets: &str) -> String {
-        HOST_RECOVER_VMS_SCRIPT
-            .replace("__FORCE__", if force { "1" } else { "0" })
-            .replace("__TARGETS__", targets)
+        script_template::render_host_recover_vms_script(force, targets)
+            .expect("benign force/targets must render")
     }
 
     #[test]
@@ -55621,5 +55036,377 @@ mod recover_host_vms_tests {
         // destroy then start = clean boot + new DHCP lease, the whole point.
         assert!(s.contains(r#"virsh -c qemu:///system destroy "$d""#));
         assert!(s.contains(r#"virsh -c qemu:///system start "$d""#));
+    }
+}
+
+/// QH-01 / QH-02: **real-call-path** negative tests for the two entry points the
+/// template-injection class was reachable from.
+///
+/// Why this module exists, and why the validator-level tests elsewhere are not
+/// enough: `execute_ops_vm_lab_provision_guest` had **no test reaching it at all**
+/// — deleting `ensure_provision_guest_name` or `ensure_provision_image_name` from
+/// it left `cargo test … --lib provision` at 9/9 green, because every existing
+/// test called the validators directly. That is exactly QH-02's finding: *a
+/// control with a green test suite is not a verified control.*
+///
+/// Every test here drives the **public entry point** with `dry_run: true`. Both
+/// functions validate above their dry-run return, so these exercise the same code
+/// a live run does and **go red if an enforcement call is deleted** — while
+/// performing **no SSH and no network I/O** (the dry-run return precedes every
+/// remote call, including the `findmnt` SSH argv sink).
+///
+/// Negative cases are derived from **attack classes**, never from the
+/// implementation's reject-list: a list mirroring the implementation can only
+/// confirm what the code already rejects, and cannot detect an under-inclusive
+/// rule — which is precisely how both live findings passed the previous tests.
+/// (That is not theoretical here: writing `x;id` into the `--image` list caught
+/// `ensure_provision_image_name` still accepting `;`, `|`, `&` and `>`, which the
+/// planned "pair it with the metacharacter check" fix would have left open.)
+///
+/// **Mutation-verified.** Deleting any one of these nine enforcement calls turns
+/// exactly the named test below red: `ensure_provision_guest_name`,
+/// `ensure_provision_image_name`, `ensure_provision_pool_path`, and the
+/// `ensure_single_quoted_script_value` calls for `authorized_key`, `report_dir`,
+/// `orchestrator arg`, `host_ssh_identity`, `host_known_hosts` and the launcher's
+/// `host repo_dir`.
+///
+/// **Honest gap:** the `host repo_dir` guards in
+/// `execute_ops_vm_lab_fetch_host_artifact` and `execute_ops_vm_lab_stop_host_run`
+/// are *not* covered here — neither entry point has a `dry_run`, so reaching them
+/// would require SSH to a lab host. Their control is the renderer escaping the
+/// value as a `Literal` (covered by the byte-for-byte and structural tests); the
+/// validator call there is defence in depth only.
+#[cfg(test)]
+mod qh01_real_call_path_tests {
+    use super::tests::{cleanup_temp_inventory, write_temp_inventory};
+    use super::{
+        VmLabLaunchOnHostConfig, VmLabProvisionGuestConfig, execute_ops_vm_lab_launch_on_host,
+        execute_ops_vm_lab_provision_guest,
+    };
+    use std::path::Path;
+
+    /// A libvirt host with an SSH endpoint, a repo_dir and a declared
+    /// `pool_disk_model` — the shape `ubuntu-kvm-1` has, so the guarded
+    /// `findmnt` path is the one under test (it is never reached: dry-run returns
+    /// first).
+    const INVENTORY: &str = r#"{
+  "version": 1,
+  "hosts": [
+    {
+      "host_id": "kvm-test",
+      "kind": "libvirt",
+      "connect_uri": "qemu+ssh://u@192.0.2.1/system",
+      "repo_dir": "/home/u/Rustynet",
+      "pool_disk_model": "Samsung SSD 870 EVO 500GB"
+    }
+  ],
+  "entries": [ { "alias": "a", "ssh_target": "192.0.2.9", "platform": "linux" } ]
+}"#;
+
+    fn provision(inventory: &Path) -> VmLabProvisionGuestConfig {
+        VmLabProvisionGuestConfig {
+            inventory_path: Some(inventory.to_path_buf()),
+            host_id: "kvm-test".to_owned(),
+            name: "provtest".to_owned(),
+            image: "debian-13.qcow2".to_owned(),
+            pool: None,
+            disk_gb: 20,
+            ram_mb: 2048,
+            vcpus: 2,
+            authorized_key: None,
+            dry_run: true,
+            ..VmLabProvisionGuestConfig::default()
+        }
+    }
+
+    fn launch(inventory: &Path) -> VmLabLaunchOnHostConfig {
+        VmLabLaunchOnHostConfig {
+            inventory_path: Some(inventory.to_path_buf()),
+            host_id: "kvm-test".to_owned(),
+            report_dir: "artifacts/live_lab/x".to_owned(),
+            orchestrator_args: Vec::new(),
+            dry_run: true,
+            ..VmLabLaunchOnHostConfig::default()
+        }
+    }
+
+    /// The baseline: the benign config must SUCCEED, so a later `is_err()` is
+    /// evidence about the hostile value and not about the fixture.
+    #[test]
+    fn the_benign_dry_run_configs_succeed_so_the_negatives_mean_something() {
+        let path = write_temp_inventory(INVENTORY);
+        execute_ops_vm_lab_provision_guest(provision(&path)).expect("benign provision dry-run");
+        execute_ops_vm_lab_launch_on_host(launch(&path)).expect("benign launch dry-run");
+        cleanup_temp_inventory(&path);
+    }
+
+    /// `--pool` had **no validator at all**, and it reaches two sinks in this
+    /// function: the `findmnt` SSH argv (whose remote login shell re-parses it) and
+    /// `POOL=__POOL__` in the host script. Deleting `ensure_provision_pool_path`
+    /// turns this red.
+    #[test]
+    fn provision_guest_refuses_hostile_pool_on_the_real_call_path() {
+        let path = write_temp_inventory(INVENTORY);
+        for hostile in [
+            "/var/lib/libvirt/images';touch /tmp/pwned;'", // quote breakout
+            "/var/lib/libvirt/images;id",                  // command separator
+            "/var/lib/libvirt/images|id",                  //
+            "/var/lib/libvirt/images&",                    //
+            "/var/lib/libvirt/images>/tmp/x",              // redirection
+            "/var/lib/libvirt/*",                          // glob
+            "/var/lib/libvirt/images $(id)",               // command substitution
+            "/var/lib/libvirt/`id`",                       //
+            "/var/lib/libvirt/$HOME",                      // expansion
+            "/var/lib/libvirt/im ages",                    // word split in remote argv
+            "/var/lib/libvirt/imagеs",                     // Cyrillic 'е' homoglyph
+            "var/lib/libvirt/images",                      // not absolute
+            "/var/lib/../../etc",                          // traversal
+            "-/var/lib/libvirt/images",                    // leading dash
+            "",                                            // empty
+        ] {
+            let mut config = provision(&path);
+            config.pool = Some(hostile.to_owned());
+            assert!(
+                execute_ops_vm_lab_provision_guest(config).is_err(),
+                "provision_guest must refuse --pool {hostile:?} before any remote call"
+            );
+        }
+        cleanup_temp_inventory(&path);
+    }
+
+    /// `--image` was validated for **path shape only**: a compiled copy of
+    /// `ensure_provision_image_name` + `ensure_no_control_chars` accepted every
+    /// payload below, so `--image "d.qcow2';id;'"` broke out with no ordering trick
+    /// and no `--authorized-key`. Deleting either the image call or the canonical
+    /// single-quoted-value call turns this red.
+    #[test]
+    fn provision_guest_refuses_hostile_image_on_the_real_call_path() {
+        let path = write_temp_inventory(INVENTORY);
+        let overlong = format!("{}.qcow2", "d".repeat(500));
+        let cases: Vec<String> = vec![
+            "x'; id; '".to_owned(),           // quote breakout
+            "a'$(id)'".to_owned(),            // quote + command substitution
+            "debian`id`.qcow2".to_owned(),    // backtick
+            "deb$USER.qcow2".to_owned(),      // expansion
+            "d\\ebian.qcow2".to_owned(),      // backslash
+            "debian-13.qcow2\"".to_owned(),   // double quote
+            "x;id".to_owned(),                // command separator
+            "x|id".to_owned(),                //
+            "x&id".to_owned(),                //
+            "x>y".to_owned(),                 // redirection
+            "dеbian-13.qcow2".to_owned(),     // Cyrillic 'е' homoglyph
+            "-leading-dash.qcow2".to_owned(), // leading dash becomes an argv flag
+            overlong,                         // over-length
+            "".to_owned(),                    // empty
+            "sub/dir.qcow2".to_owned(),       // path separator
+            "../../etc/passwd".to_owned(),    // traversal
+        ];
+        for hostile in cases {
+            let mut config = provision(&path);
+            config.image = hostile.clone();
+            assert!(
+                execute_ops_vm_lab_provision_guest(config).is_err(),
+                "provision_guest must refuse --image {hostile:?} before any remote call"
+            );
+        }
+        cleanup_temp_inventory(&path);
+    }
+
+    /// The guest name becomes a libvirt domain name, a pool filename and `virsh`
+    /// argv. Deleting `ensure_provision_guest_name` turns this red — nothing else
+    /// covered it, because no test reached this function at all.
+    ///
+    /// Note `__AUTH_KEY__` is deliberately NOT in this list: it is a *legal* guest
+    /// name, and the fix is that the renderer keeps it as data. Deny-listing `__`
+    /// would be tied to today's token names.
+    #[test]
+    fn provision_guest_refuses_hostile_name_on_the_real_call_path() {
+        let path = write_temp_inventory(INVENTORY);
+        let overlong = "n".repeat(61);
+        let cases: Vec<String> = vec![
+            "prov';id;'".to_owned(), // quote breakout
+            "prov;id".to_owned(),    // command separator
+            "prov|id".to_owned(),    //
+            "prov&".to_owned(),      //
+            "prov>x".to_owned(),     // redirection
+            "prov*".to_owned(),      // glob
+            "$(id)".to_owned(),      // command substitution
+            "`id`".to_owned(),       //
+            "prov test".to_owned(),  // word split
+            "prov\nid".to_owned(),   // newline
+            "prоvtest".to_owned(),   // Cyrillic 'о' homoglyph
+            "-provtest".to_owned(),  // leading dash becomes an argv flag
+            "prov.test".to_owned(),  // '.' is not in the domain-name alphabet
+            overlong,                // over-length
+            "".to_owned(),           // empty
+        ];
+        for hostile in cases {
+            let mut config = provision(&path);
+            config.name = hostile.clone();
+            assert!(
+                execute_ops_vm_lab_provision_guest(config).is_err(),
+                "provision_guest must refuse --name {hostile:?} before any remote call"
+            );
+        }
+        // A placeholder-shaped name is legal DATA, not an error — the renderer keeps
+        // it inert (see `rendering_is_single_pass_so_a_placeholder_valued_binding_is_inert`).
+        let mut ok = provision(&path);
+        ok.name = "__AUTH_KEY__".to_owned();
+        execute_ops_vm_lab_provision_guest(ok)
+            .expect("a token-shaped guest name is valid input, kept inert by the renderer");
+        cleanup_temp_inventory(&path);
+    }
+
+    /// `--authorized-key` is the value that used to be `format!("'{path}'")` — the
+    /// one that carried quotes by construction into the QH-01 breakout. It is now
+    /// validated **above** the dry-run return (it used to be validated only just
+    /// before the render, below it), so this test reaches it.
+    #[test]
+    fn provision_guest_refuses_hostile_authorized_key_on_the_real_call_path() {
+        let path = write_temp_inventory(INVENTORY);
+        for hostile in [
+            "/home/u/k.pub';touch /tmp/pwned;'", // quote breakout — the QH-01 payload
+            "/home/u/$(id).pub",                 // command substitution
+            "/home/u/`id`.pub",                  //
+            "/home/u/k\".pub",                   // double quote
+            "/home/u/k\\.pub",                   // backslash
+            "/home/u/$HOME/k.pub",               // expansion
+            "/home/u/k.pub\nRUNNER_EOF",         // newline / heredoc terminator
+            "",                                  // empty
+        ] {
+            let mut config = provision(&path);
+            config.authorized_key = Some(hostile.to_owned());
+            assert!(
+                execute_ops_vm_lab_provision_guest(config).is_err(),
+                "provision_guest must refuse --authorized-key {hostile:?} before any remote call"
+            );
+        }
+        cleanup_temp_inventory(&path);
+    }
+
+    /// `--report-dir` lands inside the `<<'RUNNER_EOF'` heredoc that `bash`
+    /// re-parses, so a newline plus a line reading `RUNNER_EOF` is its own attack
+    /// class, not merely a metacharacter.
+    #[test]
+    fn launch_on_host_refuses_hostile_report_dir_on_the_real_call_path() {
+        let path = write_temp_inventory(INVENTORY);
+        for hostile in [
+            "artifacts';touch /tmp/pwned;'",       // quote breakout
+            "artifacts$(id)",                      // command substitution
+            "artifacts`id`",                       //
+            "artifacts\"x",                        // double quote
+            "artifacts\\x",                        // backslash
+            "artifacts$HOME",                      // expansion
+            "artifacts\nRUNNER_EOF\ntouch /tmp/x", // heredoc terminator
+            "/absolute/artifacts",                 // absolute
+            "artifacts/../../etc",                 // traversal
+            "",                                    // empty
+        ] {
+            let mut config = launch(&path);
+            config.report_dir = hostile.to_owned();
+            assert!(
+                execute_ops_vm_lab_launch_on_host(config).is_err(),
+                "launch_on_host must refuse --report-dir {hostile:?} before any remote call"
+            );
+        }
+        cleanup_temp_inventory(&path);
+    }
+
+    /// Forwarded orchestrator args each become a shell word in the runner script.
+    #[test]
+    fn launch_on_host_refuses_hostile_orchestrator_args_on_the_real_call_path() {
+        let path = write_temp_inventory(INVENTORY);
+        for hostile in [
+            "--x'; rm -rf / ; '",
+            "$(id)",
+            "`id`",
+            "a\"b",
+            "a\\b",
+            "a\nb",
+            "",
+        ] {
+            let mut config = launch(&path);
+            config.orchestrator_args = vec!["--node".to_owned(), hostile.to_owned()];
+            assert!(
+                execute_ops_vm_lab_launch_on_host(config).is_err(),
+                "launch_on_host must refuse orchestrator arg {hostile:?} before any remote call"
+            );
+        }
+        cleanup_temp_inventory(&path);
+    }
+
+    /// The two host SSH-path overrides are the launcher's counterpart to
+    /// `--authorized-key`: the same `format!("'{path}'")` shape, now `Literal`s the
+    /// renderer quotes, still validated as defence in depth.
+    #[test]
+    fn launch_on_host_refuses_hostile_host_ssh_paths_on_the_real_call_path() {
+        let path = write_temp_inventory(INVENTORY);
+        for hostile in [
+            "/home/u/.ssh/k';id;'",
+            "/home/u/.ssh/$(id)",
+            "/home/u/.ssh/`id`",
+            "/home/u/.ssh/k\"",
+            "/home/u/.ssh/k\\",
+            "/home/u/.ssh/$HOME",
+            "/home/u/.ssh/k\nRUNNER_EOF",
+            "",
+        ] {
+            let mut identity = launch(&path);
+            identity.host_ssh_identity = Some(hostile.to_owned());
+            assert!(
+                execute_ops_vm_lab_launch_on_host(identity).is_err(),
+                "launch_on_host must refuse --host-ssh-identity {hostile:?}"
+            );
+            let mut known_hosts = launch(&path);
+            known_hosts.host_known_hosts = Some(hostile.to_owned());
+            assert!(
+                execute_ops_vm_lab_launch_on_host(known_hosts).is_err(),
+                "launch_on_host must refuse --host-known-hosts {hostile:?}"
+            );
+        }
+        cleanup_temp_inventory(&path);
+    }
+
+    /// A host whose inventory `repo_dir` is hostile must be refused on both entry
+    /// points that `cd` into it.
+    #[test]
+    fn a_hostile_inventory_repo_dir_is_refused_on_the_real_call_path() {
+        let hostile = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "hosts": [
+    {
+      "host_id": "kvm-test",
+      "kind": "libvirt",
+      "connect_uri": "qemu+ssh://u@192.0.2.1/system",
+      "repo_dir": "/home/u/Rusty$(id)net"
+    }
+  ],
+  "entries": [ { "alias": "a", "ssh_target": "192.0.2.9", "platform": "linux" } ]
+}"#,
+        );
+        assert!(execute_ops_vm_lab_launch_on_host(launch(&hostile)).is_err());
+        cleanup_temp_inventory(&hostile);
+    }
+
+    /// The two `format!`-assembled scripts in this file are outside
+    /// `script_template`'s newtype boundary, so their inertness rests on their
+    /// signatures: both take `&'static str`, which means no caller value can reach
+    /// them. This test is the reminder that the *compiler* is the control — passing
+    /// a `String` here does not compile, and if either ever needs a runtime value it
+    /// must move behind the renderer.
+    #[test]
+    fn format_assembled_scripts_take_only_static_strings() {
+        let status = super::privileged_rustynet_cli_script("status");
+        assert!(status.contains("rustynet status 2>&1"));
+        assert!(!status.contains("__"), "no placeholder shape may appear");
+        let sections: &[(&'static str, &'static str)] =
+            &[("hostname", "hostname"), ("uname", "uname -a")];
+        assert_eq!(
+            super::build_section_capture_script(sections),
+            "set +e; printf '%s\\n' '__VM_LAB_SECTION__hostname'; { hostname; } 2>&1 || true; \
+             printf '%s\\n' '__VM_LAB_SECTION_END__'; printf '%s\\n' '__VM_LAB_SECTION__uname'; \
+             { uname -a; } 2>&1 || true; printf '%s\\n' '__VM_LAB_SECTION_END__'; "
+        );
     }
 }
