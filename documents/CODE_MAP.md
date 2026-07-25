@@ -200,6 +200,24 @@ observation, drift detection, redacted evidence. No mutation path exists here.
 | `execute_ops_vm_lab_network_prepare` / `..._restore` | `network_prepare.rs` | `ops vm-lab-network-prepare` (dry-run plan by default; `--approve-reconfigure` is the explicit mutation boundary) and `ops vm-lab-network-restore` (verified idempotent rollback) |
 | `execute_ops_vm_lab_recover_guest_network` | `recover_guest_network.rs` | `ops vm-lab-recover-guest-network`: recover a vmnet guest that lost its IPv4 lease (stale netplan MAC-pin) with no IPv4/agent — resolve `fe80::…%bridgeN` from the NIC MAC via `ndp`/modified-EUI-64, SSH over link-local IPv6, distro-aware DHCP repair (netplan name-match / NetworkManager / systemd-networkd), report + optional inventory-update. `--dry-run` resolves the target without touching the guest. Proven by hand in `LiveLabFindings_2026-07-12.md` |
 | `derive_link_local_from_mac` / `find_link_local_by_mac` / `parse_nic_mac_from_config_plist` / `pick_primary_interface` / `corrected_netplan_yaml` / `parse_ipv4_for_interface` | `recover_guest_network.rs` | Pure, unit-tested recovery primitives (MAC→EUI-64 link-local, `ndp -an` parse, plist MAC scan, interface pick, name-matched DHCP netplan render, `ip -4 addr` parse) |
+
+### VM-lab base-image catalog + arch gate (`rustynet-cli/src/vm_lab/image_catalog.rs`)
+
+Step 1 of `HostObservabilityStabilityPlan_2026-07-24.md` §7.9. Fail-closed model
+for the tracked catalog at `documents/operations/active/lab_image_catalog.json`,
+plus the host/image architecture gate that stops a wrong-architecture image being
+provisioned (which otherwise surfaces only as an unreachable guest, minutes later).
+
+| Type | Location | Purpose |
+|---|---|---|
+| `ImageCatalog` + `CatalogImage` | `image_catalog.rs` | `serde(deny_unknown_fields)` schema v1 model (following the `topology.rs` precedent). Deny-unknown makes a typo'd `arch`/`sha256` key loud, and the derive path rejects a duplicated JSON key instead of silently keeping the last — which on a digest field is a supply-chain hazard |
+| `ImageCatalog::validate` | `image_catalog.rs` | Cross-entry rules: non-empty, version pinned to 1, case-insensitive duplicate names refused, and one pool `filename` must describe one file (identical sha256/arch/kind/os) so an alias cannot yield a different verdict for the same bytes |
+| `LabArch` / `ImageArch` / `parse_catalog_arch` / `parse_probed_arch` | `image_catalog.rs` | Closed accept-lists with no fallback arm. Catalog values require canonical spelling; probed values are lenient because the fleet really does report `x86_64`/`aarch64`/`arm64`/`AMD64`. ASCII-only case folding, so non-ASCII lookalikes fail closed |
+| `ProbedHostArch` | `image_catalog.rs` | Host arch that was established, not assumed: constructible only by `probe_host_arch` or the deliberately-greppable `assumed_by_operator`. Carries provenance so output distinguishes measured from asserted |
+| `assert_image_runnable_on` | `image_catalog.rs` | The gate. Takes a parsed `CatalogImage` + `ProbedHostArch`, so "arch matched" is unreachable without both sides parsed, and the entry reported on is the entry checked. Mismatch wording avoids transient-sounding words so `classify_cli_error` maps it to PolicyReject, never a retryable failure |
+| `CatalogImage::assert_declared_arch_matches_artifact_naming` | `image_catalog.rs` | Cross-checks the declared `arch` against arch tokens in the filename and the URL's final segment, closing the hole where a hand-typed `"arch": "amd64"` on an `…-arm64.qcow2` passes every other rule and then reports a green gate |
+| `probe_host_arch` | `image_catalog.rs` | Measures a host's arch (`uname -m` over SSH for libvirt hosts; the compiled target for the local machine). Fails closed on unreachable/empty/unparseable — there is deliberately no declared-value fallback |
+| `execute_ops_vm_lab_image_catalog` | `image_catalog.rs` | `ops vm-lab-image-catalog`. Mode is chosen by an explicit flag, never by absence of one: the ops option parser demotes a value-less `--foo` to a flag and rejects no unknown options, so mode-by-presence would exit 0 with the gate un-run. Prints `GATE: RAN` / `GATE: NOT RUN` |
 | `write_inventory_live_ips` | `mod.rs` | Shared inventory live-IP writer (atomic + reload-verify) reused by the local-UTM readiness persister and guest-network recovery |
 
 ### Installer engine (`rustynet-cli/src/install/`)

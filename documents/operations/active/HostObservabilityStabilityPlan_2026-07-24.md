@@ -376,7 +376,11 @@ Layer 1 MCP tools stay host-agnostic (work on any onboarded box, zero new code).
    `make`/`update configuration` under TCC works, MAC settable, drive `source`
    attach available → E-opt-0 chosen. Remaining: one end-to-end guest-boot
    validation (real ARM cloud image + seed → cloud-init → SSH) during step 3.
-1. Image catalog (`lab_image_catalog.json`, name→url+sha256+os+arch) + arch gate.
+1. **Image catalog + arch gate — DONE 2026-07-25 (code), LIVE-PROVEN. Catalog
+   *content* is seeded with placeholder digests (see below).**
+   `documents/operations/active/lab_image_catalog.json` (schema v1) +
+   `crates/rustynet-cli/src/vm_lab/image_catalog.rs` +
+   `ops vm-lab-image-catalog`. Detail in §7.11.
 2. `onboard-host --new` (entry authoring + allocator + manifest + observability
    fold-in) — Ubuntu path. C1 provisioning per §7.10: polkit rules (libvirt
    narrowed + service-restart), strip agent `sudo` + operator account, GRUB
@@ -387,6 +391,151 @@ Layer 1 MCP tools stay host-agnostic (work on any onboarded box, zero new code).
 6. Layer 1 MCP tools (`host_stability_report`, `host_thermal_status`) — host-agnostic.
 7. Portability scrub (resolvable connect_uri, tailnet literals, hardcoded paths).
 Each step: plan → adversarial review → implement, per the standing method.
+
+## 7.9.1 Step 1 delivered — image catalog + arch gate (2026-07-25)
+
+**Status: the code is DONE and live-proven; the catalog's digests are
+placeholders.** Split deliberately, because those are different claims.
+
+**What landed.** `crates/rustynet-cli/src/vm_lab/image_catalog.rs` (new
+`vm_lab` submodule, so it reuses the parent's private validators —
+`ensure_provision_image_name`, `ensure_script_safe_value`, `run_guest_script`,
+`load_inventory_with_hosts` — with no visibility bumps, following the
+`topology.rs` precedent), the tracked catalog
+`documents/operations/active/lab_image_catalog.json`, and
+`ops vm-lab-image-catalog` wired at the three mandatory
+`#[cfg(feature = "vm-lab")]` sites in `main.rs`.
+
+**Schema v1** is `serde(deny_unknown_fields)` per entry and at top level:
+`name`, `os`, `os_version`, `arch`, `kind`, `filename`, `url`, `sha256`,
+`digest_provenance`, optional `notes`. Two fields exist because the fleet's real
+images demanded them, not for symmetry:
+- **`kind`** (`cloud_image_qcow2` | `iso`) — `provision-guest` uses its base
+  image as a qcow2 backing file (`qemu-img create -F qcow2 -b …`), so an ISO
+  fails at runtime, not at validation. `windows-x86-1` is a libvirt guest
+  installed from an ISO, so the ISO case is real and must be representable and
+  refusable, not excluded.
+- **`digest_provenance`** (`upstream_published` | `local_tofu`) — Fedora
+  publishes no digest for `virtio-win.iso` (the adjacent `CHECKSUM` covers only
+  the four RPMs, in MD5), so any pin for it is trust-on-first-use. §7.4 says the
+  pasted hash is the trust root; a TOFU digest that is byte-identical in the file
+  to a vendor-attested one launders TLS-only trust into something that looks
+  authoritative forever. Making the distinction mandatory is what prevents that.
+
+**Fail-closed rules, each with a test.** Non-object root; missing/non-1
+`version`; empty `images`; any required field missing or whitespace-only; unknown
+key at either level; duplicate JSON key (the derive path errors where a
+`serde_json::Value` walk silently keeps the last — on a digest field that is a
+supply-chain hazard, and it is the reason this module does not follow the
+inventory loader's hand-rolled style); duplicate `name` case-insensitively; one
+`filename` described two ways; non-https `url`; `sha256` not 64 hex; `filename`
+failing the consumer's own validator; `arch` outside the closed accept-list.
+
+**The arch gate.** `LabArch` is a closed two-variant enum with no fallback arm.
+Two parsers, because the two sides have opposite needs: `parse_catalog_arch`
+demands canonical spelling (a tracked file must not accumulate four spellings of
+one architecture), while `parse_probed_arch` is lenient because the fleet really
+does report `x86_64`, `aarch64`, `arm64` and — on Windows — `AMD64`. Folding is
+ASCII-only, so non-ASCII lookalikes fail closed instead of folding onto a real
+token. `assert_image_runnable_on` takes a `CatalogImage` and a `ProbedHostArch`
+rather than two strings, which makes "arch matched" unreachable without both
+sides parsed and binds the verdict to the entry that was actually checked.
+`ProbedHostArch` is constructible only by a real probe or by the deliberately
+greppable `assumed_by_operator`, and carries that provenance into every message.
+
+Two holes found by adversarial review and closed here:
+- **A lying `arch` field** passed every other rule: `"arch": "amd64"` on
+  `debian-13-generic-arm64.qcow2` parses cleanly and then reports a green gate,
+  defeating the exact failure the gate exists to prevent. The declared value is
+  now cross-checked against arch tokens in the filename and the URL's final
+  segment. Only the final segment, so a mirror directory naming an unrelated
+  architecture does not false-fail.
+- **Mode selection by flag *presence*** would have exited 0 with the gate never
+  run: the ops option parser demotes a value-less `--foo` to a flag and rejects
+  no unknown options. Mode is now chosen by an explicit flag, a value-less
+  gate option is a hard error, and every run prints `GATE: RAN` or
+  `GATE: NOT RUN`. For a command whose purpose is to be a gate, "not run" must
+  never be mistakable for "passed".
+
+**Live proof (2026-07-25).** The gate reads the real host, not a constant —
+verdicts invert across two hosts of different architectures:
+
+| Host | Probe | `debian-13-arm64` | `debian-13-amd64` |
+| --- | --- | --- | --- |
+| `mac-utm-1` (aarch64) | `[measured]`, local | PASS, exit 0 | **fail-closed, exit 78** |
+| `ubuntu-kvm-1` (x86-64) | `[measured]`, `uname -m` over SSH | **fail-closed, exit 78** | PASS, exit 0 |
+
+A mismatch exits **78 `policy_reject`** ("DO NOT retry without operator
+review"), not 70 `transient_failure`. That is deliberate: `classify_cli_error`
+is a substring heuristic, so the message avoids every transient-sounding word —
+a CI wrapper must never retry an architecture mismatch. An unusable probe also
+exits 78 (verified), never falling back to a declared or guessed value.
+
+**Placeholder digests — precise scope of what is NOT done.** All three entries
+carry `sha256` of 64 zeros. This is safe by construction rather than a latent
+bypass: `HOST_FETCH_IMAGE_SCRIPT` verifies the pin and refuses on mismatch, so a
+zeros digest guarantees refusal. The arch gate and every other schema rule are
+enforced independently of digest *value*, which is why the gate is claimed as
+done and the catalog content is not. **Owed before the catalog is used to fetch
+anything:** real digests from Debian's signed `SHA256SUMS` for the two cloud
+images, and an adopted local-fetch digest for `virtio-win.iso`.
+
+**Still owed from the reviews, deliberately not folded in here** (they belong to
+the increment that authors the call site, and the ledger should not imply
+otherwise): `fetch-image` still accepts no digest at all
+(`sha256: Option<String>`), and `provision-guest` verifies only that its base
+image *exists* (`[ -f "$BASE" ]`) with no digest field. Until those close, the
+catalog's mandatory digest is a data-quality guarantee, **not** an integrity
+control over the bytes a guest boots. The pool is group-`kvm`-writable
+(`chmod 2771`) and the agent identity is in `kvm`, so a pool overwrite needs no
+privilege — §7.10's confused-deputy threat exactly. Closing it needs both:
+provenance-or-digest mandatory on `fetch-image` (no silent skip), and
+re-verification at consumption in `add-guest` (step 3).
+
+## 7.9.2 Prerequisite hardening — shell injection in `provision-guest` (fixed 2026-07-25)
+
+Found while mapping step 3's call site; fixed here because `add-guest` wraps
+`provision-guest`, so onboarding cannot be built on it as it stood.
+
+**Grade: MAJOR** — privileged-boundary defect plus a false safety comment. Not
+critical: the input is operator/tool-supplied, not remote-attacker-supplied, so
+this is not remote RCE. It is squarely §7.10's confused-deputy case, because the
+lab-state MCP exposes an `image` parameter and lab data an agent reads is
+untrusted.
+
+`HOST_PROVISION_GUEST_SCRIPT` interpolates `POOL='…'`, `NAME='…'`, `IMAGE='…'`
+into single-quoted shell literals, and its doc comment asserted that "the caller
+forbids a literal single quote, so the quoting cannot be escaped." **That was
+false for two of the three.** `pool` was interpolated with no validation at all,
+and `ensure_provision_image_name` was a deny-list that rejected `/`, `..` and
+control characters but permitted `'` — and had no length bound, unlike
+`ensure_provision_guest_name`'s `1..=60`. So `--image "x'; id; '"` or a `--pool`
+carrying the same closed the literal and ran the remainder as shell source on the
+lab host, as the lab identity (groups `libvirt`, `kvm`; write access to the
+group-writable pool). `name` was already safe.
+
+The hardened pattern already existed in the same file: `host-disk-status` calls
+`ensure_script_safe_value` **and** rejects `'` explicitly. This was a missing
+guard, not a missing rule.
+
+Fix: `ensure_single_quoted_script_value` composes `ensure_script_safe_value` with
+the `'` rejection, so the two halves of the rule cannot drift apart per call site
+(§3, one hardened path); `provision-guest` now applies it to `pool`;
+`ensure_provision_image_name` became a strict ASCII allow-list
+(`[A-Za-z0-9._-]`, no leading `-`/`.`, `1..=128`) which is safe under *both*
+quoting styles, since that value is also used double-quoted in
+`HOST_FETCH_IMAGE_SCRIPT`; and the doc comment now states what is enforced and
+where, plus the fact that the comment is not the control. `host-disk-status` was
+refactored onto the shared helper — semantics-preserving, and it removes the
+second copy of the rule rather than implying that path was ever broken.
+
+Verification (§4 requires an enforcement point *and* a test): negative tests
+prove `'`, shell metacharacters, whitespace, a non-ASCII homoglyph, a leading
+`-`/`.`, and an over-long value are each rejected for `image`, and that `'` plus
+every `ensure_script_safe_value` metacharacter and the empty/whitespace cases are
+rejected for `pool`. `Rocky-10-GenericCloud.latest.x86_64.qcow2`,
+`virtio-win.iso` and the real pool path stay valid, so the allow-list is not
+retroactively breaking the fleet.
 
 ## 7.10 Privilege model — FINAL (decided after two adversarial reviews)
 
@@ -457,6 +606,64 @@ worst outcome — whereas a rule set once in C1 has nothing to revert.
 - **Name the residual concentrations** (security F1/F6): the driving workstation is
   the concentrated trust root (holds all per-host keys / any future CA); the broker
   is the only control that bounds even a workstation-origin confused deputy.
+
+### Observed ground truth on `ubuntu-kvm-1` (probed 2026-07-25)
+
+Measured, not inferred. Recorded because C1 is written against this host and
+three of these facts change how a step must be written or verified. Where an item
+merely *confirms* what §7.10 already says, it is labelled as confirmation — the
+decision above is not being reopened.
+
+```
+whoami: ubuntu-server  uid=1000  groups=1000(ubuntu-server),27(sudo),107(libvirt),993(kvm)
+sudo -n true            → "sudo: a password is required"      (no PASSWORDLESS sudo)
+sudo -n -l              → password required (cannot even enumerate)
+/etc/sudoers.d/         → root-only README; no drop-ins
+/etc/polkit-1/rules.d/  → Permission denied (UNREADABLE to the agent identity)
+netdev group            → EMPTY;  /etc/netplan/*.yaml → root-only 0600
+/run/wpa_supplicant/    → Permission denied; wpa_cli → Permission denied
+net stack               → systemd-networkd + wpa_supplicant ACTIVE;
+                          NetworkManager INACTIVE; iwd INACTIVE; nmcli ABSENT
+tools present           → iw, wpa_cli, wpa_passphrase, wpa_supplicant, netplan, rfkill
+libvirt                 → qemu:///system reachable; default `virsh uri` = qemu:///session (EMPTY)
+```
+
+1. **This host is netplan + `systemd-networkd` + `wpa_supplicant`, and `nmcli`
+   and `iwctl` are ABSENT.** New constraint, not a correction — the plan named no
+   network manager either way. Any C1 network step written against
+   NetworkManager/`nmcli` simply will not run here.
+2. **The agent identity is in group `sudo` today.** Confirms §7.10's stated
+   position (it already says "'No standing agent sudo' is false today"). The
+   consequence worth stating: the privilege-shape readback assert would FAIL
+   against the box as it stands, which is the correct answer. Note the assert runs
+   at `onboard-host` *finalization*, i.e. after C1 has stripped `sudo` — it is not
+   a precondition of onboarding, or this box could never be onboarded.
+3. **`sudo -n true` failing proves no *passwordless* sudo, not no sudo** — and
+   `sudo -n -l` cannot even enumerate. So the assert must key on `id` group
+   membership (must not contain `sudo`) **and** on `sudo -n true` failing.
+   Treating the `sudo -n` failure alone as compliance would read today's
+   non-compliant box as compliant.
+4. **`/etc/polkit-1/rules.d/` is unreadable to the agent**, so the polkit half of
+   the privilege shape cannot be verified by reading files. §7.10's Scope
+   paragraph already specifies the right check (behavioural: `virsh define
+   <host-disk-xml>` denied while `start`/`stop`/`getattr` work) — this is a note
+   on *how* to run it safely, not a new requirement. **That probe mutates on the
+   failure path:** if the rule is misconfigured to allow, the `define` SUCCEEDS
+   and has just defined a domain with a raw host disk attached. So specify:
+   success of the negative probe is a hard gate FAIL, `undefine` immediately, and
+   use a harmless disk path.
+5. **The agent has no network-reconfiguration capability at all** (`netdev`
+   empty, netplan root-only 0600, `wpa_supplicant` socket unreadable) and §7.10
+   grants it none — consistent. Consequence: uplink/router work on this box cannot
+   be agent-assisted and must be done by the operator at the console.
+6. **`virsh uri` defaults to `qemu:///session`, which is EMPTY.** The shipped code
+   is already correct here — every `virsh` call in `HOST_PROVISION_GUEST_SCRIPT`
+   and `HOST_GUEST_CONSOLE_SCRIPT` passes `-c qemu:///system` explicitly. The risk
+   is a *new* C1 validation forgetting it and reading "no domains" as "all clear",
+   which is a fail-open in the validation itself.
+7. **The box rebooted 2026-07-25 14:12 and unexplained reboots recur.**
+   Reinforces the already-agreed C1 Layer-2 sinks (`systemd-pstore` + ACL,
+   one-shot `dmidecode` dump, `mcelog`→journal) and the reboot grant.
 
 ### Scope (why this is not routed through SecurityMinimumBar §2 paperwork)
 This identity is **lab/orchestrator scope, not shipped-product surface** — it lives
