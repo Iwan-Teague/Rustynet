@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
+use crate::text_truncate::clip_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -440,18 +441,18 @@ fn is_ignored_line(line: &str) -> bool {
 /// one. Byte-slicing a `&str` at a non-boundary index panics, and this runs on
 /// the failure path: a panic here destroys the failure digest for the entire
 /// run, which is the one artifact that explains what went wrong. Fail readable,
-/// never panic. Same walk-back as `sanitize_capability_message` in
-/// `vm_lab::capability`.
+/// never panic.
 fn shorten(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         return text.to_owned();
     }
-    // `is_char_boundary(0)` is always true, so this terminates at 0 at worst.
-    let mut boundary = max_len.saturating_sub(3);
-    while boundary > 0 && !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    format!("{}...", text[..boundary].trim_end())
+    // The budget includes the `...` marker here, unlike the security-audit
+    // clipping sites where the marker is added on top of the limit. Preserved
+    // deliberately: changing it would reshape existing digest output.
+    format!(
+        "{}...",
+        clip_str(text, max_len.saturating_sub(3)).trim_end()
+    )
 }
 
 fn matches_preferred_reason(line: &str) -> bool {

@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use crate::text_truncate::truncate_string_at_char_boundary;
+
 use crate::ops_security_audit::{
     EvaluateLiveCoveragePromotionConfig, ValidateLiveLabReportsConfig,
     execute_ops_evaluate_live_coverage_promotion, execute_ops_validate_live_lab_reports,
@@ -1242,14 +1244,18 @@ fn summarize_evidence(payload: &serde_json::Map<String, Value>, limit: usize) ->
     for key in keys {
         let mut rendered = stringify_json_value(evidence.get(key.as_str()).unwrap_or(&Value::Null));
         if rendered.len() > 160 {
-            rendered.truncate(160);
+            // `payload` was parsed out of a live-lab report JSON on disk, so an
+            // evidence value is free to carry non-ASCII. A bare
+            // `String::truncate` panics when the byte limit lands inside a
+            // character, which would abort the whole audit rollup.
+            truncate_string_at_char_boundary(&mut rendered, 160);
             rendered.push_str("...");
         }
         parts.push(format!("{key}={rendered}"));
     }
     let mut summary = parts.join("; ");
     if summary.len() > limit {
-        summary.truncate(limit);
+        truncate_string_at_char_boundary(&mut summary, limit);
         summary.push_str("...");
     }
     summary
@@ -1349,9 +1355,16 @@ fn run_comparative_commands(
     Ok(results)
 }
 
+/// Clip captured command output to `limit` bytes, disclosing the cut.
+///
+/// `text` is `String::from_utf8_lossy` over a child process's stdout/stderr, so
+/// non-ASCII is routine (tool output uses arrows and box drawing, and paths can
+/// be anything). A bare `String::truncate` panics when the byte limit lands
+/// inside a character, which would abort the comparative-coverage run while
+/// collecting the very output it exists to report.
 fn truncate_output(mut text: String, limit: usize) -> String {
     if text.len() > limit {
-        text.truncate(limit);
+        truncate_string_at_char_boundary(&mut text, limit);
         text.push_str("\n...[truncated]");
     }
     text
@@ -1777,5 +1790,102 @@ mod tests {
         let err = require_validation_args(specs.as_slice(), &config).expect_err("must fail");
         assert!(err.contains("server_ip_bypass:client_host"));
         assert!(err.contains("server_ip_bypass:probe_host"));
+    }
+
+    /// Both clip offsets in `summarize_evidence` used to be bare
+    /// `String::truncate` calls, which panic when the byte limit lands inside a
+    /// multi-byte character. `payload` is parsed from a live-lab report JSON on
+    /// disk, so non-ASCII evidence is ordinary input.
+    ///
+    /// Driven through `derive_findings`, the real caller, and swept across a
+    /// range of padding lengths so the 4-byte character straddles both the
+    /// per-value limit (160) and the summary limit (600) in every alignment,
+    /// rather than relying on a hand-computed offset that a later refactor of
+    /// the join format would silently invalidate.
+    #[test]
+    fn derive_findings_survives_non_ascii_evidence_across_every_clip_alignment() {
+        let wide = "\u{1F600}";
+        assert_eq!(wide.len(), 4);
+        let report_path = PathBuf::from("/nonexistent/report.json");
+
+        for pad in 0..8usize {
+            // Four keys keep the joined summary comfortably past 600 bytes
+            // while each individual value also crosses the 160-byte per-value
+            // limit, so both clips run on the same fixture.
+            let mut evidence = serde_json::Map::new();
+            for key in 0..4usize {
+                let value = format!(
+                    "{}{wide}{}",
+                    "x".repeat(150 + pad + key),
+                    "y".repeat(40 + pad)
+                );
+                evidence.insert(format!("k{key}"), Value::String(value));
+            }
+            let mut payload = serde_json::Map::new();
+            // An unknown `mode` plus a non-pass status takes the early
+            // `summarize_evidence` branch without needing a full spec fixture.
+            payload.insert(
+                "mode".to_owned(),
+                Value::String(format!("no-such-mode-{pad}")),
+            );
+            payload.insert("status".to_owned(), Value::String("fail".to_owned()));
+            payload.insert("evidence".to_owned(), Value::Object(evidence));
+
+            // Pre-fix this panicked with "byte index ... is not a char boundary".
+            let (findings, _passes) = derive_findings(report_path.as_path(), &payload);
+
+            let summary = &findings
+                .first()
+                .expect("an unknown failing mode must yield a finding")
+                .evidence_summary;
+            assert!(
+                summary.ends_with("..."),
+                "pad {pad}: the summary clip must stay disclosed: {summary}"
+            );
+            // A partial code point cannot exist in a `String`, so the real
+            // assertion is that every wide character kept is kept whole.
+            assert!(
+                !summary.contains('\u{FFFD}'),
+                "pad {pad}: clipping must not have produced a replacement char"
+            );
+        }
+    }
+
+    /// `truncate_output` receives `String::from_utf8_lossy` over a child
+    /// process's stdout/stderr. Its argv comes from a fixed spec table, so the
+    /// output cannot be injected through `run_comparative_commands`; this drives
+    /// the clipping decision directly, which is where the panic lived.
+    #[test]
+    fn truncate_output_survives_a_multi_byte_char_at_the_limit() {
+        let wide = "\u{2192}";
+        assert_eq!(wide.len(), 3);
+        for shift in 0..3usize {
+            let limit = 64usize;
+            let head = "a".repeat(limit - shift);
+            let text = format!("{head}{wide}{}", "b".repeat(16));
+            assert!(text.len() > limit);
+
+            // Pre-fix this panicked for shift 1..=2.
+            let clipped = truncate_output(text.clone(), limit);
+
+            assert!(
+                clipped.ends_with("\n...[truncated]"),
+                "shift {shift}: truncation must stay disclosed"
+            );
+            let body = clipped
+                .strip_suffix("\n...[truncated]")
+                .expect("suffix checked above");
+            assert!(
+                text.starts_with(body),
+                "shift {shift}: kept text must be a prefix of the input"
+            );
+            assert!(
+                body.len() <= limit,
+                "shift {shift}: kept {} bytes, limit is {limit}",
+                body.len()
+            );
+        }
+        // Under the limit is returned untouched, non-ASCII and all.
+        assert_eq!(truncate_output("a\u{2192}b".to_owned(), 64), "a\u{2192}b");
     }
 }
