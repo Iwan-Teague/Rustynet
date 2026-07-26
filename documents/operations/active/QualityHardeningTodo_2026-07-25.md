@@ -323,6 +323,18 @@ lines this session and neither reproduced:
   passes with **no exclusions** on the pinned toolchain reached via the
   `$HOME/.rustup/toolchains/1.88.0-*/bin` PATH prepend; `-p rustynet-mcp` alone is
   clean. The red was a Homebrew-1.97 artifact, not a code defect.
+  ★ **But the trap survives, so state the fix as a positive instruction, not as
+  "the red is fake."** Confirmed independently by two lines: the toolchain reports
+  `clippy 0.1.88` **only** once that PATH prepend is in place. Without it, Homebrew's
+  `cargo` shadows the pinned one and the red **returns** — and a correct
+  `rust-toolchain.toml` alone does NOT prevent the shadowing. So anyone who reads
+  "the exclusion is unnecessary", runs the gate without the prepend, and sees the red
+  will reasonably conclude the withdrawal was wrong and re-add `--exclude
+  rustynet-mcp`. The guidance must therefore be: *prepend the pinned toolchain's bin
+  directory, then run unexcluded* — and if `rustynet-mcp` still goes red under a
+  confirmed `clippy 0.1.88`, treat it as a real finding rather than the known artifact.
+  This is how the stale belief regenerates if the mechanism isn't recorded alongside
+  the correction.
 - `scripts/ci/check_backend_boundary_leakage.sh` passes.
 
 Also stale and corrected during the session: an assertion that CI's clippy could
@@ -409,11 +421,42 @@ it correctly refuses to read **absence** as success, but this cell affirmatively
 instruct *every* agent to verify the appended row in `live_lab_node_run_matrix.csv` as
 their acceptance criterion — pointing them at this column.
 
-Fix:
-- (a) Split `traffic_test_matrix` out of the `two_hop` column, or fail the append when two
-  distinct stage ids map to one column. The repo already knows this class —
-  `live_lab_run_matrix.rs:430-433` documents the bash-era "52 passes" false-green and fixed
-  it by splitting *ledgers*, leaving the *stage aliasing* in place.
+Fix — ★ **the obvious structural guard is WRONG, corrected 2026-07-26:**
+
+"Fail the append when two distinct stage ids map to one column" **cannot be used**: aliasing is
+pervasive and mostly *legitimate*. Measured on the live table — `two_hop` 3 ids, `managed_dns` 3,
+`reboot_recovery` 3, `bootstrap` **4** (`prime_remote_access`, `cleanup_hosts`, `bootstrap_hosts`,
+`collect_pubkeys`), plus `network_flap`, `lan_toggle`, `mixed_topology`, `role_switch_matrix` and
+`secrets_not_in_logs` at 2 each. Most are **synonyms** — the same logical stage under different
+naming eras or engines (`live_two_hop` → `live_two_hop_validation`) — and those *must* keep
+collapsing. This bug is different in kind: `traffic_test_matrix` measures a genuinely different
+thing from `live_two_hop_validation`. A purely structural check cannot tell a synonym from a
+category error without **declared intent**.
+
+Corrected plan, in this order:
+- **(a) NOW, minimal, no schema change: drop the `traffic_test_matrix → two_hop` alias.** The
+  column then reflects only real two-hop stages, and `traffic_test_matrix` reports into no
+  roll-up column until one is added deliberately. One line; kills the false-green immediately;
+  no data loss, since per-stage results still live in `live_lab_node_stage_results.csv`.
+- **(b) Separately: an explicit synonym table.** Declare which ids are deliberate aliases, then
+  fail the append on any collision *not* declared. This is the real guard, and it is a design
+  task rather than a one-liner.
+- **(c) Last, if wanted: split into its own column** — a genuine **schema migration**. Stage
+  columns are a fixed header list (`linux_stage_*`/`macos_stage_*`/`windows_stage_*`, 39
+  references); a split adds three columns and changes the schema for both
+  `live_lab_node_run_matrix.csv` (108 rows) and the frozen bash archive (549 rows), so every
+  existing row predates the new header and any reader keyed on column position or count is in
+  scope. Needs its own review.
+
+★ **The fix is FORWARD-ONLY — say so wherever the column is read.** Dropping the alias stops new
+contamination; it does not rewrite the 43 existing `pass` rows, which remain
+`traffic_test_matrix` results sitting in the `two_hop` column. So historical rows stay misleading
+after the fix, and anyone reading them needs either the caveat now carried in `CLAUDE.md`/
+`AGENTS.md` (~line 418) or a schema/version marker distinguishing pre- from post-fix rows.
+
+The repo already knows this class — `live_lab_run_matrix.rs:430-433` documents the bash-era
+"52 passes" false-green and fixed it by splitting *ledgers*, leaving the *stage aliasing* in
+place, which is how it reproduced inside the `--node` ledger.
 - (b) Keep the original point too: acceptance criteria should name the artifact and the
   field within it (a stage report's `status` plus its data block), never "the ledger says
   pass". That is now necessary rather than merely tidy.
@@ -451,19 +494,46 @@ committed in, removing the class rather than relying on everyone remembering.
 **Severity: medium. Confidence: VERIFIED for the stage log; other sites UNAUDITED.**
 **Status: a fix for the stage-log site is already assigned (sidecar spill).**
 
-A stage log was retained as roughly its last 4 KB of ~14 KB, and the truncation
-kept the **tail** — so a stage that captures per-node status blocks and then
-appends a summary loses its earliest and most diagnostic material first, every
-time. The disclosure line announcing the truncation only becomes visible after
-the evidence it would have explained is gone. This is structural, not bad luck,
-and will have quietly degraded earlier investigations.
+★ **THIS ITEM WAS SUBSTANTIALLY WRONG AND IS CORRECTED BELOW. The wrong version is
+kept visible because it is the alarming one and would otherwise be re-derived.**
 
-Chosen fix for that site: spill full stdout to a report-directory artifact and
-clip only the inline summary. Evidence runs already write a report directory, so
-discarding bytes buys nothing, and raising a byte limit only moves the cliff.
+**What it claimed:** a stage log was truncated to its last ~4 KB of ~14 KB, keeping
+the tail, so the earliest and most diagnostic material was destroyed every time —
+"structural, not bad luck", and it "will have quietly degraded earlier
+investigations". A sidecar-spill fix was assigned.
 
-Remaining work: find other places where diagnostic output is truncated,
-sampled, or summarised in a way that discards the head.
+**What is actually true** — established independently twice, by the register's
+adversarial review and then by the line that had been relying on the claim:
+- **No evidence is destroyed.** The test binary is invoked with `--log-path` and
+  writes its **own complete log** to the report directory (measured: 13,583 bytes,
+  containing every section *and* the per-node status blocks). Only the stage
+  record's **inline copy** is clipped, to `STAGE_FAILURE_STREAM_BUDGET = 4000`
+  (`vm_lab/orchestrator/stage/mod.rs:307`).
+- **The tail-keeping is deliberate and correct for its intended case**, and is
+  documented as such in the code (`:339-345`): a failing CLI dumps ~11.5 KB of
+  usage text and prints the real error **last**, so keeping the tail is what makes
+  that case diagnosable. Changing it would break the case it was built for.
+- **The sidecar-spill fix is therefore largely redundant** — the sidecar already
+  exists. It was assigned on a false premise (mine).
+
+**The real defect is much smaller, and it is a false signal rather than data loss.**
+The disclosure line announces that output was clipped **without naming the complete
+artifact sitting beside it in the same report directory**. So a reader is told
+evidence was lost when it was not — which is worse than unhelpful, and it produced
+**two** wrong conclusions in one day: this register item, and a coordinator warning
+to a worker that its probe data had been eaten (it hadn't; the worker had simply
+read the stage record instead of the log file).
+
+Fix: have the disclosure name the full artifact. Note the shape constraint — the
+caller holds `log_path_str` while the pure formatter does not, so it belongs at the
+call site or as an optional parameter, across roughly eight call sites. Keep it
+minimal; do **not** change the truncation behaviour itself.
+
+Genuine remaining work: audit whether any *other* diagnostic output is truncated,
+sampled or summarised **without** a complete copy written elsewhere. That is the
+question this item should have asked. The lesson for the register: "the evidence was
+destroyed" and "I read the wrong file" look identical from the outside, and only one
+of them is a defect.
 
 ### QH-10 — Reachability probes must use the protocol the task needs
 **Severity: low. Confidence: VERIFIED.**
@@ -810,6 +880,25 @@ Two compounding consequences, and the second is the subtle one:
 Acceptance: a Windows failure with an empty logs directory collects cleanly, and `cleanup`
 is not marked failed when it completed.
 
+★ **REPO-WIDE SWEEP RESULT (2026-07-26) — this is a REGRESSION against an established
+convention, not a systemic gap. That reframing is the actionable part.**
+Swept every StrictMode-embedding source and `.ps1` in the repo using the discriminator *"a
+StrictMode script reading a property on a pipeline result that can be `$null`"*. An automated
+pass flagged 16 candidates; **15 were false positives** on inspection — including both sites in
+the signing script (`$existingCerts = @(Get-ChildItem …)`,
+`$alreadyTrusted = @($rootStore.Certificates | …)`). `@( … )` at assignment is **already the
+consistent convention in this codebase**.
+Exactly **two** genuine exposed sites existed: the one fixed here, and
+**`script_template.rs:1281`** — introduced by code that landed the same day, i.e. new code
+regressing an existing discipline rather than an old gap nobody had noticed.
+So the standing rule to record is *"new PowerShell must maintain the `@()` discipline"*, and the
+discriminator is what makes it checkable in review. Note also why non-StrictMode scripts are
+exempt: they use `SilentlyContinue`, so the same unwrapped shape is harmless there — a sweep
+that ignores this flags mostly noise.
+Nuance for whoever fixes `:1281`: `-and` short-circuits, so wrapping only the right-hand pipeline
+suffices; the left operand `$dnsRules.Count` is already safe because `$dnsRules` is
+array-initialised.
+
 ### QH-22 — `first_failed_stage` is ALPHABETICAL, not chronological, and its name says otherwise
 **Severity: medium. Confidence: VERIFIED — resolved by code read; the computation is correct, the naming is the defect.**
 
@@ -840,6 +929,103 @@ clock skew four seconds earlier. Triage driven off that field starts at the wron
 Proposed fix: rename to reflect the ordering it actually uses, **or** emit a genuinely
 chronological `first_failed_stage` (and keep the sorted one under an honest name if the merge
 order is load-bearing elsewhere).
+
+### QH-23 — An arm64-first assumption in the Windows installers, and the untestable-branch shape that hid a bug next to it
+**Severity: high (blocked Windows bootstrap outright). Confidence: VERIFIED live on an x86-64 Windows guest, then fixed.**
+**This is the cross-platform parity mandate's own thesis, demonstrated.**
+
+`Install-RustyNetWindowsService.ps1:899-905` and `Install-RustyNetWindowsRelayService.ps1:150-155`
+each hardcoded a signtool candidate list with **`arm64` first**, breaking on first match. The
+Windows SDK installs `bin\<ver>\{arm64,x64,x86}` **side by side regardless of host
+architecture**, so on an x86-64 guest the arm64 pattern matched and won — and x64 Windows
+cannot execute an arm64 image (the emulation only runs the other way). Signing therefore
+failed, the script called `Write-Error`, and `bootstrap_hosts` died before `active_exit` could
+run.
+
+★ **Why this matters beyond the fix:** that ordering was *correct* for the Apple-Silicon UTM
+guest, which was the only Windows node the lab had ever had. The defect was invisible until a
+real x86-64 Windows guest existed, and it would have blocked the Windows exit **and** relay
+roles identically. This is precisely the class of latent single-architecture assumption the
+`CrossPlatformRoleParityPlan` mandate exists to surface, and the box's first serious job found
+one. Two sites, so record it as a pattern rather than a one-off.
+
+Diagnostic note worth keeping, because it misled the coordinator: the failure *looked* like a
+PowerShell quoting/parse error — `At line:1 char:108` with a caret under an `&` invocation. It
+was not. A parse failure surfaces as `ParserError`/`ParseException`; this was a
+**`WriteErrorException`**, i.e. the invoked script raising a terminating error under
+`$ErrorActionPreference='Stop'`, with the caret pointing at the *invocation site* rather than
+at broken syntax. The two are visually near-identical in a stage record.
+
+Fix shape adopted: derive candidate order from the host architecture and list **only runnable**
+arches (ARM64 → arm64,x64,x86; AMD64 → x64,x86; x86 → x86), consulting
+`PROCESSOR_ARCHITEW6432` before `PROCESSOR_ARCHITECTURE` so a 32-bit process on a 64-bit OS
+reports the native arch. Non-runnable arches are omitted deliberately: retaining one as a
+"last resort" would trade a clear *SDK-not-installed* error for an obscure exec failure.
+
+**Second, methodological finding from the same fix — the untestable branch.** The QH-21
+`.Count` defect sat in a branch that **no test could reach as written**; the real work of fixing
+it was *extracting* `build_diag_archive_script` so the empty-directory case became reachable at
+all. A branch with no test because it is untestable is a distinct and more dangerous shape than
+a branch someone merely forgot to test, and it will not show up in any coverage-gap review that
+only counts untested lines. Worth sweeping the other Windows adapters for the same shape.
+
+### QH-24 — The remote-script adapter layer is largely unreachable from tests, including its fail-closed paths
+**Severity: high (it is the pool every other adapter defect is drawn from). Confidence: VERIFIED by inventory on `main` @ `1994ad01`; no refactoring attempted.**
+
+The shape: a function takes a live connection, builds its remote PowerShell/shell script
+**inline**, and executes it — so the script's *content* is unreachable from any unit test. Only
+its call can be exercised, never what it says. Inventory by embedded-script line-continuations
+per function (a proxy for how much untestable script a function carries):
+
+| Function | continuations / fn lines | Why it matters |
+|---|---|---|
+| `windows_install.rs::deploy_relay_service` | **119 / 795** | largest single blind spot in the layer |
+| `windows_install.rs::run_windows_e2e_bootstrap` | 76 / 177 | |
+| ★ `windows_traffic.rs::cleanup_runtime_state` | 37 / 65 | **killswitch + NAT teardown** — residue here is a release blocker |
+| ★ `windows_install.rs::enforce_daemon` | 35 / 79 | the **`auto_tunnel_enforce` fail-closed** path |
+| `windows_install.rs::install_daemon` | 32 / 165 | the function that failed on signtool (QH-23) |
+| `macos_install.rs::enforce_daemon` | 23 / 97 | same fail-closed path, other OS |
+| `windows_traffic.rs::activate_exit_serving` | 13 / 35 | |
+| `windows_traffic.rs::assert_mesh_client_nat_session` | 9 / 28 | produces release-blocking evidence — see below |
+
+`windows_traffic.rs` contains only **three** extracted, testable script builders, one of which was
+added while fixing QH-21. The same shape recurs in the `linux_*` and `macos_*` adapters, so this is
+**adapter-layer-wide, not Windows-specific**.
+
+★ **The reframing that matters:** the QH-21 `.Count` defect was not unlucky — it was drawn from a
+large pool of script text no test can see. And two of the largest blind spots are exactly the
+paths whose correctness we most rely on: the **killswitch/NAT teardown** (where residue is
+release-blocking) and the **fail-closed enforcement** path on two operating systems.
+
+Proposed direction: extract script builders as pure functions returning the script text, so the
+text becomes assertable — the pattern already proven by `build_diag_archive_script`. Prioritise
+the two fail-closed/teardown entries over the largest by line count. Do **not** mass-refactor:
+inventory first (done), then extract where a real assertion follows.
+
+### QH-25 — The NAT-session assertion is weaker than its own doc comment claims
+**Severity: medium (it gates a release claim). Confidence: VERIFIED by hand-review of the script.**
+
+`windows_traffic.rs::assert_mesh_client_nat_session` produces the `Get-NetNatSession` evidence for
+the Windows exit cell — i.e. the artifact a release-blocking parity claim rests on. Hand-reviewed
+because it is itself one of QH-24's untestable inline scripts.
+
+Sound: `@()`-wrapped so `.Count` is safe; no StrictMode, so the `.Split`/property hazards are
+muted; the mesh-range test (octet0 == 100, octet1 in 64–127, i.e. `100.64.0.0/10`) is correct;
+retries 10 × 1500 ms; fails closed with an explicit `FAIL:` string.
+
+★ **But it asserts that *some* mesh-sourced NAT session exists — not that it is the specific
+client's mesh address.** That is a **range check, not an identity check**, while the doc comment
+describes it as proving "a client's full-tunnel traffic". Unambiguous in a single-client topology,
+materially weaker in any multi-client one, and the doc overclaims either way. Whichever way it is
+resolved, a green result should be reported as *"a mesh-sourced NAT session was translated"* unless
+the identity check is added.
+
+Also: the pass message carries the concrete pair
+(`OK nat_session <InternalSourceAddress> -> <ExternalDestinationAddress>`), so **that address pair
+is the data block to report** — "the assertion passed" is not checkable evidence, the pair is.
+Minor: a session with a null `InternalSourceAddress` makes `.Split` raise a non-terminating error
+and skip that item (`$ErrorActionPreference` is `Continue` here); the assertion's verdict is
+unaffected.
 
 ---
 
