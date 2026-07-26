@@ -8476,7 +8476,86 @@ fn execute_trust_verify(
     ))
 }
 
+/// QH-18 — what a command must claim before it may run, or `None` when the
+/// command drives no guests.
+///
+/// Kept as a pure mapping (command → claim inputs) so it can be tested without
+/// running a lab; [`execute_ops`] does nothing but hold what it returns.
+#[cfg(feature = "vm-lab")]
+struct GuestClaim {
+    command: &'static str,
+    inventory_path: Option<PathBuf>,
+    references: Vec<String>,
+}
+
+/// The guest set each live-lab-driving command claims.
+///
+/// `vm-lab-overnight` is deliberately absent: it drives the whole fleet for
+/// hours by SPAWNING individual runs, each of which reaches this function on
+/// its own. Claiming the fleet up front would serialize exactly the
+/// parallelism `MAX_CONCURRENT_LAB_RUNS = 3` exists to allow.
+#[cfg(feature = "vm-lab")]
+fn guest_claim_for(command: &OpsCommand) -> Option<GuestClaim> {
+    use vm_lab::run_exclusion as excl;
+    match command {
+        OpsCommand::VmLabSetupLiveLab { config } => Some(GuestClaim {
+            command: "vm-lab-setup-live-lab",
+            inventory_path: Some(config.inventory_path.clone()),
+            references: excl::guest_refs_for_setup(config),
+        }),
+        OpsCommand::VmLabOrchestrateLiveLab { config } => Some(GuestClaim {
+            command: "vm-lab-orchestrate-live-lab",
+            inventory_path: Some(config.inventory_path.clone()),
+            references: excl::guest_refs_for_orchestrate(config),
+        }),
+        OpsCommand::VmLabIterateLiveLab { config } => Some(GuestClaim {
+            command: "vm-lab-iterate-live-lab",
+            inventory_path: Some(config.inventory_path.clone()),
+            references: excl::guest_refs_for_iterate(config),
+        }),
+        OpsCommand::VmLabRunLiveLab { config } => Some(GuestClaim {
+            command: "vm-lab-run-live-lab",
+            // This form has no `--inventory` flag; resolve against the default
+            // one anyway. Without it a profile's `EXIT_TARGET=debian@<ip>`
+            // would key as the raw host while an orchestrate run keys the same
+            // machine as its alias, and the two forms would not exclude each
+            // other at all.
+            inventory_path: Some(vm_lab::default_inventory_path()),
+            references: excl::guest_refs_from_profile(config.profile_path.as_path()),
+        }),
+        _ => None,
+    }
+}
+
 fn execute_ops(command: OpsCommand) -> Result<String, String> {
+    // QH-18: a live-lab-driving command claims its guests HERE, at the single
+    // dispatch chokepoint, and holds them until the run returns.
+    //
+    // It must be here rather than inside the `execute_ops_vm_lab_*` functions
+    // for two independent reasons. First, three existing tests call those
+    // functions directly (`vm_lab/mod.rs`) and nextest runs one process per
+    // test, so locking at function entry would make unit tests contend on real
+    // production lock state. Second — and this one is fatal, not merely
+    // untidy — the orchestrator CALLS `execute_ops_vm_lab_setup_live_lab` and
+    // `execute_ops_vm_lab_run_live_lab` in-process as its own setup and run
+    // phases, so a lock taken there would deadlock a run against itself.
+    // `execute_ops` has exactly one caller, no test callers, and every
+    // invocation form reaches it — including `ops vm-lab-orchestrate-live-lab`,
+    // the form the runbook documents and the one that previously reached no
+    // exclusion at all.
+    //
+    // The binding must be NAMED (`_guest_claim`, not `_`): a bare `_` pattern
+    // drops the guard immediately and every lock would be released before the
+    // run it protects had started.
+    #[cfg(feature = "vm-lab")]
+    let _guest_claim = match guest_claim_for(&command) {
+        Some(claim) => Some(vm_lab::run_exclusion::claim_guests(
+            claim.command,
+            claim.inventory_path.as_deref(),
+            claim.references,
+        )?),
+        None => None,
+    };
     match command {
         OpsCommand::VerifyRuntimeBinaryCustody => execute_ops_verify_runtime_binary_custody(),
         OpsCommand::WriteDaemonEnv {
@@ -22225,6 +22304,83 @@ mod pin_authority_tests {
             plan_pin_port_mapping_authority(&revoked, &PinAuthorityAction::Clear { node_id: None })
                 .expect("clearing a revoked node's pin is allowed");
         assert_eq!(plan.node_id, "anchor-a");
+    }
+}
+
+/// QH-18 — the guest claim must be WIRED, not merely implemented.
+///
+/// `vm_lab::run_exclusion`'s own tests prove the lock works. They say nothing
+/// about whether `execute_ops` takes it, which is the half that silently rots:
+/// delete the claim from the dispatch path and every one of those tests still
+/// passes. These pin the mapping instead.
+#[cfg(all(test, feature = "vm-lab"))]
+mod guest_claim_wiring_tests {
+    use super::{OpsCommand, guest_claim_for, vm_lab};
+    use std::path::PathBuf;
+
+    fn run_live_lab_command(profile_path: PathBuf) -> OpsCommand {
+        OpsCommand::VmLabRunLiveLab {
+            config: vm_lab::VmLabRunLiveLabConfig {
+                profile_path,
+                script_path: PathBuf::from("/dev/null"),
+                dry_run: true,
+                skip_setup: false,
+                skip_gates: false,
+                skip_soak: false,
+                skip_cross_network: false,
+                enable_chaos_suite: false,
+                source_mode: None,
+                repo_ref: None,
+                report_dir: None,
+                timeout_secs: 1,
+                stage_timeout_secs: 0,
+                orchestrated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_live_lab_run_claims_the_guests_named_by_its_profile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile = tmp.path().join("p.env");
+        std::fs::write(
+            &profile,
+            "EXIT_TARGET=debian@192.168.18.65\nCLIENT_TARGET=ubuntu@192.168.18.52\n",
+        )
+        .expect("write profile");
+
+        let claim = guest_claim_for(&run_live_lab_command(profile))
+            .expect("vm-lab-run-live-lab must claim its guests");
+        assert_eq!(claim.command, "vm-lab-run-live-lab");
+        assert_eq!(
+            claim.references,
+            vec!["debian@192.168.18.65", "ubuntu@192.168.18.52"]
+        );
+        assert!(
+            claim.inventory_path.is_some(),
+            "must resolve against an inventory, or profile targets and --node \
+             aliases key differently and never collide"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_profile_claims_nothing_rather_than_inventing_guests() {
+        let claim = guest_claim_for(&run_live_lab_command(PathBuf::from(
+            "/nonexistent/profile.env",
+        )))
+        .expect("the command still claims");
+        assert!(
+            claim.references.is_empty(),
+            "no guesses from an unreadable profile; claim_guests warns that the \
+             run is unprotected rather than pretending otherwise"
+        );
+    }
+
+    #[test]
+    fn a_command_that_drives_no_guests_claims_nothing() {
+        // The claim must not creep onto unrelated ops: a non-lab command that
+        // took guest locks would refuse for no reason.
+        assert!(guest_claim_for(&OpsCommand::RefreshTrust).is_none());
     }
 }
 
