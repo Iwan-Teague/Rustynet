@@ -209,12 +209,32 @@ pub fn assert_exit_actively_serving(conn: &NodeConnection) -> Result<(), Adapter
     }
 }
 
-/// On the Windows exit, assert a WinNAT session is translating a mesh-sourced
-/// (`100.64.0.0/10`, i.e. first octet 100, second 64–127) client address
-/// outbound — direct proof that a client's full-tunnel traffic egresses via THIS
-/// exit's NAT (the W1/D7 "client mesh traffic egresses via the exit" evidence).
-/// Retries internally to cover the client's full-tunnel convergence + the probe
-/// window.
+/// On the Windows exit, assert that THIS exit's WinNAT is translating **some**
+/// mesh-range (`100.64.0.0/10`, i.e. first octet 100, second 64–127) source
+/// address outbound. Retries internally to cover the client's full-tunnel
+/// convergence + the probe window.
+///
+/// Scope of the claim — stated precisely, because it is weaker than
+/// "client egress is proven" and has been described that way before:
+/// * It IS this exit's NAT: `Get-NetNatSession` is queried on the exit host, so
+///   a translating session here means traffic egressed through this node.
+/// * It is a **range check, not an identity check.** Any source in
+///   `100.64.0.0/10` satisfies it, so it does not establish *which* peer's
+///   traffic egressed, and in a multi-client topology it cannot attribute the
+///   session to the client the stage just probed. With exactly one non-exit node
+///   it is unambiguous; beyond that, treat it as "a mesh peer egressed here".
+/// * It does not distinguish a session created by the stage's own probe from a
+///   pre-existing one, so it is evidence of NAT translation being live rather
+///   than of the probe specifically having caused it.
+///
+/// Tightening this to an identity check means threading the client's mesh
+/// address through the `NodeAdapter::assert_mesh_client_nat_session` trait
+/// method and both OS implementations; deliberately not done here so the
+/// signature change is scheduled rather than smuggled into a bug fix.
+///
+/// The success output carries the concrete pair
+/// (`OK nat_session <internal> -> <external>`) so the caller can report the
+/// observed addresses as evidence instead of a bare verdict.
 pub fn assert_mesh_client_nat_session(conn: &NodeConnection) -> Result<(), AdapterError> {
     let script = "$found = $false; $seen = ''; \
          for ($i = 0; $i -lt 10 -and -not $found; $i++) { \
