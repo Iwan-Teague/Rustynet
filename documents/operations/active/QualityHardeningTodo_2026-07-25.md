@@ -170,6 +170,55 @@ The good pattern already exists in the same file — the image negative test fai
 on revert and derives its cases from attack classes (quote breakout,
 metacharacters, a homoglyph, leading `-`/`.`, over-length).
 
+★ **THE ROOT CAUSE, IN ONE SENTENCE** — formulated 2026-07-26 by the line that hit this shape
+**twice in one day**: once as the reviewer who caught it in another branch, once as the author
+who committed it in their own.
+
+> **A test that constructs the value it's checking, instead of calling the code that constructs
+> it, will always pass.**
+
+That is the entire mechanism. Both instances *looked* thorough: import the validator or the
+quoter, rebuild the map/join inline, assert on the result. Neither touched the production
+function, so reverting production left them green. The tell is **not** weak assertions — those
+were fine — it is that **the test owns the construction**. The signature to look for is an import
+of the primitive plus a local re-implementation of what production does with it. That it caught
+the same author from both sides is the strongest evidence that the *shape* is the hazard rather
+than any individual's care.
+
+★ **Corollary, which caught a different line the same day:** *a change whose only proof is a green
+live run has no regression guard at all.* A live run proves behaviour once, on one topology, at
+one commit; it cannot fail when someone reorders the code six weeks later.
+
+★★ **The inverse, and the strongest argument for writing the test at all: a test written to CONFIRM a
+belief can REFUTE it — including a belief you have already shipped.** Measured instance: a reviewer
+asserted that `Debug` escapes neither `Cf` bidi overrides nor `Zl`/`Zp`, the coordinator relayed it as
+fact, and an author committed a code comment and a commit message repeating it. Writing the test to
+prove the resulting extension made the test **fail**, and direct measurement showed `Debug for str`
+escapes by **printability rather than by control category** — so it escapes `U+202A`, `U+202E`,
+`U+2028`, `U+2029`, `U+200D` and `U+FEFF` alike, and `{value:?}` is a complete terminal control on its
+own. Three parties had propagated the false claim; the assertion caught it.
+The rule: **encode a claim as an assertion and it becomes checkable — and that applies to claims from
+reviewers, and from the coordinator, exactly as much as to claims from the author.** Note the
+resulting test was then rewritten to pin the *corrected* reasoning (asserting that `Debug` **does**
+escape these), so if that behaviour ever changes the fallback control becomes load-bearing and the
+test says so. A test that documents which control is actually doing the work is worth more than one
+that merely passes.
+
+Related, same session: **an error string another test matches on is an interface.** Rewording
+`"unsupported control characters"` broke `bootstrap_script_rejects_control_characters`, and neither a
+stale full-lib run nor the author's targeted groups could see it — only the authoritative workspace
+sweep did.
+
+★★★ **THE CAPSTONE — why this item exists at all.** On the false `Debug`-escaping claim, the
+attribution matters far less than the propagation: it passed through **a reviewer**, through **the
+coordinator**, and through **the author** into a committed code comment *and* a commit message.
+**Three review checkpoints, none of which caught it — because none of them was a machine check.**
+The assertion caught it on **first execution**.
+That asymmetry is the entire argument of this register: prose review, however careful and however
+many people it passes through, does not converge on truth the way a single executed assertion does.
+So the working rule is to **over-encode claims as tests rather than argue them in prose** — and to
+treat any safety claim that has *only* been reviewed, no matter by how many parties, as unverified.
+
 Proposed fix / convention:
 - For each security control, at least one test that exercises the **real call
   path** and goes red if the enforcement call is deleted.
@@ -544,10 +593,25 @@ failed ping; `virsh` domain state plus a TCP/22 probe showed it running with SSH
 open. A separate, long-standing false negative exists in the other direction on
 macOS, where an in-process TCP probe reports the port closed for every node.
 
+★ **Third instance, and it cost two investigation cycles: `wg show` FAILS on a userspace
+shared-transport node.** A capture read `wg show rustynet0 allowed-ips` on every sampled host and
+recorded `aips=[]` for the final exit on every sample — which was read as *"that node has no
+WireGuard peers"* and briefly became a leading hypothesis for a dataplane failure. It was neither:
+`wg show` exits **1** there, because that node runs the **userspace shared-transport** backend and
+has no kernel WireGuard device to query. The daemon's own status showed both peers correctly
+programmed. This is the same property that makes `path_live_proven` unsatisfiable on shared-transport
+nodes while the kernel-backend node answers fine.
+
+The generalisable rule, which is the whole point of this item: **an instrument that can fail must
+have its failure distinguished from its negative result.** `aips=[]` conflated "queried, found none"
+with "the query failed" — and a capture that records only the parsed value, discarding the exit
+code, cannot tell them apart. Record the tool's exit status alongside its output, and treat a
+non-zero exit as *unknown*, never as *empty*.
+
 Proposed fix: readiness and reachability checks assert the protocol actually
 required (a TCP connect, or a real SSH session), never ICMP; and any probe that
 is known to produce false negatives in a given environment says so at the point
-of use.
+of use. Any probe reading a tool's stdout must also capture and act on its exit code.
 
 ### QH-11 — Durable working state must not live in the temp directory
 **Severity: low. Confidence: VERIFIED.**
@@ -706,11 +770,52 @@ Proposed fix:
 Acceptance: a gate result is only accepted with the tool's own exit code, captured without
 a pipeline in the path.
 
-**Related, same family (see QH-07):** `awk -F,` on the lab CSVs silently reads the wrong
-column, because every row carries quoted comma-bearing fields. That one produced a
-confidently wrong "no `pass` rows" conclusion which was then used to overturn a correct
-finding. Both are cases of a convenience idiom quietly invalidating evidence rather than
-failing loudly.
+★ **THIS IS A FAMILY, NOT A ONE-OFF — four instances in a single session, each one a tool
+reporting success while doing nothing or reading the wrong thing.** Collected here because the
+shared lesson is stronger than any single case: **read the count, not the word `ok`; read the
+tool's own exit code, not the pipeline's; and prove the reader parses what you think it does.**
+
+1. **Pipeline swallows the exit code.** `cargo test … | tail -60` exits with **`tail`'s** status.
+   Invalidated a reported-green workspace gate; the truncated tail also under-reported the test
+   count by two orders of magnitude (27 vs ~10,000).
+2. **`awk -F,` on the lab CSVs reads the wrong column**, because every row carries quoted
+   comma-bearing fields. Produced a confidently wrong "no `pass` rows" conclusion which was then
+   used to **overturn a correct finding** (see QH-07).
+3. ★ **A test filter that matches nothing still prints `ok`.** `cargo test` reported
+   `0 passed; 0 failed … ok` because `ops_e2e` is declared in **both** `lib.rs` and `main.rs`, so
+   without `--lib` the filter matched no target. A test suite that ran zero tests is
+   indistinguishable from a green one if you read the word rather than the number.
+4. ★ **An unquoted `$VAR` in zsh doesn't word-split**, so a multi-file `grep "$FILES"` searches one
+   bogus filename, fails, and the failure reads as "clean". Produced a false all-clear on a
+   credential scan of files about to be pushed to a **public** repo.
+5. ★★ **A task-completion notification reported "exit code 0" for a run whose `cargo test` exited
+   `101` with a failing test.** The notification carries the **wrapper's** status, not the tool's.
+   Only an explicitly captured `WORKSPACE_TEST_EXIT=101` revealed it — and the branch was one
+   message from being reported READY TO INTEGRATE. This is the most dangerous member of the family
+   because the false signal arrives at the *coordinator*, who is furthest from the evidence and most
+   likely to treat "exit code 0" as authoritative. **A completion notification is not a gate
+   result.** Require the tool's own captured exit code, quoted, in the report.
+
+6. ★★ **A git pipeline's later steps silently operated on the wrong content.** A
+   `git stash` → `reset --soft` → `stash pop` sequence had the **pop fail mid-pipeline**
+   (`local changes would be overwritten`, stash retained) — and the three recommits that followed
+   captured the **unfixed** file. Caught only by inspecting the artifact (`git show <commit>:file`)
+   rather than trusting that the command sequence had done what it reads as doing.
+   Specifically: **`git stash pop` after `reset --soft` is unsafe**, because the reset
+   re-materialises the same paths as local changes, so the pop cannot apply. Generalised:
+   **check the artifact, not the command sequence.**
+
+Countermeasures that actually work, all used successfully afterwards: capture the tool's own exit
+code with no pipeline in the path; assert on the parsed **count**; add a **positive control** —
+a pattern that MUST match, so a silent no-op is visible; distinguish grep's exit codes
+(`0` found / `1` clean / other = **error, do not trust**); and after any multi-step git
+manipulation, verify the committed content with `git show <commit>:<path>` before reporting.
+
+★ **A corollary that caught the same line twice in one cycle: a comment-only edit is NOT inert.**
+Under `-D warnings`, reformatting a doc comment tripped `clippy::doc_lazy_continuation` (a closing
+paragraph following a bullet list with no blank `///` separator) and took clippy to **exit 101 with
+3 errors**. It was caught only because gates were re-run after a restructure instead of assuming
+prose couldn't break a build. Re-run the gates after documentation changes too.
 
 ### QH-17 — The Windows lab-image provisioning path is internally inconsistent
 **Severity: medium. Confidence: VERIFIED by code read on `main`.**
@@ -793,6 +898,32 @@ Two consequences, and the second is the one that matters:
   ★ **Fix must be taken by the ORCHESTRATOR, not the launcher** — otherwise the documented
   direct form still bypasses it.
 
+★★ **CORRECTION 2026-07-26 — "per-host exclusion" is the WRONG unit, and this item's own framing
+(the coordinator's) would have regressed a documented workflow.** Concurrent runs on **one** host are
+**intended**: `ai_agent.rs:421` sets `MAX_CONCURRENT_LAB_RUNS = 3`; `:3760-3779`'s `allow_concurrent`
+raises the cap and its own refusal text instructs callers to pass it *"AND disjoint guests"*; `:3828`
+gives each run its own `CARGO_TARGET_DIR`; and `CLAUDE.md` §12.5 documents "≤3 overlapping" for the
+macOS↔Windows pipeline. A per-host lock would break parallelism the project deliberately built.
+**The hazard is guest contention, not host occupancy.** The exclusion unit must be the **resolved
+guest-alias set** — refuse a run whose guests overlap an in-flight run's, allow disjoint sets through.
+Two further design constraints, both verified:
+- **Lock at `main.rs:8440 execute_ops`, not at the individual functions.** Three existing tests call
+  the would-be-locked functions directly (`mod.rs:53694`, `:46211`, `:46284`) and nextest runs one
+  process per test, so locking at function entry would make unit tests contend on real production lock
+  state. `execute_ops` is a clean chokepoint: one caller, zero test callers, every invocation form
+  reaches it.
+- **Use `flock`, not a pidfile.** The kernel releases it on process death, so there is no recorded pid
+  to argv-verify and the stale-lock and pid-recycling classes vanish. The repo already has this shape
+  at `live_lab_run_matrix.rs:2216`. (The argv-verifying pidfile remains correct for the **stop** path,
+  which must signal a pid it did not create.) Verified on Darwin: flock conflicts across two separate
+  `open()`s in the *same* process (errno 35), so it must be taken exactly once per process — which the
+  chokepoint gives for free.
+**Residual accepted deliberately:** closing the false *negative* removes the dangerous direction. The
+false *positive* — `pgrep` self-tripping on an inline-over-SSH launch — stays open, because closing it
+means editing `script_template.rs:697`/`:2144` plus the two assertions pinning that string
+(`mod.rs:54748`, `:54866`) in a file that just landed. An annoyance is not worth disturbing a settled
+security boundary.
+
 Proposed fix: replace the pattern match with a real mutual exclusion — a pidfile or lockfile
 whose liveness is confirmed by checking the recorded pid's identity (this repo already has a
 pid-recycling-safe guard for the *stop* path that argv-verifies before signalling; the same
@@ -849,8 +980,22 @@ diff), by an isolated re-run, and by seeing it pass on a second unrelated branch
 
 Why it is worth fixing rather than tolerating: it makes every workspace test run slower, it
 produces failures that get attributed to whichever change is in flight, and it trains people
-to explain away a red suite. A unit test should not depend on name resolution — inject the
-resolver or use a reserved-for-testing name with a bounded timeout.
+to explain away a red suite.
+
+★★ **CORRECTED AND FIXED 2026-07-26 — the stated mechanism was WRONG, and the truth is worse than
+flakiness.** It does **not** depend on name resolution: `ssh_target` is rewritten to the
+utmctl-discovered IP before any probe runs, so `alpha-host` was never resolved at all. Measured by
+watching the test's children: ~90 s with no child process (three × 30 s **TCP** timeouts inside
+`probe_tcp_port_status`), then a 15 s **real `ssh`** invocation.
+★ **The actual finding: the fixture used `192.168.64.8` — this Mac's live UTM bridge subnet, where
+`192.168.64.20` is a real lab guest.** So a *unit test* was opening TCP connections and SSH sessions
+against an address range that hosts live lab VMs. That is a test reaching out of its sandbox into the
+running lab, not merely a slow test.
+Fixed by repointing at TEST-NET-1 / `.invalid` with a bounded timeout, matching the sibling test
+below it: **106 s → 6.7 s**, outcome now environment-invariant, and still sensitive (forcing
+`process_present = true` turns it red).
+Generalisable check worth applying elsewhere: **grep the test fixtures for addresses inside the lab's
+live subnets.** A test that happens to target a real guest passes or fails on what that guest is doing.
 
 ### QH-21 — Windows failure-artifact collection throws, losing diagnostics and inventing a second failure
 **Severity: medium-high (destroys evidence exactly when it is needed). Confidence: VERIFIED live.**
@@ -1026,6 +1171,208 @@ is the data block to report** — "the assertion passed" is not checkable eviden
 Minor: a session with a null `InternalSourceAddress` makes `.Split` raise a non-terminating error
 and skip that item (`$ErrorActionPreference` is `Continue` here); the assertion's verdict is
 unaffected.
+
+### QH-26 — Three unreviewed delegated-edit WIP checkpoints are on `main`, one of which deleted a trust check and silently repurposed its own negative test
+**Severity: HIGH as a process failure. Confidence: VERIFIED end-to-end.**
+**★ Do NOT simply revert `f1ef83b1` — read the direction finding below first.**
+
+`documents/…/CLAUDE.md` §12.6 states that a delegated-edit job's branch is **never merged back**, and
+that "reviewing and merging that branch is a human step — that is the actual security checkpoint."
+That checkpoint was bypassed. Three commits whose own message reads *"Committed by the
+delegated-edit tier because the job ended before the agent committed. **Review before merging.**"*
+are reachable from `origin/main`, all dated 2026-07-20, all touching `crates/rustynetd/` — the
+trust-path crate:
+
+| commit | shape |
+|---|---|
+| `f1ef83b1` | `daemon.rs` −14, `phase10.rs` −7 — **the only one that removes anything** |
+| `f54edda5` | `daemon.rs` +57/−1 — additive |
+| `15cf9f11` | `daemon.rs` +56 — purely additive |
+
+**What `f1ef83b1` removed:** the `tls13_valid` field from the trust-evidence structs, **two**
+enforcement points (`daemon.rs:2345-2347` `"trust evidence tls13_valid=false"`, and
+`phase10.rs`'s `TrustRejected("tls13_not_valid")`), and the evidence-file parser's
+**required-key** check (`missing tls13_valid` → `InvalidFormat`). On `main` today a single `tls13`
+reference survives, a leftover fixture string at `daemon.rs:21499`.
+
+★ **DIRECTION FINDING — the deletion is probably CORRECT, and reverting would restore security
+theatre.** The audit `DocCodeDiscrepancyAudit_2026-07-18.md` DA-01 (**Critical**) had already
+established that this field was **hardcoded `true` at issuance regardless of any real transport** —
+every producer emits the literal `tls13_valid=true`
+(`rustynet-cli/src/main.rs:8075`, `bin/rustynet-windows-trust-cli.rs:271`,
+`vm_lab/orchestrator/adapter/windows_install.rs:935`, plus test fixtures), and verification merely
+checked that the string parsed back as `true`. The audit's words: *"a second self-asserted,
+non-enforcing TLS claim layered on top of the original one — the gap has widened, not narrowed."*
+No crate depends on a TLS library for the control plane. So the removed "control" asserted nothing,
+and deleting it makes the code **more** honest. This is the *diagnose-direction-before-fixing* case:
+a vanished check is not automatically a regression.
+
+**The real defects, therefore, are process and honesty rather than a missing control:**
+1. **An explicitly-unreviewed WIP checkpoint reached `main`** and mutated the trust path. Whatever
+   its content, that is the review gate failing, and it happened three times.
+2. **The negative test was silently repurposed, not retired.** `tls13_valid: false` →
+   `signed_control_valid: false`, so the suite stays green and the removal is invisible — QH-02's
+   pattern again, this time hiding a deliberate change rather than a bug.
+3. **No rationale, no ledger entry, no link to DA-01.** A future reader sees a fail-closed check
+   disappear under a message that says "WIP".
+4. ★ **The doc/code gap has now inverted.** `SecurityMinimumBar.md` still claims "TLS 1.3 enforced
+   for control-plane APIs". The code got more honest; the document did not. DA-01 remains open and
+   is now the substantive item — **either implement real control-plane TLS or correct the claim**.
+   That is a change to a stated security property in the minimum bar, so it is an **operator
+   decision**, not an agent one.
+
+Acceptance: (a) `f1ef83b1`'s content is either confirmed-and-documented (rationale, DA-01 link, an
+honest test that fails for the right reason) or reverted on the merits — decided deliberately, not
+by default; (b) the two additive checkpoints are reviewed on their merits; (c) something prevents a
+"Review before merging" commit reaching `main` again; (d) DA-01 is resolved by the operator.
+
+### QH-27 — Rebasing across a moved base while holding uncommitted work silently reverts other lines' commits
+**Severity: medium-high (data loss, and it nearly landed twice). Confidence: VERIFIED — two independent near-misses in one session.**
+
+With several lines integrating in parallel, `origin/main` moves under work-in-progress. Two
+distinct near-misses, both caught only because someone checked deliberately:
+
+1. A line held an older copy of `QualityHardeningTodo_2026-07-25.md` in its working tree. After a
+   soft reset across a moved base, that stale copy presented as a **modification**, and committing
+   it would have **reverted the register entries another line had just landed** — silently, with no
+   conflict. Avoided by taking `origin/main`'s version for every file `main` had changed before
+   committing.
+2. The same shape from the opposite direction: taking a **remote host's** working copies of the
+   three evidence ledgers to harvest appended rows. The box sat at `b7667cce` while `main` had
+   moved to `9fd68a07`, so a blind copy would have dropped the rows appended in between. Avoided by
+   diffing the host's ledgers against `main` first and confirming they were byte-identical, so the
+   copy could only add.
+
+Neither case produces a merge conflict, because in both the file is *whole* and merely older —
+which is exactly why it is dangerous. Append-mostly shared files (the run matrix, stage results,
+the triage jsonl, and any register or ledger several lines write) are the exposed surface.
+
+Practice that caught both, and should be the rule: **before copying or committing a whole file that
+another line may have touched, diff it against `origin/main` and confirm you would only ADD lines,
+never remove them.** A "lost lines" count of zero is the check; if it is non-zero, inspect every one
+before proceeding. Prefer targeted edits over whole-file copies for shared documents, and re-fetch
+immediately before any push.
+
+### QH-28 — The Windows installer script is SHARED with the shipped product, and on that path it mints a self-signed code-signing cert into `LocalMachine\Root`
+**Severity: HIGH (trust-store modification on an end-user machine). Confidence: VERIFIED by code read.**
+**★ OPERATOR DECISION — do not "fix" this autonomously. It is a design question about a shared script, not a bug with an obvious correct answer.**
+
+`scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1` is embedded in **two** places:
+
+- `crates/rustynet-cli/src/install/live_windows.rs:27` — the **shipped** installer
+- `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs:48` — the lab path
+
+`install/mod.rs:19` declares `mod live_windows;` with **no cfg gate** and `main.rs:5` pulls in
+`mod install`, so it is in the **default build** — not behind `vm-lab`, not lab-only.
+`live_windows.rs:207` writes the embedded script and invokes it with no switch that skips signing,
+and the signing block (~`:898`) is top-level, so it runs on **every** invocation.
+
+★ **The finding that needs an operator, not an agent:** that block's own comment states it "never
+leaves the lab guest" — and that is false, because the shipped path executes it. On that path it
+**mints a self-signed code-signing certificate and installs it into `LocalMachine\Root`**, i.e. the
+machine-wide Trusted Root store on an end user's computer. Consequences to weigh, none of which an
+agent should decide alone: anything signed with that key becomes trusted machine-wide; the key
+material's location and lifetime on the user's machine matter; and the reassurance in the comment is
+exactly the false-safety-claim pattern of QH-05, here guarding the most consequential behaviour in
+the file.
+
+Two consequences that are settled and actionable now:
+
+1. **A lab-motivated edit to this script is a PRODUCT change.** The arm64-first signtool defect
+   (QH-23) lived here, so its fix touches the shipped install path. Review it as such, and consider
+   whether it warrants a release note. Bounding the blast radius honestly: the defect only bites
+   where a Windows SDK is **present** with an `arm64` subdirectory — on a clean end-user machine
+   with no SDK the old code already threw "SDK not found", so the real-world exposure was
+   developer/build machines, and the fix strictly improves both cases. The relevant sharpener is
+   that release ships **`x86_64-pc-windows-msvc` only**, so every shipped Windows target is exactly
+   the architecture the old ordering broke.
+2. ★ **The two installer copies propagate by DIFFERENT mechanisms**, which matters for verifying any
+   fix to either: the daemon installer is `include_str!`-embedded, so it ships only via a **rebuild**
+   (cargo does track the `.ps1` — touching it triggers a recompile, verified); the relay installer is
+   **not** embedded and is resolved from the source root at runtime (`ops_e2e.rs:1662`), so it
+   propagates via the **guest source sync**. A stale binary hides a daemon-side fix; a stale guest
+   source tree hides a relay-side one. This also means QH-23's pinning test is doing more work than
+   credited — it holds two copies identical across two different delivery mechanisms.
+
+Acceptance: (a) the operator decides whether the shipped path should mint and trust a self-signed
+cert at all, and the comment is corrected to describe what actually happens on each path; (b) edits
+to this script are recognised as product changes in review; (c) any future divergence between the
+two copies fails a test rather than a live run.
+
+**Open, deliberately not decided by an agent: does the signtool-architecture fix warrant a release
+note?** The fix touches the shipped install path, and the defect it corrects could select an
+unrunnable signtool on any x86-64 machine that has a Windows SDK present — i.e. developer and build
+machines rather than clean end-user installs. Whether that reaches a release note is a
+release-process judgement. The landing commit carries a `NOTE FOR RELEASE REVIEW` header stating the
+shared-embedding fact so a release reviewer sees it without tracing `mod install`, and explicitly
+leaves this question open rather than answering it.
+
+### QH-29 — A fail-closed runtime self-assertion that pattern-matches generated config couples that config's *formatting* to daemon liveness
+**Severity: medium (latent, fleet-wide blast radius). Confidence: VERIFIED — the hazard was checked and found benign, but only by looking.**
+
+Adding a `counter` to the two hairpin nftables rules — a **pure observability change** with no
+behavioural effect — came within one implementation detail of failing the daemon closed on **every
+exit-serving node**.
+
+`assert_nat_forwarding` is a runtime killswitch self-assertion: it verifies the *live* ruleset
+contains `["iifname", iface, "oifname", iface, "masquerade"]`. Inserting `counter` changes the
+rendered line to `… oifname "rustynet0" counter packets 0 bytes 0 masquerade`. Had that matcher
+required the tokens to be **adjacent**, the assertion would have failed against a correct ruleset,
+and the node would have fail-closed — correctly, by its own logic, on a change that altered nothing
+about forwarding.
+
+It is safe because `chain_contains_all_tokens` (`phase10.rs:1160-1163`) tests each token as an
+**independent substring** rather than as a sequence. That is load-bearing and was previously
+undocumented; it is now noted at both rule sites so the matcher cannot be "tidied" into adjacency
+without seeing what depends on it.
+
+★ **The generalisation, and the actionable part:** wherever a fail-closed runtime assertion
+**string-matches generated configuration**, the config's *textual format* becomes part of the
+liveness contract — so a formatting-only edit can take a fleet down, and nothing in the type system
+says so. Two rules follow. First, before editing generated config text, grep for runtime assertions
+that match it. Second, **sweep for other instances**: any other self-assertion that pattern-matches
+rendered nft/route/systemd/registry output has the same coupling, and each one wants the dependency
+documented at both ends — the matcher and the generator.
+
+Worth pairing with QH-24: assertions over *generated text* are exactly the shape that is hard to
+test, because the test usually re-renders the text rather than exercising the live matcher.
+
+### QH-30 — Coverage that existed only as a side-effect of a bug disappears when the bug is fixed, silently
+**Severity: medium-high (a fail-closed branch is now wholly uncovered). Confidence: VERIFIED.**
+
+The `extra_peers` fail-closed branch (`daemon.rs:6730-6739`) — the one that rejects a traversal
+snapshot containing peers the assignment does not manage — had **no test**. It was nonetheless
+exercised end-to-end on every `two_hop` run, but only **by accident**: the stage's non-atomic bundle
+swap kept producing exactly that inconsistent state, so the branch fired constantly and its
+correctness was continuously demonstrated as a side effect of a defect.
+
+Fixing the defect (the atomicity fence) removed the only thing exercising it. The branch is now
+covered by **neither a live run nor a unit test**, while its sibling — the `missing` direction — is
+pinned at `daemon.rs:26328`. Nobody would notice, because it *used* to be well exercised.
+
+★ **The generalisable risk, stated by the line that found it:** *a fail-closed branch whose only
+historical proof was an accident of a broken test topology is one refactor away from silently
+becoming fail-open.* And the reason it evades every normal check: coverage tooling sees a branch that
+was recently and repeatedly executed, ledgers record it passing, and nothing flags that the
+*mechanism* which executed it has been deliberately removed.
+
+Actionable: whenever a fix removes an error condition that used to occur routinely, ask **what was
+that error condition exercising, and does anything still exercise it?** Then sweep for other branches
+whose only exercise is incidental — likely candidates are error paths that fire because of a known
+defect, and negative branches reached only via a misconfiguration the project is actively fixing.
+
+A precise spec for the missing test is recorded on the two_hop line's ledger: mirror the multi-peer
+snapshot test with the traversal index a strict **superset** of the assignment peer set; assert the
+"unmanaged peers" failure names the extra peer and that `restriction_mode`/`reconcile_failures`
+advance. It was deliberately **specced rather than half-built**, on the sound reasoning that a
+half-built negative test is worse than a documented gap — it looks like coverage.
+
+**Related, from the same retraction cycle — an inference rule worth keeping:** *counter arithmetic can
+bound magnitudes but cannot localise a drop across a netfilter hook upstream of the counter.*
+`IPSTATS_MIB_OUTFORWDATAGRAMS` increments in `ip_forward_finish`, downstream of `NF_INET_FORWARD`, so
+a packet dropped in the FORWARD chain is never counted — which is why a forwarded-packet count could
+not distinguish "replies never arrived" from "replies arrived and were dropped". The coordinator
+endorsed that arithmetic as decisive; it wasn't.
 
 ---
 
