@@ -299,8 +299,12 @@ impl CatalogImage {
                 self.name
             )
         })?;
-        ensure_script_safe_value("filename", self.filename.as_str())
-            .map_err(|err| format!("catalog schema: image {:?}: {err}", self.name))?;
+        // No `ensure_script_safe_value` on `filename`: `ensure_provision_image_name`
+        // is a strict `[A-Za-z0-9._+-]` allowlist, which strictly SUBSUMES that
+        // metacharacter deny-list (every character it refuses is already outside the
+        // allowlist). A second call would read as an additional control while adding
+        // nothing — the shape of redundancy that makes a reader unsure which check is
+        // load-bearing.
 
         if !self.url.starts_with("https://") {
             return Err(format!(
@@ -309,6 +313,14 @@ impl CatalogImage {
                 self.name, self.url
             ));
         }
+        // `ensure_script_safe_value` directly, rather than the composed
+        // `ensure_single_quoted_script_value` its doc steers callers to, is deliberate
+        // here: the catalog is not a shell sink. Shell safety for this value is
+        // enforced where it is actually used — `shell_quote` at the SSH sink, and
+        // `Binding::Literal` in `script_template` — so this check exists for catalog
+        // hygiene, to stop a row being authored that a downstream consumer would then
+        // reject. Adding the single-quote refusal would also bound URL length, which
+        // is not a property a catalog URL should have to satisfy.
         ensure_script_safe_value("url", self.url.as_str())
             .map_err(|err| format!("catalog schema: image {:?}: {err}", self.name))?;
 

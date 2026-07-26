@@ -83,6 +83,14 @@
 //!   and no constructor. That is what makes the `$HOME`-bearing defaults safe, and
 //!   it is checked by the compiler (verified: constructing one from another module
 //!   fails with `E0603`).
+//!
+//!   The distinction is concrete, not hypothetical: `vm_lab::image_catalog`'s
+//!   `leak_host_id` is a live `String::leak` → `&'static str` factory over
+//!   **inventory data**, one module away. It cannot reach `RawFragment` — `Binding`
+//!   is private to this module and `RawFragment` is constructed at exactly one site
+//!   (`HostSshPath::binding`) — but it is precisely the thing a `&'static str`
+//!   parameter would NOT have excluded. If `Binding` is ever made more visible, that
+//!   function is the first place to check.
 //! - [`Binding::HeredocBody`] — a multi-line body interpolated into a quoted
 //!   heredoc. Neither escaping nor a metacharacter rule is the right control
 //!   there; the rule is "the body must not contain a line equal to the
