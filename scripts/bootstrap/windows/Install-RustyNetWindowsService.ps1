@@ -896,24 +896,97 @@ Copy-Item -LiteralPath $relaySource -Destination $relayDest -Force
 # Idempotent: an existing non-expired cert with the same subject is
 # reused; signtool re-signing replaces the prior signature in place.
 Set-InstallProgressStep 'sign-installed-binaries-for-authenticode'
-$signtoolCandidatePatterns = @(
-    'C:\Program Files (x86)\Windows Kits\10\bin\*\arm64\signtool.exe',
-    'C:\Program Files\Windows Kits\10\bin\*\arm64\signtool.exe',
-    'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe',
-    'C:\Program Files\Windows Kits\10\bin\*\x64\signtool.exe',
-    'C:\Program Files (x86)\Windows Kits\10\bin\*\x86\signtool.exe'
-)
-$signtoolPath = $null
-foreach ($pattern in $signtoolCandidatePatterns) {
-    $found = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue |
-        Sort-Object FullName -Descending |
-        Select-Object -First 1
-    if ($found) { $signtoolPath = $found.FullName; break }
+# Pick a signtool.exe whose architecture can actually EXECUTE on this machine,
+# most-preferred first.
+#
+# This list used to be hardcoded arm64-first. That was correct for the only
+# Windows guest that had ever existed in the lab (an Apple-Silicon UTM guest
+# running arm64 Windows) and silently wrong everywhere else: the Windows SDK
+# installs bin\<version>\{arm,arm64,x64,x86}\ side by side regardless of host
+# architecture, so on an x86-64 guest the arm64 pattern still matched and won.
+# The selected binary then could not run -- x64 Windows cannot execute arm64
+# images (only arm64 Windows emulates x64, not the reverse) -- so signing failed
+# and Install-RustyNetWindowsService.ps1 Write-Error'd, failing bootstrap_hosts.
+# Observed live on windows-x86-1, the first x86-64 Windows node in the lab
+# (run winnat-20260725T190000Z picked ...\10.0.26100.0\arm64\signtool.exe).
+#
+# Only runnable architectures are listed, deliberately: including a
+# non-executable one as a last resort would trade a clear "SDK not installed"
+# error for an obscure exec failure. That omission is safe because `x86` appears
+# in EVERY branch and an x86 signtool runs natively on x86, under WOW64 on x64,
+# and under emulation on ARM64 -- so a universally-runnable fallback is always
+# present. Note also that the ARM64 host keeps a byte-identical preference order
+# to the previous hardcoded list, so the one Windows node that ever worked sees
+# no behavioural change at all.
+#
+# --- BEGIN shared signtool resolver -----------------------------------------
+# Byte-identical in Install-RustyNetWindowsService.ps1 and
+# Install-RustyNetWindowsRelayService.ps1, and pinned to stay that way by
+# windows_installers_share_one_signtool_resolver in
+# crates/rustynet-cli/src/ops_e2e.rs. Do not edit one copy alone: the daemon and
+# the relay must be signed by the same signtool, and a comment asking for that is
+# not a control.
+function Get-ResolvedProcessorArchitecture {
+    # PROCESSOR_ARCHITEW6432 is set when a 32-bit process runs on a 64-bit OS and
+    # reports the NATIVE architecture; PROCESSOR_ARCHITECTURE would report the
+    # emulated one. Prefer the native answer.
+    $arch = $env:PROCESSOR_ARCHITEW6432
+    if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+    return [string]$arch
 }
+
+function Get-RunnableSigntoolArchitectures {
+    $arch = Get-ResolvedProcessorArchitecture
+    switch ($arch) {
+        # arm64 Windows runs arm64 natively and x64/x86 under emulation.
+        'ARM64' { return @('arm64', 'x64', 'x86') }
+        # x64 Windows runs x64 natively and x86 under WOW64. NOT arm64.
+        'AMD64' { return @('x64', 'x86') }
+        'x86'   { return @('x86') }
+        # Fail closed rather than guessing. Defaulting to x64/x86 would, on a
+        # genuine ARM32 host, select an image that cannot execute -- reintroducing
+        # exactly the obscure exec failure this ordering exists to prevent.
+        default {
+            throw ("unsupported processor architecture for signtool selection: '" +
+                $arch + "'; expected ARM64, AMD64 or x86")
+        }
+    }
+}
+
+function Resolve-RustyNetSigntoolPath {
+    $roots = @(
+        'C:\Program Files (x86)\Windows Kits\10\bin',
+        'C:\Program Files\Windows Kits\10\bin'
+    )
+    # Enumerate version-shaped SDK directories only, newest first by NUMERIC
+    # version. Globbing bin\*\ and sorting FullName lexicographically (the prior
+    # form) let a stray directory such as 'zz-backup' outrank the real SDK, and
+    # ordered 10.0.9041.0 ABOVE 10.0.26100.0 because the comparison was textual.
+    $versionDirs = @()
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $versionDirs += @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^10\.\d+\.\d+\.\d+$' })
+    }
+    $versionDirs = @($versionDirs | Sort-Object -Property { [version]$_.Name } -Descending)
+    # Architecture is the OUTER loop: a runnable architecture matters more than a
+    # newer SDK, because an unrunnable image cannot sign at all.
+    foreach ($arch in (Get-RunnableSigntoolArchitectures)) {
+        foreach ($versionDir in $versionDirs) {
+            $candidate = Join-Path $versionDir.FullName (Join-Path $arch 'signtool.exe')
+            if (Test-Path -LiteralPath $candidate) { return $candidate }
+        }
+    }
+    return $null
+}
+# --- END shared signtool resolver -------------------------------------------
+
+$signtoolPath = Resolve-RustyNetSigntoolPath
 if (-not $signtoolPath) {
-    throw ("signtool.exe not found under any Windows SDK path; install Windows SDK 10 " +
-        "(VS Build Tools) before re-running install-release. Patterns searched: " +
-        ($signtoolCandidatePatterns -join '; '))
+    throw ("signtool.exe not found under any Windows SDK path runnable on this " +
+        "machine (resolved architecture: " + (Get-ResolvedProcessorArchitecture) +
+        "); install Windows SDK 10 (VS Build Tools) before re-running " +
+        "install-release.")
 }
 Write-Host "[install-helper] authenticode: using signtool at $signtoolPath"
 
