@@ -7574,6 +7574,99 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         );
     }
 
+    /// The signtool resolver is duplicated verbatim in the daemon installer and
+    /// the relay installer, because each script is SCP'd to the guest on its own
+    /// and cannot dot-source a shared file. Nothing but this test stops the two
+    /// copies drifting apart.
+    ///
+    /// Byte-equality here is not tidiness — the two copies reach a guest by
+    /// *different delivery mechanisms*, so drift would surface asymmetrically and
+    /// silently:
+    /// * The daemon installer is `include_str!`-embedded into this binary
+    ///   (`vm_lab/orchestrator/adapter/windows_install.rs`, and separately
+    ///   `install/live_windows.rs` for the shipped installer), so a change to it
+    ///   propagates only when the binary is REBUILT. A stale binary hides it.
+    /// * The relay installer is resolved from the source root at run time, so a
+    ///   change to it propagates when the guest's source tree is RE-SYNCED. A
+    ///   stale guest tree hides it.
+    ///
+    /// One fix can therefore be live while the other is not, with no error
+    /// anywhere — which is precisely the kind of invariant that rots unnoticed
+    /// without a test asserting it.
+    ///
+    /// The failure it prevents: someone adds an `ARM` branch, reorders the
+    /// architecture table, or changes the SDK-version filter in ONE installer and
+    /// misses the other. The daemon and the relay would then be signed by
+    /// different signtool binaries — or one would resolve an image that cannot
+    /// execute — and nothing would catch it until a live run failed on a guest of
+    /// the wrong architecture. The change this pins is the one that decides
+    /// *which binary signs artifacts*, so per §4 it needs a verification method
+    /// and not just a comment asking for the invariant to hold.
+    #[test]
+    fn windows_installers_share_one_signtool_resolver() {
+        const BEGIN: &str = "# --- BEGIN shared signtool resolver";
+        const END: &str = "# --- END shared signtool resolver";
+
+        let scripts_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows");
+
+        let extract = |name: &str| -> String {
+            let body = std::fs::read_to_string(scripts_dir.join(name))
+                .unwrap_or_else(|err| panic!("{name} should be readable: {err}"));
+            let start = body
+                .find(BEGIN)
+                .unwrap_or_else(|| panic!("{name} must carry the shared signtool resolver marker"));
+            let end = body
+                .find(END)
+                .unwrap_or_else(|| panic!("{name} must carry the resolver END marker"));
+            assert!(end > start, "{name}: resolver END marker precedes BEGIN");
+            // Normalise line endings only — the region must otherwise match byte
+            // for byte, so a reordered architecture table cannot slip through.
+            body[start..end].replace("\r\n", "\n")
+        };
+
+        let daemon = extract("Install-RustyNetWindowsService.ps1");
+        let relay = extract("Install-RustyNetWindowsRelayService.ps1");
+        assert_eq!(
+            daemon, relay,
+            "the signtool resolver must stay byte-identical between the daemon and \
+             relay installers; they are signed by the same tool and drift here means \
+             one role silently gets a different (possibly unrunnable) signtool"
+        );
+
+        // Guard the properties the resolver exists to hold, so a same-in-both-copies
+        // regression is still caught.
+        for expected in [
+            // x86 is the universally-runnable fallback and must appear in every
+            // branch; dropping it is what would make omitting non-runnable
+            // architectures unsafe.
+            "'ARM64' { return @('arm64', 'x64', 'x86') }",
+            "'AMD64' { return @('x64', 'x86') }",
+            "'x86'   { return @('x86') }",
+            // Unknown architecture must fail closed, not guess x64.
+            "unsupported processor architecture for signtool selection",
+            // Native architecture wins over the emulated report.
+            "$env:PROCESSOR_ARCHITEW6432",
+            // SDK directories are version-filtered and ordered numerically.
+            r"^10\.\d+\.\d+\.\d+$",
+            "[version]$_.Name",
+        ] {
+            assert!(
+                daemon.contains(expected),
+                "shared signtool resolver lost a required property: {expected}"
+            );
+        }
+        // arm64 must NOT be reachable on an x64 host: that exact ordering bug
+        // failed bootstrap_hosts on windows-x86-1.
+        assert!(
+            !daemon.contains("'AMD64' { return @('arm64'"),
+            "an x64 host must never prefer the arm64 signtool"
+        );
+    }
+
     #[test]
     fn windows_relay_service_install_script_contains_hardening_gates() {
         let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
