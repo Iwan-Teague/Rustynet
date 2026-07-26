@@ -6,6 +6,32 @@ boundary), taking QH-12 with it (the register names QH-12 as QH-01's preconditio
 **Scope note:** QH-03 (fail-open script shape) is **adjacent but deliberately NOT in
 this plan** — see §6; its true scope is larger than the register states.
 
+## 0. STATUS UPDATE (2026-07-26) — QH-13 is CLOSED; read this before §10/§11
+
+This document was written while `QH-13` (validate-for-the-sink / SSH post-host argv)
+was still open, and it says so in several places below — **those statements are now
+stale**. `run_host_cmd` builds its remote command through `remote_command_string`,
+which `shell_quote`s every argument, so the sink is safe independently of what any
+caller validated. Both values this document names as exposed are covered: `pool`,
+and the stdout-derived `device` (which additionally gets an
+`ensure_no_control_chars` check at capture, because it is printed to the operator).
+
+The claim was also upgraded from INFERRED to **confirmed**: `ssh(1)` states that
+arguments "will be appended to the command, separated by spaces, before it is sent
+to the server to be executed", and an adversarial review then executed the pre-fix
+payload against a real lab host and observed remote command execution, followed by
+the post-fix payloads arriving as literal text.
+
+Specific stale lines, left in place because §2's own norm is to correct the record
+rather than delete it: §5 ("until QH-13 lands"), §6 (INFERRED), §10's "remain
+**open under QH-13**", and §11's "QH-13 untouched". Read them as historical.
+
+Not closed by that work, and still open: `run_host_cmd`'s siblings are fine, but
+the empty-args fail-open is now an error rather than a silent login shell, and
+`run_host_reboot` — a dead second copy of the SSH transport options with no
+`BatchMode`, no `StrictHostKeyChecking`, no pinned `known_hosts` and no `--`
+separator — was deleted rather than repaired.
+
 ## 1. Independent reproduction (the register's own norm: a finding is not a finding until reproduced)
 QH-01 is **CONFIRMED** against `crates/rustynet-cli/src/vm_lab/mod.rs` at local
 `main` (`f9388393`). All three legs verified by reading the code:

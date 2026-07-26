@@ -2881,31 +2881,17 @@ pub fn default_lab_ssh_identity_path() -> PathBuf {
         .join(".ssh/rustynet_lab_ed25519")
 }
 
-/// Reboots a target host using SSH and systemctl reboot
-#[allow(dead_code)]
-pub fn run_host_reboot(target: &str) -> Result<(), String> {
-    // Create a command to run via SSH
-    let mut cmd = Command::new("ssh");
-    cmd.arg(target);
-    cmd.arg("sudo -n systemctl reboot");
-
-    // Execute the command with a timeout of 20 seconds
-    let output =
-        run_output_with_timeout(&mut cmd, timeout_or_default(20, DEFAULT_RUN_TIMEOUT_SECS))
-            .map_err(|e| format!("Failed to execute reboot command: {e}"))?;
-
-    // The command may fail (e.g., if host is unreachable), but we don't want to fail the entire process
-    // as reboot is expected to fail immediately
-    if !output.status.success() {
-        eprintln!(
-            "Warning: Reboot command failed for target {}: {}",
-            target,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    Ok(())
-}
+// `run_host_reboot` was deleted here (QH-13 review, S4). It was dead
+// (`#[allow(dead_code)]`, no callers) and it was a SECOND, weaker copy of this
+// module's SSH transport setup: no `-F /dev/null`, no `BatchMode=yes`, no
+// `StrictHostKeyChecking=yes`, no pinned `known_hosts`, and no `--` separator — so
+// a `target` beginning with `-` would have parsed as an ssh option. Every live SSH
+// path goes through `append_ssh_transport_options`; a dormant second copy is the
+// drift that lets one path fall behind the others unnoticed. If host reboot is ever
+// needed, add it to a path that uses the shared transport options rather than
+// reviving this. Note §7.10 of HostObservabilityStabilityPlan also forbids
+// resurrecting its `sudo -n systemctl reboot`: the agent identity holds no sudo,
+// and reboot is a narrow polkit grant instead.
 
 fn default_live_lab_setup_profile_path(report_dir: &Path) -> PathBuf {
     report_dir.join("setup_live_lab_profile.env")
@@ -5802,10 +5788,15 @@ fn ensure_provision_image_name(image: &str) -> Result<(), String> {
 /// must start with `/`). An allowlist rather than a metacharacter deny-list
 /// because sink 1 is a real shell.
 ///
-/// **Scope:** this closes the pool exposure for this function only. The
-/// `run_host_cmd` sink itself is unchanged, and `device` at the `lsblk` call
-/// below is derived from the previous command's *remote stdout* — remote output
-/// into remote argv. Both are **QH-13**, tracked separately.
+/// **Scope (updated — QH-13 has since landed).** This allowlist closes the pool
+/// exposure for this function. The `run_host_cmd` sink itself is **no longer
+/// unchanged**: it now `shell_quote`s every argument, so it is safe independently of
+/// this validator. Both layers are kept deliberately — quoting makes a value inert
+/// as syntax, and this allowlist is what confines it as a *path* (an escaped
+/// `../../etc/passwd` is a valid shell word that still traverses out of the pool).
+/// `device` at the `lsblk` call below is remote stdout flowing into a remote
+/// command; it is covered by the same quoting, plus an `ensure_no_control_chars`
+/// check at capture because it is printed to the operator.
 ///
 /// Enforced at `execute_ops_vm_lab_provision_guest` (above both sinks); proven by
 /// `provision_guest_refuses_hostile_pool_on_the_real_call_path`.
@@ -5907,8 +5898,10 @@ pub fn execute_ops_vm_lab_provision_guest(
         .unwrap_or_else(|| DEFAULT_LIBVIRT_IMAGE_POOL.to_owned());
     // Validated here, above BOTH sinks it reaches: the `findmnt` SSH argv below
     // (whose remote login shell re-parses it) and `POOL=__POOL__` in the host
-    // script. See `ensure_provision_pool_path`; the `run_host_cmd` sink itself and
-    // the stdout-derived `device` value are QH-13.
+    // script. See `ensure_provision_pool_path`. Both sinks now ALSO quote
+    // independently — `run_host_cmd` via `shell_quote`, the script via
+    // `Binding::Literal` — so this is defence in depth for the syntax half, and the
+    // sole control for the path-confinement half, which no escaper provides.
     ensure_provision_pool_path(pool.as_str())?;
     let base = format!("{pool}/{}", config.image);
     let overlay = format!("{pool}/{}.qcow2", config.name);
@@ -5988,6 +5981,13 @@ pub fn execute_ops_vm_lab_provision_guest(
                 host.host_id
             ));
         }
+        // `device` is the ONE value here that is neither operator-supplied nor
+        // validated: it is the previous remote command's stdout. QH-13 makes it inert
+        // as *shell syntax* (it is `shell_quote`d into the next command), but that
+        // says nothing about it being safe to PRINT, and it is printed — into the
+        // refusal message below. So validate it here, which is the only point where
+        // it enters our control flow.
+        ensure_no_control_chars("device (from remote findmnt output)", device)?;
         let model = run_host_cmd(
             endpoint.as_str(),
             &["lsblk", "-no", "MODEL", device],
@@ -5997,7 +5997,10 @@ pub fn execute_ops_vm_lab_provision_guest(
         let model = model.lines().next().unwrap_or("").trim();
         if model != expected {
             return Err(format!(
-                "host {}: REFUSING — {pool} is on {device} reporting model {model:?}, \
+                // `{device:?}` not `{device}`: this is remote-derived text going to an
+                // operator's terminal, and `Debug` for `str` escapes control
+                // characters. `{model:?}` was already correct; `{device}` was not.
+                "host {}: REFUSING — {pool} is on {device:?} reporting model {model:?}, \
                  but the host declares pool_disk_model {expected:?}. Nothing was written.",
                 host.host_id
             ));
@@ -6072,6 +6075,41 @@ pub fn execute_ops_vm_lab_provision_guest(
         "host {} — {result}\n  next: discover_hosts to get its IP, then provision_guest_toolchain + bootstrap_vm\n",
         host.host_id
     ))
+}
+
+/// Build the single command string sent to a lab host over SSH.
+///
+/// This exists as its own function so the proving tests exercise **the code
+/// `run_host_cmd` actually runs**. The first version of this fix inlined the
+/// map/join and the tests re-implemented it, which meant reverting the fix left
+/// both named tests green — a safety comment citing tests that did not cover its
+/// enforcement point, i.e. the same QH-02/QH-05 shape the renderer work exists to
+/// eliminate. Keep the seam.
+///
+/// Every argument is [`shell_quote`]d and joined with a space, so the remote login
+/// shell parses exactly the words the caller passed. `shell_quote` is this module's
+/// existing escaper — also what `script_template` applies to `Binding::Literal` —
+/// rather than a second POSIX quoter beside it.
+///
+/// Empty `args` is an **error**, not an empty string. `ssh host ""` is "no command",
+/// so sshd opens an interactive login shell: the call exits 0 and returns the MOTD
+/// as stdout. Two callers would misread that — the in-flight-run probe treats
+/// non-empty output as "a run IS in flight", turning a MOTD into a phantom run, and
+/// two ledger readers would feed MOTD text to `parse_stage_result_csv`. Failing
+/// closed here is cheaper than teaching every caller to distrust its own stdout.
+fn remote_command_string(args: &[&str]) -> Result<String, String> {
+    if args.is_empty() {
+        return Err(
+            "refusing to run an empty remote command: ssh would open a login shell and \
+             return its MOTD as successful output"
+                .to_owned(),
+        );
+    }
+    Ok(args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 /// Run a command on a lab host over SSH.
@@ -6153,25 +6191,21 @@ fn run_host_cmd(
     )?;
     command.arg("--").arg(endpoint);
     // QH-13: one pre-quoted command string, because the remote side is a shell
-    // either way (see this function's doc comment). Quoting here is what makes the
-    // sink safe by construction instead of depending on each caller having
-    // validated for a shell rather than for argv — which two of them had not.
-    //
-    // Reuses `shell_quote`, the escaper this module already has and which
-    // `script_template` uses for `Binding::Literal`. Adding a second POSIX quoter
-    // beside it would be a new idiom for an existing job, and a duplicated
-    // security rule is how the original omission hid.
-    command.arg(
-        args.iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
+    // either way (see this function's doc comment). Built by
+    // `remote_command_string`, which is the seam the proving tests exercise — they
+    // must not re-implement the map/join, or reverting this line would leave them
+    // green (QH-02).
+    let remote = remote_command_string(args)?;
+    command.arg(remote.as_str());
     let output = run_output_with_timeout(&mut command, timeout)?;
     if !output.status.success() {
         return Err(format!(
-            "ssh {} on {endpoint} exited {}: {}",
-            args.join(" "),
+            // The QUOTED string is what crossed the wire, so it is what an operator
+            // needs in order to reproduce the failure by hand. The unquoted
+            // `args.join(" ")` used here before was not copy-pasteable and, for a
+            // value carrying spaces or metacharacters, actively misleading about
+            // what ran.
+            "ssh {remote} on {endpoint} exited {}: {}",
             status_code(output.status),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
@@ -37232,15 +37266,42 @@ fn ensure_no_control_chars(label: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{label} must not be empty"));
     }
-    // The whole ASCII control range, not just NUL/CR/LF. TAB, VT, FF, ESC and DEL
-    // used to pass, and these values are echoed back to the operator — the
-    // provision-guest dry-run plan prints `pool` with `Display` — so a raw ESC
-    // reaches a terminal and can rewrite what the operator believes they are
-    // approving. `\0`/`\n`/`\r` remain the load-bearing three (a newline is what
-    // lets a heredoc body emit its own terminator, per QH-19); the rest are cheap
-    // to refuse and no lab identifier or path legitimately contains one.
-    if value.chars().any(char::is_control) {
-        return Err(format!("{label} contains unsupported control characters"));
+    // `\0`, `\n` and `\r` are the load-bearing three: a newline is what lets a
+    // heredoc body emit its own terminator and escape into the outer script
+    // (QH-19), and a NUL truncates. Those are refused for SCRIPT-SAFETY reasons and
+    // are why this function exists.
+    //
+    // The rest of this check is for DISPLAY INTEGRITY, and the honest scope of that
+    // is narrower than an earlier version of this comment claimed. It justified the
+    // widening by "the dry-run plan prints `pool` with `Display`" — but `pool` goes
+    // through `ensure_provision_pool_path`, which allowlists `[A-Za-z0-9./_-]`, so
+    // `pool` cannot carry any of these and the widening does nothing for it. The
+    // values it does protect are the ones with no allowlist: `device` (remote
+    // `findmnt` stdout), `repo_dir`, `report_dir`, and forwarded orchestrator args.
+    //
+    // For those, refusing only `Cc` would miss the characters that actually rewrite
+    // what an operator sees. A terminal is not the only reader: `Cf` bidirectional
+    // overrides reorder rendered text (the Trojan-Source class) and `Zl`/`Zp` are
+    // line breaks that many viewers honour, so a value carrying them can make a
+    // refusal message read as an approval. Refuse all three categories.
+    //
+    // Prefer `{value:?}` at print sites regardless — `Debug` for `str` escapes `Cc`,
+    // and defence in depth is cheap here. It does NOT escape `Cf`/`Zl`/`Zp`, which
+    // is the other half of why they are refused at the boundary instead.
+    if let Some(bad) = value.chars().find(|ch| {
+        ch.is_control()
+            || matches!(ch,
+                // Cf bidirectional overrides / isolates.
+                '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                // Zl line separator, Zp paragraph separator.
+                | '\u{2028}' | '\u{2029}'
+            )
+    }) {
+        return Err(format!(
+            "{label} contains an unsupported control or text-direction character \
+             (U+{:04X})",
+            u32::from(bad)
+        ));
     }
     Ok(())
 }
@@ -55095,26 +55156,37 @@ mod provision_guest_create_tests {
 
 #[cfg(test)]
 mod run_host_cmd_quoting_tests {
-    use super::{ensure_no_control_chars, shell_quote};
+    use super::{ensure_no_control_chars, remote_command_string};
 
-    /// QH-13's enforcement point. `run_host_cmd` maps `shell_quote` over its args
-    /// and joins with a space, so these assertions describe the exact bytes the
-    /// remote login shell receives.
+    /// QH-13's enforcement point, exercised through the function `run_host_cmd`
+    /// itself calls. These assertions describe the exact bytes the remote login
+    /// shell receives.
+    ///
+    /// Deliberately does NOT re-implement the map/join: an earlier version did, so
+    /// reverting the fix left this test green while the sink was wide open. Asserting
+    /// on `remote_command_string` is what makes it bind.
     #[test]
     fn remote_command_words_are_shell_quoted() {
         assert_eq!(
-            shell_quote("/var/lib/libvirt/images"),
-            "'/var/lib/libvirt/images'"
+            remote_command_string(&["findmnt", "-n", "--target", "/var/lib/libvirt/images"]),
+            Ok("'findmnt' '-n' '--target' '/var/lib/libvirt/images'".to_owned())
+        );
+        // A metacharacter-bearing argument stays one word.
+        assert_eq!(
+            remote_command_string(&["findmnt", "--target", "/pool; id"]),
+            Ok("'findmnt' '--target' '/pool; id'".to_owned())
         );
         // An embedded single quote must be encoded, not terminate the word.
-        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
-        // The joined form is what actually crosses the boundary.
-        let joined = ["findmnt", "-n", "--target", "/pool; id"]
-            .iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(joined, "'findmnt' '-n' '--target' '/pool; id'");
+        assert_eq!(
+            remote_command_string(&["echo", "a'b"]),
+            Ok("'echo' 'a'\\''b'".to_owned())
+        );
+        // An empty argument must SURVIVE as `''`. The old argv form dropped it,
+        // silently shifting every later positional argument.
+        assert_eq!(
+            remote_command_string(&["grep", "", "file"]),
+            Ok("'grep' '' 'file'".to_owned())
+        );
     }
 
     /// The metacharacters the *quoting-position* validators deliberately PERMIT are
@@ -55141,8 +55213,13 @@ mod run_host_cmd_quoting_tests {
             "/pool#c",
             "/pool\nid",
             "two words",
+            "'",
+            "''',",
         ] {
-            let quoted = shell_quote(hostile);
+            let rendered = remote_command_string(&["cmd", hostile]).expect("non-empty args");
+            let quoted = rendered
+                .strip_prefix("'cmd' ")
+                .unwrap_or_else(|| panic!("unexpected render: {rendered}"));
             assert!(
                 quoted.starts_with('\'') && quoted.ends_with('\''),
                 "{hostile:?} -> {quoted}"
@@ -55156,6 +55233,15 @@ mod run_host_cmd_quoting_tests {
                 "{hostile:?} leaves an unencoded quote: {quoted}"
             );
         }
+    }
+
+    /// Empty args must fail closed rather than become `""`, which ssh reads as "no
+    /// command" — it opens a login shell and returns the MOTD as successful output.
+    #[test]
+    fn an_empty_remote_command_is_refused() {
+        let err = remote_command_string(&[]).expect_err("empty args must be refused");
+        assert!(err.contains("empty remote command"), "{err}");
+        assert!(err.contains("MOTD"), "the reason must be stated: {err}");
     }
 
     /// The full ASCII control range is refused, not just NUL/CR/LF. ESC matters
