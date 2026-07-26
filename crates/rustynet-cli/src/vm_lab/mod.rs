@@ -43829,6 +43829,29 @@ mod tests {
         cleanup_temp_inventory(path.as_path());
     }
 
+    /// The `utmctl` stub reports a live IP but no running process, so the
+    /// inventory-refresh gate must refuse to persist it.
+    ///
+    /// **Every address and name here is a reserved, guaranteed-dead one, and
+    /// that is load-bearing, not cosmetic.** This test took **106 s** and was
+    /// observed both passing and failing on unrelated branches, because it used
+    /// `192.168.64.8` — an address on this Mac's **live** UTM bridge subnet
+    /// (`192.168.64.20` is a real lab guest). A live bridge with no host at the
+    /// target silently drops the SYN, so `probe_tcp_port_status` spent the full
+    /// `timeout` on each of its three fallback attempts (3 x 30 s), and then a
+    /// real `ssh` child ran against that host-LAN address for another ~15 s
+    /// (`ConnectTimeout=15` is hardcoded in `run_remote_shell_command`, so only
+    /// the outer `timeout` bounds it). Timing and outcome therefore both
+    /// depended on what happened to be answering on the operator's lab network.
+    ///
+    /// Fixed the way the sibling test below already does it: TEST-NET-1
+    /// (RFC 5737 `192.0.2.0/24`) is never routable, so each probe fails
+    /// immediately instead of timing out; `.invalid` (RFC 2606) is guaranteed
+    /// NXDOMAIN, which bounds the one path that would resolve `ssh_target` as a
+    /// name (it is normally rewritten to the utmctl-discovered IP, so the name
+    /// is only reached if that resolution fails); and `timeout_secs` is small
+    /// enough to bound every probe even if one of those guarantees is violated.
+    /// A unit test must not depend on the host's network or resolver.
     #[test]
     fn execute_ops_vm_lab_discover_local_utm_skips_inventory_update_when_no_live_ip_observed() {
         let unique = SystemTime::now()
@@ -43845,9 +43868,9 @@ mod tests {
   "entries": [
     {{
       "alias": "alpha",
-      "ssh_target": "alpha-host",
+      "ssh_target": "alpha-host.invalid",
       "ssh_user": "debian",
-      "last_known_ip": "192.168.64.20",
+      "last_known_ip": "192.0.2.20",
       "mesh_ip": "100.64.0.1",
       "controller": {{
         "type": "local_utm",
@@ -43862,7 +43885,7 @@ mod tests {
 
         let original = fs::read_to_string(inventory.as_path()).expect("inventory should read");
         let utmctl = write_temp_executable(
-            "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"alpha\" ]; then\n  printf '192.168.64.8\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"alpha\" ]; then\n  printf '192.0.2.8\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
         );
         let report = execute_ops_vm_lab_discover_local_utm(VmLabDiscoverLocalUtmConfig {
             inventory_path: Some(inventory.clone()),
@@ -43871,7 +43894,7 @@ mod tests {
             ssh_identity_file: None,
             known_hosts_path: None,
             ssh_port: 65_534,
-            timeout_secs: 30,
+            timeout_secs: 2,
             update_inventory_live_ips: true,
             report_dir: None,
         })
