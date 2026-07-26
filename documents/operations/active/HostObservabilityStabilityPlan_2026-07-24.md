@@ -494,6 +494,22 @@ re-verification at consumption in `add-guest` (step 3).
 
 ## 7.9.2 Prerequisite hardening — shell injection in `provision-guest` (fixed 2026-07-25)
 
+> **SUPERSEDED IN IMPLEMENTATION — read this first.** The defect analysis below is
+> accurate and worth keeping as the record of how the class was found. **The fix
+> described in it is NOT the fix that shipped.** A parallel line independently built
+> a stronger structural answer, `crates/rustynet-cli/src/vm_lab/script_template.rs`
+> (QH-01), which landed on `main` and is now the single audited boundary between a
+> Rust value and a host script: a module-private `ScriptTemplate` with no
+> constructor, a typed `Binding` enum where the variant *is* the safety argument,
+> and escaping owned by the renderer rather than validation owned by each caller.
+> That subsumes the `ensure_single_quoted_script_value` consolidation and the
+> single-pass renderer described below, both of which were dropped rather than
+> merged — see §7.9.3 for why, and read `script_template.rs`'s module docs (QH-19)
+> for the current model. What survived from this work and is live on `main`: the
+> `pool`/`image` validator hardening (escaping does **not** subsume path
+> confinement, so those validators are still load-bearing), the QH-13 SSH-argv fix,
+> and the widened control-character rule.
+
 Found while mapping step 3's call site; fixed here because `add-guest` wraps
 `provision-guest`, so onboarding cannot be built on it as it stood.
 
@@ -678,3 +694,55 @@ define the polkit rule, confirm `virsh start/stop/destroy` + the lab's bridge/po
 ops still work while `virsh define <host-disk-xml>` is denied without a password, and
 grep the vm-lab orchestrator's libvirt call sites to confirm no allowed steady-state
 op secretly needs a define/save-class API.
+
+## 7.9.3 Reconciliation with the landed renderer — what was dropped and why
+
+Two lines independently attacked the same injection class on 2026-07-25. Recorded
+because the *reason* one was chosen matters more than the outcome, and because the
+losing side contained a correct argument that had to be carried forward.
+
+**`script_template.rs` (QH-01) became canonical.** Not on execution quality — on
+three substantive grounds:
+1. It covers three render sites in `recover_guest_network.rs` whose scripts are
+   piped to **`sudo bash -s` as root**, a higher-severity sink than either line had
+   originally scoped.
+2. It makes the **renderer own the quoting** (escape at interpolation) rather than
+   relying on validators to reject dangerous characters, so it is safe even for a
+   value nobody validated.
+3. It confines rendering with a **module + type boundary** rather than a CI grep.
+   That matters: the grep was proposed and then shown to be evadable via
+   `replacen`, `format!`, or a variable token. A private field with no constructor
+   is checked by the compiler — demonstrated by an `E0603` on a deliberate bypass
+   attempt, not asserted.
+
+**Dropped from this line:** a single-pass `render_script_template` (superseded by
+the typed-`Binding` renderer), and the consolidation of eight hand-rolled
+single-quote checks onto `ensure_single_quoted_script_value` (superseded — the
+landed branch consolidated on the same helper *and* added the escaper, so the
+direction was right but incomplete on its own).
+
+**Carried forward, because a renderer does NOT subsume it:** the `pool` and `image`
+validators. Escaping and validation are complementary layers, not competing answers
+— `shell_quote("../../etc/passwd")` is a perfectly safe shell *word* that still
+traverses out of the pool, because `BASE="$POOL/$IMAGE"` is a path composition and
+path confinement is orthogonal to quoting. Deleting a validator because "the
+renderer handles quoting now" reopens a different hole than QH-01 closed. The
+landed branch keeps them, correctly. This is the single most transferable
+conclusion from the whole exercise and is written up as **QH-19** in
+`script_template.rs`'s module docs, with the six sink contexts and the control that
+applies to each.
+
+**Also carried forward:** **QH-13** — `run_host_cmd` is an OpenSSH post-host
+argument string re-parsed by a *remote login shell*, which QH-19 classifies as a
+distinct sink from template rendering, and which the landed renderer deliberately
+left open. Fixed by quoting at that sink with the module's existing `shell_quote`
+rather than a second POSIX quoter. And the **control-character rule** widened from
+NUL/CR/LF to the whole ASCII control range, because these values are printed back
+to the operator in the dry-run plan.
+
+**Process note worth keeping.** Two lines on one file cost more than the duplicated
+work: 17 conflicting hunks inside a 1949-line restructuring, which is unmergeable
+by hand without re-deciding each hunk in a file that no longer has the same shape —
+the likeliest failure being to silently resurrect a superseded weaker validator.
+The resolution was to land the stronger branch first and cherry-pick the four
+genuinely additive survivors onto it, rather than rebase-and-resolve.
