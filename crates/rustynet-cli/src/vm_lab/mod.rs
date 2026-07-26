@@ -9,6 +9,7 @@ pub mod network_profile;
 pub mod orchestrator;
 pub mod overnight;
 pub mod recover_guest_network;
+pub mod run_exclusion;
 pub mod run_history;
 mod script_template;
 pub mod topology;
