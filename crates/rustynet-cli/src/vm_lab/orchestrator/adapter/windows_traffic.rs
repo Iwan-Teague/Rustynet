@@ -237,14 +237,26 @@ pub fn assert_mesh_client_nat_session(conn: &NodeConnection) -> Result<(), Adapt
     }
 }
 
-/// Collect diagnostic artifacts from the Windows host to `dst`.
-/// Key material paths (`keys\*`, `*.priv`) MUST NOT appear in the collected set.
-pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), AdapterError> {
-    let remote_tmp = format!(r"{WINDOWS_STAGING_DIR}\rn_diag_artifacts.zip");
-    let remote_tmp_ps = remote_tmp.replace('\\', "/");
-
-    // Create archive on remote, excluding keys directory.
-    let diag_script = format!(
+/// Build the remote PowerShell that archives the Windows diagnostic logs,
+/// excluding key material.
+///
+/// Split out of `collect_artifacts` so the generated script is unit-testable
+/// without a live `NodeConnection` — the empty-log-directory case below is exactly
+/// the one that broke in production, and it was previously unreachable by a test.
+fn build_diag_archive_script(remote_zip_path: &str) -> Result<String, AdapterError> {
+    // The `@( ... )` around the if/else is load-bearing, not stylistic. Under the
+    // `Set-StrictMode -Version Latest` this script sets, reading `.Count` on a value
+    // that is not a collection throws `PropertyNotFoundStrict`, and the
+    // `Get-ChildItem | Where-Object` pipeline yields `$null` when nothing matches.
+    // The `else` branch was already array-safe; the taken branch was not, so a logs
+    // directory that existed but held no non-key files aborted the whole collection.
+    // That is the worst possible time for it to fail: this runs on the failure path,
+    // so it destroyed the diagnostics for the very failure being investigated, and
+    // the error then folded into the always-run `cleanup` stage and reported it as
+    // failed even though cleanup itself had completed. Observed live on
+    // windows-x86-1 in run winnat-20260725T190000Z. The array subexpression forces a
+    // collection in every branch, so `.Count` is always valid.
+    Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
@@ -254,10 +266,10 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
          }}; \
          $logsDir = {logs_dir_q}; \
          $zipPath = {zip_q}; \
-         $filesToArchive = if (Test-Path -LiteralPath $logsDir) {{ \
+         $filesToArchive = @(if (Test-Path -LiteralPath $logsDir) {{ \
              Get-ChildItem -Path $logsDir -Recurse -File | \
                  Where-Object {{ $_.FullName -notlike {keys_pattern_q} }} \
-         }} else {{ @() }}; \
+         }} else {{ @() }}); \
          if ($filesToArchive.Count -gt 0) {{ \
              Compress-Archive -Path ($filesToArchive | Select-Object -ExpandProperty FullName) \
                  -DestinationPath $zipPath -Force \
@@ -268,9 +280,19 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
          }}",
         staging_q = ps_quote(WINDOWS_STAGING_DIR)?,
         logs_dir_q = ps_quote(&format!(r"{WINDOWS_STATE_ROOT}\logs"))?,
-        zip_q = ps_quote(&remote_tmp)?,
+        zip_q = ps_quote(remote_zip_path)?,
         keys_pattern_q = ps_quote(&format!(r"{WINDOWS_STATE_ROOT}\keys\*"))?,
-    );
+    ))
+}
+
+/// Collect diagnostic artifacts from the Windows host to `dst`.
+/// Key material paths (`keys\*`, `*.priv`) MUST NOT appear in the collected set.
+pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), AdapterError> {
+    let remote_tmp = format!(r"{WINDOWS_STAGING_DIR}\rn_diag_artifacts.zip");
+    let remote_tmp_ps = remote_tmp.replace('\\', "/");
+
+    // Create archive on remote, excluding keys directory.
+    let diag_script = build_diag_archive_script(remote_tmp.as_str())?;
     run_remote_ps(conn, &diag_script, MEDIUM_TIMEOUT)?;
 
     // Download the archive.
@@ -831,6 +853,52 @@ fn verify_no_key_material_zip(path: &Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for the QH-21 failure-path defect: under
+    /// `Set-StrictMode -Version Latest`, `.Count` on a non-collection throws
+    /// `PropertyNotFoundStrict`, and `Get-ChildItem | Where-Object` yields `$null`
+    /// when nothing matches. The collection therefore has to force an array in
+    /// EVERY branch, not only the `else`. This asserts the array subexpression is
+    /// present and wraps the conditional, because losing it silently re-breaks
+    /// diagnostics collection precisely on the failure path — where it is needed
+    /// most and where nobody notices until they go looking for artifacts that
+    /// were never captured.
+    #[test]
+    fn diag_archive_script_forces_an_array_so_empty_log_dir_cannot_throw() {
+        let script = build_diag_archive_script(r"C:\Windows\Temp\rn_diag_artifacts.zip")
+            .expect("diag archive script should render");
+
+        // Strict mode is what makes the array wrapper mandatory; if this ever
+        // stops being set, the reasoning behind the wrapper changes.
+        assert!(
+            script.contains("Set-StrictMode -Version Latest"),
+            "strict mode is the precondition for the .Count hazard: {script}"
+        );
+        // The array subexpression must OPEN the assignment...
+        assert!(
+            script.contains("$filesToArchive = @(if ("),
+            "assignment must be wrapped in an array subexpression: {script}"
+        );
+        // ...and CLOSE after the else branch, so both branches yield a collection.
+        // Single braces: `{{`/`}}` is format-string escaping, so the RENDERED
+        // script carries single braces. Asserting the doubled form as an
+        // alternative would be a disjunct that can never be true, i.e. a test
+        // that looks like it tolerates two renderings while only checking one.
+        assert!(
+            script.contains("} else { @() });"),
+            "array subexpression must close after the else branch: {script}"
+        );
+        // The guarded .Count read is retained (that is what needs to be safe).
+        assert!(
+            script.contains("if ($filesToArchive.Count -gt 0)"),
+            "count-guarded archive branch should remain: {script}"
+        );
+        // Key material must still be excluded from the collected set.
+        assert!(
+            script.contains(r"keys\*"),
+            "key material exclusion must be preserved: {script}"
+        );
+    }
 
     #[test]
     fn windows_node_clean_assert_script_covers_rules_outbound_services_and_adapter() {
