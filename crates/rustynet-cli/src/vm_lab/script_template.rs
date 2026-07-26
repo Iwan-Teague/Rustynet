@@ -1277,8 +1277,20 @@ foreach ($ruleName in $dnsRuleNames) {
         };
     }
 }
+# `@(...)` around the pipeline is load-bearing under `Set-StrictMode -Version
+# Latest` (set at the top of this script): a `Where-Object` that matches nothing
+# yields `$null`, and reading `.Count` on `$null` throws PropertyNotFoundStrict.
+# `$dnsRules.Count` on the line above needs no wrap — it is initialised `@()` and
+# only ever appended to, so it is always an array.
+#
+# The reachable state is "exactly two DNS rules exist but none is
+# Block/Outbound/Enabled": `-and` short-circuits otherwise. It threw rather than
+# reporting a false pass, so this was never a bypass — but it threw INSTEAD of
+# reporting "rules present but not blocking", and `firewall_block_rules.json` was
+# then never written, so the cost was the diagnosability of a security-relevant
+# DNS misconfiguration.
 $dnsRulesOk = ($dnsRules.Count -eq 2) -and
-    (($dnsRules | Where-Object { $_.action -eq 'Block' -and $_.direction -eq 'Outbound' -and $_.enabled -eq 'True' }).Count -eq 2);
+    (@($dnsRules | Where-Object { $_.action -eq 'Block' -and $_.direction -eq 'Outbound' -and $_.enabled -eq 'True' }).Count -eq 2);
 if ($dnsRulesOk) {
     New-Item -ItemType Directory -Force -Path $DnsDir | Out-Null;
     Write-JsonFile -Path (Join-Path -Path $DnsDir -ChildPath 'firewall_block_rules.json') -Value ([pscustomobject]@{
@@ -2589,6 +2601,174 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             "script rendering must stay inside vm_lab::script_template:\n  {}",
             offenders.join("\n  ")
         );
+    }
+
+    /// Under `Set-StrictMode -Version Latest`, reading a property on a `$null`
+    /// pipeline result throws `PropertyNotFoundStrict`. A `Where-Object` that
+    /// matches nothing yields `$null`, so `(… | Where-Object {…}).Count` throws
+    /// exactly when the filter matches nothing — which is usually the branch the
+    /// check exists to detect.
+    ///
+    /// This scans the CLASS rather than asserting one fixed string, because the
+    /// same shape has now appeared in two files written by two different lines, and
+    /// a text assertion on one call site would not have caught either of them. The
+    /// discriminator is deliberately narrow: only scripts that actually set
+    /// StrictMode, and only parenthesised expressions that contain a pipeline. A
+    /// script using `-ErrorAction SilentlyContinue` instead of StrictMode is not
+    /// affected, and `(Get-Thing -ErrorAction Stop).Prop` throws by design rather
+    /// than reading through a `$null`.
+    ///
+    /// Cannot be a behavioural test: these are PowerShell bodies rendered by Rust,
+    /// and no PowerShell runtime is available here. A machine-checked invariant over
+    /// the text is the strongest available control, and unlike a per-site assertion
+    /// it also covers scripts nobody has written yet.
+    #[test]
+    fn strictmode_scripts_never_read_a_property_off_an_unwrapped_pipeline() {
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vm_lab/script_template.rs"),
+        )
+        .expect("readable source");
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (offset, body) in raw_string_literals(&source) {
+            if !body.contains("Set-StrictMode") {
+                continue;
+            }
+            let bytes = body.as_bytes();
+            for (index, window) in bytes.windows(2).enumerate() {
+                // A property read on a parenthesised expression: `).Identifier`
+                if window != b")." {
+                    continue;
+                }
+                if !bytes
+                    .get(index + 2)
+                    .is_some_and(|ch| ch.is_ascii_alphabetic())
+                {
+                    continue;
+                }
+                // Walk back to the matching `(`.
+                let mut depth = 0i32;
+                let mut open = None;
+                for back in (0..=index).rev() {
+                    match bytes[back] {
+                        b')' => depth += 1,
+                        b'(' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                open = Some(back);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(open) = open else { continue };
+                let inner = &body[open + 1..index];
+                // Only a pipeline can yield `$null` here; `(Get-X -EA Stop).Prop`
+                // throws by design and is not this defect.
+                if !inner.contains('|') {
+                    continue;
+                }
+                // `@( … )` makes the result always an array, so the property is valid.
+                if open > 0 && bytes[open - 1] == b'@' {
+                    continue;
+                }
+                let property: String = body[index + 2..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric())
+                    .collect();
+                offenders.push(format!(
+                    "script at byte {offset}: `.{property}` read off an unwrapped \
+                     pipeline — wrap it as `@( … ).{property}`, or StrictMode throws \
+                     PropertyNotFoundStrict when the pipeline yields nothing"
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "StrictMode scripts must not read a property off an unwrapped pipeline:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The scanner above must actually detect the shape it claims to — otherwise it
+    /// is a green test that proves nothing, which is the QH-02 failure mode.
+    #[test]
+    fn the_strictmode_scanner_detects_the_shape_it_claims_to() {
+        // Mirrors the real defect: StrictMode set, pipeline result, unwrapped.
+        let bad = "Set-StrictMode -Version Latest;\n$ok = ($x | Where-Object { $_ }).Count;\n";
+        let good = "Set-StrictMode -Version Latest;\n$ok = @($x | Where-Object { $_ }).Count;\n";
+        // A non-pipeline property read must NOT be flagged.
+        let unrelated =
+            "Set-StrictMode -Version Latest;\n$f = (Get-Thing -ErrorAction Stop).Prop;\n";
+        // Nor a pipeline read in a script without StrictMode.
+        let no_strict = "$ok = ($x | Where-Object { $_ }).Count;\n";
+
+        assert!(
+            unwrapped_pipeline_property_reads(bad) > 0,
+            "must flag: {bad}"
+        );
+        assert_eq!(
+            unwrapped_pipeline_property_reads(good),
+            0,
+            "must not flag the wrapped form"
+        );
+        assert_eq!(
+            unwrapped_pipeline_property_reads(unrelated),
+            0,
+            "must not flag a non-pipeline property read"
+        );
+        assert_eq!(
+            unwrapped_pipeline_property_reads(no_strict),
+            0,
+            "must not flag a script that does not set StrictMode"
+        );
+    }
+
+    /// Extracted so the scanner's logic is exercisable on synthetic input by
+    /// `the_strictmode_scanner_detects_the_shape_it_claims_to`. The whole-file test
+    /// above answers "is the repo clean"; this answers "does the check work".
+    fn unwrapped_pipeline_property_reads(body: &str) -> usize {
+        if !body.contains("Set-StrictMode") {
+            return 0;
+        }
+        let bytes = body.as_bytes();
+        let mut count = 0usize;
+        for (index, window) in bytes.windows(2).enumerate() {
+            if window != b")." {
+                continue;
+            }
+            if !bytes
+                .get(index + 2)
+                .is_some_and(|ch| ch.is_ascii_alphabetic())
+            {
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut open = None;
+            for back in (0..=index).rev() {
+                match bytes[back] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            open = Some(back);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(open) = open else { continue };
+            if !body[open + 1..index].contains('|') {
+                continue;
+            }
+            if open > 0 && bytes[open - 1] == b'@' {
+                continue;
+            }
+            count += 1;
+        }
+        count
     }
 
     /// Every `r#"…"#` / `r##"…"##` body in `source`, with its byte offset.
