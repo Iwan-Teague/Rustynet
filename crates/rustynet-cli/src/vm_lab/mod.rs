@@ -6084,17 +6084,38 @@ pub fn execute_ops_vm_lab_provision_guest(
 /// word containing a space arrives as two words. Client-side argv does not
 /// survive as remote argv.
 ///
-/// That is **QH-13**, tracked separately and deliberately NOT fixed here — the
-/// right fix is to build the remote command from `shell_quote`d words. Until then
-/// every caller must validate for a *shell*, not for argv. The two values that
-/// reach this today from `execute_ops_vm_lab_provision_guest` are `pool` (now
-/// narrowed by `ensure_provision_pool_path`, which is why that alphabet is
-/// tighter than a metacharacter rule) and `device`, which is derived from the
-/// **previous command's remote stdout** — remote output into remote argv, the
-/// worse of the two and untouched by QH-01.
+/// That was **QH-13**, and it is **fixed here now**: every argument is
+/// [`shell_quote`]d and the result is sent as one pre-quoted command string, so the
+/// remote shell sees exactly the words the caller intended. This is quoting for the
+/// sink that actually exists rather than another per-caller validator, because the
+/// values arriving here had *already* been validated — just for the wrong context
+/// (`ensure_single_quoted_script_value` and friends reject `"`, `$`, backtick, `\`
+/// and `'`, and deliberately permit `;`, `|`, `&`, `<`, `>`, `(`, `)`, `*`, which is
+/// the correct permitted set for a quoting position and the wrong one for a shell).
+///
+/// It reuses this module's existing `shell_quote` — the same escaper
+/// `script_template` applies to `Binding::Literal` — rather than introducing a
+/// second POSIX quoter. A duplicated security rule with two spellings is how the
+/// original `provision-guest` omission stayed invisible.
+///
+/// Both values that reach this from `execute_ops_vm_lab_provision_guest` are now
+/// covered: `pool`, and `device`, which is derived from the **previous command's
+/// remote stdout** — remote output flowing into remote argv, the worse of the two,
+/// and one that no amount of caller-side validation could have bounded because the
+/// value is not the caller's to validate.
+///
+/// **Consequence to respect:** arguments are literals. Shell operators, globs,
+/// `$VAR` and redirections passed *as arguments* are no longer interpreted
+/// remotely. No caller relies on that (every one passes a plain command plus
+/// arguments — verified). If shell semantics are ever genuinely needed, write an
+/// explicit script and send it through `run_guest_script`, which pipes a body to a
+/// shell on purpose; do not un-quote this.
 ///
 /// The false "argv-only (§4)" claim this replaces is exactly the QH-05 failure
 /// mode: a safety assertion with no named enforcement point and no proving test.
+/// The enforcement point is the `shell_quote` map below; the proving tests are
+/// `remote_command_words_are_shell_quoted` and
+/// `remote_command_string_is_inert_for_every_shell_metacharacter`.
 fn run_host_cmd(
     endpoint: &str,
     args: &[&str],
@@ -6131,9 +6152,21 @@ fn run_host_cmd(
         Some(known_hosts.as_path()),
     )?;
     command.arg("--").arg(endpoint);
-    for arg in args {
-        command.arg(arg);
-    }
+    // QH-13: one pre-quoted command string, because the remote side is a shell
+    // either way (see this function's doc comment). Quoting here is what makes the
+    // sink safe by construction instead of depending on each caller having
+    // validated for a shell rather than for argv — which two of them had not.
+    //
+    // Reuses `shell_quote`, the escaper this module already has and which
+    // `script_template` uses for `Binding::Literal`. Adding a second POSIX quoter
+    // beside it would be a new idiom for an existing job, and a duplicated
+    // security rule is how the original omission hid.
+    command.arg(
+        args.iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     let output = run_output_with_timeout(&mut command, timeout)?;
     if !output.status.success() {
         return Err(format!(
@@ -37199,10 +37232,14 @@ fn ensure_no_control_chars(label: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{label} must not be empty"));
     }
-    if value
-        .chars()
-        .any(|ch| ch == '\0' || ch == '\n' || ch == '\r')
-    {
+    // The whole ASCII control range, not just NUL/CR/LF. TAB, VT, FF, ESC and DEL
+    // used to pass, and these values are echoed back to the operator — the
+    // provision-guest dry-run plan prints `pool` with `Display` — so a raw ESC
+    // reaches a terminal and can rewrite what the operator believes they are
+    // approving. `\0`/`\n`/`\r` remain the load-bearing three (a newline is what
+    // lets a heredoc body emit its own terminator, per QH-19); the rest are cheap
+    // to refuse and no lab identifier or path legitimately contains one.
+    if value.chars().any(char::is_control) {
         return Err(format!("{label} contains unsupported control characters"));
     }
     Ok(())
@@ -55053,6 +55090,94 @@ mod provision_guest_create_tests {
         // which works uniformly across debian/ubuntu/rocky bases.
         assert!(s.contains("ssh_authorized_keys:"));
         assert!(s.contains("- $PUBKEY"));
+    }
+}
+
+#[cfg(test)]
+mod run_host_cmd_quoting_tests {
+    use super::{ensure_no_control_chars, shell_quote};
+
+    /// QH-13's enforcement point. `run_host_cmd` maps `shell_quote` over its args
+    /// and joins with a space, so these assertions describe the exact bytes the
+    /// remote login shell receives.
+    #[test]
+    fn remote_command_words_are_shell_quoted() {
+        assert_eq!(
+            shell_quote("/var/lib/libvirt/images"),
+            "'/var/lib/libvirt/images'"
+        );
+        // An embedded single quote must be encoded, not terminate the word.
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        // The joined form is what actually crosses the boundary.
+        let joined = ["findmnt", "-n", "--target", "/pool; id"]
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, "'findmnt' '-n' '--target' '/pool; id'");
+    }
+
+    /// The metacharacters the *quoting-position* validators deliberately PERMIT are
+    /// exactly the ones that were dangerous at this sink, because `ssh(1)` joins
+    /// post-host arguments with spaces and `sshd` hands the result to a shell.
+    /// Every one of them must end up inert inside a single-quoted word.
+    #[test]
+    fn remote_command_string_is_inert_for_every_shell_metacharacter() {
+        for hostile in [
+            "/pool; id",
+            "/pool | id",
+            "/pool && id",
+            "/pool || id",
+            "/pool > /tmp/x",
+            "/pool < /etc/passwd",
+            "/pool $(id)",
+            "/pool `id`",
+            "/pool $HOME",
+            "/pool*",
+            "/pool?",
+            "/pool[a-z]",
+            "/pool{a,b}",
+            "/pool~",
+            "/pool#c",
+            "/pool\nid",
+            "two words",
+        ] {
+            let quoted = shell_quote(hostile);
+            assert!(
+                quoted.starts_with('\'') && quoted.ends_with('\''),
+                "{hostile:?} -> {quoted}"
+            );
+            // Nothing inside a single-quoted shell word is special, so the ONLY way
+            // out is a literal `'`. Assert none survives unencoded: strip the outer
+            // pair and the `'\''` escapes, and no bare quote may remain.
+            let inner = &quoted[1..quoted.len() - 1];
+            assert!(
+                !inner.replace("'\\''", "").contains('\''),
+                "{hostile:?} leaves an unencoded quote: {quoted}"
+            );
+        }
+    }
+
+    /// The full ASCII control range is refused, not just NUL/CR/LF. ESC matters
+    /// because these values are printed back to the operator in the dry-run plan.
+    #[test]
+    fn control_characters_are_refused_across_the_whole_ascii_range() {
+        assert!(ensure_no_control_chars("pool", "/var/lib/libvirt/images").is_ok());
+        for (name, bad) in [
+            ("NUL", "/pool\u{0}x"),
+            ("LF", "/pool\nx"),
+            ("CR", "/pool\rx"),
+            ("TAB", "/pool\tx"),
+            ("VT", "/pool\u{b}x"),
+            ("FF", "/pool\u{c}x"),
+            ("ESC", "/pool\u{1b}[2Jx"),
+            ("DEL", "/pool\u{7f}x"),
+        ] {
+            assert!(
+                ensure_no_control_chars("pool", bad).is_err(),
+                "{name} must be refused"
+            );
+        }
     }
 }
 
