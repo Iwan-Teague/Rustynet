@@ -70,6 +70,12 @@ mod secret_material;
 // surface is gated behind `vm-lab`, leaving some items dead by default.
 #[cfg_attr(not(feature = "vm-lab"), allow(dead_code))]
 mod security_audit_catalog;
+// Character-boundary-safe clipping. `truncate_string_at_char_boundary` is used
+// by the always-built security-audit workflows, but `clip_str`'s only caller is
+// the `vm-lab`-gated failure digest — so it is legitimately dead in a default
+// build, exactly like `security_audit_catalog` above.
+#[cfg_attr(not(feature = "vm-lab"), allow(dead_code))]
+mod text_truncate;
 #[cfg(feature = "vm-lab")]
 mod vm_lab;
 
