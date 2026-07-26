@@ -37279,15 +37279,24 @@ fn ensure_no_control_chars(label: &str, value: &str) -> Result<(), String> {
     // values it does protect are the ones with no allowlist: `device` (remote
     // `findmnt` stdout), `repo_dir`, `report_dir`, and forwarded orchestrator args.
     //
-    // For those, refusing only `Cc` would miss the characters that actually rewrite
-    // what an operator sees. A terminal is not the only reader: `Cf` bidirectional
-    // overrides reorder rendered text (the Trojan-Source class) and `Zl`/`Zp` are
-    // line breaks that many viewers honour, so a value carrying them can make a
-    // refusal message read as an approval. Refuse all three categories.
+    // For those, refusing only `Cc` misses `Cf` bidirectional overrides (which
+    // reorder rendered text — the Trojan-Source class) and `Zl`/`Zp` line
+    // separators, so both are refused here too.
     //
-    // Prefer `{value:?}` at print sites regardless — `Debug` for `str` escapes `Cc`,
-    // and defence in depth is cheap here. It does NOT escape `Cf`/`Zl`/`Zp`, which
-    // is the other half of why they are refused at the boundary instead.
+    // **Corrected rationale — measured, not assumed.** An earlier version of this
+    // comment justified that extension with "`Debug` does not escape `Cf`/`Zl`/`Zp`".
+    // That is FALSE. Rust's `Debug for str` escapes by printability, not by the
+    // control category, so it escapes every one of these — verified directly:
+    // `format!("{:?}", "a\u{202e}b")` yields `"a\u{202e}b"`, and the same holds for
+    // `Zl`, `Zp`, ZWJ and BOM. So `{value:?}` at a print site is a COMPLETE control
+    // for terminal rendering on its own, and it is what actually protects the
+    // `device` message below.
+    //
+    // The boundary check is therefore defence in depth rather than the primary
+    // display control, and it is kept for the readers `Debug` does not cover:
+    // `Display`-formatted output, and values written into evidence JSON, logs and
+    // files where no escaping is applied at all. Cheap, and no lab identifier or path
+    // legitimately carries one. Do not re-justify it on the escaped-by-Debug premise.
     if let Some(bad) = value.chars().find(|ch| {
         ch.is_control()
             || matches!(ch,
@@ -37297,9 +37306,14 @@ fn ensure_no_control_chars(label: &str, value: &str) -> Result<(), String> {
                 | '\u{2028}' | '\u{2029}'
             )
     }) {
+        // Wording note: keeps the substring "unsupported control characters" that
+        // `bootstrap_script_rejects_control_characters` asserts on. Widening the
+        // CHECK broke that test by changing only the MESSAGE, which is a useful
+        // reminder that an error string other code matches on is an interface —
+        // reword it and you have changed a contract, not just prose.
         return Err(format!(
-            "{label} contains an unsupported control or text-direction character \
-             (U+{:04X})",
+            "{label} contains unsupported control characters or text-direction \
+             overrides (U+{:04X})",
             u32::from(bad)
         ));
     }
@@ -55244,8 +55258,11 @@ mod run_host_cmd_quoting_tests {
         assert!(err.contains("MOTD"), "the reason must be stated: {err}");
     }
 
-    /// The full ASCII control range is refused, not just NUL/CR/LF. ESC matters
-    /// because these values are printed back to the operator in the dry-run plan.
+    /// The full control range is refused, not just NUL/CR/LF.
+    ///
+    /// `\0`/`\n`/`\r` are refused for script safety. The rest are refused for display
+    /// integrity, which matters for the values with no allowlist — `device` (remote
+    /// `findmnt` stdout), `repo_dir`, `report_dir`, forwarded orchestrator args.
     #[test]
     fn control_characters_are_refused_across_the_whole_ascii_range() {
         assert!(ensure_no_control_chars("pool", "/var/lib/libvirt/images").is_ok());
@@ -55258,12 +55275,67 @@ mod run_host_cmd_quoting_tests {
             ("FF", "/pool\u{c}x"),
             ("ESC", "/pool\u{1b}[2Jx"),
             ("DEL", "/pool\u{7f}x"),
+            // C1 range — `char::is_control` covers these, which the comment on the
+            // check previously understated.
+            ("C1 U+0085", "/pool\u{85}x"),
+            ("C1 U+009B", "/pool\u{9b}x"),
         ] {
             assert!(
                 ensure_no_control_chars("pool", bad).is_err(),
                 "{name} must be refused"
             );
         }
+    }
+
+    /// The check reaches past `Cc` to `Cf` bidi overrides and `Zl`/`Zp`, so the
+    /// extension needs its own test — extending a security control without proving
+    /// the extension is the same gap as a safety comment naming a test that does not
+    /// cover it.
+    ///
+    /// This test also **pins the corrected rationale**, because the first version of
+    /// it asserted the opposite and failed. The claim was that `Debug` does not escape
+    /// these; measured, `Debug for str` escapes by printability rather than by control
+    /// category and escapes every one of them. So the boundary rejection is defence in
+    /// depth for `Display`-formatted and file/JSON consumers, NOT the primary terminal
+    /// control — that is `{value:?}`. If someone "simplifies" this check away, the
+    /// `Display` sinks are what they are removing cover from.
+    #[test]
+    fn text_direction_overrides_are_refused_and_debug_also_escapes_them() {
+        for (name, ch) in [
+            ("LRE U+202A", '\u{202a}'),
+            ("RLE U+202B", '\u{202b}'),
+            ("PDF U+202C", '\u{202c}'),
+            ("LRO U+202D", '\u{202d}'),
+            ("RLO U+202E", '\u{202e}'),
+            ("LRI U+2066", '\u{2066}'),
+            ("RLI U+2067", '\u{2067}'),
+            ("FSI U+2068", '\u{2068}'),
+            ("PDI U+2069", '\u{2069}'),
+            ("LS U+2028", '\u{2028}'),
+            ("PS U+2029", '\u{2029}'),
+        ] {
+            let value = format!("/dev/sda{ch}evil");
+            assert!(
+                !ch.is_control(),
+                "{name} is not Cc, which is why is_control alone was insufficient"
+            );
+            // Measured, and the opposite of what this test first asserted: Debug DOES
+            // escape these. Pinned so the corrected rationale cannot quietly rot back.
+            assert!(
+                !format!("{value:?}").contains(ch),
+                "{name} is expected to be escaped by Debug — if this ever fails, \
+                 `{{value:?}}` has stopped being a complete terminal control and the \
+                 boundary check is load-bearing rather than defence in depth"
+            );
+            let err = ensure_no_control_chars("device", value.as_str())
+                .expect_err("{name} must be refused");
+            assert!(
+                err.contains("text-direction") && err.contains("U+"),
+                "the error must name the class and the codepoint: {err}"
+            );
+        }
+        // A legitimate device path must still pass.
+        assert!(ensure_no_control_chars("device", "/dev/sda").is_ok());
     }
 }
 
