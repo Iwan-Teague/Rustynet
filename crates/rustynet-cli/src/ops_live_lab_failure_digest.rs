@@ -429,11 +429,29 @@ fn is_ignored_line(line: &str) -> bool {
     line.starts_with("[parallel:") || line.starts_with("----- ")
 }
 
+/// Clip `text` to roughly `max_len` bytes, appending an explicit `...` marker so
+/// the cut is visible in the digest.
+///
+/// The cut offset MUST be walked back to a character boundary before slicing.
+/// Every caller feeds this helper text that originates outside the process —
+/// stage log lines (via [`sanitize_line`], which preserves non-ASCII) and
+/// `failure_reasons` strings read out of a stage report JSON — so a multi-byte
+/// character straddling `max_len - 3` is an ordinary input, not a pathological
+/// one. Byte-slicing a `&str` at a non-boundary index panics, and this runs on
+/// the failure path: a panic here destroys the failure digest for the entire
+/// run, which is the one artifact that explains what went wrong. Fail readable,
+/// never panic. Same walk-back as `sanitize_capability_message` in
+/// `vm_lab::capability`.
 fn shorten(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         return text.to_owned();
     }
-    format!("{}...", text[..max_len.saturating_sub(3)].trim_end())
+    // `is_char_boundary(0)` is always true, so this terminates at 0 at worst.
+    let mut boundary = max_len.saturating_sub(3);
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}...", text[..boundary].trim_end())
 }
 
 fn matches_preferred_reason(line: &str) -> bool {
@@ -1228,5 +1246,102 @@ mod typed_parser_tests {
         };
         let map = view.into_value_map();
         assert!(matches!(map.get("first_failure"), Some(Value::Null)));
+    }
+
+    /// The failure class: a stage log carrying any non-ASCII character (cargo
+    /// arrows, a UTF-8 path, an accented hostname) whose bytes straddle the
+    /// truncation offset. `shorten` used to byte-slice, so this panicked and
+    /// took the whole run's failure digest with it.
+    ///
+    /// Driven through the real entry point (`extract_likely_reason` reading a
+    /// real log file) rather than by calling `shorten` directly, because the
+    /// bug only exists because the pipeline that feeds it preserves non-ASCII.
+    /// Every offset in `0..4` is covered so the multi-byte sequence straddles
+    /// the cut in each possible alignment, including landing exactly on it.
+    #[test]
+    fn extract_likely_reason_survives_a_multi_byte_char_straddling_the_truncation_offset() {
+        // `shorten(_, 220)` cuts at byte 217.
+        const CUT: usize = 217;
+        let dir = tmp_dir("utf8-truncation");
+        fs::create_dir_all(&dir).unwrap();
+
+        // 4-byte sequence: whichever byte of it lands on CUT, the offset is a
+        // non-boundary for three of the four shifts and a boundary for one.
+        let wide = "\u{1F600}";
+        assert_eq!(wide.len(), 4);
+
+        for shift in 0..4usize {
+            let prefix_len = CUT - shift;
+            // Keep the line eligible: `matches_preferred_reason` needs a marker,
+            // and `is_ignored_line` must not claim it.
+            let head = "error: ";
+            let filler = "a".repeat(prefix_len - head.len());
+            let line = format!("{head}{filler}{wide}{}", "b".repeat(16));
+            assert!(line.len() > 220, "line must exceed the truncation limit");
+
+            let log = dir.join(format!("stage-{shift}.log"));
+            fs::write(&log, format!("{line}\n")).unwrap();
+
+            // Pre-fix this call panicked with "byte index 217 is not a char
+            // boundary" for shift 1..=3.
+            let reason = extract_likely_reason(&log);
+
+            assert!(
+                reason.ends_with("..."),
+                "shift {shift}: truncation must stay disclosed, got {reason:?}"
+            );
+            // The cut must not have produced a partial code point: `String` is
+            // UTF-8 by construction, so the real proof is that the remainder is
+            // a genuine prefix of the input with the wide char kept whole.
+            let body = reason.strip_suffix("...").expect("suffix checked above");
+            assert!(
+                line.starts_with(body),
+                "shift {shift}: kept text must be a prefix of the input"
+            );
+            let kept_wide = body.matches(wide).count();
+            let partial = body.len() > prefix_len && kept_wide == 0;
+            assert!(
+                !partial,
+                "shift {shift}: kept {} bytes past the prefix without the whole wide char",
+                body.len() - prefix_len
+            );
+            assert!(
+                body.len() <= CUT,
+                "shift {shift}: kept {} bytes, must not exceed the cut offset",
+                body.len()
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same class on the other input path: `failure_reasons` comes out of a
+    /// stage report JSON, so it is equally free to carry non-ASCII.
+    #[test]
+    fn extract_extended_soak_reason_survives_a_multi_byte_char_at_the_truncation_offset() {
+        let dir = tmp_dir("utf8-soak");
+        // 216 ASCII bytes then a 3-byte character occupying 216..219, so the
+        // cut at 217 lands mid-sequence.
+        let reason = format!("{}\u{2192}{}", "a".repeat(216), "b".repeat(16));
+        write_report(
+            &dir,
+            &json!({ "schema_version": 1, "failure_reasons": [reason] }).to_string(),
+        );
+        let out = extract_extended_soak_reason(&dir).expect("failure_reasons must surface");
+        assert!(out.ends_with("..."));
+        assert_eq!(out, format!("{}...", "a".repeat(216)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `shorten` keeps its byte-length contract for pure-ASCII input, so the
+    /// boundary walk is not silently changing existing digest output.
+    #[test]
+    fn shorten_is_unchanged_for_ascii_and_never_panics_on_a_tiny_limit() {
+        assert_eq!(shorten("abc", 3), "abc");
+        assert_eq!(shorten("abcdef", 5), "ab...");
+        // A limit below the marker width degenerates to the marker alone rather
+        // than underflowing or slicing mid-character.
+        assert_eq!(shorten("\u{1F600}\u{1F600}", 2), "...");
+        assert_eq!(shorten("\u{1F600}", 0), "...");
     }
 }
