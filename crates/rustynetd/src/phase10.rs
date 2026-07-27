@@ -2130,6 +2130,19 @@ impl DataplaneSystem for LinuxCommandSystem {
                     self.interface_name.as_str(),
                     "oifname",
                     self.interface_name.as_str(),
+                    // OBSERVABILITY, not behaviour: `counter` turns "the hairpin
+                    // forward-accept rule exists" into "it matched N packets". Whether
+                    // this rule ever matches is the single most useful fact when
+                    // diagnosing a relay-with-upstream forwarding failure, and its
+                    // absence cost multiple live-lab cycles: rule presence was
+                    // observable, rule *matching* was not.
+                    //
+                    // Safe for the runtime self-assertion: `assert_chain_contains` →
+                    // `chain_contains_all_tokens` matches each token as a SUBSTRING of
+                    // the rendered line independently (`phase10.rs:1160-1163`), not as an
+                    // adjacent sequence, so the extra `counter packets N bytes N` between
+                    // `oifname` and the verdict does not break it.
+                    "counter",
                     "accept",
                 ],
             )
@@ -2295,6 +2308,15 @@ impl DataplaneSystem for LinuxCommandSystem {
                     self.interface_name.as_str(),
                     "oifname",
                     self.interface_name.as_str(),
+                    // OBSERVABILITY, not behaviour — see the matching `counter` on the
+                    // hairpin forward-accept rule. This one matters even more: the
+                    // hairpin SNAT is load-bearing for the request leg (it rewrites the
+                    // inner source so the packet satisfies the upstream exit's cryptokey
+                    // routing, whose AllowedIPs for this node is a single /32), and
+                    // whether it MATCHED was previously unobservable — only that the rule
+                    // existed. Substring-token matching makes this safe for
+                    // `assert_nat_forwarding` (`phase10.rs:1160-1163`).
+                    "counter",
                     "masquerade",
                 ],
             ) {
