@@ -17,8 +17,20 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
 
 2. Control-plane transport security:
 - Mesh control traffic rides the WireGuard tunnel's authenticated encryption
-  (Noise IK handshake, ChaCha20-Poly1305); there is no separate TLS stack and
-  no TLS library is a workspace dependency.
+  (Noise IK handshake, ChaCha20-Poly1305); there is no separate TLS stack on the
+  control plane or the data plane.
+
+  "No TLS library is a workspace dependency" was true when written and is not
+  now: `rustls` 0.23 is present transitively via `ureq` in `rustynet-mcp`, an
+  LLM-API client unrelated to the mesh. It terminates no Rustynet protocol. It is
+  called out because it is load-bearing for a separate claim: rustls 0.23 enables
+  the hybrid post-quantum group `X25519MLKEM768` by default under the `aws-lc-rs`
+  provider, so if that provider were ever pulled in, the statement elsewhere that
+  the tree contains no post-quantum cryptography would silently become false. The
+  lockfile currently resolves rustls onto `ring` (zero `aws-lc` entries), which
+  offers X25519/secp256r1/secp384r1 and no ML-KEM. A provider change would need
+  re-checking against
+  `CrossNetworkRemoteExitNodePlan_2026-03-16.md` §5.5.2.
 - Signed membership updates (gossip convergence, `membership apply-update`)
   are authenticated by ed25519 signature verification against the current
   approver set before being applied — fail closed on any verification error,
