@@ -45,7 +45,7 @@ Establish a secure, Rust-first architecture baseline with strict protocol modula
 
 ## 4) Security Gates
 - No custom crypto design introduced.
-- TLS 1.3 (`rustls`) and key-management standards documented for implementation phases.
+- TLS 1.3 (`rustls`) — **not implemented (2026-07-27);** see `SecurityMinimumBar.md` §3.2 — and key-management standards documented for implementation phases.
 - Secrets-handling policy established (no secret/token logging).
 - Threat model explicitly covers external API abuse, credential stuffing, replay, and admin-surface threats.
 - Weak/legacy algorithm denylist and deprecation approach are explicitly documented.

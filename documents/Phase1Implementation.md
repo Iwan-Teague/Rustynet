@@ -173,7 +173,10 @@ Fail-closed rule: unsupported capability requests must return an error and must 
 
 2. Control-plane boundary (`rustynet-control`):
 - Crossing data: enrollment/auth requests, node metadata mutations.
-- Enforcement: TLS 1.3 only, abuse controls (rate limit/lockout/replay), RBAC baseline contract.
+- Enforcement: abuse controls (rate limit/lockout/replay), RBAC baseline contract.
+  (**Corrected 2026-07-27:** this read "TLS 1.3 only". No TLS stack exists —
+  see `SecurityMinimumBar.md` §3.2 for the transport security that is
+  actually in place.)
 
 3. Backend boundary (`rustynet-backend-api` to adapter):
 - Crossing data: generic peer/route/runtime instructions.
@@ -236,7 +239,14 @@ Verification methods:
 ### 5.5 Cryptographic Allowlist/Denylist and Deprecation Policy
 ### Allowlist (Phase 1 Baseline)
 - Transport security:
-  - TLS 1.3 only (`rustls`) for control-plane transport.
+  - TLS 1.3 only (`rustls`) for control-plane transport — **allowlist rule,
+    not a statement of current state (annotated 2026-07-27).** This is §5.5's
+    cryptographic allowlist, whose enforcement point is the `rustynet-crypto`
+    algorithm policy module; `CryptoAlgorithm::Tls13` is allowlisted there and
+    pinned by `allowlisted_algorithm_is_accepted`. The rule constrains any
+    future TLS to 1.3 and must not be deleted. No control-plane TLS exists
+    today; control traffic rides the WireGuard tunnel's authenticated
+    encryption (`SecurityMinimumBar.md` §3.2).
   - WireGuard protocol model for tunnel crypto (no custom protocol).
 - Signatures:
   - `Ed25519` for control-plane signed artifacts.
@@ -418,7 +428,7 @@ Fail-closed rule: missing metric keys or any non-measured metric status fail CI.
 | P1-AT-14 | Integration harness skeleton | Run backend contract test harness | Harness executes and reports pass/fail. |
 | P1-AT-15 | Performance harness skeleton | Run `scripts/perf/run_phase1_baseline.sh` | Report generated with required keys and all metrics measured/pass. |
 | P1-AT-16 | Secret-handling baseline | Log redaction tests on crypto/debug surfaces | Secret bytes never emitted in plain text. |
-| P1-AT-17 | TLS baseline policy | Control-plane transport config lint/test | TLS 1.3-only policy declared and validated. |
+| P1-AT-17 | TLS baseline policy | Control-plane transport config lint/test | **Not implemented (2026-07-27).** The policy enum is declared and unit-tested; nothing negotiates a TLS session. |
 | P1-AT-18 | No custom crypto | Static review checklist + crypto module tests | No custom cryptographic construction in production path. |
 
 ## 10) Requirement-to-Implementation Traceability Matrix
@@ -448,7 +458,7 @@ Each Phase 1 requirement bullet is mapped to implementation approach, owner, and
 | P1-20 | Deliverable: crypto policy baseline approved | Maintain explicit allowlist/denylist/deprecation policy | `rustynet-crypto` + this document | Security sign-off + tests |
 | P1-21 | Deliverable: protocol assurance strategy approved | Document and implement contract/property tests | Backend API + crypto tests | Test plan approval + passing tests |
 | P1-22 | Security gate: no custom crypto design | Restrict to vetted primitives/protocols only | `rustynet-crypto`, architecture policy | Static review + module tests |
-| P1-23 | Security gate: TLS 1.3 and key-management standards documented | Enforce TLS 1.3-only policy and key custody rules | `rustynet-control` transport policy + `rustynet-crypto` | Config lint/tests |
+| P1-23 | Security gate: transport and key-management standards documented | Key custody rules enforced; the TLS-1.3-only policy is **declared, not enforced** (2026-07-27) | `rustynet-control` transport policy + `rustynet-crypto` | Config lint/tests |
 | P1-24 | Security gate: no secret/token logging | Redacted debug/log formats for secrets | `rustynet-crypto`, logging policy | Redaction tests |
 | P1-25 | Security gate: threat model covers abuse/replay/admin threats | Threat model section includes required abuse classes | this document | Threat checklist audit |
 | P1-26 | Security gate: weak-algorithm denylist + deprecation policy | Denylist hard rejection plus expiring exceptions | `rustynet-crypto` policy loader | Negative tests + expiry tests |

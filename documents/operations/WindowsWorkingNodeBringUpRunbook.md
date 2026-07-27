@@ -73,12 +73,24 @@ Status MUST be `Valid`. (The winget package source is itself
 signature-verified, but operators on regulated networks may want
 the explicit confirmation.)
 
-To opt out of the WireGuard install (staging hosts that should
-stay on the fail-closed `windows-unsupported` backend), an
-operator skips Step 3.4's auto-detection by passing
-`-ForceUnsupportedBackend` to the install helper. The daemon
-will refuse to start until a future install-helper run flips the
-env file.
+**WireGuard for Windows is required. There is no install path
+without it, and this section previously said otherwise.**
+
+The opt-out documented here — passing `-ForceUnsupportedBackend`
+to stay on the fail-closed `windows-unsupported` backend on a
+staging host — has not worked since 2026-04-30, when the install
+helper gained its `rekey-wireguard-under-runtime-identity` step.
+That step runs `rustynetd key init`, which shells out to
+`wg genkey`, so a host without WireGuard fails the install
+before reaching the service-install work that follows. It failed silently for
+2 months 27 days; as of 2026-07-27 the helper refuses at
+`require-wireguard-wg-binary` with an explicit message instead.
+
+`-ForceUnsupportedBackend` still pins the label on a host that
+*does* have WireGuard, which is the staging use it was written
+for. Restoring a genuinely WireGuard-less install would mean
+making the rekey step conditional — a product decision, not a
+documentation fix.
 
 ### 3.2 Sync source + build
 
@@ -211,16 +223,104 @@ refresh cadence is documented in `crates/rustynetd/src/fetcher.rs`
 ### 4.1 Daemon refuses to start with `windows-runtime-backend-explicitly-unsupported`
 
 Cause: install helper wrote `--backend windows-unsupported` to the
-env file (either WireGuard for Windows wasn't installed when the
-helper ran, or `-ForceUnsupportedBackend` was passed).
+env file — either WireGuard for Windows was not fully installed
+when the helper ran, or `-ForceUnsupportedBackend` was passed.
+
+Both causes are still live. The `require-wireguard-wg-binary` gate
+added 2026-07-27 in `8c5a24cd` does NOT make the first unreachable, because the
+gate and the backend probe ask different questions about different
+binaries: the gate resolves **`wg.exe`** (via
+`RUSTYNET_WG_BINARY_PATH` or the canonical path), while
+`Test-WireGuardDriverPresence` looks for **`wireguard.exe`** or the
+`WireGuardManager` service. A host where `wg.exe` resolves but
+`wireguard.exe` does not — a partial install, an AV quarantine of
+the GUI binary, or `RUSTYNET_WG_BINARY_PATH` pointed outside the
+canonical tree by an operator or an automation — passes the gate and
+still gets the `windows-unsupported` label.
+
+Note also that the gate throws before the env file is written, so on
+an upgraded host a pre-existing `rustynetd.env` survives unchanged.
+
+Two further routes reach the same label, and neither is a fresh
+install:
+
+- **A later helper run downgrades a working host.**
+  `Write-ReviewedEnvFile` is an unconditional write with no
+  read-modify-write, and `Resolve-ReviewedBackendLabel` is recomputed
+  on every invocation — including the `-EnforceAutoTunnel` re-run that
+  `EnforceBaselineRuntime` performs. A host that installed correctly as
+  `windows-wireguard-nt` is silently rewritten to `windows-unsupported`
+  by any later run in which `wireguard.exe` has stopped resolving while
+  `wg.exe` still does. The operator symptom is "it worked yesterday and
+  I changed nothing".
+- **The probe runs as SYSTEM, and PATH differs.**
+  `Test-WireGuardDriverPresence` falls back to `Get-Command
+  wireguard.exe`, and the helper runs as SYSTEM via `utmctl exec`. A
+  WireGuard installed to a non-default directory that is on the
+  interactive administrator's PATH is invisible to SYSTEM. This makes
+  §3.1's verification step non-predictive of §3.4's outcome: the admin
+  sees all three paths present and the helper still labels the host
+  unsupported.
 
 Fix:
-1. Install WireGuard for Windows (§3.1).
-2. Re-run the install helper without `-ForceUnsupportedBackend`.
+1. Install WireGuard for Windows (§3.1), and confirm BOTH
+   `wireguard.exe` and `wg.exe` are present at the canonical path —
+   checking as the account the helper runs under (SYSTEM), not as the
+   interactive administrator.
+2. Check `RUSTYNET_WG_BINARY_PATH`. If it is set, it is what makes the
+   gate and the backend probe disagree; clear it or point it at the
+   canonical `wg.exe`.
+3. Re-run the install helper without `-ForceUnsupportedBackend`.
 3. Confirm via `Get-Content C:\ProgramData\RustyNet\config\rustynetd.env`
    that the `RUSTYNETD_DAEMON_ARGS_JSON` line contains
    `windows-wireguard-nt`.
 4. `Restart-Service RustyNet`.
+
+### 4.1b Install fails at `sign-installed-binaries-for-authenticode` on an x86-64 host
+
+**Fixed 2026-07-26 in `003d5edc` (release-affecting; touches the shipped install path).**
+
+Both install helpers (daemon and relay) picked their `signtool.exe` from a hardcoded,
+arm64-first candidate list. The Windows SDK installs
+`bin\<version>\{arm,arm64,x64,x86}\` side by side regardless of host
+architecture, so on an x86-64 host the arm64 pattern still matched and
+won — and x64 Windows cannot execute an arm64 image (only ARM64 Windows
+emulates x64, not the reverse). Signing then failed and the helper
+`Write-Error`'d, failing `bootstrap_hosts`. In run
+`winnat-20260725T190000Z` on `windows-x86-1` (`Architecture=AMD64`)
+the captured stdout shows the helper selecting
+`...\10.0.26100.0\arm64\signtool.exe`, and the run's
+`first_failed_stage` is `bootstrap_hosts`. The step attribution is
+inferred from stdout ordering rather than captured: that run's
+`.progress` file was never collected, because `cleanup` also failed,
+and no exec-failure or `signtool sign failed` line appears in the
+artifacts.
+
+The helper now resolves the architectures the host can actually execute
+(`ARM64` → arm64, x64, x86; `AMD64` → x64, x86; `x86` → x86) and fails
+closed on anything else rather than guessing.
+
+The ARM64 architecture *sequence* is unchanged (arm64, x64, x86), but the
+selection is not otherwise identical and is not meant to be: version
+ordering moved from lexicographic to numeric (the old form sorted
+`10.0.9041.0` above `10.0.26100.0`), root precedence within an
+architecture was replaced by version ordering across merged roots, an
+`x86` candidate under `Program Files` became reachable, and a
+`^10\.\d+\.\d+\.\d+$` filter was added so a `zz-backup` directory can no
+longer outrank a real SDK. On an ARM64 host with two SDK versions
+installed, old and new can therefore select different files — deliberately,
+since the old ordering was itself a defect.
+
+The resolver is shared verbatim between
+`Install-RustyNetWindowsService.ps1` and
+`Install-RustyNetWindowsRelayService.ps1` and pinned by
+`windows_installers_share_one_signtool_resolver` (marker-delimited region,
+CRLF-normalised) — the daemon and the
+relay must be signed by the same tool, and a comment asking for that is
+not a control.
+
+If you are on a host that previously failed here, no manual step is
+needed beyond re-running the helper from a synced source tree.
 
 ### 4.2 `windows-authenticode-check` fails with `TRUST_E_NOSIGNATURE`
 

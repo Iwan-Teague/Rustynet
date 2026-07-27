@@ -373,7 +373,26 @@ fn build_diag_archive_script(remote_zip_path: &str) -> Result<String, AdapterErr
 }
 
 /// Collect diagnostic artifacts from the Windows host to `dst`.
-/// Key material paths (`keys\*`, `*.priv`) MUST NOT appear in the collected set.
+/// Key material paths (`keys\*`, `*.priv`, `*.pem`, `*.key`) MUST NOT appear in
+/// the collected set.
+///
+/// **This matches entry NAMES, not content, and is a second line rather than the
+/// control.** What decides inclusion is the ARCHIVE ROOT: the collector
+/// enumerates `<state root>\logs` only, and `<state root>\keys` is its sibling,
+/// so key material is never a candidate in the first place.
+///
+/// Note the `-notlike '<state root>\keys\*'` filter in that enumeration is
+/// therefore inert today — no `FullName` under `\logs` can match a `\keys\`
+/// pattern, and deleting it would change nothing. Keep it as a guard against a
+/// future widening of the root, but do not mistake it for the control. This
+/// check re-reads the index of what came back.
+///
+/// So it does not, and is not able to, stop key material carried under a benign
+/// name: an entry called `rustynetd.log` whose CONTENT is a private key lists
+/// cleanly and passes. Closing that would mean scanning archive content, which
+/// needs a definition of "key material" and has its own false-positive cost;
+/// it is tracked separately rather than implied here. Read this as "no
+/// key-shaped PATH escaped the archiver", which is what it actually proves.
 pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), AdapterError> {
     let remote_tmp = format!(r"{WINDOWS_STAGING_DIR}\rn_diag_artifacts.zip");
     let remote_tmp_ps = remote_tmp.replace('\\', "/");
@@ -880,7 +899,9 @@ fn base64_decode_simple(encoded: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Assert that the collected artifact zip at `path` contains no key material.
-/// Key material patterns: paths containing `keys\` or `keys/`, ending with `.priv`.
+/// Key material patterns: paths containing `keys\` or `keys/`, or ending with
+/// `.priv`, `.pem` or `.key`. (`.pem` and `.key` have been matched since
+/// 76df3c43; this line said `.priv` alone until 2026-07-27.)
 fn verify_no_key_material_zip(path: &Path) -> Result<(), AdapterError> {
     use std::process::Command;
     // Use `unzip -Z -1` to list entries; fall back to `python3 -c` if unzip absent.

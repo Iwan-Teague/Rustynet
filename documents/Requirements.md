@@ -163,7 +163,14 @@ Primary goal:
 ## 5) Security Requirements
 - Use proven protocols and libraries; no custom cryptographic protocol design.
 - Encrypt all node-to-node and node-to-exit traffic with WireGuard-style authenticated encryption.
-- Keep the control plane separate and protect it with TLS 1.3 and signed peer maps.
+- Keep the control plane separate and protect it with authenticated,
+  encrypted transport and signed peer maps. (**Corrected 2026-07-27:** this
+  read "protect it with TLS 1.3". As the normative source of truth this line
+  governs the phase plans, so leaving it uncorrected would have kept the TLS
+  requirement live at the top of the hierarchy while the plans below were
+  edited. There is no TLS stack; control traffic rides the WireGuard tunnel's
+  authenticated encryption. Reinstating a TLS requirement is a deliberate
+  product decision, not a documentation edit.)
 - Use long-lived node identity keys with ephemeral session keys for forward secrecy.
 - Support key rotation and rapid revocation/offboarding.
 - Relay servers must only forward ciphertext and must not decrypt payload data.
@@ -330,7 +337,9 @@ lan_route_access:
 - `axum` or `actix-web` (control APIs)
 - `tonic` (if gRPC chosen)
 - `serde` + `toml`/`serde_yaml` (config/policy parsing)
-- `rustls` (TLS)
+- `rustls` (TLS) — **not currently used.** Present only transitively via
+  `ureq` in `rustynet-mcp`, an LLM-API HTTPS client unrelated to the control
+  plane.
 - `sqlx` (DB)
 - Keep unsafe code minimized and isolated.
 - Prefer integration tests around networking behaviors and ACL decisions.
