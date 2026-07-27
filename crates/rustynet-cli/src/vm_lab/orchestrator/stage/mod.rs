@@ -336,6 +336,26 @@ pub(crate) fn format_stage_binary_failure(
     stdout: &[u8],
     stderr: &[u8],
 ) -> String {
+    format_stage_binary_failure_with_log(label, status, stdout, stderr, None)
+}
+
+/// As [`format_stage_binary_failure`], but names the binary's own complete log so a
+/// clipped summary cannot be misread as lost evidence.
+///
+/// The clip disclosure on its own is a **false signal**. These stages pass
+/// `--log-path`, and the binary writes its full unclipped output there, so
+/// "clipped N of M bytes" describes the *inline copy* only — nothing is actually
+/// lost. On 2026-07-25 that line was read as evidence destruction twice in one day,
+/// once in a disposition ledger, while a complete 13.5 KB log sat beside it in the
+/// same report directory. Naming the artifact removes the ambiguity for free.
+/// The truncation behaviour itself is deliberate (see `clip`) and unchanged.
+pub(crate) fn format_stage_binary_failure_with_log(
+    label: &str,
+    status: std::process::ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+    full_log: Option<&str>,
+) -> String {
     /// Keep the **tail**, not the head.
     ///
     /// A failing CLI dumps its whole usage text (11.5 KB) and prints the actual
@@ -343,7 +363,7 @@ pub(crate) fn format_stage_binary_failure(
     /// the one line worth reading — which is exactly what happened on the first
     /// run of this formatter. The existing enforce_runtime reporter already
     /// says "(stdout tail)" for the same reason.
-    fn clip(raw: &[u8]) -> String {
+    fn clip(raw: &[u8], full_log: Option<&str>) -> String {
         let text = String::from_utf8_lossy(raw);
         let text = text.trim();
         let total = text.chars().count();
@@ -352,14 +372,18 @@ pub(crate) fn format_stage_binary_failure(
         }
         let skip = total - STAGE_FAILURE_STREAM_BUDGET;
         let tail: String = text.chars().skip(skip).collect();
+        let pointer = match full_log {
+            Some(path) => format!("; complete unclipped output: {path}"),
+            None => String::new(),
+        };
         format!(
-            "…(clipped {} of {} bytes; tail follows)\n{tail}",
+            "…(clipped {} of {} bytes; tail follows{pointer})\n{tail}",
             raw.len().saturating_sub(tail.len()),
             raw.len()
         )
     }
-    let out = clip(stdout);
-    let err = clip(stderr);
+    let out = clip(stdout, full_log);
+    let err = clip(stderr, full_log);
     let mut detail = String::new();
     if !err.is_empty() {
         detail.push_str(&format!("\nstderr: {err}"));
@@ -408,6 +432,32 @@ mod failure_format_tests {
         let summary =
             format_stage_binary_failure("live_two_hop", exit_status_failure(), b"", b"   ");
         assert!(summary.contains("no output on either stream"), "{summary}");
+    }
+
+    #[test]
+    fn a_clipped_summary_names_the_complete_log_so_it_is_not_read_as_evidence_loss() {
+        let mut noisy = vec![b'x'; STAGE_FAILURE_STREAM_BUDGET * 2];
+        noisy.extend_from_slice(b"THE ACTUAL ERROR");
+        let summary = format_stage_binary_failure_with_log(
+            "live_two_hop",
+            exit_status_failure(),
+            &noisy,
+            b"",
+            Some("/report/live_two_hop.log"),
+        );
+        assert!(
+            summary.contains("clipped"),
+            "clipping stays disclosed: {summary}"
+        );
+        assert!(
+            summary.contains("/report/live_two_hop.log"),
+            "a clipped summary must name the unclipped log, or the disclosure reads as \
+             evidence loss when a complete copy sits beside it: {summary}"
+        );
+        // With no log to point at, the disclosure is unchanged.
+        let plain = format_stage_binary_failure("live_two_hop", exit_status_failure(), &noisy, b"");
+        assert!(plain.contains("clipped"), "{plain}");
+        assert!(!plain.contains("complete unclipped output"), "{plain}");
     }
 
     #[test]

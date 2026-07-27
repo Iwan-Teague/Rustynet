@@ -182,11 +182,15 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
                     StageOutcome::Passed
                 } else {
                     StageOutcome::Failed(
-                        crate::vm_lab::orchestrator::stage::format_stage_binary_failure(
+                        // Name the binary's own complete log: the inline copy is
+                        // clipped, and without this pointer that disclosure reads as
+                        // evidence loss when a full unclipped log sits beside it.
+                        crate::vm_lab::orchestrator::stage::format_stage_binary_failure_with_log(
                             "live_two_hop binary",
                             output.status,
                             &output.stdout,
                             &output.stderr,
+                            Some(log_path_str),
                         ),
                     )
                 }
