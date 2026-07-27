@@ -782,7 +782,11 @@ pub(crate) fn normalize_os_family(platform: &str, os_version: &str) -> Result<St
     Ok(family.to_owned())
 }
 
-fn attributable_node_status<'a>(
+/// `pub(crate)` so the producers of the summaries it parses can prove their
+/// messages are actually attributable, rather than asserting it in prose. The
+/// diagnostics collector's per-node error text is one such producer, and it
+/// silently failed this for its whole life by quoting the alias.
+pub(crate) fn attributable_node_status<'a>(
     status: &'a str,
     stage_scope: &str,
     alias: &str,

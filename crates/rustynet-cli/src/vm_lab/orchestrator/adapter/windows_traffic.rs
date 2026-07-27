@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -13,6 +14,32 @@ use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEv
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A complete, valid zip archive containing nothing: the 22-byte
+/// end-of-central-directory record, `PK\x05\x06` followed by 18 zero bytes
+/// (disk numbers, entry counts, central-directory size and offset, comment
+/// length). Byte-identical to what `ZipFile.Open(.., Create).Dispose()` emits.
+///
+/// ONE definition, used twice on purpose: the collector renders it into the
+/// PowerShell that writes the archive, and `verify_no_key_material_zip`
+/// compares the downloaded bytes against it. The check is only sound because
+/// the two are the same constant — if the writer could drift from the verifier,
+/// the verifier would be attesting something it no longer produces. Pinned by
+/// `the_empty_archive_the_script_writes_is_the_one_the_verifier_accepts`.
+const EMPTY_ARTIFACT_ARCHIVE: [u8; 22] = [
+    0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Render [`EMPTY_ARTIFACT_ARCHIVE`] as a PowerShell byte-array literal.
+fn empty_artifact_archive_ps_literal() -> String {
+    let bytes = EMPTY_ARTIFACT_ARCHIVE
+        .iter()
+        .map(|b| format!("0x{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[byte[]]@({bytes})")
+}
 
 /// Read the `WireGuard` public key from `C:\ProgramData\RustyNet\keys\wireguard.pub`.
 /// Returns the base64-encoded key decoded to hex (32-byte key → 64-char hex).
@@ -276,6 +303,47 @@ fn build_diag_archive_script(remote_zip_path: &str) -> Result<String, AdapterErr
     // failed even though cleanup itself had completed. Observed live on
     // windows-x86-1 in run winnat-20260725T190000Z. The array subexpression forces a
     // collection in every branch, so `.Count` is always valid.
+    //
+    // The `Add-Type` in the empty branch is the SECOND layer of the same failure,
+    // and it only became reachable once the `@( ... )` fix above stopped the throw
+    // that had been masking it.
+    //
+    // The empty branch writes the 22-byte end-of-central-directory record directly
+    // rather than going through `[System.IO.Compression.ZipFile]`, and each half of
+    // that choice fixes a distinct defect:
+    //
+    //   * Windows PowerShell 5.1 (Desktop) does not auto-load
+    //     `System.IO.Compression.FileSystem`, so naming that type there is
+    //     `TypeNotFound`. The previous `$dummy = [System.IO.Compression.ZipFile];`
+    //     line was reaching for exactly this and could not work — naming a type does
+    //     not load its assembly. `Add-Type` would fix that, but only that, and its
+    //     resolution failures are TERMINATING, so `-ErrorAction SilentlyContinue`
+    //     does not make it safe; it is inert in both directions. `[System.IO.File]`
+    //     lives in the always-loaded core library and needs no load at all.
+    //   * `ZipArchiveMode::Create` maps to `FileMode.CreateNew`, which THROWS if the
+    //     path already exists. The remote temp zip is deleted best-effort and only
+    //     after `scp_from`, so a timed-out download leaves it behind and the next
+    //     run's empty branch would abort — destroying diagnostics a second way. The
+    //     sibling branch already uses `Compress-Archive -Force`;
+    //     `WriteAllBytes` is `FileMode.Create` (truncate), which restores the
+    //     symmetry.
+    //
+    // The bytes are a complete, valid empty archive: signature `PK\x05\x06` followed
+    // by 18 zero bytes (disk numbers, entry counts, central-directory size and
+    // offset, comment length) — byte-identical to what
+    // `ZipFile.Open(.., Create).Dispose()` emits.
+    //
+    // This branch is not an edge case. Observed live on windows-x86-1 in run
+    // winnat-20260727T095740Z, whose ONLY failure was that the daemon never started:
+    // it therefore wrote no logs, so the logs directory was empty, so this is the
+    // branch that runs on precisely the failures worth collecting.
+    //
+    // An empty archive is the intended outcome, not a degenerate one — it
+    // distinguishes "collection ran, there was nothing to collect" from "collection
+    // failed", which is the distinction this whole path exists to make. See
+    // `verify_no_key_material_zip` for how that empty listing is recognised; it is
+    // NOT free, and getting it wrong is what made the first version of this fix
+    // fail to fix anything.
     Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
@@ -294,14 +362,13 @@ fn build_diag_archive_script(remote_zip_path: &str) -> Result<String, AdapterErr
              Compress-Archive -Path ($filesToArchive | Select-Object -ExpandProperty FullName) \
                  -DestinationPath $zipPath -Force \
          }} else {{ \
-             $dummy = [System.IO.Compression.ZipFile]; \
-             [System.IO.Compression.ZipFile]::Open( \
-                 $zipPath, [System.IO.Compression.ZipArchiveMode]::Create).Dispose() \
+             [System.IO.File]::WriteAllBytes($zipPath, {empty_zip_literal}) \
          }}",
         staging_q = ps_quote(WINDOWS_STAGING_DIR)?,
         logs_dir_q = ps_quote(&format!(r"{WINDOWS_STATE_ROOT}\logs"))?,
         zip_q = ps_quote(remote_zip_path)?,
         keys_pattern_q = ps_quote(&format!(r"{WINDOWS_STATE_ROOT}\keys\*"))?,
+        empty_zip_literal = empty_artifact_archive_ps_literal(),
     ))
 }
 
@@ -834,14 +901,39 @@ fn verify_no_key_material_zip(path: &Path) -> Result<(), AdapterError> {
     if !output.status.success() {
         // Fail closed (parity with the Linux/macOS tar path): a listing we
         // cannot read must NOT silently pass the key-exclusion invariant.
-        // The one benign non-zero case is an empty archive (`unzip -Z` exits
-        // non-zero with "Empty zipfile"/no entries) — only that is treated as
-        // OK; any other failure is a hard error.
+        // The one benign non-zero case is an empty archive — only that is
+        // treated as OK; any other failure is a hard error.
+        //
+        // The empty archive must still be recognised, because it is the NORMAL
+        // product of this path: a daemon that never starts writes no logs, so
+        // the collector ships the empty archive it was designed to ship, and
+        // `unzip` reports that with a non-zero exit. Refusing it destroyed the
+        // diagnostics for exactly the failures worth investigating.
+        //
+        // Recognise it by CONTENT, not by parsing the lister's prose. Three
+        // separate holes were found in the prose approach before this one, and
+        // the third showed the whole approach is unfixable: `unzip -Z -1` writes
+        // its human message `Empty zipfile.` to the SAME stream as entry names,
+        // so "the archive is empty" and "the first entry is named like the
+        // message" are indistinguishable from stdout text. A guest that corrupts
+        // one central-directory signature gets `unzip` to list the parsable
+        // prefix and bail — so an archive whose first entry is named
+        // `empty zipfile` lists as exactly that, exits non-zero, and its
+        // remaining `keys/id.priv` entry is never listed and never scanned. The
+        // archive is built ON the guest, so those bytes are attacker-controlled,
+        // which is precisely the threat this check exists for.
+        //
+        // A byte comparison against the archive this collector itself writes has
+        // no such ambiguity. Nothing containing key material can equal 22 bytes
+        // of end-of-central-directory record.
+        //
+        // Deliberately NOT a length check and NOT an exit-code gate. A length
+        // check admits any 22-byte file; an exit-code gate would couple
+        // acceptance to Info-ZIP's warning-vs-error convention, and a lister
+        // that reported an empty archive with some other code would fail the
+        // genuine case closed — reintroducing the very bug this exists to fix.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let listing_empty = stdout.trim().is_empty();
-        let looks_empty_archive = stderr.to_lowercase().contains("empty");
-        if listing_empty && looks_empty_archive {
+        if fs::read(path).is_ok_and(|bytes| bytes == EMPTY_ARTIFACT_ARCHIVE) {
             return Ok(());
         }
         return Err(AdapterError::Io {
@@ -918,6 +1010,210 @@ mod tests {
             script.contains(r"keys\*"),
             "key material exclusion must be preserved: {script}"
         );
+    }
+
+    /// The empty-log-dir branch must build the zip WITHOUT loading an assembly,
+    /// and must not be able to abort on a leftover file.
+    ///
+    /// Two production defects live here. Windows PowerShell 5.1 does not
+    /// auto-load `System.IO.Compression.FileSystem`, so naming
+    /// `[System.IO.Compression.ZipFile]` there raises `TypeNotFound`; and
+    /// `ZipArchiveMode::Create` maps to `FileMode.CreateNew`, which throws when
+    /// the path already exists — and the remote temp zip is only deleted
+    /// best-effort, after `scp_from`. Writing the end-of-central-directory record
+    /// through `[System.IO.File]` needs no assembly and truncates.
+    ///
+    /// This branch is the one taken whenever the daemon failed to start, which is
+    /// exactly when diagnostics matter.
+    #[test]
+    fn diag_archive_empty_branch_writes_a_bare_eocd_without_loading_an_assembly() {
+        let script = build_diag_archive_script(r"C:\Windows\Temp\rn_diag_artifacts.zip")
+            .expect("diag archive script should render");
+
+        // Asserted as ONE substring anchored to `} else {`, not as two separate
+        // `contains` checks. An earlier version checked only that the loader
+        // appeared somewhere before the type; moving it into the `if` branch left
+        // that test green while restoring the production bug verbatim.
+        assert!(
+            script.contains("} else { [System.IO.File]::WriteAllBytes("),
+            "the empty branch itself must write the archive: {script}"
+        );
+        // The 22-byte end-of-central-directory record: `PK\x05\x06` + 18 zeros.
+        assert!(
+            script.contains(&empty_artifact_archive_ps_literal()),
+            "empty archive must be rendered from the shared constant: {script}"
+        );
+
+        // No assembly load, and no reference to the type that needed one. Both
+        // spellings are refused: `Add-Type` cannot be made safe here (its
+        // resolution failures are TERMINATING, so `-ErrorAction SilentlyContinue`
+        // is inert under this script's `$ErrorActionPreference = 'Stop'`), and the
+        // older `$dummy = [...]` line never loaded anything at all.
+        assert!(
+            !script.contains("Add-Type"),
+            "the empty branch must not need an assembly load: {script}"
+        );
+        assert!(
+            !script.contains("System.IO.Compression.ZipFile"),
+            "naming that type is what required the load in the first place: {script}"
+        );
+        // `CreateNew` semantics must not come back: it throws on a leftover zip.
+        assert!(
+            !script.contains("ZipArchiveMode"),
+            "the empty branch must truncate, not refuse to overwrite: {script}"
+        );
+    }
+
+    /// The empty archive the branch above produces must SURVIVE the key-exclusion
+    /// check. This is the assertion that ties the two halves together, and its
+    /// absence is why the first attempt at this fix corrected the zip's
+    /// construction and still fixed nothing end to end.
+    ///
+    /// Info-ZIP reports an empty archive as exit 1, stdout `Empty zipfile.`,
+    /// stderr EMPTY. The check used to require an empty stdout AND the word
+    /// "empty" in stderr, so both halves were false and every empty archive
+    /// failed closed — rejecting exactly the artifact the failure path produces.
+    ///
+    /// Uses the same 22 bytes the rendered script writes, so a change to either
+    /// side that breaks the pairing shows up here.
+    #[test]
+    fn an_empty_artifact_archive_passes_the_key_exclusion_check() {
+        let unique = crate::vm_lab::unique_suffix();
+        let dir = std::env::temp_dir().join(format!("rustynet-empty-zip-{unique}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let empty_zip = dir.join("empty.zip");
+        let mut eocd = vec![0x50u8, 0x4B, 0x05, 0x06];
+        eocd.extend(std::iter::repeat_n(0u8, 18));
+        assert_eq!(eocd.len(), 22, "an EOCD-only archive is exactly 22 bytes");
+        std::fs::write(&empty_zip, &eocd).expect("write empty zip");
+
+        verify_no_key_material_zip(&empty_zip)
+            .expect("an empty archive carries no key material and must pass");
+
+        // Positive control: a NON-archive must still fail closed, so the widened
+        // acceptance above cannot be mistaken for "unreadable listings now pass".
+        let junk = dir.join("junk.zip");
+        std::fs::write(&junk, b"this is not a zip file at all").expect("write junk");
+        assert!(
+            verify_no_key_material_zip(&junk).is_err(),
+            "an unreadable archive must still fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The writer and the verifier must agree, byte for byte.
+    ///
+    /// `verify_no_key_material_zip` accepts a non-zero listing exit only when the
+    /// downloaded file EQUALS the archive this collector writes. That is sound
+    /// only while both come from one constant — if the script could drift from
+    /// the verifier, the verifier would be attesting an archive it no longer
+    /// produces, and the empty case would fail closed again.
+    #[test]
+    fn the_empty_archive_the_script_writes_is_the_one_the_verifier_accepts() {
+        assert_eq!(
+            EMPTY_ARTIFACT_ARCHIVE.len(),
+            22,
+            "an end-of-central-directory-only archive is exactly 22 bytes"
+        );
+        assert_eq!(
+            &EMPTY_ARTIFACT_ARCHIVE[..4],
+            b"PK\x05\x06",
+            "must carry the end-of-central-directory signature"
+        );
+        assert!(
+            EMPTY_ARTIFACT_ARCHIVE[4..].iter().all(|b| *b == 0),
+            "the remaining 18 bytes are all zero"
+        );
+        // Decode the literal back OUT of the rendered script and compare to the
+        // constant. Asserting `script.contains(&empty_artifact_archive_ps_literal())`
+        // is tautological — both sides come from the same function, so it cannot
+        // fail while the script uses the renderer at all. Proven: mutating the
+        // renderer to emit 21 bytes instead of 22 left every test in this module
+        // green. Decoding catches truncation, reordering, and decimal formatting.
+        //
+        // The failure mode is fail-CLOSED, not a leak: a script writing bytes the
+        // verifier does not accept means the empty archive is rejected again, and
+        // diagnostics are lost on exactly the failures worth collecting. That is
+        // the original bug, so it is worth a real assertion.
+        let script = build_diag_archive_script(r"C:\Windows\Temp\rn_diag_artifacts.zip")
+            .expect("diag archive script should render");
+        const OPEN: &str = "[byte[]]@(";
+        let start = script
+            .find(OPEN)
+            .expect("byte-array literal must be present");
+        let rest = &script[start + OPEN.len()..];
+        let end = rest.find(')').expect("byte-array literal must close");
+        let decoded: Vec<u8> = rest[..end]
+            .split(',')
+            .map(|hex| {
+                u8::from_str_radix(hex.trim().trim_start_matches("0x"), 16)
+                    .unwrap_or_else(|err| panic!("literal must be hex bytes ({hex:?}): {err}"))
+            })
+            .collect();
+        assert_eq!(
+            decoded,
+            EMPTY_ARTIFACT_ARCHIVE.to_vec(),
+            "the bytes the SCRIPT writes must equal the bytes the VERIFIER accepts"
+        );
+    }
+
+    /// ONLY the exact empty archive may pass a failed listing. Nothing else.
+    ///
+    /// Three separate holes were found in the previous approach, which parsed
+    /// `unzip`'s prose, and the third showed the approach is unfixable:
+    /// `unzip -Z -1` writes its human message `Empty zipfile.` to the SAME
+    /// stream as entry names. So an archive whose first entry is NAMED
+    /// `empty zipfile`, with one central-directory signature corrupted, lists as
+    /// exactly that message, exits non-zero, and its remaining `keys/id.priv`
+    /// entry is never listed and never scanned. The archive is built on the
+    /// guest, so those bytes are attacker-controlled — which is the precise
+    /// threat this check exists for.
+    ///
+    /// Comparing content instead of prose removes the ambiguity: nothing holding
+    /// key material can equal 22 bytes of end-of-central-directory record. These
+    /// cases assert the boundary is CONTENT, not length and not exit code.
+    #[test]
+    fn only_the_exact_empty_archive_passes_a_failed_listing() {
+        let unique = crate::vm_lab::unique_suffix();
+        let dir = std::env::temp_dir().join(format!("rustynet-zip-boundary-{unique}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let genuine = dir.join("genuine.zip");
+        std::fs::write(&genuine, EMPTY_ARTIFACT_ARCHIVE).expect("write genuine");
+        verify_no_key_material_zip(&genuine)
+            .expect("the archive this collector writes must be accepted");
+
+        // Same LENGTH, different bytes: a length check would have passed this.
+        let impostor = dir.join("impostor.zip");
+        let mut wrong = EMPTY_ARTIFACT_ARCHIVE;
+        wrong[21] = 0x01;
+        std::fs::write(&impostor, wrong).expect("write impostor");
+        assert!(
+            verify_no_key_material_zip(&impostor).is_err(),
+            "a 22-byte file that is not the empty archive must fail closed"
+        );
+
+        // An archive whose bytes merely CONTAIN the record still fails: content
+        // equality, not a prefix or substring.
+        let padded = dir.join("padded.zip");
+        let mut longer = EMPTY_ARTIFACT_ARCHIVE.to_vec();
+        longer.extend_from_slice(b"keys/id.priv");
+        std::fs::write(&padded, &longer).expect("write padded");
+        assert!(
+            verify_no_key_material_zip(&padded).is_err(),
+            "trailing content past the record must fail closed"
+        );
+
+        // Unreadable junk still fails closed, as it always did.
+        let junk = dir.join("junk.zip");
+        std::fs::write(&junk, b"this is not a zip file at all").expect("write junk");
+        assert!(
+            verify_no_key_material_zip(&junk).is_err(),
+            "an unreadable archive must still fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

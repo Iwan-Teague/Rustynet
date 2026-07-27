@@ -34,7 +34,9 @@ pub fn collect_failure_diagnostics(
 
     let mut aliases = ctx.adapters.keys().cloned().collect::<Vec<_>>();
     aliases.sort();
+    let node_count = aliases.len();
     let mut nodes = serde_json::Map::new();
+    let mut artifact_failures: Vec<String> = Vec::new();
     let artifacts_dir = diagnostics_dir.join("artifacts");
     if collect_artifacts {
         fs::create_dir_all(&artifacts_dir).map_err(|err| {
@@ -57,40 +59,88 @@ pub fn collect_failure_diagnostics(
         } else {
             "diagnostic collection disabled".to_owned()
         };
-        let artifact_path = if collect_artifacts {
+        // One node's collection failure must not discard every other node's.
+        // This used to `?` straight out of the loop, and the aliases are sorted,
+        // so a failure on a late alias threw away the artifacts already gathered
+        // for the earlier ones AND skipped `summary.json` entirely (it is written
+        // after the loop). That is exactly backwards for a failure path: in run
+        // winnat-20260727T095740Z the only node that failed was `windows-x86-1`,
+        // its collection threw, and the run ended holding artifacts for the node
+        // that had worked and nothing at all for the node under investigation.
+        //
+        // Record the error per node instead, keep going, and report at the end.
+        let mut artifact_path = None;
+        let mut artifact_error = None;
+        if collect_artifacts {
             let extension = if adapter.platform() == VmGuestPlatform::Windows {
                 "zip"
             } else {
                 "tar.gz"
             };
             let path = artifacts_dir.join(format!("{alias}.{extension}"));
-            adapter
-                .collect_artifacts(&path)
-                .map_err(|err| format!("collect failure artifacts for '{alias}': {err}"))?;
-            Some(path.display().to_string())
-        } else {
-            None
-        };
+            match adapter.collect_artifacts(&path) {
+                Ok(()) => artifact_path = Some(path.display().to_string()),
+                Err(err) => {
+                    // `{alias}:` UNQUOTED is load-bearing, not a style choice.
+                    // `live_lab_run_matrix::attributable_node_status` decides
+                    // whether a node-scope failure is attributable to a specific
+                    // node by looking for `<alias>:` or `<alias>/` in the summary,
+                    // and downgrades to `not_proven` when it finds neither. With
+                    // the alias quoted, the `'` sits between the alias and the
+                    // colon, no match is possible, and the guilty and the innocent
+                    // node land byte-identical rows — which is the whole benefit
+                    // this error message exists to deliver. Pinned by
+                    // `a_failed_node_is_attributable_to_that_node`.
+                    let message = format!("collect failure artifacts for {alias}: {err}");
+                    artifact_failures.push(message.clone());
+                    artifact_error = Some(message);
+                }
+            }
+        }
         nodes.insert(
             alias,
             json!({
                 "platform": format!("{:?}", adapter.platform()).to_lowercase(),
                 "daemon_reason": daemon_reason,
                 "artifact": artifact_path,
+                // Always present, `null` when collection succeeded or was not
+                // requested, so "this node's artifact is missing and here is why"
+                // is readable straight out of the summary rather than only from
+                // the orchestrator's stage message.
+                "artifact_error": artifact_error,
             }),
         );
     }
+    // Schema stays at 1: `artifact_error` is additive and optional, and this
+    // summary currently has no reader outside this module.
     let summary = json!({
         "schema_version": 1,
         "collected_before_cleanup": true,
+        "artifact_failure_count": artifact_failures.len(),
         "nodes": nodes,
     });
+    // Written BEFORE the failure is reported, so the record of a partial
+    // collection survives on disk even though this call is about to return Err.
     write_orchestration_artifact(
         diagnostics_dir.join("summary.json").as_path(),
         &(serde_json::to_string_pretty(&summary)
             .map_err(|err| format!("serialize Rust-native diagnostics: {err}"))?
             + "\n"),
-    )
+    )?;
+    if !artifact_failures.is_empty() {
+        // Still an error — a partial collection must not read as a clean one —
+        // but the message says what WAS kept, so the reader looks in the report
+        // directory instead of assuming everything was lost.
+        return Err(format!(
+            "{} of {} node(s) failed artifact collection: {}. Diagnostics for the \
+             remaining nodes and summary.json were still written to {}",
+            artifact_failures.len(),
+            node_count,
+            artifact_failures.join("; "),
+            diagnostics_dir.display()
+        ));
+    }
+    Ok(())
 }
 
 pub fn register_shutdown_handlers_with<F>(mut register: F) -> Result<Arc<AtomicBool>, String>
@@ -661,6 +711,282 @@ impl StageObserver for TimeoutAwareStageRecorder<'_> {
                 "record terminal timed_out outcome for stage '{name}' failed: {err}"
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_diagnostics_tests {
+    use super::*;
+    use crate::vm_lab::DaemonProbeOp;
+    use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
+    use crate::vm_lab::orchestrator::error::{
+        AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
+        NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+    };
+    use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
+
+    /// Minimal adapter double.
+    ///
+    /// `collect_failure_diagnostics` makes FOUR adapter calls, not three:
+    /// `platform`, `collect_artifacts`, and `collect_daemon_failure_reason` —
+    /// which is NOT overridden here and takes the trait's default `Ok(None)`,
+    /// rendering as "no daemon failure marker found". That is deliberate but it
+    /// is a defaulted value, so it is named rather than left to be discovered.
+    /// `alias()` is overridden and never called; the loop keys off the map.
+    ///
+    /// Every other method is `unimplemented!()` so that a future change which
+    /// starts calling one fails loudly instead of silently taking a default.
+    #[derive(Debug)]
+    struct FakeAdapter {
+        alias: String,
+        platform: VmGuestPlatform,
+        artifacts_fail: bool,
+    }
+
+    impl NodeAdapter for FakeAdapter {
+        fn platform(&self) -> VmGuestPlatform {
+            self.platform
+        }
+        fn alias(&self) -> &str {
+            &self.alias
+        }
+        fn collect_artifacts(&self, dst: &Path) -> Result<(), AdapterError> {
+            if self.artifacts_fail {
+                return Err(AdapterError::Io {
+                    message: "simulated collection failure".to_owned(),
+                });
+            }
+            std::fs::write(dst, b"fake-artifact").map_err(|err| AdapterError::Io {
+                message: err.to_string(),
+            })
+        }
+        fn start_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn stop_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn restart_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn uninstall_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
+            unimplemented!()
+        }
+        fn run_validator(&self, _op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
+            unimplemented!()
+        }
+        fn ping_mesh_peer(&self, _peer: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn probe_denied_peer(&self, _denied: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
+            unimplemented!()
+        }
+        fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn endpoint(&self) -> String {
+            unimplemented!()
+        }
+        fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+            unimplemented!()
+        }
+        fn install_daemon(
+            &self,
+            _source: &SourceArchive,
+            _ctx: &OrchestrationContext,
+        ) -> Result<InstallReport, AdapterError> {
+            unimplemented!()
+        }
+        fn init_membership_snapshot(
+            &self,
+            _owner_key: &MembershipOwnerKey,
+            _peers: &[NodeMembershipPeer],
+        ) -> Result<MembershipSnapshot, AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_signed_bundle(
+            &self,
+            _kind: BundleKind,
+            _bundle_path: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_verifier_key(
+            &self,
+            _kind: BundleKind,
+            _pub_key_path: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_bundles_to_dir(
+            &self,
+            _kind: BundleKind,
+            _env_content: &str,
+            _local_out_dir: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+    }
+
+    fn temp_report_dir(label: &str) -> PathBuf {
+        let unique = crate::vm_lab::unique_suffix();
+        let dir = std::env::temp_dir().join(format!("rustynet-diag-{label}-{unique}"));
+        std::fs::create_dir_all(&dir).expect("report dir");
+        dir
+    }
+
+    /// The regression this fix exists for.
+    ///
+    /// Aliases are collected sorted, and collection used to `?` straight out of
+    /// the loop, so a failure on a LATE alias discarded the artifacts already
+    /// gathered for the earlier ones and skipped `summary.json` entirely — it is
+    /// written after the loop. Run winnat-20260727T095740Z hit exactly that:
+    /// `linux-x86-client-1` collected, `windows-x86-1` (the node that had
+    /// actually failed, and the only reason anyone was looking) threw, and the
+    /// run kept the artifacts for the healthy node and nothing for the broken
+    /// one.
+    ///
+    /// `zz-fails` sorts AFTER `aa-works` deliberately: with the old `?` the
+    /// early node's file would survive on disk by luck, so the load-bearing
+    /// assertions here are that `summary.json` exists and that it names BOTH
+    /// nodes with the failure attributed to the right one.
+    ///
+    /// The failing node is Windows and the healthy one Linux, matching the live
+    /// shape (and exercising the `.zip` vs `.tar.gz` extension split), and
+    /// diagnostics collection is ON, because production passes
+    /// `!config.skip_diagnose_on_failure` which defaults to true — a test that
+    /// turned it off would be exercising the `--skip-diagnose-on-failure` path
+    /// rather than the one that failed.
+    #[test]
+    fn one_node_failing_artifact_collection_keeps_every_other_node_and_the_summary() {
+        let report_dir = temp_report_dir("partial");
+        let mut ctx = OrchestrationContext::new(Vec::new(), report_dir.clone(), "net".to_owned());
+        ctx.adapters.insert(
+            "aa-works".to_owned(),
+            Box::new(FakeAdapter {
+                alias: "aa-works".to_owned(),
+                platform: VmGuestPlatform::Linux,
+                artifacts_fail: false,
+            }),
+        );
+        ctx.adapters.insert(
+            "zz-fails".to_owned(),
+            Box::new(FakeAdapter {
+                alias: "zz-fails".to_owned(),
+                platform: VmGuestPlatform::Windows,
+                artifacts_fail: true,
+            }),
+        );
+
+        let result = collect_failure_diagnostics(&ctx, true, true);
+
+        // A partial collection is still an error — it must not read as clean.
+        let err = result.expect_err("a failed node must be reported");
+        assert!(
+            err.contains("zz-fails"),
+            "must name the failing node: {err}"
+        );
+        assert!(
+            !err.contains("aa-works"),
+            "must not implicate the node that succeeded: {err}"
+        );
+
+        let diagnostics_dir = report_dir.join("diagnostics/rust-native-failure");
+        // The healthy node's artifact survived.
+        assert!(
+            diagnostics_dir.join("artifacts/aa-works.tar.gz").is_file(),
+            "the healthy node's artifact must survive another node's failure"
+        );
+        // summary.json is written even though the call returns Err. This is the
+        // assertion that would have caught the original bug: it was written
+        // after the loop the `?` escaped from, so it never existed at all.
+        let summary_path = diagnostics_dir.join("summary.json");
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&summary_path).expect("summary.json must be written"),
+        )
+        .expect("summary.json must parse");
+        assert_eq!(summary["artifact_failure_count"], 1);
+        assert_eq!(summary["nodes"]["aa-works"]["artifact_error"], Value::Null);
+        assert!(
+            summary["nodes"]["zz-fails"]["artifact_error"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("simulated collection failure")),
+            "the failing node must carry its reason in the summary: {summary}"
+        );
+        assert_eq!(summary["nodes"]["zz-fails"]["artifact"], Value::Null);
+
+        let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    /// The error message must be ATTRIBUTABLE, not merely informative.
+    ///
+    /// A node-scope `fail` is downgraded to `not_proven` by
+    /// `attributable_node_status` unless the stage summary contains `<alias>:`
+    /// or `<alias>/`. The message here used to render the alias quoted —
+    /// `for 'zz-fails':` — which puts a `'` between the alias and the colon, so
+    /// nothing ever matched and the guilty node and the innocent node were
+    /// recorded byte-identically. Naming the failing node is the entire point of
+    /// the collector returning Err, so a message that cannot be attributed buys
+    /// nothing downstream.
+    ///
+    /// The message is taken from the real `collect_failure_diagnostics` rather
+    /// than rebuilt here; a test that formats its own copy would pass whatever
+    /// the production format string said.
+    #[test]
+    fn a_failed_node_is_attributable_to_that_node() {
+        use crate::live_lab_run_matrix::attributable_node_status;
+
+        let report_dir = temp_report_dir("attribution");
+        let mut ctx = OrchestrationContext::new(Vec::new(), report_dir.clone(), "net".to_owned());
+        ctx.adapters.insert(
+            "aa-works".to_owned(),
+            Box::new(FakeAdapter {
+                alias: "aa-works".to_owned(),
+                platform: VmGuestPlatform::Linux,
+                artifacts_fail: false,
+            }),
+        );
+        ctx.adapters.insert(
+            "zz-fails".to_owned(),
+            Box::new(FakeAdapter {
+                alias: "zz-fails".to_owned(),
+                platform: VmGuestPlatform::Windows,
+                artifacts_fail: true,
+            }),
+        );
+
+        let summary = collect_failure_diagnostics(&ctx, true, true)
+            .expect_err("a failed node must be reported");
+
+        assert_eq!(
+            attributable_node_status("fail", "node", "zz-fails", &summary),
+            "fail",
+            "the failing node must stay attributable: {summary}"
+        );
+        assert_eq!(
+            attributable_node_status("fail", "node", "aa-works", &summary),
+            "not_proven",
+            "a node this summary does not blame must not be recorded as failed: {summary}"
+        );
+
+        let _ = std::fs::remove_dir_all(&report_dir);
     }
 }
 
