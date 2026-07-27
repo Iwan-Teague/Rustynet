@@ -70,6 +70,44 @@ mechanism, not a lab hack.
 7. NOT clock skew (guests read UTC == host). NOT a flap-recovery bug (both nodes
    are already permanently FailClosed before the flap block is applied).
 
+> **External observation 2026-07-25 (from the `two_hop`/D1 investigation — FOR THE
+> TRACK OWNER TO VERIFY; no conclusion of this plan is changed).** §2's premise
+> ("there is no autonomous re-issuance anywhere in the daemon") holds for the
+> *daemon*, but there **is** an autonomous on-guest re-issuer outside it that this
+> plan does not mention: `rustynetd-assignment-refresh.timer`
+> (`OnUnitActiveSec=60s`) runs `ops refresh-assignment`, which calls
+> `refresh_local_traversal_bundle_from_specs` (`main.rs:14345`, invoked from
+> `main.rs:~9440-9515`) **before** the assignment-TTL short-circuit — re-minting the
+> **traversal** bundle as well as the assignment, both from the single
+> `/etc/rustynet/assignment-refresh.env`. Two consequences worth folding into the
+> plan's framing:
+> 1. **It is off by default and unavailable to ordinary nodes, so it does NOT close
+>    this plan's gap — Design A's rationale stands.**
+>    `RUSTYNET_ASSIGNMENT_AUTO_REFRESH` defaults to `"false"` at runtime
+>    (`main.rs:9443`) and in the installer (`ops_install_systemd.rs:237`), and the
+>    lab's own e2e env sets it `"false"` (`ops_e2e.rs:644`), so the timer is a **no-op**
+>    unless explicitly enabled. It is also a local *minter*, not a fetcher: it needs
+>    the mesh assignment signing secret on the node
+>    (`validate_root_owned_encrypted_signing_file` guards
+>    `/etc/rustynet/assignment.signing.secret` immediately before the call), which is
+>    exactly the key-custody expansion §3 uses to reject Design B. Where it IS enabled
+>    (e.g. `two_hop` sets `AUTO_REFRESH=true` via
+>    `live_lab_bin_support/mod.rs:733`) a node self-sustains by a path ordinary
+>    production nodes lack — worth weighing when reading
+>    `live_network_flap_validation` as a production canary.
+> 2. **Where enabled, the refresh is atomic across both halves; where not, NOTHING
+>    enforces that atomicity.** One env mints the assignment peer set *and* the
+>    traversal target index together, and since
+>    `apply_traversal_authority_to_peers` (`daemon.rs:6693-6755`) fail-closes on any
+>    set inequality between the two — latching a permanent restriction after five
+>    rejections — that atomicity is load-bearing. But on a default node neither half
+>    is autonomously re-minted, so the invariant rests entirely on the external
+>    pusher's ordering, and **any flow that changes a node's peer/target set and
+>    installs the two halves as separate steps while the daemon reconciles reproduces
+>    the failure**. That is what made `two_hop` RED (see
+>    `NodeEngineFlipDispositions_2026-07-24.md` D1, which routes the product-side
+>    question). I4's dual-path precedence must preserve the same property.
+
 ## 3. Design decision — hardened Design A (per-node self-signed)
 
 **Chosen: A.** Each node **self-signs its own** traversal candidates with its
