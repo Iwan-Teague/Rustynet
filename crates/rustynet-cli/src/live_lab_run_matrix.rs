@@ -431,6 +431,21 @@ pub fn default_live_lab_run_matrix_path() -> PathBuf {
 /// the `--node` engine had never once passed two-hop — every one of those
 /// passes was the legacy bash orchestrator. Splitting the ledgers makes the
 /// engine unambiguous by construction rather than by footnote.
+///
+/// **That split was only half the fix, and `linux_stage_two_hop` reproduced the same
+/// false-green *inside* this ledger** — because three distinct stage ids aliased onto
+/// the column, one of them `traffic_test_matrix` (mesh-ping) rather than a two-hop
+/// proof. The alias is removed as of 2026-07-26 (QH-07).
+///
+/// **The removal is FORWARD-ONLY: rows written before that commit are contaminated.**
+/// This file already holds **43 `linux_stage_two_hop = pass` rows** that are
+/// `traffic_test_matrix` results, at a time when `live_two_hop_validation` had never
+/// passed even once. Do not read a historical `two_hop` pass as evidence the chained
+/// exit path worked; go to `live_lab_node_stage_results.csv` for the per-stage truth,
+/// or to the stage's own report (`live_two_hop_report.json`, whose `dataplane` block
+/// carries the actual measurements). Note also that a quote-aware CSV parse is required
+/// to read these columns at all — every row has commas inside quoted fields, so a naive
+/// `awk -F,` shifts the stage block and silently reports the wrong column.
 pub fn default_live_lab_node_run_matrix_path() -> PathBuf {
     workspace_root_path().join("documents/operations/live_lab_node_run_matrix.csv")
 }
@@ -3741,7 +3756,21 @@ mod registry_equivalence_tests {
             "exit_handoff" | "active_exit" | "live_exit_handoff" => Some("exit_handoff"),
             "admin_issue" => Some("admin"),
             "blind_exit" => Some("blind_exit"),
-            "traffic_test_matrix" => Some("two_hop"),
+            // QH-07: `traffic_test_matrix` deliberately maps to NO roll-up column.
+            //
+            // It used to map to `two_hop`, which made the column a false-green:
+            // `traffic_test_matrix` proves only that the mesh pings (every pair
+            // reachable), whereas the two-hop column is read as proof of the chained
+            // exit path. Against the per-stage ledger the divergence is total —
+            // `live_two_hop_validation` is skip 263 / fail 116 / **pass 0**, while
+            // `traffic_test_matrix` is pass 260 — so a `pass` in that column never
+            // meant two-hop worked. Reporting into no column is strictly more honest
+            // than reporting into the wrong one, and nothing is lost: per-stage results
+            // remain in `live_lab_node_stage_results.csv`.
+            //
+            // Deliberately NOT re-aliased to another column: adding one is a schema
+            // migration (fixed header list, ~39 references, plus 108 + 549 existing
+            // rows that predate any new header) and is tracked separately.
             "role_switch_matrix" => Some("role_switch_matrix"),
             "live_lan_toggle" => Some("lan_toggle"),
             "live_two_hop" => Some("two_hop"),
