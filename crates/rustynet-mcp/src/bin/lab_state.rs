@@ -7097,15 +7097,30 @@ static STAGE_INFO: &[StageInfo] = &[
             "service install/enable (systemctl) failure on Linux",
         ],
     },
+    // QH-07: `two_hop` is NOT an alias of this stage. It used to be listed
+    // here, so `explain_stage linux_stage_two_hop` answered with peer-ping
+    // reachability and sent the reader to traffic_test_matrix.rs — the same
+    // conflation that put this stage's passes in the two_hop ledger column.
     StageInfo {
         name: "traffic",
-        aliases: &["traffic_test_matrix", "two_hop"],
-        checks: "Re-collects mesh IPs (60s retry, detects collisions), then pings every peer from every node (90s retry) to prove baseline reachability.",
+        aliases: &["traffic_test_matrix"],
+        checks: "Re-collects mesh IPs (60s retry, detects collisions), then pings every peer from every node (90s retry) to prove baseline reachability. Peer-to-peer reachability only — it proves NOTHING about chained two-hop exit routing (see the two_hop stage).",
         owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/traffic_test_matrix.rs",
         causes: &[
             "no mesh IPs collected (WireGuard interface never settled)",
             "duplicate IPs across nodes = assignment bundle not applied",
             "ping still failing after the retry window (WireGuard/daemon issue)",
+        ],
+    },
+    StageInfo {
+        name: "two_hop",
+        aliases: &["live_two_hop_validation", "live_two_hop"],
+        checks: "Proves CHAINED two-hop routing: client -> entry -> exit, driven by the live_linux_two_hop_test binary. Needs a distinct 'entry' role AND a second client; a topology with neither is SKIPPED, not failed. Depends on blind_exit_dataplane_validation.",
+        owning: "crates/rustynet-cli/src/vm_lab/orchestrator/stage/live_two_hop_validation.rs",
+        causes: &[
+            "no 'entry'-labelled node or no second client in the topology (stage skips rather than fails)",
+            "exit-chaining dataplane gap — the two hops never establish end-to-end",
+            "its dependency blind_exit_dataplane_validation skipped or failed",
         ],
     },
     StageInfo {
@@ -9402,6 +9417,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             explain_stage("nonsense").content[0]
                 .text
                 .contains("Unknown stage")
+        );
+    }
+
+    #[test]
+    fn explain_stage_does_not_conflate_two_hop_with_the_traffic_matrix() {
+        // QH-07 regression, MCP side. `two_hop` was an alias of the `traffic`
+        // entry, so an agent asking about a failing `linux_stage_two_hop`
+        // was told the stage pings peers and was sent to
+        // traffic_test_matrix.rs — the wrong stage, the wrong owning file,
+        // and the wrong root-cause list.
+        let two_hop = explain_stage("linux_stage_two_hop");
+        let text = &two_hop.content[0].text;
+        assert!(
+            text.contains("live_two_hop_validation.rs"),
+            "two_hop must resolve to the chained-exit stage: {text}"
+        );
+        assert!(
+            !text.contains("traffic_test_matrix.rs"),
+            "two_hop must NOT resolve to the peer-reachability stage: {text}"
+        );
+
+        // And the traffic matrix still explains itself, saying what it is not.
+        let traffic = explain_stage("traffic_test_matrix");
+        let traffic_text = &traffic.content[0].text;
+        assert!(traffic_text.contains("traffic_test_matrix.rs"));
+        assert!(
+            traffic_text.contains("two_hop"),
+            "the traffic entry must warn that it does not prove two-hop: {traffic_text}"
         );
     }
 
