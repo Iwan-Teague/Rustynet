@@ -45,6 +45,15 @@ const DISCOVERY_TIMEOUT_SECS: u64 = 600;
 /// failures and can fight over node services, so fail closed.
 const MAX_CONCURRENT_LIVE_LAB_JOBS: usize = 1;
 
+// LOAD-BEARING SHAPE. `rustynet-cli`'s
+// `the_mcp_coverage_column_list_stays_a_subset_of_this_schema` reads this
+// declaration as SOURCE TEXT and asserts every entry exists in
+// `DEFAULT_MATRIX_COLUMNS` — the crates cannot share the constant, since
+// rustynet-mcp does not depend on rustynet-cli. That test requires one bare
+// quoted entry per line and the closing `];` at column 0. Anything else fails
+// that test loudly — usually a panic naming the offending line, though a
+// multi-entry reflow surfaces instead as a subset failure naming a mangled
+// column. Keep it plain.
 const CANONICAL_COVERAGE_COLUMNS: &[&str] = &[
     "linux_stage_bootstrap",
     "linux_stage_membership",

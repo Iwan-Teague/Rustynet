@@ -2692,6 +2692,120 @@ mod tests {
         );
     }
 
+    /// The MCP server keeps its OWN copy of the coverage-column list, and
+    /// nothing kept the two in sync.
+    ///
+    /// `rustynet-mcp/src/bin/lab_state.rs` declares `CANONICAL_COVERAGE_COLUMNS`
+    /// by hand. It is not derived from `DEFAULT_MATRIX_COLUMNS` and cannot be:
+    /// `rustynet-mcp` does not depend on `rustynet-cli`. So the only available
+    /// guard is to read the other crate's source and compare — the same shape as
+    /// the shared-installer test in `ops_e2e`.
+    ///
+    /// What this prevents: a coverage column renamed or removed here while the
+    /// MCP list keeps the old name. `find_untested_work` resolves its columns
+    /// against the CSV header and treats an unresolvable one as `idx = None`,
+    /// which forces every row to `""` and classifies the column NEVER-RUN. So the
+    /// drift does not error — it silently reports a covered column as untested,
+    /// and points agents at work that is already done.
+    ///
+    /// One-directional on purpose, but NOT for the reason it looks like. The MCP
+    /// list is not a curated subset: 47 coverage-pattern columns in this schema
+    /// are absent from it (`linux_stage_admin`, every `*_blind_exit`, every
+    /// `*_check`, ...), and those are simply the newer additions — the list is
+    /// accumulated drift. The MCP surfaces them anyway, because
+    /// `coverage_columns_from_header` pattern-matches `_stage_` and `cross_os_`
+    /// against the live header.
+    ///
+    /// The list only matters as a FALLBACK FLOOR for a header not yet
+    /// schema-upgraded, so equality is the wrong relation to assert. The residual
+    /// gap is worth stating rather than denying: against a stale header those 47
+    /// are invisible rather than reported NEVER-RUN, which is the very failure
+    /// the floor exists to prevent.
+    #[test]
+    fn the_mcp_coverage_column_list_stays_a_subset_of_this_schema() {
+        let mcp_source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("crates/rustynet-mcp/src/bin/lab_state.rs");
+        let body = std::fs::read_to_string(&mcp_source)
+            .unwrap_or_else(|err| panic!("lab_state.rs should be readable: {err}"));
+
+        const DECL: &str = "const CANONICAL_COVERAGE_COLUMNS: &[&str] = &[";
+        let start = body
+            .find(DECL)
+            .expect("lab_state.rs must still declare CANONICAL_COVERAGE_COLUMNS");
+        let rest = &body[start + DECL.len()..];
+        // Anchored at column 0. A bare `];` search terminates early on any `];`
+        // inside a comment, and rustfmt indents in-array comments — so requiring
+        // the line start makes that impossible. Without it, a comment mentioning
+        // `DEFAULT_MATRIX_COLUMNS[..];` truncated the slice and silently dropped
+        // the whole trailing `cross_os_*` block from the comparison.
+        let end = rest
+            .find("\n];")
+            .expect("CANONICAL_COVERAGE_COLUMNS must terminate at line start");
+
+        // EVERY non-blank, non-comment line must parse as a bare quoted entry.
+        // A `filter_map` here silently discards whatever it cannot read, which
+        // made the guard defeatable by an ordinary trailing comment:
+        // `"linux_stage_bootstrap_DRIFT", // renamed` simply vanished from the
+        // extraction and the drift went unreported. Panicking means a rustfmt
+        // reflow or a changed declaration shape fails loudly instead of quietly
+        // shrinking what is checked. Note a multi-entry reflow (`"a", "b",`) does
+        // NOT panic — it parses as one entry named `a", "b` and is caught by the
+        // subset assertion below instead. Loud either way, but not always by the
+        // same route.
+        let mut mcp_columns: Vec<&str> = Vec::new();
+        for line in rest[..end].lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let column = line
+                .trim_end_matches(',')
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "CANONICAL_COVERAGE_COLUMNS line is not a bare quoted entry: \
+                         {line:?}. Extraction must never skip what it cannot read."
+                    )
+                });
+            mcp_columns.push(column);
+        }
+
+        // The subset relation cannot see DELETION — an empty list is trivially a
+        // subset of anything. The panic above stops the EXTRACTOR dropping lines
+        // it reads; it does nothing about the LIST itself losing entries, and an
+        // earlier version of this test removed a count threshold on exactly that
+        // confusion. Emptying `CANONICAL_COVERAGE_COLUMNS` then passed.
+        //
+        // This list is `find_untested_work`'s fallback floor for a header that has
+        // not been schema-upgraded, and a floor that can be emptied without a test
+        // noticing is not a floor. `>=` rather than `==` so additions do not churn
+        // the number.
+        assert!(
+            mcp_columns.len() >= 74,
+            "CANONICAL_COVERAGE_COLUMNS shrank to {} entries (floor: 74). A subset \
+             assertion cannot catch deletion, so the count is asserted separately.",
+            mcp_columns.len()
+        );
+
+        let schema: BTreeSet<&str> = DEFAULT_MATRIX_COLUMNS.iter().copied().collect();
+        let missing: Vec<&str> = mcp_columns
+            .iter()
+            .copied()
+            .filter(|column| !schema.contains(column))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "lab_state.rs CANONICAL_COVERAGE_COLUMNS names columns absent from \
+             DEFAULT_MATRIX_COLUMNS: {missing:?}. find_untested_work resolves \
+             columns by header name and treats an unresolvable one as never-run, \
+             so this drift silently reports covered work as untested."
+        );
+    }
+
     #[test]
     fn every_registry_stage_column_reference_exists_in_the_csv_schema() {
         // EXTENSIBILITY GATE: a StageSpec that references a CSV column absent
