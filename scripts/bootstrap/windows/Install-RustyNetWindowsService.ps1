@@ -38,6 +38,22 @@ param(
     # install would mean making the rekey step conditional, which is a
     # product decision and is tracked separately.
     [switch]$ForceUnsupportedBackend,
+    # QH-28. Opt OUT of minting a self-signed code-signing certificate and
+    # trusting it in LocalMachine\Root.
+    #
+    # Inverted on purpose. This script is `include_str!`-embedded into the
+    # shipped `install/live_windows.rs` AND invoked by at least four lab and
+    # e2e callers (the orchestrator adapter, `rn_bootstrap_windows.ps1`,
+    # `Bootstrap-RustyNetWindows.ps1`, and `ops install-windows-service`). An
+    # opt-IN switch would have to be threaded through every one of them, and a
+    # caller added later would silently lose the signing it needs. An opt-OUT
+    # is passed by exactly one caller — the shipped installer — and a new lab
+    # caller inherits the working default.
+    #
+    # What it protects: the block below adds a new trusted ROOT certificate
+    # authority to the machine. That is defensible on a lab guest running
+    # binaries it just built, and not on a user's machine.
+    [switch]$NoSelfSignedCodeSigning,
     # Enable auto-tunnel enforcement (auto_tunnel_enforce=true).
     # Bootstrap installs the service with auto_tunnel_enforce=false so the
     # daemon starts before any mesh assignment bundle exists.
@@ -960,10 +976,29 @@ Copy-Item -LiteralPath $relaySource -Destination $relayDest -Force
 # `Cert:\LocalMachine\Root` so WinVerifyTrust accepts it. Both stores
 # require Administrator; install-release already runs as SYSTEM via
 # the orchestrator, so the trust addition here matches the install-
-# scope authority and never leaves the lab guest.
+# scope authority.
+#
+# CORRECTED 2026-07-27: this used to add "and never leaves the lab
+# guest", which was false — the script is embedded in the shipped
+# installer too, with no cfg gate, so every shipped install added a
+# trusted root CA. It is now skipped when -NoSelfSignedCodeSigning is
+# passed, which the shipped installer does and no lab caller does.
 #
 # Idempotent: an existing non-expired cert with the same subject is
 # reused; signtool re-signing replaces the prior signature in place.
+if ($NoSelfSignedCodeSigning) {
+    # Deliberately a SKIP, not a verification failure. Shipped installs are not
+    # reliably signed: release Authenticode is conditional on
+    # RUSTYNET_SIGNING_PFX_BASE64 being configured and "steps skip cleanly when
+    # absent", the always-present signature is an ed25519 release manifest that
+    # Authenticode cannot see, and the only reachable acquisition modes
+    # (--from-dir, --build-from-source) both yield unsigned cargo output.
+    # Refusing on an unsigned binary here would turn `rustynet install
+    # --build-from-source` on Windows from working into a hard failure, which is
+    # not what declining to mint a root CA is supposed to cost.
+    Set-InstallProgressStep 'skip-self-signed-code-signing'
+    Write-Host "[install-helper] authenticode: self-signed code signing disabled (-NoSelfSignedCodeSigning); no certificate minted and no root-store change"
+} else {
 Set-InstallProgressStep 'sign-installed-binaries-for-authenticode'
 # Pick a signtool.exe whose architecture can actually EXECUTE on this machine,
 # most-preferred first.
@@ -1177,6 +1212,7 @@ foreach ($binPath in $binariesToSign) {
 # reached by installs that only lay down files, and gating those on a dependency
 # they never exercise would refuse work that would have succeeded. Here, the very
 # next command cannot succeed without it.
+}
 Set-InstallProgressStep 'require-wireguard-wg-binary'
 $wgBinaryPath = Get-RustyNetWgBinaryPath
 if (-not $wgBinaryPath) {

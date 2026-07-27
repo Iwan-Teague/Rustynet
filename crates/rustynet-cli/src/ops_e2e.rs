@@ -1088,7 +1088,9 @@ pub fn execute_ops_install_windows_service() -> Result<String, String> {
 ///
 /// On non-Windows hosts this always returns an error.
 #[cfg(not(windows))]
-pub fn execute_ops_install_windows_relay_service() -> Result<String, String> {
+pub fn execute_ops_install_windows_relay_service(
+    _self_signed: RelaySelfSignedCodeSigning,
+) -> Result<String, String> {
     Err("ops install-windows-relay-service is only supported on Windows hosts".to_owned())
 }
 
@@ -1646,13 +1648,42 @@ pub fn execute_ops_install_windows_service() -> Result<String, String> {
     Ok("RustyNet Windows service installed and started".to_string())
 }
 
+/// Whether a relay install may mint a self-signed code-signing certificate and
+/// add it to the machine-wide `LocalMachine\Root` store.
+///
+/// The relay installer signs the relay binary so Windows will accept it. In the
+/// lab the binary is built from source and unsigned, so the script mints a
+/// throwaway certificate and trusts it machine-wide — acceptable on a
+/// disposable guest, and the only reason the mint exists.
+///
+/// On an operator's real host it is not acceptable: writing to `LocalMachine\Root`
+/// makes anything signed by that key trusted for every purpose, for every user,
+/// until someone removes it by hand. `role set` is a shipped, ungated path onto
+/// a real machine, so it passes `Disallow`. Callers must state which case they
+/// are, because the two differ only in consequence, not in mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaySelfSignedCodeSigning {
+    /// Lab bring-up on a disposable guest: mint and trust.
+    ///
+    /// Gated on `vm-lab` so a release build cannot name it. The relay's whole
+    /// protection otherwise rests on one enum argument at one call site, and
+    /// flipping that argument is a one-line change no test can see; this makes
+    /// it a compile error in the builds that reach real operator hosts.
+    #[cfg(feature = "vm-lab")]
+    Allow,
+    /// A real host: never write to the machine root store.
+    Disallow,
+}
+
 /// Install the `rustynet-relay` Windows service.
 ///
 /// Runs `Install-RustyNetWindowsRelayService.ps1` from the source root resolved
 /// via `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
 /// Requires Administrator privileges.
 #[cfg(windows)]
-pub fn execute_ops_install_windows_relay_service() -> Result<String, String> {
+pub fn execute_ops_install_windows_relay_service(
+    self_signed: RelaySelfSignedCodeSigning,
+) -> Result<String, String> {
     ensure_running_as_root()?;
     let source_root = resolve_windows_install_source_root()?;
     let script_path = source_root
@@ -1669,23 +1700,27 @@ pub fn execute_ops_install_windows_relay_service() -> Result<String, String> {
     }
     let script_str = script_path.to_string_lossy().to_string();
     let source_root_str = source_root.to_string_lossy().to_string();
+    let mut args = vec![
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        script_str.as_str(),
+        "-RustyNetRoot",
+        source_root_str.as_str(),
+        "-InstallRoot",
+        r"C:\Program Files\RustyNet",
+        "-RelayRoot",
+        r"C:\ProgramData\RustyNet\relay",
+        "-ServiceName",
+        "RustyNetRelay",
+    ];
+    if self_signed == RelaySelfSignedCodeSigning::Disallow {
+        args.push("-NoSelfSignedCodeSigning");
+    }
     run_status(
         "powershell.exe",
-        &[
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            script_str.as_str(),
-            "-RustyNetRoot",
-            source_root_str.as_str(),
-            "-InstallRoot",
-            r"C:\Program Files\RustyNet",
-            "-RelayRoot",
-            r"C:\ProgramData\RustyNet\relay",
-            "-ServiceName",
-            "RustyNetRelay",
-        ],
+        &args,
         &[],
         "Windows relay service install script failed",
     )?;
@@ -7668,6 +7703,489 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         );
     }
 
+    /// Mask PowerShell comments and quoted strings with spaces, preserving every
+    /// byte offset, so that a brace scan over the result sees only braces that
+    /// actually delimit blocks.
+    ///
+    /// Offsets are preserved deliberately: needles are located in the RAW text
+    /// (where `'Root', 'LocalMachine'` survives) while block boundaries are
+    /// computed on the MASKED text, and the two are compared directly. Without
+    /// masking, a `{` inside a message string would corrupt the depth count and
+    /// the enclosure assertions would be measuring nothing.
+    fn ps_mask_strings_and_comments(src: &str) -> String {
+        ps_mask(src, true)
+    }
+
+    /// Blank comments but KEEP string contents.
+    ///
+    /// Needed because the operations that write a trusted root store name it as
+    /// a string argument — `X509Store('Root', 'LocalMachine')`,
+    /// `Cert:\LocalMachine\Root` — so searching the fully masked text for them
+    /// finds nothing. Searching the raw text instead finds the prose in the
+    /// comments that explain the hazard, of which the daemon script has six. This
+    /// is the only view that distinguishes "the script does this" from "the
+    /// script talks about this".
+    fn ps_mask_comments_only(src: &str) -> String {
+        ps_mask(src, false)
+    }
+
+    fn ps_mask(src: &str, mask_strings: bool) -> String {
+        #[derive(Clone, Copy, PartialEq)]
+        enum State {
+            Code,
+            Single,
+            Double,
+            Line,
+            Block,
+        }
+        let bytes = src.as_bytes();
+        let mut out = bytes.to_vec();
+        let mut state = State::Code;
+        let mut index = 0usize;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            match state {
+                State::Code => {
+                    // A backtick escapes the next character in CODE too, not only
+                    // inside a double-quoted string: `Write-Host x`"y` passes a
+                    // literal quote and parses clean. Without consuming the
+                    // escaped byte the scanner would treat that `"` as opening a
+                    // string and invert string/code parity for the rest of the
+                    // file.
+                    if byte == b'`' && index + 1 < bytes.len() {
+                        index += 2;
+                        continue;
+                    }
+                    if byte == b'<' && bytes.get(index + 1) == Some(&b'#') {
+                        out[index] = b' ';
+                        out[index + 1] = b' ';
+                        state = State::Block;
+                        index += 2;
+                        continue;
+                    }
+                    match byte {
+                        b'#' => {
+                            out[index] = b' ';
+                            state = State::Line;
+                        }
+                        b'\'' => {
+                            if mask_strings {
+                                out[index] = b' ';
+                            }
+                            state = State::Single;
+                        }
+                        b'"' => {
+                            if mask_strings {
+                                out[index] = b' ';
+                            }
+                            state = State::Double;
+                        }
+                        _ => {}
+                    }
+                }
+                State::Line => {
+                    if byte == b'\n' {
+                        state = State::Code;
+                    } else {
+                        out[index] = b' ';
+                    }
+                }
+                State::Block => {
+                    if byte == b'#' && bytes.get(index + 1) == Some(&b'>') {
+                        out[index] = b' ';
+                        out[index + 1] = b' ';
+                        state = State::Code;
+                        index += 2;
+                        continue;
+                    }
+                    if byte != b'\n' {
+                        out[index] = b' ';
+                    }
+                }
+                State::Single => {
+                    if mask_strings {
+                        out[index] = b' ';
+                    }
+                    if byte == b'\'' {
+                        state = State::Code;
+                    }
+                }
+                State::Double => {
+                    if mask_strings {
+                        out[index] = b' ';
+                    }
+                    // A backtick escapes the next character, including a quote,
+                    // so it must not be read as the string terminator.
+                    if byte == b'`' && index + 1 < bytes.len() {
+                        if mask_strings {
+                            out[index + 1] = b' ';
+                        }
+                        index += 2;
+                        continue;
+                    }
+                    if byte == b'"' {
+                        state = State::Code;
+                    }
+                }
+            }
+            index += 1;
+        }
+        String::from_utf8(out).expect("masking only ever writes ASCII spaces")
+    }
+
+    /// Every operation these installers could use to write a machine-wide
+    /// trusted root, as a pattern CLASS rather than the two literal spellings
+    /// that happen to be in the file today. Deleting one space from
+    /// `X509Store('Root', 'LocalMachine')` walked past the previous needle while
+    /// still adding a root CA; so would `certutil -addstore Root`,
+    /// `Import-Certificate -CertStoreLocation Cert:\LocalMachine\Root`, or
+    /// `[X509Store]::new('Root','LocalMachine')`.
+    const ROOT_STORE_WRITERS: &[&str] = &[
+        "New-SelfSignedCertificate",
+        "X509Store(",
+        "X509Store]::new(",
+        r"LocalMachine\Root",
+        "certutil",
+        "Import-Certificate",
+    ];
+
+    /// Byte offsets of every assignment to a variable whose name begins with
+    /// `stem`, including scope-qualified forms and `Set-Variable`.
+    ///
+    /// Identifier-based on purpose. The first version of this check was
+    /// `contains("$NoSelfSignedCodeSigning =")` — a `$`-prefixed substring with
+    /// one hardcoded space — and every one of
+    /// `$script:NoSelfSignedCodeSigning = $false` (the `:` breaks the `$` match),
+    /// `$NoSelfSignedCodeSigning=$false` (no space) and
+    /// `Set-Variable -Name NoSelfSignedCodeSigning -Value $false` neuters the
+    /// gate while walking straight past it. The `$script:`-qualified form is the
+    /// dangerous one: at script scope it IS the parameter variable, and it reads
+    /// like a harmless refactor.
+    fn ps_assignments_to(masked: &str, stem: &str) -> Vec<usize> {
+        let bytes = masked.as_bytes();
+        let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        let mut hits = Vec::new();
+
+        for (at, _) in masked.match_indices(stem) {
+            // `Set-Variable [-Name] <stem>` on the same line assigns without `=`.
+            let set_variable = masked[..at]
+                .rfind("Set-Variable")
+                .is_some_and(|sv| !masked[sv..at].contains('\n'));
+            if set_variable {
+                hits.push(at);
+                continue;
+            }
+
+            // Walk back over an optional `scope:` qualifier to find the sigil.
+            let mut start = at;
+            while start > 0 && is_word(bytes[start - 1]) {
+                start -= 1;
+            }
+            if start > 0 && bytes[start - 1] == b':' {
+                let mut scope = start - 1;
+                while scope > 0 && is_word(bytes[scope - 1]) {
+                    scope -= 1;
+                }
+                start = scope;
+            }
+            if start == 0 || bytes[start - 1] != b'$' {
+                continue;
+            }
+
+            // Skip the rest of the identifier and any spaces, then require a
+            // single `=` — `-eq` and `==` are comparisons, not assignments.
+            let mut end = at + stem.len();
+            while end < bytes.len() && is_word(bytes[end]) {
+                end += 1;
+            }
+            while end < bytes.len() && (bytes[end] == b' ' || bytes[end] == b'\t') {
+                end += 1;
+            }
+            if bytes.get(end) == Some(&b'=') && bytes.get(end + 1) != Some(&b'=') {
+                hits.push(at);
+            }
+        }
+        hits
+    }
+
+    /// Byte offset of the `}` matching the `{` at `open`.
+    fn ps_block_end(masked: &str, open: usize) -> usize {
+        let bytes = masked.as_bytes();
+        assert_eq!(
+            bytes[open], b'{',
+            "ps_block_end must be given the offset of an opening brace"
+        );
+        let mut depth = 0usize;
+        for (offset, byte) in bytes.iter().enumerate().skip(open) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return offset;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces from offset {open}");
+    }
+
+    /// QH-28. Certificate minting must be ENCLOSED by the opt-out gate, in both
+    /// installers, and only the shipped caller may opt out.
+    ///
+    /// Both scripts mint a per-host code-signing certificate and add it to
+    /// `LocalMachine\Root` — a new trusted root CA that makes anything signed by
+    /// that key trusted for every purpose and every user until removed by hand.
+    ///
+    /// Both are reachable from the SHIPPED binary. The daemon script is
+    /// `include_str!`-embedded into `install/live_windows.rs`. The relay script
+    /// is NOT reached by `ops install-windows-relay-service` — that verb is
+    /// `#[cfg(feature = "vm-lab")]` and absent from release builds — but by
+    /// `role set`, which is ungated: `execute_role_plan` → `execute_role_action`
+    /// → `DeployRelayService` → `execute_platform_relay_service_action`. That
+    /// path passes `RelaySelfSignedCodeSigning::Disallow`; the vm-lab verb, which
+    /// only ever runs against disposable guests, passes `Allow`.
+    ///
+    /// Asserts ENCLOSURE, not ordering, because ordering does not imply
+    /// reachability. Two mutations defeated the ordering form of this test while
+    /// keeping it green: moving the daemon arm's closing brace up so the whole
+    /// mint sat at top level, and deleting the `return` from the relay guard so
+    /// it logged "disabled; no certificate minted" and then minted anyway. So
+    /// this slices the gated region by brace matching and requires the mint and
+    /// the root-store write to appear ONLY inside it — an upper bound as well as
+    /// a lower one — and requires the relay guard to actually return.
+    #[test]
+    fn certificate_minting_is_enclosed_by_the_optout_gate_in_both_installers() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli");
+
+        // Daemon installer: the mint sits inside the `} else {` arm of the gate.
+        let daemon = std::fs::read_to_string(
+            root.join("scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1"),
+        )
+        .expect("daemon installer should be readable");
+        let daemon_masked = ps_mask_strings_and_comments(&daemon);
+        assert!(
+            daemon.contains("[switch]$NoSelfSignedCodeSigning"),
+            "daemon installer must expose the opt-out"
+        );
+        let gate_open = daemon_masked
+            .find("if ($NoSelfSignedCodeSigning) {")
+            .expect("daemon installer must gate on the switch");
+        // Brace-match the `if` arm and require the `else` to open at ITS close,
+        // rather than searching forward for the next `} else {`. The file has
+        // thirteen others, so the forward search could measure a mutation
+        // against whichever one happened to come next instead of against the
+        // real arm — it would still go red here, but by luck of layout.
+        let if_open = gate_open
+            + daemon_masked[gate_open..]
+                .find('{')
+                .expect("the gate must open a block");
+        let if_close = ps_block_end(&daemon_masked, if_open);
+        assert!(
+            daemon_masked[if_close..].starts_with("} else {"),
+            "the signing arm must be the `else` of the gate's own `if`, not a \
+             later block that happens to follow it"
+        );
+        let arm_open = if_close + "} else ".len();
+        let arm_close = ps_block_end(&daemon_masked, arm_open);
+
+        // Enclosure is only meaningful if the tested variable still holds what
+        // the parameter bound. Assigning to it between the param block and the
+        // gate neuters the gate while leaving the mint textually inside the arm.
+        let daemon_assignments: Vec<usize> =
+            ps_assignments_to(&daemon_masked, "NoSelfSignedCodeSigning")
+                .into_iter()
+                .filter(|at| *at < gate_open)
+                .collect();
+        assert!(
+            daemon_assignments.is_empty(),
+            "nothing may assign to $NoSelfSignedCodeSigning before the gate reads \
+             it — found {daemon_assignments:?}"
+        );
+
+        // Comments explain the root-store hazard in prose, so search a view that
+        // keeps string contents (the store is named by string argument) but drops
+        // comments — otherwise the daemon's six mentions of the store in its own
+        // commentary would be indistinguishable from six writes.
+        let daemon_code = ps_mask_comments_only(&daemon);
+        assert_eq!(
+            daemon_code.matches("New-SelfSignedCertificate").count(),
+            1,
+            "daemon installer must mint exactly once"
+        );
+        for needle in ROOT_STORE_WRITERS {
+            for (at, _) in daemon_code.match_indices(needle) {
+                assert!(
+                    at > arm_open && at < arm_close,
+                    "{needle} must live INSIDE the gated signing arm and nowhere \
+                     else (found at {at}; arm spans {arm_open}..{arm_close})"
+                );
+            }
+        }
+
+        // Relay installer: an early return at the top of the signing function,
+        // which covers every call site. The guard is only a guard if it returns.
+        let relay = std::fs::read_to_string(
+            root.join("scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1"),
+        )
+        .expect("relay installer should be readable");
+        let relay_masked = ps_mask_strings_and_comments(&relay);
+        assert!(
+            relay.contains("[switch]$NoSelfSignedCodeSigning"),
+            "the relay installer mints and trusts a cert too, and is reachable \
+             from the shipped binary via `role set`"
+        );
+        // The relay needs the SAME two-sided bound as the daemon. An earlier
+        // version asserted only `mint > guard_close`, which rules out the mint
+        // sitting in the first 255 lines and nothing else: hoisting the mint and
+        // the root-store write to unconditional top-level code left exactly one
+        // occurrence of each, both after the guard, guard still returning — and
+        // the test stayed green while every relay install wrote a root CA.
+        let function_marker = relay_masked
+            .find("function Sign-RelayBinaryForAuthenticode {")
+            .expect("the relay signing function must exist");
+        let body_open = function_marker
+            + relay_masked[function_marker..]
+                .find('{')
+                .expect("the signing function must open a body");
+        let body_close = ps_block_end(&relay_masked, body_open);
+
+        let guard_marker = relay_masked
+            .find("if ($script:NoSelfSignedCodeSigningRequested) {")
+            .expect("relay signing must be gated");
+        assert!(
+            guard_marker > body_open && guard_marker < body_close,
+            "the guard must live inside the signing function, not beside it"
+        );
+        let guard_open = guard_marker
+            + relay_masked[guard_marker..]
+                .find('{')
+                .expect("the relay guard must open a block");
+        let guard_close = ps_block_end(&relay_masked, guard_open);
+        // A STATEMENT-level `return`, not a substring: `$returnedEarly = $true`
+        // contains "return" and returns from nothing, which restores the exact
+        // "logs 'no certificate minted', then mints" behaviour the guard exists
+        // to prevent.
+        // The guard's LAST statement must be the return. Merely containing a line
+        // that reads `return` is not enough: `if ($false) { return }` satisfies
+        // that while returning from nothing, so the script logs "no certificate
+        // minted" and then mints — byte-for-byte the behaviour this guard exists
+        // to prevent.
+        let guard_last_statement = relay_masked[guard_open + 1..guard_close]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .next_back()
+            .unwrap_or("");
+        assert_eq!(
+            guard_last_statement, "return",
+            "the relay guard's last statement must be a bare `return`, so that \
+             nothing in the guard can be reached and fall through to the mint \
+             (guard spans {guard_open}..{guard_close})"
+        );
+
+        // The relay binds the switch into a script-scoped variable so the signing
+        // function can see it regardless of call scope. That binding is the whole
+        // wiring: set its right-hand side to `$false` and the switch is inert,
+        // every shipped `role set` writes a root CA, and nothing else in this
+        // test notices. So it must be the ONLY assignment, and it must bind the
+        // parameter.
+        let relay_assignments = ps_assignments_to(&relay_masked, "NoSelfSignedCodeSigning");
+        assert_eq!(
+            relay_assignments.len(),
+            1,
+            "the relay must assign to the signing flag exactly once, at its \
+             binding — found {relay_assignments:?}"
+        );
+        assert!(
+            relay.contains(
+                "$script:NoSelfSignedCodeSigningRequested = [bool]$NoSelfSignedCodeSigning"
+            ),
+            "the relay's script-scoped flag must be bound from the parameter, or \
+             the -NoSelfSignedCodeSigning switch controls nothing"
+        );
+
+        let relay_code = ps_mask_comments_only(&relay);
+        assert_eq!(
+            relay_code.matches("New-SelfSignedCertificate").count(),
+            1,
+            "relay installer must mint exactly once"
+        );
+        for needle in ROOT_STORE_WRITERS {
+            for (at, _) in relay_code.match_indices(needle) {
+                assert!(
+                    at > guard_close && at < body_close,
+                    "{needle} must sit after the guard returns AND inside the \
+                     guarded signing function — hoisting it to top level makes \
+                     every install mint (found at {at}; guard closes at \
+                     {guard_close}, function body spans {body_open}..{body_close})"
+                );
+            }
+        }
+
+        // The relay's protection now rests on one enum argument at one call
+        // site, so pin that call site. Flipping `role set` to `Allow` restores
+        // the original defect on the only shipped path, and nothing else in the
+        // suite reads that argument.
+        let main_rs =
+            std::fs::read_to_string(root.join("crates/rustynet-cli/src/main.rs")).expect("main.rs");
+        let shipped_fn = main_rs
+            .find("fn execute_platform_relay_service_action")
+            .expect("the shipped role-set relay path must exist");
+        let shipped_body = &main_rs[shipped_fn..];
+        let shipped_end = shipped_body
+            .find("\n}\n")
+            .expect("that function must terminate");
+        let shipped_body = &shipped_body[..shipped_end];
+        assert!(
+            shipped_body.contains("RelaySelfSignedCodeSigning::Disallow"),
+            "the shipped `role set` relay path must pass Disallow"
+        );
+        assert!(
+            !shipped_body.contains("RelaySelfSignedCodeSigning::Allow"),
+            "the shipped `role set` relay path must never pass Allow"
+        );
+        // `Allow` itself is `#[cfg(feature = "vm-lab")]`, so a release build
+        // cannot name it and the compiler — not this test — is what stops a
+        // shipped caller from minting. This asserts that gate is still there,
+        // because deleting it is silent under `--all-features`.
+        let ops_rs = std::fs::read_to_string(root.join("crates/rustynet-cli/src/ops_e2e.rs"))
+            .expect("ops_e2e.rs should be readable");
+        let enum_open = ops_rs
+            .find("pub enum RelaySelfSignedCodeSigning {")
+            .expect("the signing-policy enum must exist");
+        let allow_decl = enum_open
+            + ops_rs[enum_open..]
+                .find("    Allow,")
+                .expect("the Allow variant must exist");
+        assert!(
+            ops_rs[enum_open..allow_decl].contains("#[cfg(feature = \"vm-lab\")]"),
+            "the Allow variant must stay behind a vm-lab cfg gate, so a release \
+             build cannot name it"
+        );
+
+        // Only the shipped installer opts out. No lab caller may.
+        let shipped =
+            std::fs::read_to_string(root.join("crates/rustynet-cli/src/install/live_windows.rs"))
+                .expect("shipped installer should be readable");
+        assert!(
+            shipped.contains("-NoSelfSignedCodeSigning"),
+            "the shipped installer must opt out of minting a root CA"
+        );
+        let lab = std::fs::read_to_string(
+            root.join("crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs"),
+        )
+        .expect("lab adapter should be readable");
+        assert!(
+            !lab.contains("NoSelfSignedCodeSigning"),
+            "the lab installs self-built unsigned binaries and must KEEP signing"
+        );
+    }
+
     /// The installer must refuse to reach `rustynetd` without `wg.exe`, and must
     /// refuse BEFORE the first invocation rather than after.
     ///
@@ -7892,8 +8410,10 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
     #[cfg(not(windows))]
     #[test]
     fn install_windows_relay_service_returns_error_on_non_windows() {
-        let err = super::execute_ops_install_windows_relay_service()
-            .expect_err("must fail on non-Windows hosts");
+        let err = super::execute_ops_install_windows_relay_service(
+            super::RelaySelfSignedCodeSigning::Disallow,
+        )
+        .expect_err("must fail on non-Windows hosts");
         assert!(
             err.contains("only supported on Windows"),
             "unexpected error: {err}"
