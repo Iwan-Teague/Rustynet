@@ -30,10 +30,22 @@ if ! command -v cargo >/dev/null 2>&1; then
     #             took a different code path than any developer machine. The
     #             checker now fails closed on an empty listing regardless, but the
     #             runner should still exercise the same tool production does.
-    # The debian:trixie image ships neither, which is why this leg failed for
-    # every one of the last 100 runs while macOS and the E2E leg passed.
+    #   git    -> the evidence commit marker shells out to `git rev-parse HEAD`
+    #             (`ops_phase9.rs`). The image has NO git, so `actions/checkout`
+    #             silently falls back to a REST API tarball download and the
+    #             workspace is not a git repository at all. That surfaced as
+    #             `fault_at_matrix_append_demotes` failing with exit 128 — a
+    #             message about MatrixAppend, caused by a missing binary.
+    # The debian:trixie image ships none of the three, which is why this leg
+    # failed for every one of the last 100 runs while macOS and the E2E leg
+    # passed.
+    #
+    # Order matters: this runs before anything that needs them. An earlier
+    # attempt put a `git config safe.directory` step BEFORE this bootstrap and
+    # got `git: not found` (exit 127) — the fix has to install git, not
+    # configure a git that isn't there.
     DEBIAN_FRONTEND=noninteractive $sudo_cmd apt-get install -y --no-install-recommends \
-      ca-certificates curl build-essential pkg-config procps unzip
+      ca-certificates curl build-essential pkg-config procps unzip git
   fi
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal --default-toolchain none
