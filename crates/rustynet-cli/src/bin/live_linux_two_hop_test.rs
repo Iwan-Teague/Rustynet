@@ -203,15 +203,34 @@ fn run() -> Result<(), String> {
         second_client_addr,
         second_client_pub_hex,
     );
+    // The client deliberately does NOT peer directly with the final exit.
+    //
+    // Rationale is DETERMINISM, not unsatisfiability. While `client|final_exit` was in
+    // this spec the client had TWO available paths to the final exit's mesh IP — its own
+    // direct tunnel and the entry's `0.0.0.0/0` — and the measured per-hop delta was not
+    // stable across runs: 1 at `c66887a8c` (baseline 64 / two-hop 63), 0 at `050743825`
+    // (64 / 64), and -1 at `f9388393` (baseline unreachable). An exact oracle cannot rest
+    // on an input that depends on which of two paths the traffic happens to take.
+    // Removing the pair leaves exactly one path.
+    //
+    // NOTE, corrected 2026-07-26: an earlier version of this comment claimed the pair
+    // meant the probe "could never observe forwarding" (always TTL 64, zero decrement).
+    // That is FALSE — `c66887a8c` measured 63 *with* the pair present, i.e. forwarding
+    // was observed. The old topology produced both 63 and 64 on different runs, which is
+    // exactly the non-determinism this strip removes.
+    //
+    // With the pair removed the client has exactly one peer (the entry), so the
+    // final exit's mesh IP matches the client's `0.0.0.0/0` and the probe
+    // traverses the real two-hop chain. The reply still comes back because the
+    // entry masquerades the hairpin (`phase10.rs:2285-2299`) — that SNAT is
+    // what gives the final exit a route to the requester, since after this
+    // strip its peers carry only `entry/32` and `second_client/32`. See
+    // `NodeEngineFlipDispositions_2026-07-24.md` D1 for the TTL derivation.
     let allow_spec = format!(
-        "{}|{};{}|{};{}|{};{}|{};{}|{};{}|{};{}|{};{}|{}",
+        "{}|{};{}|{};{}|{};{}|{};{}|{};{}|{}",
         config.client_node_id,
         config.entry_node_id,
         config.entry_node_id,
-        config.client_node_id,
-        config.client_node_id,
-        config.final_exit_node_id,
-        config.final_exit_node_id,
         config.client_node_id,
         config.entry_node_id,
         config.final_exit_node_id,
@@ -317,6 +336,54 @@ fn run() -> Result<(), String> {
             config.second_client_node_id
         ),
         &second_client_assignment_local,
+    )?;
+
+    // ATOMICITY FENCE — see `NodeEngineFlipDispositions_2026-07-24.md` D1.
+    //
+    // The daemon fail-closes on ANY set inequality between the assignment
+    // bundle's peer set (`envelope.bundle.peers`, `daemon.rs:8919`) and the
+    // traversal bundle's target index, in BOTH directions
+    // (`apply_traversal_authority_to_peers`, `daemon.rs:6693-6755`), and
+    // escalates to `restriction_mode=Permanent` after
+    // `DEFAULT_MAX_RECONCILE_FAILURES` = 5 rejections (`daemon.rs:338`,
+    // `:9250-9257`) — which tears the tunnel down.
+    //
+    // Those two artifacts are ONE atomic pair. In production a single
+    // `/etc/rustynet/assignment-refresh.env` mints BOTH of them
+    // (`ops refresh-assignment` -> `refresh_local_traversal_bundle_from_specs`,
+    // `main.rs:14345`, called before the assignment-TTL short-circuit), so
+    // equality holds structurally: either both halves refresh together or
+    // neither does. This test narrows the inherited mesh and so must rewrite
+    // both halves — and installing them one at a time violates that invariant,
+    // leaving a window in which the narrowed assignment is paired with the
+    // setup's full-mesh traversal index. That window is what produced
+    // `snapshot contains unmanaged peers: <aux>,<extra>` on the entry and tore
+    // down `rustynet0` before the data-plane probes ran.
+    //
+    // So quiesce every chain node across the whole swap: stop the 60s
+    // assignment-refresh timer (it would otherwise re-mint and poke
+    // `state refresh` mid-swap) and stop the daemon, so no reconcile observes a
+    // half-swapped pair at all — regardless of which artifact is re-read on
+    // which code path. `enforce_host` below brings each daemon back up COLD onto
+    // the completed, consistent pair, and the timer is resumed immediately
+    // after.
+    //
+    // This changes NO daemon behaviour. Set equality, the failure threshold, the
+    // managed-peer definition, and signature/freshness/anti-replay validation
+    // are all untouched: the invalid intermediate state is removed, not
+    // tolerated (CLAUDE.md 13.2).
+    logger.line(
+        "[two-hop] quiescing daemons + assignment-refresh timers for the atomic bundle swap",
+    )?;
+    let swap_fence = BundleSwapFence::quiesce(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &[
+            config.final_exit_host.as_str(),
+            config.client_host.as_str(),
+            config.entry_host.as_str(),
+            config.second_client_host.as_str(),
+        ],
     )?;
 
     logger.line("[two-hop] distributing signed assignments")?;
@@ -677,6 +744,25 @@ fn run() -> Result<(), String> {
         2,
     )?;
 
+    // Release the atomicity fence: both halves of the signed pair are installed and
+    // every daemon has come up cold onto them, so the periodic refresh may resume.
+    //
+    // Belt-and-braces rather than strictly required. `enforce_host` runs
+    // `install-systemd`, which already restarts the refresh timer where
+    // auto-refresh is enabled — and this test enables it on all four chain nodes.
+    // Restarting explicitly keeps the quiesce/resume pair symmetric (so the Drop
+    // guard has a matching success path) and means the stage does not depend on
+    // that side effect of another command.
+    //
+    // Note the freshness pressure is much lower here than in production: the lab
+    // bakes `RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400`
+    // (`vm_lab/orchestrator/adapter/linux_install.rs:205-206`), a 24h window,
+    // whereas 120s is the *production* default (`ops_install_systemd.rs:300`). So
+    // the resume is not what keeps the in-stage traversal state fresh; do not
+    // justify it that way.
+    logger.line("[two-hop] resuming assignment-refresh timers")?;
+    swap_fence.release()?;
+
     // After enforce_host the daemon comes up cold and stays in
     // restricted-safe mode until it ingests fresh signed trust evidence.
     // The route advertise call below is a mutating IPC command and is
@@ -1027,6 +1113,30 @@ fn run() -> Result<(), String> {
         .as_str(),
     )?;
 
+    // Wait (bounded, fail-closed) for the cold-restarted chain to actually carry
+    // traffic before measuring it. See `await_two_hop_path_ready`.
+    let readiness = match final_exit_mesh_ipv4.as_deref() {
+        Some(ip) => await_two_hop_path_ready(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            &config.client_host,
+            ip,
+            config.platform,
+            &mut logger,
+        )?,
+        None => TwoHopReadiness::not_attempted(),
+    };
+    logger.line(
+        format!(
+            "[two-hop] path readiness attempted={} became_reachable={} attempts={} waited_secs={}",
+            readiness.attempted,
+            readiness.became_reachable,
+            readiness.attempts,
+            readiness.waited_secs
+        )
+        .as_str(),
+    )?;
+
     logger.line("[two-hop] running end-to-end data-plane reachability probe through chain")?;
     let end_to_end = probe_end_to_end_reachability(
         &config.ssh_identity_file,
@@ -1199,7 +1309,7 @@ fn run() -> Result<(), String> {
     });
 
     let report = format!(
-        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_two_hop\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"final_exit_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"entry_host\": \"{}\",\n  \"second_client_host\": \"{}\",\n  \"proof_sources\": {{\n    \"entry_peer_visibility\": \"managed_peer_endpoints\",\n    \"entry_peer_visibility_error_field\": \"managed_peer_endpoints_error\",\n    \"entry_peer_visibility_debug_only\": \"wg_show_endpoints\",\n    \"two_hop_end_to_end\": \"icmp_reachability_via_default_route_rustynet0\",\n    \"two_hop_per_hop\": \"reply_ttl_delta_entry_mesh_vs_final_exit_mesh\"\n  }},\n  \"dataplane\": {{\n    \"end_to_end_probe_target\": \"{}\",\n    \"end_to_end_probe_attempted\": {},\n    \"end_to_end_reachable\": {},\n    \"baseline_entry_mesh_ipv4\": \"{}\",\n    \"baseline_ttl_probe_attempted\": {},\n    \"baseline_reply_ttl\": {},\n    \"two_hop_final_exit_mesh_ipv4\": \"{}\",\n    \"two_hop_ttl_probe_attempted\": {},\n    \"two_hop_reply_ttl\": {},\n    \"per_hop_ttl_decrement\": {},\n    \"per_hop_ttl_decrement_ok\": {}\n  }},\n  \"checks\": {{\n    \"client_exit_is_entry\": \"{}\",\n    \"entry_exit_is_final\": \"{}\",\n    \"entry_serves_exit\": \"{}\",\n    \"final_exit_serves\": \"{}\",\n    \"client_route_via_rustynet0\": \"{}\",\n    \"second_client_route_via_rustynet0\": \"{}\",\n    \"managed_dns_fresh_all_nodes\": \"{}\",\n    \"entry_peer_visibility\": \"{}\",\n    \"entry_managed_peer_endpoints_visible\": \"{}\",\n    \"no_plaintext_passphrase_files\": \"{}\",\n    \"two_hop_end_to_end_reachable\": \"{}\",\n    \"two_hop_per_hop_ttl_decrement\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\"\n  ]\n}}\n",
+        "{{\n  \"phase\": \"phase10\",\n  \"mode\": \"live_linux_two_hop\",\n  \"evidence_mode\": \"measured\",\n  \"captured_at\": \"{}\",\n  \"captured_at_unix\": {},\n  \"git_commit\": \"{}\",\n  \"status\": \"{}\",\n  \"final_exit_host\": \"{}\",\n  \"client_host\": \"{}\",\n  \"entry_host\": \"{}\",\n  \"second_client_host\": \"{}\",\n  \"proof_sources\": {{\n    \"entry_peer_visibility\": \"managed_peer_endpoints\",\n    \"entry_peer_visibility_error_field\": \"managed_peer_endpoints_error\",\n    \"entry_peer_visibility_debug_only\": \"wg_show_endpoints\",\n    \"two_hop_end_to_end\": \"icmp_reachability_via_default_route_rustynet0\",\n    \"two_hop_per_hop\": \"reply_ttl_delta_entry_mesh_vs_final_exit_mesh\"\n  }},\n  \"dataplane\": {{\n    \"end_to_end_probe_target\": \"{}\",\n    \"end_to_end_probe_attempted\": {},\n    \"end_to_end_reachable\": {},\n    \"baseline_entry_mesh_ipv4\": \"{}\",\n    \"baseline_ttl_probe_attempted\": {},\n    \"baseline_reply_ttl\": {},\n    \"two_hop_final_exit_mesh_ipv4\": \"{}\",\n    \"two_hop_ttl_probe_attempted\": {},\n    \"two_hop_reply_ttl\": {},\n    \"per_hop_ttl_decrement\": {},\n    \"per_hop_ttl_decrement_ok\": {},\n    \"path_readiness_probe_attempted\": {},\n    \"path_readiness_became_reachable\": {},\n    \"path_readiness_attempts\": {},\n    \"path_readiness_waited_secs\": {}\n  }},\n  \"checks\": {{\n    \"client_exit_is_entry\": \"{}\",\n    \"entry_exit_is_final\": \"{}\",\n    \"entry_serves_exit\": \"{}\",\n    \"final_exit_serves\": \"{}\",\n    \"client_route_via_rustynet0\": \"{}\",\n    \"second_client_route_via_rustynet0\": \"{}\",\n    \"managed_dns_fresh_all_nodes\": \"{}\",\n    \"entry_peer_visibility\": \"{}\",\n    \"entry_managed_peer_endpoints_visible\": \"{}\",\n    \"no_plaintext_passphrase_files\": \"{}\",\n    \"two_hop_end_to_end_reachable\": \"{}\",\n    \"two_hop_per_hop_ttl_decrement\": \"{}\"\n  }},\n  \"source_artifacts\": [\n    \"{}\"\n  ]\n}}\n",
         captured_at_utc,
         captured_at_unix,
         git_commit,
@@ -1221,6 +1331,10 @@ fn run() -> Result<(), String> {
             .per_hop_ttl_decrement
             .map_or(-1_i64, i64::from),
         dataplane_proof.per_hop_ttl_decrement_ok,
+        readiness.attempted,
+        readiness.became_reachable,
+        readiness.attempts,
+        readiness.waited_secs,
         check_client_exit_is_entry,
         check_entry_exit_is_final,
         check_entry_serves_exit,
@@ -1461,17 +1575,25 @@ fn install_traversal_bundle(
         target,
         "/tmp/rn-traversal.bundle",
     )?;
-    run_root(
+    // Retried like the dns-zone installer alongside it. This runs inside the
+    // quiesce window, where a transient SSH failure would abort the swap and force
+    // the fence's error-path restore — so the flakiest step in that window is the
+    // one most worth retrying.
+    retry_root(
         identity,
         known_hosts,
         target,
         "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
+        3,
+        5,
     )?;
-    run_root(
+    retry_root(
         identity,
         known_hosts,
         target,
         "install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle",
+        3,
+        5,
     )
 }
 
@@ -1567,6 +1689,153 @@ fn managed_dns_state_is_valid(status: &str) -> bool {
     status_field(status, "dns_zone_state").as_deref() == Some("valid")
         && status_field(status, "dns_zone_error").as_deref() == Some("none")
         && status_field(status, "dns_alarm_state").as_deref() == Some("ok")
+}
+
+/// Stop the periodic assignment-refresh timer *and* the daemon on `target`, so a
+/// multi-artifact signed-bundle swap is atomic from the daemon's point of view.
+///
+/// The daemon requires exact set equality between the assignment bundle's peer
+/// set and the traversal bundle's target index and fail-closes (then escalates to
+/// a permanent restriction) on any mismatch, so it must not reconcile while only
+/// one half of the pair has been replaced. The timer is stopped before its
+/// service so the timer cannot immediately re-trigger the run we just stopped.
+///
+/// Deliberately a fence rather than a re-ordering: staging every artifact before
+/// every install would only SHRINK the inconsistent window, while quiescing
+/// ELIMINATES it (and covers the dns bundle too), so do not "fix" this by
+/// re-adding issue-then-install staging.
+///
+/// Idempotent: `systemctl stop` on an inactive unit succeeds as a no-op.
+/// Every unit name is a fixed literal — no untrusted interpolation.
+fn quiesce_node_for_bundle_swap(
+    identity: &Path,
+    known_hosts: &Path,
+    target: &str,
+) -> Result<(), String> {
+    for unit in [
+        "rustynetd-assignment-refresh.timer",
+        "rustynetd-assignment-refresh.service",
+        "rustynetd.service",
+    ] {
+        run_root(
+            identity,
+            known_hosts,
+            target,
+            &format!("systemctl stop {unit}"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Restart the periodic assignment-refresh timer after the bundle swap has
+/// completed and the daemon has come back up on the consistent pair.
+///
+/// This restores the node to the state the stage found it in; it is not what keeps
+/// the in-stage traversal state fresh (the lab bakes a 24h freshness window — see
+/// the release call site), and `enforce_host` would restart the timer anyway. It
+/// exists so quiesce and resume are symmetric and the fence's Drop guard has a
+/// matching success path.
+fn resume_assignment_refresh_timer(
+    identity: &Path,
+    known_hosts: &Path,
+    target: &str,
+) -> Result<(), String> {
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "systemctl start rustynetd-assignment-refresh.timer",
+    )
+}
+
+/// RAII guard making the quiesce/resume pair exception-safe.
+///
+/// The swap between quiesce and resume spans a long sequence of fallible SSH
+/// steps, every one of which propagates with `?`. Without this guard any of them
+/// — e.g. a transient SSH failure in `install_traversal_bundle` — would abort the
+/// stage leaving four guests with `rustynetd` and the refresh timer stopped *by
+/// the test*. That is worse than a plain stage failure for two reasons: the
+/// post-mortem then shows a daemon the test stopped, confounding exactly the
+/// root-causing this fence exists to make possible; and a later stage fails on
+/// "rustynetd-assignment-refresh.timer is active" for a reason unrelated to what
+/// it is checking.
+///
+/// So restoration is unconditional. On the error path (`drop` without `release`)
+/// the daemon is restarted as well as the timer — a node whose daemon is running
+/// and fail-closing on an inconsistent bundle pair is honestly diagnosable from
+/// its own journal, whereas a node left with no daemon at all is not.
+struct BundleSwapFence {
+    identity: PathBuf,
+    known_hosts: PathBuf,
+    hosts: Vec<String>,
+    released: bool,
+}
+
+impl BundleSwapFence {
+    /// Stop the refresh timer + daemon on every host, returning the guard that
+    /// will restore them.
+    fn quiesce(identity: &Path, known_hosts: &Path, hosts: &[&str]) -> Result<Self, String> {
+        let guard = Self {
+            identity: identity.to_path_buf(),
+            known_hosts: known_hosts.to_path_buf(),
+            hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+            released: false,
+        };
+        // Constructed before the loop so that a failure part-way through still
+        // restores the hosts already quiesced when the guard drops.
+        for host in &guard.hosts {
+            quiesce_node_for_bundle_swap(&guard.identity, &guard.known_hosts, host)?;
+        }
+        Ok(guard)
+    }
+
+    /// Success-path release: the daemons were already brought back up cold by
+    /// `enforce_host`, so only the timers need restarting — and a failure here is
+    /// surfaced rather than swallowed.
+    fn release(mut self) -> Result<(), String> {
+        // `released` is set only AFTER every host is resumed. Setting it first would
+        // disarm the guard before doing the work, so a failure on host 2 of 4 would
+        // leave hosts 3 and 4 quiesced while `Drop` no-ops — precisely the hazard this
+        // guard exists to prevent. On an early return the guard is still armed, `self`
+        // drops, and `Drop` restores every host (restart is idempotent: `systemctl
+        // start` on a running unit succeeds as a no-op, so already-resumed hosts are
+        // unharmed). Mirrors `quiesce`, which likewise constructs the guard before its
+        // loop rather than after.
+        for host in &self.hosts {
+            resume_assignment_refresh_timer(&self.identity, &self.known_hosts, host)?;
+        }
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for BundleSwapFence {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        for host in &self.hosts {
+            // Daemon first: the timer's ExecStartPost pokes `state refresh` via the
+            // daemon socket, so it wants a running daemon to talk to.
+            if let Err(err) = run_root(
+                &self.identity,
+                &self.known_hosts,
+                host,
+                "systemctl start rustynetd.service",
+            ) {
+                eprintln!(
+                    "warning: could not restart rustynetd on {host} after an aborted bundle swap: {err}"
+                );
+            }
+            if let Err(err) =
+                resume_assignment_refresh_timer(&self.identity, &self.known_hosts, host)
+            {
+                eprintln!(
+                    "warning: could not restart rustynetd-assignment-refresh.timer on {host} after an aborted bundle swap: {err}"
+                );
+            }
+        }
+    }
 }
 
 fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Result<(), String> {
@@ -1685,12 +1954,54 @@ const TUNNEL_IFACE: &str = "rustynet0";
 /// on macOS).
 const MACOS_TUNNEL_IFACE_PREFIX: &str = "utun";
 
-/// Number of expected forwarding decrements between the single-hop baseline
-/// (entry mesh IP, a direct tunnel peer) and the two-hop path (final-exit mesh
-/// IP, reached by the entry forwarding onward). The entry relays the request
-/// out and the reply back, so the reply observed at the client loses exactly
-/// two extra TTL units versus the baseline.
-const EXPECTED_PER_HOP_TTL_DECREMENT: i32 = 2;
+/// Expected reply-TTL decrement between the single-hop baseline (client -> entry
+/// mesh IP, answered by the entry itself) and the two-hop path (client ->
+/// final-exit mesh IP, answered by the final exit via the entry's forwarding
+/// hairpin).
+///
+/// WireGuard is an encapsulating *link*, not a router: encapsulation does not
+/// decrement the inner TTL — only *forwarding* does — and a node that
+/// ORIGINATES a packet, including an ICMP echo *reply*, stamps the initial TTL
+/// (64 on Linux). So the TTL observed at the client is 64 minus the number of
+/// forwarding hops on the REPLY path alone; decrements on the request path are
+/// invisible, because the reply is a new packet with a fresh TTL.
+///
+///   * baseline — the entry originates the reply and the client is a direct
+///     peer: 0 forwards on the reply path -> TTL 64.
+///   * two-hop  — the final exit originates the reply, addressed to the entry
+///     (the entry masqueraded the hairpinned request, `phase10.rs:2285-2299`);
+///     the entry un-NATs it and forwards it to the client: exactly 1 forward
+///     -> TTL 63.
+///
+/// Hence a decrement of exactly 1.
+///
+/// This constant was `2` from its introduction in `b162be02` (2026-06-25) until
+/// 2026-07-25. That value is unreachable in this topology: it requires TWO
+/// intermediate forwarders on the reply path and there is only one (the entry)
+/// — the final exit *originates* the reply rather than forwarding it. The
+/// original rationale ("the entry relays the request out and the reply back, so
+/// the reply loses two extra TTL units") double-counted the request-path
+/// decrement, which the reply's fresh TTL cannot carry. The assertion was
+/// additionally unsatisfiable in practice because `client|final_exit` was in the
+/// test's ALLOW spec, making the "two-hop" probe a direct one-hop reply. See
+/// `documents/operations/active/NodeEngineFlipDispositions_2026-07-24.md` D1 for
+/// the full derivation, which was written down and pre-registered BEFORE the
+/// verifying measurement.
+///
+/// The comparison against this value stays EXACT (`==`) — an exact oracle is
+/// the strength of this proof; a range or threshold would weaken it.
+const EXPECTED_PER_HOP_TTL_DECREMENT: i32 = 1;
+
+/// The baseline probe is answered by the entry itself across a direct peer link,
+/// so it must show an UNDECREMENTED reply.
+///
+/// Asserting the absolute baseline — not just the delta — is what makes the
+/// derivation above binding. A delta check alone accepts `(63, 62)` exactly as it
+/// accepts `(64, 63)`, even though a baseline of 63 would mean the client's reply
+/// from the entry crossed a forwarding hop that the topology does not contain, i.e.
+/// the model is wrong somewhere. Measured live at 64 on 2026-07-25, and at 64 in
+/// both `c66887a8c` archives, so this is an observed invariant rather than a guess.
+const EXPECTED_BASELINE_REPLY_TTL: u8 = 64;
 
 /// Outcome of the end-to-end ICMP reachability probe. `attempted` records that
 /// the probe actually ran (fail-closed discipline: a never-run probe is NOT a
@@ -1698,6 +2009,117 @@ const EXPECTED_PER_HOP_TTL_DECREMENT: i32 = 2;
 struct EndToEndProbe {
     attempted: bool,
     reachable: bool,
+}
+
+/// How long to wait for the two-hop path to start carrying traffic before
+/// measuring it, and how often to re-test. Bounded so a genuinely broken path
+/// still fails the stage promptly rather than hanging it.
+const TWO_HOP_READY_TIMEOUT_SECS: u64 = 90;
+const TWO_HOP_READY_POLL_SECS: u64 = 5;
+
+/// Outcome of the bounded readiness wait. Recorded in the report so a RED can be
+/// read as "still broken after N attempts over T seconds" rather than possibly
+/// "measured too early".
+struct TwoHopReadiness {
+    attempted: bool,
+    became_reachable: bool,
+    attempts: u32,
+    waited_secs: u64,
+}
+
+impl TwoHopReadiness {
+    fn not_attempted() -> Self {
+        Self {
+            attempted: false,
+            became_reachable: false,
+            attempts: 0,
+            waited_secs: 0,
+        }
+    }
+}
+
+/// Bounded, fail-closed wait for the two-hop path to carry traffic.
+///
+/// The atomicity fence cold-restarts every chain daemon, so every tunnel must
+/// re-handshake before the two-hop path works at all. Measuring a single shot
+/// immediately after that races the dataplane, and a "no reply" result then cannot
+/// be distinguished from a real forwarding failure — exactly the ambiguity that
+/// cost a diagnostic cycle on 2026-07-25, when the baseline answered at TTL 64
+/// while the final exit's mesh IP gave no reply roughly ten seconds after the
+/// entry's cold restart.
+///
+/// Reachability is tested with a real ICMP round trip, deliberately NOT with a
+/// status field: `path_live_proven` is structurally unsatisfiable on
+/// shared-transport nodes (the shared userspace socket cannot observe per-peer
+/// handshakes), so it must never be used as a liveness gate.
+///
+/// It does not weaken the *correctness* oracle: if the path never becomes reachable
+/// the probes below still run and still fail, and the evidence records that the
+/// failure persisted across every attempt, which is what makes the RED trustworthy.
+///
+/// But it is NOT free, and an earlier version of this comment overclaimed by saying
+/// it "never softens" the assertion. Two availability-oracle losses, both accepted
+/// deliberately:
+///   * **A timing oracle is relaxed.** Previously the stage implicitly asserted the
+///     path worked *immediately* after the preceding step; now it asserts only that
+///     the path works *some time within 90s*. `became_reachable` and `waited_secs`
+///     are recorded in the report but never asserted, so a path that only ever comes
+///     up after 60s reads as a pass. Read those fields — a large `waited_secs` is its
+///     own finding, not a clean result.
+///   * **Warm-up masking.** The wait emits up to 42 echo requests before the real
+///     measurement, priming conntrack state and WireGuard handshakes. A genuine
+///     first-packet or NAT-setup defect would therefore be hidden from the probes
+///     that follow.
+/// Neither is a fail-closed weakening — a broken path still fails — but both trade
+/// sensitivity for stability, and that trade should be visible here.
+fn await_two_hop_path_ready(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    target: &str,
+    platform: LiveLabPlatform,
+    logger: &mut Logger,
+) -> Result<TwoHopReadiness, String> {
+    // MONOTONIC, deliberately: `unix_now()` is `SystemTime::now()`, and this stage runs
+    // in a lab that force-syncs guest clocks. A backwards wall-clock step would collapse
+    // the elapsed figure toward zero and the bound would never trip, hanging the stage on
+    // a genuinely dead path. `Instant` cannot step backwards.
+    let start = std::time::Instant::now();
+    let mut attempts: u32 = 0;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let probe = probe_end_to_end_reachability(identity, known_hosts, host, target, platform);
+        let waited = start.elapsed().as_secs();
+        if probe.attempted && probe.reachable {
+            logger.line(
+                format!(
+                    "[two-hop] two-hop path became reachable after {attempts} attempt(s), {waited}s"
+                )
+                .as_str(),
+            )?;
+            return Ok(TwoHopReadiness {
+                attempted: true,
+                became_reachable: true,
+                attempts,
+                waited_secs: waited,
+            });
+        }
+        if waited >= TWO_HOP_READY_TIMEOUT_SECS {
+            logger.line(
+                format!(
+                    "[two-hop] two-hop path NOT reachable after {attempts} attempt(s) over {waited}s (limit {TWO_HOP_READY_TIMEOUT_SECS}s); measuring anyway so the probes below fail closed"
+                )
+                .as_str(),
+            )?;
+            return Ok(TwoHopReadiness {
+                attempted: true,
+                became_reachable: false,
+                attempts,
+                waited_secs: waited,
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_secs(TWO_HOP_READY_POLL_SECS));
+    }
 }
 
 /// Outcome of a single reply-TTL measurement. `attempted` is false when the
@@ -1751,7 +2173,10 @@ fn evaluate_two_hop_dataplane_proof(
 ) -> TwoHopDataplaneProof {
     let end_to_end_reachable = end_to_end.attempted && end_to_end.reachable;
     let per_hop_ttl_decrement = compute_ttl_decrement(baseline_ttl, two_hop_ttl);
-    let per_hop_ttl_decrement_ok = per_hop_ttl_decrement == Some(EXPECTED_PER_HOP_TTL_DECREMENT);
+    // Both conditions are required: the exact delta AND the absolute baseline. See
+    // EXPECTED_BASELINE_REPLY_TTL for why the delta alone is not a sufficient oracle.
+    let per_hop_ttl_decrement_ok = per_hop_ttl_decrement == Some(EXPECTED_PER_HOP_TTL_DECREMENT)
+        && baseline_ttl.ttl == Some(EXPECTED_BASELINE_REPLY_TTL);
     TwoHopDataplaneProof {
         end_to_end_reachable,
         per_hop_ttl_decrement,
@@ -2207,6 +2632,44 @@ mod tests {
     }
 
     #[test]
+    fn two_hop_source_raises_the_swap_fence_before_the_first_bundle_install() {
+        // The daemon requires EXACT set equality between the assignment bundle's peer
+        // set and the traversal bundle's target index, failing closed in both
+        // directions and latching a permanent restriction after five rejections. So no
+        // reconcile may observe a half-swapped pair, and the ordering that guarantees
+        // it must be pinned by a test rather than only by a green live run: revert or
+        // reorder the fence and the live suite would simply go red again for reasons
+        // that take a 40-minute run to diagnose. Mirrors the exit_handoff test that
+        // pins trust-refresh-before-state-refresh the same way.
+        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/bin/live_linux_two_hop_test.rs");
+        let source =
+            std::fs::read_to_string(&source_path).expect("two-hop source should be readable");
+        let quiesce_idx = source
+            .find("BundleSwapFence::quiesce(")
+            .expect("source should quiesce the chain nodes before swapping signed bundle halves");
+        let first_install_idx = source
+            .find("install_assignment_bundle(")
+            .expect("source should install assignment bundles");
+        let traversal_install_idx = source
+            .find("install_traversal_bundle(")
+            .expect("source should install traversal bundles");
+        let release_idx = source
+            .find("swap_fence.release()")
+            .expect("source should release the fence after both halves are installed");
+        assert!(
+            quiesce_idx < first_install_idx,
+            "the fence must be raised BEFORE the first signed-bundle install, or a \
+             reconcile can observe the narrowed assignment against the stale full-mesh \
+             traversal index and tear the tunnel down"
+        );
+        assert!(
+            traversal_install_idx < release_idx,
+            "the fence must not be released until the traversal half is installed too"
+        );
+    }
+
+    #[test]
     fn two_hop_runtime_ready_requires_expected_exit_chain_and_routes() {
         let config = super::Config {
             platform: super::live_lab_support::LiveLabPlatform::Linux,
@@ -2537,7 +3000,11 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_two_hop_dataplane_proof_passes_on_reach_and_ttl_minus_two() {
+    fn evaluate_two_hop_dataplane_proof_passes_on_reach_and_ttl_minus_one() {
+        // Baseline 64: the entry originates the reply over a direct peer link,
+        // zero forwards. Two-hop 63: the final exit originates the reply and the
+        // entry forwards it back exactly once. See
+        // EXPECTED_PER_HOP_TTL_DECREMENT for the derivation.
         let proof = super::evaluate_two_hop_dataplane_proof(
             &super::EndToEndProbe {
                 attempted: true,
@@ -2545,15 +3012,15 @@ mod tests {
             },
             &super::TtlProbe {
                 attempted: true,
-                ttl: Some(63),
+                ttl: Some(64),
             },
             &super::TtlProbe {
                 attempted: true,
-                ttl: Some(61),
+                ttl: Some(63),
             },
         );
         assert!(proof.end_to_end_reachable);
-        assert_eq!(proof.per_hop_ttl_decrement, Some(2));
+        assert_eq!(proof.per_hop_ttl_decrement, Some(1));
         assert!(proof.per_hop_ttl_decrement_ok);
     }
 
@@ -2568,11 +3035,11 @@ mod tests {
             },
             &super::TtlProbe {
                 attempted: true,
-                ttl: Some(63),
+                ttl: Some(64),
             },
             &super::TtlProbe {
                 attempted: true,
-                ttl: Some(61),
+                ttl: Some(63),
             },
         );
         assert!(!proof.end_to_end_reachable);
@@ -2582,10 +3049,12 @@ mod tests {
 
     #[test]
     fn evaluate_two_hop_dataplane_proof_rejects_wrong_ttl_delta() {
-        // A single-hop delta (−1) or no-forward delta (0) must not satisfy the
-        // two-hop per-hop assertion: only an exact −2 proves the entry relayed
-        // onward.
-        for (baseline, two_hop) in [(63u8, 63u8), (63, 62), (63, 60)] {
+        // A no-forward delta (0) must not satisfy the two-hop per-hop
+        // assertion, and neither may a delta LARGER than expected (2, 3) —
+        // those mean an extra unexplained forwarding hop on the reply path.
+        // Only an exact −1 proves the entry relayed the reply onward exactly
+        // once. The comparison is deliberately exact, never a threshold.
+        for (baseline, two_hop) in [(64u8, 64u8), (64, 62), (64, 61)] {
             let proof = super::evaluate_two_hop_dataplane_proof(
                 &super::EndToEndProbe {
                     attempted: true,
@@ -2602,10 +3071,37 @@ mod tests {
             );
             assert!(
                 !proof.per_hop_ttl_decrement_ok,
-                "delta {} must fail the exact -2 per-hop assertion",
+                "delta {} must fail the exact -1 per-hop assertion",
                 i32::from(baseline) - i32::from(two_hop)
             );
         }
+    }
+
+    #[test]
+    fn evaluate_two_hop_dataplane_proof_requires_the_absolute_baseline_not_just_the_delta() {
+        // (63, 62) has the correct delta of 1 but an impossible baseline: a reply
+        // from the entry across a direct peer link cannot have been forwarded. The
+        // delta alone would accept this identically to (64, 63), so the absolute
+        // baseline must be asserted too or the derivation does not bind.
+        let proof = super::evaluate_two_hop_dataplane_proof(
+            &super::EndToEndProbe {
+                attempted: true,
+                reachable: true,
+            },
+            &super::TtlProbe {
+                attempted: true,
+                ttl: Some(63),
+            },
+            &super::TtlProbe {
+                attempted: true,
+                ttl: Some(62),
+            },
+        );
+        assert_eq!(proof.per_hop_ttl_decrement, Some(1));
+        assert!(
+            !proof.per_hop_ttl_decrement_ok,
+            "a baseline of 63 must fail even with the expected delta"
+        );
     }
 
     #[test]
