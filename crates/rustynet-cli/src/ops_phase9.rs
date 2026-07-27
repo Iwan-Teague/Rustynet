@@ -694,10 +694,25 @@ fn current_git_commit() -> Result<String, String> {
         .output()
         .map_err(|err| format!("invoke git rev-parse HEAD failed: {err}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "git rev-parse HEAD failed with status {}",
-            output.status
-        ));
+        // Include git's own stderr. Without it this reports only "status 128",
+        // which is the same code for "not a git repository", "dubious
+        // ownership", and an unborn HEAD — indistinguishable in a CI log, and
+        // the stderr was already being captured and then discarded. A Debian CI
+        // failure took a round-trip to diagnose purely because the reason was
+        // thrown away here.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!(
+                "git rev-parse HEAD failed with status {} (no stderr)",
+                output.status
+            )
+        } else {
+            format!(
+                "git rev-parse HEAD failed with status {}: {stderr}",
+                output.status
+            )
+        });
     }
     let commit = String::from_utf8(output.stdout)
         .map_err(|err| format!("decode git commit output failed: {err}"))?

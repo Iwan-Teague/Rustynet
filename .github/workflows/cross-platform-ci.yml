@@ -76,6 +76,18 @@ jobs:
       image: debian:trixie
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Trust the workspace for git
+        # This leg runs inside a container, where the checkout is owned by a
+        # different uid than the process reading it, so git refuses the repo
+        # with exit 128. Production code shells out to `git rev-parse HEAD` for
+        # the evidence commit marker, so that refusal surfaces as a test failure
+        # (`fault_at_matrix_append_demotes`) whose message is about MatrixAppend
+        # rather than about git — the real error was pre-empting the one the
+        # test injects. Harmless where the ownership already matches.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory '*'
+          git rev-parse HEAD
       - name: Bootstrap CI tools
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
@@ -127,6 +139,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Trust the workspace for git
+        # This leg runs inside a container, where the checkout is owned by a
+        # different uid than the process reading it, so git refuses the repo
+        # with exit 128. Production code shells out to `git rev-parse HEAD` for
+        # the evidence commit marker, so that refusal surfaces as a test failure
+        # (`fault_at_matrix_append_demotes`) whose message is about MatrixAppend
+        # rather than about git — the real error was pre-empting the one the
+        # test injects. Harmless where the ownership already matches.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory '*'
+          git rev-parse HEAD
       - name: Bootstrap CI tools
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
