@@ -17,10 +17,26 @@ param(
     # daemon should not yet attempt to bring up real tunnels.
     # Default behavior (auto-detect): if WireGuard for Windows is
     # installed, the env file selects `--backend windows-wireguard-nt`
-    # so the daemon comes up on a working data-plane; if not, the
-    # env file selects `--backend windows-unsupported` and the
-    # daemon refuses to start until WireGuard for Windows is
-    # installed.
+    # so the daemon comes up on a working data-plane.
+    #
+    # CORRECTION, 2026-07-27: the second half of that sentence used to read
+    # "if not, the env file selects `--backend windows-unsupported` and the
+    # daemon refuses to start until WireGuard for Windows is installed",
+    # and that has not been reachable since 2026-04-30. The
+    # 'rekey-wireguard-under-runtime-identity' step added that day runs
+    # `rustynetd key init`, which shells out to `wg genkey`, so a host with
+    # no WireGuard now fails the install well before the backend label is
+    # computed. That was a silent failure for two months; the
+    # 'require-wireguard-wg-binary' gate below makes it an explicit one.
+    #
+    # Consequences to be aware of rather than surprised by: this switch
+    # still pins the label on a host that HAS WireGuard, which is the
+    # staging use it was written for, but there is no longer a no-WireGuard
+    # install path at all. `Resolve-ReviewedBackendLabel`'s auto-detect
+    # `windows-unsupported` arm and the `wireguard-driver-not-found` note
+    # are consequently unreachable. Restoring a genuine WireGuard-less
+    # install would mean making the rekey step conditional, which is a
+    # product decision and is tracked separately.
     [switch]$ForceUnsupportedBackend,
     # Enable auto-tunnel enforcement (auto_tunnel_enforce=true).
     # Bootstrap installs the service with auto_tunnel_enforce=false so the
@@ -294,6 +310,59 @@ function Test-PathPinnedToBinary {
         return $false
     }
     return $ImagePath.IndexOf($BinaryPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+# Resolve `wg.exe` exactly the way rustynetd does, so this check cannot disagree
+# with the thing it is checking for.
+#
+# rustynetd's `resolve_binary_path` (crates/rustynetd/src/key_material.rs) takes
+# `RUSTYNET_WG_BINARY_PATH` when it is set and non-empty, and otherwise the
+# canonical path. It NEVER searches PATH. Mirroring that matters in both
+# directions, and an earlier version of this function got both wrong:
+#
+#   * Falling back to `Get-Command wg.exe` accepted a host that has wg.exe on
+#     PATH (a chocolatey or custom install) but nothing at the canonical path.
+#     The gate would pass, print a reassuring "using wg binary at ..." line, and
+#     `key init` would then fail ~20 lines later with the canonicalization error
+#     this check exists to replace — worse than no check, because the operator
+#     has just been told wg was found.
+#   * Ignoring RUSTYNET_WG_BINARY_PATH rejected installs that would have
+#     succeeded. That variable is not hypothetical: the lab adapter sets it
+#     immediately before `rustynetd key init`
+#     (vm_lab/orchestrator/adapter/windows_install.rs), as do the macOS install
+#     path and `ops install-launchd`.
+#
+# Deliberately NOT reusing Resolve-WireGuardCliPath from
+# Bootstrap-RustyNetWindows.ps1: that one searches PATH and a (x86) tree because
+# it resolves a CLI for the OPERATOR to run, which is a different question from
+# what the daemon will open. Two resolvers with two purposes is correct here;
+# what is not correct is either of them claiming to answer the other's question.
+function Get-RustyNetWgBinaryPath {
+    $configured = $env:RUSTYNET_WG_BINARY_PATH
+    if ($configured -and $configured.Trim().Length -gt 0) {
+        $configured = $configured.Trim()
+        # rustynetd's validate_binary_path also requires an ABSOLUTE path and a
+        # REGULAR FILE ('wg binary path must be absolute' / 'must be a regular
+        # file'). Without these the gate passes on a relative path or a
+        # directory and the daemon still refuses -- and for a relative path the
+        # gate's answer would depend on the installer's working directory while
+        # the daemon's does not. The regex accepts a drive-qualified path or a
+        # UNC share and matches Rust's Windows is_absolute (prefix + root);
+        # IsPathFullyQualified is deliberately not used, as it is absent from
+        # .NET Framework 4.x and therefore from Windows PowerShell 5.1.
+        if ($configured -notmatch '^([A-Za-z]:\\|\\\\)') {
+            return $null
+        }
+        if (Test-Path -LiteralPath $configured -PathType Leaf) {
+            return $configured
+        }
+        return $null
+    }
+    $canonicalWg = 'C:\Program Files\WireGuard\wg.exe'
+    if (Test-Path -LiteralPath $canonicalWg -PathType Leaf) {
+        return $canonicalWg
+    }
+    return $null
 }
 
 function Test-WireGuardDriverPresence {
@@ -1094,6 +1163,47 @@ foreach ($binPath in $binariesToSign) {
 # `key init --force` + `key store-passphrase` here aligns the encryption
 # identity with the runtime identity (SYSTEM service), so the daemon's
 # subsequent decrypt at startup matches.  Idempotent: re-runs are safe.
+# Fail here, not 400 lines into an opaque canonicalization error.
+#
+# `rustynetd key init` is not dataplane-free: it shells out to `wg genkey` and
+# `wg pubkey` (crates/rustynetd/src/key_material.rs, generate_wireguard_keypair
+# and derive_public_key_from_private_key), so it resolves the wg binary and dies
+# without it. Resolution is per-command, not at startup: rustynetd reaches
+# argument parsing without touching wg at all, which is why the absence stays
+# invisible until this point.
+#
+# Checked at the LAST moment before the first such call rather than at
+# 'check-wireguard-driver' near the top, deliberately: the earlier point is also
+# reached by installs that only lay down files, and gating those on a dependency
+# they never exercise would refuse work that would have succeeded. Here, the very
+# next command cannot succeed without it.
+Set-InstallProgressStep 'require-wireguard-wg-binary'
+$wgBinaryPath = Get-RustyNetWgBinaryPath
+if (-not $wgBinaryPath) {
+    # Built from the SAME trimmed value the resolver tested, so the message can
+    # never name a path the gate did not actually try.
+    $wgConfigured = $env:RUSTYNET_WG_BINARY_PATH
+    $wgExpected = if ($wgConfigured -and $wgConfigured.Trim().Length -gt 0) {
+        "RUSTYNET_WG_BINARY_PATH='$($wgConfigured.Trim())' (must be an absolute path to an existing wg.exe)"
+    } else {
+        "'C:\Program Files\WireGuard\wg.exe'"
+    }
+    # Deliberately does NOT suggest setting RUSTYNET_WG_BINARY_PATH as a remedy.
+    # That variable is honoured by key_material.rs only; the Windows dataplane
+    # backend is built from compile-time constants and never consults it
+    # (rustynetd/src/daemon.rs, WindowsWireguardBackend). Pointing an operator at
+    # it would buy a green install whose service can never bring up a tunnel --
+    # trading a loud, accurate install failure for a silent one at reconcile,
+    # which is the exact class of deferred failure this gate exists to remove.
+    throw (
+        "WireGuard is not installed: wg.exe was not found at $wgExpected. " +
+        "rustynetd resolves this binary the same way, and 'key init' below shells " +
+        "out to 'wg genkey' and 'wg pubkey', so it cannot proceed without it. " +
+        "Install WireGuard for Windows on this host and re-run."
+    )
+}
+Write-Host "[install-helper] wireguard: using wg binary at $wgBinaryPath"
+
 Set-InstallProgressStep 'rekey-wireguard-under-runtime-identity'
 $wgPassphrasePath = Join-Path $StateRoot 'secrets\wireguard.passphrase.dpapi'
 $wgPassphraseDir = Split-Path -Parent $wgPassphrasePath

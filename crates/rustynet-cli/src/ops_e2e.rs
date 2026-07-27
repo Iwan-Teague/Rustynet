@@ -7602,6 +7602,7 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
     /// the wrong architecture. The change this pins is the one that decides
     /// *which binary signs artifacts*, so per §4 it needs a verification method
     /// and not just a comment asking for the invariant to hold.
+
     #[test]
     fn windows_installers_share_one_signtool_resolver() {
         const BEGIN: &str = "# --- BEGIN shared signtool resolver";
@@ -7664,6 +7665,153 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         assert!(
             !daemon.contains("'AMD64' { return @('arm64'"),
             "an x64 host must never prefer the arm64 signtool"
+        );
+    }
+
+    /// The installer must refuse to reach `rustynetd` without `wg.exe`, and must
+    /// refuse BEFORE the first invocation rather than after.
+    ///
+    /// `rustynetd key init` is not dataplane-free: it shells out to `wg genkey`
+    /// and `wg pubkey` (`key_material.rs`), so it resolves the wg binary and
+    /// fails without it. Resolution is per-command, not at startup — `rustynetd
+    /// --help` runs fine on a host with no WireGuard, which is why the absence
+    /// stays invisible until this point. On windows-x86-1 in run
+    /// winnat-20260727T095740Z it surfaced as `wg binary canonicalization failed`
+    /// roughly 400 lines after the last successful step.
+    ///
+    /// Three things are asserted, and each covers a way the gate has already been
+    /// got wrong:
+    ///
+    /// 1. ORDERING. A gate after the first invocation is decorative — the run has
+    ///    already failed there with the message this exists to replace.
+    /// 2. SCOPE. Byte-offset ordering alone is satisfied by a gate hoisted into a
+    ///    function that is never called, which parses clean and leaves the install
+    ///    completely unchecked. Brace depth pins it to top-level script scope.
+    /// 3. PREDICATE. The gate must resolve wg.exe the way rustynetd does —
+    ///    `RUSTYNET_WG_BINARY_PATH` then the canonical path, never PATH. An
+    ///    earlier version fell back to `Get-Command wg.exe`, which passes on a
+    ///    host whose only wg.exe is on PATH and then fails at `key init` anyway,
+    ///    after telling the operator wg was found.
+    #[test]
+    fn windows_installer_requires_wg_binary_before_invoking_rustynetd() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1");
+        let body = std::fs::read_to_string(&script)
+            .unwrap_or_else(|err| panic!("installer should be readable: {err}"))
+            .replace("\r\n", "\n");
+
+        let gate = body
+            .find("Set-InstallProgressStep 'require-wireguard-wg-binary'")
+            .expect("installer must gate on the wg binary before using rustynetd");
+        // Match the INVOCATION, not the prose: `key init` also appears in comments
+        // above the gate, so searching for it compares the wrong offsets.
+        let first_rustynetd_use = body
+            .find("Invoke-RustyNetNativeCommand -Path $daemonDest")
+            .expect("installer must still invoke the daemon for the rekey");
+        assert!(
+            gate < first_rustynetd_use,
+            "the wg-binary gate must PRECEDE the first rustynetd invocation, or it \
+             fires after the failure it exists to replace: gate at {gate}, first \
+             use at {first_rustynetd_use}"
+        );
+
+        // The gate must execute. A block hoisted into an uncalled function keeps
+        // its byte offset and parses clean, so ordering alone does not pin this.
+        // Line comments are stripped first: a comment carrying an unbalanced
+        // brace (a JSON fragment in a NOTE, say) parses clean but would red this
+        // assertion. The file has no `<#` block comments, so splitting on `#`
+        // suffices.
+        let scanned: String = body[..gate]
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let depth = scanned.chars().fold(0i32, |depth, ch| match ch {
+            '{' => depth + 1,
+            '}' => depth - 1,
+            _ => depth,
+        });
+        assert_eq!(
+            depth, 0,
+            "the gate must run at top-level script scope; at brace depth {depth} it \
+             sits inside a block that may never execute"
+        );
+
+        // The predicate must match rustynetd's resolver, in both directions.
+        // Scoped to the RESOLVER BODY, not the whole file: the rationale comment
+        // above the function names the rejected `Get-Command` fallback in order
+        // to explain why it is wrong, and a file-wide assertion matches that
+        // explanation and fails on its own documentation.
+        const RESOLVER: &str = "function Get-RustyNetWgBinaryPath {";
+        let resolver_start = body
+            .find(RESOLVER)
+            .expect("installer must define the wg resolver")
+            + RESOLVER.len();
+        let mut depth = 1i32;
+        let mut resolver_end = resolver_start;
+        for (offset, ch) in body[resolver_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                resolver_end = resolver_start + offset;
+                break;
+            }
+        }
+        assert!(
+            resolver_end > resolver_start,
+            "the wg resolver function must be brace-balanced"
+        );
+        let resolver = &body[resolver_start..resolver_end];
+
+        assert!(
+            resolver.contains("$env:RUSTYNET_WG_BINARY_PATH"),
+            "the resolver must honour RUSTYNET_WG_BINARY_PATH; the lab adapter sets \
+             it immediately before `key init`, so ignoring it refuses working \
+             installs: {resolver}"
+        );
+        assert!(
+            resolver.contains(r"'C:\Program Files\WireGuard\wg.exe'"),
+            "the resolver must fall back to the canonical path rustynetd defaults \
+             to: {resolver}"
+        );
+        assert!(
+            !resolver.contains("Get-Command"),
+            "the resolver must NOT search PATH: rustynetd never does, so a \
+             PATH-only wg.exe would pass this gate and then fail at key init \
+             anyway, after telling the operator wg was found: {resolver}"
+        );
+
+        // And it must FAIL, not annotate.
+        let gate_region = &body[gate..first_rustynetd_use];
+        assert!(
+            gate_region.contains("throw"),
+            "a missing wg.exe must fail the install, not add a note: {gate_region}"
+        );
+        assert!(
+            gate_region.contains("Install WireGuard for"),
+            "the failure must tell the operator what to do: {gate_region}"
+        );
+        // The resolver being PATH-free is not enough: a fallback re-added at the
+        // CALL SITE restores the original defect with the resolver untouched.
+        assert!(
+            !gate_region.contains("Get-Command"),
+            "the gate must not re-add a PATH fallback beside the call either: \
+             {gate_region}"
+        );
+        // And it must not advertise RUSTYNET_WG_BINARY_PATH as a REMEDY. The
+        // Windows dataplane backend is built from compile-time constants and
+        // never reads it, so following that advice yields a green install whose
+        // service cannot bring up a tunnel.
+        assert!(
+            !gate_region.contains("or set RUSTYNET_WG_BINARY_PATH"),
+            "the remediation must not point at a variable the dataplane ignores: \
+             {gate_region}"
         );
     }
 
