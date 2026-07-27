@@ -44,13 +44,21 @@
 //!  - **Different users on one driver host do not exclude each other.** The
 //!    lock directory defaults under `$HOME`, so a run as `iwan` and a run as
 //!    `root` claim different files. Point both at one directory with
-//!    `RUSTYNET_LAB_LOCK_DIR` if a host is driven by more than one user.
+//!    `RUSTYNET_LAB_LOCK_DIR` if a host is driven by more than one user. The
+//!    lock files are created 0o666 for exactly this reason — under 0o600 the
+//!    second user cannot open the first user's lock and every subsequent run on
+//!    that guest fails permanently — but `umask` still applies, so a
+//!    restrictive umask reintroduces the problem.
 //!  - **Different driver hosts do not exclude each other.** Two machines can
 //!    still both reach one guest over SSH; this is a host-local lock, not a
 //!    fleet-wide lease.
-//!  - **A run whose topology cannot be resolved claims nothing** (an
-//!    unreadable profile, a form with no guest flags). It runs UNPROTECTED and
-//!    says so on stderr rather than reporting exclusion it does not have.
+//!  - **Guests named only by platform are not claimed.** `--exit-platform` and
+//!    its siblings become an alias only after an inventory lookup the
+//!    orchestrator performs later; resolving them here would duplicate that
+//!    logic. They are reported as UNRESOLVED so the warning can name them, and
+//!    a run that resolves nothing at all is REFUSED rather than run unprotected
+//!    (`RUSTYNET_LAB_ALLOW_UNPROTECTED_RUN=1` overrides). A partial claim still
+//!    excludes on everything it did resolve.
 //!  - The **false-positive** half of QH-18 — `pgrep` self-tripping on an
 //!    inline-over-SSH launch — is untouched here. Closing it means editing the
 //!    host launch template and the two assertions pinning that string, in a
@@ -60,6 +68,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 #[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
@@ -69,6 +78,30 @@ use std::os::unix::fs::OpenOptionsExt;
 /// Override for the lock directory. Set it to make two checkouts on one host
 /// share (or deliberately not share) an exclusion domain.
 pub const LOCK_DIR_ENV: &str = "RUSTYNET_LAB_LOCK_DIR";
+
+/// Process-local redirect for [`lock_dir`], taking precedence over the env var.
+///
+/// This exists for one reason: the wiring test has to drive the real
+/// `execute_ops` claim path — that is the only way to catch a claim that is
+/// unwired or whose guard is dropped early — and it must not write into the
+/// operator's `~/.rustynet` while doing so. The crate is `#![forbid(unsafe_code)]`
+/// and `std::env::set_var` is `unsafe` under edition 2024, so a test cannot
+/// redirect this through the environment. A safe, explicit override is the
+/// alternative to weakening that lint.
+static LOCK_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Redirect [`lock_dir`] for this process. `None` restores the normal lookup.
+///
+/// `cfg(test)` rather than `allow(dead_code)`: this exists only so the wiring
+/// test can drive the real claim path without touching `~/.rustynet`, and a
+/// production build should not carry a way to redirect the exclusion domain.
+#[cfg(test)]
+pub fn set_lock_dir_override(dir: Option<PathBuf>) {
+    let mut guard = LOCK_DIR_OVERRIDE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = dir;
+}
 
 /// Where the per-guest lock files live.
 ///
@@ -81,6 +114,13 @@ pub const LOCK_DIR_ENV: &str = "RUSTYNET_LAB_LOCK_DIR";
 /// state). `$HOME` is the stable, per-user, non-reaped choice; the workspace
 /// `state/` directory (gitignored) is the fallback when `HOME` is unset.
 pub fn lock_dir() -> PathBuf {
+    if let Some(dir) = LOCK_DIR_OVERRIDE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return dir;
+    }
     if let Some(dir) = std::env::var_os(LOCK_DIR_ENV).filter(|value| !value.is_empty()) {
         return PathBuf::from(dir);
     }
@@ -184,13 +224,55 @@ where
         .collect()
 }
 
-/// ★ MAINTENANCE HAZARD, stated because nothing enforces it: the three
-/// `guest_refs_for_*` functions below are hand-maintained field lists. Adding a
-/// new guest-bearing field to one of those configs without adding it here
-/// silently shrinks the exclusion set — the run still claims to hold locks, it
-/// just does not hold one for the new guest. Rust cannot reflect over the
-/// struct, so when you add a `*_vm` / `*_target` field, add it here too.
+/// What a command's config says about the guests it will touch.
 ///
+/// `unresolved` exists so an incomplete claim can name what it could not
+/// resolve. A run that claims three guests but silently ignores a fourth
+/// selector reads as protected and is not, which is the exact defect QH-18
+/// exists to close — so the gap is reported rather than dropped.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GuestClaimRefs {
+    /// Guests this run will touch, in any spelling. Canonicalized later.
+    pub refs: Vec<String>,
+    /// Selectors that name a guest only indirectly and could not be resolved
+    /// from the config alone, as operator-facing flag names.
+    pub unresolved: Vec<&'static str>,
+    /// The run will not touch a guest at all, so it needs no locks and its
+    /// empty claim is not a warning.
+    pub touches_no_guest: bool,
+}
+
+impl GuestClaimRefs {
+    fn no_guests() -> Self {
+        Self {
+            touches_no_guest: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Guests named by a `--topology-profile` document, best effort.
+///
+/// An unreadable or invalid profile is NOT an error here: the run itself
+/// parses the same file and fails properly on it. Returning `None` lets the
+/// caller record the selector as unresolved instead of pretending the run
+/// touches nothing.
+fn guest_refs_from_topology_profile(path: &Path) -> Option<Vec<String>> {
+    let profile = super::topology::parse_topology_profile_file(path).ok()?;
+    Some(
+        [
+            profile.exit.as_deref(),
+            profile.relay.as_deref(),
+            profile.anchor.as_deref(),
+            profile.blind_exit.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect(),
+    )
+}
+
 /// Every guest `ops vm-lab-orchestrate-live-lab` will touch.
 ///
 /// `--node <alias>:<role>` is the Rust-native engine's topology; the legacy
@@ -199,72 +281,286 @@ where
 /// taking the union costs nothing and cannot miss the form in use.
 /// `--rebuild-nodes` is a subset of the topology, folded in anyway so a
 /// rebuild-only run of a node not otherwise named still claims it.
-pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig) -> Vec<String> {
-    let mut refs: Vec<String> = config
-        .node_assignments
+pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig) -> GuestClaimRefs {
+    // Exhaustive destructuring is deliberate, and is the enforcement the
+    // hand-maintained list did not have. Add a field to the config and this
+    // function stops compiling until someone classifies it as guest-bearing or
+    // not. The previous list was not merely AT RISK of rotting — it shipped
+    // already rotten, missing `windows_vm`, `macos_vm`, `profile_path` and
+    // `topology_profile`. That gap was not academic: the documented
+    // ≤3-concurrent-disjoint-guest workflow varies `exit_vm` while holding
+    // `windows_vm` constant, so exclusion keyed only on what varies, and two
+    // runs could share one Windows guest with both believing they were
+    // protected.
+    let super::VmLabOrchestrateLiveLabConfig {
+        // ── guests named directly ──
+        node_assignments,
+        exit_vm,
+        client_vm,
+        entry_vm,
+        aux_vm,
+        extra_vm,
+        fifth_client_vm,
+        relay_vm,
+        windows_vm,
+        macos_vm,
+        rebuild_nodes,
+        // ── guests named indirectly, resolvable here ──
+        profile_path,
+        topology_profile,
+        // ── guests named indirectly, NOT resolvable here ──
+        //
+        // These select a guest by PLATFORM, which only becomes an alias after
+        // an inventory lookup the orchestrator performs later. Resolving them
+        // here would duplicate that logic; leaving them silent would be the
+        // original defect. They are reported as unresolved instead.
+        exit_platform,
+        relay_platform,
+        anchor_platform,
+        admin_platform,
+        blind_exit_platform,
+        role_switch_platform,
+        // ── a dry run validates wiring and touches no guest ──
+        dry_run,
+        // ── everything below names no guest ──
+        inventory_path: _,
+        profile_output_path: _,
+        network_profile: _,
+        ssh_identity_file: _,
+        known_hosts_path: _,
+        require_same_network: _,
+        script_path: _,
+        report_dir: _,
+        source_mode: _,
+        repo_ref: _,
+        max_parallel_node_workers: _,
+        skip_gates: _,
+        skip_soak: _,
+        skip_cross_network: _,
+        cross_network_nat_profiles: _,
+        cross_network_required_nat_profiles: _,
+        cross_network_impairment_profile: _,
+        cross_network_substrate: _,
+        utm_documents_root: _,
+        utmctl_path: _,
+        ssh_port: _,
+        discovery_timeout_secs: _,
+        ready_timeout_secs: _,
+        timeout_secs: _,
+        collect_artifacts_on_failure: _,
+        skip_diagnose_on_failure: _,
+        setup_only: _,
+        run_only: _,
+        stop_after_ready: _,
+        resume_from: _,
+        rerun_stage: _,
+        trust_inventory_ready: _,
+        windows_only: _,
+        no_fail_on_authenticode: _,
+        validate_linux_daemon_state: _,
+        legacy_bash_orchestrator: _,
+        orchestrate_ssh_allow_cidrs: _,
+        macos_promote_exit: _,
+        enable_chaos_suite: _,
+        enable_negative_control: _,
+        stage_timeout_secs: _,
+        skip_linux_live_suite: _,
+    } = config;
+
+    if *dry_run {
+        return GuestClaimRefs::no_guests();
+    }
+
+    let mut refs: Vec<String> = node_assignments
         .iter()
         .map(|assignment| assignment.alias.clone())
         .collect();
     refs.extend(
         [
-            &config.exit_vm,
-            &config.client_vm,
-            &config.entry_vm,
-            &config.aux_vm,
-            &config.extra_vm,
-            &config.fifth_client_vm,
-            &config.relay_vm,
+            exit_vm,
+            client_vm,
+            entry_vm,
+            aux_vm,
+            extra_vm,
+            fifth_client_vm,
+            relay_vm,
+            windows_vm,
+            macos_vm,
         ]
         .into_iter()
         .flatten()
         .cloned(),
     );
-    if let Some(nodes) = config.rebuild_nodes.as_ref() {
+    if let Some(nodes) = rebuild_nodes.as_ref() {
         refs.extend(nodes.iter().cloned());
     }
-    refs
+
+    let mut unresolved: Vec<&'static str> = Vec::new();
+    if let Some(path) = profile_path.as_ref() {
+        refs.extend(guest_refs_from_profile(path.as_path()));
+    }
+    if let Some(path) = topology_profile.as_ref() {
+        match guest_refs_from_topology_profile(path.as_path()) {
+            Some(aliases) => refs.extend(aliases),
+            None => unresolved.push("--topology-profile"),
+        }
+    }
+    for (value, flag) in [
+        (exit_platform, "--exit-platform"),
+        (relay_platform, "--relay-platform"),
+        (anchor_platform, "--anchor-platform"),
+        (admin_platform, "--admin-platform"),
+        (blind_exit_platform, "--blind-exit-platform"),
+        (role_switch_platform, "--role-switch-platform"),
+    ] {
+        if value.is_some() {
+            unresolved.push(flag);
+        }
+    }
+
+    GuestClaimRefs {
+        refs,
+        unresolved,
+        touches_no_guest: false,
+    }
 }
 
 /// Every guest `ops vm-lab-setup-live-lab` will touch.
-pub fn guest_refs_for_setup(config: &super::VmLabSetupLiveLabConfig) -> Vec<String> {
-    [
-        &config.exit_vm,
-        &config.client_vm,
-        &config.entry_vm,
-        &config.aux_vm,
-        &config.extra_vm,
-        &config.fifth_client_vm,
-        &config.relay_vm,
-        &config.linux_blind_exit_vm,
+///
+/// `profile_path` matters as much as the explicit flags here: `scripts/e2e`
+/// documents `setup-live-lab` → `run-live-lab` as the primary operator path,
+/// `execute_ops_vm_lab_setup_live_lab` reads the profile on its reuse/resume
+/// path, and `run-live-lab` keys entirely off that same profile. Omitting it
+/// meant the two halves of one documented workflow keyed differently and did
+/// not exclude each other at all.
+pub fn guest_refs_for_setup(config: &super::VmLabSetupLiveLabConfig) -> GuestClaimRefs {
+    // Exhaustive: see `guest_refs_for_orchestrate`.
+    let super::VmLabSetupLiveLabConfig {
+        exit_vm,
+        client_vm,
+        entry_vm,
+        aux_vm,
+        extra_vm,
+        fifth_client_vm,
+        relay_vm,
+        linux_blind_exit_vm,
+        profile_path,
+        dry_run,
+        inventory_path: _,
+        profile_output_path: _,
+        ssh_identity_file: _,
+        known_hosts_path: _,
+        require_same_network: _,
+        script_path: _,
+        report_dir: _,
+        source_mode: _,
+        repo_ref: _,
+        resume_from: _,
+        rerun_stage: _,
+        max_parallel_node_workers: _,
+        timeout_secs: _,
+        stage_timeout_secs: _,
+        orchestrated: _,
+    } = config;
+
+    if *dry_run {
+        return GuestClaimRefs::no_guests();
+    }
+
+    let mut refs: Vec<String> = [
+        exit_vm,
+        client_vm,
+        entry_vm,
+        aux_vm,
+        extra_vm,
+        fifth_client_vm,
+        relay_vm,
+        linux_blind_exit_vm,
     ]
     .into_iter()
     .flatten()
     .cloned()
-    .collect()
+    .collect();
+    if let Some(path) = profile_path.as_ref() {
+        refs.extend(guest_refs_from_profile(path.as_path()));
+    }
+
+    GuestClaimRefs {
+        refs,
+        unresolved: Vec::new(),
+        touches_no_guest: false,
+    }
 }
 
 /// Every guest `ops vm-lab-iterate-live-lab` will touch. This form accepts a
 /// guest by alias OR by raw SSH target, which is exactly why canonicalization
 /// has to collapse both spellings onto one key.
-pub fn guest_refs_for_iterate(config: &super::VmLabIterateLiveLabConfig) -> Vec<String> {
-    [
-        &config.exit_vm,
-        &config.exit_target,
-        &config.client_vm,
-        &config.client_target,
-        &config.entry_vm,
-        &config.entry_target,
-        &config.aux_vm,
-        &config.aux_target,
-        &config.extra_vm,
-        &config.extra_target,
-        &config.fifth_client_vm,
-        &config.fifth_client_target,
-    ]
-    .into_iter()
-    .flatten()
-    .cloned()
-    .collect()
+pub fn guest_refs_for_iterate(config: &super::VmLabIterateLiveLabConfig) -> GuestClaimRefs {
+    // Exhaustive: see `guest_refs_for_orchestrate`.
+    let super::VmLabIterateLiveLabConfig {
+        exit_vm,
+        exit_target,
+        client_vm,
+        client_target,
+        entry_vm,
+        entry_target,
+        aux_vm,
+        aux_target,
+        extra_vm,
+        extra_target,
+        fifth_client_vm,
+        fifth_client_target,
+        dry_run,
+        inventory_path: _,
+        profile_output_path: _,
+        require_same_network: _,
+        ssh_identity_file: _,
+        ssh_known_hosts_file: _,
+        ssh_allow_cidrs: _,
+        network_id: _,
+        traversal_ttl_secs: _,
+        backend: _,
+        source_mode: _,
+        repo_ref: _,
+        report_dir: _,
+        script_path: _,
+        timeout_secs: _,
+        skip_gates: _,
+        skip_soak: _,
+        skip_cross_network: _,
+        require_clean_tree: _,
+        require_local_head: _,
+        validation_steps: _,
+        collect_failure_diagnostics: _,
+        failed_log_tail_lines: _,
+    } = config;
+
+    if *dry_run {
+        return GuestClaimRefs::no_guests();
+    }
+
+    GuestClaimRefs {
+        refs: [
+            exit_vm,
+            exit_target,
+            client_vm,
+            client_target,
+            entry_vm,
+            entry_target,
+            aux_vm,
+            aux_target,
+            extra_vm,
+            extra_target,
+            fifth_client_vm,
+            fifth_client_target,
+        ]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect(),
+        unresolved: Vec::new(),
+        touches_no_guest: false,
+    }
 }
 
 /// Every guest named by a live-lab profile (`ops vm-lab-run-live-lab` takes
@@ -298,23 +594,137 @@ pub fn guest_refs_from_profile(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Canonicalize `references`, take the locks, and report what was claimed.
+/// Every guest `ops vm-lab-run-live-lab` will touch. This form is driven
+/// entirely by its profile.
+pub fn guest_refs_for_run_live_lab(config: &super::VmLabRunLiveLabConfig) -> GuestClaimRefs {
+    // Exhaustive: see `guest_refs_for_orchestrate`.
+    let super::VmLabRunLiveLabConfig {
+        profile_path,
+        dry_run,
+        script_path: _,
+        skip_setup: _,
+        skip_gates: _,
+        skip_soak: _,
+        skip_cross_network: _,
+        enable_chaos_suite: _,
+        source_mode: _,
+        repo_ref: _,
+        report_dir: _,
+        timeout_secs: _,
+        stage_timeout_secs: _,
+        orchestrated: _,
+    } = config;
+
+    if *dry_run {
+        return GuestClaimRefs::no_guests();
+    }
+
+    GuestClaimRefs {
+        refs: guest_refs_from_profile(profile_path.as_path()),
+        unresolved: Vec::new(),
+        touches_no_guest: false,
+    }
+}
+
+/// Every guest `ops vm-lab-run-suite` will touch.
 ///
-/// An empty resolved set is NOT silently treated as success: it means the run
-/// is unprotected, and the operator is told so on stderr. Anything else would
-/// reproduce the defect this exists to fix — a gate that reads as exclusion
-/// while enforcing nothing.
+/// `--all` selects every guest in the inventory, which cannot be expanded from
+/// the config alone. It is reported as unresolved rather than ignored: a suite
+/// run over the whole lab is the case where exclusion matters most, so it must
+/// not be the case that silently claims nothing.
+pub fn guest_refs_for_run_suite(config: &super::VmLabRunSuiteConfig) -> GuestClaimRefs {
+    // Exhaustive: see `guest_refs_for_orchestrate`.
+    let super::VmLabRunSuiteConfig {
+        vm_aliases,
+        profile_path,
+        topology_path,
+        select_all,
+        dry_run,
+        inventory_path: _,
+        suite: _,
+        ssh_identity_file: _,
+        nat_profile: _,
+        impairment_profile: _,
+        report_dir: _,
+        timeout_secs: _,
+    } = config;
+
+    if *dry_run {
+        return GuestClaimRefs::no_guests();
+    }
+
+    let mut refs: Vec<String> = vm_aliases.clone();
+    let mut unresolved: Vec<&'static str> = Vec::new();
+    if let Some(path) = profile_path.as_ref() {
+        refs.extend(guest_refs_from_profile(path.as_path()));
+    }
+    if let Some(path) = topology_path.as_ref() {
+        match guest_refs_from_topology_profile(path.as_path()) {
+            Some(aliases) => refs.extend(aliases),
+            None => unresolved.push("--topology"),
+        }
+    }
+    if *select_all {
+        unresolved.push("--all");
+    }
+
+    GuestClaimRefs {
+        refs,
+        unresolved,
+        touches_no_guest: false,
+    }
+}
+
+/// Escape hatch for the empty-claim refusal below. Set to `1` to run anyway.
+pub const ALLOW_UNPROTECTED_ENV: &str = "RUSTYNET_LAB_ALLOW_UNPROTECTED_RUN";
+
+/// Canonicalize the claim, take the locks, and report what was claimed.
+///
+/// An empty resolved set REFUSES the run. It previously warned and proceeded,
+/// which is the defect this module exists to close wearing a different hat: a
+/// run that claims nothing is a run with no exclusion at all, and printing a
+/// warning nobody reads on a lab host is indistinguishable from having no gate.
+/// Refusing converts every gap in the collection functions — including any
+/// added later — from silent to loud. `RUSTYNET_LAB_ALLOW_UNPROTECTED_RUN=1`
+/// overrides it for the operator who genuinely means it.
+///
+/// A PARTIAL claim (some guests resolved, some selectors not) warns and
+/// proceeds, naming the selectors. Refusing there would break `--exit-platform`
+/// runs outright, and a partial claim still excludes on everything it did
+/// resolve, so the proportionate response is to say exactly what is unguarded.
 pub fn claim_guests(
     command: &str,
     inventory_path: Option<&Path>,
-    references: Vec<String>,
+    claim: GuestClaimRefs,
 ) -> Result<GuestRunLocks, String> {
-    let keys = canonical_guest_keys(inventory_path, references);
+    if claim.touches_no_guest {
+        let no_keys: BTreeSet<String> = BTreeSet::new();
+        return acquire_guest_run_locks(&no_keys);
+    }
+    let unresolved = claim.unresolved.clone();
+    let keys = canonical_guest_keys(inventory_path, claim.refs);
     if keys.is_empty() {
+        if std::env::var(ALLOW_UNPROTECTED_ENV).as_deref() != Ok("1") {
+            return Err(format!(
+                "{command} resolved NO guests for run exclusion, so it would run with no \
+                 protection against a concurrent run on the same guests (QH-18). Name the \
+                 guests explicitly, or set {ALLOW_UNPROTECTED_ENV}=1 to run unprotected \
+                 deliberately.{}",
+                unresolved_suffix(&unresolved)
+            ));
+        }
         eprintln!(
-            "warning: {command} claimed NO guests for run exclusion — its topology could not \
-             be resolved from the command line or profile. This run is NOT protected against \
-             a concurrent run on the same guests (QH-18)."
+            "warning: {command} claimed NO guests for run exclusion and \
+             {ALLOW_UNPROTECTED_ENV}=1 is set. This run is NOT protected against a \
+             concurrent run on the same guests (QH-18).{}",
+            unresolved_suffix(&unresolved)
+        );
+    } else if !unresolved.is_empty() {
+        eprintln!(
+            "warning: {command} claimed {} guest(s) but could not resolve {} from this \
+             config, so any guest named only that way is NOT protected (QH-18).",
+            keys.len(),
+            unresolved.join(", ")
         );
     }
     let held = acquire_guest_run_locks(&keys)?;
@@ -326,6 +736,14 @@ pub fn claim_guests(
         );
     }
     Ok(held)
+}
+
+fn unresolved_suffix(unresolved: &[&'static str]) -> String {
+    if unresolved.is_empty() {
+        String::new()
+    } else {
+        format!(" Unresolved selector(s): {}.", unresolved.join(", "))
+    }
 }
 
 /// One lock file per guest. Keep the whole set alive for the run's duration:
@@ -429,11 +847,19 @@ pub fn acquire_guest_run_locks_in(
 fn acquire_one(held: &mut GuestRunLocks, key: &str, path: &Path) -> Result<(), String> {
     // create(true), NOT create_new: a lock file legitimately survives a crash.
     // Exclusion comes from the advisory lock, never from the file existing.
+    // 0o666, not 0o600. The module recommends pointing two users at one
+    // directory via RUSTYNET_LAB_LOCK_DIR, and 0o600 made that advice
+    // self-defeating: user B cannot open user A's lock file, so every future
+    // run on that guest fails with "Permission denied" — permanently, and with
+    // a message that reads like a tool bug rather than a chmod. The file holds
+    // no secret; exclusion comes from the advisory lock, not from the mode.
+    // umask still applies, so a restrictive umask reintroduces the problem —
+    // hence the note in the module docs.
     let file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
+        .mode(0o666)
         .open(path)
         .map_err(|err| format!("open lab guest lock failed ({}): {err}", path.display()))?;
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {

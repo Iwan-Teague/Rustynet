@@ -8485,7 +8485,7 @@ fn execute_trust_verify(
 struct GuestClaim {
     command: &'static str,
     inventory_path: Option<PathBuf>,
-    references: Vec<String>,
+    claim: vm_lab::run_exclusion::GuestClaimRefs,
 }
 
 /// The guest set each live-lab-driving command claims.
@@ -8501,17 +8501,17 @@ fn guest_claim_for(command: &OpsCommand) -> Option<GuestClaim> {
         OpsCommand::VmLabSetupLiveLab { config } => Some(GuestClaim {
             command: "vm-lab-setup-live-lab",
             inventory_path: Some(config.inventory_path.clone()),
-            references: excl::guest_refs_for_setup(config),
+            claim: excl::guest_refs_for_setup(config),
         }),
         OpsCommand::VmLabOrchestrateLiveLab { config } => Some(GuestClaim {
             command: "vm-lab-orchestrate-live-lab",
             inventory_path: Some(config.inventory_path.clone()),
-            references: excl::guest_refs_for_orchestrate(config),
+            claim: excl::guest_refs_for_orchestrate(config),
         }),
         OpsCommand::VmLabIterateLiveLab { config } => Some(GuestClaim {
             command: "vm-lab-iterate-live-lab",
             inventory_path: Some(config.inventory_path.clone()),
-            references: excl::guest_refs_for_iterate(config),
+            claim: excl::guest_refs_for_iterate(config),
         }),
         OpsCommand::VmLabRunLiveLab { config } => Some(GuestClaim {
             command: "vm-lab-run-live-lab",
@@ -8521,7 +8521,16 @@ fn guest_claim_for(command: &OpsCommand) -> Option<GuestClaim> {
             // machine as its alias, and the two forms would not exclude each
             // other at all.
             inventory_path: Some(vm_lab::default_inventory_path()),
-            references: excl::guest_refs_from_profile(config.profile_path.as_path()),
+            claim: excl::guest_refs_for_run_live_lab(config),
+        }),
+        // `vm-lab-run-suite` resolves `--vm` aliases into a topology and drives
+        // those guests for a full live-lab-length timeout. It was omitted from
+        // the first version of this dispatcher, so a suite run and a live-lab
+        // run could hold the same guests simultaneously.
+        OpsCommand::VmLabRunSuite { config } => Some(GuestClaim {
+            command: "vm-lab-run-suite",
+            inventory_path: Some(config.inventory_path.clone()),
+            claim: excl::guest_refs_for_run_suite(config),
         }),
         _ => None,
     }
@@ -8552,7 +8561,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         Some(claim) => Some(vm_lab::run_exclusion::claim_guests(
             claim.command,
             claim.inventory_path.as_deref(),
-            claim.references,
+            claim.claim,
         )?),
         None => None,
     };
@@ -22312,18 +22321,24 @@ mod pin_authority_tests {
 /// `vm_lab::run_exclusion`'s own tests prove the lock works. They say nothing
 /// about whether `execute_ops` takes it, which is the half that silently rots:
 /// delete the claim from the dispatch path and every one of those tests still
-/// passes. These pin the mapping instead.
+/// passes. Most of these pin the mapping; the last one drives `execute_ops`
+/// itself, which is the only test here that reds when the claim is unwired or
+/// its guard is dropped early.
 #[cfg(all(test, feature = "vm-lab"))]
 mod guest_claim_wiring_tests {
-    use super::{OpsCommand, guest_claim_for, vm_lab};
+    use super::{OpsCommand, execute_ops, guest_claim_for, vm_lab};
     use std::path::PathBuf;
 
     fn run_live_lab_command(profile_path: PathBuf) -> OpsCommand {
+        run_live_lab_command_with_dry_run(profile_path, false)
+    }
+
+    fn run_live_lab_command_with_dry_run(profile_path: PathBuf, dry_run: bool) -> OpsCommand {
         OpsCommand::VmLabRunLiveLab {
             config: vm_lab::VmLabRunLiveLabConfig {
                 profile_path,
                 script_path: PathBuf::from("/dev/null"),
-                dry_run: true,
+                dry_run,
                 skip_setup: false,
                 skip_gates: false,
                 skip_soak: false,
@@ -22353,7 +22368,7 @@ mod guest_claim_wiring_tests {
             .expect("vm-lab-run-live-lab must claim its guests");
         assert_eq!(claim.command, "vm-lab-run-live-lab");
         assert_eq!(
-            claim.references,
+            claim.claim.refs,
             vec!["debian@192.168.18.65", "ubuntu@192.168.18.52"]
         );
         assert!(
@@ -22370,7 +22385,7 @@ mod guest_claim_wiring_tests {
         )))
         .expect("the command still claims");
         assert!(
-            claim.references.is_empty(),
+            claim.claim.refs.is_empty(),
             "no guesses from an unreadable profile; claim_guests warns that the \
              run is unprotected rather than pretending otherwise"
         );
@@ -22381,6 +22396,121 @@ mod guest_claim_wiring_tests {
         // The claim must not creep onto unrelated ops: a non-lab command that
         // took guest locks would refuse for no reason.
         assert!(guest_claim_for(&OpsCommand::RefreshTrust).is_none());
+    }
+
+    /// A dry run validates wiring and touches no guest, so it must not contend
+    /// for one. Locking it turned `ai_lab_run`'s documented "fast wiring check"
+    /// into something that fails whenever a real run is in flight — a new false
+    /// refusal introduced by the fix for the old false permit.
+    #[test]
+    fn a_dry_run_claims_no_guests_because_it_touches_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let profile = tmp.path().join("p.env");
+        std::fs::write(&profile, "EXIT_TARGET=debian@192.0.2.11\n").expect("write profile");
+
+        let claim = guest_claim_for(&run_live_lab_command_with_dry_run(profile, true))
+            .expect("the command still maps");
+        assert!(
+            claim.claim.touches_no_guest,
+            "a dry run must be marked as touching no guest"
+        );
+        assert!(claim.claim.refs.is_empty(), "and must claim nothing");
+    }
+
+    /// QH-18. This pins the WIRING. Everything above pins the MAPPING, and the
+    /// two are not the same thing: the mapping being right says nothing about
+    /// whether the claim is taken and HELD.
+    ///
+    /// Two mutations disable the feature outright while leaving every other
+    /// test in this module green:
+    ///
+    ///   1. delete the claim block from `execute_ops` — caught only by
+    ///      `dead_code`, and only for as long as nothing else in the crate
+    ///      references `run_exclusion`. A status subcommand or a second caller
+    ///      would evaporate that pin;
+    ///   2. change `let _guest_claim` to a bare `let _`, which drops every lock
+    ///      before the run it protects has started. Nothing caught that at all.
+    ///
+    /// Under (2) the run still prints "holds N guest lock(s)" and enforces
+    /// nothing — precisely the "reads as exclusion, enforces nothing" defect
+    /// QH-18 exists to close. So this drives `execute_ops` itself with the
+    /// guest's lock already held and requires the refusal, which reds under
+    /// both.
+    #[test]
+    fn execute_ops_refuses_a_run_whose_guest_is_already_locked() {
+        use vm_lab::run_exclusion as excl;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Point the lock directory at the tempdir. Without this the test would
+        // write into the operator's real `~/.rustynet`.
+        excl::set_lock_dir_override(Some(tmp.path().to_path_buf()));
+
+        let profile = tmp.path().join("p.env");
+        std::fs::write(&profile, "EXIT_TARGET=debian@192.0.2.11\n").expect("write profile");
+
+        let claim = guest_claim_for(&run_live_lab_command(profile.clone()))
+            .expect("vm-lab-run-live-lab must claim its guests");
+        let keys = excl::canonical_guest_keys(claim.inventory_path.as_deref(), claim.claim.refs);
+        assert!(
+            !keys.is_empty(),
+            "fixture must resolve at least one guest, or this test proves nothing"
+        );
+
+        let held = excl::acquire_guest_run_locks(&keys).expect("first claim must succeed");
+        assert!(!held.keys().is_empty(), "the first claim must hold a lock");
+
+        let err = execute_ops(run_live_lab_command(profile))
+            .expect_err("a second run on a held guest must be REFUSED, not merely warned about");
+        assert!(
+            keys.iter().any(|key| err.contains(key.as_str())),
+            "the refusal must name the contended guest so the operator can find \
+             the other run; got: {err}"
+        );
+
+        drop(held);
+        excl::set_lock_dir_override(None);
+    }
+
+    /// Text pin for the one property the behavioural test above CANNOT observe:
+    /// that `execute_ops` binds the claim to a NAMED guard.
+    ///
+    /// A bare `let _` drops its value immediately, so under that mutation every
+    /// lock is released before the run it protects has started — and the test
+    /// above still passes. It has to: in the contended case the refusal comes
+    /// from `claim_guests` failing to ACQUIRE, which happens identically whether
+    /// or not the caller would have held the result. Guard lifetime is only
+    /// observable by racing a live run from another thread, and a
+    /// timing-dependent test is exactly how this suite acquired its flakiness
+    /// elsewhere.
+    ///
+    /// So this pins the source text, and says plainly that that is what it is.
+    ///
+    /// The needles are assembled at runtime rather than written as literals: the
+    /// file this test reads is the file this test lives in, so a literal needle
+    /// would match the assertion's own source and the positive check would pass
+    /// even with the binding deleted.
+    #[test]
+    fn the_claim_in_execute_ops_is_bound_to_a_named_guard() {
+        let main_rs = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("main.rs should be readable");
+
+        let named = format!(
+            "let _guest{}claim = {}",
+            "_", "match guest_claim_for(&command)"
+        );
+        let anonymous = format!("let _ = {}", "match guest_claim_for(");
+
+        assert!(
+            main_rs.contains(named.as_str()),
+            "execute_ops must bind the guest claim to a NAMED guard; a bare `let _` \
+             releases every lock before the run starts and no behavioural test notices"
+        );
+        assert!(
+            !main_rs.contains(anonymous.as_str()),
+            "the guest claim must never be bound to a bare `_`"
+        );
     }
 }
 
