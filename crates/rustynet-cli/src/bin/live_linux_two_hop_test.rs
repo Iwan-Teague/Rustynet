@@ -2070,6 +2070,7 @@ impl TwoHopReadiness {
 ///     measurement, priming conntrack state and WireGuard handshakes. A genuine
 ///     first-packet or NAT-setup defect would therefore be hidden from the probes
 ///     that follow.
+///
 /// Neither is a fail-closed weakening — a broken path still fails — but both trade
 /// sensitivity for stability, and that trade should be visible here.
 fn await_two_hop_path_ready(
