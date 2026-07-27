@@ -21,6 +21,51 @@ const TOPOLOGY_COLUMN: usize = 11;
 const OVERALL_RESULT_COLUMN: usize = 12;
 const FIRST_FAILED_STAGE_COLUMN: usize = 13;
 
+/// The header names those three positions MUST carry, checked before any row is
+/// read.
+///
+/// This module addresses rows positionally and previously discarded the header
+/// outright (`let _header = lines.next();`). The positions are correct today in
+/// both ledgers, but by coincidence rather than by construction.
+///
+/// The shift path is NOT `ensure_matrix_schema`, which only ever APPENDS
+/// (`schema.push`) — that is precisely what keeps index 11 immovable, and why
+/// the shipped headers have drifted so far from the constant's order that
+/// `linux_stage_admin` sits at constant index 43 and CSV index 211, with 223 of
+/// 266 positions differing. It is `live_lab_run_matrix.rs`'s fresh-file
+/// initialisation, which writes `DEFAULT_MATRIX_COLUMNS.join(",")` verbatim: a
+/// mid-list insertion before index 11 shifts every NEWLY CREATED matrix while
+/// leaving the shipped ledgers untouched. The two then disagree, and this report
+/// is right on one file and silently wrong on the other — attributing failures
+/// to the wrong topology, and producing SPRT/CUSUM verdicts (read as evidence
+/// about whether a cell is flaky or genuinely regressing) that are confidently
+/// wrong.
+///
+/// A wrong verdict that looks right is worse than no verdict, so this fails
+/// closed with a message naming what moved.
+const EXPECTED_HEADER_COLUMNS: [(usize, &str); 3] = [
+    (TOPOLOGY_COLUMN, "topology_summary"),
+    (OVERALL_RESULT_COLUMN, "overall_result"),
+    (FIRST_FAILED_STAGE_COLUMN, "first_failed_stage"),
+];
+
+/// Confirm the positional column assumptions against the ledger's own header.
+fn validate_matrix_header(header: &[String]) -> Result<(), String> {
+    for (index, expected) in EXPECTED_HEADER_COLUMNS {
+        let actual = header.get(index).map(String::as_str).unwrap_or("<absent>");
+        if actual != expected {
+            return Err(format!(
+                "run matrix header changed: column {index} is '{actual}', expected \
+                 '{expected}'. This module reads rows by position, so a shifted \
+                 header would silently attribute outcomes to the wrong topology and \
+                 produce confident, wrong flake verdicts. Re-derive the constants in \
+                 `run_history.rs` against the current header before using this report."
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CusumVerdict {
     /// Failure rate shifted UP from baseline: regression signature.
@@ -291,7 +336,11 @@ pub fn render_flake_report(matrix_path: &Path) -> Result<String, String> {
     let raw = std::fs::read_to_string(matrix_path)
         .map_err(|err| format!("read run matrix {}: {err}", matrix_path.display()))?;
     let mut lines = raw.lines();
-    let _header = lines.next();
+    // The header is VALIDATED, not discarded. See `EXPECTED_HEADER_COLUMNS`.
+    let header = lines
+        .next()
+        .ok_or_else(|| format!("run matrix {} is empty", matrix_path.display()))?;
+    validate_matrix_header(&parse_csv_record(header)?)?;
     let mut rows = Vec::new();
     for line in lines {
         if line.trim().is_empty() {
@@ -330,7 +379,9 @@ fn truncate_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CellOutcome, CusumDetector, CusumVerdict, SprtClassifier, SprtVerdict, classify_cells,
+        CellOutcome, CusumDetector, CusumVerdict, FIRST_FAILED_STAGE_COLUMN, OVERALL_RESULT_COLUMN,
+        SprtClassifier, SprtVerdict, TOPOLOGY_COLUMN, classify_cells, parse_csv_record,
+        validate_matrix_header,
     };
     use std::collections::BTreeMap;
 
@@ -464,6 +515,67 @@ mod tests {
             bad.label.contains("REGRESSION") || bad.label.contains("suspected regression"),
             "got: {}",
             bad.label
+        );
+    }
+
+    /// The positional assumptions must be checked against the ledgers that
+    /// actually ship, not against a fixture written to agree with them.
+    ///
+    /// Both run matrices are read here, because a header change lands in one
+    /// first and this module reads whichever path the caller passes.
+    #[test]
+    fn positional_columns_match_the_real_ledger_headers() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli");
+        for ledger in [
+            "documents/operations/live_lab_node_run_matrix.csv",
+            "documents/operations/live_lab_run_matrix.csv",
+        ] {
+            let path = root.join(ledger);
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("{ledger} should be readable: {err}"));
+            let header_line = raw
+                .lines()
+                .next()
+                .unwrap_or_else(|| panic!("{ledger} is empty"));
+            let header = parse_csv_record(header_line)
+                .unwrap_or_else(|err| panic!("{ledger} header should parse: {err}"));
+            validate_matrix_header(&header).unwrap_or_else(|err| panic!("{ledger}: {err}"));
+        }
+    }
+
+    /// A shifted header must fail closed, not silently read the wrong column.
+    ///
+    /// This is the whole point: the previous code discarded the header, so
+    /// inserting a column before index 11 would have moved every read with no
+    /// error anywhere — attributing outcomes to the wrong topology and producing
+    /// confident, wrong SPRT/CUSUM verdicts.
+    #[test]
+    fn a_shifted_header_is_refused_rather_than_misread() {
+        let mut header: Vec<String> = (0..14).map(|i| format!("col{i}")).collect();
+        header[TOPOLOGY_COLUMN] = "topology_summary".to_owned();
+        header[OVERALL_RESULT_COLUMN] = "overall_result".to_owned();
+        header[FIRST_FAILED_STAGE_COLUMN] = "first_failed_stage".to_owned();
+        validate_matrix_header(&header).expect("the canonical layout must be accepted");
+
+        // Insert one column before the block. This is the shape a mid-list
+        // addition to `DEFAULT_MATRIX_COLUMNS` gives a freshly initialised
+        // matrix — NOT something `ensure_matrix_schema` can do, since it only
+        // appends.
+        let mut shifted = header.clone();
+        shifted.insert(0, "newly_added_column".to_owned());
+        let err = validate_matrix_header(&shifted).expect_err("a shifted header must be refused");
+        assert!(
+            err.contains("column 11"),
+            "the error must name the column that moved: {err}"
+        );
+
+        // A truncated header must not read as valid either.
+        assert!(
+            validate_matrix_header(&header[..12]).is_err(),
+            "a header too short to carry these columns must be refused"
         );
     }
 }
