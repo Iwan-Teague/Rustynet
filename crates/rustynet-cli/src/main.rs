@@ -8548,7 +8548,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
     // untidy — the orchestrator CALLS `execute_ops_vm_lab_setup_live_lab` and
     // `execute_ops_vm_lab_run_live_lab` in-process as its own setup and run
     // phases, so a lock taken there would deadlock a run against itself.
-    // `execute_ops` has exactly one caller, no test callers, and every
+    // `execute_ops` has exactly one production caller and every
     // invocation form reaches it — including `ops vm-lab-orchestrate-live-lab`,
     // the form the runbook documents and the one that previously reached no
     // exclusion at all.

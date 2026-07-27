@@ -45,10 +45,14 @@
 //!    lock directory defaults under `$HOME`, so a run as `iwan` and a run as
 //!    `root` claim different files. Point both at one directory with
 //!    `RUSTYNET_LAB_LOCK_DIR` if a host is driven by more than one user. The
-//!    lock files are created 0o666 for exactly this reason — under 0o600 the
-//!    second user cannot open the first user's lock and every subsequent run on
-//!    that guest fails permanently — but `umask` still applies, so a
-//!    restrictive umask reintroduces the problem.
+//!    lock files are made 0o666 for exactly this reason — under 0o600 the second
+//!    user cannot open the first user's lock and every subsequent run on that
+//!    guest fails permanently with a message that reads like a tool bug. The
+//!    mode is applied with an explicit `set_permissions` after creation, because
+//!    `OpenOptions::mode` is masked by `umask` and the common default of 022
+//!    turns 0o666 into 0o644 — which reproduces the failure exactly. The
+//!    DIRECTORY is still umask-subject, so a shared lock dir must be created
+//!    group-writable by whoever sets it up.
 //!  - **Different driver hosts do not exclude each other.** Two machines can
 //!    still both reach one guest over SSH; this is a host-local lock, not a
 //!    fleet-wide lease.
@@ -73,7 +77,7 @@ use std::sync::RwLock;
 #[cfg(unix)]
 use nix::fcntl::{Flock, FlockArg};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// Override for the lock directory. Set it to make two checkouts on one host
 /// share (or deliberately not share) an exclusion domain.
@@ -655,18 +659,38 @@ pub fn guest_refs_for_run_suite(config: &super::VmLabRunSuiteConfig) -> GuestCla
 
     let mut refs: Vec<String> = vm_aliases.clone();
     let mut unresolved: Vec<&'static str> = Vec::new();
-    if let Some(path) = profile_path.as_ref() {
-        refs.extend(guest_refs_from_profile(path.as_path()));
-    }
+
+    // `--topology` here is the run-suite topology document
+    // (`{version, suite, roles, nodes}`), NOT the `--topology-profile` schema
+    // (`{exit, relay, anchor, blind_exit}`) that `orchestrate` takes. The two
+    // are `deny_unknown_fields` and mutually exclusive — each rejects the
+    // other's document — so resolving this with the profile parser meant it
+    // could NEVER resolve. That was worse than not trying: the run warned about
+    // an unresolved selector, claimed only its `--vm` aliases, and then drove
+    // every guest in the topology, including one another run was holding.
     if let Some(path) = topology_path.as_ref() {
-        match guest_refs_from_topology_profile(path.as_path()) {
-            Some(aliases) => refs.extend(aliases),
-            None => unresolved.push("--topology"),
+        match super::load_vm_lab_topology(path.as_path()) {
+            Ok(topology) => refs.extend(
+                topology
+                    .nodes
+                    .values()
+                    .flat_map(|node| [node.alias.clone(), node.normalized_target.clone()]),
+            ),
+            // The run parses the same file and fails properly on it; record the
+            // selector rather than pretending the run touches nothing.
+            Err(_) => unresolved.push("--topology"),
         }
     }
+
+    // `--all` expands against the inventory, which this function does not have.
     if *select_all {
         unresolved.push("--all");
     }
+
+    // `profile_path` is deliberately NOT read: `execute_ops_vm_lab_run_suite`
+    // never looks at it, so collecting guests from it would claim locks for a
+    // file this command does not act on.
+    let _ = profile_path;
 
     GuestClaimRefs {
         refs,
@@ -861,6 +885,18 @@ fn acquire_one(held: &mut GuestRunLocks, key: &str, path: &Path) -> Result<(), S
         .truncate(false)
         .mode(0o666)
         .open(path)
+        .inspect(|_| {
+            // `mode()` is masked by umask, and the common default (022) turns
+            // 0o666 into 0o644 — under which the second user still cannot open
+            // the first user's lock, which is the exact failure this is meant to
+            // prevent. Set the mode explicitly afterwards so the shared-directory
+            // remedy the module docs recommend actually works.
+            //
+            // Best effort: only the owner may chmod, so when the file already
+            // belongs to the other user this call fails and the existing mode —
+            // which that user already made group-writable, or did not — stands.
+            let _ = fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+        })
         .map_err(|err| format!("open lab guest lock failed ({}): {err}", path.display()))?;
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(flock) => {

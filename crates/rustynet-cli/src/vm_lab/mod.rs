@@ -53603,6 +53603,136 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         }
     }
 
+    /// QH-18. The collection functions had NO tests at all, which is how they
+    /// shipped already missing `windows_vm` and `macos_vm` — the exact fields
+    /// the documented concurrent workflow holds constant while varying
+    /// `exit_vm`. The exhaustive destructure forces a NEW field to be
+    /// classified, but nothing stops an existing one being reclassified to `_`,
+    /// so the gap is only closed if something asserts the guests come out.
+    #[test]
+    fn orchestrate_claims_windows_and_macos_guests_not_only_the_varying_ones() {
+        let mut config = empty_orchestrate_live_lab_config();
+        config.exit_vm = Some("exit-1".to_owned());
+        config.windows_vm = Some("win-1".to_owned());
+        config.macos_vm = Some("mac-1".to_owned());
+
+        let claim = super::run_exclusion::guest_refs_for_orchestrate(&config);
+        for expected in ["exit-1", "win-1", "mac-1"] {
+            assert!(
+                claim.refs.iter().any(|reference| reference == expected),
+                "orchestrate must claim {expected}; got {:?}",
+                claim.refs
+            );
+        }
+    }
+
+    /// A selector this function cannot resolve must be REPORTED, not dropped.
+    /// Silently omitting it is what makes a run read as protected when it is
+    /// not.
+    #[test]
+    fn orchestrate_reports_platform_selectors_it_cannot_resolve() {
+        let mut config = empty_orchestrate_live_lab_config();
+        config.exit_vm = Some("exit-1".to_owned());
+        config.exit_platform = Some("windows".to_owned());
+
+        let claim = super::run_exclusion::guest_refs_for_orchestrate(&config);
+        assert!(
+            claim.unresolved.contains(&"--exit-platform"),
+            "unresolved selectors must be named; got {:?}",
+            claim.unresolved
+        );
+    }
+
+    /// `run-suite --topology` takes the run-suite topology document, NOT the
+    /// `--topology-profile` schema. Resolving it with the wrong parser meant it
+    /// could never resolve, so the run claimed only its `--vm` aliases and then
+    /// drove every guest in the topology anyway.
+    #[test]
+    fn run_suite_claims_every_guest_named_by_its_topology_document() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let topology_path = dir.path().join("topology.json");
+        std::fs::write(
+            &topology_path,
+            serde_json::json!({
+                "version": 1,
+                "suite": "direct-remote-exit",
+                "roles": {"exit": "topo-exit-1", "client": "topo-client-1"},
+                "nodes": [
+                    {
+                        "alias": "topo-exit-1",
+                        "normalized_target": "debian@192.0.2.11",
+                        "node_id": "node-exit",
+                        "lab_role": "exit",
+                        "network_id": "net-a",
+                        "mesh_ip": null,
+                        "last_known_ip": "192.0.2.11",
+                        "exit_capable": true,
+                        "relay_capable": false,
+                        "rustynet_src_dir": null
+                    },
+                    {
+                        "alias": "topo-client-1",
+                        "normalized_target": "debian@192.0.2.12",
+                        "node_id": "node-client",
+                        "lab_role": "client",
+                        "network_id": "net-b",
+                        "mesh_ip": null,
+                        "last_known_ip": "192.0.2.12",
+                        "exit_capable": false,
+                        "relay_capable": false,
+                        "rustynet_src_dir": null
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write topology");
+
+        let config = super::VmLabRunSuiteConfig {
+            inventory_path: PathBuf::from("/dev/null"),
+            suite: "direct-remote-exit".to_owned(),
+            topology_path: Some(topology_path),
+            profile_path: None,
+            ssh_identity_file: PathBuf::from("/dev/null"),
+            vm_aliases: Vec::new(),
+            select_all: false,
+            dry_run: false,
+            nat_profile: None,
+            impairment_profile: None,
+            report_dir: None,
+            timeout_secs: 1,
+        };
+
+        // Probe the loader directly first. Without this, a fixture that fails to
+        // parse looks identical to a collection function that ignores the
+        // selector — both produce an empty claim — and the failure message would
+        // point at the wrong thing.
+        let probed = super::load_vm_lab_topology(
+            config
+                .topology_path
+                .as_deref()
+                .expect("fixture sets a path"),
+        );
+        assert!(
+            probed.is_ok(),
+            "the topology fixture must be valid, or this test proves nothing: {:?}",
+            probed.err()
+        );
+
+        let claim = super::run_exclusion::guest_refs_for_run_suite(&config);
+        for expected in ["topo-exit-1", "topo-client-1"] {
+            assert!(
+                claim.refs.iter().any(|reference| reference == expected),
+                "run-suite must claim {expected} from its topology; got {:?}",
+                claim.refs
+            );
+        }
+        assert!(
+            !claim.unresolved.contains(&"--topology"),
+            "a valid run-suite topology must resolve, not be reported unresolved"
+        );
+    }
+
     // ── W5.6 default-flip routing (`w56_flip_legacy_to_node`) ─────────────
     #[test]
     fn w56_flip_translates_legacy_role_flags_to_node_by_default() {
