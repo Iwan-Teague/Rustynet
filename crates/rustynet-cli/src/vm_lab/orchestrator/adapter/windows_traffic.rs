@@ -344,6 +344,43 @@ fn build_diag_archive_script(remote_zip_path: &str) -> Result<String, AdapterErr
     // `verify_no_key_material_zip` for how that empty listing is recognised; it is
     // NOT free, and getting it wrong is what made the first version of this fix
     // fail to fix anything.
+    //
+    // The NON-empty branch snapshots each file before archiving, and that is the
+    // THIRD distinct layer of this same collection defect. `Compress-Archive`
+    // opens each source for reading and does not share write access. Windows
+    // PowerShell 5.1 — the runtime the guest actually runs — ships
+    // Microsoft.PowerShell.Archive 1.0.x, whose psm1 uses the three-argument
+    // `[System.IO.File]::Open($path, Open, Read)`, i.e. `FileShare.None`, which
+    // additionally excludes other data-reading handles; pwsh 7 ships 1.2.5 and
+    // passes `FileShare.Read` explicitly. That difference is not what breaks
+    // this, though: `rustynetd` holds an open WRITE handle on its own
+    // `rustynetd.log` for the life of the process, and neither mode shares
+    // write access, so the archive failed under either with
+    // `CompressArchiveUnauthorizedAccessError` / "because it is being used by
+    // another process". Observed live on windows-x86-1 in run
+    // winnat-20260727T144642Z — the FIRST run in which the daemon started and
+    // wrote logs at all, which is why this layer stayed invisible until the two
+    // beneath it were fixed.
+    //
+    // Copying through `[System.IO.File]::Open(..., FileShare::ReadWrite)` is what
+    // makes the read possible while the writer keeps its handle. Stopping the
+    // daemon first would also work and is wrong: this runs on the failure path,
+    // and tearing the process down destroys the state under investigation.
+    //
+    // Per-file failures are collected rather than thrown. One unreadable file must
+    // not cost the operator every other file — the same lesson as the per-node
+    // loop in `diagnostics.rs`. They are not silently dropped either: names and
+    // reasons go into `COLLECTION-ERRORS.txt` inside the archive, so a partial
+    // collection announces itself in the artifact instead of looking complete.
+    //
+    // TOTAL failure throws, though, and the distinction is the point. If every
+    // copy fails — a full staging volume, an ACL denial, AV holding the tree —
+    // the manifest would be the archive's only entry, `Compress-Archive` would
+    // succeed, and the caller would report "collected artifacts into ..." for an
+    // archive containing nothing but an explanation nobody opens. A first version
+    // of this change did exactly that, turning what used to be a loud failure
+    // into a silent one. Errors have to reach the operator through the adapter,
+    // not through an artifact whose existence already reads as success.
     Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
@@ -359,8 +396,43 @@ fn build_diag_archive_script(remote_zip_path: &str) -> Result<String, AdapterErr
                  Where-Object {{ $_.FullName -notlike {keys_pattern_q} }} \
          }} else {{ @() }}); \
          if ($filesToArchive.Count -gt 0) {{ \
-             Compress-Archive -Path ($filesToArchive | Select-Object -ExpandProperty FullName) \
-                 -DestinationPath $zipPath -Force \
+             $snapshotDir = Join-Path $stagingDir 'rn_diag_snapshot'; \
+             if (Test-Path -LiteralPath $snapshotDir) {{ \
+                 Remove-Item -LiteralPath $snapshotDir -Recurse -Force \
+             }}; \
+             New-Item -ItemType Directory -Force -Path $snapshotDir | Out-Null; \
+             $rootLen = $logsDir.TrimEnd('\\').Length + 1; \
+             $copyErrors = @(); \
+             foreach ($src in $filesToArchive) {{ \
+                 try {{ \
+                     $rel = $src.FullName.Substring($rootLen); \
+                     $dest = Join-Path $snapshotDir $rel; \
+                     $destParent = Split-Path -Parent $dest; \
+                     if (-not (Test-Path -LiteralPath $destParent)) {{ \
+                         New-Item -ItemType Directory -Force -Path $destParent | Out-Null \
+                     }}; \
+                     $in = [System.IO.File]::Open($src.FullName, \
+                         [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, \
+                         [System.IO.FileShare]::ReadWrite); \
+                     try {{ \
+                         $out = [System.IO.File]::Create($dest); \
+                         try {{ $in.CopyTo($out) }} finally {{ $out.Dispose() }} \
+                     }} finally {{ $in.Dispose() }} \
+                 }} catch {{ \
+                     $copyErrors += ($src.FullName + ': ' + $_.Exception.Message) \
+                 }} \
+             }}; \
+             if ($copyErrors.Count -eq $filesToArchive.Count) {{ \
+                 throw ('diagnostics collection copied 0 of ' + \
+                     $filesToArchive.Count + ' files: ' + ($copyErrors -join '; ')) \
+             }}; \
+             if ($copyErrors.Count -gt 0) {{ \
+                 Set-Content -LiteralPath (Join-Path $snapshotDir 'COLLECTION-ERRORS.txt') \
+                     -Value $copyErrors -Encoding utf8 \
+             }}; \
+             Compress-Archive -Path (Join-Path $snapshotDir '*') \
+                 -DestinationPath $zipPath -Force; \
+             Remove-Item -LiteralPath $snapshotDir -Recurse -Force \
          }} else {{ \
              [System.IO.File]::WriteAllBytes($zipPath, {empty_zip_literal}) \
          }}",
@@ -1030,6 +1102,70 @@ mod tests {
         assert!(
             script.contains(r"keys\*"),
             "key material exclusion must be preserved: {script}"
+        );
+    }
+
+    /// The non-empty branch must archive a SNAPSHOT opened with
+    /// `FileShare.ReadWrite`, never the live files.
+    ///
+    /// `Compress-Archive` opens each source for reading without sharing write
+    /// access. Windows PowerShell 5.1 ships Microsoft.PowerShell.Archive 1.0.x,
+    /// which uses the three-argument `[System.IO.File]::Open(path, Open, Read)`
+    /// — i.e. `FileShare.None`; pwsh 7 ships 1.2.5, which passes `FileShare.Read`
+    /// explicitly. The guest runs the 5.1 form, and the difference is not what
+    /// breaks this: `rustynetd` holds an open WRITE handle on its own
+    /// `rustynetd.log`, and neither mode shares write access, so the archive
+    /// fails under either. Reproduced on windows-x86-1: archiving the live path
+    /// fails with "The process cannot access the file ... because it is being
+    /// used by another process", while copying through `FileShare::ReadWrite`
+    /// and archiving the copy succeeds.
+    ///
+    /// This is the third layer of one defect — the empty-dir strict-mode throw,
+    /// then the missing compression assembly, now this — and each was invisible
+    /// until the one beneath it was fixed. So the assertions below pin the SHAPE:
+    /// archiving must read from the snapshot directory, and must not fall back
+    /// to the live `FullName` list.
+    #[test]
+    fn diag_archive_snapshots_locked_files_instead_of_archiving_them_in_place() {
+        let script = build_diag_archive_script(r"C:\Windows\Temp\rn_diag_artifacts.zip")
+            .expect("diag archive script should render");
+
+        assert!(
+            script.contains("[System.IO.FileShare]::ReadWrite"),
+            "the copy must permit a concurrent writer, or the daemon's own log is \
+             unreadable: {script}"
+        );
+        // Archive the copy, not the original.
+        assert!(
+            script.contains("Compress-Archive -Path (Join-Path $snapshotDir '*')"),
+            "Compress-Archive must read the snapshot directory: {script}"
+        );
+        // The old form archived live paths straight out of the enumeration.
+        assert!(
+            !script.contains("Select-Object -ExpandProperty FullName"),
+            "archiving the live file list is exactly what failed on a locked log: \
+             {script}"
+        );
+        // A per-file failure must not abort the whole collection, and must not be
+        // silent either.
+        assert!(
+            script.contains("$copyErrors") && script.contains("COLLECTION-ERRORS.txt"),
+            "per-file copy failures must be recorded in the archive rather than \
+             thrown or dropped: {script}"
+        );
+        // TOTAL failure must THROW, not produce a success whose only entry is an
+        // explanation. A first version of this change reported success in that
+        // case, converting a loud failure into a silent one.
+        assert!(
+            script.contains("if ($copyErrors.Count -eq $filesToArchive.Count)")
+                && script.contains("throw ('diagnostics collection copied 0 of '"),
+            "copying zero of N files must fail the collection, not archive an \
+             error manifest and report success: {script}"
+        );
+        // The empty-dir branch is untouched by this.
+        assert!(
+            script.contains("} else { [System.IO.File]::WriteAllBytes("),
+            "the empty branch must still write the bare EOCD: {script}"
         );
     }
 
