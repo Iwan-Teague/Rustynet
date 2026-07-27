@@ -83,6 +83,50 @@ Each implemented security control must include:
 - Keep documentation synchronized with implementation changes.
 - Remove dead links, stale index entries, and prompt-only guidance when you find them.
 
+### 5.1) Git hygiene — how work gets silently destroyed here
+
+These four rules exist because each one was violated in a single session, and the
+first one nearly cost ~1,574 lines of real work.
+
+**1. Never commit from a stale checkout. Check before you commit.**
+
+```bash
+git rev-list --count HEAD..origin/main   # must be 0
+```
+
+A checkout 46 commits behind accumulated real uncommitted work on top. `git
+status` showed 27 dirty files and gave no hint that committing them would ALSO
+revert ~8,880 lines of landed work: the working copies of five source files
+predated commits that had since landed, so committing would have re-applied
+their old contents as though they were new edits. Nothing in the normal output
+warns about this. Install the hook — `./scripts/git-hooks/install.sh` — which
+refuses such a commit and names the specific files that would revert.
+
+**2. Measure your edits against HEAD, never against `origin/main`.**
+
+`git diff` (vs HEAD, the base you edited from) is your work. `git diff
+origin/main` conflates your work with the staleness. On the tree above they read
+`+1,574/−67` and `+2,389/−8,880` respectively — same tree, opposite conclusions,
+and the second one looks like a catastrophe that is not happening.
+
+**3. Commit before you experiment.**
+
+Mutation-testing a fix means editing code you intend to throw away. `git checkout
+-- <file>` then restores to the last COMMIT, so uncommitted work in the same file
+dies with the mutation. This destroyed a patch four times in one session. Commit
+first; restoring is then free and total.
+
+**4. Rescue stale work AT its original base.**
+
+When a checkout is both stale and dirty, commit the dirt to a scratch branch
+without rebasing first. Committed at its own base it reverts nothing, and the
+rebase becomes a separate, deliberate, per-file decision instead of an implicit
+one bundled into a commit.
+
+Related: `git stash` + `git checkout <other-branch>` moves your uncommitted work
+out from under you. Check `git stash list` — old entries there are usually
+forgotten work, not deliberate parking.
+
 ## 6) Documentation Rules
 - `documents/README.md` is the top-level map of the docs tree.
 - `documents/operations/README.md` is the operations/runbook map.

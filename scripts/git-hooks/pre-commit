@@ -1,0 +1,90 @@
+#!/bin/sh
+# Refuse to commit from a checkout that is behind its upstream.
+#
+# WHY THIS EXISTS
+#
+# A checkout 46 commits behind origin/main accumulated ~1,574 lines of real
+# uncommitted work. `git status` showed 27 dirty files and gave no hint that
+# committing them would ALSO revert ~8,880 lines of already-landed work: the
+# working copies of five source files predated commits that had since landed, so
+# committing the tree would have re-applied their old contents as if they were
+# new edits.
+#
+# The tell was one number nobody was looking at — `git rev-list --count
+# HEAD..@{upstream}`. This hook looks at it.
+#
+# WHAT IT DOES NOT DO
+#
+# It does not check whether your changes are good, tested, or reviewed. It checks
+# exactly one thing: that the base you are committing onto is current. Everything
+# else is someone else's job.
+#
+# BYPASS
+#
+# Committing onto an old base is occasionally correct — rescuing work from a
+# stale tree is the obvious case, and preserving it AT its original base is
+# exactly right because it reverts nothing. When you mean it:
+#
+#     RUSTYNET_ALLOW_STALE_COMMIT=1 git commit ...
+#
+# Say why in the commit message if you use it.
+
+set -eu
+
+# Detached HEAD or no upstream: nothing to compare against, so allow.
+upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+[ -n "$upstream" ] || exit 0
+
+behind=$(git rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)
+[ "$behind" -eq 0 ] && exit 0
+
+if [ "${RUSTYNET_ALLOW_STALE_COMMIT:-0}" = "1" ]; then
+  printf '\n  note: committing %s commit(s) behind %s (RUSTYNET_ALLOW_STALE_COMMIT=1).\n\n' \
+    "$behind" "$upstream" >&2
+  exit 0
+fi
+
+# Name the files most likely to cause a silent revert: ones this commit touches
+# that landed commits have also changed since HEAD.
+staged=$(git diff --cached --name-only)
+risky=""
+for f in $staged; do
+  n=$(git rev-list --count "HEAD..$upstream" -- "$f" 2>/dev/null || echo 0)
+  [ "$n" -gt 0 ] && risky="$risky  $f  (changed by $n landed commit(s))
+"
+done
+
+cat >&2 <<EOF
+
+  REFUSING TO COMMIT: this branch is $behind commit(s) behind $upstream.
+
+  Committing now can silently REVERT landed work. Your working copies were
+  edited from an older base, so any file that has also changed upstream will be
+  written back to its old contents as though that were a new edit.
+EOF
+
+if [ -n "$risky" ]; then
+  printf '\n  Staged files that landed commits have also changed:\n%s' "$risky" >&2
+  printf '  Those are the ones that would revert.\n' >&2
+else
+  printf '\n  None of the staged files have changed upstream, so this particular\n' >&2
+  printf '  commit is probably safe — but the base is still stale.\n' >&2
+fi
+
+cat >&2 <<'EOF'
+
+  Do this instead:
+
+    git fetch origin
+    git stash                 # or commit to a scratch branch
+    git rebase origin/main    # or: git reset --hard origin/main
+    git stash pop             # resolve conflicts deliberately, per file
+
+  Measure your edits with `git diff` (vs HEAD, the base you edited from).
+  `git diff origin/main` conflates your work with the staleness and will show
+  enormous phantom deletions.
+
+  Deliberate? RUSTYNET_ALLOW_STALE_COMMIT=1 git commit ...
+
+EOF
+exit 1

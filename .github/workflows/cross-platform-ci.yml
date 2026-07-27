@@ -32,6 +32,30 @@ jobs:
           # definition; --retries 0 (the default) is explicit so retries can
           # never silently mask a flaky test.
           cargo nextest run --workspace --all-targets --all-features --locked --retries 0
+      - name: Repo hygiene gates
+        # Two things nothing else enforces.
+        #
+        # AGENTS.md and CLAUDE.md are deliberately two real files (a symlink
+        # materialises as a 10-byte text file on a Windows checkout without
+        # core.symlinks, and this workflow has a Windows leg). They have never
+        # diverged in 2552 commits — by discipline alone, with nothing mechanical
+        # holding them together. This is that mechanism.
+        #
+        # The pre-commit hook refuses commits from a checkout behind its
+        # upstream. It lives in the repo but `core.hooksPath` is per-clone
+        # config, so an uninstalled hook is silent — verify at least that the
+        # hook is present and executable, or it rots unnoticed.
+        run: |
+          cmp -s AGENTS.md CLAUDE.md || {
+            echo "AGENTS.md and CLAUDE.md have diverged; they must stay byte-identical" >&2
+            diff AGENTS.md CLAUDE.md | head -40 >&2
+            exit 1
+          }
+          test -x scripts/git-hooks/pre-commit || {
+            echo "scripts/git-hooks/pre-commit missing or not executable" >&2
+            exit 1
+          }
+          echo "repo hygiene: doc pair identical, pre-commit hook present"
       - name: Lab monitor standalone gates
         # rustynet-lab-monitor is EXCLUDED from the workspace (see root
         # Cargo.toml + crate README), so the workspace validation above never
@@ -64,6 +88,30 @@ jobs:
           # nextest as the runner, cargo test as the authoritative definition —
           # see the macOS leg's comment (BLD-2).
           cargo nextest run --workspace --all-targets --all-features --locked --retries 0
+      - name: Repo hygiene gates
+        # Two things nothing else enforces.
+        #
+        # AGENTS.md and CLAUDE.md are deliberately two real files (a symlink
+        # materialises as a 10-byte text file on a Windows checkout without
+        # core.symlinks, and this workflow has a Windows leg). They have never
+        # diverged in 2552 commits — by discipline alone, with nothing mechanical
+        # holding them together. This is that mechanism.
+        #
+        # The pre-commit hook refuses commits from a checkout behind its
+        # upstream. It lives in the repo but `core.hooksPath` is per-clone
+        # config, so an uninstalled hook is silent — verify at least that the
+        # hook is present and executable, or it rots unnoticed.
+        run: |
+          cmp -s AGENTS.md CLAUDE.md || {
+            echo "AGENTS.md and CLAUDE.md have diverged; they must stay byte-identical" >&2
+            diff AGENTS.md CLAUDE.md | head -40 >&2
+            exit 1
+          }
+          test -x scripts/git-hooks/pre-commit || {
+            echo "scripts/git-hooks/pre-commit missing or not executable" >&2
+            exit 1
+          }
+          echo "repo hygiene: doc pair identical, pre-commit hook present"
       - name: Lab monitor standalone gates
         # Excluded from the workspace; gate it explicitly on the Linux leg
         # too (macOS/Linux only crate). See scripts/ci/lab_monitor_gates.sh.
