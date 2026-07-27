@@ -1070,13 +1070,18 @@ mod tests {
             .start(runtime_context())
             .expect("backend should start successfully");
         tun_state.set_next_recv_error("phase10 simulated TUN receive failure before route apply");
+        // Wait on the monotonic exit counter, not on a live/dead pair of control
+        // round trips. The obvious-looking "generation resolves AND local_addr
+        // errors" condition is only ever true in the single worker-loop pass
+        // where the worker answers the first request and then dies before the
+        // second one lands: both calls share one RuntimeControl channel, so once
+        // the worker is gone both return Err and the condition can never be
+        // satisfied again. Losing that race left the test polling a permanently
+        // unsatisfiable predicate until the budget expired, which is what made it
+        // flaky. `worker_exit_count_for_test` latches, so no scheduling delay can
+        // step over the transition.
         wait_for(Duration::from_secs(1), || {
-            backend
-                .transport_generation_for_test()
-                .ok()
-                .flatten()
-                .and_then(|_| backend.worker_local_addr_for_test().err())
-                .map(|_| ())
+            (backend.worker_exit_count_for_test().unwrap_or_default() > 0).then_some(())
         });
 
         backend
