@@ -17,8 +17,23 @@ if ! command -v cargo >/dev/null 2>&1; then
       sudo_cmd=""
     fi
     $sudo_cmd apt-get update
+    # procps and unzip are not optional conveniences — the suite asserts on them:
+    #   procps -> `ps`, spawned by the stage-deadline sweep
+    #             (`orchestrator/diagnostics.rs`); without it
+    #             `production_tree_enumerates_the_real_process_table_without_killing`
+    #             fails with "No such file or directory (os error 2)".
+    #   unzip  -> the artifact key-exclusion check
+    #             (`orchestrator/adapter/windows_traffic.rs`). Its `python3`
+    #             fallback is MORE PERMISSIVE than `unzip`: python's `zipfile`
+    #             accepts a corrupted 22-byte end-of-central-directory record and
+    #             returns an empty namelist, so a runner without `unzip` silently
+    #             took a different code path than any developer machine. The
+    #             checker now fails closed on an empty listing regardless, but the
+    #             runner should still exercise the same tool production does.
+    # The debian:trixie image ships neither, which is why this leg failed for
+    # every one of the last 100 runs while macOS and the E2E leg passed.
     DEBIAN_FRONTEND=noninteractive $sudo_cmd apt-get install -y --no-install-recommends \
-      ca-certificates curl build-essential pkg-config
+      ca-certificates curl build-essential pkg-config procps unzip
   fi
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal --default-toolchain none
