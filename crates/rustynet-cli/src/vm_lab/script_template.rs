@@ -588,12 +588,14 @@ apt_update() {
 }
 if [ "${VERIFY_ONLY:-0}" != "1" ]; then
   apt_update || exit 1
-  # nft=nftables, wg=wireguard-tools, ping=iputils-ping; clang+llvm for bindgen
+  # nft=nftables, wg=wireguard-tools, ping=iputils-ping; clang+llvm for bindgen;
+  # dnsutils=dig, required by the exit_dns_failclosed_validation live-lab stage
+  # (Debian cloud images ship no dnsutils, so dig is absent without this).
   sudo -n timeout 1200 apt-get install -y -qq \
     curl git make pkg-config clang llvm libclang-dev \
     build-essential \
     nftables wireguard-tools iproute2 \
-    tar gzip tcpdump iputils-ping \
+    tar gzip tcpdump iputils-ping dnsutils \
     libssl-dev libsqlite3-dev ca-certificates \
     >/dev/null 2>&1
   echo "[toolchain] apt packages installed"
@@ -636,7 +638,7 @@ export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 
 echo "--- rn_bootstrap prerequisite check (its list, its PATH) ---"
 missing=0
-for cmd in curl git make pkg-config clang nft wg rustup tar gzip tcpdump ping; do
+for cmd in curl git make pkg-config clang nft wg rustup tar gzip tcpdump ping dig; do
   if command -v "$cmd" >/dev/null 2>&1; then printf "  %-12s ok\n" "$cmd"
   else printf "  %-12s MISSING\n" "$cmd"; missing=1; fi
 done
@@ -2393,6 +2395,46 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
         )
         .expect("empty must be legal");
         assert_eq!(rendered, "SHA=''\n");
+    }
+
+    /// `dig` must be installed AND verified, or `exit_dns_failclosed_validation`
+    /// fails on a guest that never had it.
+    ///
+    /// Debian cloud images ship no `dnsutils`, so `dig` is absent unless the
+    /// toolchain installs it — and installing without verifying is how this went
+    /// unnoticed: the stage fails much later, on a guest, with a missing-binary
+    /// error that reads like a lab fault rather than a provisioning gap. Both
+    /// halves are asserted because either one alone is silently insufficient.
+    #[test]
+    fn the_guest_toolchain_installs_and_verifies_dig_for_the_dns_failclosed_stage() {
+        let script = render_guest_toolchain_script("1.88.0")
+            .expect("the toolchain script should render for a valid channel");
+
+        // Slice the apt-get install command, NOT the whole script. A bare
+        // `script.contains("dnsutils")` is satisfied by the COMMENT above the
+        // install list that explains why dnsutils is there — verified: deleting
+        // the package from the list left that assertion green. The comment is
+        // the thing most likely to survive a careless edit that drops the
+        // package, so it is exactly the wrong witness.
+        let install_start = script
+            .find("apt-get install")
+            .expect("the toolchain must install packages");
+        let install_end = install_start
+            + script[install_start..]
+                .find(">/dev/null")
+                .expect("the install command must terminate");
+        let install_cmd = &script[install_start..install_end];
+        assert!(
+            install_cmd.contains("dnsutils"),
+            "dnsutils (dig) must be in the apt INSTALL LIST, or \
+             exit_dns_failclosed_validation fails on a missing dig; \
+             install command was: {install_cmd}"
+        );
+        assert!(
+            script.contains(" ping dig; do"),
+            "dig must be in the command verification loop, or a failed install \
+             is not detected until the stage that needs it"
+        );
     }
 
     /// A `Bare` value is emitted unquoted, so its alphabet is the whole control.
