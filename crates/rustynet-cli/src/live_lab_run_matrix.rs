@@ -435,12 +435,17 @@ pub fn default_live_lab_run_matrix_path() -> PathBuf {
 /// **That split was only half the fix, and `linux_stage_two_hop` reproduced the same
 /// false-green *inside* this ledger** — because three distinct stage ids aliased onto
 /// the column, one of them `traffic_test_matrix` (mesh-ping) rather than a two-hop
-/// proof. The alias is removed as of 2026-07-26 (QH-07).
+/// proof. The alias is removed as of 2026-07-27 (QH-07), at the production source of
+/// truth: the `logical` field on the `traffic_test_matrix` spec in
+/// `live_lab_stage_registry.rs`. The two ids that still map to `two_hop`,
+/// `live_two_hop_validation` and `live_two_hop`, are both genuine chained-exit proofs.
 ///
 /// **The removal is FORWARD-ONLY: rows written before that commit are contaminated.**
-/// This file already holds **43 `linux_stage_two_hop = pass` rows** that are
-/// `traffic_test_matrix` results, at a time when `live_two_hop_validation` had never
-/// passed even once. Do not read a historical `two_hop` pass as evidence the chained
+/// Counted at commit `9cdd660f`, this 94-row file holds **35 `linux_stage_two_hop =
+/// pass` rows** (against fail 27 / skip 23 / not_run 9) that are `traffic_test_matrix`
+/// results, at a time when `live_two_hop_validation` had never passed even once —
+/// its per-stage record is skip 222 / fail 81 / **pass 0**. Do not read a historical
+/// `two_hop` pass as evidence the chained
 /// exit path worked; go to `live_lab_node_stage_results.csv` for the per-stage truth,
 /// or to the stage's own report (`live_two_hop_report.json`, whose `dataplane` block
 /// carries the actual measurements). Note also that a quote-aware CSV parse is required
@@ -3545,6 +3550,24 @@ mod tests {
             "deploy_relay_service",
             "relay_validation",
             "traffic_test_matrix",
+            // QH-07: `two_hop` coverage below must come from a real chained-exit
+            // stage. Until 2026-07-27 this list named only `traffic_test_matrix`
+            // and the `two_hop` assertion still passed — because that stage was
+            // aliased onto the column. The alias was the defect, so that pass was
+            // the bug proving itself. Naming the actual stage keeps the coverage
+            // instead of deleting it, and makes the assertion mean what it says.
+            //
+            // Do NOT read this test as a guard against re-aliasing. It caught the
+            // removal once, in transition, and is now insensitive to it: with both
+            // stages in this list, restoring `logical: Some("two_hop")` on
+            // `traffic_test_matrix` leaves it GREEN, because `merge_status` keeps
+            // `pass` over `pass` and both stages report `pass` here. Verified by
+            // mutation. The guard is
+            // `live_lab_stage_registry::tests::traffic_test_matrix_feeds_no_two_hop_rollup_but_keeps_cross_os`,
+            // which is the only test that fails on a BOTH-SIDES re-alias. A
+            // registry-only re-alias also reds `registry_matches_historical_logical_stage_name`,
+            // because the oracle would then disagree — measured: 2 failed, not 1.
+            "live_two_hop_validation",
             "role_switch_matrix",
             "exit_handoff",
             "active_exit",
@@ -3644,6 +3667,18 @@ mod registry_equivalence_tests {
     //!   * alias names (`distribute_windows_bundles`) — the phantom now
     //!     resolves to `distribute_windows_membership` where the old tables
     //!     returned None; that healing is the point of the alias table.
+    //!   * QH-07, 2026-07-27 — `traffic_test_matrix` returned `Some("two_hop")`
+    //!     historically and now returns None. The oracle below was edited in
+    //!     lockstep with the registry, which is this module's intended
+    //!     workflow: it is a change DETECTOR, not an archive.
+    //!
+    //! Read the guarantee precisely, because the QH-07 delta narrows it: these
+    //! tests prove the registry and the oracle AGREE. They do not prove that
+    //! historical behaviour is preserved, and they cannot detect a change made
+    //! to both sides at once — a re-alias of `traffic_test_matrix` onto
+    //! `two_hop` in the registry AND here would leave all six of them green.
+    //! That specific regression is guarded only by
+    //! `live_lab_stage_registry::tests::traffic_test_matrix_feeds_no_two_hop_rollup_but_keeps_cross_os`.
 
     use super::{TargetEvidence, platforms_for_stage};
     use crate::live_lab_stage_registry;
@@ -3762,14 +3797,16 @@ mod registry_equivalence_tests {
             // `traffic_test_matrix` proves only that the mesh pings (every pair
             // reachable), whereas the two-hop column is read as proof of the chained
             // exit path. Against the per-stage ledger the divergence is total —
-            // `live_two_hop_validation` is skip 263 / fail 116 / **pass 0**, while
-            // `traffic_test_matrix` is pass 260 — so a `pass` in that column never
+            // `live_two_hop_validation` is skip 222 / fail 81 / **pass 0**, while
+            // `traffic_test_matrix` is pass 185 — so a `pass` in that column never
             // meant two-hop worked. Reporting into no column is strictly more honest
-            // than reporting into the wrong one, and nothing is lost: per-stage results
-            // remain in `live_lab_node_stage_results.csv`.
+            // than reporting into the wrong one. It is NOT free, though: see the
+            // spec comment in `live_lab_stage_registry.rs` for what a single-platform
+            // run stops writing. The per-stage results are unaffected and remain in
+            // `live_lab_node_stage_results.csv`.
             //
             // Deliberately NOT re-aliased to another column: adding one is a schema
-            // migration (fixed header list, ~39 references, plus 108 + 549 existing
+            // migration (fixed header list, ~39 references, plus 94 + 549 existing
             // rows that predate any new header) and is tracked separately.
             "role_switch_matrix" => Some("role_switch_matrix"),
             "live_lan_toggle" => Some("lan_toggle"),

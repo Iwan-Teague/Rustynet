@@ -872,7 +872,51 @@ pub const STAGES: &[StageSpec] = &[
         name: "traffic_test_matrix",
         state_machine_only: true,
         group: StageGroup::Live,
-        logical: Some("two_hop"),
+        // QH-07: deliberately NO roll-up column. This field is the production
+        // source of truth for the `<platform>_stage_<logical>` write
+        // (`logical_stage_name` -> `populate_stage_result_values`), and until
+        // 2026-07-27 it said `Some("two_hop")`.
+        //
+        // `traffic_test_matrix` proves only that the mesh pings — every pair
+        // reachable. The `two_hop` column is read as proof of the chained exit
+        // path, which is a different claim.
+        //
+        // Counted at commit `9cdd660f` with a quote-aware CSV reader (every row
+        // has commas inside quoted fields, so a naive split reads the wrong
+        // column). In `live_lab_node_stage_results.csv`: `live_two_hop_validation`
+        // is skip 222 / fail 81 / **pass 0**, while `traffic_test_matrix` is
+        // pass 185 / skip 74 / not_proven 34 / fail 10. In the 94-row
+        // `live_lab_node_run_matrix.csv`: `linux_stage_two_hop` is pass 35 /
+        // fail 27 / skip 23 / not_run 9. So a pass in that column never meant
+        // two-hop worked, and 35 such rows are already written.
+        //
+        // Reporting into no column is strictly more honest than reporting into
+        // the wrong one. Be precise about what that costs, because the earlier
+        // version of this comment claimed "nothing is lost" and that was false:
+        //
+        //   * On a MULTI-platform run this stage still feeds
+        //     `cross_os_peer_visibility` — `populate_cross_os_values` is called
+        //     outside the `logical_stage_name` branch, so severing `logical`
+        //     does not reach it.
+        //   * On a SINGLE-platform run it now writes NO run-matrix column at
+        //     all. `populate_cross_os_values` early-returns when
+        //     `unique_platforms(targets).len() < 2` and the stage name contains
+        //     neither "windows" nor "macos", which is this stage on any
+        //     single-OS run. That is the common case: `cross_os_peer_visibility`
+        //     is not_run on 82 of those 94 rows and has never once been `pass`.
+        //   * `counts_as_check` stays true either way, because
+        //     `live_lab_stage_manifest` reads the `cross_os` FIELD below, not
+        //     whether a write happened.
+        //
+        // The per-stage truth is unaffected and stays in
+        // `live_lab_node_stage_results.csv`, which is where a reader should go.
+        // The field-level half is pinned by
+        // `traffic_test_matrix_feeds_no_two_hop_rollup_but_keeps_cross_os`.
+        //
+        // Deliberately NOT re-aliased to some other column: adding one is a
+        // schema migration against a fixed header list and hundreds of rows
+        // that predate it, and is tracked separately.
+        logical: None,
         cross_os: Some("cross_os_peer_visibility"),
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
@@ -2394,6 +2438,45 @@ pub fn default_budget_secs(stage: &str) -> u64 {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// QH-07. Pins both halves of the decision on the `traffic_test_matrix`
+    /// spec: that it feeds NO `two_hop` roll-up, and that removing the roll-up
+    /// did not cost it the reporting it legitimately earns.
+    ///
+    /// Asserted through the production accessors rather than by reading the
+    /// spec fields, because the accessors are what the run-matrix writer calls.
+    /// The equivalence test in `live_lab_run_matrix` cannot stand in for this
+    /// one: it only checks that the registry and the historical oracle AGREE,
+    /// so re-aliasing both at once would leave it green.
+    #[test]
+    fn traffic_test_matrix_feeds_no_two_hop_rollup_but_keeps_cross_os() {
+        assert_eq!(
+            logical_stage_name("traffic_test_matrix"),
+            None,
+            "traffic_test_matrix proves mesh-ping reachability, not the chained \
+             exit path. Aliasing it onto a roll-up column — `two_hop` or any \
+             other — reports a pass for a claim it does not test; that is how 35 \
+             false-green two_hop rows were written while live_two_hop_validation \
+             had passed exactly zero times. If a roll-up is genuinely wanted, add \
+             a column of its own (a schema migration), do not reuse another \
+             stage's."
+        );
+        // The stage still DECLARES a cross-OS column. Deliberately narrow: this
+        // asserts the spec field, which is the thing
+        // `live_lab_stage_manifest`'s `counts_as_check` actually reads — it does
+        // NOT assert that a cross-OS value is written on any given run, and it
+        // must not be read as the "nothing is lost" proof. It is not:
+        // `populate_cross_os_values` early-returns on a single-platform run, so
+        // on those runs this stage writes no run-matrix column at all. See the
+        // spec comment for the measured breakdown.
+        assert_eq!(
+            cross_os_column("traffic_test_matrix"),
+            Some("cross_os_peer_visibility"),
+            "severing `logical` must not also cost this stage its cross_os \
+             declaration — that field is what keeps `counts_as_check` true, so \
+             dropping it would silently demote the stage to not-a-check"
+        );
+    }
 
     #[test]
     fn registry_names_and_aliases_are_unique() {
