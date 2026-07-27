@@ -61,7 +61,17 @@ Deliver secure identity and enrollment flows with auditable control-plane APIs, 
 - Reusable credential safety controls and policy enforcement documented and tested.
 
 ## 4) Security Gates
-- TLS 1.3 enforced on control-plane endpoints.
+- Control-plane transport security enforced. **Status correction 2026-07-27:**
+  this gate originally read "TLS 1.3 enforced on control-plane endpoints".
+  There is no TLS stack and no TLS library is a workspace dependency;
+  `rustls` appears only transitively via `ureq` in `rustynet-mcp`, an
+  LLM-API client unrelated to the control plane. What is actually enforced
+  is described in `SecurityMinimumBar.md` §3.2 — mesh control traffic rides
+  the WireGuard tunnel's authenticated encryption (Noise IK,
+  ChaCha20-Poly1305), with ed25519 signature verification on membership
+  updates. `Requirements.md` — the normative source of truth this document
+  defers to — was corrected in the same pass, so the requirement is not live
+  above this line either.
 - Token and credential secrets are never logged.
 - Revocation and offboarding path tested for correctness.
 - Rate-limit, lockout/backoff, and replay-protection controls are verified with negative tests.
