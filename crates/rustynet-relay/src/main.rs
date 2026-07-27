@@ -765,6 +765,13 @@ mod daemon {
     struct PreAuthHelloLimiter {
         max_per_sec: u32,
         counts: HashMap<IpAddr, (u32, Instant)>,
+        /// How many times `prune` has run. Test-only, and the only thing that
+        /// makes the lazy-prune property observable: reverting `check` to prune
+        /// on every call is otherwise invisible to the suite, because the test
+        /// that used to notice only failed when the fill happened to exceed one
+        /// second -- a timing race, not a guard.
+        #[cfg(test)]
+        prune_calls: usize,
     }
 
     impl PreAuthHelloLimiter {
@@ -772,15 +779,36 @@ mod daemon {
             Self {
                 max_per_sec,
                 counts: HashMap::new(),
+                #[cfg(test)]
+                prune_calls: 0,
             }
         }
 
         fn check(&mut self, ip: IpAddr) -> bool {
             let now = Instant::now();
-            self.prune(now);
-            if !self.counts.contains_key(&ip) && self.counts.len() >= MAX_PRE_AUTH_HELLO_SOURCE_IPS
+            // Prune only when it can change the outcome: at capacity, with a NEW
+            // source IP. `prune` is a full `retain`, so calling it on EVERY hello
+            // made this O(n) per packet -- on the PRE-AUTH path, where n is
+            // attacker-chosen and capped at 4096. Filling the table then cost
+            // 8,386,560 entry visits, which is what made the bound test below
+            // slower than the very window it was measuring.
+            //
+            // Mirrors `HelloLimiter::check` in `transport.rs`, which already
+            // prunes lazily for the same RSA-0037 reason and whose comment
+            // cross-references this function. The two were meant to match; this
+            // one had drifted.
+            //
+            // Fail-closed behaviour is unchanged: an existing IP always reaches
+            // its counter, and a new IP is rejected only if the table is STILL
+            // full after pruning. Stale entries may now linger below capacity,
+            // which costs nothing -- the map is bounded by the cap either way and
+            // each entry's own window is still reset on use.
+            if self.counts.len() >= MAX_PRE_AUTH_HELLO_SOURCE_IPS && !self.counts.contains_key(&ip)
             {
-                return false;
+                self.prune(now);
+                if self.counts.len() >= MAX_PRE_AUTH_HELLO_SOURCE_IPS {
+                    return false;
+                }
             }
             let entry = self.counts.entry(ip).or_insert((0, now));
             if now.duration_since(entry.1) >= Duration::from_secs(1) {
@@ -794,6 +822,10 @@ mod daemon {
         }
 
         fn prune(&mut self, now: Instant) {
+            #[cfg(test)]
+            {
+                self.prune_calls += 1;
+            }
             self.counts.retain(|_, (_, window_start)| {
                 now.duration_since(*window_start) < Duration::from_secs(1)
             });
@@ -4287,22 +4319,83 @@ mod daemon {
 
         #[test]
         fn pre_auth_hello_limiter_bounds_source_ip_table() {
-            let mut limiter = PreAuthHelloLimiter::new(1);
-            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS {
-                let ip = IpAddr::V4(Ipv4Addr::new(
+            // Assert the bound against a LITERAL, not the symbol. Writing the
+            // test in terms of `MAX_PRE_AUTH_HELLO_SOURCE_IPS` end to end made it
+            // scale with the constant, so shrinking the constant to 8 -- the very
+            // "limiter tracks only 8 source IPs" bug this test exists to catch --
+            // left the whole suite green.
+            assert_eq!(
+                MAX_PRE_AUTH_HELLO_SOURCE_IPS, 4096,
+                "the source-IP cap is the property under test; changing it must \
+                 be deliberate and must update this test"
+            );
+
+            let source_ip = |index: usize| {
+                IpAddr::V4(Ipv4Addr::new(
                     10,
                     ((index >> 16) & 0xff) as u8,
                     ((index >> 8) & 0xff) as u8,
                     (index & 0xff) as u8,
-                ));
-                assert!(limiter.check(ip));
-            }
+                ))
+            };
 
-            assert!(!limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))));
+            let mut limiter = PreAuthHelloLimiter::new(1);
+
+            // Fill through the REAL `check` path. An earlier version inserted
+            // straight into the map to dodge a timing problem, which cut the
+            // number of real `check` calls in any test from 4098 to 7 and left
+            // the per-call cost exercised by nothing. The timing problem was in
+            // `check` itself -- it pruned the whole table on every call -- and is
+            // fixed there, so this can go back through the front door.
+            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS - 1 {
+                assert!(limiter.check(source_ip(index)));
+            }
+            assert_eq!(limiter.counts.len(), MAX_PRE_AUTH_HELLO_SOURCE_IPS - 1);
+
+            // The lazy-prune property, asserted deterministically. Filling the
+            // table below capacity must not prune at all -- pruning is only
+            // useful when the table is full and the incoming IP is new. Reverting
+            // `check` to an unconditional `prune(now)` makes this 4095 instead of
+            // 0, which is the ONLY thing in the suite that notices: the timing
+            // symptom it used to produce (a fill exceeding the one-second window)
+            // is a race that passes 40/40 on a fast machine.
+            assert_eq!(
+                limiter.prune_calls, 0,
+                "filling below capacity must not prune; pruning on every hello is \
+                 O(n) per packet on the pre-auth path"
+            );
+
+            // Probe the boundary from BOTH sides. Asserting only that a full
+            // table rejects is satisfied by any bound <= 4096, so a limiter
+            // tracking far fewer IPs would pass while locking out real peers.
+            let last_admissible = source_ip(MAX_PRE_AUTH_HELLO_SOURCE_IPS - 1);
+            assert!(
+                limiter.check(last_admissible),
+                "a new source IP must still be admitted while the table is below \
+                 its bound, or the limiter locks out legitimate peers"
+            );
+            assert_eq!(limiter.counts.len(), MAX_PRE_AUTH_HELLO_SOURCE_IPS);
+
+            // At the bound a new address is rejected AND must not be recorded.
+            // Without the size assertion, a `check` that rejects but inserts
+            // anyway passes -- unbounded growth, in a test named for bounding
+            // the table.
+            let over_bound = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30));
+            assert!(!limiter.check(over_bound));
+            assert_eq!(
+                limiter.counts.len(),
+                MAX_PRE_AUTH_HELLO_SOURCE_IPS,
+                "a rejected source IP must not be recorded, or the table grows \
+                 without bound one rejection at a time"
+            );
+
+            // Ageing every window makes the entries collectable, after which the
+            // same address is admitted -- proving the rejection was the bound and
+            // not something permanent.
             limiter.counts.values_mut().for_each(|(_, window_start)| {
                 *window_start = Instant::now() - Duration::from_secs(2);
             });
-            assert!(limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))));
+            assert!(limiter.check(over_bound));
         }
     }
 }
