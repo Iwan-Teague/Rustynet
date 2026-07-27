@@ -1886,12 +1886,36 @@ mod tests {
         peer_socket
             .send_to(b"peer-ciphertext", authoritative_addr)
             .expect("peer ciphertext should be sent");
+        // Wait on a LATCHING predicate and assert the exact count separately.
+        //
+        // `records.len() == 1` reads like "wait for the record to arrive", but it
+        // is an equality on a collection that only grows: it is true for exactly
+        // one poll's worth of state and false again the moment a second record
+        // appears. Today each of these tests injects exactly one packet, so the
+        // sequence is 0..0,1,1,.. and it happens to behave. If a retransmit, a
+        // duplicate, or a later change to the fixture ever produces a second
+        // record, the predicate becomes permanently unsatisfiable and the test
+        // spends its whole budget polling before failing with a timeout that
+        // names nothing — the same defect, and the same misleading symptom, as
+        // the dead-worker wait at `linux_userspace_shared_backend_recovers_dead_
+        // worker_before_route_reconcile`, whose fix lives on a sibling branch and
+        // is NOT in this tree. That one is a live flake (roughly 2 runs in 30);
+        // the six changed here have never been observed to fail.
+        //
+        // `!is_empty()` latches. The count is then asserted directly, so "exactly
+        // one record arrived" is still enforced, but a second record fails loudly
+        // and immediately instead of hanging.
         let peer_ingress = wait_for(Duration::from_secs(1), || {
             let records = backend
                 .recorded_peer_ciphertext_ingress_for_test()
                 .expect("peer ingress query should succeed");
-            (records.len() == 1).then_some(records)
+            (!records.is_empty()).then_some(records)
         });
+        assert_eq!(
+            peer_ingress.len(),
+            1,
+            "exactly one peer ciphertext ingress record should be recorded"
+        );
 
         let response = backend
             .authoritative_transport_round_trip(stun_addr, b"stun-request", Duration::from_secs(1))
@@ -1980,12 +2004,19 @@ mod tests {
         peer_socket
             .send_to(b"peer-ciphertext", authoritative_addr)
             .expect("peer ciphertext should be sent");
-        let _ = wait_for(Duration::from_secs(1), || {
+        // Latching predicate, exact count asserted separately — see the peer
+        // ingress wait earlier in this file for why.
+        let peer_ingress = wait_for(Duration::from_secs(1), || {
             let records = backend
                 .recorded_peer_ciphertext_ingress_for_test()
                 .expect("peer ingress query should succeed");
-            (records.len() == 1).then_some(records)
+            (!records.is_empty()).then_some(records)
         });
+        assert_eq!(
+            peer_ingress.len(),
+            1,
+            "exactly one peer ciphertext ingress record should be recorded"
+        );
 
         let response = backend
             .authoritative_transport_round_trip(relay_addr, b"relay-hello", Duration::from_secs(1))
@@ -2516,12 +2547,19 @@ mod tests {
             .inject_plaintext_packet_for_test(plaintext_packet.clone())
             .expect("plaintext injection should succeed");
 
+        // Latching predicate, exact count asserted separately — see the peer
+        // ingress wait earlier in this file for why.
         let delivered_packets = wait_for(Duration::from_secs(2), || {
             let packets = right_backend
                 .recorded_tunnel_plaintext_packets_for_test()
                 .expect("tunnel packet query should succeed");
-            (packets.len() == 1).then_some(packets)
+            (!packets.is_empty()).then_some(packets)
         });
+        assert_eq!(
+            delivered_packets.len(),
+            1,
+            "exactly one tunnel plaintext packet should be delivered"
+        );
         let left_handshake = wait_for(Duration::from_secs(2), || {
             left_backend
                 .peer_latest_handshake_unix(&left_peer_node)
@@ -2729,11 +2767,15 @@ mod tests {
             .queue_tun_plaintext_packet_for_test(valid_plaintext.clone())
             .expect("valid plaintext queue should succeed");
 
+        // Latching predicate — see the peer ingress wait earlier in this file.
+        // The exact count needs no separate assertion here: the `assert_eq!`
+        // against `vec![valid_plaintext]` below already pins both length and
+        // contents, which is strictly stronger.
         let delivered_packets = wait_for(Duration::from_secs(2), || {
             let packets = right_backend
                 .recorded_tun_outbound_packets_for_test()
                 .expect("right outbound packet query should succeed");
-            (packets.len() == 1).then_some(packets)
+            (!packets.is_empty()).then_some(packets)
         });
 
         assert_eq!(delivered_packets, vec![valid_plaintext]);
@@ -2818,11 +2860,15 @@ mod tests {
             .queue_tun_plaintext_packet_for_test(valid_plaintext.clone())
             .expect("valid plaintext queue should succeed");
 
+        // Latching predicate — see the peer ingress wait earlier in this file.
+        // The exact count needs no separate assertion here: the `assert_eq!`
+        // against `vec![valid_plaintext]` below already pins both length and
+        // contents, which is strictly stronger.
         let delivered_packets = wait_for(Duration::from_secs(2), || {
             let packets = right_backend
                 .recorded_tun_outbound_packets_for_test()
                 .expect("right outbound packet query should succeed");
-            (packets.len() == 1).then_some(packets)
+            (!packets.is_empty()).then_some(packets)
         });
 
         assert_eq!(delivered_packets, vec![valid_plaintext]);

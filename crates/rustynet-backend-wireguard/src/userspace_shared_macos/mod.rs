@@ -984,12 +984,23 @@ mod tests {
         peer_socket
             .send_to(b"peer-ciphertext", worker_addr)
             .expect("peer ciphertext should send");
+        // Wait on a LATCHING predicate and assert the exact count separately.
+        // `records.len() == 1` is an equality on a collection that only grows:
+        // it stops being satisfiable the moment a second record appears, so a
+        // retransmit or a later fixture change would turn this into a full-budget
+        // hang ending in a timeout that names nothing. `!is_empty()` latches, and
+        // the count is asserted directly so exactness is still enforced.
         let peer_ingress = wait_for(Duration::from_secs(1), || {
             let records = backend
                 .recorded_peer_ciphertext_ingress_for_test()
                 .expect("peer ingress should resolve");
-            (records.len() == 1).then_some(records)
+            (!records.is_empty()).then_some(records)
         });
+        assert_eq!(
+            peer_ingress.len(),
+            1,
+            "exactly one peer ciphertext ingress record should be recorded"
+        );
 
         let response = backend
             .authoritative_transport_round_trip(relay_addr, b"relay-hello", Duration::from_secs(1))
