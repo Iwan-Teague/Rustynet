@@ -1039,7 +1039,37 @@ fn verify_no_key_material_zip(path: &Path) -> Result<(), AdapterError> {
         });
     }
     let listing = String::from_utf8_lossy(&output.stdout);
-    for entry in listing.lines() {
+    let entries: Vec<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    // A lister that SUCCEEDS but reports zero entries has told us nothing about
+    // a file that is not the archive we wrote, so the scan below would iterate
+    // over nothing and pass it.
+    //
+    // This is not hypothetical: the two listers disagree. `unzip` rejects a
+    // 22-byte record whose end-of-central-directory bytes are corrupted, but the
+    // `python3` fallback's `zipfile` accepts it and yields an empty namelist —
+    // so on a host without `unzip` (the Debian CI runner, for one) a corrupted
+    // 22-byte file passed the key-exclusion check outright. The archive is built
+    // ON the guest, so those bytes are attacker-controlled, which is exactly the
+    // threat this function exists for.
+    //
+    // Only the archive this collector itself writes may pass with no entries,
+    // and it is recognised by content, as above.
+    if entries.is_empty() && !fs::read(path).is_ok_and(|bytes| bytes == EMPTY_ARTIFACT_ARCHIVE) {
+        return Err(AdapterError::Io {
+            message: format!(
+                "artifact zip {} listed zero entries but is not the empty archive \
+                 this collector writes; failing closed on key-exclusion check",
+                path.display()
+            ),
+        });
+    }
+
+    for entry in entries {
         let lower = entry.to_lowercase();
         if lower.contains("keys/")
             || lower.contains("keys\\")
