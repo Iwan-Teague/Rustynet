@@ -307,6 +307,10 @@ fn json_str<'v>(value: &'v serde_json::Value, key: &str) -> &'v str {
 #[derive(Debug, Clone)]
 struct MergedOutcome {
     class: StatusClass,
+    /// QH-22: `started_at` from `stages.tsv` (empty for outcomes seen only in
+    /// `orchestrate_result.json`, which records no start time). Used solely to
+    /// answer "which failure came FIRST" in time rather than in name order.
+    started_at: String,
 }
 
 /// Verify one run's evidence. IO-level failures (missing/unreadable
@@ -426,27 +430,46 @@ pub fn verify(config: &VerifierConfig) -> Result<VerdictReport, String> {
     // alias-qualified name — the writer's dedupe key), keeping the worst
     // status; ties keep the later record.
     let mut merged: BTreeMap<String, MergedOutcome> = BTreeMap::new();
-    let mut ingest = |stage: &str, raw_status: &str, source: &str, p42: &mut PropertyCheck| {
-        if is_taxonomy_violation(raw_status) {
-            p42.fail(format!(
+    let mut ingest =
+        |stage: &str, raw_status: &str, started_at: &str, source: &str, p42: &mut PropertyCheck| {
+            if is_taxonomy_violation(raw_status) {
+                p42.fail(format!(
                 "stage '{stage}' has status '{raw_status}' outside the closed taxonomy ({source})"
             ));
-        }
-        let class = classify_status(raw_status);
-        merged
-            .entry(stage.to_owned())
-            .and_modify(|existing| {
-                if class.rank() >= existing.class.rank() {
-                    existing.class = class;
-                }
-            })
-            .or_insert(MergedOutcome { class });
-    };
+            }
+            let class = classify_status(raw_status);
+            merged
+                .entry(stage.to_owned())
+                .and_modify(|existing| {
+                    if class.rank() >= existing.class.rank() {
+                        existing.class = class;
+                    }
+                    // Earliest recorded start wins, so a timestamp survives being
+                    // merged with a timestamp-less source (QH-22).
+                    if !started_at.is_empty()
+                        && (existing.started_at.is_empty()
+                            || started_at < existing.started_at.as_str())
+                    {
+                        existing.started_at = started_at.to_owned();
+                    }
+                })
+                .or_insert(MergedOutcome {
+                    class,
+                    started_at: started_at.to_owned(),
+                });
+        };
     for row in &tsv_rows {
-        ingest(&row.stage, &row.status, "stages.tsv", &mut p42);
+        ingest(
+            &row.stage,
+            &row.status,
+            &row.started_at,
+            "stages.tsv",
+            &mut p42,
+        );
     }
     for (stage, status) in &orchestrate_outcomes {
-        ingest(stage, status, "orchestrate_result.json", &mut p42);
+        // orchestrate_result.json carries no per-stage start time.
+        ingest(stage, status, "", "orchestrate_result.json", &mut p42);
     }
 
     // A recorded stage name the manifest does not know (after alias strip)
@@ -524,11 +547,29 @@ pub fn verify(config: &VerifierConfig) -> Result<VerdictReport, String> {
     } else {
         "unknown"
     };
-    // First failing stage in the merged (name-ordered) evidence — the same
-    // order the ledger writer reports after its dedupe.
+    // The failing stage that started FIRST IN TIME (QH-22). This used to take
+    // the first Fail while iterating `merged`, a BTreeMap — i.e. the
+    // ALPHABETICALLY first failure, which named `cleanup` as the failure of a
+    // run whose root cause was `preflight` four seconds earlier. Failures with
+    // no recorded start sort last, then by name, so the degenerate case is the
+    // old behaviour rather than an arbitrary one.
+    //
+    // ★ This deliberately reproduces the ledger writer's rule
+    // (`live_lab_run_matrix::first_failed_stage`). A2's independence is
+    // structurally intact elsewhere — its own implementation, no call into the
+    // ledger's helper — but on THIS field its agreement with the ledger is
+    // guaranteed by construction and is therefore not evidence. The two paths
+    // could not have disagreed; do not cite their agreement as corroboration.
     let first_failed = merged
         .iter()
-        .find(|(_, outcome)| outcome.class == StatusClass::Fail)
+        .filter(|(_, outcome)| outcome.class == StatusClass::Fail)
+        .min_by(|(a_name, a), (b_name, b)| {
+            a.started_at
+                .is_empty()
+                .cmp(&b.started_at.is_empty())
+                .then_with(|| a.started_at.cmp(&b.started_at))
+                .then_with(|| a_name.cmp(b_name))
+        })
         .map(|(name, _)| name.clone());
 
     // ── §4.1: manifest completeness (recorder-first, tsv-only) ──────────
@@ -1037,6 +1078,20 @@ mod tests {
         std::fs::write(dir.join(STAGES_TSV_RELATIVE_PATH), body).expect("write stages.tsv");
     }
 
+    /// Like [`write_stages_tsv`] but with a per-row `started_at`, for the
+    /// ordering properties that the uniform `T0` above cannot express.
+    fn write_stages_tsv_timed(dir: &Path, rows: &[(&str, &str, &str)]) {
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).expect("mkdir state");
+        let body: String = rows
+            .iter()
+            .map(|(stage, status, started_at)| {
+                format!("{stage}\thard\t{status}\t0\t/logs/{stage}.log\t\t{started_at}\t\n")
+            })
+            .collect();
+        std::fs::write(dir.join(STAGES_TSV_RELATIVE_PATH), body).expect("write stages.tsv");
+    }
+
     fn write_marker(dir: &Path, run_complete: bool, run_passed: bool) {
         let state = dir.join("state");
         std::fs::create_dir_all(&state).expect("mkdir state");
@@ -1253,6 +1308,32 @@ mod tests {
         assert!(!report.agreement_with_ledger_row);
         assert!(!report.valid);
         assert_eq!(exit_code(&report), 1);
+    }
+
+    #[test]
+    fn recomputed_first_failed_stage_is_chronological_not_alphabetical() {
+        // QH-22: `merged` is a BTreeMap, so taking the first Fail while
+        // iterating it meant the ALPHABETICALLY first failure. On the run that
+        // exposed this, that named `cleanup` (18:52:23) as the failure of a
+        // run whose root cause was `preflight` (18:52:19) — and A2 printed it
+        // as "first failed: cleanup", corroborating the ledger's wrong answer
+        // because it had been built to mirror that ordering.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (report_dir, ledger) = valid_pass_fixture(tmp.path());
+        write_stages_tsv_timed(
+            &report_dir,
+            &[
+                ("preflight", "fail", "2026-07-24T18:52:19Z"),
+                ("cleanup", "fail", "2026-07-24T18:52:23Z"),
+            ],
+        );
+        let report = run_verify(&report_dir, &ledger);
+        assert_eq!(report.recomputed_overall_result, "fail");
+        assert_eq!(
+            report.recomputed_first_failed_stage.as_deref(),
+            Some("preflight"),
+            "A2 must name the earliest failure in time, not the alphabetically first"
+        );
     }
 
     // ── (d) reused/skipped are never a pass (§4.2) ──────────────────────
