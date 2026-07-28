@@ -411,7 +411,10 @@ The ONE exception to one-path rule is cryptographic agility for algorithm migrat
 // ALLOWED: Multiple crypto algorithms for migration
 enum CipherSuite {
     ChaCha20Poly1305,  // Current
-    AesGcm256,         // Future post-quantum hybrid
+    AesGcm256,         // Future alternative AEAD — NOT post-quantum hybrid.
+                       // Both are symmetric ciphers; swapping one for the other
+                       // changes nothing about quantum resistance. Hybrid PQ
+                       // belongs in the KEY EXCHANGE, not the AEAD.
 }
 
 // BUT: Only ONE algorithm active per session
@@ -507,7 +510,10 @@ Rustynet employs a **defense-in-depth encryption architecture** with three indep
 
 When nodes communicate via direct UDP path:
 
-1. **Protocol:** WireGuard 1.0 specification (noise-ik-psk pattern)
+1. **Protocol:** WireGuard 1.0 specification (`Noise_IKpsk2` pattern). Note that
+   the `psk2` slot is present in the pattern but carries a zero key here: the
+   backend passes `None` for the preshared key, so the handshake is effectively
+   `Noise_IK`. Naming the pattern describes the protocol, not a PSK deployment.
 2. **Implementation:** `rustynet-backend-wireguard` crate wraps kernel WireGuard or userspace wireguard-rs
 3. **Cipher Suite:** ChaCha20-Poly1305 AEAD (non-negotiable, no cipher downgrade)
 4. **Key Material:**
@@ -528,11 +534,17 @@ When nodes communicate via direct UDP path:
    - Perfect forward secrecy: compromise of long-term key doesn't decrypt old sessions
 
 **Security Properties:**
-- ✅ Confidentiality: AES-256 equivalent (ChaCha20 uses 256-bit keys)
+- ✅ Confidentiality: 256-bit symmetric strength (ChaCha20 uses 256-bit keys).
+  Deliberately NOT phrased as "AES-256 equivalent against quantum computers" —
+  that conflation is corrected in Appendix C and must not be reintroduced here.
 - ✅ Authenticity: Unforgeable MACs (Poly1305)
 - ✅ Integrity: AEAD prevents tampering
 - ✅ Anti-Replay: Sliding window prevents packet replay
-- ✅ Perfect Forward Secrecy: Session keys rotated, not derivable from static keys
+- ✅ Perfect Forward Secrecy **against classical key compromise**: session keys
+  are rotated and are not derivable from the static keys. This does NOT survive a
+  quantum adversary: PFS protects recorded traffic when the long-term key later
+  leaks, but a CRQC breaks the recorded ephemeral Curve25519 exchange itself. See
+  §5.5.2 — recorded traffic remains retroactively decryptable.
 - ✅ Identity Privacy: Responder identity encrypted in handshake
 
 **Verification Tests:**
@@ -864,12 +876,39 @@ scripts/e2e/live_linux_transition_leak_test.sh
 | WireGuard Static Key | 256 bits | 128-bit security | ❌ No (Curve25519) |
 | WireGuard Session Key | 256 bits | 128-bit security | ❌ No |
 | Control Plane Signing Key | 256 bits | 128-bit security | ❌ No (Ed25519) |
-| Relay Session Auth Key | 256 bits | 128-bit security | ✅ Symmetric |
-| PSK (Optional) | 256 bits | 256-bit security | ✅ Yes |
+| Relay Session Auth | 256 bits | 128-bit classical | ❌ No (Ed25519) |
+| PSK | 256 bits | n/a — NOT IMPLEMENTED | n/a — see below |
+
+> The "Relay Session Auth Key" row previously read `✅ Symmetric`. There is no
+> symmetric relay session key. `rustynet-relay`'s entire crypto dependency set is
+> `subtle` and `ed25519-dalek` — no HMAC, no HKDF, no AEAD — and a relay session
+> is authorised by verifying an Ed25519 signature on a control-plane-issued
+> `RelaySessionToken` (`rustynet-control/src/lib.rs`, `verify_strict`). The
+> `session_auth_key` / `HMAC-SHA256(session_auth_key, …)` scheme that row
+> described lives only in the UNCHECKED plan in §5.3.2 below, alongside a
+> relay-layer TLS 1.3/Noise_XX design that is also unbuilt: packets are
+> WireGuard-encrypted before relay handoff and the relay adds no crypto layer of
+> its own. So that row asserted quantum resistance for a key the product does not
+> have.
 
 **Post-Quantum Strategy:**
-- Current: Pre-shared key (PSK) mode adds post-quantum protection (future Phase 11)
-- Future: Hybrid key exchange (Curve25519 + Kyber) when WireGuard spec stabilizes
+
+- **Today: none.** The mesh has no post-quantum protection of any kind. Session
+  keys derive from Curve25519 alone, so recorded tunnel traffic is retroactively
+  decryptable by anyone who later obtains a cryptographically-relevant quantum
+  computer. This is the harvest-now-decrypt-later exposure and it is unmitigated.
+- **PSK is not wired up.** The vendored boringtun implements `Noise_IKpsk2` and
+  `Tunn::new` accepts an optional preshared key, but Rustynet passes `None` at
+  its only construction site (`userspace_shared/engine.rs`). Nothing generates,
+  distributes, stores or configures a PSK, and no generated WireGuard config
+  emits a `PresharedKey` line. The capability exists in the dependency; the
+  product does not use it. Wiring it up is a real feature with key-distribution
+  and enrollment consequences, not a flag.
+- **Future: hybrid key exchange.** The original plan said "Curve25519 + Kyber
+  when the WireGuard spec stabilizes". Kyber is now standardised as ML-KEM
+  (FIPS 203, 2024), so the algorithm question is settled; mainline WireGuard
+  still has no hybrid handshake, so the blocker is protocol adoption, not
+  algorithm choice.
 
 **[ ] 5.5.3 Cryptographic Implementation Hygiene**
 
@@ -2710,9 +2749,40 @@ Use this when making implementation decisions:
 | **HMAC** | HMAC-SHA256 | 256-bit | RFC 2104 | Standard, secure, widely supported |
 | **Random Number Generation** | OS-provided (`OsRng`) | N/A | N/A | Uses kernel entropy sources |
 
-**Security Level:** All algorithms provide at least 128-bit security (equivalent to AES-256 against quantum computers).
+**Security Level:** All algorithms provide at least 128-bit security **against
+classical attack**. The previous wording here — "at least 128-bit security
+(equivalent to AES-256 against quantum computers)" — was wrong twice over: it
+conflated a classical security level with a quantum one, and it implied the
+asymmetric primitives retain 128 bits against a quantum adversary. They do not.
 
-**Post-Quantum Status:** Current algorithms are vulnerable to quantum computers. Future Phase 11 will add hybrid key exchange (Curve25519 + Kyber) and optional PSK mode.
+**Post-Quantum Status:** Current algorithms are vulnerable to quantum computers,
+and the two families fail differently:
+
+- **Curve25519 and Ed25519 are broken outright by Shor's algorithm** — not
+  weakened, broken. Their effective security against a cryptographically-relevant
+  quantum computer is nil.
+- **The symmetric and hash primitives are weakened, not broken.** Grover's
+  algorithm gives at best a square-root speedup, so ChaCha20-Poly1305's and
+  HMAC-SHA256's 256-bit keys retain roughly 128 bits of quantum security, which
+  remains adequate. BLAKE2s is used unkeyed here, so the relevant properties are
+  preimage (256-bit classical, ~128-bit quantum) and collision — and collision
+  resistance is already only 128-bit classically by the birthday bound, so it is
+  not a "256-bit key retaining 128 bits" case. `OsRng` draws from the kernel and
+  is not a quantum-vulnerable construction.
+
+The practical consequence differs by family, and both are serious.
+
+Broken *key exchange* lets an adversary decrypt traffic recorded today, because
+session keys derive from Curve25519 with nothing else mixed in. That retroactive
+exposure is the one that cannot be fixed later, however the protocol changes.
+
+Broken *signatures* are prospective rather than retroactive, but not minor: the
+control-plane signing key is the root of trust for distributing WireGuard public
+keys, so forging it means minting membership and assignment bundles — mesh
+takeover, not merely a bad signature.
+
+Future Phase 11 will add hybrid key exchange (Curve25519 + ML-KEM) and optional
+PSK mode. Neither exists today — see §5.5.2.
 
 ---
 
