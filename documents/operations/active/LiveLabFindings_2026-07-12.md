@@ -352,7 +352,9 @@ fail-closed. Add a negative test pinning the 6.19 message. Then re-run the 2-nod
 > exactly the narrow rule specified above: only exit code 2 *and* a stderr
 > containing `FIB table does not exist` (case-insensitive) is treated as an empty
 > table; every other error stays fail-closed. The negative test pinning the
-> message exists at `phase10.rs:11260`. Roll-ups still listing this as "root cause
+> message exists at `phase10.rs:11728`-`:11776` — five cases, including both
+> required negative controls (matching text at other exit codes; other exit-2
+> errors). Roll-ups still listing this as "root cause
 > identified but NOT implemented" (e.g. `FullTodoInventory_2026-07-28.md`) are
 > stale on that point. **What remains open is the second half only:** re-running
 > the 2-node ubuntu mesh to green to confirm the runtime unblocks live.

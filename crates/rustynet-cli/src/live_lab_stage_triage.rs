@@ -127,6 +127,15 @@ pub fn default_triage_ledger_path(workspace_root: &Path) -> PathBuf {
 /// fill land in a different checkout's ledger than the operator meant — the
 /// same "which checkout holds this evidence" problem the fleet-evidence work
 /// exists to close. An explicit path cannot be silently wrong.
+///
+/// **Known inconsistency, deliberately not "fixed" here.** The auto-stub path
+/// does exactly what this rejects: `live_lab_run_matrix.rs` resolves the ledger
+/// via `default_triage_ledger_path(workspace_root_path())`, and that root is
+/// `env!("CARGO_MANIFEST_DIR")` — build-time-derived. A binary run outside its
+/// build tree therefore writes (and `create_dir_all`s) a ledger nobody reads.
+/// Changing it is a behaviour change to the evidence-finalization path and
+/// wants its own live verification, so it is recorded rather than bundled in.
+/// See `FleetEvidenceCollectionPlan_2026-07-28.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordStagePatchConfig {
     pub ledger: PathBuf,
@@ -269,9 +278,21 @@ pub fn append_stub(path: &Path, record: &StageTriageRecord) -> Result<bool, Stri
 ///    read-modify-write of the WHOLE file, so without the lock it races the
 ///    engine's auto-stub (which fires at evidence finalization, possibly while
 ///    an agent is filling) and drops every record appended since its own read.
-/// 3. **It replaces the ledger atomically** (tmp + rename, inside the lock).
-///    A bare `fs::write` truncates in place, so a crash mid-write leaves the
-///    committed evidence ledger truncated rather than merely stale.
+/// 3. **It replaces the ledger by tmp + rename, inside the lock**, rather than
+///    with a bare `fs::write` that truncates in place. Scope of that guarantee,
+///    stated exactly because "atomic" invites over-reading:
+///    - **Process crash: covered.** A death mid-write leaves a stale-but-intact
+///      ledger plus a stray `.tmp`, never a truncated ledger.
+///    - **Power loss / kernel panic: NOT covered.** There is no `sync_all` on
+///      the temporary file and no directory fsync, so the rename can reach disk
+///      while the tmp's data blocks have not. Adding both would close it.
+///    - **The fixed `.tmp` name is safe ONLY because of the lock in (2).** Two
+///      writers inside the critical section can never share it; a writer that
+///      skipped the lock would have one `fs::write` a partial body that the
+///      other then `rename`s into place — corrupting the ledger rather than
+///      merely truncating it, which is strictly worse than the bug this fixes.
+///      Any future writer MUST take `lock_path_for(path)`; see the module docs
+///      on why the MCP wrapper shells out instead of writing directly.
 pub fn fill_patch(path: &Path, stub_id: &str, patch: &str) -> Result<(), String> {
     if patch.trim().is_empty() {
         return Err(
@@ -706,9 +727,19 @@ mod tests {
     ///
     /// Negative control for that lock: every thread fills a DISTINCT stub, all
     /// released from a barrier together. Serialized, each read sees the previous
-    /// fills and all `THREADS` survive. Unserialized, every thread rewrites the
-    /// file from its own stale snapshot and the last writer wins — so removing
-    /// the lock fails this on the filled count, not on a timing coincidence.
+    /// fills and all `THREADS` survive.
+    ///
+    /// Unserialized it fails, but by which route depends on what was removed:
+    /// - against the ORIGINAL unlocked `fs::write` implementation, every thread
+    ///   rewrites from its own stale snapshot and the last writer wins, so this
+    ///   trips the filled-count assertion (verified: 1 of 8 survived);
+    /// - if only the lock is removed while tmp + rename is kept, threads race the
+    ///   FIXED `.tmp` path and it trips earlier, on a rename `ENOENT` when one
+    ///   thread renames the shared tmp out from under another.
+    ///
+    /// Either way it fails deterministically on a real defect rather than on a
+    /// timing coincidence. It cannot go red for correct code short of the
+    /// `append_lock` acquisition timeout.
     #[test]
     fn concurrent_fills_of_distinct_stubs_do_not_lose_each_other() {
         use std::sync::{Arc, Barrier};

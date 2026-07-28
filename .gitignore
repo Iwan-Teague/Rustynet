@@ -11,11 +11,22 @@
 /.cargo-audit-db..lock
 /.cargo-audit-db*
 
-# Transient advisory lock for the shared live-lab run-matrix CSV append
-# (serializes concurrent disjoint-node lab runs; removed on clean release).
+# Transient advisory lock for the shared live-lab ledger appends (serializes
+# concurrent disjoint-node lab runs). On unix these lock files are deliberately
+# PERSISTENT — never unlinked on release, see crates/rustynet-cli/src/append_lock.rs
+# on the split-inode race — so they MUST be ignored or every run after the first
+# leaves the worktree dirty and trips the setup->run git-provenance check.
 /documents/operations/live_lab_run_matrix.csv.lock
 /documents/operations/live_lab_node_run_matrix.csv.lock
 /documents/operations/live_lab_node_stage_results.csv.lock
+/documents/operations/live_lab_stage_triage.jsonl.lock
+
+# Scratch files for the tmp+rename ledger replaces. Present only mid-write, or
+# left behind by a crashed/failed rename; never content anything reads.
+/documents/operations/live_lab_run_matrix.csv.tmp
+/documents/operations/live_lab_node_run_matrix.csv.tmp
+/documents/operations/live_lab_node_stage_results.csv.tmp
+/documents/operations/live_lab_stage_triage.jsonl.tmp
 
 # MCP server build output (binaries built by scripts/mcp/install.sh into ./bin).
 # Build from source; do not commit the compiled servers.

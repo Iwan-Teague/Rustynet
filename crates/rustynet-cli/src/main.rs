@@ -20382,6 +20382,7 @@ fn help_text() -> String {
         "  ops write-active-network-signed-state-tamper-report --report-path <path> --baseline-status <pass|fail> --tamper-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --recovery-status <pass|fail> --exit-host <host> --client-host <host> --status-after-tamper <text> --netcheck-after-tamper <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-active-network-rogue-path-hijack-report --report-path <path> --baseline-status <pass|fail> --hijack-reject-status <pass|fail> --fail-closed-status <pass|fail> --netcheck-fail-closed-status <pass|fail> --no-rogue-endpoint-status <pass|fail> --recovery-status <pass|fail> --recovery-endpoint-status <pass|fail> --rogue-endpoint-ip <ipv4> --exit-host <host> --client-host <host> --endpoints-before <text> --endpoints-after-hijack <text> --endpoints-after-recovery <text> --status-after-hijack <text> --netcheck-after-hijack <text> --status-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops generate-live-linux-lab-failure-digest --nodes-tsv <path> --stages-tsv <path> --report-dir <path> --run-id <id> --network-id <id> --overall-status <status> --output-json <path> --output-md <path>",
+        "  ops live-lab-record-stage-patch --ledger <path> (--stub-id <id> | --run-id <id> --stage <name>) --patch <text>  (records the remedy attempted against a live-lab stage-triage stub; refuses to overwrite an already-recorded attempt. To decline deliberately, pass --patch \"none: <reason>\")",
         "  ops vm-lab-list [--inventory <path>]",
         "  ops vm-lab-diagnose --vm <alias> [--inventory <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>]",
         "  ops vm-lab-discover-local-utm [--inventory <path>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--timeout-secs <secs>] [--update-inventory-live-ips] [--report-dir <path>]",
@@ -25541,6 +25542,53 @@ mod tests {
         assert!(
             format!("{generate_live_lab_failure_digest:?}")
                 .contains("GenerateLiveLinuxLabFailureDigest")
+        );
+
+        // Both addressing forms must reach the same command. The parser demotes
+        // any token starting with `--` to a flag, so this also pins that a
+        // normal prose patch value survives as a value.
+        let record_stage_patch_by_stub = parse_command(&[
+            "ops".to_owned(),
+            "live-lab-record-stage-patch".to_owned(),
+            "--ledger".to_owned(),
+            "documents/operations/live_lab_stage_triage.jsonl".to_owned(),
+            "--stub-id".to_owned(),
+            "livelab-1785006739::live_two_hop_validation".to_owned(),
+            "--patch".to_owned(),
+            "granted the entry node exit_server capability".to_owned(),
+        ]);
+        assert!(format!("{record_stage_patch_by_stub:?}").contains("LiveLabRecordStagePatch"));
+
+        let record_stage_patch_by_pair = parse_command(&[
+            "ops".to_owned(),
+            "live-lab-record-stage-patch".to_owned(),
+            "--ledger".to_owned(),
+            "documents/operations/live_lab_stage_triage.jsonl".to_owned(),
+            "--run-id".to_owned(),
+            "livelab-1785006739".to_owned(),
+            "--stage".to_owned(),
+            "live_two_hop_validation".to_owned(),
+            "--patch".to_owned(),
+            "none: superseded by the D1 dataplane investigation".to_owned(),
+        ]);
+        assert!(format!("{record_stage_patch_by_pair:?}").contains("LiveLabRecordStagePatch"));
+
+        // --ledger is deliberately required: defaulting it could file an
+        // attempt against a different checkout's ledger. A missing required
+        // option must surface as a UsageError, never as a silently-defaulted
+        // command.
+        let record_stage_patch_no_ledger = parse_command(&[
+            "ops".to_owned(),
+            "live-lab-record-stage-patch".to_owned(),
+            "--stub-id".to_owned(),
+            "run-1::stage".to_owned(),
+            "--patch".to_owned(),
+            "x".to_owned(),
+        ]);
+        assert!(
+            matches!(record_stage_patch_no_ledger, CliCommand::UsageError(ref msg) if msg.contains("--ledger")),
+            "omitting --ledger must be a UsageError naming the option; got \
+             {record_stage_patch_no_ledger:?}"
         );
 
         let rebind_fresh_install_inputs = parse_command(&[
