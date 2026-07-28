@@ -1420,9 +1420,27 @@ fn apply_macos_endpoint_bypass_delta(
 /// wg-quick split-default. Only OFF-subnet endpoints (reachable via the default
 /// gateway, hence captured by the `0.0.0.0/1`+`128.0.0.0/1` tunnel halves) need
 /// one; an on-link (same-subnet) endpoint is delivered directly by the intact
-/// connected route, and a via-gateway bypass would actively break it. Decided
-/// from the pre-enforce routing table: a `gateway:` line in `route -n get`
-/// output means the endpoint is reached via a gateway (off-subnet).
+/// connected route, and a via-gateway bypass would actively break it. A
+/// `gateway:` line in `route -n get` output means the endpoint is reached via
+/// a gateway (off-subnet).
+///
+/// This check runs BOTH pre-enforce (initial Off→FullTunnel transition, where
+/// the gateway-line test alone is correct) AND post-enforce — the bypass-set
+/// refresh on a peer add/endpoint-update/removal while FullTunnel is already
+/// active (`refresh_exit_mode_bypass_routes_if_needed`). Post-enforce the
+/// gateway-line test alone MISCLASSIFIES the very endpoints that need a bypass:
+/// an off-subnet endpoint then resolves via the `0.0.0.0/1` half through the
+/// utun, and that output has an `interface: utunN` line and NO `gateway:` line,
+/// so it reads as "on-link" and the bypass is skipped — the endpoint's own
+/// WireGuard underlay packets are captured by the tunnel they must bring up and
+/// the handshake never completes (observed live: 100% connectivity failure to a
+/// macOS exit client whose exit peer sat on a different subnet). The tunnel
+/// case is distinguishable from genuinely on-link by the interface: a connected
+/// route is always MORE specific than a /1 half, so a lookup that lands on a
+/// utun proves no connected route covers the endpoint — i.e. it is off-subnet
+/// and must get the gateway bypass. On-link endpoints still resolve via their
+/// physical interface and are correctly skipped, so the on-link safety check is
+/// preserved.
 ///
 /// A query FAILURE is propagated, not swallowed: the previous `Err(_) ->
 /// Ok(false)` arm silently classified every endpoint as on-link whenever the
@@ -1433,8 +1451,9 @@ fn apply_macos_endpoint_bypass_delta(
 /// closed here aborts the exit-mode transition instead of installing a
 /// full-tunnel route set whose underlay cannot reach its peers; the caller's
 /// reconcile rollback then restores the previous routing state. The on-link
-/// skip remains, but ONLY as the outcome of a successful probe that shows no
-/// `gateway:` line — never as the default for an unknown routing state.
+/// skip remains, but ONLY as the outcome of a successful probe that shows
+/// neither a `gateway:` line nor a tunnel `interface:` line — never as the
+/// default for an unknown routing state.
 fn macos_endpoint_needs_gateway_bypass(
     runner: &mut dyn WireguardCommandRunner,
     endpoint: IpAddr,
@@ -1448,10 +1467,20 @@ fn macos_endpoint_needs_gateway_bypass(
             endpoint.to_string(),
         ],
     )?;
-    Ok(output
-        .stdout
-        .lines()
-        .any(|line| line.trim().starts_with("gateway:")))
+    let mut via_gateway = false;
+    let mut via_tunnel = false;
+    for line in output.stdout.lines() {
+        let normalized = line.trim();
+        if normalized.starts_with("gateway:") {
+            via_gateway = true;
+        }
+        if let Some(value) = normalized.strip_prefix("interface:")
+            && value.trim().starts_with("utun")
+        {
+            via_tunnel = true;
+        }
+    }
+    Ok(via_gateway || via_tunnel)
 }
 
 fn add_macos_endpoint_bypass_route(
@@ -2281,6 +2310,55 @@ mod tests {
                 ]),
             "rollback should re-add removed previous bypass host; calls: {:?}",
             runner.calls
+        );
+    }
+
+    #[test]
+    fn endpoint_needs_gateway_bypass_true_for_gateway_line() {
+        let mut runner = RecordingRunner {
+            capture_stdout: "gateway: 192.0.2.1\ninterface: en0\n".to_owned(),
+            ..RecordingRunner::default()
+        };
+        assert!(
+            macos_endpoint_needs_gateway_bypass(&mut runner, "203.0.113.10".parse().expect("ip"))
+                .expect("probe should succeed")
+        );
+    }
+
+    #[test]
+    fn endpoint_needs_gateway_bypass_false_for_onlink_interface_line() {
+        let mut runner = RecordingRunner {
+            capture_stdout: "interface: en0\n".to_owned(),
+            ..RecordingRunner::default()
+        };
+        assert!(
+            !macos_endpoint_needs_gateway_bypass(&mut runner, "203.0.113.10".parse().expect("ip"))
+                .expect("probe should succeed"),
+            "a genuinely on-link endpoint (physical interface, no gateway line) must not \
+             get a bypass route, or an intact connected route gets shadowed"
+        );
+    }
+
+    /// Regression test for the post-enforce blackhole: once FullTunnel is
+    /// already active, an off-subnet endpoint's own `route -n get` no longer
+    /// shows a `gateway:` line — it resolves via the `0.0.0.0/1` half through
+    /// the utun instead, so the output carries `interface: utunN` and no
+    /// `gateway:` line. The gateway-line-only test used to read that as
+    /// on-link and skip the bypass, capturing the endpoint's own WireGuard
+    /// underlay packets inside the tunnel they must bring up (observed live:
+    /// 100% connectivity failure to a macOS exit client whose exit peer sat
+    /// on a different subnet).
+    #[test]
+    fn endpoint_needs_gateway_bypass_true_for_tunnel_interface_line() {
+        let mut runner = RecordingRunner {
+            capture_stdout: "interface: utun9\n".to_owned(),
+            ..RecordingRunner::default()
+        };
+        assert!(
+            macos_endpoint_needs_gateway_bypass(&mut runner, "203.0.113.10".parse().expect("ip"))
+                .expect("probe should succeed"),
+            "an endpoint whose route resolves via a utun (no connected route covers it) \
+             is off-subnet and must still get the gateway bypass post-enforce"
         );
     }
 
