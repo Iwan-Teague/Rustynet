@@ -47,12 +47,15 @@
 //!   ([`execute_ops_record_stage_patch`]); an MCP wrapper should shell out to
 //!   it argv-only rather than touch the ledger itself.
 //!
-//! The launch gate ([`unfilled_for_planned_stages`], plan §3.6/T3) is built and
-//! tested but has no caller: wiring it into the `--node` orchestrator would
-//! block every run while the current backlog of unfilled stubs stands, so the
-//! wiring is a deliberate open decision, not an oversight. These are real,
-//! tested, working functions — not placeholders — so `#[allow]` them
-//! individually rather than deleting or silently stubbing them.
+//! The launch gate ([`enforce_launch_gate`], plan §3.6/T3) is **wired and
+//! enforcing**, fail-closed, at the `--node` orchestrator's launch point
+//! (`vm_lab::orchestrator::native`), with no bypass flag. It carries one
+//! temporary deviation from §3.6 — [`TRIAGE_GATE_HISTORICAL_WATERMARK_UTC`],
+//! which defers the pre-existing backlog so the gate could be turned on without
+//! either stopping all lab work or provoking fabricated dispositions. **That
+//! constant is meant to be deleted**; its rustdoc carries the retirement steps,
+//! and every launch prints how many stubs are still deferred so it cannot rot
+//! unnoticed.
 
 use crate::append_lock::{acquire_append_lock, lock_path_for};
 use std::fs;
@@ -347,7 +350,6 @@ pub fn fill_patch(path: &Path, stub_id: &str, patch: &str) -> Result<(), String>
 ///
 /// Scoped to the stages a run actually plans, so an unfilled stub for a stage
 /// this run does not exercise never blocks it.
-#[allow(dead_code)] // pending MCP wiring, see module docs
 pub fn unfilled_for_planned_stages<'a>(
     records: &'a [StageTriageRecord],
     planned_stages: &[String],
@@ -356,6 +358,147 @@ pub fn unfilled_for_planned_stages<'a>(
         .iter()
         .filter(|record| record.is_unfilled() && planned_stages.contains(&record.stage))
         .collect()
+}
+
+// ─── LAUNCH GATE (plan §3.6 / T3) ────────────────────────────────────────────
+//
+// ##################################################################
+// #  MANUAL ACTION REQUIRED LATER — THIS CONSTANT IS TEMPORARY.     #
+// ##################################################################
+//
+/// Unfilled stubs created STRICTLY BEFORE this instant do not block a launch.
+///
+/// # Why this exists
+///
+/// The gate as specified in §3.6 blocks a run when any *planned* stage has an
+/// unfilled stub. When the gate was built, **36 of the ledger's 51 stubs were
+/// unfilled**, across 31 runs, and they included `preflight`, `bootstrap_hosts`
+/// and `cleanup` — stages in every plan, including a focused mac/win cell under
+/// `--skip-linux-live-suite`. Wiring §3.6 literally would therefore have blocked
+/// *every* live-lab run until that historical backlog was written up, and
+/// filling 31 runs' worth of stubs quickly to unblock the lab would have
+/// produced exactly the fabricated dispositions this ledger exists to prevent.
+///
+/// So enforcement is **full strength for every stub created from now on**, and
+/// deferred only for the historical backlog. There is deliberately **no bypass
+/// flag** — see [`enforce_launch_gate`].
+///
+/// # HOW TO RETIRE THIS (the manual work this constant is standing in for)
+///
+/// 1. List what is still deferred. Every launch prints the count; to see them:
+///    `rustynet ops live-lab-record-stage-patch` has no list mode, so use the
+///    MCP `stage_triage_history` tool, or read the ledger directly:
+///    `jq -r 'select(.patch == null) | "\(.ts_utc)  \(.stub_id)"' \
+///       documents/operations/live_lab_stage_triage.jsonl | sort`
+/// 2. Disposition each one — a real remedy, or a deliberate decline recorded as
+///    `"none: <reason>"` (§3.3). Do this as you touch each stage during normal
+///    lab work; a stub you are actively investigating is cheap to fill honestly,
+///    which is how the ledger's 15 good entries were written. Do NOT bulk-fill.
+///    `rustynet ops live-lab-record-stage-patch --ledger <path> --stub-id <id> --patch <text>`
+/// 3. When the count printed at launch reaches zero, **delete this constant and
+///    the `is_deferred_historical_stub` call in [`enforce_launch_gate`]**. The
+///    gate then becomes byte-for-byte §3.6 as written, with no behaviour change
+///    on that day — because with an empty backlog the filter is already a no-op.
+/// 4. Record the retirement in `LiveLabStageTriageLedgerPlan_2026-07-16.md` §5.
+///
+/// Until step 3, this constant is the ONLY deviation from the signed-off plan.
+pub const TRIAGE_GATE_HISTORICAL_WATERMARK_UTC: &str = "2026-07-28T00:00:00Z";
+
+/// Whether `ts_utc` is the exact fixed-width RFC3339 Zulu shape the engine
+/// writes (`YYYY-MM-DDTHH:MM:SSZ`). Only that shape may be compared as a string.
+///
+/// Fail-closed rationale: string ordering is chronological ONLY for this exact
+/// shape. Any other shape — short, offset-bearing, fractional seconds — could
+/// sort before the watermark and silently exempt a brand-new stub from the gate.
+/// A stub whose timestamp is not this shape is therefore treated as NOT
+/// historical, i.e. it blocks.
+fn is_fixed_width_zulu_timestamp(ts_utc: &str) -> bool {
+    let bytes = ts_utc.as_bytes();
+    if bytes.len() != 20 || bytes[19] != b'Z' {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate().take(19) {
+        let ok = match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            _ => byte.is_ascii_digit(),
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether this stub predates the watermark and is therefore deferred.
+/// Anything not provably historical blocks (see [`is_fixed_width_zulu_timestamp`]).
+fn is_deferred_historical_stub(record: &StageTriageRecord) -> bool {
+    is_fixed_width_zulu_timestamp(record.ts_utc.as_str())
+        && record.ts_utc.as_str() < TRIAGE_GATE_HISTORICAL_WATERMARK_UTC
+}
+
+/// Outcome of a passing gate check. Carries the deferred-backlog count so the
+/// launch path can print it on EVERY run — the backlog must stay visible, or the
+/// watermark above quietly becomes permanent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriageGateReport {
+    /// Unfilled stubs for planned stages that the watermark deferred.
+    pub deferred_historical: usize,
+}
+
+/// Refuse to launch while a planned stage has an unfilled stub (plan §3.6/T3).
+///
+/// The thing being prevented is *verifying without having recorded what you are
+/// verifying*: re-running a stage whose last failure has no recorded remedy
+/// produces a result nobody can attribute to a change.
+///
+/// **There is no bypass flag, and none may be added.** A `--force` becomes the
+/// default under deadline pressure, and CLAUDE.md §3 forbids a downgrade branch
+/// in a hardened path. The sanctioned escape hatch already exists and is
+/// honest: fill the stub with `"none: <reason>"`, which keeps the decision
+/// visible instead of erasing it.
+///
+/// Fails closed on an unreadable or malformed ledger — [`load_ledger`]
+/// propagates that rather than reading it as "nothing outstanding".
+pub fn enforce_launch_gate(
+    ledger_path: &Path,
+    planned_stages: &[String],
+) -> Result<TriageGateReport, String> {
+    let records = load_ledger(ledger_path)?;
+    let outstanding = unfilled_for_planned_stages(&records, planned_stages);
+    let (deferred, blocking): (Vec<_>, Vec<_>) = outstanding
+        .into_iter()
+        .partition(|record| is_deferred_historical_stub(record));
+
+    if blocking.is_empty() {
+        return Ok(TriageGateReport {
+            deferred_historical: deferred.len(),
+        });
+    }
+
+    let mut detail = String::new();
+    for record in &blocking {
+        detail.push_str(&format!(
+            "\n  - {} (stage {}, failed {})\n      error: {}",
+            record.stub_id,
+            record.stage,
+            record.ts_utc,
+            record.error.lines().next().unwrap_or("").trim()
+        ));
+    }
+    Err(format!(
+        "live-lab launch refused: {} planned stage(s) have a failure with no recorded remedy.\n\
+         Record what you changed BEFORE re-running them, otherwise the run cannot be attributed \
+         to anything.{detail}\n\n\
+         Fill each with:\n  \
+         rustynet ops live-lab-record-stage-patch --ledger {} --stub-id <stub_id> --patch <what you changed>\n\
+         To decline deliberately, record the reason instead of a fix:\n  \
+         ... --patch \"none: <reason>\"\n\
+         There is no bypass flag by design (see enforce_launch_gate docs).",
+        blocking.len(),
+        ledger_path.display(),
+    ))
 }
 
 /// Append one stub per FAILED stage from a run's node-stage rows.
@@ -847,6 +990,103 @@ mod tests {
         // live_relay_validation is unfilled but NOT planned: a stage this run
         // does not exercise must never block it.
         assert!(blocking.iter().all(|r| r.stage != "live_relay_validation"));
+    }
+
+    /// The watermark defers the historical backlog; it must NOT defer anything
+    /// created since. This is the whole security property of option D.
+    #[test]
+    fn launch_gate_blocks_a_current_stub_and_defers_a_historical_one() {
+        let path = temp_ledger("gate_watermark");
+        let planned = vec!["live_two_hop_validation".to_owned()];
+
+        let mut historical = record("run-old", "live_two_hop_validation", None);
+        historical.ts_utc = "2026-07-19T10:00:00Z".to_owned();
+        assert!(
+            historical.ts_utc.as_str() < TRIAGE_GATE_HISTORICAL_WATERMARK_UTC,
+            "fixture must predate the watermark"
+        );
+        append_stub(path.as_path(), &historical).expect("append historical");
+
+        // Backlog alone must not block, but must be REPORTED so it stays visible.
+        let report = enforce_launch_gate(path.as_path(), &planned).expect("backlog must not block");
+        assert_eq!(report.deferred_historical, 1);
+
+        let mut current = record("run-new", "live_two_hop_validation", None);
+        current.ts_utc = "2026-07-29T10:00:00Z".to_owned();
+        append_stub(path.as_path(), &current).expect("append current");
+
+        let err = enforce_launch_gate(path.as_path(), &planned)
+            .expect_err("a stub created after the watermark must block the launch");
+        assert!(
+            err.contains("run-new::live_two_hop_validation"),
+            "got: {err}"
+        );
+        assert!(
+            !err.contains("run-old::live_two_hop_validation"),
+            "the deferred historical stub must not be named as blocking; got: {err}"
+        );
+
+        // Filling the current stub releases the gate; the backlog stays deferred.
+        fill_patch(path.as_path(), &current.stub_id, "none: not reproducible").expect("fill");
+        let report = enforce_launch_gate(path.as_path(), &planned).expect("filled must not block");
+        assert_eq!(report.deferred_historical, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// String ordering is chronological ONLY for the fixed-width Zulu shape. A
+    /// stub whose timestamp is any other shape must be treated as current (and
+    /// so block), never silently sorted below the watermark and exempted.
+    #[test]
+    fn launch_gate_treats_an_unparseable_timestamp_as_blocking() {
+        let path = temp_ledger("gate_bad_ts");
+        let planned = vec!["live_two_hop_validation".to_owned()];
+        let mut malformed = record("run-bad", "live_two_hop_validation", None);
+        // Sorts lexicographically BEFORE the watermark, but is not the shape the
+        // engine writes — under a naive string compare this would be exempted.
+        malformed.ts_utc = "2026-07-19".to_owned();
+        append_stub(path.as_path(), &malformed).expect("append");
+
+        let err = enforce_launch_gate(path.as_path(), &planned)
+            .expect_err("a non-fixed-width timestamp must not be exempted by the watermark");
+        assert!(
+            err.contains("run-bad::live_two_hop_validation"),
+            "got: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fixed_width_zulu_timestamp_shape_is_exact() {
+        assert!(is_fixed_width_zulu_timestamp("2026-07-16T12:17:17Z"));
+        // Every rejection below could otherwise sort under the watermark.
+        assert!(!is_fixed_width_zulu_timestamp("2026-07-16"));
+        assert!(!is_fixed_width_zulu_timestamp("2026-07-16T12:17:17"));
+        assert!(!is_fixed_width_zulu_timestamp("2026-07-16T12:17:17.5Z"));
+        assert!(!is_fixed_width_zulu_timestamp("2026-07-16T12:17:17+01:00"));
+        assert!(!is_fixed_width_zulu_timestamp("202X-07-16T12:17:17Z"));
+        assert!(!is_fixed_width_zulu_timestamp(""));
+    }
+
+    /// A ledger that cannot be read must never pass the gate as "nothing
+    /// outstanding" — the corrupt case is exactly when a stale fix is likeliest.
+    #[test]
+    fn launch_gate_fails_closed_on_a_malformed_ledger() {
+        let path = temp_ledger("gate_corrupt");
+        fs::write(path.as_path(), "{not json\n").expect("seed corrupt ledger");
+        assert!(
+            enforce_launch_gate(path.as_path(), &["live_two_hop_validation".to_owned()]).is_err(),
+            "a malformed ledger must fail the gate closed"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A fresh clone has no ledger. That is an empty history, not a blocker.
+    #[test]
+    fn launch_gate_passes_on_a_missing_ledger() {
+        let path = temp_ledger("gate_missing");
+        let report = enforce_launch_gate(path.as_path(), &["live_two_hop_validation".to_owned()])
+            .expect("a missing ledger must not block");
+        assert_eq!(report.deferred_historical, 0);
     }
 
     #[test]

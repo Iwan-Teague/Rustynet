@@ -9,31 +9,75 @@ Engine scope: **Rust `--node` engine only.**
 | --- | --- | --- |
 | T1 schema + module + `stub_id` idempotency | **DONE** | `crates/rustynet-cli/src/live_lab_stage_triage.rs` |
 | T2 engine auto-stub at finalization | **DONE and wired** | called at `live_lab_run_matrix.rs:710`; collapses per `(run_id, stage)` |
-| T3 launch-time gate | **OPEN — the only unbuilt phase** | `unfilled_for_planned_stages` is built and tested but has no caller; see the blocker below |
+| T3 launch-time gate | **DONE — wired and enforcing, fail-closed, no bypass flag** | `enforce_launch_gate` called from `vm_lab/orchestrator/native.rs` before the stage manifest is emitted; carries one temporary watermark, see below |
 | T4 MCP `stage_triage_history` / `record_stage_patch` | **read DONE, write BACKED** | read half live in `rustynet-mcp-lab-state`; write half is the `ops live-lab-record-stage-patch` verb (`fd8c5d04`), MCP wrapper still to add |
 | T5 backfill + doc update | **DONE** | 51 records in `documents/operations/live_lab_stage_triage.jsonl` |
 
-**T3 is blocked on a decision, not on effort.** The gate as specified in §3.6
-fails a run closed when any *planned* stage has an unfilled stub. Measured on
-the current ledger: **36 of 51 stubs are unfilled**, and they include
-`preflight` (4), `bootstrap_hosts` (4) and `cleanup` (1) — stages present in
-every plan. Wiring the gate as written therefore blocks *every* live-lab run,
-including a focused mac/win cell under `--skip-linux-live-suite`, until the
-backlog is dispositioned. That backlog is real analytical work: §3.3 requires a
-declined stub to carry `"none: <reason>"`, so filling 36 stubs wholesale to
-unblock the gate would fabricate dispositions and defeat the ledger's purpose.
+### T3 as built: fail-closed, with a self-liquidating watermark
 
-Sequencing options, none of which should be taken silently:
-1. Disposition the 36 unfilled stubs (many likely correspond to stages that now
-   pass — §3.4 derives that from the run matrix), then wire the gate as
-   specified. Strictest, and the only option that leaves §3.6 intact.
-2. Wire the gate now and accept that live-lab work stops until (1) is done.
-3. Wire it in report-only mode first. **This weakens a fail-closed control and
-   contradicts §3.6's explicit choice**, so it needs owner sign-off recorded
-   here, not an implementer's judgement call.
+**The decision, taken 2026-07-28 with owner sign-off.** §3.6 as written blocks a
+run when any *planned* stage has an unfilled stub. Measured on the ledger at the
+time: **36 of 51 stubs unfilled**, across 31 distinct runs, including `preflight`
+(4), `bootstrap_hosts` (4) and `cleanup` (1) — stages in every plan, including a
+focused mac/win cell under `--skip-linux-live-suite`. Turning §3.6 on literally
+would have blocked *every* live-lab run until that backlog was written up, and
+§3.3 requires a declined stub to carry `"none: <reason>"`, so bulk-filling to
+unblock would have fabricated dispositions and defeated the ledger's purpose.
 
-The write half of T4 landed first *because* it is a precondition for (1): before
-`fd8c5d04` the only way to fill a stub was hand-editing a 121 KB committed
+The reasoning that settled it: **the strictest gate on paper is not the strongest
+gate in practice.** A control whose honest compliance cost exceeds what the team
+sustains produces a `--force` flag, a commented-out call, or junk-filled stubs —
+and a junk-filled stub is strictly more dangerous than an empty one, because an
+empty stub reads as *unknown* while a junk one reads as *someone handled this*.
+That is the same false-confidence failure the 35 contaminated `two_hop` run-matrix
+rows already cost this project once.
+
+So: **full-strength enforcement for every stub created from 2026-07-28 onward**,
+deferred only for the historical backlog, via a single constant
+`TRIAGE_GATE_HISTORICAL_WATERMARK_UTC`. At steady state this is byte-for-byte
+option 1 — once the backlog is empty the filter is a no-op — but it reaches that
+state immediately, without the window in which someone reaches for a bypass.
+Rejected: report-only (removes the teeth while keeping the appearance) and
+retiring T3 (trades away the property the release criterion depends on).
+
+**No bypass flag exists and none may be added.** A `--force` becomes the default
+under deadline, and CLAUDE.md §3 forbids a downgrade branch in a hardened path.
+The sanctioned escape hatch is `"none: <reason>"`, which keeps a decision visible
+instead of erasing it.
+
+### ⚠️ OUTSTANDING MANUAL WORK — retiring the watermark
+
+The watermark is **temporary and meant to be deleted**. Until then it is the only
+deviation from this plan. Every launch prints how many stubs are still deferred,
+so it cannot rot unnoticed.
+
+1. List what remains deferred:
+   ```
+   jq -r 'select(.patch == null) | "\(.ts_utc)  \(.stub_id)"' \
+     documents/operations/live_lab_stage_triage.jsonl | sort
+   ```
+2. Disposition each as you touch that stage during normal lab work — a stub you
+   are actively investigating is cheap to fill honestly, which is how the 15 good
+   entries were written. **Do not bulk-fill.**
+   ```
+   rustynet ops live-lab-record-stage-patch --ledger documents/operations/live_lab_stage_triage.jsonl \
+     --stub-id <stub_id> --patch "<what you changed>"
+   ```
+3. When the deferred count printed at launch reaches zero, **delete the constant
+   `TRIAGE_GATE_HISTORICAL_WATERMARK_UTC` and its `is_deferred_historical_stub`
+   call** in `crates/rustynet-cli/src/live_lab_stage_triage.rs`. No behaviour
+   change on that day, by construction.
+4. Record the retirement here in §5.
+
+**Known residual risk, recorded deliberately.** Only 12 of 43 failing runs were
+ever dispositioned (28%). If that rate does not improve, the gate will eventually
+block on current work too. That would not mean the gate is wrong — it would mean
+the stage-failure rate is too high, and the response is fixing stages, **not
+loosening the gate**. Agreed in advance, because the moment it bites is the
+moment the argument for a bypass sounds most reasonable.
+
+The write half of T4 landed first *because* it is the precondition for step 2:
+before `fd8c5d04` the only way to fill a stub was hand-editing a 121 KB committed
 JSONL, bypassing the lock and every validation.
 
 ## 1. Problem

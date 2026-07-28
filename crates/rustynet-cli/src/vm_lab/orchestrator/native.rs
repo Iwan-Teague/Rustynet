@@ -529,6 +529,43 @@ pub(crate) fn execute_rust_native_orchestration(
         .iter()
         .map(|stage| stage.id().as_str().to_owned())
         .collect();
+
+    // Launch gate (triage-ledger plan §3.6/T3): refuse to start while a stage in
+    // THIS plan has a failure with no recorded remedy. Re-running such a stage
+    // produces a result that cannot be attributed to any change.
+    //
+    // Placed here deliberately:
+    // - AFTER the plan is resolved, because the gate is scoped to planned stages
+    //   (an unfilled stub for a stage this run does not exercise never blocks);
+    // - BEFORE the stage manifest is emitted and before any stage executes, so a
+    //   refused launch leaves no partial evidence behind and no guest is touched;
+    // - SKIPPED for `--dry-run`, which executes no stage and produces no
+    //   evidence, so it cannot "verify without recording" — the exact thing the
+    //   gate exists to prevent. Gating a wiring check would be pure friction.
+    //
+    // The ledger is resolved through the same expression the auto-stub writer
+    // uses, so the gate cannot read a file nobody writes.
+    if !dry_run {
+        let planned: Vec<String> = plan_names.iter().cloned().collect();
+        let triage_ledger = crate::live_lab_stage_triage::default_triage_ledger_path(
+            crate::live_lab_run_matrix::workspace_root_path().as_path(),
+        );
+        let gate =
+            crate::live_lab_stage_triage::enforce_launch_gate(triage_ledger.as_path(), &planned)?;
+        if gate.deferred_historical > 0 {
+            // Printed on EVERY run, by design: this is the outstanding manual
+            // work the TRIAGE_GATE_HISTORICAL_WATERMARK_UTC constant defers. If
+            // it stops being visible the watermark silently becomes permanent.
+            eprintln!(
+                "note: {} historical unfilled triage stub(s) for planned stages are deferred by \
+                 TRIAGE_GATE_HISTORICAL_WATERMARK_UTC ({}). They do NOT block this run. Disposition \
+                 them as you touch each stage, then delete that constant — see its rustdoc for the \
+                 retirement steps.",
+                gate.deferred_historical,
+                crate::live_lab_stage_triage::TRIAGE_GATE_HISTORICAL_WATERMARK_UTC,
+            );
+        }
+    }
     // Record THIS run's node→role topology in the manifest so consumers (the
     // monitor) render live roles from the current run instead of inferring them
     // from the previous finalized matrix row (emit-don't-infer).
