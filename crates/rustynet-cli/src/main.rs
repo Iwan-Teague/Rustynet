@@ -756,6 +756,28 @@ enum TrustCommand {
 
 mod ops_ci_release_perf;
 
+/// The `ops` subcommands that exist ONLY in `--features vm-lab` builds.
+///
+/// RNQ-17 keeps the lab robot out of the shipped product binary
+/// (`release.yml` builds `-p rustynet-cli --bin rustynet-cli` with no
+/// features), so every verb listed here is absent from what operators
+/// actually run. Product-facing text — install plans, error remediation,
+/// docs — must never tell an operator to run one of these.
+///
+/// Deliberately NOT gated on `vm-lab` itself: the list must read the same in
+/// both build configs so the assertions consuming it evaluate identically
+/// under `--all-features` and under default features.
+/// `install::tests::vm_lab_gated_ops_verb_list_matches_the_parser` proves
+/// each entry really is gated (and is spelled correctly) in both configs.
+#[cfg(test)]
+pub(crate) const VM_LAB_GATED_OPS_VERBS: &[&str] = &[
+    "install-windows-service",
+    "install-windows-relay-service",
+    "uninstall-windows-relay-service",
+    "install-windows-exit-service",
+    "uninstall-windows-exit-service",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpsCommand {
     VerifyRuntimeBinaryCustody,

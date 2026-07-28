@@ -432,24 +432,56 @@ fn service_mechanism(family: OsFamily) -> &'static str {
     }
 }
 
-fn service_verb(family: OsFamily, role: InstallRole) -> String {
+/// The service-registration step for `(family, role)`, as `(command, note)`.
+///
+/// `command` is the argv an operator types after `rustynet`, when the step is
+/// something they run themselves; `note` is a suffix annotation. `None`
+/// command means this installer performs the registration itself, and `note`
+/// is then the whole description.
+///
+/// INVARIANT — every argv returned here must be a verb the SHIPPED binary
+/// accepts. `rustynet install` is a product verb, and the release build
+/// carries no features, so naming a `--features vm-lab` lab-only subcommand
+/// (RNQ-17) would tell an operator to run a command they do not have. This is
+/// why the Windows relay/exit/anchor steps name `role set <preset>` — the
+/// role-transition planner reaches the same reviewed SCM installers via
+/// `ConcreteAction::Deploy{Relay,Exit}Service`, and `role set` ships — rather
+/// than the `ops install-windows-*-service` verbs, which do not.
+/// `install::tests::service_step_commands_are_never_vm_lab_gated` pins it.
+fn service_step(
+    family: OsFamily,
+    role: InstallRole,
+) -> (Option<&'static [&'static str]>, &'static str) {
     match (family, role) {
-        (OsFamily::Linux, InstallRole::Node) => "ops install-systemd".to_owned(),
-        (OsFamily::Linux, InstallRole::Relay) => "ops install-systemd-relay".to_owned(),
-        (OsFamily::Linux, InstallRole::Exit) => "ops install-systemd-exit".to_owned(),
+        (OsFamily::Linux, InstallRole::Node) => (Some(&["ops", "install-systemd"]), ""),
+        (OsFamily::Linux, InstallRole::Relay) => (Some(&["ops", "install-systemd-relay"]), ""),
+        (OsFamily::Linux, InstallRole::Exit) => (Some(&["ops", "install-systemd-exit"]), ""),
         (OsFamily::Linux, InstallRole::Anchor) => {
-            "ops install-systemd (+ anchor profile)".to_owned()
+            (Some(&["ops", "install-systemd"]), " (+ anchor profile)")
         }
-        (OsFamily::Macos, InstallRole::Relay) => "ops install-macos-relay".to_owned(),
-        (OsFamily::Macos, InstallRole::Anchor) => "ops install-macos-anchor".to_owned(),
-        (OsFamily::Macos, InstallRole::Exit) => "ops install-macos-exit".to_owned(),
+        (OsFamily::Macos, InstallRole::Relay) => (Some(&["ops", "install-macos-relay"]), ""),
+        (OsFamily::Macos, InstallRole::Anchor) => (Some(&["ops", "install-macos-anchor"]), ""),
+        (OsFamily::Macos, InstallRole::Exit) => (Some(&["ops", "install-macos-exit"]), ""),
         (OsFamily::Macos, InstallRole::Node) => {
-            "install the com.rustynet.daemon launchd job".to_owned()
+            (None, "install the com.rustynet.daemon launchd job")
         }
-        (OsFamily::Windows, InstallRole::Relay) => "ops install-windows-relay-service".to_owned(),
-        (OsFamily::Windows, InstallRole::Exit) => "ops install-windows-exit-service".to_owned(),
-        (OsFamily::Windows, _) => "ops install-windows-service".to_owned(),
-        (OsFamily::Unsupported, _) => "n/a".to_owned(),
+        // The Windows node install registers the SCM service itself, from the
+        // embedded reviewed PS1 (see `live_windows`) — there is no verb to run.
+        (OsFamily::Windows, InstallRole::Node) => (
+            None,
+            "register the RustyNet SCM service (embedded Install-RustyNetWindowsService.ps1)",
+        ),
+        (OsFamily::Windows, InstallRole::Relay) => (Some(&["role", "set", "relay"]), ""),
+        (OsFamily::Windows, InstallRole::Exit) => (Some(&["role", "set", "exit"]), ""),
+        (OsFamily::Windows, InstallRole::Anchor) => (Some(&["role", "set", "anchor"]), ""),
+        (OsFamily::Unsupported, _) => (None, "n/a"),
+    }
+}
+
+fn service_verb(family: OsFamily, role: InstallRole) -> String {
+    match service_step(family, role) {
+        (Some(argv), note) => format!("{}{note}", argv.join(" ")),
+        (None, label) => label.to_owned(),
     }
 }
 
@@ -573,7 +605,116 @@ mod tests {
         let wj = win.join("\n");
         assert!(wj.contains("WireGuard for Windows"), "{wj}");
         assert!(wj.contains("DPAPI"), "{wj}");
-        assert!(wj.contains("ops install-windows-service"), "{wj}");
+        // The Windows node install registers the SCM service itself; it must not
+        // point at an `ops install-windows-*` verb (absent from shipped builds).
+        assert!(wj.contains("Install-RustyNetWindowsService.ps1"), "{wj}");
+        assert!(!wj.contains("ops install-windows"), "{wj}");
+
+        let win_relay = build_plan(
+            &InstallRequest {
+                role: InstallRole::Relay,
+                ..req.clone()
+            },
+            &facts(OsFamily::Windows, "x86_64", None, None),
+            "x86_64-pc-windows-msvc",
+        );
+        let wrj = win_relay.join("\n");
+        assert!(wrj.contains("`role set relay` (relay role)"), "{wrj}");
+        assert!(!wrj.contains("ops install-windows"), "{wrj}");
+    }
+
+    const ALL_FAMILIES: [OsFamily; 4] = [
+        OsFamily::Linux,
+        OsFamily::Macos,
+        OsFamily::Windows,
+        OsFamily::Unsupported,
+    ];
+    const ALL_ROLES: [InstallRole; 4] = [
+        InstallRole::Node,
+        InstallRole::Relay,
+        InstallRole::Exit,
+        InstallRole::Anchor,
+    ];
+
+    fn parses(argv: &[&str]) -> bool {
+        let owned: Vec<String> = argv.iter().map(|a| (*a).to_owned()).collect();
+        !matches!(
+            crate::parse_command(&owned),
+            crate::CliCommand::UsageError(_)
+        )
+    }
+
+    /// THE invariant: an install plan may only name subcommands that exist in
+    /// the binary the operator is holding. The lab-only `--features vm-lab`
+    /// surface (RNQ-17) is compiled out of release builds, so naming one of
+    /// those verbs hands the operator a command that does not exist.
+    ///
+    /// Feature-independent on purpose: it fails under BOTH `--all-features`
+    /// and default features. A reachability-only check would pass under
+    /// `--all-features` — which is exactly how this defect survived CI.
+    #[test]
+    fn service_step_commands_are_never_vm_lab_gated() {
+        for family in ALL_FAMILIES {
+            for role in ALL_ROLES {
+                let (Some(argv), _) = service_step(family, role) else {
+                    continue;
+                };
+                if let ["ops", verb, ..] = argv {
+                    assert!(
+                        !crate::VM_LAB_GATED_OPS_VERBS.contains(verb),
+                        "install plan for {family:?}/{role:?} names `rustynet ops {verb}`, which \
+                         exists only in --features vm-lab builds; shipped release binaries do not \
+                         have it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Reachability + drift: each registered argv really parses, and the
+    /// rendered operator-facing text still contains it verbatim.
+    #[test]
+    fn service_step_commands_parse_and_match_the_rendered_text() {
+        for family in ALL_FAMILIES {
+            for role in ALL_ROLES {
+                let (command, note) = service_step(family, role);
+                let rendered = service_verb(family, role);
+                let Some(argv) = command else {
+                    assert_eq!(rendered, note, "{family:?}/{role:?}");
+                    continue;
+                };
+                let joined = argv.join(" ");
+                assert!(
+                    rendered.contains(&joined),
+                    "{family:?}/{role:?}: rendered {rendered:?} dropped the command {joined:?}"
+                );
+                assert!(
+                    parses(argv),
+                    "{family:?}/{role:?}: `rustynet {joined}` is not a subcommand this build accepts"
+                );
+            }
+        }
+    }
+
+    /// Keeps [`crate::VM_LAB_GATED_OPS_VERBS`] honest in both build configs: a
+    /// misspelled or retired entry would silently weaken the check above.
+    #[test]
+    fn vm_lab_gated_ops_verb_list_matches_the_parser() {
+        for verb in crate::VM_LAB_GATED_OPS_VERBS {
+            let reachable = parses(&["ops", verb]);
+            if cfg!(feature = "vm-lab") {
+                assert!(
+                    reachable,
+                    "`ops {verb}` does not parse in a vm-lab build — stale or misspelled entry"
+                );
+            } else {
+                assert!(
+                    !reachable,
+                    "`ops {verb}` parses without --features vm-lab — it is not actually gated, so \
+                     listing it here wrongly forbids a shipped verb"
+                );
+            }
+        }
     }
 
     #[test]
