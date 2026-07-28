@@ -38687,13 +38687,33 @@ fn validate_target_user_combination(target: &str, ssh_user: Option<&str>) -> Res
     Ok(())
 }
 
+/// A suffix unique across BOTH concurrent callers in this process and concurrent
+/// processes, laid out as three disjoint fields: `[ nanos | pid | counter ]`.
+///
+/// The process id is load-bearing and was missing. `UNIQUE_COUNTER` only
+/// disambiguates within one process, and cargo-nextest runs a crate's lib and
+/// bin test targets as **two processes executing the same test list in the same
+/// order** — so their counters advance in near-lockstep. With a coarse
+/// nanosecond tick both processes could then produce the SAME suffix, two tests
+/// would build the same temp directory, and whichever finished first deleted the
+/// other's directory mid-test. That surfaced as intermittent failures on
+/// *filesystem writes* (`fs::write(...).expect("... should write")`) in a
+/// different `vm_lab` test on every run, each of which passed in isolation —
+/// including the "temp-inventory parse panic" recorded in AGENTS.md/CLAUDE.md §7.
+///
+/// Fields are OR'd into non-overlapping ranges rather than XOR'd so that no
+/// field can cancel another, and so the pid remains directly extractable (which
+/// is what makes this testable).
 fn unique_suffix() -> u128 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let counter = u128::from(UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed));
-    (now << 16) ^ counter
+    // 16 bits is ample: the counter only has to separate calls landing in the
+    // same nanosecond within one process.
+    let counter = u128::from(UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)) & 0xFFFF;
+    let pid = u128::from(std::process::id());
+    (now << 48) | (pid << 16) | counter
 }
 
 fn sanitize_label_for_path(value: &str) -> String {
@@ -40055,7 +40075,7 @@ mod tests {
     use std::net::IpAddr;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     #[test]
     fn validate_collected_os_version_accepts_real_desktop_versions() {
@@ -40290,6 +40310,35 @@ mod tests {
         let path = dir.join("inventory.json");
         fs::write(&path, body).expect("inventory should be written");
         path
+    }
+
+    /// Two processes running the same test list in lockstep must not be able to
+    /// agree on a temp path. Without the pid field they could, and one test's
+    /// cleanup then deleted another's live directory — see `unique_suffix`.
+    #[test]
+    fn unique_suffix_embeds_the_process_id_and_never_repeats() {
+        let pid = u128::from(std::process::id());
+        let first = super::unique_suffix();
+        let second = super::unique_suffix();
+
+        assert_eq!(
+            (first >> 16) & 0xFFFF_FFFF,
+            pid,
+            "the pid field must be recoverable, or a peer process can collide"
+        );
+        assert_eq!((second >> 16) & 0xFFFF_FFFF, pid);
+        assert_ne!(
+            first, second,
+            "two calls in one process must differ even within one clock tick"
+        );
+
+        // A peer process with a different pid must differ even when its clock
+        // reading AND its counter are identical — the lockstep case.
+        let same_instant_other_pid = (first & !(0xFFFF_FFFF << 16)) | ((pid ^ 1) << 16);
+        assert_ne!(
+            first, same_instant_other_pid,
+            "identical time+counter in two processes must still not collide"
+        );
     }
 
     pub(super) fn cleanup_temp_inventory(path: &Path) {
@@ -42031,10 +42080,7 @@ mod tests {
 
     #[test]
     fn mac_address_from_utm_config_plist_reads_shared_network_mac() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let bundle = std::env::temp_dir().join(format!("rustynet-vm-lab-mac-plist-{unique}.utm"));
         fs::create_dir_all(&bundle).expect("bundle dir should be created");
         fs::write(
@@ -42057,10 +42103,7 @@ mod tests {
 
     #[test]
     fn mac_address_from_utm_config_plist_returns_none_when_missing() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let bundle =
             std::env::temp_dir().join(format!("rustynet-vm-lab-mac-plist-missing-{unique}.utm"));
         assert_eq!(mac_address_from_utm_config_plist(bundle.as_path()), None);
@@ -42068,10 +42111,7 @@ mod tests {
 
     #[test]
     fn discover_local_utm_bundle_paths_recurses_into_nested_documents() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
         fs::create_dir_all(root.join("nested").join("alpha.utm"))
             .expect("nested bundle should exist");
@@ -42098,10 +42138,7 @@ mod tests {
 
     #[test]
     fn discover_local_utm_bundle_paths_bounded_finds_bundles_within_deadline() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-bounded-{unique}.dir"));
         fs::create_dir_all(root.join("gamma.utm")).expect("bundle should exist");
 
@@ -42120,10 +42157,7 @@ mod tests {
 
     #[test]
     fn discover_local_utm_bundle_paths_bounded_rejects_missing_root() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-missing-{unique}.dir"));
 
         let err = discover_local_utm_bundle_paths_bounded(root, Duration::from_secs(10))
@@ -42264,10 +42298,7 @@ mod tests {
 
     #[test]
     fn execute_ops_vm_lab_discover_local_utm_reports_live_bundle_status() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
         let bundle = root.join("nested").join("alpha.utm");
         fs::create_dir_all(&bundle).expect("bundle should exist");
@@ -42358,10 +42389,7 @@ mod tests {
 
     #[test]
     fn execute_ops_vm_lab_discover_local_utm_summary_renders_setup_view() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
         let bundle = root.join("nested").join("alpha.utm");
         fs::create_dir_all(&bundle).expect("bundle should exist");
@@ -43652,10 +43680,7 @@ mod tests {
 
     #[test]
     fn execute_ops_vm_lab_discover_local_utm_marks_windows_unmatched_without_debian_guess() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
         let bundle = root.join("nested").join("windows-utm-1.utm");
         fs::create_dir_all(&bundle).expect("bundle should exist");
@@ -43990,10 +44015,7 @@ mod tests {
     /// A unit test must not depend on the host's network or resolver.
     #[test]
     fn execute_ops_vm_lab_discover_local_utm_skips_inventory_update_when_no_live_ip_observed() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
         let bundle = root.join("nested").join("alpha.utm");
         fs::create_dir_all(&bundle).expect("bundle should exist");
@@ -44062,10 +44084,7 @@ mod tests {
         // reachable VM as unreachable. The inventory-refresh path must not let
         // that block IP persistence — only `process_present` + a live IP +
         // an authoritative ssh target should gate the write, not SSH reachability.
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
         let bundle = root.join("nested").join("alpha.utm");
         fs::create_dir_all(&bundle).expect("bundle should exist");
@@ -44346,10 +44365,7 @@ mod tests {
 
     #[test]
     fn raw_zip_archive_excludes_macos_metadata_artifacts() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-zip-junk-{unique}.dir"));
         let sub = root.join("sub");
         fs::create_dir_all(sub.as_path()).expect("source tree should exist");
@@ -44390,10 +44406,7 @@ mod tests {
 
     #[test]
     fn raw_local_source_archives_exclude_generated_dirs() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root =
             std::env::temp_dir().join(format!("rustynet-vm-lab-generated-skip-{unique}.dir"));
         fs::create_dir_all(root.join("src")).expect("src should exist");
@@ -44570,10 +44583,7 @@ directory = "vendor"
 
     #[test]
     fn live_lab_profile_writer_renders_inventory_backed_targets() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let exit_utm_name = format!("windows-utm-test-exit-{unique}");
         let client_utm_name = format!("debian-headless-test-client-{unique}");
         let inventory = write_temp_inventory(
@@ -45943,10 +45953,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
 
     #[test]
     fn local_utm_process_present_uses_wide_ps_output() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let dir = std::env::temp_dir().join(format!("rustynet-vm-lab-ps-{unique}.dir"));
         fs::create_dir_all(&dir).expect("temp dir should exist");
         let bundle = dir.join("alpha.utm");
@@ -46091,10 +46098,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
 
     #[test]
     fn transition_local_utm_vm_accepts_timeout_when_vm_reaches_stopped_state() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let dir =
             std::env::temp_dir().join(format!("rustynet-vm-lab-timeout-transition-{unique}.dir"));
         fs::create_dir_all(&dir).expect("temp dir should exist");
@@ -53352,10 +53356,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
 
     #[test]
     fn diff_overall_status_tightens_to_fail_from_report_state() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-diffstate-{unique}.dir"));
         fs::create_dir_all(root.join("state")).expect("state dir");
 
@@ -53407,10 +53408,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         // must stay in sync: a setup stage missing from the Rust list (e.g.
         // macos_preflight_check) makes the freshness guard reject the
         // orchestrate flow's own setup evidence and brick vm_lab_run_live_lab.
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos();
+        let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-guard-{unique}.dir"));
         fs::create_dir_all(root.join("state")).expect("report state dir");
         let row = |name: &str| {
