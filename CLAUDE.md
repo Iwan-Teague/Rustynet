@@ -144,23 +144,82 @@ Run these as mandatory quality gates for substantial work:
 - `cargo audit --deny warnings`
 - `cargo deny check bans licenses sources advisories`
 
+Two things that list does **not** cover. Both were confirmed by running the
+commands, not by reading them:
+- **`--workspace` is not the whole repository.** The root `Cargo.toml`
+  `exclude`s `gui/` and `crates/rustynet-lab-monitor/` — each is its own
+  workspace with its own `Cargo.lock` — so every `--workspace` command above
+  skips them entirely and still exits 0. `rustynet-lab-monitor` alone holds 269
+  tests that the list above never runs, which means "all mandatory gates
+  passed" is a hollow claim for any change touching it. Gate it explicitly
+  whenever it is in scope: `./scripts/ci/lab_monitor_gates.sh` (verified
+  2026-07-27: **exit 0, 269 tests passed** — fmt + clippy + check + test scoped
+  inside the standalone crate). CI runs it on the macOS and Debian legs; the
+  crate is macOS/Linux-only, so the Windows leg omits it.
+  `fuzz/` also declares its own `[workspace]`, so it is outside every command
+  above as well — and unlike `rustynet-lab-monitor` it has **no** wired gate:
+  nothing in `.github/workflows/` references it, so a fuzz target that stops
+  compiling is invisible to CI. Same for `gui/`. If you change either, gate it
+  by hand and say so in the ledger; do not report a green §7 run as covering
+  them.
+- **CI adds `--locked`; the commands above do not.** Every CI validation leg
+  runs clippy and the test stage with `--locked`, so a local gate run that
+  quietly refreshes `Cargo.lock` can pass on a commit CI then fails. Prefer
+  `--locked` locally too — e.g.
+  `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+  (verified 2026-07-27: exit 0, zero warnings on this tree).
+
 Fast-fail convenience runner (recommended for local iteration):
 - `cargo run -p rustynet-xtask -- gates` runs fmt → clippy → test in
   dependency order (clippy subsumes a standalone `cargo check`; `--with-check`
   restores the check stage), stops at the first failure, streams output live, and wraps
   each stage in a timeout watchdog (kills the whole process group and prints the
   tail on a hang). Add `--skip-test` to gate without the slow test stage, or
-  pass a cargo scope such as `-p rustynet-cli`. Per-stage timeouts are
+  pass a cargo scope such as `-p rustynet-cli` — xtask always appends
+  `--all-targets --all-features` to a scoped stage, so it cannot under-test the
+  way a hand-typed `cargo test -p <crate>` does (§13.1). Per-stage timeouts are
   overridable via `XTASK_{FMT,CHECK,CLIPPY,TEST}_TIMEOUT` (seconds). The
   individual commands above remain the authoritative gate definitions.
-- The test stage (xtask and all three CI legs) *executes* through
+  Verified 2026-07-27:
+  `cargo run -p rustynet-xtask -- gates --skip-test -p rustynet-relay`
+  exits 0 and reports its clippy stage as
+  `cargo clippy --all-targets --all-features -p rustynet-relay -- -D warnings`.
+  **Side effect:** every stage appends a row to the *tracked*
+  `documents/operations/gate_timings.csv`, so running the gate dirties the
+  working tree — commit or restore that file before taking a dirty-state
+  reading for live-lab evidence (§2, §10.9).
+- The test stage (xtask and the three CI validation legs — macOS, Debian 13, and
+  Windows; the fourth job, `linux_e2e`, runs the real-WireGuard E2E harness
+  instead) *executes* through
   **cargo-nextest** (`cargo nextest run`, version pinned in
-  `bootstrap_ci_tools`), which runs the workspace's ~100 test binaries against
+  `bootstrap_ci_tools`), which runs the workspace's test binaries against
   one global concurrent pool instead of `cargo test`'s one-binary-at-a-time
-  scheduling. Retries are off (`--retries 0`) so flaky tests fail loudly.
+  scheduling. Measured 2026-07-27: **9897 tests across 155 binaries** (2
+  skipped) — budget for that, and note that nextest is fail-fast unless
+  `--no-fail-fast` is passed (only the Windows CI leg passes it), so one early
+  failure leaves the rest of the suite unrun and unknown rather than green.
+  Retries are off (`--retries 0`) so flaky tests fail loudly.
   `cargo test --workspace --all-targets --all-features` **remains the
   authoritative gate definition** — nextest is only the runner the tooling
   uses, exactly as `xtask gates` wraps the authoritative commands.
+  **But a nextest failure is a real failure — never re-run under `cargo test` to
+  turn it green.** "Authoritative definition" fixes which *flags* are normative,
+  not which *result* wins. The runners are not semantically interchangeable:
+  nextest's global pool puts the suite under concurrency that
+  one-binary-at-a-time scheduling never applies, which surfaces genuine
+  order/parallelism bugs. Verified 2026-07-27 on this tree —
+  `cargo nextest run --workspace --all-targets --all-features --locked --retries 0`
+  exits **100**, failing
+  `rustynet-cli vm_lab::tests::mixed_platform_repo_sync_scripts_do_not_cross_dispatch`
+  (temp-inventory parse panic, `vm_lab/mod.rs:40921`), while that same test
+  passes *in isolation under both runners* (`cargo test … -- --exact` exit 0;
+  `cargo nextest run -E 'test(=…)'` exit 0). When a test is load-sensitive, the
+  isolated green is the misleading result — the failure is the signal.
+  Note also that the Windows leg gates an explicit package *subset* (`rustynetd`,
+  `rustynet-windows-native`, and the protocol-agnostic primitives), not
+  `--workspace`, because `rustynet-cli` cannot build on Windows: a
+  Windows-specific regression in a crate outside that subset is not caught by
+  CI at all.
 
 Run scope-specific scripts when present:
 - `./scripts/ci/phase9_gates.sh`
@@ -318,7 +377,9 @@ Key rules:
 - Small, verifiable increments — one logical change per commit
 - Commit messages: imperative mood, what AND why
 - Never commit generated files, build artifacts, or secrets
-- Run at minimum: cargo fmt --all -- --check && cargo check -p <crate>
+- Run at minimum: cargo fmt --all -- --check && cargo check -p <crate> --all-targets --all-features
+  (the flags are mandatory, not decoration — the bare form skips
+  `required-features` targets and exits 0 anyway; see §13.1)
 
 ## 11) Repository Map & Codebase Structure
 
@@ -420,8 +481,11 @@ build-time cost.
 Authoritative gate definitions live in §7. This section is the fast-path map.
 
 ### 12.1 Build & Iterate
-- Scoped check while editing: `cargo check -p <crate>` then
-  `cargo fmt --all -- --check`.
+- Scoped check while editing:
+  `cargo check -p <crate> --all-targets --all-features` then
+  `cargo fmt --all -- --check`. **Keep `--all-targets --all-features` on every
+  scoped command** — without them Cargo silently skips targets behind
+  `required-features` and still exits 0 (§13.1 has the measured proof).
 - Fast-fail local gate run: `cargo run -p rustynet-xtask -- gates`
   (fmt → clippy → test, stops at first failure, timeout watchdog; `--with-check`
   restores the standalone check stage). Add `--skip-test` or a `-p <crate>` scope;
@@ -1032,14 +1096,42 @@ exactly where ambiguity costs most.
 
 ### 13.1 Live-Lab Hardening Loop
 Per patch inside a live-lab loop:
-1. Targeted first: scoped `cargo check -p <crate>` / `cargo test -p <crate>`, or
-   `cargo run -p rustynet-xtask -- gates --skip-test -p <crate>` — don't run the
-   full `--all-targets --all-features` suite every iteration; batch it
-   periodically instead (§7, fast-fail runner).
+1. Targeted first — but a scoped command MUST still carry
+   `--all-targets --all-features`:
+   `cargo check -p <crate> --all-targets --all-features` /
+   `cargo test -p <crate> --all-targets --all-features`, or
+   `cargo run -p rustynet-xtask -- gates --skip-test -p <crate>` (xtask and the
+   gate-runner MCP append both flags to a `-p` scope for you). Don't run the full
+   workspace suite every iteration; batch it periodically instead (§7, fast-fail
+   runner).
+   **Why the flags are not optional — the bare scoped form is a silent
+   under-test, not a failure.** Cargo *skips* a target whose
+   `required-features` are unmet and still exits 0. Verified 2026-07-27 on this
+   tree: `cargo test -p rustynet-relay` exits 0 having run 84 tests, while
+   `cargo test -p rustynet-relay --all-targets --all-features` exits 0 having
+   run 151 — the 67 tests in the `daemon`-gated `src/main.rs` never ran. (Counts
+   re-measured 2026-07-27 against this commit's tree; the original audit read
+   160/73 because it was measured with in-progress relay work present. The
+   skip itself is structural, not a count: see the exit-101 proof below.) Naming
+   the target instead is the only form that complains:
+   `cargo test -p rustynet-relay --bin rustynet-relay` exits **101**
+   ("target `rustynet-relay` ... requires the features: `daemon`"). A bare
+   `cargo check -p rustynet-relay` exits 0 without compiling `src/main.rs` at
+   all. Same shape in `rustynet-nas` (24 → 35 tests) and
+   `rustynet-llm-gateway` (36 → 38); `rustynet-cli`'s whole `vm-lab` surface is
+   default-off (RNQ-17), and `rustynet-backend-wireguard` gates targets behind
+   `test-harness`. Crates carrying `required-features` today:
+   `rustynet-relay`, `rustynet-nas`, `rustynet-llm-gateway`, `rustynet-cli`,
+   `rustynet-backend-wireguard`.
 2. Before landing: the full §7 gate list — `cargo fmt --all -- --check`,
    `cargo check --workspace --all-targets --all-features`,
    `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-   `cargo test --workspace --all-targets --all-features`.
+   `cargo test --workspace --all-targets --all-features`. This is an excerpt, not
+   a competing list: §7 also requires `cargo audit --deny warnings` and
+   `cargo deny check bans licenses sources advisories`, and none of the
+   `--workspace` commands reach the workspace-excluded
+   `crates/rustynet-lab-monitor` — run `./scripts/ci/lab_monitor_gates.sh` when
+   that crate is in scope. Read §7 before claiming "all gates pass".
 3. Live-lab: check state first (`get_lab_status` / `vm-lab-discover-local-utm-summary`),
    then `start_live_lab_run` → `wait_for_job` (`rustynet-mcp-lab-state` MCP
    tools; §12.3).
@@ -1086,3 +1178,28 @@ one MUST be applied identically to the other in the same change. When you add,
 move, or rename a crate, ledger, or top-level directory, update §2/§11/§12 here
 (and the mirror) plus `documents/CODE_MAP.md` so the structure map does not drift
 from the code.
+
+**Nothing mechanically enforces this today — the mirror is convention only.**
+Audited 2026-07-27: there is no CI step, no gate script, no xtask stage, no test,
+and no git hook that compares the two files. The only enforcement is prose (this
+section, §13.4) plus a MIRROR RULE in the `ai_doc_sync` prompt, which instructs a
+model rather than checking a file. The convention has held perfectly so far —
+across all 2552 commits reachable from every ref, the two paths have *never*
+pointed at different blobs (2543 commits carry both at one identical blob; the 9
+earliest carry neither; both were added together in `9225ec34`, and both have
+been touched by exactly the same 50 commits). Treat that as a streak, not a
+guarantee: the failure mode is silent, and it is asymmetric — an agent reading
+`CLAUDE.md` and one reading `AGENTS.md` would receive *different gate
+definitions* and neither would know. Until an identity check exists, finish any
+edit here by running `cmp AGENTS.md CLAUDE.md` and confirming it prints nothing.
+
+Do not resolve this by deleting one file or replacing it with a symlink or a
+pointer stub without checking every consumer first: both filenames are read
+directly today, by different tools that do not share a resolution path — Claude
+Code loads `CLAUDE.md`, the OpenCode/`AGENTS.md` convention loads `AGENTS.md`,
+`rustynet-mcp-repo-context` reads `AGENTS.md` by literal path for
+`get_gate_definitions` / `get_definition_of_done` / `get_architecture_constraints`
+(so §7's heading text `## 7) Validation and CI Gates` is load-bearing — its
+section extractor keys on it), and `tools/skills/rustynet-security-auditor` lists
+both. A stub containing a pointer instead of the contract would silently feed
+half of those consumers an empty gate definition.

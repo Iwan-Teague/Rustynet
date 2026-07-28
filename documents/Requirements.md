@@ -137,8 +137,10 @@ Primary goal:
 - Cross-platform clients:
 - Linux (priority), macOS, Windows.
 - ARM architecture support (finished-product requirement, not release-blocking for current mandate):
-  - 64-bit ARM (aarch64-unknown-linux-gnu): expected to work today given boringtun support; not yet CI-gated or live-lab-evidenced.
-  - 32-bit ARM (armv7-unknown-linux-gnueabihf): currently blocked by `AtomicU64` usage and `u128`/`i128` arithmetic in daemon and CLI code. Must be resolved before this target is supported. Primary use case: low-power relay and exit/blind_exit nodes (e.g., Raspberry Pi Zero 2 W class hardware running 32-bit OS). See known blockers in `documents/operations/PlatformSupportMatrix.md`.
+  - 64-bit ARM (aarch64-unknown-linux-gnu): expected to work given boringtun support. Status corrected 2026-07-27 — it IS built in CI, but only by the tag-triggered release pipeline (`.github/workflows/release.yml:52` and the `TARGETS` list at `:204`, which runs `cargo build --release --locked --target`), never by the per-change gate: `.github/workflows/cross-platform-ci.yml` has no ARM leg at all (its runners are `macos-14`, `ubuntu-latest` x2, `windows-2022`). So aarch64 is **build-only and release-tag-only — never `cargo test`ed, never clippy-gated, gating nothing on a PR** — and still not live-lab-evidenced. The previous wording, "not yet CI-gated", understated the build coverage while overstating nothing else.
+  - 32-bit ARM (armv7-unknown-linux-gnueabihf): not supported. Primary use case: low-power relay and exit/blind_exit nodes (e.g., Raspberry Pi Zero 2 W class hardware running 32-bit OS). See `documents/operations/PlatformSupportMatrix.md`.
+    - Blocker scope corrected 2026-07-27. The previous wording said the blockers were `AtomicU64` usage and `u128`/`i128` arithmetic "in daemon and CLI code". That undercounts. `AtomicU64` appears in **five** crates, not two — `rustynet-cli` (12 files), `rustynet-backend-wireguard` (3), `rustynet-mcp` (2), `rustynetd` (1, only `crates/rustynetd/src/key_rotation.rs:387`), and `rustynet-relay` (1) — and the two omitted sites are the ones that actually matter for this use case: the userspace dataplane (`crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs:20`) and **the relay binary itself** (`crates/rustynet-relay/src/main.rs:285-286`), which is the very target this bullet names as the armv7 use case. `u128`/`i128` likewise spans five crates (`rustynet-cli` 29 hits, `rustynetd` 11, `rustynet-netns-probe` 2, `rustynet-lab-monitor` 2, `rustynet-backend-wireguard` 2), e.g. `crates/rustynetd/src/resilience.rs:91`.
+    - The blocker itself is UNVERIFIED and should be re-derived before being restated as fact. No armv7 target appears anywhere in `.github/` or `scripts/` (grep for `armv7` returns nothing), so no failing build has ever been recorded in-tree. Note also — this part is reasoned from rustc target data, NOT build-verified, so confirm it rather than quoting it — that `armv7-unknown-linux-gnueabihf` is documented with `max_atomic_width = 64` (LDREXD/STREXD), and `u128`/`i128` compile on 32-bit targets (lowered to compiler-rt calls), so neither item is self-evidently a hard blocker; and 9 of the 12 `rustynet-cli` `AtomicU64` files are `#[cfg(test)]` blocks or `src/bin/` lab harnesses that never ship to a relay node. Action: attempt a real armv7 cross-build and record the actual errors, rather than carrying an inherited assumption.
   - CI coverage and live-lab evidence required before either ARM target can be called supported.
 - Cross-platform role parity (completeness mandate, release-blocking):
 - Every node role and capability (client, admin, anchor, exit, blind_exit, relay, and the service-hosting nas/llm roles) must be operable AND live-lab-proven on Linux, macOS, AND Windows. Linux is the reference and is complete; macOS and Windows must graduate from compatibility-mode client to full per-role support — each role and its platform-native dataplane (kill-switch, NAT/egress, DNS fail-closed, route advertise, signed-state verify, anti-replay) proven live in the UTM lab. No OS may limit which role a node can take. Rustynet is not cross-platform complete until this holds for every role on macOS and Windows. Single source of truth + status matrix + acceptance criteria: `operations/active/CrossPlatformRoleParityPlan_2026-06-21.md`.
@@ -332,15 +334,21 @@ lan_route_access:
 ```
 
 ## 11) Rust Implementation Notes
-- Candidate crates:
-- `tokio` (async runtime)
-- `axum` or `actix-web` (control APIs)
-- `tonic` (if gRPC chosen)
-- `serde` + `toml`/`serde_yaml` (config/policy parsing)
-- `rustls` (TLS) — **not currently used.** Present only transitively via
-  `ureq` in `rustynet-mcp`, an LLM-API HTTPS client unrelated to the control
-  plane.
-- `sqlx` (DB)
+
+This section was a v0.3 brainstorm list. Reconciled against the built system
+2026-07-27 — five of its six lines did not describe what was actually adopted,
+which was misleading readers into assuming an HTTP control API and an async SQL
+layer exist. Actual stack, with the original candidates kept for provenance:
+
+- Adopted:
+- `tokio` (async runtime) — in use, e.g. `crates/rustynet-relay/Cargo.toml:13`, feature-gated behind `daemon`.
+- `serde` + `toml` (config/policy parsing) — in use.
+- `rusqlite` 0.32, `features = ["bundled"]` (DB) — `crates/rustynet-control/Cargo.toml:15`, used at `crates/rustynet-control/src/persistence.rs`. This **replaced the `sqlx` candidate**; `sqlx` is not a dependency anywhere. Note the architectural consequence: persistence is synchronous/embedded, not async-pooled.
+- Considered and NOT adopted (absent from `Cargo.toml` and `Cargo.lock` repo-wide):
+- `axum` / `actix-web` (control APIs) — absent. There is no HTTP or gRPC server framework in the workspace at all; the only HTTP listener is the relay's hand-rolled health/metrics endpoint (`crates/rustynet-relay/src/main.rs:1367`).
+- `tonic` (gRPC) — absent; gRPC was not chosen.
+- `sqlx` — absent, see `rusqlite` above.
+- `rustls` (TLS) — never adopted as a direct dependency, but present transitively: `rustls` 0.23.41 (`Cargo.lock:1278`) arrives via `ureq` in `crates/rustynet-mcp/Cargo.toml:29`. It is used for outbound HTTPS in operator tooling, not for any Rustynet transport. This does not satisfy the TLS 1.3 requirement in §5; see `SecurityMinimumBar.md` §3 control 2 for that unmet-requirement record.
 - Keep unsafe code minimized and isolated.
 - Prefer integration tests around networking behaviors and ACL decisions.
 

@@ -10,6 +10,28 @@ source live in the ledger finding entry). As fixes land, flip the finding's ledg
 
 **Release gate (SecurityMinimumBar §2):** no unmet Critical; **2 High** were unmet on reachable paths (RSA-0009, RSA-0063) — **both APPLIED 2026-06-24** (code-complete; RSA-0009 unit-replay-validated, RSA-0063 lint-validated).
 
+> **Independently re-verified 2026-07-27** (adversarial re-review of the security-claims
+> cluster; committed code, not the working tree): RSA-0009 —
+> `crates/rustynet-control/src/membership.rs:1845-1941` threads `op_created_at_unix` into the
+> reducer (no `unix_now()` remains there), with
+> `rsa0009_{revoke,restore,rotate_key,set_capabilities}_applies_when_created_at_differs_from_apply_time`
+> at `:3892-4013`. RSA-0063 — `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh:307-320`
+> arms `trap 'rm -f "${sudoers_tmp}"' EXIT` before the `curl|bash` and clears it on success;
+> lint test at
+> `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs:1950-1959`. Both
+> APPLIED ticks hold. Note the ledger's own Executive Summary and closing Verdict still read
+> "2 High controls are unmet on reachable paths" — that text is stale, and is annotated there.
+>
+> **Correction 2026-07-27 — this plan's scope line above is stale/incomplete.** It sequences
+> "73 findings, RSA-0001..RSA-0074". The ledger now carries **RSA-0001..RSA-0081**; the seven
+> findings **RSA-0075, RSA-0076, RSA-0078, RSA-0079, RSA-0080, RSA-0081** (and RSA-0077 only
+> via a one-line mention under Wave P2 crypto/consistency) have **no wave, owner, or effort
+> entry in this document** — verified by enumerating every `RSA-00xx` token in this file. Two
+> of them are live: **RSA-0081** (open — macOS service-hardening check validates a stale
+> passphrase path) and **RSA-0080** (marked APPLIED 2026-07-17 in the ledger, i.e. remediation
+> landed without ever appearing in this plan). A reader treating this plan as "the complete
+> remediation view of the ledger" would miss them.
+
 Effort key: **S** ≤½ day · **M** ~1–2 days · **L** ≥3 days / needs design decision.
 
 ---

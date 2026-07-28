@@ -17,8 +17,32 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
 
 2. Control-plane transport security:
 - Mesh control traffic rides the WireGuard tunnel's authenticated encryption
-  (Noise IK handshake, ChaCha20-Poly1305); there is no separate TLS stack and
-  no TLS library is a workspace dependency.
+  (Noise IK handshake, ChaCha20-Poly1305; vendored at
+  `third_party/boringtun/src/noise/handshake.rs:13`). No control-plane TLS
+  terminator exists: the workspace contains no HTTP or gRPC server framework
+  at all (`axum`, `actix-web`, `hyper`, `tonic` are all absent from
+  `Cargo.lock`), and `rustynet-control` has no network listener — its binary
+  is a 49-line scaffold (`crates/rustynet-control/src/main.rs`).
+  - **CORRECTION 2026-07-27.** This control previously read "there is no
+    separate TLS stack and no TLS library is a workspace dependency". The
+    second half was false. `rustls` 0.23.41 **is** a workspace dependency
+    (`Cargo.lock:1278`), pulled in by `ureq` 2.12.1
+    (`crates/rustynet-mcp/Cargo.toml:29`); `rustynet-mcp` is a member of the
+    security-gated workspace (`Cargo.toml:20`, deliberately not in the
+    `exclude` list) and makes real outbound HTTPS calls through it
+    (`crates/rustynet-mcp/src/bin/ai_agent.rs:750`). TLS is therefore inside
+    this project's supply-chain, SBOM, and CVE-triage scope. Do not use this
+    control to justify skipping TLS advisories.
+  - **UNMET REQUIREMENT — code gap, not a doc gap. Do not delete.**
+    `Requirements.md:166` mandates protecting the control plane with TLS 1.3.
+    Nothing in the tree negotiates TLS 1.3. The only enforcement code —
+    `ControlPlaneTransportPolicy::validate_negotiated_tls`
+    (`crates/rustynet-control/src/lib.rs:209`) and
+    `ControlPlaneCore::validate_transport_security` (`:2327`) — receives the
+    "negotiated" version as a caller-supplied argument instead of observing a
+    real handshake, and its only callers are its own unit test (`:7010`,
+    `:7016`; the single `#[cfg(test)]` boundary in that file is line 4355).
+    The requirement stands and is unsatisfied; closing it is code work.
 - Signed membership updates (gossip convergence, `membership apply-update`)
   are authenticated by ed25519 signature verification against the current
   approver set before being applied — fail closed on any verification error,
@@ -32,7 +56,9 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
   produced). A device pulling a bundle accepts it only when: the §6.B pinned
   membership owner public key is an Owner in the attested approver set AND
   its private-key holder actually signed the attestation (roster presence
-  alone is rejected); valid signatures from the attested state's active
+  alone is rejected — but this list is NOT exhaustive; see the pin-rotation
+  grace path recorded below, which the original wording omitted); valid
+  signatures from the attested state's active
   approvers, one per DISTINCT signing key (no two approver ids may share a
   key — `MembershipState::validate` rejects that roster shape outright, so it
   can never even acquire a state root, let alone be signed or persisted), meet
@@ -56,6 +82,27 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
   implementation, three independent adversarial reviews, and the fix each
   produced — recorded in
   [`operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md).
+
+  **ADDED 2026-07-27 — second accept path (pin-rotation grace), previously
+  undocumented here.** The acceptance list above read as exhaustive but omitted
+  a real accept path that the code implements and self-documents. A pinned key
+  that matches a **Revoked** former Owner in the attested state is still
+  accepted, provided a currently-Active Owner co-signed the same attestation
+  (`crates/rustynet-control/src/membership.rs:1308-1346`; the pin is classified
+  Active-vs-Revoked at `:1318-1319`, and the grace check — reject only when the
+  pin is not an active owner AND no active owner co-signed — is at `:1338-1346`.
+  The design note and its stated residual risk are at `:1207-1213`.) The code
+  states the residual risk plainly and this document should too: a **compromised
+  old owner key can still satisfy this grace path on any device that never
+  received the new pin.** That is a second residual limit alongside the
+  watermark-deletion TOFU reset described below — the phrase "the honest
+  residual limit" in that paragraph is scoped to stale-cache rollback only and
+  must not be read as the complete residual set for this control.
+  Verified against code 2026-07-27; the rest of this control's attestation,
+  quorum, freshness, fork-detection, and pubkey-uniqueness claims were
+  independently re-verified and hold as written
+  (`membership.rs:1214-1381` for the verifier, `:237-260` for the
+  pubkey-uniqueness gate).
 
   **Stale-cache rollback — CLOSED (2026-07-20).** Epoch-regression
   protection previously read its floor fresh from the client's OWN local
@@ -255,15 +302,50 @@ running daemon:
 
 2. **Bundle-pull endpoint default-deny.** The `anchor.bundle_pull`
    endpoint defaults to loopback bind
-   (`127.0.0.1:51822`). LAN-IP bind requires an explicit
-   `--anchor-bundle-pull-lan-bind` flag and documented operator
+   (`127.0.0.1:51822` — verified, `crates/rustynetd/src/daemon.rs:193`).
+   LAN-IP bind requires explicit opt-in and documented operator
    acknowledgement. Non-loopback packets MUST be dropped when the
    endpoint is loopback-only.
+   - **CORRECTION 2026-07-27.** This control previously named an
+     `--anchor-bundle-pull-lan-bind` flag. **No such flag exists** — it
+     appears nowhere in the codebase, only in this document and in
+     `operations/active/AnchorNodeRoleDesign_2026-05-21.md:121,276`. An
+     operator following the old wording would get an unknown-argument
+     error. The real opt-in is `--anchor-bundle-pull-allow-lan <true|false>`
+     (`crates/rustynetd/src/main.rs:2903-2919`), which takes a mandatory
+     value rather than being a bare flag, or the environment variable
+     `RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN`
+     (`crates/rustynetd/src/daemon.rs:199`). The bind-time refusal itself is
+     real and fail-closed (`daemon.rs:966-976`, called from `:1271`, `:9957`,
+     `:11056`).
+   - **Scope note on "non-loopback packets MUST be dropped" (verified
+     2026-07-27).** This holds today only by kernel socket semantics — the
+     listener is bound to `127.0.0.1` (`daemon.rs:1275`). There is no
+     application-layer peer check: `poll_anchor_bundle_pull_once`
+     (`daemon.rs:1292-1331`) reads `peer_addr` but only logs it, and no
+     nftables/pf rule scopes port 51822. Consequently, once
+     `--anchor-bundle-pull-allow-lan true` is set, the sole remaining gate is
+     the shared bearer token (`daemon.rs:1054`, `constant_time_ascii_eq`, inside
+     `write_anchor_bundle_pull_response_with_have` at `:1047`).
 
 3. **Token-gated bundle-pull + enrollment redemption.** Anchor
    bundle-pull and anchor-hosted enrollment redemption MUST share a
    single-use enrollment-token ledger so a token cannot be consumed
    for both. Replay of a consumed token MUST be rejected fail-closed.
+   - **UNMET REQUIREMENT — code gap, not a doc gap. Do not delete.**
+     Verified 2026-07-27: bundle-pull does **not** use the single-use
+     enrollment-token ledger. It authenticates with a static, long-lived
+     bearer token read from a file
+     (`crates/rustynetd/src/daemon.rs:195` for the default path
+     `/var/lib/rustynet/anchor-bundle-pull.token`, loader at `:978-993`,
+     constant-time comparison at `:1054`), so there is no consumption, no ledger
+     sharing, and no replay rejection on this surface. The single-use ledger
+     that this control describes does exist and is production-wired, but only
+     for enrollment-token redemption
+     (`crates/rustynetd/src/enrollment_token.rs:833-867`, reached from
+     `daemon.rs:8268`). §3 control 2 already acknowledges this gap; the two
+     statements are now cross-referenced rather than left to contradict each
+     other.
 
 4. **Anchor secret custody.** The anchor enrollment-endpoint HMAC
    secret MUST be stored in OS-secure custody:
@@ -274,6 +356,30 @@ running daemon:
    - Windows: DPAPI-protected `anchor_enrollment_secret.dpapi` blob
      under `C:\ProgramData\RustyNet\secrets\`; ACL must be
      SYSTEM/Administrators-only and validated by the W4 verifier.
+   - **UNMET REQUIREMENT ON ALL THREE PLATFORMS — code gap, not a doc gap.
+     Do not delete.** Verified 2026-07-27 by grepping each named artifact.
+     `anchor_enrollment_secret.cred` and `anchor_enrollment_secret.dpapi`
+     appear **nowhere in the codebase or in any systemd unit** — only in this
+     document and in
+     `operations/active/AnchorNodeRoleDesign_2026-05-21.md:192,209,278`. The
+     macOS Keychain label `rustynet.anchor_enrollment_secret` has exactly one
+     occurrence in Rust, `crates/rustynet-crypto/src/lib.rs:2456`, and it is a
+     **`#[cfg(test)]` fixture** (test module begins at `:1723`) inside
+     `validate_macos_keychain_label_accepts_canonical_descriptors` — it asserts
+     only that the string passes a charset/length validator. No Keychain item
+     with that service is ever stored or read. Do not mistake that test for
+     custody evidence.
+     What actually ships, on every platform, is a **plaintext 32-byte file at
+     mode 0600** — i.e. exactly the "plaintext custody" this control says is
+     rejected: `RUSTYNET_ENROLLMENT_SECRET=/var/lib/rustynet/keys/enrollment.secret`
+     (`scripts/systemd/rustynetd.service:27`), loaded by
+     `enrollment_token::load_secret` (`crates/rustynetd/src/enrollment_token.rs:720-749`),
+     consumed at `crates/rustynetd/src/daemon.rs:8239`, and generated as a
+     plain file on macOS too
+     (`scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh:622-670`). The only
+     `LoadCredentialEncrypted=` entry in the Linux unit is
+     `wg_key_passphrase` (`scripts/systemd/rustynetd.service:66`), not the
+     anchor enrollment secret.
 
 5. **Anchor downgrade is fail-closed.** A bundle that removes anchor
    capabilities from a previously-anchored node without a higher epoch
@@ -375,10 +481,20 @@ Required controls for every role transition:
     operators can verify resolved role state without elevation.
 
 Enforcement points map to verification tests in
-`scripts/ci/role_taxonomy_gates.sh`,
-`scripts/ci/role_transition_audit_gates.sh`, and
-`scripts/ci/blind_exit_irreversibility_gates.sh` (new gates added
-in D12).
+`scripts/ci/role_taxonomy_gates.sh` and
+`scripts/ci/role_transition_audit_gates.sh` (added in D12).
+
+**CORRECTION 2026-07-27.** This paragraph previously also listed
+`scripts/ci/blind_exit_irreversibility_gates.sh`. **That script does not
+exist** — it is absent from `scripts/ci/` and from the whole repository,
+while three documents assert it (this file, plus
+`operations/active/NodeRoleTaxonomy_2026-05-21.md:417` and
+`operations/active/LiveLabSecurityTestCoverage_2026-06-22.md:229`, where the
+row carrying it is marked as passing). Control 2 above (BlindExit
+irreversibility) therefore has **no gate-level verification method**, which
+is a violation of the "each control must have an enforcement point in code
+and a verification method" rule stated in §6.C. The control itself stands;
+the missing gate is code/CI work.
 
 ## 6.E) Service-Hosting Role Controls (`nas`, `llm`)
 
@@ -401,6 +517,25 @@ signatures.
    `rustynet-nas` / `rustynet-llm-gateway`, and the
    `inet rustynet_svc_<service>` nftables scope table
    (`linux_runtime_nftables::render_service_port_tunnel_scope_table`).
+   - **ENFORCEMENT NOT ACTUALLY WIRED (verified 2026-07-27) — code gap, not a
+     doc gap. Do not delete the control.** All three named enforcement points
+     exist as production code but have **zero production callers**:
+     `validate_tunnel_only_bind` (`crates/rustynetd/src/service_exposure.rs:169`)
+     and `validate_loopback_only_bind` (`:207`) are invoked only from that
+     file's own `#[cfg(test)]` module (boundary `:596`; calls at `:662`, `:674`,
+     `:682`, `:693`, `:704`), and
+     `render_service_port_tunnel_scope_table`
+     (`crates/rustynetd/src/linux_runtime_nftables.rs:437`) has exactly one
+     non-definition reference in the repo — a `rg` presence check in
+     `scripts/ci/service_hosting_role_gates.sh:35`.
+     Neither service crate even depends on `rustynetd`
+     (`crates/rustynet-nas/Cargo.toml`, `crates/rustynet-llm-gateway/Cargo.toml`).
+     Each binary instead ships its own **weaker** check —
+     `validate_tunnel_shaped_bind` (`crates/rustynet-nas/src/main.rs:185`,
+     `crates/rustynet-llm-gateway/src/main.rs:163`) — which rejects only
+     unspecified / loopback / multicast and has **no tunnel-address list**.
+     Consequence: today a NAS or LLM listener bound to a LAN or public IP
+     passes startup validation, which is precisely the state E1 forbids.
 
 2. **E2 — Default-deny per-peer service authorisation.** Being inside
    the tunnel is necessary, not sufficient. Every new service session
@@ -412,10 +547,27 @@ signatures.
    access). Identity comes from the authenticated tunnel source
    resolved against signed state — never from a client-supplied
    header or key; there is no API key.
-   Enforcement: `service_exposure::evaluate_service_access`,
-   `rustynet_policy::context_matches`, per-frame grant re-checks in
-   both service binaries (deny-all when no signed access state is
-   materialised).
+   Enforcement: `service_exposure::evaluate_service_access`, the
+   (crate-private) `context_matches` helper in `rustynet-policy`, per-frame
+   grant re-checks in both service binaries (deny-all when no signed access
+   state is materialised).
+   - **VERIFIED WIRED 2026-07-27 — this is the one §6.E control that is
+     genuinely enforced at runtime.** `evaluate_service_access`
+     (`crates/rustynetd/src/service_exposure.rs:257`) is reached in production
+     via `crates/rustynetd/src/service_access_state.rs:90` ←
+     `materialize_service_access_state` (`daemon.rs:4512`), called from
+     `daemon.rs:4938`, `:7536`, `:8489`, `:9051`; both binaries then enforce
+     per-frame (`crates/rustynet-nas/src/main.rs:307-317`,
+     `crates/rustynet-llm-gateway/src/main.rs:460`). Default-deny is real and
+     doubly enforced: `evaluate_with_membership` (`:224`) falls through past the
+     rule loop to a bare `Decision::Deny`
+     (`crates/rustynet-policy/src/lib.rs:255`) and denies outright when
+     membership does not resolve (`:229-231`); and an empty `contexts` list
+     cannot match a service context — `context_matches` returns
+     `!candidate.is_service_context()` for the legacy empty form (`:386-397`).
+     One naming correction: the path `rustynet_policy::context_matches` given
+     in the old wording is not reachable — `context_matches`
+     (`crates/rustynet-policy/src/lib.rs:386`) is private, not `pub`.
 
 3. **E3 — Service teardown precedes capability revocation.** On
    `serves_nas`/`serves_llm` removal the daemon closes the listener
@@ -428,6 +580,17 @@ signatures.
    and the severance of every active session; the LLM gateway
    additionally re-checks grants per token event so revocation cuts
    in-flight generations mid-stream.
+   - **ENFORCEMENT NOT ACTUALLY WIRED (verified 2026-07-27) — code gap, not a
+     doc gap. Do not delete the control.** `ServiceExposureController`
+     (`crates/rustynetd/src/service_exposure.rs:364`), `begin_revocation`
+     (`:511`) and `capability_release_ready` (`:538`) are production code, but
+     **the controller is never constructed outside tests**: every
+     `ServiceExposureController::new` call site is inside the `#[cfg(test)]`
+     module (`:803`, `:889`, `:906`, `:934`; boundary `:596`). The
+     teardown-before-revoke state machine is therefore a unit-tested library,
+     not an active runtime control. The per-token-event grant re-check in the
+     LLM gateway IS real (`crates/rustynet-llm-gateway/src/main.rs:460`) and is
+     what actually limits exposure today.
 
 4. **E4 — App-layer token cannot exceed signed policy.** Any
    node-issued service session token is short-lived, single-audience,
@@ -437,8 +600,23 @@ signatures.
    expiry. Tokens are defence-in-depth only — never an identity
    source, never a substitute for the tunnel.
    Enforcement: `rustynet_llm_gateway::session::verify_session_token`
-   (signature → validity window → peer/audience binding → current
+   (signature → validity window → audience/peer binding → current
    policy decision, in that order).
+   - **ENFORCEMENT NOT ACTUALLY WIRED (verified 2026-07-27) — code gap, not a
+     doc gap. Do not delete the control.** `verify_session_token`
+     (`crates/rustynet-llm-gateway/src/session.rs:152`) exists and implements
+     exactly the ordering claimed (`:166-168` signature, `:169-171` validity
+     window, `:172-177` audience then peer, `:178-180` current policy). But
+     **neither it nor `issue_session_token` is ever called from the gateway
+     binary** — the only references repo-wide are the definitions, that file's
+     own tests, and a `rg` presence check in
+     `scripts/ci/service_hosting_role_gates.sh:34`. `main.rs` handles
+     `--session-signing-key` by stat-validating the file only
+     (`crates/rustynet-llm-gateway/src/main.rs:146-147`, `:181-208`); the key is
+     never loaded and no session token is ever minted or verified at runtime.
+     Live authorisation rests entirely on the E2 access-dir grant check.
+     Note this means E4's "defence-in-depth" layer is currently absent, so E2
+     is load-bearing alone.
 
 Inherited essentials restated for the category: capability grant
 requires the owner signing key (no self-promotion); deploy-before-
@@ -453,7 +631,27 @@ Enforcement points map to verification tests in
 `scripts/ci/service_hosting_role_gates.sh`,
 `scripts/ci/nas_default_deny_gates.sh`,
 `scripts/ci/llm_default_deny_gates.sh`, and
-`scripts/ci/llm_exit_coexistence_gates.sh` (D13).
+`scripts/ci/llm_exit_coexistence_gates.sh` (D13). All four scripts exist
+(verified 2026-07-27).
+
+**METHODOLOGICAL WARNING, added 2026-07-27 — read before trusting a green
+§6.E gate.** These gates verify E1/E3/E4 with **symbol-presence greps**, not
+with call-path assertions:
+
+```
+rg -q 'validate_tunnel_only_bind' crates/rustynetd/src/service_exposure.rs   # E1
+rg -q 'capability_release_ready'  crates/rustynetd/src/service_exposure.rs   # E3
+rg -q 'verify_session_token'      crates/rustynet-llm-gateway/src/session.rs # E4
+```
+(`scripts/ci/service_hosting_role_gates.sh:29-35`)
+
+A grep for a symbol's own definition, in its own defining file, passes whether
+or not anything calls it. That is exactly how E1, E3, and E4 stayed green in CI
+while having zero production call sites — the accompanying `run_required_test`
+lines exercise the functions as isolated units, never through the daemon or the
+service binaries. A gate of this shape proves a symbol exists; it cannot prove a
+control is enforced. Any future control added here needs a
+reachability/integration assertion, not a presence check.
 
 ## 7) Phase Mapping
 - Phase 1: baseline standards and threat model defined.

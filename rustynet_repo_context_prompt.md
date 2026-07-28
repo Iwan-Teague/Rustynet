@@ -10,12 +10,27 @@
 > extends that material (plus `documents/CODE_MAP.md`, the doc indexes, and file:line
 > specifics) into one consolidated read. Update this doc when the project's architecture,
 > crate layout, or doc structure changes — not when a specific bug or ledger status changes.
+>
+> **Verified against the code 2026-07-27** (adversarial pass; every ✅, every file:line, every
+> command, and every MCP tool signature re-checked against committed code, with the documented
+> `xtask` commands actually executed). Corrections landed in §2, §4, §5, §6, §7, §8, §10, §11,
+> §12, §13, §14, §15, §16, §17. If you find a claim here that the code contradicts, fix the
+> claim in the same change — this file's only job is to be true today, so a stale line in it is
+> worse than a missing one.
 
 ═══════════════════════════════════════════
 1) MISSION & SCOPE
 ═══════════════════════════════════════════
 Rustynet is a production-grade, security-first Rust mesh VPN — a Cargo workspace
-(`edition = "2024"`, `resolver = "2"`, `unsafe_code = "forbid"` workspace-wide). It is being
+(`edition = "2024"`, `resolver = "2"`, and `unsafe_code = "forbid"` declared in
+`[workspace.lints.rust]`). The forbid is inherited by every crate carrying `[lints] workspace =
+true`, which is all of them except three documented cases: `rustynetd` downgrades it to
+`deny` at the manifest level so one scoped `#[allow(unsafe_code)]` module
+(`macos_utun_helper_unsafe`, the SCM_RIGHTS fd-passing primitives) can compile — every other
+`rustynetd` module still pins `#![forbid(unsafe_code)]` per file; `rustynet-windows-native`
+does not inherit the workspace lints at all and legitimately contains ~94 `unsafe` blocks
+(Win32 FFI — the sanctioned OS-boundary exception); `rustynet-lab-monitor` is outside the
+workspace entirely. Do NOT assume "no unsafe anywhere". It is being
 built to the same bar as Tailscale/NetBird-class overlay networks: signed membership state,
 default-deny policy, fail-closed trust handling, WireGuard behind a replaceable backend
 adapter, no custom cryptography, no custom VPN protocol.
@@ -84,8 +99,8 @@ the current control catalog with both columns filled in.
 6. The active scope document for the task
 7. Relevant runbooks under `documents/operations/`
 
-**The docs tree is large (196 files at last count) and actively curated — don't hand-enumerate
-it, use the tools built for it:**
+**The docs tree is large (310 files as of 2026-07-27, per `list_documents`) and actively curated
+— don't hand-enumerate it, use the tools built for it:**
 - `mcp__rustynet-repo-context__get_read_order(task)` — hands you the exact ordered doc list for
   a described task (e.g. "add a relay feature", "fix a Windows killswitch bug").
 - `mcp__rustynet-repo-context__list_documents(filter?)` — every `.md` in the repo, grouped by
@@ -145,6 +160,16 @@ identically to the other in the same change.
   `rustynet-security-auditor` skill (attack catalog, audit checklist, lab playbooks).
 - `profiles/live_lab/` — live-lab impairment/topology profiles.
 - `artifacts/` — generated evidence/SBOM/provenance outputs — do not hand-edit.
+- `gui/node-map-tool/` — tracked operator-side UI tool with its OWN workspace + `Cargo.lock`,
+  deliberately `exclude`d from the security-gated workspace (UI dependency trees / license
+  surface). Not covered by `--workspace` gates. Same treatment as
+  `crates/rustynet-lab-monitor/`.
+- `bin/` — **gitignored** drop point for prebuilt MCP server binaries
+  (`rustynet-mcp-{repo-context,gate-runner,lab-state,ai-agent}`) that `mcp/mcp.json` launches.
+  `scripts/ci/check_mcp_binaries_fresh.sh` fails loud when one is stale — rebuild rather than
+  debugging a stale server's answers.
+- `state/` — gitignored live-lab runtime scratch (run logs, known_hosts, profiles). Never source
+  of truth, never cite it as evidence.
 - `start.sh` — interactive setup/menu wizard. `rust-toolchain.toml` pins the toolchain.
   `deny.toml` configures `cargo deny`.
 
@@ -176,10 +201,10 @@ section is the layer-level orientation.
 **Backend abstraction layer** (the WireGuard adapter boundary):
 | Crate | Owns |
 |---|---|
-| `rustynet-backend-api` | The `Backend` trait and abstract types. No backend internals. |
-| `rustynet-backend-wireguard` | Kernel WireGuard adapter (wraps `boringtun`/`rustynet-tun`). |
-| `rustynet-backend-userspace` | Userspace (boringtun) backend. |
-| `rustynet-backend-stub` | Deterministic test stub backend. |
+| `rustynet-backend-api` | The `TunnelBackend` trait (`src/lib.rs:198` — NOT named `Backend`) and abstract types. No backend internals. |
+| `rustynet-backend-wireguard` | The one production WireGuard adapter crate, holding BOTH the kernel-path command adapters (`linux-wireguard`, `macos-wireguard`, `windows-wireguard-nt`) and the boringtun userspace-shared backends (`LinuxUserspaceSharedBackend`, `MacosUserspaceSharedBackend`). Wraps vendored `boringtun` + `rustynet-tun`. This is the crate `rustynetd` actually depends on for every platform. |
+| `rustynet-backend-userspace` | A 228-line re-export shim: `UserspaceBackend` delegates to `rustynet-backend-wireguard`'s `{Linux,Macos}UserspaceSharedBackend`. **No workspace crate depends on it** — `rustynetd` reaches the shared backends directly. Do not assume the macOS userspace dataplane flows through here. |
+| `rustynet-backend-stub` | Deterministic test stub backend. **No workspace crate depends on it** either; it exists for backend-contract conformance tests. |
 
 **Platform + UX + tooling layer:**
 | Crate | Does |
@@ -193,41 +218,74 @@ section is the layer-level orientation.
 | `rustynet-netns-probe` | LAB TOOLING (not shipped): the Rust-native STUN responder + NAT mapping/filtering probes the `--node` cross-network netns simulator runs on-guest. `std`-only, offline-buildable. STUN wire is byte-pinned to `rustynetd`'s `stun_client.rs`. |
 | `rustynet-lab-monitor` | The pixelated TUI live-lab monitor. Excluded from the main workspace; build separately. |
 
-**Dependency chains** (who breaks when you patch the shared crate):
-- `rustynet-control` ← `rustynetd`, `rustynet-cli`, `rustynet-operator`, `rustynet-mcp`
-- `rustynet-backend-api` ← `rustynet-backend-{wireguard,userspace,stub}` ← `rustynetd`
-- `rustynet-policy` ← `rustynetd` (policy eval is daemon-side)
-- `rustynet-crypto` ← `rustynet-control`, `rustynetd`, `rustynet-cli`
+**Dependency chains** — exact reverse-dependency sets, read out of `crates/*/Cargo.toml`
+(who breaks when you patch the shared crate):
+- `rustynet-control` ← `rustynetd`, `rustynet-cli`, `rustynet-relay`. (NOT `rustynet-operator`
+  and NOT `rustynet-mcp` — neither depends on any internal crate.)
+- `rustynet-policy` ← `rustynetd`, `rustynet-control`, `rustynet-cli`, `rustynet-llm-gateway`.
+  Policy eval is NOT daemon-only: `rustynet-control` and the LLM gateway both link it.
+- `rustynet-crypto` ← `rustynet-control`, `rustynetd`, `rustynet-cli`, `rustynet-nas`.
+- `rustynet-backend-api` ← `rustynet-backend-{wireguard,userspace,stub}`; but only
+  `rustynet-backend-api` + `rustynet-backend-wireguard` are consumed by `rustynetd`.
+  `backend-userspace` and `backend-stub` have no workspace consumers at all.
+- `rustynet-windows-native` ← `rustynetd`, `rustynet-control`, `rustynet-crypto`,
+  `rustynet-relay`, `rustynet-backend-wireguard` (mostly under `[target.'cfg(windows)']`).
+  Note `rustynet-cli` does NOT depend on it directly.
+- `rustynet-cli` ← nothing (top of the graph); it depends on almost everything, so it is the
+  crate most often broken by a domain-crate API change.
 
 **CRITICAL BOUNDARY:** domain crates (`control`, `policy`, `dns-zone`, `crypto`) MUST NOT import
-backend or WireGuard types. The backend trait lives in `rustynet-backend-api`; all
-WireGuard-specific code lives behind it. Violation is blocked by
-`scripts/ci/check_backend_boundary_leakage.sh`.
+backend or WireGuard types. The backend trait (`TunnelBackend`) lives in
+`rustynet-backend-api`; all WireGuard-specific code lives behind it. Violation is blocked by
+`scripts/ci/check_backend_boundary_leakage.sh` (a 2-line wrapper that `exec`s
+`cargo run -p rustynet-cli --bin check_backend_boundary_leakage`).
 
 **Release profile note:** `[profile.release]`/`[profile.bench]` enable thin LTO and pin
 `codegen-units = 1` for the hot crypto/dataplane crates (`boringtun`,
 `rustynet-backend-wireguard`, `rustynet-relay`) — a perf tuning, keep it only while the
 perfprobe/criterion numbers justify the build-time cost.
 
-Use `mcp__rustynet-repo-context__get_crate_structure()` and `get_crate_dependencies()` for the
-always-fresh version of this table, and `which_crate(symbol_or_concept)` to jump straight to
-the owning crate from a symbol or concept name.
+Tool caveats, verified by calling them — do not treat these three as "always fresh":
+- `get_crate_structure()` returns a **hand-maintained static list of 17 crates** compiled into
+  `crates/rustynet-mcp/src/bin/repo_context.rs` (`static CRATES`, ~line 1888). It is missing
+  `rustynet-nas`, `rustynet-llm-gateway`, `rustynet-advisor`, `rustynet-netns-probe`, and
+  `rustynet-lab-monitor`. The table above is more complete than the tool.
+- `get_crate_dependencies(crate)` **requires a crate name** and IS parsed live from
+  `crates/*/Cargo.toml` — this one is trustworthy. Call it as
+  `get_crate_dependencies(crate: "rustynet-backend-api")`.
+- `which_crate(path)` takes a **repo-relative FILE PATH**, not a symbol or concept. It looks for
+  a literal `crates/<name>/` segment. `which_crate("MembershipState")` returns
+  "No owning crate" — verified. To go from a symbol to its crate, grep, or use `find_in_docs` /
+  `documents/CODE_MAP.md`.
 
 ═══════════════════════════════════════════
 7) KEY DOMAIN TYPES & ROLE TRANSITIONS
 ═══════════════════════════════════════════
-| Type | File | Notes |
+Exact type names and file:line, verified against the code. Several of these do NOT have the
+obvious name — use the real one or your grep will come up empty.
+
+| Type | File:line | Notes |
 |---|---|---|
-| `NodeRole` (Client/Admin/Exit/BlindExit/Relay/Anchor/Nas/Llm) | `rustynet-control/src/roles.rs` | 8 roles, used everywhere |
-| `Capability` enum | `rustynet-control/src/roles.rs` | Sub-capabilities per role |
-| `RoleTransition` | `rustynet-control/src/role_presets.rs` | Transition plan: identity/local-only/signed/blocked/irreversible |
-| `MembershipState` | `rustynet-control/src/membership.rs` | Signed membership bundle, peer list, epoch, watermark |
-| `SignedUpdate` (enum) | `rustynet-control/src/membership.rs` | Revoke/Restore/RotateKey/SetCapabilities variants |
-| `DefaultDenyPolicy` | `rustynet-policy/src/eval.rs` | Default-deny ACL evaluator |
-| `Backend` trait | `rustynet-backend-api/src/lib.rs` | Tunnel backend abstraction — WireGuard lives behind it |
+| `RolePreset` (Client/Admin/Exit/BlindExit/Relay/Anchor/Nas/Llm) | `rustynet-control/src/role_presets.rs:34` | **This** is the canonical 8-role user-facing enum. |
+| `PrimaryRole` (Admin/Client/BlindExit) | `rustynet-control/src/role_presets.rs:134` | The local primary role a preset maps down to. |
+| `Capability` enum | `rustynet-control/src/role_presets.rs:178` | Preset-composition capabilities: `ServesExit`, `ServesRelay`, `AnchorGossipSeed`, `AnchorBundlePull`, `AnchorEnrollmentEndpoint`, `AnchorRelayColocation`, `AnchorPortMappingAuthoritative`, `ServesNas`/`ServesLlm`. Operational metadata, NOT trust authority. |
+| `RoleCapability` enum | `rustynet-control/src/roles.rs:6` | A *second*, distinct enum — the membership-wire capability that enters the canonical signed pre-image (`Anchor`, `Client`, `ExitServer`, `BlindExit`, `RelayHost`, `EntryRelay`, `Anchor*`). **Append-only: reordering variants changes the signed pre-image.** `roles.rs` contains NO role enum, only this + `ANCHOR_CAPABILITIES`. |
+| `TransitionPlan` / `TransitionKind` | `rustynet-control/src/role_presets.rs:472` / `:429` | The transition plan + its outcome kind: `Identity`/`LocalOnly`/`SignedMembership`/`Blocked(reason)`/`Irreversible(reason)`. There is no type named `RoleTransition`. |
+| `MembershipState` | `rustynet-control/src/membership.rs:175` | Signed membership bundle, peer list, epoch, watermark. |
+| `MembershipOperation` (enum) | `rustynet-control/src/membership.rs:373` | `AddNode`/`RemoveNode`/`RevokeNode`/`RestoreNode`/`RotateNodeKey`/`SetNodeCapabilities`/`RotateApprover`/`SetQuorum`. There is no type named `SignedUpdate`. |
+| `SignedMembershipUpdate` | `rustynet-control/src/membership.rs:581` | The signed wrapper an operation travels in. |
+| `PolicySet` / `ContextualPolicySet` | `rustynet-policy/src/lib.rs:126` / `:195` | The default-deny ACL evaluators (`evaluate`, `evaluate_with_membership`) — both fall through to `Decision::Deny`. There is no `eval.rs` and no `DefaultDenyPolicy`; `rustynet-policy` is a single `lib.rs`. |
+| `TunnelBackend` trait | `rustynet-backend-api/src/lib.rs:198` | Tunnel backend abstraction — WireGuard lives behind it. Not named `Backend`. |
+
+**Beware three unrelated `NodeRole` enums.** None of them lives in `rustynet-control`:
+`rustynetd/src/daemon.rs:1384` (daemon role), `rustynet-cli/src/vm_lab/orchestrator/role.rs:12`
+(lab-orchestrator role, includes `Entry`/`Aux`/`Extra`/`Custom`), and
+`rustynet-operator/src/role.rs:5` (operator/host role). If a task says "the role enum", pin down
+which layer first — the domain-layer one is `RolePreset`.
 
 **Role transitions are not just string changes — the side effects matter more than the role
-field.** Rules (verify against `mcp__rustynet-repo-context__get_role_transition()` or
+field.** Rules (verify against `mcp__rustynet-repo-context__get_role_transition(from, to,
+platform?)` — both `from` and `to` are REQUIRED, a no-arg call errors — or read
 `rustynet-control/src/role_presets.rs` before writing any role-transition code):
 - client→admin: signed, adds `serves_admin`
 - admin→exit: signed, adds `serves_exit` (also deploys the relay service if `serves_relay`)
@@ -250,29 +308,34 @@ stage). Both must exist before a control counts as "done."
 
 | § | Control | Enforcement point | Verifier |
 |---|---|---|---|
-| 4.A | Signed state validation before mutation | `rustynet-control/src/membership.rs` — `verify()` before `apply()` | unit test + live lab |
-| 4.B | Anti-replay watermark | `rustynet-control/src/watermark.rs` — reject stale epochs | unit test |
-| 4.C | Key custody: OS secure storage or encrypted-at-rest | `rustynet-crypto/src/key_custody.rs` — Keychain/DPAPI or encrypted file + `0o600` | key_custody stage |
+| 4.A | Signed state validation before mutation | `rustynet-control/src/membership.rs:910` — `apply_signed_update()` runs `state.validate()`, network-id/expiry/skew/prev-state-root/epoch-chain checks, then `verify_membership_signatures()` (`:938`), and only then reduces. There is no `verify()`/`apply()` pair to grep for. | unit test + live lab |
+| 4.B | Anti-replay watermark | `rustynet-control/src/membership.rs:1413` `membership_watermark_is_replay()`, `:1426` `load_membership_watermark()`, `:1816` `verify_epoch_tagged_bundle()`; per-epoch policy in `rustynet-control/src/key_rotation.rs` (`PerEpochReplayWatermark`). **There is no `watermark.rs`.** | unit test |
+| 4.C | Key custody: OS secure storage or encrypted-at-rest | `rustynet-crypto/src/lib.rs:311`/`:331` (`store_in_macos_keychain`/`load_from_macos_keychain`, `SecKeychain` at `:21`) + `validate_key_custody_permissions`; per-OS enforcement in `rustynetd/src/{linux,macos,windows}_key_custody.rs` (`0o600` at `linux_key_custody.rs:183`). **There is no `rustynet-crypto/src/key_custody.rs`** — that crate is a single `lib.rs`. | key_custody stage |
 | 4.D | No secrets in logs | `rustynetd/src/secret_log_audit.rs` — greps the daemon journal for key material | secrets_not_in_logs stage |
-| 4.E | Default-deny ACL | `rustynet-policy/src/eval.rs` — empty/missing → deny | policy_default_deny audit |
+| 4.E | Default-deny ACL | `rustynet-policy/src/lib.rs:131` `PolicySet::evaluate` and `:152` `evaluate_with_membership` — no matching rule falls through to `Decision::Deny`. **There is no `eval.rs`.** | policy_default_deny audit |
 | 4.F | Fail-closed on trust state unavailable | `rustynetd/src/phase10.rs` — error on missing state, never default | runtime validation |
 | 4.G | One hardened execution path, no runtime fallback | all security paths — no try-or-downgrade | code review |
 | 4.H | Privileged helper argv allowlist | `rustynetd/src/privileged_helper.rs` — `validate_request()` | helper_allowlist audit |
-| 4.I | `blind_exit` irreversibility | `rustynet-control/src/role_presets.rs` — `preview_next_state()` rejects `blind_exit`→anything | blind_exit_reversal audit |
+| 4.I | `blind_exit` irreversibility | `rustynet-control/src/role_presets.rs:537-545` — leaving `RolePreset::BlindExit` returns `TransitionKind::Blocked("blind_exit is immutable; factory reset …")`. (`preview_next_state()` is a *membership* fn, `membership.rs:787`, not a role_presets one.) | blind_exit_reversal audit |
 | 4.J | Enrollment token replay prevention | `rustynetd/src/enrollment_token.rs` — token consumption idempotent | enrollment_replay audit |
 | 4.K | Gossip revoked-peer re-admission denial | `rustynetd/src/peer_gossip.rs` — reject bundles from revoked sources | gossip_revoked_readmit audit |
 | 4.L | Revoked peer dataplane denial | `rustynetd/src/revoked_peer_denied_audit.rs` — NoopBackend eval | revoked_peer_denied audit |
 | 4.M | Membership signature forgery rejection | `rustynetd/src/membership_signature_audit.rs` | signature_forgery audit |
 | 4.N | Membership revoke delayed-apply | `rustynetd/src/membership_revoke_audit.rs` — 4 delayed-apply + 2 negative cases | membership_revoke audit |
 | 4.O | Hello-limiter flood cap | `rustynet-relay/src/hello_limiter_audit.rs` — DOS-1 | hello_limiter_flood audit |
-| 4.P | Runtime ACL integrity | `rustynetd/src/{linux,macos,windows}_runtime_acls.rs` | runtime_acls stage |
+| 4.P | Runtime ACL integrity | `rustynetd/src/linux_runtime_acls.rs`, `macos_runtime_acls.rs`, and — note the different name — `windows_registry_acls.rs`. There is no `windows_runtime_acls.rs`. | runtime_acls stage |
 | 4.Q | Service hardening | `rustynetd/src/{linux,macos,windows}_service_hardening.rs` | service_hardening stage |
 | 4.R | Mesh state integrity | `rustynetd/src/{linux,macos,windows}_mesh_status.rs` | mesh_status stage |
 
 Every control needs at least one unit test + one live-lab stage (except the planned NAS/LLM
-roles, which don't have live-lab stages yet). Use
-`mcp__rustynet-repo-context__get_security_controls()` and `get_security_findings()` for the
-always-fresh version, cross-checked against `documents/SecurityMinimumBar.md` itself.
+roles, which don't have live-lab stages yet). The verifier names above are stage *families*: the
+real stage IDs in `rustynet-cli/src/live_lab_stage_registry.rs` are platform-prefixed and often
+have a `validate_` twin — e.g. `linux_key_custody` / `validate_linux_key_custody`,
+`windows_dpapi_key_custody`, `macos_keychain_key_custody`, `linux_privileged_helper_allowlist`,
+`{linux,macos,windows}_membership_signature_forgery`. Grep the registry for the exact ID before
+naming a stage in a command. Use `mcp__rustynet-repo-context__get_security_controls()` (reads
+`documents/SecurityMinimumBar.md` live) and `get_security_findings()` — but note the latter only
+parses `SecurityReview_2026-05-24.md`'s RN-* tracker, see §15.
 
 ═══════════════════════════════════════════
 9) COMMON ENGINEERING PATTERNS — HOW TO PASS REVIEW HERE
@@ -357,11 +420,37 @@ cargo audit --deny warnings
 cargo deny check bans licenses sources advisories
 ```
 
+The six commands above remain the authoritative gate *definition* (AGENTS.md §7), but note how
+the tooling actually executes them:
+
 **Fast-fail convenience runner** (recommended for local iteration):
-`cargo run -p rustynet-xtask -- gates` runs fmt→check→clippy→test in dependency order, stops at
-the first failure, streams output live, and wraps each stage in a timeout watchdog. Add
-`--skip-test` to gate without the slow test stage, or `-p <crate>` to scope. Per-stage timeouts
-are overridable via `XTASK_{FMT,CHECK,CLIPPY,TEST}_TIMEOUT` (seconds).
+`cargo run -p rustynet-xtask -- gates` runs **fmt → clippy → test** — there is NO standalone
+`check` stage by default. Clippy is rustc plus lint passes, so it already provides the
+compile-correctness gate at roughly the cost of `check` alone; running both would duplicate the
+whole compile (no shared incremental cache across the clippy wrapper). It stops at the first
+failure, streams output live, and wraps each stage in a timeout watchdog that kills the whole
+process group and prints the tail on a hang.
+
+Flags (all verified by running them):
+- `--skip-test` — gate without the slow test stage.
+- `-p <crate>` / any cargo scope arg — scope clippy/test; `fmt` always runs workspace-wide.
+- `--with-check` — restores the old `fmt → check → clippy → test` order. This is the escape
+  hatch for a broken/poisoned clippy toolchain, not the default.
+- `--affected [--base <ref>]` — scope to workspace crates changed since `--base` (default
+  `origin/main`, including uncommitted + untracked) plus the full transitive closure of their
+  reverse-dependents. Falls back to the full workspace if a root build file
+  (`Cargo.toml`/`Cargo.lock`/`rust-toolchain*`) changed or nothing is detected.
+- Per-stage timeouts (seconds) via `XTASK_{FMT,CHECK,CLIPPY,TEST}_TIMEOUT` — defaults 120 /
+  1200 / 1500 / 5400.
+
+**The test stage requires `cargo-nextest`.** xtask executes tests as
+`cargo nextest run … --retries 0` (retries pinned off so a flake fails loudly), and if nextest is
+absent it refuses with exit code 2 *before* spending ~20min on fmt/clippy. The repo pins
+**0.9.114** (`PINNED_NEXTEST_VERSION` in `crates/rustynet-xtask/src/main.rs:83`, mirrored in
+`rustynet-cli/src/bin/bootstrap_ci_tools.rs` and the Windows CI leg). Install with
+`cargo install cargo-nextest --locked --version 0.9.114`; CI installs it via
+`scripts/ci/bootstrap_ci_tools.sh`. Each stage's wall-clock is appended to
+`documents/operations/gate_timings.csv`. Exit codes: 0 pass, 1 gate failed, 124 timed out.
 
 **Scope-specific scripts** (run the one matching your active scope document): `./scripts/ci/
 phase9_gates.sh`, `phase10_gates.sh`, `membership_gates.sh`, and any other active-phase gate
@@ -402,14 +491,14 @@ them liberally rather than re-deriving structure by hand with `grep`/`find`.
 | `get_definition_of_done()` | The DoD checklist from `AGENTS.md` §9 |
 | `get_gate_definitions()` | The authoritative gate commands from `AGENTS.md` §7 |
 | `get_architecture_constraints()` | The non-negotiable constraints from `AGENTS.md` §3 |
-| `get_crate_structure()` | Per-crate summary: what it does, its layer, its boundary rule |
-| `get_crate_dependencies()` | The dependency graph between crates |
-| `which_crate(symbol_or_concept)` | Jump from a symbol/concept name to its owning crate |
-| `get_platform_support()` | Current per-platform support status |
+| `get_crate_structure()` | Per-crate summary: layer + boundary rule. **Hand-maintained static list of 17 crates — missing nas/llm-gateway/advisor/netns-probe/lab-monitor.** §6's table is more complete. |
+| `get_crate_dependencies(crate)` | Internal deps + reverse deps for ONE crate. Required arg. Parsed live from `crates/*/Cargo.toml` — trustworthy. |
+| `which_crate(path)` | Owning crate for a **repo-relative file path** (needs a literal `crates/<name>/` segment). NOT a symbol lookup — `which_crate("MembershipState")` returns "No owning crate". |
+| `get_platform_support(feature?, platform?)` | Per-platform role/feature status. **Hand-maintained static tables** inside the MCP server, not derived from the code — see §14. |
 | `get_requirements()` | `Requirements.md` content, queryable |
-| `get_role_transition()` | The role-transition rules (§7 above) |
-| `get_security_controls()` | The security controls catalog (§8 above) |
-| `get_security_findings()` | Current open security findings |
+| `get_role_transition(from, to, platform?)` | The role-transition rules (§7 above). `from`+`to` are REQUIRED. |
+| `get_security_controls(filter?)` | Section-filtered `documents/SecurityMinimumBar.md` (read live) |
+| `get_security_findings(status?, severity?, id?)` | **Only** the RN-01..RN-38 tracker in `SecurityReview_2026-05-24.md`. Does NOT cover RSA-*/AUDIT-* findings — see §15. |
 | `get_orchestrator_stages()` | Live-lab orchestration stage list — lab-specific; see the companion live-lab-loop doc |
 
 **`rustynet-mcp-gate-runner`:**
@@ -433,11 +522,12 @@ them liberally rather than re-deriving structure by hand with `grep`/`find`.
   `operations/done/` or `documents/archive/`) in the same change.
 - Do not reintroduce standalone prompt or status documents; keep execution guidance in the
   active ledgers themselves.
-- **Exception — two operator-sanctioned, repo-root prompt templates:** this doc
-  (`rustynet_repo_context_prompt.md`) and its companion `rustynet_live_lab_loop_prompt.md`.
-  Neither is source-of-truth guidance (the active ledgers are) and neither should be deleted as
-  a "stale prompt doc" — keep both current with the architecture, tooling, and MCP functions
-  they reference.
+- **Exception — three operator-sanctioned, repo-root prompt templates:** this doc
+  (`rustynet_repo_context_prompt.md`), its companion `rustynet_live_lab_loop_prompt.md`, and
+  `rustynet_hard_problem_prompt.md` (the hard-problem brief prepended to reasoning calls, added
+  2026-07-18 in `2881aea2`). None is source-of-truth guidance (the active ledgers are) and none
+  should be deleted as a "stale prompt doc" — keep all three current with the architecture,
+  tooling, and MCP functions they reference.
 - `AGENTS.md` and `CLAUDE.md` are intentionally byte-for-byte mirrored. Any edit to one MUST be
   applied identically to the other in the same change. When a crate, ledger, or top-level
   directory is added/moved/renamed, update §2/§11/§12 there (and the mirror) plus
@@ -445,13 +535,20 @@ them liberally rather than re-deriving structure by hand with `grep`/`find`.
 - Remove dead links, stale index entries, and prompt-only guidance when you find them.
 
 ═══════════════════════════════════════════
-13) FULL CLI COMMAND SURFACE (`rustynet` binary, `ops vm-lab-*`/lab-only verbs excluded — see the
-live-lab-loop doc for those)
+13) FULL CLI COMMAND SURFACE — the DEFAULT-FEATURE (shipped) `rustynet` binary
 ═══════════════════════════════════════════
-This is the complete `rustynet` subcommand surface as of this doc's last update (source: `rustynet
-status`/help dump). Structural, low-churn — read once, don't re-derive with `--help` every session.
-Verify against a live `rustynet --help` / `rustynet <verb> --help` if a flag looks off; this is a
-snapshot, not a substitute for `--help` on the exact flags of a command you're about to run.
+This block is the complete subcommand surface of the shipped binary, re-verified 2026-07-27 as
+**byte-identical** to `rustynet-cli --help` built with default features (no `vm-lab`).
+Structural, low-churn — read once, don't re-derive with `--help` every session. Still run
+`rustynet <verb> --help` for the exact flags of a command you are about to run.
+
+Under `--features vm-lab` the surface roughly doubles (241 help lines vs 124): the whole
+`ops vm-lab-*` fleet-control family, plus every `ops e2e-*`, `ops write-live-*`,
+`ops *-cross-network-*`, `ops validate-live-lab-*`, `ops run-*-gates`, `ops install-windows-*`
+and assorted lab helpers. **All of those are vm-lab-gated, not just the `vm-lab-` prefixed
+ones** — if a verb you expect is absent below, check whether it needs `--features vm-lab`
+before concluding it does not exist. They are documented in the companion
+`rustynet_live_lab_loop_prompt.md`.
 
 ```
 status [--json]
@@ -578,17 +675,32 @@ ops apply-role-coupling --target-role <admin|client> [--preferred-exit-node-id <
 ops peer-store-validate --config-dir <absolute-path> --peers-file <absolute-path>
 ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]
 ```
-The `ops vm-lab-*` family (orchestrate/run/setup/sync-host/host-preflight/run-matrix-compare/
-discover/etc.) is deliberately omitted here — it only exists under `--features vm-lab` and is fully
-documented in the companion `rustynet_live_lab_loop_prompt.md`.
+═══════════════════════════════════════════
+14) PLATFORM SUPPORT MATRIX (hand-maintained — read the provenance note before trusting it)
+═══════════════════════════════════════════
+**Provenance, verified 2026-07-27 — this matters, an earlier version of this section claimed a
+code-derived source it does not have:**
+- These tables are a copy of the **hand-maintained static tables inside the repo-context MCP
+  server** — `role_support()` (`crates/rustynet-mcp/src/bin/repo_context.rs:1685`) and
+  `static PLATFORM_FEATURES` (`:1818`). Calling
+  `mcp__rustynet-repo-context__get_platform_support()` returns the same hand-written data, so it
+  is **not** an independent re-verification. Nothing here is generated from the code.
+- `is_blind_exit_supported_host` IS a live production gate
+  (`rustynet-operator/src/role.rs:81`, called from `normalize_role` at `:111`) and agrees with
+  the `blind_exit` row.
+- `NodeRole::is_supported_for_platform` (`rustynet-cli/src/vm_lab/orchestrator/role.rs:60`) is
+  **NOT** a live gate: it has no production caller — every non-test reference is a comment, and
+  the module carries `#![allow(dead_code)]`. The gate the orchestrator actually consults is
+  `is_lab_assignable_for_platform` (`vm_lab/orchestrator/native.rs:266,440`).
+- That dead function also **disagrees** with the table below: it restricts `Admin` (and
+  `Anchor`/`Relay`) to Linux, while `admin` is recorded ✅ on macOS and Windows here. The ✅ is
+  the better-evidenced side — `CrossPlatformRoleParityPlan_2026-06-21.md:57` records
+  `validate_macos_admin_issue` PASS (run `livelab-1782135034`, 2026-06-22) and
+  `validate_windows_admin_issue` PASS (run `livelab-1782526081`, 2026-06-27). The stale artifact
+  is the code gate, not the matrix. **Do not "fix" the matrix to match that function.**
 
-═══════════════════════════════════════════
-14) PLATFORM SUPPORT MATRIX (mirrored from the live code gate — `is_supported_for_platform` /
-`is_blind_exit_supported_host`)
-═══════════════════════════════════════════
-Snapshot as of this doc's last update. Re-verify with `mcp__rustynet-repo-context__get_platform_support()`
-before relying on it for a release decision — this is exactly the kind of fact that changes when a
-parity cell lands.
+For a real release decision, go to `CrossPlatformRoleParityPlan_2026-06-21.md` (the
+release-blocking per-role × OS live-proof matrix) — not to this snapshot and not to the MCP.
 
 **Roles × OS** (✅ supported/live-evidence · ⛔ fail-closed — implemented + lab-assignable, pending
 live evidence · 📋 planned · 🚫 blocked by design):
@@ -609,13 +721,13 @@ live evidence · 📋 planned · 🚫 blocked by design):
 | killswitch (linux) | ✅ supported — nftables pre-start and post-start |
 | killswitch (macos) | ⛔ fail-closed — pf anchor available; pre-killswitch not yet mandatory |
 | killswitch (windows) | ⛔ fail-closed — netsh-based; IPv4 LAN egress allow-all is RN-06 (open); WFP migration planned |
-| wireguard-kernel (linux) | ✅ in-kernel `wireguard.ko` |
-| wireguard-userspace (macos) | ✅ boringtun userspace backend |
-| wireguard-nt (windows) | ✅ WireGuard-NT kernel driver |
-| dpapi-secrets (windows) | ✅ DPAPI-protected blobs under `ProgramData\RustyNet\secrets` |
-| keychain-secrets (macos) | ✅ macOS keychain key custody |
-| ipv6-dataplane (linux) | ✅ dual-stack with v6 candidate gathering |
-| upnp-natpmp-pcp (linux) | ✅ gateway detection via `/proc/net/route` |
+| wireguard-kernel (linux) | ✅ in-kernel WireGuard via the `linux-wireguard` backend mode (`rustynetd/src/daemon.rs:863`) |
+| wireguard-userspace (macos) | ✅ boringtun userspace backend (`MacosUserspaceSharedBackend`, in `rustynet-backend-wireguard`) |
+| wireguard-nt (windows) | ⛔ **opt-in, NOT release-gated support.** The `windows-wireguard-nt` label exists (`rustynetd/src/windows_backend_gate.rs:4`) but the default label is `windows-unsupported`, which fail-closes (`require_supported_windows_backend`, `:22-29`), and the code states the mode "is opt-in and still outside release-gated support until measured evidence exists" (`windows_service.rs:421`). It is also **not** a directly-loaded WireGuardNT DLL: the adapter shells out to the official WireGuard-for-Windows `wireguard.exe`/`wg.exe` and readiness fails closed if they are absent (`windows_backend_readiness.rs:6-34`). |
+| dpapi-secrets (windows) | ✅ DPAPI-protected blobs under `C:\ProgramData\RustyNet\secrets` (`rustynetd/src/windows_paths.rs:12`, `windows_key_custody.rs:291`) |
+| keychain-secrets (macos) | ✅ macOS keychain key custody (`SecKeychain`, `rustynet-crypto/src/lib.rs:21,311,331`) |
+| ipv6-dataplane (linux) | ✅ dual-stack with v6 candidate gathering (`rustynetd/src/dataplane_candidates.rs`, `linux_ipv6_leak.rs`) |
+| upnp-natpmp-pcp (linux) | ✅ gateway detection via `/proc/net/route` (`rustynet-sysinfo/src/lib.rs`, `rustynetd/src/port_mapper.rs`) |
 
 **The single biggest structural gap driving the Linux-VM-host program (companion doc §5.6):**
 Windows exit/blind_exit is fail-closed/blocked specifically because Apple-Silicon UTM/QEMU exposes
@@ -631,13 +743,26 @@ retires the last — cross-check the ledger, not just the newest date, when the 
 **Newest, broadest: `documents/operations/active/SecurityAuditLedger_2026-06-18.md`** — file-by-file
 audit against `SecurityMinimumBar.md`, coverage-complete (594/594 tracked files). **76 findings raised
 → 2 withdrawn as false-positive → 74 standing: 0 Critical / 2 High / 15 Medium / 34 Low / 19 Info / 4
-Question.** The two standing Highs:
-- **RSA-0009** — membership reducer non-determinism → revoke/key-rotation updates can fail to apply
-  (AUDIT-040 cross-reference).
-- **RSA-0063** — macOS bootstrap can leave `NOPASSWD: ALL` in sudoers on a failed run → local
-  privilege escalation (AUDIT-045/RN-32 cross-reference).
-Both survived an adversarial re-verification pass. All findings here are proposals awaiting human
-approval — no production code/crypto/config has been changed by the audit itself.
+Question.** Those counts are the ledger's own as-written state (2026-06-18/19) and still match it.
+
+**The two Highs it lists are BOTH FIXED — do not start work believing revocation is broken.**
+`SecurityRemediationPlan_2026-06-19.md:11` records both as **APPLIED 2026-06-24**, and the code
+confirms it (verified 2026-07-27):
+- **RSA-0009** (membership reducer stamped `unix_now()` into the canonical state-root, so
+  Revoke/RotateKey/Restore/SetCapabilities could never apply) — **FIXED.**
+  `apply_signed_update` now re-derives with the *signed record's own* `created_at_unix`
+  (`rustynet-control/src/membership.rs:940-947`; see the `RSA-0009` note at `:1847`), with a
+  dedicated regression audit (`rustynetd/src/membership_revoke_audit.rs`, "Adversarial self-audit
+  proving RSA-0009's fix actually works") wired to fail loudly if it regresses
+  (`rustynetd/src/main.rs:1975`), plus Tier-0 live-lab stages added 2026-07-01 (`b101a1f0`).
+- **RSA-0063** (macOS bootstrap could leave `NOPASSWD: ALL` in sudoers → local privesc) —
+  **FIXED.** EXIT-trap removal on every exit path,
+  `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh:310`, mirrored in
+  `rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs:1951`.
+
+The rest of the ledger's 74 findings remain review-only proposals awaiting human approval — the
+audit itself changed no production code/crypto/config. So: the ledger is a valid *inventory* but
+its High row is stale; the remediation plan is the status of record.
 
 **Prior full-repo pass: `documents/operations/active/SecurityAndQualityAudit_2026-06-10.md`** — 14
 independent deep reviews, first-hand verified. **53 net-new findings (AUDIT-001..053): 0 Critical /
@@ -645,13 +770,14 @@ independent deep reviews, first-hand verified. **53 net-new findings (AUDIT-001.
 risks flagged: the fail-closed killswitch could fail open (RN-03/04/10 — since fixed per the ledger
 above), the (now-superseded, do-not-run-without-`--dry-run`) uncommitted overnight driver's live path
 was destructive, `lab_state` MCP `report_dir` was unconfined (AUDIT-006 — since remediated), the
-membership reducer non-determinism (AUDIT-040 = RSA-0009, still open), Windows encrypted-key custody
-ACL was a no-op (AUDIT-027/RN-33), a relay pre-auth DoS (AUDIT-031), and the macOS bootstrap
-`NOPASSWD: ALL` sudoers residue (AUDIT-045/RN-32 = RSA-0063, still open).
+membership reducer non-determinism (AUDIT-040 = RSA-0009 — **since fixed**, see above), Windows
+encrypted-key custody ACL was a no-op (AUDIT-027/RN-33), a relay pre-auth DoS (AUDIT-031), and the
+macOS bootstrap `NOPASSWD: ALL` sudoers residue (AUDIT-045/RN-32 = RSA-0063 — **since fixed**).
 
-**Sequencing:** `documents/operations/active/SecurityRemediationPlan_2026-06-19.md` sequences the
-audit ledger's findings into waves (P0 = the 2 standing Highs; P1 = Mediums by 7 systemic themes; P2 =
-Low/Info by category) with per-item fix + verification test + effort estimate.
+**Sequencing and status of record:** `documents/operations/active/SecurityRemediationPlan_2026-06-19.md`
+sequences the audit ledger's findings into waves (P0 = the 2 Highs, both now APPLIED; P1 = Mediums by
+7 systemic themes; P2 = Low/Info by category) with per-item fix + verification test + effort estimate.
+Read this file for CURRENT status, not the ledger's severity table.
 
 **Original firm-grade review (older, narrower, still referenced): `documents/operations/active/
 SecurityReview_2026-05-24.md`** (RN-* namespace, 38 findings across 6 domains) — most Highs/Mediums
@@ -660,12 +786,21 @@ as of the newer audits' cross-reference. Use `mcp__rustynet-repo-context__get_se
 the machine-parsed live version of this specific file — it does NOT cover the newer RSA-*/AUDIT-*
 findings above, so don't treat its "all fixed" rows as the whole security picture.
 
-**Practical rule:** before touching crypto/auth/policy/trust-state code, check RSA-0009 and RSA-0063
-status first (they're the two P0s), then grep the relevant crate's findings across all three ledgers
-by RN-*/AUDIT-*/RSA-* number rather than trusting any single doc's "current" framing.
+**Practical rule:** before touching crypto/auth/policy/trust-state code, grep the relevant crate's
+findings across all three ledgers by RN-*/AUDIT-*/RSA-* number, and check the *remediation plan* (not
+the ledger) for status. Every "still open" framing in a dated audit doc is a claim about the day it
+was written — confirm against code before building on it. There is a repo pattern here: this doc's
+own RSA-0009/RSA-0063 rows were stale by a month, and `DocCodeDiscrepancyAudit_2026-07-18.md` exists
+because doc-vs-code drift is a recurring failure mode in this repo.
+
+There are also newer security docs than the three below — e.g.
+`AnchorBundlePullAttestationSecurityReview_2026-07-20.md`,
+`SecurityAuditAndMainConsolidation_2026-07-21.md`, `LinuxMtuPrivilegedHelperAllowlistGap_2026-07-21.md`,
+`QH01TemplateInjectionFixPlan_2026-07-25.md`. Run
+`list_documents(filter: "operations/active")` rather than assuming §15 or §17 enumerates everything.
 
 ═══════════════════════════════════════════
-16) FULL CI GATE SCRIPT CATALOG (`scripts/ci/*.sh`, 50 scripts)
+16) FULL CI GATE SCRIPT CATALOG (`scripts/ci/*.sh`, 51 scripts — verified 2026-07-27)
 ═══════════════════════════════════════════
 From `mcp__rustynet-gate-runner__list_gate_scripts()`. Run the curated security set with
 `run_security_gates`; run any hand-picked set with `run_gate_scripts([...])`; lab-dependent ones need
@@ -697,7 +832,9 @@ supersedes the historical grep-based secret scan), `supply_chain_integrity_gates
 (hermetic — validates without necessarily running live), `orchestrator_engine_gates.sh` (Rust-native
 orchestrator engine gates), `windows_cross_compile_gate.sh`.
 
-**other (7):** `bootstrap_ci_tools.sh` (dispatches to the Rust `bootstrap_ci_tools` binary),
+**other (8):** `bootstrap_ci_tools.sh` (dispatches to the Rust `bootstrap_ci_tools` binary — this is
+what installs the pinned `cargo-nextest`), `check_mcp_binaries_fresh.sh` (added 2026-07-17 in
+`adae8a94` — fails loud when a prebuilt MCP server binary under `bin/` is stale),
 `lab_monitor_gates.sh` (standalone gate for the excluded `rustynet-lab-monitor` crate),
 `llm_default_deny_gates.sh` (D13.d §9), `membership_gates.sh`, `nas_default_deny_gates.sh` (D13.c
 §7), `run_required_test.sh`, `windows_compile_check.sh` (local Windows compile gate, readiness plan
@@ -709,8 +846,15 @@ E1).
 This is a captured copy of `documents/operations/active/README.md`'s annotated ledger list — the
 single richest "what's currently being worked and why" index in the repo — embedded here so a fresh
 agent doesn't have to spend a tool call reading it before getting oriented. **It WILL drift**: ledgers
-move to `done/`, new ones appear, statuses change. Treat every annotation below as "true as of this
-doc's last update" and re-read `documents/operations/active/README.md` directly (one file read, not a
+move to `done/`, new ones appear, statuses change. **Snapshot date: 2026-07-17.** Every filename
+below still exists (all 76 checked 2026-07-27), but `operations/active/` has since grown by ~19
+documents that are NOT listed here (2026-07-18 onward: `DocCodeDiscrepancyAudit_2026-07-18`,
+`EfficiencyAndAdvancedTechniqueOpportunityCatalog_2026-07-19`, `RepoReview_2026-07-20`,
+`AnchorBundlePull*_2026-07-20`, `SecurityAuditAndMainConsolidation_2026-07-21`,
+`BlindExitPcbHardwarePlan_2026-07-22`, `NodeEngineAcceptanceSpec_2026-07-23`,
+`CrossPlatformRoleParityRefresh_2026-07-23`, `BashRetirementPlan_2026-07-24`,
+`QualityHardeningTodo_2026-07-25`, and others). Treat every annotation below as "true as of
+2026-07-17" and re-read `documents/operations/active/README.md` directly (one file read, not a
 tool round-trip) before making any claim that depends on current status. Paths below are repo-relative
 under `documents/operations/active/` unless otherwise noted.
 

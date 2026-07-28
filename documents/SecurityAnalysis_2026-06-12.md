@@ -2,6 +2,36 @@
 
 **Date:** 2026-06-12 · **Commit:** `4fbd5f1` originally, reconciled against current `129cf4d69fb2` + working-tree fixes · **Status:** Current findings below were re-checked against live code; stale/false items were removed or narrowed. Working-tree P0 fixes now close RN-03, RN-04, RN-05, and RN-11; RN-02 remains open as cleanup/dead-code risk.
 
+> **Staleness note — 2026-07-27** (added by an adversarial re-review of the security-claims
+> cluster; original text above and below left intact). This document's status line and several
+> findings describe a tree that has since moved. Verified in committed code on 2026-07-27:
+> - **"Working-tree P0 fixes"** (RN-03/04/05/11) are long since committed and were
+>   independently re-verified by the 2026-06-18 audit ledger (Batch 2 positive controls,
+>   `SecurityAuditLedger_2026-06-18.md:1036-1041`). Read "Fixed in working tree" below as
+>   "fixed, committed".
+> - **RN-02 is resolved in code, not open.** `crates/rustynetd/src/dataplane.rs` no longer
+>   exists — deleted 2026-06-26 in `a39a70aa` ("security: retire dead dataplane.rs, point
+>   phase-4 assurance at the live path (RN-02)"); no `LinuxDataplane` type remains (only
+>   `LinuxDataplaneMode` in `phase10.rs`). §1.5's "**Verified:** … is referenced only in its
+>   own `#[cfg(test)]` block" and §4's "RN-02 | **Still open** | Dead code still present" are
+>   both stale statements of current fact. **Residual (code, not corrected here):**
+>   `crates/rustynet-cli/src/security_audit_catalog.rs:279` still lists the deleted
+>   `crates/rustynetd/src/dataplane.rs` in the `server_ip_bypass` spec's `affected_files`,
+>   even though the same file's `:415` comment records the removal — an ops-report catalog
+>   citing a nonexistent enforcement point (the RSA-0049 assurance-over-claim class).
+> - **RN-N7 (§7, CIDR validation character-set-only) is fixed.** `validate_cidr` now does a
+>   structural parse — `crates/rustynetd/src/ipc.rs:272-292` (split on `/`, `IpAddr::parse`,
+>   family-appropriate prefix bound); tracked as ledger RSA-0027, applied 2026-06-24.
+> - **RN-08 (§2.2) remains real**: the ambiguous v0/v1 envelope detection is still present at
+>   `crates/rustynet-crypto/src/lib.rs:1605-1607` (`bytes.len() >= 45 && bytes[0] != 0`). Note
+>   the disposition conflict a reader must reconcile: this document says "do not close yet /
+>   **Required follow-up**", while `SecurityRemediationPlan_2026-06-19.md` Wave P2 records the
+>   same finding (RSA-0001) as **DEFERRED 2026-06-24** with an on-disk-migration rationale.
+>   One of the two needs to become the record; that is an owner call.
+> - The §6 fuzz-coverage table is still accurate: `fuzz/fuzz_targets/` contains exactly
+>   `ipc_parse_command.rs`, `membership_decode_state.rs`, `membership_decode_signed_update.rs`
+>   — the relay/gossip/STUN/PCP/uPnP/dns-zone gaps (RN-N6 class) are unchanged.
+
 ---
 
 ## 0. Methodology
@@ -186,14 +216,55 @@ These were checked during the deep scan and confirmed as correctly implemented:
 | Relay hello handler | 12-step ordered security check (rate-limit → signature → TTL → freshness → replay → ct_eq bindings → scope → capacity) | ✅ |
 | Enrollment tokens | HMAC is recomputed and compared with `ct_eq` before expiry, future-issued, or replay checks in both consume and inspect paths | ✅ |
 | Key material | `symlink_metadata()` BEFORE every I/O op; `create_new(true)` for atomic writes; `fs::rename()` for commit; symlink rejection on all paths | ✅ |
-| Service exposure | Tunnel-only bind enforced; default-deny via `evaluate_with_membership`; session severance on policy change; audit events with thumbprints only | ✅ |
+| Service exposure | Tunnel-only bind enforced; default-deny via `evaluate_with_membership`; session severance on policy change; audit events with thumbprints only | ✅ ⚠ **partly unenforced — see 2026-07-27 note below** |
 | Gossip deserialization | `checked_add`/`checked_mul` on all offsets; `MAX_CANDIDATES_PER_BUNDLE=32`; `WireTruncated`/`WireMalformed` errors; version gate | ✅ |
 | Windows named pipes | `PIPE_REJECT_REMOTE_CLIENTS` at kernel level; SDDL ACL with forbidden principals list; 16KB message cap | ✅ |
 | macOS utun helper | Unsafe isolated in one file; bounded buffers; MSG_CTRUNC detection; truncated cmsg test coverage | ✅ |
 | DNS zone parser | 256KB bundle cap; 16K line cap; 4KB line cap; 128B key cap; 1.5KB value cap; 1024 record cap; 8 alias cap | ✅ |
 | UPnP HTTP client | 256KB body cap with +1 byte overflow detection; control-char sanitization on gateway-supplied strings; 4-device SSDP cap | ✅ |
 | STUN parser | 1024B buffer; attribute boundary check; 4-byte alignment; transaction ID match | ✅ |
-| Unsafe code | Zero `unsafe` in `rustynetd/src/` outside `macos_utun_helper_unsafe.rs`; `#![forbid(unsafe_code)]` on all other files | ✅ |
+| Unsafe code | Zero `unsafe` in `rustynetd/src/` outside `macos_utun_helper_unsafe.rs`; `#![forbid(unsafe_code)]` on all other files | ✅ ⚠ **first half holds; the `forbid` mechanism claim does not — see 2026-07-27 note below** |
+
+### Corrections to the Positive-Controls table — 2026-07-27
+
+Added by an adversarial re-review of the security-claims document cluster. The rows above are
+left as written (they are the dated record of what this pass asserted); the corrections below
+state what was verified in code on 2026-07-27. No ✅ is removed and no finding status is
+changed — those are owner decisions.
+
+- **"Service exposure — Tunnel-only bind enforced … session severance on policy change ✅"
+  overstates two of its four sub-claims.** What is real: the **default-deny** path is wired
+  end-to-end — `crates/rustynetd/src/daemon.rs:4512-4560`
+  (`materialize_service_access_state`, called from bootstrap/reconcile/membership-apply at
+  `:4938`, `:7536`, `:8489`, `:9051`) derives grants via
+  `crates/rustynetd/src/service_access_state.rs:38` (`evaluate_service_access`), fails closed
+  to `force_deny_all` on a write error, and the sibling binaries deny when the files are
+  absent (`crates/rustynet-nas/src/main.rs:279-292` `admitted_peer`). What is **not**
+  enforced: the *authoritative* tunnel-only bind check and session severance are dead code —
+  `validate_tunnel_only_bind` / `validate_loopback_only_bind` have **zero callers** anywhere
+  in `crates/` (the only two mentions are doc comments at
+  `crates/rustynetd/src/linux_runtime_nftables.rs:432` and
+  `crates/rustynet-nas/src/main.rs:182`), and `ServiceExposureController` (which owns E3
+  teardown-before-revoke / `capability_release_ready`) is never constructed by the daemon.
+  The nas/llm binaries do only a **bind-shape** startup check
+  (`crates/rustynet-nas/src/main.rs:167,184-195` — rejects unspecified/loopback/multicast),
+  whose own comment says the authoritative check "lives in the daemon". This matches ledger
+  finding **RSA-0024** (`SecurityAuditLedger_2026-06-18.md:1093-1102`), which is still
+  `open`; this ✅ row therefore contradicts the ledger on the more widely-read artifact.
+  Honest wording: *"per-peer default-deny is enforced (daemon-materialised grants +
+  deny-on-missing in the service binaries); tunnel-only bind is a shape-only check in the
+  service binary — the authoritative signed-state bind validation and E3 session severance
+  are implemented and unit-tested but unwired (RSA-0024)."*
+- **"Unsafe code … `#![forbid(unsafe_code)]` on all other files"** — the *property* holds
+  (no `unsafe` block or `unsafe fn` exists in `crates/rustynetd/src/` outside
+  `macos_utun_helper_unsafe.rs`), but the *mechanism* named does not: the crate root uses
+  `#![deny(unsafe_code)]` (`crates/rustynetd/src/lib.rs:1`) with an explicit
+  `#[allow(unsafe_code)]` on the exception module (`:56`); only 29 of the 86 files in
+  `crates/rustynetd/src/` carry any `forbid(unsafe_code)`. The distinction is load-bearing for
+  a reader relying on this row: `forbid` cannot be overridden downstream, `deny` can — line 56
+  is itself the proof. Honest wording: *"crate-level `#![deny(unsafe_code)]` with one
+  documented module-level `#[allow]` (`macos_utun_helper_unsafe.rs`); no other `unsafe` in the
+  crate."*
 
 ---
 

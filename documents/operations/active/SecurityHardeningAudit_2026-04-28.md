@@ -166,6 +166,32 @@ is reintroduced into reviewed Rust sources (line 1255: "unsafe
 keyword usage is forbidden in repository Rust sources"). **Cleared
 2026-04-28.**
 
+> **Correction 2026-07-27 — the inventory is stale and the CI-gate claim is not supported**
+> (adversarial re-review of the security-claims cluster; original text left intact).
+> - **"The only legitimate `unsafe` blocks are in `crates/rustynet-windows-native/src/lib.rs`"
+>   is no longer true, and was already incomplete on 2026-04-28.**
+>   `crates/rustynetd/src/macos_utun_helper_unsafe.rs` (22 `unsafe` occurrences) was added
+>   2026-05-25 in `be3a43ea` and is now the documented RN-14 exception — the daemon crate root
+>   carries `#![deny(unsafe_code)]` (`crates/rustynetd/src/lib.rs:1`) with an explicit
+>   `#[allow(unsafe_code)]` for it at `:56`. Separately, `third_party/rustynet-tun` — vendored
+>   production dataplane FFI executed as root — was added **2026-04-13** (`929b1d8b`), i.e.
+>   before this section was written, and its `unsafe` blocks are ledger finding **RSA-0074**
+>   (`SecurityAuditLedger_2026-06-18.md:1530`, still `open`).
+> - **The scanner is real but is not a CI gate.** `unsafe_scan_path_is_allowlisted` /
+>   `UNSAFE_SCAN_ALLOWED_CRATE_PREFIXES` (`crates/rustynet-cli/src/ops_phase1.rs:1303-1317`)
+>   allowlists exactly one prefix, `rustynet-windows-native/`, and the scan root defaults to
+>   `crates` — so `third_party/` is outside its reach entirely, and the sanctioned
+>   `macos_utun_helper_unsafe.rs` is *inside* its reach with no exemption. Nothing invokes it:
+>   grepping `check_no_unsafe` / `check-no-unsafe` / `no-unsafe` across `scripts/`,
+>   `crates/rustynet-xtask/` and `crates/rustynet-mcp/` returns **zero** hits, so no gate
+>   script, xtask target, or MCP gate definition runs it. (VERIFIED: allowlist contents, scan
+>   root, and the absence of any invoker. REASONED, not executed: run today against `crates`
+>   it would flag the macos_utun exception.)
+> - Honest wording: *"no `unsafe` outside `rustynet-windows-native` (Win32 FFI), the documented
+>   `macos_utun_helper_unsafe` module, and vendored `third_party/rustynet-tun` (RSA-0074);
+>   enforcement is crate-level `#![deny(unsafe_code)]` plus an on-demand scanner that is not
+>   currently wired into any gate."*
+
 #### A.3.6 W2.5 wrapper-hygiene audit — Windows bootstrap PS scripts
 
 **Result:** Audit performed across the five reviewed PowerShell
@@ -421,6 +447,15 @@ both).
 
 **Cleared 2026-04-28.**
 
+> **Correction 2026-07-27:** the "strictly stronger" clearance rested on a
+> revocation/key-rotation path that was **non-functional at the time of writing** — see the
+> dated correction in §B.12 for the code evidence at commit `53005e79` (2026-04-29): the
+> membership reducer stamped `unix_now()` into a state root that `apply_signed_update`
+> then required to match the signed `new_state_root`, so `RevokeNode`/`RotateNodeKey`/
+> `RestoreNode` could never apply (later raised as ledger **RSA-0009**, High; fixed
+> 2026-06-24 and re-verified 2026-07-27). Signature-based pinning of a *snapshot* was real;
+> the ability to rotate or revoke a pinned key was not.
+
 ---
 
 ### B.6 Nebula — certificate-based peer authentication
@@ -462,6 +497,39 @@ required.
 **Severity:** N/A.
 
 **Cleared 2026-04-28.**
+
+> **Correction 2026-07-27 — this "Gap: none" does not hold as written** (adversarial
+> re-review of the security-claims cluster; original text left intact above; no severity or
+> status changed here — the re-rating is an owner call).
+>
+> The two properties are not equivalent, and the WireGuard feature that *would* make them
+> equivalent is the one Rustynet leaves unset. `tls-crypt-v2` means an attacker without the
+> per-client PSK cannot make the responder do handshake work at all. WireGuard's analogue is
+> the Noise **pre-shared key** (`Noise_IKpsk2`); Rustynet's sole production `Tunn::new` passes
+> `preshared_key: None` —
+> `crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs:269-276` (third parameter
+> is `preshared_key: Option<[u8; 32]>`, `third_party/boringtun/src/noise/mod.rs:194-197`) — so
+> boringtun mixes the all-zero default (`third_party/boringtun/src/noise/handshake.rs:615-618`,
+> `:859-862`) and the deployed handshake is cryptographically equivalent to plain `Noise_IK`.
+> There is no configuration surface to set one: `PeerConfig` has no PSK field
+> (`crates/rustynet-backend-api/src/lib.rs:72-83`), the `wg set` command backends never emit
+> `preshared-key`, and `preshared`/`psk` appears nowhere under `crates/` or `scripts/`.
+>
+> Concretely, the claimed property fails at the *initiation* step, not the completion step:
+> `mac1` is keyed by the **responder's public key**
+> (`third_party/boringtun/src/noise/handshake.rs:387-389`), which every current or former mesh
+> member holds, so anyone with that public key can force a full DH/AEAD handshake attempt —
+> bounded only by boringtun's per-peer handshake rate limiter
+> (`third_party/boringtun/src/noise/mod.rs:219-223`), i.e. DoS mitigation, not a PSK gate.
+> The narrower sentence in the original text ("without the static peer keys an attacker cannot
+> *complete* handshake-1 validation") is true; "equivalent property" and "Gap: none" are not.
+>
+> Honest characterisation: *"Rustynet does not implement a `tls-crypt-v2`-equivalent pre-auth
+> wrapper. WireGuard's PSK slot, which would supply the closest equivalent (plus a
+> static-key-compromise / harvest-now-decrypt-later hedge), is deployed unset. Whether to add
+> optional/required PSK support is an open owner decision, not a cleared axis."* The same
+> mischaracterisation appears in `SecurityAuditLedger_2026-06-18.md` as three "standard
+> `Noise_IKpsk2`" assertions, annotated there on the same date.
 
 ---
 
@@ -566,6 +634,29 @@ The deep comparative audit found the Rustynet posture *strictly
 matches or exceeds* the published Tailscale / WireGuard / Nebula
 practices on every reviewed axis. Open items are pure defense-in-
 depth additions, none security-bar:
+
+> **Correction 2026-07-27 — "on every reviewed axis" does not hold** (adversarial re-review
+> of the security-claims cluster; original text left intact). At least one reviewed axis was
+> cleared on a property the deployment does not have: **§B.7** (OpenVPN `tls-crypt-v2`-style
+> pre-auth) — see the dated correction in that section; the WireGuard PSK that would supply
+> the equivalent is deployed unset (`preshared_key: None`,
+> `crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs:269-276`). Two later
+> full-repo passes also contradict "none security-bar": the 2026-06-18 audit ledger raised two
+> **High** findings on reachable paths (RSA-0009 membership-reducer non-determinism →
+> revocation/key-rotation non-functional; RSA-0063 macOS bootstrap `NOPASSWD: ALL` sudoers
+> residue), both since applied and re-verified in code on 2026-07-27
+> (`crates/rustynet-control/src/membership.rs:1845-1941` + tests `:3892-4013`;
+> `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh:307-320`). RSA-0009 in particular was
+> **already present when this audit was written**, which undercuts **§B.5** ("signed-membership
+> pinning … *strictly stronger* than per-node thumbprint pinning"): verified at the
+> nearest commit to this document's date (`53005e79`, 2026-04-29) — the reducer's `RevokeNode`
+> arm stamped `node.updated_at_unix = unix_now()` (`membership.rs:982`, likewise
+> `RestoreNode`/`RotateNodeKey` at `:994`/`:1007`), `updated_at_unix` was part of the canonical
+> payload (`:236`), and `apply_signed_update` rejected the update when
+> `computed_new_root != record.new_state_root` (`:664-665`). So on 2026-04-28 signed
+> `RevokeNode`/`RotateNodeKey`/`RestoreNode` updates could not apply at all, and §B.5's
+> comparison rested on a revocation/rotation path that was non-functional. Treat this §B.12
+> summary as a dated snapshot, not a standing posture statement.
 
 - **B.4.1 [MEDIUM, partially LANDED 2026-04-28]** The original
   finding called for a resolver-output filter on the daemon's
