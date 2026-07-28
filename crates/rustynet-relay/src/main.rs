@@ -234,6 +234,25 @@ mod daemon {
     const RELAY_KEEPALIVE_MSG_TYPE: u8 = 0x04;
     const MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC: u32 = 50;
     const MAX_PRE_AUTH_HELLO_SOURCE_IPS: usize = 4096;
+    /// Per-source-IP ceiling on what the relay emits — reject datagram or log
+    /// line — in response to packets from an unvalidated source address.
+    ///
+    /// Deliberately equal to `MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC`: the relay
+    /// answers a source's refusals at most as often as it would have admitted
+    /// that source's hellos. That is the strongest per-IP bound that cannot
+    /// silence a legitimate peer the limiter is refusing (see
+    /// `PreAuthNoticeBudget`), and it matches the bound already in force at the
+    /// post-parse reject site in `handle_hello`, so no single source address —
+    /// spoofed or not — can be streamed at from either site.
+    const MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC: u32 = MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC;
+    /// Global ceiling on the same emissions. This is the bound that protects
+    /// the serialized control loop: the per-IP ceiling alone would permit
+    /// `MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC * MAX_PRE_AUTH_HELLO_SOURCE_IPS`
+    /// = 204_800 emissions/s, far past what the loop can afford. At the
+    /// measured ~4.2us per `send_to` this ceiling costs ~17ms per second,
+    /// under 2% of the loop, while leaving normal operation (which never
+    /// approaches it) completely unbudgeted.
+    const MAX_PRE_AUTH_NOTICES_PER_SEC: u32 = 4096;
 
     /// Maps allocated ports to session IDs for ciphertext forwarding.
     struct PortAllocation {
@@ -265,6 +284,32 @@ mod daemon {
     struct ForwardStats {
         frames_forwarded_total: AtomicU64,
         bytes_forwarded_total: AtomicU64,
+    }
+
+    /// Pre-auth refusal counters, surfaced read-only via `/healthz` and
+    /// `/metrics` alongside `ForwardStats`.
+    ///
+    /// These exist because `PreAuthNoticeBudget` throttles the per-packet log
+    /// line the relay used to emit for every refused pre-auth hello. That line
+    /// was the only signal an operator had that a flood was happening, and a
+    /// throttled line cannot report volume — so the volume moves here, where a
+    /// scraper can see it whether or not any line was emitted. Counters, not
+    /// log output, is also the right shape for the job: an unauthenticated
+    /// packet gets a `fetch_add`, never a write to the operator's log.
+    ///
+    /// Relaxed ordering throughout: monitoring only, never a term in any
+    /// admit/reject/emit decision.
+    #[derive(Default)]
+    struct PreAuthStats {
+        /// Pre-auth hellos the limiter refused, whether or not answered.
+        hellos_refused_total: AtomicU64,
+        /// Control packets rejected as empty or of unknown message type.
+        malformed_packets_total: AtomicU64,
+        /// Emissions (reject datagram or log line) the budget suppressed. The
+        /// gap between this and the two totals above is what the relay chose to
+        /// answer, so an operator can see the throttle working rather than
+        /// having to infer it from missing lines.
+        notices_suppressed_total: AtomicU64,
     }
 
     /// Records one successfully forwarded frame. `len` is the byte count
@@ -299,6 +344,19 @@ mod daemon {
         transport: Arc<Mutex<RelayTransport>>,
         control_socket: UdpSocket,
         pre_auth_hello_limiter: Arc<RwLock<PreAuthHelloLimiter>>,
+        /// Budget for *responding at all* to a packet whose source address
+        /// nothing has validated — the rate-limit reject datagram
+        /// (`emit_pre_auth_rate_limit_reject_notice`) and the malformed-packet
+        /// log line (`log_control_packet_error`) both spend from it.
+        ///
+        /// Both spenders share ONE budget deliberately: they are two ways of
+        /// saying "this source is misbehaving", they cost the same order of
+        /// magnitude on the serialized control loop (~4.2us for the `send_to`,
+        /// a log write in the same range), and one budget means an attacker
+        /// cannot switch message type to get a second allowance.
+        pre_auth_notice_budget: Arc<RwLock<PreAuthNoticeBudget>>,
+        /// Pre-auth refusal counters (see `PreAuthStats`).
+        pre_auth_stats: Arc<PreAuthStats>,
         /// Allocated port sockets indexed by port number. `Arc<UdpSocket>`
         /// because each socket is owned by two places at once: the port's
         /// own forward task (which blocks on `recv_from` on its clone) and
@@ -358,6 +416,8 @@ mod daemon {
                 pre_auth_hello_limiter: Arc::new(RwLock::new(PreAuthHelloLimiter::new(
                     MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
                 ))),
+                pre_auth_notice_budget: Arc::new(RwLock::new(PreAuthNoticeBudget::new())),
+                pre_auth_stats: Arc::new(PreAuthStats::default()),
                 allocated_sockets: Arc::new(RwLock::new(HashMap::new())),
                 next_port: Arc::new(RwLock::new(config.port_range_start)),
                 forward_stats: Arc::new(ForwardStats::default()),
@@ -442,6 +502,7 @@ mod daemon {
                 let transport_health = Arc::clone(&self.transport);
                 let allocated_health = Arc::clone(&self.allocated_sockets);
                 let forward_stats_health = Arc::clone(&self.forward_stats);
+                let pre_auth_stats_health = Arc::clone(&self.pre_auth_stats);
                 let max_sessions_per_node = self.config.max_sessions_per_node;
                 let max_total_sessions = self.config.max_total_sessions;
                 tokio::spawn(async move {
@@ -450,6 +511,7 @@ mod daemon {
                         transport_health,
                         allocated_health,
                         forward_stats_health,
+                        pre_auth_stats_health,
                         max_sessions_per_node,
                         max_total_sessions,
                     )
@@ -470,7 +532,14 @@ mod daemon {
                         match recv_result {
                             Ok((len, from_addr)) => {
                                 if let Err(e) = self.handle_control_packet(&buf[..len], from_addr).await {
-                                    eprintln!("control packet error from {from_addr}: {e}");
+                                    log_control_packet_error(
+                                        &self.pre_auth_notice_budget,
+                                        &self.pre_auth_stats,
+                                        from_addr,
+                                        &e,
+                                        Instant::now(),
+                                    )
+                                    .await;
                                 }
                             }
                             Err(e) => {
@@ -512,12 +581,14 @@ mod daemon {
                         .await
                         .check(from_addr.ip())
                     {
-                        let reject_bytes = serialize_relay_reject();
-                        self.control_socket
-                            .send_to(&reject_bytes, from_addr)
-                            .await
-                            .map_err(|e| format!("failed to send rate-limit reject: {e}"))?;
-                        eprintln!("pre-auth relay hello rate limited from {}", from_addr.ip());
+                        emit_pre_auth_rate_limit_reject_notice(
+                            &self.control_socket,
+                            &self.pre_auth_notice_budget,
+                            &self.pre_auth_stats,
+                            from_addr,
+                            Instant::now(),
+                        )
+                        .await?;
                         return Ok(());
                     }
                     self.handle_hello(data, from_addr).await
@@ -762,16 +833,24 @@ mod daemon {
         }
     }
 
+    /// The per-source-IP counting window.
+    const PRE_AUTH_HELLO_WINDOW: Duration = Duration::from_secs(1);
+
     struct PreAuthHelloLimiter {
         max_per_sec: u32,
         counts: HashMap<IpAddr, (u32, Instant)>,
-        /// How many times `prune` has run. Test-only, and the only thing that
-        /// makes the lazy-prune property observable: reverting `check` to prune
-        /// on every call is otherwise invisible to the suite, because the test
-        /// that used to notice only failed when the fill happened to exceed one
-        /// second -- a timing race, not a guard.
-        #[cfg(test)]
-        prune_calls: usize,
+        /// A LOWER BOUND on every `window_start` currently in `counts` (not
+        /// necessarily the exact minimum — entries whose window is reset move
+        /// forward without updating this, which only ever makes the bound
+        /// conservative).
+        ///
+        /// This is what makes `prune` skippable without changing any decision:
+        /// every entry satisfies `window_start >= earliest_window_start`, so if
+        /// `now - earliest_window_start < PRE_AUTH_HELLO_WINDOW` then no entry
+        /// can have expired and a sweep provably removes nothing. `prune`
+        /// recomputes it exactly from the retained entries after each real
+        /// sweep, so a stale bound costs at most one wasted sweep per window.
+        earliest_window_start: Instant,
     }
 
     impl PreAuthHelloLimiter {
@@ -779,31 +858,46 @@ mod daemon {
             Self {
                 max_per_sec,
                 counts: HashMap::new(),
-                #[cfg(test)]
-                prune_calls: 0,
+                earliest_window_start: Instant::now(),
             }
         }
 
         fn check(&mut self, ip: IpAddr) -> bool {
-            let now = Instant::now();
-            // Prune only when it can change the outcome: at capacity, with a NEW
-            // source IP. `prune` is a full `retain`, so calling it on EVERY hello
-            // made this O(n) per packet -- on the PRE-AUTH path, where n is
-            // attacker-chosen and capped at 4096. Filling the table then cost
-            // 8,386,560 entry visits, which is what made the bound test below
-            // slower than the very window it was measuring.
+            self.check_at(ip, Instant::now())
+        }
+
+        /// `check` with the clock injected, so the equivalence and expiry
+        /// tests can drive an exact timeline instead of racing the wall clock.
+        fn check_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+            // Keep the lower bound valid without assuming anything about the
+            // clock. A production `check` only ever supplies a monotonically
+            // non-decreasing `Instant::now()`, so this never fires there; it
+            // means the invariant holds by construction rather than by an
+            // unstated precondition on the caller.
+            if now < self.earliest_window_start {
+                self.earliest_window_start = now;
+            }
+            // Sweep ONLY on the path that can actually need space: a source IP
+            // we are not already tracking, arriving at the table bound. The
+            // previous unconditional `prune(now)` put an O(table) scan in front
+            // of every pre-auth packet — 4096 `Instant` comparisons of pure
+            // attacker-triggered work before any validation, on the serialized
+            // control loop. Measured at ~9.5us/packet in a release build with a
+            // full table, so merely admitting the traffic this limiter's own
+            // policy allows (4096 IPs x 50/s = 204_800 hellos/s) cost ~1.9 CPU
+            // cores of scanning: the enforcement was dearer than the rule it
+            // enforced, and a ~36Mbps flood of 1-byte UDP datagrams (a bare
+            // 0x01 reaches here — `handle_control_packet` only inspects
+            // `data[0]`) could saturate the loop and starve legitimate peers.
             //
-            // Mirrors `HelloLimiter::check` in `transport.rs`, which already
-            // prunes lazily for the same RSA-0037 reason and whose comment
-            // cross-references this function. The two were meant to match; this
-            // one had drifted.
-            //
-            // Fail-closed behaviour is unchanged: an existing IP always reaches
-            // its counter, and a new IP is rejected only if the table is STILL
-            // full after pruning. Stale entries may now linger below capacity,
-            // which costs nothing -- the map is bounded by the cap either way and
-            // each entry's own window is still reset on use.
-            if self.counts.len() >= MAX_PRE_AUTH_HELLO_SOURCE_IPS && !self.counts.contains_key(&ip)
+            // The admit/reject decisions are UNCHANGED. Capacity rejection
+            // still sweeps first, so an IP is refused only when the table is
+            // genuinely full of live windows; expiry for a tracked IP is now
+            // applied lazily on access by the window reset below, which is
+            // exactly what the eager sweep used to do by deleting the entry and
+            // letting it be re-inserted at `(0, now)`. Mirrors the reviewed
+            // `HelloLimiter::check` in `transport.rs` (RSA-0037).
+            if !self.counts.contains_key(&ip) && self.counts.len() >= MAX_PRE_AUTH_HELLO_SOURCE_IPS
             {
                 self.prune(now);
                 if self.counts.len() >= MAX_PRE_AUTH_HELLO_SOURCE_IPS {
@@ -811,7 +905,7 @@ mod daemon {
                 }
             }
             let entry = self.counts.entry(ip).or_insert((0, now));
-            if now.duration_since(entry.1) >= Duration::from_secs(1) {
+            if now.duration_since(entry.1) >= PRE_AUTH_HELLO_WINDOW {
                 *entry = (0, now);
             }
             if entry.0 >= self.max_per_sec {
@@ -822,14 +916,201 @@ mod daemon {
         }
 
         fn prune(&mut self, now: Instant) {
-            #[cfg(test)]
-            {
-                self.prune_calls += 1;
+            // Provably a no-op when nothing can have expired yet. Without this
+            // guard an attacker rotating through unseen source IPs against a
+            // full table would still force a full scan per packet — the very
+            // cost this design removes.
+            if now.duration_since(self.earliest_window_start) < PRE_AUTH_HELLO_WINDOW {
+                return;
             }
             self.counts.retain(|_, (_, window_start)| {
-                now.duration_since(*window_start) < Duration::from_secs(1)
+                now.duration_since(*window_start) < PRE_AUTH_HELLO_WINDOW
             });
+            self.earliest_window_start = self
+                .counts
+                .values()
+                .map(|(_, window_start)| *window_start)
+                .min()
+                .unwrap_or(now);
         }
+    }
+
+    /// Bounds everything the relay emits in response to a packet whose source
+    /// address nothing has validated: the pre-auth rate-limit reject datagram
+    /// and the malformed-packet log line.
+    ///
+    /// # Why a budget exists at all
+    ///
+    /// `handle_control_packet` inspects nothing but `data[0]`, so a bare 1-byte
+    /// `0x01` datagram reaches `PreAuthHelloLimiter`, and a UDP source address
+    /// is trivially spoofed. The original code answered EVERY refusal with a
+    /// `send_to` plus a log line, on the single serialized control loop
+    /// (`RelayDaemon::run`'s `recv_from` select) — so the relay paid more to
+    /// refuse a flood than to drop it, and a spoofing attacker could point an
+    /// unbounded stream of unsolicited relay packets at any third party.
+    ///
+    /// Measured in a release build on this host (macOS, loopback), with the
+    /// amortised-prune `PreAuthHelloLimiter` already in place so both arms
+    /// measure the same limiter: the limiter decision costs ~47-59ns and
+    /// `serialize_relay_reject` ~11-22ns, while the `send_to` costs ~4.1-5.2us
+    /// (~3.6-3.8us for the bare blocking syscall, so it is the syscall, not
+    /// async overhead). End to end, one loop absorbing a flood of 1-byte
+    /// hellos managed 234-253k pkt/s dropping versus 57-66k pkt/s replying;
+    /// replying to a black hole measured the same as replying to the source,
+    /// confirming the cost is the syscall and not loopback delivery. The log
+    /// write is the same order of magnitude but is strongly
+    /// destination-dependent (measurements on this host ranged from ~1.1us to
+    /// a pipe up to ~7.9us to a regular file), so it is budgeted on the same
+    /// terms rather than on a specific figure.
+    ///
+    /// Reflection is NOT the reason for the budget and should not be sold as
+    /// one: 1 byte in, 9 bytes of payload out is ~29 bytes in and ~37 out on
+    /// IPv4+UDP, about 1.28x, with a strict 1:1 packet ratio. That is not an
+    /// amplifier and nobody would choose it over DNS or NTP. What the budget
+    /// removes is the *unbounded* per-victim stream, not the ratio.
+    ///
+    /// # Why the two ceilings are what they are
+    ///
+    /// A single tight per-IP ceiling was the obvious design and it is wrong.
+    /// Both this budget and `pre_auth_hello_limiter` key on `from_addr.ip()`,
+    /// and a peer does not own an IP: behind CGNAT or an office NAT, N daemons
+    /// share one address, and a refusal only happens once their AGGREGATE
+    /// exceeds `MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC`. A 1-per-IP-per-second
+    /// notice would therefore silence almost every legitimately refused
+    /// daemon, and silence is expensive on the client: the relay client sends
+    /// ONE hello, never retransmits it (`RelayClient::establish_session_with_
+    /// round_trip`), and blocks on a 10s non-configurable
+    /// `RelayClientConfig::session_timeout` inside the daemon's
+    /// single-threaded reconcile loop, whose failure also aborts the rest of
+    /// that pass. A reject costs a real peer one RTT; silence costs it ~10s of
+    /// stalled control plane. So the per-IP ceiling is deliberately loose —
+    /// equal to the hello rate the limiter would have admitted from that same
+    /// address — and the GLOBAL ceiling is what protects the loop.
+    ///
+    /// Net effect: in normal operation, including a legitimately over-limit
+    /// NAT, the global ceiling is never approached and every refusal is
+    /// answered exactly as before. Only an actual flood spends the budget out,
+    /// and then the loop cost is capped at `MAX_PRE_AUTH_NOTICES_PER_SEC`
+    /// (~1.7% of the loop) instead of one `send_to` per attacker packet.
+    ///
+    /// # The other two reject sites are deliberately NOT budgeted
+    ///
+    /// `handle_hello`'s `validate_hello_from_tuple` reject is post-parse but
+    /// still pre-auth — `validate_hello_from_tuple` takes `_observed_addr` and
+    /// discards it, so that reject also goes to an unvalidated source. It is
+    /// left alone because it is a net de-amplifier (a minimum well-formed
+    /// hello is ~126 bytes in for 37 out), because it is already bounded to
+    /// `MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC` per source IP by the limiter above
+    /// it — the same ceiling this budget now applies — and because its reject
+    /// is the signal a real peer needs to diagnose an expired token or clock
+    /// skew. Note that `RelayTransport`'s own `HelloLimiter` does NOT help
+    /// there: it is keyed on the attacker-controlled `hello.node_id` and
+    /// consulted before signature verification, so rotating `node_id` defeats
+    /// it entirely (a pre-existing finding, tracked separately, and the reason
+    /// per-packet ed25519 verification — not this reject — is the dominant
+    /// cost on that path). The `RelayHelloResponse::Rejected` reject is
+    /// post-validation: reaching it requires a control-plane-signed token
+    /// naming this relay, so the source is no longer usefully spoofable.
+    struct PreAuthNoticeBudget {
+        /// Per source IP, so no single address can be streamed at. Reuses
+        /// `PreAuthHelloLimiter` rather than a bespoke structure so this
+        /// inherits its reviewed bounded table and window semantics verbatim.
+        per_ip: PreAuthHelloLimiter,
+        /// Emissions already spent in the current global window.
+        spent_this_window: u32,
+        window_start: Instant,
+    }
+
+    impl PreAuthNoticeBudget {
+        fn new() -> Self {
+            Self {
+                per_ip: PreAuthHelloLimiter::new(MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC),
+                spent_this_window: 0,
+                window_start: Instant::now(),
+            }
+        }
+
+        /// Whether the relay may emit one thing in response to `ip` right now.
+        /// Consumes budget only when it returns `true`.
+        fn allow(&mut self, ip: IpAddr, now: Instant) -> bool {
+            // Global ceiling first, and deliberately so: it needs no table
+            // lookup, and checking it first means a source IP does not burn its
+            // own per-IP allowance on an emission that is globally refused
+            // anyway.
+            if now.duration_since(self.window_start) >= PRE_AUTH_HELLO_WINDOW {
+                self.spent_this_window = 0;
+                self.window_start = now;
+            }
+            if self.spent_this_window >= MAX_PRE_AUTH_NOTICES_PER_SEC {
+                return false;
+            }
+            if !self.per_ip.check_at(ip, now) {
+                return false;
+            }
+            self.spent_this_window += 1;
+            true
+        }
+    }
+
+    /// Tells `from_addr` that its pre-auth hellos are being rate limited, if
+    /// the budget allows. Returns whether a reject was actually sent.
+    ///
+    /// See [`PreAuthNoticeBudget`] for why the emission is budgeted, what the
+    /// two ceilings are, and why the other reject sites are left alone.
+    async fn emit_pre_auth_rate_limit_reject_notice(
+        control_socket: &UdpSocket,
+        budget: &RwLock<PreAuthNoticeBudget>,
+        stats: &PreAuthStats,
+        from_addr: SocketAddr,
+        now: Instant,
+    ) -> Result<bool, String> {
+        // Counted before the budget so the total keeps measuring flood volume
+        // even while emissions are suppressed.
+        stats.hellos_refused_total.fetch_add(1, Ordering::Relaxed);
+        if !budget.write().await.allow(from_addr.ip(), now) {
+            stats
+                .notices_suppressed_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+        let reject_bytes = serialize_relay_reject();
+        control_socket
+            .send_to(&reject_bytes, from_addr)
+            .await
+            .map_err(|e| format!("failed to send rate-limit reject: {e}"))?;
+        eprintln!("pre-auth relay hello rate limited from {}", from_addr.ip());
+        Ok(true)
+    }
+
+    /// Logs a `handle_control_packet` failure, if the budget allows. Returns
+    /// whether a line was actually written.
+    ///
+    /// This shares [`PreAuthNoticeBudget`] with the reject above because it is
+    /// reachable on strictly easier terms: `handle_control_packet` refuses an
+    /// empty datagram or any first byte that is not `RELAY_HELLO_MSG_TYPE`
+    /// WITHOUT consulting any limiter, so an unbudgeted log here would let a
+    /// 1-byte `0x00` buy a log write per datagram on the serialized control
+    /// loop — the same cost the reject budget exists to remove, reachable by
+    /// changing one byte. Volume stays visible via
+    /// `PreAuthStats::malformed_packets_total`.
+    async fn log_control_packet_error(
+        budget: &RwLock<PreAuthNoticeBudget>,
+        stats: &PreAuthStats,
+        from_addr: SocketAddr,
+        error: &str,
+        now: Instant,
+    ) -> bool {
+        stats
+            .malformed_packets_total
+            .fetch_add(1, Ordering::Relaxed);
+        if !budget.write().await.allow(from_addr.ip(), now) {
+            stats
+                .notices_suppressed_total
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        eprintln!("control packet error from {from_addr}: {error}");
+        true
     }
 
     /// Parses a `RelayHello` from wire format.
@@ -1074,6 +1355,13 @@ mod daemon {
         max_total_sessions: usize,
         frames_forwarded_total: u64,
         bytes_forwarded_total: u64,
+        /// Pre-auth refusal volume (see `PreAuthStats`). Exposed because
+        /// `PreAuthNoticeBudget` throttles the log line that used to be the
+        /// only signal a flood was in progress; a throttled line cannot report
+        /// volume, so a scraper needs these.
+        pre_auth_hellos_refused_total: u64,
+        pre_auth_malformed_packets_total: u64,
+        pre_auth_notices_suppressed_total: u64,
     }
 
     async fn bind_health_listener(bind_addr: SocketAddr) -> Result<TcpListener, String> {
@@ -1090,6 +1378,7 @@ mod daemon {
         transport: Arc<Mutex<RelayTransport>>,
         allocated_sockets: Arc<RwLock<AllocatedSockets>>,
         forward_stats: Arc<ForwardStats>,
+        pre_auth_stats: Arc<PreAuthStats>,
         max_sessions_per_node: usize,
         max_total_sessions: usize,
     ) -> Result<(), String> {
@@ -1101,6 +1390,7 @@ mod daemon {
             let transport = Arc::clone(&transport);
             let allocated_sockets = Arc::clone(&allocated_sockets);
             let forward_stats = Arc::clone(&forward_stats);
+            let pre_auth_stats = Arc::clone(&pre_auth_stats);
             tokio::spawn(async move {
                 let mut request = [0u8; 1024];
                 let read = match stream.read(&mut request).await {
@@ -1130,6 +1420,15 @@ mod daemon {
                         .load(Ordering::Relaxed),
                     bytes_forwarded_total: forward_stats
                         .bytes_forwarded_total
+                        .load(Ordering::Relaxed),
+                    pre_auth_hellos_refused_total: pre_auth_stats
+                        .hellos_refused_total
+                        .load(Ordering::Relaxed),
+                    pre_auth_malformed_packets_total: pre_auth_stats
+                        .malformed_packets_total
+                        .load(Ordering::Relaxed),
+                    pre_auth_notices_suppressed_total: pre_auth_stats
+                        .notices_suppressed_total
                         .load(Ordering::Relaxed),
                 };
                 let (status, content_type, body) = match path {
@@ -1164,25 +1463,31 @@ mod daemon {
 
     fn render_health_json(snapshot: HealthSnapshot) -> String {
         format!(
-            "{{\"status\":\"ok\",\"active_sessions\":{},\"allocated_ports\":{},\"max_sessions_per_node\":{},\"max_total_sessions\":{},\"frames_forwarded_total\":{},\"bytes_forwarded_total\":{}}}\n",
+            "{{\"status\":\"ok\",\"active_sessions\":{},\"allocated_ports\":{},\"max_sessions_per_node\":{},\"max_total_sessions\":{},\"frames_forwarded_total\":{},\"bytes_forwarded_total\":{},\"pre_auth_hellos_refused_total\":{},\"pre_auth_malformed_packets_total\":{},\"pre_auth_notices_suppressed_total\":{}}}\n",
             snapshot.active_sessions,
             snapshot.allocated_ports,
             snapshot.max_sessions_per_node,
             snapshot.max_total_sessions,
             snapshot.frames_forwarded_total,
-            snapshot.bytes_forwarded_total
+            snapshot.bytes_forwarded_total,
+            snapshot.pre_auth_hellos_refused_total,
+            snapshot.pre_auth_malformed_packets_total,
+            snapshot.pre_auth_notices_suppressed_total
         )
     }
 
     fn render_metrics(snapshot: HealthSnapshot) -> String {
         format!(
-            "# TYPE rustynet_relay_active_sessions gauge\nrustynet_relay_active_sessions {}\n# TYPE rustynet_relay_allocated_ports gauge\nrustynet_relay_allocated_ports {}\n# TYPE rustynet_relay_max_sessions_per_node gauge\nrustynet_relay_max_sessions_per_node {}\n# TYPE rustynet_relay_max_total_sessions gauge\nrustynet_relay_max_total_sessions {}\n# TYPE rustynet_relay_frames_forwarded_total counter\nrustynet_relay_frames_forwarded_total {}\n# TYPE rustynet_relay_bytes_forwarded_total counter\nrustynet_relay_bytes_forwarded_total {}\n",
+            "# TYPE rustynet_relay_active_sessions gauge\nrustynet_relay_active_sessions {}\n# TYPE rustynet_relay_allocated_ports gauge\nrustynet_relay_allocated_ports {}\n# TYPE rustynet_relay_max_sessions_per_node gauge\nrustynet_relay_max_sessions_per_node {}\n# TYPE rustynet_relay_max_total_sessions gauge\nrustynet_relay_max_total_sessions {}\n# TYPE rustynet_relay_frames_forwarded_total counter\nrustynet_relay_frames_forwarded_total {}\n# TYPE rustynet_relay_bytes_forwarded_total counter\nrustynet_relay_bytes_forwarded_total {}\n# TYPE rustynet_relay_pre_auth_hellos_refused_total counter\nrustynet_relay_pre_auth_hellos_refused_total {}\n# TYPE rustynet_relay_pre_auth_malformed_packets_total counter\nrustynet_relay_pre_auth_malformed_packets_total {}\n# TYPE rustynet_relay_pre_auth_notices_suppressed_total counter\nrustynet_relay_pre_auth_notices_suppressed_total {}\n",
             snapshot.active_sessions,
             snapshot.allocated_ports,
             snapshot.max_sessions_per_node,
             snapshot.max_total_sessions,
             snapshot.frames_forwarded_total,
-            snapshot.bytes_forwarded_total
+            snapshot.bytes_forwarded_total,
+            snapshot.pre_auth_hellos_refused_total,
+            snapshot.pre_auth_malformed_packets_total,
+            snapshot.pre_auth_notices_suppressed_total
         )
     }
 
@@ -2585,11 +2890,11 @@ mod daemon {
     #[cfg(test)]
     mod tests {
         use super::{
-            ForwardStats, HealthSnapshot, MAX_PRE_AUTH_HELLO_SOURCE_IPS, PortAllocation,
-            PreAuthHelloLimiter, RELAY_KEEPALIVE_MSG_TYPE, RELAY_REJECT_GENERIC_REASON,
-            RELAY_REJECT_MSG_TYPE, RelayConfig, RelayDaemon, RelayHelloResponse,
-            RelayHostEntrySelection, RelayTransport, WindowsRelayServiceHardeningSnapshot,
-            WindowsRelayServiceOptions, bind_health_listener,
+            ForwardStats, HealthSnapshot, MAX_PRE_AUTH_HELLO_SOURCE_IPS, PRE_AUTH_HELLO_WINDOW,
+            PortAllocation, PreAuthHelloLimiter, PreAuthNoticeBudget, PreAuthStats,
+            RELAY_KEEPALIVE_MSG_TYPE, RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE,
+            RelayConfig, RelayDaemon, RelayHelloResponse, RelayHostEntrySelection, RelayTransport,
+            WindowsRelayServiceHardeningSnapshot, WindowsRelayServiceOptions, bind_health_listener,
             build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
             http_request_path, load_control_verifier_key, parse_relay_id_arg,
             parse_windows_image_path_argv, record_forward, render_health_json, render_metrics,
@@ -3725,6 +4030,9 @@ mod daemon {
                 max_total_sessions: 32,
                 frames_forwarded_total: 41,
                 bytes_forwarded_total: 12_345,
+                pre_auth_hellos_refused_total: 91,
+                pre_auth_malformed_packets_total: 7,
+                pre_auth_notices_suppressed_total: 88,
             };
 
             let health = render_health_json(snapshot);
@@ -3733,6 +4041,9 @@ mod daemon {
             assert!(health.contains("\"max_total_sessions\":32"));
             assert!(health.contains("\"frames_forwarded_total\":41"));
             assert!(health.contains("\"bytes_forwarded_total\":12345"));
+            assert!(health.contains("\"pre_auth_hellos_refused_total\":91"));
+            assert!(health.contains("\"pre_auth_malformed_packets_total\":7"));
+            assert!(health.contains("\"pre_auth_notices_suppressed_total\":88"));
             assert!(!health.contains("verifier"));
             assert!(!health.contains("replay"));
             assert!(!health.contains("token"));
@@ -3744,6 +4055,9 @@ mod daemon {
             assert!(metrics.contains("rustynet_relay_max_total_sessions 32"));
             assert!(metrics.contains("rustynet_relay_frames_forwarded_total 41"));
             assert!(metrics.contains("rustynet_relay_bytes_forwarded_total 12345"));
+            assert!(metrics.contains("rustynet_relay_pre_auth_hellos_refused_total 91"));
+            assert!(metrics.contains("rustynet_relay_pre_auth_malformed_packets_total 7"));
+            assert!(metrics.contains("rustynet_relay_pre_auth_notices_suppressed_total 88"));
             assert!(!metrics.contains("verifier"));
             assert!(!metrics.contains("replay"));
             assert!(!metrics.contains("token"));
@@ -3813,6 +4127,7 @@ mod daemon {
                 Arc::clone(&transport),
                 Arc::clone(&allocated_sockets),
                 Arc::clone(&forward_stats),
+                Arc::new(PreAuthStats::default()),
                 8,
                 4096,
             ));
@@ -3873,6 +4188,7 @@ mod daemon {
                 transport,
                 allocated_sockets,
                 Arc::clone(&forward_stats),
+                Arc::new(PreAuthStats::default()),
                 8,
                 4096,
             ));
@@ -4320,82 +4636,611 @@ mod daemon {
         #[test]
         fn pre_auth_hello_limiter_bounds_source_ip_table() {
             // Assert the bound against a LITERAL, not the symbol. Writing the
-            // test in terms of `MAX_PRE_AUTH_HELLO_SOURCE_IPS` end to end made it
-            // scale with the constant, so shrinking the constant to 8 -- the very
-            // "limiter tracks only 8 source IPs" bug this test exists to catch --
-            // left the whole suite green.
+            // test in terms of `MAX_PRE_AUTH_HELLO_SOURCE_IPS` end to end makes
+            // it scale with the constant, so shrinking the constant to 8 — the
+            // very "limiter tracks only 8 source IPs" bug this test exists to
+            // catch — would leave the whole suite green.
             assert_eq!(
                 MAX_PRE_AUTH_HELLO_SOURCE_IPS, 4096,
                 "the source-IP cap is the property under test; changing it must \
                  be deliberate and must update this test"
             );
 
-            let source_ip = |index: usize| {
-                IpAddr::V4(Ipv4Addr::new(
+            let mut limiter = PreAuthHelloLimiter::new(1);
+            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS {
+                let ip = IpAddr::V4(Ipv4Addr::new(
                     10,
                     ((index >> 16) & 0xff) as u8,
                     ((index >> 8) & 0xff) as u8,
                     (index & 0xff) as u8,
-                ))
-            };
-
-            let mut limiter = PreAuthHelloLimiter::new(1);
-
-            // Fill through the REAL `check` path. An earlier version inserted
-            // straight into the map to dodge a timing problem, which cut the
-            // number of real `check` calls in any test from 4098 to 7 and left
-            // the per-call cost exercised by nothing. The timing problem was in
-            // `check` itself -- it pruned the whole table on every call -- and is
-            // fixed there, so this can go back through the front door.
-            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS - 1 {
-                assert!(limiter.check(source_ip(index)));
+                ));
+                assert!(limiter.check(ip));
             }
-            assert_eq!(limiter.counts.len(), MAX_PRE_AUTH_HELLO_SOURCE_IPS - 1);
 
-            // The lazy-prune property, asserted deterministically. Filling the
-            // table below capacity must not prune at all -- pruning is only
-            // useful when the table is full and the incoming IP is new. Reverting
-            // `check` to an unconditional `prune(now)` makes this 4095 instead of
-            // 0, which is the ONLY thing in the suite that notices: the timing
-            // symptom it used to produce (a fill exceeding the one-second window)
-            // is a race that passes 40/40 on a fast machine.
-            assert_eq!(
-                limiter.prune_calls, 0,
-                "filling below capacity must not prune; pruning on every hello is \
-                 O(n) per packet on the pre-auth path"
-            );
-
-            // Probe the boundary from BOTH sides. Asserting only that a full
-            // table rejects is satisfied by any bound <= 4096, so a limiter
-            // tracking far fewer IPs would pass while locking out real peers.
-            let last_admissible = source_ip(MAX_PRE_AUTH_HELLO_SOURCE_IPS - 1);
-            assert!(
-                limiter.check(last_admissible),
-                "a new source IP must still be admitted while the table is below \
-                 its bound, or the limiter locks out legitimate peers"
-            );
-            assert_eq!(limiter.counts.len(), MAX_PRE_AUTH_HELLO_SOURCE_IPS);
-
-            // At the bound a new address is rejected AND must not be recorded.
-            // Without the size assertion, a `check` that rejects but inserts
-            // anyway passes -- unbounded growth, in a test named for bounding
-            // the table.
-            let over_bound = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30));
-            assert!(!limiter.check(over_bound));
-            assert_eq!(
-                limiter.counts.len(),
-                MAX_PRE_AUTH_HELLO_SOURCE_IPS,
-                "a rejected source IP must not be recorded, or the table grows \
-                 without bound one rejection at a time"
-            );
-
-            // Ageing every window makes the entries collectable, after which the
-            // same address is admitted -- proving the rejection was the bound and
-            // not something permanent.
+            assert!(!limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))));
+            let aged = Instant::now() - Duration::from_secs(2);
             limiter.counts.values_mut().for_each(|(_, window_start)| {
-                *window_start = Instant::now() - Duration::from_secs(2);
+                *window_start = aged;
             });
-            assert!(limiter.check(over_bound));
+            // This test back-dates `counts` directly, so it must also restore
+            // the `earliest_window_start` lower-bound invariant it just broke —
+            // otherwise the (sound) prune guard correctly concludes nothing can
+            // have expired and skips the sweep.
+            limiter.earliest_window_start = aged;
+            assert!(limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))));
+        }
+
+        fn test_ip(index: usize) -> IpAddr {
+            IpAddr::V4(Ipv4Addr::new(
+                10,
+                ((index >> 16) & 0xff) as u8,
+                ((index >> 8) & 0xff) as u8,
+                (index & 0xff) as u8,
+            ))
+        }
+
+        /// The pre-`check_at` limiter: an unconditional full-table sweep on
+        /// every call. Kept here purely as the differential oracle for
+        /// [`optimised_limiter_decisions_match_the_eager_sweep_oracle`].
+        struct EagerSweepOracle {
+            max_per_sec: u32,
+            counts: HashMap<IpAddr, (u32, Instant)>,
+        }
+
+        impl EagerSweepOracle {
+            fn new(max_per_sec: u32) -> Self {
+                Self {
+                    max_per_sec,
+                    counts: HashMap::new(),
+                }
+            }
+
+            fn check_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+                self.counts.retain(|_, (_, window_start)| {
+                    now.duration_since(*window_start) < Duration::from_secs(1)
+                });
+                if !self.counts.contains_key(&ip)
+                    && self.counts.len() >= MAX_PRE_AUTH_HELLO_SOURCE_IPS
+                {
+                    return false;
+                }
+                let entry = self.counts.entry(ip).or_insert((0, now));
+                if now.duration_since(entry.1) >= Duration::from_secs(1) {
+                    *entry = (0, now);
+                }
+                if entry.0 >= self.max_per_sec {
+                    return false;
+                }
+                entry.0 += 1;
+                true
+            }
+        }
+
+        /// THE invariant: dropping the per-packet sweep is a pure optimisation.
+        /// Every admit/reject decision must still match the original eager-sweep
+        /// limiter call-for-call, so this is a convergence on the same guarantee
+        /// rather than a relaxation of it.
+        ///
+        /// Drives a deterministic timeline that crosses window boundaries and
+        /// exercises table saturation, tracked-IP re-hits, rotating unseen IPs,
+        /// and post-expiry re-admission.
+        #[test]
+        fn optimised_limiter_decisions_match_the_eager_sweep_oracle() {
+            let base = Instant::now();
+            let mut limiter = PreAuthHelloLimiter::new(3);
+            let mut oracle = EagerSweepOracle::new(3);
+
+            // Deterministic pseudo-random walk over a mix of IPs that both
+            // stays under the table bound and blows past it.
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+            let (mut admits, mut rejects, mut peak_len) = (0_u32, 0_u32, 0_usize);
+            for step in 0..12_000_u64 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                // Mix of a small hot set, the full table range, and fresh IPs.
+                let index = match (state >> 33) % 3 {
+                    0 => (state % 16) as usize,
+                    1 => (state % (MAX_PRE_AUTH_HELLO_SOURCE_IPS as u64 * 2)) as usize,
+                    _ => 500_000 + step as usize,
+                };
+                let ip = test_ip(index);
+                // Advance 2ms/step, so the 1s window elapses repeatedly.
+                let now = base + Duration::from_micros(step * 2_000);
+
+                let got = limiter.check_at(ip, now);
+                let want = oracle.check_at(ip, now);
+                assert_eq!(
+                    got,
+                    want,
+                    "step {step}: optimised limiter returned {got} for {ip} at +{:?}, \
+                     eager-sweep oracle returned {want} — dropping the per-packet sweep \
+                     changed a decision, which is a relaxation, not an optimisation",
+                    now.duration_since(base)
+                );
+                assert!(
+                    limiter.counts.len() <= MAX_PRE_AUTH_HELLO_SOURCE_IPS,
+                    "step {step}: table grew to {}, past the {MAX_PRE_AUTH_HELLO_SOURCE_IPS} bound",
+                    limiter.counts.len()
+                );
+                if got {
+                    admits += 1;
+                } else {
+                    rejects += 1;
+                }
+                peak_len = peak_len.max(limiter.counts.len());
+            }
+
+            // Guard against a vacuous pass: the walk must actually have
+            // saturated the table and produced both outcomes, or "the decisions
+            // agree" would be proving nothing about the interesting path.
+            assert_eq!(
+                peak_len, MAX_PRE_AUTH_HELLO_SOURCE_IPS,
+                "walk never saturated the table (peak {peak_len}); the capacity/sweep branch \
+                 the optimisation touches was never exercised"
+            );
+            assert!(
+                admits > 0 && rejects > 0,
+                "walk produced only one outcome (admits={admits}, rejects={rejects})"
+            );
+        }
+
+        /// `earliest_window_start` must stay a true lower bound on every tracked
+        /// window. The prune guard's soundness rests entirely on this: if the
+        /// bound could ever exceed a real `window_start`, the guard would skip a
+        /// sweep that had live entries to reclaim and wrongly reject a new IP.
+        ///
+        /// The step size matters and is load-bearing: at 200us x 5_000 steps the
+        /// walk spanned exactly one window, so it never reached a state produced
+        /// BY a sweep and could not observe a bound recomputed wrongly after one.
+        /// Verified by mutation — recomputing the bound as `now` instead of from
+        /// the retained entries passed the whole suite at 200us and fails here at
+        /// step 4096 ("ran ahead ... by 998ms"). Keep the span several windows
+        /// wide.
+        #[test]
+        fn earliest_window_start_is_always_a_lower_bound() {
+            let base = Instant::now();
+            let mut limiter = PreAuthHelloLimiter::new(2);
+            for step in 0..5_000_u64 {
+                let index = (step % (MAX_PRE_AUTH_HELLO_SOURCE_IPS as u64 + 500)) as usize;
+                let now = base + Duration::from_micros(step * 2_000);
+                limiter.check_at(test_ip(index), now);
+
+                if let Some(min) = limiter.counts.values().map(|(_, ws)| *ws).min() {
+                    assert!(
+                        limiter.earliest_window_start <= min,
+                        "step {step}: earliest_window_start ran ahead of the true minimum \
+                         window_start by {:?} — the prune guard is no longer sound",
+                        limiter.earliest_window_start.duration_since(min)
+                    );
+                }
+            }
+        }
+
+        /// A full table must still admit a brand-new source IP once the tracked
+        /// windows genuinely elapse — the property the removed per-packet sweep
+        /// used to provide. Driven through the public decision path on an
+        /// injected clock, with no reaching into private state.
+        #[test]
+        fn full_table_readmits_a_new_ip_after_the_window_elapses() {
+            let base = Instant::now();
+            let mut limiter = PreAuthHelloLimiter::new(1);
+            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS {
+                assert!(limiter.check_at(test_ip(index), base));
+            }
+
+            let newcomer = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30));
+            // Still inside the window: the table is legitimately full.
+            assert!(
+                !limiter.check_at(newcomer, base + Duration::from_millis(900)),
+                "a full table of live windows must reject an untracked source IP"
+            );
+            // Past the window: every tracked entry has expired, so the sweep
+            // must reclaim them and let the newcomer in.
+            assert!(
+                limiter.check_at(newcomer, base + Duration::from_millis(1_100)),
+                "once every tracked window elapsed the newcomer must be admitted"
+            );
+            assert!(limiter.counts.len() <= MAX_PRE_AUTH_HELLO_SOURCE_IPS);
+        }
+
+        /// The regression this whole change is about: with the table full and
+        /// every window live, an attacker rotating through never-seen source
+        /// IPs must not be able to force a full-table scan per packet. Asserts
+        /// on sweep COUNT, not wall-clock, so it is not a flaky timing test.
+        #[test]
+        fn rotating_unseen_ips_against_a_full_table_do_not_sweep_per_packet() {
+            let base = Instant::now();
+            let mut limiter = PreAuthHelloLimiter::new(1);
+            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS {
+                assert!(limiter.check_at(test_ip(index), base));
+            }
+
+            // `earliest_window_start` is the only thing a sweep rewrites, so
+            // watching it tells us whether a sweep actually ran.
+            let before = limiter.earliest_window_start;
+            for step in 0..5_000_u64 {
+                let now = base + Duration::from_micros(step);
+                assert!(
+                    !limiter.check_at(test_ip(900_000 + step as usize), now),
+                    "step {step}: a full table of live windows must reject an unseen IP"
+                );
+            }
+            assert_eq!(
+                limiter.earliest_window_start, before,
+                "the prune guard let a sweep run while no window could have expired — \
+                 that is the O(table)-per-packet pre-auth flood this change removes"
+            );
+        }
+
+        /// A distinct address inside `127.0.0.0/8`. Every one of these routes to
+        /// the loopback interface on Linux and macOS, so a `send_to` aimed at
+        /// one really is issued (and then dropped for want of a listener)
+        /// instead of failing with `EADDRNOTAVAIL` the way a non-loopback
+        /// destination would from a loopback-bound socket. `index` must be
+        /// >= 1 so the unroutable `127.0.0.0` is never produced.
+        fn loopback_test_ip(index: usize) -> IpAddr {
+            assert!(index >= 1, "index 0 would produce the unroutable 127.0.0.0");
+            IpAddr::V4(Ipv4Addr::new(
+                127,
+                ((index >> 16) & 0xff) as u8,
+                ((index >> 8) & 0xff) as u8,
+                (index & 0xff) as u8,
+            ))
+        }
+
+        /// Drives `emit_pre_auth_rate_limit_reject_notice` against a real UDP
+        /// socket pair and reports both the function's own verdict and whether
+        /// a datagram actually landed, so the test can never pass on the return
+        /// value alone.
+        async fn notice_attempt(
+            relay: &UdpSocket,
+            peer: &UdpSocket,
+            budget: &RwLock<PreAuthNoticeBudget>,
+            stats: &PreAuthStats,
+            from_addr: std::net::SocketAddr,
+            now: Instant,
+        ) -> (bool, Option<Vec<u8>>) {
+            let emitted =
+                super::emit_pre_auth_rate_limit_reject_notice(relay, budget, stats, from_addr, now)
+                    .await
+                    .expect("notice emission must not fail");
+            let mut buf = [0u8; 64];
+            let received =
+                match tokio::time::timeout(Duration::from_millis(50), peer.recv_from(&mut buf))
+                    .await
+                {
+                    Ok(Ok((len, _))) => Some(buf[..len].to_vec()),
+                    Ok(Err(err)) => panic!("peer recv failed: {err}"),
+                    Err(_) => None,
+                };
+            assert_eq!(
+                emitted,
+                received.is_some(),
+                "emit_pre_auth_rate_limit_reject_notice returned {emitted} but a datagram {} \
+                 arrive — the return value must track the wire",
+                if received.is_some() { "did" } else { "did not" }
+            );
+            (emitted, received)
+        }
+
+        /// Half of THE invariant: a real peer earning a refusal still gets told,
+        /// with the exact reject its client already parses, and telling resumes
+        /// after the window. Pinned because the tempting fix — stop replying —
+        /// costs a legitimate peer ~10s of stalled control plane (see
+        /// `PreAuthNoticeBudget`), so "the relay went quiet" must never become
+        /// the normal-operation behaviour.
+        #[tokio::test]
+        async fn legitimate_refusals_are_still_answered_and_resume_after_the_window() {
+            let relay = UdpSocket::bind("127.0.0.1:0").await.expect("relay bind");
+            let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer bind");
+            let peer_addr = peer.local_addr().expect("peer addr");
+            let budget = RwLock::new(PreAuthNoticeBudget::new());
+            let stats = PreAuthStats::default();
+            let base = Instant::now();
+
+            let (emitted, received) =
+                notice_attempt(&relay, &peer, &budget, &stats, peer_addr, base).await;
+            assert!(
+                emitted,
+                "the first refusal for a source IP must be answered"
+            );
+            let reject = received.expect("first notice must reach the peer");
+            assert_eq!(
+                reject,
+                serialize_relay_reject(),
+                "the budgeted notice must be the same reject clients already parse"
+            );
+            assert_eq!(reject[0], RELAY_REJECT_MSG_TYPE);
+            assert_eq!(&reject[1..], RELAY_REJECT_GENERIC_REASON.as_bytes());
+
+            // A source IP whose whole per-IP allowance is spent goes quiet for
+            // the rest of the window...
+            let mut emitted_in_window = 1_u32;
+            for step in 1..(super::MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC as u64 * 3) {
+                let (emitted, _) = notice_attempt(
+                    &relay,
+                    &peer,
+                    &budget,
+                    &stats,
+                    peer_addr,
+                    base + Duration::from_micros(step),
+                )
+                .await;
+                if emitted {
+                    emitted_in_window += 1;
+                }
+            }
+            assert_eq!(
+                emitted_in_window,
+                super::MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC,
+                "one source IP must get exactly its per-IP allowance in a window"
+            );
+
+            // ...and is answered again in the next one.
+            let (emitted, received) = notice_attempt(
+                &relay,
+                &peer,
+                &budget,
+                &stats,
+                peer_addr,
+                base + PRE_AUTH_HELLO_WINDOW + Duration::from_millis(1),
+            )
+            .await;
+            assert!(
+                emitted,
+                "after the window elapses the source must be answered again — a permanently \
+                 silent relay is a behaviour change for real clients"
+            );
+            assert!(received.is_some());
+        }
+
+        /// One shape of flood: rotating through source IPs the budget has never
+        /// seen. Bounded by the per-IP limiter's own table, since an unseen
+        /// source cannot be admitted once 4096 live windows are tracked. Pins
+        /// that reusing `PreAuthHelloLimiter` really does inherit that bound.
+        ///
+        /// This is NOT the load-bearing case — see
+        /// `the_global_ceiling_bounds_emissions_when_per_ip_allowance_remains`
+        /// for the shape that defeats the table bound.
+        #[tokio::test]
+        async fn rotating_unseen_spoofed_source_ips_are_bounded_by_the_table() {
+            let relay = UdpSocket::bind("127.0.0.1:0").await.expect("relay bind");
+            let budget = RwLock::new(PreAuthNoticeBudget::new());
+            let stats = PreAuthStats::default();
+            let base = Instant::now();
+
+            // Sources are spread across 127.0.0.0/8 (all routed to the loopback
+            // interface, nothing bound at the target ports) so every emitted
+            // notice performs a real `send_to` that the kernel then drops,
+            // rather than the test's addressing quietly deciding the outcome.
+            let attempts = MAX_PRE_AUTH_HELLO_SOURCE_IPS as u64 * 4;
+            for step in 1..=attempts {
+                let from_addr = std::net::SocketAddr::new(loopback_test_ip(step as usize), 40_000);
+                // A send the host refuses (some platforms are stricter than
+                // Linux/macOS about `127.0.0.0/8` destinations) is deliberately
+                // tolerated: the property under test is how many emissions the
+                // budget AUTHORISED, which `stats` records before the socket is
+                // touched. Counting from `stats` keeps this a real end-to-end
+                // call without making it a portability tripwire.
+                let _ = super::emit_pre_auth_rate_limit_reject_notice(
+                    &relay,
+                    &budget,
+                    &stats,
+                    from_addr,
+                    // Inside ONE global window, so the ceiling cannot be
+                    // refilled part-way through.
+                    base + Duration::from_micros(step),
+                )
+                .await;
+            }
+            let emitted_total = attempts - stats.notices_suppressed_total.load(Ordering::Relaxed);
+
+            assert_eq!(
+                emitted_total, MAX_PRE_AUTH_HELLO_SOURCE_IPS as u64,
+                "a flood rotating through {attempts} never-before-seen spoofed source IPs inside \
+                 one window emitted {emitted_total} rejects; the source-IP table bound \
+                 ({MAX_PRE_AUTH_HELLO_SOURCE_IPS}) must cap it"
+            );
+            assert!(emitted_total < attempts, "no suppression happened at all");
+            assert_eq!(
+                stats.hellos_refused_total.load(Ordering::Relaxed),
+                attempts,
+                "the refusal counter must see every packet even when no notice is emitted — it \
+                 is the only remaining signal of flood volume"
+            );
+        }
+
+        /// THE load-bearing bound. The per-IP ceiling and the source-IP table
+        /// together still permit
+        /// `MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC * MAX_PRE_AUTH_HELLO_SOURCE_IPS`
+        /// = 204_800 emissions per window, which is a `send_to` per attacker
+        /// packet at any rate the loop can reach. Only the global ceiling stops
+        /// it.
+        ///
+        /// Driven round-robin over a full table of source IPs so that every
+        /// refusal has per-IP allowance left over — i.e. the table bound is
+        /// deliberately NOT the thing doing the work here. Deleting the global
+        /// ceiling must fail this test even though every other test still
+        /// passes.
+        #[tokio::test]
+        async fn the_global_ceiling_bounds_emissions_when_per_ip_allowance_remains() {
+            let relay = UdpSocket::bind("127.0.0.1:0").await.expect("relay bind");
+            let budget = RwLock::new(PreAuthNoticeBudget::new());
+            let stats = PreAuthStats::default();
+            let base = Instant::now();
+
+            let rounds = u64::from(super::MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC);
+            let sources = MAX_PRE_AUTH_HELLO_SOURCE_IPS as u64;
+            let mut step = 0_u64;
+            for _ in 0..rounds {
+                for source in 1..=sources {
+                    step += 1;
+                    let from_addr =
+                        std::net::SocketAddr::new(loopback_test_ip(source as usize), 40_000);
+                    // Send failures tolerated for the same reason as in
+                    // `rotating_unseen_spoofed_source_ips_are_bounded_by_the_table`.
+                    let _ = super::emit_pre_auth_rate_limit_reject_notice(
+                        &relay,
+                        &budget,
+                        &stats,
+                        from_addr,
+                        // One global window throughout: 204_800 steps at 1ns
+                        // apart stays far inside PRE_AUTH_HELLO_WINDOW, so the
+                        // ceiling is never legitimately refilled.
+                        base + Duration::from_nanos(step),
+                    )
+                    .await;
+                }
+            }
+
+            let attempts = rounds * sources;
+            let emitted_total = attempts - stats.notices_suppressed_total.load(Ordering::Relaxed);
+            assert_eq!(
+                emitted_total,
+                u64::from(super::MAX_PRE_AUTH_NOTICES_PER_SEC),
+                "{attempts} refusals spread over {sources} sources — each well inside its own \
+                 per-IP allowance of {rounds} — emitted {emitted_total} rejects. Without the \
+                 global ceiling ({}) the serialized control loop pays a send_to per attacker \
+                 packet, which is the entire cost this budget exists to remove",
+                super::MAX_PRE_AUTH_NOTICES_PER_SEC
+            );
+            assert!(emitted_total < attempts, "no suppression happened at all");
+            assert_eq!(
+                stats.hellos_refused_total.load(Ordering::Relaxed),
+                attempts,
+                "every refusal must be counted regardless of what was emitted"
+            );
+        }
+
+        /// The malformed-packet log shares the same budget. Without this, the
+        /// whole rationale is bypassed by changing one byte: `0x00` never
+        /// reaches any limiter, so an unbudgeted log line here would let a
+        /// 1-byte datagram buy a log write per packet on the control loop.
+        #[tokio::test]
+        async fn malformed_packet_logging_spends_the_same_budget() {
+            let budget = RwLock::new(PreAuthNoticeBudget::new());
+            let stats = PreAuthStats::default();
+            let base = Instant::now();
+            let from_addr =
+                std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 21)), 40_000);
+
+            let mut logged = 0_u32;
+            for step in 0..(super::MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC * 4) {
+                if super::log_control_packet_error(
+                    &budget,
+                    &stats,
+                    from_addr,
+                    "unknown message type: 0x00",
+                    base + Duration::from_micros(u64::from(step)),
+                )
+                .await
+                {
+                    logged += 1;
+                }
+            }
+            assert_eq!(
+                logged,
+                super::MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC,
+                "an unauthenticated malformed datagram must not buy a log line per packet"
+            );
+            assert_eq!(
+                stats.malformed_packets_total.load(Ordering::Relaxed),
+                u64::from(super::MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC * 4)
+            );
+        }
+
+        /// The budget and the hello limiter are two `PreAuthHelloLimiter`s with
+        /// different rates, so a mis-wired call site would silently give the
+        /// reject path the hello path's 50/s and every helper-level test above
+        /// would still pass. This drives the real `RelayDaemon::handle_control_
+        /// packet` end to end and counts datagrams on the wire, so the wiring
+        /// itself is pinned, not just the helper.
+        #[tokio::test]
+        async fn handle_control_packet_budgets_its_reject_through_the_daemon_wiring() {
+            let dir = restricted_temp_dir("preauth-wiring");
+            let key_path = dir.join("control.pub");
+            write_verifier_key(&key_path);
+            // `RelayConfig::validate` refuses port 0, so probe a free ephemeral
+            // port, release it, and retry a few times if something else claims
+            // it in between — the alternative is a hard-coded port, which would
+            // collide with a parallel test run.
+            let mut built = None;
+            for _ in 0..16 {
+                let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe bind");
+                let port = probe.local_addr().expect("probe addr").port();
+                drop(probe);
+                let config = RelayConfig {
+                    relay_id: parse_relay_id_arg("relay-eu-1").expect("relay id should parse"),
+                    verifier_key_path: key_path.to_str().expect("utf8 path").to_owned(),
+                    replay_store_path: dir
+                        .join("replay.store")
+                        .to_str()
+                        .expect("utf8 path")
+                        .to_owned(),
+                    bind_addr: std::net::SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        port,
+                    ),
+                    health_bind_addr: None,
+                    ..RelayConfig::default()
+                };
+                if let Ok(daemon) = RelayDaemon::new(config).await {
+                    built = Some(daemon);
+                    break;
+                }
+            }
+            let daemon = built.expect("relay daemon should build on a free loopback port");
+            let relay_addr = daemon
+                .control_socket
+                .local_addr()
+                .expect("control socket addr");
+
+            let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer bind");
+            let peer_addr = peer.local_addr().expect("peer addr");
+
+            // Exhaust the hello limiter for this source, so every subsequent
+            // 1-byte 0x01 lands on the budgeted reject path.
+            let overshoot = super::MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC * 4;
+            for _ in 0..(super::MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC + overshoot) {
+                // A bare 0x01 is all it takes: `handle_control_packet` reads
+                // nothing but `data[0]` before consulting the limiter.
+                let _ = daemon.handle_control_packet(&[0x01], peer_addr).await;
+            }
+
+            let mut rejects = 0_u32;
+            let mut buf = [0u8; 64];
+            while let Ok(Ok((len, from))) =
+                tokio::time::timeout(Duration::from_millis(50), peer.recv_from(&mut buf)).await
+            {
+                assert_eq!(
+                    from, relay_addr,
+                    "rejects must come from the control socket"
+                );
+                assert_eq!(&buf[..len], serialize_relay_reject().as_slice());
+                rejects += 1;
+            }
+
+            assert!(
+                rejects > 0,
+                "the daemon must still answer a refused source at least once"
+            );
+            assert!(
+                rejects <= super::MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC,
+                "handle_control_packet emitted {rejects} rejects to one source inside a single \
+                 window, above the {} ceiling — the reject path is wired to the wrong budget",
+                super::MAX_PRE_AUTH_NOTICES_PER_IP_PER_SEC
+            );
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .hellos_refused_total
+                    .load(Ordering::Relaxed),
+                u64::from(overshoot),
+                "every refusal the daemon made must be counted"
+            );
+
+            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
     }
 }
