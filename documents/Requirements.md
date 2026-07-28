@@ -348,7 +348,7 @@ layer exist. Actual stack, with the original candidates kept for provenance:
 - `axum` / `actix-web` (control APIs) — absent. There is no HTTP or gRPC server framework in the workspace at all; the only HTTP listener is the relay's hand-rolled health/metrics endpoint (`crates/rustynet-relay/src/main.rs:1367`).
 - `tonic` (gRPC) — absent; gRPC was not chosen.
 - `sqlx` — absent, see `rusqlite` above.
-- `rustls` (TLS) — never adopted as a direct dependency, but present transitively: `rustls` 0.23.41 (`Cargo.lock:1278`) arrives via `ureq` in `crates/rustynet-mcp/Cargo.toml:29`. It is used for outbound HTTPS in operator tooling, not for any Rustynet transport. This does not satisfy the TLS 1.3 requirement in §5; see `SecurityMinimumBar.md` §3 control 2 for that unmet-requirement record.
+- `rustls` (TLS) — never adopted as a direct dependency, but present transitively: `rustls` 0.23.41 (`Cargo.lock:1278`) arrives via `ureq` in `crates/rustynet-mcp/Cargo.toml:29`. It is used for outbound HTTPS in operator tooling, not for any Rustynet transport. Note this is NOT a partial satisfaction of anything in §5: that section's control-plane requirement was amended on 2026-07-27 (see the note at `Requirements.md:168`) and no longer mandates TLS 1.3. `rustls` is nonetheless inside this project's supply-chain, SBOM and CVE-triage scope — see `SecurityMinimumBar.md` §3 control 2.
 - Keep unsafe code minimized and isolated.
 - Prefer integration tests around networking behaviors and ACL decisions.
 
