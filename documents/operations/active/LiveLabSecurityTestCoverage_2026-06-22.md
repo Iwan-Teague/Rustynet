@@ -426,10 +426,16 @@ validation). Together they mean **node revocation is effectively non-functional*
   the reducer state-root deterministic so revocation applies"). Verified
   present in current code: `reduce_membership_state` now takes
   `op_created_at_unix: u64` and stamps it on `SetNodeCapabilities`/`RevokeNode`/
-  `RestoreNode`/`RotateNodeKey` instead of calling `unix_now()`. **The code fix
+  `RestoreNode`/`RotateNodeKey` instead of calling `unix_now()`. ~~**The code fix
   is real; `validate_linux_membership_revoke_applies` still does not exist**
-  (zero hits in `vm_lab/mod.rs`) — this is Tier 0 priority 1 above. Until that
-  stage exists and passes live, the fix's correctness rests on unit tests only.
+  (zero hits in `vm_lab/mod.rs`)~~ — this is Tier 0 priority 1 above.
+- **CORRECTION (2026-07-28):** the stage **does** now exist — it resolves in
+  `vm_lab/mod.rs`, `live_lab_stage_registry.rs`, `live_lab_run_matrix.rs` and
+  both MCP servers, as does `validate_linux_revoked_peer_denied_e2e`. The open
+  question is no longer existence but attainment: whether either has passed
+  green under the `--node` engine. Read that from the stage's own report
+  artifact in a run's report directory — not from a run-matrix column, and not
+  from this document.
 
 ### FINDING-B (CRITICAL) — DD-03 / RSA-0007/0008: dataplane/exit/LAN admission is revocation-blind
 
@@ -839,6 +845,6 @@ Adding a new stage to the FULL STAGE MATRIX tab:
 |---|---|---|
 | FINDING-A (RSA-0009) fixed | Read current `membership.rs::reduce_membership_state`, confirmed `op_created_at_unix` param + usage on all 4 mutation ops | Confirmed fixed, `a23df5f` present in HEAD history |
 | FINDING-B (DD-03/RSA-0007) fixed | Grepped `rustynetd` for `.evaluate(` vs `.evaluate_with_membership(`, read `phase10.rs` call sites | Confirmed fixed, `92e5748` present in HEAD history; sole remaining blind-`evaluate` call is the audit harness itself |
-| `validate_linux_membership_revoke_applies` / `validate_linux_revoked_peer_denied_e2e` exist | Grepped `crates/rustynet-cli/src/` + `documents/` | Zero hits outside this document — neither stage is built |
+| `validate_linux_membership_revoke_applies` / `validate_linux_revoked_peer_denied_e2e` exist | Grepped `crates/rustynet-cli/src/` + `documents/` | ~~Zero hits outside this document — neither stage is built~~ — **SUPERSEDED, re-verified 2026-07-28: both stages are built.** Each resolves in `live_lab_stage_registry.rs`, `live_lab_run_matrix.rs`, `vm_lab/mod.rs`, and both MCP servers. The Tier 0 entries below are stale on existence; what remains open is whether either has *passed live* on the `--node` engine — take that from the stage's own report artifact, not from this row |
 | Relay forwarding is live-proven ("✅" in §3 row 8) | Read `live_linux_relay_test.rs` (lifecycle/healthz only) and `live_linux_two_hop_test.rs` (separate exit-chaining subsystem) | Claim was inaccurate — corrected in §3; cross-referenced against `LiveLabCoverageAndHonestyAudit_2026-06-25.md` findings #7/#8 and `MasterWorkPlan_2026-03-22.md` HP-3 |
 | CPA-1 (`validate_linux_audit_chain_integrity`) is ✅DONE | Grepped `vm_lab/mod.rs` + `src/bin/` for `audit_chain_integrity` | Zero hits — flagged ⚠️UNVERIFIED in §2.4, not re-asserted as done |

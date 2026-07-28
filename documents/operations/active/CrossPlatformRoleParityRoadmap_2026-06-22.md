@@ -383,11 +383,11 @@ safe to run at the same time. The macOS/Windows parity stages fire on `--macos-v
 (`source_archive.rs:127-129`); `network_id` is timestamp-unique (`mod.rs:6638-6644`);
 guest `/tmp` paths are fixed but only collide if the **same guest** is in both runs
 (disjoint partition avoids it); report dirs are per-run and reuse is rejected
-(`mod.rs:6630`). **The one genuine host-side collision is the un-locked run-matrix CSV
-append** (`live_lab_run_matrix.rs:1528-1560` does read→write→append with no `flock`) — two
-runs finishing near-simultaneously can interleave. **Enabling fix (§11.1):** wrap the
-append in an advisory `flock` (~20 lines). Until then, stagger the two completions or
-append the second run's row by hand.
+(`mod.rs:6630`). ~~**The one genuine host-side collision is the un-locked run-matrix CSV
+append**~~ — **FIXED; verified 2026-07-28** (§11.1). Both writers now hold an
+advisory lock across the whole read-modify-write (`live_lab_run_matrix.rs:922`,
+`:2293`, via `append_lock.rs`). Two runs finishing simultaneously no longer
+interleave, and the staggering / hand-appended-row workaround is obsolete.
 
 **One thing to verify on the first concurrent run:** Run B's `--exit-vm` is a
 Debian node not flagged `exit_capable` in the inventory (only `debian-headless-1` is). For
@@ -493,9 +493,14 @@ external blockers: Windows exit WinNAT, relay forwarding HP-3).
 
 ## 11. Enabling tasks (small infra — do these alongside the cells)
 
-1. **`flock` the run-matrix append** (`live_lab_run_matrix.rs:1528-1560`) — advisory lock
-   on `documents/operations/live_lab_run_matrix.csv` (or a sidecar `.lock`). The only
-   host-side hazard for concurrent runs. ~20 lines + a test. **Unblocks §8.3 fully.**
+1. ~~**`flock` the run-matrix append**~~ — **DONE (verified 2026-07-28).** Both
+   writers take an advisory lock across the entire read-modify-write:
+   `live_lab_run_matrix.rs:922` (node-stage matrix) and `:2293` (`upsert_csv_row`).
+   The mechanism is the shared `crates/rustynet-cli/src/append_lock.rs`, whose
+   module doc records that it was *extracted from this very path* and then reused
+   for the triage ledger. The fixed `<path>.tmp` scratch name is safe because it is
+   written inside the critical section. **§8.3 is unblocked; concurrent runs no
+   longer need staggering or hand-appended rows.**
 2. **Authored `CrossOsRoleSwitchPlan_2026-06-24.md`** (replaces the gitignored `state/` path the matrix cited) —
    the role-transition design (§4) that cell #4 depends on.
 3. **Correct the §3 matrix** (the three corrections in §1): admin 🟡-ready (drop the stale

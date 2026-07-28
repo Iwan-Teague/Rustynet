@@ -346,3 +346,13 @@ flow):** in `rustynetd`'s route-table inspection, treat the specific stderr `FIB
 exit 2) as an **empty table (no routes yet)**, NOT a reconcile failure — while keeping every *other* error
 fail-closed. Add a negative test pinning the 6.19 message. Then re-run the 2-node ubuntu mesh to green
 (ubuntu is fully lab-ready at `192.168.64.21`). Tracked as a spawned fix task.
+
+> **STATUS CORRECTION (2026-07-28): the code fix LANDED — this is no longer an
+> unimplemented item.** `crates/rustynetd/src/phase10.rs:1075-1101` implements
+> exactly the narrow rule specified above: only exit code 2 *and* a stderr
+> containing `FIB table does not exist` (case-insensitive) is treated as an empty
+> table; every other error stays fail-closed. The negative test pinning the
+> message exists at `phase10.rs:11260`. Roll-ups still listing this as "root cause
+> identified but NOT implemented" (e.g. `FullTodoInventory_2026-07-28.md`) are
+> stale on that point. **What remains open is the second half only:** re-running
+> the 2-node ubuntu mesh to green to confirm the runtime unblocks live.

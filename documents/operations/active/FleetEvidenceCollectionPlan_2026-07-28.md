@@ -191,11 +191,19 @@ Default ON, explicit opt-out flag.
 documents why unlinking on unix would let two acquirers flock distinct inodes.
 Revision 1's characterisation was accurate here.
 
-**But it covers the matrix only.** `live_lab_stage_triage.rs`'s `append_stub`
-has no lock: it reads the ledger to check `stub_id`, then opens with
-`append(true)` — a TOCTOU window where two concurrent appends both observe
-absence and both write. The triage ledger was revision 1's **#1 fetch priority**,
-so this must be fixed or the merge declared single-writer.
+~~**But it covers the matrix only.**~~ **Corrected 2026-07-28: it covers the
+triage ledger too.** `append_stub` takes the same lock
+(`live_lab_stage_triage.rs:159`), holding the `stub_id` dedupe read and the
+append in one critical section, with a barrier-based negative-control test that
+fails if the lock is removed. There is no TOCTOU window and the merge does not
+need to be declared single-writer.
+
+**A different defect on the same file was real and is now fixed** (`fd8c5d04`):
+`fill_patch` — the ledger's only whole-file rewrite — took *no* lock, wrote
+non-atomically via a truncating `fs::write`, and silently overwrote an
+already-recorded attempt. So the write path was unsafe, just not at the function
+revision 1 named. It now takes the append lock, writes tmp+rename inside it, and
+refuses to overwrite a filled stub.
 
 ### Partial runs
 
