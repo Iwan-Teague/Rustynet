@@ -3006,10 +3006,32 @@ fn git_head_commit() -> Result<String, String> {
         timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
     )?;
     if !output.status.success() {
-        return Err(format!(
-            "git rev-parse HEAD failed with status {}",
-            status_code(output.status)
-        ));
+        // Carry git's own stderr. Status 128 is the same code for "not a git
+        // repository", "detected dubious ownership" and an unborn HEAD, so the
+        // bare code cannot distinguish them — and this failure has already cost
+        // two wrong diagnoses in CI, where `debian:trixie` ships no git and
+        // `actions/checkout` therefore falls back to a REST tarball, leaving a
+        // workspace with no `.git` at all.
+        //
+        // Note there is a SECOND implementation of this in
+        // `ops_phase9.rs::current_git_commit` with the identical message. The
+        // first attempt at this fix improved only that one, and the CI error was
+        // unchanged because the evidence path calls THIS function.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!(
+                "git rev-parse HEAD failed with status {} (no stderr) [cwd={}]",
+                status_code(output.status),
+                workspace_root_path().display()
+            )
+        } else {
+            format!(
+                "git rev-parse HEAD failed with status {}: {stderr} [cwd={}]",
+                status_code(output.status),
+                workspace_root_path().display()
+            )
+        });
     }
     let stdout = String::from_utf8(output.stdout)
         .map_err(|err| format!("git rev-parse HEAD returned non-UTF-8 output: {err}"))?;
