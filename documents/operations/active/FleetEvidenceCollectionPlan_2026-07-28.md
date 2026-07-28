@@ -193,7 +193,7 @@ Revision 1's characterisation was accurate here.
 
 ~~**But it covers the matrix only.**~~ **Corrected 2026-07-28: it covers the
 triage ledger too.** `append_stub` takes the same lock
-(`live_lab_stage_triage.rs:159`), holding the `stub_id` dedupe read and the
+(`live_lab_stage_triage.rs:228`), holding the `stub_id` dedupe read and the
 append in one critical section, with a barrier-based negative-control test that
 fails if the lock is removed. There is no TOCTOU window and the merge does not
 need to be declared single-writer.

@@ -2928,7 +2928,23 @@ impl LabStateServer {
         let os_filter = arg_str(args, "os").map(|s| s.trim().to_ascii_lowercase());
 
         let path = self.abs_path("documents/operations/live_lab_stage_triage.jsonl");
-        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        // Only an ABSENT ledger is an empty history (fresh clone, or nothing has
+        // failed yet). Every other read error — permissions, I/O, a wrong repo
+        // root — must surface, for the same reason the malformed-line arm below
+        // fails loudly: "cannot read it" reported as "nothing has been tried"
+        // sends an agent to re-derive a fix that is already recorded, which is
+        // the one outcome this ledger exists to prevent. Mirrors `load_ledger`
+        // in `rustynet-cli`'s `live_lab_stage_triage`, which draws the same line.
+        let body = match std::fs::read_to_string(&path) {
+            Ok(body) => body,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return tool_error(&format!(
+                    "stage triage ledger is unreadable ({}): {err}",
+                    path.display()
+                ));
+            }
+        };
         let mut records: Vec<Value> = Vec::new();
         for line in body.lines().filter(|l| !l.trim().is_empty()) {
             match serde_json::from_str::<Value>(line) {
