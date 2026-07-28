@@ -30,11 +30,29 @@
 //!
 //! [`live_lab_node_stage_results.csv`]: ../../../documents/operations/live_lab_node_stage_results.csv
 //!
-//! The `stage_triage_history`/`record_stage_patch` MCP tools that call into
-//! this module are still pending (see the plan doc); until that wiring
-//! lands, several `pub fn`s here have no caller anywhere in the workspace.
-//! They are real, tested, working code — not placeholders — so `#[allow]`
-//! them individually rather than deleting or silently stubbing them.
+//! Wiring status of the plan's two MCP tools (plan §3.5), which differs per
+//! tool and is worth stating exactly, because the two have different safety
+//! properties:
+//!
+//! - **`stage_triage_history` (read) — live.** `rustynet-mcp-lab-state`
+//!   implements it directly, re-parsing this JSONL rather than calling in here:
+//!   `rustynet-mcp` does not depend on `rustynet-cli`, and this module is
+//!   private and `vm-lab`-gated. A second *reader* is benign.
+//! - **`record_stage_patch` (write) — backed here, MCP wrapper pending.** The
+//!   write side must NOT be re-implemented in the MCP: [`fill_patch`] performs
+//!   a locked, atomic whole-file rewrite, and a second independently written
+//!   writer is precisely how one file acquires two different definitions of
+//!   "serialized" (see `crate::append_lock`). The single writer is the
+//!   `ops live-lab-record-stage-patch` verb
+//!   ([`execute_ops_record_stage_patch`]); an MCP wrapper should shell out to
+//!   it argv-only rather than touch the ledger itself.
+//!
+//! The launch gate ([`unfilled_for_planned_stages`], plan §3.6/T3) is built and
+//! tested but has no caller: wiring it into the `--node` orchestrator would
+//! block every run while the current backlog of unfilled stubs stands, so the
+//! wiring is a deliberate open decision, not an oversight. These are real,
+//! tested, working functions — not placeholders — so `#[allow]` them
+//! individually rather than deleting or silently stubbing them.
 
 use crate::append_lock::{acquire_append_lock, lock_path_for};
 use std::fs;
@@ -80,7 +98,6 @@ pub struct StageTriageRecord {
 impl StageTriageRecord {
     /// Whether this record still needs a patch description. The launch gate
     /// refuses to start a run while a stub for a planned stage is unfilled.
-    #[allow(dead_code)] // pending MCP wiring, see module docs
     pub fn is_unfilled(&self) -> bool {
         self.patch
             .as_deref()
@@ -97,6 +114,58 @@ pub fn stub_id(run_id: &str, stage: &str) -> String {
 /// Absolute path to the committed ledger.
 pub fn default_triage_ledger_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(TRIAGE_LEDGER_RELATIVE_PATH)
+}
+
+/// `ops live-lab-record-stage-patch` — record the attempted remedy for a stub.
+///
+/// The stub is addressed either directly by `stub_id`, or by the
+/// `(run_id, stage)` pair it is derived from (plan §3.5).
+///
+/// `ledger` is required rather than defaulted. This project routinely drives
+/// several checkouts at once (the lab host box, per-job worktrees), and a
+/// hidden default resolved from the build-time manifest directory would let a
+/// fill land in a different checkout's ledger than the operator meant — the
+/// same "which checkout holds this evidence" problem the fleet-evidence work
+/// exists to close. An explicit path cannot be silently wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordStagePatchConfig {
+    pub ledger: PathBuf,
+    pub stub_id: Option<String>,
+    pub run_id: Option<String>,
+    pub stage: Option<String>,
+    pub patch: String,
+}
+
+/// Resolve the addressed stub and fill it. Ambiguous or absent addressing is an
+/// error: guessing which stub was meant would record an attempt against the
+/// wrong failure, which is worse than recording none.
+pub fn execute_ops_record_stage_patch(config: RecordStagePatchConfig) -> Result<String, String> {
+    let stub = match (
+        config.stub_id.as_deref(),
+        config.run_id.as_deref(),
+        config.stage.as_deref(),
+    ) {
+        (Some(id), None, None) => id.to_owned(),
+        (None, Some(run_id), Some(stage)) => stub_id(run_id, stage),
+        (Some(_), _, _) => {
+            return Err("pass either --stub-id or --run-id with --stage, not both".to_owned());
+        }
+        (None, _, _) => {
+            return Err(
+                "addressing a stub requires --stub-id, or --run-id together with --stage"
+                    .to_owned(),
+            );
+        }
+    };
+    fill_patch(
+        config.ledger.as_path(),
+        stub.as_str(),
+        config.patch.as_str(),
+    )?;
+    Ok(format!(
+        "recorded patch against stage triage stub {stub:?} in {}",
+        config.ledger.display()
+    ))
 }
 
 /// Read every record. A missing ledger is an empty history, not an error — the
@@ -186,8 +255,23 @@ pub fn append_stub(path: &Path, record: &StageTriageRecord) -> Result<bool, Stri
 }
 
 /// Record the patch attempted against a stub. Rewrites the ledger in place;
-/// this is the one non-append mutation, and it only ever fills a `null`.
-#[allow(dead_code)] // pending MCP wiring, see module docs
+/// this is the one non-append mutation, and it only ever fills an unfilled stub.
+///
+/// Three properties this function must keep, each of which it was missing:
+///
+/// 1. **It refuses to overwrite a filled stub.** The whole value of the ledger
+///    is that a second agent can see what a first already tried; silently
+///    replacing that erases the only record of it. Declining to patch is
+///    expressed as a filled `"none: <reason>"` (§3.3), so a filled stub is
+///    always a deliberate answer and never a placeholder to clobber. Re-filling
+///    is therefore an error, not an update.
+/// 2. **It holds the same append lock as [`append_stub`].** This is a
+///    read-modify-write of the WHOLE file, so without the lock it races the
+///    engine's auto-stub (which fires at evidence finalization, possibly while
+///    an agent is filling) and drops every record appended since its own read.
+/// 3. **It replaces the ledger atomically** (tmp + rename, inside the lock).
+///    A bare `fs::write` truncates in place, so a crash mid-write leaves the
+///    committed evidence ledger truncated rather than merely stale.
 pub fn fill_patch(path: &Path, stub_id: &str, patch: &str) -> Result<(), String> {
     if patch.trim().is_empty() {
         return Err(
@@ -196,11 +280,21 @@ pub fn fill_patch(path: &Path, stub_id: &str, patch: &str) -> Result<(), String>
                 .to_owned(),
         );
     }
+    // One critical section covering the read, the match and the rewrite —
+    // the same lock `append_stub` takes, because these two mutate one file.
+    let _lock = acquire_append_lock(lock_path_for(path).as_path(), "stage triage ledger")?;
     let mut records = load_ledger(path)?;
     let record = records
         .iter_mut()
         .find(|record| record.stub_id == stub_id)
         .ok_or_else(|| format!("no stage triage stub with stub_id {stub_id:?}"))?;
+    if !record.is_unfilled() {
+        return Err(format!(
+            "stage triage stub {stub_id:?} is already filled: {:?}; refusing to overwrite \
+             a recorded attempt (open a new stub by re-running the stage instead)",
+            record.patch.as_deref().unwrap_or_default()
+        ));
+    }
     record.patch = Some(patch.trim().to_owned());
     let mut body = String::new();
     for record in &records {
@@ -209,9 +303,20 @@ pub fn fill_patch(path: &Path, stub_id: &str, patch: &str) -> Result<(), String>
         body.push_str(&line);
         body.push('\n');
     }
-    fs::write(path, body).map_err(|err| {
+    let tmp = {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(".tmp");
+        PathBuf::from(value)
+    };
+    fs::write(&tmp, body).map_err(|err| {
         format!(
-            "rewrite stage triage ledger failed ({}): {err}",
+            "write stage triage ledger tmp failed ({}): {err}",
+            tmp.display()
+        )
+    })?;
+    fs::rename(&tmp, path).map_err(|err| {
+        format!(
+            "replace stage triage ledger failed ({}): {err}",
             path.display()
         )
     })
@@ -567,6 +672,130 @@ mod tests {
         let path = temp_ledger("unknown");
         append_stub(path.as_path(), &record("run-1", "s", None)).expect("append");
         assert!(fill_patch(path.as_path(), "run-9::nope", "x").is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A filled stub is always a deliberate answer — a decision not to patch is
+    /// recorded as `"none: <reason>"`, never left `None` — so a second fill is
+    /// an attempt to erase the only record of what a previous agent tried.
+    #[test]
+    fn fill_patch_refuses_to_overwrite_an_already_recorded_attempt() {
+        let path = temp_ledger("no_overwrite");
+        let stub = record("run-1", "live_two_hop_validation", None);
+        append_stub(path.as_path(), &stub).expect("append");
+        fill_patch(path.as_path(), &stub.stub_id, "first agent's attempt").expect("first fill");
+
+        let err = fill_patch(path.as_path(), &stub.stub_id, "second agent's attempt")
+            .expect_err("re-filling a recorded attempt must be an error, not an update");
+        assert!(
+            err.contains("already filled"),
+            "the error must say the stub is already filled; got: {err}"
+        );
+
+        let loaded = load_ledger(path.as_path()).expect("load");
+        assert_eq!(
+            loaded[0].patch.as_deref(),
+            Some("first agent's attempt"),
+            "the original attempt must survive the refused overwrite"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `fill_patch` rewrites the WHOLE ledger from a prior read, so it must hold
+    /// the same lock `append_stub` does.
+    ///
+    /// Negative control for that lock: every thread fills a DISTINCT stub, all
+    /// released from a barrier together. Serialized, each read sees the previous
+    /// fills and all `THREADS` survive. Unserialized, every thread rewrites the
+    /// file from its own stale snapshot and the last writer wins — so removing
+    /// the lock fails this on the filled count, not on a timing coincidence.
+    #[test]
+    fn concurrent_fills_of_distinct_stubs_do_not_lose_each_other() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        let path = temp_ledger("concurrent_fill");
+        let stub_ids: Vec<String> = (0..THREADS)
+            .map(|i| {
+                let stub = record("run-race", &format!("stage_{i}"), None);
+                append_stub(path.as_path(), &stub).expect("seed append");
+                stub.stub_id
+            })
+            .collect();
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = stub_ids
+            .into_iter()
+            .map(|id| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    fill_patch(path.as_path(), id.as_str(), "concurrent attempt")
+                        .expect("fill must not error");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+
+        let loaded = load_ledger(path.as_path()).expect("ledger must still parse");
+        assert_eq!(
+            loaded.len(),
+            THREADS,
+            "a lost-update must not drop stubs from the ledger"
+        );
+        let filled = loaded.iter().filter(|r| !r.is_unfilled()).count();
+        assert_eq!(
+            filled, THREADS,
+            "all {THREADS} concurrent fills must survive; found {filled} — a \
+             whole-file rewrite from a stale read silently discards the others"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_stage_patch_requires_unambiguous_addressing() {
+        let path = temp_ledger("addressing");
+        let stub = record("run-1", "live_two_hop_validation", None);
+        append_stub(path.as_path(), &stub).expect("append");
+
+        let both = execute_ops_record_stage_patch(RecordStagePatchConfig {
+            ledger: path.clone(),
+            stub_id: Some(stub.stub_id.clone()),
+            run_id: Some("run-1".to_owned()),
+            stage: Some("live_two_hop_validation".to_owned()),
+            patch: "x".to_owned(),
+        });
+        assert!(
+            both.is_err(),
+            "both addressing forms at once must be rejected"
+        );
+
+        let neither = execute_ops_record_stage_patch(RecordStagePatchConfig {
+            ledger: path.clone(),
+            stub_id: None,
+            run_id: None,
+            stage: None,
+            patch: "x".to_owned(),
+        });
+        assert!(neither.is_err(), "no addressing at all must be rejected");
+
+        // (run_id, stage) must resolve to the same stub as the stub_id form.
+        execute_ops_record_stage_patch(RecordStagePatchConfig {
+            ledger: path.clone(),
+            stub_id: None,
+            run_id: Some("run-1".to_owned()),
+            stage: Some("live_two_hop_validation".to_owned()),
+            patch: "addressed by run_id + stage".to_owned(),
+        })
+        .expect("pair addressing must resolve");
+        let loaded = load_ledger(path.as_path()).expect("load");
+        assert_eq!(
+            loaded[0].patch.as_deref(),
+            Some("addressed by run_id + stage")
+        );
         let _ = fs::remove_file(&path);
     }
 
