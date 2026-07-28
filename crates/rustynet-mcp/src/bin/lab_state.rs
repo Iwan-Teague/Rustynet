@@ -2998,7 +2998,7 @@ impl LabStateServer {
                 "## {}. run {} @ {}\n- when: {}\n- os: {}\n- error: {}\n- **patch tried**: {}\n\n",
                 index + 1,
                 field(record, "run_id"),
-                &field(record, "run_commit")
+                field(record, "run_commit")
                     .chars()
                     .take(12)
                     .collect::<String>(),
@@ -5810,10 +5810,10 @@ impl McpServer for LabStateServer {
                 // one selector. Guessing between an empty `aliases` and a stray
                 // `alias` is how a "bootstrap both" call silently does one.
                 let mut aliases = string_array(args, "aliases");
-                if let Some(single) = arg_str(args, "alias") {
-                    if !single.is_empty() {
-                        aliases.push(single.to_owned());
-                    }
+                if let Some(single) = arg_str(args, "alias")
+                    && !single.is_empty()
+                {
+                    aliases.push(single.to_owned());
                 }
                 let select_all = arg_bool(args, "select_all");
                 if aliases.is_empty() && !select_all {
