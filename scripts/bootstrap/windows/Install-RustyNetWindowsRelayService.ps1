@@ -15,9 +15,30 @@ param(
     [string]$Bind = '0.0.0.0:4600',
     [string]$PortRange = '50000-59999',
     [string]$HealthBind = '127.0.0.1:9100',
+    # QH-28. Opt OUT of minting a self-signed code-signing certificate and
+    # trusting it in LocalMachine\Root. Mirrors the daemon installer's switch,
+    # and exists for the same reason: this script is reachable from the SHIPPED
+    # binary, so its root-store write was landing on users' machines too.
+    #
+    # NOT via `rustynet ops install-windows-relay-service` — that verb is
+    # `#[cfg(feature = "vm-lab")]` and is not compiled into release builds. The
+    # shipped path is `rustynet role set`, which is ungated:
+    # execute_role_plan -> execute_role_action -> DeployRelayService ->
+    # execute_platform_relay_service_action -> execute_ops_install_windows_relay_service.
+    # That caller passes RelaySelfSignedCodeSigning::Disallow, which is what
+    # supplies this switch; the vm-lab verb passes Allow, because lab guests are
+    # disposable and run binaries built from source.
+    #
+    # Inverted for the same reason as the daemon's — an opt-out is passed by the
+    # callers that need it, whereas an opt-in would have to be threaded through
+    # every lab and e2e caller and a new one would silently lose signing.
+    [switch]$NoSelfSignedCodeSigning,
     [switch]$StartService,
     [string]$OutputPath = ''
 )
+
+# Bound once so the signing function can see it regardless of call scope.
+$script:NoSelfSignedCodeSigningRequested = [bool]$NoSelfSignedCodeSigning
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -226,6 +247,12 @@ function Find-Signtool {
 
 function Sign-RelayBinaryForAuthenticode {
     param([Parameter(Mandatory = $true)][string]$Path)
+    # Gated at function entry rather than at the call sites, so a future caller
+    # cannot reintroduce the root-store write by forgetting the guard.
+    if ($script:NoSelfSignedCodeSigningRequested) {
+        Write-Host "[relay-install] authenticode: self-signed code signing disabled (-NoSelfSignedCodeSigning); no certificate minted and no root-store change"
+        return
+    }
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "relay binary does not exist for signing: $Path"
     }

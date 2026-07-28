@@ -216,6 +216,26 @@ fn run_service_installer(src_root: &Path, node_id: &str, report: &Path) -> Resul
         .args(["-ServiceName", SERVICE_NAME])
         .args(["-NodeId", node_id])
         .args(["-NodeRole", "client"])
+        // QH-28: the ONLY caller that opts out of self-signed code signing.
+        //
+        // The install script mints a per-host code-signing certificate and adds
+        // it to `LocalMachine\Root` — a new trusted root CA on the machine. That
+        // is defensible on a lab guest running binaries it just built, and not
+        // on a user's machine. The script is `include_str!`-embedded here and in
+        // the lab adapter, and this module has no cfg gate, so before this flag
+        // the minting ran on every shipped install.
+        //
+        // The switch is an opt-OUT so that the four lab and e2e callers keep the
+        // signing they need without being edited, and a lab caller added later
+        // inherits the working default rather than silently losing it.
+        //
+        // It deliberately does NOT also demand a valid signature. Shipped
+        // installs are not reliably signed — release Authenticode is conditional
+        // on a configured secret, and both reachable acquisition modes
+        // (`--from-dir`, `--build-from-source`) yield unsigned cargo output — so
+        // refusing here would turn `rustynet install --build-from-source` on
+        // Windows from working into a hard failure.
+        .arg("-NoSelfSignedCodeSigning")
         .arg("-OutputPath")
         .arg(report)
         .arg("-NoDaemonStart")
