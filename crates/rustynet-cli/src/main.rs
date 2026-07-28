@@ -9031,7 +9031,11 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::InstallWindowsService => ops_e2e::execute_ops_install_windows_service(),
         #[cfg(feature = "vm-lab")]
         OpsCommand::InstallWindowsRelayService => {
-            ops_e2e::execute_ops_install_windows_relay_service()
+            // vm-lab-gated verb: lab guests are disposable and run binaries
+            // built from source, so the mint is allowed here and only here.
+            ops_e2e::execute_ops_install_windows_relay_service(
+                ops_e2e::RelaySelfSignedCodeSigning::Allow,
+            )
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::UninstallWindowsRelayService => {
@@ -19546,7 +19550,11 @@ fn execute_platform_relay_service_action(install: bool) -> Result<String, String
         // platform. The Rust caller drives PowerShell with argv-only
         // args; the script enforces fail-closed on missing dependencies.
         if install {
-            return ops_e2e::execute_ops_install_windows_relay_service();
+            // `role set` is shipped and ungated — this reaches real operator
+            // hosts, so the relay installer must not write to LocalMachine\Root.
+            return ops_e2e::execute_ops_install_windows_relay_service(
+                ops_e2e::RelaySelfSignedCodeSigning::Disallow,
+            );
         }
         return ops_e2e::execute_ops_uninstall_windows_relay_service();
     }

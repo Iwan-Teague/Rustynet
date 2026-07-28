@@ -56,6 +56,20 @@ jobs:
             exit 1
           }
           echo "repo hygiene: doc pair identical, pre-commit hook present"
+      - name: Shipped-binary feature gate
+        # Everything above builds --all-features, so nothing here ever compiles
+        # the CLI the way it actually ships. That gap is not cosmetic: features
+        # are additive, so a `#[cfg(feature = "vm-lab")]` item is NAMEABLE under
+        # --all-features and absent from a release build. Anything guarded that
+        # way — QH-28 gates relay certificate minting on exactly this — is
+        # therefore unenforced before merge and fails at tag time instead, in
+        # release.yml, the only place that builds with default features.
+        #
+        # This compiles the binary as shipped. It is a compile check, not a text
+        # assertion, so it cannot be walked around by moving a call behind a
+        # helper or by renaming anything.
+        run: |
+          cargo check -p rustynet-cli --bin rustynet-cli --locked
       - name: Lab monitor standalone gates
         # rustynet-lab-monitor is EXCLUDED from the workspace (see root
         # Cargo.toml + crate README), so the workspace validation above never
@@ -134,6 +148,20 @@ jobs:
             exit 1
           }
           echo "repo hygiene: doc pair identical, pre-commit hook present"
+      - name: Shipped-binary feature gate
+        # Everything above builds --all-features, so nothing here ever compiles
+        # the CLI the way it actually ships. That gap is not cosmetic: features
+        # are additive, so a `#[cfg(feature = "vm-lab")]` item is NAMEABLE under
+        # --all-features and absent from a release build. Anything guarded that
+        # way — QH-28 gates relay certificate minting on exactly this — is
+        # therefore unenforced before merge and fails at tag time instead, in
+        # release.yml, the only place that builds with default features.
+        #
+        # This compiles the binary as shipped. It is a compile check, not a text
+        # assertion, so it cannot be walked around by moving a call behind a
+        # helper or by renaming anything.
+        run: |
+          cargo check -p rustynet-cli --bin rustynet-cli --locked
       - name: Lab monitor standalone gates
         # Excluded from the workspace; gate it explicitly on the Linux leg
         # too (macOS/Linux only crate). See scripts/ci/lab_monitor_gates.sh.
