@@ -487,10 +487,32 @@ with the trust anchor centralized in the membership owner key.
 TLS handshake in an HMAC keyed off a pre-shared per-client key, so
 attackers without the PSK cannot even initiate a handshake.
 
-**Rustynet today:** WireGuard's noise framework provides equivalent
-property — without the static peer keys an attacker cannot complete
-handshake-1 message validation. No additional pre-auth wrapper
-required.
+**Rustynet today:** WireGuard's noise framework provides a related but
+STRICTLY WEAKER property — without the static peer keys an attacker
+cannot complete handshake-1 message validation.
+
+**Correction (post-clearance, accuracy only — the verdict below has not
+been changed and needs operator review).** The original wording called
+these "equivalent". They are not. `tls-crypt-v2` keys its wrapper on a
+SECRET per-client PSK, so an attacker without it cannot emit a
+well-formed initiation at all. WireGuard's `mac1` is keyed on
+`HASH(LABEL_MAC1 ‖ responder_static_public)` — verified at
+`third_party/boringtun/src/noise/handshake.rs:386`,
+`b2s_hash(LABEL_MAC1, peer_static_public.as_bytes())`. That input is
+PUBLIC: it is distributed in signed membership bundles and rendered
+into generated config files (`windows_command.rs:297`). Anyone holding
+a responder's public key can therefore craft a mac1-valid initiation
+and force the responder to do handshake work. OpenVPN's property is
+stronger; ours bounds the damage (the handshake still cannot complete)
+but does not deny initiation.
+
+This also bears on QH-28-adjacent work: "No additional pre-auth wrapper
+required" reads as a standing decision that no PSK layer is needed,
+while a WireGuard PSK is the standard mitigation for the
+harvest-now-decrypt-later exposure that
+`CrossNetworkRemoteExitNodePlan_2026-03-16.md` §5.5.2 now records as
+unmitigated. Whether to reopen this finding is an operator call, not a
+documentation edit.
 
 **Gap:** none — equivalent at the noise layer.
 

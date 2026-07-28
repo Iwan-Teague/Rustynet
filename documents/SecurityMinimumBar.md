@@ -33,6 +33,14 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
     (`crates/rustynet-mcp/src/bin/ai_agent.rs:750`). TLS is therefore inside
     this project's supply-chain, SBOM, and CVE-triage scope. Do not use this
     control to justify skipping TLS advisories.
+    Worth stating precisely because rustls 0.23 enables the hybrid
+    post-quantum group `X25519MLKEM768` by default under the `aws-lc-rs`
+    provider, so if that provider were ever pulled in, the statement
+    elsewhere that the tree contains no post-quantum cryptography would
+    silently become false. The lockfile currently resolves rustls onto
+    `ring` (zero `aws-lc` entries), which offers X25519/secp256r1/secp384r1
+    and no ML-KEM. A provider change would need re-checking against
+    `CrossNetworkRemoteExitNodePlan_2026-03-16.md` §5.5.2.
   - **SUPERSEDED 2026-07-28 — the requirement was amended, the dead code was
     not.** This block previously read "UNMET REQUIREMENT — code gap, not a doc
     gap. Do not delete." and cited `Requirements.md:166` as mandating TLS 1.3 for
