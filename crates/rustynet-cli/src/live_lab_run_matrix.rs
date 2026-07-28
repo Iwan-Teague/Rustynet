@@ -992,7 +992,12 @@ fn upsert_node_stage_csv(
     })
 }
 
-fn workspace_root_path() -> PathBuf {
+/// `pub(crate)` so the launch gate resolves the triage ledger through the SAME
+/// expression the auto-stub writer uses (`:710`). If the gate and the stub
+/// writer ever derived the root differently the gate would read a file nobody
+/// writes and pass unconditionally — a silent no-op, the worst failure mode
+/// available to a fail-closed check.
+pub(crate) fn workspace_root_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
