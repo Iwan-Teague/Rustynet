@@ -1,6 +1,13 @@
 # Rustynet Unified TODO Ledger — 2026-07-10
 
-Status: active repository-wide roll-up
+**Superseded 2026-07-28 by
+[FullTodoInventory_2026-07-28.md](./FullTodoInventory_2026-07-28.md)**, a
+full raw sweep of all 291 markdown docs in the repository (this file's own
+§2–§22 content is re-captured there under each item's owning source
+document). Kept for its section structure and as the prior snapshot; treat
+the newer file as current.
+
+Status: active repository-wide roll-up (historical snapshot, see notice above)
 
 Snapshot date: 2026-07-10
 
