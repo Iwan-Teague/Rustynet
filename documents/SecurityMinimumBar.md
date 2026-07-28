@@ -33,16 +33,28 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
     (`crates/rustynet-mcp/src/bin/ai_agent.rs:750`). TLS is therefore inside
     this project's supply-chain, SBOM, and CVE-triage scope. Do not use this
     control to justify skipping TLS advisories.
-  - **UNMET REQUIREMENT — code gap, not a doc gap. Do not delete.**
-    `Requirements.md:166` mandates protecting the control plane with TLS 1.3.
-    Nothing in the tree negotiates TLS 1.3. The only enforcement code —
+  - **SUPERSEDED 2026-07-28 — the requirement was amended, the dead code was
+    not.** This block previously read "UNMET REQUIREMENT — code gap, not a doc
+    gap. Do not delete." and cited `Requirements.md:166` as mandating TLS 1.3 for
+    the control plane. That mandate was amended by the owner on 2026-07-27 to
+    "authenticated, encrypted transport and signed peer maps"
+    (`Requirements.md:168`), so there is no longer an unmet TLS requirement to
+    record here, and reinstating one would be a product decision rather than a
+    documentation edit. Corrected because the audit that wrote this block was
+    working from a base that predated the amendment.
+    What REMAINS true, and is the residual worth acting on — dead code shaped
+    like a control. Nothing in the tree negotiates TLS 1.3. The only enforcement
+    code —
     `ControlPlaneTransportPolicy::validate_negotiated_tls`
     (`crates/rustynet-control/src/lib.rs:209`) and
     `ControlPlaneCore::validate_transport_security` (`:2327`) — receives the
     "negotiated" version as a caller-supplied argument instead of observing a
     real handshake, and its only callers are its own unit test (`:7010`,
     `:7016`; the single `#[cfg(test)]` boundary in that file is line 4355).
-    The requirement stands and is unsatisfied; closing it is code work.
+    A reader can mistake either symbol for a live control. With the requirement
+    amended away, the honest dispositions are to delete them or to wire them to a
+    real handshake; leaving them is what let this be read as an enforced control
+    in the first place.
 - Signed membership updates (gossip convergence, `membership apply-update`)
   are authenticated by ed25519 signature verification against the current
   approver set before being applied — fail closed on any verification error,
