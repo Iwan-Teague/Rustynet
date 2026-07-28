@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod anchor_init;
+#[cfg(feature = "vm-lab")]
+mod append_lock;
 mod env_file;
 mod install;
 #[cfg(feature = "vm-lab")]

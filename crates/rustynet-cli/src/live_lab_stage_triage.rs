@@ -36,6 +36,7 @@
 //! They are real, tested, working code — not placeholders — so `#[allow]`
 //! them individually rather than deleting or silently stubbing them.
 
+use crate::append_lock::{acquire_append_lock, lock_path_for};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -139,12 +140,8 @@ pub fn load_ledger(path: &Path) -> Result<Vec<StageTriageRecord>, String> {
 /// resumed run); a duplicated stub would make one failure read as several
 /// attempts.
 pub fn append_stub(path: &Path, record: &StageTriageRecord) -> Result<bool, String> {
-    if load_ledger(path)?
-        .iter()
-        .any(|existing| existing.stub_id == record.stub_id)
-    {
-        return Ok(false);
-    }
+    // The parent must exist before the lock file can be created beside the
+    // ledger, so this precedes the critical section.
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             format!(
@@ -152,6 +149,19 @@ pub fn append_stub(path: &Path, record: &StageTriageRecord) -> Result<bool, Stri
                 parent.display()
             )
         })?;
+    }
+    // The dedupe read and the append are ONE critical section. Split, they are a
+    // TOCTOU: two finalizers (interim then final, or a resumed run racing a
+    // concurrent agent) both read a ledger lacking the stub_id, both conclude
+    // they must write, and both append — a duplicate stub makes one failure read
+    // as several attempts, which is exactly the signal this ledger exists to
+    // give. The unserialized `write_all`s are the second hazard the lock closes.
+    let _lock = acquire_append_lock(lock_path_for(path).as_path(), "stage triage ledger")?;
+    if load_ledger(path)?
+        .iter()
+        .any(|existing| existing.stub_id == record.stub_id)
+    {
+        return Ok(false);
     }
     let mut line = serde_json::to_string(record)
         .map_err(|err| format!("serialize stage triage record failed: {err}"))?;
@@ -461,6 +471,61 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0], stub);
         let _ = fs::remove_file(&path);
+    }
+
+    /// The dedupe read and the append must be ONE critical section.
+    ///
+    /// This is the negative control for the `append_stub` flock: every thread is
+    /// held at a barrier until all of them are ready, so they all enter the
+    /// `stub_id` dedupe read together. Serialized, exactly one observes an absent
+    /// stub_id and writes. Unserialized, they all observe it absent and all
+    /// append — so removing the lock makes this fail on the record count, not on
+    /// a timing coincidence.
+    #[test]
+    fn concurrent_appends_of_one_stub_id_write_exactly_one_record() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        let path = temp_ledger("concurrent");
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Same run_id + stage in every thread => one stub_id, so a
+                    // correct implementation writes it once.
+                    let stub = record("run-race", "live_two_hop_validation", None);
+                    barrier.wait();
+                    append_stub(path.as_path(), &stub).expect("append must not error")
+                })
+            })
+            .collect();
+
+        let wrote = handles
+            .into_iter()
+            .filter(|_| true)
+            .map(|handle| handle.join().expect("thread panicked"))
+            .filter(|written| *written)
+            .count();
+
+        let loaded = load_ledger(path.as_path()).expect("ledger must still parse");
+        assert_eq!(
+            loaded.len(),
+            1,
+            "{THREADS} concurrent appends of one stub_id must leave exactly one \
+             record; found {} (duplicate stubs make one failure read as several \
+             attempts, and interleaved writes can also corrupt a line)",
+            loaded.len()
+        );
+        assert_eq!(
+            wrote, 1,
+            "exactly one caller may report having written the stub"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(crate::append_lock::lock_path_for(path.as_path()));
     }
 
     #[test]
