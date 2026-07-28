@@ -90,6 +90,13 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates
           git --version
+          # The container runs as a different uid than owns the mounted
+          # workspace, so git refuses it with exit 128 "detected dubious
+          # ownership". Trust it BEFORE checkout, so the checkout produces a
+          # real clone and every later `git rev-parse HEAD` works — production
+          # code shells out to it for the evidence commit marker.
+          git config --global --add safe.directory '*'
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Bootstrap CI tools
         run: |
