@@ -25,6 +25,35 @@ All are review-only proposals awaiting human approval; **no
 production code, crypto, or config was changed** (the one applied edit — a scratch-comment
 cleanup in `daemon.rs` — was a separate, explicitly-authorised request, gates green).
 
+**Correction 2026-07-27 — the tallies in this Executive Summary, the severity table below,
+and the closing "Ledger self-consistency QA" / "Verdict" section are STALE; read them with
+the dates attached.** Two independently verifiable drifts, neither of which changes any
+finding's status here:
+1. **Numbering/counts.** This summary and the self-consistency QA both state
+   `RSA-0001..RSA-0077` / "76 raised → 74 standing" / "no other gaps". Four later entries
+   exist in this same file: **RSA-0078** (Info), **RSA-0079** (Low/Question), **RSA-0080**
+   (Low — now marked APPLIED 2026-07-17) and **RSA-0081** (Low, open), all dated 2026-06-21
+   and appended after the QA ran. Actual range is `RSA-0001..RSA-0081` (80 raised, 78
+   standing). The summary also contradicts itself on Mediums: the severity table says
+   **15**, the Findings-Log pointer paragraph says **"the 17 Medium"** (pre-downgrade
+   figure).
+2. **Release posture.** The Verdict states "**2 High controls are unmet on reachable
+   paths**". Both Highs' own rows now say `applied` (2026-06-24), and both were
+   **re-verified in committed code on 2026-07-27**: RSA-0009 —
+   `crates/rustynet-control/src/membership.rs:1845-1941` stamps `op_created_at_unix` (no
+   `unix_now()` in the reducer) with regression tests
+   `rsa0009_{revoke,restore,rotate_key,set_capabilities}_applies_when_created_at_differs_from_apply_time`
+   at `:3892-4013`; RSA-0063 —
+   `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh:307-320` registers
+   `trap 'rm -f "${sudoers_tmp}"' EXIT` **before** the `curl|bash` and clears it on success,
+   with the lint test
+   `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs:1950-1959` (the
+   over-broad `NOPASSWD: ALL` scope is retained by explicit decision — the residue, which was
+   the vulnerability, is closed). A reader consulting only this summary or the closing verdict
+   would wrongly conclude the release gate still has two unmet Highs and that the finding set
+   ends at RSA-0077. Refreshing the tallies/verdict is an owner action; this note does not
+   change them.
+
 | Severity | Count | Notes (post adversarial re-verification 2026-06-19) |
 |---|---|---|
 | Critical | 0 | none found |
@@ -66,7 +95,8 @@ to remove it — a failed/aborted bootstrap leaves passwordless root on the host
 (Batches 5/5b/6) and the vendored sub-tier (Batch 7) found 0 Critical and only the one
 new Tier-4 High (RSA-0063):** the CI gate scripts are argv-array `exec` wrappers with
 fail-closed zero-match gates, the 13 systemd units are strongly hardened, and **vendored
-boringtun is clean** (standard Noise_IKpsk2, `ct_eq` MACs, AEAD-via-crate anti-replay,
+boringtun is clean** (standard Noise_IKpsk2 — **but see Correction 2026-07-27 — PSK
+below: the *deployed* handshake supplies no PSK**, `ct_eq` MACs, AEAD-via-crate anti-replay,
 no local weakening; device/ffi/jni uncompiled). Supply chain clean (`cargo audit`
 0/210, `cargo deny` advisories+bans+sources OK). Recurring *themes* across the codebase
 (each individually ≤Medium, but worth a systemic fix): (a) the non-unix permission-check
@@ -76,10 +106,44 @@ host/config values into PowerShell/bash/env-file** (RSA-0046/0051/0057/0059/0068
 **`unsafe` without `// SAFETY:`** on production FFI (RSA-0032/0074); (e) **controls
 built+tested but unwired** / asserted-but-unverified (RSA-0018/0024/0026/0049).
 
+**Correction 2026-07-27 — PSK / "standard `Noise_IKpsk2`" (adversarial re-review of this
+document cluster; no status or severity changed by this note).** The three `Noise_IKpsk2`
+assertions in this ledger — this Executive Summary, the `noise/handshake.rs` coverage row
+(Tier V), and the Batch-7 preamble — are accurate **only about the vendored code**:
+`third_party/boringtun` implements WireGuard's IKpsk2 exactly as upstream, with no local
+weakening. They are **not** statements about the deployed handshake, and a reader takes them
+as such. Verified first-hand in code 2026-07-27:
+- the sole production `Tunn::new` call site passes `preshared_key: None` —
+  `crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs:269-276`; the third
+  parameter is `preshared_key: Option<[u8; 32]>`
+  (`third_party/boringtun/src/noise/mod.rs:194-197`);
+- boringtun therefore mixes `self.params.preshared_key.unwrap_or([0u8; 32])` into the
+  chaining key on both handshake halves —
+  `third_party/boringtun/src/noise/handshake.rs:615-618` and `:859-862`;
+- nothing can supply one: `PeerConfig` has no PSK field
+  (`crates/rustynet-backend-api/src/lib.rs:72-83`), the `wg`-command backends never emit
+  `preshared-key` (`crates/rustynet-backend-wireguard/src/macos_command.rs:163-190,474-530`;
+  `linux_command.rs:351-406`), and `preshared`/`psk` occurs nowhere under `crates/` or
+  `scripts/` (only inside `third_party/boringtun`).
+
+An all-zero PSK adds no entropy, so the **deployed** handshake is cryptographically
+equivalent to plain `Noise_IK`. It does **not** carry psk2's static-key-compromise /
+harvest-now-decrypt-later hedge, and it does **not** provide a "cannot even initiate without
+the PSK" pre-auth property — `mac1` is keyed by the responder's *public* key
+(`third_party/boringtun/src/noise/handshake.rs:387-389`), so any holder of a node's public
+key can force full handshake processing, subject only to boringtun's per-peer handshake rate
+limiter (`third_party/boringtun/src/noise/mod.rs:219-223`). Honest characterisation for
+future readers: *"vendored boringtun implements standard `Noise_IKpsk2` faithfully; Rustynet
+deploys it with the PSK slot unset (`None`) — effectively `Noise_IK` — and exposes no
+configuration surface to set one."* Whether an optional PSK should become a supported (or
+required) deployment control is an owner decision, not an audit finding closed here. The same
+correction applies to `SecurityHardeningAudit_2026-04-28.md` §B.7, which cleared the
+OpenVPN-`tls-crypt-v2` comparison axis with "Gap: none" on this exact property.
+
 ### SecurityMinimumBar — Critical-control trace (where each is enforced; gaps flagged)
 | SecMinBar §3 Critical control | Primary enforcement (audited) | Status / gap |
 |---|---|---|
-| §3.1 Proven crypto only | `rustynet-crypto` (Argon2id/XChaCha20-Poly1305/Ed25519 `verify_strict`); vendored boringtun Noise | **PASS** (1 consistency gap: RSA-0043 dns-zone plain `verify`) |
+| §3.1 Proven crypto only | `rustynet-crypto` (Argon2id/XChaCha20-Poly1305/Ed25519 `verify_strict`); vendored boringtun Noise | **PASS** (1 consistency gap: RSA-0043 dns-zone plain `verify`) — **scope note added 2026-07-27:** this PASS covers algorithm choice and the vendored Noise implementation, **not** PSK key material; the deployed handshake runs with `preshared_key: None` (effectively `Noise_IK`) — see *Correction 2026-07-27 — PSK* above |
 | §3.2 Control-plane TLS 1.3 + signed-state verify-before-apply | `membership.rs` verify→freshness→replay→apply; daemon loaders | **PASS** on ordering; **gap RSA-0009 (High)** — signed updates for revoke/rotate can't apply (reducer non-determinism) |
 | §3.3 Auth/enrollment hardening + atomic one-time creds | enrollment token HMAC `ct_eq`; relay 12-step; rate limiters | **gap RSA-0023 (Med)** one-time consume not cross-process atomic (no ledger lock); RSA-0037 (Med) relay pre-auth memory-DoS |
 | §3.4 Secret/key custody + zeroize + redaction | OS keystore + AEAD fallback; `zeroize`; secret-log-audit gate | **PASS** core; **gaps** RSA-0002/0025 (Win perm no-op + `.enc` ACL), RSA-0026 (redaction-gate coverage), RSA-0039 (Win backend `Debug` key) |
@@ -747,7 +811,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 | `third_party/boringtun/src/lib.rs` | 2026-06-18 | V | C1,E2,V1 | PASS | none | none needed | verified: Declares only noise/x25519/serialization/(mock_instant\\|sleepyinstant). device/ffi/jni intentionally NOT wired. | audited |
 | `third_party/boringtun/src/mock_instant.rs` | 2026-06-18 | V | C1,E2,V1 | PASS | none | none needed | verified: Atomic mock clock gated behind mock-instant feature (test-only); not in production timer path. | audited |
 | `third_party/boringtun/src/noise/errors.rs` | 2026-06-18 | V | C1,E2,V1 | PASS | none | none needed | verified: WireGuardError enum only (InvalidMac/InvalidAeadTag/Duplicate/InvalidCounter present). No logic. | audited |
-| `third_party/boringtun/src/noise/handshake.rs` | 2026-06-18 | V | C1,E2,V1 | PASS | none | none needed | verified: Standard Noise_IKpsk2. ct_eq on peer static key, AEAD tag via crate, TAI64N monotonic replay check, secrets redacted, no unsafe. | audited |
+| `third_party/boringtun/src/noise/handshake.rs` | 2026-06-18 | V | C1,E2,V1 | PASS | none | none needed | verified: Standard Noise_IKpsk2. ct_eq on peer static key, AEAD tag via crate, TAI64N monotonic replay check, secrets redacted, no unsafe. **Correction 2026-07-27:** this row's PASS / "none needed" is about the *vendored file* (faithful to upstream, no local weakening) and must not be read as a deployment property — Rustynet calls `Tunn::new(..., preshared_key: None, ...)` (`crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs:269-276`), so the psk is the all-zero default at `:615-618`/`:859-862` and the deployed handshake is effectively `Noise_IK`. See *Correction 2026-07-27 — PSK* in the Executive Summary. | audited |
 | `third_party/boringtun/src/noise/mod.rs` | 2026-06-18 | V | C1,E2,V1 | PASS | none | none needed | verified: Tunn dispatch + length-checked packet parse. Attacker bytes route to WireGuardError, not panic. Standard boringtun. | audited |
 | `third_party/boringtun/src/noise/rate_limiter.rs` | 2026-06-18 | V | C1,E2,V1 | PASS | none | none needed | verified: mac1/mac2 verified with ct_eq (constant-time), cookie via XChaCha20Poly1305. No == on MACs, no weakening. | audited |
 | `third_party/boringtun/src/noise/session.rs` | 2026-06-18 | V | C1,E2,V1 | PASS | none | none needed | verified: Per-packet ChaCha20Poly1305 via crate, sliding-window anti-replay bitmap, tag verified by AEAD. Replay test present. No weakening. | audited |
@@ -846,6 +910,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 - Justification / source: CLAUDE.md §10.4 (default-deny; empty ⇒ deny); SecurityMinimumBar §3.6; CWE-1188/CWE-636 (fail-open default) — https://cwe.mitre.org/data/definitions/636.html (accessed 2026-06-18).
 - Verification method: `cargo clippy` dead-code surfacing + a doc/test asserting empty-directory denial (already exists at `:714`).
 - Status: **open** (2026-06-18)
+- **Correction 2026-07-27 — this entry's "zero callers / not currently reachable as a weakening" rationale no longer holds; the predicted regression happened inside this cluster's own remediation.** This entry warned: *"a future caller that re-introduces `if membership.is_populated() { enforce } else { allow }` would resurrect RN-11."* The **RSA-0008 fix applied 2026-06-24** does exactly that shape at the issuance layer — `crates/rustynet-control/src/lib.rs:3432-3437`: `if self.membership_directory.is_populated() && !(active(source) && active(destination)) { return false; }`, i.e. when the directory is empty the membership check is **skipped** (the code comment states the intent: "Empty/unpopulated directory ⇒ pre-membership deployment: fall back to plain default-deny ACL evaluation alone"). Verified 2026-07-27: `is_populated()` is defined at `crates/rustynet-policy/src/lib.rs:116-118` (doc comment still says the gate "skips the check") and now has two production callers, both in the control crate (`lib.rs:2324`, `:3432`) plus one test (`policy/src/lib.rs:730`). Blast radius is bounded and was disclosed in the RSA-0008 note (the daemon's own `check_peer_membership_active` is fail-closed on empty, so the end-to-end bypass stays foreclosed) — so this is **not** a new fail-open in the enforced path, but the "dead API / no callers" premise of this Low is now false, and the attractive nuisance is live. Proposed enforcement is unchanged and now more urgent: rewrite the `is_populated()` doc comment (it still advertises RN-11 semantics) and make the empty-directory fallback explicit at each caller. Severity/status re-rating is an owner decision.
 
 ### RSA-0006 — `validate_policy_safety` only blocks the literal `Protocol::Any` allow-all; a protocol-enumerated allow-all evades the canary safety net
 - File: `crates/rustynet-policy/src/lib.rs:369-380` (`validate_policy_safety`), called by `PolicyRolloutController::stage_revision` (`:335-344`)
@@ -1215,6 +1280,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 - File: `crates/rustynet-relay/src/main.rs:430-435,452-456` (`serialize_relay_reject` to `from_addr`)
 - Date: 2026-06-18 · Severity: **Low** (low amplification factor ~9×; bounded by the same per-IP limiter)
 - Bar mapping: OWASP/CWE-406 (amplification); SecurityMinimumBar §4.7. Reachability: on the rate-limited and validation-failure paths the relay sends a ~9-byte reject to the (UDP-spoofable) `from_addr`. A spoofing attacker can use the relay as a low-factor reflector against a third party; sustained volume to one victim is bounded by the `PreAuthHelloLimiter`. Proposed: drop silently on the pre-auth-rate-limited path (as the dataplane does), or only reply after at least one field authenticates; keep replies ≤ request size. Source: CWE-406 "Insufficient Control of Network Message Volume" — https://cwe.mitre.org/data/definitions/406.html (accessed 2026-06-18). Status: **open** (net-new; 2026-06-18)
+- **Correction 2026-07-27 — the severity rationale above is FALSE (verified first-hand in committed code; severity left unchanged pending owner decision).** The stated bound does not exist: the reject is emitted **precisely because** the limiter refused. At the audit's committed baseline and still at `HEAD` (`f9388393`), `handle_control_packet` does `if !self.pre_auth_hello_limiter.write().await.check(from_addr.ip()) { let reject_bytes = serialize_relay_reject(); … send_to(&reject_bytes, from_addr) … return Ok(()) }` — `git show HEAD:crates/rustynet-relay/src/main.rs`, lines 509-522 (the current working tree adds a separate `PreAuthNoticeBudget` on this path; that change is out of scope for this correction and does not retroactively support the 2026-06-18 rationale). The same is true of the global-capacity refusal arm (`MAX_PRE_AUTH_HELLO_SOURCE_IPS`, HEAD `:781-784`): it returns `false`, so it also reflects. Net: `PreAuthHelloLimiter` bounds *session establishment*, not reject emission — reflected packets were **1:1 with attacker packets and unbounded per victim**. The `~9×` factor is correct but for a reason the entry did not state: the limiter check runs **before** `parse_relay_hello`, so a single 1-byte `[0x01]` datagram elicits the 9-byte `[type]+"Rejected"` reply (`serialize_relay_reject`, HEAD `:974-979`; `RELAY_REJECT_GENERIC_REASON` = `"Rejected"`, `crates/rustynet-relay/src/main.rs:233`). Corrected rationale for the record: *"Severity **Low** on the basis of the small absolute amplification factor (9 bytes returned for a 1-byte probe; ≤1 reply per received packet), **not** on any per-victim volume bound — there is none: the reject fires on the limiter-refusal path, so every over-limit or malformed datagram is reflected."* Severity re-rating (retain Low vs raise) is an owner decision; the false premise is the defect corrected here.
 
 ### RSA-0040 — No cargo-fuzz target for the relay hello/token wire parsers + hello validation state machine (re-confirms RN-N6)
 - File: `crates/rustynet-relay/src/main.rs:669-827` (`parse_relay_hello`/`parse_relay_token`), `crates/rustynet-relay/src/transport.rs:330-436` (`validate_hello` state machine)
@@ -1491,6 +1557,16 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 > `enrollment_two_peer_redeem`, `quorum_multi_approver`, `role_capability_enforcement`,
 > `gossip_three_peer_mesh`, …) assert their negative paths — confirmed T1/T2 evidence;
 > `live_signed_bundle_forger` is a test-only adversarial minter.
+>
+> **Correction 2026-07-27:** "standard `Noise_IKpsk2` handshake" above describes the
+> **vendored file**, not the deployed protocol. Rustynet's only production `Tunn::new`
+> passes `preshared_key: None`
+> (`crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs:269-276`), boringtun
+> then mixes the all-zero default (`third_party/boringtun/src/noise/handshake.rs:615-618`,
+> `:859-862`), and no configuration surface exists to set a PSK
+> (`crates/rustynet-backend-api/src/lib.rs:72-83`; no `preshared`/`psk` anywhere under
+> `crates/`or `scripts/`). The deployed handshake is therefore equivalent to plain
+> `Noise_IK`. Full note: *Correction 2026-07-27 — PSK* in the Executive Summary.
 
 ### RSA-0074 — Vendored `rustynet-tun` FFI `unsafe` blocks lack `// SAFETY:` rationale comments (production dataplane, called as root)
 - File: `third_party/rustynet-tun/src/lib.rs:28-43,50-63,68-78,82-…`
@@ -1835,4 +1911,21 @@ posture per SecurityMinimumBar §2: **2 High controls are unmet on reachable pat
 (RSA-0009 revocation/rotation non-functional; RSA-0063 macOS bootstrap privesc residue) —
 each requires documented risk-acceptance or a fix before the next security milestone; no
 unmet **Critical** control was found.
+
+**Correction 2026-07-27 (adversarial re-review of this document cluster) — this QA block and
+Verdict are superseded by their own dates; three statements above no longer hold:**
+- "range RSA-0001..RSA-0077 … **74 standing**, no other gaps" — **RSA-0078/0079/0080/0081**
+  were appended to this ledger on 2026-06-21, after this QA ran. Actual range
+  `RSA-0001..RSA-0081`; 80 raised, 78 standing.
+- "internally consistent" — the Executive Summary's severity table (Medium **15**) and the
+  Findings-Log pointer ("the **17** Medium") disagree; see *Correction 2026-07-27* at the top
+  of this file.
+- "**2 High controls are unmet on reachable paths**" — both are marked `applied` in their own
+  rows (2026-06-24) and were re-verified in committed code 2026-07-27
+  (`crates/rustynet-control/src/membership.rs:1845-1941` + tests `:3892-4013`;
+  `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh:307-320` + lint test
+  `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs:1950-1959`).
+  Whether the release-posture verdict is rewritten — and whether the two rows move to a
+  terminal status — is an owner decision; this note only records that the code no longer
+  matches the verdict text.
 
