@@ -1,7 +1,40 @@
 # Live-Lab Stage Triage Ledger — Plan (2026-07-16)
 
-Status: **PROPOSED** — schema + phases agreed, implementation pending.
+Status: **LARGELY IMPLEMENTED** — corrected 2026-07-28 against the tree at
+`fd8c5d04`. The header said "PROPOSED — implementation pending" long after four
+of the five phases had landed, and roll-ups downstream repeated that.
 Engine scope: **Rust `--node` engine only.**
+
+| phase | status (verified 2026-07-28) | evidence |
+| --- | --- | --- |
+| T1 schema + module + `stub_id` idempotency | **DONE** | `crates/rustynet-cli/src/live_lab_stage_triage.rs` |
+| T2 engine auto-stub at finalization | **DONE and wired** | called at `live_lab_run_matrix.rs:710`; collapses per `(run_id, stage)` |
+| T3 launch-time gate | **OPEN — the only unbuilt phase** | `unfilled_for_planned_stages` is built and tested but has no caller; see the blocker below |
+| T4 MCP `stage_triage_history` / `record_stage_patch` | **read DONE, write BACKED** | read half live in `rustynet-mcp-lab-state`; write half is the `ops live-lab-record-stage-patch` verb (`fd8c5d04`), MCP wrapper still to add |
+| T5 backfill + doc update | **DONE** | 51 records in `documents/operations/live_lab_stage_triage.jsonl` |
+
+**T3 is blocked on a decision, not on effort.** The gate as specified in §3.6
+fails a run closed when any *planned* stage has an unfilled stub. Measured on
+the current ledger: **36 of 51 stubs are unfilled**, and they include
+`preflight` (4), `bootstrap_hosts` (4) and `cleanup` (1) — stages present in
+every plan. Wiring the gate as written therefore blocks *every* live-lab run,
+including a focused mac/win cell under `--skip-linux-live-suite`, until the
+backlog is dispositioned. That backlog is real analytical work: §3.3 requires a
+declined stub to carry `"none: <reason>"`, so filling 36 stubs wholesale to
+unblock the gate would fabricate dispositions and defeat the ledger's purpose.
+
+Sequencing options, none of which should be taken silently:
+1. Disposition the 36 unfilled stubs (many likely correspond to stages that now
+   pass — §3.4 derives that from the run matrix), then wire the gate as
+   specified. Strictest, and the only option that leaves §3.6 intact.
+2. Wire the gate now and accept that live-lab work stops until (1) is done.
+3. Wire it in report-only mode first. **This weakens a fail-closed control and
+   contradicts §3.6's explicit choice**, so it needs owner sign-off recorded
+   here, not an implementer's judgement call.
+
+The write half of T4 landed first *because* it is a precondition for (1): before
+`fd8c5d04` the only way to fill a stub was hand-editing a 121 KB committed
+JSONL, bypassing the lock and every validation.
 
 ## 1. Problem
 

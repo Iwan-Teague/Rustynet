@@ -141,6 +141,35 @@ sections, or was confirmed stale by a separate audit:
     (relocated to `done/`), while a live `SecurityHardeningBacklog_2026-06-01.md`
     also exists — ambiguous which one current tooling/checks should target.
 
+## 2a. Addendum 2026-07-28 — items verified against code and found ALREADY DONE
+
+This roll-up is a doc-tree sweep: an entry here means *a document said this was
+open*, which is not the same as *the code leaves it undone*. The distinction was
+measured, not assumed. Six harness-side items below were checked against the
+tree at `2e742929` before any work started; **five were already implemented** and
+one was half-implemented.
+
+Recorded because the cost is asymmetric: acting on a stale "open" wastes a
+session re-deriving a landed fix, and a live-lab campaign planned around these
+would budget for work that does not exist. **Assume this staleness rate applies
+to the rest of the file** — verify against code before scheduling anything here.
+
+| Claim (source doc) | Verdict | Evidence |
+| --- | --- | --- |
+| "flock the run-matrix CSV append" not done (`CrossPlatformRoleParityRoadmap` §11) | **DONE** | `live_lab_run_matrix.rs:922` and `:2293` both hold `acquire_append_lock` across the whole read-modify-write; the shared mechanism is `append_lock.rs`, whose module doc records that it was *extracted from* this very path |
+| `cleanup_hosts` must bootout `com.rustynet.anchor` (`CrossPlatformRoleParityPlan`) | **DONE** | `cleanup_hosts` → macOS adapter → `macos_traffic::cleanup_runtime_state`; `MACOS_LAUNCHD_STOP_COMMAND` boots the label *and* the plist path (`macos_traffic.rs:27-28`) |
+| iproute2 6.19 FIB regression "root cause identified but NOT implemented" (`LiveLabFindings_2026-07-12`) | **DONE** | `phase10.rs:1091-1101` — narrow fail-closed match on exit-2 + `FIB table does not exist`, with a pinning test at `:11260` |
+| Tier 0: `validate_linux_membership_revoke_applies` / `validate_linux_revoked_peer_denied_e2e` "neither stage exists" (`LiveLabSecurityTestCoverage`) | **DONE** | both wired through `live_lab_stage_registry.rs`, `live_lab_run_matrix.rs`, `vm_lab/mod.rs`, and both MCP servers |
+| "Add a lock to `live_lab_stage_triage.rs`'s `append_stub` (TOCTOU window)" (`FleetEvidenceCollectionPlan`) | **DONE** | `live_lab_stage_triage.rs:159` takes the lock; the dedupe read and append are one critical section, with a barrier-based negative-control test |
+| Triage ledger T1/T2/T4/T5 "not built" (`LiveLabStageTriageLedgerPlan`) | **MOSTLY DONE** — see that plan's corrected status block | T1 built; T2 built *and wired* at `live_lab_run_matrix.rs:710`; T4 read-half live in the MCP, write-half landed `fd8c5d04`; T5 backfilled (51 records). **Only T3 is genuinely open.** |
+
+One item in this addendum's scope was found genuinely broken and was fixed in
+`fd8c5d04`: `fill_patch`, the ledger's only whole-file rewrite, ran unlocked,
+non-atomically, and silently overwrote an already-recorded attempt while its own
+doc-comment claimed it "only ever fills a `null`". That defect was not in this
+inventory or any source doc — it surfaced only from reading the code the stale
+entries pointed at, which is the argument for verifying rather than scheduling.
+
 ---
 
 ## Part 1 — `documents/operations/active/` (117 files, A→Z)
