@@ -8078,8 +8078,7 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         let guard_last_statement = relay_masked[guard_open + 1..guard_close]
             .lines()
             .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .next_back()
+            .rfind(|line| !line.is_empty())
             .unwrap_or("");
         assert_eq!(
             guard_last_statement, "return",
