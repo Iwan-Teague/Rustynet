@@ -1039,6 +1039,10 @@ enum OpsCommand {
         config: ops_live_lab_failure_digest::GenerateLiveLinuxLabFailureDigestConfig,
     },
     #[cfg(feature = "vm-lab")]
+    LiveLabRecordStagePatch {
+        config: live_lab_stage_triage::RecordStagePatchConfig,
+    },
+    #[cfg(feature = "vm-lab")]
     VmLabList {
         config: vm_lab::VmLabListConfig,
     },
@@ -3555,6 +3559,16 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        #[cfg(feature = "vm-lab")]
+        "live-lab-record-stage-patch" => Ok(OpsCommand::LiveLabRecordStagePatch {
+            config: live_lab_stage_triage::RecordStagePatchConfig {
+                ledger: parser.required_path("--ledger")?,
+                stub_id: parser.value("--stub-id"),
+                run_id: parser.value("--run-id"),
+                stage: parser.value("--stage"),
+                patch: parser.required("--patch")?,
+            },
+        }),
         #[cfg(feature = "vm-lab")]
         "vm-lab-list" => Ok(OpsCommand::VmLabList {
             config: vm_lab::VmLabListConfig {
@@ -8879,6 +8893,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::GenerateLiveLinuxLabFailureDigest { config } => {
             ops_live_lab_failure_digest::execute_ops_generate_live_linux_lab_failure_digest(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::LiveLabRecordStagePatch { config } => {
+            live_lab_stage_triage::execute_ops_record_stage_patch(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabList { config } => vm_lab::execute_ops_vm_lab_list(config),
