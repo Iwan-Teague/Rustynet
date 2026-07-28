@@ -1,20 +1,12 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-#[cfg(not(unix))]
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
-#[cfg(unix)]
-use nix::fcntl::{Flock, FlockArg};
-
+use crate::append_lock::{acquire_append_lock, lock_path_for};
 use crate::env_file::parse_env_value;
 use crate::live_lab_results::read_parallel_stage_results;
 use serde_json::Value;
@@ -802,6 +794,17 @@ pub(crate) fn attributable_node_status<'a>(
     }
 }
 
+/// Write the PER-RUN stage-results artifact
+/// (`state/live_lab_node_stage_results.csv` under the report dir).
+///
+/// The schema lives in two artifacts — this per-run file and the committed
+/// aggregate ledger — so a header migration has to cover both or reading old runs
+/// breaks. This half needs no row migration: the file belongs to exactly one run
+/// and is rewritten whole, so an older header left by an earlier build is replaced
+/// by the canonical one along with its rows. That is asserted by
+/// `an_existing_per_run_file_with_an_old_header_is_rewritten_canonical`, because
+/// "it truncates anyway" is the kind of assumption that stops being true when
+/// someone makes this function append.
 fn write_node_stage_csv(path: &Path, rows: &[BTreeMap<String, String>]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -829,6 +832,70 @@ fn render_named_csv_row(columns: &[&str], values: &BTreeMap<String, String>) -> 
         .join(",")
 }
 
+/// Reconcile a stage-results file's header against the canonical
+/// [`NODE_STAGE_COLUMNS`], returning the columns THAT FILE is written against.
+///
+/// Rows must be parsed positionally against their own header, not against the
+/// canonical list: once a column is appended to the schema, a file written by an
+/// earlier build has fewer fields, and reading it against the new list shifts
+/// every value after the insertion point. That silent misalignment is worse than
+/// a hard error, because the rows still parse.
+///
+/// Accepted:
+///
+/// * an exact match — the common case;
+/// * an OLDER schema, i.e. a strict prefix of `NODE_STAGE_COLUMNS`. Columns are
+///   only ever appended, so a shorter header is a previous version; its rows are
+///   upgraded on write by padding the new trailing columns with empty values.
+///
+/// Rejected (fail closed, never guess): a header that reorders, renames, drops an
+/// interior column, or carries a column this build does not know. Guessing an
+/// alignment there would corrupt the committed ledger.
+fn node_stage_header_columns(header: &str, path: &Path) -> Result<Vec<String>, String> {
+    let found: Vec<String> = header.split(',').map(str::to_owned).collect();
+    if found.len() > NODE_STAGE_COLUMNS.len() {
+        return Err(format!(
+            "node-stage matrix schema is NEWER than this build ({}): {} columns, expected at most {}. \
+             Upgrade the binary rather than downgrading the ledger.",
+            path.display(),
+            found.len(),
+            NODE_STAGE_COLUMNS.len()
+        ));
+    }
+    let is_prefix = found
+        .iter()
+        .zip(NODE_STAGE_COLUMNS.iter())
+        .all(|(have, want)| have == want);
+    if !is_prefix {
+        let mismatch = found
+            .iter()
+            .zip(NODE_STAGE_COLUMNS.iter())
+            .position(|(have, want)| have != want)
+            .unwrap_or(0);
+        return Err(format!(
+            "node-stage matrix schema mismatch ({}) at column {}: found {:?}, expected {:?}. \
+             Only appended columns are migratable; a reordered or renamed column is not.",
+            path.display(),
+            mismatch + 1,
+            found.get(mismatch).map(String::as_str).unwrap_or(""),
+            NODE_STAGE_COLUMNS.get(mismatch).copied().unwrap_or("")
+        ));
+    }
+    Ok(found)
+}
+
+/// Re-render one existing row from `file_columns` into the canonical schema,
+/// padding appended columns with empty values.
+fn migrate_node_stage_row(line: &str, file_columns: &[String]) -> Result<String, String> {
+    let fields = parse_csv_record(line)?;
+    let values: BTreeMap<String, String> = file_columns
+        .iter()
+        .cloned()
+        .zip(fields.into_iter().chain(std::iter::repeat(String::new())))
+        .collect();
+    Ok(render_named_csv_row(NODE_STAGE_COLUMNS, &values))
+}
+
 fn upsert_node_stage_csv(
     path: &Path,
     run_id: &str,
@@ -852,26 +919,27 @@ fn upsert_node_stage_csv(
             )
         })?;
     }
-    let _lock = acquire_matrix_append_lock(matrix_lock_path_for(path).as_path())?;
+    let _lock = acquire_append_lock(lock_path_for(path).as_path(), "run-matrix")?;
     let body = fs::read_to_string(path)
         .map_err(|err| format!("read node-stage matrix failed ({}): {err}", path.display()))?;
     let mut lines = body.lines();
     let header = lines
         .next()
         .ok_or_else(|| format!("node-stage matrix is empty: {}", path.display()))?;
-    if header != NODE_STAGE_COLUMNS.join(",") {
-        return Err(format!(
-            "node-stage matrix schema mismatch ({}); expected exact normalized schema",
-            path.display()
-        ));
-    }
-    let run_index = NODE_STAGE_COLUMNS
+    // An older (shorter) header is read against ITS OWN columns and upgraded
+    // below; anything else fails closed. See `node_stage_header_columns`.
+    let file_columns = node_stage_header_columns(header, path)?;
+    let upgrading = file_columns.len() != NODE_STAGE_COLUMNS.len();
+    // Indices come from the FILE's header, not the canonical list: on an older
+    // file the two can differ, and matching on the wrong index would replace the
+    // wrong run's rows.
+    let run_index = file_columns
         .iter()
-        .position(|column| *column == "run_id")
+        .position(|column| column == "run_id")
         .unwrap_or(0);
-    let report_index = NODE_STAGE_COLUMNS
+    let report_index = file_columns
         .iter()
-        .position(|column| *column == "report_dir")
+        .position(|column| column == "report_dir")
         .unwrap_or(5);
     let mut retained = Vec::new();
     for line in lines.filter(|line| !line.trim().is_empty()) {
@@ -879,7 +947,20 @@ fn upsert_node_stage_csv(
             fields.get(run_index).map(String::as_str) == Some(run_id)
                 && fields.get(report_index).map(String::as_str) == Some(report_dir)
         });
-        if !replace {
+        if replace {
+            continue;
+        }
+        if upgrading {
+            // Re-render under the canonical schema. A row that will not parse
+            // cannot be realigned, so fail closed rather than write it back
+            // verbatim under a wider header — that would silently misalign it.
+            retained.push(migrate_node_stage_row(line, &file_columns).map_err(|err| {
+                format!(
+                    "migrate node-stage row failed ({}): {err}; row: {line}",
+                    path.display()
+                )
+            })?);
+        } else {
             retained.push(line.to_owned());
         }
     }
@@ -2195,138 +2276,6 @@ fn earliest_stage_time_from_rows(_stages: &[StageEvidence], _started: bool) -> O
     None
 }
 
-/// RAII guard for the shared run-matrix CSV append lock. Unix uses a persistent
-/// lock file held under an exclusive advisory `flock` (kernel-released when the
-/// descriptor closes, including on process death); non-unix uses an `O_EXCL`
-/// lock file whose existence IS the lock. Two disjoint-node live-lab runs can
-/// finish near-simultaneously and each append one row; without serialization
-/// their read→normalize→append sequences interleave and clobber rows.
-struct MatrixAppendLock {
-    // Only the non-unix (O_EXCL) path tracks the lock-file path for removal;
-    // the unix path holds a persistent file and releases via the flock fd.
-    #[cfg(not(unix))]
-    path: PathBuf,
-    #[cfg(unix)]
-    _flock: Flock<File>,
-    #[cfg(not(unix))]
-    _handle: File,
-}
-
-impl Drop for MatrixAppendLock {
-    fn drop(&mut self) {
-        // Non-unix: the O_EXCL lock file's existence IS the lock, so remove it
-        // to release. Unix: the advisory flock is released automatically when
-        // `_flock`'s descriptor closes (including on process death), and the
-        // lock file is intentionally PERSISTENT. Removing it on unix would open
-        // a split-inode race under high contention: with the name unlinked, two
-        // acquirers can each create a distinct inode and flock their own copy,
-        // both entering the critical section and clobbering the append.
-        #[cfg(not(unix))]
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn matrix_lock_path_for(path: &Path) -> PathBuf {
-    let mut out = path.as_os_str().to_os_string();
-    out.push(".lock");
-    PathBuf::from(out)
-}
-
-/// Acquire the exclusive run-matrix append lock, failing closed on timeout or a
-/// non-recoverable I/O error. Unix uses an advisory `flock` (auto-released on
-/// crash); the lock file itself may legitimately survive a crash, so mutual
-/// exclusion comes from the `flock`, not the file's existence.
-#[cfg(unix)]
-fn acquire_matrix_append_lock(lock_path: &Path) -> Result<MatrixAppendLock, String> {
-    const MAX_WAIT: Duration = Duration::from_secs(10);
-    const WAIT_MS: u64 = 10;
-    let deadline = Instant::now() + MAX_WAIT;
-
-    loop {
-        // create(true) (NOT create_new): a lock file may legitimately survive a
-        // crash; mutual exclusion comes from the advisory flock below.
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).mode(0o600);
-        match options.open(lock_path) {
-            Ok(file) => match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(flock) => {
-                    return Ok(MatrixAppendLock { _flock: flock });
-                }
-                Err((_returned, _errno)) => {
-                    // Held by another live descriptor (EWOULDBLOCK). A dead
-                    // holder's flock is already released, so this loops only for
-                    // genuine live contention.
-                    if Instant::now() >= deadline {
-                        return Err(format!(
-                            "acquire run-matrix append lock timed out ({})",
-                            lock_path.display()
-                        ));
-                    }
-                    sleep(Duration::from_millis(WAIT_MS));
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                // Wrong-owned lock file (e.g. left by a root-run op); we own the
-                // directory, so unlink and recreate under our own UID.
-                if fs::remove_file(lock_path).is_err() || Instant::now() >= deadline {
-                    return Err(format!(
-                        "acquire run-matrix append lock failed: wrong-owned lock ({})",
-                        lock_path.display()
-                    ));
-                }
-                sleep(Duration::from_millis(WAIT_MS));
-            }
-            Err(err) => {
-                return Err(format!(
-                    "open run-matrix append lock failed ({}): {err}",
-                    lock_path.display()
-                ));
-            }
-        }
-    }
-}
-
-/// Non-unix fallback: `O_EXCL` lock file as a mutex (mirrors the
-/// `rustynetd::resilience` non-unix path). Advisory-lock hardening
-/// (auto-release on process death) is unix-only.
-#[cfg(not(unix))]
-fn acquire_matrix_append_lock(lock_path: &Path) -> Result<MatrixAppendLock, String> {
-    const MAX_WAIT: Duration = Duration::from_secs(10);
-    const WAIT_MS: u64 = 10;
-    let deadline = Instant::now() + MAX_WAIT;
-
-    loop {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        match options.open(lock_path) {
-            Ok(mut handle) => {
-                let stamp = format!("pid={}\n", std::process::id());
-                let _ = handle.write_all(stamp.as_bytes());
-                let _ = handle.sync_all();
-                return Ok(MatrixAppendLock {
-                    path: lock_path.to_path_buf(),
-                    _handle: handle,
-                });
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                if Instant::now() >= deadline {
-                    return Err(format!(
-                        "acquire run-matrix append lock timed out ({})",
-                        lock_path.display()
-                    ));
-                }
-                sleep(Duration::from_millis(WAIT_MS));
-            }
-            Err(err) => {
-                return Err(format!(
-                    "open run-matrix append lock failed ({}): {err}",
-                    lock_path.display()
-                ));
-            }
-        }
-    }
-}
-
 /// Insert or replace this run's row under the append lock (Finding 2:
 /// upsert-by-run-key). The natural key is (report_dir, run_started_utc);
 /// a Final row replaces every earlier row for the key, an Interim row
@@ -2341,7 +2290,7 @@ fn upsert_csv_row(
 ) -> Result<bool, String> {
     // Serialize the read→match→rewrite against concurrent live-lab runs
     // touching the same shared matrix. Held (RAII) until this fn returns.
-    let _lock = acquire_matrix_append_lock(matrix_lock_path_for(path).as_path())?;
+    let _lock = acquire_append_lock(lock_path_for(path).as_path(), "run-matrix")?;
     let body = fs::read_to_string(path).map_err(|err| {
         format!(
             "read live-lab run matrix failed ({}): {err}",
@@ -4434,8 +4383,9 @@ mod conclusion_barrier_tests {
     //! "passing" run whose plan has holes.
 
     use super::{
-        NodeStagePlanEntry, StageEvidence, apply_conclusion_barrier, attributable_node_status,
-        node_stage_scope, normalize_os_family, overall_result, upsert_node_stage_csv,
+        NODE_STAGE_COLUMNS, NodeStagePlanEntry, StageEvidence, apply_conclusion_barrier,
+        attributable_node_status, node_stage_scope, normalize_os_family, overall_result,
+        parse_csv_record, render_named_csv_row, upsert_node_stage_csv, write_node_stage_csv,
     };
     use crate::live_lab_stage_manifest::{build_stage_manifest, write_stage_manifest};
     use crate::live_lab_stage_registry::TargetSelectors;
@@ -4689,6 +4639,153 @@ mod conclusion_barrier_tests {
             roles: Vec::new(),
         };
         assert_eq!(node_stage_scope(&topology_stage).unwrap(), "topology");
+    }
+
+    /// An older, shorter header must be READ correctly and UPGRADED on write.
+    ///
+    /// The schema lives in two artifacts, so this covers the aggregate half. The
+    /// old row is built from the old column list itself, so this test keeps
+    /// working when a column is appended (which is the event it exists for).
+    #[test]
+    fn an_old_header_aggregate_is_read_and_upgraded_on_write() {
+        let root = temp_report_dir("node-stage-migrate");
+        let path = root.join("node-stage.csv");
+
+        // Previous schema = canonical minus the appended trailing column.
+        let old_columns: Vec<&str> = NODE_STAGE_COLUMNS[..NODE_STAGE_COLUMNS.len() - 1].to_vec();
+        let appended = *NODE_STAGE_COLUMNS.last().expect("a canonical column");
+        let mut old_row = BTreeMap::new();
+        for column in &old_columns {
+            old_row.insert((*column).to_owned(), format!("old-{column}"));
+        }
+        let body = format!(
+            "{}\n{}\n",
+            old_columns.join(","),
+            render_named_csv_row(&old_columns, &old_row)
+        );
+        fs::write(&path, body).expect("seed an old-header ledger");
+
+        let mut new_row = BTreeMap::new();
+        for (key, value) in [
+            ("run_id", "run-new"),
+            ("report_dir", "/tmp/report-new"),
+            ("alias", "rocky-utm-1"),
+            ("status", "pass"),
+        ] {
+            new_row.insert(key.to_owned(), value.to_owned());
+        }
+        upsert_node_stage_csv(&path, "run-new", "/tmp/report-new", &[new_row])
+            .expect("an older header must migrate, not error");
+
+        let out = fs::read_to_string(&path).expect("read migrated ledger");
+        let mut lines = out.lines();
+        assert_eq!(
+            lines.next().expect("header"),
+            NODE_STAGE_COLUMNS.join(","),
+            "the header must be upgraded to the canonical schema"
+        );
+
+        let rows: Vec<Vec<String>> = lines
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| parse_csv_record(line).expect("row parses"))
+            .collect();
+        assert_eq!(rows.len(), 2, "the pre-existing row must survive migration");
+        for row in &rows {
+            assert_eq!(
+                row.len(),
+                NODE_STAGE_COLUMNS.len(),
+                "every row must be widened to the canonical width"
+            );
+        }
+
+        // Alignment is the whole point: each old value must still sit under its
+        // own column, and the appended column must be empty rather than shifted.
+        let index = |name: &str| {
+            NODE_STAGE_COLUMNS
+                .iter()
+                .position(|column| *column == name)
+                .expect("canonical column")
+        };
+        let migrated = rows
+            .iter()
+            .find(|row| row[index("run_id")] == "old-run_id")
+            .expect("the migrated old row");
+        for column in &old_columns {
+            assert_eq!(
+                migrated[index(column)],
+                format!("old-{column}"),
+                "column {column} must not shift during migration"
+            );
+        }
+        assert_eq!(
+            migrated[index(appended)],
+            "",
+            "the appended column must be empty for a row written before it existed"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Only APPENDED columns are migratable. A reordered header, or one from a
+    /// newer build, must fail closed — guessing an alignment would corrupt the
+    /// committed ledger silently.
+    #[test]
+    fn a_non_appended_node_stage_header_change_fails_closed() {
+        let root = temp_report_dir("node-stage-badhdr");
+
+        let mut swapped: Vec<&str> = NODE_STAGE_COLUMNS.to_vec();
+        swapped.swap(1, 2);
+        let reordered = root.join("reordered.csv");
+        fs::write(&reordered, format!("{}\n", swapped.join(","))).expect("seed reordered");
+        let err = upsert_node_stage_csv(&reordered, "r", "/d", &[BTreeMap::new()])
+            .expect_err("a reordered header must be rejected");
+        assert!(
+            err.contains("schema mismatch"),
+            "must name the mismatch, got: {err}"
+        );
+
+        let newer = root.join("newer.csv");
+        let mut wider: Vec<&str> = NODE_STAGE_COLUMNS.to_vec();
+        wider.push("column_from_the_future");
+        fs::write(&newer, format!("{}\n", wider.join(","))).expect("seed newer");
+        let err = upsert_node_stage_csv(&newer, "r", "/d", &[BTreeMap::new()])
+            .expect_err("a newer schema must be rejected");
+        assert!(
+            err.contains("NEWER than this build"),
+            "must say the binary is behind, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The per-run half of the same schema. It is rewritten whole, so an old
+    /// header left by an earlier build is replaced — asserted rather than assumed,
+    /// because that stops holding the moment someone makes this function append.
+    #[test]
+    fn an_existing_per_run_file_with_an_old_header_is_rewritten_canonical() {
+        let root = temp_report_dir("node-stage-perrun");
+        let path = root.join("state/live_lab_node_stage_results.csv");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let old_columns: Vec<&str> = NODE_STAGE_COLUMNS[..NODE_STAGE_COLUMNS.len() - 1].to_vec();
+        fs::write(&path, format!("{}\nstale,row\n", old_columns.join(","))).expect("seed");
+
+        let mut row = BTreeMap::new();
+        row.insert("run_id".to_owned(), "run-1".to_owned());
+        row.insert("status".to_owned(), "pass".to_owned());
+        write_node_stage_csv(&path, &[row]).expect("write per-run CSV");
+
+        let out = fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            out.lines().next().expect("header"),
+            NODE_STAGE_COLUMNS.join(","),
+            "the per-run artifact must carry the canonical header after a write"
+        );
+        assert!(
+            !out.contains("stale,row"),
+            "the per-run file is owned by one run and rewritten whole"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

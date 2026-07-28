@@ -33,6 +33,9 @@ pub mod role_cli;
 mod anchor_init;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
+mod append_lock;
+#[cfg(feature = "vm-lab")]
+#[allow(dead_code)]
 mod env_file;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
