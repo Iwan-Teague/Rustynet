@@ -1929,3 +1929,79 @@ Verdict are superseded by their own dates; three statements above no longer hold
   terminal status — is an owner decision; this note only records that the code no longer
   matches the verdict text.
 
+---
+
+## Findings Log — Batch 8 (relay pre-auth review + doc audit spillover, 2026-07-28)
+
+> Raised from the 2026-07-27 adversarial relay review and the normative/security
+> doc audits of the same day. Those reviews produced dispositions that were
+> recorded only in commit messages and doc annotations, which is how this ledger's
+> summary layer drifted from its own findings before — so they are filed here.
+>
+> **Read the confidence label on each.** Four were verified first-hand against
+> committed `origin/main` while filing (`1e4284cb`); four are RAISED from the
+> review and NOT first-hand verified, and say so. A ledger row that does not
+> distinguish these is how "asserted-but-unverified" became a finding class in the
+> first place.
+
+### RSA-0082 — relay forward path runs a full allocated-socket prune on every failed forward, unlimited and pre-token
+- File: `crates/rustynet-relay/src/main.rs:708-711` (`spawn_forward_task`, `match forward_result { .. Err(_) => prune_inactive_allocated_sockets(..) }`)
+- Date: 2026-07-28 · Severity: **Medium** (unauthenticated self-inflicted cost on the dataplane path)
+- Bar mapping: SecurityMinimumBar §3.8 (dataplane availability); CWE-405 (asymmetric resource consumption).
+- Reachability: **VERIFIED FIRST-HAND.** Any datagram to an allocated dataplane port whose source does not match the session makes `forward_packet` return `Err`, and the arm then runs `prune_inactive_allocated_sockets`, which snapshots the transport under its mutex and takes the `allocated_sockets` write lock — O(allocated ports) per packet. There is no rate limiter, no token requirement, and no spoofing needed: the port number is the only thing an attacker must find. Contrast the same file's pre-auth hello path, which IS limited (`pre_auth_hello_limiter`, `:510`), and the periodic prune at `:436` which is ticker-driven by design.
+- Proposed enforcement: budget or debounce the failure-triggered prune (the periodic task at `:436` already covers liveness), or gate it behind a per-source limiter as the hello path is.
+- Note: the review that raised this cited "the `Err(_)` arm of `spawn_forward_task`" without a line; two other `prune_inactive_allocated_sockets` call sites (`:547` post-validation, `:564` in the `Accepted` arm) are NOT attacker-triggerable, and were checked and excluded before confirming this one.
+- Source: 2026-07-27 adversarial relay review (residual 1, rated by its own reviewer above the defect that review fixed). Status: **open** (net-new; 2026-07-28)
+
+### RSA-0083 — relay control socket sets no `SO_RCVBUF`
+- File: `crates/rustynet-relay/src/main.rs` (no `SO_RCVBUF` / `set_recv_buffer` anywhere in the file)
+- Date: 2026-07-28 · Severity: **Low** (availability tuning; already CONCERN-rated for embedded targets)
+- Bar mapping: SecurityMinimumBar §3.8. Reachability: **VERIFIED FIRST-HAND** — zero occurrences in the relay binary, so the control socket inherits the OS default receive buffer. Under a pre-auth flood the serialized control loop is the bottleneck, and a small default buffer drops legitimate hellos before the loop can shed the flood.
+- Proposed enforcement: set an explicit `SO_RCVBUF` on the control socket, sized against the documented pre-auth ceiling.
+- Source: 2026-07-27 relay review (residual 6); pre-existing CONCERN in `Arm32BitEmbeddedSupportReference_2026-06-23.md`. Status: **open** (2026-07-28)
+
+### RSA-0084 — Windows relay installer defaults to a public bind with no firewall rule
+- File: `scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1:15` (`[string]$Bind = '0.0.0.0:4600'`)
+- Date: 2026-07-28 · Severity: **Medium** (network exposure by default, platform-asymmetric)
+- Bar mapping: SecurityMinimumBar §6.E (tunnel-only exposure); CWE-1188 (insecure default).
+- Reachability: **VERIFIED FIRST-HAND** — the default binds every interface, and the script contains zero `New-NetFirewallRule` / `netsh advfirewall` calls, so nothing scopes who may reach it. The Linux and macOS installers default to loopback, so a Windows relay is exposed where the same operator action on another OS is not.
+- Proposed enforcement: default to loopback (or the tunnel address) and require an explicit override, and/or add a firewall rule scoping the listener. Either way, make the platforms agree.
+- Source: 2026-07-27 relay review (residual 7). Status: **open** (2026-07-28)
+
+### RSA-0085 — WireGuard pre-shared key is never set: deployed handshake is effectively `Noise_IK`, not `Noise_IKpsk2`
+- File: `crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs:269` (sole production `Tunn::new`, PSK argument `None`); `third_party/boringtun/src/noise/handshake.rs:618,862` (`preshared_key.unwrap_or([0u8; 32])`)
+- Date: 2026-07-28 · Severity: **Question** (owner decision: adopt a PSK control, or record it as out of scope)
+- Bar mapping: SecurityMinimumBar §3 "proven crypto only"; the four ledger assertions of "standard `Noise_IKpsk2`" corrected 2026-07-27 (see the PSK correction blocks in the Executive Summary and at `:98`, `:146`, `:814`).
+- Reachability: **VERIFIED FIRST-HAND.** `Tunn::new` is called once in production with `None`; boringtun mixes an all-zero key into the chaining key on both handshake halves, which contributes no entropy, so the deployed handshake is cryptographically plain `Noise_IK`. There is no configuration surface: `PeerConfig` has no PSK field, `preshared`/`psk` appears nowhere under `crates/` or `scripts/`, and no `wg set` backend emits `preshared-key`. The properties NOT held are psk2's hedge against static-key compromise / harvest-now-decrypt-later, and any "cannot initiate without the PSK" pre-auth property (`mac1` is keyed by the responder's public key).
+- Proposed enforcement (owner decision): (a) adopt an optional or required PSK, which needs a key-distribution and rotation story this project does not yet have; or (b) record PSK as deliberately out of scope, in which case the corrected claims already standing are the complete disposition and this row closes as `accepted`.
+- Source: 2026-07-27 security-cluster doc audit (seed finding). Status: **open** (net-new; 2026-07-28)
+
+### RSA-0086 — pre-auth ed25519 verify is per-packet, keyed on an attacker-chosen `node_id`, under the transport lock
+- File: relay hello path — `crates/rustynet-relay/src/main.rs` + `crates/rustynet-relay/src/transport.rs` (`HelloLimiter`, keyed on `hello.node_id`)
+- Date: 2026-07-28 · Severity: **Medium** (RAISED — reachability NOT first-hand verified)
+- Bar mapping: SecurityMinimumBar §3.8; CWE-405.
+- Reachability: **RAISED, NOT VERIFIED.** The review reports that `HelloLimiter` keys on `hello.node_id`, which is attacker-controlled and read before signature verification, so it sheds nothing under a flood of distinct ids; and that `lock_transport` is held across the ed25519 verify, so the cost lands on the dataplane too. I confirmed only that the hello parser reads a `u16`-length `node_id` (`main.rs:815-823`) and that `pre_auth_hello_limiter` (the IP-keyed one, `:510`) is a different limiter. The node_id-keyed limiter's call site and the lock scope across the verify were not checked.
+- Proposed enforcement: verify the claim first; if it holds, key the pre-auth limiter on something the attacker cannot vary freely (source IP already is), and move the verify out of the transport lock.
+- Source: 2026-07-27 relay review (residual 2, rated by its own reviewer above the defect that review fixed). Status: **open — needs first-hand confirmation before action** (2026-07-28)
+
+### RSA-0087 — IPv6: per-IP pre-auth limiters key on the full address, so a routed /64 is a cheap total lockout
+- File: `crates/rustynet-relay/src/main.rs` (`PreAuthHelloLimiter`, `MAX_PRE_AUTH_HELLO_SOURCE_IPS`)
+- Date: 2026-07-28 · Severity: **Medium** (RAISED — arithmetic NOT first-hand verified)
+- Bar mapping: SecurityMinimumBar §3.8; CWE-770.
+- Reachability: **RAISED, NOT VERIFIED.** The review reports that keying on the full IPv6 address lets a single routed /64 present effectively unlimited distinct sources, filling the bounded 4096-entry table — which fails closed — at roughly 4096 packets/s, denying pre-auth to every legitimate peer. Plausible on its face given the table bound is per-address, but the fail-closed-on-full behaviour and the rate were not confirmed here.
+- Proposed enforcement: verify, then key IPv6 sources on a prefix (/64 or /48) rather than the full address, so one routed prefix consumes one entry.
+- Source: 2026-07-27 relay review (residual 4). Status: **open — needs first-hand confirmation** (2026-07-28)
+
+### RSA-0088 — `node_id` is length-bounded only by the datagram and becomes a map key before signature verification
+- File: `crates/rustynet-relay/src/main.rs:815-823` (`u16` length prefix, `String::from_utf8` of that many bytes)
+- Date: 2026-07-28 · Severity: **Low** (partially verified)
+- Bar mapping: CWE-770. Reachability: the `u16` length parse and the bounds check against `data.len()` are **VERIFIED FIRST-HAND**; the claim that this string then becomes a `HelloLimiter` map key before verification is **NOT** (see RSA-0086, same code path). `MAX_HELLO_LIMITER_ENTRIES` bounds entry COUNT, not bytes per entry, so a datagram-sized id inflates per-entry cost.
+- Proposed enforcement: cap `node_id` length at the protocol's real maximum at parse time.
+- Source: 2026-07-27 relay review (residual 3). Status: **open** (2026-07-28)
+
+### RSA-0089 — relay client: 10s non-configurable session timeout on a single un-retransmitted hello
+- File: relay client hello/session path (`session_timeout`)
+- Date: 2026-07-28 · Severity: **Low** (RAISED — NOT first-hand verified; availability/robustness, not a security control)
+- Reachability: **RAISED, NOT VERIFIED.** The review reports a fixed 10s `session_timeout`, a single hello with no retransmission, and a synchronous block on the daemon's single-threaded reconcile loop — so one lost hello costs ~10s of stalled reconcile and aborts the rest of that pass. Filed because it is the failure mode a monitor would misread as a relay fault, and because it interacts with any decision to throttle reject notices (a silenced reject leaves the client waiting the full timeout).
+- Proposed enforcement: verify; then make the timeout configurable and retransmit the hello.
+- Source: 2026-07-27 relay review (residual 5, raised by the correctness reviewer while breaking the review's first design). Status: **open — needs first-hand confirmation** (2026-07-28)
