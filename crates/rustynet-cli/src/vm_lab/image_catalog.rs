@@ -675,8 +675,7 @@ pub fn probe_host_arch(
             let token = output
                 .lines()
                 .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .next_back()
+                .rfind(|line| !line.is_empty())
                 .ok_or_else(|| {
                     format!("fail-closed: host {host_id} returned no architecture from `uname -m`")
                 })?;
