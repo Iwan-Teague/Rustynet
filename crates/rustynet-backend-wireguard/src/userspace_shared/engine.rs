@@ -343,6 +343,57 @@ impl UserspaceEngine {
         )
     }
 
+    /// Drive boringtun's periodic timers for every configured peer.
+    ///
+    /// `Tunn::update_timers` is what advances boringtun's internal clock
+    /// (`TimeCurrent`), and every other timer is recorded relative to it. It
+    /// also emits persistent keepalives and the rekey handshake. Nothing in
+    /// this workspace called it, which had three consequences on the
+    /// userspace-shared backends:
+    ///
+    /// - `time_since_last_handshake` is computed as
+    ///   `time_since_tun_start - TimeSessionEstablished`, and with the clock
+    ///   frozen that second term stayed at its initial value. The reported
+    ///   handshake age therefore grew without bound, so a peer that had just
+    ///   completed a handshake still read as ancient and never counted as
+    ///   live.
+    /// - persistent keepalives were never emitted, so NAT bindings were left
+    ///   to expire on their own.
+    /// - the periodic rekey was never driven.
+    ///
+    /// Returns any handshake observed while ticking so the caller can record
+    /// it, matching `initiate_handshake`'s contract.
+    pub(crate) fn update_peer_timers<S: EngineIoSink>(
+        &mut self,
+        transport_generation: u64,
+        sink: &mut S,
+    ) -> Result<Vec<(NodeId, u64)>, BackendError> {
+        let mut observed = Vec::new();
+        let mut timer_buf = vec![0u8; MAX_ENCRYPTED_PACKET_BYTES];
+        let node_ids: Vec<NodeId> = self.peer_states.keys().cloned().collect();
+        for node_id in node_ids {
+            let Some(peer_state) = self.peer_states.get_mut(&node_id) else {
+                continue;
+            };
+            let result = peer_state.tunnel.update_timers(&mut timer_buf);
+            // A timer tick can legitimately produce nothing (Done), a packet to
+            // send (keepalive or rekey initiation), or a connection-expired
+            // error. `drive_outbound_result` already routes each of those and
+            // reports any handshake it observes.
+            if let Some(handshake) = drive_outbound_result(
+                &node_id,
+                peer_state,
+                transport_generation,
+                result,
+                &mut self.recorded_tunnel_plaintext_packets,
+                sink,
+            )? {
+                observed.push(handshake);
+            }
+        }
+        Ok(observed)
+    }
+
     pub(crate) fn current_peer_endpoint(&self, node_id: &NodeId) -> Option<SocketEndpoint> {
         self.peer_states
             .get(node_id)
