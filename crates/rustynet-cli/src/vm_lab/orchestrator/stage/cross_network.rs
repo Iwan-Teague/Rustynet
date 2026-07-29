@@ -945,12 +945,20 @@ fn stage_log_path_for_idx(
 }
 
 fn cargo_ops_command(subcommand: &str) -> Command {
+    // `--features vm-lab` is REQUIRED. Every `ops` verb driven through here is
+    // `#[cfg(feature = "vm-lab")]`-gated, so without it cargo builds a
+    // default-feature binary that lacks them and the call dies with
+    // `unknown ops subcommand` — which surfaces as exit 64 (bad_args) and
+    // reads like a caller argument error rather than a missing build feature.
+    // That is exactly how `cross_network_preflight` recorded a FALSE RED.
     let mut cmd = Command::new("cargo");
     cmd.current_dir(repo_root()).args([
         "run",
         "--quiet",
         "-p",
         "rustynet-cli",
+        "--features",
+        "vm-lab",
         "--",
         "ops",
         subcommand,
