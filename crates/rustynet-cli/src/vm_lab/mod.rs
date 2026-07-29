@@ -40461,12 +40461,30 @@ mod tests {
             let Ok(body) = fs::read_to_string(&path) else {
                 continue;
             };
-            if !body.contains("\"--bin\",") {
+            // EVERY cargo invocation in the file must carry the feature, not
+            // just one of them. The per-FILE check this replaced passed
+            // vacuously on cross_network.rs: that file spawns cargo twice, the
+            // `--bin` launcher was fixed (putting the literal in the file), and
+            // the sibling `cargo_ops_command` helper kept the bug — which then
+            // recorded a live FALSE RED on cross_network_preflight. Counting
+            // invocations against feature literals catches a partially-fixed
+            // file; a per-file `contains` cannot.
+            let cargo_spawns = body.matches("Command::new(\"cargo\")").count();
+            if cargo_spawns == 0 {
                 continue;
             }
             checked += 1;
-            if !body.contains("\"vm-lab\"") {
-                offenders.push(path.display().to_string());
+            // Count the quoted `"--features"` ARGUMENT, not the string
+            // "vm-lab". Prose mentioning vm-lab — including the explanatory
+            // comments on these very call sites — contains `"vm-lab"` and
+            // inflated the count enough to let a reverted fix pass. The
+            // argument token appears only in an args list.
+            let feature_args = body.matches("\"--features\"").count();
+            if feature_args < cargo_spawns {
+                offenders.push(format!(
+                    "{} ({cargo_spawns} cargo spawn(s), {feature_args} \"--features\" arg(s))",
+                    path.display()
+                ));
             }
         }
         assert!(
