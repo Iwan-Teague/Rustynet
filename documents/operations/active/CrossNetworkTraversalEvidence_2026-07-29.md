@@ -1,11 +1,11 @@
 # Cross-Network NAT Traversal — First Live Evidence (2026-07-29)
 
 **Status:** Active evidence record. First time rustynet's own NAT traversal has been
-exercised against two genuinely separate physical networks. **Six defects found and
+exercised against two genuinely separate physical networks. **Seven defects found and
 fixed**; direct hole-punched connectivity achieved, **bulk data transfers byte-exact
-over it at 6.94 Mbit/s with 0-1% loss**. Remaining open: liveness never registers
-(§4.2b — the highest-value next fix), reflexive-endpoint publication, same-site hairpin,
-and kernel-WireGuard's inability to run STUN.
+over it at 13.69 Mbit/s with 0% loss**. Remaining open: reflexive endpoints are never
+published into the signed bundle (§4.4) and the same-site NAT hairpin that follows from it
+(§4.4b), plus kernel-WireGuard's inability to run STUN (§4.5).
 
 **Why this could not be done before:** every prior cross-network claim was blocked on
 "the owner does not have a second network right now"
@@ -51,9 +51,10 @@ lab.
 
 ## 2. Defects found and fixed
 
-All six were measured, not inferred, and each is fixed on `main`. §2.1–§2.3 unblocked
-the handshake; §4.1 covers the two MTU faults that unblocked bulk data; §4.2 covers the
-handshake-collision storm that was causing the packet loss.
+All seven were measured, not inferred, and each is fixed on `main`. §2.1–§2.3 unblocked
+the handshake; §4.1 covers the two MTU faults that unblocked bulk data; §4.2 the
+handshake-collision storm behind the packet loss; §4.2b the frozen boringtun clock that
+was the root cause beneath both the loss and the empty liveness counters.
 
 ### 2.1 Boot killswitch never received the STUN allow-list — `fe634559`
 
@@ -208,17 +209,56 @@ the floor, and an explicit force still wins.
 | packet loss (mac→ubu) | 7.5% | **1%** (99/100) |
 | 4 MB TCP throughput | 0.37 Mbit/s | **6.94 Mbit/s** (sha256 matched) |
 
-### 4.2b Liveness still never registers — the cause behind the cause, STILL OPEN
-`7a3af8fe` bounds the damage; it does not cure why the re-race engaged. Even now, with
-0% loss and 6.94 Mbit/s flowing, every node still reports
-`path_live_peer_count=0`, `path_live_direct_peers=0`,
-`path_latest_live_handshake_unix=none`, `path_live_proven=false`.
+### 4.2b ~~Liveness never registers~~ — **FIXED** (`3e44e627`)
+**Nothing in the workspace ever called `Tunn::update_timers`.** That is boringtun's clock
+driver: it advances the internal `TimeCurrent`, and every other timer is stored relative
+to it. With it frozen,
 
-The userspace-shared backend has a `HandshakeTelemetry` tracker and four call sites that
-record into it (`userspace_shared/runtime.rs`), yet the timestamp never surfaces. Until
-that is fixed the daemon cannot tell a healthy direct path from a dead one, `path_live_*`
-remains unusable as evidence, and the re-probe floor is the only thing preventing the
-storm from returning. **This is now the highest-value next fix.**
+```
+time_since_last_handshake = time_since_tun_start - TimeSessionEstablished
+```
+
+grew without bound, because the second term stayed at its initial value. A peer that had
+just handshaked reported an ancient one and never satisfied the freshness window — which
+is why `path_live_*` read empty on a path demonstrably carrying 4 MB byte-exact.
+
+It is also **why the §4.2 re-race loop engaged at all**: the Direct arm re-probes while a
+handshake is not fresh, and the handshake could never *become* fresh. `7a3af8fe` paced
+that loop; this removes the reason it engaged.
+
+Two further consequences of the frozen clock, both also fixed: persistent keepalives were
+never emitted (NAT bindings left to expire on their own) and the periodic rekey was never
+driven.
+
+Both userspace-shared backends share one engine, so the tick is implemented once and each
+runtime drives it once per second. The tests pin that each runtime **drives** the tick,
+not merely defines it — defining without calling would reproduce the defect exactly.
+
+**Measured effect**, all four nodes:
+
+| | before | after |
+| --- | --- | --- |
+| `path_live_peer_count` | 0 | **2** (of 3; the third is the §4.4b hairpin peer) |
+| `path_live_direct_peers` | 0 | **2** |
+| `path_latest_live_handshake_unix` | none | **real timestamp** |
+| `path_mode` | direct_programmed | **mixed_active** |
+| loss (60 pings) | 0-1% | **0%** (60/60) |
+| 4 MB TCP | 6.94 Mbit/s | **13.69 Mbit/s** |
+
+Throughput across the whole session: **0.37 → 6.94 → 13.69 Mbit/s** (37x).
+
+### 4.4b Same-site peers cannot connect — NAT hairpin, OPEN
+Two nodes behind the *same* NAT hold only each other's server-reflexive endpoint
+(e.g. `xnet-ubu-2/213.233.155.131:14558` as seen from `xnet-ubu-1`, its own site's public
+address). Reaching that requires NAT hairpinning, which many NATs do not support, so the
+pair never connects — 100% loss, and it is the reason `path_live_peer_count` is 2 of 3
+rather than 3 of 3.
+
+The bundle format already supports a candidate *list* per peer
+(`TraversalCandidateType::{Host,ServerReflexive,Relay}`), which is exactly what ICE needs
+to prefer a host candidate for a same-site peer and srflx only for remote ones. Nothing
+populates more than one candidate today, so this is the same root as §4.4: candidates are
+never published, they are hand-minted one-per-peer.
 
 ### 4.3 `path_live_peer_count` stays 0 while traffic flows — reporting discrepancy
 Real bidirectional traffic is captured on the wire and mesh pings succeed, yet the
