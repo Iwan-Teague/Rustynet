@@ -73,6 +73,25 @@ pub const DEFAULT_BASE_PLPMTU: u16 = 1280;
 /// from the local interface.
 pub const DEFAULT_MAX_PLPMTU: u16 = 1420;
 
+/// Compile-time drift pins between this module and the backend that actually
+/// sets the interface MTU.
+///
+/// These are separate crates with separate constants, and a mismatch only
+/// surfaces on constrained paths: if the backend's override floor dropped below
+/// this module's absolute floor, `PathMtuConfig::for_bringup_mtu` would start
+/// rejecting a legal operator configuration, and if the ceiling default drifted
+/// from the bring-up default the search would aim at a size the interface is
+/// never set to. Both are cheap to prevent and expensive to debug, so they fail
+/// the build rather than a test.
+const _: () = assert!(
+    rustynet_backend_wireguard::MIN_BRINGUP_TUNNEL_MTU >= MIN_SUPPORTED_BASE_PLPMTU,
+    "the backend's minimum bring-up MTU must stay at or above this module's absolute floor"
+);
+const _: () = assert!(
+    DEFAULT_MAX_PLPMTU == rustynet_backend_wireguard::SAFE_BRINGUP_TUNNEL_MTU,
+    "the path-MTU search ceiling default and the backend's bring-up default must not drift"
+);
+
 /// Default number of consecutive losses of one probe size before that size is
 /// declared unsupported by the path (RFC 8899 `MAX_PROBES`).
 pub const DEFAULT_MAX_PROBES: u8 = 3;
@@ -148,6 +167,33 @@ impl PathMtuConfig {
             max_probes,
             blackhole_confirm_threshold,
         })
+    }
+
+    /// Derive a coherent config from the tunnel MTU the backend actually
+    /// brings the interface up at.
+    ///
+    /// Phase 4 will set the search ceiling from the local interface, and the
+    /// obvious source is the bring-up MTU. Doing that naively is a latent bug:
+    /// [`DEFAULT_BASE_PLPMTU`] is 1280, but the bring-up value is operator
+    /// overridable down to `rustynet_backend_wireguard::MIN_BRINGUP_TUNNEL_MTU`
+    /// (1200) because a NAT-traversed path can ride a 1280-byte carrier, and a
+    /// measured cross-network path needed exactly 1220. Passing 1220 straight
+    /// into [`PathMtuConfig::new`] yields `CeilingBelowBase` and the machine
+    /// cannot be constructed at all — precisely on the constrained paths it
+    /// exists to serve.
+    ///
+    /// So the base is clamped to the ceiling when the operator has pinned the
+    /// tunnel below the RFC 8899 floor. That is not a weakening: on such a path
+    /// 1280 is not achievable by definition, and the machine still refuses to
+    /// search below [`MIN_SUPPORTED_BASE_PLPMTU`].
+    pub fn for_bringup_mtu(bringup_mtu: u16) -> Result<Self, PathMtuConfigError> {
+        let base = DEFAULT_BASE_PLPMTU.min(bringup_mtu);
+        Self::new(
+            base,
+            bringup_mtu,
+            DEFAULT_MAX_PROBES,
+            DEFAULT_BLACKHOLE_CONFIRM_THRESHOLD,
+        )
     }
 
     /// The always-safe floor the machine assumes while nothing is confirmed.
@@ -561,6 +607,63 @@ impl PathMtuDiscovery {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn for_bringup_mtu_stays_constructible_on_a_constrained_path() {
+        // A clean underlay: the RFC 8899 floor is achievable, so it is kept and
+        // the ceiling is the bring-up value.
+        let clean = super::PathMtuConfig::for_bringup_mtu(1420).expect("1420 is constructible");
+        assert_eq!(clean.base_plpmtu(), super::DEFAULT_BASE_PLPMTU);
+        assert_eq!(clean.max_plpmtu(), 1420);
+
+        // The constrained case this exists for. 1220 is what a measured
+        // cross-network path needed (a 1280-byte carrier minus encapsulation).
+        // Passing it straight to `new` with the default base is
+        // `CeilingBelowBase`, i.e. the machine could not be built at all on
+        // exactly the paths it is meant to serve.
+        assert!(matches!(
+            super::PathMtuConfig::new(
+                super::DEFAULT_BASE_PLPMTU,
+                1220,
+                super::DEFAULT_MAX_PROBES,
+                super::DEFAULT_BLACKHOLE_CONFIRM_THRESHOLD,
+            ),
+            Err(super::PathMtuConfigError::CeilingBelowBase { .. })
+        ));
+        let constrained =
+            super::PathMtuConfig::for_bringup_mtu(1220).expect("1220 must stay constructible");
+        assert_eq!(constrained.base_plpmtu(), 1220);
+        assert_eq!(constrained.max_plpmtu(), 1220);
+
+        // The hard floor is still enforced -- clamping the base must never
+        // license searching below what this module accepts at all.
+        assert!(
+            super::PathMtuConfig::for_bringup_mtu(super::MIN_SUPPORTED_BASE_PLPMTU - 1).is_err()
+        );
+        let at_floor = super::PathMtuConfig::for_bringup_mtu(super::MIN_SUPPORTED_BASE_PLPMTU)
+            .expect("the absolute floor is constructible");
+        assert_eq!(at_floor.base_plpmtu(), super::MIN_SUPPORTED_BASE_PLPMTU);
+    }
+
+    #[test]
+    fn every_legal_bringup_mtu_yields_a_constructible_config() {
+        // The constant-to-constant drift pins live at module scope as `const`
+        // assertions (compile-time, so they cannot be skipped by a filtered
+        // test run). This covers the part that is genuinely runtime: that every
+        // bring-up value the backend will accept can actually be turned into a
+        // config, including the constrained ones nobody routinely tests.
+        for mtu in [
+            rustynet_backend_wireguard::MIN_BRINGUP_TUNNEL_MTU,
+            1220,
+            1280,
+            rustynet_backend_wireguard::SAFE_BRINGUP_TUNNEL_MTU,
+        ] {
+            let config = super::PathMtuConfig::for_bringup_mtu(mtu)
+                .unwrap_or_else(|err| panic!("bring-up MTU {mtu} must be constructible: {err:?}"));
+            assert_eq!(config.max_plpmtu(), mtu);
+            assert!(config.base_plpmtu() <= config.max_plpmtu());
+        }
+    }
     use super::*;
 
     fn config(base: u16, max: u16) -> PathMtuConfig {
