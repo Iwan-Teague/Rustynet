@@ -291,46 +291,33 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("write observations: {e}"))?;
 
     // ── Delegate to existing report writer ────────────────────────────────────
-    let report_args = vec![
-        "--report-path".to_owned(),
-        report_path.to_string_lossy().to_string(),
-        "--observations-path".to_owned(),
-        observations_path.to_string_lossy().to_string(),
-        "--exit-pre".to_owned(),
-        exit_pre.trim().to_owned(),
-        "--exit-post".to_owned(),
-        exit_post.trim().to_owned(),
-        "--client-pre".to_owned(),
-        client_pre.trim().to_owned(),
-        "--client-post".to_owned(),
-        client_post.trim().to_owned(),
-        "--exit-return".to_owned(),
-        exit_return_str.to_owned(),
-        "--exit-boot-change".to_owned(),
-        exit_boot_change_str.to_owned(),
-        "--post-exit-dns-refresh".to_owned(),
-        post_exit_dns_refresh.as_str().to_owned(),
-        "--post-exit-twohop".to_owned(),
-        stronger_check(exit_twohop_str, post_exit_twohop)
-            .as_str()
-            .to_owned(),
-        "--client-return".to_owned(),
-        client_return_str.to_owned(),
-        "--client-boot-change".to_owned(),
-        client_boot_change_str.to_owned(),
-        "--post-client-dns-refresh".to_owned(),
-        post_client_dns_refresh.as_str().to_owned(),
-        "--post-client-twohop".to_owned(),
-        post_client_twohop.as_str().to_owned(),
-        "--salvage-twohop".to_owned(),
-        "skipped".to_owned(),
-    ];
-    let report_refs: Vec<&str> = report_args.iter().map(String::as_str).collect();
-    let report_status = run_cargo_ops(
-        &ctx.root_dir,
-        "write-live-linux-reboot-recovery-report",
-        &report_refs,
-    )?;
+    // In-process, not `cargo run … ops …`: the subprocess built a
+    // default-feature binary lacking this `vm-lab`-gated verb, so the write
+    // failed with `unknown ops subcommand` and the stage recorded FAIL after
+    // its assertions had already passed. Every field keeps the exact value the
+    // argv form produced, including the two literal "skipped" sentinels.
+    let report_status =
+        rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_live_linux_reboot_recovery_report(
+            rustynet_cli::ops_live_lab_orchestrator::WriteLiveLinuxRebootRecoveryReportConfig {
+                report_path: report_path.clone(),
+                observations_path: observations_path.clone(),
+                exit_pre: exit_pre.trim().to_owned(),
+                exit_post: exit_post.trim().to_owned(),
+                client_pre: client_pre.trim().to_owned(),
+                client_post: client_post.trim().to_owned(),
+                exit_return: exit_return_str.to_owned(),
+                exit_boot_change: exit_boot_change_str.to_owned(),
+                post_exit_dns_refresh: post_exit_dns_refresh.as_str().to_owned(),
+                post_exit_twohop: stronger_check(exit_twohop_str, post_exit_twohop)
+                    .as_str()
+                    .to_owned(),
+                client_return: client_return_str.to_owned(),
+                client_boot_change: client_boot_change_str.to_owned(),
+                post_client_dns_refresh: post_client_dns_refresh.as_str().to_owned(),
+                post_client_twohop: post_client_twohop.as_str().to_owned(),
+                salvage_twohop: "skipped".to_owned(),
+            },
+        )?;
 
     append_standalone_matrix_row(&report_path, report_status == "pass");
 

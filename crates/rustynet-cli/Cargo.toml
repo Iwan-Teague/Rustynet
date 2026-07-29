@@ -91,6 +91,11 @@ name = "live_linux_endpoint_hijack_test"
 path = "src/bin/live_linux_endpoint_hijack_test.rs"
 required-features = ["vm-lab"]
 
+[[bin]]
+name = "live_linux_reboot_recovery_test"
+path = "src/bin/live_linux_reboot_recovery_test.rs"
+required-features = ["vm-lab"]
+
 [dependencies]
 base64 = "0.22"
 rustynet-advisor = { path = "../rustynet-advisor" }
