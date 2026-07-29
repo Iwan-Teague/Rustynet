@@ -1,18 +1,50 @@
-# Adversarial Security Remediation Plan — 2026-07-29
+# Adversarial Security Remediation — starting notes — 2026-07-29
 
-Status: **proposals only — nothing here has been applied, and nothing here is verified.**
-Companion to: `documents/operations/active/AdversarialSecurityReview_2026-07-29.md` (the findings doc). This document is its mirror: **every finding ID in that document has exactly one entry here**, so it can be used as a lookup table — problem → fix.
+Status: **starting notes, not a plan.** Nothing here has been applied, and no fix
+here has been designed, prototyped, or costed.
+Companion to: `documents/operations/active/AdversarialSecurityReview_2026-07-29.md` (the findings doc). Every finding ID there has exactly one entry here, so this works as a lookup: problem → where to start.
 Coverage: 103 finding IDs across Parts I–VIII (POL, CRY, PF, RLY, CTL, WIN, IPV, ENR).
 
-## How to use this document
+## What this document is for
 
-Look up the ID from the findings doc; this gives the fix, its effort, and — critically — whether it is safe to apply directly. Read the finding itself before implementing: the entries here are deliberately terse and omit the evidence, the worked example, and the reachability caveats that determine whether a fix is worth doing at all.
+**It exists to save the next agent the orientation time**, not to hand it a
+solution. For each finding it gives a few facts worth knowing before touching the
+code, and a possible direction where one is obvious. That is all.
 
-Effort scale: **XS** one line · **S** under half a day · **M** one to three days · **L** design decision required first.
+## What work actually went into it — read this before trusting a row
 
-Gate column: **direct** = safe to implement as written · **test-first** = needs a failing test before the fix · **GATED** = has an unresolved prerequisite, do not apply yet · **DECISION** = needs an owner to choose, not an engineer to implement · **DO-NOT-FIX** = the current behaviour is deliberate and correct.
+Being explicit, because the format of a table invites more confidence than it has
+earned:
 
-Per `SecurityMinimumBar.md`, a security-sensitive fix requires **both** an enforcement point **and** a negative verification test. Entries marked test-first are the ones where the test is the harder half.
+- Every entry was written **by reading the finding and the surrounding code**. None
+  was prototyped, compiled, or tested. No fix here has been shown to work.
+- Roughly a quarter of the findings carried an explicit "proposed enforcement" note
+  in the review; those entries restate it. **The remaining ~three quarters had no
+  such note, and their direction was written here for the first time** — those are
+  first-pass suggestions from reading, and some will turn out to be wrong.
+- **Size is a sort order, not an estimate.** It reflects how large the change looked
+  while reading, not an attempt at the change. "one line" means the edit looked like
+  one line; it says nothing about the test, the review, or the live-lab proof.
+- The genuinely load-bearing content is **§1 (do not apply as written)** and
+  **§2 (one change closes several findings)**. Those came out of adversarial
+  verification and are the parts most likely to save real time. The per-row
+  directions are the weakest content in the document.
+
+So: treat a row as a starting point for reasoning, and expect to discard some.
+Always read the finding itself first — the entries here omit the evidence, the
+worked example, and the reachability caveats that decide whether a fix is worth
+doing at all.
+
+Size column (rough, unvalidated): **XS** looked like one line · **S** small and
+local · **M** touches several sites or needs a fixture · **L** needs a design
+decision before any code.
+
+Before-you-start column: **—** nothing special noticed · **test first** the
+negative test is the harder half, and per `SecurityMinimumBar.md` a
+security-sensitive fix needs both an enforcement point and a negative test ·
+**GATED** unresolved prerequisite, see §1 · **DECISION** someone has to choose;
+this is not an engineering ticket · **DO-NOT-FIX** current behaviour is deliberate
+and correct.
 
 ---
 
@@ -33,186 +65,186 @@ A remediation doc invites someone to implement an entry without reading the cave
 
 ---
 
-## 2. Shared fixes — one change closes many findings
+## 2. Changes that would close several findings at once
 
-Do these before working the dictionary. Each is a single edit that resolves several IDs, and three of them convert currently-silent failures into detectable ones.
+Worth reading before the dictionary. Each looks like a single change that resolves several findings, and three of them would convert currently-silent failures into detectable ones. These groupings came out of the adversarial passes rather than from reading one finding in isolation, so they are the most reliable content here — but they are still unbuilt.
 
-### S1 — Bound `ManagementCidr::from_str` · closes **PF-02, WIN-05**, and the Linux nft twin · effort **S** · test-first
+### S1 — Bound `ManagementCidr::from_str` · closes **PF-02, WIN-05**, and the Linux nft twin · looked **S** · test first
 
 One unbounded validator produces the same unrestricted TCP/22 egress hole on **three** backends (macOS pf, Linux nftables, Windows netsh). Add a width floor or private/CGNAT/ULA containment, mirroring `macos_pf_mesh_cidr::validate_mesh_egress_source_cidr` — whose doc comment already spells out the reasoning verbatim. Fixing at `from_str` is the only placement that cannot drift between platforms. Management CIDRs are bounded operator networks by definition, so this false-rejects nothing real.
 
 Separately and independently: move the SSH block inside the `strict_fail_closed` guard, or document why it must fire in the strictest posture.
 
-### S2 — Assert precedence, not presence · closes **PF-05, WIN-03, IPV-03**, and **RN-27** · effort **M** · test-first
+### S2 — Assert precedence, not presence · closes **PF-05, WIN-03, IPV-03**, and **RN-27** · looked **M** · test first
 
 Four sites make the same error: they check that a block rule *exists*, not that it is *reachable*. Because pf and nftables are first-match-wins, a permissive rule ordered earlier defeats a block that is still literally present — which is exactly why **PF-01, PF-02 and IPV-01 are silent**.
 
 The fix is to model the rendered ruleset as an ordered list and assert that no rule preceding the terminator matches broader than an allowlisted shape. For WFP, read the filter back and assert `action`, condition count, and that the condition LUID is the tunnel — not merely that the GUIDs exist. **This is the highest-leverage item in the document**: it does not fix PF-01/PF-02/IPV-01, but it makes them, and any future instance of the class, impossible to introduce silently.
 
-### S3 — Apply the single-line guard that already exists · closes the node-id vector of **CTL-01** and the issuance half of **RLY-03**; partially **ENR-01, ENR-03** · effort **S** · direct
+### S3 — Apply the single-line guard that already exists · closes the node-id vector of **CTL-01** and the issuance half of **RLY-03**; partially **ENR-01, ENR-03** · looked **S**
 
 `is_single_line_payload_value` already exists in `rustynet-control/src/lib.rs` and already rejects `\n`, `\r`, `=`. It is applied to relay-fleet fields and **not** to node ids. Apply it inside `is_valid_node_id_text`, at `NodeRegistry::upsert`, and at `EnrolleeAdmitContext` construction.
 
 Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`-delimited payload plus unsigned timestamp), or the `os`-field vector in CTL-03. Real node ids in this tree are hostname slugs, so the guard strands no existing fleet.
 
-### S4 — Cap `node_id` length at parse · closes **RLY-05**, finishes NO-SHIP item **AUDIT-031** · effort **XS** · direct
+### S4 — Cap `node_id` length at parse · closes **RLY-05**, finishes NO-SHIP item **AUDIT-031** · looked **XS**
 
 `parse_relay_hello` reads a bare `u16` length with no maximum, and the pre-auth limiter stores the unverified value as a map key — 1015 MiB retained pre-authentication. RSA-0037 capped entry *count*; this caps *bytes*. **AUDIT-031 is on the before-release list and is currently only half-closed.**
 
-### S5 — Fail closed where a platform check is unimplemented · closes **CRY-05 / AUDIT-027** · effort **XS** · direct
+### S5 — Fail closed where a platform check is unimplemented · closes **CRY-05 / AUDIT-027** · looked **XS**
 
 `validate_key_custody_permissions`'s `#[cfg(not(unix))]` arm returns `Ok(())`. Return `Err(CryptoError::PermissionValidationUnavailable)` — the variant already exists and is already constructed elsewhere in the same file. **This is on the repo's own NO-SHIP before-release list.**
 
 ---
 
-## 3. The dictionary
+## 3. The dictionary — per-finding starting notes
 
 ### Part I — `rustynet-policy` (POL)
 
-| ID | Problem | Fix | Effort | Gate |
+| ID | Problem | Possible direction | Size? | Before you start |
 |---|---|---|---|---|
-| POL-01 | Selector prefix allowlist fails open on its miss branch; unrecognised/mis-cased prefixes skip revocation | Invert the default: parse every selector into a recognised, canonicalised kind and **deny anything unparseable**; treat a non-conforming selector as a policy *load* error, not a runtime allow | M | test-first |
+| POL-01 | Selector prefix allowlist fails open on its miss branch; unrecognised/mis-cased prefixes skip revocation | Invert the default: parse every selector into a recognised, canonicalised kind and **deny anything unparseable**; treat a non-conforming selector as a policy *load* error, not a runtime allow | M | test first |
 | POL-02 | Raw CIDR dst plus `user:local` resolving only to the local node means two route paths validate no remote peer | Give literal destinations a selector kind that resolves to the owning node's membership status; stop using one `user:local` constant as `src` for decisions whose subject is a remote peer | M | DECISION |
-| POL-03 | Empty string is a valid, ungated, `*`-matching identity | Reject empty selectors at construction in both rules and requests | XS | direct |
+| POL-03 | Empty string is a valid, ungated, `*`-matching identity | Reject empty selectors at construction in both rules and requests | XS | — |
 | POL-04 | The gate never binds a selector to the *requesting* peer | Pass the requester's verified identity into evaluation and require the matched selector to be one the peer holds | L | DECISION |
 | POL-05 | Scope absence = maximum privilege, reached silently by three paths | Make absence deny: `ScopeTable::Loaded \| Unavailable` where `Unavailable` denies; fail closed on read error; reject malformed numerics instead of `.ok()` | M | **DECISION** — see §1 |
-| POL-06 | Issuance membership gate is unconditionally inert (directory never installed) | Install the directory at the three `ControlPlaneCore::new` sites, or make `ControlPlaneCore` refuse to issue without one | S | test-first |
-| POL-07 | `validate_policy_safety` evadable and context-blind | Flag any `*`→`*` Allow regardless of protocol; consider a protocol-spanning set; make the check context-aware | S | direct |
-| POL-08 | Rollback target is mutable and not content-addressed | Reject duplicate revision ids, or content-address revisions by digest and bind the id to the signed bytes | S | direct |
-| POL-09 | `rollback_to` activates never-promoted revisions | Require the target to have been promoted at least once; emit an audit event with actor and timestamp | S | direct |
+| POL-06 | Issuance membership gate is unconditionally inert (directory never installed) | Install the directory at the three `ControlPlaneCore::new` sites, or make `ControlPlaneCore` refuse to issue without one | S | test first |
+| POL-07 | `validate_policy_safety` evadable and context-blind | Flag any `*`→`*` Allow regardless of protocol; consider a protocol-spanning set; make the check context-aware | S | — |
+| POL-08 | Rollback target is mutable and not content-addressed | Reject duplicate revision ids, or content-address revisions by digest and bind the id to the signed bytes | S | — |
+| POL-09 | `rollback_to` activates never-promoted revisions | Require the target to have been promoted at least once; emit an audit event with actor and timestamp | S | — |
 | POL-10 | `PolicyRolloutController` is decorative — no accessor returns the active policy | **DECISION:** wire it (immutable revisions, accessor, real canary evaluation, audit events) or delete it and the runbook that describes it. Half-present is what makes POL-07/08/09 latent traps | L | DECISION |
-| POL-11 | Scope key format mismatch: policy emits `node:<id>`, gateway looks up bare `<id>` | Converge on one key form; add a round-trip test across writer and parser | S | test-first |
-| POL-12 | `scope_for` doc claims specificity tiering the code lacks | Either implement prefix-based tiering, or correct the doc and rename so the caller's ordering obligation is explicit; intersect scopes rather than first-match | S | direct |
-| POL-13 | No fuzz target covers the policy engine | Add a differential target: a canonical selector and any whitespace/case/prefix mutation must not differ in `Decision`. Would have caught POL-01/02/03 mechanically | S | direct |
-| POL-14 | Two daemon ACL results discarded with `let _ =` | Consume both `Result`s and fail closed; `set_exit_node` half is AUDIT-044 | XS | direct |
+| POL-11 | Scope key format mismatch: policy emits `node:<id>`, gateway looks up bare `<id>` | Converge on one key form; add a round-trip test across writer and parser | S | test first |
+| POL-12 | `scope_for` doc claims specificity tiering the code lacks | Either implement prefix-based tiering, or correct the doc and rename so the caller's ordering obligation is explicit; intersect scopes rather than first-match | S | — |
+| POL-13 | No fuzz target covers the policy engine | Add a differential target: a canonical selector and any whitespace/case/prefix mutation must not differ in `Decision`. Would have caught POL-01/02/03 mechanically | S | — |
+| POL-14 | Two daemon ACL results discarded with `let _ =` | Consume both `Result`s and fail closed; `set_exit_node` half is AUDIT-044 | XS | — |
 
 ### Part II — `rustynet-crypto` (CRY)
 
-| ID | Problem | Fix | Effort | Gate |
+| ID | Problem | Possible direction | Size? | Before you start |
 |---|---|---|---|---|
 | CRY-01 | `RequireOsSecureStore` is load-side only; the key file is written unconditionally | Gate the disk write on the returned `KeyCustodyBackend`, or make the intent explicit in the type (`materialize_disk_backup: bool`) rather than implied by a comment | S | DECISION |
 | CRY-02 | Linux has no strict-policy arm, and its OS store fails to `OsStoreUnavailable` in the ordinary headless case | Decide Linux's tier explicitly rather than by omission; surface the returned backend so a silent downgrade is observable | S | DECISION |
-| CRY-03 | 16-char passphrase floor with no entropy requirement; Argon2 params not stored in the blob | Store `(algorithm, version, m, t, p)` in the envelope so cost can be raised migration-safely; raise the passphrase floor given this string bounds at-rest security | M | test-first |
+| CRY-03 | 16-char passphrase floor with no entropy requirement; Argon2 params not stored in the blob | Store `(algorithm, version, m, t, p)` in the envelope so cost can be raised migration-safely; raise the passphrase floor given this string bounds at-rest security | M | test first |
 | CRY-04 | v0/v1 framing ambiguity renders ~99.6% of legacy blobs undecodable | **Land the regression test only** (hand-build a v0 blob, assert it decodes). The framing fix is deferred by decision | S | **GATED** — see §1 |
-| CRY-05 | Windows permission validation is an `Ok(())` no-op, both directions | **See S5.** Also apply a DACL at write time on non-unix rather than inheriting | XS | direct |
-| CRY-06 | `NodeKeyPair::from_raw` never verifies pub/priv correspondence | Delete it (dead public API), or make it take a seed and derive the public key, as `from_seed` already does | XS | direct |
-| CRY-07 | Unix permission validator checks modes but not ownership | Add a uid check, matching the pattern `ops_peer_store.rs` is audited PASS for; optionally `O_NOFOLLOW` + `fstat` for the TOCTOU | S | direct |
+| CRY-05 | Windows permission validation is an `Ok(())` no-op, both directions | **See S5.** Also apply a DACL at write time on non-unix rather than inheriting | XS | — |
+| CRY-06 | `NodeKeyPair::from_raw` never verifies pub/priv correspondence | Delete it (dead public API), or make it take a seed and derive the public key, as `from_seed` already does | XS | — |
+| CRY-07 | Unix permission validator checks modes but not ownership | Add a uid check, matching the pattern `ops_peer_store.rs` is audited PASS for; optionally `O_NOFOLLOW` + `fstat` for the TOCTOU | S | — |
 | CRY-08 | `with_exceptions` rejects all non-empty lists, making the denylist loop dead | **Comment only** — state that exceptions are administratively disabled by design, so nobody "repairs" the guard into a fail-open | XS | **DO-NOT-FIX** |
 | CRY-09 | Three security controls unwired; `release_manifest.rs` builds what the strict default forbids | Wire `validate_signing_provider_policy` into `release_manifest.rs` and accept a documented exception, or delete all three controls | M | DECISION |
-| CRY-10 | `aead_seal` doc claims OS-secure custody; production reads a raw key from a plain file | Correct the doc comment to describe the actual key sources | XS | direct |
-| CRY-11 | `from_seed` never zeroizes its by-value seed parameter | Zeroize the parameter copy after `SigningKey::from_bytes` | XS | direct |
-| CRY-12 | Blob length arithmetic unchecked — debug panic on 32-bit | `checked_add` / `saturating_add` before the equality compare; fold into whatever work first attempts the armv7 cross-build | XS | direct |
+| CRY-10 | `aead_seal` doc claims OS-secure custody; production reads a raw key from a plain file | Correct the doc comment to describe the actual key sources | XS | — |
+| CRY-11 | `from_seed` never zeroizes its by-value seed parameter | Zeroize the parameter copy after `SigningKey::from_bytes` | XS | — |
+| CRY-12 | Blob length arithmetic unchecked — debug panic on 32-bit | `checked_add` / `saturating_add` before the equality compare; fold into whatever work first attempts the armv7 cross-build | XS | — |
 
 ### Part III — macOS `pf` privileged boundary (PF)
 
-| ID | Problem | Fix | Effort | Gate |
+| ID | Problem | Possible direction | Size? | Before you start |
 |---|---|---|---|---|
 | PF-01 | `allow_egress_interface=true` is a one-boolean full-IPv4 killswitch off-switch, and it passes the assertion | Make the exit posture a distinct spec *kind* the helper can reason about, or require a helper-visible attestation of the signed exit capability. **S2 is the prerequisite** that makes this detectable | L | DECISION |
-| PF-02 | `ssh_cidr=0.0.0.0/0` opens unrestricted off-tunnel TCP/22, even under strict, not interface-scoped | **See S1.** Also consider deleting the outbound half — the inbound rule is `keep state`, so it already covers sshd replies | S | test-first |
+| PF-02 | `ssh_cidr=0.0.0.0/0` opens unrestricted off-tunnel TCP/22, even under strict, not interface-scoped | **See S1.** Also consider deleting the outbound half — the inbound rule is `keep state`, so it already covers sshd replies | S | test first |
 | PF-03 | Anchor flush precedes the load, so a failed load leaves egress open | Reorder to load-then-flush, **or** fold the flush into the builtin so the helper flushes only after its own load succeeds | S | **GATED** — see §1 |
 | PF-04 | The `-F all` flush arm lets the daemon empty the live killswitch anchor | Have the helper own generation state, or move flush inside the atomic builtin (also resolves PF-03), or drop the boundary flush arm | M | DECISION |
-| PF-05 | Killswitch assertions check presence, not precedence | **See S2** | M | test-first |
-| PF-06 | Specs that pass decode but that `pfctl` rejects (iface length/keywords, `/+N`) | Port the length bound of 15 **only** — adopting `is_interface_name` wholesale drops `.` from the charset and silently rejects dotted interface names. Also reject pf keywords and pure-digit names; adopt parse-to-typed-then-re-render for the three raw-string CIDR sites | S | **partial — see §1** |
-| PF-07 | `generation` is an unbounded daemon-chosen `u64` | Reject a generation the helper has not seen monotonically advance, or cap the live anchor count. **Also run the sub-anchor ordering experiment PF-03 depends on** | S | direct |
-| PF-08 | Module list caps exceed what the 16 KiB wire can frame | Reconcile `MAX_MANAGED_PEER_ENDPOINTS` with the frame budget and add a test asserting the budget, so a future peer-cap raise fails loudly | XS | test-first |
-| PF-09 | `push_list` does not bound a single over-cap element | Add an assert that one element fits `MAX_ARG_BYTES - key.len() - 1` | XS | direct |
-| PF-10 | Root `pfctl -f` on a predictable `$TMPDIR` file in the precedence validator | Convert `write_restore_file` to the `write_root_owned_pf_temp` pattern, or route the restore through the builtin (closes SR-020) | S | direct |
-| PF-11 | `contains_forbidden_route_primitive` evadable but unreachable | Tighten the matcher for tidiness only; note the test at `:635` blesses the paren gap and must be updated with it | XS | direct |
-| PF-12 | This production privilege-boundary file has no ledger row — and 11 unrowed production files exist | Add rows for all 11, cross-linking the parity-log review and this document. Root cause: they postdate the ledger's snapshot, so add a step that catches new production files | S | direct |
-| PF-13 | Three round-trip tests pin render equality, not spec equality | Assert `decoded == original` in the blind-exit and exit-NAT round-trips; sweep `strict` and `generation` in the cartesian test | S | direct |
-| PF-14 | `reject_nonempty` is a content guard with a presence-guard name | Rename, or add a presence check so the guard matches its name | XS | direct |
-| PF-15 | **`block_all_egress` does not block all egress** — `FailClosed` leaves up to 320 UDP passes rendered | Have `force_fail_closed` clear the three lists (or have `apply_pf_rules(true)` ignore them). Replace the two "minimal" tests with fixtures that **populate** all four lists, so the assertion cannot pass vacuously | S | test-first |
+| PF-05 | Killswitch assertions check presence, not precedence | **See S2** | M | test first |
+| PF-06 | Specs that pass decode but that `pfctl` rejects (iface length/keywords, `/+N`) | Port the length bound of 15 **only** — adopting `is_interface_name` wholesale drops `.` from the charset and silently rejects dotted interface names. Also reject pf keywords and pure-digit names; adopt parse-to-typed-then-re-render for the three raw-string CIDR sites | S | **see §1** |
+| PF-07 | `generation` is an unbounded daemon-chosen `u64` | Reject a generation the helper has not seen monotonically advance, or cap the live anchor count. **Also run the sub-anchor ordering experiment PF-03 depends on** | S | — |
+| PF-08 | Module list caps exceed what the 16 KiB wire can frame | Reconcile `MAX_MANAGED_PEER_ENDPOINTS` with the frame budget and add a test asserting the budget, so a future peer-cap raise fails loudly | XS | test first |
+| PF-09 | `push_list` does not bound a single over-cap element | Add an assert that one element fits `MAX_ARG_BYTES - key.len() - 1` | XS | — |
+| PF-10 | Root `pfctl -f` on a predictable `$TMPDIR` file in the precedence validator | Convert `write_restore_file` to the `write_root_owned_pf_temp` pattern, or route the restore through the builtin (closes SR-020) | S | — |
+| PF-11 | `contains_forbidden_route_primitive` evadable but unreachable | Tighten the matcher for tidiness only; note the test at `:635` blesses the paren gap and must be updated with it | XS | — |
+| PF-12 | This production privilege-boundary file has no ledger row — and 11 unrowed production files exist | Add rows for all 11, cross-linking the parity-log review and this document. Root cause: they postdate the ledger's snapshot, so add a step that catches new production files | S | — |
+| PF-13 | Three round-trip tests pin render equality, not spec equality | Assert `decoded == original` in the blind-exit and exit-NAT round-trips; sweep `strict` and `generation` in the cartesian test | S | — |
+| PF-14 | `reject_nonempty` is a content guard with a presence-guard name | Rename, or add a presence check so the guard matches its name | XS | — |
+| PF-15 | **`block_all_egress` does not block all egress** — `FailClosed` leaves up to 320 UDP passes rendered | Have `force_fail_closed` clear the three lists (or have `apply_pf_rules(true)` ignore them). Replace the two "minimal" tests with fixtures that **populate** all four lists, so the assertion cannot pass vacuously | S | test first |
 
 ### Part IV — `rustynet-relay` (RLY)
 
-| ID | Problem | Fix | Effort | Gate |
+| ID | Problem | Possible direction | Size? | Before you start |
 |---|---|---|---|---|
-| RLY-01 | No lower bound on `issued_at_unix`; a future-dated token replays forever | Reject `issued_at_unix > now + skew` in `validate_hello`. One check, restores the retention invariant the comment already claims | XS | test-first |
-| RLY-02 | One unauthenticated datagram forces O(N) work under both global locks (~4900× amplification) | Match on the error variant and prune only for reclamation-worthy cases — `UnauthorizedSourceTuple` means the session is *healthy*. The keepalive path already does this correctly. Safe: prune is also driven by the periodic cleanup and the accept path | XS | test-first |
-| RLY-03 | Signed-payload field boundaries not bound by the signature | Reject `\n`/`\r`/`=` in `node_id`/`peer_node_id` at parse time, **or** length-prefix the signed payload, **or** port the text parser's re-canonicalization check to the binary parser. **S3** covers the issuance half | S | test-first |
-| RLY-04 | Replay store never parent-dir fsync'd, and a doc asserts it is | Add the parent-directory fsync after rename, using the existing pattern from `rustynet-crypto` / `write_ledger`; correct `Arm32BitEmbeddedSupportReference:919` | XS | direct |
-| RLY-05 | Pre-auth limiter bounds entry count but not key size (~1015 MiB) | **See S4** | XS | direct |
-| RLY-06 | Pre-auth ed25519 verify keyed on attacker `node_id`, under the transport mutex | Key the pre-auth limiter on the source IP rather than the claimed identity; move the verify out from under the transport mutex | M | direct |
+| RLY-01 | No lower bound on `issued_at_unix`; a future-dated token replays forever | Reject `issued_at_unix > now + skew` in `validate_hello`. One check, restores the retention invariant the comment already claims | XS | test first |
+| RLY-02 | One unauthenticated datagram forces O(N) work under both global locks (~4900× amplification) | Match on the error variant and prune only for reclamation-worthy cases — `UnauthorizedSourceTuple` means the session is *healthy*. The keepalive path already does this correctly. Safe: prune is also driven by the periodic cleanup and the accept path | XS | test first |
+| RLY-03 | Signed-payload field boundaries not bound by the signature | Reject `\n`/`\r`/`=` in `node_id`/`peer_node_id` at parse time, **or** length-prefix the signed payload, **or** port the text parser's re-canonicalization check to the binary parser. **S3** covers the issuance half | S | test first |
+| RLY-04 | Replay store never parent-dir fsync'd, and a doc asserts it is | Add the parent-directory fsync after rename, using the existing pattern from `rustynet-crypto` / `write_ledger`; correct `Arm32BitEmbeddedSupportReference:919` | XS | — |
+| RLY-05 | Pre-auth limiter bounds entry count but not key size (~1015 MiB) | **See S4** | XS | — |
+| RLY-06 | Pre-auth ed25519 verify keyed on attacker `node_id`, under the transport mutex | Key the pre-auth limiter on the source IP rather than the claimed identity; move the verify out from under the transport mutex | M | — |
 | RLY-07 | Rate limiting per-`node_id` only; no aggregate or per-destination cap | Add a global token bucket and a per-destination cap, **or** amend the module header's "bounded resources" claim to match reality | S | DECISION |
-| RLY-08 | Reject-path log writes are the unbudgeted twin of the budgeted notice path | Route the ten `eprintln!` sites through `PreAuthNoticeBudget` | S | direct |
-| RLY-09 | Bind mutation precedes the rate-limit check; IP-only TOFU bind lets a spoofer lock out the real peer | Consult the limiter **before** mutating the bind (free win). Consider a rebind path or full-tuple bind — note the "intentional NAT concession" rationale does **not** exist, so nothing recorded blocks tightening it | S | direct |
-| RLY-10 | One-second replay window at exactly `skew == 120` | Ceiling the skew at `MAX_RELAY_TTL_SECS - 1`, or make `prune` use `>` | XS | test-first |
-| RLY-11 | No self-pair rejection — the relay echoes to the sender | Assert `node_id != peer_node_id` in `validate_hello` as defence in depth; the control plane already refuses to mint one | XS | direct |
-| RLY-12 | `node_id` written unescaped into log lines | Escape or reject control characters before logging; the correct upstream guard is `is_valid_node_id_text` (**S3**), not `NodeId::new` | XS | direct |
-| RLY-13 | Unreachable size guard; invisible tuple rejections; data-path skew inconsistency; O(n) persist per hello | Restate the `rate_limit.rs` ledger row (the "caller caps len" justification is vacuous); add a counter for `UnauthorizedSourceTuple`; apply skew consistently on the data path or document why not; batch the nonce persist | S | direct |
-| RLY-14 | Ledger maintenance | Mark AUDIT-031 stale (superseded by applied RSA-0037 — but see S4, the byte half is open); promote RSA-0086/0087/0088 off "needs confirmation"; add a row for `hello_limiter_audit.rs`; name the authoritative port range | S | direct |
-| RLY-15 | `now_unix()` → `0` on a pre-1970 clock makes every token unexpired in both `is_expired` and the data path | Make the clock failure explicit: return `Result` and fail closed at the call sites, or substitute a sentinel that makes tokens **expired** rather than unexpired, so a broken clock denies instead of admitting. Matters because the repo targets RTC-less Pi Zero-class relay hardware | S | test-first |
+| RLY-08 | Reject-path log writes are the unbudgeted twin of the budgeted notice path | Route the ten `eprintln!` sites through `PreAuthNoticeBudget` | S | — |
+| RLY-09 | Bind mutation precedes the rate-limit check; IP-only TOFU bind lets a spoofer lock out the real peer | Consult the limiter **before** mutating the bind (free win). Consider a rebind path or full-tuple bind — note the "intentional NAT concession" rationale does **not** exist, so nothing recorded blocks tightening it | S | — |
+| RLY-10 | One-second replay window at exactly `skew == 120` | Ceiling the skew at `MAX_RELAY_TTL_SECS - 1`, or make `prune` use `>` | XS | test first |
+| RLY-11 | No self-pair rejection — the relay echoes to the sender | Assert `node_id != peer_node_id` in `validate_hello` as defence in depth; the control plane already refuses to mint one | XS | — |
+| RLY-12 | `node_id` written unescaped into log lines | Escape or reject control characters before logging; the correct upstream guard is `is_valid_node_id_text` (**S3**), not `NodeId::new` | XS | — |
+| RLY-13 | Unreachable size guard; invisible tuple rejections; data-path skew inconsistency; O(n) persist per hello | Restate the `rate_limit.rs` ledger row (the "caller caps len" justification is vacuous); add a counter for `UnauthorizedSourceTuple`; apply skew consistently on the data path or document why not; batch the nonce persist | S | — |
+| RLY-14 | Ledger maintenance | Mark AUDIT-031 stale (superseded by applied RSA-0037 — but see S4, the byte half is open); promote RSA-0086/0087/0088 off "needs confirmation"; add a row for `hello_limiter_audit.rs`; name the authoritative port range | S | — |
+| RLY-15 | `now_unix()` → `0` on a pre-1970 clock makes every token unexpired in both `is_expired` and the data path | Make the clock failure explicit: return `Result` and fail closed at the call sites, or substitute a sentinel that makes tokens **expired** rather than unexpired, so a broken clock denies instead of admitting. Matters because the repo targets RTC-less Pi Zero-class relay hardware | S | test first |
 | RLY-16 | The replay store's **file-side** permission check is skipped on any non-`NotFound` stat error | Either treat a non-`NotFound` stat error as fail-closed, or keep the documented skip and narrow the surrounding claim so nobody relies on "fails closed" for the file. The existing rationale is defensible — decide, do not just tighten | S | **DECISION** |
 
 ### Part V — `rustynet-control`, trust issuer (CTL)
 
-| ID | Problem | Fix | Effort | Gate |
+| ID | Problem | Possible direction | Size? | Before you start |
 |---|---|---|---|---|
-| CTL-01 | `is_valid_node_id_text` is non-blank only, so node-id-bearing signed payloads are delimiter-injectable | **See S3.** Note the reachable path is `NodeRegistry::upsert` via three CLI verbs, not the test-only enroll path | S | direct |
-| CTL-02 | `verify_signed_endpoint_hint_bundle` is the only bundle verifier with no re-canonicalization | Add the `expected_payload != bundle.payload` comparison both siblings already have; same for `verify_signed_auto_tunnel_bundle` | S | test-first |
+| CTL-01 | `is_valid_node_id_text` is non-blank only, so node-id-bearing signed payloads are delimiter-injectable | **See S3.** Note the reachable path is `NodeRegistry::upsert` via three CLI verbs, not the test-only enroll path | S | — |
+| CTL-02 | `verify_signed_endpoint_hint_bundle` is the only bundle verifier with no re-canonicalization | Add the `expected_payload != bundle.payload` comparison both siblings already have; same for `verify_signed_auto_tunnel_bundle` | S | test first |
 | CTL-03 | `SignedPeerMap` leaves `generated_at_unix` outside the signature and validates nothing | Include a version line and the timestamp in the signed payload; reject `\|`, `\n`, `\r` in all six interpolated fields; reject duplicate `node_id` records | M | **GATED** — see §1 |
-| CTL-04 | Enrollment evaluates credential expiry against a caller-supplied clock | Inject a clock or use `unix_now()`; treat `request.now_unix` as an untrusted hint bounded to ±skew. Confirmed *not* to affect the production path | S | direct |
-| CTL-05 | No bundle verifier checks expiry — all four accept decades-expired artifacts | Add a `now_unix` parameter and reject `now > expires_at` and `generated_at > now + skew`; **or** rename to `verify_*_signature` and add a distinct freshness wrapper so callers cannot mistake one for the other | M | test-first |
+| CTL-04 | Enrollment evaluates credential expiry against a caller-supplied clock | Inject a clock or use `unix_now()`; treat `request.now_unix` as an untrusted hint bounded to ±skew. Confirmed *not* to affect the production path | S | — |
+| CTL-05 | No bundle verifier checks expiry — all four accept decades-expired artifacts | Add a `now_unix` parameter and reject `now > expires_at` and `generated_at > now + skew`; **or** rename to `verify_*_signature` and add a distinct freshness wrapper so callers cannot mistake one for the other | M | test first |
 | CTL-06 | No signed artifact carries a generation, so there is no anti-rollback | Add a monotonic `generation` to each signed bundle; have consumers persist and enforce a highest-seen floor. Bounded today by TTL except for `SignedPeerMap` | L | DECISION |
-| CTL-07 | RSA-0010 and RSA-0017 are applied but their ledger rows read open | Update both rows; name the remediation plan authoritative for the 2026-06-24 batch; `sign_at` remains `pub` and un-gated (RSA-0010's second half) | XS | direct |
+| CTL-07 | RSA-0010 and RSA-0017 are applied but their ledger rows read open | Update both rows; name the remediation plan authoritative for the 2026-06-24 batch; `sign_at` remains `pub` and un-gated (RSA-0010's second half) | XS | — |
 
 ### Part VI — Windows privileged/at-rest surface (WIN)
 
-| ID | Problem | Fix | Effort | Gate |
+| ID | Problem | Possible direction | Size? | Before you start |
 |---|---|---|---|---|
-| WIN-01 | The DPAPI custody ACL gate is a three-alias substring denylist, not default-deny | Port the `windows_ipc.rs` pattern: enumerate allow-ACE principals, require a subset of `{SY, BA, service SID}`, pin owner, reject any unparsable or non-`A` ACE. Confirm against the 13 live `windows_dpapi_key_custody` runs | M | test-first |
-| WIN-02 | Pipe name unowned between messages; client never authenticates the server | Hold one persistent listening instance (or pre-create before the loop); use `CreateFileW` with `SECURITY_SQOS_PRESENT \| SECURITY_ANONYMOUS` plus a `GetNamedPipeServerProcessId` token check; add bounded backoff on the serve-error path | M | test-first |
-| WIN-03 | WFP installs only a max-weight PERMIT with `CLEAR_ACTION_RIGHT`; the assertion checks existence not scope | Read the filter back and assert `action == PERMIT`, exactly one condition, `fieldKey == IP_LOCAL_INTERFACE`, and the LUID equals the tunnel alias; reject an alias resolving to `egress_interface`. **Part of S2** | M | test-first |
-| WIN-04 | System32 check is a substring test — UNC and user-writable prefixes pass | Resolve `%SystemRoot%` via `GetSystemDirectoryW` and require a canonicalized **prefix** match; reject UNC unconditionally; verify Authenticode before first exec | S | test-first |
-| WIN-05 | PF-02 generalizes to the Windows backend | **See S1** | S | test-first |
-| WIN-06 | `validate_windows_dpapi_file` accepts an inherited DACL | Require `D:P` on the file as well as the root; set an explicit DACL in `write_windows_dpapi_blob` | S | direct |
+| WIN-01 | The DPAPI custody ACL gate is a three-alias substring denylist, not default-deny | Port the `windows_ipc.rs` pattern: enumerate allow-ACE principals, require a subset of `{SY, BA, service SID}`, pin owner, reject any unparsable or non-`A` ACE. Confirm against the 13 live `windows_dpapi_key_custody` runs | M | test first |
+| WIN-02 | Pipe name unowned between messages; client never authenticates the server | Hold one persistent listening instance (or pre-create before the loop); use `CreateFileW` with `SECURITY_SQOS_PRESENT \| SECURITY_ANONYMOUS` plus a `GetNamedPipeServerProcessId` token check; add bounded backoff on the serve-error path | M | test first |
+| WIN-03 | WFP installs only a max-weight PERMIT with `CLEAR_ACTION_RIGHT`; the assertion checks existence not scope | Read the filter back and assert `action == PERMIT`, exactly one condition, `fieldKey == IP_LOCAL_INTERFACE`, and the LUID equals the tunnel alias; reject an alias resolving to `egress_interface`. **Part of S2** | M | test first |
+| WIN-04 | System32 check is a substring test — UNC and user-writable prefixes pass | Resolve `%SystemRoot%` via `GetSystemDirectoryW` and require a canonicalized **prefix** match; reject UNC unconditionally; verify Authenticode before first exec | S | test first |
+| WIN-05 | PF-02 generalizes to the Windows backend | **See S1** | S | test first |
+| WIN-06 | `validate_windows_dpapi_file` accepts an inherited DACL | Require `D:P` on the file as well as the root; set an explicit DACL in `write_windows_dpapi_blob` | S | — |
 | WIN-07 | The pipe security policy type has zero production callers; a hardcoded check does the real work | Pass the policy into `named_pipe_client_authorized`, or delete the type so the tests stop implying it governs the boundary | S | DECISION |
-| WIN-08 | Self-check pipe leaf is an unbounded prefix match | Bound the suffix to `[0-9]{1,10}` and forbid `\` after the prefix | XS | direct |
-| WIN-09 | All three SDDL evaluators are blind to conditional (`XA`) ACEs | Treat any ACE type other than `A` as a rejection rather than a skip | XS | direct |
-| WIN-10 | AUDIT-028/029/030 confirmations, plus a doc correction | Supply `pOptionalEntropy` and bind the blob description to its key id (AUDIT-028); zeroize the DPAPI plaintext before `LocalFree` (AUDIT-029); reject interior NULs in `to_wide` (AUDIT-030) | S | direct |
+| WIN-08 | Self-check pipe leaf is an unbounded prefix match | Bound the suffix to `[0-9]{1,10}` and forbid `\` after the prefix | XS | — |
+| WIN-09 | All three SDDL evaluators are blind to conditional (`XA`) ACEs | Treat any ACE type other than `A` as a rejection rather than a skip | XS | — |
+| WIN-10 | AUDIT-028/029/030 confirmations, plus a doc correction | Supply `pOptionalEntropy` and bind the blob description to its key id (AUDIT-028); zeroize the DPAPI plaintext before `LocalFree` (AUDIT-029); reject interior NULs in `to_wide` (AUDIT-030) | S | — |
 
 ### Part VII — IPv6 leak prevention + blind exit (IPV)
 
-| ID | Problem | Fix | Effort | Gate |
+| ID | Problem | Possible direction | Size? | Before you start |
 |---|---|---|---|---|
-| IPV-01 | The Linux exit own-egress accept is family-agnostic, so an `inet` killswitch does not contain IPv6 — and the assertion *requires* that rule | Qualify as `oifname <egress> ip accept`; add `meta nfproto ipv6 oifname != <tunnel> drop` at the top of the chain; assert **both** in `assert_firewall_ruleset`. Also correct RN-07's premise sentence, and retarget "bring Windows to Linux parity" at macOS's rendering discipline | M | test-first |
+| IPV-01 | The Linux exit own-egress accept is family-agnostic, so an `inet` killswitch does not contain IPv6 — and the assertion *requires* that rule | Qualify as `oifname <egress> ip accept`; add `meta nfproto ipv6 oifname != <tunnel> drop` at the top of the chain; assert **both** in `assert_firewall_ruleset`. Also correct RN-07's premise sentence, and retarget "bring Windows to Linux parity" at macOS's rendering discipline | M | test first |
 | IPV-02 | Flipping `ipv6_parity_supported` removes the only working control | Gate the flag on the `ip6` sibling table existing, and refuse to promote it while `linux_runtime_nftables` is unwired | S | **GATED** — see §1 |
-| IPV-03 | `nft_ruleset_has_v6_drop` credits chain `policy drop` while ignoring accepts above it | Require `policy drop` **and** no `accept` preceding the drop in the same chain, or replace the heuristic with a positive `meta nfproto ipv6 … drop` requirement. Update the fixture that pins the blind spot. **Part of S2** | M | test-first |
-| IPV-04 | `rule_is_v6_drop` credits RA suppression, single-address, DNS-only, input-hook, unhooked and foreign-table drops | Require the drop to be unqualified (`meta nfproto ipv6`, no daddr/dport/icmpv6-type narrowing), in the killswitch table, on an egress hook, with no preceding accept. Evaluate the table/hook gate **before** crediting | M | test-first |
-| IPV-05 | `probe_attempted` only proves the ping binary exists; a failed pcap capture reads as zero leaks | Require a **positive control** (the probe must reach a global v6 target with the killswitch down before the run counts); make an unreadable or absent pcap `leaked = unknown → fail`. Withdraw the "exemplar template" credit in the two live-lab honesty docs | M | test-first |
-| IPV-06 | The sole production IPv6 control is an unasserted, allowlist-revocable sysctl; Linux has no drift loop | Re-read `disable_ipv6` in `assert_firewall_ruleset` and fail closed on drift, as `assert_nat_forwarding` already does for `ip_forward`; add a periodic reconcile matching macOS's poller | M | test-first |
-| IPV-07 | `prior_ipv6_disabled` re-captured on every apply, clobbering the true baseline | Copy the `is_none()` guard from the IPv4 path verbatim | XS | direct |
-| IPV-08 | Blind-exit drift checks are exact-string equality; blind to supersets and `policy accept` | Require `policy drop` on the forward chain; replace equality-based absence checks with a positive whitelist ("the forward chain contains exactly these N rules") — the only shape that catches a superset | M | test-first |
-| IPV-09 | The blind-exit mesh allow is credited from any table and any chain | Parse to `(family, table, chain)` and require the rule inside `inet <killswitch_table>` chain `forward` with `hook forward` | S | direct |
-| IPV-10 | The blind-exit evaluator is not on the daemon assert path, contradicting its own doc | Call `evaluate_linux_blind_exit_ruleset` from `assert_exit_serving` when `blind_exit_config.is_some()`; correct the module doc either way | S | test-first |
-| IPV-11 | The blind-exit re-author is three `nft` invocations, not one transaction | Emit one `nft -f -` transaction so flush+adds are atomic, and pin `policy drop` in the same transaction | S | direct |
+| IPV-03 | `nft_ruleset_has_v6_drop` credits chain `policy drop` while ignoring accepts above it | Require `policy drop` **and** no `accept` preceding the drop in the same chain, or replace the heuristic with a positive `meta nfproto ipv6 … drop` requirement. Update the fixture that pins the blind spot. **Part of S2** | M | test first |
+| IPV-04 | `rule_is_v6_drop` credits RA suppression, single-address, DNS-only, input-hook, unhooked and foreign-table drops | Require the drop to be unqualified (`meta nfproto ipv6`, no daddr/dport/icmpv6-type narrowing), in the killswitch table, on an egress hook, with no preceding accept. Evaluate the table/hook gate **before** crediting | M | test first |
+| IPV-05 | `probe_attempted` only proves the ping binary exists; a failed pcap capture reads as zero leaks | Require a **positive control** (the probe must reach a global v6 target with the killswitch down before the run counts); make an unreadable or absent pcap `leaked = unknown → fail`. Withdraw the "exemplar template" credit in the two live-lab honesty docs | M | test first |
+| IPV-06 | The sole production IPv6 control is an unasserted, allowlist-revocable sysctl; Linux has no drift loop | Re-read `disable_ipv6` in `assert_firewall_ruleset` and fail closed on drift, as `assert_nat_forwarding` already does for `ip_forward`; add a periodic reconcile matching macOS's poller | M | test first |
+| IPV-07 | `prior_ipv6_disabled` re-captured on every apply, clobbering the true baseline | Copy the `is_none()` guard from the IPv4 path verbatim | XS | — |
+| IPV-08 | Blind-exit drift checks are exact-string equality; blind to supersets and `policy accept` | Require `policy drop` on the forward chain; replace equality-based absence checks with a positive whitelist ("the forward chain contains exactly these N rules") — the only shape that catches a superset | M | test first |
+| IPV-09 | The blind-exit mesh allow is credited from any table and any chain | Parse to `(family, table, chain)` and require the rule inside `inet <killswitch_table>` chain `forward` with `hook forward` | S | — |
+| IPV-10 | The blind-exit evaluator is not on the daemon assert path, contradicting its own doc | Call `evaluate_linux_blind_exit_ruleset` from `assert_exit_serving` when `blind_exit_config.is_some()`; correct the module doc either way | S | test first |
+| IPV-11 | The blind-exit re-author is three `nft` invocations, not one transaction | Emit one `nft -f -` transaction so flush+adds are atomic, and pin `policy drop` in the same transaction | S | — |
 | IPV-12 | The WireGuard port allows are family-agnostic | Decide whether v6 peer endpoints require it; if not, qualify with `ip`. Correct `SecurityReview_2026-05-24:518`, which cites this as the narrow model | S | DECISION |
-| IPV-13 | macOS `pf_rules_have_v6_block` ignores direction, interface and anchor reachability | Require an `out`-direction, unscoped v6 block with no preceding `pass`; verify the anchor is referenced by the main ruleset | S | test-first |
-| IPV-14 | Orchestrator passes no `--killswitch-table`, so the nft branch evaluates a stale generation | Pass the live table name through from the run context | XS | direct |
+| IPV-13 | macOS `pf_rules_have_v6_block` ignores direction, interface and anchor reachability | Require an `out`-direction, unscoped v6 block with no preceding `pass`; verify the anchor is referenced by the main ruleset | S | test first |
+| IPV-14 | Orchestrator passes no `--killswitch-table`, so the nft branch evaluates a stale generation | Pass the live table name through from the run context | XS | — |
 
 ### Part VIII — Enrollment (ENR)
 
-| ID | Problem | Fix | Effort | Gate |
+| ID | Problem | Possible direction | Size? | Before you start |
 |---|---|---|---|---|
-| ENR-01 | `admit --node-id` with a newline permanently corrupts the persisted membership snapshot | Validate charset and length in `MembershipState::validate` **and** at `EnrolleeAdmitContext` construction (**S3**); add a negative test for each of the three observed corruption shapes | S | test-first |
-| ENR-02 | `NodeRegistry::upsert` has zero validation and three production callers | Validate inside `upsert` itself so every caller inherits it (**S3**) | XS | direct |
-| ENR-03 | A `\r` silently mutates an identifier across encode/decode, producing state-root drift | Rejecting `\r` (**S3**) closes it; add a round-trip test asserting `decode(encode(x)) == x` for identifier edge cases | S | test-first |
-| ENR-04 | `admit` burns the single-use token before validating the collision or loading the signing key | Move the duplicate-`node_id` check, the signing-key load, and an output-path writability probe **ahead** of the consume — or make the consume the last durable step | S | direct |
-| ENR-05 | Role bridge drops 8/14 tokens to Client **and** grants `Anchor` from 4 tokens the canonical parser rejects | Delegate to `RoleCapability::parse` and return a typed error on any unrecognised token. **Also re-rate RSA-0015** — its "can only drop privilege" rationale is wrong in both directions | S | test-first |
-| ENR-06 | A `--roles blind_exit` typo at admit is irreversible | Require an explicit `--confirm-irreversible` flag when the admit role set maps to `BlindExit`. **Do not** touch the reducer guard | S | **direct** (see §1) |
-| ENR-07 | On non-Unix the `<ledger>.lock` file wedges enrollment permanently after a crash | Use a real Windows file lock (`LockFileEx`), or stamp the lock with the owning PID and treat a dead owner as stale | S | test-first |
-| ENR-08 | `load_ledger` lacks the permission gate and size cap that `load_secret` has | Apply the same group/world rejection and size cap | XS | direct |
+| ENR-01 | `admit --node-id` with a newline permanently corrupts the persisted membership snapshot | Validate charset and length in `MembershipState::validate` **and** at `EnrolleeAdmitContext` construction (**S3**); add a negative test for each of the three observed corruption shapes | S | test first |
+| ENR-02 | `NodeRegistry::upsert` has zero validation and three production callers | Validate inside `upsert` itself so every caller inherits it (**S3**) | XS | — |
+| ENR-03 | A `\r` silently mutates an identifier across encode/decode, producing state-root drift | Rejecting `\r` (**S3**) closes it; add a round-trip test asserting `decode(encode(x)) == x` for identifier edge cases | S | test first |
+| ENR-04 | `admit` burns the single-use token before validating the collision or loading the signing key | Move the duplicate-`node_id` check, the signing-key load, and an output-path writability probe **ahead** of the consume — or make the consume the last durable step | S | — |
+| ENR-05 | Role bridge drops 8/14 tokens to Client **and** grants `Anchor` from 4 tokens the canonical parser rejects | Delegate to `RoleCapability::parse` and return a typed error on any unrecognised token. **Also re-rate RSA-0015** — its "can only drop privilege" rationale is wrong in both directions | S | test first |
+| ENR-06 | A `--roles blind_exit` typo at admit is irreversible | Require an explicit `--confirm-irreversible` flag when the admit role set maps to `BlindExit`. **Do not** touch the reducer guard | S | **see §1** |
+| ENR-07 | On non-Unix the `<ledger>.lock` file wedges enrollment permanently after a crash | Use a real Windows file lock (`LockFileEx`), or stamp the lock with the owning PID and treat a dead owner as stale | S | test first |
+| ENR-08 | `load_ledger` lacks the permission gate and size cap that `load_secret` has | Apply the same group/world rejection and size cap | XS | — |
 | ENR-09 | The persisted single-use ledger has no MAC, generation, or anti-rollback | MAC the ledger with the enrollment secret and add a monotonic counter; deleting the file should not silently reset single-use state | M | DECISION |
-| ENR-10 | No rate limit or attempt counter on the consume path | Add an attempt budget; check the token HMAC **before** taking the exclusive ledger lock and reading the whole ledger | S | direct |
-| ENR-11 | `purge_expired_against` is a genuine no-op | Implement the purge (RN-26); the ledger is currently grow-only | S | direct |
-| ENR-12 | The daemon never provisions the enrollment secret, contradicting the module doc | Either provision it at bring-up as documented, or correct the doc and add the operator provisioning step to the runbook | S | direct |
-| ENR-13 | `enrollment mint --output` writes the bearer token under the default umask | Write 0o600, matching `write_secret` / `write_ledger` (AUDIT-011) | XS | direct |
-| ENR-14 | Two per-file ledger rows read `open` for an applied RSA-0023 | Update both rows | XS | direct |
-| ENR-15 | A stale ledger reachability claim — `build_gossip_node` is a second production setter | Correct the claim; the IPC `enrollment consume` verb is config-gated live, not dead | XS | direct |
+| ENR-10 | No rate limit or attempt counter on the consume path | Add an attempt budget; check the token HMAC **before** taking the exclusive ledger lock and reading the whole ledger | S | — |
+| ENR-11 | `purge_expired_against` is a genuine no-op | Implement the purge (RN-26); the ledger is currently grow-only | S | — |
+| ENR-12 | The daemon never provisions the enrollment secret, contradicting the module doc | Either provision it at bring-up as documented, or correct the doc and add the operator provisioning step to the runbook | S | — |
+| ENR-13 | `enrollment mint --output` writes the bearer token under the default umask | Write 0o600, matching `write_secret` / `write_ledger` (AUDIT-011) | XS | — |
+| ENR-14 | Two per-file ledger rows read `open` for an applied RSA-0023 | Update both rows | XS | — |
+| ENR-15 | A stale ledger reachability claim — `build_gossip_node` is a second production setter | Correct the claim; the IPC `enrollment consume` verb is config-gated live, not dead | XS | — |
 
 ---
 
-## 4. Suggested sequencing
+## 4. A suggested order (opinion, not a schedule)
 
 1. **S5 (CRY-05)** — already on the NO-SHIP list, one line.
 2. **S4 (RLY-05)** — one line, and finishes the half-closed NO-SHIP item AUDIT-031.
@@ -225,7 +257,7 @@ Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`
 9. Everything marked **DECISION** — route to an owner; these are choices, not tickets.
 10. Everything marked **GATED** — do not start until the prerequisite in §1 is resolved.
 
-## 5. Prerequisites that block other work
+## 5. Open questions that gate other work
 
 | Prerequisite | Blocks | Why |
 |---|---|---|

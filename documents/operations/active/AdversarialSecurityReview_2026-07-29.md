@@ -79,8 +79,10 @@ Every remaining Part III reference either sits in an unmodified file or shifts b
 pure constant; **nothing needed re-review for material code change.**
 
 **Companion document:** `documents/operations/active/AdversarialSecurityRemediation_2026-07-29.md`
-mirrors this one entry-for-entry — every finding ID below has exactly one fix entry
-there, with effort and a gate flag. **Eight of those fixes must not be applied as
+mirrors this one entry-for-entry — every finding ID below has one entry there. It is
+**starting notes, not a plan**: no fix in it has been prototyped or tested, and about
+three quarters of its directions were written from reading rather than restating a
+verified enforcement note. **Eight of those fixes must not be applied as
 written** (one would blackhole a live fleet, one would convert a protective guard
 into a fail-open); that document's §1 lists them. Read a finding here before
 implementing its fix there.
