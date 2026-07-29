@@ -54,7 +54,18 @@ mod daemon {
 
     use rustynet_control::canonical_relay_id_from_label;
     use rustynet_relay::session::SessionId;
-    use rustynet_relay::transport::{RelayHelloResponse, RelayTransport};
+    use rustynet_relay::transport::{RelayForwardError, RelayHelloResponse, RelayTransport};
+
+    /// Maximum accepted byte length of `node_id` / `peer_node_id` in a relay
+    /// hello, enforced at parse time before either value is copied or used as a
+    /// pre-auth map key (RLY-05).
+    ///
+    /// Node ids in this deployment are hostname-style slugs (`exit-1`,
+    /// `client-1`, `relay-1`), so 128 bytes is far above any legitimate value
+    /// while cutting the pre-authentication memory a hostile sender can park from
+    /// ~65 KB per entry to ~128 B — a ~500x reduction against
+    /// `MAX_HELLO_LIMITER_ENTRIES` retained keys.
+    const MAX_RELAY_NODE_ID_BYTES: usize = 128;
 
     const DEFAULT_MAX_TOTAL_SESSIONS: usize = 4096;
     const DEFAULT_WINDOWS_RELAY_SERVICE_NAME: &str = "RustyNetRelay";
@@ -318,6 +329,26 @@ mod daemon {
     /// appropriate: this is a monitoring counter, not a security invariant
     /// (the forwarding decision itself, in `RelayTransport::forward_packet`,
     /// is unaffected by when this update becomes visible to other threads).
+    /// Whether a `forward_packet` error justifies the O(allocated ports)
+    /// `prune_inactive_allocated_sockets` sweep (RLY-02).
+    ///
+    /// Extracted as a pure function so the decision is unit-testable: the sweep
+    /// takes the transport mutex AND the exclusive `allocated_sockets` write lock,
+    /// so getting this wrong is a remote denial-of-service lever rather than a
+    /// performance nit.
+    ///
+    /// `SessionNotFound` / `SessionExpired` mean the port's session really is gone,
+    /// so reclaiming the port is the correct response. `UnauthorizedSourceTuple`
+    /// means the session is HEALTHY and only the sender was wrong — it is the one
+    /// variant an unauthenticated attacker can trigger at will (there is no per-IP
+    /// limiter on dataplane ports), so it must buy no work.
+    fn should_prune_on_forward_error(err: &RelayForwardError) -> bool {
+        match err {
+            RelayForwardError::SessionNotFound | RelayForwardError::SessionExpired => true,
+            RelayForwardError::UnauthorizedSourceTuple => false,
+        }
+    }
+
     fn record_forward(stats: &ForwardStats, len: usize) {
         stats.frames_forwarded_total.fetch_add(1, Ordering::Relaxed);
         stats
@@ -776,9 +807,40 @@ mod daemon {
                             }
                         }
                         Ok(None) => {}
-                        Err(_) => {
-                            Self::prune_inactive_allocated_sockets(&allocated_sockets, &transport)
+                        // Prune ONLY for the reclamation-worthy errors (RLY-02).
+                        //
+                        // `prune_inactive_allocated_sockets` is an O(allocated
+                        // ports) pass that takes the transport mutex AND an
+                        // exclusive write lock on `allocated_sockets` — the same
+                        // two locks every forward task needs per frame. Running it
+                        // per bad packet let one unauthenticated sender spend
+                        // ~204us of our work for a ~29-byte datagram (~4900x
+                        // amplification; ~1.1 Mbit/s saturates a core) and starve
+                        // all legitimate forwarding.
+                        //
+                        // `SessionNotFound`/`SessionExpired` mean the port's
+                        // session really is gone, so reclaiming is the correct
+                        // response. `UnauthorizedSourceTuple` means the session is
+                        // HEALTHY and merely the sender was wrong — it is the one
+                        // error an unauthenticated attacker can trigger at will
+                        // (there is no per-IP limiter on dataplane ports), and it
+                        // must not buy any work. The keepalive path at the
+                        // `touch_session_from_tuple` call site above already
+                        // discards this same error without pruning.
+                        Err(err) => {
+                            if should_prune_on_forward_error(&err) {
+                                Self::prune_inactive_allocated_sockets(
+                                    &allocated_sockets,
+                                    &transport,
+                                )
                                 .await;
+                            }
+                            // Otherwise deliberately no work. No counter is bumped
+                            // here either: that would mean threading a new field
+                            // through ForwardStats, the /healthz snapshot and
+                            // /metrics, which is RLY-13's observability finding
+                            // rather than this one. Left open on purpose so this
+                            // stays a single-behaviour change.
                         }
                     }
                 }
@@ -1128,6 +1190,25 @@ mod daemon {
         let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
+        // Bound the identifier BEFORE it is copied (RLY-05 / AUDIT-031).
+        //
+        // `validate_hello`'s first check keys the pre-auth `HelloLimiter` on this
+        // value — `counts.entry(node_id.to_owned())` — which happens BEFORE the
+        // signature is verified. `MAX_HELLO_LIMITER_ENTRIES` bounds how many
+        // entries that map holds, but nothing bounded how large each key was, and
+        // the only ceiling here was the 64 KiB datagram. 16384 entries x ~65 KB
+        // measured at ~1015 MiB of unverified attacker-chosen bytes resident
+        // pre-authentication.
+        //
+        // AUDIT-031 ("cap the relay pre-auth map") is on the before-release list;
+        // RSA-0037 capped the entry COUNT, and this caps the byte size, which was
+        // the remaining half.
+        if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+            return Err(format!(
+                "node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+            ));
+        }
+
         if pos + node_id_len > data.len() {
             return Err("truncated node_id".to_owned());
         }
@@ -1141,6 +1222,15 @@ mod daemon {
         }
         let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
+
+        // Same bound as `node_id` above: `peer_node_id` is likewise copied out of
+        // an unauthenticated datagram, and both are compared against the signed
+        // token later, so neither can legitimately exceed the protocol cap.
+        if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+            return Err(format!(
+                "peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+            ));
+        }
 
         if pos + peer_node_id_len > data.len() {
             return Err("truncated peer_node_id".to_owned());
@@ -2890,17 +2980,138 @@ mod daemon {
     #[cfg(test)]
     mod tests {
         use super::{
-            ForwardStats, HealthSnapshot, MAX_PRE_AUTH_HELLO_SOURCE_IPS, PRE_AUTH_HELLO_WINDOW,
-            PortAllocation, PreAuthHelloLimiter, PreAuthNoticeBudget, PreAuthStats,
-            RELAY_KEEPALIVE_MSG_TYPE, RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE,
-            RelayConfig, RelayDaemon, RelayHelloResponse, RelayHostEntrySelection, RelayTransport,
+            ForwardStats, HealthSnapshot, MAX_PRE_AUTH_HELLO_SOURCE_IPS, MAX_RELAY_NODE_ID_BYTES,
+            PRE_AUTH_HELLO_WINDOW, PortAllocation, PreAuthHelloLimiter, PreAuthNoticeBudget,
+            PreAuthStats, RELAY_HELLO_MSG_TYPE, RELAY_KEEPALIVE_MSG_TYPE,
+            RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE, RelayConfig, RelayDaemon,
+            RelayForwardError, RelayHelloResponse, RelayHostEntrySelection, RelayTransport,
             WindowsRelayServiceHardeningSnapshot, WindowsRelayServiceOptions, bind_health_listener,
             build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
-            http_request_path, load_control_verifier_key, parse_relay_id_arg,
+            http_request_path, load_control_verifier_key, parse_relay_hello, parse_relay_id_arg,
             parse_windows_image_path_argv, record_forward, render_health_json, render_metrics,
             run_hello_limiter_audit_command, select_relay_host_entry, serialize_relay_reject,
-            serve_health_endpoint,
+            serve_health_endpoint, should_prune_on_forward_error,
         };
+
+        // ---- Negative regression tests for the 2026-07-29 adversarial review ----
+
+        /// RLY-02: `UnauthorizedSourceTuple` must NOT buy the O(allocated ports)
+        /// prune sweep.
+        ///
+        /// That sweep takes the transport mutex AND the exclusive
+        /// `allocated_sockets` write lock — the two locks every forward needs per
+        /// frame — so pruning per bad packet let one unauthenticated sender spend
+        /// ~204us of relay work for a ~29-byte datagram and starve all legitimate
+        /// forwarding. Pre-fix every `Err` took the prune arm, so this test's
+        /// third assertion failed.
+        #[test]
+        fn only_reclamation_worthy_forward_errors_trigger_prune_rly02() {
+            // Session genuinely gone: reclaiming the port is correct.
+            assert!(should_prune_on_forward_error(
+                &RelayForwardError::SessionNotFound
+            ));
+            assert!(should_prune_on_forward_error(
+                &RelayForwardError::SessionExpired
+            ));
+
+            // Session is HEALTHY, only the sender was wrong. This is the variant an
+            // unauthenticated attacker can trigger at will, so it must cost nothing.
+            assert!(
+                !should_prune_on_forward_error(&RelayForwardError::UnauthorizedSourceTuple),
+                "an unauthenticated source-tuple mismatch must not trigger the \
+                 O(allocated ports) prune — that is a remote DoS amplifier"
+            );
+        }
+
+        /// RLY-05 / AUDIT-031: an oversized `node_id` must be refused by its length
+        /// bound, before the value is copied.
+        ///
+        /// `validate_hello` keys the pre-auth `HelloLimiter` on this value before
+        /// the signature is checked, and only the entry COUNT was capped — so
+        /// ~65 KB keys x 16384 entries parked ~1015 MiB of unverified bytes
+        /// pre-authentication. Pre-fix this datagram was rejected for being
+        /// truncated rather than for being oversized, so the assertion on the
+        /// message is what distinguishes the two.
+        #[test]
+        fn oversized_node_id_is_rejected_by_the_length_bound_rly05() {
+            // [type][node_id_len = 65535] — the declared length is what matters;
+            // the bound is checked before the truncation check.
+            let data = [RELAY_HELLO_MSG_TYPE, 0xFF, 0xFF];
+            let err = parse_relay_hello(&data).expect_err("oversized node_id must be rejected");
+            assert!(
+                err.contains("exceeds maximum"),
+                "must be refused by the length bound, not incidentally as truncated; got: {err}"
+            );
+
+            // The same bound applies to peer_node_id.
+            let data = vec![RELAY_HELLO_MSG_TYPE, 0x00, 0x01, b'a', 0xFF, 0xFF];
+            let err =
+                parse_relay_hello(&data).expect_err("oversized peer_node_id must be rejected");
+            assert!(
+                err.contains("exceeds maximum"),
+                "peer_node_id must share the bound; got: {err}"
+            );
+
+            // A legitimate hostname-style id stays acceptable (no false reject):
+            // it must fail LATER, on the token, not on the identifier bound.
+            let mut ok = vec![RELAY_HELLO_MSG_TYPE, 0x00, 0x06];
+            ok.extend_from_slice(b"exit-1");
+            ok.extend_from_slice(&[0x00, 0x08]);
+            ok.extend_from_slice(b"client-1");
+            let err = parse_relay_hello(&ok).expect_err("truncated token should still fail");
+            assert!(
+                !err.contains("exceeds maximum"),
+                "a normal node_id must not hit the length bound; got: {err}"
+            );
+        }
+
+        /// RLY-05 boundary: the cap must be EXACTLY `MAX_RELAY_NODE_ID_BYTES`.
+        ///
+        /// The test above uses `0xFFFF` against a 6-byte id, which proves only
+        /// that *some* bound exists — an adversarial reviewer raised the constant
+        /// to 60_000 (restoring ~937 MiB of the ~1015 MiB the finding measured)
+        /// and the whole suite stayed green. This pins the constant itself.
+        #[test]
+        fn node_id_bound_is_exactly_max_relay_node_id_bytes_rly05() {
+            // Pin the VALUE with a literal, not just the relationship.
+            //
+            // Deriving both boundary cases from the constant pins only that a
+            // boundary exists *somewhere*: raising the constant makes the test
+            // follow it and stay green. That is exactly what happened — a mutation
+            // to 60_000 (restoring ~937 MiB of the ~1015 MiB this finding measured)
+            // survived the first version of this test. Here the bound IS the
+            // security property, so widening it must require deliberately editing
+            // this line and justifying the new number.
+            assert_eq!(
+                MAX_RELAY_NODE_ID_BYTES, 128,
+                "the pre-auth identifier bound is a memory-exhaustion control; \
+                 raising it needs an explicit justification, not a silent edit"
+            );
+
+            let declared = |len: usize| {
+                let hi = ((len >> 8) & 0xFF) as u8;
+                let lo = (len & 0xFF) as u8;
+                vec![RELAY_HELLO_MSG_TYPE, hi, lo]
+            };
+
+            // Exactly at the cap: must NOT be refused by the length bound. The
+            // datagram is still truncated, so it fails for that reason instead.
+            let err = parse_relay_hello(&declared(MAX_RELAY_NODE_ID_BYTES))
+                .expect_err("a truncated datagram still fails");
+            assert!(
+                !err.contains("exceeds maximum"),
+                "len == cap must be inside the bound; got: {err}"
+            );
+
+            // One byte over: refused by the bound, and the message names it.
+            let err = parse_relay_hello(&declared(MAX_RELAY_NODE_ID_BYTES + 1))
+                .expect_err("len == cap + 1 must be rejected");
+            assert!(
+                err.contains("exceeds maximum"),
+                "len == cap + 1 must be refused by the length bound; got: {err}"
+            );
+        }
+
         use std::sync::atomic::Ordering;
         // Only the off-Windows fail-closed test calls this collector directly; on
         // Windows the symbol is unused here, so gate the import to match its caller.

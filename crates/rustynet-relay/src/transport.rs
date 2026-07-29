@@ -47,17 +47,65 @@ const IDLE_SESSION_TIMEOUT_SECS: u64 = 30;
 /// Maximum forwarded-payload size.  Packets larger than this are dropped
 /// silently rather than returned as an error (to avoid amplification).
 const MAX_PACKET_SIZE_BYTES: usize = 65_536;
-/// How long we retain nonces in the replay-prevention store (must cover the
-/// full TTL window so a nonce cannot be recycled within its validity period).
-const NONCE_RETENTION_SECS: u64 = MAX_RELAY_TTL_SECS * 2;
+/// How long we retain nonces in the replay-prevention store: must cover the
+/// entire window in which a token can still be accepted, so a nonce cannot be
+/// recycled while its token remains valid.
+///
+/// RLY-10: this was `MAX_RELAY_TTL_SECS * 2` (240 s), which assumed the skew
+/// tolerance is applied **once**. It is applied **twice** on independent axes:
+/// `validate_hello`'s future-dating check admits `issued_at <= now + skew`, and
+/// `is_expired` then admits `now <= expires_at + skew` where
+/// `expires_at = issued_at + ttl`. So the true acceptance window measured from
+/// the instant a nonce is first recorded is `ttl + 2 * skew`, not `ttl + skew`.
+/// At the daemon's default skew of 90 that is `120 + 180 = 300 > 240`, leaving a
+/// 61-second window in which the nonce had been pruned but the token was still
+/// accepted — i.e. a replay. The hole opened for any token with `ttl >= 60`.
+///
+/// Sizing retention from the real bound fixes it without reducing the
+/// operator-facing skew tolerance (clamping skew below 60 would reject the honest
+/// 60–90 s clock drift the tolerance exists to absorb). Cost: retention grows
+/// 240 → 359 s, so the nonce map and the per-hello `O(n)` persist grow ~50% —
+/// trivial in absolute terms at this scale.
+const NONCE_RETENTION_SECS: u64 = MAX_RELAY_TTL_SECS + 2 * MAX_CLOCK_SKEW_TOLERANCE_SECS + 1;
 /// Hard ceiling on `clock_skew_tolerance_secs` accepted by `RelayTransport`
 /// constructors. The replay store retains nonces for `NONCE_RETENTION_SECS`
 /// (two TTL windows). If a caller supplied a larger skew, a token could
 /// remain non-expired (per `is_expired`) after its nonce was already pruned,
 /// re-opening the replay window. We clamp at construction time to keep the
-/// invariant `MAX_RELAY_TTL_SECS + skew <= NONCE_RETENTION_SECS`. Equivalently,
-/// `skew <= MAX_RELAY_TTL_SECS`.
-const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = MAX_RELAY_TTL_SECS;
+/// invariant `MAX_RELAY_TTL_SECS + skew < NONCE_RETENTION_SECS`.
+///
+/// RLY-10: this ceiling used to be `MAX_RELAY_TTL_SECS`, which satisfied the
+/// invariant only by EQUALITY (120 + 120 == 240). That one second mattered,
+/// because the two comparisons are not symmetric: `prune` evicts at
+/// `age >= retention` (exclusive boundary, pinned by
+/// `nonce_at_exact_retention_age_is_pruned_by_cleanup`) while `is_expired`
+/// retains a token at `now == expires_at + skew` (it compares with `>`). At the
+/// old ceiling there was therefore a single second in which the nonce had been
+/// pruned but the token was still valid — a replay window. Subtracting one makes
+/// the invariant hold strictly, closing it without loosening the retention
+/// boundary that test deliberately pins.
+///
+/// Not reachable in the shipped daemon (its default skew is 90 and there is no
+/// flag to raise it), so this is defence in depth for library consumers that
+/// construct `RelayTransport` directly.
+const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = MAX_RELAY_TTL_SECS - 1;
+
+/// Compile-time guard for the RLY-10 invariant.
+///
+/// Deliberately a `const` assertion rather than a unit test: these are all
+/// compile-time constants, so a runtime test of them would assert something
+/// clippy correctly flags as constant. This way any future edit to the TTL,
+/// the skew ceiling or the retention window that reopens the replay window is a
+/// **build error**, which is strictly stronger than a test.
+const _: () = assert!(
+    MAX_RELAY_TTL_SECS + 2 * MAX_CLOCK_SKEW_TOLERANCE_SECS < NONCE_RETENTION_SECS,
+    "nonce retention must strictly exceed the FULL acceptance window, which is \
+     `ttl + 2 * skew` — skew is applied once when admitting `issued_at <= now + \
+     skew` and again when admitting `now <= expires_at + skew`. Sizing this with \
+     a single skew term leaves a replay window in which the nonce is pruned but \
+     the token is still accepted."
+);
+
 /// Maximum `handle_hello` calls accepted per node within a one-second window
 /// before the hello itself is rejected (separate from packet rate limiting).
 const MAX_HELLOS_PER_NODE_PER_SEC: u32 = 5;
@@ -362,6 +410,48 @@ impl RelayTransport {
         {
             eprintln!("Relay hello rejected: token expired");
             return Err(RejectReason::ExpiredToken);
+        }
+
+        // Check 4b: Token must not be future-dated (RLY-01).
+        //
+        // `ttl_secs()` is a DIFFERENCE (`expires_at - issued_at`), and
+        // `is_expired` is an upper bound only, so without this check a token
+        // dated far in the future satisfies both: `ttl <= MAX_RELAY_TTL_SECS`
+        // holds because the difference is small, and `now > expires_at + skew`
+        // is false because `expires_at` is enormous.
+        //
+        // That matters beyond freshness. `NONCE_RETENTION_SECS` is measured from
+        // *insert* time, not from the token's own window, so the retention
+        // invariant documented above ("a nonce cannot be recycled within its
+        // validity period") silently depends on `issued_at <= now`. A
+        // future-dated token outlives its own nonce entry and can therefore be
+        // replayed indefinitely, once per prune cycle.
+        //
+        // The repo already applies this norm to signed membership attestations —
+        // `documents/SecurityMinimumBar.md:87` requires they be fresh "and not
+        // future-dated beyond clock-skew tolerance". That text governs
+        // attestations rather than relay tokens, so it is cited here as the
+        // precedent for the shape of this check, not as a requirement that
+        // already covered this path.
+        if hello.session_token.issued_at_unix
+            > now_unix.saturating_add(self.clock_skew_tolerance_secs)
+        {
+            eprintln!("Relay hello rejected: token is future-dated beyond skew tolerance");
+            return Err(RejectReason::InvalidToken);
+        }
+
+        // Check 4c: Reject a self-paired token (RLY-11).
+        //
+        // Checked against the TOKEN's fields, not the hello's, so this only ever
+        // runs on data the signature has already authenticated. An honest issuer
+        // already refuses to mint these (`control/lib.rs` rejects
+        // `node_id == peer_node_id`), so this is defence in depth against a
+        // compromised or buggy issuer: with both fields equal, `node_pair_index`
+        // keys `(A, A)` and the forward-path reverse lookup resolves to the
+        // session's OWN id, making the relay echo every frame back to the sender.
+        if hello.session_token.node_id == hello.session_token.peer_node_id {
+            eprintln!("Relay hello rejected: token is self-paired (node_id == peer_node_id)");
+            return Err(RejectReason::InvalidToken);
         }
 
         // Check 5: Replay nonce
@@ -820,6 +910,16 @@ impl NonceStore {
         let to_remove: Vec<([u8; 16], u64)> = self
             .nonces
             .iter()
+            // Boundary is EXCLUSIVE and deliberately stays so: an entry at exactly
+            // `retention_secs` is evicted. This is pinned by
+            // `nonce_at_exact_retention_age_is_pruned_by_cleanup`, whose comment
+            // states it exists so "a future loosening would be caught by tests".
+            //
+            // RLY-10 (a one-second replay window when skew was at its ceiling) was
+            // therefore fixed on the OTHER side of the invariant — by lowering
+            // `MAX_CLOCK_SKEW_TOLERANCE_SECS` to `MAX_RELAY_TTL_SECS - 1` so that
+            // `TTL + skew < NONCE_RETENTION_SECS` holds strictly rather than by
+            // equality. Do not "fix" it here by loosening this comparison.
             .filter(|(_, inserted_at)| now.saturating_sub(**inserted_at) >= retention_secs)
             .map(|(nonce, inserted_at)| (*nonce, *inserted_at))
             .collect();
@@ -980,6 +1080,35 @@ fn persist_nonce_map(path: &Path, nonces: &HashMap<[u8; 16], u64>) -> Result<(),
         .map_err(|err| format!("set replay store permissions: {err}"))?;
 
     fs::rename(&tmp_path, path).map_err(|err| format!("replace replay store: {err}"))?;
+
+    // Durability: fsync the PARENT DIRECTORY after the rename (RLY-04).
+    //
+    // `file.sync_all()` above makes the temp file's *contents* durable, but the
+    // rename that publishes it is a directory-entry update, which is not covered
+    // by that fsync. Without this, a crash immediately after the rename can lose
+    // the entry and drop recently accepted nonces — reopening the replay window
+    // for exactly those tokens until they expire, in a store whose only purpose
+    // is crash-durable replay prevention.
+    //
+    // This mirrors the sequence `rustynet-crypto::write_atomic_encrypted_key_file`
+    // and `rustynetd::enrollment_token::write_ledger` already use. Directory
+    // fsync is a no-op on Windows (opening a directory handle for
+    // FlushFileBuffers requires access flags `File::open` does not request), so
+    // it is unix-gated exactly as those two call sites are.
+    // Derive the directory EXACTLY as the temp-file write above does, including
+    // the `"."` fallback. An earlier revision of this fix skipped the fsync when
+    // `path.parent()` was `Some("")` — which is what a bare relative filename
+    // yields — so for that input the temp file was written into `.` while the
+    // directory was never synced, and the fix silently did nothing. Sharing the
+    // derivation keeps the two halves honest.
+    #[cfg(unix)]
+    {
+        let dir =
+            fs::File::open(parent).map_err(|err| format!("open replay store parent dir: {err}"))?;
+        dir.sync_all()
+            .map_err(|err| format!("sync replay store parent dir: {err}"))?;
+    }
+
     Ok(())
 }
 
@@ -2677,13 +2806,20 @@ mod tests {
 
     #[test]
     fn skew_clamp_invariant_holds_for_replay_retention() {
-        // Compile-time-style invariant test: the clamp must always be small
-        // enough that even at exact expiry + skew, the nonce is still inside
-        // the retention window. This protects against future constant tweaks
-        // that would silently re-open the replay window.
+        // Compile-time-style invariant test: retention must always cover the
+        // whole window in which a token can still be accepted, so a nonce is
+        // never pruned while its token remains valid.
+        //
+        // RLY-10: this previously asserted `ttl + skew <= retention`, which
+        // undercounts. Skew is applied TWICE on independent axes — once
+        // admitting `issued_at <= now + skew`, once admitting
+        // `now <= expires_at + skew` — so the real bound is `ttl + 2 * skew`,
+        // and it must be STRICT because `prune` evicts at `age >= retention`
+        // while `is_expired` still retains at the boundary.
         const _: () = assert!(
-            MAX_RELAY_TTL_SECS + MAX_CLOCK_SKEW_TOLERANCE_SECS <= NONCE_RETENTION_SECS,
-            "skew + ttl must never exceed nonce retention or replay window reopens"
+            MAX_RELAY_TTL_SECS + 2 * MAX_CLOCK_SKEW_TOLERANCE_SECS < NONCE_RETENTION_SECS,
+            "ttl + 2*skew must be strictly less than nonce retention, or the \
+             replay window reopens"
         );
     }
 
@@ -3402,5 +3538,197 @@ mod tests {
                 "unexpected io kind {kind:?} must warn"
             );
         }
+    }
+
+    // ---- Negative regression tests for the 2026-07-29 adversarial review ----
+    //
+    // Most of these fail against the pre-fix code. Two do NOT, and saying so
+    // matters more than the tidy claim: a test that passes both before and after
+    // a fix proves nothing, which was itself a finding in this review (PF-15, two
+    // contradictory "minimal ruleset" tests green simultaneously because their
+    // fixtures could not express the non-minimal case).
+    //
+    // Verified by reverting each fix individually:
+    //   discriminates  — future_dated_token_is_rejected_rly01
+    //   discriminates  — self_paired_token_is_rejected_rly11
+    //   discriminates  — skew_ceiling_keeps_the_retention_invariant_strict_rly10
+    //   discriminates  — token_future_dating_boundary_is_exactly_skew_rly01
+    //   discriminates  — node_id_bound_is_exactly_max_relay_node_id_bytes_rly05
+    //   DOES NOT       — persist_tolerates_a_path_without_a_directory_component_rly04
+    //                    (a regression guard for the parent-dir derivation; the
+    //                    fsync itself is not observable from a unit test)
+
+    /// RLY-01: a token dated far in the future must be refused.
+    ///
+    /// Pre-fix this was ACCEPTED: `ttl_secs()` is a difference so the TTL bound
+    /// passed, and `is_expired` is an upper bound only so the expiry check passed
+    /// too. Because nonce retention is measured from insert time rather than from
+    /// the token's own window, such a token outlives its nonce entry and replays
+    /// indefinitely.
+    #[test]
+    fn future_dated_token_is_rejected_rly01() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let far_future = now_unix().saturating_add(3_153_600_000);
+        let token =
+            RelaySessionToken::sign_at(&sk, "node-a", "node-b", TEST_RELAY_ID, far_future, 60);
+        let hello = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: token,
+        };
+
+        match transport.handle_hello(hello) {
+            RelayHelloResponse::Rejected(RejectReason::InvalidToken) => {}
+            other => panic!("future-dated token must be rejected as InvalidToken, got {other:?}"),
+        }
+        assert_eq!(
+            transport.session_count(),
+            0,
+            "a future-dated token must not create a session"
+        );
+    }
+
+    /// RLY-01 boundary: a token issued within the skew tolerance is still fine,
+    /// so the new check cannot false-reject an honest peer whose clock runs fast.
+    #[test]
+    fn token_issued_slightly_ahead_within_skew_is_accepted_rly01() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        // One second ahead — well inside the default skew tolerance.
+        let slightly_ahead = now_unix().saturating_add(1);
+        let token =
+            RelaySessionToken::sign_at(&sk, "node-a", "node-b", TEST_RELAY_ID, slightly_ahead, 60);
+        let hello = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: token,
+        };
+
+        match transport.handle_hello(hello) {
+            RelayHelloResponse::Accepted(_) => {}
+            other => panic!("a token 1s ahead must stay acceptable, got {other:?}"),
+        }
+    }
+
+    /// RLY-01 boundary: the future-dating cutoff must be EXACTLY `now + skew`.
+    ///
+    /// The two tests above bracket the check far too loosely — 100 years ahead is
+    /// rejected and 1 second ahead is accepted, which together prove only that
+    /// *some* bound exists. An adversarial reviewer loosened the check to accept
+    /// 104 days of future-dating and the whole suite stayed green. This pins the
+    /// actual constant so that mutation fails.
+    #[test]
+    fn token_future_dating_boundary_is_exactly_skew_rly01() {
+        let (sk, _) = make_test_keypair();
+        let skew = make_transport(&sk).clock_skew_tolerance_secs;
+
+        let issue_at = |offset: u64| {
+            let token = RelaySessionToken::sign_at(
+                &sk,
+                "node-a",
+                "node-b",
+                TEST_RELAY_ID,
+                now_unix().saturating_add(offset),
+                60,
+            );
+            RelayHello {
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                session_token: token,
+            }
+        };
+
+        // Exactly at the tolerance: still acceptable.
+        let mut at_bound = make_transport(&sk);
+        match at_bound.handle_hello(issue_at(skew)) {
+            RelayHelloResponse::Accepted(_) => {}
+            other => panic!("issued_at == now + skew must be accepted, got {other:?}"),
+        }
+
+        // One second past it: refused.
+        let mut past_bound = make_transport(&sk);
+        match past_bound.handle_hello(issue_at(skew + 1)) {
+            RelayHelloResponse::Rejected(RejectReason::InvalidToken) => {}
+            other => panic!("issued_at == now + skew + 1 must be rejected, got {other:?}"),
+        }
+    }
+
+    /// RLY-11: a self-paired token must be refused.
+    ///
+    /// Pre-fix this was ACCEPTED, and `node_pair_index` then keyed `(A, A)` so the
+    /// forward-path reverse lookup resolved to the session's own id — the relay
+    /// echoed every frame back to the sender.
+    #[test]
+    fn self_paired_token_is_rejected_rly11() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let hello = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-a".to_owned(),
+            session_token: make_valid_token(&sk, "node-a", "node-a", 60),
+        };
+
+        match transport.handle_hello(hello) {
+            RelayHelloResponse::Rejected(RejectReason::InvalidToken) => {}
+            other => panic!("self-paired token must be rejected as InvalidToken, got {other:?}"),
+        }
+        assert_eq!(
+            transport.session_count(),
+            0,
+            "a self-paired token must not create a session"
+        );
+    }
+
+    /// RLY-10: the skew ceiling must keep `TTL + skew < NONCE_RETENTION_SECS`
+    /// STRICTLY, not by equality.
+    ///
+    /// The two comparisons around the retention window are asymmetric — `prune`
+    /// evicts at `age >= retention` while `is_expired` still retains a token at
+    /// `now == expires_at + skew` — so an equality-only invariant left a
+    /// one-second window in which the nonce was pruned but the token remained
+    /// valid. Pre-fix, `compute_clamped_skew(120)` returned `(120, false)` and
+    /// `120 + 120 == 240` hit that window.
+    ///
+    /// The fix is on the skew side deliberately: the retention boundary itself is
+    /// pinned by `nonce_at_exact_retention_age_is_pruned_by_cleanup`, whose stated
+    /// purpose is to catch exactly the kind of loosening that "fixing" `prune`
+    /// would have been. That test caught it.
+    #[test]
+    fn skew_ceiling_keeps_the_retention_invariant_strict_rly10() {
+        // A caller asking for the old ceiling is now clamped down and told so.
+        let (clamped, was_clamped) = compute_clamped_skew(MAX_RELAY_TTL_SECS);
+        assert_eq!(clamped, MAX_RELAY_TTL_SECS - 1);
+        assert!(
+            was_clamped,
+            "requesting the old ceiling must report that it was clamped"
+        );
+
+        // And the new ceiling itself is accepted unchanged.
+        assert_eq!(
+            compute_clamped_skew(MAX_CLOCK_SKEW_TOLERANCE_SECS),
+            (MAX_CLOCK_SKEW_TOLERANCE_SECS, false)
+        );
+    }
+
+    /// RLY-04 regression guard: adding the parent-directory fsync introduced a new
+    /// failure path, so prove a store whose path has no directory component still
+    /// persists rather than erroring on an empty parent.
+    #[test]
+    fn persist_tolerates_a_path_without_a_directory_component_rly04() {
+        let mut store = NonceStore {
+            path: Some(PathBuf::from("rustynet-relay-rly04-probe.store")),
+            nonces: HashMap::new(),
+        };
+        let result = store.insert([7u8; 16]);
+        // Clean up regardless of outcome so a failure cannot leave residue.
+        let _ = fs::remove_file("rustynet-relay-rly04-probe.store");
+        assert!(
+            result.is_ok(),
+            "a bare relative store path must still persist: {result:?}"
+        );
     }
 }
