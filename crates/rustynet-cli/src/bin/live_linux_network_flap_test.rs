@@ -314,31 +314,22 @@ fn run() -> Result<(), String> {
     let overall_pass = baseline_ok && recovery_arrived && membership_intact;
 
     // ── Write report ──────────────────────────────────────────────────────────
-    let report_args = vec![
-        "--report-path".to_owned(),
-        report_path.to_string_lossy().to_string(),
-        "--baseline-handshake-age-s".to_owned(),
-        baseline_age_s.to_string(),
-        "--flap-duration-s".to_owned(),
-        flap_duration_s.to_string(),
-        "--disruption-confirmed".to_owned(),
-        pass_fail(disruption_confirmed).to_owned(),
-        "--recovery-handshake-arrived".to_owned(),
-        pass_fail(recovery_arrived).to_owned(),
-        "--recovery-time-s".to_owned(),
-        recovery_time_s.to_string(),
-        "--gossip-recovered".to_owned(),
-        pass_fail(tunnel_active).to_owned(),
-        "--membership-intact".to_owned(),
-        pass_fail(membership_intact).to_owned(),
-        "--overall-status".to_owned(),
-        pass_fail(overall_pass).to_owned(),
-    ];
-    let report_refs: Vec<&str> = report_args.iter().map(String::as_str).collect();
-    run_cargo_ops(
-        &ctx.root_dir,
-        "write-live-linux-network-flap-report",
-        &report_refs,
+    // Called IN-PROCESS, not via `cargo run … ops …`. The subprocess form built
+    // a default-feature binary in which this `vm-lab`-gated subcommand does not
+    // exist, so the write failed with `unknown ops subcommand` and the stage
+    // recorded FAIL even though every assertion above had passed.
+    rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_live_linux_network_flap_report(
+        rustynet_cli::ops_live_lab_orchestrator::WriteLiveLinuxNetworkFlapReportConfig {
+            report_path: report_path.clone(),
+            baseline_handshake_age_s: baseline_age_s,
+            flap_duration_s,
+            disruption_confirmed: pass_fail(disruption_confirmed).to_owned(),
+            recovery_handshake_arrived: pass_fail(recovery_arrived).to_owned(),
+            recovery_time_s,
+            gossip_recovered: pass_fail(tunnel_active).to_owned(),
+            membership_intact: pass_fail(membership_intact).to_owned(),
+            overall_status: pass_fail(overall_pass).to_owned(),
+        },
     )?;
 
     append_standalone_matrix_row(&report_path, overall_pass);

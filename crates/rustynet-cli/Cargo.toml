@@ -48,6 +48,17 @@ name = "live_lab_evidence_verifier"
 path = "src/bin/live_lab_evidence_verifier.rs"
 required-features = ["vm-lab"]
 
+# This stage binary now calls its report writer IN-PROCESS via
+# `rustynet_cli::ops_live_lab_orchestrator`, which is itself `vm-lab`-gated, so
+# the target can no longer build under default features. It previously shelled
+# out to `cargo run … ops …` WITHOUT the feature, which built a binary lacking
+# the gated verb and made the stage report a false RED after its assertions had
+# already passed. Same `required-features` rationale as the two targets above.
+[[bin]]
+name = "live_linux_network_flap_test"
+path = "src/bin/live_linux_network_flap_test.rs"
+required-features = ["vm-lab"]
+
 [dependencies]
 base64 = "0.22"
 rustynet-advisor = { path = "../rustynet-advisor" }

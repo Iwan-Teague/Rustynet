@@ -72,9 +72,17 @@ mod live_lab_stage_triage;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
 mod ops_e2e;
+// `pub` so the standalone `live_*` stage binaries can call the report writers
+// IN-PROCESS. They used to shell out via `cargo run -p rustynet-cli -- ops …`,
+// which silently built a DEFAULT-feature binary in which these very
+// subcommands do not exist (they are `vm-lab`-gated in `main.rs`), so every
+// such stage failed with `unknown ops subcommand` *after* its real assertions
+// had already passed — a false RED. Calling them directly makes that mismatch
+// impossible by construction. Still `vm-lab`-gated, so the shipped
+// default-feature binary carries none of it (RNQ-17).
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
-mod ops_live_lab_orchestrator;
+pub mod ops_live_lab_orchestrator;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
 mod secret_material;
