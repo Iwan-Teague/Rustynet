@@ -5,7 +5,7 @@ mod live_lab_support;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use live_lab_support::{LiveLabContext, Logger, repo_root, run_cargo_ops};
+use live_lab_support::{LiveLabContext, Logger, repo_root};
 
 fn main() {
     if let Err(err) = run() {
@@ -296,38 +296,29 @@ fn run() -> Result<(), String> {
 
     let captured_at_utc = now_utc();
     let captured_at_unix = now_unix();
-    let report_args = vec![
-        "--report-path".to_owned(),
-        report_path.to_string_lossy().to_string(),
-        "--rogue-endpoint-ip".to_owned(),
-        rogue_endpoint_ip.clone(),
-        "--baseline-status".to_owned(),
-        baseline_status_output.clone(),
-        "--baseline-netcheck".to_owned(),
-        baseline_netcheck_output.clone(),
-        "--baseline-endpoints".to_owned(),
-        baseline_endpoints.clone(),
-        "--status-after-hijack".to_owned(),
-        status_after_hijack.clone(),
-        "--netcheck-after-hijack".to_owned(),
-        netcheck_after_hijack.clone(),
-        "--endpoints-after-hijack".to_owned(),
-        endpoints_after_hijack.clone(),
-        "--status-after-recovery".to_owned(),
-        status_after_recovery.clone(),
-        "--endpoints-after-recovery".to_owned(),
-        endpoints_after_recovery.clone(),
-        "--captured-at-utc".to_owned(),
-        captured_at_utc,
-        "--captured-at-unix".to_owned(),
-        captured_at_unix,
-    ];
-    let report_refs = report_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let report_status = run_cargo_ops(
-        &ctx.root_dir,
-        "write-live-linux-endpoint-hijack-report",
-        &report_refs,
-    )?;
+    // In-process, not `cargo run … ops …`: the subprocess built a
+    // default-feature binary lacking this `vm-lab`-gated verb, so the write
+    // failed with `unknown ops subcommand` and the stage recorded FAIL after
+    // its assertions had already passed. captured_at_unix keeps the CLI
+    // parser's unwrap_or(0) so a clock-read failure does not fail the stage.
+    let report_status =
+        rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_live_linux_endpoint_hijack_report(
+            rustynet_cli::ops_live_lab_orchestrator::WriteLiveLinuxEndpointHijackReportConfig {
+                report_path: report_path.clone(),
+                rogue_endpoint_ip: rogue_endpoint_ip.clone(),
+                baseline_status: baseline_status_output.clone(),
+                baseline_netcheck: baseline_netcheck_output.clone(),
+                baseline_endpoints: baseline_endpoints.clone(),
+                status_after_hijack: status_after_hijack.clone(),
+                netcheck_after_hijack: netcheck_after_hijack.clone(),
+                endpoints_after_hijack: endpoints_after_hijack.clone(),
+                status_after_recovery: status_after_recovery.clone(),
+                endpoints_after_recovery: endpoints_after_recovery.clone(),
+                captured_at_utc,
+                captured_at_unix: captured_at_unix.parse::<u64>().unwrap_or(0),
+            },
+        )?;
+
     if report_status != "pass" {
         return Err(format!(
             "endpoint hijack test failed; see {}",
