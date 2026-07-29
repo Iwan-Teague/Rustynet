@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use ed25519_dalek::SigningKey;
 use rustynet_crypto::NodeKeyPair;
 use rustynet_policy::{AccessRequest, PolicyRule, PolicySet, Protocol, RuleAction};
 
@@ -34,7 +35,14 @@ fn print_scaffold_ready() -> Result<(), String> {
         protocol: Protocol::Udp,
     });
 
-    let keypair = NodeKeyPair::from_raw([11; 32], [13; 32]).map_err(|err| err.to_string())?;
+    // CRY-06: `from_raw` now verifies the public half actually belongs to the
+    // private half, so the demo pair must be a real one. This previously passed
+    // `([11; 32], [13; 32])`, which is not a corresponding pair — it was accepted
+    // only because nothing checked, and it made this binary fail at startup once
+    // the check landed. Derive the public key from the seed instead.
+    let seed = [13u8; 32];
+    let public_key = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    let keypair = NodeKeyPair::from_raw(public_key, seed).map_err(|err| err.to_string())?;
 
     println!(
         "rustynet-control scaffold ready: decision={decision:?}, signing_pubkey_prefix={}",
