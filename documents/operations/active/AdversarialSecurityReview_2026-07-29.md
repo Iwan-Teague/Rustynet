@@ -68,6 +68,13 @@ meta-review itself in three places:
 Every remaining Part III reference either sits in an unmodified file or shifts by a
 pure constant; **nothing needed re-review for material code change.**
 
+**Companion document:** `documents/operations/active/AdversarialSecurityRemediation_2026-07-29.md`
+mirrors this one entry-for-entry — every finding ID below has exactly one fix entry
+there, with effort and a gate flag. **Eight of those fixes must not be applied as
+written** (one would blackhole a live fleet, one would convert a protective guard
+into a fail-open); that document's §1 lists them. Read a finding here before
+implementing its fix there.
+
 Out of scope throughout: WireGuard backends, live-lab evidence, and the GUI.
 (Earlier revisions of this header also excluded relay framing; Part IV now covers
 the relay's untrusted-input path, so that exclusion no longer applies.)
