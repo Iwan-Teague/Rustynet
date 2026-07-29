@@ -560,12 +560,7 @@ fn write_file_in_place_no_symlink(path: &Path, contents: &[u8]) -> Result<(), St
         .truncate(true)
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(path)
-        .map_err(|err| {
-            format!(
-                "open {} for in-place write (must be an existing regular file): {err}",
-                path.display()
-            )
-        })?;
+        .map_err(|err| in_place_write_open_error(path, &err))?;
     file.write_all(contents)
         .map_err(|err| format!("write {}: {err}", path.display()))?;
     file.flush()
@@ -573,6 +568,51 @@ fn write_file_in_place_no_symlink(path: &Path, contents: &[u8]) -> Result<(), St
     file.sync_all()
         .map_err(|err| format!("fsync {}: {err}", path.display()))?;
     Ok(())
+}
+
+/// Turn an in-place-write open failure into something an operator can act on.
+///
+/// Both failure modes here are produced by the same host misconfiguration — a
+/// symlinked `/etc/resolv.conf`, which is the systemd-resolved default on a
+/// stock cloud image — but neither raw errno says so, and both surface from
+/// deep inside a fail-closed rollback:
+///
+/// - `ELOOP` ("Too many levels of symbolic links") when the symlink is still
+///   in place: `O_NOFOLLOW` refuses it, correctly, rather than writing through.
+/// - `EROFS` ("Read-only file system") *after* the file has been replaced with
+///   a regular one, because systemd resolved the old symlink when it built the
+///   helper's mount namespace and bound the read-only target instead. The
+///   namespace is stale until the **helper** is restarted; restarting only the
+///   daemon changes nothing, which makes this failure look unfixable.
+///
+/// Linux cannot self-heal either case the way macOS does (atomic temp+rename),
+/// because `ProtectSystem=strict` deliberately keeps `/etc` read-only apart
+/// from this one inode, so the helper has no writable parent directory to
+/// rename into. Naming the condition and the remedy is therefore the fix.
+#[cfg(unix)]
+fn in_place_write_open_error(path: &Path, err: &std::io::Error) -> String {
+    let raw = err.raw_os_error();
+    let symlink_hint = raw == Some(nix::libc::ELOOP) || raw == Some(nix::libc::EROFS);
+    let base = format!(
+        "open {} for in-place write (must be an existing regular file): {err}",
+        path.display()
+    );
+    if !symlink_hint {
+        return base;
+    }
+    format!(
+        "{base}. This is what a symlinked {} looks like -- the systemd-resolved \
+         default on a stock cloud image. Protected-mode DNS writes this inode in \
+         place because ProtectSystem=strict keeps /etc read-only, so a symlink \
+         cannot be followed or replaced here. Remedy on the host: replace it with \
+         a regular file (`cp --remove-destination \"$(readlink -f {})\" {}`), then \
+         restart rustynetd-privileged-helper so systemd rebuilds its mount \
+         namespace -- restarting only rustynetd leaves the stale read-only bind \
+         mount in place and the write keeps failing",
+        path.display(),
+        path.display(),
+        path.display()
+    )
 }
 
 /// Remove `path` if present; absent is success. Uses `remove_file`, which
@@ -588,6 +628,47 @@ fn remove_file_if_present(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn in_place_write_open_error_names_the_symlink_remedy() {
+        use std::io::{Error, ErrorKind};
+        let path = std::path::Path::new(super::RESOLV_CONF_PATH);
+
+        // Both errnos a symlinked resolv.conf produces must carry the remedy:
+        // ELOOP while the symlink is present, EROFS afterwards because the
+        // helper's mount namespace still holds the old read-only bind.
+        for errno in [nix::libc::ELOOP, nix::libc::EROFS] {
+            let rendered = super::in_place_write_open_error(path, &Error::from_raw_os_error(errno));
+            assert!(
+                rendered.contains("systemd-resolved"),
+                "errno {errno} must name the systemd-resolved default: {rendered}"
+            );
+            assert!(
+                rendered.contains("rustynetd-privileged-helper"),
+                "errno {errno} must tell the operator to restart the HELPER, since restarting \
+                 only the daemon leaves the stale bind mount: {rendered}"
+            );
+            assert!(
+                rendered.contains("readlink -f"),
+                "errno {errno} must give the concrete conversion command: {rendered}"
+            );
+        }
+
+        // An unrelated failure must NOT be dressed up as a symlink problem.
+        let unrelated = super::in_place_write_open_error(
+            path,
+            &Error::new(ErrorKind::PermissionDenied, "nope"),
+        );
+        assert!(
+            !unrelated.contains("systemd-resolved"),
+            "an unrelated open failure must not claim a symlink cause: {unrelated}"
+        );
+        assert!(
+            unrelated.contains("must be an existing regular file"),
+            "the base diagnostic must survive: {unrelated}"
+        );
+    }
+
     use super::*;
 
     #[test]
