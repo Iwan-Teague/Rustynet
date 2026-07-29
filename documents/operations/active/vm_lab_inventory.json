@@ -299,7 +299,7 @@
         "domain": "windows-x86-1",
         "host_id": "ubuntu-kvm-1"
       },
-      "notes": "Windows 11 Pro 25H2 on the x86-64 KVM box; nested virt (Hyper-V) works so WinNAT/exit-role is capable \u2014 New-NetNat + Get-NetNatSession proven live 2026-07-24 (impossible on the Apple-Silicon UTM guest). SSH user labadmin, password in the untracked secrets sidecar. Key-auth as labadmin VERIFIED; rustc/cargo 1.88.0 installed; MSVC Build Tools installed at C:\\BuildTools with link.exe confirmed resolving through VsDevCmd (2026-07-25) \u2014 the repo pins channel 1.88.0 against rustup's default host (msvc), and release ships msvc only, so msvc is required here rather than the gnu toolchain also present. NOTE: this guest does not answer ICMP (Windows Defender blocks inbound echo) \u2014 judge reachability by TCP/22 or virsh domain state, never ping. The active_exit / WinNAT cell run itself is still PENDING."
+      "notes": "Windows 11 Pro 25H2 on the x86-64 KVM box; nested virt (Hyper-V) works so WinNAT/exit-role is capable — New-NetNat + Get-NetNatSession proven live 2026-07-24 (impossible on the Apple-Silicon UTM guest). SSH user labadmin, password in the untracked secrets sidecar. Key-auth as labadmin VERIFIED; rustc/cargo 1.88.0 installed; MSVC Build Tools installed at C:\\BuildTools with link.exe confirmed resolving through VsDevCmd (2026-07-25) — the repo pins channel 1.88.0 against rustup's default host (msvc), and release ships msvc only, so msvc is required here rather than the gnu toolchain also present. NOTE: this guest does not answer ICMP (Windows Defender blocks inbound echo) — judge reachability by TCP/22 or virsh domain state, never ping. The active_exit / WinNAT cell run itself is still PENDING."
     },
     {
       "alias": "fedora-x86-1",
@@ -322,7 +322,7 @@
         "domain": "fedora-x86-1",
         "host_id": "ubuntu-kvm-1"
       },
-      "notes": "Fedora 42 x86-64 cloud guest on the KVM box; NetworkManager active + firewalld available (distinct network/firewall stack vs Debian \u2014 native x86-64 coverage of the NM/firewalld path, cf the enforce_baseline_runtime NM regression). key-auth via fedora user (box host key). Needs provision_guest_toolchain (dnf) before a rustynet build."
+      "notes": "Fedora 42 x86-64 cloud guest on the KVM box; NetworkManager active + firewalld available (distinct network/firewall stack vs Debian — native x86-64 coverage of the NM/firewalld path, cf the enforce_baseline_runtime NM regression). key-auth via fedora user (box host key). Needs provision_guest_toolchain (dnf) before a rustynet build."
     }
   ]
 }
