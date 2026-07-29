@@ -1801,6 +1801,30 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
+        // Same shape, matched on the SOURCE port. Outbound WireGuard leaves the
+        // daemon's bound socket with the listen port as its source, whatever
+        // port the peer's NAT mapped it to; without this a peer reached at its
+        // server-reflexive candidate is unreachable and NAT traversal cannot
+        // complete. Bounded identically to the dport form: an owned fail-closed
+        // table, a real interface name, and a u16 port.
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            "udp",
+            "sport",
+            port,
+            "accept",
+        ] if is_owned_failclosed_table_token(table)
+            && is_interface_name(interface)
+            && is_u16_token(port) =>
+        {
+            Ok(())
+        }
         [
             "add",
             "rule",
