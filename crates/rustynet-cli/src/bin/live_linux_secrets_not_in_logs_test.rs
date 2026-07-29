@@ -178,36 +178,21 @@ fn run() -> Result<(), String> {
     ))?;
 
     // ── Write report ──────────────────────────────────────────────────────────
-    let suspicious_str = total_suspicious.to_string();
-    let line_count_str = line_count.to_string();
-    let report_args = vec![
-        "--report-path".to_owned(),
-        report_path.to_string_lossy().to_string(),
-        "--log-lines-checked".to_owned(),
-        line_count_str,
-        "--suspicious-matches".to_owned(),
-        suspicious_str,
-        "--hex64-matches".to_owned(),
-        hex64_matches.len().to_string(),
-        "--hex32-matches".to_owned(),
-        hex32_matches.len().to_string(),
-        "--b64-key-matches".to_owned(),
-        b64_key_matches.len().to_string(),
-        "--verdict".to_owned(),
-        if overall_pass {
-            "clean"
-        } else {
-            "contaminated"
-        }
-        .to_owned(),
-        "--overall-status".to_owned(),
-        pass_fail(overall_pass).to_owned(),
-    ];
-    let report_refs: Vec<&str> = report_args.iter().map(String::as_str).collect();
-    run_cargo_ops(
-        &ctx.root_dir,
-        "write-live-linux-secrets-not-in-logs-report",
-        &report_refs,
+    // In-process, not `cargo run … ops …`: the subprocess built a
+    // default-feature binary lacking this `vm-lab`-gated verb, so the write
+    // failed with `unknown ops subcommand` and the stage recorded FAIL after
+    // its assertions had already passed.
+    rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_live_linux_secrets_not_in_logs_report(
+        rustynet_cli::ops_live_lab_orchestrator::WriteLiveLinuxSecretsNotInLogsReportConfig {
+            report_path: report_path.clone(),
+            log_lines_checked: line_count as u64,
+            suspicious_matches: total_suspicious as u64,
+            hex64_matches: hex64_matches.len() as u64,
+            hex32_matches: hex32_matches.len() as u64,
+            b64_key_matches: b64_key_matches.len() as u64,
+            verdict: if overall_pass { "clean" } else { "contaminated" }.to_owned(),
+            overall_status: pass_fail(overall_pass).to_owned(),
+        },
     )?;
 
     append_standalone_matrix_row(&report_path, overall_pass);

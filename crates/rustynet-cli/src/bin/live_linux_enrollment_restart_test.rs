@@ -273,26 +273,25 @@ fn write_report_and_exit(
     kill_timing_ms: &str,
     overall_status: &str,
 ) -> Result<(), String> {
-    let report_args = vec![
-        "--report-path".to_owned(),
-        report_path.to_string_lossy().to_string(),
-        "--admin-recovered".to_owned(),
-        admin_recovered.to_owned(),
-        "--enrollment-outcome".to_owned(),
-        enrollment_outcome.to_owned(),
-        "--membership-integrity".to_owned(),
-        membership_integrity.to_owned(),
-        "--kill-timing-ms".to_owned(),
-        kill_timing_ms.to_owned(),
-        "--overall-status".to_owned(),
-        overall_status.to_owned(),
-    ];
-    let report_refs: Vec<&str> = report_args.iter().map(String::as_str).collect();
-    let status = run_cargo_ops(
-        &ctx.root_dir,
-        "write-live-linux-enrollment-restart-report",
-        &report_refs,
-    )?;
+    // In-process, not `cargo run … ops …`: the subprocess built a
+    // default-feature binary lacking this `vm-lab`-gated verb, so the write
+    // failed with `unknown ops subcommand` and the stage recorded FAIL after
+    // its assertions had already passed. Parsing `kill_timing_ms` here rather
+    // than handing the CLI a string surfaces a malformed value at the call
+    // site instead of as an opaque bad_args exit from a child process.
+    let status =
+        rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_live_linux_enrollment_restart_report(
+            rustynet_cli::ops_live_lab_orchestrator::WriteLiveLinuxEnrollmentRestartReportConfig {
+                report_path: report_path.to_path_buf(),
+                admin_recovered: admin_recovered.to_owned(),
+                enrollment_outcome: enrollment_outcome.to_owned(),
+                membership_integrity: membership_integrity.to_owned(),
+                kill_timing_ms: kill_timing_ms.parse::<u64>().map_err(|err| {
+                    format!("invalid kill_timing_ms {kill_timing_ms:?}: {err}")
+                })?,
+                overall_status: overall_status.to_owned(),
+            },
+        )?;
     logger.line(format!(
         "[enrollment-restart] report written status={status}"
     ))?;

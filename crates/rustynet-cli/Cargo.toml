@@ -66,6 +66,16 @@ name = "live_linux_key_custody_test"
 path = "src/bin/live_linux_key_custody_test.rs"
 required-features = ["vm-lab"]
 
+[[bin]]
+name = "live_linux_secrets_not_in_logs_test"
+path = "src/bin/live_linux_secrets_not_in_logs_test.rs"
+required-features = ["vm-lab"]
+
+[[bin]]
+name = "live_linux_enrollment_restart_test"
+path = "src/bin/live_linux_enrollment_restart_test.rs"
+required-features = ["vm-lab"]
+
 [dependencies]
 base64 = "0.22"
 rustynet-advisor = { path = "../rustynet-advisor" }
