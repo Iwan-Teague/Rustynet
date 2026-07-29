@@ -2,7 +2,7 @@
 
 Status: **proposals only — nothing here has been applied, and nothing here is verified.**
 Companion to: `documents/operations/active/AdversarialSecurityReview_2026-07-29.md` (the findings doc). This document is its mirror: **every finding ID in that document has exactly one entry here**, so it can be used as a lookup table — problem → fix.
-Coverage: 101 finding IDs across Parts I–VIII (POL, CRY, PF, RLY, CTL, WIN, IPV, ENR).
+Coverage: 103 finding IDs across Parts I–VIII (POL, CRY, PF, RLY, CTL, WIN, IPV, ENR).
 
 ## How to use this document
 
@@ -141,6 +141,8 @@ Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`
 | RLY-12 | `node_id` written unescaped into log lines | Escape or reject control characters before logging; the correct upstream guard is `is_valid_node_id_text` (**S3**), not `NodeId::new` | XS | direct |
 | RLY-13 | Unreachable size guard; invisible tuple rejections; data-path skew inconsistency; O(n) persist per hello | Restate the `rate_limit.rs` ledger row (the "caller caps len" justification is vacuous); add a counter for `UnauthorizedSourceTuple`; apply skew consistently on the data path or document why not; batch the nonce persist | S | direct |
 | RLY-14 | Ledger maintenance | Mark AUDIT-031 stale (superseded by applied RSA-0037 — but see S4, the byte half is open); promote RSA-0086/0087/0088 off "needs confirmation"; add a row for `hello_limiter_audit.rs`; name the authoritative port range | S | direct |
+| RLY-15 | `now_unix()` → `0` on a pre-1970 clock makes every token unexpired in both `is_expired` and the data path | Make the clock failure explicit: return `Result` and fail closed at the call sites, or substitute a sentinel that makes tokens **expired** rather than unexpired, so a broken clock denies instead of admitting. Matters because the repo targets RTC-less Pi Zero-class relay hardware | S | test-first |
+| RLY-16 | The replay store's **file-side** permission check is skipped on any non-`NotFound` stat error | Either treat a non-`NotFound` stat error as fail-closed, or keep the documented skip and narrow the surrounding claim so nobody relies on "fails closed" for the file. The existing rationale is defensible — decide, do not just tighten | S | **DECISION** |
 
 ### Part V — `rustynet-control`, trust issuer (CTL)
 
@@ -235,9 +237,31 @@ Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`
 | On-disk framing migration plan | CRY-04 | The framing fix is deferred pending it |
 | Wire-format migration plan | CTL-03 | The code explicitly forbids a local fix |
 
-## 6. Honesty notes
+## 6. Untriaged leads — discovered but NOT reviewed, so deliberately not given finding IDs
+
+These surfaced as side-observations during the reviews. None has been verified, none
+is a finding, and none should be treated as one — they are recorded so they are not
+lost, and so nobody mistakes the 103-entry dictionary for a complete account of
+everything the reviews touched.
+
+| Lead | Where it came from | Why it is not a finding | Suggested next step |
+|---|---|---|---|
+| `linux_exit_nat_lifecycle.rs` appears to carry the **same `unwrap_or_default()` fail-open** that IPV-05 found in the IPv6 leak modules — and `LiveLabCoverageAndHonestyAudit_2026-06-25.md` items #1/#2 already record it there at **CRIT**, apparently unfixed | Part VII, as context for IPV-05 | That file was never in any part's scope and was not read | Review the file; if the twin is confirmed, it is a pre-existing CRIT that IPV-05's fix should be applied to at the same time |
+| `managed_peer_egress_endpoints` may accept **peer-advertised** endpoints without the guard `validate_runtime_relay_candidate_endpoint` applies to relay candidates | Part III, PF-15 | Explicitly labelled INFERRED; the managed-peer path was not traced | Trace it. If a remote peer can mint a pass, **PF-15 becomes High** |
+| pf `anchor "com.apple/*"` sub-anchor **evaluation order** (lexicographic vs numeric) | Part III, PF-07 | Needs an on-box experiment that was not run | Run it — it gates PF-03, PF-04 and PF-07 (see §5) |
+| The `Skip`-on-absent-artifact behaviour in the IPv6 leak orchestrator stage | Part VII | Documented intent, honest message — raised as an observation only | Leave unless the skip is masking real absences |
+
+## 7. Honesty notes
 
 - **Nothing here is verified.** These are proposals derived from a review that changed no code. Each needs an enforcement point plus a negative test before it counts as closed.
 - **The findings doc had a 12-error rate** when adversarially audited, including two mis-rated Highs in both directions. Where a fix here looks disproportionate to its finding, re-read the finding first — the severity may be the thing that is wrong.
 - **Effort estimates are structural, not scheduled.** "XS" means the code change is one line, not that the test, review and live-lab proof are free.
+- **This dictionary was built by mapping finding IDs to fixes, which means it can only
+  ever be as complete as the ID list.** Two real defects (**RLY-15**, **RLY-16**) were
+  originally written as prose corrections inside a *defence* list rather than as
+  numbered findings, and were therefore invisible to this mapping until a
+  completeness check found them. The rule that follows: **withdrawing a credited
+  defence must create a finding**, because a defence that does not hold usually means
+  a defect does. §6 exists for the same reason — to hold what is deliberately *not*
+  in the dictionary.
 - **Several entries fix a *document*, not code** (PF-12, CTL-07, RLY-14, ENR-14, ENR-15, IPV-05's credit withdrawal, CRY-10, IPV-01's RN-07 correction). Those are cheap and worth doing early, because stale docs are what produced several findings in the first place.
