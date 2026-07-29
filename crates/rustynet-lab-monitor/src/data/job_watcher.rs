@@ -224,6 +224,25 @@ fn find_running_jobs_with_live_processes(
     // on disk (e.g. /private/tmp/...) is still found even though it has no
     // job-state JSON and its report dir isn't under repo_root/state/.
     for (pid, dir_path) in live_processes {
+        // `--report-dir` is taken verbatim off the orchestrator's command line,
+        // and operators routinely pass a RELATIVE path
+        // (`--report-dir artifacts/live_lab/<run>`). A relative path resolves
+        // against OUR working directory, not the orchestrator's — and this
+        // monitor is workspace-excluded, so it is launched from
+        // `crates/rustynet-lab-monitor/`, where that path does not exist. The
+        // `is_dir()` below then rejected a perfectly live run and the TUI
+        // reported "idle" while stages were visibly executing (QH-31).
+        //
+        // Resolving against `repo_root` is the fix: it is the directory the
+        // orchestrator is launched from in every documented workflow, so it is
+        // the right base for a relative report dir. An absolute path is used
+        // as-is, so this cannot break the `/private/tmp/...` case this scan was
+        // originally written for.
+        let dir_path = if dir_path.is_absolute() {
+            dir_path
+        } else {
+            repo_root.join(&dir_path)
+        };
         if !dir_path.is_dir() {
             continue;
         }
@@ -929,6 +948,45 @@ mod tests {
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].pid, Some(std::process::id()));
         assert_eq!(running[0].report_dir, external.path().display().to_string());
+    }
+
+    /// QH-31: a RELATIVE `--report-dir` must resolve against the repo root.
+    ///
+    /// Operators routinely launch with `--report-dir artifacts/live_lab/<run>`.
+    /// A relative path resolves against the MONITOR's working directory, and
+    /// this crate is workspace-excluded so the monitor runs from
+    /// `crates/rustynet-lab-monitor/` — where that path does not exist. Before
+    /// the fix the live run was silently dropped and the TUI showed "idle"
+    /// while stages were visibly executing.
+    ///
+    /// This is a true negative control: against the old code the relative path
+    /// is tested against the test process's own cwd, fails `is_dir()`, and the
+    /// job count is 0.
+    #[test]
+    fn process_discovered_relative_report_dir_resolves_against_repo_root() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let relative = std::path::Path::new("artifacts/live_lab/gatefirst-run");
+        std::fs::create_dir_all(repo.path().join(relative)).expect("report dir");
+
+        // Exactly what `ps` yields for `--report-dir artifacts/live_lab/...`.
+        let live_processes = vec![(std::process::id(), relative.to_path_buf())];
+        let running = find_running_jobs_with_live_processes(repo.path(), live_processes)
+            .expect("running jobs");
+
+        assert_eq!(
+            running.len(),
+            1,
+            "a live orchestrator with a relative --report-dir must be discovered; \
+             dropping it is what made the TUI report idle during a live run"
+        );
+        assert_eq!(running[0].pid, Some(std::process::id()));
+        assert!(
+            running[0]
+                .report_dir
+                .ends_with("artifacts/live_lab/gatefirst-run"),
+            "report_dir should be the resolved path, got {}",
+            running[0].report_dir
+        );
     }
 
     #[test]
