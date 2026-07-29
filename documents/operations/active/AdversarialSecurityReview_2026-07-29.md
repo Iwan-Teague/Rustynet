@@ -8,7 +8,7 @@ Method: rolling adversarial review, one focused area per part. Each part names i
 |---|---|---|---|
 | **I** | `rustynet-policy` — ACL / policy evaluation engine | POL-01 … POL-14 | complete |
 | **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … CRY-12 | complete |
-| **III** | macOS `pf` privileged-helper boundary — killswitch rule regeneration | PF-01 … PF-14 | complete |
+| **III** | macOS `pf` privileged-helper boundary — killswitch rule regeneration | PF-01 … PF-15 | complete |
 | **IV** | `rustynet-relay` — remote/unauthenticated input path | RLY-01 … RLY-14 | complete |
 | **V** | `rustynet-control` — the trust issuer (signed-artifact issuance) | CTL-01 … CTL-07 | complete |
 | **VI** | Windows privileged + at-rest surface (named pipe, DPAPI, WFP) | WIN-01 … WIN-10 | complete |
@@ -47,10 +47,24 @@ independently checked and found sound except RLY-08 above. Findings marked
 **New** were re-checked against the ledger; the four with prior coverage are now
 attributed (POL-05, POL-14, PF-05, CTL-01).
 
-**Known remaining weakness:** Part III's line references predate three commits to
-`phase10.rs` and are ~+43 lines stale after `:2650`; a corrected anchor table is
-in that part's header, but anything depending on render *ordering* there needs
-re-verification at HEAD rather than a renumber.
+**Follow-up completed 2026-07-29.** The two loose ends this meta-review left have
+since been closed by a dedicated re-verification pass, which corrected the
+meta-review itself in three places:
+
+- The withdrawn "DNS ordering" defence is now resolved as **PF-15** — and the real
+  defect is not the mode inversion but that `block_all_egress` leaves up to 320 UDP
+  passes rendered in the state named `FailClosed`, reachable in honest operation.
+- The render function is **byte-identical to the baseline**, so PF-15 was an error
+  in the original credit rather than drift. The meta-review's "needs re-verification
+  at HEAD because the renderer moved" caveat was chasing a shift that never touched
+  this code.
+- Part III's corrected anchor table was itself wrong twice: PF-04's flush arm is at
+  `:2210` (not `:2193`), and only `c5018acb` touched `phase10.rs` — its +43 lines are
+  entirely in `LinuxCommandSystem`, and the traversal/managed-peer render loops
+  predate the baseline. A complete per-file shift mapping is now in Part III's header.
+
+Every remaining Part III reference either sits in an unmodified file or shifts by a
+pure constant; **nothing needed re-review for material code change.**
 
 Out of scope throughout: WireGuard backends, live-lab evidence, and the GUI.
 (Earlier revisions of this header also excluded relay framing; Part IV now covers
@@ -1228,10 +1242,15 @@ Crate baseline: `crates/rustynetd/src/macos_pf_load_spec.rs`, 1061 lines, added 
 Scope: the `macos-pf-load` privileged builtin end to end — `MacosPfLoadSpec` encode/decode across the daemon→root boundary, anchor derivation, the three rule renderers it drives (`render_macos_killswitch_pf_rules`, `build_macos_blind_exit_pf_rules`, `build_macos_exit_nat_pf_rules`), the `assert_rule_invariants` guard, and the surrounding apply/assert ordering in `phase10.rs` and `privileged_helper.rs`
 Out of scope for this part: Linux nftables killswitch paths except where they share a validator, and Windows WFP (Part VI now covers the latter)
 
-> **Line-reference drift (meta-review 2026-07-29).** `phase10.rs` moved under
-> `fe634559`, `c5018acb` and `5bbf2062`, which added the traversal/managed-peer
-> endpoint fields and render loops. References into that file **after ~`:2650` are
-> uniformly ~+43 lines** at HEAD. Substance was re-checked and holds in every case
+> **Line-reference drift (meta-review 2026-07-29; corrected again after a
+> dedicated re-verification pass).** References into `phase10.rs` after ~`:1864`
+> are uniformly **+43 lines** at HEAD. Two claims in the first version of this note
+> were wrong: only **`c5018acb`** touched `phase10.rs` (not `fe634559`/`5bbf2062`),
+> and its +43 lines are entirely inside `LinuxCommandSystem` (an nft `udp sport`
+> allow) — the traversal/managed-peer fields and render loops **predate the
+> baseline entirely**, which is why PF-15 is a baseline-era defect and not drift.
+> The corrected PF-04 anchor below was also itself wrong (`:2193`; the flush arm is
+> at **`:2210`**). Substance was re-checked and holds in every case
 > examined, but the refs below are as-of `22847b12`. Key corrected anchors:
 > PF-01's `allow_egress_interface` pass `:2653-2662` → **`:2700-2705`** (guard
 > opens `:2674`, closes **`:2706`**); PF-02's SSH block `:2663-2677` →
@@ -1240,7 +1259,9 @@ Out of scope for this part: Linux nftables killswitch paths except where they sh
 > **`:2983-3041`** with the flush `:2944-2948` → **`:2988-2991`** and the load
 > `:2971` → **`:3012-3015`**; `block_all_egress` `:3585-3588` → **`:3628-3631`**;
 > PF-05's `assert_killswitch` `:3515` → **`:3544`** with the substring test at
-> **`:3558`**; PF-04's flush arm `:2169` → **`:2193`**. `macos_pf_load_spec.rs` is
+> **`:3558`**; PF-04's flush arm `:2169` → **`:2210`** (`privileged_helper.rs`
+> shifts +15 in 1330-1803, +41 in 1900-3206, +75 above 3211).
+> `macos_pf_load_spec.rs` is
 > **unmodified** since the baseline, so all refs into it are exact. Anything in
 > this part that depends on render *ordering* — notably §14 item 14 — needs
 > re-verification at HEAD, not a renumber.
@@ -1302,6 +1323,7 @@ nor the helper rule-shape assert, nor the self-referential evaluator caught the
 | PF-12 | This production privilege-boundary file has zero audit-ledger rows | Low (bookkeeping) | **New** |
 | PF-13 | Three round-trip tests pin render equality, not spec equality | Low (test coverage) | **New** |
 | PF-14 | `reject_nonempty` is a content guard with a presence-guard name | Info | **New** |
+| PF-15 | **`block_all_egress` does not block all egress** — entering `FailClosed` leaves up to 320 UDP passes (and possibly TCP/22) rendered, in honest operation | Medium | **New** (resolves the former "candidate missing finding") |
 
 ## 13. Findings
 
@@ -1547,7 +1569,7 @@ Three classes, each verified by feeding rendered output to the host's
 `/sbin/pfctl -n -f`. Each is a validated-but-unloadable spec, which lands as a
 failed load and therefore triggers PF-03.
 
-1. **Interface-name length.** `parse_interface` (`macos_pf_load_spec.rs:509`) and
+1. **Interface-name length.** `parse_interface` (`macos_pf_load_spec.rs:507`) and
    `macos_blind_exit::validate_interface_name` allow length ≤ **31**; pf's limit is
    `IFNAMSIZ-1` = **15** (`len=16` → `interface name too long`). The same codebase
    already has the correct bound: `privileged_helper.rs:1330-1332`
@@ -1640,8 +1662,7 @@ No legitimate configuration is rejected today — `MAX_AUTO_TUNNEL_PEER_COUNT = 
 (`daemon.rs:374`), and 128 IPv6 peers frame at ≈12,737 of 16,384 bytes (78%). So
 this is not a live defect. It is recorded because (a) the module's cap and the wire
 budget are mutually inconsistent, (b) headroom in the IPv6 direction is only
-≈1.6×, and (c) the module's tests assert `MAX_ARGS`/`MAX_ARG_BYTES` (`:1007-1011`,
-`:1051-1052`) but **nothing asserts the frame budget** — so a future peer-cap
+≈1.6×, and (c) the module's tests assert `MAX_ARGS`/`MAX_ARG_BYTES` (`macos_pf_load_spec.rs:1007-1011`, `:1051-1052`) but **nothing asserts the frame budget** — so a future peer-cap
 raise would not be caught by tests, and would surface as a failed load, i.e.
 PF-03.
 
@@ -1762,6 +1783,92 @@ because the sibling scalar guard `reject_present` (`:457`) genuinely is
 presence-based, so the two guards with parallel names have different semantics; a
 future field addition could reasonably assume presence semantics from the name.
 
+### PF-15 — `block_all_egress` does not block all egress (Medium, CONFIRMED by execution against real `pfctl`)
+
+Files: `crates/rustynetd/src/phase10.rs:3628-3631` (`block_all_egress`), `:5453-5459` (`force_fail_closed`), render at `:2658-2744`
+
+This finding replaces the "candidate missing finding" that section 14 item 14 was
+downgraded into, and it resolves it in a different place than expected.
+
+Only two rule families sit inside the `!strict_fail_closed` guard (`:2674-2706`):
+the DNS quartet and the two `inet all` passes. **Four families render under
+strict** — the SSH pass pair (up to 64 CIDRs → 128 rules), the traversal passes (up
+to 64), the managed-peer passes (up to 256), and the v6 block. So up to **320 UDP
+passes on the physical interface survive strict mode**, and `assert_rule_invariants`
+plus `assert_killswitch` both report healthy in every case.
+
+**The sharp part is not the mode inversion.** `block_all_egress` is
+`apply_pf_rules(true)` and its only production caller is `force_fail_closed`, which
+transitions to `DataplaneState::FailClosed`. Verified by reading: it sets
+`current_serve_exit_node = false`, calls `block_all_egress()`, sets
+`ExitMode::Off`, and transitions — it **never clears**
+`traversal_bootstrap_allow_endpoints`, `managed_peer_egress_endpoints`, or
+`fail_closed_ssh_allow_cidrs`, all of which are persistent `MacosCommandSystem`
+fields. `managed_peer_egress_endpoints` is populated during normal reconcile, i.e.
+exactly the state you are in when you fail closed.
+
+So this is a fail-closed-guarantee violation reachable in **honest operation with
+no compromise at all**. Worked example, confirmed against the host's real
+`/sbin/pfctl -n -vv`: a node with an operator STUN server and a live peer hits a
+dataplane error → `force_fail_closed` → the rendered "fail closed" ruleset is
+
+```text
+set block-policy drop
+pass quick on lo0 all
+pass out quick on en0 inet proto udp to 203.0.113.10 port 3478 keep state
+pass out quick on en0 inet proto udp to 203.0.113.7 port 51820 keep state
+block drop out quick all
+```
+
+— two off-tunnel cleartext UDP channels on the physical NIC, in the state named
+"fail closed".
+
+Held at **Medium**, not High, for three reasons: the passes are narrow by
+construction (single `ip:port`, UDP, outbound, `keep state`, interface-scoped),
+unlike PF-01's blanket `inet all`; in the compromised-daemon model it is *strictly
+dominated* by PF-01, since a daemon that can set `strict` can instead set
+`strict=false, allow_egress_interface=true` for full cleartext IPv4, so "strict is
+weaker" is not an attacker lever; and in honest operation the endpoints are
+legitimate, so the residual channels go to hosts the node was already talking to.
+
+**The mode inversion is a corollary, and narrower than first described.** Strict is
+genuinely weaker than non-strict for one case only — IPv4 UDP/TCP **port 53** with
+`dns_protected=true`, where non-strict's `quick` DNS block matches first (verified
+at `@3` vs the traversal pass at `@6`) and strict has no DNS block at all. For any
+other port both modes pass it, and for IPv6 endpoints both modes pass it, because
+the v6 endpoint pass renders *before* `block drop out quick inet6 all` — so
+`ipv6_blocked=true` does not contain a v6 traversal or managed-peer endpoint in
+either mode. That last point is the same shape as PF-02's aggravating detail 3, on
+a different parameter.
+
+**Test assurance is false here, and demonstrably so.**
+`strict_killswitch_is_minimal_and_terminal` (`macos_pf_load_spec.rs:660-681`) still
+passes at HEAD, but only because its fixture empties all four lists — it pins
+"minimal" over a fixture that cannot express the non-minimal case, as does
+`macos_render_pf_rules_strict_fail_closed_snapshot` (`phase10.rs:12326-12339`). The
+decisive evidence is that
+`macos_render_pf_rules_allow_configured_traversal_bootstrap_endpoints`
+(`phase10.rs:12513-12531`) calls `render_pf_rules(true)` and asserts the traversal
+pass **is** present. Both tests are green simultaneously: the repo pins two
+contradictory claims about what strict renders, and they coexist only because the
+fixtures differ. That also means the endpoint-under-strict behaviour is deliberate
+and test-pinned — which is the strongest argument that the defect is the missing
+list-clearing in `block_all_egress` rather than the guard placement.
+
+**Unresolved escalation lever (INFERRED — needs its own check).**
+`managed_peer_egress_endpoints` derives from `controller.managed_peer_endpoint(...)`
+(`daemon.rs:6317`), i.e. control-plane or peer-advertised data. A
+`validate_runtime_relay_candidate_endpoint` exists for relay candidates
+(`daemon.rs:14520`); whether the managed-peer path has an equivalent guard was not
+verified. If a remote peer can advertise an arbitrary endpoint and have a pass
+minted for it, this becomes **High** — a remote attacker minting an egress hole that
+survives fail-closed. Worth a targeted follow-up.
+
+Proposed enforcement (review-only — do NOT apply): have `force_fail_closed` clear
+the three lists (or have `apply_pf_rules(true)` ignore them) so the strict render
+is genuinely minimal; and replace the two "minimal" tests with ones whose fixtures
+populate all four lists, so the assertion cannot pass vacuously.
+
 ## 14. Defences that hold — verified, for the record
 
 The regeneration design is well built and most of what was aimed at it failed.
@@ -1851,10 +1958,11 @@ Each item below was probed and held:
     Under `strict_fail_closed = true` — the posture `block_all_egress` itself uses
     — there is no DNS block at all and the endpoint pass stands unopposed. That is
     the same "fires even under strict" property PF-02 flags for SSH, on a
-    parameter this part did not flag, so it is a **candidate missing finding**, not
-    merely a narrowed defence. Part III's renderer moved under
-    `fe634559`/`c5018acb`/`5bbf2062`; it needs re-verification at HEAD rather than
-    a line-number refresh.
+    parameter this part did not flag. **Now resolved as PF-15** — and the
+    re-verification changed the conclusion twice over: the sharp defect is not the
+    mode inversion but that `block_all_egress` leaves those passes rendered, and
+    the render function turns out to be **byte-identical to the baseline**, so this
+    was an error in the original credit rather than drift.
 
 ## 15. Suggested triage order for Part III
 
@@ -1886,7 +1994,7 @@ Each item below was probed and held:
 ## 16. Reproduction (Part III)
 
 ```bash
-git -C ~/Desktop/rustynet rev-parse --short HEAD   # expect 22847b12
+git -C ~/Desktop/rustynet rev-parse --short HEAD   # baseline was 22847b12; the tree has since advanced
 ```
 
 Findings marked CONFIRMED-by-execution were verified by replicating the validators
