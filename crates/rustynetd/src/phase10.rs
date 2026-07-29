@@ -1376,6 +1376,18 @@ impl LinuxCommandSystem {
                 ],
                 "wireguard listen port killswitch allow rule missing",
             )?;
+            self.assert_chain_contains(
+                &killswitch,
+                &[
+                    "oifname",
+                    self.egress_interface.as_str(),
+                    "udp",
+                    "sport",
+                    port_str.as_str(),
+                    "accept",
+                ],
+                "wireguard source port killswitch allow rule missing",
+            )?;
         }
         self.assert_chain_contains(
             &forward,
@@ -1817,6 +1829,37 @@ impl LinuxCommandSystem {
             .map_err(|err| {
                 SystemError::FirewallApplyFailed(format!(
                     "wireguard listen port {} allow rule failed: {err}",
+                    self.wg_listen_port
+                ))
+            })?;
+            // Match outbound WireGuard by SOURCE port as well.  The dport rule
+            // above only covers peers that happen to listen on our own port,
+            // which holds on a LAN but is exactly the assumption NAT traversal
+            // breaks: a peer reached at its server-reflexive candidate sits on
+            // an arbitrary NAT-mapped port (e.g. 51.186.254.100:44883), so the
+            // handshake datagram is dropped and traversal can never complete.
+            // Every datagram the daemon emits leaves its bound WireGuard socket
+            // with this source port, so matching on it keeps the rule as narrow
+            // as the dport form while covering any peer endpoint.
+            self.run(
+                PrivilegedCommandProgram::Nft,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    table.as_str(),
+                    "killswitch",
+                    "oifname",
+                    self.egress_interface.as_str(),
+                    "udp",
+                    "sport",
+                    port_str.as_str(),
+                    "accept",
+                ],
+            )
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "wireguard source port {} allow rule failed: {err}",
                     self.wg_listen_port
                 ))
             })?;

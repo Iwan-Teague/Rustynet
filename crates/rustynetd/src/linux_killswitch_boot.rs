@@ -343,6 +343,23 @@ fn install_linux_boot_killswitch_inner(
             port_str.as_str(),
             "accept",
         ])?;
+        // Also match outbound WireGuard by SOURCE port.  The dport rule only
+        // covers peers listening on our own port; a peer reached at its
+        // server-reflexive candidate sits on an arbitrary NAT-mapped port, so
+        // without this the handshake is dropped here and NAT traversal can
+        // never complete.  Every datagram the daemon emits leaves its bound
+        // WireGuard socket with this source port.
+        nft(&[
+            "add",
+            "rule",
+            "inet",
+            BOOT_KILLSWITCH_TABLE,
+            "killswitch",
+            "udp",
+            "sport",
+            port_str.as_str(),
+            "accept",
+        ])?;
     }
     // Allow outbound UDP to each configured traversal-bootstrap endpoint.
     // STUN gathering uses an ephemeral source port toward the server's
@@ -1287,6 +1304,24 @@ table inet rustynetfoo {
             source.contains("endpoint.addr.as_str()"),
             "the traversal allow rule must match the exact destination address, keeping it a \
              pinhole rather than a general UDP egress hole"
+        );
+    }
+
+    #[test]
+    fn boot_killswitch_allows_wireguard_by_source_port() {
+        // Pin against the regression this fixes: the boot chain allowed
+        // outbound WireGuard only by DESTINATION port, which silently assumes
+        // every peer listens on our own listen port. That holds on a LAN and
+        // is exactly what NAT traversal breaks -- a peer reached at its
+        // server-reflexive candidate sits on an arbitrary NAT-mapped port, so
+        // the handshake datagram was dropped with EPERM and traversal could
+        // never complete. Measured on a real two-network lab 2026-07-29:
+        // `send_to failed for 51.186.254.100:44883: Operation not permitted`.
+        let source = include_str!("linux_killswitch_boot.rs");
+        assert!(
+            source.contains("\"sport\","),
+            "install_linux_boot_killswitch_inner must emit a `sport` match so outbound \
+             WireGuard to a NAT-mapped peer endpoint is permitted"
         );
     }
 }
