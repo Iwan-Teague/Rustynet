@@ -1388,6 +1388,120 @@ The norm worth keeping: **a finding is not a finding until someone independently
 reproduced it.** Correspondingly, a fix is not done until a test fails without
 it. Most items above are instances of one or the other.
 
+### QH-31 — The lab monitor reports "idle" while an orchestrator is visibly running, because ad-hoc run discovery resolves `--report-dir` against the TUI's own cwd
+**Severity: medium (an operator watching the TUI cannot tell a live run from a dead one). Confidence: VERIFIED live 2026-07-29 against `f22be5af`, during the first run of the triage launch gate.**
+
+A real `vm-lab-orchestrate-live-lab` run was in flight — 30 stages recorded, guests
+being driven over SSH, `state/stages.tsv` updating every few seconds — and the TUI
+showed **idle**. The operator reasonably concluded the run had crashed.
+
+All three of `find_running_jobs_with_live_processes`'s discovery paths missed it:
+
+1. **Process-table discovery** (`job_watcher.rs:226-252`) exists precisely to catch
+   this case; its own doc comment says it is there "so an ad-hoc CLI-launched run is
+   found even when it has no job-state JSON". It takes the `--report-dir` value
+   **verbatim from the command line** and immediately does `if !dir_path.is_dir()
+   { continue; }`, with no `repo_root` join. A **relative** `--report-dir` therefore
+   resolves against *the TUI's* working directory. `rustynet-lab-monitor` is
+   workspace-excluded and is launched with `cd crates/rustynet-lab-monitor`, so
+   `artifacts/live_lab/<run>` does not resolve there and the live run is skipped.
+   Measured: same path resolves `YES` from the repo root, `NO` from the TUI's cwd.
+2. **`state/` orphan scan** (`:173-219`) only walks `repo_root/state/`; a report dir
+   anywhere else (`artifacts/`, `/tmp`, a lab-reports dir) is invisible to it.
+3. **No job-state JSON**, because the run was launched from the CLI rather than
+   through `start_live_lab_run`.
+
+Each path individually has a defensible reason to miss it. Together they mean the
+*normal* way a human launches a run — relative `--report-dir`, straight from the
+CLI — is the one combination nothing detects.
+
+**Fix direction (not started):** resolve a relative `--report-dir` against the repo
+root (or against the orchestrator process's own cwd, readable on macOS via
+`lsof -a -p <pid> -d cwd` and on Linux via `/proc/<pid>/cwd`) before calling
+`is_dir()`. A regression test should pin a *relative* report dir specifically —
+`parse_orchestrator_processes` is already isolated for exactly this kind of test,
+and every existing case presumably passes an absolute path, which is why this
+survived.
+
+★ **Generalisable:** this is the mirror image of the earlier candidate finding that
+the TUI shows a *phantom live run* when `pid` is null (`unwrap_or(true)`). Same
+module, same class — **liveness inferred from a signal that can silently fail to
+resolve**, failing open in one direction and closed in the other. Worth auditing
+both directions together rather than patching whichever one was last observed.
+
+**Do not mistake this for a run failure.** The ground truth while a run is in
+flight is `<report_dir>/state/stages.tsv`; the TUI is a view over job discovery,
+not over the run itself.
+
+---
+
+### QH-32 — A live-lab run prints nothing to stdout for its entire duration, so "working" and "hung" look identical
+**Severity: medium (drove a false crash diagnosis; worse for remote runs). Confidence: VERIFIED 2026-07-29.**
+
+`vm-lab-orchestrate-live-lab` emits a handful of banner lines at launch and then is
+silent for the whole run — ~10 minutes here, 30-45 for a full suite. All progress
+goes to `state/stages.tsv` and per-stage log files under the report dir. From a
+terminal there is no way to distinguish a healthy run from a wedged one without
+knowing that file exists and reading it out of band.
+
+The seam already exists: the `RustNativeStageRecorder` observer in
+`orchestrator/native.rs` is notified on every stage start and finish and upserts
+those rows today. Teeing one line per transition to stderr is nearly free.
+
+This compounds QH-31 (the TUI, the other way of watching, was simultaneously
+showing idle) and matters more for the remote host, where there is no terminal to
+glance at and `host_run_status` reads the same ledger.
+
+---
+
+### QH-33 — Several `vm_lab` unit tests perform real network I/O against the live lab subnet, making the full suite intermittently red and ~5 minutes slower
+**Severity: medium (a flaky gate is a gate nobody trusts). Confidence: VERIFIED — six full-suite runs 2026-07-29.**
+
+Across six `cargo nextest run --workspace` runs, **five different** `vm_lab` tests
+failed on different runs, each passing in isolation. Two contributing causes:
+
+- **Fixed (`7b0310d5`), but not the dominant one:** 17 tests built temp paths from
+  `SystemTime::now().as_nanos()` alone. nextest runs a crate's lib and bin test
+  targets as two processes over the same test list in lockstep, so both could derive
+  the same directory and one's `remove_dir_all` deleted the other's mid-test —
+  surfacing as failures on `fs::write`, not on assertions. All 17 now use
+  `unique_suffix()`, which also gained a pid field.
+- **Open, and dominant:** several tests do **real TCP probes against
+  `192.168.64.0/24`** — the live lab subnet — with short timeouts. One uses
+  `timeout_secs: 2`; three `execute_ops_vm_lab_discover_local_utm_*` tests take
+  ~106 s each waiting on connects and alone account for roughly five minutes of
+  every full-suite run. Timing that tight is not deterministic under nextest's
+  global concurrent pool, and the result depends on what is powered on in the lab.
+
+**Fix direction:** inject the probe behind the seam these tests already use for
+`utmctl` (they pass an `utmctl_path` to a fake script; the TCP probe has no
+equivalent). That fixes the flakiness and the runtime together.
+
+---
+
+### QH-34 — Every run records `dirty:worktree` because the run itself mutates a tracked file that the dirty-state exclude list does not cover
+**Severity: low-medium (devalues the provenance field on every evidence row). Confidence: VERIFIED 2026-07-29.**
+
+The run at `f22be5af` started from a **clean, committed tree** — `host_preflight`
+reported `local_clean PASS` moments before launch — yet its run-matrix row records
+`dirty:worktree`. The orchestrator legitimately refreshes
+`documents/operations/active/vm_lab_inventory.json` (live-IP updates) during the
+run, and unlike the three ledger CSVs and the triage JSONL, that path is **not** in
+the `:(exclude)` list used by the dirty-state check
+(`live_lab_run_matrix.rs:1425-1436`, `vm_lab/mod.rs:28931-28942`).
+
+So the field cannot distinguish "operator ran with uncommitted edits" — the thing
+it exists to warn about — from "the orchestrator updated the inventory, as designed".
+A provenance flag that is always set carries no information.
+
+**Decide, do not just add an exclude:** either exclude the inventory (accepting that
+a hand-edited inventory then goes unflagged), or sample dirty-state *before* the run
+mutates anything and record that. The second preserves the signal; the first is a
+one-line change. Worth checking whether any historical `dirty:*` reading is
+trustworthy before relying on one.
+
+---
+
 ## Related documents
 
 - `NodeEngineFlipDispositions_2026-07-24.md` — D1 carries the two_hop mechanism,

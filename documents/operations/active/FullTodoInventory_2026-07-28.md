@@ -588,7 +588,13 @@ entries pointed at, which is the argument for verifying rather than scheduling.
 - Explicitly out of scope: QH-03 (fail-open `-e` shape) and QH-13 (SSH post-host argv sink) — separate work.
 
 ### QualityHardeningTodo_2026-07-25.md
-- Status: OPEN. 30 items (QH-01..QH-30). Selected still-open highlights (full detail in the doc):
+- Status: OPEN. **34** items (QH-01..QH-34) — QH-31..QH-34 added 2026-07-29 from the first
+  live run of the triage launch gate: QH-31 lab-monitor reports "idle" during a live run
+  (relative `--report-dir` unresolvable from the TUI's cwd), QH-32 a run prints nothing to
+  stdout for its whole duration, QH-33 `vm_lab` unit tests do real network I/O against the
+  live lab subnet (intermittently red suite, ~5 min/run), QH-34 every run records
+  `dirty:worktree` because it mutates an un-excluded tracked file. Selected still-open
+  highlights (full detail in the doc):
 - QH-01 built, integration pending. QH-02 partially closed, 2 guards uncovered. QH-03 REFUTED for named script but 2 real fail-open scripts + all 10 host-script consts lack `-e`. QH-04 verified, release-blocking, **no owner assigned**. QH-05 convention not adopted. QH-06 stale guidance still lives in 6 places. QH-07 ledger `two_hop` column shows pass for a stage that's never passed (0/379). QH-08 dedicated-worktree convention not implemented. QH-09 disclosure line doesn't name the sidecar artifact across ~8 sites. QH-10 reachability probes use wrong protocol (ICMP not TCP/SSH); `wg show` failure not distinguished from no-peers. QH-11 durable state under `/private/tmp` destroyed a coordination file once — not fixed. QH-13 SSH post-host argv still unvalidated at 7 of 8 sites, upgraded to HIGH. QH-14 `provision-toolchain` Debian/apt-only despite detecting Fedora. QH-15 Windows build timeout hard-coded. QH-16 "read the tool's own exit code" convention not enforced (documents 6 related false-signal instances). QH-17 Windows lab-image provisioning gaps. QH-18 live-lab singleton gate has no real mutual exclusion (fix direction specified, not implemented). QH-19 sink-context classification not complete. QH-21 one sibling StrictMode site still exposed (`script_template.rs:1281`). QH-22 `first_failed_stage` still alphabetical. QH-24 remote-script adapter layer largely unreachable from tests. QH-25 `assert_mesh_client_nat_session` overclaims. QH-26 3 unreviewed WIP commits reached main touching trust path — needs operator decision. QH-27 no tooling fix for the rebase-across-moved-base hazard. QH-28 shipped Windows installer mints self-signed CA cert into product path — needs OPERATOR DECISION. QH-29 fail-closed assertion string-matches generated nftables text — sweep not done. QH-30 `extra_peers` fail-closed branch has no test.
 - (QH-12/QH-20 closed/resolved.)
 
