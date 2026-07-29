@@ -1,8 +1,10 @@
 # Cross-Network NAT Traversal — First Live Evidence (2026-07-29)
 
 **Status:** Active evidence record. First time rustynet's own NAT traversal has been
-exercised against two genuinely separate physical networks. Three defects found and
-fixed; direct hole-punched connectivity achieved; two quality gaps remain open.
+exercised against two genuinely separate physical networks. **Five defects found and
+fixed**; direct hole-punched connectivity achieved and **bulk data now transfers
+byte-exact over it**. Remaining open: 30% path loss, `path_live_*` under-reporting,
+reflexive-endpoint publication, and kernel-WireGuard's inability to run STUN.
 
 **Why this could not be done before:** every prior cross-network claim was blocked on
 "the owner does not have a second network right now"
@@ -48,7 +50,8 @@ lab.
 
 ## 2. Defects found and fixed
 
-All three were measured, not inferred, and each is fixed on `main`.
+All five were measured, not inferred, and each is fixed on `main`. §2.1–§2.3 unblocked
+the handshake; §4.1 covers the two MTU faults that unblocked bulk data.
 
 ### 2.1 Boot killswitch never received the STUN allow-list — `fe634559`
 
