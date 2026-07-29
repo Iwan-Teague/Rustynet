@@ -8,7 +8,7 @@ use rustynet_backend_api::{BackendError, ExitMode, Route, RouteKind, RuntimeCont
 use rustynet_tun::SyncDevice;
 
 use crate::linux_command::{
-    LinuxCommandRunner, SAFE_BRINGUP_TUNNEL_MTU, WireguardCommandRunner, validate_interface_name,
+    LinuxCommandRunner, WireguardCommandRunner, bringup_tunnel_mtu, validate_interface_name,
 };
 
 pub(crate) struct TunDevice {
@@ -283,7 +283,7 @@ impl TunLifecycle for DirectTunLifecycle {
                     "link".to_owned(),
                     "set".to_owned(),
                     "mtu".to_owned(),
-                    SAFE_BRINGUP_TUNNEL_MTU.to_string(),
+                    bringup_tunnel_mtu().to_string(),
                     "dev".to_owned(),
                     interface_name.to_owned(),
                 ],
@@ -420,7 +420,7 @@ impl TunLifecycle for HelperBackedTunLifecycle {
                     "link".to_owned(),
                     "set".to_owned(),
                     "mtu".to_owned(),
-                    SAFE_BRINGUP_TUNNEL_MTU.to_string(),
+                    bringup_tunnel_mtu().to_string(),
                     "dev".to_owned(),
                     interface_name.to_owned(),
                 ],
@@ -1416,7 +1416,7 @@ mod tests {
         // packets were silently black-holed -- measured on a real
         // cross-network path 2026-07-29, where ICMP flowed to ~1000 bytes and
         // bulk TCP stalled outright. The kernel backend already pinned
-        // SAFE_BRINGUP_TUNNEL_MTU here; these two paths were missed.
+        // the shared bring-up MTU here; these two paths were missed.
         let source = include_str!("tun.rs");
         let mtu_sets = source.matches("\"mtu\".to_owned(),").count();
         assert!(
@@ -1425,8 +1425,8 @@ mod tests {
              found {mtu_sets} mtu argv site(s)"
         );
         assert!(
-            source.contains("SAFE_BRINGUP_TUNNEL_MTU.to_string()"),
-            "the userspace-shared bring-up must use the shared SAFE_BRINGUP_TUNNEL_MTU constant \
+            source.contains("bringup_tunnel_mtu().to_string()"),
+            "the userspace-shared bring-up must resolve the MTU through bringup_tunnel_mtu() \
              rather than a divergent literal"
         );
         // Ordering matters: an MTU set after link-up leaves a window where the

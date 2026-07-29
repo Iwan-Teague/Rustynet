@@ -1327,6 +1327,21 @@ fn is_nft_token(value: &str) -> bool {
     matches!(value, "{" | "}" | ";" | "!=") || is_safe_token(value)
 }
 
+/// Accept an `ip link set mtu` value only inside the audited bring-up range.
+///
+/// Bounded by `rustynet_backend_wireguard`'s own constants so the helper and
+/// the backend can never drift apart: the ceiling is the audited default, the
+/// floor is the smallest tunnel MTU that still clears a 1280-byte outer hop.
+/// Anything outside the range -- or not a plain u16 -- is refused, so this
+/// stays a narrow capability grant rather than "any numeric MTU".
+fn is_bringup_tunnel_mtu_token(value: &str) -> bool {
+    value.parse::<u16>().is_ok_and(|mtu| {
+        (rustynet_backend_wireguard::MIN_BRINGUP_TUNNEL_MTU
+            ..=rustynet_backend_wireguard::SAFE_BRINGUP_TUNNEL_MTU)
+            .contains(&mtu)
+    })
+}
+
 fn is_interface_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 15
@@ -1909,18 +1924,20 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
         ["link", "set", "up", "dev", interface] if is_interface_name(interface) => Ok(()),
         ["link", "set", "down", "dev", interface] if is_interface_name(interface) => Ok(()),
         // FIS-0027 Phase 2 (fef40bb) made the Linux WireGuard bring-up set a safe
-        // tunnel MTU (`ip link set mtu <SAFE_BRINGUP_TUNNEL_MTU> dev <iface>`)
-        // right after interface creation. Match the value as an EXACT LITERAL,
-        // not any numeric MTU: an allowlist entry is a capability grant to
-        // whatever code might one day call the helper, so widening it to any u16
-        // would hand a compromised daemon a real (if narrow) capability for zero
-        // present-day benefit -- the only caller sends this one constant today.
-        // When FIS-0027 Phase 3 replaces the static value with a dynamically
-        // measured per-path MTU, widen this to a validated bounded range AT THAT
-        // TIME, not now.
+        // tunnel MTU (`ip link set mtu <mtu> dev <iface>`) right after interface
+        // creation. This was originally matched as an EXACT LITERAL because the
+        // only caller sent one constant, with a note to widen it to a validated
+        // bounded range once the value became dynamic.
+        //
+        // That time has come: a NAT-traversed path can ride a carrier with a
+        // smaller MTU than the 1500-byte underlay the default assumes, so the
+        // bring-up value is now resolved per host and can legitimately be lower.
+        // The range is still tightly bounded and, critically, its CEILING is the
+        // audited default -- so this can only ever make a tunnel more
+        // conservative, never grant a larger MTU than the exact-literal form
+        // allowed. A compromised daemon gains no reach it did not already have.
         ["link", "set", "mtu", mtu, "dev", interface]
-            if *mtu == rustynet_backend_wireguard::SAFE_BRINGUP_TUNNEL_MTU.to_string()
-                && is_interface_name(interface) =>
+            if is_bringup_tunnel_mtu_token(mtu) && is_interface_name(interface) =>
         {
             Ok(())
         }
@@ -3213,7 +3230,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_request_accepts_the_fis0027_bring_up_mtu_set_but_only_the_exact_literal() {
+    fn validate_request_accepts_the_bring_up_mtu_set_only_inside_the_audited_range() {
         // Regression coverage for the live-lab-verified enforce_baseline_runtime
         // failure: FIS-0027 Phase 2 (fef40bb) made the Linux WireGuard bring-up
         // run `ip link set mtu <SAFE_BRINGUP_TUNNEL_MTU> dev <iface>`, but the
@@ -3228,15 +3245,49 @@ mod tests {
         )
         .expect("the bring-up MTU-set schema linux_command sends must be accepted");
 
-        // A DIFFERENT, still-valid u16 MTU must be REJECTED -- this is the
-        // assertion that proves the entry is an exact literal match on
-        // SAFE_BRINGUP_TUNNEL_MTU rather than a lazy `parse::<u16>().is_ok()`
-        // that would over-grant the capability.
+        // The bring-up value is now resolved per host (a NAT-traversed path can
+        // ride a carrier with a smaller MTU than the 1500-byte underlay the
+        // default assumes), so the entry is a bounded RANGE rather than an exact
+        // literal. The bound is what keeps it a narrow capability grant instead
+        // of a lazy `parse::<u16>().is_ok()`.
+
+        // Above the ceiling must be REJECTED. The ceiling is the audited
+        // default, so an override can only ever make the tunnel more
+        // conservative -- never grant a larger MTU than before.
+        for over in ["9999", "1421"] {
+            let err = validate_request(
+                PrivilegedCommandProgram::Ip,
+                &["link", "set", "mtu", over, "dev", "rustynet0"],
+            )
+            .expect_err("an MTU above the audited bring-up ceiling must be rejected");
+            assert!(err.contains("unsupported ip argument schema"));
+        }
+
+        // Below the floor must also be REJECTED, so a typo cannot cripple the
+        // link to an unusable MTU.
+        for under in ["576", "1199", "0"] {
+            let err = validate_request(
+                PrivilegedCommandProgram::Ip,
+                &["link", "set", "mtu", under, "dev", "rustynet0"],
+            )
+            .expect_err("an MTU below the audited bring-up floor must be rejected");
+            assert!(err.contains("unsupported ip argument schema"));
+        }
+
+        // A legitimate constrained-path value inside the range is accepted --
+        // 1220 is what the measured 1280-byte cross-network path needs.
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["link", "set", "mtu", "1220", "dev", "rustynet0"],
+        )
+        .expect("an in-range constrained-path MTU must be accepted");
+
+        // Non-numeric junk must never reach `ip`.
         let err = validate_request(
             PrivilegedCommandProgram::Ip,
-            &["link", "set", "mtu", "9999", "dev", "rustynet0"],
+            &["link", "set", "mtu", "1420; rm -rf /", "dev", "rustynet0"],
         )
-        .expect_err("any MTU other than the exact bring-up constant must be rejected");
+        .expect_err("a non-numeric MTU token must be rejected");
         assert!(err.contains("unsupported ip argument schema"));
 
         // A non-interface-name `dev` target must also be rejected.
