@@ -7,7 +7,7 @@ Method: rolling adversarial review, one focused area per part. Each part names i
 | Part | Area | Findings | Status |
 |---|---|---|---|
 | **I** | `rustynet-policy` — ACL / policy evaluation engine | POL-01 … POL-14 | complete |
-| **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … CRY-11 | complete |
+| **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … CRY-12 | complete |
 
 This is a single rolling document by intent: the areas share the same baseline
 commit and the same fail-closed/default-deny constraints, and several findings
@@ -659,6 +659,7 @@ gap rather than a regression.
 | CRY-09 | Three security controls are entirely unwired — and `release_manifest.rs` builds exactly the provider config the default policy forbids | Medium | **New** |
 | CRY-10 | `aead_seal` doc claims OS-secure key custody; production reads a raw key from a plain file | Low (doc) | **New** |
 | CRY-11 | `Ed25519SigningProvider::from_seed` never zeroizes its by-value seed parameter | Info | **New** |
+| CRY-12 | Blob length arithmetic is unchecked — a debug-build panic if the planned armv7 target lands | Low | **New** |
 
 ---
 
@@ -743,16 +744,33 @@ reading: `"aaaaaaaaaaaaaaaa"` is accepted. Combined with CRY-01 (the file always
 exists), this string is the effective at-rest security boundary for the WG
 private key.
 
-Both encrypt and decrypt use `Argon2::default()` (`lib.rs:1324`, `:1362`) and the
-**KDF parameters are not recorded in the blob** — `EncryptedKeyBlob` carries only
-`version`, `salt`, `nonce`, `ciphertext`. Two consequences:
+Both encrypt and decrypt use `Argon2::default()` (`lib.rs:1324`, `:1362`).
+Verified against the vendored `argon2-0.5.3` source, those defaults are
+**Argon2id, version 0x13, m_cost = 19 × 1024 KiB (19 MiB), t_cost = 2,
+p_cost = 1**, 32-byte output (`params.rs:42`, `:52`, `:61`, `:76`). To be fair to
+the authors: that is exactly the OWASP-recommended Argon2id minimum, so the
+choice is defensible and is **not** itself a vulnerability — it is on the low end
+for wrapping an at-rest key (19 MiB / 2 passes is the interactive-login bar,
+where a key-wrapping KDF can usually afford more), but it clears the bar.
+
+The actual defect is that the **KDF parameters are not recorded in the blob** —
+`EncryptedKeyBlob` (`lib.rs:272-278`) carries only `version`, `salt`, `nonce`,
+`ciphertext`. Two consequences:
 
 1. There is no way to raise the KDF cost for new blobs without breaking old ones,
    because a reader cannot know which parameters produced a given blob.
-2. If the `argon2` crate ever changes its defaults (a minor-version change could),
-   every existing blob silently becomes undecryptable — the same class of
-   failure as CRY-04, arriving through a dependency bump rather than a framing
-   bug.
+2. If the `argon2` crate ever changes its defaults (a minor-version bump could;
+   they have moved historically), every existing blob silently becomes
+   undecryptable — the same class of failure as CRY-04, arriving through a
+   dependency bump rather than a framing bug. Worse, the failure is
+   indistinguishable from a wrong passphrase: both surface as
+   `DecryptionFailed`, with no diagnostic separating "bad passphrase" from
+   "parameters drifted."
+
+This is the opposite of the standard PHC-string approach, where `m`/`t`/`p` travel
+with the hash. The `version` byte is a migration lever, but as written both
+encrypt and decrypt are pinned to the *ambient crate default* rather than an
+explicitly recorded, version-bound parameter set.
 
 Credit where due, and this is a real defence: the passphrase *sources* refuse
 insecure defaults. macOS file custody is explicitly disabled in favour of the
@@ -784,11 +802,28 @@ and returns `InvalidLength` (`:1653`).
 The direction is worth stating precisely, because it determines the severity:
 this **fails closed**. The misparse cannot yield a wrong-key decryption — for a
 real v0 blob of length `44+N`, the v1 check requires `44+N == 45+G` where `G` is
-the big-endian u32 at `bytes[41..45]`; for small `N` that region is
-`[0, 0, N, ct[0]]`, giving `G = N*256 + ct[0]`, which cannot equal `N-1`. So the
-outcome is a daemon that cannot load its key and fail-closes — an availability
-and upgrade-compatibility failure, not a confidentiality bypass. That matches the
-ledger's own assessment.
+the big-endian u32 at `bytes[41..45]`, which in a v0 blob is
+`[len[1], len[2], len[3], ct[0]]`, giving `G = ((N & 0xFFFFFF) << 8) | ct[0] >= 256`
+for any `N >= 1` — always vastly larger than the required `N-1`. Confirmed by
+execution: a brute force over `N ∈ [1, 100000]` × every `ct[0] ∈ [0, 255]` found
+**zero** accepting combinations. So the outcome is a daemon that cannot load its
+key and fail-closes — an availability and upgrade-compatibility failure, not a
+confidentiality bypass. That matches the ledger's own assessment.
+
+One nuance the existing entry does not record, and it sharpens the operator
+impact: **the failure is nondeterministic per key file.** The 1/256 of v0 blobs
+whose `salt[0]` happens to be `0x00` route to the v0 parser and decode perfectly.
+So the symptom is not "all legacy nodes fail after upgrade" but "≈99.6% of legacy
+nodes fail, apparently at random" — which is materially harder to diagnose in the
+field than a uniform failure, and easy to misattribute to a bad passphrase.
+
+The reverse direction is also fail-closed, verified by execution: flipping
+`bytes[0]` to `0` on a v1 blob routes it to the v0 parser, which then reads its
+length from `bytes[40..44]` = `[nonce[23], len[0], len[1], len[2]]` — garbage
+(1728053248 vs a real 49 in the demo) → `InvalidLength`. Even had the structure
+matched, salt and nonce would be shifted by one byte and the empty-AAD path would
+face a tag computed over the v1 AAD → `DecryptionFailed`. The crate's own test at
+`:1980-1992` already pins that empty-AAD relabelling fails the tag check.
 
 Two contributions only:
 
@@ -982,6 +1017,35 @@ transient stack copy of the signing seed survives the call. The resulting
 being a default feature — confirmed in the vendored manifest), so this is the
 parameter copy only. Recorded for completeness rather than as a practical risk.
 
+### CRY-12 — blob length arithmetic is unchecked, which becomes a debug-build panic if 32-bit ARM lands (Low, forward-looking, CONFIRMED)
+
+File: `crates/rustynet-crypto/src/lib.rs:1624-1625`, `:1652-1653`
+
+Both parsers do `u32::from_be_bytes(...) as usize` and then compare
+`bytes.len() != 44 + ciphertext_len` / `!= 45 + ciphertext_len`.
+
+On every currently-shipping target this is a non-issue: `usize` is 64-bit, so
+`45 + u32::MAX ≈ 4.29e9` cannot overflow and the equality against the real
+(small) buffer length simply fails → `InvalidLength`. Verified.
+
+On a **32-bit** target it is not benign. With an attacker-declared
+`ciphertext_len` near `u32::MAX`, `44 + ciphertext_len` overflows `usize`: a
+**debug build panics** ("attempt to add with overflow") while merely *parsing a
+malformed key file*, and a release build wraps (e.g. `45 + 0xFFFFFFF5 ≡ 34 mod 2^32`,
+executed) — though the wrapped sum then mismatches the real length, so no
+malformed blob passes. There is no allocation hazard in either case: the parsers
+slice the real buffer (`bytes[44..]` / `bytes[45..]`) and only after the exact-length
+equality passes, so no capacity is ever reserved from the declared length.
+
+This is recorded because 32-bit ARM is an explicit product direction, not
+speculation: `documents/Requirements.md:141-143` names
+`armv7-unknown-linux-gnueabihf` for "low-power relay and exit/blind_exit nodes
+(e.g. Raspberry Pi Zero 2 W class hardware)", and that same entry states its
+blockers are UNVERIFIED and should be re-derived. If armv7 is attempted, this is
+one more thing to fix, and it is a two-character fix now (`checked_add` /
+`saturating_add`) versus a debug-build DoS later. Exploitation requires write
+access to the key file, which already implies serious compromise — hence Low.
+
 ## 9. Defences that hold — verified, for the record
 
 This crate resisted most of what was aimed at it. Each item below was probed and
@@ -1037,6 +1101,37 @@ held:
 9. **Dependencies are vetted primitives only**, no custom crypto, matching the
    `#3` architecture constraint and the existing PASS on
    `rustynet-crypto/Cargo.toml`.
+10. **No salt or nonce reuse on any write path.** `write_encrypted_key_file`
+    mints fresh material via `try_generate_key_custody_material()` (`:1481`) on
+    every call and passes it straight into the envelope;
+    `write_atomic_encrypted_key_file` touches no crypto state, only already-encoded
+    bytes. There is no stored-salt/stored-nonce path, so a re-encryption always
+    draws a new 192-bit nonce — the specific catastrophic failure mode for
+    XChaCha20-Poly1305 is structurally absent. Nonce reuse is only reachable by
+    calling the lower-level `encrypt_private_key_envelope` directly with a fixed
+    nonce, which the file API never does.
+11. **The atomic write is properly hardened on unix.** The temp file is opened
+    `create_new(true)` (O_CREAT|O_EXCL) with `.mode(policy.required_file_mode)`
+    applied **at creation** (`:1531-1536`), so 0o600 is set atomically and there is
+    no world-readable window (and it is umask-safe, since umask only clears bits).
+    O_EXCL means a predictable temp name (`:1569`) is at worst a squatting DoS,
+    never a symlink-follow write. Durability ordering is correct: `sync_all()` on
+    the file before rename (`:1543`), then the parent directory is opened and
+    `sync_all()`'d after rename (`:1557-1558`). The temp file is removed on the
+    write, sync, and rename error paths (`:1540`, `:1544`, `:1548`). Only residual:
+    a crash between create and rename leaves an empty 0o600 temp with no GC.
+12. **`read_encrypted_key_file` validates before reading.** Permission validation
+    (`:1579`) runs *before* `std::fs::read` (`:1580`) and before decode/decrypt —
+    check-before-read, not check-after-read. (The residual path-based TOCTOU is
+    CRY-07.)
+13. **The v1 version byte is effectively authenticated.** The v1 AAD is built from
+    `blob.version` rather than a literal `1` (`:1382`), but that arm is reached only
+    through `match blob.version { 1 => ... }` (`:1375`), so the value is provably
+    `1` there — functionally identical. Versions `2..=255` hit
+    `_ => DeniedAlgorithm` (`:1392-1395`). An attacker rewriting byte 0 achieves
+    only denial of service, and the crate pins both outcomes with tests
+    (`:1968-1978` for the deny, `:1980-1992` for the tag failure). No
+    version-confusion or AAD-substitution attack exists.
 
 ## 10. Suggested triage order for Part II
 
@@ -1057,6 +1152,9 @@ held:
    change is free.
 7. **CRY-07, CRY-08, CRY-10, CRY-11** — low-cost hygiene; CRY-08 is a comment, not
    a code change.
+8. **CRY-12** — fold into whatever work first attempts the armv7 cross-build that
+   `Requirements.md:141-143` calls for; it is a `checked_add` today and a
+   debug-build DoS after that target lands.
 
 ## 11. Reproduction (Part II)
 
