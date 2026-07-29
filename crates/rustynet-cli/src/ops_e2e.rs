@@ -2927,6 +2927,15 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
     }
     prepare_clean_issue_dir(config.issue_dir.as_path(), "traversal issue dir")?;
 
+    // Optional server-reflexive candidates, one per node:
+    //   SRFLX_SPEC="node-a|203.0.113.7:41338;node-b|198.51.100.3:15782"
+    // Absent means "host candidates only", which is exactly the previous
+    // behaviour, so an existing env file is unaffected.
+    let srflx_by_node = match env_values.get("SRFLX_SPEC") {
+        Some(spec) => parse_srflx_spec(spec.as_str(), &endpoints_by_node)?,
+        None => BTreeMap::new(),
+    };
+
     let verifier_key_output = config.issue_dir.join("rn-traversal.pub");
     let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("traversal")?;
     let result = (|| -> Result<(), String> {
@@ -2943,6 +2952,7 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
             nodes.as_slice(),
             allow_pairs.as_slice(),
             ttl_secs,
+            &srflx_by_node,
         )?;
         for pair_bundle in &traversal_artifacts.pair_bundles {
             let pair_path = config.issue_dir.join(format!(
@@ -3264,6 +3274,7 @@ pub(crate) fn issue_traversal_bundles_locally(
             nodes.as_slice(),
             allow_pairs.as_slice(),
             bundle_ttl_secs,
+            &BTreeMap::new(),
         )?;
         for node in &nodes {
             let aggregate = artifacts
@@ -3554,11 +3565,85 @@ fn issue_assignment_bundle_artifacts(
     Ok((assignment_verifier_key_hex(signing_secret), bundles))
 }
 
+/// Parse `SRFLX_SPEC` -- `node_id|ip:port` entries joined by `;`.
+///
+/// Every node named must exist in `NODES_SPEC`, and every endpoint must be a
+/// numeric `ip:port`: a server-reflexive candidate is by definition an address
+/// observed by a STUN server, so a hostname here would mean the caller supplied
+/// something else. Both are hard errors rather than skips, because silently
+/// dropping a reflexive candidate produces a bundle that looks complete while
+/// leaving remote peers unable to connect.
+fn parse_srflx_spec(
+    spec: &str,
+    endpoints_by_node: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for entry in spec.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let (node_id, endpoint) = entry
+            .split_once('|')
+            .ok_or_else(|| format!("SRFLX_SPEC entry must be `node_id|ip:port` (got: {entry})"))?;
+        let node_id = node_id.trim();
+        let endpoint = endpoint.trim();
+        if !endpoints_by_node.contains_key(node_id) {
+            return Err(format!(
+                "node {node_id} from SRFLX_SPEC is missing in NODES_SPEC"
+            ));
+        }
+        if endpoint.parse::<std::net::SocketAddr>().is_err() {
+            return Err(format!(
+                "SRFLX_SPEC endpoint for {node_id} must be a numeric ip:port (got: {endpoint})"
+            ));
+        }
+        if out
+            .insert(node_id.to_owned(), endpoint.to_owned())
+            .is_some()
+        {
+            return Err(format!("SRFLX_SPEC lists node {node_id} more than once"));
+        }
+    }
+    Ok(out)
+}
+
+/// Candidate list a peer receives for one target.
+///
+/// The host candidate outranks the server-reflexive one, which is what ICE
+/// expects and what makes a same-site pair work: two nodes behind the same NAT
+/// must reach each other on the LAN address, because reaching their own shared
+/// public address requires NAT hairpinning that many NATs do not implement. A
+/// bundle carrying only the reflexive address leaves such a pair unable to
+/// connect at all. Remote peers, for whom the host address is unroutable, fall
+/// through to the reflexive candidate.
+///
+/// A reflexive candidate identical to the host address is dropped rather than
+/// duplicated -- the control plane rejects duplicate endpoints in one bundle,
+/// and on a publicly-addressed node the two legitimately coincide.
+fn traversal_candidates_for_target(
+    host_endpoint: &str,
+    srflx_endpoint: Option<&String>,
+) -> Vec<EndpointHintCandidate> {
+    let mut candidates = vec![EndpointHintCandidate {
+        candidate_type: EndpointHintCandidateType::Host,
+        endpoint: host_endpoint.to_owned(),
+        relay_id: None,
+        priority: 900,
+    }];
+    if let Some(srflx) = srflx_endpoint.filter(|value| value.as_str() != host_endpoint) {
+        candidates.push(EndpointHintCandidate {
+            candidate_type: EndpointHintCandidateType::ServerReflexive,
+            endpoint: srflx.clone(),
+            relay_id: None,
+            priority: 800,
+        });
+    }
+    candidates
+}
+
 fn issue_traversal_bundle_artifacts(
     signing_secret: &[u8],
     nodes: &[GenericTraversalNodeSpec],
     allow_pairs: &[GenericTraversalAllowSpec],
     ttl_secs: u64,
+    srflx_by_node: &BTreeMap<String, String>,
 ) -> Result<IssuedTraversalArtifacts, String> {
     let endpoints_by_node = nodes
         .iter()
@@ -3592,12 +3677,10 @@ fn issue_traversal_bundle_artifacts(
                 generated_at_unix,
                 ttl_secs,
                 nonce: snapshot_nonce,
-                candidates: vec![EndpointHintCandidate {
-                    candidate_type: EndpointHintCandidateType::Host,
-                    endpoint: target_endpoint.clone(),
-                    relay_id: None,
-                    priority: 900,
-                }],
+                candidates: traversal_candidates_for_target(
+                    target_endpoint,
+                    srflx_by_node.get(pair.target_node_id.as_str()),
+                ),
             })
             .map_err(|err| format!("issue traversal bundle failed: {err}"))?;
         if !core.verify_signed_endpoint_hint_bundle(&bundle) {
@@ -7174,6 +7257,7 @@ pub fn execute_ops_e2e_worker_enforce_runtime(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use super::{
@@ -7432,6 +7516,7 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
             nodes.as_slice(),
             allow_pairs.as_slice(),
             120,
+            &BTreeMap::new(),
         )
         .expect("traversal artifacts should issue");
 
@@ -7546,10 +7631,114 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             nodes.as_slice(),
             allow_pairs.as_slice(),
             120,
+            &BTreeMap::new(),
         )
         .expect_err("hostname traversal endpoints must fail closed");
 
         assert!(err.contains("candidate endpoint is invalid"));
+    }
+
+    /// A peer must receive the host candidate AND, when known, the
+    /// server-reflexive one -- with host ranked higher.
+    ///
+    /// Regression pin for the same-site failure measured live: with only the
+    /// reflexive address in the bundle, two nodes behind the SAME NAT had to
+    /// reach each other via their shared public address, which needs NAT
+    /// hairpinning that the lab NAT does not implement. That pair saw 100%
+    /// loss while every cross-site pair worked. Ranking host above srflx is
+    /// what lets a same-site pair use the LAN address and a remote pair fall
+    /// through to the reflexive one.
+    #[test]
+    fn traversal_candidates_rank_host_above_server_reflexive() {
+        let candidates = super::traversal_candidates_for_target(
+            "192.168.64.10:51820",
+            Some(&"51.186.254.100:39235".to_owned()),
+        );
+        assert_eq!(candidates.len(), 2, "both candidates must be offered");
+
+        assert_eq!(candidates[0].endpoint, "192.168.64.10:51820");
+        assert!(matches!(
+            candidates[0].candidate_type,
+            super::EndpointHintCandidateType::Host
+        ));
+        assert_eq!(candidates[1].endpoint, "51.186.254.100:39235");
+        assert!(matches!(
+            candidates[1].candidate_type,
+            super::EndpointHintCandidateType::ServerReflexive
+        ));
+        assert!(
+            candidates[0].priority > candidates[1].priority,
+            "host must outrank server-reflexive so a same-site pair does not require \
+             NAT hairpinning"
+        );
+
+        // No reflexive address known: unchanged from the previous behaviour.
+        let host_only = super::traversal_candidates_for_target("192.168.64.10:51820", None);
+        assert_eq!(host_only.len(), 1);
+
+        // A reflexive address equal to the host address must not be duplicated:
+        // the control plane rejects duplicate endpoints in one bundle, and on a
+        // publicly-addressed node the two legitimately coincide.
+        let coincident = super::traversal_candidates_for_target(
+            "203.0.113.7:51820",
+            Some(&"203.0.113.7:51820".to_owned()),
+        );
+        assert_eq!(
+            coincident.len(),
+            1,
+            "a reflexive candidate identical to the host address must be dropped"
+        );
+    }
+
+    #[test]
+    fn parse_srflx_spec_validates_nodes_and_endpoints() {
+        let endpoints = BTreeMap::from([
+            ("node-a".to_owned(), "192.168.64.4:51820".to_owned()),
+            ("node-b".to_owned(), "192.168.121.26:51820".to_owned()),
+        ]);
+
+        let parsed = super::parse_srflx_spec(
+            "node-a|203.0.113.7:41338; node-b|198.51.100.3:15782",
+            &endpoints,
+        )
+        .expect("well-formed spec should parse");
+        assert_eq!(
+            parsed.get("node-a").map(String::as_str),
+            Some("203.0.113.7:41338")
+        );
+        assert_eq!(
+            parsed.get("node-b").map(String::as_str),
+            Some("198.51.100.3:15782")
+        );
+
+        // Absent/empty is the documented "host candidates only" case.
+        assert!(
+            super::parse_srflx_spec("", &endpoints)
+                .expect("empty spec is valid")
+                .is_empty()
+        );
+
+        // Every rejection below is a hard error rather than a skip: silently
+        // dropping a reflexive candidate yields a bundle that looks complete
+        // while leaving remote peers unable to connect.
+        for (bad, why) in [
+            ("node-a=203.0.113.7:41338", "missing the | separator"),
+            ("ghost|203.0.113.7:41338", "node absent from NODES_SPEC"),
+            (
+                "node-a|stun.example.com:3478",
+                "hostname rather than ip:port",
+            ),
+            ("node-a|203.0.113.7", "missing port"),
+            (
+                "node-a|203.0.113.7:41338;node-a|198.51.100.3:1",
+                "duplicate node",
+            ),
+        ] {
+            assert!(
+                super::parse_srflx_spec(bad, &endpoints).is_err(),
+                "must reject {why}: {bad:?}"
+            );
+        }
     }
 
     #[test]

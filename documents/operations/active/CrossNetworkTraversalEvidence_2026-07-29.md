@@ -267,6 +267,59 @@ daemon reports `path_live_peer_count=0`, `path_live_proven=false`,
 `traversal_probe_latest_handshake_unix=multiple`. The liveness accounting disagrees with
 observable reality; treat `path_live_*` as unreliable evidence until reconciled.
 
+### 4.4 Reflexive endpoints could not be expressed in a bundle — **STRUCTURAL HALF FIXED**
+`srflx_candidates` counts candidates **inside the signed traversal bundle**
+(`daemon.rs:5906-5918`), not locally-gathered STUN results. The daemon side was never the
+problem: it already parses a candidate *list*, counts host/srflx/relay separately, and
+races the list through `traversal_direct_probe_candidates`. The control plane was not the
+problem either — `EndpointHintCandidateType` has had `Host | ServerReflexive | Relay`,
+plus a signed/TTL'd/nonce'd `signed_endpoint_hint_bundle` and its wire codec, all along.
+
+**The gap was one line of issuance.** `issue_traversal_bundle_artifacts` emitted exactly
+one candidate per pair, hardcoded to `Host`, from the static `NODES_SPEC` endpoint — so a
+reflexive address had no way into a bundle at all, and the only way to use one was to
+hand-mint the whole bundle with the public address *replacing* the host address. That is
+what forced the manual re-minting, and what caused §4.4b.
+
+Issuance now emits `Host` **and**, when supplied, `ServerReflexive`, with host ranked
+higher (900 vs 800) as ICE expects. A reflexive candidate identical to the host address is
+dropped rather than duplicated, since the control plane rejects duplicate endpoints and on
+a publicly-addressed node the two legitimately coincide. Reflexive addresses are supplied
+per node via an optional `SRFLX_SPEC="node|ip:port;…"`; absent means host-only, exactly the
+previous behaviour, so existing env files are unaffected. Malformed entries, unknown nodes,
+and non-numeric endpoints are hard errors — silently dropping a reflexive candidate would
+yield a bundle that looks complete while leaving remote peers unable to connect.
+
+**Still open — the automation half.** A node discovers its own reflexive address
+(`netcheck` reports `stun_candidates=<ip:port>`, correctly bound to the WG listen port),
+but nothing carries it to the issuer automatically: it must still be collected and fed
+into `SRFLX_SPEC`, and it changes when a NAT binding is rebuilt. Closing that means
+publishing the discovered candidate over gossip and merging it into the issued bundle —
+D14.d. The primitive for it already exists and is unused: `signed_endpoint_hint_bundle`
+is signed with a *separate* endpoint-hint key derived from the control-plane secret, and
+the daemon currently uses that key only to verify coordination records.
+
+### 4.4b Same-site peers cannot connect — **CAUSE FIXED, needs live re-proof**
+### 4.4b Same-site peers cannot connect — NAT hairpin, OPEN
+Two nodes behind the *same* NAT hold only each other's server-reflexive endpoint
+(e.g. `xnet-ubu-2/213.233.155.131:14558` as seen from `xnet-ubu-1`, its own site's public
+address). Reaching that requires NAT hairpinning, which many NATs do not support, so the
+pair never connects — 100% loss, and it is the reason `path_live_peer_count` is 2 of 3
+rather than 3 of 3.
+
+The bundle format already supports a candidate *list* per peer
+(`TraversalCandidateType::{Host,ServerReflexive,Relay}`), which is exactly what ICE needs
+to prefer a host candidate for a same-site peer and srflx only for remote ones. Nothing
+populates more than one candidate today, so this is the same root as §4.4: candidates are
+never published, they are hand-minted one-per-peer.
+
+### 4.3 `path_live_peer_count` stays 0 while traffic flows — reporting discrepancy
+Real bidirectional traffic is captured on the wire and mesh pings succeed, yet the
+daemon reports `path_live_peer_count=0`, `path_live_proven=false`,
+`path_latest_live_handshake_unix=none` — while `traversal_probe_result=direct` and
+`traversal_probe_latest_handshake_unix=multiple`. The liveness accounting disagrees with
+observable reality; treat `path_live_*` as unreliable evidence until reconciled.
+
 ### 4.4 Reflexive endpoints are never published — the structural gap
 `srflx_candidates` counts candidates **inside the signed traversal bundle**
 (`daemon.rs:5906-5918`), not locally-gathered STUN results. Nothing feeds a node's
