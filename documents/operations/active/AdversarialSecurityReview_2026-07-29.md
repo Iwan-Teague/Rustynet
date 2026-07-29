@@ -12,6 +12,8 @@ Method: rolling adversarial review, one focused area per part. Each part names i
 | **IV** | `rustynet-relay` — remote/unauthenticated input path | RLY-01 … RLY-14 | complete |
 | **V** | `rustynet-control` — the trust issuer (signed-artifact issuance) | CTL-01 … CTL-07 | complete |
 | **VI** | Windows privileged + at-rest surface (named pipe, DPAPI, WFP) | WIN-01 … WIN-10 | complete |
+| **VII** | IPv6 leak prevention + blind-exit dataplane (Linux, macOS) | IPV-01 … IPV-14 | complete |
+| **VIII** | Enrollment — token, ledger, admit path | ENR-01 … ENR-15 | complete |
 
 This is a single rolling document by intent: the areas share the same baseline
 commit and the same fail-closed/default-deny constraints, and several findings
@@ -2312,7 +2314,8 @@ Prior coverage, enumerated before writing: **RSA-0008** (Medium, open — issuan
 
 **Re-rated and re-attributed 2026-07-29 (meta-review).** This finding was originally rated High and called "the single highest-leverage fix in the whole document." Both claims were wrong and are corrected here, because leaving them would have sent an engineer down a day-long path for nothing:
 
-- **Reachability discount, which this finding failed to apply to itself.** The only two writes to `ControlPlaneCore.nodes` are `enroll_with_throwaway` and `enroll_with_throwaway_and_persist`, and **both have zero production callers** — verified directly, every call site is ≥ `:4721`, inside the `#[cfg(test)]` module. So the injection precondition, a *registered* node id containing `\n`/`=`, is not reachable in a shipped `ControlPlaneCore`. That is exactly the discount CTL-04 applies to itself two findings later, and that POL-10, CRY-09, CTL-03 and WIN-07 all receive. Consistency demands it here.
+- **The Medium rating is right, but the reason first given for it was wrong — corrected again after Part VIII.** The first re-rating argued that `enroll_with_throwaway` and its persisting sibling have zero production callers, so the precondition was unreachable. Those two do indeed have no production callers, but they are **not** the only writers. `NodeRegistry::upsert` (`lib.rs:1354-1358`) is `pub`, is a bare `guard.insert(...)` with **no validation at all** — not even the non-blank check — and is called with operator-supplied node ids by **three shipped CLI verbs**: `auto-tunnel issue` (`rustynet-cli/src/main.rs:6892`), `dns-zone issue` (`:6999`), and `traversal issue` (`:7090`), all verified directly. Part VIII confirmed by execution that `rustynet traversal issue` registers `source_node_id = "exit-1\ntarget_node_id=victim"` and emits a **validly signed** endpoint-hint bundle carrying the injected line. So the precondition **is** reachable in production. What actually holds this at Medium is **consumer-side containment, not unreachability**: the daemon's `parse_traversal_bundle_section` (`rustynetd/src/daemon.rs:13870-13917`) enforces a strict key allowlist plus duplicate-key rejection and refuses the injected bundle, and the issuer's own `verify_signed_endpoint_hint_bundle` returns `false` on it. Recording the correct reason matters: containment can be weakened by a future consumer, whereas unreachability could not.
+- **The `=` half is overstated — narrow to `\n`/`\r`.** Part VIII tested `=` on both the membership snapshot and the endpoint-hint payload: every parser splits on the *first* `=` (`split_once('=')`), so `node_id=exit-1=x` round-trips and verifies `true`. `|` and tab are likewise harmless. Only `\n` and `\r` bite, and `\r` has its own distinct effect (ENR-03).
 - **The class is already tracked.** `SecurityAndQualityAudit_2026-06-10.md:422` (**AUDIT-042**, Low) records the same defect in `membership.rs` — fields embedding `node_id` "with only `trim().is_empty()` checks — no rejection of embedded `\n`/`=`" — and explicitly names the contrast with `is_single_line_payload_value`. Extending the class to `is_valid_node_id_text` and the issuance payloads is legitimate new work; calling the class itself new was not.
 - **Scope contradiction, now acknowledged.** Part V's header lists enrollment as in scope *and* `enrollment.rs` as out of scope. The production enrollment surface is `rustynet_control::enrollment` plus the IPC enrollment commands — the module that would actually determine reachability — and it was **not** reviewed (it has its own ledger row, RSA-0015, open). A High rating for this finding cannot be argued without covering it.
 
@@ -2353,7 +2356,7 @@ This is also the sharpest answer to Part I's POL-06 follow-up: `signed_peer_map`
 
 `EnrollmentRequest.now_unix` (`:1381`) is supplied by the enrolling party and used verbatim as the clock for the credential-expiry decision, in both the in-memory store (`:816`) and the SQL backend (`persistence.rs:341-359`). Executed on a credential expiring at 160: an honest `now_unix = 1_000_000` gives `credential expired`, while a back-dated `now_unix = 150` **enrolls**. Nothing sweeps unused expired credentials, so back-dating revives them indefinitely; the same field also sets the access-token window, and `now_unix = 4_000_000_000` mints a token accepted until 2096.
 
-Latent: `EnrollmentRequest` has no production construction and `enroll_with_throwaway` has no callers outside tests. Answering the sub-questions directly — enrollment is authenticated only by possession of a single-use `credential_id`; there is no rate limit, nonce, or replay guard beyond the credential's use counter; and state allocation correctly happens *after* the credential is consumed, so there is no pre-auth allocation.
+Latent, and **confirmed not to repeat on the production path (Part VIII)**: `verify_and_consume_token` takes **no clock argument** — it calls `current_unix_seconds()` internally, and every production caller (the IPC handler and the CLI) uses that trusted-clock entry point. The `_with_now` variants exist but are test-only. So this defect is confined to the unwired `ControlPlaneCore` surface. `EnrollmentRequest` has no production construction and `enroll_with_throwaway` has no callers outside tests. Answering the sub-questions directly — enrollment is authenticated only by possession of a single-use `credential_id`; there is no rate limit, nonce, or replay guard beyond the credential's use counter; and state allocation correctly happens *after* the credential is consumed, so there is no pre-auth allocation.
 
 ### CTL-05 — no bundle verifier checks expiry (Medium, CONFIRMED by execution)
 
@@ -2530,3 +2533,186 @@ The named-pipe boundary is the best-built surface in this part, and both of the 
 Part V's CONFIRMED-by-execution findings were driven by two standalone binaries outside the repo, built against the real `rustynet-control` with an isolated `CARGO_TARGET_DIR`: they enroll node ids containing delimiters, re-frame signed bundles against the same signature bytes, and exercise the wire-splitter battery.
 
 Part VI could not execute Windows syscalls on this macOS host. The SDDL evaluators and the path validators were extracted verbatim into a scratch program and **run**, which is what established WIN-01, WIN-04, WIN-06, WIN-08, and WIN-09. Every claim about Win32 runtime behaviour — NPFS name ownership, client impersonation defaults, WFP arbitration, reparse-point handling — is labelled **INFERRED** and should be confirmed on a Windows host before being treated as established.
+
+---
+
+# Part VII — IPv6 leak prevention + blind-exit dataplane (Linux, macOS)
+
+Crate baseline: `crates/rustynetd/src/{linux_ipv6_leak.rs, macos_ipv6_leak.rs, linux_blind_exit.rs, linux_blind_exit_dataplane.rs}` — 1753 lines, **all four with zero audit-ledger rows**
+Scope: what actually prevents IPv6 traffic egressing outside the tunnel on Linux and macOS, the verifiers that certify it, and the blind-exit forward-chain posture
+Out of scope for this part: `linux_killswitch_boot.rs` and `linux_runtime_nftables.rs` (both already have rows, used as context only)
+
+## 28. Why this area, and the result that reframes RN-07
+
+`SecurityReview_2026-05-24.md` records **RN-07**: on Windows, "disable IPv6" only suppresses router advertisements while native IPv6 egress is still permitted — a real traffic leak. Its remediation (`:231`, `:516`) is to bring Windows "to **Linux parity**", so Linux is treated as the reference.
+
+**The reference holds on the path it is credited for, and fails on a path nobody checked.** My sharpest hypothesis — that Linux suppresses rather than blocks — is **refuted**: there is not a single `accept_ra` write anywhere in `crates/` (verified directly), and `disable_ipv6=1` on `all` is a stack-level kill. RN-07's specific defect is genuinely absent from Linux *enforcement*.
+
+But three things fall out that matter more:
+
+1. **RN-07's own premise sentence is false on exit-serving nodes.** `SecurityReview_2026-05-24.md:118` asserts "Linux … uses an `inet` killswitch (drops v4+v6)". IPV-01 shows it does not, for any NATing exit.
+2. **macOS is the *stronger* platform on family scoping, not the weaker one** — the opposite of what the remediation assumes. Anyone acting on "bring Windows to Linux parity" should target macOS's rendering discipline instead.
+3. **RN-07's defect class is alive inside the Linux reference's own verifier** (IPV-04), which credits an RA-suppression rule as IPv6 egress containment.
+
+All four files postdating the ledger's snapshot (added 2026-06-22 … 2026-07-02) is the root cause of **PF-12**, now confirmed as systematic.
+
+| ID | Finding | Severity | New? |
+|---|---|---|---|
+| IPV-01 | The Linux exit own-egress accept is **family-agnostic**, so an `inet` killswitch does not contain IPv6 on any NATing exit — and the assertion *requires* that rule | High | **New**; extends RN-12, contradicts RN-07's premise |
+| IPV-02 | `ipv6_parity_supported=true` removes the only working IPv6 control and replaces it with a table that does not exist | High (latent) | **New** — no security ID owns the hazard |
+| IPV-03 | `nft_ruleset_has_v6_drop` credits chain `policy drop` while ignoring every `accept` above it | High | New site; CONFIRMS RN-27 / PF-05 class |
+| IPV-04 | `rule_is_v6_drop` credits RA suppression, single-address, DNS-only, input-hook, unhooked and **foreign-table** drops | High | **New** — RN-07's defect relocated into the verifier |
+| IPV-05 | `probe_attempted` only proves the ping binary exists; a failed pcap capture reads as zero leaks | Medium-High | **New**; withdraws an "exemplar" credit the repo currently gives these files |
+| IPV-06 | The sole production IPv6 control is an unasserted, allowlist-revocable sysctl, with no Linux drift loop | Medium | **New** |
+| IPV-07 | `prior_ipv6_disabled` is re-captured on every apply, clobbering the true baseline | Medium | **New** |
+| IPV-08 | Blind-exit drift checks are exact-string equality — evaded by `counter`, set syntax, comments; blind to supersets and `policy accept` | Medium | **New** |
+| IPV-09 | The blind-exit mesh allow is credited from any table and any chain, including unhooked and foreign ones | Medium | **New** |
+| IPV-10 | The blind-exit evaluator is not on the daemon runtime assert path at all, contradicting its own module doc | Medium | **New** |
+| IPV-11 | The blind-exit re-author is three `nft` invocations, not one transaction | Low-Medium | **New**, adjacent to PF-03 |
+| IPV-12 | The WireGuard port allows are family-agnostic — the one rule RN-07 holds up as the narrow model | Low | **New** |
+| IPV-13 | macOS `pf_rules_have_v6_block` never checks direction, interface, or anchor reachability | Low | **New** for direction/scope; precedence half CONFIRMS PF-02/PF-05 |
+| IPV-14 | Orchestrator passes no `--killswitch-table`, so the nft branch evaluates a stale generation | Info | **New** |
+
+## 29. Findings
+
+### IPV-01 — the Linux `inet` killswitch does not contain IPv6 on an exit node (High; CONFIRMED by reading, nftables matching INFERRED)
+
+`phase10.rs:2385-2402` adds, for every regular NATing exit, `add rule inet <table> killswitch oifname <egress> accept` — verified directly: the argv contains `oifname`, the interface, and `accept`, with **no `ip` or `ip6` qualifier**. In an `inet` table that matches **both families** (INFERRED — nftables semantics), so the node's own native IPv6 egress out the physical NIC is accepted before `policy drop` is ever consulted.
+
+`assert_firewall_ruleset` does not merely tolerate this — it **requires** it (`:1421-1427`, "egress-interface killswitch allow rule missing while nat forwarding is active"), verified directly. So the assertion enforces the rule that defeats the containment.
+
+Contrast macOS (`:2697-2705`): every `pass out` is explicitly `inet all` — verified, both occurrences — so IPv6 falls through to `block drop out quick inet6 all` and the terminal block **by construction**, independent of the `ipv6_blocked` flag. That is why macOS, not Linux, is the tighter reference.
+
+Reachability today is **masked, not absent**: `phase10.rs:5307-5310` runs `hard_disable_ipv6_egress()` whenever `!ipv6_parity_supported`, and production hardcodes that false, so the sysctl covers it. The nft path becomes the only control the moment that flag flips — which is IPV-02. RN-12 already records the *DNS* dimension of this same rule; the IPv6 dimension is recorded nowhere.
+
+### IPV-02 — flipping `ipv6_parity_supported` removes the working control and substitutes one that does not exist (High, latent)
+
+`:5307` skips the kernel disable when the flag is true and `:5346-5350` actively *rolls back* a previously applied disable. The intended replacement — an `ip6` sibling table — is still listed as unbuilt in `PlatformImprovementBacklog_2026-05-14.md:248-252`, and the only checker of that invariant (`linux_runtime_nftables.rs:192-210`) is recorded in the ledger as "entire module is unwired in production." Apply ordering is fine, but `apply_nat_forwarding` then installs IPV-01's accept, so the post-flip end state on an exit node is: IPv6 enabled, IPv6 egress accepted, nothing checking. The *plan* is tracked; the *hazard* is owned by no security ID.
+
+### IPV-03 / IPV-04 — the IPv6-leak verifier certifies leaks (High, CONFIRMED by execution)
+
+Two independent defects in `linux_ipv6_leak.rs`:
+
+**IPV-03** credits containment on `line_is_terminal_drop` (`:220`, `:237-247`) inside an egress base chain — but `policy drop` is the chain *default*, applied only after every rule fails to match, and the function never inspects rules. Fed the exact ruleset IPV-01 produces, the whole chain returns a clean pass: `killswitch_v6_drop_present=true`, `leaked=0`, `PASS containment=inet/ip6-killswitch-drop`. The module's own fixture `INET_KILLSWITCH_WITH_TERMINAL_DROP` (`:369-374`) already contains an `accept` after `policy drop` and asserts `true`, so the blind spot is **pinned as correct behaviour**. RN-27 records exactly this for `block_all_egress` and PF-05 for macOS pf; neither names this module.
+
+**IPV-04** is the sharper one: `rule_is_v6_drop` (`:227-235`) needs only a v6 *selector* plus the substring `drop`, and `:215` evaluates it **before** any table or hook gate. All of these returned `killswitch_v6_drop_present=true`:
+
+| Rule credited as IPv6 egress containment | What it actually does |
+|---|---|
+| `icmpv6 type nd-router-advert drop` | suppresses autoconfiguration — **verbatim RN-07** |
+| `icmpv6 type echo-request drop` | blocks only what the `ping -6` probe measures — circular |
+| `ip6 daddr 2606:4700:4700::1111 drop` | one address |
+| `ip6 daddr ::/0 udp dport 53 drop` | DNS only |
+| `meta nfproto ipv6 drop` on `hook input` | inbound only |
+| the same in an unhooked chain | never evaluated by the kernel |
+| the same in a **foreign table** | not ours at all |
+
+So an operator who adds `icmpv6 type nd-router-advert drop` believing it stops IPv6 gets `containment=inet/ip6-killswitch-drop` while TCP and UDP over IPv6 egress freely. This is RN-07 with the platforms swapped: the Windows *implementation* has been fixed, while the Linux *verifier* still accepts the defective shape.
+
+### IPV-05 — the evidence path fails open twice, and the repo credits these files as the exemplar (Medium-High, CONFIRMED by execution)
+
+`linux_ipv6_leak.rs:346` / `macos_ipv6_leak.rs:242`: `let probe_attempted = ping_status.is_ok();`. `Command::status()` returns `Ok` for any process that spawned and exited, so a guest with **no IPv6 upstream at all** reports `attempted=true, reached=false, leaked=0` → clean pass. Only a genuinely absent `ping` binary is caught. That is the weak-negative anti-pattern `LiveLabCoverageAndHonestyAudit_2026-06-25.md:170` names explicitly.
+
+`linux_ipv6_leak.rs:351-355`: the pcap read is `.unwrap_or_default()`. `tcpdump` `spawn()` succeeds for a nonexistent interface, no pcap is written, the read returns empty, and `count_pcap_datagrams("")` → `0` → "no leak". Since `--egress-iface` is orchestrator-supplied, a wrong interface name produces a clean pass. Same `unwrap_or_default()` fail-open already recorded **CRIT** for `linux_exit_nat_lifecycle.rs` in that audit's items #1/#2 — this is its unfixed twin.
+
+**This withdraws a credit the repo currently gives.** `LiveLabCoverageAndHonestyAudit_2026-06-25.md:176-181` and `LiveLabWave0_LinuxHonestyFixes_2026-06-25.md:20-23` both hold these two files up as the *exemplary* anti-vacuous template. That credit is not earned.
+
+### IPV-06 / IPV-07 — the sysctl is unasserted and its baseline is clobbered (Medium)
+
+**IPV-06:** no assertion re-reads `/proc/sys/net/ipv6/conf/all/disable_ipv6`. The asymmetry is stark — `assert_nat_forwarding` *does* re-read `ip_forward` and fails closed on drift. `sysctl -w …disable_ipv6=0` is an allowlisted argv (`privileged_helper.rs:2081-2084`), necessary for legitimate rollback but revocable by a daemon compromised to helper uid, with nothing noticing. There is also **no periodic reconcile on Linux**: macOS has a fixed-interval poller, Linux runs its asserts only inside `apply_dataplane`, so an external `nft flush ruleset` goes undetected until the next apply. RN-07's own remediation demands verification in `assert_killswitch`; the reference platform never does it either.
+
+**IPV-07:** `:2561-2568` captures the prior value unconditionally, where the IPv4 twin at `:1705-1710` guards with `if self.prior_ipv4_forwarding.is_none()` and its comment calls the unguarded form a "residue release-blocker". Second apply reads the already-set `1` and overwrites the true baseline `0`, so rollback leaves the operator's host with IPv6 permanently disabled. Fail-*closed* for leaks, so this is residue rather than a leak — but it means the captured prior is untrustworthy after the first re-enforce.
+
+### IPV-08 … IPV-11 — the blind-exit posture (Medium / Low-Medium)
+
+- **IPV-08:** `linux_blind_exit.rs:196-217` compares whole normalized lines with `==`. Every one of `oifname "eth0" counter packets 12 bytes 900 accept` (how nft actually renders counters), `ct state new accept`, `oifname { "eth0" } accept`, `oif "eth0" accept`, a trailing `comment "…"`, `iifname "rustynet0" accept`, `oifname "eth0" ip saddr 0.0.0.0/0 accept`, and `policy accept;` produced **zero drift reasons**. The last two are the serious ones: a **superset** allow beside the correct mesh-scoped rule is invisible, so the "scoped to the mesh CIDR" guarantee is unverified. The module doc claims the forward chain "keeps `policy drop`" — the builder never sets it and the evaluator never checks it. The repo already knows `counter` breaks naive matching (`phase10.rs:2175-2185` documents it for `assert_chain_contains`); the blind-exit evaluator uses equality, so it does not survive it.
+- **IPV-09:** `:168`, `:182-192` flatten the whole ruleset with no table or chain scoping — the mesh rule is credited from an unhooked chain, from the output chain with no forward chain at all, and from a foreign table.
+- **IPV-10:** the module doc says the evaluator "is what the runtime assert path and the unit tests both call." It is not — the only non-test caller is the lab subcommand. The daemon path degenerates: `assert_exit_serving` calls `assert_killswitch` + `assert_nat_forwarding`, and the latter returns `Ok(())` immediately when `nat_table` is `None`, always true for blind_exit by design. So a blind_exit node's exit-serving assertion is just the base killswitch check, and `chain_contains_all_tokens` matches tokens as independent substrings, so it **cannot distinguish** the mesh-scoped rule from an unrestricted one. macOS imports its blind-exit evaluator into the daemon; Linux does not.
+- **IPV-11:** the re-author is three separate `nft` invocations in a loop. Flush succeeds, an `add` fails → the forward chain is **empty**, which is fail-closed *only because* the chain policy is drop — the property IPV-08 shows is neither set nor verified. Same shape as PF-03, opposite outcome today, resting on an unchecked invariant.
+
+### IPV-12 … IPV-14 — smaller items (Low / Info)
+
+- **IPV-12:** `phase10.rs:1811-1866` adds the WireGuard `udp dport`/`sport` allows with no family qualifier, so UDP/51820 egresses over IPv6 too. Every *other* parameterised allow is family-scoped. `SecurityReview_2026-05-24.md:518` cites this rule as the narrow model Windows should mirror; it is not as narrow as claimed.
+- **IPV-13:** `macos_ipv6_leak.rs:144-162` credits `block drop in quick all` (inbound), a loopback-scoped block, a DNS-only block, and a ruleset where `pass out quick on en0 inet6 all` precedes the block, as IPv6 *egress* containment. It also never verifies the anchor is referenced by the main ruleset — an orphaned anchor reports identically. The precedence half is PF-02's mechanism; the direction/scope crediting is new.
+- **IPV-14:** `role_validation/ipv6_leak.rs:54-59` passes no `--killswitch-table`, so it always evaluates `rustynet_g1` while the daemon rotates the generation. Conservative in effect (a real drop in `g2` is *not* credited), but it means the nft branch mis-evaluates on any rotated generation.
+
+## 30. Defences that hold (Part VII)
+
+Two of my hypotheses were refuted outright, which is the most useful part of this pass:
+
+1. **Linux does not suppress-instead-of-block.** Zero `accept_ra` writes in `crates/`, verified. `disable_ipv6=1` is a stack-level kill covering statically configured addresses and pre-installed default routes (INFERRED: kernel semantics). RN-07 has no Linux twin on the enforcement path — only in the verifier.
+2. **The mesh CIDR cannot be widened into an open relay — hypothesis refuted.** `validate_mesh_egress_source_cidr` *is* correctly applied on the Linux dataplane path (`linux_blind_exit_dataplane.rs:85` → `LinuxBlindExitConfig::new` → `:251`, re-validated at render). Executed: `0.0.0.0/0`, `::/0`, `0.0.0.0/1`, `8.8.8.0/24`, `100.0.0.0/8` all rejected; `100.64.0.0/10`, `10.0.0.0/8`, `fc00::/7` accepted.
+3. **The nft parser's hook state machine is correct per chain** — an `input` chain following an `output` chain is not credited, and `policy drop;` on its own line after `hook input` is not credited.
+4. **Table-name matching is exact** — `rustynet_g1x` is not credited for `rustynet_g1`; generation mismatch fails closed.
+5. **Two of the three captures fail closed** — a `capture_proc_flag` read error yields `ipv6_disabled=false`, and a `capture_nft_ruleset` failure yields `drop_present=false`. Only the pcap read fails open (IPV-05).
+6. **`read_sysctl_bool` refuses unknown values**, so a garbage or unreadable sysctl aborts the apply rather than recording a false baseline.
+7. **The blind-exit NAT-absence check is the right shape** — substring over the whole normalized ruleset, table-unscoped, which for a *forbidden* item is the correct direction; it caught an injected `snat` in execution.
+8. **Blind-exit input validation is solid** — identical tunnel/egress rejected, interface and table names charset- and length-bounded, argv-only with shell-metacharacter tests pinned.
+9. **The blind-exit checker's expected mesh CIDR is a hardcoded constant** and the orchestrator passes no overrides, so an operator cannot talk it into blessing a wider installed rule.
+10. **`build_unobservable_report` fails closed rather than skip-as-pass** — off-Linux, `nft` failure, and egress-detection failure all set `host_observable=false` → `overall_ok=false`. A genuinely better shape than the IPv6 modules', which have no such field.
+11. **Apply ordering is fail-closed** — the killswitch is installed before obsolete controls are rolled back, and rollback runs stages in reverse.
+12. **blind_exit irreversibility holds** — rollback re-applies the hard lock rather than relaxing to open NAT, and removal is `FactoryReset`-only with all five events pinned by test.
+13. **Rules do not duplicate on re-apply** — each apply bumps the generation so the table is rebuilt, and blind_exit flushes before re-adding. Idempotence holds; drift *detection* between applies does not (IPV-06).
+
+---
+
+# Part VIII — Enrollment (token, ledger, admit path)
+
+Crate baseline: `crates/rustynet-control/src/enrollment.rs`, `membership.rs`; `crates/rustynetd/src/{enrollment_token.rs, enrollment_consume.rs}`; the `enrollment` CLI verbs in `rustynet-cli/src/main.rs`
+Scope: what authenticates an enrollment, how single-use is enforced and persisted, what the enrollee receives, and whether operator-supplied identifiers can corrupt signed state
+Purpose: this part exists to close an **acknowledged gap** — Part V listed enrollment in scope while excluding `enrollment.rs`, and CTL-01's severity turned on it
+
+## 31. The CTL-01 question, answered
+
+**CTL-01's Medium rating is correct, but the reason first given for it was wrong**, and CTL-01 has been corrected in place. The discount rested on `enroll_with_throwaway` having no production callers. True, but not the only writer: `NodeRegistry::upsert` is `pub`, validates **nothing**, and has three production CLI callers. A node id containing `\n` **can** be registered in production, and `rustynet traversal issue` was shown by execution to emit a validly signed bundle carrying the injected line. What holds the severity down is **consumer-side containment** — the daemon's strict key allowlist and duplicate-key rejection — not unreachability. That distinction matters, because containment can be weakened by a future consumer while unreachability could not.
+
+Two precisions also folded back into Part V: the `=` half of CTL-01 is **overstated** (every parser splits on the first `=`, so `=`, `|` and tab are harmless; only `\n`/`\r` bite), and CTL-04's caller-supplied-clock defect **does not repeat** on the production path.
+
+Prior coverage: **RSA-0015** (Info, open), **RSA-0023** (Medium, applied 2026-06-24 — but both per-file rows still read `open`), **RSA-0079** (Low, open), **AUDIT-042** (Low, open), **AUDIT-011** (Low, open), **RN-26** (open), RSA-0059/RSA-0029 adjacent. No prior coverage exists for the operator CLI entry point, the TTL cap, the `<ledger>.lock` file, `load_ledger`'s permission handling, or the push-address policy.
+
+| ID | Finding | Severity | New? |
+|---|---|---|---|
+| ENR-01 | `enrollment admit --node-id` with a newline **permanently corrupts the persisted membership snapshot** | Medium | CONFIRMS AUDIT-042 class; new at the operator entry point |
+| ENR-02 | `NodeRegistry::upsert` has zero validation and three production callers | Medium | **New** — corrects CTL-01 |
+| ENR-03 | A `\r` silently mutates an identifier across encode/decode, producing state-root drift | Medium | **New** |
+| ENR-04 | `admit` burns the single-use token *before* validating the collision or loading the signing key | Medium | **New** |
+| ENR-05 | The role bridge drops 8/14 capability tokens **and** grants `Anchor` from 4 tokens the canonical parser rejects | Medium | CONFIRMS RSA-0015 — whose severity rationale is wrong |
+| ENR-06 | A `--roles blind_exit` typo at admit is irreversible by design, with no confirmation | Low | **New** |
+| ENR-07 | On non-Unix the `<ledger>.lock` file wedges enrollment permanently after a crash | Medium (Windows) | **New** |
+| ENR-08 | `load_ledger` lacks the permission gate and size cap that `load_secret` has | Low | **New** |
+| ENR-09 | The persisted single-use ledger has no MAC, generation, or anti-rollback | Low | **New** (partly by design) |
+| ENR-10 | No rate limit or attempt counter anywhere on the consume path | Low | **New** |
+| ENR-11 | `purge_expired_against` is a genuine no-op | Info | CONFIRMS RN-26 |
+| ENR-12 | The daemon never provisions the enrollment secret, contradicting the module doc | Low | **New** |
+| ENR-13 | `enrollment mint --output` writes the bearer token under the default umask | Low | CONFIRMS AUDIT-011 |
+| ENR-14 | Two per-file ledger rows still read `open` for an applied RSA-0023 | Low | **New** (bookkeeping) |
+| ENR-15 | A stale ledger reachability claim: `build_gossip_node` is a second, production setter | Low | **New** (correction) |
+
+## 32. The findings that matter most
+
+**ENR-01 (CONFIRMED by execution).** `--node-id` is taken raw with no charset check and flows into `MembershipNode.node_id`, where `MembershipState::validate` only rejects blank. `canonical_payload` then writes `node.{index}.node_id={}`. Executed end to end through sign → apply → persist → reload:
+
+- `--node-id 'minipc-2'$'\n''node.1.status=revoked'` → admit **accepted**, epoch advances, snapshot persists, and every later load fails with `duplicate field node.1.status`. The signed-update envelope is equally unparseable, so co-signing is dead too. **A single operator typo bricks the membership snapshot.**
+- `--node-id 'minipc-2'$'\n''zz.injected=1'` → reloads fine but silently drops the injected line, so the stored root **≠** the recomputed root: root drift under a valid approver signature.
+
+**ENR-04 (CONFIRMED by reading).** `execute_enrollment_admit` consumes and durably persists the token at step 1, then checks the duplicate `node_id` at step 2, builds the record at step 3, and loads the signing key at step 4. The author reasoned about this ordering for the pubkey only ("Decode the enrollee pubkey early so a malformed input fails before we burn a token"). So a wrong `--node-id`, a wrong passphrase, or an unwritable `--output` destroys a single-use token unrecoverably and forces an out-of-band re-delivery.
+
+**ENR-05 (CONFIRMS RSA-0015, and corrects its rationale).** Executed against every token `RoleCapability::parse` accepts: **8 of 14** are silently dropped to `Client` (`anchor.gossip_seed`, `anchor.bundle_pull`, `anchor.enrollment_endpoint`, `anchor.relay_colocation`, `anchor.port_mapping_authoritative`, `anchor.port_mapping_pinned`, `serves_nas`, `serves_llm`), so `--roles anchor.bundle_pull` yields a client-only node and reports success. Worse in the other direction: `admin`, `tag:owners`, `tag:admins` and `tag:servers` — all **rejected** by the canonical parser — grant `Anchor`. RSA-0015's severity rationale reads "fail-safe — can only *drop* privilege"; that is not accurate, since `--roles tag:servers` is a plausible operator shorthand that grants a control-plane capability. Recommend re-rating from Info.
+
+## 33. Defences that hold (Part VIII)
+
+The enrollment token surface is the best-built area in this entire document, and four of my hypotheses were refuted:
+
+1. **CTL-04's caller-supplied clock does not repeat here** — `verify_and_consume_token` takes no clock argument and reads the host clock internally; the `_with_now` variants are test-only.
+2. **Single-use is enforced atomically; there is no check/consume TOCTOU.** RSA-0023 is genuinely applied — both the daemon and the CLI hold an exclusive `flock` across the whole `load → verify → register → write` sequence, and the HMAC is verified *before* the ledger is touched, so a tampered token never records a consume (executed: `consumed_count == 0`). The repo ships its own adversarial prover for this, including an 8-thread race case.
+3. **`inspect_token` does not consume — refuted.** Executed: inspecting a fresh token leaves `consumed_count=0`, and after a real consume it correctly reports `already_consumed: true`. Nor is `enrollment verify` an unauthenticated oracle — it requires read access to the 0o600 daemon-owned secret.
+4. **`=`, `|` and tab in identifiers are harmless — refuted**, which is what narrowed CTL-01.
+5. **Expiry and freshness are bounded and correct.** Executed: `ttl=0` rejected, `86400` accepted, `86401` and `u64::MAX` rejected; `issued_at` more than 300 s in the future rejected; expiry is `expires_at <= now`, so there is **no off-by-one open window** — unlike RLY-01.
+6. **Token hygiene is thorough** — domain separation, `subtle` constant-time tag compare, `OsRng` with fail-closed RNG handling, redacting `Debug`, `Drop` zeroizing both fields, `Zeroizing` around the base64 intermediate, and a length cap applied *before* the decode allocates.
+7. **Nothing is persisted before authentication**, and the ledger write deliberately precedes peer registration so a crash cannot register a peer without a durable consume record.
+8. **Authorization is layered and Admin-only** — every local IPC command clears a uid/gid gate, `EnrollmentConsume` additionally requires `NodeRole::Admin`, and the remote path pins the subject, enforces a 60 s two-sided window, uses `verify_strict`, and keeps a per-subject nonce replay set, failing closed with no verifying key.
+9. **What the enrollee receives is correctly minimal** — no keys and no token, just a routing-table registration. Its identity is the raw 32-byte verifying key, never an operator string, so **the entire CTL-01 injection class is structurally absent from the IPC consume path**.
+10. **The signed-update envelope is hex-framed, not delimiter-framed** (`payload_hex=<hex>`), so the record payload cannot be reframed at the envelope layer — materially better than the raw-delimited issuance payloads Part V criticises.
+11. **`write_ledger` does the full `temp(0o600) → write → fsync → rename → parent fsync` sequence** — the same discipline Part II §9 credits `rustynet-crypto` for, and which RLY-04 found missing in the relay. Three data points now: crypto and enrollment do it, the relay does not.
+12. **Snapshot integrity plumbing is sound** — the digest is recomputed and compared on load, `validate()` re-runs, and an attestation that does not bind to `(network_id, epoch, state_root)` is refused, as are duplicate approver ids.
+13. **`BlindExit` immutability is enforced at the trust boundary**, not in an advisory helper — executed and confirmed refused. ENR-06 is a UX gap on top of a correct control.
