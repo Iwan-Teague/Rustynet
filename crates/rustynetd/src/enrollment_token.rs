@@ -434,10 +434,41 @@ const LEDGER_WIRE_VERSION: u8 = 1;
 /// Read a consumed-token ledger from disk. Returns `Ok(default)`
 /// when the file is absent (fresh daemon). Returns
 /// `Err(Corrupt)` on any structural mismatch.
+/// Upper bound on the on-disk single-use ledger, checked before the file is read
+/// (ENR-08). Each consumed entry is a 32-byte hex token id plus a separator, so
+/// 1 MiB is far above any real ledger while bounding an O(1) rejection of a
+/// corrupt or hostile file. `purge_expired_against` is still a no-op (RN-26), so
+/// the ledger is grow-only and this is also the practical ceiling on that growth.
+const MAX_LEDGER_FILE_BYTES: u64 = 1024 * 1024;
+
 pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, EnrollmentSpoolError> {
     use std::fs;
     if !path.exists() {
         return Ok(ConsumedTokenLedger::new());
+    }
+    // ENR-08: gate permissions and size before reading, mirroring `load_secret`.
+    //
+    // `load_secret` rejects any group/world bit and caps the size in O(1); this
+    // function did neither, despite the ledger being the single-use enforcement
+    // state — its integrity matters as much as the secret's confidentiality. A
+    // world-writable ledger was previously read without complaint, and an
+    // oversized one was read entirely into memory before any validation.
+    // `write_ledger` always writes 0o600, so a looser mode means something else
+    // touched the file: fail closed so the operator notices.
+    let metadata = fs::metadata(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+    if metadata.len() > MAX_LEDGER_FILE_BYTES {
+        return Err(EnrollmentSpoolError::Corrupt(
+            "enrollment ledger file is larger than the supported maximum",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(EnrollmentSpoolError::Corrupt(
+                "enrollment ledger file has group/world permission bits set",
+            ));
+        }
     }
     let content =
         fs::read_to_string(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
@@ -1245,6 +1276,65 @@ mod tests {
         let err = inspect_token_with_now(&encoded, &attacker, &ledger, 1_700_000_300)
             .expect_err("inspect under wrong secret must reject");
         assert!(matches!(err, EnrollmentTokenError::TagMismatch));
+    }
+
+    /// ENR-08: a ledger with group/world permission bits must be refused, and an
+    /// oversized one rejected before it is read.
+    ///
+    /// `load_secret` already enforced both; `load_ledger` enforced neither, despite
+    /// the ledger being the single-use enforcement state. `write_ledger` always
+    /// writes 0o600, so a looser mode means something else touched the file.
+    #[cfg(unix)]
+    #[test]
+    fn load_ledger_rejects_group_world_permissions_and_oversize_enr08() {
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+
+        // Loose permissions: refused.
+        let loose = dir.path().join("loose.ledger");
+        let mut ledger = ConsumedTokenLedger::new();
+        ledger.record_consumed([0xa1u8; TOKEN_ID_LEN]);
+        write_ledger(&loose, &ledger).expect("seed ledger");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666))
+            .expect("relax permissions");
+        match load_ledger(&loose) {
+            Err(EnrollmentSpoolError::Corrupt(msg)) => {
+                assert!(
+                    msg.contains("group/world"),
+                    "must be refused for permissions; got: {msg}"
+                );
+            }
+            other => panic!("a 0o666 ledger must be refused, got {other:?}"),
+        }
+
+        // Restoring 0o600 makes it loadable again — proving the gate is the
+        // permission bits and not something incidental about the file.
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o600))
+            .expect("restore permissions");
+        assert_eq!(
+            load_ledger(&loose)
+                .expect("0o600 ledger loads")
+                .consumed_count(),
+            1
+        );
+
+        // Oversized: refused before the read.
+        let big = dir.path().join("big.ledger");
+        std::fs::write(&big, vec![b'x'; (MAX_LEDGER_FILE_BYTES + 1) as usize])
+            .expect("write oversized");
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o600))
+            .expect("tighten permissions");
+        match load_ledger(&big) {
+            Err(EnrollmentSpoolError::Corrupt(msg)) => {
+                assert!(
+                    msg.contains("larger than"),
+                    "must be refused for size; got: {msg}"
+                );
+            }
+            other => panic!("an oversized ledger must be refused, got {other:?}"),
+        }
     }
 
     #[test]
