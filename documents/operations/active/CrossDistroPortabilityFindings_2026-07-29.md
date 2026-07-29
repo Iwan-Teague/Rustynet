@@ -20,53 +20,54 @@ distro, not a portability quirk at all.
 
 ---
 
-## 1. Protected-mode DNS apply cannot write `/etc/resolv.conf` — DEFECT, open
+## 1. A symlinked `/etc/resolv.conf` defeats the helper's ReadWritePaths — DEFECT (diagnostic), open
 
-Two layered problems, and the ordering matters. My first reading of this was **wrong**
-and is corrected here.
+**I got this wrong twice before landing on the mechanism. Both earlier readings are
+retracted here.**
 
-**1a. A symlinked `/etc/resolv.conf` is rejected outright.**
+- ~~"Fedora-specific: symlinked resolv.conf is rejected"~~ — the symlink is involved, but
+  the rejection is not the whole story.
+- ~~"`ReadWritePaths` omits `/etc/resolv.conf`"~~ — **false.** I was reading the *daemon*
+  unit. The write is performed by the **privileged helper**, whose unit does include it:
+  `ReadWritePaths=-/run/rustynet -/proc/sys/net/ipv4 -/proc/sys/net/ipv6 -/etc/resolv.conf -/etc/NetworkManager/conf.d`
+
+**Actual mechanism.** systemd resolves `ReadWritePaths` entries **when it builds the
+unit's mount namespace**. With `/etc/resolv.conf` a symlink to
+`../run/systemd/resolve/stub-resolv.conf` (the systemd-resolved default on a stock cloud
+image), the entry binds the *stub target*, which is outside the writable set. The helper's
+in-place `O_NOFOLLOW` write then fails — first as
+`Too many levels of symbolic links`, and after the file is converted, as
+`Read-only file system` **until the helper is restarted**, because the stale namespace
+still holds the old bind mount. The `-` prefix means systemd tolerates the situation
+silently rather than failing at start, so nothing surfaces the misconfiguration.
+
+**Verified fix on the host** (both steps are required):
 
 ```
-dns apply failed: open /etc/resolv.conf for in-place write
-(must be an existing regular file): Too many levels of symbolic links
+# 1. replace the symlink with a regular file
+cp --remove-destination "$(readlink -f /etc/resolv.conf)" /etc/resolv.conf
+# 2. rebuild the helper's mount namespace -- restarting only the daemon is NOT enough
+systemctl restart rustynetd-privileged-helper && systemctl restart rustynetd
 ```
 
-That is the **systemd-resolved default** on a stock cloud image
-(`/etc/resolv.conf -> ../run/systemd/resolve/stub-resolv.conf`). Refusing to write through
-a symlink is a legitimate posture (symlink-swap attacks); having no handling for the
-distro default is the gap.
+Applied to `xnet2-ubu-fed`, it went from no interface to **`mtu 1220`, STUN discovering
+`213.233.155.131:14337`, zero errors** — third distro unblocked.
 
-**1b. Converting it to a regular file does NOT fix it** — the write then fails with
-`Read-only file system`, because the unit runs `ProtectSystem=strict` with
+**Why Linux cannot self-heal this.** macOS already handles a symlinked resolv.conf with an
+atomic temp+`rename` (which swaps the symlink for a regular file), but that needs a
+writable `/etc`. On Linux `ProtectSystem=strict` deliberately keeps `/etc` read-only apart
+from the single resolv.conf inode, so the helper **cannot** rename in `/etc` — by design.
 
-```
-ReadWritePaths=-/run/rustynet /var/lib/rustynet /etc/rustynet
-```
+**So the product gap is diagnostic, not mechanical:** the operator gets
+`Too many levels of symbolic links` or `Read-only file system` from deep inside a
+fail-closed rollback, with no indication that the cause is a symlinked resolv.conf or that
+the remedy involves restarting the *helper*. A preflight check that names the condition and
+the fix is the right change.
 
-`/etc/resolv.conf` is not in that list, so it is read-only *to the daemon* regardless of
-its type or permissions — verified: root can write it fine from a shell. **The unit is
-byte-identical on the working Debian node**, so this is not distro-specific at all; it is
-latent everywhere and only reached when a DNS apply actually runs.
-
-**Why the other nodes never hit it:** every working node reports `dns_zone_state=absent`
-and `dns_alarm_state=missing` — they hold no signed DNS zone, so the apply never executes.
-
-**Causality — corrected.** On the failing node the DNS error is a **secondary** failure
-inside the fail-closed rollback, not the primary fault. Counts over three minutes:
-
-| log event | count |
-| --- | --- |
-| `truncated frame header` | 202 ← **primary** |
-| `reconcile_apply_failed` | 200 |
-| `rolling back fail-closed` | 80 |
-| `dns apply failed` | 94 ← secondary |
-
-So the node fails reconcile first (§5, helper IPC), tries to fail closed, and the
-fail-closed path *itself* fails on the DNS write. That second part is the more serious
-finding: **a host that needs to enter protected-mode DNS cannot, because the unit does not
-grant write access to the file the apply targets.** It is masked today only because no lab
-node carries a signed DNS zone.
+**Causality on the failing node.** The DNS error was **secondary**. Counts over three
+minutes: `truncated frame header` 202 (primary, §5 helper IPC) → `reconcile_apply_failed`
+200 → `rolling back fail-closed` 80 → `dns apply failed` 94. Diagnose the helper IPC
+first; do not start at resolv.conf.
 
 ## 2. Rocky/RHEL sudo `secure_path` omits `/usr/local/bin`
 
@@ -155,10 +156,10 @@ re-testing on the kernel-WireGuard backend before concluding the race is gone.
   reflexive endpoint `51.186.254.100:37904`
 - `xnet2-mac-rocky` (Rocky aarch64) — `DataplaneApplied`, mtu 1220, 2 peers programmed,
   reflexive endpoint `51.186.254.100:46183`
-- `xnet2-ubu-fed` (Fedora x86_64) — blocked by §5 (helper IPC), whose fail-closed rollback
-  then trips §1
+- `xnet2-ubu-fed` (Fedora x86_64) — **unblocked**, `DataplaneApplied`, mtu 1220,
+  reflexive endpoint `213.233.155.131:14337`
 
-Two of three distros validated end-to-end. The third stayed blocked, and chasing it is
-what surfaced §1b — that protected-mode DNS apply can never write its target file under
-the shipped unit hardening, on **any** distro. That is the most valuable thing this run
-found, and it is latent rather than distro-specific.
+**All three distros validated.** The traversal fixes are not Debian-specific. The most
+valuable find was §1: a symlinked `/etc/resolv.conf` silently defeats the helper's
+`ReadWritePaths`, and recovering from it needs a **helper** restart, not just a daemon
+restart — surfaced only as an opaque EROFS from inside a fail-closed rollback.
