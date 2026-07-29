@@ -14,39 +14,59 @@ nodes they were developed on.
 | `xnet2-ubu-fed` | Ubuntu KVM | Fedora 42 | x86_64 | active | inactive |
 
 **Headline:** the fixes are **not** Debian-specific — Fedora and Rocky on aarch64 both
-reached `DataplaneApplied` with the correct 1220 MTU and 2 programmed peers. Getting
-there surfaced six distinct portability issues, one of which is a genuine product defect.
+reached `DataplaneApplied` with the correct 1220 MTU and 2 programmed peers. Getting there
+surfaced six issues, one of which turned out to be a latent defect present on every
+distro, not a portability quirk at all.
 
 ---
 
-## 1. Symlinked `/etc/resolv.conf` breaks DNS apply — PRODUCT DEFECT, open
+## 1. Protected-mode DNS apply cannot write `/etc/resolv.conf` — DEFECT, open
+
+Two layered problems, and the ordering matters. My first reading of this was **wrong**
+and is corrected here.
+
+**1a. A symlinked `/etc/resolv.conf` is rejected outright.**
 
 ```
-dns apply failed: i/o failed: open /etc/resolv.conf for in-place write
+dns apply failed: open /etc/resolv.conf for in-place write
 (must be an existing regular file): Too many levels of symbolic links
 ```
 
-The DNS apply refuses to write through a symlink. That refusal is a *legitimate* security
-posture (symlink-swap attacks), but there is no handling for the case that is the
-**systemd-resolved default**, where `/etc/resolv.conf` is a symlink to
-`../run/systemd/resolve/stub-resolv.conf`. On such a host the failure cascades:
-DNS apply fails → fail-closed rollback → **the WireGuard backend never starts** →
-no `rustynet0`, no traversal, node stuck `FailClosed`.
+That is the **systemd-resolved default** on a stock cloud image
+(`/etc/resolv.conf -> ../run/systemd/resolve/stub-resolv.conf`). Refusing to write through
+a symlink is a legitimate posture (symlink-swap attacks); having no handling for the
+distro default is the gap.
 
-Measured across the fleet — every node runs systemd-resolved, so the discriminator is
-purely the symlink:
+**1b. Converting it to a regular file does NOT fix it** — the write then fails with
+`Read-only file system`, because the unit runs `ProtectSystem=strict` with
 
-| node | `/etc/resolv.conf` | outcome |
-| --- | --- | --- |
-| fedora-utm-1, rocky-utm-1, debian-x86 | regular file | works |
-| **fedora-x86-1** | symlink → stub-resolv.conf | **backend never starts** |
+```
+ReadWritePaths=-/run/rustynet /var/lib/rustynet /etc/rustynet
+```
 
-The three "working" nodes had been converted to a regular file by earlier lab runs; a
-**stock cloud image keeps the symlink**, so this hits any fresh systemd-resolved host.
+`/etc/resolv.conf` is not in that list, so it is read-only *to the daemon* regardless of
+its type or permissions — verified: root can write it fine from a shell. **The unit is
+byte-identical on the working Debian node**, so this is not distro-specific at all; it is
+latent everywhere and only reached when a DNS apply actually runs.
 
-*Not yet fixed.* The right fix is to handle the systemd-resolved case deliberately —
-either resolve/replace the symlink under a documented, audited path, or integrate with
-resolved — rather than to relax the regular-file check.
+**Why the other nodes never hit it:** every working node reports `dns_zone_state=absent`
+and `dns_alarm_state=missing` — they hold no signed DNS zone, so the apply never executes.
+
+**Causality — corrected.** On the failing node the DNS error is a **secondary** failure
+inside the fail-closed rollback, not the primary fault. Counts over three minutes:
+
+| log event | count |
+| --- | --- |
+| `truncated frame header` | 202 ← **primary** |
+| `reconcile_apply_failed` | 200 |
+| `rolling back fail-closed` | 80 |
+| `dns apply failed` | 94 ← secondary |
+
+So the node fails reconcile first (§5, helper IPC), tries to fail closed, and the
+fail-closed path *itself* fails on the DNS write. That second part is the more serious
+finding: **a host that needs to enter protected-mode DNS cannot, because the unit does not
+grant write access to the file the apply targets.** It is masked today only because no lab
+node carries a signed DNS zone.
 
 ## 2. Rocky/RHEL sudo `secure_path` omits `/usr/local/bin`
 
@@ -135,7 +155,10 @@ re-testing on the kernel-WireGuard backend before concluding the race is gone.
   reflexive endpoint `51.186.254.100:37904`
 - `xnet2-mac-rocky` (Rocky aarch64) — `DataplaneApplied`, mtu 1220, 2 peers programmed,
   reflexive endpoint `51.186.254.100:46183`
-- `xnet2-ubu-fed` (Fedora x86_64) — blocked by finding §1
+- `xnet2-ubu-fed` (Fedora x86_64) — blocked by §5 (helper IPC), whose fail-closed rollback
+  then trips §1
 
-Two of three distros validated end-to-end; the third is blocked by a product defect that
-would hit any stock systemd-resolved host, which is the most valuable thing this run found.
+Two of three distros validated end-to-end. The third stayed blocked, and chasing it is
+what surfaced §1b — that protected-mode DNS apply can never write its target file under
+the shipped unit hardening, on **any** distro. That is the most valuable thing this run
+found, and it is latent rather than distro-specific.
