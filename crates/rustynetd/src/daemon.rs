@@ -2167,6 +2167,75 @@ struct TraversalProbeStatus {
     next_reprobe_unix: Option<u64>,
 }
 
+/// Decide whether a peer's traversal race is due.
+///
+/// Split out of `DaemonRuntime` so the pacing rules are testable without
+/// standing up a runtime: the only runtime state it needs is the handshake
+/// freshness window.
+fn traversal_probe_due_decision(
+    current: TraversalProbeCurrentState,
+    direct_candidates: &[ProbeTraversalCandidate],
+    existing_status: Option<&TraversalProbeStatus>,
+    now_unix: u64,
+    force_reprobe: bool,
+    handshake_freshness_secs: u64,
+) -> bool {
+    if force_reprobe {
+        return true;
+    }
+    let Some(status) = existing_status else {
+        return true;
+    };
+    let handshake_is_fresh = |value: Option<u64>| {
+        value
+            .is_some_and(|timestamp| now_unix.saturating_sub(timestamp) <= handshake_freshness_secs)
+    };
+
+    match current.path {
+        Some(PathMode::Direct) => {
+            let current_endpoint_is_direct_candidate = current.endpoint.is_some_and(|endpoint| {
+                direct_candidates
+                    .iter()
+                    .any(|candidate| candidate.endpoint == endpoint)
+            });
+            if !current_endpoint_is_direct_candidate {
+                // The incumbent endpoint is no longer an offered candidate, so
+                // the path is definitionally wrong. Re-race immediately; pacing
+                // a known-bad path would only prolong the outage.
+                return true;
+            }
+            let effective_handshake = current
+                .latest_handshake_unix
+                .or(status.latest_handshake_unix);
+            if handshake_is_fresh(effective_handshake) {
+                return false;
+            }
+            // The handshake is stale. WHY it is stale decides how fast we react.
+            //
+            // If it was fresh when we last evaluated, the path has just died and
+            // we must re-race immediately — that is what fails a dead direct path
+            // over to relay without waiting out a timer.
+            //
+            // If it was ALREADY stale then, re-racing did not fix it, so repeating
+            // every reconcile tick is pure harm: each re-race forces a WireGuard
+            // handshake, and with both peers doing it at once the handshakes
+            // collide endlessly. Measured on a live cross-network path at
+            // ~6 handshakes/second against 40 data packets, discarding the
+            // superseded session's in-flight data (7.5-17.5% loss). Pace the
+            // repeats the same way the Relay arm has always been paced.
+            let was_fresh_when_last_evaluated = status.latest_handshake_unix.is_some_and(|stamp| {
+                status.evaluated_at_unix.saturating_sub(stamp) <= handshake_freshness_secs
+            });
+            if was_fresh_when_last_evaluated {
+                return true;
+            }
+            status.next_reprobe_unix.is_none_or(|next| now_unix >= next)
+        }
+        Some(PathMode::Relay) => status.next_reprobe_unix.is_none_or(|next| now_unix >= next),
+        None => true,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TraversalProbeCurrentState {
     path: Option<PathMode>,
@@ -6493,8 +6562,14 @@ impl DaemonRuntime {
                     selected_endpoint: report.selected_endpoint,
                     latest_handshake_unix: report.latest_handshake_unix,
                     evaluated_at_unix: now_unix,
-                    next_reprobe_unix: (report.decision == TraversalProbeDecision::Relay).then(
-                        || now_unix.saturating_add(self.traversal_probe_reprobe_interval_secs),
+                    // Arm the re-probe floor for EVERY decision, not just Relay.
+                    // A Direct peer whose handshake is not fresh used to re-probe
+                    // on every reconcile tick with nothing pacing it, and each
+                    // re-probe forces a new WireGuard handshake. With both peers
+                    // doing it at once the handshakes collide continuously and
+                    // data encrypted under the superseded session is discarded.
+                    next_reprobe_unix: Some(
+                        now_unix.saturating_add(self.traversal_probe_reprobe_interval_secs),
                     ),
                 },
             );
@@ -6562,32 +6637,14 @@ impl DaemonRuntime {
         now_unix: u64,
         force_reprobe: bool,
     ) -> bool {
-        if force_reprobe {
-            return true;
-        }
-        let Some(status) = existing_status else {
-            return true;
-        };
-
-        match current.path {
-            Some(PathMode::Direct) => {
-                let current_endpoint_is_direct_candidate =
-                    current.endpoint.is_some_and(|endpoint| {
-                        direct_candidates
-                            .iter()
-                            .any(|candidate| candidate.endpoint == endpoint)
-                    });
-                !current_endpoint_is_direct_candidate
-                    || !self.traversal_handshake_is_fresh(
-                        current
-                            .latest_handshake_unix
-                            .or(status.latest_handshake_unix),
-                        now_unix,
-                    )
-            }
-            Some(PathMode::Relay) => status.next_reprobe_unix.is_none_or(|next| now_unix >= next),
-            None => true,
-        }
+        traversal_probe_due_decision(
+            current,
+            direct_candidates,
+            existing_status,
+            now_unix,
+            force_reprobe,
+            self.traversal_probe_handshake_freshness_secs,
+        )
     }
 
     fn relay_session_refresh_due(
@@ -24000,7 +24057,21 @@ mod tests {
             recovered_status.reason,
             TraversalProbeReason::FreshHandshakeObserved
         );
-        assert_eq!(recovered_status.next_reprobe_unix, None);
+        // A Direct decision now arms the re-probe floor too. This assertion
+        // previously required `None`, which left the Direct arm of
+        // `should_reprobe` with nothing pacing it: while a handshake was not
+        // fresh it re-raced on every reconcile tick, and because each re-race
+        // forces a WireGuard handshake, two peers doing it simultaneously
+        // collided endlessly and dropped the superseded session's in-flight
+        // data. Measured on a live cross-network path at ~6 handshakes/second
+        // against 40 data packets, 7.5-17.5% loss.
+        let armed = recovered_status
+            .next_reprobe_unix
+            .expect("a Direct decision must arm the re-probe floor, not leave it unpaced");
+        assert!(
+            armed > unix_now(),
+            "the re-probe floor must be in the future so the next tick cannot immediately re-race"
+        );
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);
@@ -24016,6 +24087,154 @@ mod tests {
         let _ = std::fs::remove_file(traversal_verifier_path);
         let _ = std::fs::remove_file(traversal_watermark_path);
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn traversal_probe_due_paces_a_stale_direct_handshake() {
+        // Regression pin for the packet-loss defect measured on a live
+        // cross-network path: the Direct arm had no rate limit, so while a
+        // handshake was not fresh it returned true on every reconcile tick
+        // (1/s). Each re-race forces a WireGuard handshake, and with both peers
+        // racing simultaneously the handshakes collided continuously --
+        // ~6 handshakes/second against 40 data packets -- discarding whatever
+        // the superseded session had in flight. Wire capture showed 105
+        // handshake initiations and 105 responses for a 40-ping burst, with
+        // 7.5-17.5% of the pings lost.
+        const FRESHNESS: u64 = 30;
+        let endpoint = SocketEndpoint {
+            addr: "10.0.0.2".parse().expect("ipv4 should parse"),
+            port: 51820,
+        };
+        let candidates = vec![super::ProbeTraversalCandidate {
+            endpoint,
+            priority: 100,
+            source: crate::traversal::CandidateSource::Host,
+            observed_at_unix: 0,
+        }];
+        let now = 10_000u64;
+        // Handshake far older than the freshness window, so the staleness
+        // branch is what decides -- exactly the state that used to spin.
+        let stale = now - 10_000;
+        let current = super::TraversalProbeCurrentState {
+            path: Some(super::PathMode::Direct),
+            endpoint: Some(endpoint),
+            latest_handshake_unix: Some(stale),
+        };
+        let status = super::TraversalProbeStatus {
+            remote_node_id: "peer".to_owned(),
+            decision: super::TraversalProbeDecision::Direct,
+            reason: super::TraversalProbeReason::FreshHandshakeObserved,
+            attempts: 1,
+            selected_endpoint: endpoint,
+            latest_handshake_unix: Some(stale),
+            evaluated_at_unix: now,
+            next_reprobe_unix: Some(now + FRESHNESS),
+        };
+
+        // Already stale at the last evaluation and the floor has not elapsed:
+        // must NOT re-race. This is the spin that caused the packet loss.
+        assert!(
+            !super::traversal_probe_due_decision(
+                current,
+                &candidates,
+                Some(&status),
+                now,
+                false,
+                FRESHNESS
+            ),
+            "a persistently stale Direct handshake must be paced, not re-raced every tick"
+        );
+
+        // But a path that was healthy at the last evaluation and has JUST gone
+        // stale must re-race immediately -- that is what fails a dead direct
+        // path over to relay without waiting out the floor.
+        let just_died = super::TraversalProbeStatus {
+            latest_handshake_unix: Some(now - 1),
+            evaluated_at_unix: now - 1,
+            ..status.clone()
+        };
+        let just_died_current = super::TraversalProbeCurrentState {
+            path: Some(super::PathMode::Direct),
+            endpoint: Some(endpoint),
+            latest_handshake_unix: Some(now - 1),
+        };
+        assert!(
+            super::traversal_probe_due_decision(
+                just_died_current,
+                &candidates,
+                Some(&just_died),
+                now + FRESHNESS + 1,
+                false,
+                FRESHNESS
+            ),
+            "a path that has just gone stale must re-race immediately, not wait out the floor"
+        );
+
+        // A fresh handshake is never a reason to re-race.
+        let healthy = super::TraversalProbeCurrentState {
+            path: Some(super::PathMode::Direct),
+            endpoint: Some(endpoint),
+            latest_handshake_unix: Some(now),
+        };
+        assert!(
+            !super::traversal_probe_due_decision(
+                healthy,
+                &candidates,
+                Some(&status),
+                now,
+                false,
+                FRESHNESS
+            ),
+            "a fresh Direct handshake must never trigger a re-race"
+        );
+
+        // Once the floor passes, the re-race is allowed again.
+        assert!(
+            super::traversal_probe_due_decision(
+                current,
+                &candidates,
+                Some(&status),
+                now + FRESHNESS + 1,
+                false,
+                FRESHNESS
+            ),
+            "the re-race must resume once the re-probe floor elapses"
+        );
+
+        // An endpoint that is no longer an offered candidate is definitionally
+        // wrong, so it must bypass the floor and re-race immediately.
+        let stranded = super::TraversalProbeCurrentState {
+            path: Some(super::PathMode::Direct),
+            endpoint: Some(SocketEndpoint {
+                addr: "10.0.0.9".parse().expect("ipv4 should parse"),
+                port: 51820,
+            }),
+            latest_handshake_unix: Some(now),
+        };
+        assert!(
+            super::traversal_probe_due_decision(
+                stranded,
+                &candidates,
+                Some(&status),
+                now,
+                false,
+                FRESHNESS
+            ),
+            "an endpoint that is no longer a candidate must re-race immediately"
+        );
+
+        // An explicit force must still win over the floor.
+        assert!(
+            super::traversal_probe_due_decision(
+                current,
+                &candidates,
+                Some(&status),
+                now,
+                true,
+                FRESHNESS
+            ),
+            "a forced re-probe must bypass the floor"
+        );
     }
 
     #[test]
