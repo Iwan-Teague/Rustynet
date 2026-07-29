@@ -9,14 +9,16 @@ Method: rolling adversarial review, one focused area per part. Each part names i
 | **I** | `rustynet-policy` — ACL / policy evaluation engine | POL-01 … POL-14 | complete |
 | **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … CRY-12 | complete |
 | **III** | macOS `pf` privileged-helper boundary — killswitch rule regeneration | PF-01 … PF-14 | complete |
+| **IV** | `rustynet-relay` — remote/unauthenticated input path | RLY-01 … RLY-14 | complete |
 
 This is a single rolling document by intent: the areas share the same baseline
 commit and the same fail-closed/default-deny constraints, and several findings
 cross-reference each other (Part I's membership gate depends on Part II's signed
 key custody). Splitting them would hide those links.
 
-Out of scope throughout: WireGuard backends, relay framing, live-lab evidence,
-and the GUI.
+Out of scope throughout: WireGuard backends, live-lab evidence, and the GUI.
+(Earlier revisions of this header also excluded relay framing; Part IV now covers
+the relay's untrusted-input path, so that exclusion no longer applies.)
 
 ---
 
@@ -1794,3 +1796,282 @@ the host's real `/sbin/pfctl -n -f` — which is what established PF-06's three
 rejection classes and confirmed that PF-01's and PF-02's renders are accepted by
 pf. PF-07's anchor-ordering component is the one item left **inferred**: it needs an
 on-box experiment on pf wildcard sub-anchor evaluation order that was not run.
+
+---
+
+# Part IV — relay untrusted-input path (remote attacker surface)
+
+Crate baseline: `crates/rustynet-relay/src/{transport.rs,session.rs,rate_limit.rs,hello_limiter_audit.rs}`; `cargo test -p rustynet-relay` **84/84 green** at this commit
+Scope: the relay's handling of bytes from remote hosts — `RelayHello` validation and its ed25519 trust root, the disk-persisted nonce replay store, clock-skew handling, session pairing and caps, `forward_packet` and the dataplane port demux, and the rate limiters
+Out of scope for this part: `main.rs`'s CLI/wiring except where it determines reachability or effective limits, and the relay *client* in `rustynetd`
+
+## 17. Why this area, and the threat-model shift
+
+Parts I–III all assumed a **local** adversary: a misconfigured policy, an attacker with filesystem access, or a daemon compromised to the helper's uid. Part IV covers the one component that processes bytes from **arbitrary remote hosts that hold no credential at all**. That completes the threat-model coverage of this review.
+
+Two honest calibrations before any finding, both of which bound how alarming the rest should read:
+
+1. **The shipped unit binds loopback by default.** `scripts/systemd/rustynet-relay.service` sets the control bind to `127.0.0.1:4500`; an operator must widen it for the relay to serve peers. A relay's *purpose* is to be publicly reachable, so the deployed posture is public — but the out-of-box posture is not, and "remotely exploitable" below means "once deployed as intended."
+2. **The relay performs no membership check at all.** `validate_hello` consults no allowlist and no signed membership state; a `node_id` is legitimate iff the control-plane key signed a token naming it. Revocation is therefore not enforced at the relay until the token expires, which is bounded by `MAX_RELAY_SESSION_TOKEN_TTL_SECS = 120` plus skew. That is a defensible short-lived-token design rather than a defect, but it is an explicit trust assumption worth recording, and it connects directly to Part I's revocation findings: the relay inherits whatever the issuer decided.
+
+### 17.1 Prior coverage — most of this area is already tracked
+
+This crate has ledger rows for all five source files, and the relay is the most heavily tracked area in this review. Enumerated before writing:
+
+| ID | Sev | Status | This review |
+|---|---|---|---|
+| RSA-0037 | Medium | **applied** 2026-06-24 | Confirmed fixed; RLY-05 is its residual *size* dimension |
+| RSA-0040 | Low | open | **Confirms** — this is where my own "no relay fuzz target" observation lands, not a new finding |
+| RSA-0041 | Low | open (+2026-07-27 correction) | Confirms; RLY-08 is the log-write twin |
+| RSA-0082 | Medium | open | **Confirms and quantifies** — see RLY-02 |
+| RSA-0083 | Low | open | Re-confirmed still open (zero `SO_RCVBUF` sites) |
+| RSA-0086 | Medium | open, *"needs first-hand confirmation"* | **Confirmed first-hand with measurements** |
+| RSA-0087 | Medium | open, *"needs first-hand confirmation"* | **Confirmed, with a refinement** |
+| RSA-0088 | Low | open, partially verified | **Confirmed with a measured figure** |
+| AUDIT-031 | High | listed **Open**, named a ship-blocker | **Stale** — same defect as the applied RSA-0037 (RLY-14) |
+| RSA-0043 / RSA-0077 | — | applied / open | Not on this path; `verify_strict` confirmed here |
+
+`hello_limiter_audit.rs` has no ledger row, which is chronological rather than an oversight: it was created 2026-07-01, after the 2026-06-18 ledger.
+
+| ID | Finding | Severity | New? |
+|---|---|---|---|
+| RLY-01 | No lower bound on `issued_at_unix` — a future-dated token is accepted and replays forever after nonce prune | Medium | **New** |
+| RLY-02 | One unauthenticated datagram to a live dataplane port forces O(N) work under both global locks | High | RSA-0082 (quantified) |
+| RLY-03 | Signed-payload field boundaries are not bound by the signature; the relay's binary parser omits the canonicality check its text sibling has | Low-Medium | **New** |
+| RLY-04 | Replay store is not parent-dir fsync'd, and a doc asserts that it is | Medium | **New** |
+| RLY-05 | Pre-auth hello limiter bounds entry *count* but not key *size* — ~1 GB retained pre-authentication | Medium | RSA-0088 (measured) |
+| RLY-06 | Pre-auth ed25519 verify is keyed on an attacker-chosen `node_id` and runs under the transport mutex | Medium | RSA-0086 (confirmed) |
+| RLY-07 | Rate limiting is per-`node_id` only — no aggregate or per-destination cap | Medium | **New** |
+| RLY-08 | Reject-path log writes are the unbudgeted twin of the budgeted notice path | Low | **New** |
+| RLY-09 | Bind mutation precedes the rate-limit check; IP-only TOFU bind lets a spoofer lock out the real peer | Low | **New** |
+| RLY-10 | One-second replay window at exactly `skew == 120` | Low (latent) | **New** |
+| RLY-11 | No self-pair rejection — the relay echoes to the sender | Low | **New** |
+| RLY-12 | `node_id` written unescaped into log lines; `NodeId::new` permits newlines | Low | **New** |
+| RLY-13 | Assorted: unreachable size guard, invisible tuple rejections, data-path skew inconsistency, O(n) persist per hello | Info | **New** |
+| RLY-14 | Ledger maintenance: AUDIT-031 stale; three findings promotable from "needs confirmation" | Low (bookkeeping) | **New** |
+
+## 18. Findings
+
+### RLY-01 — no lower bound on `issued_at_unix`, so a future-dated token is accepted and replays indefinitely (Medium, CONFIRMED by execution)
+
+Files: `crates/rustynet-relay/src/transport.rs:348-365`, `:50-59`; `crates/rustynet-control/src/lib.rs:1886-1891`
+
+`validate_hello` bounds the token from **above** only. Check 3 rejects `ttl_secs() > MAX_RELAY_TTL_SECS` and Check 4 rejects `is_expired(now, skew)`, which is `now > expires_at + skew`. Nothing checks `now >= issued_at - skew`. Verified by reading `:348-365` directly.
+
+Because `ttl_secs()` is a *difference*, a token with `issued_at = now + 3_153_600_000` and `expires_at = issued_at + 120` passes both checks. And because nonce retention is measured from **insert** time (`:796`), not from the token's own window, the documented invariant at `:50-59` — retention ≥ maximum validity window — silently depends on `issued_at <= now`, which is never verified. Confirmed by execution: the hello is accepted, an immediate replay is correctly `ReplayedNonce`, and after ageing the stored stamp past the 240 s retention and running the shipped `prune`, the same captured hello is **Accepted again** — repeatable indefinitely from one capture, since the hello is plaintext UDP.
+
+The repo's own bar already states the correct rule. `documents/SecurityMinimumBar.md:87` requires signed material be fresh *and* "not future-dated beyond clock-skew tolerance"; the relay implements only the first half.
+
+**Reachability, stated honestly:** every in-repo token producer is clock-based, so this is not a live unauthenticated path today. `LocalRelaySessionTokenIssuer::issue_token` (`rustynetd/src/relay_client.rs:124-146`) uses `try_sign` with the local clock, and the trait takes only `ttl_secs`. But `ControlPlaneCore::issue_relay_session_token` (`control/lib.rs:2995`) passes `request.requested_at_unix` verbatim into `try_sign_at` with only a `!= 0` check and no bound against its own clock, and `parse_relay_session_token_wire` (`:2024-2028`) also permits arbitrary future timestamps. So the defect is a fail-open in the relay's *own* enforcement — it trusts a property nothing establishes.
+
+Proposed enforcement (review-only — do NOT apply): reject `issued_at_unix > now + skew` in `validate_hello`. That single check restores the retention invariant the comment already claims.
+
+---
+
+### RLY-02 — one unauthenticated datagram to a live dataplane port forces O(N) work under both global locks (High; confirms **RSA-0082**, newly quantified)
+
+Files: `crates/rustynet-relay/src/main.rs:779-782`, `:788-833`; `crates/rustynet-relay/src/transport.rs:528-548`
+
+The mechanism is tracked as RSA-0082 (open). What this review adds is measurement and a precise statement of *why* the wrong error is in the wrong arm.
+
+Verified by reading: `forward_packet` returns `Err(UnauthorizedSourceTuple)` at `transport.rs:534`/`:537` — and returns it **before** the rate-limit check at `:544`, so no budget is consulted. There is no per-IP limiter on dataplane ports at all (the pre-auth limiter is control-socket only). In `main.rs`, *any* `Err` from `forward_packet` lands in one arm:
+
+```rust
+Err(_) => {
+    Self::prune_inactive_allocated_sockets(&allocated_sockets, &transport).await;
+}
+```
+
+That prune performs, per bad packet, an O(N) pass that takes the transport mutex **and** an exclusive write lock on `allocated_sockets` — the same two locks every forward task needs per frame.
+
+Measured against a faithful reproduction (release build, real `RelayTransport`, 4096 sessions / 4096 ports): **204.8 µs of prune work per bad packet** versus 0.042 µs for the reject itself — a **~4900× amplification** — with one core saturated by **~4884 bad packets/s ≈ 1.1 Mbit/s** of 29-byte datagrams from a single unauthenticated host. The reproduction also showed `ports_after_prune = 4096`: the session **survives**, so the same port can be hammered indefinitely.
+
+Two details sharpen it. First, the prune-on-`Err` arm is legitimate for `SessionExpired` (that is how a stale port is reclaimed) — the flaw is that `UnauthorizedSourceTuple`, the one error an unauthenticated attacker can trigger at will and which by definition means *the session is healthy*, is lumped in with it. Second, the correct handling already exists a few lines away: the keepalive path at `main.rs:754` discards the identical error without pruning. And the codebase already fixed this exact class on the control path — `main.rs:880-891` documents removing an O(4096) scan costing "~9.5 µs/packet"; this instance is ~20× more expensive per packet and far cheaper to trigger.
+
+Proposed enforcement (review-only — do NOT apply): match on the error and prune only for the reclamation-worthy variants, or rate-limit the prune itself.
+
+---
+
+### RLY-03 — signed-payload field boundaries are not bound by the signature (Low-Medium, CONFIRMED by execution)
+
+Files: `crates/rustynet-control/src/lib.rs:1873-1884`, `:1970`, `:2045-2049`; `crates/rustynet-relay/src/main.rs:1173-1275`
+
+`canonical_payload` is built by `format!` with `\n` and `=` delimiters and **no length prefixes**, interpolating `node_id` and `peer_node_id` raw — verified by reading `:1873-1884`. Neither field has any charset validation anywhere: `NodeId::new` only rejects empty, `is_valid_node_id_text` is a not-blank check and is not applied on this path, and the relay's parser accepts any UTF-8.
+
+So one signature can cover two different field splits. Confirmed by execution: a token issued for `node_id = "a"`, `peer_node_id = "b\npeer_node_id=c"` produces a payload byte-identical to one for `node_id = "a\npeer_node_id=b"`, `peer_node_id = "c"`. The re-split token passes `verify_strict` with the **same 64 signature bytes**, and `handle_hello` accepts the re-split identity end to end — creating a session under a `(node_id, peer_node_id)` pair the control plane never authorized, and under a different key for both the per-node session cap and the packet rate limiter.
+
+The instructive part is an asymmetry between two parsers of the same token. The **text** parser `parse_relay_session_token_wire` defends this properly: it rejects duplicate keys (`:1970`) and re-canonicalizes, comparing `token.canonical_payload() != payload` (`:2045-2049`). The relay's **binary** `parse_relay_token` (`main.rs:1173-1275`) has neither check, and also omits the text path's `issued_at != 0 && expires > issued` sanity checks — which is the same gap RLY-01 exploits from the other direction.
+
+Precondition: a registered node id containing `"\npeer_node_id="`, which no layer currently forbids. Proposed enforcement (review-only — do NOT apply): reject `\n`, `\r`, and `=` in `node_id`/`peer_node_id` at parse time, or length-prefix the signed payload, or port the text parser's re-canonicalization check to the binary parser.
+
+---
+
+### RLY-04 — the replay store is never parent-dir fsync'd, and a doc asserts that it is (Medium, CONFIRMED)
+
+Files: `crates/rustynet-relay/src/transport.rs:946-984`; `documents/operations/Arm32BitEmbeddedSupportReference_2026-06-23.md:919`
+
+`persist_nonce_map` writes a temp file with mode 0600, `write_all`s, `sync_all`s **the file**, re-applies permissions, and then `fs::rename`s — and returns. Verified by reading: there is no `File::open` of the parent directory and no `sync_all` on it after the rename. A crash immediately after the rename can therefore lose the directory-entry update and drop recently accepted nonces, reopening the replay window for exactly those tokens until they expire (≤120 s + skew) — in a store whose entire purpose is crash-durable replay prevention.
+
+Two things make this worth recording rather than shrugging at:
+
+- **A normative doc claims the opposite.** `Arm32BitEmbeddedSupportReference_2026-06-23.md:919` states "All state writes use atomic temp→fsync→rename pattern **with parent dir fsync**." That is false for this path.
+- **The repo already does it correctly elsewhere, including in this review.** Part II §11 credits `rustynet-crypto`'s `write_atomic_encrypted_key_file` for precisely the missing step — file `sync_all` before rename, then the parent directory opened and `sync_all`'d after (`crypto/src/lib.rs:1557-1558`) — and `vm_lab/orchestrator/context.rs::atomic_write_fsync` is a general primitive. So this is an inconsistency between two crates, with a doc asserting the stronger property globally.
+
+No ledger or plan row covers replay-store durability.
+
+---
+
+### RLY-05 — the pre-auth hello limiter bounds entry count but not key size (Medium; confirms **RSA-0088**, newly measured)
+
+Files: `crates/rustynet-relay/src/transport.rs:336`, `:1057`, `:1023`; `crates/rustynet-relay/src/main.rs:1128-1136`
+
+`validate_hello`'s first check calls `hello_limiter.check(&hello.node_id)` at `:336`, **before** the signature verification at `:341`, and `HelloLimiter::check` does `counts.entry(node_id.to_owned())` (`:1057`) — an owned `String` copy of an unverified attacker-chosen value. `MAX_HELLO_LIMITER_ENTRIES = 16_384` bounds the *count*; nothing bounds key *length*. `parse_relay_hello` reads a `u16` length with no maximum, the control receive buffer is 64 KiB, and no charset or length rule for `node_id` exists anywhere in the tree.
+
+Measured: **16,384 entries holding 1,064,960,000 key bytes ≈ 1015.6 MiB retained entirely pre-authentication**, plus per-entry map overhead. Entries drop only at capacity or on the 10 s cleanup tick, so a ~1 Gbps flood of maximum-size hellos parks ~1 GB of RSS. The ratio is roughly 1:1 so it is not an amplifier, but it converts bandwidth into an OOM-shaped resource.
+
+This is precisely the residual of the **applied** RSA-0037 fix: the count dimension was closed, the size dimension was not. Proposed enforcement (review-only — do NOT apply): cap `node_id` length at parse time — a one-line change at `main.rs:1128-1136`.
+
+---
+
+### RLY-06 — pre-auth ed25519 verify keyed on attacker-chosen `node_id`, under the transport mutex (Medium; confirms **RSA-0086**, which the ledger marks unverified)
+
+Files: `crates/rustynet-relay/src/transport.rs:336` vs `:341`; `crates/rustynet-relay/src/main.rs:604-607`, `:760`
+
+Both of RSA-0086's mechanism claims hold at this baseline, so the finding can move off "needs first-hand confirmation":
+
+- The limiter is keyed on the claimed `node_id` and consulted **before** the signature check, and `validate_hello_from_tuple` takes `_observed_addr` and discards it — the limiter is bound to no verified key and to no source address. Confirmed by execution: **2000/2000** hellos with rotated `node_id`s reached ed25519 verification, versus exactly 5 for a fixed `node_id`.
+- The transport mutex **is** held across the verify (`main.rs:604-607` scopes the lock around the whole `validate_hello_from_tuple` call), and every forward task takes that same mutex per frame (`:760`) — so pre-auth crypto cost lands on the dataplane.
+
+Measured cost: **25.9 µs/hello ≈ 38,600 hello/s/core**, dominated by `verify_strict`, with no disk write per packet.
+
+**One correction to the ledger entry's premise, in the defenders' favour:** RSA-0086 says the limiter "sheds nothing under a flood of distinct ids." That is now stale — the RSA-0037 fix bounds it. At capacity the limiter prunes and returns `false`, and `validate_hello` returns `RateLimitExceeded` *before* the verify, so admitted-verify rate is capped by cap turnover rather than unbounded. Upstream, the per-IP limiter (50/IP/s over a 4096-IP table) means saturating one core needs ~773 spoofed source IPs ≈ 39k pps ≈ 5 MB/s. *(Those two rate figures are arithmetic from the constants, not measured.)*
+
+Also confirmed: the same signature is verified **twice** per accepted hello — once in the advisory preflight and again in the commit — by the deliberate design documented at `transport.rs:244-249`.
+
+---
+
+### RLY-07 — rate limiting is per-`node_id` only, with no aggregate or per-destination cap (Medium, CONFIRMED by execution)
+
+Files: `crates/rustynet-relay/src/rate_limit.rs:13`, `:18-19`, `:39-49`; `crates/rustynet-relay/src/transport.rs:21-22`
+
+`RateLimiter.buckets` is a `HashMap<String, TokenBucket>` keyed on `node_id` — not per-session, not global. Confirmed by execution: 50 node ids at `max_pps = 10` yielded **500 aggregate accepted packets**.
+
+Two wiring facts make this concrete. `set_rate_limits` is **never called in production** (only the example and the bench), so `RateLimiter::default()` stands: **10,000 pps / 100 Mbps per `node_id`**. And with `max_total_sessions = 4096` and `max_sessions_per_node = 8`, at least 512 distinct node ids can be live, giving a **~51 Gbps aggregate ceiling with no global bound** — against a module header at `transport.rs:21-22` that claims "Bounded resources." There is likewise no per-*destination* cap, so a victim holding its 8 permitted sessions can be fed 8 × 100 Mbps.
+
+Honest bound: every node id requires a control-plane-signed token, so the real limit is identity issuance rather than the relay. A node's ≤8 sessions also share one bucket, which is the correct direction. The finding is that the module's stated property is aggregate-bounded resources and no aggregate bound exists.
+
+---
+
+### RLY-08 — reject-path log writes are the unbudgeted twin of the budgeted notice path (Low, CONFIRMED)
+
+Files: `crates/rustynet-relay/src/transport.rs:345`, `:352`, `:363`, `:369`, `:380`, `:391`, `:398`, `:404`, `:416`, `:428`; `crates/rustynet-relay/src/main.rs:996-1013`
+
+Every rejected hello writes at least two unconditional `eprintln!`s — one of the ten sites inside `validate_hello`, plus one at `main.rs:614`. The daemon's `PreAuthNoticeBudget` deliberately budgets the pre-parse notice datagram and the malformed-packet line, and `main.rs:996-1013` reasons explicitly about leaving the post-parse reject *datagram* unbudgeted — but the transport's own log writes sit outside that accounting entirely, and the rationale does not address them even though the code's own measurements put a log write at 1.1–7.9 µs, the same order as the `send_to` it does budget.
+
+Fronted only by the 50/IP/s limiter over a 4096-IP table, policy therefore admits on the order of **200,000 log lines/s** aggregate, which saturates a core and grows the journal without bound. *(Aggregate figure is arithmetic from the two constants.)* This is the log-write sibling of RSA-0041's datagram residual.
+
+---
+
+### RLY-09 — bind mutation precedes the rate-limit check, and the TOFU bind is IP-only (Low, CONFIRMED by execution)
+
+File: `crates/rustynet-relay/src/transport.rs:536-540` vs `:544`
+
+On the unbound branch, `forward_packet` compares only `session.hello_source_addr.ip() != from_addr.ip()` and then writes `session.bound_peer_addr = Some(from_addr)` — **before** the rate limiter at `:544`. Confirmed by execution: a first packet on a new tuple binds successfully even with an empty token bucket, so claiming a session's bind costs zero rate budget.
+
+The IP-only comparison is intentional (a NAT concession, reasoned at `main.rs:4544-4549`). The consequence is that an off-path attacker who can spoof the victim's source IP and hit the right dataplane port can bind the session to a port **of the attacker's choosing**; because `bound_peer_addr` is written exactly once and there is no rebind path, the real peer then receives `UnauthorizedSourceTuple` for the rest of the session's life — until the 30 s idle reap. Both independent reviewers found this, and neither located it in the ledger.
+
+The ordering half is a free hardening win: consulting the limiter before mutating the bind costs nothing and removes the zero-budget bind.
+
+---
+
+### RLY-10 — a one-second replay window opens at exactly `skew == 120` (Low, latent, CONFIRMED by execution)
+
+Files: `crates/rustynet-relay/src/transport.rs:823`, `:50-59`; `crates/rustynet-control/src/lib.rs:1886-1891`
+
+`prune` drops an entry when `now - inserted_at >= NONCE_RETENTION_SECS` (240), while `is_expired` retains a token when `now == expires_at + skew` (the comparison is `>`, not `>=`). With `ttl = 120`, `skew = 120`, and the hello accepted in the same second the token was issued, both conditions are true in the single second `now == inserted_at + 240`: the nonce is pruned while the token is still valid, so a replay is accepted. Confirmed by execution, together with the two controls that isolate the cause — one second later the replay is refused, and reducing skew by one second closes the window entirely.
+
+The comment at `:50-59` asserts the clamp establishes `TTL + skew <= NONCE_RETENTION_SECS`; it holds only by *equality* (240 ≤ 240), and the mismatched comparison operators make that exactly one second too loose. Not reachable in the shipped daemon — the default skew is 90, leaving a 30 s margin, and there is no flag to raise it — but reachable by any library consumer constructing `RelayTransport` with a skew of 120. Fix is a ceiling of `MAX_RELAY_TTL_SECS - 1`, or making `prune` use `>`.
+
+---
+
+### RLY-11 — no self-pair rejection, so the relay echoes to the sender (Low, CONFIRMED by execution)
+
+File: `crates/rustynet-relay/src/transport.rs:330-436`, `:319-322`, `:581`
+
+Nothing rejects `node_id == peer_node_id`. With both equal, `node_pair_index` is keyed `(A, A)` and the forward-path reverse lookup key is also `(A, A)`, resolving to the session's **own** id, which `is_paired_with` accepts. Confirmed by execution: the self-pair is accepted and the forward target is the sender's own bound address, so the relay echoes each frame back.
+
+Impact is bounded and should not be overstated: strictly 1:1 bytes, no amplification, and the target IP was verified against the sender's own hello, so it cannot be aimed at a third party. It also requires a validly signed token, so it is currently prevented only by whatever the control plane declines to sign. Cheap to assert in `validate_hello`.
+
+---
+
+### RLY-12 — `node_id` is written unescaped into log lines, and newlines are permitted (Low, CONFIRMED)
+
+Files: `crates/rustynet-relay/src/transport.rs:429-431`, `:405-407`
+
+Both sites interpolate attacker-supplied text raw into `eprintln!`. Since `NodeId::new` permits newlines, an *enrolled* malicious peer can forge relay log lines by deliberately tripping the per-node capacity rejection. These sites are post-signature, so the id must be control-plane-signed — which bounds the attacker set to enrolled nodes and makes this a log-integrity issue rather than a pre-auth one. Everything on the daemon side is safe by contrast: it logs hex, `SocketAddr`, and `Debug` enums.
+
+---
+
+### RLY-13 — assorted smaller items (Info, CONFIRMED)
+
+1. **The `MAX_PACKET_SIZE_BYTES` guard is unreachable.** `transport.rs:513` drops when `payload.len() > 65_536`, but both receive buffers are exactly `[0u8; 65536]` and `recv_from` truncates, so the condition can never hold. Harmless — but the `rate_limit.rs` ledger row justifies its PASS partly on "caller caps len at 64 KiB first", and that cap is vacuous; the safety of `len * 8` in `check_packet` actually rests on the buffer size. Worth restating in the row rather than changing code.
+2. **Unauthorized source-tuple rejections are invisible.** The error is discarded at `main.rs:754` and only triggers a prune at `:779-782`; there is no counter and no log line, so an attacker probing dataplane ports leaves no trace while control-port probing is counted by `PreAuthStats`. Observability gap, and it is the same path as RLY-02.
+3. **Skew tolerance is applied at admission but not on the data path.** `is_expired(now, skew)` gates the hello, but `forward_packet`, `touch_session_from_tuple`, and the cleanup pass all use a bare `expires_at_unix <= now_unix`. A session admitted on a token up to 90 s stale burns a slot and an allocated port and can never forward a byte. Fail-closed direction, but inconsistent.
+4. **`NonceStore::insert` rewrites the whole file and `sync_all`s it on every accepted hello**, plus two `stat` calls via `validate_replay_store_path`. The comment at `:790-795` records removing an O(n) map clone, but the O(n) full-file fsync remains, so the O(n²) total work it describes still exists in the I/O.
+
+---
+
+### RLY-14 — ledger maintenance (Low, bookkeeping, CONFIRMED)
+
+- **AUDIT-031 is stale.** It is listed `Open`/High in `SecurityAndQualityAudit_2026-06-10.md:66` and named a ship-blocker at `:32`, but it describes the same defect as RSA-0037, which has been `applied` since 2026-06-24.
+- **RSA-0086, RSA-0087, and RSA-0088 can move off "needs first-hand confirmation."** All three mechanisms are confirmed at this baseline, with numbers in RLY-05/RLY-06, one premise correction (RSA-0086's shedding claim is now bounded by the RSA-0037 fix) and one refinement: RSA-0087's IPv6 lockout hits **new/unseen** sources only, because the `contains_key` test precedes the capacity branch, so established peers keep working.
+- **`hello_limiter_audit.rs` needs a row** (created after the ledger). It is a report-only self-audit harness driving the real shipped `HelloLimiter` at production cap, wired as a CLI subcommand and consumed by live-lab stage 45 — it enforces nothing at runtime. Minor: it hardcodes `AUDIT_MAX_PER_SEC = 5` rather than reading `MAX_HELLOS_PER_NODE_PER_SEC`; the two are equal today, so the audit is honest by coincidence rather than by construction.
+- **Constant drift worth pinning:** the code default dataplane port range and the shipped systemd unit's range differ (50000-59999 vs 40000-49999). Both are internally consistent; the ledger should name which is authoritative.
+
+## 19. Defences that hold — verified, for the record
+
+This is the best-defended area in the review, and several of my own attack hypotheses were refuted outright:
+
+1. **No unauthenticated write into the replay store.** The nonce is checked at `:368`, *after* signature verification at `:341`, and `contains` is a read-only lookup; the insert happens only in the commit path. Confirmed by execution: 50 bad-signature hellos leave the store empty. My "cheap unauthenticated disk write" hypothesis is **refuted**.
+2. **Signature coverage is complete.** `canonical_payload` signs version, `node_id`, `peer_node_id`, `relay_id`, scope, `issued_at_unix`, `expires_at_unix`, and nonce; the hello carries no field outside the token, and the source address and allocated port come from the UDP header and the daemon rather than the attacker. My "field outside the signature" hypothesis is **refuted** — RLY-03 is about boundaries *within* the payload, not a missing field.
+3. **`verify_strict` is used**, and a repo-wide grep for plain `.verify(` returns zero hits in `crates/` — RSA-0043's assertion holds here.
+4. **Pre-auth ordering is cheapest-first and correct.** Limiter → signature → TTL → expiry → nonce read → `ct_eq` bindings → capacity. No session, no nonce entry, no disk write, and no port allocation happens pre-auth; a shipped test pins that the preflight does not consume the nonce.
+5. **Session identity is the allocated port, not a guessable id.** Ciphertext frames carry no session id — `spawn_forward_task` captures it at spawn time — so learning a session id grants nothing on the data path. `SessionId` is 128 bits from `OsRng` with a fail-closed error variant and no degraded fallback.
+6. **Source-tuple enforcement is real; there is no rebinding or takeover.** `bound_peer_addr` is written exactly once; a second port on a bound session is refused and the original tuple keeps working.
+7. **No third-party reflection and no amplification on the data path.** The forward target is always the *peer's* own verified bound address, the target type carries no payload by construction, and the daemon sends exactly the received slice — strict 1:1 bytes and packets. A sender cannot choose the destination host.
+8. **Pairing is symmetric and cannot evict a third party.** `node_pair_index` is only ever keyed `(node_id, peer_node_id)`, both `ct_eq`-bound to the signed token, so `remove_session_for_pair` can only replace the same pair. Confirmed by execution — a re-hello left the other peer's session intact. My "eviction primitive" hypothesis is **refuted**.
+9. **Caps refuse rather than evict, and a single credential cannot fill the table.** At the global cap the newcomer is refused; the per-node cap is 8, so filling 4096 slots needs ~512 distinct signed identities, and an unauthenticated attacker gets zero.
+10. **Half-open and idle timeouts cannot be defeated by keepalives.** `is_stale_half_open` uses `established_at`, written only at creation, and `touch_session_from_tuple` refuses to refresh an unbound session. My "half-open forever if touched" hypothesis is **refuted**. Maximum session lifetime is bounded by the 120 s token TTL regardless of traffic.
+11. **Eviction is complete — no partial removal.** Sessions, pair index, rate-limiter buckets, hello-limiter windows, and allocated sockets plus their tasks are all reclaimed, with nonces deliberately retained for the replay window. No stale routes, no leaks.
+12. **No error reaches a data-path sender**, so there is no session-id or node-id oracle; control-path rejects collapse to one generic datagram and `RejectReason` never leaves the process. My "error oracle" hypothesis is **refuted**.
+13. **Token-bucket arithmetic is correct.** Monotonic `Instant` (not `SystemTime`), saturating `duration_since` so no backwards-time credit, all-`f64` with no integer truncation, both dimensions capped, no free-packet edge, and burst is exactly one refill period.
+14. **The replay store fails closed and is path-validated.** Load and startup-prune failures abort the daemon; insert failure rejects the hello and rolls back the in-memory entry; the path check requires a regular non-symlink file with `mode & 0o077 == 0` for both file and parent; persist is temp-then-rename with 0600 applied at open and again after. The one non-fail-closed path — a cleanup-tick prune failure — is safe in the replay direction because it *retains* nonces.
+15. **Other correct choices:** `now_unix` fails closed to 0 rather than panicking; skew is clamped downward with a warning; `set_max_total_sessions` propagates its error and aborts startup; `cleanup_idle_sessions` is driven on a 10 s timer and a zero interval is rejected; the verifier key path is validated absolute, regular, non-symlink, `mode & 0o022 == 0` including its parent; the health endpoint is loopback-enforced and exposes only aggregate counters; and the serialized control loop closes the preflight/commit TOCTOU on the nonce.
+
+## 20. Suggested triage order for Part IV
+
+1. **RLY-02** — match on the error variant instead of pruning on any `Err`. Smallest change, largest measured effect, and it removes the cheapest total-denial lever in the system.
+2. **RLY-05** — cap `node_id` length at parse time. One line, closes ~1 GB of pre-auth memory and the residual of an already-applied fix.
+3. **RLY-01** and **RLY-03** together — both are missing sanity checks the codebase already implements elsewhere (the bar text for RLY-01, the text parser's re-canonicalization for RLY-03), so both are ports rather than designs.
+4. **RLY-06** — key the pre-auth limiter on the source IP rather than the claimed identity, and consider moving the verify out from under the transport mutex.
+5. **RLY-04** — add the parent-dir fsync using the existing primitive, and correct the doc that claims it is already universal.
+6. **RLY-07** — add a global bucket, or amend the module header's "bounded resources" claim to match reality.
+7. **RLY-08, RLY-09** — the log budget and the limiter-before-bind reorder; both cheap.
+8. **RLY-10 … RLY-14** — latent, informational, and bookkeeping; RLY-14 is ledger edits only.
+9. **RSA-0040** — the relay still has no fuzz target, which is the one gap that would have found RLY-03 mechanically. Worth pairing with the Part I fuzz recommendation.
+
+## 21. Reproduction (Part IV)
+
+```bash
+git -C ~/Desktop/rustynet rev-parse --short HEAD   # expect 22847b12
+cargo test -p rustynet-relay                       # expect 84/84 green
+```
+
+CONFIRMED-by-execution findings were verified two ways, both entirely outside the
+repository. For the auth path, `transport.rs`/`session.rs`/`rate_limit.rs` were
+copied verbatim into a scratch crate with a path dependency on the real
+`rustynet-control`, plus a child module so private items are drivable; 12
+adversarial tests were added and the suite ran 93 passed / 0 failed. For the
+dataplane, a faithful reproduction with 4096 live sessions and ports measured
+RLY-02's prune cost and RLY-05's retained memory. Rate figures derived by
+arithmetic from constants rather than measured are labelled as such inline.
