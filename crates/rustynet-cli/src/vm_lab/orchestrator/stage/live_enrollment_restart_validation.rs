@@ -66,6 +66,8 @@ impl OrchestrationStage for LiveEnrollmentRestartValidationStage {
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--bin",
             "live_linux_enrollment_restart_test",
             "--",

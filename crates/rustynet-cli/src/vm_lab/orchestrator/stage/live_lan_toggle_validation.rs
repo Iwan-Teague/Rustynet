@@ -70,6 +70,8 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--bin",
             "live_linux_lan_toggle_test",
             "--",

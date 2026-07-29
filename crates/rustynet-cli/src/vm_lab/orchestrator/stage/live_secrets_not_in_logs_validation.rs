@@ -48,6 +48,8 @@ impl OrchestrationStage for LiveSecretsNotInLogsValidationStage {
                 "--quiet",
                 "-p",
                 "rustynet-cli",
+                "--features",
+                "vm-lab",
                 "--bin",
                 "live_linux_secrets_not_in_logs_test",
                 "--",
