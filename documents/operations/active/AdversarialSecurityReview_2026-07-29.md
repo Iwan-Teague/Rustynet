@@ -1,10 +1,29 @@
-# `rustynet-policy` Adversarial Review — 2026-07-29
+# Adversarial Security Review — 2026-07-29
 
 Status: review only — **no code changed**, no enforcement applied; findings await owner triage
-Audit baseline: repository at commit **`22847b12`** ("refactor(live-lab): call the key-custody report writer in-process"), clean working tree on `main`, in sync with `origin/main`
+Audit baseline: repository at commit **`22847b12`** ("refactor(live-lab): call the key-custody report writer in-process"), on `main`
+Method: rolling adversarial review, one focused area per part. Each part names its own crate baseline, scope, and reachability conclusions.
+
+| Part | Area | Findings | Status |
+|---|---|---|---|
+| **I** | `rustynet-policy` — ACL / policy evaluation engine | POL-01 … POL-14 | complete |
+| **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … | complete |
+
+This is a single rolling document by intent: the areas share the same baseline
+commit and the same fail-closed/default-deny constraints, and several findings
+cross-reference each other (Part I's membership gate depends on Part II's signed
+key custody). Splitting them would hide those links.
+
+Out of scope throughout: WireGuard backends, relay framing, live-lab evidence,
+and the GUI.
+
+---
+
+# Part I — `rustynet-policy` (ACL / policy evaluation engine)
+
 Crate baseline: `crates/rustynet-policy/src/lib.rs`, 1132 lines, zero external dependencies, `#![forbid(unsafe_code)]`; `cargo test -p rustynet-policy` **21/21 green** at this commit
-Scope: the ACL/policy evaluation engine — selector and identity handling, the membership/revocation gate, context matching, `PolicyRolloutController` + `validate_policy_safety`, and `LlmAccessScope`/`LlmScopePolicy`; plus the production call sites in `rustynetd`, `rustynet-control`, and `rustynet-llm-gateway` that determine whether each defect is reachable
-Out of scope: crypto primitives, signing/verification, WireGuard backends, relay framing, live-lab evidence, and the NAS/LLM gateways except where they consume this crate's types
+Scope: selector and identity handling, the membership/revocation gate, context matching, `PolicyRolloutController` + `validate_policy_safety`, and `LlmAccessScope`/`LlmScopePolicy`; plus the production call sites in `rustynetd`, `rustynet-control`, and `rustynet-llm-gateway` that determine whether each defect is reachable
+Out of scope for this part: crypto primitives and signing/verification (covered in Part II)
 
 ## 1. Purpose and security rule
 
