@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use rustynet_backend_api::{BackendError, ExitMode, Route, RouteKind, RuntimeContext};
 use rustynet_tun::SyncDevice;
 
-use crate::linux_command::{LinuxCommandRunner, WireguardCommandRunner, validate_interface_name};
+use crate::linux_command::{
+    LinuxCommandRunner, SAFE_BRINGUP_TUNNEL_MTU, WireguardCommandRunner, validate_interface_name,
+};
 
 pub(crate) struct TunDevice {
     _inner: TunDeviceInner,
@@ -270,6 +272,22 @@ impl TunLifecycle for DirectTunLifecycle {
                     interface_name.to_owned(),
                 ],
             )?;
+            // Pin the safe bring-up tunnel MTU before link-up, exactly as the
+            // kernel-WireGuard backend does. Without this the TUN device keeps
+            // the platform default of 1500, and 1500 + WireGuard overhead does
+            // not fit even a clean 1500-byte Ethernet underlay, so large
+            // packets are silently black-holed.
+            self.runner.run(
+                "ip",
+                &[
+                    "link".to_owned(),
+                    "set".to_owned(),
+                    "mtu".to_owned(),
+                    SAFE_BRINGUP_TUNNEL_MTU.to_string(),
+                    "dev".to_owned(),
+                    interface_name.to_owned(),
+                ],
+            )?;
             self.runner.run(
                 "ip",
                 &[
@@ -391,6 +409,18 @@ impl TunLifecycle for HelperBackedTunLifecycle {
                     "address".to_owned(),
                     "add".to_owned(),
                     context.local_cidr.clone(),
+                    "dev".to_owned(),
+                    interface_name.to_owned(),
+                ],
+            )?;
+            // Same safe bring-up MTU the kernel backend pins, before link-up.
+            self.runner.run(
+                "ip",
+                &[
+                    "link".to_owned(),
+                    "set".to_owned(),
+                    "mtu".to_owned(),
+                    SAFE_BRINGUP_TUNNEL_MTU.to_string(),
                     "dev".to_owned(),
                     interface_name.to_owned(),
                 ],
@@ -1374,6 +1404,49 @@ mod tests {
             destination_cidr: destination_cidr.to_owned(),
             via_node: NodeId::new("phase1-route-node").expect("valid node id"),
             kind,
+        }
+    }
+
+    #[test]
+    fn userspace_shared_lifecycles_pin_bringup_mtu_before_link_up() {
+        // Pin against the regression this fixes: the userspace-shared TUN
+        // lifecycles brought the interface up without ever setting an MTU, so
+        // it kept the platform default of 1500. 1500 plus WireGuard overhead
+        // does not fit even a clean 1500-byte Ethernet underlay, so large
+        // packets were silently black-holed -- measured on a real
+        // cross-network path 2026-07-29, where ICMP flowed to ~1000 bytes and
+        // bulk TCP stalled outright. The kernel backend already pinned
+        // SAFE_BRINGUP_TUNNEL_MTU here; these two paths were missed.
+        let source = include_str!("tun.rs");
+        let mtu_sets = source.matches("\"mtu\".to_owned(),").count();
+        assert!(
+            mtu_sets >= 2,
+            "both HelperBackedTunLifecycle and DirectTunLifecycle must pin the bring-up MTU; \
+             found {mtu_sets} mtu argv site(s)"
+        );
+        assert!(
+            source.contains("SAFE_BRINGUP_TUNNEL_MTU.to_string()"),
+            "the userspace-shared bring-up must use the shared SAFE_BRINGUP_TUNNEL_MTU constant \
+             rather than a divergent literal"
+        );
+        // Ordering matters: an MTU set after link-up leaves a window where the
+        // interface is carrying traffic at the wrong MTU.
+        for marker in [
+            "linux userspace-shared TUN create/open failed",
+            "linux userspace-shared TUN open failed",
+        ] {
+            let open_at = source.find(marker).expect("open marker present");
+            let prefix = &source[..open_at];
+            let last_mtu = prefix
+                .rfind("\"mtu\".to_owned(),")
+                .expect("an mtu set must precede this lifecycle's TUN open");
+            let last_up = prefix
+                .rfind("\"up\".to_owned(),")
+                .expect("a link-up must precede this lifecycle's TUN open");
+            assert!(
+                last_mtu < last_up,
+                "bring-up MTU must be set BEFORE link-up for {marker}"
+            );
         }
     }
 
