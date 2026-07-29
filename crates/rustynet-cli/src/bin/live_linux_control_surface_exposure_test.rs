@@ -5,7 +5,7 @@ mod live_lab_support;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use live_lab_support::{LiveLabContext, Logger, read_text, repo_root, run_cargo_ops};
+use live_lab_support::{LiveLabContext, Logger, read_text, repo_root};
 
 fn main() {
     if let Err(err) = run() {
@@ -272,36 +272,28 @@ fn run() -> Result<(), String> {
 
     let captured_at_utc = now_utc();
     let captured_at_unix = now_unix();
-    let work_dir_string = ctx.work_dir.to_string_lossy().to_string();
-    let report_args = vec![
-        "--report-path".to_owned(),
-        report_path.to_string_lossy().to_string(),
-        "--dns-bind-addr".to_owned(),
-        dns_bind_addr.clone(),
-        "--remote-dns-probe-status".to_owned(),
-        remote_dns_probe_status.clone(),
-        "--remote-dns-probe-output".to_owned(),
-        remote_dns_probe_output.clone(),
-        "--work-dir".to_owned(),
-        work_dir_string,
-        "--captured-at-utc".to_owned(),
-        captured_at_utc,
-        "--captured-at-unix".to_owned(),
-        captured_at_unix,
-    ];
-    let mut host_label_args = Vec::new();
-    for label in &host_labels {
-        host_label_args.push("--host-label".to_owned());
-        host_label_args.push(label.clone());
-    }
-    let mut cargo_args = report_args;
-    cargo_args.extend(host_label_args);
-    let cargo_refs = cargo_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let report_status = run_cargo_ops(
-        &ctx.root_dir,
-        "write-live-linux-control-surface-report",
-        &cargo_refs,
-    )?;
+    // In-process, not `cargo run … ops …`: the subprocess built a
+    // default-feature binary lacking this `vm-lab`-gated verb, so the write
+    // failed with `unknown ops subcommand` and the stage recorded FAIL after
+    // its assertions had already passed.
+    //
+    // `captured_at_unix` is parsed here because the local `now_unix()` returns
+    // a String (it renders "0" on a clock error). The typed config wants u64,
+    // and mapping a bad value to 0 preserves that existing fallback rather than
+    // failing a security stage on a clock read.
+    let report_status =
+        rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_live_linux_control_surface_report(
+            rustynet_cli::ops_live_lab_orchestrator::WriteLiveLinuxControlSurfaceReportConfig {
+                report_path: report_path.clone(),
+                dns_bind_addr: dns_bind_addr.clone(),
+                remote_dns_probe_status: remote_dns_probe_status.clone(),
+                remote_dns_probe_output: remote_dns_probe_output.clone(),
+                work_dir: ctx.work_dir.clone(),
+                host_labels: host_labels.clone(),
+                captured_at_utc,
+                captured_at_unix: captured_at_unix.parse::<u64>().unwrap_or(0),
+            },
+        )?;
 
     if report_status != "pass" {
         return Err(format!(
