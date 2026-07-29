@@ -135,8 +135,33 @@ impl fmt::Display for CryptoError {
 impl Error for CryptoError {}
 
 impl NodeKeyPair {
+    /// Build a keypair from raw bytes, rejecting material that is degenerate or
+    /// internally inconsistent.
+    ///
+    /// CRY-06: this previously validated only that neither half was all-zeros,
+    /// which is close to security theatre — it rejects exactly one degenerate
+    /// encoding while every other mismatch passes. Nothing checked that
+    /// `public_key` is actually the key belonging to `private_key`, so the struct
+    /// could hold an inconsistent pair. The crate's own test proved it: a pair of
+    /// `([7; 32], [9; 32])` was accepted. Publishing such a `public_key` while
+    /// signing with `private_key` yields signatures nobody can verify, or binds an
+    /// identity to a key the holder does not control.
+    ///
+    /// The private half is an ed25519 seed (the same interpretation
+    /// `Ed25519SigningProvider::from_seed` uses), so the correct public key is
+    /// derivable and the pair can simply be checked. The all-zeros check is kept
+    /// as a cheap early reject with a distinct error.
     pub fn from_raw(public_key: [u8; 32], private_key: [u8; 32]) -> Result<Self, CryptoError> {
         if is_all_zeros(&public_key) || is_all_zeros(&private_key) {
+            return Err(CryptoError::WeakMaterial);
+        }
+
+        // Derived from the private half; comparison is on public material, so a
+        // constant-time compare buys nothing here.
+        let derived = SigningKey::from_bytes(&private_key)
+            .verifying_key()
+            .to_bytes();
+        if derived != public_key {
             return Err(CryptoError::WeakMaterial);
         }
 
@@ -1129,10 +1154,14 @@ impl Ed25519SigningProvider {
     pub fn from_seed(
         provider_kind: SigningProviderKind,
         key_id: impl Into<String>,
-        seed: [u8; 32],
+        mut seed: [u8; 32],
     ) -> Self {
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
+        // CRY-11: wipe our by-value copy of the seed. `SigningKey` zeroizes its
+        // own copy on drop (ed25519-dalek's `ZeroizeOnDrop`), but this parameter
+        // is a separate stack copy that otherwise outlives the call.
+        seed.zeroize();
         Self {
             provider_kind,
             key_id: key_id.into(),
@@ -1410,11 +1439,18 @@ pub fn decrypt_private_key_envelope(
 /// Raw-key XChaCha20-Poly1305 sealed blob for at-rest service data
 /// (D13 NAS backup objects, snapshot manifests, quota records).
 /// Same reviewed primitive as the key envelopes — no new crypto.
-/// The 32-byte key comes from OS-secure custody (keychain / DPAPI /
-/// `LoadCredentialEncrypted`), NOT from a passphrase KDF, and the
-/// associated data binds the blob to its logical location (peer
-/// namespace + content address) so a ciphertext cannot be replayed
-/// into another peer's namespace or under another name.
+/// The 32-byte key is supplied by the caller and is NOT derived from a
+/// passphrase KDF. CRY-10: an earlier version of this comment claimed the key
+/// "comes from OS-secure custody (keychain / DPAPI / `LoadCredentialEncrypted`)".
+/// That overstates the production path — `rustynet-nas` loads it from
+/// `--at-rest-key-file` (a plain 0600 file holding exactly 32 raw bytes) or from
+/// `--at-rest-key-credential`; only the latter plausibly involves a systemd
+/// credential, and no keychain or DPAPI is involved on any platform. Callers are
+/// responsible for the key's custody.
+///
+/// The associated data binds the blob to its logical location (peer namespace +
+/// content address) so a ciphertext cannot be replayed into another peer's
+/// namespace or under another name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AeadSealedBlob {
     pub nonce: [u8; 24],
@@ -1622,7 +1658,14 @@ fn decode_encrypted_blob_v0(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
     let mut length_bytes = [0u8; 4];
     length_bytes.copy_from_slice(&bytes[40..44]);
     let ciphertext_len = u32::from_be_bytes(length_bytes) as usize;
-    if bytes.len() != 44 + ciphertext_len {
+    // CRY-12: checked add. The declared length is attacker-controlled up to
+    // u32::MAX; on a 32-bit target (armv7 relay/exit nodes are a documented
+    // roadmap item) `44 + ciphertext_len` overflows `usize`, which panics in a
+    // debug build while merely parsing a malformed key file.
+    let expected_len = ciphertext_len
+        .checked_add(44)
+        .ok_or(CryptoError::InvalidLength)?;
+    if bytes.len() != expected_len {
         return Err(CryptoError::InvalidLength);
     }
 
@@ -1650,7 +1693,11 @@ fn decode_encrypted_blob_v1(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
     let mut length_bytes = [0u8; 4];
     length_bytes.copy_from_slice(&bytes[41..45]);
     let ciphertext_len = u32::from_be_bytes(length_bytes) as usize;
-    if bytes.len() != 45 + ciphertext_len {
+    // CRY-12: see the v0 decoder — checked add for the same reason.
+    let expected_len = ciphertext_len
+        .checked_add(45)
+        .ok_or(CryptoError::InvalidLength)?;
+    if bytes.len() != expected_len {
         return Err(CryptoError::InvalidLength);
     }
 
@@ -1726,10 +1773,12 @@ mod tests {
         AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
         Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
         NodeKeyPair, SigningProvider, SigningProviderKind, SigningProviderPolicy,
-        create_provider_attestation, decrypt_private_key_envelope, encrypt_private_key_envelope,
-        generate_key_custody_material, try_generate_key_custody_material,
-        validate_signing_provider_policy, verify_provider_attestation,
+        create_provider_attestation, decode_encrypted_blob_v0, decode_encrypted_blob_v1,
+        decrypt_private_key_envelope, encrypt_private_key_envelope, generate_key_custody_material,
+        try_generate_key_custody_material, validate_signing_provider_policy,
+        verify_provider_attestation,
     };
+    use ed25519_dalek::SigningKey;
     // The encrypted-key-file custody helpers and the OS-store fallback policy are
     // only exercised by `#[cfg(unix)]` tests below (they rely on unix permission
     // bits / symlink semantics); gate the imports to match so Windows does not see
@@ -1823,6 +1872,33 @@ mod tests {
         );
     }
 
+    /// CRY-11: `Ed25519SigningProvider::from_seed` must wipe its by-value copy of
+    /// the seed.
+    ///
+    /// Pinned by source-grep because a stack wipe is not observable from a unit
+    /// test — the same reason this crate already pins the fallible-CSPRNG call
+    /// below that way. `SigningKey` zeroizes its own copy on drop, but the
+    /// parameter is a separate copy that would otherwise outlive the call.
+    #[test]
+    fn from_seed_zeroizes_its_seed_parameter() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+        let start = body
+            .find("pub fn from_seed(")
+            .expect("from_seed must remain present");
+        let window_end = (start + 1_200).min(body.len());
+        let window = &body[start..window_end];
+        assert!(
+            window.contains("mut seed: [u8; 32]"),
+            "from_seed must take the seed as `mut` so it can be wiped"
+        );
+        assert!(
+            window.contains("seed.zeroize()"),
+            "from_seed must zeroize its by-value seed copy before returning"
+        );
+    }
+
     /// Regression: `write_encrypted_key_file` must use the fallible nonce/salt
     /// generator. A future refactor that called the panicking
     /// `generate_key_custody_material` would re-introduce the same DoS-on-
@@ -1859,8 +1935,77 @@ mod tests {
 
     #[test]
     fn accepts_nonzero_key_material() {
-        let result = NodeKeyPair::from_raw([7; 32], [9; 32]);
-        assert!(result.is_ok());
+        // CRY-06: this fixture used to be `from_raw([7; 32], [9; 32])`, which is
+        // NOT a corresponding pair — it passed only because nothing checked that
+        // the public half belongs to the private half, and the finding cited this
+        // test as the demonstration of that gap. The test's intent (valid nonzero
+        // material is accepted) is preserved by deriving the public key.
+        let private_key = [9u8; 32];
+        let public_key = SigningKey::from_bytes(&private_key)
+            .verifying_key()
+            .to_bytes();
+        let result = NodeKeyPair::from_raw(public_key, private_key);
+        assert!(result.is_ok(), "a corresponding pair must be accepted");
+    }
+
+    /// CRY-06: a public key that does not belong to the private key must be
+    /// refused. Pre-fix `from_raw([7; 32], [9; 32])` was accepted, so the struct
+    /// could hold an inconsistent pair — publishing that public key while signing
+    /// with that private key produces signatures nobody can verify, or binds an
+    /// identity to a key the holder does not control.
+    #[test]
+    fn rejects_mismatched_public_and_private_key() {
+        let result = NodeKeyPair::from_raw([7u8; 32], [9u8; 32]);
+        assert_eq!(
+            result.err(),
+            Some(CryptoError::WeakMaterial),
+            "a non-corresponding keypair must be rejected"
+        );
+
+        // And a pair that is correct except for a single flipped bit.
+        let private_key = [9u8; 32];
+        let mut public_key = SigningKey::from_bytes(&private_key)
+            .verifying_key()
+            .to_bytes();
+        public_key[0] ^= 0x01;
+        assert_eq!(
+            NodeKeyPair::from_raw(public_key, private_key).err(),
+            Some(CryptoError::WeakMaterial),
+            "a one-bit public-key mismatch must be rejected"
+        );
+    }
+
+    /// CRY-12: a declared ciphertext length near `u32::MAX` must be refused.
+    ///
+    /// **This test does not discriminate the fix on a 64-bit host, and saying so
+    /// matters.** `ciphertext_len` comes from a `u32`, so `44 + ciphertext_len`
+    /// cannot overflow a 64-bit `usize` — the malformed blob is rejected either
+    /// way, and reverting `checked_add` to a wrapping add leaves this test green.
+    /// The overflow is only reachable where `usize` is 32-bit (armv7 relay/exit
+    /// nodes are a documented roadmap item), where the pre-fix code panics in a
+    /// debug build while merely parsing a malformed key file. What this test does
+    /// pin is that such a blob is refused at all; the overflow safety itself is
+    /// carried by `checked_add` being present, not by this assertion.
+    #[test]
+    fn blob_decode_rejects_overflowing_declared_length() {
+        // v0 frame: [salt:16][nonce:24][len:4][ct] with len = u32::MAX.
+        let mut v0 = vec![7u8; 40];
+        v0.extend_from_slice(&u32::MAX.to_be_bytes());
+        v0.push(0);
+        assert_eq!(
+            decode_encrypted_blob_v0(&v0).err(),
+            Some(CryptoError::InvalidLength)
+        );
+
+        // v1 frame: [version:1][salt:16][nonce:24][len:4][ct].
+        let mut v1 = vec![1u8];
+        v1.extend_from_slice(&[7u8; 40]);
+        v1.extend_from_slice(&u32::MAX.to_be_bytes());
+        v1.push(0);
+        assert_eq!(
+            decode_encrypted_blob_v1(&v1).err(),
+            Some(CryptoError::InvalidLength)
+        );
     }
 
     #[test]

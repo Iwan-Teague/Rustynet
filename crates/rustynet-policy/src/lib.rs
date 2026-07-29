@@ -380,6 +380,21 @@ fn validate_policy_safety(policy: &ContextualPolicySet) -> Result<(), RolloutErr
 }
 
 fn selector_matches(rule_value: &str, candidate: &str) -> bool {
+    // POL-03: an empty selector is absent trust state, not a harmless literal, so
+    // it must never match — in either position.
+    //
+    // Previously `selector_matches("*", "")` was true and
+    // `selector_requires_membership("")` was false, so a request carrying an empty
+    // identity skipped the revocation gate entirely and was then admitted by any
+    // wildcard rule. An empty *rule* field likewise matched an empty request
+    // field. Both directions now fail closed: an empty candidate matches nothing
+    // (so evaluation falls through to the terminal `Decision::Deny`), and a rule
+    // with an accidentally-empty selector is inert rather than dangerously
+    // permissive. No caller in this workspace emits an empty selector, so this
+    // cannot false-reject a real request.
+    if rule_value.is_empty() || candidate.is_empty() {
+        return false;
+    }
     rule_value == "*" || rule_value == candidate
 }
 
@@ -1127,6 +1142,75 @@ mod tests {
             set.evaluate_with_membership(&request, &membership),
             Decision::Allow,
             "active node must proceed to rule evaluation"
+        );
+    }
+
+    /// POL-03: an empty identity must never be admitted.
+    ///
+    /// Pre-fix `selector_matches("*", "")` was true and
+    /// `selector_requires_membership("")` was false, so a request carrying an empty
+    /// src or dst skipped the revocation gate entirely and was then admitted by any
+    /// wildcard allow rule — a fail-open on absent trust state, which
+    /// `CLAUDE.md` §10.4 explicitly forbids ("empty/missing/malformed → deny").
+    #[test]
+    fn empty_identity_is_never_allowed_pol03() {
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        for (src, dst, label) in [
+            ("", "node:b", "empty src"),
+            ("node:a", "", "empty dst"),
+            ("", "", "both empty"),
+        ] {
+            let request = AccessRequest {
+                src: src.to_owned(),
+                dst: dst.to_owned(),
+                protocol: Protocol::Tcp,
+            };
+            assert_eq!(
+                set.evaluate(&request),
+                Decision::Deny,
+                "{label} must be denied even under a wildcard allow rule"
+            );
+
+            // And with the membership gate engaged, for the same reason.
+            let mut membership = MembershipDirectory::default();
+            membership.set_node_status("a", MembershipStatus::Active);
+            membership.set_node_status("b", MembershipStatus::Active);
+            assert_eq!(
+                set.evaluate_with_membership(&request, &membership),
+                Decision::Deny,
+                "{label} must be denied on the membership-aware path too"
+            );
+        }
+    }
+
+    /// POL-03: a rule whose selector is accidentally empty must be inert, not
+    /// dangerously permissive — it must not match an empty request field.
+    #[test]
+    fn empty_rule_selector_matches_nothing_pol03() {
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: String::new(),
+                dst: String::new(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        assert_eq!(
+            set.evaluate(&AccessRequest {
+                src: String::new(),
+                dst: String::new(),
+                protocol: Protocol::Tcp,
+            }),
+            Decision::Deny,
+            "an empty rule selector must not match an empty request field"
         );
     }
 }
