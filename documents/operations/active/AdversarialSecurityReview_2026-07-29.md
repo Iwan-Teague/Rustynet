@@ -2031,6 +2031,38 @@ on-box experiment on pf wildcard sub-anchor evaluation order that was not run.
 # Part IV — relay untrusted-input path (remote attacker surface)
 
 Crate baseline: `crates/rustynet-relay/src/{transport.rs,session.rs,rate_limit.rs,hello_limiter_audit.rs}`; `cargo test -p rustynet-relay` **84/84 green** at this commit
+
+> ## ✅ Six of these findings are FIXED — commit `1c44ed3f`
+>
+> **RLY-01, RLY-02, RLY-04, RLY-05, RLY-10, RLY-11** are closed in code, each with a
+> negative test. Gates at that commit: fmt clean, clippy `-D warnings` (all-targets,
+> `--features daemon`) clean, **93 lib + 76 bin** tests pass, workspace checks.
+>
+> Fix efficacy was verified by **mutation**, not by the tests merely being green —
+> six of seven mutations are caught, and the seventh is named as uncatchable:
+>
+> | Mutation | Caught? |
+> |---|---|
+> | RLY-01 remove check / loosen to 104 days | ✅ / ✅ |
+> | RLY-11 remove self-pair check | ✅ |
+> | RLY-02 prune on every error | ✅ |
+> | RLY-05 raise cap to 60000 | ✅ |
+> | RLY-10 revert retention | ✅ (build error) |
+> | RLY-04 remove parent-dir fsync | ❌ **not observable from a unit test** |
+>
+> **RLY-10's first fix was wrong**, and the correction changes this finding's
+> content. Lowering the skew ceiling by one second assumed skew applies *once*. It
+> applies **twice** on independent axes — check 4b admits `issued_at <= now + skew`
+> and `is_expired` then admits `now <= expires_at + skew` — so the real acceptance
+> window is `ttl + 2*skew`. At the daemon's default skew of 90 that is `300 > 240`:
+> a **61-second** replay window, opening for any token with `ttl >= 60`, reproduced
+> by execution. RLY-10 as originally written understated the window and its proposed
+> fix would have left it open behind a false compile-time guarantee. Fixed properly
+> by sizing retention from the true bound (`ttl + 2*skew + 1 = 359`) and correcting
+> **two** guards, one of them pre-existing.
+>
+> Still open in this part: RLY-03, RLY-06, RLY-07, RLY-08, RLY-09, RLY-12, RLY-13,
+> RLY-14, RLY-15, RLY-16.
 Scope: the relay's handling of bytes from remote hosts — `RelayHello` validation and its ed25519 trust root, the disk-persisted nonce replay store, clock-skew handling, session pairing and caps, `forward_packet` and the dataplane port demux, and the rate limiters
 Out of scope for this part: `main.rs`'s CLI/wiring except where it determines reachability or effective limits, and the relay *client* in `rustynetd`
 
@@ -2073,7 +2105,7 @@ This crate has ledger rows for all five source files, and the relay is the most 
 | RLY-07 | Rate limiting is per-`node_id` only — no aggregate or per-destination cap | Medium | **New** |
 | RLY-08 | Reject-path log writes are the unbudgeted twin of the budgeted notice path | Low | **New** |
 | RLY-09 | Bind mutation precedes the rate-limit check; IP-only TOFU bind lets a spoofer lock out the real peer | Low | **New** |
-| RLY-10 | One-second replay window at exactly `skew == 120` | Low (latent) | **New** |
+| RLY-10 | Replay window whenever `ttl + 2*skew >= retention` — **61 s at the shipped default skew**, any `ttl >= 60`. Originally recorded as a one-second window at `skew == 120`; that undercounted because skew applies twice | Medium (corrected up from Low) | **New** — ✅ fixed `1c44ed3f` |
 | RLY-11 | No self-pair rejection — the relay echoes to the sender | Low | **New** |
 | RLY-12 | `node_id` written unescaped into log lines; `NodeId::new` permits newlines | Low | **New** |
 | RLY-13 | Assorted: unreachable size guard, invisible tuple rejections, data-path skew inconsistency, O(n) persist per hello | Info | **New** |
