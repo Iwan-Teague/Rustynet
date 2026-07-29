@@ -790,7 +790,23 @@ entries pointed at, which is the argument for verifying rather than scheduling.
 - Categories 8-14 (21 proposed subcommands across node/membership, policy, relay, cert/trust, analytics, backup/restore, config) are designed but **not implemented** — "Proposed Future Commands (Phases 4+)," with a stated priority order.
 
 ### CODE_MAP.md
-- FIS-0027 `PathMtuDiscovery`: Phase 1 done; probe carriage (Phase 3) and dynamic apply (Phase 4) not wired.
+- FIS-0027 `PathMtuDiscovery`: Phase 1 done; probe carriage (Phase 3) and dynamic apply
+  (Phase 4) not wired. **Assessed 2026-07-29 — Phase 4 cannot land before Phase 3.** With no
+  probe events the machine's fail-closed `effective_plpmtu` is `base_plpmtu` (1280), so
+  applying it today would drop every node from the 1420 they currently run. Phase 3 needs a
+  padded probe + ack channel on the tunnel, and none exists: there is no ICMP construction,
+  no echo facility, and no `IP_RECVERR`/PTB ingestion on the userspace socket (and
+  `unsafe_code = "forbid"` rules out raw `setsockopt`, while nix 0.28 exposes `MSG_ERRQUEUE`
+  but no safe `IpRecvErr` sockopt). Two candidate carriages, in preference order:
+  (a) **in-tunnel padded ICMP echo** to the peer's mesh IP — the peer's kernel replies with
+  no new protocol and no peer-side code, and `inject_plaintext_packet` already exists as the
+  injection point; the work is packet construction plus reply matching on the inbound TUN
+  path. (b) PTB ingestion via the error queue — a real signal needing no protocol, but it can
+  only ever *lower*, never confirm, so it cannot drive the search on its own.
+  Phase 4 groundwork landed in `75890519`: `PathMtuConfig::for_bringup_mtu` plus `const`
+  drift pins, because deriving the ceiling from the bring-up MTU was previously
+  unconstructible on exactly the constrained paths DPLPMTUD exists to serve (base 1280 >
+  a legal 1220 ceiling → `CeilingBelowBase`).
 - FIS-0028 UDP-offload capability probe: Phase 1 implemented but not called from any packet path.
 - RN-03: of 44 `force_fail_closed` sites, 10 were discarded — flagged "open P0."
 
