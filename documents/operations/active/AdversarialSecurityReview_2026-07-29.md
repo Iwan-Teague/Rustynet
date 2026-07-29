@@ -7,7 +7,7 @@ Method: rolling adversarial review, one focused area per part. Each part names i
 | Part | Area | Findings | Status |
 |---|---|---|---|
 | **I** | `rustynet-policy` — ACL / policy evaluation engine | POL-01 … POL-14 | complete |
-| **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … | complete |
+| **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … CRY-11 | complete |
 
 This is a single rolling document by intent: the areas share the same baseline
 commit and the same fail-closed/default-deny constraints, and several findings
@@ -599,3 +599,475 @@ The probe used for every CONFIRMED result: copy
 strip its `#[cfg(test)]` module, append a `main` exercising the tables above, and
 build with `rustc --edition 2021`. The crate's zero-dependency design makes this
 a two-command reproduction and is worth preserving for exactly this reason.
+
+---
+
+# Part II — `rustynet-crypto` (key custody, key envelopes, signing)
+
+Crate baseline: `crates/rustynet-crypto/src/lib.rs`, 2708 lines; deps are vetted primitives only (argon2, chacha20poly1305, ed25519-dalek, sha2, subtle, zeroize) plus platform keystores; `cargo test -p rustynet-crypto` **38/38 green** at this commit
+Scope: `KeyCustodyManager` + `OsStoreFallbackPolicy`, the Argon2id/XChaCha20-Poly1305 key envelope and its on-disk framing, `aead_seal`/`aead_open`, `AlgorithmPolicy`/`CompatibilityException`, `SigningProviderPolicy` + provider attestation, `SecretKey`/`NodeKeyPair` hygiene, and `validate_key_custody_permissions`; plus the production call sites in `rustynetd/src/key_material.rs`, `rustynet-cli`, `rustynet-nas`, and `rustynet-windows-trust-cli`
+Out of scope for this part: the vendored boringtun Noise implementation, and the macOS `security` CLI argv exposure already tracked as RSA-0004
+
+## 7. Prior coverage — this crate is already well audited
+
+**Read this before treating anything below as new.** Unlike Part I's area, this
+crate has an existing audit row (`SecurityAuditLedger_2026-06-18.md:209`) with
+four findings, and I checked them *before* writing:
+
+| This review | Existing entry | Relationship |
+|---|---|---|
+| CRY-04 | **RSA-0001** (open, **DEFERRED 2026-06-24**) | Confirms exactly; adds line-drift correction. **Not new** |
+| CRY-05 | **RSA-0002** (Medium, open) | Confirms; adds the unused-error-variant and write-path details |
+| CRY-08 | **RSA-0003** (**ASSESSED 2026-06-24, keep as-is**) | Confirms the repo's decision is correct; adds only a readability note |
+| — | RSA-0004 (macOS `-A` keychain, open) | Not re-reviewed; out of scope |
+| CRY-01, CRY-02, CRY-03, CRY-06, CRY-07, CRY-09, CRY-10, CRY-11 | none found | **New** |
+
+Searched `documents/` for `OsStoreFallbackPolicy`, `AllowEncryptedFileFallback`,
+`fallback_passphrase`, Argon2 parameters, `temp_path_for`, `provider_attestation`,
+and pub/priv correspondence in `from_raw`. Only `OsStoreFallbackPolicy` had a hit
+(inside RSA-0002's reachability note), and the `from_raw` hits are unrelated
+(`from_raw_fd` / `from_raw_parts` in other crates).
+
+Two honest calibrations found during that check, both of which stopped me
+overstating a finding:
+
+- RSA-0002's note already records that the daemon's primary WG-key path uses
+  `RequireOsSecureStore` + DPAPI, so "the fallback policy defaults to permissive"
+  is **not** by itself a live defect on macOS/Windows. CRY-01 and CRY-02 are
+  narrowed accordingly.
+- RSA-0001 is not an oversight but a **recorded deliberate deferral**: "high-blast-radius
+  key-load change; the safe fix needs an on-disk-framing migration + the upgrade
+  path can't be validated without a lab, so deferred rather than risk a fleet
+  key-load regression — AEAD preserves confidentiality meanwhile"
+  (`SecurityRemediationPlan_2026-06-19.md:92`). CRY-04 does not re-argue it.
+
+As in Part I, the crate's suite is green (38/38), so every finding is a coverage
+gap rather than a regression.
+
+## 8. Findings
+
+| ID | Finding | Severity | New? |
+|---|---|---|---|
+| CRY-01 | `RequireOsSecureStore` is a **load-side-only** guarantee — the encrypted key file is written unconditionally on every platform | High | **New** |
+| CRY-02 | Linux has no strict-policy arm, and Linux's OS store fails to `OsStoreUnavailable` in exactly the headless case — so the file fallback is the *normal* path, silently | Medium-High | **New** |
+| CRY-03 | Passphrase floor is 16 chars with no entropy requirement; Argon2 params are not stored in the blob | Medium | **New** |
+| CRY-04 | v0/v1 framing ambiguity makes ~99.6% of legacy v0 blobs undecodable | Medium (availability) | RSA-0001 |
+| CRY-05 | Windows permission validation is an `Ok(())` no-op, on both read and write | Medium | RSA-0002 |
+| CRY-06 | `NodeKeyPair::from_raw` never checks that the public key corresponds to the private key | Medium-if-used | **New** |
+| CRY-07 | Unix permission validator checks modes but never ownership (uid); plus a narrow TOCTOU | Low | **New** |
+| CRY-08 | `with_exceptions` rejects all non-empty lists, making the denylist loop dead code | Low (quality) | RSA-0003 |
+| CRY-09 | Three security controls are entirely unwired — and `release_manifest.rs` builds exactly the provider config the default policy forbids | Medium | **New** |
+| CRY-10 | `aead_seal` doc claims OS-secure key custody; production reads a raw key from a plain file | Low (doc) | **New** |
+| CRY-11 | `Ed25519SigningProvider::from_seed` never zeroizes its by-value seed parameter | Info | **New** |
+
+---
+
+### CRY-01 — `RequireOsSecureStore` protects only the load path; the key file is written unconditionally (High, CONFIRMED)
+
+Files: `crates/rustynetd/src/key_material.rs:562-580`, `:596-599`; `crates/rustynet-crypto/src/lib.rs:399-447`
+
+`encrypt_private_key_with_passphrase` stores the key through the custody manager
+and then, with **no `cfg` and no branch on the returned backend**, also writes a
+passphrase-encrypted copy to disk (`key_material.rs:572-579`). Verified by
+reading; the code even explains itself:
+
+> `// Keep the configured encrypted-key path materialized on disk for service prechecks and`
+> `// deterministic bootstrap across hosts, even when the custody backend also stores by key-id.`
+
+So this is **deliberate, not an oversight**, and the finding is not "someone
+forgot a branch." The finding is that the guarantee is narrower than its name
+conveys: `OsStoreFallbackPolicy::RequireOsSecureStore` removes the file from the
+*load* path only (`lib.rs:430-436`). It is a "don't read from disk" guarantee,
+never a "no key on disk" guarantee. On macOS and Windows — the two platforms that
+*do* set the strict policy (`key_material.rs:596-599`) — a passphrase-encrypted
+copy of the WireGuard private key is on disk regardless.
+
+Why that matters is CRY-03: the at-rest strength of that copy is
+Argon2id-with-default-parameters over an operator string whose only enforced
+property is length ≥ 16. So the effective at-rest protection of the WG private
+key is not the OS keystore — it is the weaker of the two, and the file copy is
+the weaker one. Reached in production from `rustynetd/src/daemon.rs:2998`, `:3910`,
+`:3959`, `:9451`, `:10830`, `:19805`, `:19985`, plus
+`key_material.rs:1020`/`:1077`.
+
+Proposed enforcement (review-only — do NOT apply): if the on-disk copy is
+genuinely required for service prechecks and bootstrap, say so in the type — e.g.
+rename the policy to reflect load-side semantics, or add an explicit
+`materialize_disk_backup: bool` so the decision is visible at the call site
+rather than implied by a comment. If it is not required when the OS store
+succeeded, gate it on the returned `KeyCustodyBackend`.
+
+Verification method: a test asserting that under `RequireOsSecureStore` with a
+healthy OS store, no key file is created (or, if it must be, that its existence
+is an explicit documented decision with a strength floor attached).
+
+---
+
+### CRY-02 — on Linux the encrypted-file fallback is the normal path, silently (Medium-High, CONFIRMED)
+
+Files: `crates/rustynetd/src/key_material.rs:596-599`, `:564`; `crates/rustynet-crypto/src/lib.rs:905-949`, `:406`, `:430`
+
+`key_custody_manager` has a `#[cfg(target_os = "macos")]` arm and a
+`#[cfg(target_os = "windows")]` arm applying `RequireOsSecureStore`. **There is no
+Linux arm**, so Linux keeps `OsStoreFallbackPolicy::default()` —
+`AllowEncryptedFileFallback` (`lib.rs:357-362`).
+
+That default matters more on Linux than anywhere else, because Linux's "OS secure
+store" is `secret-tool` shelling out (`lib.rs:905-949`), and **every** failure
+mode — binary absent, no D-Bus session, locked collection, nonzero exit — maps to
+`CryptoError::OsStoreUnavailable` (`:915`, `:916`, `:921`, `:923`, `:927`, `:937`),
+which is precisely the variant that triggers the file fallback (`:406`, `:430`).
+A headless `rustynetd` has no Secret Service session, so the **ordinary** Linux
+path is the encrypted-file fallback.
+
+It is also silent: `let _backend = manager.store_private_key(...)`
+(`key_material.rs:564`) discards the `KeyCustodyBackend` discriminator, so nothing
+logs or surfaces which custody tier was actually used. An operator cannot tell
+from the outside whether their key is in a keystore or in a file.
+
+Proposed enforcement (review-only — do NOT apply): decide Linux's intended tier
+explicitly rather than by omission; and surface the returned
+`KeyCustodyBackend` (log at minimum, ideally a health/precheck field) so a
+silent downgrade is observable.
+
+---
+
+### CRY-03 — passphrase floor is 16 characters with no entropy requirement, and Argon2 parameters are not stored (Medium, CONFIRMED)
+
+Files: `crates/rustynetd/src/key_material.rs:191-214`; `crates/rustynet-crypto/src/lib.rs:1324`, `:1362`
+
+`parse_passphrase_bytes` enforces exactly one strength property (`:207`):
+`if trimmed.len() < 16 { return Err("passphrase must be at least 16 characters") }`.
+No entropy estimate, no charset requirement, no dictionary rejection. Verified by
+reading: `"aaaaaaaaaaaaaaaa"` is accepted. Combined with CRY-01 (the file always
+exists), this string is the effective at-rest security boundary for the WG
+private key.
+
+Both encrypt and decrypt use `Argon2::default()` (`lib.rs:1324`, `:1362`) and the
+**KDF parameters are not recorded in the blob** — `EncryptedKeyBlob` carries only
+`version`, `salt`, `nonce`, `ciphertext`. Two consequences:
+
+1. There is no way to raise the KDF cost for new blobs without breaking old ones,
+   because a reader cannot know which parameters produced a given blob.
+2. If the `argon2` crate ever changes its defaults (a minor-version change could),
+   every existing blob silently becomes undecryptable — the same class of
+   failure as CRY-04, arriving through a dependency bump rather than a framing
+   bug.
+
+Credit where due, and this is a real defence: the passphrase *sources* refuse
+insecure defaults. macOS file custody is explicitly disabled in favour of the
+System keychain (`key_material.rs:730`), and Linux requires an explicit
+`RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH` or systemd `CREDENTIALS_DIRECTORY`,
+deliberately refusing to fall back to the configured default path (`:760-765`).
+So the passphrase is operator-supplied and never hardcoded or generated — the gap
+is only its strength floor.
+
+Proposed enforcement (review-only — do NOT apply): store the Argon2 parameters
+(m, t, p, algorithm, version) in the envelope so cost can be raised
+migration-safely; and raise the passphrase floor (length plus a minimum-entropy or
+generated-passphrase requirement) given that this string, not the OS keystore,
+bounds at-rest security.
+
+---
+
+### CRY-04 — v0/v1 framing ambiguity renders legacy blobs undecodable (Medium, availability; confirms **RSA-0001**)
+
+File: `crates/rustynet-crypto/src/lib.rs:1604-1611`, with `:1613-1663`, framing at `:1585-1602`
+
+Confirms RSA-0001 with no new argument. `decode_encrypted_blob` dispatches on
+`bytes.len() >= 45 && bytes[0] != 0`. A v0 blob is `[salt:16][nonce:24][len:4][ct]`,
+so `bytes[0]` is `salt[0]` — a CSPRNG byte, nonzero 255/256 of the time — and a
+32-byte key yields 44+48 = 92 bytes. So a genuine v0 blob is routed to
+`decode_encrypted_blob_v1`, which reads its length from `bytes[41..45]` (garbage)
+and returns `InvalidLength` (`:1653`).
+
+The direction is worth stating precisely, because it determines the severity:
+this **fails closed**. The misparse cannot yield a wrong-key decryption — for a
+real v0 blob of length `44+N`, the v1 check requires `44+N == 45+G` where `G` is
+the big-endian u32 at `bytes[41..45]`; for small `N` that region is
+`[0, 0, N, ct[0]]`, giving `G = N*256 + ct[0]`, which cannot equal `N-1`. So the
+outcome is a daemon that cannot load its key and fail-closes — an availability
+and upgrade-compatibility failure, not a confidentiality bypass. That matches the
+ledger's own assessment.
+
+Two contributions only:
+
+- **Line drift for the ledger.** RSA-0001 cites `decode_encrypted_blob` at
+  `:1601-1608` and `encode_encrypted_blob` at `:1582-1599`; at this baseline they
+  are `:1604-1611` and `:1585-1602`. RSA-0002 cites the non-unix branch at
+  `:1712-1717`; it is now `:1715-1720`. Worth refreshing so the entries stay
+  greppable.
+- **The regression test RSA-0001 asked for still does not exist.** Confirmed
+  against the 38 passing tests: there is no test that hand-builds a v0
+  `[salt][nonce][len][ct]` blob and asserts it decodes. Given the fix is
+  deliberately deferred, adding *only* the failing-or-ignored regression test
+  would at least pin the contract without touching the key-load path.
+
+`encode_encrypted_blob`'s v0 branch (`:1586-1592`) is confirmed dead for writes:
+`encrypt_private_key_envelope` hardcodes `KEY_ENVELOPE_VERSION = 1` (`:1315`,
+`:1346`), and the encoder is private with one caller. So v0 is read-only legacy.
+
+---
+
+### CRY-05 — Windows permission validation is a no-op on both directions (Medium; confirms **RSA-0002**)
+
+File: `crates/rustynet-crypto/src/lib.rs:1715-1720`, plus `:1498-1511`, `:1519`, `:1532-1536`
+
+Confirms RSA-0002. The `#[cfg(not(unix))]` branch returns `Ok(())` with
+`// Windows ACL validation not yet implemented; defer to OS enforcement.` Two
+details to add to the existing entry:
+
+1. **The write side is unprotected too, not just the check.**
+   `write_encrypted_key_file`'s permission-tightening block is `#[cfg(unix)]`
+   (`:1498-1511`) and `write_atomic_encrypted_key_file` applies `options.mode(_mode)`
+   only under `#[cfg(unix)]` (`:1532-1536`), so on Windows the key file is created
+   with inherited directory ACLs, never restricted *and* never validated.
+2. **The error variant the fix needs already exists and is unused.**
+   `CryptoError::PermissionValidationUnavailable` (`:84`, "permission validation
+   unavailable on this platform") is defined but never constructed here — which is
+   exactly what RSA-0002's proposed enforcement calls for
+   (`SecurityAuditLedger_2026-06-18.md:869`). The one-line fail-closed change is
+   already expressible in the existing type.
+
+Reachable in production from `rustynet-cli/src/bin/rustynet-windows-trust-cli.rs:325`
+and `:375`, whose policy helper is a bare default (`:385-387`) — and per RSA-0002's
+own note, the most sensitive instance is the **trust signing key**.
+
+---
+
+### CRY-06 — `NodeKeyPair::from_raw` never verifies pub/priv correspondence (Medium-if-used, CONFIRMED by the crate's own test)
+
+File: `crates/rustynet-crypto/src/lib.rs:137-154`
+
+`from_raw` validates only `is_all_zeros` on each half. The public key is never
+derived from, or compared against, the private key, so the struct can hold an
+inconsistent pair. The crate's own passing test demonstrates it:
+`accepts_nonzero_key_material` (`:1860-1864`) constructs
+`from_raw([7; 32], [9; 32])` and succeeds — `[7u8; 32]` is certainly not the
+ed25519 public key for seed `[9u8; 32]`.
+
+Consequence if wired: publishing `public_key` while signing with `private_key`
+produces signatures nobody can verify (availability), or binds an identity to a
+key the holder does not control. The all-zeros check is largely security theatre
+— it rejects one degenerate encoding while other small-order and non-canonical
+encodings pass, and for a dalek seed any nonzero 32 bytes is "valid."
+
+Severity is held at *Medium-if-used* because **there is no non-test consumer** of
+`from_raw` — it is dead public API. The correct shape already exists in the same
+file: `Ed25519SigningProvider::from_seed` (`:1128-1142`) takes only the seed and
+derives the verifying key, making mismatch structurally impossible.
+
+Proposed enforcement (review-only — do NOT apply): either delete `NodeKeyPair::from_raw`,
+or make it accept a seed and derive the public key, following `from_seed`.
+
+---
+
+### CRY-07 — unix permission validator checks modes but not ownership (Low, CONFIRMED)
+
+File: `crates/rustynet-crypto/src/lib.rs:1685-1713`
+
+The unix path is genuinely strict about *modes* — it rejects symlinks and wrong
+types on both directory and file via `symlink_metadata` (`:1689-1697`) and
+requires exact `0o700` / `0o600` (`:1702-1709`). But it never compares the owning
+`uid` against the effective user, so an **attacker-owned** directory and file with
+correct modes validate successfully.
+
+This matters only where an attacker can influence `fallback_directory`, which
+in-crate callers do not — hence Low. It is worth recording because the repo
+already applies the stronger pattern elsewhere: `ops_peer_store.rs` is audited as
+PASS specifically for having a "uid check" alongside 0700/0600
+(`SecurityAuditLedger_2026-06-18.md:490`). This validator is the weaker of two
+sibling implementations.
+
+Also present and correctly rated as theoretical: a TOCTOU window between
+`symlink_metadata`, the later `metadata` calls (`:1699-1700`), and the actual
+`std::fs::read` in `read_encrypted_key_file` (`:1579-1580`). Exploiting it needs
+write access inside a directory the same function requires to be `0700`, i.e. the
+attacker is already the owner or root. Hardening would be an `O_NOFOLLOW` open
+plus `fstat` on the handle.
+
+---
+
+### CRY-08 — `with_exceptions` rejects every non-empty list, making the denylist loop dead code (Low, quality; confirms **RSA-0003**)
+
+File: `crates/rustynet-crypto/src/lib.rs:188-199`
+
+Line `:189` returns `Err(CryptoError::InvalidException)` for any non-empty
+exception list, so the per-exception denylist loop at `:192-196` is unreachable.
+
+**The repo's existing decision is correct and this review does not challenge it.**
+RSA-0003 was ASSESSED 2026-06-24 as *keep as-is*, on the grounds that the
+inverted guard is currently protective — it denies all exceptions, the
+strictest-secure outcome — and that "repairing" it would make it fail-open
+(`SecurityRemediationPlan_2026-06-19.md:92`). Independently verified here: the
+exception path in `validate` (`:211-219`) would otherwise be the one route by
+which a *denylisted* algorithm (Md5, Sha1, Rc4, Des, TripleDes, BlowfishCbc,
+WeakDh) could return `Ok(())`, and it is unreachable because `exceptions` is
+private and no non-empty list can be constructed.
+
+The only residual point is readability: a dead validation loop plus a live
+`CompatibilityException` type reads as a working feature, which invites a future
+contributor to "fix" the guard and reintroduce the downgrade path. A comment
+stating that exceptions are administratively disabled by design would prevent
+that, at zero security cost.
+
+---
+
+### CRY-09 — three security controls are entirely unwired, and one production path builds exactly what the default policy forbids (Medium, CONFIRMED)
+
+Files: `crates/rustynet-crypto/src/lib.rs:183-233`, `:1088-1194`, `:1195-1236`; `crates/rustynet-cli/src/release_manifest.rs:114`
+
+Three separate controls in this crate have **zero production callers**:
+
+1. `AlgorithmPolicy` / `CompatibilityException` / `validate` — every call site is
+   a test (`lib.rs:1868`-`:1911`; `rustynet-control/src/lib.rs:4697`, `:4703-4704`,
+   inside that crate's `#[cfg(test)]` module). `validate_now` (`:228`) has **no
+   callers at all**, test or otherwise. So the algorithm allowlist/denylist —
+   which is correct and complete (§9.1) — governs nothing at runtime.
+2. `SigningProviderPolicy` / `validate_signing_provider_policy` — only
+   `lib.rs:2216` (test).
+3. `create_provider_attestation` / `verify_provider_attestation` — only tests
+   (`lib.rs:2236`-`:2264`).
+
+The sharpest part is the interaction. `SigningProviderPolicy::default()` is
+strict — `require_hardware_backed_primary: true`, `allow_local_fallback: false`
+(`:1096-1097`) — and the one production consumer of the provider abstraction
+constructs precisely what that default forbids, without calling the validator
+(`release_manifest.rs:114`):
+
+```rust
+let provider =
+    Ed25519SigningProvider::from_seed(SigningProviderKind::LocalEncryptedFile, key_id, seed);
+```
+
+It also signs via `SigningProvider::sign_attestation` directly, bypassing
+`create_provider_attestation` and therefore the provider-kind and key-id binding
+checks at `:1221-1226`. So the policy that would reject a local-file signing key
+for release manifests exists, defaults to rejecting it, and is never consulted.
+
+Proposed enforcement (review-only — do NOT apply): either wire
+`validate_signing_provider_policy` into `release_manifest.rs` and accept an
+explicit documented exception for local-file signing, or delete the three unwired
+controls. Leaving a strict-by-default policy unconsulted is the failure mode Part I
+records as POL-10 — a control that reads as protection and provides none.
+
+---
+
+### CRY-10 — `aead_seal` doc claims OS-secure key custody; production reads a raw key from a plain file (Low, doc, CONFIRMED)
+
+Files: `crates/rustynet-crypto/src/lib.rs:1413-1414`; `crates/rustynet-nas/src/main.rs:98`, `:198-243`
+
+The doc comment states the 32-byte key "comes from OS-secure custody (keychain /
+DPAPI / `LoadCredentialEncrypted`), NOT from a passphrase KDF." The actual
+production path is `load_at_rest_key`, which reads a raw 32-byte key from
+`--at-rest-key-file` (validated as a regular file, `mode & 0o077 == 0`, exactly 32
+bytes) or `--at-rest-key-credential`. Only the systemd-credential variant
+plausibly involves `LoadCredentialEncrypted`; the file variant is a plain 0600
+file with no keychain or DPAPI involvement on any platform.
+
+The AEAD construction itself is sound and is credited in §9. This is a doc
+accuracy issue: a reader auditing NAS at-rest encryption would conclude the key is
+hardware/OS-protected when it need not be.
+
+---
+
+### CRY-11 — `from_seed` does not zeroize its by-value seed parameter (Info, CONFIRMED)
+
+File: `crates/rustynet-crypto/src/lib.rs:1129-1142`
+
+`Ed25519SigningProvider::from_seed` takes `seed: [u8; 32]` by value and never
+zeroizes that parameter copy after `SigningKey::from_bytes` copies out of it, so a
+transient stack copy of the signing seed survives the call. The resulting
+`SigningKey` *is* zeroized on drop (ed25519-dalek 2.x `ZeroizeOnDrop`, `zeroize`
+being a default feature — confirmed in the vendored manifest), so this is the
+parameter copy only. Recorded for completeness rather than as a practical risk.
+
+## 9. Defences that hold — verified, for the record
+
+This crate resisted most of what was aimed at it. Each item below was probed and
+held:
+
+1. **Algorithm coverage is complete with a terminal deny.** `CryptoAlgorithm` has
+   18 variants; the allowlist (`:234-249`) covers 11 and the denylist (`:251-262`)
+   covers 7 — no variant is in neither. More robustly, `validate` ends in an
+   unconditional `Err(CryptoError::DeniedAlgorithm)` (`:225`), so even a *future*
+   variant added to neither list is denied. **No default-allow defect.** Ordering
+   is also right: the allowlist is checked first, and an exception is consulted
+   only inside the denylisted branch, so an exception can never bless a
+   neither-listed algorithm.
+2. **Clock failure fails closed.** `unix_now` (`:264-270`) maps errors to
+   `InvalidClock`, and `validate_now` (`:228-231`) propagates with `?` — the
+   expiry check is never skipped. The only other `SystemTime` use
+   (`temp_path_for`, `:1563-1571`) does `unwrap_or(0)` but feeds a temp-file name
+   suffix, where a collision hits `create_new(true)` (`:1531`) and fails.
+3. **`SecretKey` hygiene is correct.** `Drop` (`:61-68`) really zeroizes; `Debug`
+   (`:55-59`) prints `SecretKey(REDACTED)`; the type has **no derives at all**
+   (`:43`) so it is not `Clone`, not `Copy`, and `==` on it will not compile;
+   `ct_eq` (`:50-52`) delegates to `subtle::ConstantTimeEq`. No `==` on secret
+   bytes anywhere in the crate.
+4. **Attestation verification is real, not field theatre.**
+   `verify_provider_attestation` (`:1216-1235`) ends in
+   `provider.verify_attestation`, which for Ed25519 is `verify_strict`
+   (`:1173-1175`) — strict RFC-8032/ZIP-215, rejecting non-canonical S and
+   small-order components — and the crate has an executed regression for malleable
+   signatures. A forged attestation cannot pass without the signing key. (Trust
+   root is the caller-supplied provider's verifying key; there is no chain, which
+   is a contract observation, not a defect.)
+5. **CSPRNG handling fails closed, and is enforced by a test.**
+   `try_generate_key_custody_material` (`:1288-1299`) refuses to degrade to
+   `ThreadRng`, with a comment explaining why. The panicking legacy variant
+   (`:1264-1274`) has **zero production callers** — all three are in `#[cfg(test)]`
+   — and there is a source-scanning regression test (`:1831-1851`) that keeps
+   `write_encrypted_key_file` on the fallible path.
+6. **AEAD associated data genuinely binds location.** All eight `aead_seal`/`aead_open`
+   sites in `rustynet-nas/src/store.rs` pass an AAD that fully determines the
+   blob's location: objects use `nas:object:{peer_id}:{hash}` (`:375`, `:397`),
+   snapshots `nas:snapshot:{peer_id}:{snapshot_id}`, quotas `nas:quota:{peer_id}`,
+   each matching its real path granularity. Object reads are additionally
+   hash-checked after open (`:399-405`). The one constant AAD (`nas:keycheck`) is
+   correct by design — a single fixed sentinel file with no per-location
+   component.
+7. **`hex_decode` is correct for its use** (`:1245-1262`): rejects empty and
+   odd-length input, rejects non-hex per nibble, accepts both cases. Not
+   constant-time, but it decodes a *signature* — public material — so timing
+   reveals nothing useful.
+8. **Passphrase sources refuse insecure defaults** — see CRY-03: macOS file
+   custody disabled in favour of the System keychain; Linux requires an explicit
+   credential path and refuses the default.
+9. **Dependencies are vetted primitives only**, no custom crypto, matching the
+   `#3` architecture constraint and the existing PASS on
+   `rustynet-crypto/Cargo.toml`.
+
+## 10. Suggested triage order for Part II
+
+1. **CRY-01 + CRY-03 together** — they compose into the one finding that changes
+   the threat model: the WG private key is always on disk, protected by a
+   possibly-trivial passphrase under unrecorded KDF parameters. Either the disk
+   copy or the passphrase floor has to change; deciding requires knowing whether
+   the "service prechecks and deterministic bootstrap" requirement is real.
+2. **CRY-02** — cheap and self-contained: give Linux an explicit policy arm and
+   stop discarding the `KeyCustodyBackend`.
+3. **CRY-09** — decide wire-or-delete for the three unwired controls; at minimum
+   stop `release_manifest.rs` from silently contradicting the strict default.
+4. **CRY-04** — the fix stays deferred per the recorded 2026-06-24 decision, but
+   the regression test it asked for can land independently and should.
+5. **CRY-05** — one-line fail-closed change using the already-defined
+   `PermissionValidationUnavailable`, per RSA-0002's own proposal.
+6. **CRY-06** — derive-or-delete `from_raw` while it is still dead API and the
+   change is free.
+7. **CRY-07, CRY-08, CRY-10, CRY-11** — low-cost hygiene; CRY-08 is a comment, not
+   a code change.
+
+## 11. Reproduction (Part II)
+
+```bash
+git -C ~/Desktop/rustynet rev-parse --short HEAD   # expect 22847b12
+cargo test -p rustynet-crypto                      # expect 38/38 green
+```
+
+Unlike Part I, this crate has real dependencies, so the standalone-`rustc` probe
+does not apply to the whole crate. The blob framing functions
+(`encode_encrypted_blob` / `decode_encrypted_blob*`) are pure byte manipulation
+and **can** be copied out and compiled standalone, which is how CRY-04's
+arithmetic was checked. Crate-level runs used a `CARGO_TARGET_DIR` outside the
+repository to avoid contending with concurrent workers' builds.
