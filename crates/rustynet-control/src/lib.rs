@@ -1352,6 +1352,19 @@ pub struct NodeRegistry {
 
 impl NodeRegistry {
     pub fn upsert(&self, node: NodeMetadata) -> Result<(), ControlPlaneError> {
+        // Validate at the point of entry, not only where a payload is built.
+        // Everything downstream of the registry treats a registered node id as
+        // already-trusted text, and several signing paths read it straight out
+        // of here, so an id carrying `\n`, `\r` or `=` would reach a signed
+        // `key=value` payload with nothing else in the way. Rejecting on the
+        // way in means a bad id cannot be stored at all, which is a smaller
+        // surface than auditing every read. CTL-01.
+        if !is_valid_node_id_text(node.node_id.as_str()) {
+            return Err(ControlPlaneError::Assignment(format!(
+                "node id is not a valid single-line payload value: {:?}",
+                node.node_id
+            )));
+        }
         let mut guard = self.nodes.lock().map_err(|_| ControlPlaneError::Internal)?;
         guard.insert(node.node_id.clone(), node);
         Ok(())
@@ -3710,8 +3723,24 @@ fn selectors_for_node(node: &NodeMetadata) -> Vec<String> {
     selectors
 }
 
+/// Whether a node id is safe to place in a signed payload.
+///
+/// Non-empty is not sufficient. Node ids are interpolated into the
+/// `|`-delimited, `key=value` payloads this module signs, so an id containing
+/// `\n`, `\r` or `=` can forge additional fields inside the signed text: the
+/// signature covers the forged payload, so every downstream verifier accepts
+/// it. That is the node-id vector of CTL-01, and the issuance half of RLY-03.
+///
+/// [`is_single_line_payload_value`] already rejects exactly those three bytes
+/// and was already applied to the relay-fleet descriptor fields — just not
+/// here, which is why the guard existed while the hole stayed open. Real node
+/// ids in this tree are hostname slugs, so requiring it strands nothing.
+///
+/// Deliberately NOT claimed: this does not address CTL-02 (verifier
+/// soundness), CTL-03 (the `|`-delimited payload plus its unsigned timestamp),
+/// or the `os`-field vector, all of which need their own changes.
 fn is_valid_node_id_text(value: &str) -> bool {
-    !value.trim().is_empty()
+    !value.trim().is_empty() && is_single_line_payload_value(value)
 }
 
 fn validate_assignment_node_capabilities(node: &NodeMetadata) -> Result<(), ControlPlaneError> {
@@ -4354,6 +4383,99 @@ fn is_valid_ipv4_or_ipv6_cidr(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A node id must not be able to forge fields inside a signed payload.
+    ///
+    /// CTL-01. The payloads this module signs are `|`-delimited `key=value`
+    /// text, so an id carrying `\n`, `\r` or `=` can append or overwrite a
+    /// field -- and because the signature is computed over the forged text,
+    /// every downstream verifier accepts it. The guard for this
+    /// (`is_single_line_payload_value`) already existed and was already applied
+    /// to relay-fleet fields; node ids were simply never routed through it.
+    #[test]
+    fn node_id_rejects_signed_payload_injection() {
+        // Shapes that would forge a field. Each is a realistic attempt, not a
+        // fuzz artifact: they close one field and open another.
+        for hostile in [
+            "node-a\nrole=admin",
+            "node-a\r\nrole=admin",
+            "node-a=evil",
+            "node-a|role=admin\ncap",
+            "\nnode-a",
+            "node-a\n",
+        ] {
+            assert!(
+                !super::is_valid_node_id_text(hostile),
+                "node id must be rejected as a payload-injection vector: {hostile:?}"
+            );
+        }
+
+        // Empty / whitespace-only stays rejected (the pre-existing rule).
+        for blank in ["", " ", "\t", "   "] {
+            assert!(
+                !super::is_valid_node_id_text(blank),
+                "blank node id must stay rejected: {blank:?}"
+            );
+        }
+
+        // Real ids in this tree are hostname slugs -- the guard must strand none
+        // of them, or it would break every existing fleet.
+        for benign in [
+            "client-1",
+            "xnet-mac-1",
+            "debian-headless-2",
+            "linux-x86-exit-1",
+            "node_a.example",
+            "NODE-A",
+        ] {
+            assert!(
+                super::is_valid_node_id_text(benign),
+                "a real hostname-slug node id must still be accepted: {benign:?}"
+            );
+        }
+    }
+
+    /// The registry must refuse a hostile id on the way IN.
+    ///
+    /// Several signing paths read node ids straight out of the registry and
+    /// treat them as already-trusted text, so validating only where a payload
+    /// is built leaves every other reader exposed. Rejecting at `upsert` is the
+    /// smaller surface.
+    #[test]
+    fn node_registry_upsert_rejects_payload_injection() {
+        let registry = super::NodeRegistry::default();
+        let node = |id: &str| super::NodeMetadata {
+            node_id: id.to_owned(),
+            hostname: "host".to_owned(),
+            os: "linux".to_owned(),
+            tags: Vec::new(),
+            capabilities: vec![super::RoleCapability::Client],
+            owner: "owner".to_owned(),
+            endpoint: "192.0.2.1:51820".to_owned(),
+            last_seen_unix: 0,
+            public_key: [7u8; 32],
+        };
+
+        let err = registry
+            .upsert(node("node-a\nrole=admin"))
+            .expect_err("a payload-injecting node id must not be storable");
+        assert!(matches!(err, super::ControlPlaneError::Assignment(_)));
+
+        // And nothing was stored under either the hostile id or its prefix.
+        assert!(
+            registry
+                .get("node-a\nrole=admin")
+                .expect("registry read")
+                .is_none()
+        );
+        assert!(registry.get("node-a").expect("registry read").is_none());
+
+        // A benign id still round-trips.
+        registry
+            .upsert(node("client-1"))
+            .expect("a hostname-slug node id must still be storable");
+        assert!(registry.get("client-1").expect("registry read").is_some());
+    }
     use super::{
         ACCESS_TOKEN_SIGNING_SEED_INFO_V1, ASSIGNMENT_SIGNING_SEED_INFO_V1, AbuseAlertPolicy,
         ApiAbuseMonitor, AuthError, AuthRateLimitConfig, AuthSurfaceGuard, AutoTunnelBundleRequest,
