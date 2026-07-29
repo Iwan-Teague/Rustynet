@@ -1,7 +1,7 @@
 # Adversarial Security Review — 2026-07-29
 
 Status: review only — **no code changed**, no enforcement applied; findings await owner triage
-Audit baseline: repository at commit **`22847b12`** ("refactor(live-lab): call the key-custody report writer in-process"), on `main`
+Audit baseline: repository at commit **`22847b12`** ("refactor(live-lab): call the key-custody report writer in-process"), on `main`. Parts V and VI were verified as the tree advanced under concurrent workers (`fe634559`, then `c5018acb`); those parts note their own drift and their line refs should be treated as approximate.
 Method: rolling adversarial review, one focused area per part. Each part names its own crate baseline, scope, and reachability conclusions.
 
 | Part | Area | Findings | Status |
@@ -10,6 +10,8 @@ Method: rolling adversarial review, one focused area per part. Each part names i
 | **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … CRY-12 | complete |
 | **III** | macOS `pf` privileged-helper boundary — killswitch rule regeneration | PF-01 … PF-14 | complete |
 | **IV** | `rustynet-relay` — remote/unauthenticated input path | RLY-01 … RLY-14 | complete |
+| **V** | `rustynet-control` — the trust issuer (signed-artifact issuance) | CTL-01 … CTL-07 | complete |
+| **VI** | Windows privileged + at-rest surface (named pipe, DPAPI, WFP) | WIN-01 … WIN-10 | complete |
 
 This is a single rolling document by intent: the areas share the same baseline
 commit and the same fail-closed/default-deny constraints, and several findings
@@ -860,12 +862,16 @@ details to add to the existing entry:
    (`:1498-1511`) and `write_atomic_encrypted_key_file` applies `options.mode(_mode)`
    only under `#[cfg(unix)]` (`:1532-1536`), so on Windows the key file is created
    with inherited directory ACLs, never restricted *and* never validated.
-2. **The error variant the fix needs already exists and is unused.**
+2. **The error variant the fix needs already exists, and is not used *here*.**
    `CryptoError::PermissionValidationUnavailable` (`:84`, "permission validation
-   unavailable on this platform") is defined but never constructed here — which is
-   exactly what RSA-0002's proposed enforcement calls for
-   (`SecurityAuditLedger_2026-06-18.md:869`). The one-line fail-closed change is
-   already expressible in the existing type.
+   unavailable on this platform") is never constructed by
+   `validate_key_custody_permissions` — which is exactly what RSA-0002's proposed
+   enforcement calls for (`SecurityAuditLedger_2026-06-18.md:869`). The one-line
+   fail-closed change is already expressible in the existing type.
+   **Corrected in Part VI (WIN-10):** an earlier revision of this finding said the
+   variant was "defined but never constructed" anywhere. That was wrong — it *is*
+   constructed on the Windows DPAPI path at `:1016` and `:1033`. The claim is
+   narrowed to this function; CRY-05's substance is unaffected.
 
 Reachable in production from `rustynet-cli/src/bin/rustynet-windows-trust-cli.rs:325`
 and `:375`, whose policy helper is a bare default (`:385-387`) — and per RSA-0002's
@@ -1217,7 +1223,7 @@ nor the helper rule-shape assert, nor the self-referential evaluator caught the
 | ID | Finding | Severity | New? |
 |---|---|---|---|
 | PF-01 | `allow_egress_interface=true` is a one-boolean full-IPv4 killswitch off-switch, and it passes the repo's own killswitch assertion | High | **New** |
-| PF-02 | `ssh_cidr=0.0.0.0/0` opens unrestricted off-tunnel TCP/22 — **even under `strict=true`**, and not interface-scoped | High | **New** |
+| PF-02 | `ssh_cidr=0.0.0.0/0` opens unrestricted off-tunnel TCP/22 — **even under `strict=true`**, and not interface-scoped. Confirmed on macOS pf, Linux nft **and** Windows netsh (WIN-05) | High | **New** |
 | PF-03 | `apply_pf_rules` flushes the old anchor **before** loading the new one, on every reconcile — a failed load leaves egress wide open | High | **New** |
 | PF-04 | The allowed `pfctl -a <anchor> -F all` arm lets the daemon empty the live killswitch anchor, bypassing the whole regeneration boundary | High (adjacent) | **New** |
 | PF-05 | Killswitch assertions validate rule **presence, not precedence** — the root cause of PF-01/PF-02 being silent | Medium | **New** |
@@ -2075,3 +2081,230 @@ adversarial tests were added and the suite ran 93 passed / 0 failed. For the
 dataplane, a faithful reproduction with 4096 live sessions and ports measured
 RLY-02's prune cost and RLY-05's retained memory. Rate figures derived by
 arithmetic from constants rather than measured are labelled as such inline.
+
+---
+
+# Part V — `rustynet-control` as the trust issuer
+
+Crate baseline: `crates/rustynet-control/src/lib.rs` (8192 lines). **Baseline drift:** Parts I–IV were taken at `22847b12`; this part was verified as the tree advanced (`fe634559`, and `c5018acb` by the time of writing). Line references were re-checked at write time, but this area is under active development and refs should be treated as approximate.
+Scope: the signed-artifact issuance and verification surface — `SignedPeerMap`, `SignedEndpointHintBundle`, `SignedRelayFleetBundle`, `SignedAutoTunnelBundle`, `SignedTraversalCoordinationRecord`, the relay-session-token path, enrollment, and `derive_gossip_signing_key`
+Out of scope for this part: the sibling files with their own ledger rows (`membership.rs`, `enrollment.rs`, `role_audit.rs`, `scale.rs`, `persistence.rs`, `admin.rs`, `operations.rs`) except where cited
+
+## 22. Why this area — it is what Parts I and IV delegate to
+
+Part I established that `ControlPlaneCore`'s issuance membership gate is *unconditionally inert* in production (POL-06), and Part IV established that the relay performs **no** membership check of its own, delegating the entire decision to whoever signed the token. Both parts therefore end at the same place: the issuer. Part V audits it, following two concrete leads Part IV left behind — RLY-01 (`issue_relay_session_token` trusts a caller-supplied timestamp) and RLY-03 (the signed payload is delimiter-framed with no length prefixes).
+
+Prior coverage, enumerated before writing: **RSA-0008** (Medium, open — issuance gated by revocation-blind `evaluate`), **RSA-0010** (Low, open), **RSA-0011** (Info, open — `TrustState` has no anti-rollback floor), **RSA-0005** (Low, open), RSA-0043 (applied), RSA-0077 (open, outside this scope).
+
+| ID | Finding | Severity | New? |
+|---|---|---|---|
+| CTL-01 | `is_valid_node_id_text` is a non-blank check, so every node-id-bearing signed payload is delimiter-injectable — the root cause of RLY-03's class | High | **New** |
+| CTL-02 | `verify_signed_endpoint_hint_bundle` is the only bundle verifier with no re-canonicalization | Medium | **New** |
+| CTL-03 | `SignedPeerMap` leaves `generated_at_unix` outside the signature and permits full record injection | Medium (latent) | **New** |
+| CTL-04 | Enrollment evaluates credential expiry against a caller-supplied clock | Medium (latent) | **New** |
+| CTL-05 | No bundle verifier checks expiry — all four accept artifacts expired for decades | Medium | **New** |
+| CTL-06 | No signed artifact carries a generation, so there is no anti-rollback | Medium | Partly RSA-0011 |
+| CTL-07 | Ledger maintenance: RSA-0010 and RSA-0017 are applied, not open | Low | **New** |
+
+### CTL-01 — the node-id guard is non-blank only, and the correct guard already exists beside it (High, CONFIRMED by execution)
+
+Verified by direct reading:
+
+```rust
+fn is_valid_node_id_text(value: &str) -> bool { !value.trim().is_empty() }   // :3713-3715
+fn is_single_line_payload_value(value: &str) -> bool {                        // :4007-4012
+    !value.is_empty() && !value.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'='))
+}
+```
+
+The second function is exactly the guard needed, lives in the same file, and **is** applied to relay-fleet `relay_id`/`region`. It is not applied to node ids — which are interpolated into `\n`/`=`-delimited signed payloads at `:2840`, `:3088`, `:3093`, `:3151-3152`, `:3232-3233`, `:4284-4285`. `enroll_with_throwaway` applies **no** validation to `request.node_id` before `nodes.upsert` (`:2338`, `:2358`); confirmed by execution that a node id containing `\n` and `=` enrolls successfully.
+
+That asymmetry is the whole story: relay-fleet resists the field-boundary attack and the node-id paths do not, for no reason other than which helper was called. Applying `is_single_line_payload_value` inside `is_valid_node_id_text` and at the enrollment boundary closes CTL-01, CTL-02, CTL-03 and the issuance half of RLY-03 in one change. **This is the single highest-leverage fix in the whole document.**
+
+### CTL-02 — one bundle verifier omits the re-canonicalization its siblings have (Medium, CONFIRMED by execution)
+
+`verify_signed_endpoint_hint_bundle` (`:3137-3211`) cross-checks outer fields against the payload with `endpoint_hint_payload_field_matches` (`:3863-3874`), which **returns on the first occurrence of a key**. It never compares a re-serialized payload against the received bytes — whereas `verify_signed_traversal_coordination_record` (`:3265-3269`) and `verify_signed_relay_fleet_bundle_with_key` (`:1573-1580`) both do.
+
+Worked example, executed: enroll a node whose id is `node-a\ntarget_node_id=node-victim`, issue a hint bundle for that node → `node-b`. The **legitimately issued** bundle verifies `false`, while re-framing the outer struct to `source_node_id="node-a"`, `target_node_id="node-victim"` — with the **same 64 signature bytes** — verifies `true`. Direct issuance for that pair is refused. So the only framing of those bytes the verifier accepts is one the control plane never authorized.
+
+Reachability, stated honestly: there is no `parse_signed_endpoint_hint_bundle_wire`, so the outer struct is never reconstituted from untrusted bytes in this crate; the daemon's parser rejects duplicate keys and drops the injected payload. Exploiting it needs an in-process consumer building the struct from attacker-influenced fields, and today's consumers self-verify their own freshly issued bundles. This is a live inconsistency in a public verifier, not a live end-to-end bypass. `verify_signed_auto_tunnel_bundle` (`:3321-3367`) shares the gap with a narrower achievable re-frame.
+
+### CTL-03 — `SignedPeerMap` signs the records but not the timestamp, and does not validate them (Medium, latent, CONFIRMED by execution)
+
+Verified by reading `:2478-2492`: the signed payload is only `node_id|hostname|os|owner|last_seen_unix|pubkey` lines — **no version line, no `generated_at_unix`, no nonce**. The timestamp lives in the outer struct and is never signed; executed, rewriting it to `99999999999` still verifies `true`. There is no expiry, generation, or signed freshness of any kind, so a captured peer map replays indefinitely and is indistinguishable from a current one.
+
+`verify_signed_peer_map` (`:2499-2510`) performs only a bare signature check — no field cross-check, no re-canonicalization, no duplicate-record rejection. Combined with CTL-01, executed: enrolling with an `os` field carrying `|` and `\n` produced a **verifying** map whose injected second record binds `victim-node` to the **attacker's own public key** — key substitution under a valid control-plane signature.
+
+This is also the sharpest answer to Part I's POL-06 follow-up: `signed_peer_map` calls neither `policy_allows_node_pair` nor any membership check, and simply names every registered node. It is not merely revocation-blind, it is **policy-blind by construction**. Severity is held at Medium-latent only because the type has zero consumers outside this crate.
+
+### CTL-04 — enrollment trusts the enrolling party's clock (Medium, latent, CONFIRMED by execution)
+
+`EnrollmentRequest.now_unix` (`:1381`) is supplied by the enrolling party and used verbatim as the clock for the credential-expiry decision, in both the in-memory store (`:816`) and the SQL backend (`persistence.rs:341-359`). Executed on a credential expiring at 160: an honest `now_unix = 1_000_000` gives `credential expired`, while a back-dated `now_unix = 150` **enrolls**. Nothing sweeps unused expired credentials, so back-dating revives them indefinitely; the same field also sets the access-token window, and `now_unix = 4_000_000_000` mints a token accepted until 2096.
+
+Latent: `EnrollmentRequest` has no production construction and `enroll_with_throwaway` has no callers outside tests. Answering the sub-questions directly — enrollment is authenticated only by possession of a single-use `credential_id`; there is no rate limit, nonce, or replay guard beyond the credential's use counter; and state allocation correctly happens *after* the credential is consumed, so there is no pre-auth allocation.
+
+### CTL-05 — no bundle verifier checks expiry (Medium, CONFIRMED by execution)
+
+None of the four `verify_*` functions (`:1524`, `:3137`, `:3216`, `:3321`) takes a `now` parameter. They validate internal timestamp *consistency* but never compare against a clock. Executed under a real 2026 wall clock: an endpoint-hint bundle and a relay-fleet bundle both dated `expires_at_unix = 260` — 1 January 1970 — verify `true`.
+
+`SecurityMinimumBar.md:87` requires signed material be fresh *and* not future-dated beyond skew; these verifiers implement neither half, and the name `verify_signed_X` does not signal that freshness is the caller's job. The one type that does implement expiry is the relay session token, via a separate `is_expired(now, skew)` that callers must remember to call — and which is upper-bound-only, which is RLY-01.
+
+### CTL-06 — no anti-rollback on any signed artifact (Medium; partly **CONFIRMS RSA-0011**)
+
+No `Signed{PeerMap, EndpointHintBundle, RelayFleetBundle, AutoTunnelBundle, TraversalCoordinationRecord}` carries a generation, sequence, or monotonic counter, and no stored floor exists to compare against.
+
+Chasing the rollback question honestly: for the four bundle types the answer is **bounded, not open** — replay is limited by `expires_at_unix` (TTL ≤ 86400 s, or ≤ 300 s for relay-fleet), and the daemon does enforce freshness, exposing `traversal_stale_rejections`, `traversal_replay_rejections`, and `traversal_future_dated_rejections` counters. The exception is `SignedPeerMap`, which has no expiry in its signed bytes at all (CTL-03) and is therefore replayable without limit — but is unwired. `TrustState`'s missing floor is already RSA-0011.
+
+### CTL-07 — two ledger rows are stale (Low, bookkeeping, CONFIRMED)
+
+- **RSA-0010 is applied, not open.** `issue_relay_session_token` now mints via `try_sign_at` (`:3038`) with an explicit `// RSA-0010:` rationale. Residual: the second half of the proposed enforcement was not done — `sign_at` (`:1752`) is still `pub` and not `#[cfg(test)]`-gated.
+- **RSA-0017 is applied, not open.** `SqliteStore::open` rejects group/other-accessible DB files, with a negative test in `persistence.rs`.
+
+## 23. Defences that hold (Part V)
+
+Four hypotheses I handed the reviewer were **refuted**, which is the useful part:
+
+1. **`verify_strict` is universal in this scope.** A grep for `.verify(` over `crates/rustynet-control/src/` returns **zero** hits; all eight verification sites use `verify_strict`, and `rustynet-dns-zone` is now `verify_strict` too, confirming RSA-0043 applied. RSA-0077's remaining plain-`verify` sites are all outside this scope.
+2. **`derive_gossip_signing_key` is sound.** Real HKDF-SHA256 with a fixed salt and a distinct domain-separation string, different from all four sibling constants; no truncation, no key reuse; both the by-value secret and the intermediate seed are zeroized. Confirmed by execution that the derived key differs from siblings and from the raw identity key.
+3. **The relay-fleet bundle is the correctly-built one** — two independent controls: `is_single_line_payload_value` on the interpolated fields, *and* re-canonicalization in both the parser and the verifier. Executed: injecting `"r1\nrelay_count=99"` is refused at issuance.
+4. **`split_signed_relay_fleet_wire` is solid.** Executed against seven hostile inputs — trailing data, duplicate signature line, blank line, empty-key line, leading whitespace — all rejected with distinct errors. Only CRLF is accepted, benignly (the payload is rebuilt with `\n` and is signature-identical). Parse and verify enforce the same invariant set, so there is no parse/verify asymmetry.
+5. **Traversal re-canonicalization genuinely defeats the re-split**, which the reviewer expected to fail. The check forces the outer fields to account for *all* payload bytes, so any alternative split leaves the injected text inside an outer field rather than yielding a clean victim id. Executed: the clean re-split verifies `false`.
+6. **The daemon's parsers contain the injection class.** All three reject duplicate keys and enforce strict allowed-key lists plus a key-charset check. A deliberate cross-type confusion attempt (injecting traversal keys into an endpoint-hint payload) was blocked by three independent barriers: an *exact* field count of 9, a nonce format mismatch (32 hex vs decimal `u64`), and duplicate-key rejection.
+7. **Enrollment allocates no state before authenticating**, and nonce generation fails closed on CSPRNG failure.
+
+Fuzz coverage: five `pub fn` text parsers in this scope have none — `parse_signed_relay_fleet_bundle_wire`, `parse_relay_session_token_wire`, `split_signed_relay_fleet_wire`, `parse_relay_fleet_payload_fields`, and the `TrustState` parser. `fuzz/Cargo.toml` already depends on this crate, so each is a three-line addition. Same class as RSA-0040.
+
+---
+
+# Part VI — Windows privileged and at-rest surface
+
+Crate baseline: `crates/rustynetd/src/windows_ipc.rs` (901), `windows_key_custody.rs` (930), `crates/rustynet-windows-native/src/lib.rs` (1948), plus the Windows arms of `rustynet-crypto` and `phase10.rs`
+Scope: the named-pipe privilege boundary, DPAPI key custody, and the WFP killswitch — the Windows counterparts of Part III
+Out of scope for this part: Windows installer scripts (RSA-0084) and the smoke-module hygiene items (HB-1…HB-5)
+
+## 24. Reachability — shipped and compiled, never live-exercised
+
+This distinction governs every finding below, so it is stated once. Windows is **not** build-blocked: `rustynetd` and `rustynet-windows-native` are compiled, clippy-gated at `-D warnings`, and unit-tested on `windows-2022` on every PR. The code ships. What does not exist is live proof — in the 97-run node matrix, `windows_named_pipe_acl` and `windows_dpapi_key_custody` are `not_run` **97/97**, and `windows_stage_bootstrap` is 0 pass / 5 fail. `PlatformSupportMatrix.md` excludes Windows from the release gate.
+
+So nothing below is dead code, and nothing below has ever run outside a unit test. Because this host is macOS, every claim about *Win32 runtime semantics* is marked **INFERRED**; the SDDL and path string logic was extracted and executed.
+
+Prior coverage: all three target files carry **`PASS`/`audited` ledger rows with zero findings**, so this part had a high bar to clear. Related open IDs: **RSA-0002** (Medium — but its body explicitly *carves out* the DPAPI path as "does validate SDDL"), **RSA-0025** (Medium), **RSA-0036** (Info), **AUDIT-027** (High), **AUDIT-028/029/030** (Medium/Medium/Low), **RN-06** (fixed), **RN-07** (partial). Part III explicitly excluded Windows WFP, and `windows_ipc.rs` had no findings in any namespace — both genuinely unexamined.
+
+| ID | Finding | Severity | New? |
+|---|---|---|---|
+| WIN-01 | The DPAPI custody ACL gate is a three-alias substring denylist, not default-deny | High | **New** |
+| WIN-02 | Named-pipe lifecycle leaves the name unowned between messages, and the client never authenticates the server | High | **New** |
+| WIN-03 | WFP installs only a max-weight PERMIT that can veto the firewall block, and the assertion checks existence not scope | Medium-High | **New** |
+| WIN-04 | `validate_windows_binary_path` System32 check is a substring test — UNC and user-writable prefixes pass | Medium | **New** |
+| WIN-05 | PF-02 generalizes to the Windows backend | Medium | CONFIRMS PF-02 |
+| WIN-06 | `validate_windows_dpapi_file` accepts an inherited DACL | Medium | **New** |
+| WIN-07 | The pipe security policy type is decorative — zero production callers | Low | **New** |
+| WIN-08 | Self-check pipe leaf is an unbounded prefix match | Low | **New** |
+| WIN-09 | All three SDDL evaluators are blind to conditional (`XA`) ACEs | Low | **New** |
+| WIN-10 | Confirmations of AUDIT-028/029/030, plus a precision correction to this document's own CRY-05 | Info | Mixed |
+
+### WIN-01 — the enforcing DPAPI custody ACL gate is a denylist (High, CONFIRMED by execution)
+
+Verified by direct reading of `crates/rustynet-crypto/src/lib.rs:1011-1042`. The entire ACL test in `validate_windows_dpapi_root` and `validate_windows_dpapi_file` is a substring check: require `D:P` (root) or `D:` (file), then reject exactly three literals — `;;;WD)`, `;;;AU)`, `;;;BU)`.
+
+This is the whole security boundary, by the code's own account: `store_in_windows_dpapi` states that NTFS ACLs on the custody directory "are the access boundary" and that DPAPI LocalMachine encryption only protects against off-machine extraction. With `CRYPTPROTECT_LOCAL_MACHINE` and null entropy (AUDIT-028), **any local principal who can read the blob can decrypt it** — so a three-entry denylist is all that stands between an unprivileged local user and the WireGuard private key.
+
+Executed against the extracted logic, all of these are **accepted** where they should be rejected: a single unprivileged user SID, `IU` (every interactive logon), `BG` (Guests), `AN` (Anonymous), `AC` (all application packages), and three further spellings of Everyone itself — `(XA;;FA;;;WD;(TRUE))`, `(A;;FA;;;WD;(X))`, `(OA;;FA;g1;g2;WD)`. The `;;;WD)` marker requires the SID to be followed immediately by `)`, which is why the alternate Everyone spellings slip past.
+
+Worked example: an administrator or repair script runs `icacls C:\ProgramData\RustyNet\secrets\key-custody /grant alice:(OI)(CI)R`. The validator returns `Ok`, `alice` reads the blob, calls `CryptUnprotectData` with no entropy, and recovers the key. `windows-key-custody-check` also reports green.
+
+**This is not RSA-0002.** That entry's body explicitly excludes the DPAPI path on the grounds that it *does* validate SDDL. It validates SDDL; it does not validate it soundly.
+
+The finding's force is the contrast: `windows_ipc.rs:285-294` implements exactly the right shape — a **default-deny allowlist** requiring the allow-ACE principal set to be a subset of `{SY, BA, service SID}`, plus owner and group pinning. The named-pipe boundary got default-deny; the key files got a denylist. Proposed enforcement (review-only): port the `windows_ipc.rs` pattern to both validators.
+
+Fair mitigation, and it matters: an *unhardened* directory fails closed. A default-inherited `C:\ProgramData` child grants `Users` read and is not protected, so it fails both the `D:P` requirement and `;;;BU)`. WIN-01 requires a directory deliberately hardened to a wrong-but-not-well-known principal — not the out-of-box state.
+
+### WIN-02 — the pipe name is unowned between messages, and the client never authenticates the server (High; server-side CONFIRMED by reading, Win32 semantics INFERRED)
+
+`serve_named_pipe_one_message_authorized` creates the pipe, serves **one** message, and drops the handle; `daemon.rs:10050-10096` calls it in a bare `loop { … }` with no persistent instance, no pre-creation, and no backoff. Between close and the next `CreateNamedPipeW` there is a window in which zero instances of the name exist. Since the NPFS root permits any authenticated user to create a pipe name (INFERRED — documented Windows behaviour), an attacker looping on `CreateNamedPipeW` wins that race — and because the daemon passes `FILE_FLAG_FIRST_PIPE_INSTANCE`, its own re-create then fails permanently. The flag that correctly prevents startup squatting becomes the mechanism that locks the daemon out afterwards, and the error path retries immediately, adding a CPU spin and log flood.
+
+Compounding it, the client performs **no server authentication**: `call_named_pipe` uses `CallNamedPipeW`, which cannot request `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, and named-pipe clients default to `SecurityImpersonation` (INFERRED). So a squatting server can impersonate an arriving administrative client.
+
+Note the asymmetry this exposes: the operator-run `collect_windows_named_pipe_acl_report` *would* detect a squat, because its evaluator rejects a non-`SY` owner — but that is a diagnostic, not something the client consults before talking. Proposed enforcement (review-only): hold one persistent listening instance so the name is never unowned; use `CreateFileW` with `SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS` plus a `GetNamedPipeServerProcessId` token check on the client side; add bounded backoff.
+
+### WIN-03 — WFP has no block filter, and the killswitch assertion checks filter existence rather than scope (Medium-High; CONFIRMED by reading, WFP arbitration INFERRED)
+
+There is **no `FWP_ACTION_BLOCK` anywhere in the repository**. Windows blocking is `netsh advfirewall … blockoutbound`; WFP contributes exactly one filter, a **permit**, installed at `weight = u16::MAX` with `FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`. On a permit, `CLEAR_ACTION_RIGHT` strips lower-weight sublayers of the right to veto — so this filter can override the Windows Firewall default-block. That is the WFP analogue of pf's first-match-`quick` from Part III.
+
+Its only condition is `FWPM_CONDITION_IP_LOCAL_INTERFACE == luid`, derived from `interface_alias_to_luid(&self.interface_name)`, and **nothing validates that the alias is the tunnel adapter rather than the physical NIC**. Meanwhile `assert_killswitch` verifies the netsh rules and every profile's `DefaultOutboundAction`, plus `wfp_tunnel_permit_present()` — which is `FwpmFilterGetByKey0` on two fixed GUIDs, i.e. **pure existence**.
+
+So the answer to Part III's question, transposed: **yes.** A filter set installed with `interface_name = "Ethernet"` yields both GUIDs present, all netsh rules correct, every profile default-block — `assert_killswitch` returns `Ok` — while a max-weight `CLEAR_ACTION_RIGHT` permit passes all egress on the physical NIC. Green killswitch, cleartext egress. PF-01 plus PF-05, reproduced on the platform Part III excluded.
+
+Honest severity calibration: unlike macOS, **no privilege boundary is crossed** — `apply_wfp_tunnel_permit` runs in-process in a daemon already executing as SYSTEM, so a compromised daemon gains nothing by lying. The live weight is therefore (a) a typo or misconfiguration in `interface_name` silently disables the killswitch while every assertion reports green, and (b) the assertion is structurally incapable of detecting a permissive filter, so the class stays invisible. Secondary and **INFERRED**: both sublayer and filters are `PERSISTENT`, so a stale permit keyed to a LUID the OS later reassigns to a different adapter would hold veto power from boot — narrowed by the fact that LUIDs encode `IfType`, so collisions are confined to same-type adapters.
+
+### WIN-04 — the System32 check is a substring test (Medium, CONFIRMED by execution)
+
+`phase10.rs:6366-6440` gates the `netsh.exe`/`powershell.exe` path that the SYSTEM-running daemon executes, resolved from an environment variable. Its own comment names the threat as "equivalent to RCE as SYSTEM". Executed against the extracted logic:
+
+| Path | Accepted |
+|---|---|
+| `C:\Windows\System32\netsh.exe` | yes (intended) |
+| `\\attacker-host\share\Windows\System32\netsh.exe` | **yes** — UNC satisfies the absoluteness test |
+| `C:\Users\Public\Windows\System32\netsh.exe` | **yes** — world-writable prefix |
+| `C:\Windows\System32\..\Temp\evil.exe` | no (`..` caught) |
+
+The check only asks whether `\windows\system32\` appears *anywhere* in the lowercased string. `C:\Users\Public` is world-writable by default, so an unprivileged user can pre-stage the payload; the remaining gate is service-environment write access. Compounding: no Authenticode verification is performed before execution — `verify_authenticode_chain` is reachable only from a CLI report, consistent with open S3-10. Proposed enforcement (review-only): resolve `%SystemRoot%` via `GetSystemDirectoryW` and require a canonicalized **prefix** match; reject UNC unconditionally; verify Authenticode before first exec.
+
+### WIN-05 — PF-02 generalizes to Windows (Medium, **CONFIRMS PF-02**)
+
+Windows uses the same unbounded `ManagementCidr`. `windows_firewall_allow_ssh_out_args` renders `dir=out action=allow protocol=tcp remoteport=22 remoteip={cidr}` with **no interface scoping**, and it fires whenever `fail_closed_ssh_allow` is set — not gated on strictness, exactly as PF-02 describes for macOS. `ssh_cidr=0.0.0.0/0` therefore opens unrestricted off-tunnel TCP/22 on Windows too, and the PowerShell assertion checks only that each egress rule is Allow/Outbound/Enabled, never its scope.
+
+**PF-02 is therefore confirmed on all three platforms** — macOS pf, Linux nftables, and Windows netsh — from one unbounded validator. That materially raises its priority: the single fix at `ManagementCidr::from_str` recommended in Part III now covers three backends.
+
+### WIN-06 — `validate_windows_dpapi_file` accepts an inherited DACL (Medium, CONFIRMED by execution)
+
+The file check tests `contains("D:")` where the root check tests `contains("D:P")`. `"D:"` is satisfied by essentially every SDDL Windows emits, including `D:AI` (auto-inherited). The blob is created by `write_windows_dpapi_blob` with a plain `create_new` and **no explicit DACL**, so it carries whatever it inherits, and the read-side check cannot tell. This is the DPAPI-blob analogue of RSA-0025's write-time gap at a different site.
+
+### WIN-07 … WIN-09 — smaller items (Low, CONFIRMED)
+
+- **WIN-07:** `WindowsNamedPipeSecurityPolicy`, `WindowsNamedPipeClientFacts`, and `is_client_authorized` (`windows_ipc.rs:41-136`) have **zero production callers** — only definitions and two unit tests. The runtime decision is a separate hardcoded `is_local_system || is_builtin_administrator || matches_service_identity` that never receives the policy. Setting `allow_builtin_administrators: false` would omit the ACE but leave the authorization OR intact, and the tests would still pass — false assurance that the policy governs the boundary. Same "dead security control" pattern as POL-10 and CRY-09.
+- **WIN-08:** the self-check pipe leaf accepts any suffix beginning `rustynet\rustynetd-privileged.check-`, and the charset allowlist permits `\` and `.`. Executed: `…check-attacker-controlled-anything` and `…check-\..\..\evil` both validate, defeating the stated purpose of pinning the reviewed leaf. Whether NPFS grants `..` traversal semantics is **INFERRED, low confidence**; the unbounded-suffix property itself is confirmed. This one is cross-platform and ungated.
+- **WIN-09:** all three SDDL evaluators match the ACE type token exactly (`== "A"`), so conditional-allow `XA` ACEs never match. Executed: `(XA;;GA;;;WD;(TRUE))` appended to an otherwise-canonical pipe DACL is accepted by **the named-pipe evaluator too** — the one that otherwise held everything. Requires `WRITE_DAC` on the object already, so it is a drift-detection gap rather than a primary vector.
+
+### WIN-10 — confirmations, and a correction to this document (Info/Medium)
+
+- **CONFIRMS AUDIT-028:** `dpapi_protect` passes `null()` for `pOptionalEntropy`, and every production call site uses `LocalMachine` scope; `CurrentUser` is defined and never used. `dpapi_unprotect` also discards the description, so nothing binds a blob to its intended key id — blobs are freely substitutable within the directory.
+- **CONFIRMS AUDIT-029:** the DPAPI plaintext is `to_vec()`'d then `LocalFree`'d with no zeroization of the OS buffer.
+- **CONFIRMS AUDIT-030:** `to_wide` still truncates at an interior NUL, so an `inspect_file_sddl` target can diverge from the path actually opened.
+- **Correction to this document's CRY-05.** Part II states that `CryptoError::PermissionValidationUnavailable` is "defined but never constructed." That is true of `validate_key_custody_permissions`, but the variant **is** constructed at `crypto/src/lib.rs:1016` and `:1033` — verified directly. CRY-05's text has been narrowed accordingly; the substance of CRY-05 (the `cfg(not(unix))` no-op) is unaffected.
+
+## 25. Defences that hold (Part VI)
+
+The named-pipe boundary is the best-built surface in this part, and both of the hypotheses I handed the reviewer about it were **refuted**:
+
+1. **The pipe is not openable by an unprivileged user.** The SDDL is `O:SYG:SYD:P` plus `(A;;GA;;;SY)(A;;GA;;;BA)` and an optional service SID — no `Everyone`, no `Authenticated Users` — and `PIPE_REJECT_REMOTE_CLIENTS` is set, so the kernel refuses remote clients.
+2. **The server does authenticate its client**, genuinely: `ImpersonateNamedPipeClient` → `OpenThreadToken` → `TokenUser`/`TokenGroups` SID comparison, with `RevertToSelf` in a `Drop` guard so impersonation is dropped on every path including early return.
+3. **UAC-filtered admin tokens are handled correctly** — the group check requires `SE_GROUP_ENABLED` *and* `!SE_GROUP_USE_FOR_DENY_ONLY` before `S-1-5-32-544` counts, with named tests. This is frequently got wrong; it is right here.
+4. **The named-pipe evaluator is a real default-deny allowlist** and resisted everything thrown at it except WIN-09's conditional ACEs. Executed: an appended unprivileged SID, `IU`, an inherited non-`D:P` DACL, and an attacker-owned squatted descriptor were all rejected with specific errors. Notably `--service-sid WD` does **not** whitelist Everyone, because the forbidden-principal loop runs before the allowlist loop — correct and deliberate ordering.
+5. **Parse-before-authenticate is safe here, and the reasoning is documented:** the message must be read before impersonating because `ImpersonateNamedPipeClient` returns `ERROR_CANNOT_IMPERSONATE` until the first read completes — a real Win32 constraint. The read is size-capped, caps are enforced **before** decode on both directions, and the bytes never reach the handler until authorization succeeds.
+6. **Only data crosses the pipe, never commands.** The request type is `Probe { protocol_version }` or `InspectRuntimePathAcl { path }` — no command strings, no argv, no rule text — and the one path that crosses is validated **twice**, at decode and again in the daemon handler, by a validator that normalizes separators and rejects Linux roots, UNC, non-absolute paths, and `..`/`.` segments before requiring membership in a reviewed-root allowlist. This is Part III's re-derivation discipline, correctly applied.
+7. **The Windows killswitch apply order is fail-CLOSED — the inverse of PF-03.** It deletes the allow rules first, sets `blockoutbound`, then adds allows, so a failure at the WFP or scoped-egress step returns `Err` with the block policy already in force. I looked for PF-03's flush-before-load hazard specifically; it does not exist here.
+8. **`assert_killswitch` queries real OS state**, iterating `Get-NetFirewallProfile` and requiring every profile's `DefaultOutboundAction` to be `Block` — stronger than pf's substring-presence check, and it defeats `netsh advfirewall reset` drift. Rule names are passed as PowerShell **parameters**, never interpolated into the script body. WIN-03 is that it never checks the WFP filter's *content*, not that it is a stub.
+9. **`block_all_egress` explicitly removes the WFP permit**, with a comment noting that deleting the netsh rule alone "would leave the WFP permit in place and fail OPEN" — exactly the right instinct about `CLEAR_ACTION_RIGHT`.
+10. **WFP mutations are transactional**, wrapping begin/commit with abort on every error path and closing the engine unconditionally, with filter deletion ordered before sublayer deletion for a documented `FWP_E_IN_USE` reason.
+11. **Reparse points and junctions are rejected** on the DPAPI custody path via `symlink_metadata` + `is_symlink()`, which on Windows covers both symlink and mount-point tags (INFERRED from Rust std behaviour).
+12. **Other correct choices:** the `write_windows_dpapi_blob` temp dance is not a TOCTOU because the create is `create_new`; key identifiers are restricted to `[A-Za-z0-9_-]` before the filename join, foreclosing traversal; `named_pipe_missing_error` is correctly tokenized rather than substring-matched, so a "missing pipe" drift signal cannot be misclassified as benign; and the Authenticode stub, while a real gap (RSA-0036), fails safe in direction — the thumbprint is always `None`, so pinned policy can never falsely accept.
+
+## 26. Suggested triage order for Parts V and VI
+
+1. **CTL-01** — apply the guard that already exists. One change closes CTL-01, CTL-02, CTL-03 and the issuance half of RLY-03; the highest-leverage fix in this document.
+2. **WIN-01** — replace the DPAPI ACL denylist with the default-deny allowlist already implemented in `windows_ipc.rs`. It is the enforcing gate on the WireGuard private key, and the code itself names it as the boundary.
+3. **PF-02 / WIN-05** — now confirmed on three platforms from one validator; fix at `ManagementCidr::from_str`.
+4. **CTL-05** — add a `now_unix` parameter to the four bundle verifiers, or rename them so callers cannot mistake a signature check for a freshness check.
+5. **WIN-02** — persistent pipe instance plus client-side server verification.
+6. **WIN-03** — assert the WFP filter's content and condition, and reject a tunnel alias that resolves to the egress interface.
+7. **WIN-04** — prefix-match under `GetSystemDirectoryW`, reject UNC.
+8. **CTL-03, CTL-04, CTL-06** — latent because unwired; fix before anything wires them, since each becomes live the moment a consumer appears.
+9. **WIN-06 … WIN-09, CTL-07, WIN-10** — bounded hygiene and ledger edits.
+10. **Fuzz coverage** — RSA-0040 plus the five `rustynet-control` parsers; `fuzz/Cargo.toml` already has the dependency.
+
+## 27. Reproduction (Parts V and VI)
+
+Part V's CONFIRMED-by-execution findings were driven by two standalone binaries outside the repo, built against the real `rustynet-control` with an isolated `CARGO_TARGET_DIR`: they enroll node ids containing delimiters, re-frame signed bundles against the same signature bytes, and exercise the wire-splitter battery.
+
+Part VI could not execute Windows syscalls on this macOS host. The SDDL evaluators and the path validators were extracted verbatim into a scratch program and **run**, which is what established WIN-01, WIN-04, WIN-06, WIN-08, and WIN-09. Every claim about Win32 runtime behaviour — NPFS name ownership, client impersonation defaults, WFP arbitration, reparse-point handling — is labelled **INFERRED** and should be confirmed on a Windows host before being treated as established.
