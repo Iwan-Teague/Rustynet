@@ -1761,14 +1761,85 @@ pub fn validate_key_custody_permissions(
 
     #[cfg(not(unix))]
     {
-        // Windows ACL validation not yet implemented; defer to OS enforcement.
+        // FAIL CLOSED. This used to return `Ok(())` with the note "Windows ACL
+        // validation not yet implemented; defer to OS enforcement" — but the
+        // caller cannot tell that answer apart from a real pass, so an
+        // unimplemented check silently became a passing one.
+        //
+        // That matters because of where this sits: it gates
+        // `read_encrypted_key_file`, i.e. the encrypted-at-rest FALLBACK used
+        // when the OS secure store is unavailable. The SecurityMinimumBar
+        // requires that fallback to carry "strict permissions and startup
+        // permission checks"; on a non-unix target it carried neither, so the
+        // one control standing between a world-readable key file and the
+        // process was absent. "Defer to OS enforcement" is not enforcement —
+        // nothing had asked the OS anything.
+        //
+        // `PermissionValidationUnavailable` is the honest answer, and the
+        // variant already existed for exactly this shape (the Windows DPAPI
+        // validators return it when an SDDL read fails). Windows key custody
+        // proper goes through DPAPI, which has its own SDDL checks, so this
+        // arm bites only on the fallback path that was never validated.
+        //
+        // Implementing it means mapping `KeyCustodyPermissionPolicy`'s unix
+        // mode bits onto an SDDL assertion; until then a loud failure is
+        // correct. CRY-05 / AUDIT-027.
         let _ = (directory, file, policy);
-        Ok(())
+        Err(CryptoError::PermissionValidationUnavailable)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// The unimplemented-platform arm must FAIL, not pass.
+    ///
+    /// Runs only where the arm exists. The source pin below is what protects
+    /// this on unix hosts, where the arm is compiled out and this test cannot
+    /// execute at all.
+    #[cfg(not(unix))]
+    #[test]
+    fn key_custody_permission_check_fails_closed_when_unimplemented() {
+        let dir = std::env::temp_dir();
+        let file = dir.join("rustynet-cry05-probe.key");
+        let err = super::validate_key_custody_permissions(
+            dir.as_path(),
+            file.as_path(),
+            super::KeyCustodyPermissionPolicy::default(),
+        )
+        .expect_err("an unimplemented permission check must not report success");
+        assert!(matches!(
+            err,
+            super::CryptoError::PermissionValidationUnavailable
+        ));
+    }
+
+    /// Source pin for CRY-05 / AUDIT-027, because the arm it guards is
+    /// compiled out on every host that runs this suite by default.
+    ///
+    /// The regression is a one-word edit — `Err(...)` back to `Ok(())` — and it
+    /// would restore a silent fail-open on the encrypted-at-rest fallback path,
+    /// where this is the only permission control. A reviewer on unix cannot see
+    /// it compile, so pin the text.
+    #[test]
+    fn non_unix_key_custody_arm_does_not_return_ok() {
+        let source = include_str!("lib.rs");
+        let marker = "let _ = (directory, file, policy);";
+        let at = source
+            .find(marker)
+            .expect("the non-unix key-custody arm must still discard its arguments");
+        let tail = &source[at + marker.len()..];
+        let next_stmt: String = tail.chars().take(120).collect();
+        assert!(
+            next_stmt.contains("Err(CryptoError::PermissionValidationUnavailable)"),
+            "the non-unix key-custody arm must fail closed; found: {next_stmt:?}"
+        );
+        assert!(
+            !next_stmt.trim_start().starts_with("Ok(())"),
+            "the non-unix key-custody arm must never return Ok(()) -- that is the \
+             fail-open CRY-05/AUDIT-027 records"
+        );
+    }
+
     use super::{
         AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
         Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
