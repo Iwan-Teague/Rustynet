@@ -48,6 +48,30 @@ and correct.
 
 ---
 
+## 0. Status — six entries are DONE
+
+**RLY-01, RLY-02, RLY-04, RLY-05, RLY-10, RLY-11** were implemented in commit
+`1c44ed3f` and are no longer starting notes. Their rows below are marked **DONE**.
+
+Two lessons from doing them, which apply to the rest of this document:
+
+1. **A "possible direction" here can be wrong in a way that matters.** RLY-10's
+   direction — lower the skew ceiling — was insufficient: skew is applied twice on
+   independent axes, so the real bound is `ttl + 2*skew`, and implementing the
+   suggested fix would have shipped a compile-time assertion of an invariant the
+   code did not hold. The correct fix was on the retention side. Treat every row
+   here as a hypothesis to test, exactly as §"What work actually went into it" says.
+2. **Your test suite is a real check on these fixes.** A pre-existing test
+   (`nonce_at_exact_retention_age_is_pruned_by_cleanup`) rejected the first RLY-10
+   attempt, with a comment saying it exists to catch precisely that loosening. Run
+   the suite before assuming a direction here is safe.
+
+Fix efficacy for the six was verified by mutation rather than by green tests: six of
+seven mutations are caught, and RLY-04's is not (an fsync is not observable from a
+unit test), which is recorded in the code.
+
+---
+
 ## 1. Fixes that must NOT be applied as written — read this first
 
 A remediation doc invites someone to implement an entry without reading the caveats. These are the entries where that would cause harm. This section exists because the repo already has a precedent for it: **RSA-0003** was assessed "keep as-is" because the obvious fix would have introduced a fail-open.
@@ -159,17 +183,17 @@ Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`
 
 | ID | Problem | Possible direction | Size? | Before you start |
 |---|---|---|---|---|
-| RLY-01 | No lower bound on `issued_at_unix`; a future-dated token replays forever | Reject `issued_at_unix > now + skew` in `validate_hello`. One check, restores the retention invariant the comment already claims | XS | test first |
-| RLY-02 | One unauthenticated datagram forces O(N) work under both global locks (~4900× amplification) | Match on the error variant and prune only for reclamation-worthy cases — `UnauthorizedSourceTuple` means the session is *healthy*. The keepalive path already does this correctly. Safe: prune is also driven by the periodic cleanup and the accept path | XS | test first |
+| RLY-01 | No lower bound on `issued_at_unix`; a future-dated token replays forever | Reject `issued_at_unix > now + skew` in `validate_hello`. One check, restores the retention invariant the comment already claims | XS | **DONE** `1c44ed3f` |
+| RLY-02 | One unauthenticated datagram forces O(N) work under both global locks (~4900× amplification) | Match on the error variant and prune only for reclamation-worthy cases — `UnauthorizedSourceTuple` means the session is *healthy*. The keepalive path already does this correctly. Safe: prune is also driven by the periodic cleanup and the accept path | XS | **DONE** `1c44ed3f` |
 | RLY-03 | Signed-payload field boundaries not bound by the signature | Reject `\n`/`\r`/`=` in `node_id`/`peer_node_id` at parse time, **or** length-prefix the signed payload, **or** port the text parser's re-canonicalization check to the binary parser. **S3** covers the issuance half | S | test first |
-| RLY-04 | Replay store never parent-dir fsync'd, and a doc asserts it is | Add the parent-directory fsync after rename, using the existing pattern from `rustynet-crypto` / `write_ledger`; correct `Arm32BitEmbeddedSupportReference:919` | XS | — |
-| RLY-05 | Pre-auth limiter bounds entry count but not key size (~1015 MiB) | **See S4** | XS | — |
+| RLY-04 | Replay store never parent-dir fsync'd, and a doc asserts it is | Add the parent-directory fsync after rename, using the existing pattern from `rustynet-crypto` / `write_ledger`; correct `Arm32BitEmbeddedSupportReference:919` | XS | **DONE** `1c44ed3f` |
+| RLY-05 | Pre-auth limiter bounds entry count but not key size (~1015 MiB) | **See S4** | XS | **DONE** `1c44ed3f` |
 | RLY-06 | Pre-auth ed25519 verify keyed on attacker `node_id`, under the transport mutex | Key the pre-auth limiter on the source IP rather than the claimed identity; move the verify out from under the transport mutex | M | — |
 | RLY-07 | Rate limiting per-`node_id` only; no aggregate or per-destination cap | Add a global token bucket and a per-destination cap, **or** amend the module header's "bounded resources" claim to match reality | S | DECISION |
 | RLY-08 | Reject-path log writes are the unbudgeted twin of the budgeted notice path | Route the ten `eprintln!` sites through `PreAuthNoticeBudget` | S | — |
 | RLY-09 | Bind mutation precedes the rate-limit check; IP-only TOFU bind lets a spoofer lock out the real peer | Consult the limiter **before** mutating the bind (free win). Consider a rebind path or full-tuple bind — note the "intentional NAT concession" rationale does **not** exist, so nothing recorded blocks tightening it | S | — |
-| RLY-10 | One-second replay window at exactly `skew == 120` | Ceiling the skew at `MAX_RELAY_TTL_SECS - 1`, or make `prune` use `>` | XS | test first |
-| RLY-11 | No self-pair rejection — the relay echoes to the sender | Assert `node_id != peer_node_id` in `validate_hello` as defence in depth; the control plane already refuses to mint one | XS | — |
+| RLY-10 | Replay window whenever `ttl + 2*skew >= retention` — **61 s at the daemon's default skew**, for any `ttl >= 60` (originally recorded as a one-second window at `skew == 120`, which undercounted: skew applies twice) | Size retention from the true acceptance window: `NONCE_RETENTION_SECS = ttl + 2*skew_ceiling + 1`, and fix **both** const guards. Do **not** clamp the skew below 60 — that rejects the honest 60–90 s drift the tolerance exists for | S | **DONE** `1c44ed3f` — see §0; the originally-suggested skew-ceiling fix was insufficient |
+| RLY-11 | No self-pair rejection — the relay echoes to the sender | Assert `node_id != peer_node_id` in `validate_hello` as defence in depth; the control plane already refuses to mint one | XS | **DONE** `1c44ed3f` |
 | RLY-12 | `node_id` written unescaped into log lines | Escape or reject control characters before logging; the correct upstream guard is `is_valid_node_id_text` (**S3**), not `NodeId::new` | XS | — |
 | RLY-13 | Unreachable size guard; invisible tuple rejections; data-path skew inconsistency; O(n) persist per hello | Restate the `rate_limit.rs` ledger row (the "caller caps len" justification is vacuous); add a counter for `UnauthorizedSourceTuple`; apply skew consistently on the data path or document why not; batch the nonce persist | S | — |
 | RLY-14 | Ledger maintenance | Mark AUDIT-031 stale (superseded by applied RSA-0037 — but see S4, the byte half is open); promote RSA-0086/0087/0088 off "needs confirmation"; add a row for `hello_limiter_audit.rs`; name the authoritative port range | S | — |
