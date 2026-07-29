@@ -599,9 +599,34 @@ fn write_request_frame(stream: &mut UnixStream, request: &HelperRequest) -> Resu
 #[cfg(not(windows))]
 fn read_response_frame(stream: &mut UnixStream) -> Result<HelperResponse, String> {
     let response_bytes = read_frame(stream, HELPER_FRAME_TYPE_RESPONSE)
-        .map_err(|err| format!("privileged helper response read failed: {err}"))?;
+        .map_err(|err| format!("privileged helper response read failed: {err}"))
+        .map_err(annotate_helper_response_read_error)?;
     decode_helper_response(&response_bytes)
         .map_err(|err| format!("privileged helper response decode failed: {err}"))
+}
+
+/// Add the operational cause to a truncated-response error.
+///
+/// On a length-prefixed IPC, an `UnexpectedEof` mid-frame means the peer went
+/// away — it is never data corruption. The overwhelmingly common reason is the
+/// helper's own I/O timeout elapsing while it runs a privileged command, after
+/// which it drops the connection and the daemon reports a *framing* fault. That
+/// wording sends the reader looking for protocol damage instead of at a
+/// too-tight timeout: observed live on a 2-core guest as a continuous
+/// `truncated frame header` loop that stopped dead when the timeout was raised
+/// from 2000 ms to 10000 ms. Name the knob so the next reader does not have to
+/// rediscover it.
+#[cfg(not(windows))]
+fn annotate_helper_response_read_error(message: String) -> String {
+    if !message.contains("truncated") {
+        return message;
+    }
+    format!(
+        "{message} (the helper closed the connection mid-frame -- this is not protocol \
+         corruption; it is usually the helper's own I/O timeout elapsing while it runs a \
+         privileged command, so raise --timeout-ms / \
+         RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS before suspecting the transport)"
+    )
 }
 
 #[cfg(not(windows))]
@@ -3358,6 +3383,39 @@ mod tests {
 
         let err = read_request(&mut server_stream).expect_err("truncated payload must fail");
         assert!(err.contains("truncated frame payload"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn truncated_response_error_names_the_timeout_not_corruption() {
+        // Regression pin for a live 2-core-guest failure: the daemon logged
+        // `privileged helper response read failed: truncated frame header` in a
+        // continuous loop, which reads as protocol corruption. It was the
+        // helper's own I/O timeout elapsing mid-command; raising it from
+        // 2000 ms to 10000 ms stopped it dead. On a length-prefixed IPC an EOF
+        // mid-frame can only mean the peer went away.
+        let annotated = super::annotate_helper_response_read_error(
+            "privileged helper response read failed: truncated frame header".to_owned(),
+        );
+        assert!(
+            annotated.contains("RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS"),
+            "a truncated response must name the timeout knob: {annotated}"
+        );
+        assert!(
+            annotated.contains("not protocol corruption"),
+            "a truncated response must steer the reader away from transport damage: {annotated}"
+        );
+
+        // A non-truncation read failure must be left exactly as-is, so this
+        // cannot misattribute an unrelated I/O fault to the timeout.
+        let untouched = "privileged helper response read failed: read frame header failed: \
+             Connection reset by peer"
+            .to_owned();
+        assert_eq!(
+            super::annotate_helper_response_read_error(untouched.clone()),
+            untouched,
+            "only truncation carries the timeout hint"
+        );
     }
 
     #[test]
