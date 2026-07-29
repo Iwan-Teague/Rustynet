@@ -3,9 +3,11 @@
 **Status:** Active evidence record. First time rustynet's own NAT traversal has been
 exercised against two genuinely separate physical networks. **Seven defects found and
 fixed**; direct hole-punched connectivity achieved, **bulk data transfers byte-exact
-over it at 13.69 Mbit/s with 0% loss**. Remaining open: reflexive endpoints are never
-published into the signed bundle (§4.4) and the same-site NAT hairpin that follows from it
-(§4.4b), plus kernel-WireGuard's inability to run STUN (§4.5).
+over it at 13.69 Mbit/s with 0% loss**. Every fix is now regression-checked on the
+ordinary same-network path too (§4c), where the same-site hairpin and the liveness
+counters were finally proven. Remaining open: **automatic** publication of a node's
+reflexive address (§4.4 — the manual `SRFLX_SPEC` half is done and proven) and
+kernel-WireGuard's inability to run STUN (§4.5).
 
 **Why this could not be done before:** every prior cross-network claim was blocked on
 "the owner does not have a second network right now"
@@ -338,6 +340,45 @@ backend**. Both Ubuntu nodes had to be switched to
 `linux-wireguard-userspace-shared` for this run.
 
 ---
+
+## 4c. Same-network regression validation of every fix (2026-07-30)
+
+The operator returned to a single network, which removed cross-network testing but
+*enabled* the one proof that had been missing: **two guests behind the same NAT are a
+same-site pair**, so §4.4b could finally be re-measured without a second network.
+
+Fresh 2-node network `xnet3-lab` on the two x86-64 KVM guests (`xnet3-ubu-a`
+192.168.121.26, `xnet3-ubu-b` 192.168.121.137), both behind the same public address
+`213.233.155.131` — confirming a genuine same-site pair. Bundles minted with the new
+`SRFLX_SPEC`, carrying host **and** reflexive candidates.
+
+| claim | evidence |
+| --- | --- |
+| **§4.4 srflx issuance works** | `candidate_count=2 host_candidates=1 srflx_candidates=1`, `max_candidate_priority=900` (host above srflx's 800). Previously unit-tested only. |
+| **§4.4b hairpin fixed** | `managed_peer_endpoints=xnet3-ubu-b/192.168.121.137:51820` — the pair selected the **host/LAN** candidate, not the shared public address that would need hairpinning. The 100%-loss pair now works. |
+| **§4.2b liveness registers** | `path_mode=direct_active`, **`path_live_proven=true`**, `path_live_direct_peers=1`, `path_latest_live_handshake_unix=1785368743`. First `path_live_proven=true` observed at all. |
+| **§4.2 no handshake storm** | 15 s capture during 20 pings: `length 116 x20` (the pings), `length 92 x2`, **`length 148 x0` — zero handshake initiations**. Before the pacing fix the same shape was 105 initiations + 105 responses for 40 pings. |
+| MTU bring-up | `mtu 1420` — the correct default on a clean underlay, with no override set. |
+| killswitch + privileged-boundary schema | both nodes reached `DataplaneApplied` with no schema rejection and no `EPERM`. |
+| data path | mesh ping **30/30, 0% loss**, 10-29 ms. |
+
+Every fix from 2026-07-29 is therefore regression-checked on the ordinary same-network
+path, and the two items previously marked "not re-proven live" are now proven.
+
+### 4c.1 Three procedural traps found while doing it
+
+- **`e2e-bootstrap-host` and `e2e-enforce-host` reinstall BOTH binaries** from
+  `<src-dir>/target/release` into `/usr/local/bin`. A binary hand-installed to
+  `/usr/local/bin` is silently reverted, which cost two false diagnoses here (a daemon
+  rejecting `--traversal-stun-servers`, and a CLI silently ignoring `SRFLX_SPEC` —
+  confirmed by `strings | grep -c SRFLX_SPEC` returning 0). **Seed the guest's
+  `target/release` instead**, so any reinstall keeps the intended build.
+- **membership files need `0600 rustynetd:rustynetd`**, not the `0640 root:rustynetd` the
+  *bundles* use. Getting it wrong fails closed at startup with
+  `membership snapshot permissions are too broad: 640` — correct behaviour, easy to trip.
+- **Bootstrap alone leaves `auto-tunnel-enforce false`**, so no peers are programmed
+  (`managed_peer_endpoints=none`, and both nodes report the same placeholder mesh IP).
+  `e2e-enforce-host` is a required step, not an optimisation.
 
 ## 5. Caveats on this evidence
 
