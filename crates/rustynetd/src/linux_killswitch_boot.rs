@@ -147,6 +147,51 @@ impl BootSshCidr {
     }
 }
 
+/// A validated traversal-bootstrap endpoint (a STUN server) used when
+/// building boot-time killswitch allow rules.  Owns the IP family
+/// string ("ip" for IPv4, "ip6" for IPv6), the bare address, and the
+/// UDP port, so the emitted rule matches exactly one destination
+/// socket rather than opening a port range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootTraversalEndpoint {
+    /// nftables address-family selector for this endpoint ("ip" or "ip6").
+    pub family: &'static str,
+    /// Bare destination address, e.g. "74.125.250.129".
+    pub addr: String,
+    /// Destination UDP port, e.g. 19302.
+    pub port: u16,
+}
+
+impl BootTraversalEndpoint {
+    /// Parse and validate an `ip:port` endpoint string.  IPv6 endpoints
+    /// use the bracketed `[addr]:port` form, matching the daemon's own
+    /// `--traversal-stun-servers` parser.  Returns an error rather than
+    /// silently skipping a malformed entry: a STUN server that fails to
+    /// parse must fail the boot install loudly, not leave the operator
+    /// believing traversal egress is permitted when it is not.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty traversal endpoint string".to_owned());
+        }
+        let addr: std::net::SocketAddr = s
+            .parse()
+            .map_err(|e| format!("invalid traversal endpoint {s}: {e}"))?;
+        if addr.port() == 0 {
+            return Err(format!("traversal endpoint port must not be 0: {s}"));
+        }
+        let family: &'static str = match addr {
+            std::net::SocketAddr::V4(_) => "ip",
+            std::net::SocketAddr::V6(_) => "ip6",
+        };
+        Ok(Self {
+            family,
+            addr: addr.ip().to_string(),
+            port: addr.port(),
+        })
+    }
+}
+
 /// Install a minimal pre-protective boot-time killswitch table
 /// (`inet rustynet_boot`) before the daemon starts.  The table is
 /// always deleted and recreated so each ExecStartPre call is
@@ -165,6 +210,14 @@ impl BootSshCidr {
 ///   Both chains hook `output` at priority 0 and a `policy drop`
 ///   verdict in this boot chain still drops the packet regardless of
 ///   what the daemon chain decides.
+/// - outbound UDP accept for each configured traversal-bootstrap
+///   endpoint (STUN server) in `traversal_endpoints` — same reasoning
+///   as `wg_listen_port` above.  STUN candidate gathering leaves the
+///   host on an ephemeral source port toward the server's port, so the
+///   `wg_listen_port` rule does not cover it and the boot chain's
+///   `policy drop` silently vetoes every STUN datagram the daemon's own
+///   table accepts.  Without this the daemon can never gather a
+///   server-reflexive candidate and NAT traversal cannot work at all.
 /// - TCP port 22 accept for each CIDR in `ssh_cidrs` when
 ///   `ssh_allow` is true
 /// - implicit `policy drop` for everything else
@@ -175,8 +228,15 @@ pub fn install_linux_boot_killswitch(
     ssh_allow: bool,
     ssh_cidrs: &[BootSshCidr],
     wg_listen_port: Option<u16>,
+    traversal_endpoints: &[BootTraversalEndpoint],
 ) -> Result<(), String> {
-    install_linux_boot_killswitch_inner(iface, ssh_allow, ssh_cidrs, wg_listen_port)
+    install_linux_boot_killswitch_inner(
+        iface,
+        ssh_allow,
+        ssh_cidrs,
+        wg_listen_port,
+        traversal_endpoints,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -185,6 +245,7 @@ fn install_linux_boot_killswitch_inner(
     ssh_allow: bool,
     ssh_cidrs: &[BootSshCidr],
     wg_listen_port: Option<u16>,
+    traversal_endpoints: &[BootTraversalEndpoint],
 ) -> Result<(), String> {
     // Argv-only helper: no shell construction, args are separate tokens.
     fn nft(args: &[&str]) -> Result<(), String> {
@@ -283,6 +344,32 @@ fn install_linux_boot_killswitch_inner(
             "accept",
         ])?;
     }
+    // Allow outbound UDP to each configured traversal-bootstrap endpoint.
+    // STUN gathering uses an ephemeral source port toward the server's
+    // destination port, so the `wg_listen_port` rule above does not match
+    // it.  Both chains share the `output` hook, so without this rule the
+    // boot chain's `policy drop` vetoes every STUN datagram even though
+    // the daemon's generation-rotated table explicitly accepts it, and
+    // the daemon can never gather a server-reflexive candidate.  The
+    // match is narrowed to the exact destination address and port so this
+    // stays a pinhole rather than a general UDP egress hole.
+    for endpoint in traversal_endpoints {
+        let port_str = endpoint.port.to_string();
+        nft(&[
+            "add",
+            "rule",
+            "inet",
+            BOOT_KILLSWITCH_TABLE,
+            "killswitch",
+            endpoint.family,
+            "daddr",
+            endpoint.addr.as_str(),
+            "udp",
+            "dport",
+            port_str.as_str(),
+            "accept",
+        ])?;
+    }
     if ssh_allow {
         for cidr in ssh_cidrs {
             nft(&[
@@ -310,6 +397,7 @@ fn install_linux_boot_killswitch_inner(
     _ssh_allow: bool,
     _ssh_cidrs: &[BootSshCidr],
     _wg_listen_port: Option<u16>,
+    _traversal_endpoints: &[BootTraversalEndpoint],
 ) -> Result<(), String> {
     // Off-Linux: no-op. The boot-time killswitch is Linux-specific.
     Ok(())
@@ -1111,7 +1199,12 @@ table inet rustynetfoo {
             BootSshCidr::parse("192.168.0.0/16").unwrap(),
             BootSshCidr::parse("fd00::/64").unwrap(),
         ];
-        let result = install_linux_boot_killswitch("rustynet0", true, &cidrs, Some(51820));
+        let endpoints = vec![
+            BootTraversalEndpoint::parse("74.125.250.129:19302").unwrap(),
+            BootTraversalEndpoint::parse("[2001:db8::1]:3478").unwrap(),
+        ];
+        let result =
+            install_linux_boot_killswitch("rustynet0", true, &cidrs, Some(51820), &endpoints);
         assert!(
             result.is_ok(),
             "off-Linux install must be a no-op: {result:?}"
@@ -1145,6 +1238,55 @@ table inet rustynetfoo {
             source.contains("wg_listen_port: Option<u16>"),
             "install_linux_boot_killswitch* signatures must accept Option<u16> for the \
              WireGuard listen port so the systemd unit can forward RUSTYNET_WG_LISTEN_PORT"
+        );
+    }
+
+    #[test]
+    fn boot_traversal_endpoint_parses_and_rejects_malformed() {
+        let v4 = BootTraversalEndpoint::parse("74.125.250.129:19302").expect("ipv4 endpoint");
+        assert_eq!(v4.family, "ip");
+        assert_eq!(v4.addr, "74.125.250.129");
+        assert_eq!(v4.port, 19302);
+
+        let v6 = BootTraversalEndpoint::parse("[2001:db8::1]:3478").expect("ipv6 endpoint");
+        assert_eq!(v6.family, "ip6");
+        assert_eq!(v6.port, 3478);
+
+        // Fail closed on anything malformed rather than silently skipping:
+        // a dropped entry would leave the operator believing STUN egress is
+        // permitted when the boot chain still vetoes it.
+        for bad in ["", "not-an-endpoint", "74.125.250.129", "74.125.250.129:0"] {
+            assert!(
+                BootTraversalEndpoint::parse(bad).is_err(),
+                "malformed traversal endpoint must be rejected: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_killswitch_source_contains_traversal_endpoint_rule() {
+        // Pin against the regression this fixes: the traversal-bootstrap
+        // allow-list (the STUN servers) was emitted only into the daemon's
+        // generation-rotated table, never into this boot chain. Both hook
+        // `output` at priority 0, so the boot chain's `policy drop` vetoed
+        // every STUN datagram the daemon's table accepted, leaving
+        // srflx_candidates permanently 0 and NAT traversal impossible.
+        // Measured on a real two-network lab 2026-07-29.
+        let source = include_str!("linux_killswitch_boot.rs");
+        assert!(
+            source.contains("for endpoint in traversal_endpoints {"),
+            "install_linux_boot_killswitch_inner must emit an allow rule per configured \
+             traversal-bootstrap endpoint"
+        );
+        assert!(
+            source.contains("traversal_endpoints: &[BootTraversalEndpoint]"),
+            "install_linux_boot_killswitch* signatures must accept the traversal endpoints so \
+             the systemd unit can forward RUSTYNET_TRAVERSAL_STUN_SERVERS"
+        );
+        assert!(
+            source.contains("endpoint.addr.as_str()"),
+            "the traversal allow rule must match the exact destination address, keeping it a \
+             pinhole rather than a general UDP egress hole"
         );
     }
 }
