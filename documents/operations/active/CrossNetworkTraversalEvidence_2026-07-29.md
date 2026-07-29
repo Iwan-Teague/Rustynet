@@ -136,21 +136,41 @@ Mesh reachability over that path:
 
 ## 4. Open gaps (not yet fixed)
 
-### 4.1 `rustynet0` MTU is not adapted to the discovered path — quality, blocking bulk transfer
-`rustynet0` comes up at **MTU 1500** on both sides, but the punched path only carries a
-~1000-byte payload:
+### 4.1 ~~MTU not adapted to the discovered path~~ — **FIXED** (`e3741da2`, `4c4d6c5f`)
+Two distinct faults, both now closed:
 
-| ICMP payload | 200 | 600 | 1000 | 1200 | 1370 |
-| --- | --- | --- | --- | --- | --- |
-| result | OK | OK | OK | **FAIL** | **FAIL** |
+1. **The userspace-shared TUN lifecycles never set an MTU at all** (`e3741da2`). The
+   kernel, macOS and Windows backends all pin `SAFE_BRINGUP_TUNNEL_MTU` before link-up —
+   the Linux kernel path even comments that it is "closing the never-set-MTU gap" — but
+   both userspace-shared lifecycles were missed, leaving the platform default of **1500**.
+   1500 plus WireGuard overhead does not fit even a clean 1500-byte Ethernet underlay.
+2. **Even the 1420 default is too large for a NAT-traversed path** (`4c4d6c5f`). The
+   outer hop here is 1280 bytes, leaving 1220 for the inner packet.
+   `RUSTYNET_WG_TUNNEL_MTU` now overrides the bring-up value, bounded to
+   `MIN_BRINGUP_TUNNEL_MTU..=SAFE_BRINGUP_TUNNEL_MTU`, falling back to the default on
+   anything absent/unparseable/out-of-range. The **ceiling is the audited default**, so an
+   override can only ever make a tunnel more conservative. The privileged helper's
+   allowlist entry moved from an exact literal to that same bounded range — which its own
+   comment had asked for once the value became dynamic.
 
-Consequence: ICMP and small packets flow, **bulk TCP stalls outright** (a 4 MB transfer
-timed out). The daemon does not lower the interface MTU to fit a traversal path whose
-real MTU is well below the LAN assumption.
+Measured progression on the same path:
+
+| interface MTU | ICMP 1000B | ICMP 1192B | ICMP 1200B | 4 MB TCP |
+| --- | --- | --- | --- | --- |
+| 1500 (before) | OK | — | FAIL | stalled |
+| 1420 (parity fix) | OK | — | FAIL | **stalled after 0.03 MB** |
+| **1220 (override)** | OK | **OK** | n/a | **4194304 bytes, sha256 `b14138a3ca83b79c` both ends** |
+
+**Still interim.** A static value — default or override — cannot track a path MTU that
+varies per peer and over time. The real answer is per-path measurement via the DPLPMTUD
+state machine that already exists in `rustynetd::path_mtu`, fully unit-tested, **with no
+consumer** (FIS-0027 Phase 3).
 
 ### 4.2 Punched path is lossy — 30% sustained
 20 pings over the direct path: **14 received, 30% loss**, RTT 73–267 ms (mdev 48 ms).
-Root cause not established; candidates are NAT binding churn and the exit-node hop.
+Root cause not established; candidates are NAT binding churn and the exit-node hop. This
+is now the dominant throughput limiter: with MTU fixed, a 4 MB transfer completes but at
+only **0.37 Mbit/s**.
 
 ### 4.3 `path_live_peer_count` stays 0 while traffic flows — reporting discrepancy
 Real bidirectional traffic is captured on the wire and mesh pings succeed, yet the
