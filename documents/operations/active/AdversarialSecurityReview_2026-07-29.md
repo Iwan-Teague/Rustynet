@@ -8,6 +8,7 @@ Method: rolling adversarial review, one focused area per part. Each part names i
 |---|---|---|---|
 | **I** | `rustynet-policy` — ACL / policy evaluation engine | POL-01 … POL-14 | complete |
 | **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … CRY-12 | complete |
+| **III** | macOS `pf` privileged-helper boundary — killswitch rule regeneration | PF-01 … PF-14 | complete |
 
 This is a single rolling document by intent: the areas share the same baseline
 commit and the same fail-closed/default-deny constraints, and several findings
@@ -1169,3 +1170,627 @@ does not apply to the whole crate. The blob framing functions
 and **can** be copied out and compiled standalone, which is how CRY-04's
 arithmetic was checked. Crate-level runs used a `CARGO_TARGET_DIR` outside the
 repository to avoid contending with concurrent workers' builds.
+
+---
+
+# Part III — macOS `pf` privileged-helper boundary (killswitch rule regeneration)
+
+Crate baseline: `crates/rustynetd/src/macos_pf_load_spec.rs`, 1061 lines, added by `fd1b50d1` ("macos pf: close the pfctl -f privileged boundary via rule regeneration")
+Scope: the `macos-pf-load` privileged builtin end to end — `MacosPfLoadSpec` encode/decode across the daemon→root boundary, anchor derivation, the three rule renderers it drives (`render_macos_killswitch_pf_rules`, `build_macos_blind_exit_pf_rules`, `build_macos_exit_nat_pf_rules`), the `assert_rule_invariants` guard, and the surrounding apply/assert ordering in `phase10.rs` and `privileged_helper.rs`
+Out of scope for this part: Linux nftables killswitch paths except where they share a validator, and Windows WFP
+
+## 12. Why this area, and what was already known
+
+Part I and Part II covered an in-process authorization engine and at-rest key
+custody. This part covers a **privilege boundary**: a possibly-compromised daemon
+talking to a root helper that programs the macOS `pf` firewall. The killswitch is
+what prevents traffic leaving outside the tunnel, so a defect here is a **traffic
+leak**, which is a different and more severe failure class than either earlier
+part.
+
+Target selection was evidence-driven rather than by intuition. Of the 594 file
+rows in `SecurityAuditLedger_2026-06-18.md`, none are pending — the ledger is
+thorough — so the gap is code that postdates it. Enumerating tracked `.rs` files
+with **no ledger row** showed almost all of them are lab/test tooling
+(`vm_lab/`, `lab-monitor`, `live_lab_*`), which the charter explicitly places
+outside the production trust path. Two were production daemon code, and this file
+is the load-bearing one.
+
+**This boundary is not unreviewed, and that must be stated plainly.**
+`AutonomousSecurityParityPassLog_2026-06-24.md:119-129` records a prior 4-lens
+workflow review of exactly this landed boundary, which found one HIGH — a
+compromised daemon sending `mesh_cidr=0.0.0.0/0` renders
+`pass out quick on en0 inet from 0.0.0.0/0 to any`, passing all local-origin
+egress before the terminal block — and **fixed** it via
+`macos_pf_mesh_cidr::validate_mesh_egress_source_cidr`. Verified at this
+baseline: that fix is live and well generalized, wired into
+`macos_blind_exit.rs:269`, `macos_exit_nat.rs:195`, **and** `linux_blind_exit.rs:251`.
+
+So the useful question was not "is this reviewed" but **"did that fix
+generalize to the sibling parameters?"** It did not, and that is the substance of
+Part III. The prior entry also noted that neither the per-module `validate_cidr`,
+nor the helper rule-shape assert, nor the self-referential evaluator caught the
+`mesh_cidr` case — PF-05 explains why that is structural and still true.
+
+| ID | Finding | Severity | New? |
+|---|---|---|---|
+| PF-01 | `allow_egress_interface=true` is a one-boolean full-IPv4 killswitch off-switch, and it passes the repo's own killswitch assertion | High | **New** |
+| PF-02 | `ssh_cidr=0.0.0.0/0` opens unrestricted off-tunnel TCP/22 — **even under `strict=true`**, and not interface-scoped | High | **New** |
+| PF-03 | `apply_pf_rules` flushes the old anchor **before** loading the new one, on every reconcile — a failed load leaves egress wide open | High | **New** |
+| PF-04 | The allowed `pfctl -a <anchor> -F all` arm lets the daemon empty the live killswitch anchor, bypassing the whole regeneration boundary | High (adjacent) | **New** |
+| PF-05 | Killswitch assertions validate rule **presence, not precedence** — the root cause of PF-01/PF-02 being silent | Medium | **New** |
+| PF-06 | Specs that pass decode but that `pfctl` rejects (iface length/keywords, `/+N` prefixes) — feeds PF-03 | Medium | **New** |
+| PF-07 | `generation` is an unbounded daemon-chosen `u64` | Low-Medium | **New** |
+| PF-08 | `MAX_MANAGED_PEER_ENDPOINTS = 256` is unreachable through the 16 KiB wire budget; no test pins the budget | Low | **New** |
+| PF-09 | `push_list` does not bound a single over-cap list element | Low | **New** |
+| PF-10 | A root `pfctl -f` on a predictable `$TMPDIR` file survives in the killswitch-precedence validator | Medium (adjacent) | **New** |
+| PF-11 | `contains_forbidden_route_primitive` is evadable but unreachable — defence-in-depth only | Info | **New** |
+| PF-12 | This production privilege-boundary file has zero audit-ledger rows | Low (bookkeeping) | **New** |
+| PF-13 | Three round-trip tests pin render equality, not spec equality | Low (test coverage) | **New** |
+| PF-14 | `reject_nonempty` is a content guard with a presence-guard name | Info | **New** |
+
+## 13. Findings
+
+### PF-01 — `allow_egress_interface=true` is a one-boolean killswitch off-switch (High, CONFIRMED by execution)
+
+Files: `crates/rustynetd/src/phase10.rs:2653-2662`; entitlement at `:3356`
+
+With `strict_fail_closed=false` and `allow_egress_interface=true`, the render emits
+an unconditional pass on the **physical** interface:
+
+```text
+set block-policy drop
+pass quick on lo0 all
+pass out quick on utun9 inet all keep state
+pass out quick on en0 inet all keep state      <-- ALL IPv4 egress, cleartext, off-tunnel
+block drop out quick inet6 all
+block drop out quick all
+```
+
+pf `quick` is first-match-wins, so every local-origin IPv4 packet leaves on `en0`
+before the terminator is ever consulted. The terminal block is still present,
+`assert_rule_invariants` passes, and `render()` returns `Ok`. **The killswitch is
+off.** Confirmed by reading `:2653-2662` directly and by an out-of-repo replica
+whose output was fed to the host's real `/sbin/pfctl -n -f`.
+
+Entitlement is the crux. In honest operation this flag is set `true` in exactly
+one place — `apply_nat_forwarding` (`:3356`), the exit-node/NAT path — and reset to
+`false` at `:3314`, `:3349`, `:3391`. It is gated on a **signed exit capability at
+the daemon layer**. The helper accepts `allow_egress_interface=true`
+unconditionally and has no way to observe that capability. So a daemon compromised
+to the helper's uid obtains full cleartext IPv4 egress by flipping one boolean it
+is not entitled to flip.
+
+This directly contradicts the module doc's claim (`macos_pf_load_spec.rs:13-15`)
+that a compromised daemon "can never inject rule text, redirect the anchor, or
+load a foreign file" — the first two clauses hold (see §14), but the *goal* behind
+them, that a compromised daemon cannot defeat default-deny egress, does not.
+
+**What makes this materially worse than PF-04**, and the reason it is ranked
+first: it is **silent**. See PF-05 — the repo's own `assert_killswitch` is a
+substring-presence check that this ruleset satisfies. Emptying the anchor (PF-04)
+trips that assertion; a permissive `quick` pass inside a loaded anchor does not.
+One route is loud, this one is not.
+
+Proposed enforcement (review-only — do NOT apply): make the exit posture a
+distinct spec *kind* the helper can reason about, or require a helper-visible
+attestation of the signed exit capability, rather than a bare boolean the helper
+must trust.
+
+---
+
+### PF-02 — `ssh_cidr=0.0.0.0/0` opens unrestricted off-tunnel TCP/22, even in strict mode (High, CONFIRMED by execution)
+
+Files: `crates/rustynetd/src/phase10.rs:2663-2677`; `ManagementCidr::from_str` at `:188-210`
+
+**Correction to my own earlier assessment.** On first read I judged this defended
+and said so, on two grounds: the rules are scoped to `proto tcp … port 22` rather
+than general egress, and the authors reference `0.0.0.0/0` for SSH explicitly at
+`:1207`. Both grounds were wrong. The `:1207` comment is diagnosing a
+*route-assertion* bug (iproute2 renders the default route as `default`, breaking a
+literal string compare), not endorsing `0.0.0.0/0` as safe. And "only TCP/22" is
+not narrow — unrestricted outbound SSH to anywhere is a serviceable exfil and
+tunnelling channel; SSH is precisely the protocol one would choose for it. The
+finding stands and I had it backwards.
+
+Three aggravating details, all confirmed:
+
+1. **It fires in the strictest posture.** The `if spec.fail_closed_ssh_allow` block
+   at `:2663` sits **outside** the `if !strict_fail_closed` guard that closes at
+   `:2662`. So `strict=true` — the fail-closed mode — does not suppress it.
+2. **The outbound rule is not interface-scoped.** It renders
+   `pass out quick {af} proto tcp from any to {cidr} port 22 keep state`
+   (`:2671-2676`) with no `on <iface>` clause, so it covers the physical NIC.
+3. **Being `quick`, it pre-empts the IPv6 block.** With `ssh_cidr=::/0` the v6
+   `pass out` precedes `block drop out quick inet6 all` (`:2696`), so `ipv6_blocked=true`
+   does not contain it.
+
+`ManagementCidr::from_str` (`:188-210`) checks only `prefix > max_prefix`, so
+prefix 0 is accepted with no width floor. Independently reproduced by a second
+probe, which pinned the ordering positionally: the v6 `pass out` lands at offset
+141 and `block drop out quick inet6 all` at 177, so the bypass of `ipv6_blocked`
+is confirmed by construction, not inferred. Grep confirms there is **no** range
+bound on `ManagementCidr` anywhere in the crate.
+
+**Scope correction — this is not macOS-only.** The Linux nftables killswitch
+emits the same unbounded shape from the same `fail_closed_ssh_allow_cidrs`
+values: `phase10.rs:930-947` adds `<family> daddr <cidr> tcp dport 22 accept`
+(plus the `sport 22` counterpart). Verified by reading. So the correct fix site is
+`ManagementCidr::from_str` itself — bounding there covers the pf path, the nft
+path, and the operator flag in one change, and is the only placement that cannot
+drift between platforms.
+
+A second, independent narrowing worth considering: the outbound half
+(`pass out … to <cidr> port 22`) is only needed for node-*initiated* SSH, because
+the inbound rule is `keep state` and therefore already covers sshd's reply
+traffic. If nothing legitimately initiates outbound SSH from the node, deleting
+that half removes the egress channel without any policy change at all. Worst case
+at the cap is 64 CIDRs → 128 unbounded port-22 rules.
+
+**This is the same bug class as the fixed `mesh_cidr` HIGH, left unfixed on the
+sibling parameter.** The reasoning in `macos_pf_mesh_cidr.rs:101-105` transfers
+verbatim — "a global or default-route range would carry local-origin egress past
+the killswitch." The asymmetry reads as an oversight rather than a decision.
+Note `blind_exit`'s `management_ssh_allow_cidrs` go through
+`macos_blind_exit.rs:315-330` `validate_cidr` rather than the bounding validator,
+so it shares the gap.
+
+Honest mitigation: the operator config path (`main.rs:3514-3535`) also accepts
+`0.0.0.0/0`, so the helper is not loosening relative to configuration — an
+operator can already choose this. The counter-argument is that management-SSH
+CIDRs are bounded operator networks by definition, so a width floor (or
+private/CGNAT/ULA containment, mirroring `mesh_cidr`) would never false-reject a
+real deployment. There is also a correct guard already present and worth
+crediting: `:780-784` rejects `fail_closed_ssh_allow=true` with an empty CIDR
+list, so the inconsistent config fails closed.
+
+---
+
+### PF-03 — the anchor flush precedes the load, so a failed load leaves egress wide open (High, CONFIRMED)
+
+File: `crates/rustynetd/src/phase10.rs:2940-2998`, with recovery at `:3585-3588`
+
+`apply_pf_rules` flushes the **previous** anchor (`:2944-2948`,
+`run_allow_failure(Pfctl, ["-a", previous, "-F", "all"])`) and only then loads the
+new one (`:2971`), setting `self.anchor_name` on success (`:2973`).
+
+Because `current_anchor_name` is `com.apple/rustynet_g{generation}` (`:2838-2843`)
+and the generation bumps on every apply cycle (`:3199`, `:5170`), the
+previous-anchor branch fires on **every normal reconcile** — this is not a rare
+error path. If the load then fails for any reason (a PF-06 input-shaped rejection,
+a transient `pfctl` error, a full filesystem), the state is:
+
+- old anchor `…_g(N-1)`: **flushed, empty**
+- new anchor `…_gN`: **never loaded, empty**
+- macOS `/etc/pf.conf`'s wildcard `anchor "com.apple/*"` evaluates the empty
+  anchors → **no block rule anywhere** → egress wide open
+- `self.anchor_name` still points at the flushed old anchor
+
+Recovery does not save it: `block_all_egress` (`:3585-3588`) is
+`apply_pf_rules(true)` — the same path with the same inputs — so a deterministic
+input-shaped failure re-fails while egress stays open, and the daemon surfaces
+`BlockEgressFailed`. This is exactly the "stranding the node undefended" outcome
+that `macos_pf_load_spec.rs:20-21` calls *worse than the original vulnerability*,
+and it violates the repo's fail-closed constraint.
+
+Proposed enforcement (review-only — do NOT apply): reorder to load-then-flush.
+pf tolerates both anchors being briefly populated — both terminators are `quick`
+and identical in effect — so the overlap is strictly safer than the gap. Better
+still, fold the flush into the `macos-pf-load` builtin so the helper flushes the
+old anchor only after its own load succeeds, which also addresses PF-04.
+
+---
+
+### PF-04 — the daemon can simply empty the killswitch anchor via the allowed flush arm (High, adjacent, CONFIRMED)
+
+File: `crates/rustynetd/src/privileged_helper.rs:2169`, with `is_anchor_name_token` at `:1402-1418`
+
+The boundary's `pfctl` allowlist includes:
+
+```rust
+["-a", anchor, "-F", "all"] if is_anchor_name_token(anchor) => Ok(()),
+```
+
+and `is_anchor_name_token` admits **any** `com.apple/rustynet_g*` (plus the two
+fixed anchors). The check is stateless — the helper has no notion of which
+generation is live. So a compromised daemon sends
+`pfctl -a com.apple/rustynet_g<current> -F all` and the killswitch anchor is
+emptied: no spec, no injection, no `-f`. The elaborate regeneration boundary is
+bypassed by the flush arm sitting immediately beside it.
+
+The asymmetry in the code is striking and worth recording: the `-f` denial
+directly below (`:2170-2177`) carries a thorough do-not-re-add rationale and
+regression tests, while the flush arm has no equivalent analysis. I found no
+mention of this capability in `documents/`.
+
+This is a genuine design tension, not a simple oversight — flush is required for
+rotation and teardown, and the helper is stateless by design. It matters for how
+the `-f` closure is described: it **narrows the attack surface** (no arbitrary
+rule text, no foreign file, no anchor redirection) rather than eliminating the
+impact (egress can still be opened). PF-01 remains the more serious of the two
+because it is silent where this is detectable.
+
+Proposed enforcement (review-only — do NOT apply): have the helper own generation
+state; or move flush inside the atomic builtin (fixes PF-03 too); or drop the
+boundary flush arm and rely on the next load overwriting the anchor.
+
+---
+
+### PF-05 — the killswitch assertions check presence, not precedence (Medium, CONFIRMED)
+
+Files: `crates/rustynetd/src/phase10.rs:3515`; `crates/rustynetd/src/macos_pf_load_spec.rs:186-207`
+
+`assert_killswitch` reduces to:
+
+```rust
+if !output.stdout.contains("block drop out quick all") {
+    return Err(SystemError::KillSwitchAssertionFailed("pf killswitch rule missing"));
+}
+```
+
+Because pf `quick` is first-match-wins, a ruleset containing
+`pass out quick on en0 inet all keep state` **followed by** that terminator
+satisfies this assertion while providing zero egress protection. The assertion
+validates that a string is present, not that it is reachable.
+
+`assert_rule_invariants` has the same blind spot from the other side: it requires
+the last non-empty trimmed line to be the terminator and rejects route primitives,
+but it never checks for over-broad passes. Executed:
+`assert_rule_invariants("pass out quick all\n   block drop out quick all   \n")`
+returns `Ok(())`. The existing test at `:941` gives false confidence — its fixture
+omits the terminator, so it fails for the terminator reason rather than for the
+blanket pass.
+
+This is the **root cause of PF-01's and PF-02's stealth**, and it explains the
+prior review's observation that neither the per-module validator nor the helper
+rule-shape assert caught the `mesh_cidr` case: none of these checks model pf
+evaluation order, so none of them can distinguish a defended anchor from a fully
+open one.
+
+Proposed enforcement (review-only — do NOT apply): assert *precedence*, not
+presence — e.g. reject any `pass` whose match set is broader than an allowlisted
+shape appearing before the terminator, or model the render as an ordered rule list
+and assert no rule preceding the terminator matches "all egress".
+
+---
+
+### PF-06 — specs that pass decode but that `pfctl` rejects (Medium, CONFIRMED against real `pfctl`)
+
+Three classes, each verified by feeding rendered output to the host's
+`/sbin/pfctl -n -f`. Each is a validated-but-unloadable spec, which lands as a
+failed load and therefore triggers PF-03.
+
+1. **Interface-name length.** `parse_interface` (`macos_pf_load_spec.rs:509`) and
+   `macos_blind_exit::validate_interface_name` allow length ≤ **31**; pf's limit is
+   `IFNAMSIZ-1` = **15** (`len=16` → `interface name too long`). The same codebase
+   already has the correct bound: `privileged_helper.rs:1330-1332`
+   `is_interface_name` uses `value.len() <= 15` for other programs. Straight
+   inconsistency.
+2. **Charset-legal but grammatically invalid names.** All pass `parse_interface`;
+   all are `pfctl` syntax errors: `0`, `123`, `08`, `-`, `.`, `all`, `inet`,
+   `state`, `route-to`. Pure-digit names lex as `NUMBER`; the others collide with
+   pf keywords.
+3. **Non-canonical prefixes on the raw-string CIDR paths.** `u8::from_str` accepts
+   a leading `+`, so `10.0.0.0/+8` validates and renders verbatim → `pfctl` syntax
+   error. This affects `blind_exit`'s `ssh_cidr` and both `mesh_cidr` paths, which
+   carry the raw string through to rule text. The killswitch `ssh_cidr` path is
+   **immune**, because `ManagementCidr` re-renders from typed fields
+   (`phase10.rs:182-186`), turning `10.0.0.0/+8` into `10.0.0.0/8`.
+
+That last contrast is the fix pattern for the whole class: parse to typed fields
+and re-render, rather than validating a string and passing it through. §14 credits
+it as the strongest construct in the module.
+
+Two related details, both confirmed by execution:
+
+- **The `decode` docstring is not literally accurate.** `macos_pf_load_spec.rs:227-230`
+  states every field is re-parsed through a typed validator. For the three
+  raw-string CIDR fields (`blind_exit` `ssh_cidr`, and `mesh_cidr` on both
+  `blind_exit` and `exit_nat`) it is validate-then-pass-through: the daemon's exact
+  bytes reach the rule text, which is how `/+10` and `/0010` survive.
+- **`blind_exit`'s `ssh_cidr` prefix is not range-checked at decode.**
+  `ssh_cidr=192.168.0.0/99` and `.../abc` both decode `Ok` and fail later in
+  `render()`; `pf_family_for_cidr_str` (`:529-538`) parses only the base address,
+  and the comment at `:366-367` admits this. The killswitch equivalent *is* caught
+  at decode. Direction is safe: `execute_macos_pf_load`
+  (`privileged_helper.rs:996-1000`) always decodes **then** renders, while the
+  standalone preflight (`:1299-1301`) is only an admission gate — so execute is
+  strictly stricter than preflight.
+
+---
+
+### PF-07 — `generation` is an unbounded daemon-chosen `u64` (Low-Medium, CONFIRMED; one part inferred)
+
+File: `crates/rustynet-crypto` n/a — `crates/rustynetd/src/macos_pf_load_spec.rs:155-163`, `:292`
+
+The anchor is `format!("com.apple/rustynet_g{generation}")` from a `parse_u64`
+value that is never bounded, range-checked, or compared against helper-side state.
+Daemon-side the generation is monotonic (`phase10.rs:5060` `saturating_add(1)`),
+but a compromised daemon speaks the IPC directly.
+
+What is genuinely safe here and worth crediting: the reachable anchor set is
+exactly `com.apple/rustynet_g` + digits, so there is no traversal and no escape
+from the namespace; and because the name is formatted from the *parsed* integer,
+`generation=007` and `generation=7` both yield `…_g7`, so no shadow/duplicate
+anchor pair can be created.
+
+Two further executed results narrow this finding, and both cut against inflating
+it. First, non-canonical spellings cause **no** anchor divergence: `generation=+7`
+and `generation=00007` are accepted by `u64::from_str` but format back to
+`…_g7`, identical to what `encode` emits for 7, so the decoded spec compares equal
+to the canonical one; `1_0`, `-1`, `" 1"`, `0x10`, `1e3`, and `u64::MAX + 1` are
+all rejected. Second, **stale anchors are reclaimed**: `phase10.rs:3000-3007`
+enumerates `com.apple/rustynet_g*` and flushes anchors the daemon no longer owns,
+so a healthy daemon cleans up after a hostile one. Every minted anchor is also
+content-fail-closed, since the terminator is asserted at
+`macos_pf_load_spec.rs:201`.
+
+Residual is therefore anchor *residue* and exhaustion rather than bypass: a
+hostile generation can write into a stale or not-yet-used generation's anchor and
+mint many anchors, but each is fail-closed and reclaimable. **Inferred and
+explicitly unverified:** pf evaluates `anchor "com.apple/*"`
+sub-anchors in lexicographic order while rustynet orders them numerically
+(`macos_exit_killswitch_precedence.rs:141-196` sorts by parsed generation
+descending), so a chosen generation might be made to sort before the legitimate
+anchor and win first-match-`quick`. Confirming this needs an on-box pf experiment
+that was not run; do not treat it as established.
+
+---
+
+### PF-08 — the module's list caps exceed what the wire can frame (Low, CONFIRMED)
+
+Files: `crates/rustynetd/src/macos_pf_load_spec.rs:52-55`; `crates/rustynetd/src/privileged_helper.rs:79`, `:82-83`
+
+`MAX_ARGS = 128` and `MAX_ARG_BYTES = 256` are both enforced before `decode` runs
+(`:709`, `:714-719` in `read_request`; again in `validate_request` `:1261-1278`) —
+correct ordering, credited in §14. But the binding constraint is
+`MAX_MESSAGE_BYTES = 16_384` (`:79`), and at the module's own decode caps with
+all-IPv6 values the request cannot be framed at all: the first failing IPv6
+`managed_peer` count alongside full 64-entry `ssh_cidr` and `traversal` lists is
+≈**202**, well under `MAX_MANAGED_PEER_ENDPOINTS = 256`.
+
+No legitimate configuration is rejected today — `MAX_AUTO_TUNNEL_PEER_COUNT = 128`
+(`daemon.rs:374`), and 128 IPv6 peers frame at ≈12,737 of 16,384 bytes (78%). So
+this is not a live defect. It is recorded because (a) the module's cap and the wire
+budget are mutually inconsistent, (b) headroom in the IPv6 direction is only
+≈1.6×, and (c) the module's tests assert `MAX_ARGS`/`MAX_ARG_BYTES` (`:1007-1011`,
+`:1051-1052`) but **nothing asserts the frame budget** — so a future peer-cap
+raise would not be caught by tests, and would surface as a failed load, i.e.
+PF-03.
+
+---
+
+### PF-09 — `push_list` does not bound a single over-cap element (Low, CONFIRMED)
+
+File: `crates/rustynetd/src/macos_pf_load_spec.rs:417-435`
+
+The chunking guard flushes *before* appending, so every emitted token satisfies
+`len(key) + 1 + len(current) <= MAX_ARG_BYTES` by induction. But after a flush
+`current` is empty and the next value is appended unconditionally, with no check
+that the element itself fits: a 300-byte element yields a 313-byte token.
+Unreachable today — the longest legitimate element is a full IPv6 `SocketAddr`
+(~47 bytes) or IPv6 CIDR (~43), with an observed maximum token of 255. Worth a
+one-line assert rather than a fix.
+
+---
+
+### PF-10 — a root `pfctl -f` on a predictable `$TMPDIR` file survives in the precedence validator (Medium, adjacent, CONFIRMED)
+
+File: `crates/rustynetd/src/macos_exit_killswitch_precedence.rs:275`, `:285-290`, with `write_restore_file` at `:349-362`
+
+While the boundary's `-f` arm is gone, one root `pfctl -f` remains in the tree:
+
+```rust
+let restore_path = write_restore_file(anchor.as_str(), baseline_rules.as_str())?;
+…
+run_pfctl_status(&["-a", anchor.as_str(), "-f", restore_path.to_string_lossy().as_ref()])
+```
+
+`write_restore_file` does `std::env::temp_dir().join(format!("rustynet-macos-killswitch-{}-{now}.pf", …))`
+then a plain `fs::write` — a **predictable name**, **symlink-following** write,
+with no `O_EXCL`, no `O_NOFOLLOW`, no mode, and no ownership check. That is exactly
+the artifact-custody shape the helper's `write_root_owned_pf_temp` (`O_EXCL`, 0600,
+128-bit `OsRng` nonce, root-only 0700 directory) exists to avoid, and it writes
+into the **killswitch anchor**.
+
+Scoped honestly: this is a CLI subcommand (`main.rs:2285`, `:362`) run as root by
+the live-lab validator, not the daemon service, and on macOS `env::temp_dir()` is
+normally the per-user 0700 `/var/folders/…`. So it is **not** the daemon-uid
+boundary bypass that `fd1b50d1` closed. But it is a root `pfctl -f` on a file whose
+integrity is never established, `$TMPDIR` is inherited from the invoking
+environment, and it matches the ask already recorded as SR-020
+(`documents/archive/SecurityReview-2026-03-24.md:1715`). It simply was not
+converted to the regeneration builtin.
+
+---
+
+### PF-11 — `contains_forbidden_route_primitive` is evadable but unreachable (Info, CONFIRMED)
+
+File: `crates/rustynetd/src/macos_pf_load_spec.rs:540-547`
+
+The matcher lowercases each line and tests `" route-to "`, `" reply-to "`,
+`" dup-to "` with required surrounding single spaces. Executed evasions: a **tab**
+delimiter, `route-to(en1 …)` with no space before the paren, and `route-to` at
+line start or line end all pass undetected; doubled spaces and CRLF are caught.
+
+**None of it matters, and it should not be inflated.** The function has exactly one
+call site — `assert_rule_invariants` (`:187`), reached only from `render()` (`:178`)
+— so it asserts over text produced by the three reviewed builders in the same
+process, none of which emit any route primitive in any branch, and per §14 no
+parameter can introduce a tab, newline, or paren. It is defence-in-depth against a
+future builder regression, with no exploitable path today. Note the test at `:635`
+deliberately blesses the `route-to(en0)` gap, so tightening the matcher means
+updating that test.
+
+Two same-named functions elsewhere (`macos_blind_exit.rs:161`,
+`macos_exit_nat.rs:156`) *do* run against live `pfctl -s` output; those are drift
+detectors, not boundary filters.
+
+---
+
+### PF-12 — this file has no audit-ledger row (Low, bookkeeping, CONFIRMED)
+
+`SecurityAuditLedger_2026-06-18.md` contains 594 file rows and zero mentions of
+`macos_pf_load_spec.rs`, even though the boundary was reviewed in
+`AutonomousSecurityParityPassLog_2026-06-24.md`. Anyone auditing coverage via the
+ledger — its stated purpose — would conclude this production privilege boundary
+was never examined, or would miss it entirely. Recording a row that cross-links
+the parity-log review (and this Part) would close the tracking gap.
+
+### PF-13 — three round-trip tests pin render equality, not spec equality (Low, test coverage, CONFIRMED)
+
+File: `crates/rustynetd/src/macos_pf_load_spec.rs:715`, `:769`, `:970`
+
+The round-trip property itself holds — a probe over 2592 killswitch specs
+(booleans × 0..2 entries per list × `generation ∈ {0, 1, u64::MAX}`) plus
+blind-exit and exit-NAT variants confirmed `decode(encode(spec)) == spec` in every
+case. The gap is what the *committed* tests pin:
+
+- `killswitch_roundtrip_renders_identically` (`:639`) and `ipv6_endpoints_roundtrip`
+  (`:787`) correctly assert `decoded == original`.
+- `blind_exit_roundtrip` (`:715`) and `exit_nat_roundtrip_is_nat_only` (`:769`)
+  assert only that the *render* matches — two specs differing in a field that does
+  not affect rule text would pass.
+- `no_false_reject_cartesian_sweep` (`:970`) sweeps encode→decode→render but pins
+  `strict=false` and `generation=1`, so the strict-mode and generation dimensions
+  are unswept.
+
+Cheap to close, and worth it because the round-trip is the property that keeps
+`decode` from accepting more than `encode` can emit — the core boundary invariant.
+
+---
+
+### PF-14 — `reject_nonempty` is a content guard with a presence-guard name (Info, CONFIRMED)
+
+File: `crates/rustynetd/src/macos_pf_load_spec.rs:466`, with `extend_csv` at `:437-443`
+
+`extend_csv` drops empty parts, so a cross-kind list key whose value is only
+separators leaves the vector empty and slips past `reject_nonempty`. Executed:
+`kind=exit_nat … ssh_cidr=,` and `kind=killswitch … mesh_cidr=,` are both
+**accepted**.
+
+No reachable effect — the resulting spec and render are byte-identical to the same
+token list with the offending token removed, which was verified. Recorded only
+because the sibling scalar guard `reject_present` (`:457`) genuinely is
+presence-based, so the two guards with parallel names have different semantics; a
+future field addition could reasonably assume presence semantics from the name.
+
+## 14. Defences that hold — verified, for the record
+
+The regeneration design is well built and most of what was aimed at it failed.
+Each item below was probed and held:
+
+1. **Rule-text injection is genuinely impossible.** Every parameter reaching rule
+   text was enumerated and attacked: interface names (`[A-Za-z0-9._-]`, len 1..=31,
+   `:505-517`) exclude all whitespace and every pf metacharacter; `ssh_cidr` on the
+   killswitch path is parsed to typed fields and **re-rendered** via `Display`
+   (`phase10.rs:182-186`) so the raw string never reaches text; endpoints are
+   decomposed to `IpAddr` + `u16` before rendering; booleans are exact-match;
+   `generation` is a `u64`. Executed and rejected at decode: newline, space, tab,
+   CR, `{`, `$`, `#`, `<table>`, and `route-to (…)` payloads in interface, CIDR, and
+   endpoint positions. **IPv6 brackets never reach rule text** because `SocketAddr`
+   is decomposed — only `endpoint.ip()` is interpolated.
+2. **Anchor derivation is airtight.** No `anchor=` token exists in the wire grammar
+   and unknown keys are rejected (`:256-273`), so anchor redirection is foreclosed;
+   the name is a pure helper-side function of kind + generation; formatting from the
+   parsed integer canonicalises leading zeros so no shadow anchor pair is possible.
+3. **`decode` is the sole ingress.** The wire request is exactly
+   `{ program: String, args: Vec<String> }` (`privileged_helper.rs:537-540`) — no
+   path, env, fd, or cwd crosses the boundary. The `pfctl` binary is resolved from a
+   fixed candidate list and validated root-owned, non-group-writable, regular
+   (`:1167-1205`); the temp file is helper-owned with `O_EXCL`, mode 0600, a
+   128-bit `OsRng` nonce, inside a verified root-only 0700 directory (`:1038-1112`).
+   A peer-credential gate precedes everything (`:493-500`).
+4. **`-f` is genuinely gone from the boundary.** `validate_pfctl_args`
+   (`:2159-2184`) accepts only six read-only/flush shapes, with a reasoned
+   do-not-re-add comment and regression tests (`:3844-3874`, `:3959-3975`), and
+   `MacosPfLoad` is a builtin with an empty binary-candidate set so it can never
+   reach `resolve_binary`/exec.
+5. **Wire caps are enforced before `decode`**, in `read_request` (`:709`,
+   `:714-719`) and again in `validate_request` (`:1261-1278`) — correct ordering.
+6. **The terminator cannot be defeated.** `render_macos_killswitch_pf_rules`
+   returns `String` (not `Result`), has no early return on any path, and pushes
+   `block drop out quick all` unconditionally as its final statement
+   (`phase10.rs:2699`); `build_macos_blind_exit_pf_rules` likewise
+   (`macos_blind_exit.rs:133`), its only early exits being `?` on validation, which
+   abort before any text. The `quick` discipline is coherent: because the terminator
+   itself is `quick`, last-match-wins never engages for `out` traffic, and every
+   builder-emitted pass is `quick` and ordered before it. `ExitNat` correctly gets a
+   *different* invariant (every non-empty line must start with `nat `,
+   `macos_pf_load_spec.rs:208-222`) since it is a translation anchor.
+7. **Cross-kind and malformed-token rejection is thorough — mechanically verified,
+   not spot-checked.** All 14 field keys were fired at all 3 kinds: **23/23**
+   cross-variant combinations are rejected, so no field is silently ignored
+   (e.g. `blind_exit + strict=false` → rejected at `:340`;
+   `killswitch + mesh_cidr=0.0.0.0/0` → rejected at `:290`;
+   `exit_nat + ipv6_blocked=true` → rejected at `:393`). Dropping each scalar in
+   turn from each kind's minimal token list fails closed in **15/15** cases with
+   `missing required token` — **no field silently defaults**, so there is no
+   defaulting downgrade lever. An unknown key is **rejected**, not ignored
+   (`:272`), so there is no forward-compat security cost, and a token with no `=`
+   is rejected at `:253-255`.
+8. **`parse_bool` is exact.** Rejected: `TRUE`, `True`, `tRue`, `1`, `0`, `yes`,
+   `on`, `"true "`, `" true"`, `"true\n"`.
+9. **List caps apply to the accumulated total and run before per-element parsing.**
+   `ssh_cidr` split across two tokens totalling 65 entries yields
+   `list length 65 exceeds maximum 64`; 64 across two tokens is accepted. A
+   1000-element junk `managed_peer` token returns the *bound* error, never a parse
+   error — so hostile input cannot force unbounded parse work.
+10. **The parse is order-independent.** `decode` is two-phase (collect `:252-274`,
+    dispatch `:285`); verified `decode(tokens) == decode(tokens.reversed())`, and
+    `kind=` last is equivalent to `kind=` first, with list element order preserved.
+11. **The round-trip property holds** across 2592 killswitch specs plus blind-exit
+    and exit-NAT variants: `decode(encode(spec)) == spec` in every case. No token
+    list was found that `decode` accepts but `encode` could never emit, other than
+    the inert cases recorded as PF-14 and the non-canonical spellings in PF-06/PF-07.
+12. **Both daemon senders check their result.** `phase10.rs:2971` uses
+   `.map_err(...)?` and `:3092-3110` checks and additionally flushes + restores
+   forwarding on error. The RN-03 `let _ =` fail-open pattern is absent from this
+   path.
+13. **`mesh_cidr` semantics are policed, and policed well.**
+   `validate_mesh_egress_source_cidr` rejects `0.0.0.0/0`, `::/0`, `8.8.8.0/24`,
+   `100.0.0.0/8`, and `::ffff:10.0.0.0/104` at decode (executed), and the fix was
+   generalized to macOS blind-exit, macOS exit-NAT, **and** Linux blind-exit. PF-01
+   and PF-02 are precisely the parameters that did not receive this treatment.
+14. **DNS ordering is correct.** With `dns_protected=true` the global DNS blocks
+    (`:2644-2651`) are `quick` and precede the endpoint passes, so a hostile
+    `traversal=8.8.8.8:53` cannot punch through them.
+
+## 15. Suggested triage order for Part III
+
+1. **PF-03** — the two-line reorder (load, then flush). Cheapest fix with the
+   largest blast-radius reduction, and it converts every PF-06-class rejection from
+   "node stranded open" into "apply failed, old killswitch intact."
+2. **PF-02** — apply `mesh_cidr`-style bounding to `ManagementCidr` on the pf path,
+   and move the SSH block inside the `strict_fail_closed` guard (or justify in a
+   comment why it must fire in strict mode).
+3. **PF-05** — assert precedence rather than presence. This is what makes PF-01 and
+   PF-02 detectable at all, and it retroactively covers the already-fixed
+   `mesh_cidr` class.
+4. **PF-01** — needs a design decision (distinct spec kind, or helper-visible
+   capability attestation), so it is slower than the three above despite ranking
+   highest on severity.
+5. **PF-04** — decide the flush model; folding flush into the atomic builtin
+   resolves this and PF-03 together.
+6. **PF-06** — align the interface bound to 15 using the existing
+   `is_interface_name`, and adopt the parse-to-typed-then-re-render pattern for the
+   three raw-string CIDR sites.
+7. **PF-07, PF-08, PF-09, PF-11, PF-12, PF-13, PF-14** — bounded-cost hygiene;
+   PF-08/PF-09 are asserts, PF-12 is a ledger row, PF-13 is three test
+   strengthenings, PF-14 is a rename or a comment.
+8. **PF-10** — owner of the live-lab validator: convert `write_restore_file` to the
+   `write_root_owned_pf_temp` pattern or route its restore through the builtin.
+
+## 16. Reproduction (Part III)
+
+```bash
+git -C ~/Desktop/rustynet rev-parse --short HEAD   # expect 22847b12
+```
+
+Findings marked CONFIRMED-by-execution were verified by replicating the validators
+and the three renderers verbatim in a scratch crate **outside** the repository,
+driving them with a hostile parameter matrix, and feeding the rendered rule text to
+the host's real `/sbin/pfctl -n -f` — which is what established PF-06's three
+rejection classes and confirmed that PF-01's and PF-02's renders are accepted by
+pf. PF-07's anchor-ordering component is the one item left **inferred**: it needs an
+on-box experiment on pf wildcard sub-anchor evaluation order that was not run.
