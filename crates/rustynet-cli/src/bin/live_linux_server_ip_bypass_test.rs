@@ -5,9 +5,7 @@ mod live_lab_support;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use live_lab_support::{
-    LiveLabContext, Logger, REMOTE_RUSTYNET_BIN, parse_ipv4, repo_root, run_cargo_ops,
-};
+use live_lab_support::{LiveLabContext, Logger, REMOTE_RUSTYNET_BIN, parse_ipv4, repo_root};
 
 fn main() {
     if let Err(err) = run() {
@@ -277,40 +275,36 @@ fn run() -> Result<(), String> {
 
     let captured_at_utc = now_utc();
     let captured_at_unix = now_unix();
-    let report_args = vec![
-        "--report-path".to_owned(),
-        report_path.to_string_lossy().to_string(),
-        "--allowed-management-cidrs".to_owned(),
-        ssh_allow_cidrs.clone(),
-        "--probe-from-client-status".to_owned(),
-        probe_from_client_status.to_owned(),
-        "--probe-ip".to_owned(),
-        probe_ip.clone(),
-        "--probe-port".to_owned(),
-        probe_port.clone(),
-        "--client-internet-route".to_owned(),
-        client_internet_route.clone(),
-        "--client-probe-route".to_owned(),
-        client_probe_route.clone(),
-        "--client-table-51820".to_owned(),
-        client_table_51820.clone(),
-        "--client-endpoints".to_owned(),
-        client_endpoints.clone(),
-        "--probe-self-test".to_owned(),
-        probe_self_test.clone(),
-        "--probe-from-client-output".to_owned(),
-        probe_from_client_output.clone(),
-        "--captured-at-utc".to_owned(),
-        captured_at_utc,
-        "--captured-at-unix".to_owned(),
-        captured_at_unix,
-    ];
-    let report_refs = report_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let report_status = run_cargo_ops(
-        &ctx.root_dir,
-        "write-live-linux-server-ip-bypass-report",
-        &report_refs,
-    )?;
+    // In-process, not `cargo run … ops …`: the subprocess built a
+    // default-feature binary lacking this `vm-lab`-gated verb, so the write
+    // failed with `unknown ops subcommand` and the stage recorded FAIL after
+    // its assertions had already passed.
+    //
+    // probe_port and captured_at_unix are parsed here because the CLI parser
+    // did it on the far side of the process boundary. captured_at_unix keeps
+    // the parser's unwrap_or(0) rather than propagating, so a clock-read
+    // failure does not fail a security stage -- matching the prior behaviour
+    // exactly rather than tightening it as a side effect of this refactor.
+    let report_status =
+        rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_live_linux_server_ip_bypass_report(
+            rustynet_cli::ops_live_lab_orchestrator::WriteLiveLinuxServerIpBypassReportConfig {
+                report_path: report_path.clone(),
+                allowed_management_cidrs: ssh_allow_cidrs.clone(),
+                probe_from_client_status: probe_from_client_status.to_owned(),
+                probe_ip: probe_ip.clone(),
+                probe_port: probe_port
+                    .parse::<u16>()
+                    .map_err(|err| format!("invalid probe_port {probe_port:?}: {err}"))?,
+                client_internet_route: client_internet_route.clone(),
+                client_probe_route: client_probe_route.clone(),
+                client_table_51820: client_table_51820.clone(),
+                client_endpoints: client_endpoints.clone(),
+                probe_self_test: probe_self_test.clone(),
+                probe_from_client_output: probe_from_client_output.clone(),
+                captured_at_utc,
+                captured_at_unix: captured_at_unix.parse::<u64>().unwrap_or(0),
+            },
+        )?;
 
     if report_status != "pass" {
         return Err(format!(

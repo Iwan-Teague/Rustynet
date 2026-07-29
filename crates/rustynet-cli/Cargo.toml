@@ -81,6 +81,16 @@ name = "live_linux_control_surface_exposure_test"
 path = "src/bin/live_linux_control_surface_exposure_test.rs"
 required-features = ["vm-lab"]
 
+[[bin]]
+name = "live_linux_server_ip_bypass_test"
+path = "src/bin/live_linux_server_ip_bypass_test.rs"
+required-features = ["vm-lab"]
+
+[[bin]]
+name = "live_linux_endpoint_hijack_test"
+path = "src/bin/live_linux_endpoint_hijack_test.rs"
+required-features = ["vm-lab"]
+
 [dependencies]
 base64 = "0.22"
 rustynet-advisor = { path = "../rustynet-advisor" }
