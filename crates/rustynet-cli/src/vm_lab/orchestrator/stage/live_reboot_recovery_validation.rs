@@ -63,6 +63,8 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
                 "--quiet",
                 "-p",
                 "rustynet-cli",
+                "--features",
+                "vm-lab",
                 "--bin",
                 "live_linux_reboot_recovery_test",
                 "--",

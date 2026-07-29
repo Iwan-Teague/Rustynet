@@ -140,6 +140,8 @@ fn run_chaos_bin(ctx: &OrchestrationContext, spec: &ChaosBinSpec) -> StageOutcom
         "--quiet",
         "-p",
         "rustynet-cli",
+        "--features",
+        "vm-lab",
         "--bin",
         spec.bin,
         "--",

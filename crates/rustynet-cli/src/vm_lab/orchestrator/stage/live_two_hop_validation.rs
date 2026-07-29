@@ -144,6 +144,8 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
                 "--quiet",
                 "-p",
                 "rustynet-cli",
+                "--features",
+                "vm-lab",
                 "--bin",
                 "live_linux_two_hop_test",
                 "--",

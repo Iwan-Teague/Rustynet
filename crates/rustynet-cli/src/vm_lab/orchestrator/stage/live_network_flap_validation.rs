@@ -63,6 +63,8 @@ impl OrchestrationStage for LiveNetworkFlapValidationStage {
                 "--quiet",
                 "-p",
                 "rustynet-cli",
+                "--features",
+                "vm-lab",
                 "--bin",
                 "live_linux_network_flap_test",
                 "--",

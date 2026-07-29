@@ -445,6 +445,8 @@ fn run_script_stage(
                 "--quiet",
                 "-p",
                 "rustynet-cli",
+                "--features",
+                "vm-lab",
                 "--bin",
                 bin_name(spec.kind),
                 "--",

@@ -67,6 +67,8 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--bin",
             "live_linux_managed_dns_test",
             "--",

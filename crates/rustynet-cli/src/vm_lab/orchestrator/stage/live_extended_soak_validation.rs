@@ -244,7 +244,23 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
 
 fn cargo_bin_command(bin: &str, extra_args: Vec<String>) -> Command {
     let mut command = Command::new("cargo");
-    command.args(["run", "--quiet", "-p", "rustynet-cli", "--bin", bin, "--"]);
+    // `--features vm-lab` for the same two reasons as every sibling stage
+    // launcher: a stage bin carrying `required-features = ["vm-lab"]` is
+    // otherwise REFUSED outright (`error: target … requires the features`,
+    // exit 101), and the orchestrator itself is a `vm-lab` build, so shelling
+    // out with a different feature set makes cargo rebuild the crate in that
+    // second configuration mid-run instead of reusing what is already built.
+    command.args([
+        "run",
+        "--quiet",
+        "-p",
+        "rustynet-cli",
+        "--features",
+        "vm-lab",
+        "--bin",
+        bin,
+        "--",
+    ]);
     command.args(extra_args);
     command
 }

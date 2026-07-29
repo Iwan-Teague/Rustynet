@@ -84,6 +84,8 @@ impl OrchestrationStage for LiveMixedTopologyValidationStage {
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--bin",
             "live_linux_mixed_topology_test",
             "--",

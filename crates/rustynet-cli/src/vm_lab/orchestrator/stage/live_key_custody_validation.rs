@@ -51,6 +51,8 @@ impl OrchestrationStage for LiveKeyCustodyValidationStage {
                 "--quiet",
                 "-p",
                 "rustynet-cli",
+                "--features",
+                "vm-lab",
                 "--bin",
                 "live_linux_key_custody_test",
                 "--",

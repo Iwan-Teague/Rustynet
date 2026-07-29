@@ -40431,6 +40431,57 @@ mod tests {
         );
     }
 
+    /// Every orchestrator stage launcher that spawns a `rustynet-cli` **bin**
+    /// must pass `--features vm-lab`.
+    ///
+    /// Two independent reasons, one of which cost a live run:
+    ///
+    /// 1. A stage bin declaring `required-features = ["vm-lab"]` is REFUSED
+    ///    outright by a launcher that omits the flag — `error: target
+    ///    \`live_linux_network_flap_test\` in package \`rustynet-cli\` requires the
+    ///    features: \`vm-lab\``, exit 101. Observed live: adding
+    ///    `required-features` to that bin (so it could call its report writer
+    ///    in-process) immediately broke the stage that launches it, trading one
+    ///    false RED for another.
+    /// 2. The orchestrator itself is a `vm-lab` build. Shelling out with a
+    ///    DIFFERENT feature set makes cargo rebuild the whole crate in that
+    ///    second configuration mid-run rather than reusing the artifacts it
+    ///    already has.
+    #[test]
+    fn orchestrator_stage_bin_launchers_pass_the_vm_lab_feature() {
+        let stage_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vm_lab/orchestrator/stage");
+        let mut offenders = Vec::new();
+        let mut checked = 0usize;
+        for entry in fs::read_dir(&stage_dir).expect("read stage dir").flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if !body.contains("\"--bin\",") {
+                continue;
+            }
+            checked += 1;
+            if !body.contains("\"vm-lab\"") {
+                offenders.push(path.display().to_string());
+            }
+        }
+        assert!(
+            checked >= 12,
+            "expected many stage launchers spawning a bin; found {checked} — did the \
+             launch style change? This test would silently pass if so."
+        );
+        assert!(
+            offenders.is_empty(),
+            "these orchestrator stage launchers spawn a rustynet-cli bin without \
+             `--features vm-lab`; a bin with required-features is refused outright \
+             (exit 101) and the stage records a FALSE RED: {offenders:#?}"
+        );
+    }
+
     pub(super) fn cleanup_temp_inventory(path: &Path) {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
