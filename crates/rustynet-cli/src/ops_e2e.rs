@@ -5296,6 +5296,16 @@ pub(crate) const RUSTYNET_SELF: &str = "rustynet";
 /// `main.rs`'s `PINNED_RUNTIME_RUSTYNET_BIN` and the installer's own target.
 pub(crate) const RUSTYNET_INSTALL_PATH: &str = "/usr/local/bin/rustynet";
 
+/// The daemon binary as named at the ~35 spawn sites in this module.
+pub(crate) const RUSTYNETD_SELF: &str = "rustynetd";
+
+/// Where the bootstrap installs the daemon. Resolving to this explicitly is
+/// what makes those spawns work on distros whose sudo `secure_path` omits
+/// `/usr/local/bin` -- RHEL and Rocky ship
+/// `secure_path = /sbin:/bin:/usr/sbin:/usr/bin`, so a bare-name spawn there
+/// fails with a bare ENOENT while the binary is present and executable.
+pub(crate) const RUSTYNETD_INSTALL_PATH: &str = "/usr/local/bin/rustynetd";
+
 /// Resolve the program a spawn helper should exec, re-execing the *currently
 /// running* binary whenever the caller names [`RUSTYNET_SELF`].
 ///
@@ -5327,6 +5337,20 @@ pub(crate) const RUSTYNET_INSTALL_PATH: &str = "/usr/local/bin/rustynet";
 /// path, which after a replacement holds the newly-installed binary — the one
 /// we want anyway.
 pub(crate) fn resolve_self_program(program: &str) -> Result<String, String> {
+    if program == RUSTYNETD_SELF {
+        // Resolve the daemon to its installed absolute path rather than leaving
+        // it to `PATH`. Every spawn site names it bare, and `sudo`'s
+        // `secure_path` on RHEL/Rocky omits `/usr/local/bin`, so the bare form
+        // fails there with `No such file or directory` even though the binary
+        // exists and runs -- an error that reads like a missing install rather
+        // than a PATH policy. Fall back to the bare name when the install path
+        // is absent, so a host that legitimately keeps the daemon elsewhere on
+        // PATH behaves exactly as before.
+        if Path::new(RUSTYNETD_INSTALL_PATH).is_file() {
+            return Ok(RUSTYNETD_INSTALL_PATH.to_owned());
+        }
+        return Ok(program.to_owned());
+    }
     if program != RUSTYNET_SELF {
         return Ok(program.to_owned());
     }
@@ -7153,13 +7177,13 @@ mod tests {
     use std::fs;
 
     use super::{
-        AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, RUSTYNET_SELF, assignment_verifier_key_hex,
-        decode_base64, decode_hex_32, ensure_safe_token, extract_last_assignment_generated,
-        issue_assignment_bundle_artifacts, issue_dns_zone_bundle_artifacts,
-        issue_traversal_bundle_artifacts, issue_two_node_traversal_artifacts,
-        parse_generic_allow_specs, parse_generic_assignment_specs, parse_generic_nodes,
-        resolve_self_program, system_useradd_args, traversal_verifier_key_hex,
-        write_assignment_refresh_env,
+        AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, RUSTYNET_SELF, RUSTYNETD_INSTALL_PATH,
+        RUSTYNETD_SELF, assignment_verifier_key_hex, decode_base64, decode_hex_32,
+        ensure_safe_token, extract_last_assignment_generated, issue_assignment_bundle_artifacts,
+        issue_dns_zone_bundle_artifacts, issue_traversal_bundle_artifacts,
+        issue_two_node_traversal_artifacts, parse_generic_allow_specs,
+        parse_generic_assignment_specs, parse_generic_nodes, resolve_self_program,
+        system_useradd_args, traversal_verifier_key_hex, write_assignment_refresh_env,
     };
     use rustynet_control::ControlPlaneCore;
     use rustynet_policy::PolicySet;
@@ -8477,16 +8501,45 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         );
     }
 
-    /// The resolver must rewrite ONLY the self sentinel. Every other spawn in
-    /// these helpers (`systemctl`, `wg`, ...) is a genuine PATH lookup and
-    /// must pass through untouched.
+    /// The resolver must rewrite ONLY the two rustynet binaries. Every other
+    /// spawn in these helpers (`systemctl`, `wg`, ...) is a genuine PATH lookup
+    /// and must pass through untouched.
     #[test]
     fn self_program_leaves_other_programs_untouched() {
         for program in ["systemctl", "wg", "ip", "install", "/usr/bin/env"] {
             assert_eq!(
                 resolve_self_program(program).expect("resolve"),
                 program,
-                "only {RUSTYNET_SELF:?} is the self sentinel"
+                "only the rustynet binaries are rewritten"
+            );
+        }
+    }
+
+    /// The daemon must resolve to its installed absolute path when that exists.
+    ///
+    /// Regression pin for a live Rocky 10 bootstrap failure: every spawn site
+    /// names `rustynetd` bare, and RHEL/Rocky ship
+    /// `secure_path = /sbin:/bin:/usr/sbin:/usr/bin`, which omits
+    /// `/usr/local/bin`. Under `sudo` the bare name therefore failed with
+    /// `failed to spawn rustynetd: No such file or directory (os error 2)`
+    /// while `/usr/local/bin/rustynetd` was present and executable -- an error
+    /// that reads like a missing install rather than a PATH policy.
+    #[test]
+    fn daemon_program_resolves_to_the_installed_path_when_present() {
+        let resolved = resolve_self_program(RUSTYNETD_SELF).expect("resolve daemon");
+        if std::path::Path::new(RUSTYNETD_INSTALL_PATH).is_file() {
+            assert_eq!(
+                resolved, RUSTYNETD_INSTALL_PATH,
+                "the daemon must resolve to its absolute installed path so the spawn does \
+                 not depend on /usr/local/bin being in sudo's secure_path"
+            );
+        } else {
+            // No install on this build host: fall back to the bare name so a
+            // host that legitimately keeps the daemon elsewhere on PATH keeps
+            // working exactly as before.
+            assert_eq!(
+                resolved, RUSTYNETD_SELF,
+                "with no installed binary the daemon must fall back to a PATH lookup"
             );
         }
     }
