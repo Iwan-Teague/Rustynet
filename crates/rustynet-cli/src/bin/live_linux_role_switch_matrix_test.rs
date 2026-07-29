@@ -20,8 +20,8 @@ use live_lab_support::{
     assignment_refresh_env_path_for_platform, assignment_watermark_path_for_platform,
     capture_daemon_status_for_platform, capture_remote_stdout, capture_root, create_workspace,
     daemon_socket_path_for_platform, enforce_host, field_value, git_head_commit,
-    read_last_matching_line, remote_src_dir, require_command, run_cargo_ops, run_root, scp_to,
-    shell_quote, ssh_status, unix_now, wait_for_daemon_socket, write_file,
+    read_last_matching_line, remote_src_dir, require_command, run_root, scp_to, shell_quote,
+    ssh_status, unix_now, wait_for_daemon_socket, write_file,
 };
 
 const ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
@@ -474,23 +474,19 @@ fn run() -> Result<(), String> {
 
     write_file(&config.source_path, &source_body)?;
 
-    run_cargo_ops(
-        &root_dir,
-        "write-role-switch-matrix-report",
-        &[
-            OsString::from("--hosts-json-path"),
-            tmp_json.as_os_str().to_os_string(),
-            OsString::from("--report-path"),
-            config.report_path.clone().into_os_string(),
-            OsString::from("--source-path"),
-            config.source_path.clone().into_os_string(),
-            OsString::from("--git-commit"),
-            OsString::from(git_commit),
-            OsString::from("--captured-at-unix"),
-            OsString::from(captured_at_unix.to_string()),
-            OsString::from("--overall-status"),
-            OsString::from(overall_status.clone()),
-        ],
+    // In-process rather than through `cargo run … ops …`. This file's helper
+    // already passes `--features vm-lab`, so unlike the report writers this was
+    // not broken -- the win here is dropping a whole process spawn plus the
+    // OsString round-trip of values that are already typed.
+    rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_role_switch_matrix_report(
+        rustynet_cli::ops_live_lab_orchestrator::WriteRoleSwitchMatrixReportConfig {
+            hosts_json_path: tmp_json.clone(),
+            report_path: config.report_path.clone(),
+            source_path: config.source_path.clone(),
+            git_commit: git_commit.to_owned(),
+            captured_at_unix,
+            overall_status: overall_status.clone(),
+        },
     )?;
 
     logger.line(format!("role_switch_report={}", config.report_path.display()).as_str())?;
@@ -979,25 +975,17 @@ fn process_host(
     source_body
         .push_str(format!("- after_restore: {}\n\n", sanitize_line(&after_restore)).as_str());
 
-    run_cargo_ops(
-        &live_lab_support::repo_root()?,
-        "update-role-switch-host-result",
-        &[
-            OsString::from("--hosts-json-path"),
-            context.hosts_json_path.as_os_str().to_os_string(),
-            OsString::from("--os-id"),
-            OsString::from(spec.os_id),
-            OsString::from("--temp-role"),
-            OsString::from(spec.temp_role),
-            OsString::from("--switch-execution"),
-            OsString::from(switch_execution),
-            OsString::from("--post-switch-reconcile"),
-            OsString::from(post_switch_reconcile),
-            OsString::from("--policy-still-enforced"),
-            OsString::from(policy_still_enforced),
-            OsString::from("--least-privilege-preserved"),
-            OsString::from(least_privilege_preserved),
-        ],
+    // In-process; see the note on the matrix-report call above.
+    rustynet_cli::ops_live_lab_orchestrator::execute_ops_update_role_switch_host_result(
+        rustynet_cli::ops_live_lab_orchestrator::UpdateRoleSwitchHostResultConfig {
+            hosts_json_path: context.hosts_json_path.to_path_buf(),
+            os_id: spec.os_id.to_owned(),
+            temp_role: spec.temp_role.to_owned(),
+            switch_execution: switch_execution.to_owned(),
+            post_switch_reconcile: post_switch_reconcile.to_owned(),
+            policy_still_enforced: policy_still_enforced.to_owned(),
+            least_privilege_preserved: least_privilege_preserved.to_owned(),
+        },
     )?;
 
     if switch_execution != "pass"
