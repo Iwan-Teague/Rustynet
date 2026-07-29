@@ -23,6 +23,51 @@ pub(crate) const WG_LATEST_HANDSHAKES_MAX_BYTES: usize = 64 * 1024;
 /// makes bring-up deterministic instead of platform-default-dependent.
 pub const SAFE_BRINGUP_TUNNEL_MTU: u16 = 1420;
 
+/// Environment override for the bring-up tunnel MTU.
+///
+/// `SAFE_BRINGUP_TUNNEL_MTU` assumes a clean 1500-byte underlay. That
+/// assumption fails on a NAT-traversed path, where the outer packet may ride a
+/// carrier with a smaller MTU: a WireGuard datagram leaving over a 1280-byte
+/// hop only has 1280 − 60 = 1220 bytes left for the inner packet, so a 1420
+/// tunnel silently black-holes anything large while pings keep working.
+/// Measured on a real cross-network path 2026-07-29 — ICMP succeeded to a
+/// 1000-byte payload, failed from 1200 up, and bulk TCP stalled after 0.03 MB.
+///
+/// This is an interim operator escape hatch, not the answer. FIS-0027 Phase 3
+/// replaces it with the per-path measured value from the
+/// `rustynetd::path_mtu` DPLPMTUD search, whose state machine already exists
+/// but has no consumer yet.
+pub const TUNNEL_MTU_ENV: &str = "RUSTYNET_WG_TUNNEL_MTU";
+
+/// Lower bound for the override. 1200 is the smallest tunnel MTU that still
+/// clears a 1280-byte outer hop (the IPv6 minimum link MTU, and what tailscale
+/// and most tunnel carriers use) after worst-case encapsulation overhead.
+pub const MIN_BRINGUP_TUNNEL_MTU: u16 = 1200;
+
+/// Resolve the bring-up tunnel MTU.
+///
+/// Returns `SAFE_BRINGUP_TUNNEL_MTU` unless `RUSTYNET_WG_TUNNEL_MTU` holds a
+/// value inside `MIN_BRINGUP_TUNNEL_MTU..=SAFE_BRINGUP_TUNNEL_MTU`. Anything
+/// absent, unparseable, or out of range falls back to the default: a bad
+/// override must not silently produce an interface MTU nobody chose, and the
+/// ceiling stays at the audited default so this can only ever make the tunnel
+/// *more* conservative, never less.
+pub fn bringup_tunnel_mtu() -> u16 {
+    resolve_bringup_tunnel_mtu(std::env::var(TUNNEL_MTU_ENV).ok().as_deref())
+}
+
+/// Pure core of [`bringup_tunnel_mtu`], split out so the bounds are testable
+/// without touching process environment.
+pub fn resolve_bringup_tunnel_mtu(raw: Option<&str>) -> u16 {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return SAFE_BRINGUP_TUNNEL_MTU;
+    };
+    match raw.parse::<u16>() {
+        Ok(value) if (MIN_BRINGUP_TUNNEL_MTU..=SAFE_BRINGUP_TUNNEL_MTU).contains(&value) => value,
+        _ => SAFE_BRINGUP_TUNNEL_MTU,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireguardCommandOutput {
     pub stdout: String,
@@ -200,7 +245,7 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                 "link".to_owned(),
                 "set".to_owned(),
                 "mtu".to_owned(),
-                SAFE_BRINGUP_TUNNEL_MTU.to_string(),
+                bringup_tunnel_mtu().to_string(),
                 "dev".to_owned(),
                 self.interface_name.clone(),
             ],
@@ -843,6 +888,62 @@ mod tests {
                         .any(|pair| pair[0] == "persistent-keepalive" && pair[1] == "21")
             }),
             "Some(21) must emit `persistent-keepalive 21`"
+        );
+    }
+
+    #[test]
+    fn resolve_bringup_tunnel_mtu_bounds_the_override() {
+        // Absent / empty / malformed all fall back to the audited default: a bad
+        // override must never silently produce an MTU nobody chose.
+        assert_eq!(resolve_bringup_tunnel_mtu(None), SAFE_BRINGUP_TUNNEL_MTU);
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some("")),
+            SAFE_BRINGUP_TUNNEL_MTU
+        );
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some("   ")),
+            SAFE_BRINGUP_TUNNEL_MTU
+        );
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some("not-a-number")),
+            SAFE_BRINGUP_TUNNEL_MTU
+        );
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some("-5")),
+            SAFE_BRINGUP_TUNNEL_MTU
+        );
+
+        // The ceiling is the audited default, so an override can only ever make
+        // the tunnel MORE conservative -- never grant a larger MTU.
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some("9000")),
+            SAFE_BRINGUP_TUNNEL_MTU
+        );
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some(&(SAFE_BRINGUP_TUNNEL_MTU + 1).to_string())),
+            SAFE_BRINGUP_TUNNEL_MTU
+        );
+        // ...and below the floor is refused too, so a typo cannot cripple the link.
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some("576")),
+            SAFE_BRINGUP_TUNNEL_MTU
+        );
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some(&(MIN_BRINGUP_TUNNEL_MTU - 1).to_string())),
+            SAFE_BRINGUP_TUNNEL_MTU
+        );
+
+        // In-range values are honoured, including both endpoints. 1220 is the
+        // value the measured 1280-byte cross-network path actually needs.
+        assert_eq!(resolve_bringup_tunnel_mtu(Some("1220")), 1220);
+        assert_eq!(resolve_bringup_tunnel_mtu(Some(" 1220 ")), 1220);
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some(&MIN_BRINGUP_TUNNEL_MTU.to_string())),
+            MIN_BRINGUP_TUNNEL_MTU
+        );
+        assert_eq!(
+            resolve_bringup_tunnel_mtu(Some(&SAFE_BRINGUP_TUNNEL_MTU.to_string())),
+            SAFE_BRINGUP_TUNNEL_MTU
         );
     }
 
