@@ -389,6 +389,14 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
     fn stage_started(&self, id: &orchestrator::stage::StageId) {
         let name = id.as_str();
         let now = collected_at_utc_now();
+        // QH-32: echo progress to stderr. Without this a run prints a few
+        // banner lines at launch and then NOTHING for 30-45 minutes, because
+        // all progress goes to state/stages.tsv and per-stage log files. From a
+        // terminal "working" and "hung" are then indistinguishable, and a
+        // healthy run has been diagnosed as crashed on exactly that basis.
+        // stderr, not stdout, so machine-readable stdout contracts are
+        // unaffected.
+        eprintln!("[stage] {now} {name} started");
         self.started_at
             .borrow_mut()
             .insert(name.to_owned(), now.clone());
@@ -436,6 +444,18 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
             .cloned()
             .unwrap_or_default();
         let now = collected_at_utc_now();
+        // QH-32 (see stage_started). The failure summary is included because a
+        // terminal watcher otherwise learns only that something failed, and has
+        // to go find the per-stage log to learn what — the first question asked
+        // every time. Truncated so one pathological error cannot flood the
+        // console; the untruncated text is in the stage log either way.
+        if summary.trim().is_empty() {
+            eprintln!("[stage] {now} {name} {status}");
+        } else {
+            let first_line = summary.lines().next().unwrap_or_default();
+            let brief: String = first_line.chars().take(200).collect();
+            eprintln!("[stage] {now} {name} {status}: {brief}");
+        }
         // Write the per-stage log so downstream readers (get_stage_log, diagnose,
         // the monitor tail, validate_live_lab_run_artifacts) have a real file.
         // A Rust stage runs in-process; its outcome detail IS the log content
