@@ -1171,13 +1171,15 @@ fn run_linux_authenticode_check_command(args: &[String]) -> Result<(), String> {
 
 fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String> {
     use rustynetd::linux_killswitch_boot::{
-        BootSshCidr, collect_linux_killswitch_boot_report, install_linux_boot_killswitch,
+        BootSshCidr, BootTraversalEndpoint, collect_linux_killswitch_boot_report,
+        install_linux_boot_killswitch,
     };
     let mut fail_on_drift = true;
     let mut iface_name: String = "rustynet0".to_owned();
     let mut install_boot = false;
     let mut ssh_allow = false;
     let mut ssh_cidrs: Vec<BootSshCidr> = Vec::new();
+    let mut traversal_endpoints: Vec<BootTraversalEndpoint> = Vec::new();
     let mut wg_listen_port: Option<u16> = None;
     let mut index = 0usize;
     while index < args.len() {
@@ -1233,6 +1235,28 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
                     index += 2;
                 }
             }
+            Some("--traversal-stun-servers") => {
+                // Same empty-token handling as --fail-closed-ssh-allow-cidrs:
+                // systemd substitutes an empty argument when the env var is
+                // unset, which must be treated as "no endpoints", not as a
+                // parse error.
+                let raw = args.get(index + 1).map(String::as_str).unwrap_or("").trim();
+                if raw.is_empty() || raw.starts_with("--") {
+                    if raw.is_empty() && args.get(index + 1).is_some() {
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                } else {
+                    traversal_endpoints = raw
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(BootTraversalEndpoint::parse)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    index += 2;
+                }
+            }
             Some("--wg-listen-port") => {
                 let value = args.get(index + 1).ok_or_else(|| {
                     "--wg-listen-port requires a value (e.g. --wg-listen-port 51820)".to_owned()
@@ -1263,7 +1287,13 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
     // the reviewed daemon tables (rustynet / rustynet_g<N>) so the verifier
     // below is unaffected.
     if install_boot {
-        install_linux_boot_killswitch(iface_name.as_str(), ssh_allow, &ssh_cidrs, wg_listen_port)?;
+        install_linux_boot_killswitch(
+            iface_name.as_str(),
+            ssh_allow,
+            &ssh_cidrs,
+            wg_listen_port,
+            &traversal_endpoints,
+        )?;
     }
 
     let report = collect_linux_killswitch_boot_report(iface_name.as_str());
@@ -4218,7 +4248,7 @@ fn help_text() -> String {
         "  rustynetd linux-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd linux-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
         "  rustynetd linux-key-custody-check [--no-fail-on-drift]",
-        "  rustynetd linux-killswitch-boot-check [--iface <name>] [--no-fail-on-drift]",
+        "  rustynetd linux-killswitch-boot-check [--iface <name>] [--no-fail-on-drift] [--install-boot-killswitch] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--wg-listen-port <1-65535>] [--traversal-stun-servers <ip:port[,ip:port...]>]",
         "  rustynetd linux-authenticode-check [--no-fail-on-drift]",
         "  rustynetd linux-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd linux-dns-failclosed-check [--no-fail-on-drift]",
