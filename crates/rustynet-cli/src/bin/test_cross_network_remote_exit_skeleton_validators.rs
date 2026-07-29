@@ -346,6 +346,13 @@ fn run_bash(root_dir: &Path, script_path: &str, args: &[&str]) -> Result<ExitSta
 }
 
 fn run_cargo(root_dir: &Path, args: &[&str]) -> Result<ExitStatus, String> {
+    // `--features vm-lab` is REQUIRED: the only `ops` subcommand driven through
+    // here (`validate-cross-network-remote-exit-reports`) is
+    // `#[cfg(feature = "vm-lab")]`-gated, so a default-feature build does not
+    // contain it and the call fails with "unknown ops subcommand" regardless of
+    // whether the thing being validated is sound. Same defect that produced a
+    // false RED on `live_network_flap_validation`; see the note on
+    // `live_lab_support::run_cargo_ops`.
     Command::new("cargo")
         .current_dir(root_dir)
         .args([
@@ -353,6 +360,8 @@ fn run_cargo(root_dir: &Path, args: &[&str]) -> Result<ExitStatus, String> {
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--bin",
             "rustynet-cli",
             "--",

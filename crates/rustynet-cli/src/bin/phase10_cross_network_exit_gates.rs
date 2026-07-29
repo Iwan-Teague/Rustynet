@@ -161,8 +161,15 @@ fn run_bin(root_dir: &Path, bin_name: &str, args: &[OsString]) -> Result<(), i32
     command.current_dir(root_dir).args([
         "run",
         "--quiet",
+        // `--features vm-lab` is REQUIRED: the `ops` verb driven here is
+        // `#[cfg(feature = "vm-lab")]`-gated, so a default-feature build lacks it
+        // and the call fails with "unknown ops subcommand" regardless of whether
+        // the thing being validated is sound — a false RED. Pinned by
+        // `bins_calling_vm_lab_gated_ops_verbs_pass_the_feature`.
         "-p",
         "rustynet-cli",
+        "--features",
+        "vm-lab",
         "--bin",
         bin_name,
         "--",
@@ -190,8 +197,15 @@ fn run_ops(root_dir: &Path, ops_subcommand: &str, args: &[OsString]) -> Result<(
     command.current_dir(root_dir).args([
         "run",
         "--quiet",
+        // `--features vm-lab` is REQUIRED: the `ops` verb driven here is
+        // `#[cfg(feature = "vm-lab")]`-gated, so a default-feature build lacks it
+        // and the call fails with "unknown ops subcommand" regardless of whether
+        // the thing being validated is sound — a false RED. Pinned by
+        // `bins_calling_vm_lab_gated_ops_verbs_pass_the_feature`.
         "-p",
         "rustynet-cli",
+        "--features",
+        "vm-lab",
         "--",
         "ops",
         ops_subcommand,

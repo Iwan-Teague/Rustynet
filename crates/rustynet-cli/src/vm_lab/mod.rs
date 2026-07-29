@@ -40341,6 +40341,96 @@ mod tests {
         );
     }
 
+    /// A `src/bin` helper that spawns `cargo run … -p rustynet-cli … ops <verb>`
+    /// for a **`vm-lab`-gated** verb MUST pass `--features vm-lab`.
+    ///
+    /// Without it cargo builds a default-feature binary that does not contain
+    /// the verb, the call dies with `unknown ops subcommand`, and the caller
+    /// reports failure *after* its real assertions have already passed — the
+    /// stage records FAIL for work that succeeded.
+    ///
+    /// Pinned as a source invariant because this has now bitten twice for the
+    /// same reason: there are FOUR separate `run_cargo_ops` helpers, the fix
+    /// was applied to one (its comment records that it hard-failed
+    /// `live_two_hop_validation`), and the others kept the bug.
+    /// `live_network_flap_validation` hit an unfixed copy and was recorded RED
+    /// at `f22be5af` despite recovering the tunnel in 5s.
+    ///
+    /// The gated set is derived from `main.rs` rather than hardcoded, so moving
+    /// a verb behind the feature later cannot silently invalidate this test.
+    /// Scoped to gated verbs deliberately: most `cargo … ops` callers here are
+    /// CI gate binaries driving UNgated verbs, and forcing a `vm-lab` build on
+    /// those would change what CI compiles.
+    #[test]
+    fn bins_calling_vm_lab_gated_ops_verbs_pass_the_feature() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let main_rs = fs::read_to_string(manifest.join("src/main.rs")).expect("read main.rs");
+
+        // A verb is gated when its match arm is immediately preceded by the cfg.
+        let lines: Vec<&str> = main_rs.lines().collect();
+        let mut gated: Vec<String> = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix('"') else {
+                continue;
+            };
+            let Some((verb, tail)) = rest.split_once('"') else {
+                continue;
+            };
+            if !tail.trim_start().starts_with("=>") {
+                continue;
+            }
+            if index > 0 && lines[index - 1].contains("cfg(feature = \"vm-lab\")") {
+                gated.push(verb.to_owned());
+            }
+        }
+        assert!(
+            gated.len() > 20,
+            "expected many vm-lab-gated ops verbs in main.rs, found {} — did the \
+             gating style change? This test would silently pass if so.",
+            gated.len()
+        );
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![manifest.join("src/bin")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(body) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let spawns_cargo_ops = body.contains("Command::new(\"cargo\")")
+                    && body.contains("\"rustynet-cli\"")
+                    && body.lines().any(|l| l.trim() == "\"ops\",");
+                if !spawns_cargo_ops || body.contains("\"vm-lab\"") {
+                    continue;
+                }
+                for verb in &gated {
+                    if body.contains(&format!("\"{verb}\"")) {
+                        offenders.push(format!("{}: {verb}", path.display()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these src/bin helpers spawn `cargo run … ops <verb>` for a vm-lab-GATED \
+             verb without `--features vm-lab`, so the call fails with `unknown ops \
+             subcommand` and the stage records a FALSE RED: {offenders:#?}"
+        );
+    }
+
     pub(super) fn cleanup_temp_inventory(path: &Path) {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);

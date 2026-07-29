@@ -1270,6 +1270,20 @@ pub fn run_cargo_ops(
     ops_subcommand: &str,
     args: &[&str],
 ) -> Result<String, String> {
+    // `--features vm-lab` is LOAD-BEARING, not decoration. Most `ops`
+    // subcommands reached through here are `vm-lab`-gated in `main.rs`; without
+    // the flag cargo builds a DEFAULT-feature binary in which they do not exist,
+    // and the call fails with `unknown ops subcommand` *after* the caller's real
+    // assertions have already passed — a stage that did its job records FAIL.
+    // Observed live on `live_network_flap_validation` at `f22be5af`, where every
+    // probe passed (recovery in 5s, tunnel active, membership intact) and only
+    // the report write failed.
+    //
+    // This is a SAFETY NET for call sites not yet migrated. The migration is to
+    // call the writer in-process instead (see
+    // `rustynet_cli::ops_live_lab_orchestrator`), which makes the mismatch
+    // impossible by construction rather than dependent on this argument list.
+    // Converted call sites do not rely on this flag.
     let output = Command::new("cargo")
         .current_dir(root_dir)
         .args([
@@ -1277,6 +1291,8 @@ pub fn run_cargo_ops(
             "--quiet",
             "-p",
             "rustynet-cli",
+            "--features",
+            "vm-lab",
             "--",
             "ops",
             ops_subcommand,
