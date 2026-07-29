@@ -18,6 +18,40 @@ commit and the same fail-closed/default-deny constraints, and several findings
 cross-reference each other (Part I's membership gate depends on Part II's signed
 key custody). Splitting them would hide those links.
 
+## 0. Meta-review — this document was audited against the code, and corrected
+
+An adversarial review of *this document* was run on 2026-07-29 and found 12
+factual errors plus several overstatements. All are corrected in place and marked
+`Corrected 2026-07-29 (meta-review)` so the record shows what changed rather than
+quietly reading as though it were right all along. The material ones:
+
+| Was | Now |
+|---|---|
+| Part VI §24: these Windows paths have "never run outside a unit test" | **False.** The authoritative `live_lab_run_matrix.csv` shows 13 live passes each for `windows_named_pipe_acl` and `windows_dpapi_key_custody`. The earlier claim generalized from the *node* matrix — an error this repo had already caught and recorded once (`LiveLabFindings_2026-07-03.md:364-368`) |
+| CTL-01: High, "single highest-leverage fix in the whole document" | **Medium-latent.** Enrollment has zero production callers, so the injection precondition is unreachable in a shipped binary — the same discount CTL-04, POL-10, CRY-09 and WIN-07 already applied to themselves. Class also already tracked as AUDIT-042 |
+| CRY-05: Medium, mapped to RSA-0002 | **High**, also mapped to **AUDIT-027** — an existing High NO-SHIP item describing the identical lines |
+| §14 item 14: "DNS ordering is correct" | **Withdrawn as a general defence.** Under `strict_fail_closed` the DNS blocks are skipped while the endpoint passes still render — a *candidate missing finding*, not a defence |
+| §19 item 15: `now_unix` "fails closed to 0" | Fails closed against a *panic*, but **fails open on freshness** — `now = 0` disables expiry in both `is_expired` and the data path |
+| PF-03: reorder to load-then-flush, "strictly safer" | **Gated.** That asserted as fact the pf sub-anchor ordering PF-07 marks unverified; if PF-07's inference holds the reorder causes an egress blackout every reconcile |
+| POL-06: six issuance callers named | Two were mislabelled, and the wording contradicted CTL-03. `signed_peer_map` and `signed_relay_fleet_bundle` call the gate **not at all** |
+| §12: "two were production daemon code" lack ledger rows | **Eleven** do — making PF-12 a systematic gap |
+| RSA-0077 listed open | **Applied** (`6e0d0f0`); the repo-wide plain-`verify` grep is zero |
+| RLY-08: ~200,000 log lines/s | **~409,600** — the earlier figure conflated the hello rate with the line rate |
+| PF-06/RLY-09/RLY-12: three supporting citations | Each pointed at a comment or type that says something other than claimed; conclusions survive under corrected citations |
+
+Also confirmed by the meta-review, and worth recording because it was the claim
+most at risk: Part II §9's credit to `rustynet-crypto` for a full
+`temp → fsync → rename → fsync parent` sequence is **accurate**, so RLY-04's
+cross-crate contrast holds. Every quantitative claim in the document was
+independently checked and found sound except RLY-08 above. Findings marked
+**New** were re-checked against the ledger; the four with prior coverage are now
+attributed (POL-05, POL-14, PF-05, CTL-01).
+
+**Known remaining weakness:** Part III's line references predate three commits to
+`phase10.rs` and are ~+43 lines stale after `:2650`; a corrected anchor table is
+in that part's header, but anything depending on render *ordering* there needs
+re-verification at HEAD rather than a renumber.
+
 Out of scope throughout: WireGuard backends, live-lab evidence, and the GUI.
 (Earlier revisions of this header also excluded relay framing; Part IV now covers
 the relay's untrusted-input path, so that exclusion no longer applies.)
@@ -86,7 +120,7 @@ individual links, and are marked as such inline.
 | POL-02 | Raw CIDR destinations skip the gate, and `user:local` resolves only to the **local** node — so two shipped daemon paths validate no remote peer | Medium | **Yes**, shipped default policy |
 | POL-03 | The empty string is a valid, ungated, `*`-matching identity | Medium | Latent (no call site emits it) |
 | POL-04 | The gate never binds a selector to the **requesting** peer — it trusts the selector string wholesale | Medium | Latent (call sites use constants/`node:`) |
-| POL-05 | `LlmAccessScope` absence = maximum privilege, and three separate paths reach absence silently | Medium | Inert (see POL-13) |
+| POL-05 | `LlmAccessScope` absence = maximum privilege, and three separate paths reach absence silently (the `None`-is-unrestricted *design* is documented in `ServiceHostingRolesDeltaPlan_2026-06-11.md:77`; the swallowed-read-failure and malformed-parse paths are new) | Medium | Inert (see POL-13) |
 | POL-06 | `is_populated()` doc advertises a removed fail-open; its live caller is **unconditionally inert in production** | Medium (re-rate) | **Yes**, issuance layer |
 | POL-07 | `validate_policy_safety` is evadable and context-blind | Low | Inert (controller unwired) |
 | POL-08 | `stage_revision` silently overwrites a revision — the rollback target is mutable and not content-addressed | Low (High as design) | Inert |
@@ -95,7 +129,7 @@ individual links, and are marked as such inline.
 | POL-11 | Scope key format mismatch: policy emits `node:<id>`, gateway looks up bare `<id>` | Low (latent) | Inert |
 | POL-12 | `scope_for` doc claims specificity tiering the code does not implement | Low | Inert |
 | POL-13 | No fuzz target covers the policy engine | Low (process) | n/a |
-| POL-14 | Adjacent: two daemon ACL results discarded with `let _ =` | Medium | **Yes** |
+| POL-14 | Adjacent: two daemon ACL results discarded with `let _ =` (`set_exit_node` half is **AUDIT-044**; `ensure_lan_route_allowed` half is new) | Medium | **Yes** |
 
 ---
 
@@ -323,10 +357,15 @@ all five call sites are tests (`:7605`, `:7625`, `:7647`, `:7673`, `:7692`).
 (`:2288`), and the three real constructions (`rustynet-cli/src/main.rs:6889`,
 `:6996`, `:7087`) never install one. So `is_populated()` is **always** false in
 a shipped binary, the RSA-0008 issuance gate **never runs**, and
-`policy_allows_node_pair` reduces to the revocation-blind `PolicySet::evaluate`
-(`:3443`) on every issuance path — peer-map, exit-node, dns-zone, endpoint-hint,
-relay-fleet, and relay-session tokens (callers `:2609`, `:2642`, `:2748`,
-`:2840`, `:3028`, `:3116`).
+`policy_allows_node_pair` (`:3423-3455`) reduces to the revocation-blind
+`PolicySet::evaluate` on every issuance path that calls it. **Corrected
+2026-07-29 (meta-review):** an earlier revision mislabelled two of the six
+callers. The line numbers were right, the names were not — `:2609` and `:2642`
+are both inside `signed_auto_tunnel_bundle` (peers and exit node), `:2748` is
+`signed_dns_zone_bundle`, `:2840` `signed_endpoint_hint_bundle`, `:3028`
+`issue_relay_session_token`, `:3116` `signed_traversal_coordination_record`.
+`signed_peer_map` and `signed_relay_fleet_bundle` call it **not at all**, which
+is the stronger statement CTL-03 makes; the earlier wording contradicted CTL-03.
 
 This does not create an end-to-end bypass; the RSA-0008 containment argument
 still holds (the daemon's `check_peer_membership_active` drops a revoked peer).
@@ -849,7 +888,9 @@ Two contributions only:
 
 ---
 
-### CRY-05 — Windows permission validation is a no-op on both directions (Medium; confirms **RSA-0002**)
+### CRY-05 — Windows permission validation is a no-op on both directions (**re-rated High**; confirms **RSA-0002** and **AUDIT-027**)
+
+**Re-rated 2026-07-29 (meta-review).** This was originally mapped only to RSA-0002 (Medium) and rated Medium. The identical defect at the identical location is also **AUDIT-027**, which the repo rates **High** and names in its NO-SHIP list: `SecurityAndQualityAudit_2026-06-10.md:65` ("Windows encrypted-key custody ACL check is a no-op `Ok(())` (RN-33 escalated) | High | Open"), with `:32` listing "wire/fail-close the Windows key-custody ACL (AUDIT-027)" as a before-release item and `:331` recommending *verbatim* what this finding proposes. Rating it Medium while an existing High ship-blocker describes the same lines was an under-call; it is aligned to High here rather than arguing the repo's own rating down.
 
 File: `crates/rustynet-crypto/src/lib.rs:1715-1720`, plus `:1498-1511`, `:1519`, `:1532-1536`
 
@@ -1185,7 +1226,24 @@ repository to avoid contending with concurrent workers' builds.
 
 Crate baseline: `crates/rustynetd/src/macos_pf_load_spec.rs`, 1061 lines, added by `fd1b50d1` ("macos pf: close the pfctl -f privileged boundary via rule regeneration")
 Scope: the `macos-pf-load` privileged builtin end to end — `MacosPfLoadSpec` encode/decode across the daemon→root boundary, anchor derivation, the three rule renderers it drives (`render_macos_killswitch_pf_rules`, `build_macos_blind_exit_pf_rules`, `build_macos_exit_nat_pf_rules`), the `assert_rule_invariants` guard, and the surrounding apply/assert ordering in `phase10.rs` and `privileged_helper.rs`
-Out of scope for this part: Linux nftables killswitch paths except where they share a validator, and Windows WFP
+Out of scope for this part: Linux nftables killswitch paths except where they share a validator, and Windows WFP (Part VI now covers the latter)
+
+> **Line-reference drift (meta-review 2026-07-29).** `phase10.rs` moved under
+> `fe634559`, `c5018acb` and `5bbf2062`, which added the traversal/managed-peer
+> endpoint fields and render loops. References into that file **after ~`:2650` are
+> uniformly ~+43 lines** at HEAD. Substance was re-checked and holds in every case
+> examined, but the refs below are as-of `22847b12`. Key corrected anchors:
+> PF-01's `allow_egress_interface` pass `:2653-2662` → **`:2700-2705`** (guard
+> opens `:2674`, closes **`:2706`**); PF-02's SSH block `:2663-2677` →
+> **`:2707-2720`**; the terminator `:2699` → **`:2742`**; the DNS blocks
+> `:2644-2651` → **`:2688-2694`**; PF-03's `apply_pf_rules` `:2940-2998` →
+> **`:2983-3041`** with the flush `:2944-2948` → **`:2988-2991`** and the load
+> `:2971` → **`:3012-3015`**; `block_all_egress` `:3585-3588` → **`:3628-3631`**;
+> PF-05's `assert_killswitch` `:3515` → **`:3544`** with the substring test at
+> **`:3558`**; PF-04's flush arm `:2169` → **`:2193`**. `macos_pf_load_spec.rs` is
+> **unmodified** since the baseline, so all refs into it are exact. Anything in
+> this part that depends on render *ordering* — notably §14 item 14 — needs
+> re-verification at HEAD, not a renumber.
 
 ## 12. Why this area, and what was already known
 
@@ -1199,10 +1257,18 @@ part.
 Target selection was evidence-driven rather than by intuition. Of the 594 file
 rows in `SecurityAuditLedger_2026-06-18.md`, none are pending — the ledger is
 thorough — so the gap is code that postdates it. Enumerating tracked `.rs` files
-with **no ledger row** showed almost all of them are lab/test tooling
-(`vm_lab/`, `lab-monitor`, `live_lab_*`), which the charter explicitly places
-outside the production trust path. Two were production daemon code, and this file
-is the load-bearing one.
+with **no ledger row** showed most are lab/test tooling (`vm_lab/`,
+`lab-monitor`, `live_lab_*`), which the charter places outside the production
+trust path. **Corrected 2026-07-29 (meta-review):** an earlier revision said "two
+were production daemon code." The real figure is **11** of the 19 unrowed files in
+`crates/rustynetd/src/` (the other 8 are `*_audit.rs` report harnesses):
+`anchor_port_mapping_status.rs`, `keepalive.rs`, `linux_blind_exit.rs`,
+`linux_blind_exit_dataplane.rs`, `linux_ipv6_leak.rs`, `macos_exit_nat.rs`,
+`macos_ipv6_leak.rs`, `macos_pf_load_spec.rs`, `macos_pf_mesh_cidr.rs`,
+`path_mtu.rs`, `peer_traversal_prior.rs`. Several are killswitch and
+IPv6-leak-prevention code — the same severity class as the file this part
+selected. That makes **PF-12 a systematic coverage gap rather than one missing
+row**, and it means target selection here was less exhaustive than claimed.
 
 **This boundary is not unreviewed, and that must be stated plainly.**
 `AutonomousSecurityParityPassLog_2026-06-24.md:119-129` records a prior 4-lens
@@ -1226,7 +1292,7 @@ nor the helper rule-shape assert, nor the self-referential evaluator caught the
 | PF-02 | `ssh_cidr=0.0.0.0/0` opens unrestricted off-tunnel TCP/22 — **even under `strict=true`**, and not interface-scoped. Confirmed on macOS pf, Linux nft **and** Windows netsh (WIN-05) | High | **New** |
 | PF-03 | `apply_pf_rules` flushes the old anchor **before** loading the new one, on every reconcile — a failed load leaves egress wide open | High | **New** |
 | PF-04 | The allowed `pfctl -a <anchor> -F all` arm lets the daemon empty the live killswitch anchor, bypassing the whole regeneration boundary | High (adjacent) | **New** |
-| PF-05 | Killswitch assertions validate rule **presence, not precedence** — the root cause of PF-01/PF-02 being silent | Medium | **New** |
+| PF-05 | Killswitch assertions validate rule **presence, not precedence** — the root cause of PF-01/PF-02 being silent | Medium | Cross-platform analogue of **RN-27** (open), which records the identical defect on the Linux nft killswitch |
 | PF-06 | Specs that pass decode but that `pfctl` rejects (iface length/keywords, `/+N` prefixes) — feeds PF-03 | Medium | **New** |
 | PF-07 | `generation` is an unbounded daemon-chosen `u64` | Low-Medium | **New** |
 | PF-08 | `MAX_MANAGED_PEER_ENDPOINTS = 256` is unreachable through the 16 KiB wire budget; no test pins the budget | Low | **New** |
@@ -1382,10 +1448,23 @@ that `macos_pf_load_spec.rs:20-21` calls *worse than the original vulnerability*
 and it violates the repo's fail-closed constraint.
 
 Proposed enforcement (review-only — do NOT apply): reorder to load-then-flush.
-pf tolerates both anchors being briefly populated — both terminators are `quick`
-and identical in effect — so the overlap is strictly safer than the gap. Better
-still, fold the flush into the `macos-pf-load` builtin so the helper flushes the
-old anchor only after its own load succeeds, which also addresses PF-04.
+**Safety caveat added 2026-07-29 (meta-review) — do not implement this without
+the experiment PF-07 already asks for.** An earlier revision asserted that "pf
+tolerates both anchors being briefly populated — both terminators are `quick` and
+identical in effect — so the overlap is strictly safer than the gap." That
+asserts as fact precisely the pf property PF-07 marks **inferred and explicitly
+unverified**: how `anchor "com.apple/*"` orders and evaluates sub-anchors. If
+PF-07's inference holds, then during the overlap the *old* anchor's
+`block drop out quick all` preempts every pass in the new anchor — a full egress
+**blackout on every reconcile**, since PF-03 establishes that the
+previous-anchor branch fires on every normal cycle. Worse, the flush is
+`run_allow_failure` (result deliberately discarded), so a failed flush would make
+the blackout persist. The terminators are indeed identical; their position
+relative to the *other* anchor's passes is not. The direction is fail-closed, so
+this is an availability hazard rather than a security one — but a two-line
+reorder that blackholes a live fleet is worse than the window it closes. Gate it
+behind the on-box sub-anchor-ordering experiment. Folding the flush into the
+builtin has the same overlap property and needs the same gate.
 
 ---
 
@@ -1499,7 +1578,7 @@ Two related details, both confirmed by execution:
 - **`blind_exit`'s `ssh_cidr` prefix is not range-checked at decode.**
   `ssh_cidr=192.168.0.0/99` and `.../abc` both decode `Ok` and fail later in
   `render()`; `pf_family_for_cidr_str` (`:529-538`) parses only the base address,
-  and the comment at `:366-367` admits this. The killswitch equivalent *is* caught
+  **Corrected 2026-07-29 (meta-review):** an earlier revision said "the comment at `:366-367` admits this." It does not — that comment documents the split as intentional layering ("`new` validates interfaces … `build` (in `render`) re-validates the ssh CIDRs"). The behavioural claim is unaffected and consistent with the comment; only the characterisation was wrong. This was an error at the baseline, not drift — `macos_pf_load_spec.rs` is unmodified since `22847b12`. The killswitch equivalent *is* caught
   at decode. Direction is safe: `execute_macos_pf_load`
   (`privileged_helper.rs:996-1000`) always decodes **then** renders, while the
   standalone preflight (`:1299-1301`) is only an admission gate — so execute is
@@ -1509,7 +1588,7 @@ Two related details, both confirmed by execution:
 
 ### PF-07 — `generation` is an unbounded daemon-chosen `u64` (Low-Medium, CONFIRMED; one part inferred)
 
-File: `crates/rustynet-crypto` n/a — `crates/rustynetd/src/macos_pf_load_spec.rs:155-163`, `:292`
+File: `crates/rustynetd/src/macos_pf_load_spec.rs:155-163`, `:292`
 
 The anchor is `format!("com.apple/rustynet_g{generation}")` from a `parse_u64`
 value that is never bounded, range-checked, or compared against helper-side state.
@@ -1753,16 +1832,29 @@ Each item below was probed and held:
     the inert cases recorded as PF-14 and the non-canonical spellings in PF-06/PF-07.
 12. **Both daemon senders check their result.** `phase10.rs:2971` uses
    `.map_err(...)?` and `:3092-3110` checks and additionally flushes + restores
-   forwarding on error. The RN-03 `let _ =` fail-open pattern is absent from this
-   path.
+   forwarding on error. The RN-03 `let _ =` pattern is absent **from the two
+   pf-load senders specifically** — note the *previous-anchor flush* in the same
+   function is `run_allow_failure`, a helper whose purpose is discarding the
+   result, which is what PF-03 and PF-04 both turn on.
 13. **`mesh_cidr` semantics are policed, and policed well.**
    `validate_mesh_egress_source_cidr` rejects `0.0.0.0/0`, `::/0`, `8.8.8.0/24`,
    `100.0.0.0/8`, and `::ffff:10.0.0.0/104` at decode (executed), and the fix was
    generalized to macOS blind-exit, macOS exit-NAT, **and** Linux blind-exit. PF-01
    and PF-02 are precisely the parameters that did not receive this treatment.
-14. **DNS ordering is correct.** With `dns_protected=true` the global DNS blocks
-    (`:2644-2651`) are `quick` and precede the endpoint passes, so a hostile
-    `traversal=8.8.8.8:53` cannot punch through them.
+14. **DNS ordering holds only when `strict_fail_closed` is false — WITHDRAWN as a
+    general defence (meta-review 2026-07-29).** With `dns_protected=true` and
+    `strict=false`, the DNS blocks are `quick` and precede the endpoint passes, so
+    a hostile `traversal=8.8.8.8:53` cannot punch through them. But verified at
+    HEAD: the `!strict_fail_closed` guard opens at `phase10.rs:2674` and **closes
+    at `:2706`**, so the DNS blocks (`:2688`, `:2692`) sit *inside* it while the
+    traversal and managed-peer endpoint passes (`:2721`, `:2730`) sit *outside*.
+    Under `strict_fail_closed = true` — the posture `block_all_egress` itself uses
+    — there is no DNS block at all and the endpoint pass stands unopposed. That is
+    the same "fires even under strict" property PF-02 flags for SSH, on a
+    parameter this part did not flag, so it is a **candidate missing finding**, not
+    merely a narrowed defence. Part III's renderer moved under
+    `fe634559`/`c5018acb`/`5bbf2062`; it needs re-verification at HEAD rather than
+    a line-number refresh.
 
 ## 15. Suggested triage order for Part III
 
@@ -1780,8 +1872,10 @@ Each item below was probed and held:
    highest on severity.
 5. **PF-04** — decide the flush model; folding flush into the atomic builtin
    resolves this and PF-03 together.
-6. **PF-06** — align the interface bound to 15 using the existing
-   `is_interface_name`, and adopt the parse-to-typed-then-re-render pattern for the
+6. **PF-06** — align the interface bound to 15 — but note that adopting
+   `is_interface_name` *verbatim* also drops `.` from the charset that
+   `parse_interface` allows, which would silently reject dotted interface names,
+   so port the bound rather than the whole predicate — and adopt the parse-to-typed-then-re-render pattern for the
    three raw-string CIDR sites.
 7. **PF-07, PF-08, PF-09, PF-11, PF-12, PF-13, PF-14** — bounded-cost hygiene;
    PF-08/PF-09 are asserts, PF-12 is a ledger row, PF-13 is three test
@@ -1835,7 +1929,7 @@ This crate has ledger rows for all five source files, and the relay is the most 
 | RSA-0087 | Medium | open, *"needs first-hand confirmation"* | **Confirmed, with a refinement** |
 | RSA-0088 | Low | open, partially verified | **Confirmed with a measured figure** |
 | AUDIT-031 | High | listed **Open**, named a ship-blocker | **Stale** — same defect as the applied RSA-0037 (RLY-14) |
-| RSA-0043 / RSA-0077 | — | applied / open | Not on this path; `verify_strict` confirmed here |
+| RSA-0043 / RSA-0077 | — | **both applied** | Not on this path; `verify_strict` confirmed here. RSA-0077 was migrated by `6e0d0f0` (2026-06-21) and a repo-wide grep for plain `.verify(` returns zero hits |
 
 `hello_limiter_audit.rs` has no ledger row, which is chronological rather than an oversight: it was created 2026-07-01, after the 2026-06-18 ledger.
 
@@ -1974,7 +2068,7 @@ Files: `crates/rustynet-relay/src/transport.rs:345`, `:352`, `:363`, `:369`, `:3
 
 Every rejected hello writes at least two unconditional `eprintln!`s — one of the ten sites inside `validate_hello`, plus one at `main.rs:614`. The daemon's `PreAuthNoticeBudget` deliberately budgets the pre-parse notice datagram and the malformed-packet line, and `main.rs:996-1013` reasons explicitly about leaving the post-parse reject *datagram* unbudgeted — but the transport's own log writes sit outside that accounting entirely, and the rationale does not address them even though the code's own measurements put a log write at 1.1–7.9 µs, the same order as the `send_to` it does budget.
 
-Fronted only by the 50/IP/s limiter over a 4096-IP table, policy therefore admits on the order of **200,000 log lines/s** aggregate, which saturates a core and grows the journal without bound. *(Aggregate figure is arithmetic from the two constants.)* This is the log-write sibling of RSA-0041's datagram residual.
+Fronted only by the 50/IP/s limiter over a 4096-IP table, policy therefore admits 50/IP/s × 4096 IPs = **204,800 rejected hellos/s**, and since each writes *at least two* lines, **on the order of 400,000 log lines/s** — which saturates a core and grows the journal without bound. *(Corrected 2026-07-29: an earlier revision gave ~200,000 log lines/s, conflating the hello rate with the line rate and understating it 2×. Figures are arithmetic from the two constants.)* This is the log-write sibling of RSA-0041's datagram residual.
 
 ---
 
@@ -1984,7 +2078,7 @@ File: `crates/rustynet-relay/src/transport.rs:536-540` vs `:544`
 
 On the unbound branch, `forward_packet` compares only `session.hello_source_addr.ip() != from_addr.ip()` and then writes `session.bound_peer_addr = Some(from_addr)` — **before** the rate limiter at `:544`. Confirmed by execution: a first packet on a new tuple binds successfully even with an empty token bucket, so claiming a session's bind costs zero rate budget.
 
-The IP-only comparison is intentional (a NAT concession, reasoned at `main.rs:4544-4549`). The consequence is that an off-path attacker who can spoof the victim's source IP and hit the right dataplane port can bind the session to a port **of the attacker's choosing**; because `bound_peer_addr` is written exactly once and there is no rebind path, the real peer then receives `UnauthorizedSourceTuple` for the rest of the session's life — until the 30 s idle reap. Both independent reviewers found this, and neither located it in the ledger.
+**Corrected 2026-07-29 (meta-review):** an earlier revision called the IP-only comparison "intentional (a NAT concession, reasoned at `main.rs:4544-4549`)". Those lines are a **test** priming comment, and no NAT-concession rationale exists anywhere in the crate. Removing that false framing changes the disposition — nothing recorded blocks tightening this, and **Low may be understated**, since the lockout is permanent for the session's life at zero rate-limit cost. The consequence is that an off-path attacker who can spoof the victim's source IP and hit the right dataplane port can bind the session to a port **of the attacker's choosing**; because `bound_peer_addr` is written exactly once and there is no rebind path, the real peer then receives `UnauthorizedSourceTuple` for the rest of the session's life — until the 30 s idle reap. Both independent reviewers found this, and neither located it in the ledger.
 
 The ordering half is a free hardening win: consulting the limiter before mutating the bind costs nothing and removes the zero-budget bind.
 
@@ -2006,7 +2100,7 @@ File: `crates/rustynet-relay/src/transport.rs:330-436`, `:319-322`, `:581`
 
 Nothing rejects `node_id == peer_node_id`. With both equal, `node_pair_index` is keyed `(A, A)` and the forward-path reverse lookup key is also `(A, A)`, resolving to the session's **own** id, which `is_paired_with` accepts. Confirmed by execution: the self-pair is accepted and the forward target is the sender's own bound address, so the relay echoes each frame back.
 
-Impact is bounded and should not be overstated: strictly 1:1 bytes, no amplification, and the target IP was verified against the sender's own hello, so it cannot be aimed at a third party. It also requires a validly signed token, so it is currently prevented only by whatever the control plane declines to sign. Cheap to assert in `validate_hello`.
+Impact is bounded and should not be overstated: strictly 1:1 bytes, no amplification, and the target IP was verified against the sender's own hello, so it cannot be aimed at a third party. It also requires a validly signed token — and the containment is in fact **stronger than this finding originally stated**: the control plane has an explicit `if request.node_id == request.peer_node_id { return Err(...) }` at `control/lib.rs:3015-3019`, so an honest issuer already refuses to mint a self-pair. The relay-side assertion remains worth adding as defence in depth.
 
 ---
 
@@ -2014,7 +2108,7 @@ Impact is bounded and should not be overstated: strictly 1:1 bytes, no amplifica
 
 Files: `crates/rustynet-relay/src/transport.rs:429-431`, `:405-407`
 
-Both sites interpolate attacker-supplied text raw into `eprintln!`. Since `NodeId::new` permits newlines, an *enrolled* malicious peer can forge relay log lines by deliberately tripping the per-node capacity rejection. These sites are post-signature, so the id must be control-plane-signed — which bounds the attacker set to enrolled nodes and makes this a log-integrity issue rather than a pre-auth one. Everything on the daemon side is safe by contrast: it logs hex, `SocketAddr`, and `Debug` enums.
+**Corrected 2026-07-29 (meta-review) on two points.** First, only `:428-431` interpolates the node id; `:405-407` prints the token **`scope`**, so "both sites interpolate [the node id]" was wrong. Second, the mechanism was cited to the wrong type: `NodeId::new` lives in `rustynet-backend-api` and is used by **neither** the relay nor `rustynet-control` — the relay's `node_id` is a plain `String`. As written an engineer would harden `NodeId::new` and change nothing on this path. The conclusion survives via the correct citation: `is_valid_node_id_text` (`control/lib.rs:3713-3715`) is `!value.trim().is_empty()`, and enrollment applies no validation at all, so an *enrolled* malicious peer can forge relay log lines by deliberately tripping the per-node capacity rejection. These sites are post-signature, so the id must be control-plane-signed — which bounds the attacker set to enrolled nodes and makes this a log-integrity issue rather than a pre-auth one. Everything on the daemon side is safe by contrast: it logs hex, `SocketAddr`, and `Debug` enums.
 
 ---
 
@@ -2051,8 +2145,8 @@ This is the best-defended area in the review, and several of my own attack hypot
 11. **Eviction is complete — no partial removal.** Sessions, pair index, rate-limiter buckets, hello-limiter windows, and allocated sockets plus their tasks are all reclaimed, with nonces deliberately retained for the replay window. No stale routes, no leaks.
 12. **No error reaches a data-path sender**, so there is no session-id or node-id oracle; control-path rejects collapse to one generic datagram and `RejectReason` never leaves the process. My "error oracle" hypothesis is **refuted**.
 13. **Token-bucket arithmetic is correct.** Monotonic `Instant` (not `SystemTime`), saturating `duration_since` so no backwards-time credit, all-`f64` with no integer truncation, both dimensions capped, no free-packet edge, and burst is exactly one refill period.
-14. **The replay store fails closed and is path-validated.** Load and startup-prune failures abort the daemon; insert failure rejects the hello and rolls back the in-memory entry; the path check requires a regular non-symlink file with `mode & 0o077 == 0` for both file and parent; persist is temp-then-rename with 0600 applied at open and again after. The one non-fail-closed path — a cleanup-tick prune failure — is safe in the replay direction because it *retains* nonces.
-15. **Other correct choices:** `now_unix` fails closed to 0 rather than panicking; skew is clamped downward with a warning; `set_max_total_sessions` propagates its error and aborts startup; `cleanup_idle_sessions` is driven on a 10 s timer and a zero interval is rejected; the verifier key path is validated absolute, regular, non-symlink, `mode & 0o022 == 0` including its parent; the health endpoint is loopback-enforced and exposes only aggregate counters; and the serialized control loop closes the preflight/commit TOCTOU on the nonce.
+14. **The replay store fails closed and is path-validated.** Load and startup-prune failures abort the daemon; insert failure rejects the hello and rolls back the in-memory entry; the path check requires a regular non-symlink file with `mode & 0o077 == 0` for the parent (fail-closed) and, **with one documented exception**, for the file: on any `symlink_metadata` error other than `NotFound` the file-side permission check is *skipped* with only a warning, on the recorded rationale that the parent directory is the relevant security surface — so "fails closed" is accurate for the parent and for load/insert, but not unconditionally for the file check; persist is temp-then-rename with 0600 applied at open and again after. The one non-fail-closed path — a cleanup-tick prune failure — is safe in the replay direction because it *retains* nonces.
+15. **Mostly-correct choices, with one correction:** `now_unix` returns `0` instead of panicking on a pre-1970 clock — which is fail-closed against a *crash* (the repo's own framing) but **fails OPEN on freshness**: with `now = 0`, `is_expired`'s `now > expires_at + skew` is false for every token, and `forward_packet`'s `expires_at_unix <= now_unix` never fires, so nothing expires. Low reachability (needs a clock strictly before 1970), but the repo explicitly targets RTC-less Raspberry Pi Zero 2 W-class hardware. Also correct: skew is clamped downward with a warning; `set_max_total_sessions` propagates its error and aborts startup; `cleanup_idle_sessions` is driven on a 10 s timer and a zero interval is rejected; the verifier key path is validated absolute, regular, non-symlink, `mode & 0o022 == 0` including its parent; the health endpoint is loopback-enforced and exposes only aggregate counters; and the serialized control loop closes the preflight/commit TOCTOU on the nonce.
 
 ## 20. Suggested triage order for Part IV
 
@@ -2094,11 +2188,11 @@ Out of scope for this part: the sibling files with their own ledger rows (`membe
 
 Part I established that `ControlPlaneCore`'s issuance membership gate is *unconditionally inert* in production (POL-06), and Part IV established that the relay performs **no** membership check of its own, delegating the entire decision to whoever signed the token. Both parts therefore end at the same place: the issuer. Part V audits it, following two concrete leads Part IV left behind — RLY-01 (`issue_relay_session_token` trusts a caller-supplied timestamp) and RLY-03 (the signed payload is delimiter-framed with no length prefixes).
 
-Prior coverage, enumerated before writing: **RSA-0008** (Medium, open — issuance gated by revocation-blind `evaluate`), **RSA-0010** (Low, open), **RSA-0011** (Info, open — `TrustState` has no anti-rollback floor), **RSA-0005** (Low, open), RSA-0043 (applied), RSA-0077 (open, outside this scope).
+Prior coverage, enumerated before writing: **RSA-0008** (Medium, open — issuance gated by revocation-blind `evaluate`), **RSA-0010** (Low, open), **RSA-0011** (Info, open — `TrustState` has no anti-rollback floor), **RSA-0005** (Low, open), RSA-0043 (applied), **RSA-0077 (also applied** — migrated by `6e0d0f0`; a repo-wide grep for plain `.verify(` returns zero hits, so the ledger row is stale).
 
 | ID | Finding | Severity | New? |
 |---|---|---|---|
-| CTL-01 | `is_valid_node_id_text` is a non-blank check, so every node-id-bearing signed payload is delimiter-injectable — the root cause of RLY-03's class | High | **New** |
+| CTL-01 | `is_valid_node_id_text` is a non-blank check, so node-id-bearing signed payloads are delimiter-injectable | Medium (latent — enrollment is test-only) | Class tracked as **AUDIT-042**; extension to the issuance payloads is new |
 | CTL-02 | `verify_signed_endpoint_hint_bundle` is the only bundle verifier with no re-canonicalization | Medium | **New** |
 | CTL-03 | `SignedPeerMap` leaves `generated_at_unix` outside the signature and permits full record injection | Medium (latent) | **New** |
 | CTL-04 | Enrollment evaluates credential expiry against a caller-supplied clock | Medium (latent) | **New** |
@@ -2106,7 +2200,13 @@ Prior coverage, enumerated before writing: **RSA-0008** (Medium, open — issuan
 | CTL-06 | No signed artifact carries a generation, so there is no anti-rollback | Medium | Partly RSA-0011 |
 | CTL-07 | Ledger maintenance: RSA-0010 and RSA-0017 are applied, not open | Low | **New** |
 
-### CTL-01 — the node-id guard is non-blank only, and the correct guard already exists beside it (High, CONFIRMED by execution)
+### CTL-01 — the node-id guard is non-blank only, and the correct guard already exists beside it (Medium-latent, CONFIRMED by execution; partly **AUDIT-042**)
+
+**Re-rated and re-attributed 2026-07-29 (meta-review).** This finding was originally rated High and called "the single highest-leverage fix in the whole document." Both claims were wrong and are corrected here, because leaving them would have sent an engineer down a day-long path for nothing:
+
+- **Reachability discount, which this finding failed to apply to itself.** The only two writes to `ControlPlaneCore.nodes` are `enroll_with_throwaway` and `enroll_with_throwaway_and_persist`, and **both have zero production callers** — verified directly, every call site is ≥ `:4721`, inside the `#[cfg(test)]` module. So the injection precondition, a *registered* node id containing `\n`/`=`, is not reachable in a shipped `ControlPlaneCore`. That is exactly the discount CTL-04 applies to itself two findings later, and that POL-10, CRY-09, CTL-03 and WIN-07 all receive. Consistency demands it here.
+- **The class is already tracked.** `SecurityAndQualityAudit_2026-06-10.md:422` (**AUDIT-042**, Low) records the same defect in `membership.rs` — fields embedding `node_id` "with only `trim().is_empty()` checks — no rejection of embedded `\n`/`=`" — and explicitly names the contrast with `is_single_line_payload_value`. Extending the class to `is_valid_node_id_text` and the issuance payloads is legitimate new work; calling the class itself new was not.
+- **Scope contradiction, now acknowledged.** Part V's header lists enrollment as in scope *and* `enrollment.rs` as out of scope. The production enrollment surface is `rustynet_control::enrollment` plus the IPC enrollment commands — the module that would actually determine reachability — and it was **not** reviewed (it has its own ledger row, RSA-0015, open). A High rating for this finding cannot be argued without covering it.
 
 Verified by direct reading:
 
@@ -2117,9 +2217,13 @@ fn is_single_line_payload_value(value: &str) -> bool {                        //
 }
 ```
 
-The second function is exactly the guard needed, lives in the same file, and **is** applied to relay-fleet `relay_id`/`region`. It is not applied to node ids — which are interpolated into `\n`/`=`-delimited signed payloads at `:2840`, `:3088`, `:3093`, `:3151-3152`, `:3232-3233`, `:4284-4285`. `enroll_with_throwaway` applies **no** validation to `request.node_id` before `nodes.upsert` (`:2338`, `:2358`); confirmed by execution that a node id containing `\n` and `=` enrolls successfully.
+The second function is exactly the guard needed, lives in the same file, and **is** applied to relay-fleet `relay_id`/`region`. It is not applied to node ids — which reach `\n`/`=`-delimited signed payloads. (**Corrected 2026-07-29:** the list given in an earlier revision — `:2840`, `:3088`, `:3093`, `:3151-3152`, `:3232-3233`, `:4284-4285` — is the **`is_valid_node_id_text` call-site list**, not the interpolation sites; it also omits `:2816`/`:2821`, and `:2840` is in fact a `policy_allows_node_pair` line copied in error from POL-06.). `enroll_with_throwaway` applies **no** validation to `request.node_id` before `nodes.upsert` (`:2338`, `:2358`); confirmed by execution that a node id containing `\n` and `=` enrolls successfully.
 
-That asymmetry is the whole story: relay-fleet resists the field-boundary attack and the node-id paths do not, for no reason other than which helper was called. Applying `is_single_line_payload_value` inside `is_valid_node_id_text` and at the enrollment boundary closes CTL-01, CTL-02, CTL-03 and the issuance half of RLY-03 in one change. **This is the single highest-leverage fix in the whole document.**
+That asymmetry is the real content: relay-fleet resists the field-boundary attack and the node-id paths do not, for no reason other than which helper was called.
+
+**Corrected scope of the fix.** An earlier revision claimed applying `is_single_line_payload_value` "closes CTL-01, CTL-02, CTL-03 and the issuance half of RLY-03 in one change." It does not. The guard rejects only `\n`, `\r` and `=` — whereas `SignedPeerMap`'s payload is **`|`-delimited**, which the guard does not reject; CTL-03's demonstrated injection went through the **`os`** field rather than a node id; CTL-03's other half (`generated_at_unix` outside the signature) is untouched by any charset guard; and CTL-02's verifier stays unsound no matter what issuance validates. The honest claim is that it closes **the node-id vector of CTL-01 and the issuance half of RLY-03**; CTL-02 and CTL-03 each need their own change.
+
+Reassuringly, the fix is **safe to apply**: real node ids in this tree are hostname slugs (`exit-1`, `client-1`, `relay-1`), none derived from base64 or any encoding that emits `=`, so adding the guard would not reject an already-enrolled id or strand a live fleet.
 
 ### CTL-02 — one bundle verifier omits the re-canonicalization its siblings have (Medium, CONFIRMED by execution)
 
@@ -2133,7 +2237,7 @@ Reachability, stated honestly: there is no `parse_signed_endpoint_hint_bundle_wi
 
 Verified by reading `:2478-2492`: the signed payload is only `node_id|hostname|os|owner|last_seen_unix|pubkey` lines — **no version line, no `generated_at_unix`, no nonce**. The timestamp lives in the outer struct and is never signed; executed, rewriting it to `99999999999` still verifies `true`. There is no expiry, generation, or signed freshness of any kind, so a captured peer map replays indefinitely and is indistinguishable from a current one.
 
-`verify_signed_peer_map` (`:2499-2510`) performs only a bare signature check — no field cross-check, no re-canonicalization, no duplicate-record rejection. Combined with CTL-01, executed: enrolling with an `os` field carrying `|` and `\n` produced a **verifying** map whose injected second record binds `victim-node` to the **attacker's own public key** — key substitution under a valid control-plane signature.
+`verify_signed_peer_map` (`:2498-2509`) performs only a bare signature check — no field cross-check, no re-canonicalization, no duplicate-record rejection. **This is a recorded deliberate decision, not an oversight**, and honesty requires quoting it: the cited lines are themselves a comment explaining that there is "no `version=N` line to gate on", that a version prefix "would be a wire-format change that breaks compatibility with existing peer maps and is tracked as a separate followup", and — explicitly — "Do NOT add a `payload_field_matches` gate here without a coordinated wire-format change." This document honours exactly that kind of recorded decision for RSA-0003 in CRY-08, and must here too: the finding is that the *compatibility* constraint leaves a real hole, not that anyone forgot. Combined with CTL-01, executed: enrolling with an `os` field carrying `|` and `\n` produced a **verifying** map whose injected second record binds `victim-node` to the **attacker's own public key** — key substitution under a valid control-plane signature.
 
 This is also the sharpest answer to Part I's POL-06 follow-up: `signed_peer_map` calls neither `policy_allows_node_pair` nor any membership check, and simply names every registered node. It is not merely revocation-blind, it is **policy-blind by construction**. Severity is held at Medium-latent only because the type has zero consumers outside this crate.
 
@@ -2164,7 +2268,7 @@ Chasing the rollback question honestly: for the four bundle types the answer is 
 
 Four hypotheses I handed the reviewer were **refuted**, which is the useful part:
 
-1. **`verify_strict` is universal in this scope.** A grep for `.verify(` over `crates/rustynet-control/src/` returns **zero** hits; all eight verification sites use `verify_strict`, and `rustynet-dns-zone` is now `verify_strict` too, confirming RSA-0043 applied. RSA-0077's remaining plain-`verify` sites are all outside this scope.
+1. **`verify_strict` is universal in this scope.** A grep for `.verify(` over `crates/rustynet-control/src/` returns **zero** hits; all eight verification sites use `verify_strict`, and `rustynet-dns-zone` is now `verify_strict` too, confirming RSA-0043 applied. **Correction:** an earlier revision referred to "RSA-0077's remaining plain-`verify` sites"; there are none — that finding is applied and the repo-wide grep is zero.
 2. **`derive_gossip_signing_key` is sound.** Real HKDF-SHA256 with a fixed salt and a distinct domain-separation string, different from all four sibling constants; no truncation, no key reuse; both the by-value secret and the intermediate seed are zeroized. Confirmed by execution that the derived key differs from siblings and from the raw identity key.
 3. **The relay-fleet bundle is the correctly-built one** — two independent controls: `is_single_line_payload_value` on the interpolated fields, *and* re-canonicalization in both the parser and the verifier. Executed: injecting `"r1\nrelay_count=99"` is refused at issuance.
 4. **`split_signed_relay_fleet_wire` is solid.** Executed against seven hostile inputs — trailing data, duplicate signature line, blank line, empty-key line, leading whitespace — all rejected with distinct errors. Only CRLF is accepted, benignly (the payload is rebuilt with `\n` and is signature-identical). Parse and verify enforce the same invariant set, so there is no parse/verify asymmetry.
@@ -2184,9 +2288,19 @@ Out of scope for this part: Windows installer scripts (RSA-0084) and the smoke-m
 
 ## 24. Reachability — shipped and compiled, never live-exercised
 
-This distinction governs every finding below, so it is stated once. Windows is **not** build-blocked: `rustynetd` and `rustynet-windows-native` are compiled, clippy-gated at `-D warnings`, and unit-tested on `windows-2022` on every PR. The code ships. What does not exist is live proof — in the 97-run node matrix, `windows_named_pipe_acl` and `windows_dpapi_key_custody` are `not_run` **97/97**, and `windows_stage_bootstrap` is 0 pass / 5 fail. `PlatformSupportMatrix.md` excludes Windows from the release gate.
+This distinction governs every finding below, so it is stated once. Windows is **not** build-blocked: `rustynetd` and `rustynet-windows-native` are compiled, clippy-gated at `-D warnings`, and unit-tested on `windows-2022` on every PR. The code ships.
 
-So nothing below is dead code, and nothing below has ever run outside a unit test. Because this host is macOS, every claim about *Win32 runtime semantics* is marked **INFERRED**; the SDDL and path string logic was extracted and executed.
+**Corrected 2026-07-29 (meta-review).** An earlier revision of this section claimed these paths had "never run outside a unit test", based on the *node* matrix (`live_lab_node_run_matrix.csv`, 97 rows), where `windows_named_pipe_acl` and `windows_dpapi_key_custody` are indeed `not_run` 97/97. **That was wrong**, and wrong in a way this repo has already caught once: `LiveLabFindings_2026-07-03.md:364-368` records an identical error and its correction, noting the agent "had generalized from the *node-identity* columns." The authoritative matrix is `documents/operations/live_lab_run_matrix.csv` (549 rows), verified directly:
+
+| Stage | Result |
+|---|---|
+| `windows_named_pipe_acl` | **13 pass**, 529 not_run, 2 skip, 2 na |
+| `windows_dpapi_key_custody` | **13 pass**, 529 not_run, 2 skip, 2 na |
+| `windows_stage_bootstrap` | **66 pass**, 8 fail, 466 not_run |
+
+So the DPAPI custody validator and the named-pipe ACL evaluator **have** executed against real Windows SDDL, in 13 distinct dated runs (2026-07-03/04/07) with evidence bundles in-tree. That materially improves this part: several `INFERRED` premises below are **checkable against those runs** rather than unverifiable, and confirming them there is the cheapest next step. `PlatformSupportMatrix.md:70-71` does genuinely exclude Windows from the release gate — that half of the original claim stands.
+
+Nothing below is dead code. Because this host is macOS, every claim about *Win32 runtime semantics* is marked **INFERRED**; the SDDL and path string logic was extracted and executed.
 
 Prior coverage: all three target files carry **`PASS`/`audited` ledger rows with zero findings**, so this part had a high bar to clear. Related open IDs: **RSA-0002** (Medium — but its body explicitly *carves out* the DPAPI path as "does validate SDDL"), **RSA-0025** (Medium), **RSA-0036** (Info), **AUDIT-027** (High), **AUDIT-028/029/030** (Medium/Medium/Low), **RN-06** (fixed), **RN-07** (partial). Part III explicitly excluded Windows WFP, and `windows_ipc.rs` had no findings in any namespace — both genuinely unexamined.
 
@@ -2196,7 +2310,7 @@ Prior coverage: all three target files carry **`PASS`/`audited` ledger rows with
 | WIN-02 | Named-pipe lifecycle leaves the name unowned between messages, and the client never authenticates the server | High | **New** |
 | WIN-03 | WFP installs only a max-weight PERMIT that can veto the firewall block, and the assertion checks existence not scope | Medium-High | **New** |
 | WIN-04 | `validate_windows_binary_path` System32 check is a substring test — UNC and user-writable prefixes pass | Medium | **New** |
-| WIN-05 | PF-02 generalizes to the Windows backend | Medium | CONFIRMS PF-02 |
+| WIN-05 | PF-02 generalizes to the Windows backend | **High** (aligned to PF-02 — same root cause, one validator) | CONFIRMS PF-02 |
 | WIN-06 | `validate_windows_dpapi_file` accepts an inherited DACL | Medium | **New** |
 | WIN-07 | The pipe security policy type is decorative — zero production callers | Low | **New** |
 | WIN-08 | Self-check pipe leaf is an unbounded prefix match | Low | **New** |
