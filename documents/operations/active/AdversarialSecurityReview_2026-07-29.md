@@ -9,7 +9,7 @@ Method: rolling adversarial review, one focused area per part. Each part names i
 | **I** | `rustynet-policy` — ACL / policy evaluation engine | POL-01 … POL-14 | complete |
 | **II** | `rustynet-crypto` — key custody, key envelopes, signing | CRY-01 … CRY-12 | complete |
 | **III** | macOS `pf` privileged-helper boundary — killswitch rule regeneration | PF-01 … PF-15 | complete |
-| **IV** | `rustynet-relay` — remote/unauthenticated input path | RLY-01 … RLY-14 | complete |
+| **IV** | `rustynet-relay` — remote/unauthenticated input path | RLY-01 … RLY-16 | complete |
 | **V** | `rustynet-control` — the trust issuer (signed-artifact issuance) | CTL-01 … CTL-07 | complete |
 | **VI** | Windows privileged + at-rest surface (named pipe, DPAPI, WFP) | WIN-01 … WIN-10 | complete |
 | **VII** | IPv6 leak prevention + blind-exit dataplane (Linux, macOS) | IPV-01 … IPV-14 | complete |
@@ -48,6 +48,16 @@ cross-crate contrast holds. Every quantitative claim in the document was
 independently checked and found sound except RLY-08 above. Findings marked
 **New** were re-checked against the ledger; the four with prior coverage are now
 attributed (POL-05, POL-14, PF-05, CTL-01).
+
+**Process lesson, recorded because it caused a real gap.** This meta-review
+withdrew or narrowed **three** credited defences (the DNS-ordering credit,
+`now_unix`, and the replay-store path check). Only the first was promoted to a
+numbered finding at the time. The other two were left as prose corrections inside a
+defence list — and because the companion remediation document is built by mapping
+*finding IDs* to fixes, both fell out of it entirely and went unplanned until a
+completeness check caught them. They are now **RLY-15** and **RLY-16**.
+The rule this implies: **withdrawing a credited defence should always create a
+finding**, because a defence that does not hold usually means a defect does.
 
 **Follow-up completed 2026-07-29.** The two loose ends this meta-review left have
 since been closed by a dedicated re-verification pass, which corrected the
@@ -2066,6 +2076,8 @@ This crate has ledger rows for all five source files, and the relay is the most 
 | RLY-12 | `node_id` written unescaped into log lines; `NodeId::new` permits newlines | Low | **New** |
 | RLY-13 | Assorted: unreachable size guard, invisible tuple rejections, data-path skew inconsistency, O(n) persist per hello | Info | **New** |
 | RLY-14 | Ledger maintenance: AUDIT-031 stale; three findings promotable from "needs confirmation" | Low (bookkeeping) | **New** |
+| RLY-15 | `now_unix()` returns `0` on a pre-1970 clock, which makes **every token unexpired** in both `is_expired` and the data path | Low-Medium | **New** (promoted from a withdrawn defence) |
+| RLY-16 | The replay store's **file-side** permission check is skipped on any non-`NotFound` stat error | Low | **New** (promoted from a narrowed defence) |
 
 ## 18. Findings
 
@@ -2244,6 +2256,60 @@ Files: `crates/rustynet-relay/src/transport.rs:429-431`, `:405-407`
 - **RSA-0086, RSA-0087, and RSA-0088 can move off "needs first-hand confirmation."** All three mechanisms are confirmed at this baseline, with numbers in RLY-05/RLY-06, one premise correction (RSA-0086's shedding claim is now bounded by the RSA-0037 fix) and one refinement: RSA-0087's IPv6 lockout hits **new/unseen** sources only, because the `contains_key` test precedes the capacity branch, so established peers keep working.
 - **`hello_limiter_audit.rs` needs a row** (created after the ledger). It is a report-only self-audit harness driving the real shipped `HelloLimiter` at production cap, wired as a CLI subcommand and consumed by live-lab stage 45 — it enforces nothing at runtime. Minor: it hardcodes `AUDIT_MAX_PER_SEC = 5` rather than reading `MAX_HELLOS_PER_NODE_PER_SEC`; the two are equal today, so the audit is honest by coincidence rather than by construction.
 - **Constant drift worth pinning:** the code default dataplane port range and the shipped systemd unit's range differ (50000-59999 vs 40000-49999). Both are internally consistent; the ledger should name which is authoritative.
+
+### RLY-15 — `now_unix()` failing to `0` disables expiry enforcement entirely (Low-Medium, CONFIRMED by reading)
+
+Files: `crates/rustynet-relay/src/transport.rs:861-866`; `crates/rustynet-control/src/lib.rs:1886-1891`; data path at `transport.rs:521`
+
+**Promoted from a withdrawn defence.** §19 originally credited `now_unix` for
+"failing closed to 0 rather than panicking". The meta-review narrowed that, and it
+should have become a finding at the same time — this entry closes that gap.
+
+`now_unix()` is `SystemTime::now().duration_since(UNIX_EPOCH).map(...).unwrap_or(0)`.
+It is fail-closed against a *panic*, which is the repo's own framing, but with
+`now = 0` the freshness logic inverts:
+
+- `is_expired` is `now_unix > expires_at_unix.saturating_add(skew)` — `0 > anything`
+  is **false**, so every token is unexpired.
+- the data path's `session.expires_at_unix <= now_unix` never fires, so no session
+  is ever reaped for expiry.
+
+So a clock that fails to initialise does not merely lose freshness — it disables
+the 120 s token TTL that bounds every other relay guarantee, including the
+maximum session lifetime credited in §19.
+
+Reachability is genuinely low: it needs a clock strictly before 1970, which on a
+normal host does not happen. It is recorded because the repo explicitly targets
+RTC-less Raspberry Pi Zero 2 W-class hardware for relay and exit nodes
+(`Requirements.md:141-143`), where an uninitialised clock at boot is the expected
+state rather than a fault.
+
+Proposed enforcement (review-only — do NOT apply): make the clock failure explicit
+— return `Result` and fail closed at the call sites, or substitute a sentinel that
+makes every token *expired* rather than unexpired, so a broken clock denies rather
+than admits.
+
+### RLY-16 — the replay store's file-side permission check is skipped on a stat error (Low, CONFIRMED by reading)
+
+File: `crates/rustynet-relay/src/transport.rs:909-925`
+
+**Promoted from a narrowed defence**, for the same reason as RLY-15. §19 credited
+the replay-store path check as requiring `mode & 0o077 == 0` "for both file and
+parent". That is unconditionally true for the parent, which propagates its error
+with `?`. For the *file* it is not: on any `symlink_metadata` error other than
+`NotFound`, the permission check is skipped and only a warning is logged.
+
+Unlike most findings here, this carries a **documented rationale** — the comment
+states that `NotFound` is expected on first run and that "the parent directory is
+the relevant security surface and is checked below." That reasoning is defensible,
+so this belongs in the same category as CRY-08 and CTL-03: a recorded decision, not
+an oversight. The finding is narrow — that the *blanket* claim "fails closed" is
+wrong, and that a permission-denied or I/O error on the file is silently tolerated
+in a store whose integrity is the whole replay defence.
+
+Proposed enforcement (review-only — do NOT apply): treat a non-`NotFound` stat
+error as fail-closed, or keep the skip and narrow the surrounding documentation so
+nobody relies on the stronger reading. **This is a DECISION, not a defect fix.**
 
 ## 19. Defences that hold — verified, for the record
 
