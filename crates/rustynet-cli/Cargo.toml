@@ -59,6 +59,13 @@ name = "live_linux_network_flap_test"
 path = "src/bin/live_linux_network_flap_test.rs"
 required-features = ["vm-lab"]
 
+# Same rationale: calls its report writer in-process through the vm-lab-gated
+# `ops_live_lab_orchestrator`, so it cannot build under default features.
+[[bin]]
+name = "live_linux_key_custody_test"
+path = "src/bin/live_linux_key_custody_test.rs"
+required-features = ["vm-lab"]
+
 [dependencies]
 base64 = "0.22"
 rustynet-advisor = { path = "../rustynet-advisor" }
