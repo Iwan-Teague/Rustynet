@@ -184,29 +184,21 @@ fn run() -> Result<(), String> {
     let overall_pass = initial_mode_ok && rejection_confirmed && daemon_recovered && final_mode_ok;
 
     // ── Write report ──────────────────────────────────────────────────────────
-    let report_args = vec![
-        "--report-path".to_owned(),
-        report_path.to_string_lossy().to_string(),
-        "--initial-key-file-mode".to_owned(),
-        initial_key_mode,
-        "--initial-key-dir-mode".to_owned(),
-        initial_dir_mode,
-        "--initial-mode-ok".to_owned(),
-        pass_fail(initial_mode_ok).to_owned(),
-        "--daemon-rejected-bad-mode".to_owned(),
-        pass_fail(rejection_confirmed).to_owned(),
-        "--daemon-recovered".to_owned(),
-        pass_fail(daemon_recovered).to_owned(),
-        "--final-mode-ok".to_owned(),
-        pass_fail(final_mode_ok).to_owned(),
-        "--overall-status".to_owned(),
-        pass_fail(overall_pass).to_owned(),
-    ];
-    let report_refs: Vec<&str> = report_args.iter().map(String::as_str).collect();
-    run_cargo_ops(
-        &ctx.root_dir,
-        "write-live-linux-key-custody-report",
-        &report_refs,
+    // In-process, not `cargo run … ops …`: the subprocess form built a
+    // default-feature binary lacking this `vm-lab`-gated verb, so the write
+    // failed with `unknown ops subcommand` and the stage recorded FAIL after
+    // its assertions had already passed.
+    rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_live_linux_key_custody_report(
+        rustynet_cli::ops_live_lab_orchestrator::WriteLiveLinuxKeyCustodyReportConfig {
+            report_path: report_path.clone(),
+            initial_key_file_mode: initial_key_mode,
+            initial_key_dir_mode: initial_dir_mode,
+            initial_mode_ok: pass_fail(initial_mode_ok).to_owned(),
+            daemon_rejected_bad_mode: pass_fail(rejection_confirmed).to_owned(),
+            daemon_recovered: pass_fail(daemon_recovered).to_owned(),
+            final_mode_ok: pass_fail(final_mode_ok).to_owned(),
+            overall_status: pass_fail(overall_pass).to_owned(),
+        },
     )?;
 
     append_standalone_matrix_row(&report_path, overall_pass);
