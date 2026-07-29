@@ -150,7 +150,6 @@ fn run() -> Result<(), String> {
                 "[enrollment-restart] mint failed (no anchor state?): {e}"
             ))?;
             write_report_and_exit(
-                &mut ctx,
                 &logger,
                 &report_path,
                 "skipped",
@@ -237,7 +236,6 @@ fn run() -> Result<(), String> {
     let overall_pass = admin_recovered && membership_integrity == "pass";
 
     write_report_and_exit(
-        &mut ctx,
         &logger,
         &report_path,
         if admin_recovered { "pass" } else { "fail" },
@@ -264,7 +262,6 @@ fn run() -> Result<(), String> {
 
 #[allow(clippy::too_many_arguments)]
 fn write_report_and_exit(
-    ctx: &mut LiveLabContext,
     logger: &Logger,
     report_path: &std::path::Path,
     admin_recovered: &str,
