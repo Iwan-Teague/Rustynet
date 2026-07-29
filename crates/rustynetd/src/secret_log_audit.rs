@@ -1235,6 +1235,16 @@ const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, &str, &str)] = &[
         "session_token.scope != RELAY_TOKEN_SCOPE",
         "public-scope label string equality on relay hello (relay token scope is a public domain string, not secret material)",
     ),
+    (
+        "crates/rustynet-relay/src/transport.rs",
+        "session_token.node_id == hello.session_token.peer_node_id",
+        "self-paired-token structural check on relay hello (RLY-11): compares two NODE IDENTIFIERS carried in the same already-signature-verified token, not secret material. Both values are attacker-supplied and attacker-known, so there is no timing oracle to protect and ct_eq would be inappropriate",
+    ),
+    (
+        "crates/rustynet-relay/src/transport.rs",
+        "token is self-paired (node_id == peer_node_id)",
+        "the rejection MESSAGE for the check above -- a string literal quoting the expression, not a compare site at all (scanner text match)",
+    ),
 ];
 
 /// Returns true iff the given `(file_path_label, line_content)` matches any
