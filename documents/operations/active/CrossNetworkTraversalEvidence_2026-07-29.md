@@ -1,10 +1,11 @@
 # Cross-Network NAT Traversal — First Live Evidence (2026-07-29)
 
 **Status:** Active evidence record. First time rustynet's own NAT traversal has been
-exercised against two genuinely separate physical networks. **Five defects found and
-fixed**; direct hole-punched connectivity achieved and **bulk data now transfers
-byte-exact over it**. Remaining open: 30% path loss, `path_live_*` under-reporting,
-reflexive-endpoint publication, and kernel-WireGuard's inability to run STUN.
+exercised against two genuinely separate physical networks. **Six defects found and
+fixed**; direct hole-punched connectivity achieved, **bulk data transfers byte-exact
+over it at 6.94 Mbit/s with 0-1% loss**. Remaining open: liveness never registers
+(§4.2b — the highest-value next fix), reflexive-endpoint publication, same-site hairpin,
+and kernel-WireGuard's inability to run STUN.
 
 **Why this could not be done before:** every prior cross-network claim was blocked on
 "the owner does not have a second network right now"
@@ -50,8 +51,9 @@ lab.
 
 ## 2. Defects found and fixed
 
-All five were measured, not inferred, and each is fixed on `main`. §2.1–§2.3 unblocked
-the handshake; §4.1 covers the two MTU faults that unblocked bulk data.
+All six were measured, not inferred, and each is fixed on `main`. §2.1–§2.3 unblocked
+the handshake; §4.1 covers the two MTU faults that unblocked bulk data; §4.2 covers the
+handshake-collision storm that was causing the packet loss.
 
 ### 2.1 Boot killswitch never received the STUN allow-list — `fe634559`
 
@@ -169,11 +171,54 @@ varies per peer and over time. The real answer is per-path measurement via the D
 state machine that already exists in `rustynetd::path_mtu`, fully unit-tested, **with no
 consumer** (FIS-0027 Phase 3).
 
-### 4.2 Punched path is lossy — 30% sustained
-20 pings over the direct path: **14 received, 30% loss**, RTT 73–267 ms (mdev 48 ms).
-Root cause not established; candidates are NAT binding churn and the exit-node hop. This
-is now the dominant throughput limiter: with MTU fixed, a 4 MB transfer completes but at
-only **0.37 Mbit/s**.
+### 4.2 ~~Punched path is lossy~~ — **FIXED** (`7a3af8fe`)
+The loss was **not** the network. The underlay is clean: 50/50 ICMP, **0% loss**, to the
+exact public address the punched path uses, from both the host and the guest.
+
+It was a **handshake-collision storm inside rustynet**. Wire capture on one peer pair
+during a 40-ping burst:
+
+| length | count | meaning |
+| --- | --- | --- |
+| 116 | 40 | data packets (the pings) |
+| 148 | **105** | WireGuard handshake **initiations** |
+| 92 | **105** | handshake responses |
+
+~6 handshakes/second against 40 data packets. Both peers were initiating, so handshakes
+collided continuously and whatever the superseded session had in flight was discarded.
+
+**Cause:** the Direct arm of the re-probe predicate had no rate limit. While a handshake
+was not fresh it returned true on *every* reconcile tick (1/s), and each re-race calls
+`initiate_peer_handshake`. The Relay arm has always been paced by `next_reprobe_unix`;
+Direct was the asymmetry, and that field was only ever armed for Relay decisions.
+
+**Fix:** arm the floor for every decision, and split staleness by cause — if the
+handshake was fresh at the last evaluation the path has *just* died, so re-race
+immediately (this preserves prompt direct→relay failover, which a blunt timer would have
+delayed by 30 s and which an existing test correctly caught); if it was already stale,
+the re-race did not help, so pace the repeat. A no-longer-offered endpoint still bypasses
+the floor, and an explicit force still wins.
+
+**Measured effect**, identical 40-ping burst:
+
+| | before | after |
+| --- | --- | --- |
+| handshake initiations | 105 | **5** |
+| packet loss (ubu→mac) | 17.5% | **0%** (100/100) |
+| packet loss (mac→ubu) | 7.5% | **1%** (99/100) |
+| 4 MB TCP throughput | 0.37 Mbit/s | **6.94 Mbit/s** (sha256 matched) |
+
+### 4.2b Liveness still never registers — the cause behind the cause, STILL OPEN
+`7a3af8fe` bounds the damage; it does not cure why the re-race engaged. Even now, with
+0% loss and 6.94 Mbit/s flowing, every node still reports
+`path_live_peer_count=0`, `path_live_direct_peers=0`,
+`path_latest_live_handshake_unix=none`, `path_live_proven=false`.
+
+The userspace-shared backend has a `HandshakeTelemetry` tracker and four call sites that
+record into it (`userspace_shared/runtime.rs`), yet the timestamp never surfaces. Until
+that is fixed the daemon cannot tell a healthy direct path from a dead one, `path_live_*`
+remains unusable as evidence, and the re-probe floor is the only thing preventing the
+storm from returning. **This is now the highest-value next fix.**
 
 ### 4.3 `path_live_peer_count` stays 0 while traffic flows — reporting discrepancy
 Real bidirectional traffic is captured on the wire and mesh pings succeed, yet the
