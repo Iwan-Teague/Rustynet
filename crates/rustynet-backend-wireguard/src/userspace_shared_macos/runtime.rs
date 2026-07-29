@@ -22,6 +22,11 @@ use crate::userspace_shared::engine::{
 use crate::userspace_shared::handshake::HandshakeTelemetry;
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Cadence for driving boringtun's periodic timers. WireGuard rounds its own
+/// timers to one second, so ticking faster buys nothing and ticking slower
+/// delays keepalives and rekey.
+const PEER_TIMER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK: usize = 64;
 const MAX_TUN_PACKETS_PER_TICK: usize = 64;
 /// Size of the long-lived UDP/TUN receive scratch buffers (max
@@ -541,6 +546,8 @@ struct RuntimeState {
     // budgets (DoS fairness between packet work and control commands) and
     // the commands-first loop structure exactly as before.
     udp_budget_exhausted: bool,
+    // Last time boringtun's periodic timers were driven; see poll_peer_timers.
+    last_peer_timer_tick: Instant,
     tun_budget_exhausted: bool,
 }
 
@@ -860,6 +867,43 @@ impl RuntimeState {
                 .saturating_duration_since(now)
                 .min(WORKER_POLL_INTERVAL)
         }
+    }
+
+    /// Drive boringtun's periodic timers for every peer, at most once per
+    /// `PEER_TIMER_TICK_INTERVAL`. Mirrors the Linux userspace-shared runtime:
+    /// nothing drove `Tunn::update_timers`, which left boringtun's internal
+    /// clock frozen so `time_since_last_handshake` grew without bound (a peer
+    /// that had just handshaked never counted as live), and suppressed both
+    /// persistent keepalives and the periodic rekey.
+    fn poll_peer_timers(&mut self) -> Result<(), BackendError> {
+        if self.last_peer_timer_tick.elapsed() < PEER_TIMER_TICK_INTERVAL {
+            return Ok(());
+        }
+        self.last_peer_timer_tick = Instant::now();
+
+        let local_addr = self.authoritative_socket.local_addr()?;
+        let transport_generation = self.authoritative_socket.transport_generation();
+        let Self {
+            engine,
+            authoritative_socket,
+            tun_device,
+            recorded_peer_ciphertext_egress,
+            handshake_telemetry,
+            ..
+        } = self;
+        let mut sink = RuntimeIoSink {
+            authoritative_socket: &*authoritative_socket,
+            tun_device: &*tun_device,
+            local_addr,
+            transport_generation,
+            recorded_peer_ciphertext_egress,
+        };
+        for (node_id, observed_unix) in
+            engine.update_peer_timers(transport_generation, &mut sink)?
+        {
+            handshake_telemetry.record_authenticated_handshake(&node_id, observed_unix);
+        }
+        Ok(())
     }
 
     fn poll_authoritative_socket(&mut self) -> Result<(), BackendError> {
@@ -1215,6 +1259,7 @@ fn run_worker(parts: WorkerRuntimeParts) {
         udp_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
         tun_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
         udp_budget_exhausted: false,
+        last_peer_timer_tick: Instant::now(),
         tun_budget_exhausted: false,
     };
 
@@ -1259,6 +1304,12 @@ fn run_worker(parts: WorkerRuntimeParts) {
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        if let Err(err) = state.poll_peer_timers() {
+            state.fail_outstanding_round_trip(err);
+            mark_worker_exit(&test_state, &worker_alive);
+            return;
         }
 
         if let Err(err) = state.poll_authoritative_socket() {
@@ -1407,6 +1458,37 @@ fn handle_request(state: &mut RuntimeState, request: RuntimeRequest) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn worker_loop_drives_boringtun_peer_timers() {
+        // Regression pin: nothing in this workspace ever called
+        // `Tunn::update_timers`. That is boringtun's clock driver, and because
+        // every other timer is stored relative to it, leaving it frozen made
+        // `time_since_last_handshake` grow without bound -- a peer that had
+        // just completed a handshake still reported an ancient handshake, so
+        // `path_live_peer_count` stayed 0 while traffic flowed cleanly at
+        // 6.94 Mbit/s on a real cross-network path. It also suppressed
+        // persistent keepalives (leaving NAT bindings to expire) and the
+        // periodic rekey.
+        let source = include_str!("runtime.rs");
+        assert!(
+            source.contains("fn poll_peer_timers(&mut self)"),
+            "macos userspace-shared runtime must define the peer timer tick"
+        );
+        assert!(
+            source.contains("state.poll_peer_timers()"),
+            "macos userspace-shared worker loop must DRIVE the peer timer tick; \
+             defining it without calling it leaves boringtun's clock frozen"
+        );
+        assert!(
+            source.contains("engine.update_peer_timers(transport_generation, &mut sink)"),
+            "macos peer timer tick must call through to the engine's update_peer_timers"
+        );
+        assert!(
+            source.contains("PEER_TIMER_TICK_INTERVAL"),
+            "macos peer timer tick must be paced by an explicit interval"
+        );
+    }
     use std::io::Write;
     use std::net::{SocketAddr, UdpSocket};
     use std::thread;
@@ -1881,6 +1963,7 @@ mod tests {
                 udp_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
                 tun_recv_scratch: vec![0u8; RECV_SCRATCH_BYTES],
                 udp_budget_exhausted: false,
+                last_peer_timer_tick: Instant::now(),
                 tun_budget_exhausted: false,
             },
             tun_state,
