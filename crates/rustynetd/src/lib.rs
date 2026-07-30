@@ -20,6 +20,7 @@ pub mod ipc;
 pub mod keepalive;
 pub mod key_material;
 pub mod key_rotation;
+pub mod killswitch_precedence;
 pub mod linux_authenticode;
 pub mod linux_blind_exit;
 pub mod linux_blind_exit_dataplane;
