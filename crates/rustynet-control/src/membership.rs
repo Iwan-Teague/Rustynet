@@ -15,8 +15,7 @@ use nix::unistd::Uid;
 use sha2::{Digest, Sha256};
 
 use crate::roles::{
-    RoleCapability, anchor_role_capabilities, canonicalize_role_capabilities,
-    parse_role_capability_csv, role_capability_csv,
+    RoleCapability, canonicalize_role_capabilities, parse_role_capability_csv, role_capability_csv,
 };
 
 pub const MEMBERSHIP_SCHEMA_VERSION: u8 = 1;
@@ -2031,10 +2030,7 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
                 fields
                     .get(format!("node.{index}.capabilities").as_str())
                     .copied(),
-                fields
-                    .get(format!("node.{index}.roles").as_str())
-                    .copied()
-                    .unwrap_or(""),
+                &format!("node.{index}.capabilities"),
             )?,
             joined_at_unix: parse_u64_field(&fields, &format!("node.{index}.joined_at_unix"))?,
             updated_at_unix: parse_u64_field(&fields, &format!("node.{index}.updated_at_unix"))?,
@@ -2134,14 +2130,17 @@ fn parse_membership_update_payload(
             roles: split_csv(required_field(&fields, "op.roles")?),
             capabilities: parse_node_capabilities(
                 fields.get("op.capabilities").copied(),
-                fields.get("op.roles").copied().unwrap_or(""),
+                "op.capabilities",
             )?,
             joined_at_unix: parse_u64_field(&fields, "op.joined_at_unix")?,
             updated_at_unix: parse_u64_field(&fields, "op.updated_at_unix")?,
         }),
         "set_node_capabilities" => MembershipOperation::SetNodeCapabilities {
             node_id: required_field(&fields, "op.node_id")?.to_owned(),
-            capabilities: parse_node_capabilities(fields.get("op.capabilities").copied(), "")?,
+            capabilities: parse_node_capabilities(
+                fields.get("op.capabilities").copied(),
+                "op.capabilities",
+            )?,
         },
         "remove_node" => MembershipOperation::RemoveNode {
             node_id: required_field(&fields, "op.node_id")?.to_owned(),
@@ -2579,57 +2578,51 @@ fn validate_membership_node_capabilities(node: &MembershipNode) -> Result<(), Me
     Ok(())
 }
 
+/// Decode a node's signed capability set from its `…capabilities=` field.
+///
+/// **A missing field is a hard reject, not an inference.** This function used to
+/// fall back to deriving capabilities from the free-form `roles` string when the
+/// capabilities field was absent — a compatibility shim for snapshots written
+/// before the field existed. That shim was deleted deliberately (ENR-05,
+/// decode-side half), for a reason stronger than tidiness:
+///
+/// Capabilities are the *authorization* field. In a snapshot with no
+/// capabilities line, what the approvers signed is a `roles` string — a label.
+/// The fallback read that label and derived authority from it, mapping
+/// `tag:servers` (a token the canonical parser rejects outright) to
+/// `RoleCapability::Anchor`. The quorum's signature covered the label; it never
+/// covered the grant. So the shim converted a signed label into an unsigned
+/// privilege, which is the POL-05 shape — absence of authorization state
+/// resolving to *more* authority rather than less — and the exact inversion
+/// §10.4's default-deny rule exists to prevent. Making the shim merely stricter
+/// would not have fixed that; only refusing to infer does.
+///
+/// Deleting it was measured, not assumed, before the change landed:
+/// `MEMBERSHIP_SCHEMA_VERSION` has never been bumped (so the field was added
+/// without one, which is why the shim existed); `canonical_payload` *always*
+/// writes the field, so every snapshot this codebase has produced carries it;
+/// no test anywhere reached the fallback, confirmed by making it `panic!` and
+/// running the suite green; and no archived artifact contained such a snapshot.
+///
+/// The accepted residual risk: a genuine pre-capabilities snapshot no longer
+/// loads, and its node fails closed. The diagnostic names the field so the
+/// operator knows the remedy is to re-issue the snapshot.
+///
+/// Note an explicit-but-empty `capabilities=` still decodes to an empty set —
+/// only *absence* is refused — so deliberately clearing a node's capabilities
+/// remains expressible.
 fn parse_node_capabilities(
     explicit: Option<&str>,
-    legacy_roles: &str,
+    field_label: &str,
 ) -> Result<Vec<RoleCapability>, MembershipError> {
-    if let Some(value) = explicit {
-        return parse_role_capability_csv(value).map_err(|err| {
-            MembershipError::InvalidFormat(format!("invalid role capability: {err}"))
-        });
-    }
-
-    let mut capabilities = Vec::new();
-    for role in split_csv(legacy_roles) {
-        match role.as_str() {
-            "anchor" => capabilities.extend(anchor_role_capabilities()),
-            "admin" | "tag:owners" | "tag:admins" | "tag:servers" => {
-                capabilities.push(RoleCapability::Anchor)
-            }
-            "client" | "tag:members" | "tag:clients" => capabilities.push(RoleCapability::Client),
-            "exit_server" | "exit-server" | "exit" => capabilities.push(RoleCapability::ExitServer),
-            "blind_exit" | "blind-exit" => {
-                capabilities.push(RoleCapability::BlindExit);
-                capabilities.push(RoleCapability::ExitServer);
-            }
-            "relay_host" | "relay-host" | "relay" => capabilities.push(RoleCapability::RelayHost),
-            "entry_relay" | "entry-relay" | "entry" => {
-                capabilities.push(RoleCapability::EntryRelay);
-                capabilities.push(RoleCapability::Client);
-            }
-            "anchor.gossip_seed" | "gossip_seed" | "gossip-seed" => {
-                capabilities.push(RoleCapability::AnchorGossipSeed)
-            }
-            "anchor.bundle_pull" | "bundle_pull" | "bundle-pull" => {
-                capabilities.push(RoleCapability::AnchorBundlePull)
-            }
-            "anchor.enrollment_endpoint" | "enrollment_endpoint" | "enrollment-endpoint" => {
-                capabilities.push(RoleCapability::AnchorEnrollmentEndpoint)
-            }
-            "anchor.relay_colocation" | "relay_colocation" | "relay-colocation" => {
-                capabilities.push(RoleCapability::AnchorRelayColocation);
-                capabilities.push(RoleCapability::RelayHost);
-            }
-            "anchor.port_mapping_authoritative"
-            | "port_mapping_authoritative"
-            | "port-mapping-authoritative" => {
-                capabilities.push(RoleCapability::AnchorPortMappingAuthoritative)
-            }
-            _ => {}
-        }
-    }
-
-    Ok(canonicalize_role_capabilities(capabilities))
+    let Some(value) = explicit else {
+        return Err(MembershipError::InvalidFormat(format!(
+            "{field_label} is missing; capabilities are never inferred from roles — \
+             re-issue the membership snapshot with an explicit capabilities field"
+        )));
+    };
+    parse_role_capability_csv(value)
+        .map_err(|err| MembershipError::InvalidFormat(format!("invalid role capability: {err}")))
 }
 
 fn split_csv(value: &str) -> Vec<String> {
@@ -3697,6 +3690,67 @@ mod tests {
             state.validate().is_ok(),
             "a node_id exactly at the cap must still be accepted"
         );
+    }
+
+    /// ENR-05, decode-side half. A snapshot whose node carries no
+    /// `capabilities=` field must be REFUSED, not have its capabilities
+    /// inferred from the free-form `roles` label.
+    ///
+    /// The deleted fallback mapped `tag:servers` — which the canonical parser
+    /// rejects outright — to `Anchor`. The approvers signed a label; they never
+    /// signed that grant. This test pins the refusal at the exact shape that
+    /// used to escalate.
+    #[test]
+    fn a_node_without_a_capabilities_field_is_refused_not_inferred() {
+        let encoded = encode_membership_state(&base_state()).expect("encode");
+        assert!(
+            encoded.contains("node.0.capabilities="),
+            "the encoder must always write the field"
+        );
+
+        // Drop the capabilities line and relabel the node the way the deleted
+        // shim would have escalated.
+        let stripped: String = encoded
+            .lines()
+            .filter(|line| !line.starts_with("node.0.capabilities="))
+            .map(|line| {
+                if line.starts_with("node.0.roles=") {
+                    "node.0.roles=tag:servers".to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let err = decode_membership_state(&stripped)
+            .expect_err("a node with no signed capabilities must be refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("node.0.capabilities"),
+            "the diagnostic must name the missing field, got: {text}"
+        );
+
+        // The point of the test: it must fail, not silently yield Anchor.
+        if let Ok(state) = decode_membership_state(&stripped) {
+            panic!(
+                "capabilities were inferred from a label: {:?}",
+                state.nodes[0].capabilities
+            );
+        }
+    }
+
+    /// Only ABSENCE is refused. An explicit but empty `capabilities=` still
+    /// decodes to an empty set, so deliberately clearing a node's capabilities
+    /// stays expressible — and a Revoked node legitimately has none.
+    #[test]
+    fn an_explicitly_empty_capabilities_field_still_decodes() {
+        use super::parse_node_capabilities;
+        assert_eq!(
+            parse_node_capabilities(Some(""), "node.0.capabilities").expect("empty is valid"),
+            Vec::<RoleCapability>::new()
+        );
+        assert!(parse_node_capabilities(None, "node.0.capabilities").is_err());
     }
 
     #[test]
