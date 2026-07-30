@@ -72,6 +72,17 @@ pub const MAX_MEMBERSHIP_NODE_COUNT: usize = 65_536;
 pub const MAX_MEMBERSHIP_APPROVER_COUNT: usize = 4_096;
 pub const MAX_MEMBERSHIP_SIGNATURE_COUNT: usize = 4_096;
 
+/// Upper bound on any free-form operator-supplied string that
+/// [`MembershipState::canonical_payload`] interpolates into a payload line.
+///
+/// The whole snapshot is already capped by [`MAX_MEMBERSHIP_SNAPSHOT_BYTES`],
+/// but that bound only applies on the *decode* side: an in-memory state built
+/// from operator input can hold an arbitrarily long identifier and be signed
+/// before anything reaches disk. Real values here are hostname slugs, principal
+/// names and role tokens, so 256 bytes strands nothing that exists while
+/// keeping a single hostile field from dominating a snapshot.
+pub const MAX_MEMBERSHIP_FIELD_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MembershipNodeStatus {
     Active,
@@ -192,6 +203,19 @@ impl MembershipState {
                 "network id must not be empty".to_owned(),
             ));
         }
+        validate_membership_payload_field("network id", &self.network_id)?;
+        if let Some(metadata_hash) = self.metadata_hash.as_deref() {
+            validate_membership_payload_field("metadata hash", metadata_hash)?;
+            // `Some("")` encodes to the same `metadata_hash=` line as `None`
+            // and decodes back as `None` — the ENR-03 silent-mutation shape at
+            // an optional field. Refuse the ambiguous form so the encoding
+            // stays injective.
+            if metadata_hash.is_empty() {
+                return Err(MembershipError::InvalidFormat(
+                    "metadata hash must be absent rather than empty".to_owned(),
+                ));
+            }
+        }
         if self.quorum_threshold == 0 {
             return Err(MembershipError::InvalidFormat(
                 "quorum threshold must be at least 1".to_owned(),
@@ -207,6 +231,7 @@ impl MembershipState {
                     "node id must not be empty".to_owned(),
                 ));
             }
+            validate_membership_payload_field("node id", &node.node_id)?;
             if !node_ids.insert(node.node_id.as_str()) {
                 return Err(MembershipError::InvalidFormat(format!(
                     "duplicate node id {}",
@@ -219,6 +244,10 @@ impl MembershipState {
                     "node {} has empty owner",
                     node.node_id
                 )));
+            }
+            validate_membership_payload_field("node owner", &node.owner)?;
+            for role in &node.roles {
+                validate_membership_role_entry("node role", role)?;
             }
             validate_membership_node_capabilities(node)?;
         }
@@ -246,6 +275,7 @@ impl MembershipState {
                     "approver id must not be empty".to_owned(),
                 ));
             }
+            validate_membership_payload_field("approver id", &approver.approver_id)?;
             if !approver_ids.insert(approver.approver_id.as_str()) {
                 return Err(MembershipError::InvalidFormat(format!(
                     "duplicate approver id {}",
@@ -2410,6 +2440,77 @@ fn bounded_count(
     Ok(count)
 }
 
+/// Reject a free-form field that would not survive
+/// `canonical_payload` → `parse_membership_state_payload` unchanged.
+///
+/// The canonical payload is a line-oriented `key=value` text format, so a
+/// value carrying one of the framing bytes is not merely ugly — it changes the
+/// structure of the signed text. Both halves were confirmed by execution
+/// (ENR-01, ENR-03):
+///
+/// - `\n` **forges a line**. `admit --node-id 'minipc-2'$'\n''node.1.status=revoked'`
+///   is accepted, the epoch advances and the snapshot persists — after which
+///   every load fails with `duplicate field node.1.status`, and the signed
+///   envelope is equally unparseable, so co-signing is dead too. One operator
+///   typo permanently bricks the membership snapshot. The forged line can also
+///   be chosen to parse cleanly (`zz.injected=1`), in which case the reload
+///   silently drops it and the stored state root no longer matches the
+///   recomputed one: root drift under a valid approver signature.
+/// - `\r` **mutates the value silently**. `str::lines()` strips a trailing
+///   `\r`, so `evil\r` encodes and decodes back as `evil`. Nothing errors; the
+///   identifier is simply not what was signed.
+/// - `=` is the key/value separator. Every parser here splits on the *first*
+///   `=`, so this one round-trips today and is rejected for consistency with
+///   [`crate::is_single_line_payload_value`] rather than because a live vector
+///   is known. Node ids are hostname slugs, so it strands nothing.
+///
+/// This is the chokepoint rather than a per-call-site guard on purpose:
+/// `validate` runs inside both [`MembershipState::canonical_payload`] and
+/// [`decode_membership_state`], so no writer can reach the signed text or the
+/// snapshot without passing it, and a future writer inherits the check instead
+/// of having to remember it. Tracked as AUDIT-042 in the 2026-06-10 audit,
+/// which named this exact contrast with `is_single_line_payload_value`.
+pub fn validate_membership_payload_field(label: &str, value: &str) -> Result<(), MembershipError> {
+    if value.len() > MAX_MEMBERSHIP_FIELD_BYTES {
+        return Err(MembershipError::InvalidFormat(format!(
+            "{label} exceeds {MAX_MEMBERSHIP_FIELD_BYTES} bytes"
+        )));
+    }
+    if let Some(byte) = value
+        .bytes()
+        .find(|byte| matches!(byte, b'\n' | b'\r' | b'='))
+    {
+        return Err(MembershipError::InvalidFormat(format!(
+            "{label} contains a payload framing byte {byte:#04x}"
+        )));
+    }
+    Ok(())
+}
+
+/// Same contract as [`validate_membership_payload_field`] for a single entry of
+/// `node.<i>.roles`, which is additionally `,`-joined on encode and
+/// `split(',') → trim → drop-empty` on decode ([`split_csv`]).
+///
+/// Those three decode steps are each a silent mutation of the signed value, so
+/// the round-trip invariant needs all three refused here: a `,` splits one role
+/// into two, surrounding whitespace is trimmed away, and an empty entry
+/// vanishes entirely. Same ENR-03 shape as the `\r` case — no error is raised
+/// at any layer, the roster simply stops matching what was signed.
+fn validate_membership_role_entry(label: &str, role: &str) -> Result<(), MembershipError> {
+    validate_membership_payload_field(label, role)?;
+    if role.contains(',') {
+        return Err(MembershipError::InvalidFormat(format!(
+            "{label} contains the role-list separator ','"
+        )));
+    }
+    if role != role.trim() || role.is_empty() {
+        return Err(MembershipError::InvalidFormat(format!(
+            "{label} must be non-empty and free of surrounding whitespace"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_membership_node_capabilities(node: &MembershipNode) -> Result<(), MembershipError> {
     let capabilities = canonicalize_role_capabilities(node.capabilities.iter().copied());
     if node.status == MembershipNodeStatus::Active && capabilities.is_empty() {
@@ -3437,6 +3538,164 @@ mod tests {
             apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
                 .is_err(),
             "truncated signature must be rejected"
+        );
+    }
+
+    /// Identifier edge cases must EITHER be refused outright, OR survive
+    /// `encode → decode` byte-identically. The failure this pins is the silent
+    /// third outcome (ENR-03): nothing errors, and the roster that comes back
+    /// is not the roster that was signed.
+    ///
+    /// Written to fail loudly if the guard is removed rather than to pass
+    /// vacuously once it is present — every hostile case below round-trips
+    /// *wrong* without it, so the assertion fires instead of being skipped.
+    #[test]
+    fn identifier_edge_cases_either_reject_or_round_trip_unchanged() {
+        // `encode` runs `validate`, and so does `decode`; `None` means one of
+        // them refused, which is the acceptable outcome.
+        fn round_trip(state: &MembershipState) -> Option<MembershipState> {
+            let encoded = encode_membership_state(state).ok()?;
+            decode_membership_state(&encoded).ok()
+        }
+
+        const CASES: &[&str] = &[
+            "node-b",                        // ordinary slug
+            "node-b\nnode.1.status=revoked", // ENR-01, the snapshot-bricking shape
+            "node-b\nzz.injected=1",         // ENR-01, the root-drift shape
+            "node-b\r",                      // ENR-03: `str::lines()` eats the trailing \r
+            "\rnode-b",
+            "node-b=x",       // the key/value separator itself
+            " node-b ",       // round-trips today; pinned so it keeps doing so
+            "ünïcodé-node-b", // multi-byte UTF-8 must not be collateral damage
+        ];
+
+        for case in CASES {
+            let mut state = base_state();
+            state.nodes[0].node_id = (*case).to_owned();
+            if let Some(decoded) = round_trip(&state) {
+                assert_eq!(
+                    decoded.nodes[0].node_id, *case,
+                    "node_id {case:?} was silently mutated by the round-trip"
+                );
+            }
+
+            let mut state = base_state();
+            state.nodes[0].owner = (*case).to_owned();
+            if let Some(decoded) = round_trip(&state) {
+                assert_eq!(
+                    decoded.nodes[0].owner, *case,
+                    "owner {case:?} was silently mutated by the round-trip"
+                );
+            }
+
+            let mut state = base_state();
+            state.approver_set[0].approver_id = (*case).to_owned();
+            if let Some(decoded) = round_trip(&state) {
+                let ids: Vec<&str> = decoded
+                    .approver_set
+                    .iter()
+                    .map(|approver| approver.approver_id.as_str())
+                    .collect();
+                assert!(
+                    ids.contains(case),
+                    "approver_id {case:?} was silently mutated by the round-trip (got {ids:?})"
+                );
+            }
+
+            let mut state = base_state();
+            state.network_id = (*case).to_owned();
+            if let Some(decoded) = round_trip(&state) {
+                assert_eq!(
+                    decoded.network_id, *case,
+                    "network_id {case:?} was silently mutated by the round-trip"
+                );
+            }
+        }
+
+        // Roles get a `,`-join on encode and a `split(',') → trim → drop-empty`
+        // on decode, so they carry three mutation shapes the other fields do not.
+        for case in [" tag:servers ", "tag:servers,tag:owners", ""] {
+            let mut state = base_state();
+            state.nodes[0].roles = vec![case.to_owned()];
+            if let Some(decoded) = round_trip(&state) {
+                assert_eq!(
+                    decoded.nodes[0].roles,
+                    vec![case.to_owned()],
+                    "role {case:?} was silently mutated by the round-trip"
+                );
+            }
+        }
+    }
+
+    /// The companion to the round-trip test above: the specific shapes ENR-01
+    /// and ENR-03 were confirmed with must be REJECTED, not merely
+    /// round-trip-stable. Without this, deleting the guard could leave the
+    /// round-trip test passing on any case that happens to survive.
+    #[test]
+    fn validate_rejects_payload_framing_bytes_in_every_free_form_field() {
+        for hostile in ["x\nnode.1.status=revoked", "x\r", "x=y"] {
+            let mut state = base_state();
+            state.nodes[0].node_id = hostile.to_owned();
+            assert!(
+                state.validate().is_err(),
+                "node_id {hostile:?} must be rejected"
+            );
+            // The signed text and the state root are both derived through
+            // `validate`, so neither can be produced over a hostile roster.
+            assert!(state.canonical_payload().is_err());
+            assert!(state.state_root_hex().is_err());
+
+            let mut state = base_state();
+            state.nodes[0].owner = hostile.to_owned();
+            assert!(
+                state.validate().is_err(),
+                "owner {hostile:?} must be rejected"
+            );
+
+            let mut state = base_state();
+            state.approver_set[0].approver_id = hostile.to_owned();
+            assert!(
+                state.validate().is_err(),
+                "approver_id {hostile:?} must be rejected"
+            );
+
+            let mut state = base_state();
+            state.network_id = hostile.to_owned();
+            assert!(
+                state.validate().is_err(),
+                "network_id {hostile:?} must be rejected"
+            );
+
+            let mut state = base_state();
+            state.metadata_hash = Some(hostile.to_owned());
+            assert!(
+                state.validate().is_err(),
+                "metadata_hash {hostile:?} must be rejected"
+            );
+
+            let mut state = base_state();
+            state.nodes[0].roles = vec![hostile.to_owned()];
+            assert!(
+                state.validate().is_err(),
+                "role {hostile:?} must be rejected"
+            );
+        }
+
+        // `Some("")` encodes to the same line as `None` and decodes back as
+        // `None`, so the encoding would not be injective.
+        let mut state = base_state();
+        state.metadata_hash = Some(String::new());
+        assert!(state.validate().is_err(), "empty metadata_hash must reject");
+
+        // Over-length is bounded at encode time, not just by the decode-side
+        // whole-snapshot cap.
+        let mut state = base_state();
+        state.nodes[0].node_id = "n".repeat(super::MAX_MEMBERSHIP_FIELD_BYTES + 1);
+        assert!(state.validate().is_err(), "over-length node_id must reject");
+        state.nodes[0].node_id = "n".repeat(super::MAX_MEMBERSHIP_FIELD_BYTES);
+        assert!(
+            state.validate().is_ok(),
+            "a node_id exactly at the cap must still be accepted"
         );
     }
 

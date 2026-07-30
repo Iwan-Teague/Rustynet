@@ -8287,6 +8287,7 @@ fn consume_enrollment_token_locked(
 
 fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
     use rustynet_control::enrollment::{EnrolleeAdmitContext, build_add_node_record_for_enrollee};
+    use rustynet_control::membership::validate_membership_payload_field;
     use rustynetd::enrollment_token::load_secret;
     let now_unix = unix_now();
     // Decode the enrollee pubkey early so a malformed input fails
@@ -8302,6 +8303,15 @@ fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
         ));
     }
     let pubkey_hex: String = pubkey_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    // Same reason as the pubkey above, for the two operator-typed identifiers:
+    // reject them before a single-use token is burned. `build_add_node_record_for_enrollee`
+    // and `MembershipState::validate` both refuse these anyway (ENR-01/ENR-03),
+    // but only at step 3 — by which point step 1 has already consumed the token
+    // durably, so a typo would cost an out-of-band re-delivery.
+    validate_membership_payload_field("node id", &config.node_id)
+        .map_err(|err| format!("enrollee node id rejected: {err}"))?;
+    validate_membership_payload_field("node owner", &config.owner)
+        .map_err(|err| format!("enrollee owner rejected: {err}"))?;
 
     // Step 1 — verify + consume the token + persist ledger under the ledger
     // lock so concurrent admits cannot double-spend a single-use token

@@ -39,7 +39,7 @@
 
 use crate::membership::{
     MembershipError, MembershipNode, MembershipNodeStatus, MembershipOperation, MembershipState,
-    MembershipUpdateRecord, preview_next_state,
+    MembershipUpdateRecord, preview_next_state, validate_membership_payload_field,
 };
 use crate::roles::{RoleCapability, canonicalize_role_capabilities};
 
@@ -146,6 +146,16 @@ pub fn build_add_node_record_for_enrollee(
     if ctx.ttl_secs == 0 {
         return Err(EnrollmentMembershipError::TtlMustBePositive);
     }
+    // ENR-01/ENR-03: the operator-supplied identifiers are interpolated into
+    // the line-oriented canonical payload this record's state roots are
+    // computed over. `MembershipState::validate` is the real chokepoint and
+    // would refuse these below, inside `preview_next_state`, but only after a
+    // `MembershipError` has been wrapped several layers deep. Checking them
+    // here turns "membership bridge failed: invalid format …" into a reject
+    // naming the offending input, for the one caller — the admit CLI — whose
+    // user typed it.
+    validate_membership_payload_field("node id", &ctx.node_id)?;
+    validate_membership_payload_field("node owner", &ctx.owner)?;
     let now_unix = ctx.now_unix;
     let expires_at_unix = now_unix.saturating_add(ctx.ttl_secs);
     let candidate_node = MembershipNode {
@@ -335,6 +345,54 @@ mod tests {
         let err =
             build_add_node_record_for_enrollee(&state, ctx).expect_err("zero ttl must reject");
         assert!(matches!(err, EnrollmentMembershipError::TtlMustBePositive));
+    }
+
+    /// ENR-01: `admit --node-id` carrying a newline was accepted end to end —
+    /// the epoch advanced and the snapshot persisted, after which every later
+    /// load failed on the forged line. The bridge is the last shared point
+    /// before the record's state roots are computed, so it must refuse the
+    /// input rather than sign over it.
+    #[test]
+    fn build_add_node_record_rejects_framing_bytes_in_operator_identifiers() {
+        for hostile in [
+            "minipc-2\nnode.1.status=revoked",
+            "minipc-2\r",
+            "minipc-2=x",
+        ] {
+            let ctx = EnrolleeAdmitContext {
+                node_id: hostile.to_owned(),
+                node_pubkey_hex: hex_lower(&[1u8; 32]),
+                owner: "bob".to_owned(),
+                roles: vec![],
+                update_id: "u".to_owned(),
+                reason_code: "r".to_owned(),
+                policy_context: None,
+                now_unix: 1_700_000_500,
+                ttl_secs: 3_600,
+            };
+            let err = build_add_node_record_for_enrollee(&base_state(), ctx)
+                .expect_err("hostile node id must reject");
+            assert!(
+                matches!(err, EnrollmentMembershipError::Membership(_)),
+                "node_id {hostile:?} produced the wrong error: {err:?}"
+            );
+
+            let ctx = EnrolleeAdmitContext {
+                node_id: "minipc-2".to_owned(),
+                node_pubkey_hex: hex_lower(&[1u8; 32]),
+                owner: hostile.to_owned(),
+                roles: vec![],
+                update_id: "u".to_owned(),
+                reason_code: "r".to_owned(),
+                policy_context: None,
+                now_unix: 1_700_000_500,
+                ttl_secs: 3_600,
+            };
+            assert!(
+                build_add_node_record_for_enrollee(&base_state(), ctx).is_err(),
+                "owner {hostile:?} must reject"
+            );
+        }
     }
 
     #[test]
