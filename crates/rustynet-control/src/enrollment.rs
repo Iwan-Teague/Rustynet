@@ -100,6 +100,12 @@ pub enum EnrollmentMembershipError {
     /// canonical-payload validator already rejects, but failing
     /// earlier with a clearer diagnostic is friendlier.
     TtlMustBePositive,
+    /// Caller passed a `--roles` token the canonical
+    /// [`RoleCapability::parse`] does not recognise. Previously such a
+    /// token was silently discarded, which is the ENR-05 defect: the
+    /// admit reported success while granting something other than what
+    /// was asked for.
+    UnknownRole(String),
     /// Underlying membership reducer / validation error.
     Membership(MembershipError),
 }
@@ -109,6 +115,12 @@ impl std::fmt::Display for EnrollmentMembershipError {
         match self {
             EnrollmentMembershipError::TtlMustBePositive => {
                 write!(f, "admit update ttl_secs must be > 0")
+            }
+            EnrollmentMembershipError::UnknownRole(role) => {
+                write!(
+                    f,
+                    "unrecognised role {role:?}; admit accepts only the canonical role-capability tokens"
+                )
             }
             EnrollmentMembershipError::Membership(err) => {
                 write!(f, "membership bridge failed: {err}")
@@ -163,7 +175,7 @@ pub fn build_add_node_record_for_enrollee(
         node_pubkey_hex: ctx.node_pubkey_hex.clone(),
         owner: ctx.owner.clone(),
         status: MembershipNodeStatus::Active,
-        capabilities: enrollee_capabilities_from_roles(&ctx.roles),
+        capabilities: enrollee_capabilities_from_roles(&ctx.roles)?,
         roles: ctx.roles,
         joined_at_unix: now_unix,
         updated_at_unix: now_unix,
@@ -194,31 +206,55 @@ pub fn build_add_node_record_for_enrollee(
     })
 }
 
-fn enrollee_capabilities_from_roles(roles: &[String]) -> Vec<RoleCapability> {
+/// Map the operator's `--roles` tokens onto signed role capabilities.
+///
+/// Delegates to the canonical [`RoleCapability::parse`] and rejects anything it
+/// does not recognise. This is ENR-05, and the hand-written table this replaced
+/// was wrong in **both** directions — the review executed every token the
+/// canonical parser accepts:
+///
+/// - **8 of 14 were silently dropped to `Client`** by the catch-all arm: the six
+///   `anchor.*` sub-capabilities plus `serves_nas` and `serves_llm`. So
+///   `--roles anchor.bundle_pull` produced a client-only node and reported
+///   success.
+/// - **4 tokens the canonical parser REJECTS granted `Anchor`** — `admin`,
+///   `tag:owners`, `tag:admins`, `tag:servers`. That is the half that matters:
+///   `tag:servers` is plausible operator shorthand, and it handed out a
+///   control-plane capability.
+///
+/// RSA-0015 rated this Info on the rationale that the bridge "can only *drop*
+/// privilege, so it is fail-safe". The second bullet is the counter-example, and
+/// the review recommends re-rating on exactly that ground.
+///
+/// Two implications must be re-added after parsing, because
+/// `canonicalize_role_capabilities` only sorts and dedups — it does not expand.
+/// `validate_membership_node_capabilities` requires `BlindExit` to carry
+/// `ExitServer` and `EntryRelay` to carry `Client`, so omitting them would make
+/// this function emit rosters that the very next validation step rejects.
+fn enrollee_capabilities_from_roles(
+    roles: &[String],
+) -> Result<Vec<RoleCapability>, EnrollmentMembershipError> {
     let mut capabilities = Vec::new();
     for role in roles.iter().map(|role| role.trim()) {
-        match role {
-            "anchor" | "admin" | "tag:owners" | "tag:admins" | "tag:servers" => {
-                capabilities.push(RoleCapability::Anchor)
-            }
-            "client" | "tag:members" | "tag:clients" => capabilities.push(RoleCapability::Client),
-            "exit_server" | "exit-server" | "exit" => capabilities.push(RoleCapability::ExitServer),
-            "blind_exit" | "blind-exit" => {
-                capabilities.push(RoleCapability::BlindExit);
-                capabilities.push(RoleCapability::ExitServer);
-            }
-            "relay_host" | "relay-host" | "relay" => capabilities.push(RoleCapability::RelayHost),
-            "entry_relay" | "entry-relay" | "entry" => {
-                capabilities.push(RoleCapability::EntryRelay);
-                capabilities.push(RoleCapability::Client);
-            }
+        if role.is_empty() {
+            continue;
+        }
+        let capability = RoleCapability::parse(role)
+            .map_err(|_| EnrollmentMembershipError::UnknownRole(role.to_owned()))?;
+        capabilities.push(capability);
+        match capability {
+            RoleCapability::BlindExit => capabilities.push(RoleCapability::ExitServer),
+            RoleCapability::EntryRelay => capabilities.push(RoleCapability::Client),
             _ => {}
         }
     }
     if capabilities.is_empty() {
+        // Documented and legitimate: no roles requested means a plain client
+        // peer. Reachable only from an empty (or all-whitespace) input now that
+        // every other unrecognised token is an error.
         capabilities.push(RoleCapability::Client);
     }
-    canonicalize_role_capabilities(capabilities)
+    Ok(canonicalize_role_capabilities(capabilities))
 }
 
 #[cfg(test)]
@@ -345,6 +381,123 @@ mod tests {
         let err =
             build_add_node_record_for_enrollee(&state, ctx).expect_err("zero ttl must reject");
         assert!(matches!(err, EnrollmentMembershipError::TtlMustBePositive));
+    }
+
+    /// ENR-05, the silent-drop half. Every token the canonical parser accepts
+    /// must survive the bridge as the capability the parser named.
+    ///
+    /// The expectation is *derived from* `RoleCapability::parse` rather than
+    /// hand-copied into this test, deliberately: a second hand-written table is
+    /// what produced ENR-05 in the first place, and a hand-copied expectation
+    /// would drift the same way and keep passing. Adding a new capability to
+    /// the canonical parser therefore extends this test automatically.
+    #[test]
+    fn every_canonical_role_token_survives_the_bridge() {
+        const CANONICAL_TOKENS: &[&str] = &[
+            "anchor",
+            "client",
+            "exit_server",
+            "blind_exit",
+            "relay_host",
+            "entry_relay",
+            "anchor.gossip_seed",
+            "anchor.bundle_pull",
+            "anchor.enrollment_endpoint",
+            "anchor.relay_colocation",
+            "anchor.port_mapping_authoritative",
+            "anchor.port_mapping_pinned",
+            "serves_nas",
+            "serves_llm",
+        ];
+
+        for token in CANONICAL_TOKENS {
+            let expected = RoleCapability::parse(token)
+                .unwrap_or_else(|err| panic!("{token} is not canonical: {err}"));
+            let produced = enrollee_capabilities_from_roles(&[(*token).to_owned()])
+                .unwrap_or_else(|err| panic!("{token} rejected by the bridge: {err}"));
+            assert!(
+                produced.contains(&expected),
+                "role {token} produced {produced:?}, which does not include {expected:?} \
+                 — this is the ENR-05 silent drop"
+            );
+        }
+    }
+
+    /// ENR-05, the privilege-granting half — the reason the finding is not
+    /// merely cosmetic. These four are REJECTED by the canonical parser and yet
+    /// the old hand-written table mapped every one of them to `Anchor`, a
+    /// control-plane capability. `tag:servers` in particular is plausible
+    /// operator shorthand.
+    #[test]
+    fn tokens_the_canonical_parser_rejects_no_longer_grant_anchor() {
+        for token in ["admin", "tag:owners", "tag:admins", "tag:servers"] {
+            assert!(
+                RoleCapability::parse(token).is_err(),
+                "{token} is canonical after all — this test's premise is stale"
+            );
+            let err = enrollee_capabilities_from_roles(&[token.to_owned()])
+                .expect_err("a non-canonical token must not silently grant a capability");
+            match err {
+                EnrollmentMembershipError::UnknownRole(reported) => {
+                    assert_eq!(reported, token)
+                }
+                other => panic!("{token} produced the wrong error: {other:?}"),
+            }
+        }
+
+        // The aliases the old table invented are gone too. They were never
+        // canonical, so accepting them taught operators a vocabulary the rest
+        // of the system does not share.
+        for token in ["exit", "relay", "entry", "tag:members", "tag:clients"] {
+            assert!(
+                enrollee_capabilities_from_roles(&[token.to_owned()]).is_err(),
+                "non-canonical alias {token} must be rejected"
+            );
+        }
+    }
+
+    /// The two implications `canonicalize_role_capabilities` does not expand.
+    /// Without them the bridge emits a roster that
+    /// `validate_membership_node_capabilities` immediately rejects, so this
+    /// pins the round trip through a real record build rather than just the
+    /// helper's return value.
+    #[test]
+    fn implied_capabilities_survive_the_delegation() {
+        let blind = enrollee_capabilities_from_roles(&["blind_exit".to_owned()]).expect("blind");
+        assert!(blind.contains(&RoleCapability::BlindExit));
+        assert!(
+            blind.contains(&RoleCapability::ExitServer),
+            "blind_exit must imply exit_server or validate rejects it: {blind:?}"
+        );
+
+        let entry = enrollee_capabilities_from_roles(&["entry_relay".to_owned()]).expect("entry");
+        assert!(entry.contains(&RoleCapability::EntryRelay));
+        assert!(
+            entry.contains(&RoleCapability::Client),
+            "entry_relay must imply client or validate rejects it: {entry:?}"
+        );
+
+        // No roles at all remains a plain client peer, which is documented
+        // behaviour rather than an accident of the old catch-all arm.
+        assert_eq!(
+            enrollee_capabilities_from_roles(&[]).expect("empty"),
+            vec![RoleCapability::Client]
+        );
+
+        // A record built from blind_exit must actually validate end to end.
+        let ctx = EnrolleeAdmitContext {
+            node_id: "blind-1".to_owned(),
+            node_pubkey_hex: hex_lower(&[7u8; 32]),
+            owner: "bob".to_owned(),
+            roles: vec!["blind_exit".to_owned()],
+            update_id: "u-blind".to_owned(),
+            reason_code: "r".to_owned(),
+            policy_context: None,
+            now_unix: 1_700_000_500,
+            ttl_secs: 3_600,
+        };
+        build_add_node_record_for_enrollee(&base_state(), ctx)
+            .expect("a blind_exit admit must still build a valid record");
     }
 
     /// ENR-01: `admit --node-id` carrying a newline was accepted end to end —
