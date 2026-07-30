@@ -39,6 +39,10 @@
 //! `nft_ruleset_has_v6_drop`, `count_pcap_datagrams`) so it is fully
 //! unit-tested without the live lab.
 
+use crate::killswitch_precedence::{
+    ContainedInterfaces, RuleDisposition, nft_chain_rules_in_evaluation_order,
+    terminator_is_reachable,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -165,10 +169,13 @@ fn parse_proc_flag(stdout: &str) -> bool {
     stdout.trim() == "1"
 }
 
-/// Detect a killswitch drop rule that covers the IPv6 family on the EGRESS
-/// path. Two signals count:
+/// Detect whether the killswitch actually CONTAINS outbound global-scope IPv6.
+///
+/// Two signals can establish containment, and both are now subject to
+/// precedence:
 ///   1. an explicit v6-scoped drop (`meta nfproto ipv6 ... drop`, an
-///      `ip6`/`inet6` saddr/daddr drop) — explicit intent, credited anywhere;
+///      `ip6`/`inet6` saddr/daddr drop) — explicit intent, credited in any
+///      chain;
 ///   2. the canonical family-agnostic terminal drop (the `block drop out quick
 ///      all` analogue: `policy drop` / a bare `drop`) — but ONLY inside an
 ///      EGRESS base chain (`hook output`/`hook postrouting`/`hook forward`) of
@@ -176,52 +183,181 @@ fn parse_proc_flag(stdout: &str) -> bool {
 ///      on an `input`/`prerouting` chain, a regular (unhooked) chain, or an
 ///      `ip` (IPv4-only) table does NOT contain outbound IPv6 — crediting it
 ///      would be a false fail-closed positive.
+///
+/// # Presence is not containment (IPV-03)
+///
+/// This function used to return `true` the moment it saw such a drop, without
+/// looking at the rules above it. nftables is first-match-wins inside a chain
+/// and `policy drop` is the chain *default* — applied only after every rule
+/// fails to match — so any `accept` in the chain is evaluated FIRST and the
+/// policy never fires for traffic that accept matches. Fed the ruleset produced
+/// by an IPv4-only killswitch with a broad v6 accept, the old scan reported
+/// `killswitch_v6_drop_present=true` and the verifier passed while global IPv6
+/// egressed freely.
+///
+/// Each candidate chain is therefore walked in evaluation order via
+/// [`crate::killswitch_precedence`], and the drop is credited only if it is
+/// actually REACHABLE for global-scope outbound IPv6.
+///
+/// # Why the result is a union across chains
+///
+/// A packet traverses EVERY base chain registered at a hook, and a `drop`
+/// anywhere is immediate and terminal for the whole evaluation, while an
+/// `accept` ends only the chain that issued it. So one chain accepting does not
+/// undo another chain's drop: containment holds if ANY egress chain drops the
+/// traffic. Requiring every chain to drop would fail closed on correct
+/// multi-chain rulesets, so the per-chain verdicts are OR-ed.
 fn nft_ruleset_has_v6_drop(stdout: &str, killswitch_table: &str) -> bool {
+    let contained = ContainedInterfaces::default();
+    nft_egress_chain_bodies(stdout, killswitch_table)
+        .into_iter()
+        .any(|(body, in_killswitch_table)| {
+            let rules = nft_chain_rules_in_evaluation_order(&body);
+            terminator_is_reachable(&rules, |rule| {
+                classify_v6_egress_rule(rule, in_killswitch_table, &contained)
+            })
+            .is_ok()
+        })
+}
+
+/// Split an `nft list ruleset` dump into candidate egress chain bodies.
+///
+/// Returns one entry per chain that could contain outbound IPv6: the chain body
+/// text, plus whether that chain sits in the dual-stack `inet` killswitch table
+/// (which is what licenses crediting a family-agnostic terminal drop). Chains
+/// hooked on `input`/`prerouting` are excluded — they cannot contain egress.
+/// Unhooked regular chains are retained because an explicit v6 drop in one is
+/// still explicit intent, but they are not flagged as killswitch-table egress.
+fn nft_egress_chain_bodies(stdout: &str, killswitch_table: &str) -> Vec<(String, bool)> {
+    let mut chains = Vec::new();
     let mut in_inet_killswitch_table = false;
-    // Whether the chain currently being scanned is hooked on an egress path.
-    // Reset on every `table`/`chain` boundary; set by a base-chain `hook` line.
-    let mut chain_is_egress = false;
+    let mut current: Option<(String, bool, bool)> = None;
+
+    // Finish the chain under construction, keeping it unless it is hooked on an
+    // ingress path.
+    fn flush(current: Option<(String, bool, bool)>, chains: &mut Vec<(String, bool)>) {
+        if let Some((body, in_table, is_ingress)) = current
+            && !is_ingress
+        {
+            chains.push((body, in_table));
+        }
+    }
+
     for raw in stdout.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if line.starts_with("table ") {
+            flush(current.take(), &mut chains);
             in_inet_killswitch_table = line.starts_with("table inet ")
                 && line
                     .split_whitespace()
                     .nth(2)
                     .map(|name| name.trim_end_matches('{').trim() == killswitch_table)
                     .unwrap_or(false);
-            chain_is_egress = false;
             continue;
         }
         if line.starts_with("chain ") {
-            // A new chain; its hook (if any) is declared on a following line.
-            chain_is_egress = false;
+            flush(current.take(), &mut chains);
+            current = Some((String::new(), in_inet_killswitch_table, false));
             continue;
         }
-        // Base-chain hook declaration (may also carry `policy drop` on the
-        // same line). Only output/postrouting/forward are egress-relevant.
-        if line.contains("hook output")
-            || line.contains("hook postrouting")
-            || line.contains("hook forward")
-        {
-            chain_is_egress = true;
-        } else if line.contains("hook input") || line.contains("hook prerouting") {
-            chain_is_egress = false;
+        if line == "}" {
+            flush(current.take(), &mut chains);
+            continue;
         }
-        // Explicit v6-scoped drop: credited (explicit intent, usually oifname).
-        if rule_is_v6_drop(line) {
-            return true;
-        }
-        // Family-agnostic terminal drop: only on an egress base chain of the
-        // inet killswitch table.
-        if in_inet_killswitch_table && chain_is_egress && line_is_terminal_drop(line) {
-            return true;
+        if let Some((body, _, is_ingress)) = current.as_mut() {
+            // A base chain declares its hook; only output/postrouting/forward
+            // are egress-relevant.
+            if line.contains("hook input") || line.contains("hook prerouting") {
+                *is_ingress = true;
+            }
+            body.push_str(line);
+            body.push('\n');
         }
     }
-    false
+    flush(current.take(), &mut chains);
+    chains
+}
+
+/// Reduce one nft rule to its effect on global-scope OUTBOUND IPv6.
+///
+/// Fail-closed: anything not positively recognised as unable-to-match or
+/// tunnel-scoped is [`RuleDisposition::Escapes`], so an unfamiliar rule
+/// withholds containment rather than being skipped over.
+fn classify_v6_egress_rule(
+    rule: &str,
+    in_killswitch_table: bool,
+    contained: &ContainedInterfaces,
+) -> RuleDisposition {
+    // Terminators first: an explicit v6 drop counts anywhere, a family-agnostic
+    // one only inside the dual-stack killswitch table's egress chains.
+    if rule_is_v6_drop(rule) {
+        return RuleDisposition::Terminator;
+    }
+    if in_killswitch_table && line_is_terminal_drop(rule) {
+        return RuleDisposition::Terminator;
+    }
+    // An IPv4-only selector cannot match IPv6 at all, whatever it permits.
+    if rule_is_ipv4_only(rule) {
+        return RuleDisposition::Irrelevant;
+    }
+    // A rule scoped to link-local or multicast v6 cannot carry global-scope
+    // traffic off the host; the leak probe targets a global address.
+    if rule_is_non_global_v6_scope(rule) {
+        return RuleDisposition::Irrelevant;
+    }
+    // No verdict at all (`counter`, a bare `comment`): the packet falls
+    // through to the next rule, so this one cannot escape.
+    if !rule_has_permissive_verdict(rule) && !rule.contains("jump") && !rule.contains("goto") {
+        return RuleDisposition::Irrelevant;
+    }
+    // `return` in a base chain ends the chain and applies its policy, so it
+    // cannot escape a `policy drop`.
+    if rule_verdict_is_return(rule) {
+        return RuleDisposition::Irrelevant;
+    }
+    // A permissive verdict scoped to the tunnel (or loopback) is how encrypted
+    // traffic legitimately leaves; that is containment, not a leak.
+    if let Some(interface) = ContainedInterfaces::nft_rule_output_interface(rule)
+        && contained.contains(interface)
+    {
+        return RuleDisposition::Contained;
+    }
+    // Everything else — a broad accept, an accept on a physical interface, a
+    // jump to a chain whose contents are not visible here — defeats the drop.
+    RuleDisposition::Escapes
+}
+
+/// Whether the rule carries a selector that can only ever match IPv4.
+fn rule_is_ipv4_only(rule: &str) -> bool {
+    rule.contains("nfproto ipv4")
+        || rule.contains("ip saddr")
+        || rule.contains("ip daddr")
+        || rule.contains("ip protocol")
+        || rule.contains("ip version 4")
+}
+
+/// Whether the rule is scoped to v6 addresses that cannot leave the link.
+fn rule_is_non_global_v6_scope(rule: &str) -> bool {
+    rule.contains("fe80::/10") || rule.contains("ff00::/8") || rule.contains("::1/128")
+}
+
+/// Whether the rule reaches a verdict that lets the packet proceed.
+fn rule_has_permissive_verdict(rule: &str) -> bool {
+    ["accept", "return", "queue", "dup", "fwd"]
+        .iter()
+        .any(|verdict| {
+            rule == *verdict
+                || rule.ends_with(&format!(" {verdict}"))
+                || rule.ends_with(&format!(" {verdict};"))
+                || rule.contains(&format!(" {verdict} "))
+        })
+}
+
+fn rule_verdict_is_return(rule: &str) -> bool {
+    rule == "return" || rule.ends_with(" return") || rule.ends_with(" return;")
 }
 
 fn rule_is_v6_drop(line: &str) -> bool {
@@ -436,6 +572,167 @@ mod tests {
             IPV4_ONLY_KILLSWITCH,
             "rustynet_g1"
         ));
+    }
+
+    /// IPV-03, the defect itself: a broad `accept` above the terminator.
+    ///
+    /// `policy drop` is the chain DEFAULT -- it fires only after every rule
+    /// fails to match -- so this accept is evaluated first and global IPv6
+    /// egresses freely. The old presence-only scan saw `policy drop`, returned
+    /// true, and the whole verifier reported
+    /// `killswitch_v6_drop_present=true, leaked=0, PASS`. Each of these
+    /// rulesets must now be reported as NOT contained.
+    #[test]
+    fn nft_ruleset_accept_above_the_policy_drop_is_not_containment() {
+        const BROAD_ACCEPT: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        accept
+    }
+}"#;
+        const PHYSICAL_IFACE_ACCEPT: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        oifname "enp0s1" accept
+    }
+}"#;
+        const EXPLICIT_V6_ACCEPT: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        meta nfproto ipv6 accept
+    }
+}"#;
+        const CT_STATE_ACCEPT: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        ct state established,related accept
+    }
+}"#;
+        // A jump whose target chain is not visible here could accept anything;
+        // fail closed rather than assume the target drops.
+        const JUMP_TO_UNSEEN_CHAIN: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        jump operator_overrides
+    }
+}"#;
+        // The accept precedes an EXPLICIT v6 drop rather than a policy default.
+        const ACCEPT_ABOVE_EXPLICIT_V6_DROP: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0;
+        oifname "enp0s1" accept
+        meta nfproto ipv6 drop
+    }
+}"#;
+
+        for (label, ruleset) in [
+            ("a bare accept", BROAD_ACCEPT),
+            (
+                "an accept on the physical egress interface",
+                PHYSICAL_IFACE_ACCEPT,
+            ),
+            ("an explicit IPv6 accept", EXPLICIT_V6_ACCEPT),
+            ("a conntrack-state accept", CT_STATE_ACCEPT),
+            ("a jump to a chain not in the dump", JUMP_TO_UNSEEN_CHAIN),
+            (
+                "an accept above an explicit v6 drop",
+                ACCEPT_ABOVE_EXPLICIT_V6_DROP,
+            ),
+        ] {
+            assert!(
+                !nft_ruleset_has_v6_drop(ruleset, "rustynet_g1"),
+                "{label} precedes the terminator, so IPv6 is NOT contained"
+            );
+        }
+    }
+
+    /// The other direction, which matters just as much: a precedence check that
+    /// fails closed on correct rulesets would be reverted within a week. None
+    /// of these may be reported as a leak.
+    #[test]
+    fn nft_ruleset_precedence_check_does_not_false_fail_real_rulesets() {
+        // The canonical shape: tunnel egress accepted, everything else dropped.
+        const TUNNEL_PLUS_LOOPBACK: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        oifname "rustynet0" accept
+    }
+}"#;
+        // An IPv4-only accept cannot match IPv6, so it cannot leak it.
+        const IPV4_ONLY_ACCEPT: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        ip daddr 192.168.64.0/24 tcp dport 22 accept
+    }
+}"#;
+        // Counters and comments reach no verdict; the packet falls through.
+        const COUNTER_ONLY: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        counter packets 0 bytes 0
+    }
+}"#;
+        // Link-local and multicast v6 never leave the link.
+        const LINK_LOCAL_ACCEPT: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        ip6 daddr fe80::/10 accept
+        ip6 daddr ff00::/8 accept
+    }
+}"#;
+        // The traversal-endpoint allows are narrow but not tunnel-scoped, so
+        // they DO escape -- asserted in the negative test above via
+        // ct/jump shapes. Here: a second chain drops what the first accepts.
+        // A packet traverses every base chain at a hook and any drop is
+        // terminal, so this ruleset genuinely contains IPv6.
+        const SECOND_CHAIN_DROPS: &str = r#"table inet rustynet_g1 {
+    chain permissive {
+        type filter hook output priority 0;
+        accept
+    }
+    chain killswitch {
+        type filter hook output priority 10; policy drop;
+        oifname "rustynet0" accept
+    }
+}"#;
+
+        for (label, ruleset) in [
+            ("tunnel plus loopback accepts", TUNNEL_PLUS_LOOPBACK),
+            ("an IPv4-only accept", IPV4_ONLY_ACCEPT),
+            ("a counter-only rule", COUNTER_ONLY),
+            ("link-local and multicast accepts", LINK_LOCAL_ACCEPT),
+            ("a sibling chain that drops", SECOND_CHAIN_DROPS),
+        ] {
+            assert!(
+                nft_ruleset_has_v6_drop(ruleset, "rustynet_g1"),
+                "{label} must still be credited as containment"
+            );
+        }
+    }
+
+    /// The fixture that pinned the blind spot deserves an explicit note, since
+    /// its expected value did NOT change and that looks like an oversight.
+    ///
+    /// `INET_KILLSWITCH_WITH_TERMINAL_DROP` carries `oifname "rustynet0" accept`
+    /// above its `policy drop`, which the review flagged as an accept-above-drop
+    /// asserting `true`. The assertion is nonetheless correct: that accept is
+    /// scoped to the TUNNEL, so traffic it matches leaves encrypted rather than
+    /// leaking. What was wrong was the reasoning, not the expectation -- the old
+    /// code would have returned `true` for a physical-interface accept too, and
+    /// that case is now covered above.
+    #[test]
+    fn tunnel_scoped_accept_fixture_is_credited_for_the_right_reason() {
+        assert!(nft_ruleset_has_v6_drop(
+            INET_KILLSWITCH_WITH_TERMINAL_DROP,
+            "rustynet_g1"
+        ));
+        // Same ruleset, tunnel swapped for the physical NIC: must now fail.
+        let leaky = INET_KILLSWITCH_WITH_TERMINAL_DROP.replace("rustynet0", "enp0s1");
+        assert!(
+            !nft_ruleset_has_v6_drop(&leaky, "rustynet_g1"),
+            "the fixture passes because of the tunnel scope, not because a drop is present"
+        );
     }
 
     #[test]
