@@ -58,7 +58,7 @@ the handshake; §4.1 covers the two MTU faults that unblocked bulk data; §4.2 t
 handshake-collision storm behind the packet loss; §4.2b the frozen boringtun clock that
 was the root cause beneath both the loss and the empty liveness counters.
 
-### 2.1 Boot killswitch never received the STUN allow-list — `fe634559`
+### 2.1 Boot killswitch never received the STUN allow-list — `cef5282c`
 
 `traversal_bootstrap_allow_endpoints` was emitted only into the daemon's
 generation-rotated table (`rustynet_g<N>`), never into `rustynet_boot`. Both install a
@@ -78,7 +78,7 @@ Note the identical failure mode had already been fixed for the WireGuard listen 
 and is documented in `install_linux_boot_killswitch`'s own doc comment — the traversal
 endpoints simply never received the same treatment.
 
-### 2.2 Outbound WireGuard allowed only by destination port — `c5018acb`
+### 2.2 Outbound WireGuard allowed only by destination port — `13bb4a45`
 
 Both killswitch tables permitted outbound WireGuard by **destination** port matching the
 local listen port. That silently assumes every peer listens on the same port we do —
@@ -99,7 +99,7 @@ WireGuard socket with the listen port as source, whatever the destination — as
 the dport form, but covering any peer endpoint a NAT hands us. Applied to both chains,
 plus a matching drift assertion in the generation table's verifier.
 
-### 2.3 Privileged boundary rejected the new rule shape — `5bbf2062`
+### 2.3 Privileged boundary rejected the new rule shape — `caf80cbd`
 
 The privileged helper validates every nft argv against an explicit schema allow-list and
 refused the source-port rule:
@@ -144,15 +144,15 @@ Mesh reachability over that path:
 
 ## 4. Open gaps (not yet fixed)
 
-### 4.1 ~~MTU not adapted to the discovered path~~ — **FIXED** (`e3741da2`, `4c4d6c5f`)
+### 4.1 ~~MTU not adapted to the discovered path~~ — **FIXED** (`d1a8f0df`, `6b465b1f`)
 Two distinct faults, both now closed:
 
-1. **The userspace-shared TUN lifecycles never set an MTU at all** (`e3741da2`). The
+1. **The userspace-shared TUN lifecycles never set an MTU at all** (`d1a8f0df`). The
    kernel, macOS and Windows backends all pin `SAFE_BRINGUP_TUNNEL_MTU` before link-up —
    the Linux kernel path even comments that it is "closing the never-set-MTU gap" — but
    both userspace-shared lifecycles were missed, leaving the platform default of **1500**.
    1500 plus WireGuard overhead does not fit even a clean 1500-byte Ethernet underlay.
-2. **Even the 1420 default is too large for a NAT-traversed path** (`4c4d6c5f`). The
+2. **Even the 1420 default is too large for a NAT-traversed path** (`6b465b1f`). The
    outer hop here is 1280 bytes, leaving 1220 for the inner packet.
    `RUSTYNET_WG_TUNNEL_MTU` now overrides the bring-up value, bounded to
    `MIN_BRINGUP_TUNNEL_MTU..=SAFE_BRINGUP_TUNNEL_MTU`, falling back to the default on
@@ -174,7 +174,7 @@ varies per peer and over time. The real answer is per-path measurement via the D
 state machine that already exists in `rustynetd::path_mtu`, fully unit-tested, **with no
 consumer** (FIS-0027 Phase 3).
 
-### 4.2 ~~Punched path is lossy~~ — **FIXED** (`7a3af8fe`)
+### 4.2 ~~Punched path is lossy~~ — **FIXED** (`b89edeca`)
 The loss was **not** the network. The underlay is clean: 50/50 ICMP, **0% loss**, to the
 exact public address the punched path uses, from both the host and the guest.
 
@@ -211,7 +211,7 @@ the floor, and an explicit force still wins.
 | packet loss (mac→ubu) | 7.5% | **1%** (99/100) |
 | 4 MB TCP throughput | 0.37 Mbit/s | **6.94 Mbit/s** (sha256 matched) |
 
-### 4.2b ~~Liveness never registers~~ — **FIXED** (`3e44e627`)
+### 4.2b ~~Liveness never registers~~ — **FIXED** (`0c49397a`)
 **Nothing in the workspace ever called `Tunn::update_timers`.** That is boringtun's clock
 driver: it advances the internal `TimeCurrent`, and every other timer is stored relative
 to it. With it frozen,
@@ -225,7 +225,7 @@ just handshaked reported an ancient one and never satisfied the freshness window
 is why `path_live_*` read empty on a path demonstrably carrying 4 MB byte-exact.
 
 It is also **why the §4.2 re-race loop engaged at all**: the Direct arm re-probes while a
-handshake is not fresh, and the handshake could never *become* fresh. `7a3af8fe` paced
+handshake is not fresh, and the handshake could never *become* fresh. `b89edeca` paced
 that loop; this removes the reason it engaged.
 
 Two further consequences of the frozen clock, both also fixed: persistent keepalives were

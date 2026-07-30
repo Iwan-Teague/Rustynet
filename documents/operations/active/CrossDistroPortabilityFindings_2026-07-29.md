@@ -145,7 +145,7 @@ distro is not required.
 All three nodes run NetworkManager, and two also run firewalld, which is the environment
 where `enforce_baseline_runtime` previously flapped on the `ip link set mtu` at
 `rustynet0` bring-up. With the userspace-shared backend and the MTU now pinned before
-link-up (`e3741da2`), both Fedora and Rocky came up clean at 1220 with no flap. Worth
+link-up (`d1a8f0df`), both Fedora and Rocky came up clean at 1220 with no flap. Worth
 re-testing on the kernel-WireGuard backend before concluding the race is gone.
 
 ---
