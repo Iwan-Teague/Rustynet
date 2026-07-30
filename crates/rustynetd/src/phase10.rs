@@ -4685,11 +4685,22 @@ impl DataplaneSystem for WindowsCommandSystem {
                 "Windows advfirewall killswitch verification failed: {err}"
             ))
         })?;
-        // Confirm the native WFP tunnel-permit filters (E2) are present so the
-        // tunnel can still egress through the killswitch. A missing permit fails
-        // safe (tunnel blocked), but a correct "killswitch active" assertion must
+        // Confirm the native WFP tunnel-permit filters (E2) are present AND are
+        // genuinely tunnel-scoped hard permits. A missing permit fails safe
+        // (tunnel blocked), but a correct "killswitch active" assertion must
         // catch it rather than silently report green.
-        if !rustynet_windows_native::wfp_tunnel_permit_present().map_err(|err| {
+        //
+        // WIN-03: the SCOPE argument is the security-critical part. These are
+        // hard permits in a max-weight sublayer, built to win arbitration over
+        // the default-block-outbound policy, so a filter whose interface
+        // condition has been dropped or repointed at the underlay NIC is a total
+        // outbound bypass. Passing the egress interface as forbidden makes that
+        // case name itself instead of reading as a generic LUID mismatch.
+        if !rustynet_windows_native::wfp_tunnel_permit_present(
+            self.interface_name.as_str(),
+            &[self.egress_interface.as_str()],
+        )
+        .map_err(|err| {
             SystemError::KillSwitchAssertionFailed(format!(
                 "Windows WFP tunnel-permit verification failed: {err}"
             ))

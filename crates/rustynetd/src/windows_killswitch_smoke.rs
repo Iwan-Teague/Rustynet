@@ -289,6 +289,9 @@ pub fn run_windows_killswitch_smoke(
     // Loopback resolver bind addr is only consulted by DNS protection (unused
     // here) but the constructor validates it must stay on loopback.
     let resolver_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 53));
+    // WIN-03: the WFP shape assertion needs both aliases, and `egress_interface`
+    // is moved into the system below.
+    let egress_alias = egress_interface.clone();
     let mut system = crate::phase10::WindowsCommandSystem::new(
         options.tunnel_name.clone(),
         egress_interface,
@@ -316,7 +319,8 @@ pub fn run_windows_killswitch_smoke(
     // panics, this restores the default allow-outbound policy + removes the WFP
     // permit so the guest is never left wedged behind the killswitch.
     let mut guard = FirewallRestoreGuard::armed();
-    let sequence = run_killswitch_sequence(&mut system, options, tunnel_started);
+    let sequence =
+        run_killswitch_sequence(&mut system, options, tunnel_started, egress_alias.as_str());
 
     // Always attempt teardown, regardless of the sequence outcome.
     match sequence {
@@ -349,6 +353,10 @@ fn run_killswitch_sequence(
     system: &mut crate::phase10::WindowsCommandSystem,
     options: &WindowsKillswitchSmokeOptions,
     tunnel_started: bool,
+    // WIN-03: the WFP shape assertion needs the underlay NIC alias to name a
+    // repointed LUID. It is resolved by the caller and moved into `system`, so
+    // it arrives here as its own parameter.
+    egress_alias: &str,
 ) -> Result<WindowsKillswitchSmokeSignals, String> {
     use crate::phase10::DataplaneSystem;
 
@@ -357,7 +365,8 @@ fn run_killswitch_sequence(
         ..Default::default()
     };
 
-    signals.permit_absent_before = !wfp_tunnel_permit_present()?;
+    signals.permit_absent_before =
+        !wfp_tunnel_permit_present(options.tunnel_name.as_str(), egress_alias)?;
 
     system
         .apply_firewall_killswitch()
@@ -367,7 +376,8 @@ fn run_killswitch_sequence(
     // assert_killswitch is a posture *query*, not a control mutation — a failed
     // assertion is a recorded signal, not a hard error (we still roll back).
     signals.asserted_active = system.assert_killswitch().is_ok();
-    signals.permit_present_under_killswitch = wfp_tunnel_permit_present()?;
+    signals.permit_present_under_killswitch =
+        wfp_tunnel_permit_present(options.tunnel_name.as_str(), egress_alias)?;
 
     // N3 — DNS fail-closed in protected mode: while the killswitch is active,
     // exercise the netsh port-53 LAN-block. Block rules override the killswitch's
@@ -419,7 +429,8 @@ fn run_killswitch_sequence(
         .map_err(|err| format!("rollback_firewall failed: {err:?}"))?;
     signals.rolled_back = true;
     signals.asserted_inactive_after_rollback = system.assert_killswitch().is_err();
-    signals.permit_absent_after_rollback = !wfp_tunnel_permit_present()?;
+    signals.permit_absent_after_rollback =
+        !wfp_tunnel_permit_present(options.tunnel_name.as_str(), egress_alias)?;
 
     if options.exercise_full_block {
         signals.full_block_exercised = true;
@@ -428,7 +439,8 @@ fn run_killswitch_sequence(
             .map_err(|err| format!("block_all_egress failed: {err:?}"))?;
         signals.full_block_applied = true;
         // The fail-closed proof: full block must leave NO tunnel egress permit.
-        signals.full_block_permit_removed = !wfp_tunnel_permit_present()?;
+        signals.full_block_permit_removed =
+            !wfp_tunnel_permit_present(options.tunnel_name.as_str(), egress_alias)?;
         system
             .rollback_firewall()
             .map_err(|err| format!("post-block rollback_firewall failed: {err:?}"))?;
@@ -439,8 +451,11 @@ fn run_killswitch_sequence(
 }
 
 #[cfg(windows)]
-fn wfp_tunnel_permit_present() -> Result<bool, String> {
-    rustynet_windows_native::wfp_tunnel_permit_present()
+fn wfp_tunnel_permit_present(tunnel_alias: &str, egress_alias: &str) -> Result<bool, String> {
+    // WIN-03: presence alone is not the signal. Assert the filter is a
+    // tunnel-scoped hard permit, and name the underlay NIC as forbidden so a
+    // repointed LUID reports itself rather than reading as a generic mismatch.
+    rustynet_windows_native::wfp_tunnel_permit_present(tunnel_alias, &[egress_alias])
         .map_err(|err| format!("WFP tunnel-permit presence check failed: {err}"))
 }
 

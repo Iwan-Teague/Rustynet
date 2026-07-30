@@ -221,7 +221,10 @@ pub fn remove_wfp_tunnel_permit() -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-pub fn wfp_tunnel_permit_present() -> Result<bool, String> {
+pub fn wfp_tunnel_permit_present(
+    _tunnel_interface_alias: &str,
+    _forbidden_interface_aliases: &[&str],
+) -> Result<bool, String> {
     Err("WFP killswitch filters are only available on Windows hosts".to_owned())
 }
 
@@ -1736,32 +1739,466 @@ mod imp {
         result
     }
 
-    /// True if BOTH RustyNet WFP tunnel-permit filters (IPv4 + IPv6) are present.
-    /// Used by the killswitch assertion to confirm the tunnel can still egress
-    /// through the killswitch. A missing filter fails safe (the tunnel is
-    /// blocked), but a correct "killswitch active" check should catch it.
-    pub fn wfp_tunnel_permit_present() -> Result<bool, String> {
+    /// `GUID` -> `u128`, the exact inverse of `GUID::from_u128`.
+    ///
+    /// `windows_sys` provides `from_u128` but no `to_u128`, so the read-back
+    /// path needs this to hand a plain integer to the portable validator. It is
+    /// `const` so the drift pins below can call it at compile time, and so that
+    /// there is exactly ONE conversion -- a second copy for the pins would be
+    /// free to disagree with the one the read-back actually uses, which is the
+    /// only way the pins could pass while the comparison was wrong.
+    const fn guid_to_u128(guid: &GUID) -> u128 {
+        ((guid.data1 as u128) << 96)
+            | ((guid.data2 as u128) << 80)
+            | ((guid.data3 as u128) << 64)
+            | (u64::from_be_bytes(guid.data4) as u128)
+    }
+
+    // Drift pins. The portable validator restates these constants as plain
+    // integers so it compiles off-Windows; if `windows_sys` ever disagrees, the
+    // Windows build must FAIL rather than silently compare against a stale
+    // value. A wrong GUID here would make the shape check vacuous.
+    const _: () = assert!(
+        guid_to_u128(&FWPM_CONDITION_IP_LOCAL_INTERFACE)
+            == crate::wfp_filter_shape::CONDITION_IP_LOCAL_INTERFACE
+    );
+    const _: () = assert!(FWP_ACTION_PERMIT == crate::wfp_filter_shape::ACTION_PERMIT);
+    const _: () = assert!(FWP_UINT64 == crate::wfp_filter_shape::DATA_TYPE_UINT64);
+    const _: () = assert!(FWP_MATCH_EQUAL == crate::wfp_filter_shape::MATCH_EQUAL);
+
+    /// Read one RustyNet WFP filter back and reduce it to plain values.
+    ///
+    /// Returns `Ok(None)` when the filter is absent. Every pointer the engine
+    /// hands back is dereferenced only after a null check; the LUID in
+    /// particular is modelled by `windows_sys` as `*mut u64`, so a filter whose
+    /// pointer is null must be reported as malformed rather than read.
+    fn wfp_read_filter_shape(
+        engine: HANDLE,
+        filter_key: &GUID,
+    ) -> Result<Option<crate::wfp_filter_shape::WfpFilterShape>, String> {
+        let mut filter: *mut FWPM_FILTER0 = null_mut();
+        let status = unsafe { FwpmFilterGetByKey0(engine, filter_key, &mut filter) };
+        if status == FWP_E_FILTER_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(format!("FwpmFilterGetByKey0 failed with {status}"));
+        }
+        if filter.is_null() {
+            return Err("FwpmFilterGetByKey0 succeeded but returned a null filter".to_owned());
+        }
+        let shape = (|| -> Result<crate::wfp_filter_shape::WfpFilterShape, String> {
+            let filter_ref = unsafe { &*filter };
+            let count = filter_ref.numFilterConditions as usize;
+            // A non-zero count with a null array is malformed; refuse to read it
+            // rather than treating it as "no conditions", which would look like
+            // the benign case while being the dangerous one.
+            if count > 0 && filter_ref.filterCondition.is_null() {
+                return Err(
+                    "WFP filter declares conditions but its condition array is null".to_owned(),
+                );
+            }
+            // Bound the walk. A corrupt count must not turn into a wild read;
+            // the filter this code owns has exactly one condition, and anything
+            // beyond a handful is already a validation failure.
+            const MAX_CONDITIONS: usize = 16;
+            let mut conditions = Vec::new();
+            for index in 0..count.min(MAX_CONDITIONS) {
+                let condition = unsafe { &*filter_ref.filterCondition.add(index) };
+                // `uint64` is a POINTER in this union. Read it only when the
+                // declared type says it is a uint64 and the pointer is real.
+                let uint64_value = if condition.conditionValue.r#type == FWP_UINT64 {
+                    let pointer = unsafe { condition.conditionValue.Anonymous.uint64 };
+                    if pointer.is_null() {
+                        return Err(
+                            "WFP condition declares FWP_UINT64 but its value pointer is null"
+                                .to_owned(),
+                        );
+                    }
+                    unsafe { *pointer }
+                } else {
+                    0
+                };
+                conditions.push(crate::wfp_filter_shape::WfpConditionShape {
+                    field_key: guid_to_u128(&condition.fieldKey),
+                    match_type: condition.matchType,
+                    value_type: condition.conditionValue.r#type,
+                    uint64_value,
+                });
+            }
+            // Preserve the true count so a corrupt/oversized one still fails the
+            // exactly-one-condition check instead of being silently truncated
+            // to a passing shape.
+            if count > MAX_CONDITIONS {
+                conditions.truncate(0);
+                for _ in 0..count {
+                    conditions.push(crate::wfp_filter_shape::WfpConditionShape {
+                        field_key: 0,
+                        match_type: 0,
+                        value_type: 0,
+                        uint64_value: 0,
+                    });
+                }
+            }
+            Ok(crate::wfp_filter_shape::WfpFilterShape {
+                action_type: filter_ref.action.r#type,
+                conditions,
+            })
+        })();
+        // FwpmFilterGetByKey0 allocates the returned filter; free it either way.
+        let mut freeable = filter as *mut c_void;
+        unsafe { FwpmFreeMemory0(&mut freeable) };
+        shape.map(Some)
+    }
+
+    /// True if BOTH RustyNet WFP tunnel-permit filters (IPv4 + IPv6) are present
+    /// AND are genuinely tunnel-scoped hard permits.
+    ///
+    /// # WIN-03
+    ///
+    /// This used to treat any status other than `FWP_E_FILTER_NOT_FOUND` as
+    /// proof the killswitch was intact, without looking at what the filter DID.
+    /// These filters are hard permits (`CLEAR_ACTION_RIGHT`) in a max-weight
+    /// sublayer, built specifically to WIN arbitration against the
+    /// default-block-outbound policy — so a filter tampered to drop its
+    /// interface condition, or to repoint its LUID at the underlay NIC, is a
+    /// total outbound bypass that the old check reported as healthy.
+    ///
+    /// `tunnel_interface_alias` is resolved to a LUID and the read-back
+    /// condition must equal it. `forbidden_interface_aliases` — the underlay
+    /// egress NIC — are resolved too, and a filter permitting one of those is
+    /// reported by name rather than as a generic mismatch.
+    ///
+    /// A missing filter still returns `Ok(false)` (the tunnel is blocked, which
+    /// fails safe); a filter present but malformed is an `Err`, because that is
+    /// an active bypass and must never be mistaken for the safe case.
+    pub fn wfp_tunnel_permit_present(
+        tunnel_interface_alias: &str,
+        forbidden_interface_aliases: &[&str],
+    ) -> Result<bool, String> {
+        let expected_luid = interface_alias_to_luid(tunnel_interface_alias)?;
+        // A forbidden alias that cannot be resolved is not fatal: it may simply
+        // not exist on this host. Skipping it only forgoes the more specific
+        // error message; the LUID equality check below still rejects the filter.
+        let forbidden: Vec<(u64, &str)> = forbidden_interface_aliases
+            .iter()
+            .filter_map(|alias| {
+                interface_alias_to_luid(alias)
+                    .ok()
+                    .map(|luid| (luid, *alias))
+            })
+            .collect();
+
         let engine = wfp_engine_open()?;
         let result = (|| -> Result<bool, String> {
             for filter_key in [RUSTYNET_WFP_FILTER_V4_KEY, RUSTYNET_WFP_FILTER_V6_KEY] {
-                let mut filter: *mut FWPM_FILTER0 = null_mut();
-                let status = unsafe { FwpmFilterGetByKey0(engine, &filter_key, &mut filter) };
-                if status == FWP_E_FILTER_NOT_FOUND {
+                let Some(shape) = wfp_read_filter_shape(engine, &filter_key)? else {
                     return Ok(false);
-                }
-                if status != 0 {
-                    return Err(format!("FwpmFilterGetByKey0 failed with {status}"));
-                }
-                // FwpmFilterGetByKey0 allocates the returned filter; free it.
-                if !filter.is_null() {
-                    let mut freeable = filter as *mut c_void;
-                    unsafe { FwpmFreeMemory0(&mut freeable) };
-                }
+                };
+                crate::wfp_filter_shape::validate_tunnel_permit_shape(
+                    &shape,
+                    expected_luid,
+                    &forbidden,
+                )
+                .map_err(|err| err.to_string())?;
             }
             Ok(true)
         })();
         unsafe { FwpmEngineClose0(engine) };
         result
+    }
+}
+
+/// Portable validation of a read-back WFP filter's SHAPE.
+///
+/// # WIN-03
+///
+/// `wfp_tunnel_permit_present` used to call `FwpmFilterGetByKey0` and treat any
+/// status other than `FWP_E_FILTER_NOT_FOUND` as proof the killswitch was
+/// intact. It never looked at what the filter DID. That matters more here than
+/// for a mere presence check elsewhere, because this filter is a hard-permit
+/// (`FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`) in a max-weight sublayer: it is
+/// specifically built to WIN arbitration against the default-block-outbound
+/// policy. A filter tampered to drop its interface condition, or to point its
+/// LUID at the physical NIC, becomes a full outbound bypass that this assertion
+/// reported as a healthy killswitch.
+///
+/// # Why the decision logic lives out here
+///
+/// The FFI read-back is necessarily `#[cfg(windows)]`, and the Windows CI leg
+/// gates only a package subset while macOS and Debian never compile this file at
+/// all. Logic embedded in the unsafe shim would therefore ship with its only
+/// test coverage on one CI leg. Marshalling stays in the shim; every judgement
+/// is made here, on plain values, under tests that run on every platform.
+pub mod wfp_filter_shape {
+    /// `FWPM_CONDITION_IP_LOCAL_INTERFACE` as a `u128`.
+    ///
+    /// Duplicated as a plain integer so this module compiles off-Windows. The
+    /// Windows build pins it against the real `windows_sys` constant with a
+    /// `const` assertion, so a drift breaks the build rather than silently
+    /// comparing against the wrong GUID.
+    pub const CONDITION_IP_LOCAL_INTERFACE: u128 = 0x4cd6_2a49_59c3_4969_b7f3_bda5_d328_90a4;
+    /// `FWP_ACTION_PERMIT`.
+    pub const ACTION_PERMIT: u32 = 4098;
+    /// `FWP_UINT64` — the data type an interface-LUID condition must carry.
+    pub const DATA_TYPE_UINT64: i32 = 4;
+    /// `FWP_MATCH_EQUAL`.
+    pub const MATCH_EQUAL: i32 = 0;
+
+    /// One condition of a read-back filter, as plain values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WfpConditionShape {
+        /// `FWPM_FILTER_CONDITION0::fieldKey`, as a `u128`.
+        pub field_key: u128,
+        /// `FWPM_FILTER_CONDITION0::matchType`.
+        pub match_type: i32,
+        /// `FWPM_FILTER_CONDITION0::conditionValue::type`.
+        pub value_type: i32,
+        /// The `uint64` payload, when `value_type` is [`DATA_TYPE_UINT64`].
+        pub uint64_value: u64,
+    }
+
+    /// A read-back filter, as plain values.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct WfpFilterShape {
+        /// `FWPM_FILTER0::action::type`.
+        pub action_type: u32,
+        /// Every condition on the filter, in order.
+        pub conditions: Vec<WfpConditionShape>,
+    }
+
+    /// Why a read-back filter is not the tunnel-permit it should be.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum WfpShapeError {
+        /// The action is not `FWP_ACTION_PERMIT`.
+        NotPermit { action_type: u32 },
+        /// Not exactly one condition. Zero conditions is the dangerous case: a
+        /// hard-permit with no condition permits ALL outbound traffic.
+        WrongConditionCount { count: usize },
+        /// The single condition does not key on the local interface.
+        WrongFieldKey { field_key: u128 },
+        /// The condition is not an equality match on a `uint64`.
+        WrongConditionValueEncoding { match_type: i32, value_type: i32 },
+        /// The LUID does not match the tunnel.
+        LuidMismatch { found: u64, expected: u64 },
+        /// The LUID matches an interface known NOT to be the tunnel.
+        LuidIsNotTunnel { found: u64, interface: String },
+    }
+
+    impl std::fmt::Display for WfpShapeError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::NotPermit { action_type } => write!(
+                    f,
+                    "WFP tunnel-permit filter action is {action_type}, expected \
+                     FWP_ACTION_PERMIT ({ACTION_PERMIT})"
+                ),
+                Self::WrongConditionCount { count } => write!(
+                    f,
+                    "WFP tunnel-permit filter has {count} conditions, expected exactly 1; a \
+                     hard-permit with no interface condition permits ALL outbound traffic"
+                ),
+                Self::WrongFieldKey { field_key } => write!(
+                    f,
+                    "WFP tunnel-permit filter condition keys on {field_key:#034x}, expected \
+                     FWPM_CONDITION_IP_LOCAL_INTERFACE"
+                ),
+                Self::WrongConditionValueEncoding {
+                    match_type,
+                    value_type,
+                } => write!(
+                    f,
+                    "WFP tunnel-permit condition is match_type={match_type} value_type=\
+                     {value_type}, expected FWP_MATCH_EQUAL on FWP_UINT64"
+                ),
+                Self::LuidMismatch { found, expected } => write!(
+                    f,
+                    "WFP tunnel-permit filter permits interface LUID {found}, expected the \
+                     tunnel's {expected}"
+                ),
+                Self::LuidIsNotTunnel { found, interface } => write!(
+                    f,
+                    "WFP tunnel-permit filter permits interface LUID {found}, which resolves \
+                     to {interface} rather than the tunnel"
+                ),
+            }
+        }
+    }
+
+    /// Validate that a read-back filter really is a tunnel-scoped hard permit.
+    ///
+    /// `forbidden_luids` names interfaces that must never be the permitted one —
+    /// the underlay egress NIC above all. A filter whose LUID resolves there is
+    /// an outbound bypass wearing the tunnel-permit's GUID, and is reported
+    /// distinctly from a plain mismatch so the alarm names the actual hazard.
+    ///
+    /// Checks are ordered from most to least specific so the error names the real
+    /// problem rather than a downstream symptom of it.
+    pub fn validate_tunnel_permit_shape(
+        shape: &WfpFilterShape,
+        expected_tunnel_luid: u64,
+        forbidden_luids: &[(u64, &str)],
+    ) -> Result<(), WfpShapeError> {
+        if shape.action_type != ACTION_PERMIT {
+            return Err(WfpShapeError::NotPermit {
+                action_type: shape.action_type,
+            });
+        }
+        if shape.conditions.len() != 1 {
+            return Err(WfpShapeError::WrongConditionCount {
+                count: shape.conditions.len(),
+            });
+        }
+        let condition = shape.conditions[0];
+        if condition.field_key != CONDITION_IP_LOCAL_INTERFACE {
+            return Err(WfpShapeError::WrongFieldKey {
+                field_key: condition.field_key,
+            });
+        }
+        if condition.match_type != MATCH_EQUAL || condition.value_type != DATA_TYPE_UINT64 {
+            return Err(WfpShapeError::WrongConditionValueEncoding {
+                match_type: condition.match_type,
+                value_type: condition.value_type,
+            });
+        }
+        // Name the hazard before the generic mismatch: "this permits your WAN
+        // NIC" is actionable in a way "LUID differs" is not.
+        if let Some((luid, interface)) = forbidden_luids
+            .iter()
+            .find(|(luid, _)| *luid == condition.uint64_value)
+        {
+            return Err(WfpShapeError::LuidIsNotTunnel {
+                found: *luid,
+                interface: (*interface).to_owned(),
+            });
+        }
+        if condition.uint64_value != expected_tunnel_luid {
+            return Err(WfpShapeError::LuidMismatch {
+                found: condition.uint64_value,
+                expected: expected_tunnel_luid,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const TUNNEL_LUID: u64 = 0x0000_0006_0000_0018;
+        const WAN_LUID: u64 = 0x0000_0006_0000_0002;
+
+        fn tunnel_permit() -> WfpFilterShape {
+            WfpFilterShape {
+                action_type: ACTION_PERMIT,
+                conditions: vec![WfpConditionShape {
+                    field_key: CONDITION_IP_LOCAL_INTERFACE,
+                    match_type: MATCH_EQUAL,
+                    value_type: DATA_TYPE_UINT64,
+                    uint64_value: TUNNEL_LUID,
+                }],
+            }
+        }
+
+        #[test]
+        fn the_real_tunnel_permit_validates() {
+            validate_tunnel_permit_shape(&tunnel_permit(), TUNNEL_LUID, &[(WAN_LUID, "Ethernet")])
+                .expect("the filter the daemon installs must satisfy its own assertion");
+        }
+
+        /// The dangerous shape: a hard permit with NO interface condition. In a
+        /// max-weight sublayer with CLEAR_ACTION_RIGHT this permits all outbound
+        /// traffic and overrides the default-block policy -- and the old
+        /// existence-only check reported the killswitch intact.
+        #[test]
+        fn an_unconditional_hard_permit_is_rejected() {
+            let mut shape = tunnel_permit();
+            shape.conditions.clear();
+            assert_eq!(
+                validate_tunnel_permit_shape(&shape, TUNNEL_LUID, &[]),
+                Err(WfpShapeError::WrongConditionCount { count: 0 })
+            );
+        }
+
+        /// A second condition changes the match semantics: WFP ANDs conditions
+        /// on different fields but ORs conditions on the SAME field, so an added
+        /// interface condition widens the permit rather than narrowing it.
+        #[test]
+        fn an_extra_condition_is_rejected() {
+            let mut shape = tunnel_permit();
+            shape.conditions.push(WfpConditionShape {
+                field_key: CONDITION_IP_LOCAL_INTERFACE,
+                match_type: MATCH_EQUAL,
+                value_type: DATA_TYPE_UINT64,
+                uint64_value: WAN_LUID,
+            });
+            assert_eq!(
+                validate_tunnel_permit_shape(&shape, TUNNEL_LUID, &[(WAN_LUID, "Ethernet")]),
+                Err(WfpShapeError::WrongConditionCount { count: 2 })
+            );
+        }
+
+        /// The LUID repointed at the underlay NIC: a total outbound bypass
+        /// wearing the tunnel-permit's own GUID.
+        #[test]
+        fn a_luid_pointing_at_the_underlay_nic_is_named_as_such() {
+            let mut shape = tunnel_permit();
+            shape.conditions[0].uint64_value = WAN_LUID;
+            assert_eq!(
+                validate_tunnel_permit_shape(&shape, TUNNEL_LUID, &[(WAN_LUID, "Ethernet")]),
+                Err(WfpShapeError::LuidIsNotTunnel {
+                    found: WAN_LUID,
+                    interface: "Ethernet".to_owned(),
+                })
+            );
+        }
+
+        #[test]
+        fn every_other_tampered_field_is_rejected() {
+            // Action flipped to BLOCK (4097) -- or anything but PERMIT.
+            let mut action = tunnel_permit();
+            action.action_type = 4097;
+            assert_eq!(
+                validate_tunnel_permit_shape(&action, TUNNEL_LUID, &[]),
+                Err(WfpShapeError::NotPermit { action_type: 4097 })
+            );
+
+            // Condition rekeyed to some other field: no longer interface-scoped.
+            let mut field = tunnel_permit();
+            field.conditions[0].field_key = 0xdead_beef;
+            assert_eq!(
+                validate_tunnel_permit_shape(&field, TUNNEL_LUID, &[]),
+                Err(WfpShapeError::WrongFieldKey {
+                    field_key: 0xdead_beef
+                })
+            );
+
+            // A non-equality match, or a non-uint64 payload, means the LUID
+            // comparison below would be reading a value that is not a LUID.
+            for (match_type, value_type) in [(1, DATA_TYPE_UINT64), (MATCH_EQUAL, 0)] {
+                let mut encoding = tunnel_permit();
+                encoding.conditions[0].match_type = match_type;
+                encoding.conditions[0].value_type = value_type;
+                assert_eq!(
+                    validate_tunnel_permit_shape(&encoding, TUNNEL_LUID, &[]),
+                    Err(WfpShapeError::WrongConditionValueEncoding {
+                        match_type,
+                        value_type
+                    })
+                );
+            }
+
+            // An unrelated LUID: not the tunnel, not a known forbidden NIC.
+            let mut stray = tunnel_permit();
+            stray.conditions[0].uint64_value = 0x1234;
+            assert_eq!(
+                validate_tunnel_permit_shape(&stray, TUNNEL_LUID, &[(WAN_LUID, "Ethernet")]),
+                Err(WfpShapeError::LuidMismatch {
+                    found: 0x1234,
+                    expected: TUNNEL_LUID,
+                })
+            );
+        }
     }
 }
 
