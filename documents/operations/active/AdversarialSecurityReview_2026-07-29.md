@@ -687,6 +687,18 @@ Crate baseline: `crates/rustynet-crypto/src/lib.rs`, 2708 lines; deps are vetted
 Scope: `KeyCustodyManager` + `OsStoreFallbackPolicy`, the Argon2id/XChaCha20-Poly1305 key envelope and its on-disk framing, `aead_seal`/`aead_open`, `AlgorithmPolicy`/`CompatibilityException`, `SigningProviderPolicy` + provider attestation, `SecretKey`/`NodeKeyPair` hygiene, and `validate_key_custody_permissions`; plus the production call sites in `rustynetd/src/key_material.rs`, `rustynet-cli`, `rustynet-nas`, and `rustynet-windows-trust-cli`
 Out of scope for this part: the vendored boringtun Noise implementation, and the macOS `security` CLI argv exposure already tracked as RSA-0004
 
+> ## ✅ CRY-06, CRY-10, CRY-11 and CRY-12 are FIXED — `49a5652a`, corrections in `0742cb0c`
+>
+> Mutation-verified: CRY-06 (full-key compare, plus the all-zeros branch's one
+> decisive case) and CRY-11 (source-pinned) are caught. **CRY-12's test does not
+> discriminate on a 64-bit host** — `ciphertext_len` comes from a `u32`, so the
+> addition cannot overflow a 64-bit `usize`; the overflow is reachable only where
+> `usize` is 32-bit, and the test's own doc comment says so.
+>
+> CRY-06 also **broke a production binary** on landing — see the correction in the
+> finding below. Still open here: CRY-01, CRY-02, CRY-03, CRY-04, CRY-05, CRY-07,
+> CRY-08, CRY-09.
+
 ## 7. Prior coverage — this crate is already well audited
 
 **Read this before treating anything below as new.** Unlike Part I's area, this
@@ -972,8 +984,15 @@ key the holder does not control. The all-zeros check is largely security theatre
 — it rejects one degenerate encoding while other small-order and non-canonical
 encodings pass, and for a dalek seed any nonzero 32 bytes is "valid."
 
-Severity is held at *Medium-if-used* because **there is no non-test consumer** of
-`from_raw` — it is dead public API. The correct shape already exists in the same
+Severity was originally held at *Medium-if-used* on the grounds that there is "no
+non-test consumer" of `from_raw`. **That was wrong — corrected 2026-07-30.**
+`rustynet-control/src/main.rs:37` is a production caller, and it passed a
+*non-corresponding* pair, so when the fix landed the binary failed at startup with
+`weak key material` (repaired in `e3adf9c1` by deriving the public key). The lesson
+is procedural: a finding that rests on "no production caller" must have that grep
+re-run at fix time, because every other gate missed it — fmt, clippy, a workspace
+check and ~2,400 tests were all green while a shipped binary was broken.
+`cargo check` compiles a binary but never runs it. The correct shape already exists in the same
 file: `Ed25519SigningProvider::from_seed` (`:1128-1142`) takes only the seed and
 derives the verifying key, making mismatch structurally impossible.
 

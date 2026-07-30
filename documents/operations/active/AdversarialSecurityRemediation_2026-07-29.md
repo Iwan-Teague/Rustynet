@@ -48,7 +48,25 @@ and correct.
 
 ---
 
-## 0. Status — six entries are DONE
+## 0. Status — twelve entries are DONE
+
+**Round 2 (2026-07-30):** CRY-06, CRY-10, CRY-11, CRY-12, POL-03 and ENR-08 landed
+in `49a5652a`, with review corrections in `0742cb0c` and a scaffold repair in
+`e3adf9c1`. Three lessons from that round, all of which generalise:
+
+1. **A fix can introduce a worse defect than it closes.** ENR-08's size cap was
+   enforced on read but not on write, and the ledger is grow-only (RN-26 no-op), so
+   at ~31,775 tokens the daemon would have written a file it then refused to load —
+   an unrecoverable enrollment outage whose only recovery reopens replay. Caught by
+   review, fixed by capping the write side too.
+2. **`cargo check --workspace` does not run binaries.** CRY-06 broke
+   `rustynet-control`'s startup, and fmt, clippy, a workspace check and ~2,400
+   passing tests were all green. Run the workspace's binaries after touching a
+   shared constructor or validator.
+3. **Tests derived from a constant follow it when mutated.** This bit both rounds.
+   Where the constant *is* the control, pin it with a literal.
+
+**Round 1:** RLY-01, RLY-02, RLY-04, RLY-05, RLY-10 and RLY-11 landed in `1c44ed3f`.
 
 **RLY-01, RLY-02, RLY-04, RLY-05, RLY-10, RLY-11** were implemented in commit
 `1c44ed3f` and are no longer starting notes. Their rows below are marked **DONE**.
@@ -93,7 +111,18 @@ A remediation doc invites someone to implement an entry without reading the cave
 
 Worth reading before the dictionary. Each looks like a single change that resolves several findings, and three of them would convert currently-silent failures into detectable ones. These groupings came out of the adversarial passes rather than from reading one finding in isolation, so they are the most reliable content here — but they are still unbuilt.
 
-### S1 — Bound `ManagementCidr::from_str` · closes **PF-02, WIN-05**, and the Linux nft twin · looked **S** · test first
+### S1 — Bound `ManagementCidr::from_str` · **RECLASSIFIED: DECISION, not a safe fix** · closes **PF-02, WIN-05**, and the Linux nft twin
+
+> **Corrected 2026-07-30.** This entry previously read "test first" and asserted a
+> width floor "false-rejects nothing real". That is **wrong**, and it was checked
+> before implementing rather than after. `phase10.rs:1205-1213` documents allowing
+> SSH from anywhere (`0.0.0.0/0`) as *"reachable in production"* — a
+> route-assertion bug was fixed specifically to make that configuration work — and
+> `ipc.rs:473` asserts `validate_cidr("0.0.0.0/0")` is valid. Rejecting prefix 0
+> would break a configuration this repo deliberately accommodates, and prefix 0 is
+> the whole finding, so the two cannot be reconciled by choosing a gentler floor.
+> **An owner must decide** whether unrestricted management SSH remains supported.
+> Everything below is the original text, kept for the reasoning.
 
 One unbounded validator produces the same unrestricted TCP/22 egress hole on **three** backends (macOS pf, Linux nftables, Windows netsh). Add a width floor or private/CGNAT/ULA containment, mirroring `macos_pf_mesh_cidr::validate_mesh_egress_source_cidr` — whose doc comment already spells out the reasoning verbatim. Fixing at `from_str` is the only placement that cannot drift between platforms. Management CIDRs are bounded operator networks by definition, so this false-rejects nothing real.
 
@@ -129,7 +158,7 @@ Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`
 |---|---|---|---|---|
 | POL-01 | Selector prefix allowlist fails open on its miss branch; unrecognised/mis-cased prefixes skip revocation | Invert the default: parse every selector into a recognised, canonicalised kind and **deny anything unparseable**; treat a non-conforming selector as a policy *load* error, not a runtime allow | M | test first |
 | POL-02 | Raw CIDR dst plus `user:local` resolving only to the local node means two route paths validate no remote peer | Give literal destinations a selector kind that resolves to the owning node's membership status; stop using one `user:local` constant as `src` for decisions whose subject is a remote peer | M | DECISION |
-| POL-03 | Empty string is a valid, ungated, `*`-matching identity | Reject empty selectors at construction in both rules and requests | XS | — |
+| POL-03 | Empty string is a valid, ungated, `*`-matching identity | Reject empty selectors at construction in both rules and requests | XS | **DONE** `49a5652a` + `0742cb0c` |
 | POL-04 | The gate never binds a selector to the *requesting* peer | Pass the requester's verified identity into evaluation and require the matched selector to be one the peer holds | L | DECISION |
 | POL-05 | Scope absence = maximum privilege, reached silently by three paths | Make absence deny: `ScopeTable::Loaded \| Unavailable` where `Unavailable` denies; fail closed on read error; reject malformed numerics instead of `.ok()` | M | **DECISION** — see §1 |
 | POL-06 | Issuance membership gate is unconditionally inert (directory never installed) | Install the directory at the three `ControlPlaneCore::new` sites, or make `ControlPlaneCore` refuse to issue without one | S | test first |
@@ -151,13 +180,13 @@ Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`
 | CRY-03 | 16-char passphrase floor with no entropy requirement; Argon2 params not stored in the blob | Store `(algorithm, version, m, t, p)` in the envelope so cost can be raised migration-safely; raise the passphrase floor given this string bounds at-rest security | M | test first |
 | CRY-04 | v0/v1 framing ambiguity renders ~99.6% of legacy blobs undecodable | **Land the regression test only** (hand-build a v0 blob, assert it decodes). The framing fix is deferred by decision | S | **GATED** — see §1 |
 | CRY-05 | Windows permission validation is an `Ok(())` no-op, both directions | **See S5.** Also apply a DACL at write time on non-unix rather than inheriting | XS | — |
-| CRY-06 | `NodeKeyPair::from_raw` never verifies pub/priv correspondence | Delete it (dead public API), or make it take a seed and derive the public key, as `from_seed` already does | XS | — |
+| CRY-06 | `NodeKeyPair::from_raw` never verifies pub/priv correspondence | Delete it (dead public API), or make it take a seed and derive the public key, as `from_seed` already does | XS | **DONE** `49a5652a` — also fixed a scaffold it broke (`e3adf9c1`) |
 | CRY-07 | Unix permission validator checks modes but not ownership | Add a uid check, matching the pattern `ops_peer_store.rs` is audited PASS for; optionally `O_NOFOLLOW` + `fstat` for the TOCTOU | S | — |
 | CRY-08 | `with_exceptions` rejects all non-empty lists, making the denylist loop dead | **Comment only** — state that exceptions are administratively disabled by design, so nobody "repairs" the guard into a fail-open | XS | **DO-NOT-FIX** |
 | CRY-09 | Three security controls unwired; `release_manifest.rs` builds what the strict default forbids | Wire `validate_signing_provider_policy` into `release_manifest.rs` and accept a documented exception, or delete all three controls | M | DECISION |
-| CRY-10 | `aead_seal` doc claims OS-secure custody; production reads a raw key from a plain file | Correct the doc comment to describe the actual key sources | XS | — |
-| CRY-11 | `from_seed` never zeroizes its by-value seed parameter | Zeroize the parameter copy after `SigningKey::from_bytes` | XS | — |
-| CRY-12 | Blob length arithmetic unchecked — debug panic on 32-bit | `checked_add` / `saturating_add` before the equality compare; fold into whatever work first attempts the armv7 cross-build | XS | — |
+| CRY-10 | `aead_seal` doc claims OS-secure custody; production reads a raw key from a plain file | Correct the doc comment to describe the actual key sources | XS | **DONE** `49a5652a` |
+| CRY-11 | `from_seed` never zeroizes its by-value seed parameter | Zeroize the parameter copy after `SigningKey::from_bytes` | XS | **DONE** `49a5652a` — source-pinned; a stack wipe is not behaviourally testable |
+| CRY-12 | Blob length arithmetic unchecked — debug panic on 32-bit | `checked_add` / `saturating_add` before the equality compare; fold into whatever work first attempts the armv7 cross-build | XS | **DONE** `49a5652a` — test does not discriminate on 64-bit; see the code comment |
 
 ### Part III — macOS `pf` privileged boundary (PF)
 
@@ -257,7 +286,7 @@ Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`
 | ENR-05 | Role bridge drops 8/14 tokens to Client **and** grants `Anchor` from 4 tokens the canonical parser rejects | Delegate to `RoleCapability::parse` and return a typed error on any unrecognised token. **Also re-rate RSA-0015** — its "can only drop privilege" rationale is wrong in both directions | S | test first |
 | ENR-06 | A `--roles blind_exit` typo at admit is irreversible | Require an explicit `--confirm-irreversible` flag when the admit role set maps to `BlindExit`. **Do not** touch the reducer guard | S | **see §1** |
 | ENR-07 | On non-Unix the `<ledger>.lock` file wedges enrollment permanently after a crash | Use a real Windows file lock (`LockFileEx`), or stamp the lock with the owning PID and treat a dead owner as stale | S | test first |
-| ENR-08 | `load_ledger` lacks the permission gate and size cap that `load_secret` has | Apply the same group/world rejection and size cap | XS | — |
+| ENR-08 | `load_ledger` lacks the permission gate and size cap that `load_secret` has | Apply the same group/world rejection and size cap | XS | **DONE** `49a5652a` + `0742cb0c` — needed a write-side cap too; see §0 |
 | ENR-09 | The persisted single-use ledger has no MAC, generation, or anti-rollback | MAC the ledger with the enrollment secret and add a monotonic counter; deleting the file should not silently reset single-use state | M | DECISION |
 | ENR-10 | No rate limit or attempt counter on the consume path | Add an attempt budget; check the token HMAC **before** taking the exclusive ledger lock and reading the whole ledger | S | — |
 | ENR-11 | `purge_expired_against` is a genuine no-op | Implement the purge (RN-26); the ledger is currently grow-only | S | — |
