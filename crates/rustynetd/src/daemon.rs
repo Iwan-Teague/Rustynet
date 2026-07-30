@@ -4740,6 +4740,30 @@ impl DaemonRuntime {
         (state.to_owned(), record_count, error)
     }
 
+    /// Restore the pre-`LanAccessOn` state after a refused grant (POL-14).
+    ///
+    /// The LAN-access grant is a sequence of mutations followed by a
+    /// post-condition check (`ensure_lan_route_allowed` reads
+    /// `lan_access_enabled`, the advertised set, and the ACL), so the check
+    /// cannot run before the mutations and a denial has to be unwound instead of
+    /// prevented. This is the exact inverse of that sequence.
+    ///
+    /// Unwinding matters beyond the immediate response: the advertised set and
+    /// the ACL are durable controller state, so residue from a refused grant
+    /// would be visible to the NEXT evaluation of the same gate — a denial could
+    /// leave behind precisely the entries that make a later attempt succeed.
+    ///
+    /// `advertised_to` is `None` when no route was advertised yet, so this is
+    /// safe to call from any failure point in the sequence.
+    fn revert_lan_access_grant(&mut self, user: &str, cidr: &str, advertised_to: Option<&NodeId>) {
+        if let Some(node_id) = advertised_to {
+            self.controller.withdraw_lan_route(node_id, cidr);
+        }
+        self.controller.set_lan_route_acl(user, cidr, false);
+        self.controller.set_lan_access(false);
+        self.lan_access_enabled = false;
+    }
+
     fn dns_inspect_message(&self) -> String {
         let Some(envelope) = self.dns_zone.as_ref() else {
             if let Some(error) = self.dns_zone_error.as_deref() {
@@ -8002,28 +8026,105 @@ impl DaemonRuntime {
                 Err(err) => IpcResponse::err(err.to_string()),
             },
             IpcCommand::LanAccessOn => {
+                // POL-14: the ACL grant below used to be `let _ = ...`, so a
+                // DENIED grant enabled LAN access anyway. RSA-0007 routed that
+                // call through the membership-aware evaluator, which is
+                // load-bearing only where the Result is consumed -- here it was
+                // thrown away, so a revoked requester selector was denied by the
+                // evaluator and admitted by the daemon.
+                //
+                // `ensure_lan_route_allowed` is a POST-CONDITION check over
+                // `lan_access_enabled` + the advertised set + the ACL, so it
+                // cannot be hoisted above the mutations that establish those.
+                // Failing closed therefore means REVERTING them: every failure
+                // path below restores the pre-command state, so a refused grant
+                // leaves no residue for a later evaluation of the gate to find.
+                const LAN_ACCESS_USER: &str = "user:local";
+                const LAN_ACCESS_CIDR: &str = "192.168.1.0/24";
+
                 self.controller.set_lan_access(true);
                 self.lan_access_enabled = true;
-                if let Some(exit_node) = &self.selected_exit_node {
+                if let Some(exit_node) = self.selected_exit_node.clone() {
                     if self.membership_directory.node_status(exit_node.as_str())
                         != MembershipStatus::Active
                     {
+                        // Previously returned here having already set both
+                        // `set_lan_access(true)` and `self.lan_access_enabled`,
+                        // leaving LAN access live in memory on a denial.
+                        self.revert_lan_access_grant(LAN_ACCESS_USER, LAN_ACCESS_CIDR, None);
                         return IpcResponse::err(
                             "lan-access denied: selected exit node is not active in membership state",
                         );
                     }
                     self.controller
-                        .set_lan_route_acl("user:local", "192.168.1.0/24", true);
-                    if let Ok(node_id) = NodeId::new(exit_node.clone()) {
-                        self.controller
-                            .advertise_lan_route(node_id, "192.168.1.0/24");
-                    }
-                    let _ = self.controller.ensure_lan_route_allowed(RouteGrantRequest {
-                        user: "user:local".to_owned(),
-                        cidr: "192.168.1.0/24".to_owned(),
+                        .set_lan_route_acl(LAN_ACCESS_USER, LAN_ACCESS_CIDR, true);
+                    let advertised_to = match NodeId::new(exit_node.clone()) {
+                        Ok(node_id) => {
+                            self.controller
+                                .advertise_lan_route(node_id.clone(), LAN_ACCESS_CIDR);
+                            Some(node_id)
+                        }
+                        // An unusable exit-node id cannot be advertised to, so
+                        // the gate below can never pass. Fail closed here rather
+                        // than proceeding into a guaranteed denial.
+                        Err(err) => {
+                            self.revert_lan_access_grant(LAN_ACCESS_USER, LAN_ACCESS_CIDR, None);
+                            return IpcResponse::err(format!(
+                                "lan-access denied: selected exit node id is invalid: {err}"
+                            ));
+                        }
+                    };
+                    match self.controller.ensure_lan_route_allowed(RouteGrantRequest {
+                        user: LAN_ACCESS_USER.to_owned(),
+                        cidr: LAN_ACCESS_CIDR.to_owned(),
                         protocol: Protocol::Any,
                         context: TrafficContext::SharedExit,
-                    });
+                    }) {
+                        Ok(()) => {}
+                        // `ExitNotSelected` here is NOT an authorization denial.
+                        // It means the CONTROLLER holds no selected exit node
+                        // even though the daemon does -- the two are separate
+                        // fields, and the restore and auto-exit paths assign the
+                        // daemon's without calling `controller.set_exit_node`.
+                        // There is then no exit route to grant through, so there
+                        // is nothing to authorize and nothing that could leak.
+                        // The LAN-access toggle itself is still legitimate: the
+                        // daemon's own `if let Some(exit_node)` guard already
+                        // says the route grant applies only when an exit node is
+                        // selected.
+                        //
+                        // So withdraw the route-grant state -- it is unusable and
+                        // must not become residue -- keep the toggle, and warn,
+                        // because a divergence that used to be invisible behind
+                        // `let _ =` should be observable. Tracked as its own
+                        // finding; deliberately not repaired here, since the fix
+                        // belongs in the restore/auto-exit assignment paths.
+                        Err(crate::phase10::Phase10Error::ExitNotSelected) => {
+                            log::warn!(
+                                "lan-access: daemon has selected exit node {exit_node} but the \
+                                 dataplane controller does not; no LAN route granted"
+                            );
+                            if let Some(node_id) = advertised_to.as_ref() {
+                                self.controller.withdraw_lan_route(node_id, LAN_ACCESS_CIDR);
+                            }
+                            self.controller.set_lan_route_acl(
+                                LAN_ACCESS_USER,
+                                LAN_ACCESS_CIDR,
+                                false,
+                            );
+                        }
+                        // Every other error IS a denial -- LanAccessDenied covers
+                        // the ACL and the membership-aware policy evaluation --
+                        // so fail closed and revert everything.
+                        Err(err) => {
+                            self.revert_lan_access_grant(
+                                LAN_ACCESS_USER,
+                                LAN_ACCESS_CIDR,
+                                advertised_to.as_ref(),
+                            );
+                            return IpcResponse::err(format!("lan-access denied: {err}"));
+                        }
+                    }
                 }
                 if let Err(err) = self.persist_state() {
                     return IpcResponse::err(format!("persist failed: {err}"));
