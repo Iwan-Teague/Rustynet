@@ -61,6 +61,36 @@ const DEFAULT_LIVE_LAB_TIMEOUT_SECS: u64 = 86_400;
 const DEFAULT_PREFLIGHT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_COLLECT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
+/// Floor for a LOCAL `utmctl`/`ps` process probe, independent of the operator's
+/// discovery timeout.
+///
+/// The discovery timeout is one knob bounding two unrelated things: local process
+/// execs, and network probes to hosts that may be unreachable. Those want
+/// opposite values. A short budget is right for the network probe -- an
+/// unreachable host should fail fast, and it is load-bearing: raising the shared
+/// knob from 2s to 20s in one test took it from 6.6s to 55.7s, because the SSH
+/// probe then waits the full budget against a blackholed RFC 5737 address.
+///
+/// But the same short budget applied to a LOCAL exec makes it a real-time race.
+/// Under the workspace suite's global concurrent pool, merely spawning the probe
+/// can exceed two seconds, which is what made
+/// `execute_ops_vm_lab_discover_local_utm_updates_inventory_ip_even_when_ssh_unreachable`
+/// fail intermittently -- passing in isolation in 6.6s and failing once inside
+/// the full suite.
+///
+/// A floor here is free rather than merely cheap, and that was measured, not
+/// assumed: a timeout is an upper bound, so a probe that answers promptly returns
+/// just as fast. The `discover_local_utm` test group runs in the same wall-clock
+/// time with and without it (2:10 either way; three of those tests already exceed
+/// 60s each at baseline for unrelated reasons). It only stops scheduling delay
+/// from being read as a failed probe.
+const LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS: u64 = 20;
+
+/// Bound a local process probe, never tighter than
+/// [`LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS`].
+fn local_process_probe_timeout(operator_timeout: Duration) -> Duration {
+    operator_timeout.max(Duration::from_secs(LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS))
+}
 const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
 const WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS: u64 = 300;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
@@ -37180,7 +37210,7 @@ fn local_utm_process_present_with_utmctl_list(
     }
     let mut command = Command::new(utmctl_path);
     command.arg("list");
-    let output = run_output_with_timeout(&mut command, timeout)?;
+    let output = run_output_with_timeout(&mut command, local_process_probe_timeout(timeout))?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -37199,7 +37229,7 @@ fn local_utm_process_present_with_ps(
 ) -> Result<bool, String> {
     let mut command = Command::new(ps_path);
     command.args(["axww", "-o", "command"]);
-    let output = run_output_with_timeout(&mut command, timeout)?;
+    let output = run_output_with_timeout(&mut command, local_process_probe_timeout(timeout))?;
     if !output.status.success() {
         return Err(format!(
             "ps exited with status {}",
@@ -40008,7 +40038,8 @@ fn execute_bootstrap_phase_for_target(
 mod tests {
     use super::script_template;
     use super::{
-        DEFAULT_LIBVIRT_CONNECT_URI, DaemonProbe as _, DiscoveredGuest, LabHost, LabHostKind,
+        DEFAULT_LIBVIRT_CONNECT_URI, DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS, DaemonProbe as _,
+        DiscoveredGuest, LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS, LabHost, LabHostKind,
         LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary, LocalUtmReadyState,
         PlatformRollup, PortStatus, PreflightGate, PreflightStatus, ProbeState, RemoteExec as _,
         RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _,
@@ -40038,7 +40069,7 @@ mod tests {
         extract_ip_candidates_for_macs_from_ip_neigh_output, extract_ip_for_mac_from_arp_output,
         is_macos_metadata_artifact_name, libvirt_ready_state_reason_codes,
         live_lab_stage_forensics_notes, load_inventory, load_inventory_with_hosts,
-        load_live_lab_profile, local_utm_process_present_in_ps_output,
+        load_live_lab_profile, local_process_probe_timeout, local_utm_process_present_in_ps_output,
         local_utm_process_present_with_ps, mac_address_from_utm_config_plist,
         macos_peer_list_indicates_mesh_join, materialize_orchestration_staging_dir,
         normalize_mac_address, parse_libvirt_domifaddr_candidates, parse_libvirt_domiflist_macs,
@@ -44234,6 +44265,47 @@ mod tests {
                 .parent()
                 .expect("temp executable parent should exist"),
         );
+    }
+
+    /// A local process probe must not inherit the operator's short network
+    /// timeout, or spawning it becomes a real-time race under concurrency.
+    ///
+    /// This is the mechanism behind an intermittent failure of
+    /// `execute_ops_vm_lab_discover_local_utm_updates_inventory_ip_even_when_ssh_unreachable`:
+    /// it passed in isolation in 6.6s and failed once inside the full workspace
+    /// suite, where ~150 test binaries share one pool. The test sets a 2s
+    /// discovery timeout deliberately -- it points the SSH probe at a blackholed
+    /// RFC 5737 address, and raising the shared knob to 20s took the test from
+    /// 6.6s to 55.7s -- so the network side must stay short while the local side
+    /// must not.
+    #[test]
+    fn a_local_process_probe_timeout_is_never_tighter_than_the_floor() {
+        let floor = Duration::from_secs(LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS);
+
+        // A short operator timeout is raised to the floor: the network probe
+        // keeps the operator's value, the local exec does not.
+        for tight in [0u64, 1, 2, 3, 5, LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS - 1] {
+            assert_eq!(
+                local_process_probe_timeout(Duration::from_secs(tight)),
+                floor,
+                "a {tight}s operator timeout must not bound a local process spawn"
+            );
+        }
+
+        // A generous operator timeout is preserved, not clamped down to the
+        // floor -- the floor is a minimum, not an override.
+        for generous in [
+            LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS,
+            LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS + 1,
+            DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS,
+            600,
+        ] {
+            assert_eq!(
+                local_process_probe_timeout(Duration::from_secs(generous)),
+                Duration::from_secs(generous),
+                "an operator timeout above the floor must be preserved"
+            );
+        }
     }
 
     #[test]
