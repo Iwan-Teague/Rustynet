@@ -431,16 +431,26 @@ impl std::error::Error for EnrollmentSpoolError {}
 /// rejects fail-closed.
 const LEDGER_WIRE_VERSION: u8 = 1;
 
+/// Upper bound on the on-disk single-use ledger (ENR-08), enforced on **both**
+/// read and write so the daemon can never persist a ledger it will later refuse
+/// to load.
+///
+/// Each consumed entry is a 16-byte token id rendered as 32 hex characters plus a
+/// separator, i.e. 33 bytes, so this admits ~31.7k consumed tokens.
+///
+/// The write-side check is not optional. `purge_expired_against` is a documented
+/// no-op (RN-26), so the ledger is grow-only: a read-only cap would eventually
+/// reject a file the daemon itself wrote, aborting every subsequent redemption.
+/// That fails closed, but the only field recovery is deleting the ledger — which
+/// resets single-use enforcement and reopens replay for every consumed-but-
+/// unexpired token. Failing at write time instead keeps the failure actionable and
+/// never produces an unreadable file. Raising this bound is not the fix; landing
+/// RN-26's purge is.
+const MAX_LEDGER_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Read a consumed-token ledger from disk. Returns `Ok(default)`
 /// when the file is absent (fresh daemon). Returns
 /// `Err(Corrupt)` on any structural mismatch.
-/// Upper bound on the on-disk single-use ledger, checked before the file is read
-/// (ENR-08). Each consumed entry is a 32-byte hex token id plus a separator, so
-/// 1 MiB is far above any real ledger while bounding an O(1) rejection of a
-/// corrupt or hostile file. `purge_expired_against` is still a no-op (RN-26), so
-/// the ledger is grow-only and this is also the practical ceiling on that growth.
-const MAX_LEDGER_FILE_BYTES: u64 = 1024 * 1024;
-
 pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, EnrollmentSpoolError> {
     use std::fs;
     if !path.exists() {
@@ -455,6 +465,12 @@ pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, Enroll
     // oversized one was read entirely into memory before any validation.
     // `write_ledger` always writes 0o600, so a looser mode means something else
     // touched the file: fail closed so the operator notices.
+    //
+    // The permission half is `cfg(unix)` only, at exact parity with `load_secret`.
+    // That parity is deliberate, but it is also the same shape as CRY-05 /
+    // AUDIT-027 (a `cfg(not(unix))` path that validates nothing), and rustynetd
+    // ships a Windows service — so on Windows only the size bound below applies.
+    // Tracked with that finding rather than diverging from `load_secret` here.
     let metadata = fs::metadata(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
     if metadata.len() > MAX_LEDGER_FILE_BYTES {
         return Err(EnrollmentSpoolError::Corrupt(
@@ -561,6 +577,15 @@ pub fn write_ledger(
         }
     }
     payload.push('\n');
+    // ENR-08: refuse to persist a ledger larger than `load_ledger` will accept.
+    // Without this the daemon writes a file it then permanently refuses to read
+    // (see the constant's doc for why that is worse than failing here).
+    if payload.len() as u64 > MAX_LEDGER_FILE_BYTES {
+        return Err(EnrollmentSpoolError::Corrupt(
+            "enrollment ledger is full; the consumed-token spool needs purging \
+             (RN-26) before further redemptions can be recorded",
+        ));
+    }
     let temp_path = path.with_extension(format!(
         "tmp.{}.{}",
         std::process::id(),
@@ -1278,6 +1303,43 @@ mod tests {
         assert!(matches!(err, EnrollmentTokenError::TagMismatch));
     }
 
+    /// ENR-08: `write_ledger` must refuse to persist a ledger larger than
+    /// `load_ledger` will accept.
+    ///
+    /// Without the write-side bound the daemon eventually writes a file it then
+    /// permanently refuses to read — fail-closed, but an unrecoverable enrollment
+    /// outage whose only field recovery (deleting the ledger) resets single-use
+    /// enforcement and reopens replay. Failing at write time keeps it actionable.
+    #[test]
+    fn write_ledger_refuses_to_persist_an_unreadable_ledger_enr08() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("full.ledger");
+
+        // 33 bytes per entry (32 hex chars + separator); overshoot the cap.
+        let entries = (MAX_LEDGER_FILE_BYTES / 33) + 64;
+        let mut ledger = ConsumedTokenLedger::new();
+        for i in 0..entries {
+            let mut id = [0u8; TOKEN_ID_LEN];
+            id[..8].copy_from_slice(&i.to_be_bytes());
+            ledger.record_consumed(id);
+        }
+
+        match write_ledger(&path, &ledger) {
+            Err(EnrollmentSpoolError::Corrupt(msg)) => {
+                assert!(
+                    msg.contains("full"),
+                    "must refuse with an actionable message; got: {msg}"
+                );
+            }
+            other => panic!("an oversized ledger must not be persisted, got {other:?}"),
+        }
+        assert!(
+            !path.exists(),
+            "no unreadable ledger file may be left behind"
+        );
+    }
+
     /// ENR-08: a ledger with group/world permission bits must be refused, and an
     /// oversized one rejected before it is read.
     ///
@@ -1290,6 +1352,18 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
 
+        // Pin the cap VALUE with a literal, not just the relationship. Deriving the
+        // oversize fixture from the constant means raising the constant makes the
+        // test follow it and stay green — a mutation to `u64::MAX` survived an
+        // earlier version of this test for exactly that reason. The bound is the
+        // control, so widening it must require editing this line.
+        assert_eq!(
+            MAX_LEDGER_FILE_BYTES,
+            1024 * 1024,
+            "the ledger size bound is a DoS/inconsistency control; changing it needs \
+             an explicit justification and RN-26's purge, not a silent edit"
+        );
+
         let dir = TempDir::new().expect("tempdir");
 
         // Loose permissions: refused.
@@ -1297,7 +1371,11 @@ mod tests {
         let mut ledger = ConsumedTokenLedger::new();
         ledger.record_consumed([0xa1u8; TOKEN_ID_LEN]);
         write_ledger(&loose, &ledger).expect("seed ledger");
-        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o666))
+        // 0o640 — GROUP-readable only, no world bits. Chosen deliberately: a
+        // weakened predicate of `mode & 0o007` (world only) still trips on 0o666,
+        // so that mutation survived an earlier version of this test. Only a mask
+        // covering the group bits rejects this.
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o640))
             .expect("relax permissions");
         match load_ledger(&loose) {
             Err(EnrollmentSpoolError::Corrupt(msg)) => {
