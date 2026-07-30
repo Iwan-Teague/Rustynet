@@ -5571,6 +5571,26 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             .insert(cidr.to_owned());
     }
 
+    /// Withdraw a previously advertised LAN route.
+    ///
+    /// POL-14: `ensure_lan_route_allowed` is a POST-CONDITION check over
+    /// `lan_access_enabled` + the advertised set + the ACL, so a caller can only
+    /// evaluate the gate after establishing all three. That makes an exact
+    /// inverse of `advertise_lan_route` a prerequisite for failing closed: a
+    /// refused grant must leave no advertised residue behind, or the next
+    /// evaluation of the gate would find a route this one was denied.
+    ///
+    /// Empties the node's entry rather than leaving an empty set, so a withdrawn
+    /// route is indistinguishable from one never advertised.
+    pub fn withdraw_lan_route(&mut self, node_id: &NodeId, cidr: &str) {
+        if let Some(routes) = self.advertised_lan_routes.get_mut(node_id) {
+            routes.remove(cidr);
+            if routes.is_empty() {
+                self.advertised_lan_routes.remove(node_id);
+            }
+        }
+    }
+
     pub fn set_lan_route_acl(&mut self, user: &str, cidr: &str, allowed: bool) {
         self.lan_route_acl
             .insert((user.to_owned(), cidr.to_owned()), allowed);
@@ -10800,6 +10820,145 @@ mod tests {
                 context: TrafficContext::SharedExit,
             })
             .expect("grant should pass with toggle + route + acl + policy");
+    }
+
+    /// POL-14: a REFUSED LAN-route grant must leave no residue.
+    ///
+    /// The daemon's `LanAccessOn` handler mutates (`set_lan_access`,
+    /// `set_lan_route_acl`, `advertise_lan_route`) and only THEN evaluates the
+    /// gate, because `ensure_lan_route_allowed` is a post-condition check over
+    /// exactly those three pieces of state. So a denial has to be unwound rather
+    /// than prevented -- and the unwind has to be complete, or a refused grant
+    /// leaves behind precisely the entries that let a later attempt through.
+    ///
+    /// This pins the controller half: `withdraw_lan_route` is the exact inverse
+    /// of `advertise_lan_route`, and after the full revert the gate denies again.
+    #[test]
+    fn withdrawing_a_lan_route_leaves_no_residue_for_the_next_grant() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let exit_node = NodeId::new("exit-1").expect("node id should parse");
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+        controller
+            .set_exit_node(exit_node.clone(), "user:alice", Protocol::Tcp)
+            .expect("policy should allow selecting exit");
+
+        let request = || RouteGrantRequest {
+            user: "user:alice".to_owned(),
+            cidr: "192.168.1.0/24".to_owned(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::SharedExit,
+        };
+
+        // Establish the full granted state and confirm the gate passes, so the
+        // denial below is caused by the revert and not by never having passed.
+        controller.set_lan_access(true);
+        controller.advertise_lan_route(exit_node.clone(), "192.168.1.0/24");
+        controller.set_lan_route_acl("user:alice", "192.168.1.0/24", true);
+        controller
+            .ensure_lan_route_allowed(request())
+            .expect("the fully granted state must pass, or this test proves nothing");
+
+        // The exact revert the daemon performs on a refused grant.
+        controller.withdraw_lan_route(&exit_node, "192.168.1.0/24");
+        controller.set_lan_route_acl("user:alice", "192.168.1.0/24", false);
+        controller.set_lan_access(false);
+
+        assert_eq!(
+            controller.ensure_lan_route_allowed(request()).err(),
+            Some(Phase10Error::LanAccessDenied),
+            "after the revert the gate must deny again"
+        );
+
+        // Residue check, ISOLATED to the advertised set. Restore BOTH the toggle
+        // and the ACL, so the only remaining difference from the passing state
+        // above is whether the route is still advertised. Without restoring the
+        // ACL the ACL check denies first and masks the thing under test -- which
+        // it did, until a mutation test showed a no-op `withdraw_lan_route`
+        // passing this assertion.
+        controller.set_lan_access(true);
+        controller.set_lan_route_acl("user:alice", "192.168.1.0/24", true);
+        assert_eq!(
+            controller.ensure_lan_route_allowed(request()).err(),
+            Some(Phase10Error::LanAccessDenied),
+            "a withdrawn route must be indistinguishable from one never advertised"
+        );
+
+        // And re-advertising restores the pass, proving the denial above came
+        // from the withdraw and not from some unrelated state the reverts broke.
+        controller.advertise_lan_route(exit_node.clone(), "192.168.1.0/24");
+        controller
+            .ensure_lan_route_allowed(request())
+            .expect("re-advertising must restore the grant");
+    }
+
+    /// `withdraw_lan_route` must be safe and inert on inputs that were never
+    /// advertised, because the daemon calls the revert from failure points that
+    /// occur BEFORE any route is advertised.
+    #[test]
+    fn withdrawing_an_unadvertised_lan_route_is_inert() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        let exit_node = NodeId::new("exit-1").expect("node id should parse");
+        let other = NodeId::new("exit-2").expect("node id should parse");
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("apply should succeed");
+
+        // Never advertised at all.
+        controller.withdraw_lan_route(&exit_node, "192.168.1.0/24");
+        // Advertised, then withdrawn for a DIFFERENT cidr and a different node.
+        controller.advertise_lan_route(exit_node.clone(), "192.168.1.0/24");
+        controller.withdraw_lan_route(&exit_node, "10.0.0.0/8");
+        controller.withdraw_lan_route(&other, "192.168.1.0/24");
+
+        controller.set_lan_access(true);
+        controller.set_lan_route_acl("user:alice", "192.168.1.0/24", true);
+        controller
+            .set_exit_node(exit_node.clone(), "user:alice", Protocol::Tcp)
+            .expect("policy should allow selecting exit");
+        controller
+            .ensure_lan_route_allowed(RouteGrantRequest {
+                user: "user:alice".to_owned(),
+                cidr: "192.168.1.0/24".to_owned(),
+                protocol: Protocol::Tcp,
+                context: TrafficContext::SharedExit,
+            })
+            .expect("an unrelated withdraw must not remove the advertised route");
     }
 
     #[test]
