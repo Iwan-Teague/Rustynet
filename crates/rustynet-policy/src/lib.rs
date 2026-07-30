@@ -383,15 +383,27 @@ fn selector_matches(rule_value: &str, candidate: &str) -> bool {
     // POL-03: an empty selector is absent trust state, not a harmless literal, so
     // it must never match — in either position.
     //
-    // Previously `selector_matches("*", "")` was true and
-    // `selector_requires_membership("")` was false, so a request carrying an empty
-    // identity skipped the revocation gate entirely and was then admitted by any
-    // wildcard rule. An empty *rule* field likewise matched an empty request
-    // field. Both directions now fail closed: an empty candidate matches nothing
-    // (so evaluation falls through to the terminal `Decision::Deny`), and a rule
-    // with an accidentally-empty selector is inert rather than dangerously
-    // permissive. No caller in this workspace emits an empty selector, so this
+    // Previously `selector_matches("*", "")` was true, so a request carrying an
+    // empty identity was admitted by any wildcard rule. An empty *rule* field
+    // likewise matched an empty request field. Now an empty candidate matches
+    // nothing (evaluation falls through to the terminal `Decision::Deny`) and a
+    // rule with an accidentally-empty selector is inert rather than dangerously
+    // permissive.
+    //
+    // Note precisely what this does and does not do: the deny comes from *this*
+    // function, not from the membership gate. `selector_membership_allowed` also
+    // refuses an empty selector now (see there), but any future evaluator that
+    // consults membership without routing through `selector_matches` would need
+    // its own guard. No caller in this workspace emits an empty selector, so this
     // cannot false-reject a real request.
+    // The `candidate` half is what actually closes the hole. The `rule_value` half
+    // is currently REDUNDANT and no test can distinguish it: under equality
+    // matching an empty rule value already fails (`"" != "*"` and `"" != <any real
+    // identity>`), so the only case it decides is both-empty, which the candidate
+    // half already covers. It is kept anyway so the invariant is stated locally
+    // rather than depending on the matching semantics below — if this function ever
+    // gains prefix or glob matching, an empty pattern could otherwise match
+    // everything. Stated explicitly so nobody reads it as tested behaviour.
     if rule_value.is_empty() || candidate.is_empty() {
         return false;
     }
@@ -425,6 +437,13 @@ fn membership_request_allowed(src: &str, dst: &str, membership: &MembershipDirec
 }
 
 fn selector_membership_allowed(selector: &str, membership: &MembershipDirectory) -> bool {
+    // POL-03: an empty selector is absent trust state — refuse it here too, so the
+    // revocation gate does not depend on `selector_matches` having already
+    // rejected it. Without this, `selector_requires_membership("")` is false and
+    // an empty identity passes the gate unexamined.
+    if selector.is_empty() {
+        return false;
+    }
     if selector == "*" {
         return true;
     }
@@ -460,7 +479,7 @@ mod tests {
         AccessRequest, ContextualAccessRequest, ContextualPolicyRule, ContextualPolicySet,
         Decision, LlmAccessScope, LlmScopePolicy, MembershipDirectory, MembershipStatus,
         PolicyRolloutController, PolicyRule, PolicySet, Protocol, RolloutError, RuleAction,
-        TrafficContext,
+        TrafficContext, selector_membership_allowed,
     };
 
     #[test]
@@ -1203,6 +1222,8 @@ mod tests {
                 action: RuleAction::Allow,
             }],
         };
+
+        // Both-empty: covered by either half of the guard.
         assert_eq!(
             set.evaluate(&AccessRequest {
                 src: String::new(),
@@ -1212,5 +1233,38 @@ mod tests {
             Decision::Deny,
             "an empty rule selector must not match an empty request field"
         );
+
+        // Empty RULE against a NON-empty request. Note this does NOT pin the
+        // rule-side guard: an empty rule value fails equality anyway, so a
+        // candidate-only guard passes this too (verified by mutation). It is kept
+        // as a behavioural assertion of the outcome, not as coverage of that
+        // branch — see `selector_matches` for why the branch is retained.
+        assert_eq!(
+            set.evaluate(&AccessRequest {
+                src: "node:a".to_owned(),
+                dst: "node:b".to_owned(),
+                protocol: Protocol::Tcp,
+            }),
+            Decision::Deny,
+            "an empty rule selector must not match a real identity"
+        );
+    }
+
+    /// POL-03: the membership gate must independently refuse an empty selector.
+    ///
+    /// Tested directly because no public path reaches it without
+    /// `selector_matches` having already rejected the request — the guard exists so
+    /// that a future evaluator which consults membership on its own cannot
+    /// reintroduce the fail-open. Removing it left every other test green.
+    #[test]
+    fn membership_gate_refuses_an_empty_selector_pol03() {
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("a", MembershipStatus::Active);
+        assert!(
+            !selector_membership_allowed("", &membership),
+            "an empty selector is absent trust state and must not pass the gate"
+        );
+        // A wildcard still passes, so the guard has not broken the normal path.
+        assert!(selector_membership_allowed("*", &membership));
     }
 }

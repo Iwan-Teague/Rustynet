@@ -149,8 +149,15 @@ impl NodeKeyPair {
     ///
     /// The private half is an ed25519 seed (the same interpretation
     /// `Ed25519SigningProvider::from_seed` uses), so the correct public key is
-    /// derivable and the pair can simply be checked. The all-zeros check is kept
-    /// as a cheap early reject with a distinct error.
+    /// derivable and the pair can simply be checked.
+    ///
+    /// The all-zeros check is kept as a cheap early reject. It returns the same
+    /// `WeakMaterial` error as the correspondence check — an earlier version of
+    /// this comment wrongly claimed a distinct error. It is not redundant: an
+    /// all-zero seed has a real corresponding public key, so a genuinely
+    /// consistent all-zero pair is refused only by that branch. That single
+    /// decisive case has no test, which is worth stating rather than implying the
+    /// branch is fully covered.
     pub fn from_raw(public_key: [u8; 32], private_key: [u8; 32]) -> Result<Self, CryptoError> {
         if is_all_zeros(&public_key) || is_all_zeros(&private_key) {
             return Err(CryptoError::WeakMaterial);
@@ -2033,16 +2040,35 @@ mod tests {
             "a non-corresponding keypair must be rejected"
         );
 
-        // And a pair that is correct except for a single flipped bit.
+        // A pair correct except for a single flipped bit — flipped in the LAST
+        // byte deliberately. Flipping byte 0 would also be caught by a
+        // first-byte-only comparison, so it would not distinguish a full compare
+        // from a weakened one; a mutation to `derived[0] != public_key[0]`
+        // survived an earlier version of this test for exactly that reason.
         let private_key = [9u8; 32];
         let mut public_key = SigningKey::from_bytes(&private_key)
             .verifying_key()
             .to_bytes();
-        public_key[0] ^= 0x01;
+        public_key[31] ^= 0x01;
         assert_eq!(
             NodeKeyPair::from_raw(public_key, private_key).err(),
             Some(CryptoError::WeakMaterial),
-            "a one-bit public-key mismatch must be rejected"
+            "a one-bit mismatch in the final byte must be rejected — the whole key \
+             must be compared, not a prefix"
+        );
+    }
+
+    /// CRY-06: an all-zero seed has a real corresponding public key, so a
+    /// genuinely *consistent* all-zero pair is refused only by the all-zeros
+    /// branch. The review noted that branch had no discriminating test; this is it.
+    #[test]
+    fn rejects_consistent_but_all_zero_keypair() {
+        let seed = [0u8; 32];
+        let public_key = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        assert_eq!(
+            NodeKeyPair::from_raw(public_key, seed).err(),
+            Some(CryptoError::WeakMaterial),
+            "an all-zero seed must be refused even though its public key corresponds"
         );
     }
 
