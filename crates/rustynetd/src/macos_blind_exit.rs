@@ -152,11 +152,27 @@ pub fn evaluate_macos_blind_exit_pf_rules(
     };
     let normalized: Vec<String> = rules.lines().map(normalize_pf_rule).collect();
 
-    if !normalized
-        .iter()
-        .any(|line| line == "block drop out quick all")
+    // Presence AND precedence. pf is first-match-wins and `quick` takes effect
+    // immediately, so a `quick` pass above the terminal block wins outright and
+    // the block never fires. Checking only that the block's text appears -- the
+    // former behaviour here -- credits a ruleset that leaks everything. This is
+    // the same defect class as PF-05, on the blind_exit renderer.
+    if let Err(failure) =
+        crate::killswitch_precedence::terminator_is_reachable(&normalized, |rule| {
+            crate::macos_exit_killswitch_precedence::classify_pf_egress_rule(
+                rule,
+                &crate::killswitch_precedence::ContainedInterfaces::default()
+                    .with_name(config.tunnel_interface.as_str()),
+            )
+        })
     {
-        reasons.push("blind_exit PF rules missing terminal `block drop out quick all`".to_owned());
+        match failure {
+            crate::killswitch_precedence::ContainmentFailure::NoTerminator(_) => reasons
+                .push("blind_exit PF rules missing terminal `block drop out quick all`".to_owned()),
+            crate::killswitch_precedence::ContainmentFailure::Escaped(violation) => reasons.push(
+                format!("blind_exit PF rules let egress escape the terminal block: {violation}"),
+            ),
+        }
     }
     if contains_forbidden_route_primitive(&normalized) {
         reasons.push(
@@ -449,6 +465,47 @@ mod tests {
         cfg.mesh_cidr = "0.0.0.0/0".to_owned();
         build_macos_blind_exit_pf_rules(&cfg)
             .expect_err("render must fail closed on a default-route mesh CIDR");
+    }
+
+    /// The blind_exit renderer's terminal-block check was presence-only, the
+    /// same defect as PF-05. pf is first-match-wins and `quick` takes effect
+    /// immediately, so a wide-open `quick` pass ABOVE the terminal block wins
+    /// outright -- the block is still literally present and never fires.
+    #[test]
+    fn evaluator_rejects_a_quick_pass_above_the_terminal_block() {
+        let cfg = config();
+        // The generated posture, with one interface-wide pass spliced in ABOVE
+        // the terminator rather than appended after it.
+        let generated = build_macos_blind_exit_pf_rules(&cfg).unwrap();
+        let hoisted = generated.replace(
+            "block drop out quick all\n",
+            "pass out quick on en0 inet all keep state\nblock drop out quick all\n",
+        );
+        assert_ne!(hoisted, generated, "the splice must have applied");
+
+        let reasons = evaluate_macos_blind_exit_pf_rules(&hoisted, &cfg);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("escape the terminal block")),
+            "an interface-wide quick pass above the block must be reported as an escape: {reasons:?}"
+        );
+    }
+
+    /// And the terminal block must still be credited when the only rules above
+    /// it are the tunnel-scoped and mesh-bounded ones the renderer emits, or
+    /// every working blind_exit node reports itself broken.
+    #[test]
+    fn evaluator_credits_the_terminal_block_behind_the_generated_allows() {
+        let cfg = config();
+        let generated = build_macos_blind_exit_pf_rules(&cfg).unwrap();
+        let reasons = evaluate_macos_blind_exit_pf_rules(&generated, &cfg);
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r.contains("escape the terminal block") || r.contains("missing terminal")),
+            "the renderer's own output must satisfy its own precedence check: {reasons:?}"
+        );
     }
 
     #[test]
