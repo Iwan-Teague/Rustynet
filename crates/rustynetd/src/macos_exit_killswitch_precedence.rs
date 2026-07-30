@@ -8,6 +8,9 @@
 //! RustyNet pf anchor, flush it, prove the killswitch assertion fails,
 //! then restore the exact captured rules before returning.
 
+use crate::killswitch_precedence::{
+    ContainedInterfaces, ContainmentFailure, RuleDisposition, terminator_is_reachable,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -123,19 +126,141 @@ pub fn build_macos_killswitch_assert_report(rules: &str) -> MacosKillswitchAsser
     }
 }
 
+/// Verify the macOS pf killswitch actually CONTAINS general egress.
+///
+/// # Presence is not precedence (PF-05)
+///
+/// This used to be a substring search for `block drop out quick all` anywhere
+/// in the ruleset. pf evaluates rules top to bottom and `quick` takes effect
+/// immediately, so a `pass out quick` rule ABOVE the block wins outright and the
+/// block never fires — while the assertion, finding the block's text present,
+/// reported the killswitch verified. That is why the permissive-rule defects on
+/// this backend were silent: this function was their alibi.
+///
+/// The ruleset is now walked in evaluation order (for pf, textual order) via
+/// [`crate::killswitch_precedence`], and the block is credited only if it is
+/// actually REACHABLE.
+///
+/// # Only `quick` passes above the block can defeat it
+///
+/// This is what makes the check precise rather than merely strict. Because the
+/// terminator itself carries `quick`, it wins against any non-`quick` pass
+/// regardless of order — pf's last-match-wins rule never gets to apply. So a
+/// non-`quick` pass is genuinely harmless here and reporting it would be a
+/// false positive. Only a `quick` pass, positioned above the block, and broader
+/// than an allowlisted shape, actually breaks containment.
 pub fn evaluate_macos_killswitch_rules(rules: &str) -> Result<(), String> {
-    let has_block_all = rules.lines().any(|line| {
-        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        normalized.eq_ignore_ascii_case("block drop out quick all")
-            || normalized
-                .to_ascii_lowercase()
-                .contains("block drop out quick all")
-    });
-    if has_block_all {
-        Ok(())
-    } else {
-        Err("macOS pf killswitch verification failed: block drop out quick all missing".to_owned())
+    let contained = ContainedInterfaces::default();
+    let lines: Vec<&str> = rules.lines().collect();
+    terminator_is_reachable(&lines, |rule| classify_pf_egress_rule(rule, &contained)).map_err(
+        |failure| match failure {
+            ContainmentFailure::NoTerminator(_) => {
+                "macOS pf killswitch verification failed: block drop out quick all missing"
+                    .to_owned()
+            }
+            ContainmentFailure::Escaped(violation) => format!(
+                "macOS pf killswitch verification failed: {violation}; a `quick` pass above \
+                 `block drop out quick all` wins outright, so the block never fires"
+            ),
+        },
+    )
+}
+
+/// Reduce one pf rule to its effect on general outbound traffic.
+///
+/// Fail-closed: a `quick` pass that cannot be proven narrow or tunnel-scoped is
+/// [`RuleDisposition::Escapes`].
+pub fn classify_pf_egress_rule(rule: &str, contained: &ContainedInterfaces) -> RuleDisposition {
+    let normalized = rule.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = normalized.to_ascii_lowercase();
+    if lowered.is_empty() || lowered.starts_with('#') {
+        return RuleDisposition::Irrelevant;
     }
+    // The terminator: the canonical all-traffic outbound block.
+    if lowered.contains("block drop out quick all") {
+        return RuleDisposition::Terminator;
+    }
+    // Any other block only tightens the posture.
+    if lowered.starts_with("block") {
+        return RuleDisposition::Irrelevant;
+    }
+    if !lowered.starts_with("pass") {
+        // `scrub`, `nat`, `rdr`, `anchor`, `set`, `table`: not a filter verdict
+        // on egress. `route-to` on a pass is handled below.
+        return RuleDisposition::Irrelevant;
+    }
+    // Inbound rules cannot leak outbound traffic.
+    if lowered.starts_with("pass in") {
+        return RuleDisposition::Irrelevant;
+    }
+    // A pass WITHOUT `quick` loses to the terminator, which has it. pf's
+    // last-match-wins never applies once a quick rule matches.
+    if !lowered.split(' ').any(|token| token == "quick") {
+        return RuleDisposition::Irrelevant;
+    }
+    // `route-to`/`reply-to`/`dup-to` force traffic out a named interface,
+    // bypassing the routing table entirely. Never creditable.
+    if ["route-to", "reply-to", "dup-to"]
+        .iter()
+        .any(|primitive| lowered.contains(primitive))
+    {
+        return RuleDisposition::Escapes;
+    }
+    // A quick pass bound to the tunnel (or loopback) is how encrypted traffic
+    // legitimately leaves.
+    if let Some(interface) = pf_rule_interface(&normalized)
+        && contained.contains(interface)
+    {
+        return RuleDisposition::Contained;
+    }
+    // A quick pass narrowed to one service or source range is an operator
+    // allowlist entry, not a general escape. See RuleDisposition::NarrowAllow
+    // for the limits of that judgement.
+    if pf_rule_is_narrowly_scoped(&lowered) {
+        return RuleDisposition::NarrowAllow;
+    }
+    // What remains is an interface-wide or unrestricted quick pass — the shape
+    // that silently disables the killswitch.
+    RuleDisposition::Escapes
+}
+
+/// Extract the `on <interface>` argument of a pf rule, if present.
+fn pf_rule_interface(rule: &str) -> Option<&str> {
+    let mut tokens = rule.split(' ');
+    while let Some(token) = tokens.next() {
+        if token == "on" {
+            // `on { en0 en1 }` is an interface list; a list containing anything
+            // uncontained must not be credited, so decline to name one.
+            return tokens.next().filter(|name| *name != "{");
+        }
+    }
+    None
+}
+
+/// Whether a pass rule is restricted to a specific service or address range
+/// rather than permitting a whole interface or all traffic.
+fn pf_rule_is_narrowly_scoped(lowered: &str) -> bool {
+    // A specific port is a service allowlist (the WireGuard endpoint, DNS).
+    let has_port = lowered.contains(" port ");
+    // A source or destination that is not `any`/`all` bounds the rule. The
+    // blind_exit and exit-NAT rules take the `from <mesh_cidr> to any` shape.
+    let bounded_source = lowered
+        .split(" from ")
+        .nth(1)
+        .map(|rest| {
+            let value = rest.split(' ').next().unwrap_or("");
+            !value.is_empty() && value != "any" && value != "all"
+        })
+        .unwrap_or(false);
+    let bounded_destination = lowered
+        .split(" to ")
+        .nth(1)
+        .map(|rest| {
+            let value = rest.split(' ').next().unwrap_or("");
+            !value.is_empty() && value != "any" && value != "all"
+        })
+        .unwrap_or(false);
+    has_port || bounded_source || bounded_destination
 }
 
 pub fn select_macos_rustynet_anchor(pfctl_anchors_stdout: &str) -> Option<String> {
@@ -372,6 +497,113 @@ mod tests {
         );
         assert!(report.overall_ok);
         assert_eq!(report.exit_code, 0);
+    }
+
+    /// PF-05, the defect itself: a `quick` pass ABOVE the block.
+    ///
+    /// pf evaluates top to bottom and `quick` takes effect immediately, so each
+    /// of these rulesets lets all egress out while `block drop out quick all` is
+    /// still literally present. The old substring search found that text and
+    /// reported the killswitch verified.
+    #[test]
+    fn quick_pass_above_the_block_is_not_containment() {
+        // The real one. `macos_exit_nat.rs` emits exactly this line when
+        // allow_egress_interface is set -- a one-boolean, full-IPv4
+        // killswitch off-switch (PF-01) that this assertion used to pass.
+        const EGRESS_INTERFACE_WIDE_OPEN: &str =
+            "pass out quick on en0 inet all keep state\nblock drop out quick all\n";
+        const UNRESTRICTED: &str = "pass out quick all\nblock drop out quick all\n";
+        const ANY_TO_ANY: &str =
+            "pass out quick inet from any to any keep state\nblock drop out quick all\n";
+        // route-to forces egress out a named interface, bypassing routing.
+        const ROUTE_TO: &str = "pass out quick route-to (en1 192.0.2.1) inet all keep state\n\
+             block drop out quick all\n";
+        // An interface LIST containing the physical NIC must not be credited
+        // just because a tunnel appears in it.
+        const INTERFACE_LIST: &str =
+            "pass out quick on { utun9 en0 } all keep state\nblock drop out quick all\n";
+
+        for (label, rules) in [
+            (
+                "an interface-wide pass on the physical NIC",
+                EGRESS_INTERFACE_WIDE_OPEN,
+            ),
+            ("an unrestricted quick pass", UNRESTRICTED),
+            ("an any-to-any quick pass", ANY_TO_ANY),
+            ("a route-to bypass", ROUTE_TO),
+            (
+                "an interface list including the physical NIC",
+                INTERFACE_LIST,
+            ),
+        ] {
+            let report = build_macos_killswitch_assert_report(rules);
+            assert!(
+                !report.overall_ok,
+                "{label} defeats the block, so the killswitch must NOT verify"
+            );
+            assert_eq!(report.exit_code, 2);
+            assert!(
+                report.reason.contains("quick"),
+                "the reason must explain the precedence failure, got: {}",
+                report.reason
+            );
+        }
+    }
+
+    /// The inverse: rulesets that genuinely contain egress must still verify, or
+    /// the check fires on every working deployment and gets deleted.
+    #[test]
+    fn precedence_check_does_not_false_fail_real_pf_rulesets() {
+        // Tunnel-scoped pass: how encrypted traffic legitimately leaves.
+        const TUNNEL: &str =
+            "pass out quick inet on utun9 all keep state\nblock drop out quick all\n";
+        // A pass WITHOUT `quick` loses to the terminator, which has it -- pf's
+        // last-match-wins never applies once a quick rule matches. Reporting
+        // this would be a false positive.
+        const NON_QUICK_PASS: &str = "pass out inet all keep state\nblock drop out quick all\n";
+        // The blind_exit shape: quick pass on the PHYSICAL interface, but
+        // bounded to the mesh CIDR as source.
+        const MESH_SOURCE_BOUNDED: &str = "pass out quick on en0 inet from 100.64.0.0/10 to any keep state\n\
+             block drop out quick all\n";
+        // The WireGuard handshake must reach the peer endpoint before any
+        // tunnel exists; a specific port bounds it.
+        const ENDPOINT_ALLOW: &str = "pass out quick inet proto udp from any to any port = 51820 keep state\n\
+             block drop out quick all\n";
+        // Ingress rules cannot leak egress.
+        const INBOUND: &str =
+            "pass in quick on en0 inet all keep state\nblock drop out quick all\n";
+        // Non-filter statements and comments.
+        const NOISE: &str = "# generated by rustynet\nscrub-anchor \"com.apple/*\"\n\
+             nat-anchor \"com.apple/*\"\nblock drop out quick all\n";
+
+        for (label, rules) in [
+            ("a tunnel-scoped quick pass", TUNNEL),
+            ("a non-quick pass", NON_QUICK_PASS),
+            ("a mesh-CIDR-bounded pass", MESH_SOURCE_BOUNDED),
+            ("a WireGuard endpoint allow", ENDPOINT_ALLOW),
+            ("an inbound pass", INBOUND),
+            ("comments and anchors", NOISE),
+        ] {
+            let report = build_macos_killswitch_assert_report(rules);
+            assert!(
+                report.overall_ok,
+                "{label} must still verify; got: {}",
+                report.reason
+            );
+        }
+    }
+
+    /// Rules BELOW the terminator are unreachable: the block carries `quick`.
+    #[test]
+    fn quick_pass_below_the_block_is_unreachable() {
+        let report = build_macos_killswitch_assert_report(
+            "block drop out quick all\npass out quick on en0 all keep state\n",
+        );
+        assert!(
+            report.overall_ok,
+            "a pass beneath a quick block never evaluates; got: {}",
+            report.reason
+        );
     }
 
     #[test]
