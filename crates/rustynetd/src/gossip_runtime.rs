@@ -159,6 +159,44 @@ pub struct AnchorRuntimeView {
 }
 
 /// Runtime state for one gossip participant.
+/// I3 — per-origin accept budget. A verified member that floods gossip is
+/// bounded here, so a single compromised member cannot drive the epidemic
+/// re-push (every accepted bundle is forwarded to every known peer) or the
+/// probe path, which emits up to `MAX_PAIRS * SIMULTANEOUS_OPEN_ROUNDS`
+/// packets per peer per cycle.
+///
+/// Deliberately generous relative to the mint cadence
+/// (`GOSSIP_REMINT_INTERVAL_SECS` = 30 s): a healthy peer re-mints twice a
+/// minute, so 12 accepts per window leaves ~6x headroom for legitimate
+/// bursts (endpoint-change re-publication, epidemic duplicates arriving by
+/// several paths) while still bounding a flood by two orders of magnitude.
+pub const GOSSIP_PER_ORIGIN_ACCEPTS_PER_WINDOW: u32 = 12;
+/// Sliding window for [`GOSSIP_PER_ORIGIN_ACCEPTS_PER_WINDOW`].
+pub const GOSSIP_PER_ORIGIN_WINDOW_SECS: u64 = 60;
+
+// A sequence fast-forward bound was built here and REMOVED before landing.
+// It rejected a bundle whose sequence advanced more than N past the last
+// accepted one, to stop a member jumping to u64::MAX and stranding its own
+// anti-replay ledger. Two reasons it was a net negative:
+//
+//   * The harm it prevented is self-inflicted and unreachable by an attacker.
+//     `source_node_id` IS the verifying key and the signature is checked
+//     first, so no one can fast-forward a victim's sequence — only their own.
+//   * It created a REAL lockout for honest peers. `highest_accepted` advances
+//     only on accept, so once a returning peer's sequence is past the bound,
+//     every later bundle is further past it: a permanent, self-reinforcing
+//     refusal of a legitimate member that had merely been away.
+//
+// Flooding — the actual concern in the plan's I3 wording — is bounded by the
+// per-origin budget above, which does not have this failure mode.
+
+/// Per-origin accept accounting for [`GOSSIP_PER_ORIGIN_ACCEPTS_PER_WINDOW`].
+#[derive(Debug, Clone, Default)]
+struct OriginRate {
+    window_start_unix: u64,
+    accepts_in_window: u32,
+}
+
 pub struct GossipNode {
     pub local_node_id: [u8; 32],
     signing_key: SigningKey,
@@ -193,6 +231,8 @@ pub struct GossipNode {
     local_membership_epoch: Option<u64>,
     pub gossip_sequence: u64,
     pub seen_gossip_sequences: SeenSequenceState,
+    /// I3 per-origin accept budget; keyed on the VERIFIED source id.
+    origin_rates: HashMap<[u8; 32], OriginRate>,
     pub last_minted_bundle: Option<GossipBundle>,
     pub next_gossip_mint_at: Option<Instant>,
     pub remint_interval: Duration,
@@ -226,6 +266,7 @@ impl GossipNode {
             local_membership_epoch: None,
             gossip_sequence: 0,
             seen_gossip_sequences: SeenSequenceState::new(),
+            origin_rates: HashMap::new(),
             last_minted_bundle: None,
             next_gossip_mint_at: None,
             remint_interval: Duration::from_secs(GOSSIP_REMINT_INTERVAL_SECS),
@@ -559,6 +600,26 @@ impl GossipNode {
             );
             return Err(GossipNodeError::Bundle(GossipError::RevokedSource));
         }
+        // I3 — per-origin accept budget. Keyed on the VERIFIED source id and
+        // applied AFTER signature verification on purpose: keying on an
+        // unverified id would let an attacker forge a legitimate peer's id to
+        // exhaust that peer's budget, turning the limiter itself into a denial
+        // of service against honest gossip. Applied BEFORE any mutation, so a
+        // throttled bundle advances no watermark, admits no endpoint and is
+        // never re-pushed.
+        if !self.consume_origin_budget(bundle.source_node_id, now_unix) {
+            self.bump_reject_counter("origin_rate_limited");
+            log::warn!(
+                "gossip_reject_origin_rate_limited source={} sender={:?} budget={}/{}s",
+                short_id(&bundle.source_node_id),
+                sender,
+                GOSSIP_PER_ORIGIN_ACCEPTS_PER_WINDOW,
+                GOSSIP_PER_ORIGIN_WINDOW_SECS
+            );
+            return Err(GossipNodeError::Bundle(GossipError::WireMalformed(
+                "per-origin gossip accept budget exceeded",
+            )));
+        }
         // accept_bundle_with_now passed against a clone of the
         // seen-state; commit it to the real ledger only after the
         // watermark spool write succeeds.
@@ -637,6 +698,29 @@ impl GossipNode {
             return Ok(());
         };
         write_gossip_watermark(path, watermark)
+    }
+
+    /// Consume one unit of `source`'s per-window accept budget.
+    /// Returns false when the budget is exhausted.
+    ///
+    /// A plain sliding window rather than a token bucket: the mint cadence is
+    /// fixed and low, so the extra state a bucket needs buys nothing here, and
+    /// a window is far easier to reason about when reviewing whether a
+    /// throttled peer can be starved.
+    fn consume_origin_budget(&mut self, source: [u8; 32], now_unix: u64) -> bool {
+        let entry = self.origin_rates.entry(source).or_default();
+        // Reset on window roll. `saturating_sub` also covers a backwards
+        // clock: `now < window_start` yields 0, which is inside the window,
+        // so a clock step cannot silently widen the budget.
+        if now_unix.saturating_sub(entry.window_start_unix) >= GOSSIP_PER_ORIGIN_WINDOW_SECS {
+            entry.window_start_unix = now_unix;
+            entry.accepts_in_window = 0;
+        }
+        if entry.accepts_in_window >= GOSSIP_PER_ORIGIN_ACCEPTS_PER_WINDOW {
+            return false;
+        }
+        entry.accepts_in_window = entry.accepts_in_window.saturating_add(1);
+        true
     }
 
     fn bump_reject_counter(&mut self, kind: &'static str) {
@@ -1895,6 +1979,75 @@ mod tests {
         assert!(
             !node.applied_endpoints.contains_key(&sender_id),
             "a revoked source's endpoints must never be admitted"
+        );
+    }
+
+    #[cfg(unix)] // uses the unix-only GossipTransport (Track Beta: windows path queued)
+    #[test]
+    fn ingest_rate_limits_a_flooding_origin_with_no_side_effect() {
+        // I3 per-origin budget. Every bundle here is individually VALID —
+        // correctly signed, fresh, in-epoch, monotonic sequence — so only the
+        // budget can stop them. That is the point: the limiter bounds a
+        // compromised MEMBER, not a forger.
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(4, dir.path());
+        let sender_key = SigningKey::from_bytes(&[9u8; 32]);
+        let sender_id = sender_key.verifying_key().to_bytes();
+        node.register_peer(sender_id, sender_key.verifying_key(), loopback_bind());
+        let transport = GossipTransport::bind(loopback_bind()).expect("transport");
+
+        let mut accepted = 0u32;
+        for seq in 1..=(GOSSIP_PER_ORIGIN_ACCEPTS_PER_WINDOW + 5) {
+            let bundle = mint_bundle_with_timestamp(
+                &sender_key,
+                u64::from(seq),
+                1_700_000_000,
+                TEST_EPOCH,
+                CandidateSet::default(),
+            )
+            .unwrap();
+            if node
+                .ingest_inbound_bundle(None, bundle, &transport, 1_700_000_000)
+                .is_ok()
+            {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, GOSSIP_PER_ORIGIN_ACCEPTS_PER_WINDOW,
+            "exactly the budget must be accepted, no more"
+        );
+        assert_eq!(
+            node.rejected_counts.get("origin_rate_limited"),
+            Some(&5),
+            "every over-budget bundle must be counted as throttled"
+        );
+        // The property that matters: a throttled bundle has NO effect. The
+        // accept counter must equal the budget, not the offered count.
+        assert_eq!(
+            node.accepted_count,
+            u64::from(GOSSIP_PER_ORIGIN_ACCEPTS_PER_WINDOW)
+        );
+
+        // Budget refreshes on window roll — a throttled peer is bounded, never
+        // permanently starved.
+        let bundle = mint_bundle_with_timestamp(
+            &sender_key,
+            9_000,
+            1_700_000_000 + GOSSIP_PER_ORIGIN_WINDOW_SECS,
+            TEST_EPOCH,
+            CandidateSet::default(),
+        )
+        .unwrap();
+        assert!(
+            node.ingest_inbound_bundle(
+                None,
+                bundle,
+                &transport,
+                1_700_000_000 + GOSSIP_PER_ORIGIN_WINDOW_SECS
+            )
+            .is_ok(),
+            "the budget must refresh on window roll, not starve the peer forever"
         );
     }
 
