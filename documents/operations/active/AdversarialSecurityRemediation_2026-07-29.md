@@ -32,6 +32,34 @@ turned out larger than the "M" the table guessed:
   finding rather than being decided by a verifier change that would fail every
   exit node closed.
 
+**Individual findings closed after S1–S5 (2026-07-30).** All mode-verified and,
+where a behaviour change was involved, mutation-verified:
+
+| Finding | What changed |
+|---|---|
+| **POL-01** (High) | `selector_requires_membership` failed OPEN on a prefix miss, so `NODE:revoked-node`, `nodes:revoked-node`, `" node:revoked-node"` and the bare `revoked-node` all skipped the revocation check entirely. Replaced with a closed `SelectorKind` parser — anything unparseable denies. The review's whole confirmed exploit table is now a test. |
+| **POL-14** (Medium) | The `ensure_lan_route_allowed` half: the `Result` was discarded, so a DENIED grant enabled LAN access anyway. Now consumed, with every failure path reverting the mutations it made. |
+| **POL-06** (Medium) | `is_populated`'s doc comment still advertised a governance-disabled bypass that `8cca1458` had removed — a stale doc describing a fail-open is an invitation to restore it, and this one had already been cited as current behaviour in a security review. Corrected, and the actual deny-on-empty behaviour pinned. |
+| **POL-07** (Low) | `validate_policy_safety` required `Protocol::Any`, so three rules enumerating Tcp/Udp/Icmp staged successfully while being equivalent to allow-all. Any `*` → `*` Allow is now refused regardless of protocol. |
+| **POL-08** (Low) | `stage_revision` did a bare `insert`, so re-staging an id silently redefined what rolling back to it meant. Duplicate ids are refused. |
+| **POL-09** (Low) | `rollback_to` checked only `contains_key`, so a staged-but-never-promoted revision could be activated by a method whose name reads as a safety action. It must now have been promoted at least once. |
+| **POL-12** (Low) | `scope_for`'s doc claimed a specificity tiering the code does not have — precedence comes entirely from the caller's selector order. Doc corrected and the real contract pinned by a test that reverses the caller order and shows the BROADER scope winning. |
+| **CRY-07** (Low) | The unix key-custody validator checked modes but not ownership, so an ATTACKER-owned directory and file with perfect `0700`/`0600` validated. Added a `Uid::effective()` check, matching the peer store's audited-PASS sibling. |
+| **IPV-10** (Medium) | `evaluate_linux_blind_exit_ruleset` was thorough and not on the daemon assert path — its only production caller was the evidence-report command, so a blind_exit node's posture was checked when someone asked for a report and never during operation. Wired into `assert_exit_serving`, closing a platform asymmetry (macOS already did this). |
+| **WIN-08** (Low) | The self-check pipe leaf was an unbounded prefix match and the charset allowlist permits `\` and `.`, so `…check-\..\..\evil` validated. Suffix bounded to 1–10 ASCII digits with no separator after the prefix. |
+| **PF-09 / PF-08** (Low) | `push_list` could emit an over-cap token for a single over-cap element. Documented rather than changed, because the current behaviour is the safest available — the decoder rejects the whole spec, whereas dropping the element would silently narrow the rendered `pf` ruleset. `debug_assert` makes it loud in test builds, and the new budget test covers PF-08's ask so a future peer-cap raise fails there rather than at the helper. |
+| **PF-11** (Medium) | The blind_exit pf evaluator's terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name. |
+
+**Still open on POL-06, and it is a decision.** The doc comment is fixed but the
+*inertness* is not: `set_membership_directory` / `with_membership_directory` have
+**zero** production callers, so `is_populated()` is always false in a shipped
+binary and the RSA-0008 issuance gate never runs. Closing it means either giving
+the three CLI issuance commands (`execute_assignment`,
+`execute_dns_zone_issue`, `execute_traversal_issue`) a way to supply a membership
+snapshot — a CLI contract change across three commands — or making
+`ControlPlaneCore` refuse to issue without one, which breaks all three until the
+first is done. Order matters and the contract question is the operator's.
+
 **One new finding surfaced while doing S2, not yet filed in the review:** with
 NAT active *and* `dns_protected`, the killswitch chain orders the wide-open
 egress accept **above** the `udp/tcp dport 53 oifname != <tunnel> drop` rules, so
