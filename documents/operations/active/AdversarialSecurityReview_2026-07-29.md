@@ -2855,6 +2855,7 @@ of the original review pass.
 | --- | --- | --- | --- |
 | PF-11 | `macos_blind_exit`'s own terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name | Medium | **FIXED** `3b598514` |
 | IPV-05 | On an exit node with DNS protection, the wide-open egress accept is ordered ABOVE the port-53 fail-closed drops, so plaintext DNS out the underlay is accepted before the drop is reached | **High** | **OPEN — needs a decision** |
+| POL-15 | `selected_exit_node` is tracked twice — daemon and controller — and the restore + auto-exit paths assign only the daemon's, so the LAN-route gate can never pass in those states | Medium | **OPEN — needs a decision** |
 
 ### PF-11 — a fifth presence-only terminal-block check (Medium; FIXED)
 
@@ -2909,3 +2910,42 @@ to exclude port 53; or refuse the `serve_exit_node + protected_dns` combination
 at config time and say why. Pick one deliberately — and extend the precedence
 walk to the DNS traffic class afterwards so the choice is enforced rather than
 assumed.
+
+### POL-15 — `selected_exit_node` is tracked in two places that can disagree (Medium; CONFIRMED by test; OPEN)
+
+Surfaced by fixing POL-14: the discarded `let _ =` had been hiding it.
+
+`DaemonRuntime::selected_exit_node` and `Phase10Controller::selected_exit_node`
+are **separate fields**. `IpcCommand::ExitNodeSelect` keeps them consistent — it
+sets the daemon's only when `controller.set_exit_node` returns `Ok`
+(`daemon.rs:8004-8016`) — but two other paths assign the daemon's field alone:
+
+- **state restore**, `daemon.rs:~8919`: `self.selected_exit_node = snapshot.selected_exit_node;`
+- **auto-exit selection**, `daemon.rs:~7626`: `self.selected_exit_node = auto_exit;`
+
+`ensure_lan_route_allowed` reads the **controller's** copy, so in either state it
+returns `ExitNotSelected` and the LAN-route grant can never be authorised, no
+matter how the ACL and policy are configured. The daemon meanwhile reports an
+exit node as selected.
+
+**Confirmed, not inferred:** consuming the previously-discarded `Result` made
+`daemon::tests::role_auth_matrix_runtime_is_exhaustive_and_fail_closed` fail with
+`role=admin mode=manual hop=one_hop command=lan-access on message=lan-access
+denied: exit node not selected` — an admin, in a supported configuration, on a
+command the matrix classifies as allowed.
+
+Reachability is what keeps this Medium rather than High: the consequence is a
+*refused* grant, so the divergence fails safe. The hazard is the shape, not this
+instance — two sources of truth for an authorization input, where the one the
+gate reads is not the one the rest of the daemon maintains.
+
+**Why it is a decision.** Deduplicating is the obvious answer and is not a
+one-liner: the daemon's copy is what `persist_state`/`restore` serialise, the
+controller's is what the ACL gate and `apply_dataplane_generation` consume, and
+making restore call `controller.set_exit_node` would run a policy evaluation
+during startup — which may be correct (it would fail closed on a revoked
+persisted exit node) or may break boot ordering. Options: have the daemon read
+through to the controller and delete its own field; make restore and auto-exit
+call `set_exit_node` and handle the denial; or keep both and add an invariant
+check that fails closed on divergence. The POL-14 fix currently warns on it and
+declines to grant, which is safe but leaves the inconsistency in place.
