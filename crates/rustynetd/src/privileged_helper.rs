@@ -1041,8 +1041,18 @@ const MACOS_PF_SPOOL_DIR: &str = "/var/run/rustynet-pf";
 /// Render-to-load tail for the macOS pf builtin: own a root-only temp file and
 /// run `pfctl` against the helper-derived anchor. Unix-only; fails closed
 /// elsewhere.
+///
+/// `pub(crate)` rather than private because there is a SECOND root
+/// `pfctl -f` in this tree: the macOS exit-killswitch precedence validator has
+/// to restore the anchor's baseline rules after deliberately tampering with
+/// them (PF-10). That path had its own `write_restore_file` doing a plain
+/// `fs::write` to a predictable `$TMPDIR` name — no `O_EXCL`, no `O_NOFOLLOW`,
+/// no mode, no ownership check — and then handed the path to a root
+/// `pfctl -f`. Sharing this function instead of hardening that copy is
+/// deliberate: artifact custody for a root `pfctl -f` should have exactly one
+/// implementation, or the two drift and only the audited one stays correct.
 #[cfg(unix)]
-fn load_macos_pf_anchor(anchor: &str, rules: &str) -> Result<(), String> {
+pub(crate) fn load_macos_pf_anchor(anchor: &str, rules: &str) -> Result<(), String> {
     let dir = ensure_macos_pf_spool_dir()?;
     let path = write_root_owned_pf_temp(&dir, rules)?;
     let result = run_macos_pfctl_load(anchor, &path);
@@ -1051,7 +1061,7 @@ fn load_macos_pf_anchor(anchor: &str, rules: &str) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn load_macos_pf_anchor(anchor: &str, rules: &str) -> Result<(), String> {
+pub(crate) fn load_macos_pf_anchor(anchor: &str, rules: &str) -> Result<(), String> {
     let _ = (anchor, rules);
     Err("macOS pf anchor load is only supported on Unix".to_owned())
 }

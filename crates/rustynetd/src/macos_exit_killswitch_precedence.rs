@@ -15,11 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 #[cfg(target_os = "macos")]
-use std::path::PathBuf;
-#[cfg(target_os = "macos")]
 use std::process::Command;
-#[cfg(target_os = "macos")]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MACOS_EXIT_KILLSWITCH_PRECEDENCE_SCHEMA_VERSION: u32 = 1;
 pub const MACOS_RUSTYNET_ANCHOR_PREFIX: &str = "com.apple/rustynet_g";
@@ -397,7 +393,6 @@ fn collect_macos_exit_killswitch_precedence_report(
         });
     }
 
-    let restore_path = write_restore_file(anchor.as_str(), baseline_rules.as_str())?;
     let mut restore_error: Option<String> = None;
     let tampered_result = (|| {
         run_pfctl_status(&["-a", anchor.as_str(), "-F", "all"])?;
@@ -407,16 +402,28 @@ fn collect_macos_exit_killswitch_precedence_report(
         ))
     })();
 
-    let restore_result = run_pfctl_status(&[
-        "-a",
-        anchor.as_str(),
-        "-f",
-        restore_path.to_string_lossy().as_ref(),
-    ]);
+    // PF-10: restore through the helper's audited render-to-load tail rather
+    // than a local temp file.
+    //
+    // This used to write the baseline rules with `write_restore_file` — a plain
+    // `fs::write` to `$TMPDIR/rustynet-macos-killswitch-<anchor>-<millis>.pf`,
+    // so: a predictable name, a symlink-following write, no `O_EXCL`, no mode
+    // and no ownership check — and then ran a root `pfctl -f` against that path.
+    // `load_macos_pf_anchor` owns the artifact end-to-end instead: a root-owned
+    // `0700` spool directory verified not to be a symlink, an `O_EXCL` create at
+    // `0600` with a 128-bit `OsRng` nonce in the name, and removal afterwards.
+    //
+    // Scoped honestly: this subcommand runs as root from the live-lab validator,
+    // not as the daemon service, and macOS `env::temp_dir()` is normally the
+    // per-user `0700` `/var/folders/...`, so this was not the daemon-uid boundary
+    // bypass that `fd1b50d1` closed. But `$TMPDIR` is inherited from the invoking
+    // environment, the file's integrity was never established, and it is a root
+    // `pfctl -f` — which is the whole shape SR-020 asked to be converted.
+    let restore_result =
+        crate::privileged_helper::load_macos_pf_anchor(anchor.as_str(), baseline_rules.as_str());
     if let Err(err) = restore_result {
         restore_error = Some(err);
     }
-    let _ = fs::remove_file(&restore_path);
 
     if let Some(err) = restore_error {
         return Err(format!(
@@ -472,23 +479,53 @@ fn run_pfctl_status(args: &[&str]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn write_restore_file(anchor: &str, rules: &str) -> Result<PathBuf, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "rustynet-macos-killswitch-{}-{now}.pf",
-        anchor.replace(['/', '.'], "_")
-    ));
-    fs::write(&path, rules)
-        .map_err(|err| format!("write restore pf rules {} failed: {err}", path.display()))?;
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PF-10: the anchor restore must go through the helper's audited
+    /// render-to-load tail, never through a local temp file.
+    ///
+    /// A source pin because the real behaviour needs root and macOS. What it
+    /// guards is narrow and specific: this module used to write the baseline
+    /// rules with a plain `fs::write` to a predictable `$TMPDIR` name and then
+    /// run a root `pfctl -f` against that path. Re-introducing a local
+    /// temp-then-load here would be a silent regression of artifact custody for a
+    /// root `pfctl -f`, and no unit test of the pure functions would notice.
+    #[test]
+    fn anchor_restore_uses_the_audited_helper_not_a_local_temp_file() {
+        let source = include_str!("macos_exit_killswitch_precedence.rs");
+
+        assert!(
+            source.contains("crate::privileged_helper::load_macos_pf_anchor("),
+            "the restore must call the helper's audited render-to-load tail"
+        );
+
+        // Needles are assembled at runtime so this test's own source does not
+        // match them. A literal would make the assertion permanently true (the
+        // file always contains it) -- the same self-reference trap as grepping a
+        // process table for your own command line.
+        let deleted_writer = format!("fn write_{}", "restore_file");
+        assert!(
+            !source.contains(&deleted_writer),
+            "the local predictable-name temp writer must stay deleted"
+        );
+
+        // No `pfctl -f` may be issued from this module at all: `-f` takes a file
+        // path, so its presence means an artifact whose custody this module owns
+        // rather than the helper.
+        let load_flag = format!("{}f\"", "\"-");
+        for (index, line) in source.lines().enumerate() {
+            let is_comment = line.trim_start().starts_with("//");
+            let is_this_assertion = line.contains("load_flag");
+            assert!(
+                is_comment || is_this_assertion || !line.contains(&load_flag),
+                "line {} issues a pfctl -f from this module; artifact custody for a root \
+                 pfctl load belongs to the helper: {line}",
+                index + 1
+            );
+        }
+    }
 
     #[test]
     fn killswitch_assert_accepts_reviewed_block_all_rule() {
