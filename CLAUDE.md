@@ -221,6 +221,40 @@ Fast-fail convenience runner (recommended for local iteration):
   Windows-specific regression in a crate outside that subset is not caught by
   CI at all.
 
+**Stop the lab VMs before running a full gate.** Measured 2026-07-30 on the same
+commit, same command, same green result — `10317 passed` both ways:
+
+| Machine state | Test-stage wall clock | Tests flagged `slow` |
+| --- | --- | --- |
+| VMs stopped, machine fresh | **128 s** | 3 |
+| 7 UTM VMs up, ~8 h of prior compilation | **668 s** | **24** |
+
+Same code, 5.2x the wall clock and 8x the slow-flags. The cause is not the suite.
+nextest spawns **a process per test** (~10.3k of them), and on macOS every
+freshly-built unsigned binary is validated by Gatekeeper on exec — `syspolicyd`
+had burned **516 minutes of CPU** and was the top consumer at 132% while the gate
+ran. Compound that with swap exhausted (8130 MB of 9216 MB used, **1.55M
+pageouts**) and six QEMU guests holding RAM, and the box thrashes: a 13-line
+`black_box` XOR benchmark (`crates/rustynetd/benches/phase1_runtime_baseline.rs`)
+sat at **5:17 elapsed** having done microseconds of work. It was blocked on
+paging and scheduling, not computing — which is the tell that this is
+environmental, not a hung test.
+
+So: `utmctl stop` the guests you are not using, *then* gate. Keep only what the
+next lab step needs. If a full gate is already crawling, check
+`sysctl -n vm.swapusage` and `ps -Ao %cpu,command -r | head` before suspecting
+the code — and note a **hung** gate looks different from a **slow** one: a slow
+gate has test binaries under it turning over (`ps -Ao etime,command | grep
+target/debug/deps`), a hung one has the nextest parent at 0% CPU with **nothing
+running beneath it**. The parent sitting at 0% is normal in both cases; only the
+children distinguish them.
+
+Do not read progress from nextest's stdout during a run — it block-buffers when
+not attached to a TTY, so the log stays empty until the final summary. It also
+interleaves binaries across one global pool rather than finishing them in order,
+so "which binary is running" is not a position indicator and cannot be
+extrapolated into a completion estimate.
+
 Run scope-specific scripts when present:
 - `./scripts/ci/phase9_gates.sh`
 - `./scripts/ci/phase10_gates.sh`
