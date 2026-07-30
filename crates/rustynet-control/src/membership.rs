@@ -489,6 +489,32 @@ impl MembershipUpdateRecord {
                 "membership update expires_at_unix must be greater than created_at_unix".to_owned(),
             ));
         }
+        // ENR-01/ENR-03, second encoder. This payload is what the approver
+        // signatures are computed over, and it uses the same line-oriented
+        // key=value framing as the snapshot — so the same forged-line and
+        // silently-mutated-value defects apply here, to a MORE sensitive
+        // artifact. The `trim().is_empty()` checks above are exactly the weak
+        // guard ENR-01 was raised about.
+        //
+        // `reason_code` and `policy_context` had no validation at all and are
+        // taken straight from operator flags (`--reason`, `--policy-context`),
+        // as are `--update-id` and `--approver-id`. A newline in any of them
+        // forges a line inside the signed update.
+        validate_membership_payload_field("membership update network id", &self.network_id)?;
+        validate_membership_payload_field("membership update id", &self.update_id)?;
+        validate_membership_payload_field("membership update target", &self.target)?;
+        validate_membership_payload_field("membership update reason code", &self.reason_code)?;
+        validate_membership_payload_field(
+            "membership update prev state root",
+            &self.prev_state_root,
+        )?;
+        validate_membership_payload_field(
+            "membership update new state root",
+            &self.new_state_root,
+        )?;
+        if let Some(policy_context) = self.policy_context.as_deref() {
+            validate_membership_payload_field("membership update policy context", policy_context)?;
+        }
 
         // Build the canonical signed payload by writing into one buffer (no
         // per-line `format!` temporary). Byte-identical output — the update
@@ -515,6 +541,12 @@ impl MembershipUpdateRecord {
 
         match &self.operation {
             MembershipOperation::AddNode(node) => {
+                validate_membership_payload_field("op node id", &node.node_id)?;
+                validate_membership_payload_field("op node owner", &node.owner)?;
+                validate_membership_payload_field("op node pubkey", &node.node_pubkey_hex)?;
+                for role in &node.roles {
+                    validate_membership_role_entry("op node role", role)?;
+                }
                 let _ = writeln!(out, "op.node_id={}", node.node_id);
                 let _ = writeln!(out, "op.node_pubkey_hex={}", node.node_pubkey_hex);
                 let _ = writeln!(out, "op.owner={}", node.owner);
@@ -535,22 +567,31 @@ impl MembershipUpdateRecord {
                 node_id,
                 capabilities,
             } => {
+                validate_membership_payload_field("op node id", node_id)?;
                 let _ = writeln!(out, "op.node_id={node_id}");
                 let _ = writeln!(out, "op.capabilities={}", role_capability_csv(capabilities));
             }
             MembershipOperation::RemoveNode { node_id }
             | MembershipOperation::RevokeNode { node_id }
             | MembershipOperation::RestoreNode { node_id } => {
+                validate_membership_payload_field("op node id", node_id)?;
                 let _ = writeln!(out, "op.node_id={node_id}");
             }
             MembershipOperation::RotateNodeKey {
                 node_id,
                 new_pubkey_hex,
             } => {
+                validate_membership_payload_field("op node id", node_id)?;
+                validate_membership_payload_field("op new pubkey", new_pubkey_hex)?;
                 let _ = writeln!(out, "op.node_id={node_id}");
                 let _ = writeln!(out, "op.new_pubkey_hex={new_pubkey_hex}");
             }
             MembershipOperation::RotateApprover(approver) => {
+                validate_membership_payload_field("op approver id", &approver.approver_id)?;
+                validate_membership_payload_field(
+                    "op approver pubkey",
+                    &approver.approver_pubkey_hex,
+                )?;
                 let _ = writeln!(out, "op.approver_id={}", approver.approver_id);
                 let _ = writeln!(
                     out,
@@ -626,6 +667,14 @@ impl SignedMembershipUpdate {
         let _ = writeln!(out, "payload_hex={}", hex_encode(payload.as_bytes()));
         let _ = writeln!(out, "sig_count={}", signatures.len());
         for (index, signature) in signatures.iter().enumerate() {
+            // The record payload is hex-framed above and so cannot reframe the
+            // envelope, but the signature identities are written raw and
+            // `--approver-id` is operator-supplied.
+            validate_membership_payload_field("signature approver id", &signature.approver_id)?;
+            validate_membership_payload_field("signature hex", &signature.signature_hex)?;
+            if let Some(head_signature_hex) = &signature.head_signature_hex {
+                validate_membership_payload_field("head signature hex", head_signature_hex)?;
+            }
             let _ = writeln!(out, "sig.{index}.approver_id={}", signature.approver_id);
             let _ = writeln!(out, "sig.{index}.signature_hex={}", signature.signature_hex);
             // Optional per-signer head signature (membership head
@@ -3751,6 +3800,134 @@ mod tests {
             Vec::<RoleCapability>::new()
         );
         assert!(parse_node_capabilities(None, "node.0.capabilities").is_err());
+    }
+
+    /// ENR-01/ENR-03 at the SECOND encoder. `MembershipUpdateRecord::canonical_payload`
+    /// is what the approver signatures are computed over, and it uses the same
+    /// line-oriented `key=value` framing as the snapshot — so a newline in any
+    /// free-form field forges a line inside a SIGNED artifact.
+    ///
+    /// `reason_code` and `policy_context` had no validation whatsoever, and
+    /// both are taken straight from operator flags (`--reason`,
+    /// `--policy-context`), as is `--update-id`. The pre-existing
+    /// `trim().is_empty()` checks are exactly the weak guard ENR-01 named.
+    ///
+    /// This case was missed by the first ENR-01 fix, which guarded only
+    /// `MembershipState::validate`, and was found by adversarial review of it.
+    #[test]
+    fn update_record_payload_refuses_framing_bytes_in_every_operator_field() {
+        fn record_with(mutate: impl FnOnce(&mut MembershipUpdateRecord)) -> MembershipUpdateRecord {
+            let state = base_state();
+            let mut record = MembershipUpdateRecord {
+                network_id: state.network_id.clone(),
+                update_id: "update-1".to_owned(),
+                operation: MembershipOperation::RemoveNode {
+                    node_id: "node-a".to_owned(),
+                },
+                target: "node-a".to_owned(),
+                prev_state_root: state.state_root_hex().expect("root"),
+                new_state_root: state.state_root_hex().expect("root"),
+                epoch_prev: state.epoch,
+                epoch_new: state.epoch + 1,
+                created_at_unix: 101,
+                expires_at_unix: 400,
+                reason_code: "ops".to_owned(),
+                policy_context: None,
+            };
+            mutate(&mut record);
+            record
+        }
+
+        // Sanity: the unmutated record encodes, so a rejection below is the
+        // guard firing and not a broken fixture.
+        assert!(record_with(|_| {}).canonical_payload().is_ok());
+
+        for hostile in ["x\nepoch_new=99", "x\r", "x=y"] {
+            let cases: Vec<(&str, MembershipUpdateRecord)> = vec![
+                (
+                    "update_id",
+                    record_with(|r| r.update_id = hostile.to_owned()),
+                ),
+                ("target", record_with(|r| r.target = hostile.to_owned())),
+                (
+                    "reason_code",
+                    record_with(|r| r.reason_code = hostile.to_owned()),
+                ),
+                (
+                    "policy_context",
+                    record_with(|r| r.policy_context = Some(hostile.to_owned())),
+                ),
+                (
+                    "network_id",
+                    record_with(|r| r.network_id = hostile.to_owned()),
+                ),
+                (
+                    "op.node_id",
+                    record_with(|r| {
+                        r.operation = MembershipOperation::RemoveNode {
+                            node_id: hostile.to_owned(),
+                        }
+                    }),
+                ),
+            ];
+            for (field, record) in cases {
+                assert!(
+                    record.canonical_payload().is_err(),
+                    "{field} accepted {hostile:?} into a signed update payload"
+                );
+            }
+        }
+    }
+
+    /// The envelope hex-frames the record payload, so the record cannot reframe
+    /// it — but the signature identities are written raw, and `--approver-id`
+    /// is operator-supplied.
+    #[test]
+    fn signed_envelope_refuses_framing_bytes_in_signature_identity() {
+        let state = base_state();
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-1".to_owned(),
+            operation: MembershipOperation::RemoveNode {
+                node_id: "node-a".to_owned(),
+            },
+            target: "node-a".to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: state.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 101,
+            expires_at_unix: 400,
+            reason_code: "ops".to_owned(),
+            policy_context: None,
+        };
+        let signed_ok = SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: vec![MembershipSignature {
+                approver_id: "owner-1".to_owned(),
+                signature_hex: "ab".repeat(64),
+                head_signature_hex: None,
+            }],
+        };
+        assert!(
+            signed_ok.canonical_envelope().is_ok(),
+            "fixture must encode"
+        );
+
+        for hostile in ["owner-1\nsig_count=99", "owner-1\r", "owner-1=x"] {
+            let signed = SignedMembershipUpdate {
+                record: record.clone(),
+                approver_signatures: vec![MembershipSignature {
+                    approver_id: hostile.to_owned(),
+                    signature_hex: "ab".repeat(64),
+                    head_signature_hex: None,
+                }],
+            };
+            assert!(
+                signed.canonical_envelope().is_err(),
+                "approver_id accepted {hostile:?} into a signed envelope"
+            );
+        }
     }
 
     #[test]
