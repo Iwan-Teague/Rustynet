@@ -2863,6 +2863,7 @@ before the renumber (`3b598514`, `cecb8773`) still say `PF-11`; they mean
 | PF-16 | `macos_blind_exit`'s own terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name | Medium | **FIXED** `3b598514` |
 | IPV-15 | On an exit node with DNS protection, the wide-open egress accept is ordered ABOVE the port-53 fail-closed drops, so plaintext DNS out the underlay is accepted before the drop is reached | **High** | **OPEN — needs a decision** |
 | POL-15 | `selected_exit_node` is tracked twice — daemon and controller — and the restore + auto-exit paths assign only the daemon's, so the LAN-route gate can never pass in those states | Medium | **OPEN — needs a decision** |
+| RLY-17 | The daemon-side clock helper carries the same false "returns 0 ⇒ fail-closed" claim as RLY-15, and its safety comes from a different check than the one the comment names | Low | **Comment FIXED; hardening open** |
 
 ### PF-16 — a fifth presence-only terminal-block check (Medium; FIXED)
 
@@ -2956,3 +2957,43 @@ through to the controller and delete its own field; make restore and auto-exit
 call `set_exit_node` and handle the denial; or keep both and add an invariant
 check that fails closed on divergence. The POL-14 fix currently warns on it and
 declines to grant, which is safe but leaves the inconsistency in place.
+
+### RLY-17 — the daemon-side clock twin is safe by accident, and says so incorrectly (Low; CONFIRMED by reading; comment fixed, hardening open)
+
+Found by sweeping for RLY-15's shape across the workspace rather than by reading
+the review, which cited only `relay/transport.rs` and `control/lib.rs`.
+
+`rustynetd/src/relay_client.rs`'s `current_unix()` is the same
+`unwrap_or(0)` helper, carrying nearly the same doc comment: *"Now returns 0 on
+failure, which makes any relay session token's `expires_at_unix > 0` look
+already-expired — fail-closed."* **That mechanism is false**, for exactly the
+reason RLY-15 gives: the check is `token.expires_at_unix <= now_unix`
+(`:854`), and with `now_unix = 0` no real token satisfies it, so the expiry
+check does **not** fire.
+
+**But the outcome here IS fail-closed, via a different check.** Two lines later
+`:857` rejects `token.issued_at_unix > now_unix + skew`; with `now = 0` that is
+true for every real token, so everything is refused as future-dated. Nothing
+validates while the clock is broken.
+
+So the daemon side is safe *by accident*. That matters for two reasons:
+
+1. The comment names the wrong guarantee, so a reader auditing the expiry path
+   would come away believing a check fires that does not. This is the POL-06
+   failure mode — a doc asserting a control the code does not implement.
+2. The safety rests entirely on the future-dating check, which is RLY-01's twin
+   and is exactly the kind of check a future refactor might relax or move. If it
+   goes, the fail-open appears with no other guard behind it.
+
+**Scope of the sweep, for the record.** 59 production sites use the
+`duration_since(UNIX_EPOCH) … unwrap_or(0)` idiom. Triaged, **58 are benign** —
+temp-filename uniqueness, report timestamps, and recorded `*_at_unix` fields
+where `0` is inert. Notably the two most trust-sensitive candidates,
+`rustynet-control/src/membership.rs:1487` and `:2208`, are both temp-filename
+uniqueness. Only this one feeds a freshness comparison. The idiom is therefore
+widespread but not widely dangerous; what makes it dangerous is a freshness
+consumer, and there is exactly one besides the relay's.
+
+Remaining work: give `current_unix()` the same `Option` treatment as
+`now_unix_checked()` so the daemon side is fail-closed by construction rather
+than by a neighbouring check.
