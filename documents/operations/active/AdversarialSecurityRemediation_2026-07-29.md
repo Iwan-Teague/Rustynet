@@ -64,14 +64,36 @@ reader would otherwise have acted on:
 Closed in this pass: **ENR-01**, **ENR-03** (`436b23b7`), **ENR-13**
 (`fa67f646`), **ENR-05** (`c61c1e92`), plus the two stamp-only corrections above.
 
-**Named but deliberately NOT closed by ENR-05:** `parse_node_capabilities`'s
-legacy roles→capabilities decode fallback (`membership.rs`) carries the same
-mapping with *different* coverage — it handles the `anchor.*` tokens the bridge
-dropped, but still drops `serves_nas`, `serves_llm` and
-`anchor.port_mapping_pinned`, and grants `Anchor` from the same four tokens the
-canonical parser rejects. Issuance and decode are not the same risk: refusing
-input at issuance strands nothing, whereas refusing it at decode is a
-snapshot-compatibility break. Tracked as its own decision.
+**ENR-05's decode-side twin is now closed too** (`93dbd421`), as a separate
+change after an explicit decision to accept the compatibility break.
+`parse_node_capabilities` carried the same mapping for its legacy
+roles→capabilities fallback, drifted differently again — it handled the
+`anchor.*` tokens the bridge dropped, still dropped `serves_nas`, `serves_llm`
+and `anchor.port_mapping_pinned`, and granted `Anchor` from the same four tokens
+the canonical parser rejects.
+
+It was **deleted rather than made stricter**, because strictness was the wrong
+axis. Capabilities are the *authorization* field; in a snapshot with no
+`capabilities` line what the approvers signed is a `roles` string — a *label*.
+The shim read that label and derived authority from it, mapping `tag:servers` to
+`Anchor`. The quorum's signature covered the label and never covered the grant,
+so the shim converted a **signed label into an unsigned privilege** — the POL-05
+shape, and the exact inversion §10.4's default-deny rule exists to prevent.
+
+Four things were measured before deleting, not assumed:
+`MEMBERSHIP_SCHEMA_VERSION` has never been bumped (`git log -S` returns only the
+initial commit), which is *why* the shim existed; `canonical_payload` always
+writes the field; **no test reached the fallback**, proven by making the branch
+`panic!` and running the crate suite green; and no archived artifact contained
+such a snapshot.
+
+The schema version is deliberately **not** bumped — bumping refuses strictly
+more, including good snapshots that *do* carry capabilities, for no extra
+security. The versioning debt is recorded instead: `version=1` now means
+slightly stricter than it did. Accepted residual risk: a genuine
+pre-capabilities snapshot no longer loads and its node fails closed. Only
+*absence* is refused — an explicit empty `capabilities=` still decodes, so
+clearing a node's capabilities stays expressible.
 
 One caution on that table. A "closed" row means a fix landed with a commit and,
 where behaviour changed, a mutation-verified test — it does **not** mean the
@@ -398,7 +420,7 @@ Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`
 | ENR-02 | `NodeRegistry::upsert` has zero validation and three production callers | Validate inside `upsert` itself so every caller inherits it (**S3**) | XS | **DONE** `4333d473` (S3) — stamped 2026-07-30; the fix landed with S3 but the row was never marked |
 | ENR-03 | A `\r` silently mutates an identifier across encode/decode, producing state-root drift | Rejecting `\r` (**S3**) closes it; add a round-trip test asserting `decode(encode(x)) == x` for identifier edge cases | S | **DONE** `436b23b7` — reading the decoder found three more mutation shapes the review did not name: `split_csv` does `split(',') → trim → drop-empty`, so a role with an embedded comma, surrounding whitespace, or an empty entry also fails the round trip; and `metadata_hash: Some("")` decoded back as `None`. All refused |
 | ENR-04 | `admit` burns the single-use token before validating the collision or loading the signing key | Move the duplicate-`node_id` check, the signing-key load, and an output-path writability probe **ahead** of the consume — or make the consume the last durable step | S | — |
-| ENR-05 | Role bridge drops 8/14 tokens to Client **and** grants `Anchor` from 4 tokens the canonical parser rejects | Delegate to `RoleCapability::parse` and return a typed error on any unrecognised token. **Also re-rate RSA-0015** — its "can only drop privilege" rationale is wrong in both directions | S | **DONE** `c61c1e92` — the second table is deleted, not corrected; the five invented aliases (`exit`, `relay`, `entry`, `tag:members`, `tag:clients`) go with it. Tests derive their expectation FROM the canonical parser, so a new capability extends them automatically rather than needing a third hand-copy. **STILL OWED: the RSA-0015 re-rate**, which lives in another ledger and was not touched here |
+| ENR-05 | Role bridge drops 8/14 tokens to Client **and** grants `Anchor` from 4 tokens the canonical parser rejects | Delegate to `RoleCapability::parse` and return a typed error on any unrecognised token. **Also re-rate RSA-0015** — its "can only drop privilege" rationale is wrong in both directions | S | **DONE** `c61c1e92` — the second table is deleted, not corrected; the five invented aliases (`exit`, `relay`, `entry`, `tag:members`, `tag:clients`) go with it. Tests derive their expectation FROM the canonical parser, so a new capability extends them automatically rather than needing a third hand-copy. Decode-side twin closed separately at `93dbd421`. **STILL OWED: the RSA-0015 re-rate**, which lives in another ledger and was not touched here |
 | ENR-06 | A `--roles blind_exit` typo at admit is irreversible | Require an explicit `--confirm-irreversible` flag when the admit role set maps to `BlindExit`. **Do not** touch the reducer guard | S | **see §1** |
 | ENR-07 | On non-Unix the `<ledger>.lock` file wedges enrollment permanently after a crash | Use a real Windows file lock (`LockFileEx`), or stamp the lock with the owning PID and treat a dead owner as stale | S | test first |
 | ENR-08 | `load_ledger` lacks the permission gate and size cap that `load_secret` has | Apply the same group/world rejection and size cap | XS | **DONE** `73ae5cc9` + `de9a6afb` — needed a write-side cap too; see §0 |
