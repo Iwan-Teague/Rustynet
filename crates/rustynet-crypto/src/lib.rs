@@ -1731,6 +1731,54 @@ impl Default for KeyCustodyPermissionPolicy {
     }
 }
 
+/// The ownership and mode facts about a key-custody directory and file.
+///
+/// Split out from the syscalls so the decision below is testable. The
+/// attacker-owned case is the one that matters most and an unprivileged test
+/// cannot create it -- `chown` to another uid needs root -- so a test that only
+/// drove the real filesystem could verify the modes and never the ownership
+/// check, which is precisely the half that was missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixCustodyMetadata {
+    pub directory_uid: u32,
+    pub directory_mode: u32,
+    pub file_uid: u32,
+    pub file_mode: u32,
+}
+
+/// Decide whether a key-custody directory and file are safely held.
+///
+/// # CRY-07
+///
+/// This used to check modes only. An ATTACKER-owned directory and file with
+/// perfectly correct `0700`/`0600` modes passed: the owner of a file may rewrite
+/// it however restrictively it is moded, so "only the owner may read this" says
+/// nothing useful until you also assert WHO the owner is.
+///
+/// It was the weaker of two sibling implementations -- the peer store's
+/// `ensure_unix_owner` is audited PASS specifically for pairing a uid check with
+/// `0700`/`0600`. The two now agree, and use the same `Uid::effective()`
+/// primitive.
+///
+/// Modes are checked before ownership so the error a misconfigured (rather than
+/// hostile) deployment sees still points at the more likely cause.
+pub fn evaluate_unix_custody_metadata(
+    metadata: UnixCustodyMetadata,
+    policy: KeyCustodyPermissionPolicy,
+    effective_uid: u32,
+) -> Result<(), CryptoError> {
+    if metadata.directory_mode != policy.required_directory_mode {
+        return Err(CryptoError::PermissionDenied);
+    }
+    if metadata.file_mode != policy.required_file_mode {
+        return Err(CryptoError::PermissionDenied);
+    }
+    if metadata.directory_uid != effective_uid || metadata.file_uid != effective_uid {
+        return Err(CryptoError::PermissionDenied);
+    }
+    Ok(())
+}
+
 pub fn validate_key_custody_permissions(
     directory: &Path,
     file: &Path,
@@ -1738,6 +1786,7 @@ pub fn validate_key_custody_permissions(
 ) -> Result<(), CryptoError> {
     #[cfg(unix)]
     {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
 
         let directory_link_metadata =
@@ -1753,17 +1802,18 @@ pub fn validate_key_custody_permissions(
         let directory_metadata = std::fs::metadata(directory).map_err(|_| CryptoError::Io)?;
         let file_metadata = std::fs::metadata(file).map_err(|_| CryptoError::Io)?;
 
-        let directory_mode = directory_metadata.permissions().mode() & 0o777;
-        let file_mode = file_metadata.permissions().mode() & 0o777;
-
-        if directory_mode != policy.required_directory_mode {
-            return Err(CryptoError::PermissionDenied);
-        }
-        if file_mode != policy.required_file_mode {
-            return Err(CryptoError::PermissionDenied);
-        }
-
-        Ok(())
+        // Effective rather than real uid, because that is the identity the
+        // subsequent `read` will be authorized against.
+        evaluate_unix_custody_metadata(
+            UnixCustodyMetadata {
+                directory_uid: directory_metadata.uid(),
+                directory_mode: directory_metadata.permissions().mode() & 0o777,
+                file_uid: file_metadata.uid(),
+                file_mode: file_metadata.permissions().mode() & 0o777,
+            },
+            policy,
+            nix::unistd::Uid::effective().as_raw(),
+        )
     }
 
     #[cfg(not(unix))]
@@ -1793,6 +1843,132 @@ pub fn validate_key_custody_permissions(
         // correct. CRY-05 / AUDIT-027.
         let _ = (directory, file, policy);
         Err(CryptoError::PermissionValidationUnavailable)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_custody_tests {
+    use super::{
+        CryptoError, KeyCustodyPermissionPolicy, UnixCustodyMetadata,
+        evaluate_unix_custody_metadata,
+    };
+
+    const ME: u32 = 501;
+    const ATTACKER: u32 = 502;
+
+    fn safe() -> UnixCustodyMetadata {
+        UnixCustodyMetadata {
+            directory_uid: ME,
+            directory_mode: 0o700,
+            file_uid: ME,
+            file_mode: 0o600,
+        }
+    }
+
+    #[test]
+    fn correctly_owned_and_moded_custody_is_accepted() {
+        evaluate_unix_custody_metadata(safe(), KeyCustodyPermissionPolicy::default(), ME)
+            .expect("0700/0600 owned by the effective user must pass");
+    }
+
+    /// CRY-07: the case the mode-only validator accepted.
+    ///
+    /// Every mode is exactly right; only the owner is wrong. The owner of a file
+    /// can rewrite it regardless of its mode, so this must be refused.
+    #[test]
+    fn attacker_owned_custody_with_perfect_modes_is_refused() {
+        for (label, metadata) in [
+            (
+                "attacker owns both",
+                UnixCustodyMetadata {
+                    directory_uid: ATTACKER,
+                    file_uid: ATTACKER,
+                    ..safe()
+                },
+            ),
+            (
+                "attacker owns the directory",
+                UnixCustodyMetadata {
+                    directory_uid: ATTACKER,
+                    ..safe()
+                },
+            ),
+            (
+                // The subtler half: the directory is ours but the KEY FILE is
+                // not. Checking only the directory would pass this.
+                "attacker owns the key file",
+                UnixCustodyMetadata {
+                    file_uid: ATTACKER,
+                    ..safe()
+                },
+            ),
+            (
+                // root is not a safe owner either when we are not root: the
+                // check is equality with the effective uid, not a trust ranking.
+                "root owns the key file",
+                UnixCustodyMetadata {
+                    file_uid: 0,
+                    ..safe()
+                },
+            ),
+        ] {
+            assert_eq!(
+                evaluate_unix_custody_metadata(metadata, KeyCustodyPermissionPolicy::default(), ME),
+                Err(CryptoError::PermissionDenied),
+                "{label}: correct modes must not substitute for correct ownership"
+            );
+        }
+    }
+
+    /// The pre-existing mode checks must survive the restructure.
+    #[test]
+    fn wrong_modes_are_still_refused_regardless_of_ownership() {
+        for (label, metadata) in [
+            (
+                "group-readable directory",
+                UnixCustodyMetadata {
+                    directory_mode: 0o750,
+                    ..safe()
+                },
+            ),
+            (
+                "world-readable key file",
+                UnixCustodyMetadata {
+                    file_mode: 0o644,
+                    ..safe()
+                },
+            ),
+            (
+                "group-readable key file",
+                UnixCustodyMetadata {
+                    file_mode: 0o640,
+                    ..safe()
+                },
+            ),
+        ] {
+            assert_eq!(
+                evaluate_unix_custody_metadata(metadata, KeyCustodyPermissionPolicy::default(), ME),
+                Err(CryptoError::PermissionDenied),
+                "{label} must be refused"
+            );
+        }
+    }
+
+    /// root running as root is the ordinary daemon case and must still work --
+    /// the check is uid EQUALITY, so it must not special-case uid 0 in either
+    /// direction.
+    #[test]
+    fn root_owned_custody_passes_when_the_effective_user_is_root() {
+        evaluate_unix_custody_metadata(
+            UnixCustodyMetadata {
+                directory_uid: 0,
+                file_uid: 0,
+                ..safe()
+            },
+            KeyCustodyPermissionPolicy::default(),
+            0,
+        )
+        .expect("a root-owned key store must validate for a root-running daemon");
     }
 }
 
