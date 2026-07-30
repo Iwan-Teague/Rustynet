@@ -73,6 +73,23 @@ pub enum RuleDisposition {
     /// that keeps a real killswitch from being reported as broken: every
     /// working killswitch necessarily accepts its own tunnel egress.
     Contained,
+    /// Matches and permits egress outside the tunnel, but only for a single
+    /// operator-declared service or source range — a specific proto+port, or a
+    /// restricted source/destination — rather than for traffic in general.
+    ///
+    /// This variant exists because real killswitches need such rules: the
+    /// WireGuard handshake must reach the peer endpoint on the physical
+    /// interface before any tunnel exists, and an exit node must forward its
+    /// mesh CIDR. Treating those as escapes would report every working
+    /// deployment as broken, and a check that fires on correct configuration
+    /// gets deleted rather than heeded.
+    ///
+    /// The honest limit: such a rule *is* a real egress channel for the narrow
+    /// class it names. It does not defeat containment of the general traffic
+    /// class, which is what this walk decides, but auditing whether each narrow
+    /// allow is itself justified is a separate question this model does not
+    /// answer.
+    NarrowAllow,
     /// Matches and permits egress outside the tunnel. This rule defeats the
     /// terminator for any traffic it matches. Also the fail-closed default for
     /// anything the classifier cannot positively prove safe.
@@ -158,7 +175,9 @@ pub fn terminator_is_reachable<S: AsRef<str>>(
             continue;
         }
         match classify(rule) {
-            RuleDisposition::Irrelevant | RuleDisposition::Contained => continue,
+            RuleDisposition::Irrelevant
+            | RuleDisposition::Contained
+            | RuleDisposition::NarrowAllow => continue,
             RuleDisposition::Escapes => {
                 return Err(ContainmentFailure::Escaped(PrecedenceViolation {
                     index,
