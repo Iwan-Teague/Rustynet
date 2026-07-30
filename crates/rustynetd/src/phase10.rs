@@ -205,6 +205,29 @@ impl std::str::FromStr for ManagementCidr {
         if prefix > max_prefix {
             return Err(format!("invalid management cidr prefix: {value}"));
         }
+        // Containment, not just syntax. A management CIDR becomes the match
+        // clause of a TCP/22 allow rule on THREE backends -- macOS pf, Linux
+        // nftables, and Windows netsh -- and every one of them was reachable
+        // with `0.0.0.0/0`, which authorises unrestricted port-22 egress past
+        // the killswitch. Syntactic validation accepted it: `/0` is a
+        // well-formed prefix.
+        //
+        // Bounding it HERE is deliberate. This is the single place all three
+        // backends funnel through, so a per-backend guard is the one shape that
+        // can drift between platforms while looking fixed on the one that was
+        // audited. Reusing `validate_mesh_egress_source_cidr` rather than
+        // reimplementing the check keeps the *policy* from drifting too: one
+        // supernet table, one set of tests.
+        //
+        // Strictest practical default: a management network is a bounded
+        // operator range by definition (RFC1918, RFC6598 CGNAT, RFC4193 ULA, or
+        // link-local), so this false-rejects nothing real. An operator wanting a
+        // globally-routable management range must widen the supernet table
+        // explicitly -- a visible, reviewable change rather than a `/0` typo.
+        // Closes PF-02 and WIN-05 and the Linux nft twin of both.
+        crate::macos_pf_mesh_cidr::validate_mesh_egress_source_cidr(value).map_err(|err| {
+            format!("invalid management cidr {value}: must be a bounded operator range ({err})")
+        })?;
         Ok(Self { address, prefix })
     }
 }
@@ -6957,6 +6980,80 @@ pub fn write_phase10_perf_report(
 
 #[cfg(test)]
 mod tests {
+
+    /// A management CIDR must be a bounded operator range, not a default route.
+    ///
+    /// PF-02 / WIN-05 and the Linux nft twin: this one value becomes the match
+    /// clause of a TCP/22 allow rule on macOS pf, Linux nftables AND Windows
+    /// netsh. `0.0.0.0/0` parsed cleanly -- `/0` is a well-formed prefix -- and
+    /// authorised unrestricted port-22 egress past the killswitch on all three.
+    #[test]
+    fn management_cidr_rejects_unbounded_ranges() {
+        use std::str::FromStr;
+
+        // The vectors. Each is syntactically valid and was previously accepted.
+        for hostile in [
+            "0.0.0.0/0",
+            "::/0",
+            "128.0.0.0/1",
+            "8.8.8.0/24",
+            "1.1.1.1/32",
+            "2001:4860:4860::8888/128",
+            "2000::/3",
+        ] {
+            assert!(
+                super::ManagementCidr::from_str(hostile).is_err(),
+                "an unbounded or globally-routable management CIDR must be rejected: {hostile:?}"
+            );
+        }
+
+        // Real operator ranges must still parse -- including every value this
+        // repo's own live lab uses, so the guard cannot break the lab it ships
+        // with.
+        for benign in [
+            "192.168.64.0/24",
+            "192.168.121.0/24",
+            "192.168.8.0/24",
+            "172.20.0.0/30",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "100.64.0.0/10",
+            "fc00::/7",
+            "fe80::/10",
+        ] {
+            super::ManagementCidr::from_str(benign).unwrap_or_else(|err| {
+                panic!("a real operator range must parse: {benign:?}: {err}")
+            });
+        }
+
+        // Malformed input still fails, and the prefix bound still holds.
+        for malformed in ["192.168.1.0", "192.168.1.0/33", "notanip/24", "10.0.0.0/x"] {
+            assert!(
+                super::ManagementCidr::from_str(malformed).is_err(),
+                "malformed management CIDR must be rejected: {malformed:?}"
+            );
+        }
+    }
+
+    /// The bound must live at the shared parser, not in a per-backend guard.
+    ///
+    /// The whole point of PF-02/WIN-05 being one finding across three backends
+    /// is that they share this parser. A guard added in the pf renderer would
+    /// leave nftables and netsh exposed while looking fixed on the platform
+    /// that was audited, which is exactly how this survived the first audit.
+    #[test]
+    fn management_cidr_bound_lives_in_the_shared_parser() {
+        let source = include_str!("phase10.rs");
+        let from_str_at = source
+            .find("impl std::str::FromStr for ManagementCidr")
+            .expect("ManagementCidr must still implement FromStr");
+        let body: String = source[from_str_at..].chars().take(2200).collect();
+        assert!(
+            body.contains("validate_mesh_egress_source_cidr"),
+            "the containment check must be applied inside ManagementCidr::from_str, the one \
+             place all three backends funnel through"
+        );
+    }
     #[cfg(unix)]
     #[test]
     fn helper_command_timeout_kills_a_hung_command() {
