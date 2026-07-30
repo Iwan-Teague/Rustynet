@@ -39,11 +39,11 @@ they did not before, and a reader scanning rows would have re-done closed work:
 | | count |
 |---|---|
 | closed | **38** |
-| partially closed (one half landed, the other named) | 3 |
+| partially closed (one half landed, the other named) | 4 |
 | parked — DECISION / GATED / DO-NOT-FIX | 20 |
-| genuinely open | **42** |
+| genuinely open | **41** |
 
-Open, for planning: `CRY-03 CRY-05 CTL-02 CTL-04 CTL-05 CTL-07 ENR-04 ENR-06
+Open, for planning: `CRY-03 CTL-02 CTL-04 CTL-05 CTL-07 ENR-04 ENR-06
 ENR-07 ENR-10…ENR-12 ENR-14 ENR-15 IPV-01 IPV-04…IPV-09 IPV-11 IPV-13 IPV-14 PF-06
 PF-07 PF-11 PF-12 PF-15 POL-11 POL-13 RLY-06 RLY-08 RLY-09 RLY-13 RLY-14 WIN-01
 WIN-02 WIN-04 WIN-06 WIN-09 WIN-10`. The ENR block is still the largest single
@@ -316,7 +316,7 @@ Scope honestly: this does **not** close CTL-02 (verifier soundness), CTL-03 (`|`
 | CRY-02 | Linux has no strict-policy arm, and its OS store fails to `OsStoreUnavailable` in the ordinary headless case | Decide Linux's tier explicitly rather than by omission; surface the returned backend so a silent downgrade is observable | S | DECISION |
 | CRY-03 | 16-char passphrase floor with no entropy requirement; Argon2 params not stored in the blob | Store `(algorithm, version, m, t, p)` in the envelope so cost can be raised migration-safely; raise the passphrase floor given this string bounds at-rest security | M | test first |
 | CRY-04 | v0/v1 framing ambiguity renders ~99.6% of legacy blobs undecodable | **Land the regression test only** (hand-build a v0 blob, assert it decodes). The framing fix is deferred by decision | S | **GATED** — see §1 |
-| CRY-05 | Windows permission validation is an `Ok(())` no-op, both directions | **See S5.** Also apply a DACL at write time on non-unix rather than inheriting | XS | — |
+| CRY-05 | Windows permission validation is an `Ok(())` no-op, both directions | **See S5.** Also apply a DACL at write time on non-unix rather than inheriting | XS | **PARTIAL** `0968c44d` (S5) — stamped 2026-07-30. Verified: the `#[cfg(not(unix))]` arm of `validate_key_custody_permissions` now returns `PermissionValidationUnavailable` instead of `Ok(())`, so the READ-side no-op is closed. The WRITE-side half is **not** done — `write_encrypted_key_file` applies permissions only under `#[cfg(unix)]`, so a non-unix key file still inherits its DACL, and `rustynet-windows-native` exposes only `inspect_*_sddl` readers with no setter to call. Sizing the remainder as XS is optimistic: it needs a new native primitive |
 | CRY-06 | `NodeKeyPair::from_raw` never verifies pub/priv correspondence | Delete it (dead public API), or make it take a seed and derive the public key, as `from_seed` already does | XS | **DONE** `73ae5cc9` — also fixed a scaffold it broke (`acb5ef15`) |
 | CRY-07 | Unix permission validator checks modes but not ownership | Add a uid check, matching the pattern `ops_peer_store.rs` is audited PASS for; optionally `O_NOFOLLOW` + `fstat` for the TOCTOU | S | **DONE** `306575df` |
 | CRY-08 | `with_exceptions` rejects all non-empty lists, making the denylist loop dead | **Comment only** — state that exceptions are administratively disabled by design, so nobody "repairs" the guard into a fail-open | XS | **DO-NOT-FIX** |
