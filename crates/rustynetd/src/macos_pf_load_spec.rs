@@ -248,6 +248,16 @@ impl MacosPfLoadSpec {
         let mut traversal: Vec<&str> = Vec::new();
         let mut managed_peer: Vec<&str> = Vec::new();
         let mut mesh_cidr: Vec<&str> = Vec::new();
+        // PF-14: presence is tracked separately from the parsed values, because
+        // `extend_csv` drops empty parts. A token whose value is only separators
+        // (`ssh_cidr=,`) leaves the vector EMPTY while the token was very much
+        // present, so a cross-kind guard reading the vector cannot tell "absent"
+        // from "present but empty" -- and the cross-kind guards are supposed to
+        // reject the token, not its contents.
+        let mut ssh_cidr_seen = false;
+        let mut traversal_seen = false;
+        let mut managed_peer_seen = false;
+        let mut mesh_cidr_seen = false;
 
         for arg in args {
             let (key, value) = arg
@@ -265,10 +275,22 @@ impl MacosPfLoadSpec {
                 "fail_closed_ssh_allow" => set_once(&mut fail_closed_ssh_allow, key, value)?,
                 "ipv6_blocked" => set_once(&mut ipv6_blocked, key, value)?,
                 "ipv6_tunnel_allowed" => set_once(&mut ipv6_tunnel_allowed, key, value)?,
-                "ssh_cidr" => extend_csv(&mut ssh_cidr, value),
-                "traversal" => extend_csv(&mut traversal, value),
-                "managed_peer" => extend_csv(&mut managed_peer, value),
-                "mesh_cidr" => extend_csv(&mut mesh_cidr, value),
+                "ssh_cidr" => {
+                    ssh_cidr_seen = true;
+                    extend_csv(&mut ssh_cidr, value);
+                }
+                "traversal" => {
+                    traversal_seen = true;
+                    extend_csv(&mut traversal, value);
+                }
+                "managed_peer" => {
+                    managed_peer_seen = true;
+                    extend_csv(&mut managed_peer, value);
+                }
+                "mesh_cidr" => {
+                    mesh_cidr_seen = true;
+                    extend_csv(&mut mesh_cidr, value);
+                }
                 other => return Err(format!("unknown macos pf-load token key: {other}")),
             }
         }
@@ -287,7 +309,7 @@ impl MacosPfLoadSpec {
                 // Reject fields that do not belong to this kind (fail closed).
                 reject_present("killswitch", "tunnel", tunnel)?;
                 reject_present("killswitch", "ipv6_tunnel_allowed", ipv6_tunnel_allowed)?;
-                reject_nonempty("killswitch", "mesh_cidr", &mesh_cidr)?;
+                reject_list_present("killswitch", "mesh_cidr", mesh_cidr_seen)?;
 
                 let generation = parse_u64(require(generation, "generation")?, "generation")?;
                 let strict_fail_closed = parse_bool(require(strict, "strict")?, "strict")?;
@@ -346,8 +368,8 @@ impl MacosPfLoadSpec {
                 )?;
                 reject_present("blind_exit", "fail_closed_ssh_allow", fail_closed_ssh_allow)?;
                 reject_present("blind_exit", "ipv6_blocked", ipv6_blocked)?;
-                reject_nonempty("blind_exit", "traversal", &traversal)?;
-                reject_nonempty("blind_exit", "managed_peer", &managed_peer)?;
+                reject_list_present("blind_exit", "traversal", traversal_seen)?;
+                reject_list_present("blind_exit", "managed_peer", managed_peer_seen)?;
 
                 let tunnel_interface = require(tunnel, "tunnel")?.to_owned();
                 let egress_interface = require(egress, "egress")?.to_owned();
@@ -392,9 +414,9 @@ impl MacosPfLoadSpec {
                 reject_present("exit_nat", "fail_closed_ssh_allow", fail_closed_ssh_allow)?;
                 reject_present("exit_nat", "ipv6_blocked", ipv6_blocked)?;
                 reject_present("exit_nat", "ipv6_tunnel_allowed", ipv6_tunnel_allowed)?;
-                reject_nonempty("exit_nat", "ssh_cidr", &ssh_cidr)?;
-                reject_nonempty("exit_nat", "traversal", &traversal)?;
-                reject_nonempty("exit_nat", "managed_peer", &managed_peer)?;
+                reject_list_present("exit_nat", "ssh_cidr", ssh_cidr_seen)?;
+                reject_list_present("exit_nat", "traversal", traversal_seen)?;
+                reject_list_present("exit_nat", "managed_peer", managed_peer_seen)?;
 
                 let egress_interface = require(egress, "egress")?.to_owned();
                 if mesh_cidr.is_empty() {
@@ -493,8 +515,27 @@ fn reject_present(kind: &str, key: &str, slot: Option<&str>) -> Result<(), Strin
     Ok(())
 }
 
-fn reject_nonempty(kind: &str, key: &str, values: &[&str]) -> Result<(), String> {
-    if !values.is_empty() {
+/// Reject a list token that does not belong to this spec kind.
+///
+/// # PF-14: this is a presence guard, and it used to be a content guard
+///
+/// It was named `reject_nonempty` and took the parsed `&[&str]`, so it rejected
+/// the token's CONTENTS rather than the token. Because `extend_csv` drops empty
+/// parts, a value consisting only of separators produced an empty vector and
+/// slipped through: `kind=exit_nat … ssh_cidr=,` and
+/// `kind=killswitch … mesh_cidr=,` were both accepted (executed).
+///
+/// The sibling scalar guard `reject_present` genuinely is a presence guard, so
+/// the two disagreed about what "must not carry token" means while sharing the
+/// error message. Now they agree: `seen` is set when the key appears at all,
+/// whatever it parses to.
+///
+/// No reachable effect was demonstrated — the resulting spec and render are
+/// byte-identical to the same token list with the offending token removed — so
+/// this is about the guard meaning what it says, before something downstream
+/// starts depending on it meaning that.
+fn reject_list_present(kind: &str, key: &str, seen: bool) -> Result<(), String> {
+    if seen {
         return Err(format!(
             "macos pf-load {kind} spec must not carry token: {key}"
         ));
@@ -740,6 +781,113 @@ mod tests {
         assert_eq!(original.render().unwrap(), direct);
     }
 
+    /// PF-13: sweep `strict` and `generation` rather than pinning one pair.
+    ///
+    /// The committed round-trips each tested a single point (`generation=7`,
+    /// `strict=false`), and two of them asserted only render equality — so a
+    /// decode that lost or transposed a field would pass as long as the renderer
+    /// happened to emit the same text. The review ran a 2592-case probe ad hoc
+    /// and confirmed the property holds; this commits a bounded version of it, so
+    /// the property is enforced rather than remembered.
+    ///
+    /// `generation` boundaries matter specifically: it is formatted into the pf
+    /// anchor name, so 0 and `u64::MAX` are the values most likely to expose a
+    /// formatting or parsing asymmetry.
+    #[test]
+    fn killswitch_roundtrip_holds_across_strict_and_generation() {
+        for generation in [0u64, 1, 7, u64::MAX / 2, u64::MAX] {
+            for strict in [false, true] {
+                for dns_protected in [false, true] {
+                    for ipv6_blocked in [false, true] {
+                        for allow_egress_interface in [false, true] {
+                            let spec = MacosKillswitchSpec {
+                                dns_protected,
+                                ipv6_blocked,
+                                allow_egress_interface,
+                                ..rich_killswitch_spec()
+                            };
+                            let original = killswitch(spec, generation, strict);
+                            let encoded = original.encode();
+                            let refs: Vec<&str> = encoded.iter().map(String::as_str).collect();
+                            let decoded = MacosPfLoadSpec::decode(&refs).unwrap_or_else(|err| {
+                                panic!(
+                                    "decode failed for generation={generation} strict={strict} \
+                                     dns={dns_protected} ipv6_blocked={ipv6_blocked} \
+                                     allow_egress={allow_egress_interface}: {err}"
+                                )
+                            });
+                            assert_eq!(
+                                decoded, original,
+                                "spec did not survive the round trip: generation={generation} \
+                                 strict={strict} dns={dns_protected} \
+                                 ipv6_blocked={ipv6_blocked} \
+                                 allow_egress={allow_egress_interface}"
+                            );
+                            assert_eq!(
+                                decoded.anchor_name(),
+                                format!("com.apple/rustynet_g{generation}"),
+                                "the anchor name must be formatted from the parsed generation"
+                            );
+                            // Whatever the flags, the render stays terminal.
+                            assert!(
+                                decoded
+                                    .render()
+                                    .expect("render")
+                                    .trim_end()
+                                    .ends_with("block drop out quick all"),
+                                "generation={generation} strict={strict} render is not terminal"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// PF-14: a cross-kind list token must be rejected for being PRESENT, not for
+    /// having contents. `extend_csv` drops empty parts, so a value of only
+    /// separators used to parse to an empty vector and slip past the guard.
+    #[test]
+    fn a_cross_kind_list_token_is_rejected_even_when_it_parses_to_nothing() {
+        let base = killswitch(rich_killswitch_spec(), 3, false).encode();
+
+        for empty_value in ["", ",", ",,", ",,,"] {
+            let mut tokens = base.clone();
+            tokens.push(format!("mesh_cidr={empty_value}"));
+            let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            let err = MacosPfLoadSpec::decode(&refs).expect_err(
+                "a killswitch spec carrying mesh_cidr must be refused however it parses",
+            );
+            assert!(
+                err.contains("must not carry token: mesh_cidr"),
+                "unexpected error for mesh_cidr={empty_value:?}: {err}"
+            );
+        }
+
+        // The exit_nat side of the same defect, with its own three keys.
+        let nat_config =
+            MacosExitNatPfConfig::new("en0", vec!["100.64.0.0/10".to_owned()]).unwrap();
+        let nat_base = MacosPfLoadSpec::ExitNat { config: nat_config }.encode();
+        for key in ["ssh_cidr", "traversal", "managed_peer"] {
+            let mut tokens = nat_base.clone();
+            tokens.push(format!("{key}=,"));
+            let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            let err = MacosPfLoadSpec::decode(&refs)
+                .expect_err("an exit_nat spec must refuse a cross-kind list token");
+            assert!(
+                err.contains(&format!("must not carry token: {key}")),
+                "unexpected error for {key}: {err}"
+            );
+        }
+
+        // And the guard must not have become a blanket refusal: the same base
+        // specs, without the offending token, still decode.
+        let refs: Vec<&str> = base.iter().map(String::as_str).collect();
+        MacosPfLoadSpec::decode(&refs).expect("the unmodified killswitch spec must still decode");
+        let refs: Vec<&str> = nat_base.iter().map(String::as_str).collect();
+        MacosPfLoadSpec::decode(&refs).expect("the unmodified exit_nat spec must still decode");
+    }
+
     #[test]
     fn killswitch_render_always_ends_in_block_all() {
         let spec = killswitch(rich_killswitch_spec(), 1, false);
@@ -815,6 +963,13 @@ mod tests {
         let encoded = original.encode();
         let refs: Vec<&str> = encoded.iter().map(String::as_str).collect();
         let decoded = MacosPfLoadSpec::decode(&refs).expect("decode");
+        // PF-13: assert SPEC equality, not just render equality. Two specs that
+        // differ in a field the renderer happens not to emit -- or emits
+        // identically -- render the same while decoding to something the daemon
+        // did not send, so a render-only assertion cannot catch a lossy decode.
+        // `MacosPfLoadSpec` derives `PartialEq`, so this is directly assertable;
+        // `ipv6_endpoints_roundtrip` already did it, these two did not.
+        assert_eq!(decoded, original);
         assert_eq!(decoded.render().unwrap(), original.render().unwrap());
         assert_eq!(decoded.anchor_name(), "com.rustynet/blind_exit");
         assert!(
@@ -863,6 +1018,7 @@ mod tests {
         let encoded = original.encode();
         let refs: Vec<&str> = encoded.iter().map(String::as_str).collect();
         let decoded = MacosPfLoadSpec::decode(&refs).expect("decode");
+        assert_eq!(decoded, original);
         assert_eq!(decoded.render().unwrap(), original.render().unwrap());
         assert_eq!(decoded.anchor_name(), "com.rustynet/nat");
         let rules = decoded.render().unwrap();
