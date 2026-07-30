@@ -2851,13 +2851,20 @@ Added after the fact, during the S1–S5 remediation. Kept in this document so
 every finding stays in one place, and marked separately because it was not part
 of the original review pass.
 
+**Numbering note.** These were first filed as `PF-11` and `IPV-05`, which
+COLLIDED with existing findings of those ids (`PF-11` is the evadable-but-
+unreachable route-primitive guard; `IPV-05` is the evidence path failing open
+twice). Renumbered to `PF-16` and `IPV-15` on the same day. Commit messages from
+before the renumber (`3b598514`, `cecb8773`) still say `PF-11`; they mean
+`PF-16`.
+
 | ID | Problem | Severity | Status |
 | --- | --- | --- | --- |
-| PF-11 | `macos_blind_exit`'s own terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name | Medium | **FIXED** `3b598514` |
-| IPV-05 | On an exit node with DNS protection, the wide-open egress accept is ordered ABOVE the port-53 fail-closed drops, so plaintext DNS out the underlay is accepted before the drop is reached | **High** | **OPEN — needs a decision** |
+| PF-16 | `macos_blind_exit`'s own terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name | Medium | **FIXED** `3b598514` |
+| IPV-15 | On an exit node with DNS protection, the wide-open egress accept is ordered ABOVE the port-53 fail-closed drops, so plaintext DNS out the underlay is accepted before the drop is reached | **High** | **OPEN — needs a decision** |
 | POL-15 | `selected_exit_node` is tracked twice — daemon and controller — and the restore + auto-exit paths assign only the daemon's, so the LAN-route gate can never pass in those states | Medium | **OPEN — needs a decision** |
 
-### PF-11 — a fifth presence-only terminal-block check (Medium; FIXED)
+### PF-16 — a fifth presence-only terminal-block check (Medium; FIXED)
 
 `evaluate_macos_blind_exit_pf_rules` asserted only that the line `block drop out
 quick all` appeared somewhere in the ruleset. pf is first-match-wins and `quick`
@@ -2867,7 +2874,7 @@ closed with the same shared precedence walk. The pre-existing test appended its
 wide-open pass *after* the block, where it is genuinely unreachable, which is why
 nothing caught the hoisted case.
 
-### IPV-05 — DNS fail-closed is void on an exit node (High; CONFIRMED by reading the call order; OPEN)
+### IPV-15 — DNS fail-closed is void on an exit node (High; CONFIRMED by reading the call order; OPEN)
 
 Two controls contradict each other, and the ordering decides which wins.
 

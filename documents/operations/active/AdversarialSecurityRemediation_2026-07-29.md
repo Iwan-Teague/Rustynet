@@ -48,7 +48,8 @@ where a behaviour change was involved, mutation-verified:
 | **IPV-10** (Medium) | `evaluate_linux_blind_exit_ruleset` was thorough and not on the daemon assert path — its only production caller was the evidence-report command, so a blind_exit node's posture was checked when someone asked for a report and never during operation. Wired into `assert_exit_serving`, closing a platform asymmetry (macOS already did this). |
 | **WIN-08** (Low) | The self-check pipe leaf was an unbounded prefix match and the charset allowlist permits `\` and `.`, so `…check-\..\..\evil` validated. Suffix bounded to 1–10 ASCII digits with no separator after the prefix. |
 | **PF-09 / PF-08** (Low) | `push_list` could emit an over-cap token for a single over-cap element. Documented rather than changed, because the current behaviour is the safest available — the decoder rejects the whole spec, whereas dropping the element would silently narrow the rendered `pf` ruleset. `debug_assert` makes it loud in test builds, and the new budget test covers PF-08's ask so a future peer-cap raise fails there rather than at the helper. |
-| **PF-11** (Medium) | The blind_exit pf evaluator's terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name. |
+| **PF-16** (Medium) | The blind_exit pf evaluator's terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name. |
+| **RLY-12** (Low) | **Already closed** — verified, not fixed. The review cited an unescaped `node_id` interpolated into a relay log line at `transport.rs:429-431`; that interpolation is no longer in the tree. Every remaining `eprintln!` in the relay crate interpolates a `SocketAddr`, a `Debug` enum, or an error — no peer-supplied string. S3's single-line guard on `is_valid_node_id_text` closes the upstream half independently. |
 
 **Still open on POL-06, and it is a decision.** The doc comment is fixed but the
 *inertness* is not: `set_membership_directory` / `with_membership_directory` have
@@ -60,7 +61,7 @@ snapshot — a CLI contract change across three commands — or making
 `ControlPlaneCore` refuse to issue without one, which breaks all three until the
 first is done. Order matters and the contract question is the operator's.
 
-**One new finding surfaced while doing S2, not yet filed in the review:** with
+**One new finding surfaced while doing S2, filed in the review as IPV-15:** with
 NAT active *and* `dns_protected`, the killswitch chain orders the wide-open
 egress accept **above** the `udp/tcp dport 53 oifname != <tunnel> drop` rules, so
 plaintext DNS out the underlay is accepted before the fail-closed drop is
