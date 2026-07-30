@@ -1359,6 +1359,51 @@ impl LinuxCommandSystem {
         ))
     }
 
+    /// Assert a blind_exit node's live nft posture against its own evaluator.
+    ///
+    /// # IPV-10
+    ///
+    /// `evaluate_linux_blind_exit_ruleset` existed, was thorough, and was not on
+    /// the daemon's assert path. Its only production caller was the
+    /// evidence-report command (`linux_blind_exit_dataplane`), so a blind_exit
+    /// node's runtime posture was checked when an operator or the lab asked for a
+    /// report and never during operation -- while the module documented itself as
+    /// the runtime check.
+    ///
+    /// macOS already does exactly this from its own `assert_exit_serving`, so
+    /// this closes a platform asymmetry rather than inventing a control: the same
+    /// class of drift (masquerade NAT appearing on a blind exit, an unrestricted
+    /// forward, the operator's own egress leaking) was loud on macOS and silent
+    /// on Linux.
+    ///
+    /// A no-op when blind_exit is not configured. `assert_nat_forwarding` still
+    /// runs afterwards and is itself a no-op without a NAT table, which is the
+    /// blind_exit case -- so nothing about the NAT path changes.
+    fn assert_blind_exit_posture(&self) -> Result<(), SystemError> {
+        let Some(config) = self.blind_exit_config.as_ref() else {
+            return Ok(());
+        };
+        let table = self.firewall_table.clone().ok_or_else(|| {
+            SystemError::KillSwitchAssertionFailed(
+                "blind_exit assertion: killswitch table missing".to_owned(),
+            )
+        })?;
+        let ruleset = self.nft_table_output(
+            "inet",
+            table.as_str(),
+            "nft list blind_exit killswitch table",
+        )?;
+        let reasons =
+            crate::linux_blind_exit::evaluate_linux_blind_exit_ruleset(ruleset.as_str(), config);
+        if !reasons.is_empty() {
+            return Err(SystemError::KillSwitchAssertionFailed(format!(
+                "blind_exit nft assertion failed: {}",
+                reasons.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
     fn assert_firewall_ruleset(&self) -> Result<(), SystemError> {
         let table = self.firewall_table.clone().ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("killswitch table missing".to_owned())
@@ -2648,6 +2693,7 @@ impl DataplaneSystem for LinuxCommandSystem {
 
     fn assert_exit_serving(&mut self, _mesh_cidr: &str) -> Result<(), SystemError> {
         self.assert_killswitch()?;
+        self.assert_blind_exit_posture()?;
         self.assert_nat_forwarding()
     }
 
@@ -7035,6 +7081,55 @@ pub fn write_phase10_perf_report(
 
 #[cfg(test)]
 mod tests {
+
+    /// IPV-10: the blind_exit evaluator must be ON the daemon assert path.
+    ///
+    /// The evaluator itself is pure and thoroughly tested in
+    /// `linux_blind_exit`; what this pins is that it is actually CALLED. That was
+    /// the entire defect — a thorough check whose only production caller was the
+    /// evidence-report command, so a blind_exit node's posture was verified when
+    /// someone asked for a report and never during operation.
+    ///
+    /// A source pin because the Linux firewall-assertion tests are
+    /// `cfg(target_os = "linux")` and never run on the macOS CI leg, so an
+    /// unwiring would be invisible there — which is how it stayed unwired.
+    #[test]
+    fn linux_assert_exit_serving_checks_the_blind_exit_posture() {
+        let source = include_str!("phase10.rs");
+
+        // The Linux `assert_exit_serving` is the one that also asserts NAT
+        // forwarding; anchor on that pair so this cannot match another platform's
+        // implementation of the same trait method.
+        let at = source
+            .find("self.assert_blind_exit_posture()?;")
+            .expect("the Linux assert path must call assert_blind_exit_posture");
+        let window = &source[at.saturating_sub(200)..at];
+        assert!(
+            window.contains("fn assert_exit_serving"),
+            "the blind_exit posture check must be called from assert_exit_serving, not \
+             from some unrelated path"
+        );
+        let after = &source[at..source.len().min(at + 200)];
+        assert!(
+            after.contains("self.assert_nat_forwarding()"),
+            "this must be the Linux assert_exit_serving, which also asserts NAT forwarding"
+        );
+
+        // And the posture check must consult the real evaluator rather than
+        // reimplementing a weaker one locally.
+        let body_at = source
+            .find("fn assert_blind_exit_posture")
+            .expect("the posture check must exist");
+        let body: String = source[body_at..].chars().take(1600).collect();
+        assert!(
+            body.contains("evaluate_linux_blind_exit_ruleset"),
+            "the posture check must call the audited evaluator"
+        );
+        assert!(
+            body.contains("KillSwitchAssertionFailed"),
+            "a failed blind_exit posture must fail the assertion, not warn"
+        );
+    }
 
     /// A management CIDR must be a bounded operator range, not a default route.
     ///

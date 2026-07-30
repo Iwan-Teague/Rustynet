@@ -414,9 +414,39 @@ impl MacosPfLoadSpec {
 /// Append `values` to `args` as one or more `key=v1,v2,...` tokens, never
 /// exceeding [`MAX_ARG_BYTES`] per token. The decoder treats repeated `key=`
 /// tokens additively and re-splits on commas, so the chunking is transparent.
+///
+/// # A single over-cap element (PF-09)
+///
+/// The chunking guard flushes BEFORE appending, so every emitted token satisfies
+/// `key.len() + 1 + current.len() <= MAX_ARG_BYTES` by induction — except for the
+/// first element after a flush, which is appended unconditionally. An element
+/// longer than `MAX_ARG_BYTES - key.len() - 1` therefore yields an over-cap
+/// token.
+///
+/// That over-cap token is emitted DELIBERATELY rather than dropped, and this is
+/// the reasoning, because it is not obvious:
+///
+/// - The helper's decoder rejects any arg over `MAX_ARG_BYTES`, so an over-cap
+///   token makes the helper refuse the WHOLE spec. Fail-closed.
+/// - Dropping the element instead would silently narrow the rendered `pf`
+///   ruleset — a missing `mesh_cidr` is a security-relevant omission that no
+///   error would report. That is the one genuinely dangerous option.
+/// - Panicking is not available: this is a production path (CLAUDE.md §10.2).
+///
+/// So the invariant is enforced downstream by rejection, and asserted here in
+/// debug builds — where every test runs — so the condition is loud in CI rather
+/// than surfacing as a confusing helper-side rejection far from its cause.
+/// Unreachable today: the longest legitimate element is a full IPv6 `SocketAddr`
+/// (~47 bytes) or IPv6 CIDR (~43), and the observed maximum token is 255.
 fn push_list(args: &mut Vec<String>, key: &str, values: impl Iterator<Item = String>) {
     let mut current = String::new();
     for value in values {
+        debug_assert!(
+            key.len() + 1 + value.len() <= MAX_ARG_BYTES,
+            "PF-09: single element does not fit one {MAX_ARG_BYTES}-byte token \
+             (key={key:?}, element={} bytes); the helper will reject the whole spec",
+            value.len()
+        );
         let separator = usize::from(!current.is_empty());
         if !current.is_empty()
             && key.len() + 1 + current.len() + separator + value.len() > MAX_ARG_BYTES
@@ -548,6 +578,67 @@ fn contains_forbidden_route_primitive(rules: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// PF-09: every token `push_list` emits must fit the wire budget, and PF-08:
+    /// the module's own caps must be reconcilable with that budget, so a future
+    /// cap raise fails loudly here rather than at the helper.
+    #[test]
+    fn push_list_tokens_stay_within_the_wire_budget() {
+        // A realistic worst case: the longest legitimate elements are a full
+        // IPv6 SocketAddr (~47 bytes) and an IPv6 CIDR (~43).
+        let ipv6_endpoints: Vec<String> = (0..64)
+            .map(|n| format!("[2001:db8:aaaa:bbbb:cccc:dddd:eeee:{n:04x}]:51820"))
+            .collect();
+        let mut args = Vec::new();
+        super::push_list(
+            &mut args,
+            "managed_peer_endpoint",
+            ipv6_endpoints.iter().cloned(),
+        );
+
+        assert!(
+            !args.is_empty(),
+            "the encoder must emit at least one token for a non-empty list"
+        );
+        for token in &args {
+            assert!(
+                token.len() <= super::MAX_ARG_BYTES,
+                "token of {} bytes exceeds the {}-byte wire budget: {token}",
+                token.len(),
+                super::MAX_ARG_BYTES
+            );
+        }
+
+        // Every element must survive the chunking: the decoder re-splits on
+        // commas and treats repeated keys additively, so the round trip must be
+        // lossless. A chunker that dropped an element would silently narrow the
+        // rendered ruleset, which is the one outcome worse than an over-cap
+        // token.
+        let mut recovered = Vec::new();
+        for token in &args {
+            let values = token
+                .strip_prefix("managed_peer_endpoint=")
+                .expect("every emitted token must carry the key");
+            recovered.extend(values.split(',').map(str::to_owned));
+        }
+        assert_eq!(
+            recovered, ipv6_endpoints,
+            "chunking must be lossless and order-preserving"
+        );
+    }
+
+    /// The single-element bound itself. In debug builds -- which is where every
+    /// test runs -- an element that cannot fit one token trips the PF-09
+    /// `debug_assert`, so this asserts the panic rather than the (release-only)
+    /// over-cap token. Either way the spec never silently loses a value.
+    #[test]
+    #[should_panic(expected = "PF-09")]
+    fn push_list_rejects_an_element_that_cannot_fit_one_token() {
+        let oversized = "a".repeat(super::MAX_ARG_BYTES + 1);
+        let mut args = Vec::new();
+        super::push_list(&mut args, "mesh_cidr", std::iter::once(oversized));
+    }
+
     use super::*;
     use crate::privileged_helper::{MAX_ARG_BYTES, MAX_ARGS};
     use std::str::FromStr;
