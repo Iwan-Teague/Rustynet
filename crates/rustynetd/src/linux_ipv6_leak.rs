@@ -260,18 +260,31 @@ fn nft_egress_chain_bodies(stdout: &str, killswitch_table: &str) -> Vec<(String,
         }
         if line.starts_with("chain ") {
             flush(current.take(), &mut chains);
-            current = Some((String::new(), in_inet_killswitch_table, false));
+            // `in_table` starts false and is raised only when the chain
+            // DECLARES an egress hook below. Seeding it from the table alone
+            // flagged unhooked regular chains as killswitch-table egress,
+            // contradicting this function's own contract and crediting a
+            // family-agnostic drop in a chain the kernel never traverses.
+            current = Some((String::new(), false, false));
             continue;
         }
         if line == "}" {
             flush(current.take(), &mut chains);
             continue;
         }
-        if let Some((body, _, is_ingress)) = current.as_mut() {
+        if let Some((body, in_table, is_ingress)) = current.as_mut() {
             // A base chain declares its hook; only output/postrouting/forward
             // are egress-relevant.
             if line.contains("hook input") || line.contains("hook prerouting") {
                 *is_ingress = true;
+            } else if line.contains("hook output")
+                || line.contains("hook postrouting")
+                || line.contains("hook forward")
+            {
+                // Egress base chain: now, and only now, does membership of the
+                // dual-stack killswitch table license crediting a
+                // family-agnostic terminal drop.
+                *in_table = in_inet_killswitch_table;
             }
             body.push_str(line);
             body.push('\n');
@@ -529,6 +542,51 @@ mod tests {
         assert!(!parse_proc_flag("0\n"));
         assert!(!parse_proc_flag(""));
         assert!(!parse_proc_flag("garbage"));
+    }
+
+    /// REGRESSION PIN (introduced by f2e084d9, fixed here).
+    ///
+    /// f2e084d9 replaced a POSITIVE egress-hook test (`chain_is_egress`, set
+    /// only by `hook output|postrouting|forward`) with a NEGATIVE one (retain
+    /// unless `hook input|prerouting`). An unhooked regular chain satisfies the
+    /// negative test, so it survived — and `in_table` was seeded from table
+    /// membership alone, so a family-agnostic terminal drop inside it was
+    /// credited as IPv6 egress containment.
+    ///
+    /// The kernel never evaluates a regular chain unless something jumps to it,
+    /// so that credits containment from a chain that may never run — the same
+    /// verifier-certifies-a-leak direction f2e084d9 was written to close.
+    /// Confirmed by executing the pre-commit file: this input returned `false`
+    /// before f2e084d9 and `true` after.
+    ///
+    /// The function's own doc comments said so all along (":229" — unhooked
+    /// chains "are not flagged as killswitch-table egress"); only the code
+    /// disagreed.
+    #[test]
+    fn unhooked_chain_family_agnostic_drop_is_not_egress_containment() {
+        const UNHOOKED: &str = r#"table inet rustynet_g1 {
+	chain helper {
+		drop
+	}
+}"#;
+        assert!(
+            !nft_ruleset_has_v6_drop(UNHOOKED, "rustynet_g1"),
+            "a terminal drop in an UNHOOKED chain must not be credited as egress containment"
+        );
+
+        // The same drop in a chain that DOES declare an egress hook is still
+        // credited — this half is the false-fail guard. Without it the fix
+        // could be "tightened" into refusing every real killswitch.
+        const HOOKED: &str = r#"table inet rustynet_g1 {
+	chain killswitch {
+		type filter hook output priority 0; policy drop;
+		drop
+	}
+}"#;
+        assert!(
+            nft_ruleset_has_v6_drop(HOOKED, "rustynet_g1"),
+            "an egress-hooked chain in the killswitch table must still be credited"
+        );
     }
 
     #[test]
