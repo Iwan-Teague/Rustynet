@@ -1,7 +1,43 @@
 # Adversarial Security Remediation — starting notes — 2026-07-29
 
-Status: **starting notes, not a plan.** Nothing here has been applied, and no fix
-here has been designed, prototyped, or costed.
+Status: **starting notes, mostly unapplied.** Everything below §2 still matches
+its original description: unapplied, undesigned, unprototyped, uncosted.
+
+**Applied so far (2026-07-30) — the five grouped changes in §2, all five now
+landed, gated, and mutation-verified:**
+
+| Group | Closes | Commit(s) |
+|---|---|---|
+| **S1** bound `ManagementCidr::from_str` | PF-02, WIN-05, Linux nft twin | `e7da5aac` |
+| **S2** assert precedence, not presence | IPV-03, PF-05, RN-27, WIN-03 | `02c1cb88` (core), `2f1077bd`, `d8143375`, `3b598514`, `5f76a496`, `96ed252e` |
+| **S3** single-line guard on node ids | node-id vector of CTL-01, issuance half of RLY-03 | landed |
+| **S4** cap `node_id` length at parse | RLY-05, AUDIT-031 | landed |
+| **S5** fail closed on non-unix key custody | CRY-05 / AUDIT-027 | `c393412e` |
+
+Read §2 for what each group does. Three things about S2 specifically, because it
+turned out larger than the "M" the table guessed:
+
+- It is built on a **new shared primitive**,
+  `crates/rustynetd/src/killswitch_precedence.rs` — an ordered-rule walk plus
+  per-backend classifiers, so the four sites share one precedence model and one
+  set of adversarial tests. The review's framing was right: this is the item that
+  converts silent failures into loud ones.
+- It found a **fifth site of the same class** the review did not name:
+  `macos_blind_exit.rs`'s own terminal-block check was also presence-only
+  (`3b598514`).
+- It is deliberately the **narrow** fix, exactly as §2 said. It does **not**
+  close PF-01/PF-02/IPV-01. The wide-open `oifname "<underlay>" accept` the
+  daemon installs when NAT is active is passed as *acknowledged*: it can no
+  longer mask rules beneath it, but its own disposition stays with the owning
+  finding rather than being decided by a verifier change that would fail every
+  exit node closed.
+
+**One new finding surfaced while doing S2, not yet filed in the review:** with
+NAT active *and* `dns_protected`, the killswitch chain orders the wide-open
+egress accept **above** the `udp/tcp dport 53 oifname != <tunnel> drop` rules, so
+plaintext DNS out the underlay is accepted before the fail-closed drop is
+reached. Same class as IPV-03 but a different traffic class, so the S2 walk (which
+decides the *general* egress terminator) does not catch it. Needs its own entry.
 Companion to: `documents/operations/active/AdversarialSecurityReview_2026-07-29.md` (the findings doc). Every finding ID there has exactly one entry here, so this works as a lookup: problem → where to start.
 Coverage: 103 finding IDs across Parts I–VIII (POL, CRY, PF, RLY, CTL, WIN, IPV, ENR).
 
