@@ -8188,6 +8188,59 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
     }
 }
 
+/// Write a freshly minted enrollment token with owner-only permissions.
+///
+/// Mirrors `write_secret` / `write_ledger` in `rustynetd::enrollment_token`:
+/// create the file at 0o600 via a uniquely-named temporary and rename it into
+/// place, so the token is never momentarily readable at a wider mode and an
+/// existing destination's permissions are replaced rather than inherited.
+/// `create_new` on the temporary means a colliding name is an error, never a
+/// silent write into someone else's file.
+#[cfg(unix)]
+fn write_enrollment_token_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let temporary = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        unix_now_nanos_for_temp_name()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    if let Err(err) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(err);
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Non-Unix has no `mode()` on `OpenOptions`, so the 0o600 guarantee above
+/// cannot be made here. Fail closed rather than writing a bearer token at
+/// whatever the inherited ACL happens to be (the S5 / CRY-05 rule). Reachable
+/// only in principle: `rustynet-cli` does not build on Windows today.
+#[cfg(not(unix))]
+fn write_enrollment_token_file(_path: &Path, _contents: &[u8]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "refusing to write an enrollment token without owner-only permissions on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn unix_now_nanos_for_temp_name() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0)
+}
+
 fn execute_enrollment(command: EnrollmentCliCommand) -> Result<String, String> {
     use rustynetd::enrollment_token::{inspect_token, load_ledger, load_secret, mint_token};
     match command {
@@ -8199,7 +8252,13 @@ fn execute_enrollment(command: EnrollmentCliCommand) -> Result<String, String> {
             let secret = load_secret(&secret_path).map_err(|err| err.to_string())?;
             let (_token, encoded) = mint_token(&secret, ttl_secs).map_err(|err| err.to_string())?;
             if let Some(path) = output_path {
-                std::fs::write(&path, format!("{encoded}\n")).map_err(|err| err.to_string())?;
+                // ENR-13 / AUDIT-011: the minted token is a single-use bearer
+                // credential that admits a node to the mesh, so it gets the
+                // same 0o600 treatment as the enrollment secret and the ledger
+                // — `std::fs::write` here applied only the process umask,
+                // which is commonly 0o022 and leaves the token world-readable.
+                write_enrollment_token_file(&path, format!("{encoded}\n").as_bytes())
+                    .map_err(|err| format!("enrollment token write failed: {err}"))?;
                 Ok(format!("enrollment token written to {}", path.display()))
             } else {
                 // Print the token alone (no extra prose) so it can be
@@ -21972,6 +22031,61 @@ fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String
             };
             Ok(cli_human_or_json(json, payload, human))
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod enrollment_token_output_permission_tests {
+    use super::write_enrollment_token_file;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// ENR-13 / AUDIT-011: the minted token is a bearer credential, so its
+    /// output file must be owner-only regardless of the process umask. Pinned
+    /// against the exact mode because `std::fs::write` produced 0o644 under the
+    /// common 0o022 umask and reported success.
+    #[test]
+    fn minted_token_file_is_owner_only() {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-enr13-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("token.txt");
+
+        write_enrollment_token_file(&path, b"token-bytes\n").expect("write token");
+
+        let mode = std::fs::metadata(&path)
+            .expect("stat token")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "token file mode was {mode:#o}, expected 0o600");
+        assert_eq!(
+            std::fs::read(&path).expect("read token"),
+            b"token-bytes\n",
+            "contents must survive the temp-file-and-rename write"
+        );
+
+        // A pre-existing destination at a wider mode must be replaced, not
+        // inherited — the rename+set_permissions pair is what guarantees it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("widen mode");
+        write_enrollment_token_file(&path, b"second\n").expect("overwrite token");
+        let mode = std::fs::metadata(&path)
+            .expect("re-stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "overwrite left mode {mode:#o}, expected 0o600");
+
+        // No temporary is left behind on the success path.
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .expect("list dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(strays.is_empty(), "temporary files left behind: {strays:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
