@@ -131,6 +131,10 @@ pub enum RejectReason {
     /// Replay store could not be updated, so accepting the token would weaken
     /// anti-replay guarantees.
     ReplayStoreUnavailable,
+    /// The host clock is unusable, so token freshness cannot be established.
+    /// Mirrors `ReplayStoreUnavailable`: a guarantee we cannot evaluate is a
+    /// guarantee we refuse to assume (RLY-15).
+    ClockUnavailable,
     /// Daemon supplied an invalid allocated relay data port.
     InvalidAllocatedPort,
     /// Kernel CSPRNG was unavailable while minting the session id. We refuse
@@ -402,7 +406,13 @@ impl RelayTransport {
         }
 
         // Check 4: Token freshness / expiry
-        let now_unix = now_unix();
+        //
+        // RLY-15: with no usable clock there is no freshness to check, so refuse
+        // rather than proceed against a substituted value.
+        let Some(now_unix) = now_unix_checked() else {
+            eprintln!("Relay hello rejected: host clock unusable, cannot evaluate token freshness");
+            return Err(RejectReason::ClockUnavailable);
+        };
 
         if hello
             .session_token
@@ -552,7 +562,11 @@ impl RelayTransport {
         session_id: SessionId,
         from_addr: SocketAddr,
     ) -> Result<bool, RelayForwardError> {
-        let now_unix = now_unix();
+        // RLY-15: no usable clock means session liveness cannot be established.
+        // Report the session as expired rather than treat it as live.
+        let Some(now_unix) = now_unix_checked() else {
+            return Err(RelayForwardError::SessionExpired);
+        };
 
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return Err(RelayForwardError::SessionNotFound);
@@ -604,7 +618,10 @@ impl RelayTransport {
             return Ok(None);
         }
 
-        let now_unix = now_unix();
+        // RLY-15: as above -- an unusable clock cannot certify a live session.
+        let Some(now_unix) = now_unix_checked() else {
+            return Err(RelayForwardError::SessionExpired);
+        };
 
         let Some(session) = self.sessions.get(&session_id) else {
             return Err(RelayForwardError::SessionNotFound);
@@ -720,7 +737,13 @@ impl RelayTransport {
         let now = Instant::now();
         let idle_threshold = Duration::from_secs(IDLE_SESSION_TIMEOUT_SECS);
         let half_open_threshold = Duration::from_secs(HALF_OPEN_SESSION_TIMEOUT_SECS);
-        let now_unix = now_unix();
+        // RLY-15: the idle and half-open sweeps below use `Instant`, a MONOTONIC
+        // clock, and are unaffected by a broken wall clock -- so they must keep
+        // running. Only the wall-clock expiry comparison is skipped, by leaving
+        // `now_unix` as `None`. Not reaping an expired session is safe here
+        // because the forward paths reject it independently: it lingers in the
+        // map but cannot carry traffic.
+        let now_unix = now_unix_checked();
 
         let mut to_remove = Vec::new();
 
@@ -736,7 +759,10 @@ impl RelayTransport {
             // - it has expired according to the signed session token, OR
             // - it is half-open (no paired session) and exceeds the half-open timeout, OR
             // - it is idle (no recent packets) and exceeds the idle timeout
-            let is_expired = session.expires_at_unix <= now_unix;
+            // RLY-15: `None` means the wall clock is unusable, so this session's
+            // expiry is simply unknown -- not "not expired". Left to the
+            // forward-path rejection rather than guessed at here.
+            let is_expired = session_is_expired(session.expires_at_unix, now_unix);
             let is_stale_half_open = !has_pair && age > half_open_threshold;
             let is_idle = idle > idle_threshold;
             if is_expired || is_stale_half_open || is_idle {
@@ -883,7 +909,13 @@ impl NonceStore {
         // persist-failure consistency property is preserved: in-memory
         // state matches on-disk state, OR the operation fails closed
         // without mutating either.
-        let prior = self.nonces.insert(nonce, now_unix());
+        // RLY-15: an entry stamped from a substituted clock is worse than no
+        // entry -- it silently changes when this nonce becomes prunable, which is
+        // the whole anti-replay window. Refuse instead, which rejects the hello.
+        let Some(now) = now_unix_checked() else {
+            return Err("host clock unusable; refusing to record a replay nonce".to_owned());
+        };
+        let prior = self.nonces.insert(nonce, now);
         if let Err(err) = self.persist() {
             // Restore previous state (either remove the new entry, or
             // re-insert whatever was there before — defensive against
@@ -902,7 +934,16 @@ impl NonceStore {
     }
 
     fn prune(&mut self, retention: Duration) -> Result<(), String> {
-        let now = now_unix();
+        // RLY-15: this is the call site that rules out a sentinel. The filter
+        // below is `now - inserted_at >= retention`, so a substituted `u64::MAX`
+        // would evict EVERY nonce and empty the replay set. Return before any
+        // mutation, which retains every nonce -- pruning late is a bounded memory
+        // cost, pruning early is a replay window.
+        let Some(now) = now_unix_checked() else {
+            return Err(
+                "host clock unusable; skipping nonce prune to preserve anti-replay".to_owned(),
+            );
+        };
         let retention_secs = retention.as_secs();
         // Collect keys to drop without cloning the full map. The drop set
         // is bounded by the number of expiring nonces (typically a small
@@ -948,21 +989,53 @@ impl NonceStore {
     }
 }
 
-/// Wall-clock seconds since UNIX_EPOCH.
+/// Wall-clock seconds since UNIX_EPOCH, or `None` when the host clock is unusable.
 ///
-/// **Security**: `SystemTime::now() < UNIX_EPOCH` is rare but real on
-/// boards with no RTC during very early boot, on systems whose clock
-/// was rolled back by a misconfigured NTP, or by an operator running
-/// `date --set=...`. The previous version of this helper used
-/// `.expect(...)` which would panic and crash the relay process
-/// every time a peer presented a hello. We now return 0 on failure,
-/// which makes any token's `expires_at > 0` look already-expired —
-/// fail-closed.
-fn now_unix() -> u64 {
+/// **Security (RLY-15).** `SystemTime::now() < UNIX_EPOCH` is rare but real: a
+/// board with no RTC during very early boot, a clock rolled back by a
+/// misconfigured NTP, an operator running `date --set=...`. An older version
+/// `.expect(...)`-ed and crashed the relay on every hello, which was correctly
+/// replaced — but the replacement returned `0`, and its doc comment claimed that
+/// made tokens "look already-expired — fail-closed". It does the opposite.
+/// `is_expired` is `now > expires_at + skew`, and `0 > anything` is **false**, so
+/// every token became unexpired and the data path's
+/// `session.expires_at_unix <= now_unix` never fired. Expiry enforcement was
+/// switched off entirely, under a comment asserting the reverse.
+///
+/// # Why there is no sentinel, only an `Option`
+///
+/// The obvious repair is to substitute `u64::MAX` so `MAX > expires_at + skew`
+/// makes everything expired. That fixes expiry and breaks anti-replay:
+/// [`NonceStore::prune`] computes `now - retention`, so with `now = u64::MAX`
+/// every nonce is older than the boundary and the **entire replay set is evicted
+/// on each prune**. `0` is the exact mirror — it retains nonces while disabling
+/// expiry.
+///
+/// No single value is fail-closed for both, because the two consumers want
+/// opposite directions from it. So the failure is returned instead of encoded,
+/// and each call site disposes of it in its own safe direction: reject the hello,
+/// treat a session as expired on the forward paths, and SKIP the prune so nonces
+/// are retained.
+/// Whether a session's signed expiry has passed, given a possibly-unavailable
+/// wall clock.
+///
+/// RLY-15: `None` means "unknown", NOT "not expired". Extracted as a pure
+/// function because the interesting case needs a host clock before 1970, which no
+/// unit test can arrange -- so the disposition is tested here instead of being
+/// asserted only in prose at the call site.
+///
+/// Returning `false` for `None` is safe ONLY because the forward paths reject
+/// such a session independently: it lingers in the session map but cannot carry
+/// traffic. This function must therefore never become the sole expiry gate.
+fn session_is_expired(expires_at_unix: u64, now_unix: Option<u64>) -> bool {
+    now_unix.is_some_and(|now| expires_at_unix <= now)
+}
+
+fn now_unix_checked() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .ok()
 }
 
 /// Pure helper that clamps an operator-supplied clock-skew tolerance to the
@@ -1443,7 +1516,9 @@ mod tests {
 
         // Back-date the nonce so it appears older than the retention window
         for inserted_at in transport.nonce_store.nonces.values_mut() {
-            *inserted_at = now_unix().saturating_sub(NONCE_RETENTION_SECS + 1);
+            *inserted_at = now_unix_checked()
+                .expect("test host clock must be after the epoch")
+                .saturating_sub(NONCE_RETENTION_SECS + 1);
         }
 
         transport.cleanup_idle_sessions();
@@ -2823,22 +2898,118 @@ mod tests {
         );
     }
 
+    /// RLY-15: every consumer must dispose of an unavailable clock in ITS OWN
+    /// fail-closed direction, because no single substituted value is safe for all
+    /// of them.
     #[test]
-    fn now_unix_returns_positive_on_healthy_clock_not_panic() {
-        // Security pin: `now_unix()` previously used `.expect(...)`,
-        // which would panic when `SystemTime::now() < UNIX_EPOCH`
-        // (early boot before NTP sync, clock rollback, broken RTC).
-        // The fail-closed replacement returns 0 in that case and a
-        // sensible positive value otherwise. We can't easily force
-        // the negative branch in a unit test, but we can confirm
-        // the function:
-        //   * doesn't panic
-        //   * returns a recent-looking value on the test host
-        let now = now_unix();
+    fn an_unavailable_clock_never_reads_as_a_live_session() {
+        // Session expiry: unknown is not "not expired".
+        assert!(
+            !session_is_expired(1_000, None),
+            "an unknown clock must not be reported as expiry-passed, because the \
+             forward paths handle it"
+        );
+        // And the ordinary comparisons still hold.
+        assert!(
+            session_is_expired(1_000, Some(1_000)),
+            "expiry boundary is <="
+        );
+        assert!(session_is_expired(1_000, Some(1_001)));
+        assert!(!session_is_expired(1_000, Some(999)));
+    }
+
+    /// The anti-replay side: an unavailable clock must SKIP the prune, retaining
+    /// every nonce. This is the call site that rules out a `u64::MAX` sentinel --
+    /// the filter is `now - inserted_at >= retention`, so `MAX` evicts everything.
+    ///
+    /// A source pin, because the failing branch needs a pre-1970 host clock. What
+    /// it guards is the specific regression: reintroducing a substituted value.
+    #[test]
+    fn no_consumer_substitutes_a_value_for_an_unavailable_clock() {
+        let source = include_str!("transport.rs");
+        // Slice at the test MODULE, not the first `#[cfg(test)]`: there are
+        // `#[cfg(test)]` attributes on production helpers earlier in the file, and
+        // anchoring on those silently truncates the slice to nothing -- which made
+        // the first version of this test report zero occurrences and fail for the
+        // wrong reason.
+        let test_module = format!("#[cfg(test)]\nmod {} {{", "tests");
+        let production = &source[..source
+            .find(test_module.as_str())
+            .expect("the test module must exist")];
+
+        // No production line may unwrap a clock value into a default. Checked per
+        // LINE against both spellings rather than against a list of exact
+        // expressions: the first version of this pin only forbade
+        // `now_unix_checked().unwrap_or(..)` and therefore missed
+        // `now_unix.unwrap_or(0)` on the local binding -- which is the original
+        // defect exactly. Needles are assembled at runtime so this test's own
+        // source does not match them.
+        let unwrap_needle = format!("unwrap_{}", "or");
+        for (index, line) in production.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let mentions_clock = line.contains("now_unix") || line.contains("now_unix_checked");
+            assert!(
+                !(mentions_clock && line.contains(unwrap_needle.as_str())),
+                "line {} substitutes a default for an unavailable clock; every consumer must \
+                 dispose of `None` in its own fail-closed direction: {line}",
+                index + 1
+            );
+        }
+
+        // And the checked helper must be the only wall-clock source in the file,
+        // so a new call site cannot quietly reintroduce the old shape.
+        // Count CODE occurrences only. `now_unix_checked`'s own doc comment names
+        // `SystemTime::now()` while explaining the finding, and counting that as a
+        // call site is how the previous version of this assertion failed for the
+        // wrong reason.
+        let direct = production
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && trimmed.contains("SystemTime::now()")
+            })
+            .count();
+        assert_eq!(
+            direct, 1,
+            "SystemTime::now() must be called exactly once in production code (inside \
+             now_unix_checked), so a new call site cannot reintroduce an unchecked clock; \
+             found {direct}"
+        );
+
+        // The prune must return before mutating, not filter with a substituted now.
+        let prune_at = production
+            .find("fn prune(&mut self, retention: Duration)")
+            .expect("prune must exist");
+        let prune_head: String = production[prune_at..].chars().take(900).collect();
+        assert!(
+            prune_head.contains("return Err"),
+            "prune must fail closed on an unavailable clock before touching the nonce map"
+        );
+    }
+
+    #[test]
+    fn now_unix_checked_returns_a_recent_value_on_a_healthy_clock() {
+        // Security pin. The original helper `.expect(...)`-ed and crashed the
+        // relay on every hello when `SystemTime::now() < UNIX_EPOCH`. Its
+        // replacement returned 0 and its comment claimed that made tokens "look
+        // already-expired -- fail-closed"; RLY-15 established that this is
+        // backwards, since `is_expired` is `now > expires_at + skew` and
+        // `0 > anything` is false. Expiry was switched off entirely.
+        //
+        // The helper now returns `Option`, so the failure cannot be encoded as a
+        // value that any consumer might read in the wrong direction. The negative
+        // branch is not forceable in a unit test -- it needs a host clock before
+        // 1970 -- so what is pinned here is the positive branch plus, in the
+        // tests below, that each CONSUMER disposes of `None` in its own
+        // fail-closed direction.
+        let now = now_unix_checked().expect("test host clock must be after the epoch");
         // Sanity: > 2025-01-01 (1_735_689_600). Test runs in 2026+.
         assert!(
             now > 1_735_689_600,
-            "now_unix() should return a 2025+ value on a healthy clock; got {now}"
+            "now_unix_checked() should return a 2025+ value on a healthy clock; got {now}"
         );
     }
 
@@ -3000,7 +3171,9 @@ mod tests {
 
         // Back-date the recorded nonce to (now - retention + 1) — the latest
         // moment it can still be in the store. A replay here must be rejected.
-        let almost_pruned = now_unix().saturating_sub(NONCE_RETENTION_SECS - 1);
+        let almost_pruned = now_unix_checked()
+            .expect("test host clock must be after the epoch")
+            .saturating_sub(NONCE_RETENTION_SECS - 1);
         transport.nonce_store.nonces.insert(nonce, almost_pruned);
 
         assert_eq!(
@@ -3022,7 +3195,9 @@ mod tests {
         transport.handle_hello(make_hello(&sk, "node-a", "node-b"));
         assert_eq!(transport.nonce_store.nonces.len(), 1);
         for inserted_at in transport.nonce_store.nonces.values_mut() {
-            *inserted_at = now_unix().saturating_sub(NONCE_RETENTION_SECS);
+            *inserted_at = now_unix_checked()
+                .expect("test host clock must be after the epoch")
+                .saturating_sub(NONCE_RETENTION_SECS);
         }
         transport.cleanup_idle_sessions();
         assert_eq!(
@@ -3034,7 +3209,9 @@ mod tests {
         // And one second younger must survive.
         transport.handle_hello(make_hello(&sk, "node-c", "node-d"));
         for inserted_at in transport.nonce_store.nonces.values_mut() {
-            *inserted_at = now_unix().saturating_sub(NONCE_RETENTION_SECS - 1);
+            *inserted_at = now_unix_checked()
+                .expect("test host clock must be after the epoch")
+                .saturating_sub(NONCE_RETENTION_SECS - 1);
         }
         transport.cleanup_idle_sessions();
         assert_eq!(
@@ -3086,7 +3263,7 @@ mod tests {
         // load + prune (`new_with_replay_store_path`) does not silently drop
         // the valid entry as past-retention.
         let nonce_hex: String = (0u8..16).map(|b| format!("{b:02x}")).collect();
-        let fresh_ts = now_unix();
+        let fresh_ts = now_unix_checked().expect("test host clock must be after the epoch");
         let valid_with_blanks = format!("\n   \n{nonce_hex} {fresh_ts}\n\n");
         fs::write(&path, valid_with_blanks)
             .expect("valid-with-blanks replay store should be written");
@@ -3249,7 +3426,7 @@ mod tests {
         let path_dir = std::env::temp_dir().join(format!(
             "rustynet-relay-vanish-{}-{}",
             std::process::id(),
-            now_unix()
+            now_unix_checked().expect("test host clock must be after the epoch")
         ));
         fs::create_dir_all(&path_dir).expect("temp dir must be created");
         #[cfg(unix)]
@@ -3387,7 +3564,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "rustynet-relay-rollback-{}-{}",
             std::process::id(),
-            now_unix()
+            now_unix_checked().expect("test host clock must be after the epoch")
         ));
         fs::create_dir_all(&dir).expect("temp dir must be created");
         #[cfg(unix)]
@@ -3570,7 +3747,9 @@ mod tests {
         let (sk, _) = make_test_keypair();
         let mut transport = make_transport(&sk);
 
-        let far_future = now_unix().saturating_add(3_153_600_000);
+        let far_future = now_unix_checked()
+            .expect("test host clock must be after the epoch")
+            .saturating_add(3_153_600_000);
         let token =
             RelaySessionToken::sign_at(&sk, "node-a", "node-b", TEST_RELAY_ID, far_future, 60);
         let hello = RelayHello {
@@ -3598,7 +3777,9 @@ mod tests {
         let mut transport = make_transport(&sk);
 
         // One second ahead — well inside the default skew tolerance.
-        let slightly_ahead = now_unix().saturating_add(1);
+        let slightly_ahead = now_unix_checked()
+            .expect("test host clock must be after the epoch")
+            .saturating_add(1);
         let token =
             RelaySessionToken::sign_at(&sk, "node-a", "node-b", TEST_RELAY_ID, slightly_ahead, 60);
         let hello = RelayHello {
@@ -3631,7 +3812,9 @@ mod tests {
                 "node-a",
                 "node-b",
                 TEST_RELAY_ID,
-                now_unix().saturating_add(offset),
+                now_unix_checked()
+                    .expect("test host clock must be after the epoch")
+                    .saturating_add(offset),
                 60,
             );
             RelayHello {
