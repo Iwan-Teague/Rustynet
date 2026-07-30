@@ -191,8 +191,20 @@ pub fn validate_windows_pipe_path(path: &Path, role: WindowsLocalIpcRole) -> Res
     let lowered_suffix = suffix.to_ascii_lowercase();
     let is_reviewed_leaf = lowered_suffix == format!("rustynet\\{expected_leaf}")
         || lowered_suffix == format!("rustynet\\{expected_self_check_prefix}");
-    let is_reviewed_self_check =
-        lowered_suffix.starts_with(&format!("rustynet\\{expected_self_check_prefix}"));
+    // WIN-08: the self-check leaf used to be an unbounded prefix match, so any
+    // suffix beginning `rustynet\rustynetd-privileged.check-` validated. Because
+    // the charset allowlist above permits `\` and `.`, that admitted both
+    // `...check-attacker-controlled-anything` and `...check-\..\..\evil`
+    // (executed: both validated), defeating the entire purpose of pinning a
+    // reviewed leaf.
+    //
+    // The real self-check leaf is the prefix plus a process id, so the suffix is
+    // bounded to digits: no separator can follow the prefix, and the length cap
+    // is 10 because that is `u32::MAX`'s digit count. Anything else is refused.
+    let is_reviewed_self_check = self_check_suffix_is_reviewed(
+        lowered_suffix.as_str(),
+        format!("rustynet\\{expected_self_check_prefix}").as_str(),
+    );
     if !is_reviewed_leaf && !is_reviewed_self_check {
         return Err(format!(
             "{} must pin the reviewed pipe leaf '{}' or a reviewed self-check leaf: {}",
@@ -202,6 +214,26 @@ pub fn validate_windows_pipe_path(path: &Path, role: WindowsLocalIpcRole) -> Res
         ));
     }
     Ok(())
+}
+
+/// Whether a lowered pipe suffix is the reviewed self-check leaf.
+///
+/// WIN-08: the reviewed leaf is `<prefix><pid>`, so what follows the prefix must
+/// be a bare process id — 1 to 10 ASCII digits (`u32::MAX` is 10 digits) and
+/// nothing else. A bare prefix with no id, a non-numeric suffix, an over-long
+/// run of digits, or anything containing a path separator is refused.
+///
+/// Separated out because the bound is the security property and a prefix test is
+/// the shape that quietly lost it: `starts_with` reads like a pin while placing
+/// no constraint at all on the rest of the name.
+fn self_check_suffix_is_reviewed(lowered_suffix: &str, lowered_prefix: &str) -> bool {
+    const MAX_PID_DIGITS: usize = 10;
+    let Some(tail) = lowered_suffix.strip_prefix(lowered_prefix) else {
+        return false;
+    };
+    !tail.is_empty()
+        && tail.len() <= MAX_PID_DIGITS
+        && tail.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 pub fn build_named_pipe_security_sddl(
@@ -673,6 +705,50 @@ mod tests {
         )
         .expect_err("unexpected pipe leaf should fail");
         assert!(err.contains("must pin the reviewed pipe leaf"));
+    }
+
+    /// WIN-08: the self-check leaf was an UNBOUNDED prefix match, and the charset
+    /// allowlist permits `\` and `.`, so an attacker-chosen suffix validated.
+    /// Both of the shapes below were executed against the original validator and
+    /// both passed.
+    #[test]
+    fn validate_windows_pipe_path_rejects_an_unbounded_self_check_suffix() {
+        for hostile in [
+            // The reported cases.
+            r"\\.\pipe\RustyNet\rustynetd-privileged.check-attacker-controlled-anything",
+            r"\\.\pipe\RustyNet\rustynetd-privileged.check-\..\..\evil",
+            // A separator immediately after the prefix.
+            r"\\.\pipe\RustyNet\rustynetd-privileged.check-\evil",
+            // A nested namespace hung off the reviewed prefix.
+            r"\\.\pipe\RustyNet\rustynetd-privileged.check-1234\evil",
+            // Non-numeric, and mixed.
+            r"\\.\pipe\RustyNet\rustynetd-privileged.check-abc",
+            r"\\.\pipe\RustyNet\rustynetd-privileged.check-12ab",
+            r"\\.\pipe\RustyNet\rustynetd-privileged.check-1.2",
+            // Longer than any u32 process id can be.
+            r"\\.\pipe\RustyNet\rustynetd-privileged.check-12345678901",
+        ] {
+            let err = validate_windows_pipe_path(
+                Path::new(hostile),
+                WindowsLocalIpcRole::PrivilegedHelper,
+            )
+            .expect_err("an unbounded self-check suffix must be refused");
+            assert!(
+                err.contains("must pin the reviewed pipe leaf"),
+                "unexpected error for {hostile:?}: {err}"
+            );
+        }
+    }
+
+    /// Real process ids across the whole u32 range must still validate, or the
+    /// helper's own self-check breaks on a host with high pids.
+    #[test]
+    fn validate_windows_pipe_path_accepts_any_real_process_id() {
+        for pid in ["1", "1234", "65535", "4294967295"] {
+            let path = format!(r"\\.\pipe\RustyNet\rustynetd-privileged.check-{pid}");
+            validate_windows_pipe_path(Path::new(&path), WindowsLocalIpcRole::PrivilegedHelper)
+                .unwrap_or_else(|err| panic!("pid {pid} must validate: {err}"));
+        }
     }
 
     #[test]
