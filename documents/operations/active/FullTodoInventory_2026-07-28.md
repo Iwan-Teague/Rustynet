@@ -803,7 +803,7 @@ entries pointed at, which is the argument for verifying rather than scheduling.
   injection point; the work is packet construction plus reply matching on the inbound TUN
   path. (b) PTB ingestion via the error queue — a real signal needing no protocol, but it can
   only ever *lower*, never confirm, so it cannot drive the search on its own.
-  Phase 4 groundwork landed in `75890519`: `PathMtuConfig::for_bringup_mtu` plus `const`
+  Phase 4 groundwork landed in `e6144250`: `PathMtuConfig::for_bringup_mtu` plus `const`
   drift pins, because deriving the ceiling from the bring-up MTU was previously
   unconstructible on exactly the constrained paths DPLPMTUD exists to serve (base 1280 >
   a legal 1220 ceiling → `CeilingBelowBase`).

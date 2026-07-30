@@ -1,7 +1,7 @@
 # Adversarial Security Review — 2026-07-29
 
 Status: review only — **no code changed**, no enforcement applied; findings await owner triage
-Audit baseline: repository at commit **`22847b12`** ("refactor(live-lab): call the key-custody report writer in-process"), on `main`. Parts V and VI were verified as the tree advanced under concurrent workers (`fe634559`, then `c5018acb`); those parts note their own drift and their line refs should be treated as approximate.
+Audit baseline: repository at commit **`22847b12`** ("refactor(live-lab): call the key-custody report writer in-process"), on `main`. Parts V and VI were verified as the tree advanced under concurrent workers (`cef5282c`, then `13bb4a45`); those parts note their own drift and their line refs should be treated as approximate.
 Method: rolling adversarial review, one focused area per part. Each part names its own crate baseline, scope, and reachability conclusions.
 
 | Part | Area | Findings | Status |
@@ -71,7 +71,7 @@ meta-review itself in three places:
   at HEAD because the renderer moved" caveat was chasing a shift that never touched
   this code.
 - Part III's corrected anchor table was itself wrong twice: PF-04's flush arm is at
-  `:2210` (not `:2193`), and only `c5018acb` touched `phase10.rs` — its +43 lines are
+  `:2210` (not `:2193`), and only `13bb4a45` touched `phase10.rs` — its +43 lines are
   entirely in `LinuxCommandSystem`, and the traversal/managed-peer render loops
   predate the baseline. A complete per-file shift mapping is now in Part III's header.
 
@@ -687,7 +687,7 @@ Crate baseline: `crates/rustynet-crypto/src/lib.rs`, 2708 lines; deps are vetted
 Scope: `KeyCustodyManager` + `OsStoreFallbackPolicy`, the Argon2id/XChaCha20-Poly1305 key envelope and its on-disk framing, `aead_seal`/`aead_open`, `AlgorithmPolicy`/`CompatibilityException`, `SigningProviderPolicy` + provider attestation, `SecretKey`/`NodeKeyPair` hygiene, and `validate_key_custody_permissions`; plus the production call sites in `rustynetd/src/key_material.rs`, `rustynet-cli`, `rustynet-nas`, and `rustynet-windows-trust-cli`
 Out of scope for this part: the vendored boringtun Noise implementation, and the macOS `security` CLI argv exposure already tracked as RSA-0004
 
-> ## ✅ CRY-06, CRY-10, CRY-11 and CRY-12 are FIXED — `49a5652a`, corrections in `0742cb0c`
+> ## ✅ CRY-06, CRY-10, CRY-11 and CRY-12 are FIXED — `73ae5cc9`, corrections in `de9a6afb`
 >
 > Mutation-verified: CRY-06 (full-key compare, plus the all-zeros branch's one
 > decisive case) and CRY-11 (source-pinned) are caught. **CRY-12's test does not
@@ -988,7 +988,7 @@ Severity was originally held at *Medium-if-used* on the grounds that there is "n
 non-test consumer" of `from_raw`. **That was wrong — corrected 2026-07-30.**
 `rustynet-control/src/main.rs:37` is a production caller, and it passed a
 *non-corresponding* pair, so when the fix landed the binary failed at startup with
-`weak key material` (repaired in `e3adf9c1` by deriving the public key). The lesson
+`weak key material` (repaired in `acb5ef15` by deriving the public key). The lesson
 is procedural: a finding that rests on "no production caller" must have that grep
 re-run at fix time, because every other gate missed it — fmt, clippy, a workspace
 check and ~2,400 tests were all green while a shipped binary was broken.
@@ -1285,7 +1285,7 @@ Out of scope for this part: Linux nftables killswitch paths except where they sh
 > **Line-reference drift (meta-review 2026-07-29; corrected again after a
 > dedicated re-verification pass).** References into `phase10.rs` after ~`:1864`
 > are uniformly **+43 lines** at HEAD. Two claims in the first version of this note
-> were wrong: only **`c5018acb`** touched `phase10.rs` (not `fe634559`/`5bbf2062`),
+> were wrong: only **`13bb4a45`** touched `phase10.rs` (not `cef5282c`/`caf80cbd`),
 > and its +43 lines are entirely inside `LinuxCommandSystem` (an nft `udp sport`
 > allow) — the traversal/managed-peer fields and render loops **predate the
 > baseline entirely**, which is why PF-15 is a baseline-era defect and not drift.
@@ -2051,7 +2051,7 @@ on-box experiment on pf wildcard sub-anchor evaluation order that was not run.
 
 Crate baseline: `crates/rustynet-relay/src/{transport.rs,session.rs,rate_limit.rs,hello_limiter_audit.rs}`; `cargo test -p rustynet-relay` **84/84 green** at this commit
 
-> ## ✅ Six of these findings are FIXED — commit `1c44ed3f`
+> ## ✅ Six of these findings are FIXED — commit `62837ed0`
 >
 > **RLY-01, RLY-02, RLY-04, RLY-05, RLY-10, RLY-11** are closed in code, each with a
 > negative test. Gates at that commit: fmt clean, clippy `-D warnings` (all-targets,
@@ -2124,7 +2124,7 @@ This crate has ledger rows for all five source files, and the relay is the most 
 | RLY-07 | Rate limiting is per-`node_id` only — no aggregate or per-destination cap | Medium | **New** |
 | RLY-08 | Reject-path log writes are the unbudgeted twin of the budgeted notice path | Low | **New** |
 | RLY-09 | Bind mutation precedes the rate-limit check; IP-only TOFU bind lets a spoofer lock out the real peer | Low | **New** |
-| RLY-10 | Replay window whenever `ttl + 2*skew >= retention` — **61 s at the shipped default skew**, any `ttl >= 60`. Originally recorded as a one-second window at `skew == 120`; that undercounted because skew applies twice | Medium (corrected up from Low) | **New** — ✅ fixed `1c44ed3f` |
+| RLY-10 | Replay window whenever `ttl + 2*skew >= retention` — **61 s at the shipped default skew**, any `ttl >= 60`. Originally recorded as a one-second window at `skew == 120`; that undercounted because skew applies twice | Medium (corrected up from Low) | **New** — ✅ fixed `62837ed0` |
 | RLY-11 | No self-pair rejection — the relay echoes to the sender | Low | **New** |
 | RLY-12 | `node_id` written unescaped into log lines; `NodeId::new` permits newlines | Low | **New** |
 | RLY-13 | Assorted: unreachable size guard, invisible tuple rejections, data-path skew inconsistency, O(n) persist per hello | Info | **New** |
@@ -2416,7 +2416,7 @@ arithmetic from constants rather than measured are labelled as such inline.
 
 # Part V — `rustynet-control` as the trust issuer
 
-Crate baseline: `crates/rustynet-control/src/lib.rs` (8192 lines). **Baseline drift:** Parts I–IV were taken at `22847b12`; this part was verified as the tree advanced (`fe634559`, and `c5018acb` by the time of writing). Line references were re-checked at write time, but this area is under active development and refs should be treated as approximate.
+Crate baseline: `crates/rustynet-control/src/lib.rs` (8192 lines). **Baseline drift:** Parts I–IV were taken at `22847b12`; this part was verified as the tree advanced (`cef5282c`, and `13bb4a45` by the time of writing). Line references were re-checked at write time, but this area is under active development and refs should be treated as approximate.
 Scope: the signed-artifact issuance and verification surface — `SignedPeerMap`, `SignedEndpointHintBundle`, `SignedRelayFleetBundle`, `SignedAutoTunnelBundle`, `SignedTraversalCoordinationRecord`, the relay-session-token path, enrollment, and `derive_gossip_signing_key`
 Out of scope for this part: the sibling files with their own ledger rows (`membership.rs`, `enrollment.rs`, `role_audit.rs`, `scale.rs`, `persistence.rs`, `admin.rs`, `operations.rs`) except where cited
 
@@ -2855,12 +2855,12 @@ of the original review pass.
 COLLIDED with existing findings of those ids (`PF-11` is the evadable-but-
 unreachable route-primitive guard; `IPV-05` is the evidence path failing open
 twice). Renumbered to `PF-16` and `IPV-15` on the same day. Commit messages from
-before the renumber (`3b598514`, `cecb8773`) still say `PF-11`; they mean
+before the renumber (`7af2f0e0`, `51caf640`) still say `PF-11`; they mean
 `PF-16`.
 
 | ID | Problem | Severity | Status |
 | --- | --- | --- | --- |
-| PF-16 | `macos_blind_exit`'s own terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name | Medium | **FIXED** `3b598514` |
+| PF-16 | `macos_blind_exit`'s own terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name | Medium | **FIXED** `7af2f0e0` |
 | IPV-15 | On an exit node with DNS protection, the wide-open egress accept is ordered ABOVE the port-53 fail-closed drops, so plaintext DNS out the underlay is accepted before the drop is reached | **High** | **OPEN — needs a decision** |
 | POL-15 | `selected_exit_node` is tracked twice — daemon and controller — and the restore + auto-exit paths assign only the daemon's, so the LAN-route gate can never pass in those states | Medium | **OPEN — needs a decision** |
 | RLY-17 | The daemon-side clock helper carries the same false "returns 0 ⇒ fail-closed" claim as RLY-15, and its safety comes from a different check than the one the comment names | Low | **Comment FIXED; hardening open** |
