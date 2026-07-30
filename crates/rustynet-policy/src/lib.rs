@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -109,10 +109,31 @@ impl MembershipDirectory {
             .unwrap_or(MembershipStatus::Unknown)
     }
 
-    /// Returns `true` if at least one node has been registered in this
-    /// directory.  When the directory is unpopulated (empty) the membership
-    /// enforcement gate treats nodes as pre-membership and skips the check so
-    /// that deployments that have not yet adopted governance are not broken.
+    /// Returns `true` if at least one node has been registered in this directory.
+    ///
+    /// # This is NOT a governance-disabled bypass (POL-06)
+    ///
+    /// The previous doc comment claimed that on an empty directory "the
+    /// membership enforcement gate treats nodes as pre-membership and skips the
+    /// check so that deployments that have not yet adopted governance are not
+    /// broken." **That bypass does not exist and must not be reintroduced.**
+    /// `8cca1458` removed it under RN-11 ("empty membership directory denies peer
+    /// provisioning") and deleted the twin comment in `phase10.rs`, but left this
+    /// one standing as untouched context — so the crate's own documentation
+    /// advertised a fail-open that the code had already closed.
+    ///
+    /// What the code actually does: `selector_membership_allowed` never consults
+    /// this method, and an empty directory with a `node:` selector evaluates to
+    /// `Deny`. That is the mandated posture — absent trust state denies — and the
+    /// test named after this comment pins it.
+    ///
+    /// Correcting the comment is the point. A stale doc describing a removed
+    /// fail-open is an invitation to "restore" it, and this one had already
+    /// outlived the code it described by long enough to be cited as current
+    /// behaviour in a security review.
+    ///
+    /// Remaining callers use this as an *advisory* signal about whether
+    /// membership state has been distributed yet, never to decide access.
     pub fn is_populated(&self) -> bool {
         !self.nodes.is_empty()
     }
@@ -290,20 +311,42 @@ impl LlmAccessScope {
 }
 
 /// Selector → [`LlmAccessScope`] table distributed alongside the
-/// signed service-access policy. Lookup prefers the most specific
-/// selector: an exact peer selector (e.g. `node:laptop-1`) wins over
-/// a group selector (e.g. `group:family`); first match wins within
-/// each specificity tier (mirrors rule ordering elsewhere).
+/// signed service-access policy.
+///
+/// # Specificity is the CALLER's responsibility (POL-12)
+///
+/// This doc used to claim that "lookup prefers the most specific selector: an
+/// exact peer selector (e.g. `node:laptop-1`) wins over a group selector (e.g.
+/// `group:family`); first match wins within each specificity tier". There is no
+/// tier concept, no prefix parsing and no ranking anywhere in this type —
+/// [`LlmScopePolicy::scope_for`] walks the selectors the CALLER supplies, in the
+/// order supplied, and returns the first entry that matches one of them.
+///
+/// The outcome the old comment described does happen, but only because callers
+/// pass `["node:<id>", "group:<g>", …]` in that order. Hand it
+/// `["group:family", "node:laptop-1"]` and the group scope wins. The obligation
+/// is real and it is the caller's; documenting it as a property of this type hid
+/// that, and a reader could reasonably have added a caller that ordered
+/// selectors differently and silently widened every scope it resolved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LlmScopePolicy {
     pub entries: Vec<(String, LlmAccessScope)>,
 }
 
 impl LlmScopePolicy {
-    /// Resolve the effective scope for a peer. `peer_selectors` is
-    /// the peer's identity selectors in decreasing specificity
-    /// (typically `["node:<id>", "group:<g1>", …]`). Returns `None`
-    /// when no entry applies — the grant stays unrestricted.
+    /// Resolve the effective scope for a peer.
+    ///
+    /// `peer_selectors` MUST be ordered by decreasing specificity — typically
+    /// `["node:<id>", "group:<g1>", …]`. This method does not sort, rank or
+    /// parse them; it returns the scope for the first supplied selector that has
+    /// an entry, so the caller's ordering IS the precedence (POL-12).
+    ///
+    /// Returns `None` when no entry applies, which leaves the grant
+    /// unrestricted. That fail-open direction is deliberate here — a scope is an
+    /// optional admin restriction layered on top of an Allow decision the caller
+    /// already holds, not the authorization itself — but it is also why the
+    /// ordering obligation above matters: a mis-ordered call does not error, it
+    /// silently resolves a broader scope.
     pub fn scope_for<'a>(&'a self, peer_selectors: &[String]) -> Option<&'a LlmAccessScope> {
         for selector in peer_selectors {
             if let Some((_, scope)) = self
@@ -322,6 +365,13 @@ impl LlmScopePolicy {
 pub enum RolloutError {
     UnsafeAllowAll,
     UnknownRevision,
+    /// POL-08: a revision id that is already staged. Ids are the rollback
+    /// target's only handle, so reusing one silently redefines what rolling back
+    /// to it means.
+    DuplicateRevision,
+    /// POL-09: a rollback target that has never been active. "Rollback" must
+    /// return to a known-good state, not activate something never observed.
+    RevisionNeverPromoted,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -329,15 +379,37 @@ pub struct PolicyRolloutController {
     revisions: HashMap<String, ContextualPolicySet>,
     active_revision: Option<String>,
     canary_revision: Option<String>,
+    /// Revision ids that have been active at least once. POL-09: `rollback_to`
+    /// requires membership here, so a staged-but-never-observed revision cannot
+    /// be activated by a method whose name reads as a safety action.
+    promoted_revisions: BTreeSet<String>,
 }
 
 impl PolicyRolloutController {
+    /// Stage a revision as the canary.
+    ///
+    /// POL-08: a duplicate id is REFUSED rather than overwriting. The id is the
+    /// rollback target's only handle, so a bare `insert` meant
+    /// `stage("rev-1", tcp)` → promote → `stage("rev-1", udp)` →
+    /// `rollback_to("rev-1")` succeeded while silently activating different
+    /// content than the operator rolled back to — and re-staging also silently
+    /// made that id the canary again. Rollback is the control operators reach for
+    /// when something is already wrong; it must not be the step that changes
+    /// what they are returning to.
+    ///
+    /// Refusing is chosen over content-addressing because it keeps operator-named
+    /// ids meaningful. Content-addressed revisions would also fix this and remain
+    /// a reasonable future change; either way the invariant is that one id names
+    /// one policy forever.
     pub fn stage_revision(
         &mut self,
         revision_id: String,
         policy: ContextualPolicySet,
     ) -> Result<(), RolloutError> {
         validate_policy_safety(&policy)?;
+        if self.revisions.contains_key(&revision_id) {
+            return Err(RolloutError::DuplicateRevision);
+        }
         self.revisions.insert(revision_id.clone(), policy);
         self.canary_revision = Some(revision_id);
         Ok(())
@@ -347,14 +419,30 @@ impl PolicyRolloutController {
         let Some(canary) = self.canary_revision.clone() else {
             return Err(RolloutError::UnknownRevision);
         };
+        self.promoted_revisions.insert(canary.clone());
         self.active_revision = Some(canary);
         self.canary_revision = None;
         Ok(())
     }
 
+    /// Return to a previously-active revision.
+    ///
+    /// POL-09: the target must have been promoted at least once. The old check
+    /// was `contains_key`, so `stage_revision("rev-evil", …)` followed directly
+    /// by `rollback_to("rev-evil")` activated it — skipping the runbook's
+    /// "promote to canary, observe canary metrics and audit events" steps
+    /// entirely, under a method name that reads as a safety action rather than a
+    /// deployment.
+    ///
+    /// `UnknownRevision` and `RevisionNeverPromoted` are kept distinct so an
+    /// operator can tell a typo from a revision that exists but was never
+    /// observed running.
     pub fn rollback_to(&mut self, revision_id: &str) -> Result<(), RolloutError> {
         if !self.revisions.contains_key(revision_id) {
             return Err(RolloutError::UnknownRevision);
+        }
+        if !self.promoted_revisions.contains(revision_id) {
+            return Err(RolloutError::RevisionNeverPromoted);
         }
         self.active_revision = Some(revision_id.to_owned());
         self.canary_revision = None;
@@ -366,13 +454,29 @@ impl PolicyRolloutController {
     }
 }
 
+/// Refuse to stage a policy that allows everything to everything.
+///
+/// # POL-07 / RSA-0006: the protocol enumeration evaded this
+///
+/// The check used to require `protocol == Protocol::Any`, so three rules
+/// `*`/`*`/`Tcp`, `*`/`*`/`Udp` and `*`/`*`/`Icmp` staged successfully while
+/// being operationally equivalent to allow-all. Enumerating the protocol set is
+/// not a narrowing, and a guard that can be stepped around by writing the same
+/// policy in three lines is not a guard.
+///
+/// Any `*` → `*` Allow is now refused regardless of protocol. A rule that
+/// genuinely needs to be that broad must name a real selector on at least one
+/// side, which is the point: the operator has to say who.
+///
+/// Scope, stated honestly: this checks the `*`/`*` shape only. It does not model
+/// coverage — a rule pair that names every selector in the fleet individually is
+/// still equivalent to allow-all and still stages. Closing that needs a
+/// membership-aware coverage analysis, which this function does not attempt.
 fn validate_policy_safety(policy: &ContextualPolicySet) -> Result<(), RolloutError> {
-    let contains_allow_all = policy.rules.iter().any(|rule| {
-        rule.src == "*"
-            && rule.dst == "*"
-            && rule.protocol == Protocol::Any
-            && rule.action == RuleAction::Allow
-    });
+    let contains_allow_all = policy
+        .rules
+        .iter()
+        .any(|rule| rule.src == "*" && rule.dst == "*" && rule.action == RuleAction::Allow);
     if contains_allow_all {
         return Err(RolloutError::UnsafeAllowAll);
     }
@@ -439,16 +543,29 @@ fn membership_request_allowed(src: &str, dst: &str, membership: &MembershipDirec
 fn selector_membership_allowed(selector: &str, membership: &MembershipDirectory) -> bool {
     // POL-03: an empty selector is absent trust state — refuse it here too, so the
     // revocation gate does not depend on `selector_matches` having already
-    // rejected it. Without this, `selector_requires_membership("")` is false and
-    // an empty identity passes the gate unexamined.
+    // rejected it. Before POL-01 removed it, `selector_requires_membership("")`
+    // returned false here and an empty identity passed the gate unexamined.
     if selector.is_empty() {
         return false;
     }
-    if selector == "*" {
-        return true;
-    }
-    if !selector_requires_membership(selector) {
-        return true;
+    // POL-01: an unrecognised selector is unresolvable trust state, not a
+    // harmless literal. This match is exhaustive over `SelectorKind` on purpose:
+    // adding a variant without deciding its membership semantics fails to
+    // compile, so a future selector form cannot silently inherit an allow.
+    let Some(kind) = parse_selector(selector) else {
+        return false;
+    };
+    match kind {
+        // Matches anything; there is no identity to resolve.
+        SelectorKind::Wildcard => return true,
+        // A literal network destination carries no membership. See
+        // `SelectorKind::Cidr` — an explicitly enumerated allow, not a
+        // fallthrough, and unchanged in behaviour from before this fix.
+        SelectorKind::Cidr(_) => return true,
+        SelectorKind::Node(_)
+        | SelectorKind::User(_)
+        | SelectorKind::Group(_)
+        | SelectorKind::Tag(_) => {}
     }
     let Some(node_id) = selector_node_id(selector) else {
         let Some(members) = membership.selector_members(selector) else {
@@ -463,14 +580,120 @@ fn selector_membership_allowed(selector: &str, membership: &MembershipDirectory)
 }
 
 fn selector_node_id(selector: &str) -> Option<&str> {
-    selector.strip_prefix("node:")
+    match parse_selector(selector) {
+        Some(SelectorKind::Node(id)) => Some(id),
+        _ => None,
+    }
 }
 
-fn selector_requires_membership(selector: &str) -> bool {
-    selector.starts_with("node:")
-        || selector.starts_with("user:")
-        || selector.starts_with("group:")
-        || selector.starts_with("tag:")
+/// Every selector form this engine recognises.
+///
+/// POL-01: the point of this enum is that the set is CLOSED. The previous design
+/// asked "does this selector start with a known prefix?" and, on a miss, returned
+/// `false` from the former `selector_requires_membership` helper — which
+/// `selector_membership_allowed` read as "not an identity, therefore nothing to
+/// check" and allowed. So an unrecognised string was reclassified as harmless
+/// rather than as unresolvable trust state, and the revocation check never ran.
+///
+/// Confirmed consequences of that inversion, against the daemon's own shipped
+/// default policy with `revoked-node` marked `Revoked`: `node:revoked-node` was
+/// correctly denied, while `NODE:revoked-node`, `Node:revoked-node`,
+/// `nodes:revoked-node`, `svc:revoked-node`, `" node:revoked-node"` (leading
+/// space) and the bare `revoked-node` were all ALLOWED.
+///
+/// Now every selector must parse into one of these variants and anything else
+/// denies. Each variant that permits without a membership lookup does so
+/// EXPLICITLY, so the allow is enumerated rather than reached by fallthrough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorKind<'a> {
+    /// `*` — matches anything. No identity to resolve.
+    Wildcard,
+    /// `node:<id>` — resolves to a single membership entry.
+    Node(&'a str),
+    /// `user:<name>` — resolves via the directory's selector members.
+    User(&'a str),
+    /// `group:<name>`.
+    Group(&'a str),
+    /// `tag:<name>`.
+    Tag(&'a str),
+    /// A literal network destination such as `192.168.1.0/24` or `100.64.0.2/32`.
+    ///
+    /// Not an identity, so no membership lookup applies — but it is a real and
+    /// load-bearing selector form: LAN-route grants and exit-route intents pass
+    /// `route.destination_cidr` / `request.cidr` straight through as `dst`.
+    /// Recognising it explicitly is what lets the miss branch deny without
+    /// breaking route authorization. Whether a literal CIDR *should* be
+    /// authorizable without resolving a peer is a separate open question
+    /// (POL-02); this change does not alter that behaviour, only stops it sharing
+    /// a code path with an unrecognised string.
+    Cidr(&'a str),
+}
+
+/// Parse a selector into its kind, or `None` if it conforms to no known form.
+///
+/// Deliberately strict, and deliberately NOT canonicalising:
+///
+/// - **Case-sensitive.** `NODE:x` is rejected rather than folded to `node:x`.
+///   Folding would make a mis-cased selector start MATCHING, which widens what a
+///   rule admits; rejecting keeps the failure direction closed.
+/// - **No trimming.** `" node:x"` is rejected rather than trimmed. Trimming is
+///   also a widening: it makes two distinct strings match.
+/// - **A prefix with an empty body is malformed**, so `node:` cannot reach a
+///   membership lookup with an empty id.
+///
+/// Note: this REPLACES the former `selector_requires_membership` helper rather
+/// than sitting alongside it. That helper's whole contract was "false means no
+/// membership check applies", which is the fail-open shape POL-01 is about, so
+/// keeping it available would leave the defect one call site away from returning.
+fn parse_selector(selector: &str) -> Option<SelectorKind<'_>> {
+    if selector == "*" {
+        return Some(SelectorKind::Wildcard);
+    }
+    if selector.is_empty() {
+        return None;
+    }
+    if let Some(body) = selector.strip_prefix("node:") {
+        return (!body.is_empty()).then_some(SelectorKind::Node(body));
+    }
+    if let Some(body) = selector.strip_prefix("user:") {
+        return (!body.is_empty()).then_some(SelectorKind::User(body));
+    }
+    if let Some(body) = selector.strip_prefix("group:") {
+        return (!body.is_empty()).then_some(SelectorKind::Group(body));
+    }
+    if let Some(body) = selector.strip_prefix("tag:") {
+        return (!body.is_empty()).then_some(SelectorKind::Tag(body));
+    }
+    if selector_is_literal_cidr(selector) {
+        return Some(SelectorKind::Cidr(selector));
+    }
+    None
+}
+
+/// Whether a selector is a syntactically valid literal CIDR.
+///
+/// Validated rather than sniffed for a `/`: "contains a slash" would simply move
+/// the fail-open miss branch behind a cheaper test, which is the defect this
+/// change exists to remove. The address must parse and the prefix length must be
+/// in range for its family.
+fn selector_is_literal_cidr(selector: &str) -> bool {
+    let Some((address, prefix)) = selector.split_once('/') else {
+        return false;
+    };
+    // Reject a redundantly-written prefix such as `/024`, so one network has one
+    // spelling and any allowlist keyed on the text cannot be bypassed by
+    // rewriting it.
+    if prefix.len() > 1 && prefix.starts_with('0') {
+        return false;
+    }
+    let Ok(prefix_len) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => prefix_len <= 32,
+        Ok(std::net::IpAddr::V6(_)) => prefix_len <= 128,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +704,302 @@ mod tests {
         PolicyRolloutController, PolicyRule, PolicySet, Protocol, RolloutError, RuleAction,
         TrafficContext, selector_membership_allowed,
     };
+
+    /// POL-01, verbatim from the review's confirmed exploit table.
+    ///
+    /// Each of these was ALLOWED against the daemon's shipped default policy with
+    /// `revoked-node` marked `Revoked`, because the former
+    /// `selector_requires_membership` helper returned false on a prefix miss and
+    /// the caller read that as "nothing to check". Every one must now be denied.
+    #[test]
+    fn unrecognised_selectors_do_not_skip_the_revocation_check() {
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("revoked-node", MembershipStatus::Revoked);
+        membership.set_node_status("active-node", MembershipStatus::Active);
+
+        // The control: the correctly-spelled selector was already denied.
+        assert!(
+            !selector_membership_allowed("node:revoked-node", &membership),
+            "the correctly-spelled revoked selector must deny"
+        );
+
+        for evasion in [
+            // Case variants -- rejected rather than folded, since folding would
+            // make a mis-cased selector start matching.
+            "NODE:revoked-node",
+            "Node:revoked-node",
+            "nOdE:revoked-node",
+            // Near-miss prefixes.
+            "nodes:revoked-node",
+            "svc:revoked-node",
+            "node-revoked-node",
+            "node.revoked-node",
+            // Whitespace -- rejected rather than trimmed.
+            " node:revoked-node",
+            "node:revoked-node ",
+            "\tnode:revoked-node",
+            // No prefix at all: a bare id is not a selector.
+            "revoked-node",
+            // A prefix with no body cannot reach a membership lookup.
+            "node:",
+            "user:",
+            "group:",
+            "tag:",
+            // Not a valid CIDR, so it must not be classified as one. Sniffing for
+            // a `/` would simply relocate the fail-open branch.
+            "node/revoked",
+            "999.999.999.999/24",
+            "192.168.1.0/33",
+            "192.168.1.0/",
+            "192.168.1.0/24extra",
+            "::1/129",
+            // A redundantly-written prefix: one network, one spelling.
+            "192.168.1.0/024",
+        ] {
+            assert!(
+                !selector_membership_allowed(evasion, &membership),
+                "an unrecognised selector must deny, not skip the revocation check: {evasion:?}"
+            );
+        }
+    }
+
+    /// The other direction: every selector form this workspace actually emits
+    /// must still resolve, or the strict parser breaks real authorization.
+    ///
+    /// The literal-CIDR form is the one that makes this non-obvious. LAN-route
+    /// grants and exit-route intents pass `route.destination_cidr` /
+    /// `request.cidr` through as `dst`, so denying unrecognised selectors without
+    /// recognising a CIDR would have failed route authorization closed.
+    #[test]
+    fn every_selector_form_in_use_still_resolves() {
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("active-node", MembershipStatus::Active);
+        membership.set_selector_members("user:local", vec!["active-node".to_owned()]);
+        membership.set_selector_members("group:family", vec!["active-node".to_owned()]);
+        membership.set_selector_members("tag:servers", vec!["active-node".to_owned()]);
+
+        for allowed in [
+            "*",
+            "node:active-node",
+            "user:local",
+            "group:family",
+            "tag:servers",
+            // Literal destinations, as emitted by the route paths.
+            "192.168.1.0/24",
+            "100.64.0.2/32",
+            "0.0.0.0/0",
+            "10.0.0.0/8",
+            "fd00::/8",
+            "::1/128",
+        ] {
+            assert!(
+                selector_membership_allowed(allowed, &membership),
+                "a selector form this workspace emits must still resolve: {allowed:?}"
+            );
+        }
+    }
+
+    /// POL-06: an empty membership directory DENIES; `is_populated()` is not a
+    /// bypass. This is the behaviour the corrected doc comment on
+    /// `MembershipDirectory::is_populated` describes, pinned so the removed
+    /// fail-open cannot come back with the comment that used to advertise it.
+    #[test]
+    fn an_empty_membership_directory_denies_rather_than_skipping_the_check() {
+        let membership = MembershipDirectory::default();
+        assert!(
+            !membership.is_populated(),
+            "the directory under test must be empty"
+        );
+        for selector in ["node:any-node", "user:local", "group:family", "tag:servers"] {
+            assert!(
+                !selector_membership_allowed(selector, &membership),
+                "an empty directory must deny {selector:?}, not treat it as pre-membership"
+            );
+        }
+        // The wildcard resolves no identity, so it is unaffected either way --
+        // stated so the assertion above is not misread as "everything denies".
+        assert!(selector_membership_allowed("*", &membership));
+    }
+
+    fn allow_all_rule(protocol: Protocol) -> ContextualPolicyRule {
+        ContextualPolicyRule {
+            src: "*".to_owned(),
+            dst: "*".to_owned(),
+            protocol,
+            action: RuleAction::Allow,
+            contexts: vec![TrafficContext::Mesh],
+        }
+    }
+
+    /// POL-07 / RSA-0006: enumerating protocols was equivalent to allow-all and
+    /// staged successfully, because the guard required `Protocol::Any`.
+    #[test]
+    fn protocol_enumeration_no_longer_evades_the_allow_all_guard() {
+        for protocol in [Protocol::Any, Protocol::Tcp, Protocol::Udp, Protocol::Icmp] {
+            let mut controller = PolicyRolloutController::default();
+            let policy = ContextualPolicySet {
+                rules: vec![allow_all_rule(protocol)],
+            };
+            assert_eq!(
+                controller.stage_revision("rev-1".to_owned(), policy),
+                Err(RolloutError::UnsafeAllowAll),
+                "a `*` -> `*` Allow must be refused for protocol {protocol:?}"
+            );
+        }
+
+        // The original reported evasion: the three specific protocols together.
+        let mut controller = PolicyRolloutController::default();
+        let enumerated = ContextualPolicySet {
+            rules: vec![
+                allow_all_rule(Protocol::Tcp),
+                allow_all_rule(Protocol::Udp),
+                allow_all_rule(Protocol::Icmp),
+            ],
+        };
+        assert_eq!(
+            controller.stage_revision("rev-enum".to_owned(), enumerated),
+            Err(RolloutError::UnsafeAllowAll)
+        );
+    }
+
+    /// A rule that names a real selector on either side must still stage, or the
+    /// guard blocks every usable policy.
+    #[test]
+    fn a_policy_naming_a_real_selector_still_stages() {
+        let mut controller = PolicyRolloutController::default();
+        let policy = ContextualPolicySet {
+            rules: vec![
+                ContextualPolicyRule {
+                    src: "user:local".to_owned(),
+                    dst: "*".to_owned(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Allow,
+                    contexts: vec![TrafficContext::Mesh],
+                },
+                // A `*` -> `*` DENY is a tightening, not an allow-all.
+                ContextualPolicyRule {
+                    src: "*".to_owned(),
+                    dst: "*".to_owned(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Deny,
+                    contexts: vec![TrafficContext::Mesh],
+                },
+            ],
+        };
+        controller
+            .stage_revision("rev-1".to_owned(), policy)
+            .expect("a policy naming a real selector must stage");
+    }
+
+    fn narrow_policy(protocol: Protocol) -> ContextualPolicySet {
+        ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "user:local".to_owned(),
+                dst: "node:target".to_owned(),
+                protocol,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::Mesh],
+            }],
+        }
+    }
+
+    /// POL-08: re-staging an id silently redefined what rolling back to it meant.
+    ///
+    /// The confirmed sequence was stage `rev-1` (Tcp) -> promote -> re-stage
+    /// `rev-1` (Udp) -> `rollback_to("rev-1")` -> Ok, with the content replaced.
+    #[test]
+    fn a_duplicate_revision_id_is_refused_rather_than_overwriting() {
+        let mut controller = PolicyRolloutController::default();
+        controller
+            .stage_revision("rev-1".to_owned(), narrow_policy(Protocol::Tcp))
+            .expect("first stage should succeed");
+        controller.promote_canary().expect("promote should succeed");
+
+        assert_eq!(
+            controller.stage_revision("rev-1".to_owned(), narrow_policy(Protocol::Udp)),
+            Err(RolloutError::DuplicateRevision),
+            "one id must name one policy forever"
+        );
+        // And the refusal must not have disturbed the active revision or made the
+        // re-staged id the canary again.
+        assert_eq!(controller.active_revision(), Some("rev-1"));
+        controller
+            .rollback_to("rev-1")
+            .expect("the original revision must still be the rollback target");
+    }
+
+    /// POL-09: `rollback_to` activated never-promoted revisions, skipping the
+    /// runbook's canary-observation steps under a method name that reads as a
+    /// safety action.
+    #[test]
+    fn rollback_refuses_a_revision_that_was_never_promoted() {
+        let mut controller = PolicyRolloutController::default();
+        controller
+            .stage_revision("rev-evil".to_owned(), narrow_policy(Protocol::Tcp))
+            .expect("stage should succeed");
+
+        assert_eq!(
+            controller.rollback_to("rev-evil"),
+            Err(RolloutError::RevisionNeverPromoted),
+            "a staged-but-never-observed revision must not be activatable via rollback"
+        );
+        assert_eq!(controller.active_revision(), None);
+
+        // A typo stays distinguishable from a never-promoted revision.
+        assert_eq!(
+            controller.rollback_to("rev-typo"),
+            Err(RolloutError::UnknownRevision)
+        );
+
+        // Once actually promoted, rollback to it works -- so this is a gate on
+        // provenance, not a block on the feature.
+        controller.promote_canary().expect("promote should succeed");
+        controller
+            .stage_revision("rev-2".to_owned(), narrow_policy(Protocol::Udp))
+            .expect("stage should succeed");
+        controller.promote_canary().expect("promote should succeed");
+        assert_eq!(controller.active_revision(), Some("rev-2"));
+        controller
+            .rollback_to("rev-evil")
+            .expect("a previously-promoted revision is a valid rollback target");
+        assert_eq!(controller.active_revision(), Some("rev-evil"));
+    }
+
+    /// POL-12: `scope_for` has no specificity logic — the CALLER's selector order
+    /// is the precedence. The pre-existing test passes because it happens to pass
+    /// node-first, which reads as proof of tiering the code does not have.
+    #[test]
+    fn scope_for_precedence_comes_from_the_caller_order_not_from_specificity() {
+        let node_scope = LlmAccessScope {
+            allowed_models: Some(vec!["small-model".to_owned()]),
+            ..LlmAccessScope::default()
+        };
+        let group_scope = LlmAccessScope {
+            allowed_models: Some(vec!["small-model".to_owned(), "big-model".to_owned()]),
+            ..LlmAccessScope::default()
+        };
+        let policy = LlmScopePolicy {
+            entries: vec![
+                ("group:family".to_owned(), group_scope.clone()),
+                ("node:laptop-1".to_owned(), node_scope.clone()),
+            ],
+        };
+
+        // Node-first: the narrow scope wins.
+        assert_eq!(
+            policy.scope_for(&["node:laptop-1".to_owned(), "group:family".to_owned()]),
+            Some(&node_scope)
+        );
+        // Group-first, SAME table: the broad scope wins. If any tiering existed
+        // this would still resolve the node scope. It does not, which is exactly
+        // what the corrected doc comment now says.
+        assert_eq!(
+            policy.scope_for(&["group:family".to_owned(), "node:laptop-1".to_owned()]),
+            Some(&group_scope),
+            "a mis-ordered call silently resolves the BROADER scope -- the ordering \
+             obligation is the caller's and is documented as such"
+        );
+    }
 
     #[test]
     fn policy_defaults_to_deny() {
@@ -1167,7 +1686,7 @@ mod tests {
     /// POL-03: an empty identity must never be admitted.
     ///
     /// Pre-fix `selector_matches("*", "")` was true and
-    /// `selector_requires_membership("")` was false, so a request carrying an empty
+    /// the former `selector_requires_membership("")` was false, so a request carrying an empty
     /// src or dst skipped the revocation gate entirely and was then admitted by any
     /// wildcard allow rule — a fail-open on absent trust state, which
     /// `CLAUDE.md` §10.4 explicitly forbids ("empty/missing/malformed → deny").
