@@ -174,15 +174,21 @@ fn parse_proc_flag(stdout: &str) -> bool {
 /// Two signals can establish containment, and both are now subject to
 /// precedence:
 ///   1. an explicit v6-scoped drop (`meta nfproto ipv6 ... drop`, an
-///      `ip6`/`inet6` saddr/daddr drop) — explicit intent, credited in any
-///      chain;
+///      `ip6`/`inet6` saddr/daddr drop);
 ///   2. the canonical family-agnostic terminal drop (the `block drop out quick
-///      all` analogue: `policy drop` / a bare `drop`) — but ONLY inside an
-///      EGRESS base chain (`hook output`/`hook postrouting`/`hook forward`) of
-///      the dual-stack `inet` killswitch table. A family-agnostic terminal drop
-///      on an `input`/`prerouting` chain, a regular (unhooked) chain, or an
-///      `ip` (IPv4-only) table does NOT contain outbound IPv6 — crediting it
-///      would be a false fail-closed positive.
+///      all` analogue: `policy drop` / a bare `drop`).
+///
+/// BOTH require the same scope, and this is the load-bearing part: the rule must
+/// sit in an EGRESS base chain (`hook output`/`hook postrouting`/`hook forward`)
+/// of the dual-stack `inet` killswitch table. A drop of either kind on an
+/// `input`/`prerouting` chain, in a regular (unhooked) chain, in a foreign
+/// table, or in an `ip` (IPv4-only) table does NOT contain outbound IPv6 —
+/// crediting it would be a false fail-closed positive.
+///
+/// An earlier revision credited kind 1 in ANY chain, calling it "explicit
+/// intent". Intent is not containment: an unhooked chain is never evaluated
+/// unless jumped to, and a foreign table is not this daemon's to rely on, so
+/// its verdict can change without any rustynet state changing.
 ///
 /// # Presence is not containment (IPV-03)
 ///
@@ -304,12 +310,19 @@ fn classify_v6_egress_rule(
     in_killswitch_table: bool,
     contained: &ContainedInterfaces,
 ) -> RuleDisposition {
-    // Terminators first: an explicit v6 drop counts anywhere, a family-agnostic
-    // one only inside the dual-stack killswitch table's egress chains.
-    if rule_is_v6_drop(rule) {
-        return RuleDisposition::Terminator;
-    }
-    if in_killswitch_table && line_is_terminal_drop(rule) {
+    // Terminators: BOTH kinds require the chain to be an egress base chain of
+    // the dual-stack killswitch table. An explicit v6 drop used to be credited
+    // unconditionally on the reasoning that it is "explicit intent" — but
+    // containment is about EFFECT, not intent, and a rule the kernel never
+    // evaluates has no effect. That crediting survived the first half of this
+    // fix and was found by adversarially reviewing it: an explicit
+    // `meta nfproto ipv6 drop` in an unhooked chain, or in a table this daemon
+    // does not manage, still certified containment.
+    //
+    // Note a non-credited drop does not become an escape: `drop` is absent from
+    // `rule_has_permissive_verdict`, so it falls through to `Irrelevant` — it
+    // cannot contain, and it cannot leak either.
+    if in_killswitch_table && (rule_is_v6_drop(rule) || line_is_terminal_drop(rule)) {
         return RuleDisposition::Terminator;
     }
     // An IPv4-only selector cannot match IPv6 at all, whatever it permits.
@@ -522,8 +535,14 @@ mod tests {
     }
 }"#;
 
+    // Carries the `hook output` declaration the REAL killswitch chain has
+    // (`phase10.rs` renders `type filter hook output priority 0; policy drop;`).
+    // Without it this fixture modelled an unhooked chain — a shape production
+    // never emits — and the test below asserted that shape credits containment,
+    // which is what pinned the explicit-v6 crediting defect as correct.
     const INET_KILLSWITCH_WITH_V6_DROP: &str = r#"table inet rustynet_g1 {
     chain killswitch {
+        type filter hook output priority 0; policy drop;
         meta nfproto ipv6 oifname "enp0s1" drop
     }
 }"#;
@@ -586,6 +605,34 @@ mod tests {
         assert!(
             nft_ruleset_has_v6_drop(HOOKED, "rustynet_g1"),
             "an egress-hooked chain in the killswitch table must still be credited"
+        );
+
+        // The EXPLICIT-v6 half of the same two escapes. The first half of this
+        // fix gated only the family-agnostic terminator, so swapping the bare
+        // `drop` here for an explicit v6 drop made the defect green again.
+        const UNHOOKED_EXPLICIT_V6: &str = r#"table inet rustynet_g1 {
+	chain helper {
+		meta nfproto ipv6 drop
+	}
+}"#;
+        assert!(
+            !nft_ruleset_has_v6_drop(UNHOOKED_EXPLICIT_V6, "rustynet_g1"),
+            "an explicit v6 drop in an UNHOOKED chain must not be credited — \
+             intent is not containment when the kernel never evaluates the rule"
+        );
+
+        // A foreign table's egress chain really would drop the traffic, but it
+        // is not this daemon's rule: the verdict could flip with no rustynet
+        // state change, so it cannot evidence the rustynet killswitch.
+        const FOREIGN_TABLE_EXPLICIT_V6: &str = r#"table inet someone_else {
+	chain out {
+		type filter hook output priority 0; policy accept;
+		meta nfproto ipv6 drop
+	}
+}"#;
+        assert!(
+            !nft_ruleset_has_v6_drop(FOREIGN_TABLE_EXPLICIT_V6, "rustynet_g1"),
+            "an explicit v6 drop in a FOREIGN table must not be credited"
         );
     }
 
