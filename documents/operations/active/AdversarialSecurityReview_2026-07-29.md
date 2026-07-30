@@ -2842,3 +2842,70 @@ The enrollment token surface is the best-built area in this entire document, and
 11. **`write_ledger` does the full `temp(0o600) → write → fsync → rename → parent fsync` sequence** — the same discipline Part II §9 credits `rustynet-crypto` for, and which RLY-04 found missing in the relay. Three data points now: crypto and enrollment do it, the relay does not.
 12. **Snapshot integrity plumbing is sound** — the digest is recomputed and compared on load, `validate()` re-runs, and an attestation that does not bind to `(network_id, epoch, state_root)` is refused, as are duplicate approver ids.
 13. **`BlindExit` immutability is enforced at the trust boundary**, not in an advisory helper — executed and confirmed refused. ENR-06 is a UX gap on top of a correct control.
+
+---
+
+## 34. Addendum — findings surfaced while remediating (2026-07-30)
+
+Added after the fact, during the S1–S5 remediation. Kept in this document so
+every finding stays in one place, and marked separately because it was not part
+of the original review pass.
+
+| ID | Problem | Severity | Status |
+| --- | --- | --- | --- |
+| PF-11 | `macos_blind_exit`'s own terminal-block check was presence-only — a fifth site of the PF-05 class the review did not name | Medium | **FIXED** `3b598514` |
+| IPV-05 | On an exit node with DNS protection, the wide-open egress accept is ordered ABOVE the port-53 fail-closed drops, so plaintext DNS out the underlay is accepted before the drop is reached | **High** | **OPEN — needs a decision** |
+
+### PF-11 — a fifth presence-only terminal-block check (Medium; FIXED)
+
+`evaluate_macos_blind_exit_pf_rules` asserted only that the line `block drop out
+quick all` appeared somewhere in the ruleset. pf is first-match-wins and `quick`
+takes effect immediately, so an interface-wide `quick` pass above that block wins
+outright while the block stays literally present. Found while fixing PF-05, and
+closed with the same shared precedence walk. The pre-existing test appended its
+wide-open pass *after* the block, where it is genuinely unreachable, which is why
+nothing caught the hoisted case.
+
+### IPV-05 — DNS fail-closed is void on an exit node (High; CONFIRMED by reading the call order; OPEN)
+
+Two controls contradict each other, and the ordering decides which wins.
+
+Both rules land in the **same** nft chain (`killswitch`, `hook output`), and both
+are added with `nft add rule`, which **appends**:
+
+1. `apply_nat_forwarding` (`phase10.rs:2445`) appends
+   `oifname "<underlay>" accept` — the wide-open output-chain accept, PF-01's
+   Linux twin, here confirmed in the **installer** and not merely in the
+   assertion.
+2. `apply_dns_protection` (`phase10.rs:2508`+) appends
+   `udp dport 53 oifname != "<tunnel>" drop` and the tcp twin.
+
+The runtime calls them in exactly that order (`phase10.rs:~5350` then `~5360`):
+`apply_nat_forwarding` runs under
+`exit_mode == FullTunnel || serve_exit_node`, then `apply_dns_protection` under
+`protected_dns`. So on any node that is both, the accept sits at a **lower index**
+than the drops, nftables takes the first match, and **plaintext DNS to a LAN or
+ISP resolver egresses freely** while `assert_dns_protection` — a presence check —
+reports the protection installed.
+
+Why S2 does not catch it: the precedence walk added in S2 decides whether the
+chain's *general* egress terminator is reachable, and it treats the underlay
+accept as an acknowledged exception so that verifier change would not fail every
+exit node closed. DNS is a **different traffic class** with its **own**
+terminator, so it needs its own walk. Same defect, different class.
+
+**Why this is a decision and not a patch.** Reordering is not obviously safe or
+obviously wrong:
+
+- The output-chain accept is arguably *intended* on an exit node: that node is
+  the internet gateway, and its own locally-generated traffic legitimately
+  leaves via the underlay.
+- But `dns_protected` exists specifically to stop plaintext DNS to a LAN/ISP
+  resolver, and it is silently void exactly where an exit node most wants it.
+
+Plausible directions, none validated: insert the DNS drops at index 0 rather than
+appending (`nft insert rule` / `add rule ... index N`); scope the underlay accept
+to exclude port 53; or refuse the `serve_exit_node + protected_dns` combination
+at config time and say why. Pick one deliberately — and extend the precedence
+walk to the DNS traffic class afterwards so the choice is enforced rather than
+assumed.
