@@ -312,6 +312,133 @@ impl ContainedInterfaces {
     }
 }
 
+/// Reduce one nft rule to its effect on general locally-generated egress.
+///
+/// This is the Linux killswitch-chain counterpart of the macOS pf classifier,
+/// for the `hook output` chain that governs traffic the node itself originates.
+///
+/// `acknowledged_wide_open_interfaces` names interfaces on which a wide-open
+/// accept is a KNOWN, deliberately installed hole rather than a new regression —
+/// today, the exit node's underlay NIC. Passing it here classifies that one rule
+/// as [`RuleDisposition::NarrowAllow`] so the caller can report it explicitly
+/// instead of the check either silently crediting it or failing every exit node
+/// closed. It is the caller's job to say so out loud; this function only stops
+/// the rule from masking the terminator behind it.
+///
+/// Fail-closed: an accept this cannot prove narrow, tunnel-scoped or
+/// acknowledged is [`RuleDisposition::Escapes`].
+pub fn classify_nft_general_egress_rule(
+    rule: &str,
+    contained: &ContainedInterfaces,
+    acknowledged_wide_open_interfaces: &[&str],
+) -> RuleDisposition {
+    let lowered = rule.trim().to_ascii_lowercase();
+    if lowered.is_empty() || lowered.starts_with('#') {
+        return RuleDisposition::Irrelevant;
+    }
+    // The chain declaration is metadata, not a rule -- except for its policy,
+    // which nft_chain_rules_in_evaluation_order has already moved to the end.
+    if lowered.starts_with("type ") || lowered.starts_with("chain ") {
+        return RuleDisposition::Irrelevant;
+    }
+    if lowered.contains("drop") || lowered.contains("reject") {
+        return RuleDisposition::Terminator;
+    }
+    // A jump/goto leads somewhere this rule text cannot show; fail closed.
+    if lowered.contains("jump ") || lowered.contains("goto ") {
+        return RuleDisposition::Escapes;
+    }
+    if !lowered.contains("accept") {
+        // counter-only, comment-only, `return`: falls through to the next rule.
+        return RuleDisposition::Irrelevant;
+    }
+    // Inbound selectors cannot leak outbound traffic.
+    if lowered.contains("iifname") && !lowered.contains("oifname") {
+        return RuleDisposition::Irrelevant;
+    }
+    let interface = ContainedInterfaces::nft_rule_output_interface(rule);
+    // A negated interface match (`oifname != rustynet0 accept`) permits every
+    // OTHER interface -- the opposite of tunnel-scoped, and easy to misread.
+    let negated_interface = lowered.contains("oifname !=") || lowered.contains("oif !=");
+    if let Some(interface) = interface
+        && !negated_interface
+        && contained.contains(interface)
+    {
+        return RuleDisposition::Contained;
+    }
+    // Return traffic of flows that were already permitted is not a new channel.
+    if lowered.contains("ct state") {
+        return RuleDisposition::NarrowAllow;
+    }
+    // A specific service: the WireGuard handshake ports, DNS.
+    if lowered.contains("dport") || lowered.contains("sport") {
+        return RuleDisposition::NarrowAllow;
+    }
+    // A bounded source or destination prefix.
+    if lowered.contains("saddr") || lowered.contains("daddr") {
+        return RuleDisposition::NarrowAllow;
+    }
+    // The known, deliberately installed wide-open accept.
+    if let Some(interface) = interface
+        && !negated_interface
+        && acknowledged_wide_open_interfaces
+            .iter()
+            .any(|known| interface.trim_matches('"') == *known)
+    {
+        return RuleDisposition::NarrowAllow;
+    }
+    RuleDisposition::Escapes
+}
+
+/// Assert that a Linux killswitch chain's terminal drop is REACHABLE.
+///
+/// # RN-27
+///
+/// `assert_firewall_ruleset` asserted that a list of ALLOW rules was present
+/// and never asserted a terminal drop at all — so a chain whose `policy drop`
+/// had been rendered unreachable by a broad accept passed every check. This is
+/// the Linux twin of PF-05, and the reason it stayed silent.
+///
+/// # The acknowledged exit-node hole
+///
+/// When NAT forwarding is active the daemon deliberately installs
+/// `oifname "<underlay>" accept` in this chain, which permits ALL
+/// locally-generated traffic out the physical NIC. That is a real killswitch
+/// hole and it is tracked separately as its own finding; deciding its fate is
+/// not this function's business. What this function guarantees is that it can no
+/// longer HIDE anything: pass the interface in
+/// `acknowledged_wide_open_interfaces` and the rule stops masking rules beneath
+/// it, while any OTHER broad accept — or that same accept when NAT is not active
+/// and the interface is therefore not passed — fails the assertion loudly.
+///
+/// This is deliberately the narrow version of the fix. Converting a silent
+/// failure into a loud one is what makes the underlying holes addressable;
+/// unilaterally closing them here would fail every exit node closed as a side
+/// effect of a verifier change.
+pub fn evaluate_linux_killswitch_chain_precedence(
+    chain_body: &str,
+    tunnel_interface: &str,
+    acknowledged_wide_open_interfaces: &[&str],
+) -> Result<(), String> {
+    let mut contained = ContainedInterfaces::default();
+    if !tunnel_interface.trim().is_empty() {
+        contained = contained.with_name(tunnel_interface.trim());
+    }
+    let rules = nft_chain_rules_in_evaluation_order(chain_body);
+    terminator_is_reachable(&rules, |rule| {
+        classify_nft_general_egress_rule(rule, &contained, acknowledged_wide_open_interfaces)
+    })
+    .map_err(|failure| match failure {
+        ContainmentFailure::NoTerminator(_) => {
+            "killswitch chain has no terminal drop; egress is not contained".to_owned()
+        }
+        ContainmentFailure::Escaped(violation) => format!(
+            "killswitch chain terminal drop is unreachable: {violation}; nftables is \
+             first-match-wins within a chain, so this accept fires and the drop never does"
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +601,161 @@ mod tests {
         assert_eq!(
             ContainedInterfaces::nft_rule_output_interface("ip saddr 10.0.0.1 accept"),
             None
+        );
+    }
+
+    /// RN-27: the Linux killswitch chain's terminal drop must be REACHABLE.
+    ///
+    /// These are built to the exact shape of `sample_linux_firewall_ruleset` in
+    /// phase10.rs, which is what the live assertion parses. Those integration
+    /// tests are `cfg(target_os = "linux")` and never run on the macOS CI leg;
+    /// this logic is pure and portable so the precedence contract is gated
+    /// everywhere.
+    fn linux_killswitch_chain(extra_rules: &str) -> String {
+        format!(
+            "chain killswitch {{\n    \
+             type filter hook output priority 0; policy drop;\n    \
+             oifname \"lo\" accept\n    \
+             oifname \"enp0s9\" udp dport 51820 accept\n    \
+             ct state established,related accept\n    \
+             oifname \"rustynet0\" accept\n{extra_rules}}}"
+        )
+    }
+
+    #[test]
+    fn linux_killswitch_generated_posture_is_contained() {
+        evaluate_linux_killswitch_chain_precedence(&linux_killswitch_chain(""), "rustynet0", &[])
+            .expect("the daemon's own generated killswitch chain must satisfy its own check");
+    }
+
+    #[test]
+    fn linux_killswitch_broad_accept_makes_the_policy_unreachable() {
+        for (label, extra) in [
+            ("a bare accept", "    accept\n"),
+            (
+                "an accept on the physical NIC",
+                "    oifname \"enp0s9\" accept\n",
+            ),
+            (
+                // `oifname != tunnel accept` permits every interface EXCEPT the
+                // tunnel -- the exact inverse of tunnel-scoped, and easy to
+                // misread as a restriction.
+                "a negated tunnel match",
+                "    oifname != \"rustynet0\" accept\n",
+            ),
+            (
+                "a jump to a chain not in this text",
+                "    jump operator_overrides\n",
+            ),
+        ] {
+            let err = evaluate_linux_killswitch_chain_precedence(
+                &linux_killswitch_chain(extra),
+                "rustynet0",
+                &[],
+            )
+            .expect_err("{label} must make the policy drop unreachable");
+            assert!(
+                err.contains("unreachable"),
+                "{label}: expected an unreachable-terminator error, got: {err}"
+            );
+        }
+    }
+
+    /// The acknowledged exit-node hole must stop MASKING without failing every
+    /// exit node closed -- and must still fail when it is not acknowledged.
+    #[test]
+    fn linux_killswitch_wide_open_egress_accept_is_acknowledged_not_hidden() {
+        let with_nat = linux_killswitch_chain("    oifname \"enp0s9\" accept\n");
+
+        // Not acknowledged (NAT inactive): a wide-open accept is a hard failure.
+        assert!(
+            evaluate_linux_killswitch_chain_precedence(&with_nat, "rustynet0", &[]).is_err(),
+            "an unacknowledged wide-open egress accept must fail the assertion"
+        );
+
+        // Acknowledged (NAT active): permitted, and no longer able to hide what
+        // follows it.
+        evaluate_linux_killswitch_chain_precedence(&with_nat, "rustynet0", &["enp0s9"])
+            .expect("the acknowledged exit-node accept must not fail every exit node closed");
+
+        // Proof it no longer masks: a DIFFERENT broad accept beneath the
+        // acknowledged one is still caught.
+        let also_masked =
+            linux_killswitch_chain("    oifname \"enp0s9\" accept\n    oifname \"eth1\" accept\n");
+        assert!(
+            evaluate_linux_killswitch_chain_precedence(&also_masked, "rustynet0", &["enp0s9"])
+                .is_err(),
+            "an acknowledged accept must not launder a second broad accept beneath it"
+        );
+    }
+
+    /// A chain with no drop at all is not containment, however many allows it
+    /// carries. `assert_firewall_ruleset` never checked for one.
+    #[test]
+    fn linux_killswitch_without_a_terminal_drop_is_not_containment() {
+        let no_policy = "chain killswitch {\n    type filter hook output priority 0;\n    \
+                         oifname \"rustynet0\" accept\n}";
+        let err = evaluate_linux_killswitch_chain_precedence(no_policy, "rustynet0", &[])
+            .expect_err("a chain with no terminal drop must not be credited");
+        assert!(err.contains("no terminal drop"), "got: {err}");
+    }
+
+    #[test]
+    fn linux_killswitch_narrow_allows_do_not_defeat_the_policy() {
+        for (label, extra) in [
+            ("a DNS service allow", "    udp dport 53 accept\n"),
+            (
+                "a mesh-CIDR-bounded allow",
+                "    ip saddr 100.64.0.0/10 accept\n",
+            ),
+            ("a counter-only rule", "    counter packets 0 bytes 0\n"),
+            (
+                "an inbound accept",
+                "    iifname \"enp0s9\" ct state new accept\n",
+            ),
+        ] {
+            evaluate_linux_killswitch_chain_precedence(
+                &linux_killswitch_chain(extra),
+                "rustynet0",
+                &[],
+            )
+            .unwrap_or_else(|err| panic!("{label} must not defeat containment: {err}"));
+        }
+    }
+
+    /// The live Linux caller strips every double quote before this code sees the
+    /// chain (`normalize_ruleset_line` is `line.replace('"', "")`) and hands over
+    /// already-trimmed body lines joined with newlines. Parsing UNQUOTED
+    /// interface names is therefore the real integration contract, and the
+    /// phase10 tests that would catch a mismatch are `cfg(target_os = "linux")`
+    /// and never run on the macOS CI leg. Pin it here.
+    #[test]
+    fn linux_killswitch_parses_the_dequoted_shape_the_caller_supplies() {
+        // Exactly what nft_chain_lines yields for the generated posture.
+        let dequoted = "type filter hook output priority 0; policy drop;\n\
+                        oifname lo accept\n\
+                        oifname enp0s9 udp dport 51820 accept\n\
+                        oifname enp0s9 udp sport 51820 accept\n\
+                        ct state established,related accept\n\
+                        oifname rustynet0 accept";
+        evaluate_linux_killswitch_chain_precedence(dequoted, "rustynet0", &[]).expect(
+            "the dequoted generated posture must be contained; a parser that only \
+             handles quoted names would fail every Linux node closed here",
+        );
+
+        // And the escape is still caught without quotes.
+        let dequoted_leak = format!("{dequoted}\noifname eth1 accept");
+        assert!(
+            evaluate_linux_killswitch_chain_precedence(&dequoted_leak, "rustynet0", &[]).is_err(),
+            "an unquoted broad accept must still be caught"
+        );
+
+        // A negated match survives quote-stripping as `oifname != rustynet0`.
+        let dequoted_negated = format!("{dequoted}\noifname != rustynet0 accept");
+        assert!(
+            evaluate_linux_killswitch_chain_precedence(&dequoted_negated, "rustynet0", &[])
+                .is_err(),
+            "a dequoted negated tunnel match must still be caught"
         );
     }
 }

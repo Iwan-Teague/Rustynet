@@ -1486,6 +1486,30 @@ impl LinuxCommandSystem {
                 "dns tcp allow rule missing",
             )?;
         }
+        // RN-27: everything above is a PRESENCE check on allow rules, and none
+        // of it asserts a terminal drop at all -- so a chain whose `policy drop`
+        // had been made unreachable by a broad accept passed every assertion.
+        // nftables is first-match-wins within a chain and the policy is the
+        // chain DEFAULT, applied only after every rule fails to match, so any
+        // accept above it is evaluated first.
+        //
+        // When NAT forwarding is active the daemon deliberately installs a
+        // wide-open `oifname "<underlay>" accept` here (asserted above). That is
+        // a real killswitch hole tracked as its own finding, and closing it is
+        // not this assertion's call -- so it is passed as ACKNOWLEDGED, which
+        // stops it masking anything beneath it while leaving its own disposition
+        // to the owning finding. Any other broad accept fails loudly.
+        let acknowledged_wide_open: Vec<&str> = if self.nat_table.is_some() {
+            vec![self.egress_interface.as_str()]
+        } else {
+            Vec::new()
+        };
+        crate::killswitch_precedence::evaluate_linux_killswitch_chain_precedence(
+            killswitch.join("\n").as_str(),
+            self.interface_name.as_str(),
+            &acknowledged_wide_open,
+        )
+        .map_err(SystemError::KillSwitchAssertionFailed)?;
         Ok(())
     }
 
