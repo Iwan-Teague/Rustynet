@@ -1,11 +1,19 @@
 # Gossip status surface — make the gossip data plane observable
 
-**Status:** plan, revision 5 — the surface question is settled and the field set is
-final. Three adversarial reviews; revision 3's central decision was refuted and
+**Status:** **IMPLEMENTED** — `001c23b1` (surface + 11 fields + 17 tests) and
+`ab8e47e4` (defects found by the implementation review). Revision 5 of the plan;
+four adversarial reviews in total. Revision 3's central decision was refuted and
 revision 4's justification for reversing it was refuted in turn. What survives is
 the *conclusion* (fields go on `status`) with a **different and honest reason**.
 Implements item **7** of `I4EnforcementFlipPlan_2026-07-30.md` §4, which the
 adversarial review called a **ship-blocker, not a nice-to-have**.
+
+**Live-lab acceptance is UNMET and undeclared elsewhere, so it is declared here.**
+§6's acceptance ("the totals move under real traffic; a rate-limited origin is
+visible") requires a live run. `documents/operations/live_lab_node_run_matrix.csv`
+ends 2026-07-29 at commit `8a2d613644ea` and no row references either commit
+above. Per CLAUDE.md §9 this scope is complete in code and gates but **not
+live-proven**; that remains outstanding work, not a claimed result.
 
 **Precedence:** CLAUDE.md §3/§4. This change is **read-only observability** — it
 adds no enforcement and no trust decision. It adds three new non-trust diagnostic
@@ -312,8 +320,19 @@ peer identity — sanitised and truncated regardless.
   rejected changes. If this commit alters a trust decision, it is wrong.
 - **No new trust state.** Three new diagnostic counters (§2.4), fully declared.
 - **No change to the identity-mismatch warn latch** — read fresh instead (§2.3).
-- **No fix for the `break` in `drain_gossip_inbound`** (§6.8) — that is an
-  enforcement change.
+- ~~**No fix for the `break` in `drain_gossip_inbound`** — that is an enforcement
+  change.~~ **Reversed during implementation, deliberately and on the record.**
+  The implementation review showed the `break` does not merely defer a fix — it
+  makes the *new counter's units wrong*: incrementing at most once per drain pass,
+  which runs once per main-loop iteration against an idle sleep of up to 25 ms, so
+  the counter saturates near the loop rate and a flood renders like a trickle. A
+  counter that stops growing with the attack is worse than no counter. On
+  inspection the `break` is also not an enforcement change: no trust decision
+  moves, and the pass is already bounded by `MAX_DRAIN_PER_ITERATION = 16`, so
+  `continue` cannot spin. It also removes a stall where one malformed datagram
+  delays every legitimate bundle behind it. Changed to `continue` in `ab8e47e4`,
+  with `status_counts_every_malformed_datagram_not_just_one_per_drain` pinning it.
+  Recorded here rather than quietly widened.
 - **No fix for `status --json`** (§6.1). Repairing it means giving the status line
   a `prefix:`, breaking every whitespace parser and 18,000+ captured lines.
 - **No re-bind or transport health check** (§6.9).
@@ -449,6 +468,52 @@ is reached by setting `gossip_bind_addr` to an unbindable address before
 | `status_appends_gossip_fields_without_reordering_existing_ones` | insert mid-line — breaks the §4.1 parsers |
 | *(in `gossip_runtime.rs`)* `every_reject_kind_is_reachable_and_renders` | add a kind at a call site with no test reaching it |
 
+### 5.1 What actually shipped, and where it diverges
+
+**19 tests**, not the 14+1 planned. Divergences, stated rather than smoothed over:
+
+- Plan listed one `status_counts_push_failures_from_both_mint_and_repush`. Shipped
+  as **two** tests in `gossip_runtime.rs`, where the loops live:
+  `push_failures_are_counted_on_the_mint_path` and
+  `..._on_the_repush_path`. Strictly stronger — dropping either counter now fails
+  a distinct test (mutation-verified both ways).
+- Plan listed `every_reject_kind_is_reachable_and_renders`. Shipped as
+  `every_error_kind_is_listed_in_the_published_vocabulary`, which is **a weaker
+  property than the name it replaced**: it proves the published vocabulary cannot
+  drift from `GossipError`, not that every kind is reachable at runtime. The first
+  version of it was the tautology §5 said it had removed — a hand-maintained
+  variant array that a new enum variant would not have broken. `ab8e47e4` added a
+  compile-time exhaustiveness guard beside the array so a new variant now fails the
+  build there (verified: dropping one arm yields `error[E0004]`). The four ad-hoc
+  literals still have no such guard; a brand-new literal at a new call site would
+  escape. That residual gap is stated in the code, not just here.
+- Added `status_counts_every_malformed_datagram_not_just_one_per_drain` (pins the
+  `continue`, §3) and the totals test now also samples `gossip_peers_registered`
+  and `gossip_local_epoch`.
+
+**Three shipped tests did not deliver their stated guarantee and were fixed in
+`ab8e47e4`.** Worth recording because each *read* as coverage:
+
+1. The totals test set `gossip_rejected_total` and `gossip_recv_errors_total` both
+   to `6`, so transposing those two interpolations passed every assertion — in the
+   one test standing between a transposition and a silently wrong line, guarding
+   the exact hazard §2.2's design exists to prevent. Values are now pairwise
+   distinct, and the test asserts its own distinctness so the guard cannot rot.
+2. `assert_eq!(seen.len(), 3)` was vacuous — `seen` is pushed to unconditionally,
+   so a run where the bind failed would report `attached_pending_transport` twice
+   and still pass with `active` unexercised. Now asserts the exact sequence.
+3. The privacy pin never populated `gossip_transport_error` — the only free-form
+   value in the block, hence the only one that could carry an address. It exercised
+   everything except the thing at risk. It now forces a real bind failure and
+   asserts the local bind address does not appear.
+
+**Mutation verification: 18 mutations, each caught by its own test** — including
+the identity fail-open (`unknown`→`false`), reading the sticky latch, dropping
+either push counter, the field transposition, `continue`→`break`, and leaking the
+bind address. Two guards are structural rather than assertion-based: the
+distinctness check fires with its own message, and dropping an enum arm is a
+compile error.
+
 **Two revisions' test defects, fixed.** Revision 2's
 `status_gossip_fields_contain_no_addresses_or_node_ids` was unpassable as worded —
 it asserted over the whole line, which legitimately contains `node_id=`, endpoints
@@ -515,6 +580,33 @@ the specific thing that is invisible today.
     wrong as state — which is why §2.3 computes the field fresh instead.
 11. **`local_host_candidates` shadows `host_candidates` on the netcheck line** — the
     same collision class as §4.2.
+12. **The gossip socket binds every interface, and the module doc says it does
+    not.** `gossip_transport.rs:3-12` states each peer "binds a dedicated UDP socket
+    **on the rustynet0 mesh interface**", and builds a security argument on it:
+    because that interface "only carries traffic that has already traversed the WG
+    tunnel, the bundle datagrams ride inside an encrypted-and-authenticated channel
+    for free". The daemon binds
+    `SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), RUSTYNET_GOSSIP_PORT)`
+    (`daemon.rs:4285-4290`) — **`0.0.0.0:51821`, every interface** — and no nft/pf
+    rule scopes that port anywhere in the repo. The Ed25519 signature still gates
+    *acceptance*, so this is **not a trust bypass**; but the decode path, the
+    per-origin rate limiter and `gossip_recv_errors_total` are reachable
+    **off-tunnel** by any host that can reach UDP/51821. This is the same failure
+    this thread keeps producing: a document asserting a property the code that
+    writes it contradicts. It is also exactly the condition under which the
+    `break`-vs-`continue` saturation (§3) mattered.
+13. **`gossip_push_failures_total` cannot see a peer that is simply down.**
+    `push_bundle` wraps `UdpSocket::send_to`, where `Ok` means handed to the kernel,
+    not delivered. §1's fourth failure is therefore **partially** closed: locally
+    detectable failures (address-family mismatch, killswitch `EPERM`, no route) are
+    counted; loss in flight is not, and `0` is not separable from "nothing was
+    pushed". Closing it properly needs an acknowledged-delivery or
+    attempted/succeeded pair, which is a protocol change, not an observability one.
+14. **`ALL_GOSSIP_REJECT_KINDS` has no production reader.** `gossip_reject_reasons`
+    renders only kinds that have fired, so an operator still cannot distinguish
+    "this kind has never happened" from "this kind does not exist" without reading
+    the source.
 
-These are pre-existing, out of scope for a read-only observability change, and must
-not be silently bundled into it.
+These are pre-existing (except 13 and 14, which are stated limits of what shipped),
+out of scope for a read-only observability change, and must not be silently bundled
+into it.

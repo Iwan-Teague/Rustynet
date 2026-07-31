@@ -13108,7 +13108,9 @@ fn macos_peer_list_indicates_mesh_join(output: &str) -> bool {
         return false;
     }
     // Positive mesh evidence. `rustynet peer-list` reflects the local node's
-    // status line (one line terminating in `membership_active_nodes=N`), so the
+    // status line, which carries a `membership_active_nodes=N` token (no longer
+    // the last one — a `gossip_*` block is appended after it, which is why the
+    // parser below is token-anchored rather than end-anchored), so the
     // honest mesh-join signal is an active-membership view that includes at
     // least one peer beyond this node. A down daemon emits no such field; an
     // un-joined / still-bootstrapping daemon reports 0 (or 1 = only itself).
