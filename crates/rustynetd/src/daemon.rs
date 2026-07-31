@@ -5622,6 +5622,23 @@ impl DaemonRuntime {
         // loop stuck in this branch — the remaining bundles will be
         // drained on the next iteration.
         const MAX_DRAIN_PER_ITERATION: usize = 16;
+        // The warn below is emitted at most once per drain pass. The
+        // counter is per datagram; the log deliberately is not.
+        //
+        // This split matters because the gossip socket is bound
+        // `0.0.0.0:51821` and the production killswitch table has no
+        // `hook input` chain, so this arm is reachable by any host that
+        // can send us a datagram, unauthenticated. Logging per datagram
+        // would let that host drive 16x the log volume that breaking out
+        // of the pass allowed, into a file opened with `truncate(true)`
+        // and no rotation or size cap, on the same filesystem the daemon
+        // needs for its watermarks and ledgers — turning a nuisance into
+        // a disk-exhaustion path against a daemon whose whole design is
+        // to fail closed when that storage is unavailable.
+        //
+        // Rate information now lives in `gossip_recv_errors`, which is
+        // exactly why the log no longer has to carry it.
+        let mut warned_this_pass = false;
         for _ in 0..MAX_DRAIN_PER_ITERATION {
             match transport.recv_bundle(Duration::ZERO) {
                 Ok(Some((sender, bundle))) => {
@@ -5630,9 +5647,10 @@ impl DaemonRuntime {
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    // Count the datagram and keep draining. The pass is
-                    // already bounded by MAX_DRAIN_PER_ITERATION, so
-                    // continuing cannot spin -- while breaking here would
+                    // Count every datagram and keep draining. The pass is
+                    // already bounded by MAX_DRAIN_PER_ITERATION and
+                    // `recv_bundle(Duration::ZERO)` never blocks, so
+                    // continuing cannot spin — while breaking here would
                     // let one malformed datagram delay every legitimate
                     // bundle queued behind it until the next loop
                     // iteration, AND would make this counter measure
@@ -5641,7 +5659,10 @@ impl DaemonRuntime {
                     // that stops growing with the attack is the opposite
                     // of what an observability field owes its reader.
                     self.gossip_recv_errors = self.gossip_recv_errors.saturating_add(1);
-                    log::warn!("gossip_recv_error reason={err}");
+                    if !warned_this_pass {
+                        warned_this_pass = true;
+                        log::warn!("gossip_recv_error reason={err}");
+                    }
                     continue;
                 }
             }
@@ -26573,9 +26594,16 @@ mod tests {
         sender
             .send_to(b"this is not a gossip bundle", bound)
             .expect("send garbage");
-        // Give the datagram a moment to land before draining.
-        std::thread::sleep(Duration::from_millis(50));
-        runtime.drain_gossip_inbound();
+
+        // Condition wait rather than a fixed sleep — see the burst test.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            runtime.drain_gossip_inbound();
+            if gossip_field(&runtime.gossip_status_suffix(), "gossip_recv_errors_total") != "0" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         let suffix = runtime.gossip_status_suffix();
         assert_eq!(
@@ -26587,6 +26615,53 @@ mod tests {
             gossip_field(&suffix, "gossip_rejected_total"),
             "0",
             "it never decoded, so it is not a bundle rejection"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// `attach_gossip_runtime` is the second writer of `gossip_transport`
+    /// and must clear the bind error like the `sync_gossip_data_plane`
+    /// seam does, or it would report `gossip_state=active` beside a stale
+    /// error. It has no production caller today (`#[allow(dead_code)]`),
+    /// which is exactly why the clear needs a test: an enforcement point
+    /// with no verification is what CLAUDE.md §4 forbids, and a dead path
+    /// is the one nobody notices regressing.
+    #[cfg(unix)]
+    #[test]
+    fn attach_gossip_runtime_clears_a_stale_transport_error() {
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-attach-clears");
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[47u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime.sync_gossip_data_plane(None);
+        assert_ne!(
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_transport_error"),
+            "none",
+            "precondition: a bind error must be recorded"
+        );
+
+        let node =
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[48u8; 32]), None)
+                .expect("gossip node should build");
+        let transport = crate::gossip_transport::GossipTransport::bind(
+            "127.0.0.1:0".parse().expect("bindable addr"),
+        )
+        .expect("transport binds");
+        runtime.attach_gossip_runtime(node, transport);
+
+        let suffix = runtime.gossip_status_suffix();
+        assert_eq!(gossip_field(&suffix, "gossip_state"), "active");
+        assert_eq!(
+            gossip_field(&suffix, "gossip_transport_error"),
+            "none",
+            "attaching a transport must clear the earlier bind failure"
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
@@ -26627,13 +26702,30 @@ mod tests {
                 .send_to(format!("garbage-{index}").as_bytes(), bound)
                 .expect("send garbage");
         }
-        std::thread::sleep(Duration::from_millis(100));
-        runtime.drain_gossip_inbound();
+
+        // Wait on the CONDITION, not on a wall-clock guess. Loopback
+        // delivery is fast but not synchronous with `send_to` returning:
+        // draining immediately observes fewer than BURST a large
+        // fraction of the time. A fixed sleep would pass today and
+        // become a load-dependent flake on a slower runner, and this
+        // suite runs ~10k tests in one pool with retries disabled.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut observed = String::new();
+        while Instant::now() < deadline {
+            runtime.drain_gossip_inbound();
+            observed = gossip_field(&runtime.gossip_status_suffix(), "gossip_recv_errors_total")
+                .to_owned();
+            if observed == BURST.to_string() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         assert_eq!(
-            gossip_field(&runtime.gossip_status_suffix(), "gossip_recv_errors_total"),
+            observed,
             BURST.to_string(),
-            "a burst of {BURST} malformed datagrams must count {BURST}, not 1"
+            "a burst of {BURST} malformed datagrams must count {BURST}, not 1 — \
+             a count of 1 means the drain broke out of the pass instead of continuing"
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
