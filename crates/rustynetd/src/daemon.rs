@@ -3856,11 +3856,19 @@ struct DaemonRuntime {
     /// from "permission denied". Cleared on a successful bind so a
     /// resolved fault does not keep reading as a live one.
     gossip_transport_error: Option<String>,
-    /// Count of inbound gossip datagrams that failed to decode before
-    /// reaching the accept path. `rejected_counts` only covers bundles
-    /// that decoded, so without this a peer emitting malformed datagrams
-    /// is indistinguishable from a silent one: accepted=0, rejected=0,
-    /// reasons=none. Diagnostic only, monotonic, never persisted.
+    /// Count of inbound gossip datagrams that failed to yield a bundle
+    /// before reaching the accept path. `rejected_counts` only covers
+    /// bundles that decoded, so without this a peer emitting malformed
+    /// datagrams is indistinguishable from a silent one: accepted=0,
+    /// rejected=0, reasons=none.
+    ///
+    /// "Failed to yield a bundle" rather than "failed to decode": the
+    /// drain counts every `recv_bundle` error, which includes
+    /// `TransportError::Io` and `Oversized` alongside genuine decode
+    /// failures. Per datagram, not per drain pass -- see the `continue`
+    /// in `drain_gossip_inbound`, which is what makes that true.
+    ///
+    /// Diagnostic only, monotonic, never persisted.
     gossip_recv_errors: u64,
     /// D2.7 — paths into which the enrollment-token IPC handler
     /// reads the HMAC secret and writes the consumed-token ledger.
@@ -5448,6 +5456,12 @@ impl DaemonRuntime {
     ) {
         self.gossip_node = Some(node);
         self.gossip_transport = Some(transport);
+        // Same clear-on-recovery rule as the bind seam in
+        // `sync_gossip_data_plane`: a transport is attached here, so any
+        // earlier bind failure is resolved and must stop reading as live.
+        // Without this, the second writer of `gossip_transport` would
+        // leave `gossip_state=active` beside a stale error.
+        self.gossip_transport_error = None;
     }
 
     /// I1b/I1c — post-commit hook for the D2.5 gossip data plane. Invoked
@@ -5598,10 +5612,6 @@ impl DaemonRuntime {
     /// iteration so the gossip path can't starve the rest of the
     /// loop.
     pub fn drain_gossip_inbound(&mut self) {
-        // Accumulated locally because `node` holds a mutable borrow of
-        // `self` for the whole loop; flushed into the runtime counter
-        // once both borrows have ended.
-        let mut recv_errors: u64 = 0;
         let Some(node) = self.gossip_node.as_mut() else {
             return;
         };
@@ -5620,13 +5630,22 @@ impl DaemonRuntime {
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    recv_errors = recv_errors.saturating_add(1);
+                    // Count the datagram and keep draining. The pass is
+                    // already bounded by MAX_DRAIN_PER_ITERATION, so
+                    // continuing cannot spin -- while breaking here would
+                    // let one malformed datagram delay every legitimate
+                    // bundle queued behind it until the next loop
+                    // iteration, AND would make this counter measure
+                    // drain PASSES rather than datagrams, saturating at
+                    // roughly the main-loop rate under a flood. A counter
+                    // that stops growing with the attack is the opposite
+                    // of what an observability field owes its reader.
+                    self.gossip_recv_errors = self.gossip_recv_errors.saturating_add(1);
                     log::warn!("gossip_recv_error reason={err}");
-                    break;
+                    continue;
                 }
             }
         }
-        self.gossip_recv_errors = self.gossip_recv_errors.saturating_add(recv_errors);
     }
 
     /// True only when both gossip runtime halves are attached, i.e. when
@@ -5681,9 +5700,10 @@ impl DaemonRuntime {
     /// The `gossip_*` field block appended to the status line.
     ///
     /// Returned as one pre-formatted string rather than as eleven more
-    /// positional arguments to the 84-argument status `format!`: at that
-    /// count a transposition is silent, and a helper keeps the whole
-    /// block unit-testable without constructing a status line.
+    /// positional arguments to the status `format!`, which already takes
+    /// 86 of them: a miscount there is a compile error, but a
+    /// TRANSPOSITION at the correct count is silent, and a helper keeps
+    /// the whole block unit-testable without constructing a status line.
     ///
     /// Every value here is a count, a fixed vocabulary word, or a
     /// sanitized-and-capped diagnostic string. No addresses and no node
@@ -8012,7 +8032,7 @@ impl DaemonRuntime {
                     .relay_session_next_expiry_unix
                     .map_or_else(|| "none".to_owned(), |value| value.to_string());
                 // Built as one pre-formatted block and interpolated by
-                // name: the format below already carries 84 positional
+                // name: the format below already carries 86 positional
                 // arguments, where adding eleven more makes a silent
                 // transposition the realistic failure mode.
                 let gossip_suffix = self.gossip_status_suffix();
@@ -26176,23 +26196,50 @@ mod tests {
         let mut node =
             crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[13u8; 32]), None)
                 .expect("gossip node should build");
+        // Every numeric value here is DISTINCT on purpose. This is the
+        // only test that samples the values, so it is the only thing
+        // standing between a transposed interpolation and a silently
+        // wrong status line -- and a transposition is exactly the failure
+        // mode the one-named-capture design exists to prevent. Two equal
+        // values would make that pair's swap invisible.
         node.accepted_count = 7;
         node.minted_count = 5;
         node.push_failed_count = 3;
         node.rejected_counts.insert("unknown_source", 2);
-        node.rejected_counts.insert("origin_rate_limited", 4);
+        node.rejected_counts.insert("origin_rate_limited", 4); // sum = 6
+        node.set_local_membership_epoch(9);
+        node.register_peer(
+            [51u8; 32],
+            SigningKey::from_bytes(&[52u8; 32]).verifying_key(),
+            "198.51.100.9:40040".parse().expect("peer addr"),
+        );
         runtime.gossip_node = Some(node);
-        runtime.gossip_recv_errors = 6;
+        runtime.gossip_recv_errors = 11;
 
         let suffix = runtime.gossip_status_suffix();
-        assert_eq!(gossip_field(&suffix, "gossip_accepted_total"), "7");
-        assert_eq!(gossip_field(&suffix, "gossip_minted_total"), "5");
-        assert_eq!(gossip_field(&suffix, "gossip_push_failures_total"), "3");
-        assert_eq!(gossip_field(&suffix, "gossip_recv_errors_total"), "6");
+        let observed = [
+            ("gossip_accepted_total", "7"),
+            ("gossip_minted_total", "5"),
+            ("gossip_push_failures_total", "3"),
+            ("gossip_recv_errors_total", "11"),
+            ("gossip_rejected_total", "6"),
+            ("gossip_peers_registered", "1"),
+            ("gossip_local_epoch", "9"),
+        ];
+        for (key, want) in observed {
+            assert_eq!(gossip_field(&suffix, key), want, "{key} mis-rendered");
+        }
+
+        // Guard the guard: if two of these ever became equal, a swap of
+        // that pair would stop being detectable and this test would keep
+        // passing while proving less.
+        let mut values: Vec<&str> = observed.iter().map(|(_, value)| *value).collect();
+        values.sort_unstable();
+        values.dedup();
         assert_eq!(
-            gossip_field(&suffix, "gossip_rejected_total"),
-            "6",
-            "rejected total must be the sum of the per-kind counters"
+            values.len(),
+            observed.len(),
+            "sampled values must stay pairwise distinct or transpositions go undetected"
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
@@ -26257,6 +26304,15 @@ mod tests {
 
     /// §2.6 privacy pin. Counts, fixed vocabulary words and reject-reason
     /// KINDS only — never a peer id, an endpoint or a candidate address.
+    ///
+    /// `gossip_transport_error` is populated here from a REAL failed bind
+    /// rather than left `none`. It is the only free-form value in the
+    /// block and therefore the only one that could carry an address, so a
+    /// pin that skipped it would exercise everything except the thing at
+    /// risk. Note `sanitize_netcheck_value` preserves `.` and `:`, so an
+    /// `IP:port` WOULD survive sanitisation — the safety here comes from
+    /// std not decorating a `bind` error with its address, which is a
+    /// property worth a test precisely because it is not ours to keep.
     #[cfg(unix)]
     #[test]
     fn status_gossip_tokens_contain_no_addresses_or_node_ids() {
@@ -26278,7 +26334,17 @@ mod tests {
             vec![RoleCapability::Client],
         ));
 
+        // Force a real bind failure so the one free-form field is
+        // populated rather than sitting at `none`.
+        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime.sync_gossip_data_plane(None);
         let suffix = runtime.gossip_status_suffix();
+        assert_ne!(
+            gossip_field(&suffix, "gossip_transport_error"),
+            "none",
+            "precondition: the free-form field must actually be populated"
+        );
+
         assert_eq!(gossip_field(&suffix, "gossip_peers_registered"), "1");
         for (key, value) in gossip_tokens(&suffix) {
             assert!(
@@ -26290,6 +26356,15 @@ mod tests {
                 !value.contains("2a2a2a"),
                 "{key} leaked a peer node id prefix"
             );
+            // The bind address is local, not peer data, but it has no
+            // business on this line either -- and it is the one thing a
+            // future `.map_err(|e| format!("bind {addr}: {e}"))` would
+            // put here, surviving sanitisation intact.
+            assert!(
+                !value.contains("203.0.113.9"),
+                "{key} leaked the local bind address"
+            );
+            assert!(!value.contains("40099"), "{key} leaked the local bind port");
         }
 
         let _ = std::fs::remove_dir_all(test_dir);
@@ -26325,6 +26400,22 @@ mod tests {
         runtime.sync_gossip_data_plane(None);
         seen.push(gossip_field(&runtime.gossip_status_suffix(), "gossip_state").to_owned());
 
+        // Assert the exact sequence, not merely three pushes. `seen` is
+        // appended to unconditionally, so a length check proves nothing:
+        // if the bind silently failed this would read
+        // ["unconfigured", "attached_pending_transport",
+        //  "attached_pending_transport"] and a length assertion would
+        // still pass while `active` went unexercised.
+        assert_eq!(
+            seen,
+            vec![
+                "unconfigured".to_owned(),
+                "attached_pending_transport".to_owned(),
+                "active".to_owned(),
+            ],
+            "all three states must be reached, distinctly and in this order"
+        );
+
         for value in &seen {
             assert!(
                 ALLOWED.contains(&value.as_str()),
@@ -26337,7 +26428,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 3, "all three states must have been exercised");
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
@@ -26497,6 +26587,53 @@ mod tests {
             gossip_field(&suffix, "gossip_rejected_total"),
             "0",
             "it never decoded, so it is not a bundle rejection"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The counter must measure DATAGRAMS, not drain passes. If the drain
+    /// broke on the first error instead of continuing, a burst of N
+    /// malformed datagrams would register as 1 -- the counter would stop
+    /// growing with the attack, which is precisely backwards for an
+    /// observability field, and one malformed datagram would also delay
+    /// every legitimate bundle queued behind it.
+    #[cfg(unix)]
+    #[test]
+    fn status_counts_every_malformed_datagram_not_just_one_per_drain() {
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-recv-burst");
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[43u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+        runtime.sync_gossip_data_plane(None);
+        let bound = runtime
+            .gossip_transport
+            .as_ref()
+            .expect("transport attached")
+            .local_addr()
+            .expect("local addr");
+
+        // Below MAX_DRAIN_PER_ITERATION so a single drain pass can see
+        // them all; the point is the count, not the cap.
+        const BURST: usize = 5;
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender socket");
+        for index in 0..BURST {
+            sender
+                .send_to(format!("garbage-{index}").as_bytes(), bound)
+                .expect("send garbage");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        runtime.drain_gossip_inbound();
+
+        assert_eq!(
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_recv_errors_total"),
+            BURST.to_string(),
+            "a burst of {BURST} malformed datagrams must count {BURST}, not 1"
         );
 
         let _ = std::fs::remove_dir_all(test_dir);

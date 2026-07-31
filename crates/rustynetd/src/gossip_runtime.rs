@@ -244,14 +244,23 @@ pub struct GossipNode {
     /// bundles. Used by the integration test to assert progress.
     pub accepted_count: u64,
     pub minted_count: u64,
-    /// Outbound pushes that failed, across BOTH push paths: the mint
-    /// broadcast and the epidemic re-push. `minted_count` is bumped
+    /// Outbound pushes that failed LOCALLY, across BOTH push paths: the
+    /// mint broadcast and the epidemic re-push. `minted_count` is bumped
     /// before the broadcast loop and unconditionally of push success,
-    /// so without this a node whose every push fails to every peer
-    /// still reports a healthy, rising mint count. Counting only the
-    /// mint loop would leave that gap open on exactly the nodes where
-    /// it matters most: on an epidemic relay, re-push is the dominant
-    /// outbound path.
+    /// so without this a node whose every push fails still reports a
+    /// healthy, rising mint count. Counting only the mint loop would
+    /// leave that gap open on exactly the nodes where it matters most:
+    /// on an epidemic relay, re-push is the dominant outbound path.
+    ///
+    /// "Locally" is load-bearing and bounds what this can prove.
+    /// `push_bundle` wraps `UdpSocket::send_to`, where `Ok` means the
+    /// datagram was handed to the kernel, NOT that it arrived. So this
+    /// counts what the host can detect by itself — address-family
+    /// mismatch, `EPERM` from the killswitch, no route — and a peer that
+    /// is simply down or dropping packets in flight still pushes
+    /// "successfully". A zero here means no local send error, not
+    /// confirmed delivery, and it is not separable from "nothing was
+    /// pushed at all"; read it alongside `minted_count`.
     pub push_failed_count: u64,
 }
 
@@ -928,10 +937,17 @@ impl InternalGossipIngestSummary {
 /// expose. (`revoked_source` is also passed as a literal at one site but is
 /// already one of the 12, so it is not a seventeenth.)
 ///
-/// `every_error_kind_is_listed` ties this to `error_kind`'s exhaustive
-/// match, so a new `GossipError` variant cannot be added without landing
-/// here. It does NOT catch a brand-new ad-hoc literal added at a call
-/// site; that gap is recorded in the status-surface plan's §6.
+/// `every_error_kind_is_listed_in_the_published_vocabulary`, together with
+/// the compile-time guard beside it, ties this to `error_kind`'s
+/// exhaustive match: adding a `GossipError` variant fails the build until
+/// it lands here. It does NOT catch a brand-new ad-hoc literal added at a
+/// new call site; that residual gap is recorded in the status-surface
+/// plan's §6.
+///
+/// Note this is a vocabulary, not a report: `gossip_reject_reasons`
+/// renders only kinds that have actually fired, so an operator still
+/// cannot distinguish "this kind has never happened" from "this kind does
+/// not exist" without consulting this list.
 pub const ALL_GOSSIP_REJECT_KINDS: [&str; 16] = [
     "unknown_source",
     "revoked_source",
@@ -1314,12 +1330,43 @@ mod tests {
         assert_eq!(node.push_failed_count, 0);
     }
 
+    /// Compile-time exhaustiveness guard for the test below.
+    ///
+    /// `all_variants` there is hand-maintained, so on its own it would go
+    /// stale silently: adding a `GossipError` variant forces a new arm in
+    /// `error_kind` (that match is exhaustive) but nothing would force the
+    /// test array or `ALL_GOSSIP_REJECT_KINDS` to grow, and the test would
+    /// keep passing while the new kind stayed invisible on the status
+    /// surface. This match makes that a BUILD failure right here, next to
+    /// the list that needs updating.
+    #[allow(dead_code)]
+    fn assert_all_gossip_error_variants_are_accounted_for(err: &GossipError) {
+        match err {
+            GossipError::UnknownSource
+            | GossipError::RevokedSource
+            | GossipError::SignatureInvalid
+            | GossipError::TimestampOutsideWindow { .. }
+            | GossipError::SequenceNotMonotonic { .. }
+            | GossipError::EpochOutsideWindow { .. }
+            | GossipError::TooManyCandidates { .. }
+            | GossipError::UnreachableCandidate { .. }
+            | GossipError::TimestampUnavailable
+            | GossipError::WireVersionMismatch { .. }
+            | GossipError::WireTruncated { .. }
+            | GossipError::WireMalformed(_) => {}
+        }
+    }
+
     /// Ties `ALL_GOSSIP_REJECT_KINDS` to the code rather than to a second
-    /// hardcoded list. `error_kind`'s match is exhaustive with no `_` arm,
-    /// so constructing every `GossipError` variant here means a newly
-    /// added variant cannot reach `rejected_counts` without also landing
-    /// in the published vocabulary — which is what keeps a future reject
-    /// reason from being silently invisible on the status surface.
+    /// hardcoded list, so a future reject reason cannot be silently
+    /// invisible on the status surface.
+    ///
+    /// Honest about its limits: the enum half is guarded at compile time
+    /// by `assert_all_gossip_error_variants_are_accounted_for` above. The
+    /// four ad-hoc literals bumped at call sites have no such guard — a
+    /// brand-new literal added at a new call site would still escape both
+    /// this test and the vocabulary. That residual gap is recorded in the
+    /// status-surface plan's §6.
     #[test]
     fn every_error_kind_is_listed_in_the_published_vocabulary() {
         let all_variants = [
@@ -1354,13 +1401,31 @@ mod tests {
             GossipError::WireMalformed("reason"),
         ];
 
+        // Pinned so the array cannot silently shrink while the
+        // compile-time guard above still passes.
+        assert_eq!(
+            all_variants.len(),
+            12,
+            "every GossipError variant must be sampled here"
+        );
+
+        let mut enum_kinds = Vec::new();
         for variant in &all_variants {
             let kind = error_kind(variant);
             assert!(
                 ALL_GOSSIP_REJECT_KINDS.contains(&kind),
                 "error_kind produced {kind:?}, which is missing from ALL_GOSSIP_REJECT_KINDS"
             );
+            enum_kinds.push(kind);
         }
+        enum_kinds.sort_unstable();
+        enum_kinds.dedup();
+        assert_eq!(
+            enum_kinds.len(),
+            12,
+            "each variant must map to its own kind; a duplicate would hide one variant \
+             behind another's counter"
+        );
 
         // The four kinds that are ad-hoc literals at their call sites and
         // so are invisible to the exhaustive match above.
