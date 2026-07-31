@@ -244,6 +244,15 @@ pub struct GossipNode {
     /// bundles. Used by the integration test to assert progress.
     pub accepted_count: u64,
     pub minted_count: u64,
+    /// Outbound pushes that failed, across BOTH push paths: the mint
+    /// broadcast and the epidemic re-push. `minted_count` is bumped
+    /// before the broadcast loop and unconditionally of push success,
+    /// so without this a node whose every push fails to every peer
+    /// still reports a healthy, rising mint count. Counting only the
+    /// mint loop would leave that gap open on exactly the nodes where
+    /// it matters most: on an epidemic relay, re-push is the dominant
+    /// outbound path.
+    pub push_failed_count: u64,
 }
 
 impl GossipNode {
@@ -274,6 +283,7 @@ impl GossipNode {
             rejected_counts: HashMap::new(),
             accepted_count: 0,
             minted_count: 0,
+            push_failed_count: 0,
         };
         if let Some(path) = watermark_path.as_deref()
             && path.exists()
@@ -437,14 +447,17 @@ impl GossipNode {
         // single peer's transport failure shouldn't suppress
         // delivery to the rest of the mesh.
         for peer_id in self.ordered_peer_ids_for_rebroadcast(None, None) {
-            let Some(peer) = self.peers.get(&peer_id) else {
+            // Copy the address out so the immutable `self.peers` borrow
+            // ends before the failure arm bumps `push_failed_count`.
+            let Some(push_addr) = self.peers.get(&peer_id).map(|peer| peer.push_addr) else {
                 continue;
             };
-            if let Err(err) = transport.push_bundle(peer.push_addr, &bundle) {
+            if let Err(err) = transport.push_bundle(push_addr, &bundle) {
+                self.push_failed_count = self.push_failed_count.saturating_add(1);
                 log::warn!(
                     "gossip_push_failed source={} target={:?} reason={}",
                     short_id(&self.local_node_id),
-                    peer.push_addr,
+                    push_addr,
                     transport_error_kind(&err)
                 );
             }
@@ -507,15 +520,18 @@ impl GossipNode {
         for peer_id in
             self.ordered_peer_ids_for_rebroadcast(Some(summary.source_node_id), sender_id)
         {
-            let Some(peer) = self.peers.get(&peer_id) else {
+            // Copy the address out so the immutable `self.peers` borrow
+            // ends before the failure arm bumps `push_failed_count`.
+            let Some(push_addr) = self.peers.get(&peer_id).map(|peer| peer.push_addr) else {
                 continue;
             };
-            if let Err(err) = transport.push_bundle(peer.push_addr, &summary.bundle) {
+            if let Err(err) = transport.push_bundle(push_addr, &summary.bundle) {
+                self.push_failed_count = self.push_failed_count.saturating_add(1);
                 log::warn!(
                     "gossip_repush_failed source={} via={} target={:?} reason={}",
                     short_id(&summary.source_node_id),
                     short_id(&self.local_node_id),
-                    peer.push_addr,
+                    push_addr,
                     transport_error_kind(&err)
                 );
             }
@@ -902,6 +918,39 @@ impl InternalGossipIngestSummary {
     }
 }
 
+/// Every reject kind that can appear as a key in `rejected_counts`.
+///
+/// Sizing this by grepping `GossipError` yields 12 and misses four:
+/// `oversized`, `self_origin`, `membership_epoch_unknown` and
+/// `origin_rate_limited` are ad-hoc literals at their `bump_reject_counter`
+/// call sites rather than enum variants — and the last of those is the
+/// per-origin accept limiter, the one counter the status surface exists to
+/// expose. (`revoked_source` is also passed as a literal at one site but is
+/// already one of the 12, so it is not a seventeenth.)
+///
+/// `every_error_kind_is_listed` ties this to `error_kind`'s exhaustive
+/// match, so a new `GossipError` variant cannot be added without landing
+/// here. It does NOT catch a brand-new ad-hoc literal added at a call
+/// site; that gap is recorded in the status-surface plan's §6.
+pub const ALL_GOSSIP_REJECT_KINDS: [&str; 16] = [
+    "unknown_source",
+    "revoked_source",
+    "signature_invalid",
+    "timestamp_outside_window",
+    "sequence_not_monotonic",
+    "epoch_outside_window",
+    "too_many_candidates",
+    "unreachable_candidate",
+    "timestamp_unavailable",
+    "wire_version_mismatch",
+    "wire_truncated",
+    "wire_malformed",
+    "oversized",
+    "self_origin",
+    "membership_epoch_unknown",
+    "origin_rate_limited",
+];
+
 /// Map a `GossipError` to a short, fixed-vocabulary string. Used as
 /// the counter key in `rejected_counts` and as the log tag. NEVER
 /// includes user data.
@@ -1262,6 +1311,172 @@ mod tests {
         assert!(node.last_minted_bundle.is_none());
         assert_eq!(node.accepted_count, 0);
         assert_eq!(node.minted_count, 0);
+        assert_eq!(node.push_failed_count, 0);
+    }
+
+    /// Ties `ALL_GOSSIP_REJECT_KINDS` to the code rather than to a second
+    /// hardcoded list. `error_kind`'s match is exhaustive with no `_` arm,
+    /// so constructing every `GossipError` variant here means a newly
+    /// added variant cannot reach `rejected_counts` without also landing
+    /// in the published vocabulary — which is what keeps a future reject
+    /// reason from being silently invisible on the status surface.
+    #[test]
+    fn every_error_kind_is_listed_in_the_published_vocabulary() {
+        let all_variants = [
+            GossipError::UnknownSource,
+            GossipError::RevokedSource,
+            GossipError::SignatureInvalid,
+            GossipError::TimestampOutsideWindow { drift_secs: 1 },
+            GossipError::SequenceNotMonotonic {
+                last_seen: 2,
+                presented: 1,
+            },
+            GossipError::EpochOutsideWindow {
+                local_epoch: 5,
+                presented_epoch: 1,
+            },
+            GossipError::TooManyCandidates {
+                presented: 9,
+                max: 8,
+            },
+            GossipError::UnreachableCandidate {
+                addr: "127.0.0.1:1".to_owned(),
+            },
+            GossipError::TimestampUnavailable,
+            GossipError::WireVersionMismatch {
+                expected: 1,
+                presented: 2,
+            },
+            GossipError::WireTruncated {
+                needed: 4,
+                available: 1,
+            },
+            GossipError::WireMalformed("reason"),
+        ];
+
+        for variant in &all_variants {
+            let kind = error_kind(variant);
+            assert!(
+                ALL_GOSSIP_REJECT_KINDS.contains(&kind),
+                "error_kind produced {kind:?}, which is missing from ALL_GOSSIP_REJECT_KINDS"
+            );
+        }
+
+        // The four kinds that are ad-hoc literals at their call sites and
+        // so are invisible to the exhaustive match above.
+        for literal in [
+            "oversized",
+            "self_origin",
+            "membership_epoch_unknown",
+            "origin_rate_limited",
+        ] {
+            assert!(
+                ALL_GOSSIP_REJECT_KINDS.contains(&literal),
+                "{literal} is bumped at a call site but is not published"
+            );
+        }
+
+        let mut unique = ALL_GOSSIP_REJECT_KINDS.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ALL_GOSSIP_REJECT_KINDS.len(),
+            "vocabulary must not contain duplicates"
+        );
+    }
+
+    /// Both outbound push paths must feed the same counter. `minted_count`
+    /// is bumped before the broadcast loop and regardless of push success,
+    /// so without this a node whose every push fails still reports a
+    /// healthy rising mint count — and counting only the mint loop would
+    /// leave epidemic relays blind, where re-push is the dominant path.
+    ///
+    /// The failure is forced by address family mismatch: an IPv4-bound
+    /// socket cannot `send_to` an IPv6 peer, so no network is involved.
+    #[cfg(unix)]
+    #[test]
+    fn push_failures_are_counted_on_the_mint_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(1, dir.path());
+        let transport = GossipTransport::bind(loopback_bind()).expect("transport");
+        node.set_local_membership_epoch(1);
+        node.register_peer(
+            [77u8; 32],
+            SigningKey::from_bytes(&[78u8; 32]).verifying_key(),
+            "[::1]:40099".parse().expect("v6 peer addr"),
+        );
+
+        assert_eq!(node.push_failed_count, 0);
+        let mut candidates = CandidateSet::default();
+        candidates
+            .v4_host
+            .push(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
+
+        node.maybe_mint_and_broadcast(Instant::now(), 1_700_000_000, candidates, &transport)
+            .expect("mint succeeds even when delivery fails");
+
+        assert_eq!(
+            node.minted_count, 1,
+            "the mint itself succeeded: signed and watermark-committed"
+        );
+        assert_eq!(
+            node.push_failed_count, 1,
+            "a failed delivery must be counted separately from the mint"
+        );
+    }
+
+    /// The epidemic re-push is the SECOND outbound path, and on a node
+    /// acting as a relay it is the dominant one. Counting only the mint
+    /// broadcast would leave "every outbound push fails" invisible on
+    /// exactly the nodes where it matters most.
+    #[cfg(unix)]
+    #[test]
+    fn push_failures_are_counted_on_the_repush_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(5, dir.path());
+        let transport = GossipTransport::bind(loopback_bind()).expect("transport");
+
+        // The bundle's origin, registered so the bundle is accepted.
+        let sender_key = SigningKey::from_bytes(&[8u8; 32]);
+        let sender_id = sender_key.verifying_key().to_bytes();
+        node.register_peer(sender_id, sender_key.verifying_key(), loopback_bind());
+
+        // A THIRD peer, which the accepted bundle is re-pushed to. Its
+        // address is IPv6 while the transport socket is IPv4-bound, so the
+        // send fails deterministically without any network.
+        let other_key = SigningKey::from_bytes(&[9u8; 32]);
+        node.register_peer(
+            other_key.verifying_key().to_bytes(),
+            other_key.verifying_key(),
+            "[::1]:40099".parse().expect("v6 peer addr"),
+        );
+
+        let bundle = mint_bundle_with_timestamp(
+            &sender_key,
+            1,
+            1_700_000_000,
+            TEST_EPOCH,
+            CandidateSet::default(),
+        )
+        .unwrap();
+
+        assert_eq!(node.push_failed_count, 0);
+        node.ingest_inbound_bundle(None, bundle, &transport, 1_700_000_000)
+            .expect("a known peer's bundle must be accepted");
+
+        assert_eq!(
+            node.accepted_count, 1,
+            "precondition: the bundle was accepted, so re-push ran"
+        );
+        assert_eq!(
+            node.push_failed_count, 1,
+            "a failed epidemic re-push must be counted too"
+        );
+        assert_eq!(
+            node.minted_count, 0,
+            "re-push is not a mint; the counters must stay independent"
+        );
     }
 
     #[test]
