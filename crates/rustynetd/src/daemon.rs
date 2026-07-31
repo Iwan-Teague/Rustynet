@@ -3841,7 +3841,27 @@ struct DaemonRuntime {
     /// When our own membership entry's pubkey differs from the daemon's
     /// gossip verifying key, peers will reject every mint we send; that
     /// is warned once per daemon run instead of once per reconcile tick.
+    ///
+    /// NOTE: this is a warn latch, not a state field. Nothing clears it,
+    /// and the check that sets it short-circuits on it, so a repaired
+    /// mismatch is never re-detected. The `gossip_identity_mismatch`
+    /// status field therefore recomputes the comparison from live inputs
+    /// rather than reading this — see `gossip_identity_mismatch_state`.
     gossip_identity_mismatch_warned: bool,
+    /// Last gossip transport bind failure, or `None` when the transport
+    /// is bound or has never been attempted. Diagnostic only: no policy,
+    /// ACL or acceptance path reads it, and it is never persisted. It
+    /// exists because `gossip_state=attached_pending_transport` without a
+    /// reason is undiagnosable — an operator cannot tell "port in use"
+    /// from "permission denied". Cleared on a successful bind so a
+    /// resolved fault does not keep reading as a live one.
+    gossip_transport_error: Option<String>,
+    /// Count of inbound gossip datagrams that failed to decode before
+    /// reaching the accept path. `rejected_counts` only covers bundles
+    /// that decoded, so without this a peer emitting malformed datagrams
+    /// is indistinguishable from a silent one: accepted=0, rejected=0,
+    /// reasons=none. Diagnostic only, monotonic, never persisted.
+    gossip_recv_errors: u64,
     /// D2.7 — paths into which the enrollment-token IPC handler
     /// reads the HMAC secret and writes the consumed-token ledger.
     /// `None` disables the `enrollment consume` verb entirely.
@@ -4289,6 +4309,8 @@ impl DaemonRuntime {
                 crate::gossip_transport::RUSTYNET_GOSSIP_PORT,
             ),
             gossip_identity_mismatch_warned: false,
+            gossip_transport_error: None,
+            gossip_recv_errors: 0,
             enrollment_secret_path: config.enrollment_secret_path.clone(),
             enrollment_ledger_path: config.enrollment_ledger_path.clone(),
             rotation_ledger: load_rotation_ledger(config.wg_private_key_path.as_deref())
@@ -5495,8 +5517,14 @@ impl DaemonRuntime {
                 Ok(transport) => {
                     log::info!("gossip transport bound; gossip data plane active");
                     self.gossip_transport = Some(transport);
+                    // Clear on recovery: a bind that succeeded on a later
+                    // commit seam must not keep reporting the earlier
+                    // failure as though it were still live.
+                    self.gossip_transport_error = None;
                 }
                 Err(err) => {
+                    self.gossip_transport_error =
+                        Some(sanitize_and_cap_status_value(&err.to_string()));
                     log::error!(
                         "gossip transport bind failed; retrying on next signed-state commit: {err}"
                     );
@@ -5570,6 +5598,10 @@ impl DaemonRuntime {
     /// iteration so the gossip path can't starve the rest of the
     /// loop.
     pub fn drain_gossip_inbound(&mut self) {
+        // Accumulated locally because `node` holds a mutable borrow of
+        // `self` for the whole loop; flushed into the runtime counter
+        // once both borrows have ended.
+        let mut recv_errors: u64 = 0;
         let Some(node) = self.gossip_node.as_mut() else {
             return;
         };
@@ -5588,11 +5620,13 @@ impl DaemonRuntime {
                 }
                 Ok(None) => break,
                 Err(err) => {
+                    recv_errors = recv_errors.saturating_add(1);
                     log::warn!("gossip_recv_error reason={err}");
                     break;
                 }
             }
         }
+        self.gossip_recv_errors = self.gossip_recv_errors.saturating_add(recv_errors);
     }
 
     /// True only when both gossip runtime halves are attached, i.e. when
@@ -5605,6 +5639,115 @@ impl DaemonRuntime {
     /// defense in depth; this predicate must mirror them exactly.
     fn gossip_mint_attached(&self) -> bool {
         self.gossip_node.is_some() && self.gossip_transport.is_some()
+    }
+
+    /// Signer/verifier consistency, recomputed from live inputs for the
+    /// status surface.
+    ///
+    /// Deliberately does NOT read `gossip_identity_mismatch_warned`.
+    /// That latch is set once and never cleared, and the check that sets
+    /// it short-circuits on itself, so a mismatch repaired by
+    /// re-enrollment would keep reporting `true` for the life of the
+    /// process.
+    ///
+    /// Three-valued on purpose. The comparison needs both a gossip node
+    /// and a membership entry for this node; when either is missing
+    /// nothing was checked, and reporting `false` there would be a
+    /// default-allow read on a trust-adjacent signal. Absence of
+    /// evidence is reported as `unknown`, never as evidence of absence.
+    fn gossip_identity_mismatch_state(&self) -> &'static str {
+        let Some(node) = self.gossip_node.as_ref() else {
+            return "unknown";
+        };
+        let Some(membership_state) = self.membership_state.as_ref() else {
+            return "unknown";
+        };
+        let Some(self_entry) = membership_state
+            .nodes
+            .iter()
+            .find(|member| member.node_id == self.local_node_id)
+        else {
+            return "unknown";
+        };
+        if crate::gossip_runtime::decode_hex32(self_entry.node_pubkey_hex.as_str())
+            == Some(node.local_node_id)
+        {
+            "false"
+        } else {
+            "true"
+        }
+    }
+
+    /// The `gossip_*` field block appended to the status line.
+    ///
+    /// Returned as one pre-formatted string rather than as eleven more
+    /// positional arguments to the 84-argument status `format!`: at that
+    /// count a transposition is silent, and a helper keeps the whole
+    /// block unit-testable without constructing a status line.
+    ///
+    /// Every value here is a count, a fixed vocabulary word, or a
+    /// sanitized-and-capped diagnostic string. No addresses and no node
+    /// ids — `rejected_counts` is keyed by `&'static str` kind, so that
+    /// holds by construction rather than by remembering to redact.
+    fn gossip_status_suffix(&self) -> String {
+        let state = if self.gossip_mint_attached() {
+            // `active` means the transport bound, not that it is still
+            // healthy: nothing re-binds or health-checks an attached
+            // socket, so a transport that dies later still reads
+            // `active`.
+            "active"
+        } else if self.gossip_node.is_some() {
+            "attached_pending_transport"
+        } else {
+            "unconfigured"
+        };
+        let transport_error = self.gossip_transport_error.as_deref().unwrap_or("none");
+        let identity_mismatch = self.gossip_identity_mismatch_state();
+        let (accepted, minted, push_failures, rejected, reasons, peers, epoch) =
+            self.gossip_node.as_ref().map_or_else(
+                || (0, 0, 0, 0, "none".to_owned(), 0, "none".to_owned()),
+                |node| {
+                    let rejected_total: u64 = node
+                        .rejected_counts
+                        .values()
+                        .copied()
+                        .fold(0, u64::saturating_add);
+                    // Sorted by kind so the rendering is deterministic —
+                    // iterating the HashMap directly would make the value
+                    // reorder between calls and defeat any parser.
+                    let mut kinds: Vec<(&'static str, u64)> =
+                        node.rejected_counts.iter().map(|(k, v)| (*k, *v)).collect();
+                    kinds.sort_unstable_by_key(|(kind, _)| *kind);
+                    let reasons = if kinds.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        kinds
+                            .iter()
+                            .map(|(kind, count)| format!("{kind}={count}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    (
+                        node.accepted_count,
+                        node.minted_count,
+                        node.push_failed_count,
+                        rejected_total,
+                        reasons,
+                        node.peers.len(),
+                        node.local_membership_epoch()
+                            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                    )
+                },
+            );
+        let recv_errors = self.gossip_recv_errors;
+        format!(
+            " gossip_state={state} gossip_accepted_total={accepted} \
+             gossip_minted_total={minted} gossip_push_failures_total={push_failures} \
+             gossip_recv_errors_total={recv_errors} gossip_rejected_total={rejected} \
+             gossip_reject_reasons={reasons} gossip_peers_registered={peers} \
+             gossip_local_epoch={epoch} gossip_identity_mismatch={identity_mismatch} \
+             gossip_transport_error={transport_error}"
+        )
     }
 
     /// Periodic hook: if the local CandidateSet has changed since
@@ -7868,8 +8011,13 @@ impl DaemonRuntime {
                 let relay_session_next_expiry_unix = path_state
                     .relay_session_next_expiry_unix
                     .map_or_else(|| "none".to_owned(), |value| value.to_string());
+                // Built as one pre-formatted block and interpolated by
+                // name: the format below already carries 84 positional
+                // arguments, where adding eleven more makes a silent
+                // transposition the realistic failure mode.
+                let gossip_suffix = self.gossip_status_suffix();
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}{gossip_suffix}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -15605,6 +15753,28 @@ fn sanitize_netcheck_value(value: &str) -> String {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | ':' | '.' | '/' | '+' => ch,
             _ => '_',
         })
+        .collect()
+}
+
+/// Maximum rendered width of a free-form diagnostic value on the status
+/// line. The status line has no provable size bound and the Windows IPC
+/// response cap is a hard failure rather than a truncation, so every
+/// free-form value this change introduces is bounded at the source.
+const MAX_STATUS_DIAGNOSTIC_VALUE_CHARS: usize = 64;
+
+/// Sanitize a free-form diagnostic string and cap its width for emission
+/// on the whitespace-delimited status line.
+///
+/// `sanitize_netcheck_value` maps every character outside
+/// `[A-Za-z0-9_\-:./+]` to `_`, including whitespace and `=`, so the
+/// result can neither split into extra whitespace tokens nor forge a
+/// `key=value` pair. That also makes the output pure ASCII, so taking
+/// the first N `char`s is byte-exact and cannot panic on a char
+/// boundary — which a byte-index slice could.
+fn sanitize_and_cap_status_value(value: &str) -> String {
+    sanitize_netcheck_value(value)
+        .chars()
+        .take(MAX_STATUS_DIAGNOSTIC_VALUE_CHARS)
         .collect()
 }
 
@@ -25855,6 +26025,539 @@ mod tests {
             addr_before, addr_after,
             "sync must not rebind an already-attached gossip transport"
         );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// Extract only the `gossip_*` tokens from a status line. The rest of
+    /// the line legitimately carries node ids, endpoints and candidate
+    /// addresses, so any assertion about what gossip fields may contain
+    /// has to be scoped to the gossip block or it is unpassable.
+    #[cfg(unix)]
+    fn gossip_tokens(line: &str) -> Vec<(&str, &str)> {
+        line.split_whitespace()
+            .filter(|token| token.starts_with("gossip_"))
+            .map(|token| {
+                token
+                    .split_once('=')
+                    .expect("gossip token must be key=value")
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn gossip_field<'a>(line: &'a str, key: &str) -> &'a str {
+        gossip_tokens(line)
+            .into_iter()
+            .find(|(name, _)| *name == key)
+            .unwrap_or_else(|| panic!("status line missing {key}"))
+            .1
+    }
+
+    #[cfg(unix)]
+    fn gossip_runtime_for_status(label: &str) -> (DaemonRuntime, PathBuf) {
+        let relay_addr: SocketAddr = "203.0.113.63:40063".parse().expect("relay addr");
+        let (mut runtime, test_dir) =
+            build_runtime_with_custom_relay(label, relay_addr, "relay-eu-1");
+        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        (runtime, test_dir)
+    }
+
+    /// The "is it even on?" question. A node with no gossip signing
+    /// identity must say so rather than reporting a healthy-looking
+    /// state, and every counter must read zero rather than absent.
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_gossip_unconfigured_when_no_signing_secret() {
+        let (runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-status-unconfigured");
+        let suffix = runtime.gossip_status_suffix();
+
+        assert_eq!(gossip_field(&suffix, "gossip_state"), "unconfigured");
+        assert_eq!(gossip_field(&suffix, "gossip_accepted_total"), "0");
+        assert_eq!(gossip_field(&suffix, "gossip_minted_total"), "0");
+        assert_eq!(gossip_field(&suffix, "gossip_push_failures_total"), "0");
+        assert_eq!(gossip_field(&suffix, "gossip_recv_errors_total"), "0");
+        assert_eq!(gossip_field(&suffix, "gossip_rejected_total"), "0");
+        assert_eq!(gossip_field(&suffix, "gossip_reject_reasons"), "none");
+        assert_eq!(gossip_field(&suffix, "gossip_peers_registered"), "0");
+        assert_eq!(gossip_field(&suffix, "gossip_local_epoch"), "none");
+        assert_eq!(gossip_field(&suffix, "gossip_transport_error"), "none");
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// A bind failure leaves node=Some / transport=None with membership
+    /// already committed. That must NOT collapse into `active` (the fault
+    /// this surface exists to expose) and must carry a reason, or an
+    /// operator cannot tell "port in use" from "permission denied".
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_attached_pending_transport_when_bind_failed() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_for_status("rustynetd-gossip-status-bind-failed");
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[9u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        // Unbindable: a routable-but-not-local address cannot be bound.
+        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+        runtime.sync_gossip_data_plane(None);
+
+        assert!(
+            runtime.gossip_transport.is_none(),
+            "precondition: the bind must have failed"
+        );
+        let suffix = runtime.gossip_status_suffix();
+        assert_eq!(
+            gossip_field(&suffix, "gossip_state"),
+            "attached_pending_transport",
+            "a failed bind must not read as `active` nor as `unconfigured`"
+        );
+        assert_ne!(
+            gossip_field(&suffix, "gossip_transport_error"),
+            "none",
+            "the bind failure reason must be surfaced"
+        );
+        // The sibling field proves the middle state is not
+        // `awaiting_membership`: the epoch was committed before the bind.
+        assert_ne!(gossip_field(&suffix, "gossip_local_epoch"), "none");
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// A resolved fault must stop reading as a live one. The bind is
+    /// retried at every signed-state commit seam, so the error has to be
+    /// cleared when one finally succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_transport_error_and_clears_it_on_successful_bind() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_for_status("rustynetd-gossip-status-error-clears");
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[11u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+
+        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime.sync_gossip_data_plane(None);
+        let failed = runtime.gossip_status_suffix();
+        assert_ne!(gossip_field(&failed, "gossip_transport_error"), "none");
+
+        // Recover: a bindable address on the next seam.
+        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.sync_gossip_data_plane(None);
+        let recovered = runtime.gossip_status_suffix();
+        assert_eq!(gossip_field(&recovered, "gossip_state"), "active");
+        assert_eq!(
+            gossip_field(&recovered, "gossip_transport_error"),
+            "none",
+            "a bind that later succeeded must clear the stale error"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The counters must be read from the node, not hardcoded — and the
+    /// mint and push-failure counters must be independent, because
+    /// `minted_count` is bumped before the broadcast loop and regardless
+    /// of push success.
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_gossip_accept_mint_and_reject_totals() {
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-status-totals");
+        let mut node =
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[13u8; 32]), None)
+                .expect("gossip node should build");
+        node.accepted_count = 7;
+        node.minted_count = 5;
+        node.push_failed_count = 3;
+        node.rejected_counts.insert("unknown_source", 2);
+        node.rejected_counts.insert("origin_rate_limited", 4);
+        runtime.gossip_node = Some(node);
+        runtime.gossip_recv_errors = 6;
+
+        let suffix = runtime.gossip_status_suffix();
+        assert_eq!(gossip_field(&suffix, "gossip_accepted_total"), "7");
+        assert_eq!(gossip_field(&suffix, "gossip_minted_total"), "5");
+        assert_eq!(gossip_field(&suffix, "gossip_push_failures_total"), "3");
+        assert_eq!(gossip_field(&suffix, "gossip_recv_errors_total"), "6");
+        assert_eq!(
+            gossip_field(&suffix, "gossip_rejected_total"),
+            "6",
+            "rejected total must be the sum of the per-kind counters"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The `021c1ef0` per-origin limiter is the specific thing that is
+    /// invisible today. If it does not reach the surface, this whole
+    /// change has failed its own acceptance criterion.
+    #[cfg(unix)]
+    #[test]
+    fn status_reject_reasons_include_origin_rate_limited() {
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-status-limiter");
+        let mut node =
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[17u8; 32]), None)
+                .expect("gossip node should build");
+        node.rejected_counts.insert("origin_rate_limited", 12);
+        runtime.gossip_node = Some(node);
+
+        assert_eq!(
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_reject_reasons"),
+            "origin_rate_limited=12"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// A `HashMap` iterates in a non-deterministic order, so rendering it
+    /// directly would make the value reorder between calls and defeat any
+    /// parser reading it.
+    #[cfg(unix)]
+    #[test]
+    fn status_reject_reasons_are_deterministically_ordered() {
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-status-ordered");
+        let mut node =
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[19u8; 32]), None)
+                .expect("gossip node should build");
+        for kind in crate::gossip_runtime::ALL_GOSSIP_REJECT_KINDS {
+            node.rejected_counts.insert(kind, 1);
+        }
+        runtime.gossip_node = Some(node);
+
+        let rendered =
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_reject_reasons").to_owned();
+        let kinds: Vec<&str> = rendered
+            .split(',')
+            .map(|entry| entry.split_once('=').expect("kind=count").0)
+            .collect();
+        let mut sorted = kinds.clone();
+        sorted.sort_unstable();
+        assert_eq!(kinds, sorted, "reject reasons must render sorted by kind");
+
+        // Stable across calls, not merely sorted once.
+        for _ in 0..8 {
+            assert_eq!(
+                gossip_field(&runtime.gossip_status_suffix(), "gossip_reject_reasons"),
+                rendered
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// §2.6 privacy pin. Counts, fixed vocabulary words and reject-reason
+    /// KINDS only — never a peer id, an endpoint or a candidate address.
+    #[cfg(unix)]
+    #[test]
+    fn status_gossip_tokens_contain_no_addresses_or_node_ids() {
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-status-privacy");
+        let mut node =
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[23u8; 32]), None)
+                .expect("gossip node should build");
+        node.register_peer(
+            [42u8; 32],
+            SigningKey::from_bytes(&[43u8; 32]).verifying_key(),
+            "198.51.100.77:40077".parse().expect("peer addr"),
+        );
+        for kind in crate::gossip_runtime::ALL_GOSSIP_REJECT_KINDS {
+            node.rejected_counts.insert(kind, 3);
+        }
+        runtime.gossip_node = Some(node);
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+
+        let suffix = runtime.gossip_status_suffix();
+        assert_eq!(gossip_field(&suffix, "gossip_peers_registered"), "1");
+        for (key, value) in gossip_tokens(&suffix) {
+            assert!(
+                !value.contains("198.51.100.77"),
+                "{key} leaked a peer endpoint"
+            );
+            assert!(!value.contains("40077"), "{key} leaked a peer port");
+            assert!(
+                !value.contains("2a2a2a"),
+                "{key} leaked a peer node id prefix"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// Some live-lab validators test raw substrings rather than parsed
+    /// tokens (`contains("state=FailClosed")`). `gossip_state` ends with
+    /// an existing key, so its value vocabulary is what keeps it from
+    /// shadowing one — a shadowed `contains` flips a verdict to a FALSE
+    /// PASS, so this is pinned rather than trusted.
+    #[cfg(unix)]
+    #[test]
+    fn status_gossip_state_vocabulary_cannot_shadow_existing_needles() {
+        const ALLOWED: [&str; 3] = ["unconfigured", "attached_pending_transport", "active"];
+        const NEEDLES: [&str; 2] = ["state=FailClosed", "state=ExitActive"];
+
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-status-shadow");
+
+        // unconfigured
+        let mut seen =
+            vec![gossip_field(&runtime.gossip_status_suffix(), "gossip_state").to_owned()];
+        // attached_pending_transport
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[29u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        seen.push(gossip_field(&runtime.gossip_status_suffix(), "gossip_state").to_owned());
+        // active
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+        runtime.sync_gossip_data_plane(None);
+        seen.push(gossip_field(&runtime.gossip_status_suffix(), "gossip_state").to_owned());
+
+        for value in &seen {
+            assert!(
+                ALLOWED.contains(&value.as_str()),
+                "gossip_state value {value:?} is outside the pinned vocabulary"
+            );
+            for needle in NEEDLES {
+                assert!(
+                    !format!("gossip_state={value}").contains(needle),
+                    "gossip_state={value} shadows the live-lab needle {needle:?}"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 3, "all three states must have been exercised");
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// A raw `io::Error` carries spaces and parentheses. On a
+    /// whitespace-delimited line an unsanitised value forges extra tokens
+    /// — including ones that shadow real fields — so it is sanitised and
+    /// capped at the source.
+    #[test]
+    fn status_gossip_transport_error_is_sanitised_and_capped() {
+        let raw = "Address already in use (os error 98) = spoofed gossip_state=active";
+        let cleaned = super::sanitize_and_cap_status_value(raw);
+
+        assert!(!cleaned.contains(' '), "whitespace must not survive");
+        assert!(!cleaned.contains('='), "`=` must not survive");
+        assert_eq!(cleaned.split_whitespace().count(), 1, "must stay one token");
+        assert!(cleaned.chars().count() <= super::MAX_STATUS_DIAGNOSTIC_VALUE_CHARS);
+        assert!(cleaned.is_ascii(), "cap is byte-exact only if ASCII");
+
+        // Multi-byte input must not panic and must still be capped.
+        let wide = super::sanitize_and_cap_status_value(&"é".repeat(400));
+        assert_eq!(wide.len(), super::MAX_STATUS_DIAGNOSTIC_VALUE_CHARS);
+    }
+
+    #[cfg(unix)]
+    fn hex32(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The comparison needs BOTH a gossip node and this node's membership
+    /// entry. When either is missing nothing was checked, and reporting
+    /// `false` there would be a default-allow read on a trust-adjacent
+    /// signal — the exact fail-open the existing warn latch has. Absence
+    /// of evidence must report `unknown`.
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_identity_mismatch_as_unknown_when_uncheckable() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_for_status("rustynetd-gossip-identity-unknown");
+
+        // No gossip node at all.
+        assert_eq!(
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_identity_mismatch"),
+            "unknown"
+        );
+
+        // Gossip node, but no verified membership to compare against.
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[31u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        assert_eq!(
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_identity_mismatch"),
+            "unknown"
+        );
+
+        // Membership present, but it carries no entry for THIS node, so
+        // there is still nothing to compare.
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "some-other-node",
+            vec![RoleCapability::Client],
+        ));
+        assert_eq!(
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_identity_mismatch"),
+            "unknown",
+            "no membership entry for this node means nothing was checked"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// Computed fresh from live inputs, NOT read from
+    /// `gossip_identity_mismatch_warned`. That latch is set once and never
+    /// cleared, and its check short-circuits on itself, so reading it
+    /// would report a mismatch repaired by re-enrollment as broken for the
+    /// life of the process.
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_identity_mismatch_true_and_false_from_live_inputs() {
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-identity-live");
+        let node =
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[37u8; 32]), None)
+                .expect("gossip node should build");
+        let gossip_pubkey_hex = hex32(&node.local_node_id);
+        runtime.gossip_node = Some(node);
+
+        let local_id = runtime.local_node_id.clone();
+        let mut state =
+            make_membership_state_with_capabilities(&local_id, vec![RoleCapability::Client]);
+
+        // Membership publishes a DIFFERENT pubkey: every peer will reject
+        // this node's mints.
+        state.nodes[0].node_pubkey_hex = "aa".repeat(32);
+        runtime.membership_state = Some(state.clone());
+        assert_eq!(
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_identity_mismatch"),
+            "true"
+        );
+
+        // Repaired by re-enrollment: membership now publishes this
+        // daemon's actual gossip verifying key.
+        state.nodes[0].node_pubkey_hex = gossip_pubkey_hex;
+        runtime.membership_state = Some(state);
+        assert_eq!(
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_identity_mismatch"),
+            "false",
+            "a repaired mismatch must stop reporting true — the sticky \
+             warn latch must not be the source"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// `rejected_counts` only covers bundles that DECODED. A peer emitting
+    /// malformed datagrams would otherwise be indistinguishable from a
+    /// silent one: accepted=0, rejected=0, reasons=none.
+    #[cfg(unix)]
+    #[test]
+    fn status_counts_inbound_decode_errors() {
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-recv-errors");
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[41u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+        runtime.sync_gossip_data_plane(None);
+        let bound = runtime
+            .gossip_transport
+            .as_ref()
+            .expect("transport attached")
+            .local_addr()
+            .expect("local addr");
+
+        assert_eq!(
+            gossip_field(&runtime.gossip_status_suffix(), "gossip_recv_errors_total"),
+            "0"
+        );
+
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("sender socket");
+        sender
+            .send_to(b"this is not a gossip bundle", bound)
+            .expect("send garbage");
+        // Give the datagram a moment to land before draining.
+        std::thread::sleep(Duration::from_millis(50));
+        runtime.drain_gossip_inbound();
+
+        let suffix = runtime.gossip_status_suffix();
+        assert_eq!(
+            gossip_field(&suffix, "gossip_recv_errors_total"),
+            "1",
+            "a malformed datagram must not read as silence"
+        );
+        assert_eq!(
+            gossip_field(&suffix, "gossip_rejected_total"),
+            "0",
+            "it never decoded, so it is not a bundle rejection"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// Live-lab validators parse this line with whitespace splits and
+    /// `strip_prefix("key=")`. Appending is safe; inserting mid-line is
+    /// not. This pins that the gossip block is strictly a suffix and that
+    /// the pre-existing field order is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn status_appends_gossip_fields_without_reordering_existing_ones() {
+        let (runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-append-only");
+        let mut runtime = runtime;
+        let status = runtime.handle_command(IpcCommand::Status);
+        let line = status.message.clone();
+
+        let keys: Vec<&str> = line
+            .split_whitespace()
+            .filter_map(|token| token.split_once('=').map(|(key, _)| key))
+            .collect();
+        let first_gossip = keys
+            .iter()
+            .position(|key| key.starts_with("gossip_"))
+            .expect("gossip fields must be present");
+
+        assert!(
+            keys[first_gossip..]
+                .iter()
+                .all(|key| key.starts_with("gossip_")),
+            "gossip fields must form an unbroken suffix, not be interleaved"
+        );
+        assert_eq!(
+            keys[first_gossip - 1],
+            "membership_active_nodes",
+            "the gossip block must be appended after the previous last field"
+        );
+        assert_eq!(keys[0], "node_id", "the first field must not move");
+        assert_eq!(
+            keys[first_gossip], "gossip_state",
+            "gossip_state must lead the appended block"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The Windows IPC response cap is a hard failure, not a truncation,
+    /// and gossip cannot run on Windows — so the suffix is fixed there.
+    /// Pinning the exact width keeps the §4.3 headroom arithmetic honest.
+    #[cfg(unix)]
+    #[test]
+    fn status_gossip_suffix_is_290_bytes_when_unconfigured() {
+        let (runtime, test_dir) = gossip_runtime_for_status("rustynetd-gossip-status-width");
+        let suffix = runtime.gossip_status_suffix();
+
+        assert_eq!(
+            suffix.len(),
+            290,
+            "unconfigured suffix width changed; update the §4.3 headroom arithmetic: {suffix}"
+        );
+        assert_eq!(gossip_tokens(&suffix).len(), 11, "eleven gossip fields");
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
