@@ -8,12 +8,32 @@ the *conclusion* (fields go on `status`) with a **different and honest reason**.
 Implements item **7** of `I4EnforcementFlipPlan_2026-07-30.md` §4, which the
 adversarial review called a **ship-blocker, not a nice-to-have**.
 
-**Live-lab acceptance is UNMET and undeclared elsewhere, so it is declared here.**
+**Live-lab acceptance is UNMET, and the reason is stronger than a missing run.**
 §6's acceptance ("the totals move under real traffic; a rate-limited origin is
-visible") requires a live run. `documents/operations/live_lab_node_run_matrix.csv`
-ends 2026-07-29 at commit `8a2d613644ea` and no row references either commit
-above. Per CLAUDE.md §9 this scope is complete in code and gates but **not
-live-proven**; that remains outstanding work, not a claimed result.
+visible") cannot be satisfied by **any configuration currently in this repo**.
+`build_gossip_node` (`daemon.rs:4036`) returns `None` unless both
+`RUSTYNET_GOSSIP_SIGNING_SECRET_PATH` and its passphrase path are set, and
+**nothing sets them** — not a systemd unit, not a launchd plist, not a bootstrap
+script, not an orchestrator stage. Only the CLI argument parser
+(`main.rs:2978`, `:2992`) reads those fields at all. (`--gossip-watermark` *is*
+passed by the installers, which makes the subsystem look wired when it is not.)
+
+So on every shipped and lab node today `gossip_node` is `None`,
+`drain_gossip_inbound` early-returns, the socket is never bound, and all eleven
+fields render their unconfigured constants — a fixed 290 B. A live run right now
+would append a row reading `gossip_state=unconfigured` and prove nothing about
+the counters.
+
+`documents/operations/live_lab_node_run_matrix.csv` ends 2026-07-29 at commit
+`8a2d613644ea` and references none of these commits. Per CLAUDE.md §9 this scope
+is complete in code and gates but **not live-proven**, and proving it requires
+first wiring the signing secret into a deployment path. Outstanding work, not a
+claimed result.
+
+**Line numbers are as of `b3870a19`.** They shift whenever the file does — this
+work alone moved `daemon.rs` by ~700 lines, which invalidated every citation an
+earlier revision had made. Treat the **symbol names** as authoritative and the
+numbers as a hint; if one does not land, grep the symbol.
 
 **Precedence:** CLAUDE.md §3/§4. This change is **read-only observability** — it
 adds no enforcement and no trust decision. It adds three new non-trust diagnostic
@@ -30,7 +50,7 @@ design questions are settled**, and it is a prerequisite for diagnosing the
 others.
 
 Concretely: the gossip node maintains `accepted_count` (`gossip_runtime.rs:245`),
-`minted_count` (`:246`) and `rejected_counts` (`:242`, bumped at `:727`) —
+`minted_count` (`:246`) and `rejected_counts` (`:242`, bumped at `:751`) —
 including the `origin_rate_limited` counter landed in `021c1ef0`. **None has a
 production reader** (repo-wide, they are read only by
 `crates/rustynetd/tests/gossip_three_peer_mesh.rs`). So today, six distinct
@@ -54,7 +74,7 @@ the fault been in gossip instead, there would have been nothing to read.
 
 ## 2. Scope — the fields go on `status`
 
-Extend the **`IpcCommand::Status`** response line (`daemon.rs:7872`).
+Extend the **`IpcCommand::Status`** response line (`daemon.rs:8040`).
 
 ### 2.1 The surface question, and the rule that actually decides it
 
@@ -62,23 +82,23 @@ Revision 3 moved these fields to `netcheck`; revision 4 moved them back to
 `status`. Both used a rule neither surface satisfies.
 
 **Neither `status` nor `netcheck` is side-effect-free.** Both call
-`refresh_traversal_hint_state` (`daemon.rs:4892`) — `Status` with
-`force_reprobe=false` (`:7757`), `Netcheck` with `true` (`:7979`) — and that
+`refresh_traversal_hint_state` (`daemon.rs:4922`) — `Status` with
+`force_reprobe=false` (`:7919`), `Netcheck` with `true` (`:8146`) — and that
 parameter is threaded to **exactly one** place, `sync_traversal_runtime_state`
-at `:4948`. Everything before it is identical for both. So **`rustynet status`
+at `:4978`. Everything before it is identical for both. So **`rustynet status`
 also**:
 
-- reads the watermark and bundle set from disk (`:4900`, `:4910`);
-- **writes** the traversal anti-replay watermark to disk (`persist_traversal_watermark`, `:4919`);
-- bumps `traversal_hint_generation` (`:4899`);
+- reads the watermark and bundle set from disk (`:4930`, `:4940`);
+- **writes** the traversal anti-replay watermark to disk (`persist_traversal_watermark`, `:4949`);
+- bumps `traversal_hint_generation` (`:4929`);
 - on a `sync_traversal_runtime_state` error in enforced mode, calls
-  `restrict_recoverable` + `force_fail_closed_or_restrict` (`:4951-4952`).
+  `restrict_recoverable` + `force_fail_closed_or_restrict` (`:4981-4982`).
 
 Revision 4 asserted status was "the cheap surface". It is cheap**er**, not cheap.
 A qualifier the reviews did *not* establish, and which matters: the four
 `traversal_probe_statuses.clear()` sites that would make a subsequent pass re-race
-every peer (`:4906`, `:4923`, `:4936`, `:4945`, feeding the
-`existing_status == None ⇒ due` branch at `:2186-2188`) are all in
+every peer (`:4936`, `:4953`, `:4966`, `:4975`, feeding the
+`existing_status == None ⇒ due` branch at `:2178-2180`) are all in
 `refresh_traversal_hint_state`'s **error and missing branches**, not its happy
 path. So `status` triggers an ICE re-race only when traversal state is *already*
 broken — real, but not the routine cost `netcheck` pays unconditionally.
@@ -91,11 +111,11 @@ but: *does this change increase the frequency or cost of a side-effecting call?*
   **zero** new calls, at zero new cost. The marginal risk is nil.
 - **`netcheck`: yes.** It would have driven gossip-cadence polling onto the
   unconditional path — `traversal_probe_due_decision` short-circuits
-  `if force_reprobe { return true }` (`:2183`), forcing every peer through
+  `if force_reprobe { return true }` (`:2175`), forcing every peer through
   `execute_ice_pair_race` (`phase10.rs:6053`): up to 24 pairs × 3 rounds, each
   followed by an 80 ms `std::thread::sleep` (`phase10.rs:121-127`), on a daemon
   loop whose own comment warns a stall takes down "DNS drain, reconcile, **and
-  gossip**" (`daemon.rs:15305`). Polling gossip health would have stalled the
+  gossip**" (`daemon.rs:15499`). Polling gossip health would have stalled the
   gossip plane being measured.
 
 Revision 3's other three arguments were also false and are recorded so they are
@@ -106,6 +126,13 @@ argument (§6.1) argues for fixing `status --json`, not for relocating a
 diagnostic away from it; and the Windows-cap argument cannot discriminate, since
 gossip is unix-only (§2.5) and the suffix is fixed on Windows either way.
 
+**Conceded, because the rule is satisfied narrowly.** It is true of the diff —
+this change adds no call — but these fields exist so that operators and validators
+*will* poll `status` to watch gossip health, and `Status` is side-effecting. The
+rule is therefore answered on the diff rather than on the intent. The honest
+disposition: the correct home is the side-effect-free read path named below, and
+`status` is where the fields go *until that exists*.
+
 **That both read commands mutate state is a real defect — it is just not this
 plan's defect.** Logged as §6.6/§6.7, with the proper remedy named there: a
 genuinely side-effect-free read path, which would also be the right home for a
@@ -114,9 +141,9 @@ trust-sensitive refactor, and would leave the far larger `status` hazard unfixed
 anyway.
 
 No authorization change is needed: `IpcCommand::Status` is permitted for every
-role in `NodeRole::allows_command` (`daemon.rs:1416-1437`). (Revision 3 called
+role in `NodeRole::allows_command` (`daemon.rs:1416-1440`). (Revision 3 called
 these "foreign-uid allow lists" — wrong. Peer-credential authorization is
-**uniform across every command**; see `authorize_local_peer`, `daemon.rs:15536-15548`.)
+**uniform across every command**; see `authorize_local_peer`, `daemon.rs:15740-15752`.)
 
 ### 2.2 Implementation shape — one named argument, not eleven positional ones
 
@@ -148,7 +175,7 @@ Eleven fields, appended in this order.
 
 | Field | Source | Meaning |
 | --- | --- | --- |
-| `gossip_state` | `gossip_mint_attached()` (`daemon.rs:5606`) + `gossip_node.is_some()` | `unconfigured` / `attached_pending_transport` / `active` |
+| `gossip_state` | `gossip_mint_attached()` (`daemon.rs:5659`) + `gossip_node.is_some()` | `unconfigured` / `attached_pending_transport` / `active` |
 | `gossip_accepted_total` | `accepted_count` | bundles accepted since start |
 | `gossip_minted_total` | `minted_count` (`gossip_runtime.rs:246`) | bundles **minted** — signed and watermark-committed. **Not delivery-confirmed** |
 | `gossip_push_failures_total` | **new counter** — both push loops (§2.4) | outbound pushes that failed |
@@ -156,20 +183,20 @@ Eleven fields, appended in this order.
 | `gossip_rejected_total` | sum of `rejected_counts` | bundles rejected since start |
 | `gossip_reject_reasons` | `rejected_counts` | **`kind=count`** list, `,`-joined, sorted by kind; `none` when empty. **NOT `kind:count`** — §4.1 |
 | `gossip_peers_registered` | `peers.len()` (`gossip_runtime.rs:203`, `pub`) | peers the node may accept from |
-| `gossip_local_epoch` | accessor `local_membership_epoch()` (`gossip_runtime.rs:356`) — the field is private so the monotonic setter stays the only mutation path | the I2 epoch bound; `none` before first verified commit |
+| `gossip_local_epoch` | accessor `local_membership_epoch()` (`gossip_runtime.rs:375`) — the field is private so the monotonic setter stays the only mutation path | the I2 epoch bound; `none` before first verified commit |
 | `gossip_identity_mismatch` | **computed fresh** (§2.4) | `true` / `false` / **`unknown`** |
 | `gossip_transport_error` | **new field** (§2.4) | `none`, or the last bind error, sanitised and capped |
 
 **`gossip_minted_total` alone is a lie, and revision 3 shipped it as a truth.**
-`minted_count` is incremented at `gossip_runtime.rs:434` — **before** the
+`minted_count` is incremented at `gossip_runtime.rs:453` — **before** the
 broadcast loop at `:439-450`, and unconditionally of push success. So a node whose
 every push fails shows a healthy, rising `gossip_minted_total`. Revision 3
 justified the field as exposing exactly that failure; it does the opposite.
 
 **`gossip_push_failures_total` must cover both push loops.** There are two, and
 revision 4 instrumented one:
-- mint broadcast — `gossip_runtime.rs:439-450`, warn at `:443`;
-- epidemic re-push — `gossip_runtime.rs:508-521`, warn `gossip_repush_failed` at
+- mint broadcast — `gossip_runtime.rs:456-472`, warn at `:443`;
+- epidemic re-push — `gossip_runtime.rs:529-545`, warn `gossip_repush_failed` at
   `:513`.
 
 On a node acting as an epidemic relay, re-push is the **dominant** outbound path.
@@ -178,7 +205,7 @@ where it matters most. Both sites bump the same counter, so the field name stays
 honest.
 
 **`gossip_recv_errors_total` closes §1's fifth failure.** `drain_gossip_inbound`
-(`daemon.rs:5572-5595`) handles a transport-level decode failure as
+(`daemon.rs:5614-5648`) handles a transport-level decode failure as
 `Err(err) => { log::warn!("gossip_recv_error reason={err}"); break; }` — counted
 nowhere. Note the rejection counters *are* reached on the UDP path (they live
 inside `ingest_inbound_bundle`); it is specifically the **pre-decode** failures
@@ -192,7 +219,7 @@ observability, and is done here.)
 **`gossip_identity_mismatch` is computed fresh and is three-valued — it does NOT
 reuse the existing latch.** A node whose membership pubkey ≠ its gossip verifying
 key has its mints rejected by every peer, and the daemon already detects this
-(`daemon.rs:5526-5540`). But `gossip_identity_mismatch_warned` (`:3844`) is a
+(`daemon.rs:5568-5582`). But `gossip_identity_mismatch_warned` (`:3844`) is a
 **one-shot warn latch**: its complete write set is declaration `:3844`, init
 `false` `:4291`, set `true` `:5534` — **nothing ever clears it**, and `:5526`
 short-circuits on it (`if !self.gossip_identity_mismatch_warned && …`), so once
@@ -202,7 +229,7 @@ table the clear-on-recovery rule this plan imposes on `gossip_transport_error`.
 
 It also fails **open**: the condition only detects a mismatch when the local node
 id is found in `membership_state.nodes`. Absent local entry, `membership_state`
-`None` (early return `:5481`), or `gossip_node` `None` (`:5478`) all yield
+`None` (early return `:5518`), or `gossip_node` `None` (`:5515`) all yield
 "no mismatch" — indistinguishable from a verified match. Reporting `false` there
 is a default-allow read on a trust-adjacent signal (CLAUDE.md §10.4).
 
@@ -221,26 +248,26 @@ also asking `gossip_node.is_some()`. That is not the fork its doc-comment warns
 against: `gossip_mint_attached()` remains the sole authority for `active`, and the
 extra check only splits the remaining `false` case. Verified total over reachable
 states: node=`None` + transport=`Some` is unreachable — both writers set the pair
-together (`:5427-5428`) or set transport strictly downstream of the
-`gossip_node.as_mut()` early return (`:5478` → `:5493`), and nothing assigns
+together (`:5457-5458`) or set transport strictly downstream of the
+`gossip_node.as_mut()` early return (`:5515` → `:5493`), and nothing assigns
 `None` back.
 
 **The middle state has two causes, and revision 1 modelled only one.** The
-transport binds inside `sync_gossip_data_plane` (`daemon.rs:5493-5505`); a bind
+transport binds inside `sync_gossip_data_plane` (`daemon.rs:5530-5548`); a bind
 failure (EADDRINUSE on a restart race) is logged and retried, leaving node=`Some`,
 transport=`None` **with membership already committed**. Calling that
 `awaiting_membership` would mislabel exactly the persistent fault this surface
 exists to expose, and contradicts the sibling field: `set_local_membership_epoch`
-runs at `:5492`, *before* the bind. Hence the neutral `attached_pending_transport`
+runs at `:5528`, *before* the bind. Hence the neutral `attached_pending_transport`
 plus a separate `gossip_transport_error`.
 
 **Two honest limits, stated so they are not over-read:**
 
 - `attached_pending_transport` also covers the *awaiting-membership* cause
-  (`sync_gossip_data_plane` returns at `:5481` before any bind is attempted), where
+  (`sync_gossip_data_plane` returns at `:5518` before any bind is attempted), where
   `gossip_transport_error` is legitimately `none`. That combination is diagnosable
   via `gossip_local_epoch=none`, but it is not self-describing.
-- `active` means "bound once", not "healthy". `daemon.rs:5493` gates the bind on
+- `active` means "bound once", not "healthy". `daemon.rs:5530` gates the bind on
   `gossip_transport.is_none()` and nothing re-binds or health-checks an attached
   socket, so a transport that dies later reads `active` indefinitely. §1's third
   failure is answered; "is the transport *still* working" is not, and this plan
@@ -250,9 +277,9 @@ plus a separate `gossip_transport_error`.
 
 | New state | Where | Written | Cleared |
 | --- | --- | --- | --- |
-| `pub push_failed_count: u64` | `GossipNode` | both push loops, `gossip_runtime.rs:443` and `:513` | never (monotonic) |
-| `gossip_recv_errors: u64` | daemon runtime | drain error branch, `daemon.rs:5590` | never (monotonic) |
-| `gossip_transport_error: Option<String>` | daemon runtime | bind-failure branch, `daemon.rs:5499` | **on successful bind**, so a resolved fault does not read as live |
+| `pub push_failed_count: u64` | `GossipNode` | both push loops, `gossip_runtime.rs:464` and `:513` | never (monotonic) |
+| `gossip_recv_errors: u64` | daemon runtime | drain error branch, `daemon.rs:5644` | never (monotonic) |
+| `gossip_transport_error: Option<String>` | daemon runtime | bind-failure branch, `daemon.rs:5543` | **on successful bind**, so a resolved fault does not read as live |
 
 `push_failed_count` is `pub` — `gossip_runtime` and `daemon` are sibling modules,
 so a private field would be unreadable from the status surface. This matches its
@@ -261,19 +288,19 @@ reserved for `local_membership_epoch`, which is private *specifically* to keep t
 monotonic setter the only mutation path.
 
 Adding a field to `GossipNode` is **not** a wire-format change: `persist_watermark`
-(`gossip_runtime.rs:693-701`) serialises a separate
+(`gossip_runtime.rs:718-726`) serialises a separate
 `GossipWatermark { local_sequence, seen }`. Nothing serialises `GossipNode`.
 
 Clear-on-bind is reachable: the `gossip_transport.is_none()` gate at `:5493` does
 not make the bind one-shot — `sync_gossip_data_plane` re-runs at four signed-state
-commit seams (`:5032`, `:7618`, `:8648`, `:9210`), so a failed bind is retried and
-the `Ok` branch at `:5495-5497` runs.
+commit seams (`:5069`, `:7765`, `:8838`, `:9403`), so a failed bind is retried and
+the `Ok` branch at `:5532-5534` runs.
 
 Revision 2's §3 claimed "no new state". That was untrue; the honest framing is
 narrower: **no new *trust* state.** These values are never consulted by any
 decision — no policy, no ACL, no acceptance path reads them; never persisted;
 write-only from their branch, read-only by one surface. The one free-form string is
-sanitised via `sanitize_netcheck_value` (`daemon.rs:15601`) and capped at 64 bytes.
+sanitised via `sanitize_netcheck_value` (`daemon.rs:15769`) and capped at 64 bytes.
 That function maps every character outside `[A-Za-z0-9_\-:./+]` to `_` — including
 **whitespace and `=`** — so it can neither forge a `key=value` token nor split into
 extra whitespace tokens. Its output is pure ASCII, so a `.chars().take(64)` cap is
@@ -287,8 +314,8 @@ control that is a bad control.
 ### 2.5 Platform: gossip is structurally unix-only
 
 The `#[cfg(not(unix))]` `GossipTransport::bind` stub **always** returns
-`Unsupported` (`gossip_transport.rs:221-225`), and `validate_daemon_config` rejects
-a configured gossip secret on non-unix (`daemon.rs:11350-11358`) — and its only
+`Unsupported` (`gossip_transport.rs:232-236`), and `validate_daemon_config` rejects
+a configured gossip secret on non-unix (`daemon.rs:11544-11552`) — and its only
 production caller (`:10120`, in `run_daemon`) runs *before* the only production
 `DaemonRuntime::new` (`:10135`), where `build_gossip_node` (`:4285`) runs. Every
 other `DaemonRuntime::new` is `#[cfg(test)]`. So on Windows `gossip_state` is
@@ -300,7 +327,7 @@ and an absent key cannot be confused with an old daemon. Cost stated in §4.3.
 
 ### 2.6 Privacy constraint — binding
 
-`daemon.rs:8334-8337` states the retention policy: an ingest string **MUST NOT**
+`daemon.rs:8524-8527` states the retention policy: an ingest string **MUST NOT**
 include the bundle's candidate list, only the 8-byte source prefix and the error
 variant name.
 
@@ -358,7 +385,7 @@ peer identity — sanitised and truncated regardless.
 **Deleted from revision 2: "field-count drift."** Verified a non-risk — no test,
 validator, script or parser asserts a token or field count on either line. The only
 `fields.len() != expected` sites parse **signed bundle wire formats**
-(`daemon.rs:13200`, `:14128`, `:14266`; `main.rs:16657`;
+(`daemon.rs:13394`, `:14322`, `:14460`; `main.rs:16657`;
 `rustynet-dns-zone/src/lib.rs:403`). Repo-wide there is exactly one
 `split_whitespace().count()`, in `rustynet-llm-gateway/src/engine.rs:250`.
 
@@ -371,7 +398,7 @@ field whose **name ends with an existing field's name** shadows it.
 
 Not hypothetical: the status schema already has **six** such collisions (five
 `*_state=` keys shadow `state=`; `serving_exit_node=` shadows `exit_node=`), and
-`daemon.rs:27604`'s `assert!(status.message.contains("state="))` is **vacuous
+`daemon.rs:28536`'s `assert!(status.message.contains("state="))` is **vacuous
 today**.
 
 Of the eleven proposed names, exactly one collides: `gossip_state` ⊃ `state`. Its
@@ -386,7 +413,7 @@ red→**green**. A test pins the vocabulary (§5).
 **response**, and exceeding it is a hard error that **never truncates**: the server
 refuses at `rustynet-windows-native/src/lib.rs:777-782`, before
 `write_pipe_message`. The daemon pipe thread only `log::warn!`s
-(`daemon.rs:10228-10231`), so the client sees an opaque 5-second timeout
+(`daemon.rs:10419-10422`), so the client sees an opaque 5-second timeout
 (`main.rs:17198`). Unix has **no response cap** (`ipc.rs:311` bounds only the
 request; the Unix client uses an unbounded `read_line`, `main.rs:17180-17184`). The
 wire adds `ok|` and `\n` (`ipc.rs:176`), so the Windows budget is **4092 B**.
@@ -411,7 +438,7 @@ by 30% because it costed nine):
   but is stated to keep the line honest. Typical (0 reject kinds, small counts):
   **~290 B**.
 
-**The honest cost.** Status carries `managed_peer_endpoints` (`daemon.rs:5865`), a
+**The honest cost.** Status carries `managed_peer_endpoints` (`daemon.rs:5906`), a
 `+`-joined list **linear in mesh size** at ~33 B/peer, reaching the 4092 B Windows
 cliff at roughly **40 peers today**. The fixed 290 B suffix costs **8.8 peers**,
 moving the cliff to **~31**. Accepted because (a) both figures are far above the
@@ -423,13 +450,13 @@ daemon. Stated so it can be attacked rather than discovered.
 ### 4.4 The reject-kind vocabulary is 16, not 12
 
 Anyone sizing this by grepping `GossipError` gets 12 and misses the counter this
-plan exists to expose. `error_kind()` (`gossip_runtime.rs:908-922`) is an
+plan exists to expose. `error_kind()` (`gossip_runtime.rs:973-987`) is an
 exhaustive 12-arm match with no `_` arm; four kinds are **ad-hoc literals** at call
 sites:
 
 | Kind | Site |
 | --- | --- |
-| `oversized` | `gossip_runtime.rs:472` |
+| `oversized` | `gossip_runtime.rs:494` |
 | `self_origin` | `:549` |
 | `membership_epoch_unknown` | `:559` |
 | **`origin_rate_limited`** | `:611` — the `021c1ef0` limiter |
@@ -441,8 +468,8 @@ of the 12. No other code writes `rejected_counts`. `transport_error_kind`
 
 ## 5. Test plan — each with the mutation that must make it fail
 
-Gossip tests in this file are `#[cfg(unix)]` (`daemon.rs:25790`); this family
-follows. Helper: `build_runtime_with_custom_relay` (`daemon.rs:18613`), which
+Gossip tests in this file are `#[cfg(unix)]` (`daemon.rs:25956`); this family
+follows. Helper: `build_runtime_with_custom_relay` (`daemon.rs:18824`), which
 configures no gossip secret and so yields `unconfigured` directly. Other states use
 the hand-assignment pattern the existing tests already use (`:25802` sets
 `gossip_bind_addr`; `:25811`/`:25879` assign `gossip_node`). The bind-failure state
@@ -470,7 +497,7 @@ is reached by setting `gossip_bind_addr` to an unbindable address before
 
 ### 5.1 What actually shipped, and where it diverges
 
-**19 tests**, not the 14+1 planned. Divergences, stated rather than smoothed over:
+**18 tests** (15 in `daemon.rs`, 3 in `gossip_runtime.rs`), not the 15+1 planned. Divergences, stated rather than smoothed over:
 
 - Plan listed one `status_counts_push_failures_from_both_mint_and_repush`. Shipped
   as **two** tests in `gossip_runtime.rs`, where the loops live:
@@ -507,7 +534,7 @@ is reached by setting `gossip_bind_addr` to an unbindable address before
    everything except the thing at risk. It now forces a real bind failure and
    asserts the local bind address does not appear.
 
-**Mutation verification: 18 mutations, each caught by its own test** — including
+**Mutation verification: 21 mutations, each caught by its own test** — including
 the identity fail-open (`unknown`→`false`), reading the sticky latch, dropping
 either push counter, the field transposition, `continue`→`break`, and leaking the
 bind address. Two guards are structural rather than assertion-based: the
@@ -549,13 +576,25 @@ the specific thing that is invisible today.
    `mesh_ip`/`wg_ip` — none of which exist on the line. Dead lookups returning a
    default that reads as success.
 2. **Five status values bypass `sanitize_netcheck_value`** and can carry whitespace,
-   inflating the line and injecting fake tokens: `bootstrap_error` (`daemon.rs:7890`),
-   `last_reconcile_error` (`:7895`), `port_forward_error` (`:7972`), `node_id`
-   (`:7873`), `exit_node` (`:7877`). A real capture shows `bootstrap_error` at 304 B
+   inflating the line and injecting fake tokens: `bootstrap_error` (`daemon.rs:8058`),
+   `last_reconcile_error` (`:8063`), `port_forward_error` (`:8161`), `node_id`
+   (`:8041`), `exit_node` (`:8045`). A real capture shows `bootstrap_error` at 304 B
    carrying 36 extra whitespace tokens, taking that line from 86 to 158 tokens.
+
+   **This change gave that gap a new consequence, stated here rather than left
+   implied.** Those five values are emitted *before* the gossip block, and every
+   consumer takes the FIRST matching token — `extract_inline_field`
+   (`ops_cross_network_reports.rs:370-376`) uses `find_map`, the test helper uses
+   `.find`. Before this change a forged `gossip_*` token meant nothing; now it is
+   a health verdict live-lab validators read, and the forgery would win.
+   `status_appends_gossip_fields_without_reordering_existing_ones` proves
+   suffix-ness only for a clean line. Sanitising those five values is the fix. It
+   is a pre-existing whole-line defect and is deliberately not bundled into a
+   read-only observability change — but it is more urgent now than when it was
+   merely cosmetic.
 3. **The status line has no provable size bound** and reaches the 4092 B Windows cliff
    at ~40 peers (§4.3) — a hard failure surfacing as an opaque timeout.
-4. **`daemon.rs:27604`'s `contains("state=")` assertion is vacuous** (§4.2).
+4. **`daemon.rs:28536`'s `contains("state=")` assertion is vacuous** (§4.2).
 5. **`vm_lab/mod.rs:15550`** greps `generation=[0-9]+` unanchored; any future
    `*_generation=` field breaks the macOS killswitch-anchor lookup.
 6. **Both `Status` and `Netcheck` mutate state on a read** (§2.1): disk read, a
@@ -569,13 +608,13 @@ the specific thing that is invisible today.
    able to escalate restriction — **while the daemon is already in restricted-safe
    mode**.
 8. **`drain_gossip_inbound` `break`s the drain pass on a decode error**
-   (`daemon.rs:5590`), so one malformed datagram stalls the remaining bundles until
+   (`daemon.rs:5644`), so one malformed datagram stalls the remaining bundles until
    the next loop iteration. Bounded by `MAX_DRAIN_PER_ITERATION = 16`, so a stall
    rather than a DoS — but `continue` is almost certainly the correct handling.
 9. **Nothing re-binds or health-checks an attached gossip transport** (§2.3). A
    socket that dies after a successful bind reads `active` forever.
 10. **`gossip_identity_mismatch_warned` is a sticky latch that is never cleared and
-    whose check short-circuits on itself** (`daemon.rs:5526`, `:5534`), so a repaired
+    whose check short-circuits on itself** (`daemon.rs:5568`, `:5534`), so a repaired
     mismatch is never re-detected and never re-warned. Correct for warn-once logging,
     wrong as state — which is why §2.3 computes the field fresh instead.
 11. **`local_host_candidates` shadows `host_candidates` on the netcheck line** — the
@@ -587,7 +626,7 @@ the specific thing that is invisible today.
     tunnel, the bundle datagrams ride inside an encrypted-and-authenticated channel
     for free". The daemon binds
     `SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), RUSTYNET_GOSSIP_PORT)`
-    (`daemon.rs:4285-4290`) — **`0.0.0.0:51821`, every interface** — and no nft/pf
+    (`daemon.rs:4315-4318`) — **`0.0.0.0:51821`, every interface** — and no nft/pf
     rule scopes that port anywhere in the repo. The Ed25519 signature still gates
     *acceptance*, so this is **not a trust bypass**; but the decode path, the
     per-origin rate limiter and `gossip_recv_errors_total` are reachable
