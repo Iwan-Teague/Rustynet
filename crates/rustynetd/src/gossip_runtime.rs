@@ -938,11 +938,12 @@ impl InternalGossipIngestSummary {
 /// already one of the 12, so it is not a seventeenth.)
 ///
 /// `every_error_kind_is_listed_in_the_published_vocabulary`, together with
-/// the compile-time guard beside it, ties this to `error_kind`'s
-/// exhaustive match: adding a `GossipError` variant fails the build until
-/// it lands here. It does NOT catch a brand-new ad-hoc literal added at a
-/// new call site; that residual gap is recorded in the status-surface
-/// plan's §6.
+/// the exhaustive mirror beside it, ties this to `error_kind`: adding a
+/// `GossipError` variant fails the build in the mirror, and satisfying the
+/// mirror requires naming the new kind, which the test then requires to be
+/// present here. It does NOT catch a brand-new ad-hoc literal added at a
+/// new `bump_reject_counter` call site; that residual gap is recorded in
+/// the status-surface plan's §6.
 ///
 /// Note this is a vocabulary, not a report: `gossip_reject_reasons`
 /// renders only kinds that have actually fired, so an operator still
@@ -1339,21 +1340,30 @@ mod tests {
     /// keep passing while the new kind stayed invisible on the status
     /// surface. This match makes that a BUILD failure right here, next to
     /// the list that needs updating.
-    #[allow(dead_code)]
-    fn assert_all_gossip_error_variants_are_accounted_for(err: &GossipError) {
+    ///
+    /// It returns the kind rather than `()` on purpose. An or-pattern
+    /// guard would only force the guard itself to be updated: a new
+    /// variant could be appended to the pattern and both the build and
+    /// this test would go green with the vocabulary still stale — one
+    /// indirection short of the guarantee. Returning the kind means a new
+    /// variant forces a new arm carrying its kind STRING, which the test
+    /// then requires to be present in `ALL_GOSSIP_REJECT_KINDS`, and
+    /// cross-checks against `error_kind` so this mirror cannot drift from
+    /// the production mapper either.
+    fn kind_via_exhaustive_mirror(err: &GossipError) -> &'static str {
         match err {
-            GossipError::UnknownSource
-            | GossipError::RevokedSource
-            | GossipError::SignatureInvalid
-            | GossipError::TimestampOutsideWindow { .. }
-            | GossipError::SequenceNotMonotonic { .. }
-            | GossipError::EpochOutsideWindow { .. }
-            | GossipError::TooManyCandidates { .. }
-            | GossipError::UnreachableCandidate { .. }
-            | GossipError::TimestampUnavailable
-            | GossipError::WireVersionMismatch { .. }
-            | GossipError::WireTruncated { .. }
-            | GossipError::WireMalformed(_) => {}
+            GossipError::UnknownSource => "unknown_source",
+            GossipError::RevokedSource => "revoked_source",
+            GossipError::SignatureInvalid => "signature_invalid",
+            GossipError::TimestampOutsideWindow { .. } => "timestamp_outside_window",
+            GossipError::SequenceNotMonotonic { .. } => "sequence_not_monotonic",
+            GossipError::EpochOutsideWindow { .. } => "epoch_outside_window",
+            GossipError::TooManyCandidates { .. } => "too_many_candidates",
+            GossipError::UnreachableCandidate { .. } => "unreachable_candidate",
+            GossipError::TimestampUnavailable => "timestamp_unavailable",
+            GossipError::WireVersionMismatch { .. } => "wire_version_mismatch",
+            GossipError::WireTruncated { .. } => "wire_truncated",
+            GossipError::WireMalformed(_) => "wire_malformed",
         }
     }
 
@@ -1412,6 +1422,11 @@ mod tests {
         let mut enum_kinds = Vec::new();
         for variant in &all_variants {
             let kind = error_kind(variant);
+            assert_eq!(
+                kind,
+                kind_via_exhaustive_mirror(variant),
+                "the exhaustive mirror disagrees with the production error_kind mapper"
+            );
             assert!(
                 ALL_GOSSIP_REJECT_KINDS.contains(&kind),
                 "error_kind produced {kind:?}, which is missing from ALL_GOSSIP_REJECT_KINDS"
