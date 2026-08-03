@@ -1876,12 +1876,14 @@ fn command_supports_json_render(command: &CliCommand) -> bool {
     matches!(command, CliCommand::Status | CliCommand::Netcheck)
 }
 
-/// Convert a single daemon response line of the form
-/// `prefix: key1=value1 key2=value2 ...` into a compact JSON object whose
-/// top-level fields are `prefix` (the leading label without the colon) and
-/// the parsed key/value pairs as string fields. Returns Err when the input
-/// does not contain a `:` separator or contains a token that is not a
-/// `key=value` pair.
+/// Convert a single daemon response line — either `prefix: key=value ...`
+/// (netcheck) or a bare `key=value ...` (status) — into a compact JSON object.
+/// A detected leading label becomes the `prefix` field; an unlabelled line
+/// omits `prefix` entirely.
+///
+/// Returns Err when the input is empty, contains a token that is not a
+/// `key=value` pair, contains an empty key, or **repeats a key**. The last of
+/// those is a security property, not tidiness: see the duplicate check below.
 ///
 /// The renderer is intentionally lossless: every key/value pair the daemon
 /// emits surfaces as a string field. Numeric coercion belongs at the
@@ -1889,20 +1891,77 @@ fn command_supports_json_render(command: &CliCommand) -> bool {
 /// schema additions.
 fn render_key_value_line_as_json(line: &str) -> Result<String, String> {
     let trimmed = line.trim();
-    let (prefix, body) = trimmed
-        .split_once(':')
-        .ok_or_else(|| "missing `:` prefix separator".to_owned())?;
     let mut object = serde_json::Map::new();
-    object.insert(
-        "prefix".to_owned(),
-        serde_json::Value::String(prefix.trim().to_owned()),
-    );
+
+    // The prefix is DETECTED, not required — a leading whitespace-delimited
+    // token that ends with `:` and carries no `=`.
+    //
+    // Requiring it made `status --json` structurally impossible. Of the two
+    // commands `command_supports_json_render` advertises, only `netcheck`
+    // emits a `prefix:` label; the `status` line begins `node_id=…`. Splitting
+    // on the first `:` therefore landed inside the first colon-bearing VALUE
+    // (an endpoint like `203.0.113.77:443`), so every invocation failed and
+    // fell back to raw text — on a quiescent node with "missing `:` prefix
+    // separator", on an active one with "token without `=` separator: \"443\"".
+    //
+    // Detecting keeps netcheck byte-identical: its first token is `netcheck:`,
+    // which has no `=`. A status line's first token is `node_id=<id>`, which
+    // does, so it is treated as body. A value containing a colon can never be
+    // mistaken for a prefix because its token also contains `=`.
+    // An empty or whitespace-only line is an error, not `{}`. Rendering it as
+    // valid-but-empty JSON would suppress the raw-text fallback preamble and
+    // let a consumer's `d.get("state")` silently return its default — a
+    // missing answer dressed as a real one.
+    if trimmed.is_empty() {
+        return Err("empty response line".to_owned());
+    }
+
+    let (head, tail) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
+    let body = match head.strip_suffix(':') {
+        // `strip_suffix`, not `trim_end_matches`: the latter eats EVERY
+        // trailing colon, silently collapsing `netcheck::` to `netcheck`.
+        Some(label) if !head.contains('=') && !label.is_empty() => {
+            object.insert(
+                "prefix".to_owned(),
+                serde_json::Value::String(label.to_owned()),
+            );
+            tail
+        }
+        // No prefix: the whole line is body. `prefix` is then ABSENT rather
+        // than empty, so a consumer can tell "unlabelled line" from "label
+        // was the empty string".
+        _ => trimmed,
+    };
+
     for token in body.split_whitespace() {
         let (key, value) = token
             .split_once('=')
             .ok_or_else(|| format!("token without `=` separator: {token:?}"))?;
         if key.is_empty() {
             return Err(format!("empty key in token: {token:?}"));
+        }
+        // A repeated key is REJECTED rather than resolved last-wins.
+        //
+        // No legitimate producer emits one: both daemon format strings carry
+        // unique keys, and a real 86-token status capture has 86 unique keys.
+        // So a duplicate can only come from a token injected by a value that
+        // was never sanitized — `bootstrap_error`, `last_reconcile_error`,
+        // `port_forward_error`, `node_id` and `exit_node` are all emitted raw
+        // and may contain whitespace.
+        //
+        // Last-wins is fail-OPEN in exactly the wrong direction: an injected
+        // token lands LATER in the line than the field it shadows, and the
+        // early fields are the trust-bearing ones — `node_id`, `node_role`,
+        // `state`, `exit_node`. A node reporting `state=FailClosed` could be
+        // made to render `state=ExitActive`. Refusing the line keeps the
+        // raw-text fallback, which is visibly wrong rather than quietly wrong.
+        if object.contains_key(key) {
+            return Err(format!(
+                "duplicate key {key:?}: a repeated key cannot be distinguished \
+                 from a token injected by an unsanitized value"
+            ));
         }
         object.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
     }
@@ -27392,11 +27451,70 @@ mod tests {
         assert_eq!(parsed.as_object().unwrap().len(), 1);
     }
 
+    /// Superseded contract. This used to assert that a prefix-less line was an
+    /// ERROR, which is what made `status --json` structurally impossible: the
+    /// status line begins `node_id=…` and carries no label, so the renderer
+    /// rejected the very output one of its two supported commands produces.
+    /// A prefix-less line now renders, with `prefix` absent.
     #[test]
-    fn render_key_value_line_as_json_rejects_missing_colon() {
-        let line = "path_mode=direct_active";
-        let err = render_key_value_line_as_json(line).expect_err("must fail");
-        assert!(err.contains("missing `:` prefix separator"));
+    fn render_key_value_line_as_json_renders_a_prefixless_line() {
+        let json = render_key_value_line_as_json("path_mode=direct_active").expect("must render");
+        let obj: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(
+            obj.get("path_mode").and_then(|v| v.as_str()),
+            Some("direct_active")
+        );
+        assert!(
+            obj.get("prefix").is_none(),
+            "an unlabelled line must omit `prefix`, not emit an empty one"
+        );
+    }
+
+    /// The real `status` shape: no prefix, and a VALUE containing a colon.
+    /// Splitting on the first `:` landed inside that value and produced
+    /// `token without `=` separator: "443"`, so every `status --json` fell back
+    /// to raw text with a shape-drift preamble.
+    #[test]
+    fn render_key_value_line_as_json_renders_the_real_status_shape() {
+        let line = "node_id=node-a node_role=client state=Ready \
+                    selected_exit_peer_endpoint=203.0.113.77:443 \
+                    membership_active_nodes=5 gossip_state=unconfigured";
+        let json = render_key_value_line_as_json(line).expect("status line must render");
+        let obj: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert!(obj.get("prefix").is_none());
+        assert_eq!(obj.get("node_id").and_then(|v| v.as_str()), Some("node-a"));
+        assert_eq!(
+            obj.get("selected_exit_peer_endpoint")
+                .and_then(|v| v.as_str()),
+            Some("203.0.113.77:443"),
+            "a colon-bearing value must survive intact, not be split as a prefix"
+        );
+        assert_eq!(
+            obj.get("gossip_state").and_then(|v| v.as_str()),
+            Some("unconfigured")
+        );
+    }
+
+    /// Netcheck must be byte-identical to before — it is the one surface that
+    /// already worked, and this change must not be paid for by breaking it.
+    #[test]
+    fn render_key_value_line_as_json_keeps_the_netcheck_prefix_intact() {
+        let json = render_key_value_line_as_json("netcheck: path_mode=direct traversal_error=none")
+            .expect("netcheck must render");
+        let obj: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(obj.get("prefix").and_then(|v| v.as_str()), Some("netcheck"));
+        assert_eq!(
+            obj.get("path_mode").and_then(|v| v.as_str()),
+            Some("direct")
+        );
+
+        // A label with no body still yields just the label.
+        let bare = render_key_value_line_as_json("netcheck:").expect("bare label must render");
+        let bare_obj: serde_json::Value = serde_json::from_str(&bare).expect("valid json");
+        assert_eq!(
+            bare_obj.get("prefix").and_then(|v| v.as_str()),
+            Some("netcheck")
+        );
     }
 
     #[test]
@@ -27424,15 +27542,60 @@ mod tests {
         assert_eq!(parsed.get("epoch").and_then(|v| v.as_str()), Some("1"));
     }
 
+    /// Superseded contract. This used to assert last-wins, on the reasoning
+    /// that JSON object semantics resolve duplicates to the last value. That
+    /// was fail-OPEN once prefix-less lines began rendering: an injected token
+    /// lands LATER in the line than the field it shadows, so last-wins hands
+    /// the win to the injection, and the early fields are the trust-bearing
+    /// ones. A duplicate is now refused.
     #[test]
-    fn render_key_value_line_as_json_handles_repeated_keys_with_last_wins() {
-        // serde_json::Map preserves insertion order but the JSON object
-        // semantic says duplicates resolve to last value. We exercise that
-        // explicitly so consumers know the contract.
-        let line = "netcheck: status=ok status=fail";
-        let json = render_key_value_line_as_json(line).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("fail"));
+    fn render_key_value_line_as_json_rejects_repeated_keys() {
+        let err = render_key_value_line_as_json("netcheck: status=ok status=fail")
+            .expect_err("a repeated key must be refused");
+        assert!(err.contains("duplicate key"), "got: {err}");
+    }
+
+    /// The attack the duplicate check exists to stop, in its real shape: an
+    /// unsanitized `bootstrap_error` carrying whitespace injects a later
+    /// `state=` token that would otherwise overwrite the true one.
+    #[test]
+    fn render_key_value_line_as_json_refuses_a_shadowed_trust_field() {
+        let line = "node_id=node-a state=FailClosed \
+                    bootstrap_error=boom state=ExitActive";
+        let err =
+            render_key_value_line_as_json(line).expect_err("an injected duplicate must not render");
+        assert!(err.contains("duplicate key"), "got: {err}");
+        assert!(
+            err.contains("state"),
+            "the error must name the shadowed field: {err}"
+        );
+    }
+
+    /// An empty reply must fail, not render `{}`. Valid-but-empty JSON
+    /// suppresses the raw-text fallback and lets a consumer's `.get(...)`
+    /// default look like a real answer.
+    #[test]
+    fn render_key_value_line_as_json_rejects_empty_input() {
+        for line in ["", "   ", "\n", "\t "] {
+            assert!(
+                render_key_value_line_as_json(line).is_err(),
+                "expected Err for {line:?}, got a rendered object"
+            );
+        }
+    }
+
+    /// A whitespace-bearing unsanitized value still defeats `--json`. This is
+    /// the SECOND, independent reason status --json fails, and the prefix fix
+    /// does not touch it — pinned so the limitation is not mistaken for fixed.
+    #[test]
+    fn render_key_value_line_as_json_still_fails_on_unsanitized_whitespace_values() {
+        let line = "node_id=node-a bootstrap_error=signed state refresh failed node_role=client";
+        let err = render_key_value_line_as_json(line)
+            .expect_err("a whitespace-bearing value still breaks tokenisation");
+        assert!(
+            err.contains("token without `=` separator") || err.contains("duplicate key"),
+            "got: {err}"
+        );
     }
 
     #[test]
