@@ -8,11 +8,17 @@ bricked every existing node. No code should be written against this document unt
 §4's blockers are resolved and §5's operator decisions are made.
 
 **Provenance and trust level.** Everything below carries file:line citations from
-the agents that produced it. I have personally verified only what §1 marks
-`[verified]`. The rest is **agent-reported and must be re-verified against the
-code before it is relied on** — this session repeatedly produced confident,
-well-cited claims that were wrong, including three designs that were refuted after
-review and one factual error that reached a pushed commit (§1.1).
+the agents that produced it. Claims marked `[verified]` were then checked
+personally against the code; the rest remain **agent-reported and should be
+re-verified before being relied on** — this session repeatedly produced confident,
+well-cited claims that were wrong, including three designs refuted after review and
+one factual error that reached a pushed commit (§1.1).
+
+**Verified personally so far:** §1.1 (the env var name), §4.2 (in substance),
+§4.3 (as a *conditional* hazard, not a live one), §4.4 (fully), §4.5 (fully). The
+remaining blocker, §4.1, rests on the shipped systemd unit carrying no gossip
+config today — also verified: `scripts/systemd/rustynetd.service` passes
+`--gossip-watermark` and nothing else gossip-related.
 
 ---
 
@@ -127,32 +133,49 @@ The winner adds `Environment=RUSTYNET_GOSSIP_SIGNING_SECRET=...` plus
 has no gossip key, so every existing node would fail to start. Graft 3.1 replaces
 it. **This is the single most valuable output of the whole exercise.**
 
-### 4.2 "admit is the only place a key enters membership" is false
+### 4.2 "admit is the only place a key enters membership" is false `[verified]`
 
-Four other production writers of `node_pubkey_hex` are ungated — including
-`membership propose-add` and the rotation path the design itself mandates. The
+Other production writers of `node_pubkey_hex` are ungated. Verified two directly —
+`parser.required("--node-pubkey")` flows straight into a membership operation at
+`rustynet-cli/src/main.rs:5881-5892` and again at `:6056-6071`, both distinct from
+the admit path at `:8399`. The agent reported four; two is already enough to void
+the claim. The
 legacy operator-typed `--pubkey` path also survives, and the proof-of-possession
 flow is **opt-in** (`--request-file` is mutually exclusive with `--pubkey`). So the
 correctness-by-construction claim the ranking rests on does not hold.
 
-### 4.3 The enrollee authors its own capabilities
+### 4.3 The enrollee would author its own capabilities `[verified as conditional]`
 
-With `--request-file`, `roles` come from a file the **enrollee** wrote and signed
-with its own key, and roles are the capability grant. This would let a joining node
+**This is a hazard the proposed design would create, not a live defect** — a
+distinction worth keeping, because the two call for different urgency. Verified:
+capabilities are derived directly from roles
+(`capabilities: enrollee_capabilities_from_roles(&ctx.roles)?`,
+`rustynet-control/src/enrollment.rs:178`), but today `ctx.roles` comes from the
+**operator's** `--roles` (`config.roles`, `rustynet-cli/src/main.rs:8401`), and the
+function's own doc calls them "the operator's `--roles` tokens" (`:209`). Under the
+proposed `--request-file`, roles would instead come from a file the **enrollee**
+wrote and signed with its own key, and roles are the capability grant. This would let a joining node
 choose its own privileges. Any PoP design must take identity from the request and
 **capabilities from the admitting operator**.
 
-### 4.4 Existence checks test a decoy
+### 4.4 Existence checks test a decoy `[verified]`
 
 Every "is it provisioned" check in the design tests the **configured path**, which
-the loader never opens (§1.2). The gate can read true while the object the daemon
+the loader never opens. Verified directly: `decrypt_private_key`
+(`key_material.rs:521-542`) uses that path only to build a custody manager from its
+**parent** and a key id `wg-private-<sha256(path_string)[0..8] hex>`
+(`key_custody_key_id`, `:779-788`), then calls `manager.load_private_key(&key_id)`.
+The path is a **naming input, not a file that is read**. The gate can read true while the object the daemon
 actually needs is absent — and because the daemon aborts startup on a custody
 failure, that is a **whole-node outage, not a gossip outage**.
 
-### 4.5 Linux production never gets a secret
+### 4.5 Linux production never gets a secret `[verified]`
 
 The proposed Linux mint sits inside `ops e2e-bootstrap-host`, behind the
-**default-off `vm-lab` feature**. So production Linux nodes would receive a unit
+**default-off `vm-lab` feature** — verified: `#[cfg(feature = "vm-lab")]` sits
+directly above the `"e2e-bootstrap-host"` parse arm
+(`crates/rustynet-cli/src/main.rs:5645-5646`), so the verb does not exist in a
+default build. So production Linux nodes would receive a unit
 demanding a file that nothing mints. Combined with §4.1 this is the fleet brick
 twice over. Relatedly, the Linux path passes `--force`, which is reportedly
 *mandatory for decryptability* there yet **silently rotates the identity** of an
