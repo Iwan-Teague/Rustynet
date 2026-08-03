@@ -685,6 +685,29 @@ the specific thing that is invisible today.
     "this kind has never happened" from "this kind does not exist" without reading
     the source.
 
+15. **A truncated netcheck line records a cross-network run as a PASS.** Found while
+    auditing the status line's consumers; not a gossip defect, recorded here because
+    this is the active defect ledger and it is the same false-green class CLAUDE.md
+    §12.3 warns about. `ops_cross_network_reports.rs:1873-1913` gates a pass verdict
+    on five fields — `traversal_alarm_state`, `traversal_alarm_reason`,
+    `dns_alarm_state`, `dns_alarm_reason`, `traversal_error` — each with
+    `.as_deref().is_some_and(...)`, so an **absent** field satisfies the gate. The
+    verdict is `problems.is_empty()`.
+
+    Why that is reachable: `path_mode` is netcheck field **1** and is mandatory
+    (`ok_or_else` at `:391`), but those five are fields **59, 60, 61, 62 and 68**. A
+    line truncated anywhere after the mandatory prefix clears it and then passes
+    every alarm gate by absence, recording a pass on evidence carrying no alarm
+    state at all. The file's own convention two blocks up is the correct shape —
+    `transport_socket_identity_local_addr` uses `is_none_or`, treating absence as a
+    problem.
+
+    Note when fixing: `traversal_error` is on **netcheck only**, not `status`, while
+    the CLI flag is named `--path-status-line`. Requiring its presence correctly
+    rejects a status line, so the message must say so or the next person meets a
+    confusing failure instead of a confusing pass. The three shipped callers pass
+    `"$client_netcheck"`, so requiring presence breaks none of them.
+
 These are pre-existing (except 13 and 14, which are stated limits of what shipped),
 out of scope for a read-only observability change, and must not be silently bundled
 into it.
