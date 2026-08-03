@@ -12,7 +12,10 @@ adversarial review called a **ship-blocker, not a nice-to-have**.
 §6's acceptance ("the totals move under real traffic; a rate-limited origin is
 visible") cannot be satisfied by **any configuration currently in this repo**.
 `build_gossip_node` (`daemon.rs:4036`) returns `None` unless both
-`RUSTYNET_GOSSIP_SIGNING_SECRET_PATH` and its passphrase path are set, and
+`RUSTYNET_GOSSIP_SIGNING_SECRET` and `RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE`
+are set (note: **no `_PATH` suffix** — the Rust constant is named
+`GOSSIP_SIGNING_SECRET_PATH_ENV` but its value is not, and copying the identifier
+name would set a variable the daemon never reads), and
 **nothing sets them** — not a systemd unit, not a launchd plist, not a bootstrap
 script, not an orchestrator stage. Only the CLI argument parser
 (`main.rs:2978`, `:2992`) reads those fields at all. (`--gossip-watermark` *is*
