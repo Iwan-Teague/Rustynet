@@ -534,12 +534,48 @@ is reached by setting `gossip_bind_addr` to an unbindable address before
    everything except the thing at risk. It now forces a real bind failure and
    asserts the local bind address does not appear.
 
-**Mutation verification: 21 mutations, each caught by its own test** — including
-the identity fail-open (`unknown`→`false`), reading the sticky latch, dropping
-either push counter, the field transposition, `continue`→`break`, and leaking the
-bind address. Two guards are structural rather than assertion-based: the
-distinctness check fires with its own message, and dropping an enum arm is a
-compile error.
+### 5.2 Mutation verification — the record, not the claim
+
+Every behaviour above was verified by breaking it and confirming the **specific**
+test failed, then restoring. Recorded in full because a bare count is exactly the
+kind of unauditable assertion this plan spent a commit removing from its own
+citations.
+
+| # | Mutation applied | Caught by |
+| --- | --- | --- |
+| M1 | `gossip_identity_mismatch_state` returns `false` instead of `unknown` on the no-node early return | `status_reports_identity_mismatch_as_unknown_when_uncheckable` |
+| M2 | read the sticky `gossip_identity_mismatch_warned` latch instead of computing fresh | `status_reports_identity_mismatch_true_and_false_from_live_inputs` |
+| M3 | drop `gossip_transport_error = None` on successful bind | `status_reports_transport_error_and_clears_it_on_successful_bind` |
+| M4 | emit the raw `io::Error` unsanitised | `status_gossip_transport_error_is_sanitised_and_capped` |
+| M5 | drop `sort_unstable_by_key` on the reject-reason list | `status_reject_reasons_are_deterministically_ordered` |
+| M6 | drop the epidemic re-push counter, keep the mint one | `push_failures_are_counted_on_the_repush_path` |
+| M7 | collapse `attached_pending_transport` into `active` | `status_reports_attached_pending_transport_when_bind_failed` |
+| M8 | drop the inbound decode-error counter | `status_counts_inbound_decode_errors` |
+| M9 | render a peer's port in place of `peers.len()` | `status_gossip_tokens_contain_no_addresses_or_node_ids` |
+| M10 | interpolate the gossip block mid-line instead of appending | `status_appends_gossip_fields_without_reordering_existing_ones` |
+| M11 | hardcode accepted/minted/push counters to zero | `status_reports_gossip_accept_mint_and_reject_totals` |
+| M12 | remove `origin_rate_limited` from `ALL_GOSSIP_REJECT_KINDS` | `every_error_kind_is_listed_in_the_published_vocabulary` |
+| M13 | drop the mint-path push counter | `push_failures_are_counted_on_the_mint_path` |
+| M14 | revert `continue` to `break` in the drain error arm | `status_counts_every_malformed_datagram_not_just_one_per_drain` |
+| M16 | transpose `{recv_errors}` and `{rejected}` in the format string | `status_reports_gossip_accept_mint_and_reject_totals` |
+| M18 | interpolate the bind address into `gossip_transport_error` | `status_gossip_tokens_contain_no_addresses_or_node_ids` |
+| M19 | make two sampled values equal | same test's pairwise-distinctness guard |
+| M20 | drop one arm from the exhaustive mirror | **build failure**, `error[E0004]` |
+| M21 | drop the clear in `attach_gossip_runtime` | `attach_gossip_runtime_clears_a_stale_transport_error` |
+| M22 | mirror returns a kind string that disagrees with `error_kind` | `every_error_kind_is_listed_in_the_published_vocabulary` |
+
+Two guards are structural rather than assertion-based: M19 trips the distinctness
+check with its own message, and M20 is a compile error. M15 and M17 were planned
+and superseded (folded into M19 and M16); the numbering is the order applied and is
+left as-is so the record matches what happened rather than being tidied afterwards.
+
+**M16 and M18 are why this table exists.** Both were first run with the fixes
+*uncommitted*, so the `git checkout -- <file>` that restored each mutation also
+reverted the fixes, and both mutations then "passed" against the previous
+revision's weaker tests. The false green was caught only because two passes were
+implausible. This is CLAUDE.md §5.1 rule 3 exactly — commit before you experiment —
+and it is recorded here because the failure mode is a green result that means
+nothing.
 
 **Two revisions' test defects, fixed.** Revision 2's
 `status_gossip_fields_contain_no_addresses_or_node_ids` was unpassable as worded —
