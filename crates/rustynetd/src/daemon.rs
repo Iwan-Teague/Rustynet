@@ -26772,6 +26772,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    /// The status line's key SET must be identical across configurations, and
+    /// free of duplicates. Two separate invariants, both load-bearing:
+    ///
+    /// **Unconditional.** Every consumer is token-anchored
+    /// (`split_whitespace` + `strip_prefix("key=")`) and treats a missing key
+    /// as `None`. A key that appears only in some configurations turns a
+    /// consumer's "field absent" branch into a silent configuration-dependent
+    /// answer — which is exactly how an absent field came to evidence a
+    /// cross-network pass.
+    ///
+    /// **Duplicate-free.** `rustynet status --json` now REJECTS a repeated
+    /// key, because a duplicate cannot be distinguished from a token injected
+    /// by an unsanitized value. So a future field whose name collides with an
+    /// existing one would not merely be untidy — it would silently disable
+    /// `--json` for every node.
+    #[cfg(unix)]
+    #[test]
+    fn status_line_key_set_is_unconditional_and_duplicate_free() {
+        fn keys_of(line: &str) -> Vec<String> {
+            line.split_whitespace()
+                .filter_map(|token| token.split_once('=').map(|(key, _)| key.to_owned()))
+                .collect()
+        }
+
+        let (mut runtime, test_dir) = gossip_runtime_for_status("rustynetd-status-key-set");
+
+        // Configuration 1: gossip unconfigured, no exit node selected.
+        let baseline = runtime.handle_command(IpcCommand::Status).message;
+
+        // Configuration 2: gossip node present but transport unattached.
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[59u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        let attached_pending = runtime.handle_command(IpcCommand::Status).message;
+
+        // Configuration 3: gossip fully active, plus a selected exit node so
+        // the exit-related values leave their `none` defaults.
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+        runtime.sync_gossip_data_plane(None);
+        runtime.selected_exit_node = Some("node-exit".to_owned());
+        let active = runtime.handle_command(IpcCommand::Status).message;
+
+        let baseline_keys = keys_of(&baseline);
+        assert!(
+            baseline_keys.len() > 90,
+            "sanity: the status line should carry the full schema, got {} keys",
+            baseline_keys.len()
+        );
+
+        for (label, line) in [
+            ("unconfigured", &baseline),
+            ("attached_pending_transport", &attached_pending),
+            ("active", &active),
+        ] {
+            let keys = keys_of(line);
+
+            let mut unique = keys.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                keys.len(),
+                "{label}: duplicate key on the status line would silently disable \
+                 `status --json`; line: {line}"
+            );
+
+            assert_eq!(
+                keys, baseline_keys,
+                "{label}: the status key set must not vary with configuration"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     /// The Windows IPC response cap is a hard failure, not a truncation,
     /// and gossip cannot run on Windows — so the suffix is fixed there.
     /// Pinning the exact width keeps the §4.3 headroom arithmetic honest.
@@ -28533,7 +28612,18 @@ mod tests {
 
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
-        assert!(status.message.contains("state="));
+        // Token-anchored, not `contains("state=")`. That substring is satisfied
+        // by five other keys on this line — `dns_alarm_state`, `dns_zone_state`,
+        // `relay_session_state`, `transport_socket_identity_state` and
+        // `traversal_alarm_state` — so it asserted nothing about `state` itself.
+        assert!(
+            status
+                .message
+                .split_whitespace()
+                .any(|token| token.starts_with("state=")),
+            "status must carry a `state` token: {}",
+            status.message
+        );
 
         let select = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_owned()));
         assert!(select.ok);
