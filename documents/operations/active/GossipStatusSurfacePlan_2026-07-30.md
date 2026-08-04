@@ -723,6 +723,28 @@ the specific thing that is invisible today.
     satisfies that one gate by absence. Closing it needs the producer recorded on
     the evidence, or the soak suite moved to `netcheck` and proven in the lab.
 
+16. **The same absence-tolerant gate shape survives in `ops_phase1.rs`** —
+    NOT fixed, deliberately, and the reason is worth recording.
+    `crates/rustynet-cli/src/ops_phase1.rs:1605-1610` gates a perf metric with
+    `metric.status.as_deref().is_some_and(|s| s == "fail" || s == "not_measurable")`,
+    so a metric carrying **no** `status` clears the failure check — while `name`
+    and `value` on the same entry are mandatory via `ok_or_else` (`:1584-1598`).
+    Identical shape to defect 15.
+
+    Evidence gathered, which points toward fixing it: all **22** real metric
+    entries across `artifacts/**/*.json` carry `status`; both in-repo fixtures
+    carry it (`ops_phase1.rs:2623`, `:2673`); and the typed view already rejects
+    a non-string `status`, so the schema plainly expects a complete metric.
+
+    Why it was still not shipped: these metrics are written by **external perf
+    tooling**, and unlike defect 15's four shell callers I cannot enumerate the
+    producers from the repository. Requiring presence would convert a passing
+    perf gate into a hard error at an unknown future moment. That is the exact
+    failure this ledger recorded one entry ago, where "all the callers do X" was
+    established by grepping one pattern and missed a caller that used a helper.
+    Fixing it needs the producer set established first — then it is a
+    three-line change modelled on `require_pass_gate_field`.
+
 These are pre-existing (except 13 and 14, which are stated limits of what shipped),
 out of scope for a read-only observability change, and must not be silently bundled
 into it.
