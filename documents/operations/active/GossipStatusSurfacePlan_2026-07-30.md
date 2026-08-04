@@ -745,6 +745,44 @@ the specific thing that is invisible today.
     Fixing it needs the producer set established first — then it is a
     three-line change modelled on `require_pass_gate_field`.
 
+17. **`free_listen_port()` is a TOCTOU race that can abort the entire gate** —
+    analysed, NOT fixed, and the three obvious fixes are all illusory, which is
+    why this entry is worth its length.
+
+    `crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs:673` and
+    `tests/conformance.rs:97` both bind an ephemeral UDP port, read the number,
+    and **drop the socket on return** — releasing the port. The caller re-binds
+    it later. Between release and re-bind, any sibling can claim it. 69 call
+    sites share the two helpers.
+
+    Observed 2026-08-04: `linux_userspace_shared_backend_initiate_peer_handshake_uses_authoritative_socket`
+    failed with `bind failed on 0.0.0.0:64950: Address already in use (os error
+    48)` under load from 13 concurrent agents, and passed in isolation
+    immediately after. **The blast radius is the point:** the gate runs
+    `--retries 0` and fail-fast, so that one flake left **10,155 of 10,345 tests
+    unrun** while reporting a failure indistinguishable at a glance from a real
+    regression.
+
+    Note it is NOT a network-change artefact: `EADDRINUSE` on a **wildcard**
+    bind is interface-independent — an interface change yields `EADDRNOTAVAIL`
+    on a specific-IP bind instead.
+
+    **Why the cheap fixes do not work**, each checked:
+    - *Retry inside the helper* — the helper does not perform the real bind, so
+      a retry re-runs the same racy probe.
+    - *Hold the probe socket to reserve the port* — the real bind would then
+      collide with our own probe. Verified there is no `SO_REUSEPORT` anywhere
+      in the crate, so two binds to one UDP port cannot coexist.
+    - *Deterministic per-process range* — bases derived from pid collide
+      whenever pids differ by the range size, trading a rare race for a rarer
+      one.
+
+    The fix that works is an API change: hand the caller the **bound socket**
+    rather than a port number, so the reservation is never released.
+    `new_for_test` takes `listen_port: u16`
+    (`userspace_shared/mod.rs:82-86`), so this is a real refactor across 69
+    sites — deliberate work, not a drive-by.
+
 These are pre-existing (except 13 and 14, which are stated limits of what shipped),
 out of scope for a read-only observability change, and must not be silently bundled
 into it.
