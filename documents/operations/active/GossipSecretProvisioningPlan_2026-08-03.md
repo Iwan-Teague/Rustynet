@@ -84,6 +84,55 @@ daemon at a key file" suggests:
   (`error contains "unix-only"` for `/tmp/...` paths) cannot hold on Windows.
   That is a pre-existing defect in an existing test, not in this work.
 
+## 1.4 NEW EVIDENCE (2026-08-04) — a working provisioning precedent exists
+
+The design round below ranked **enrollment-first** first and **provisioning-parity**
+second, partly on the grounds that parity "adds no new enforcement". That ranking
+was made without the following fact, which materially weakens it.
+
+**The systemd installer already provisions a daemon secret — just not this one.**
+`crates/rustynet-cli/src/ops_install_systemd.rs` defines
+`ENROLLMENT_SECRET_PATH = "/var/lib/rustynet/keys/enrollment.secret"` (`:38`),
+generates it as exactly 32 raw bytes for admin nodes (`:830-843`), and the service
+template already points `--enrollment-secret` at it (`:818`). A test pins that the
+install path matches the daemon's default (`:2955-2961`).
+
+In the same file, `grep -c GOSSIP_SIGNING_SECRET` returns **0**.
+
+So the installer knows how to mint, permission and wire a daemon secret. It simply
+never learned to do it for gossip. That makes provisioning-parity a
+**fill-in-the-template** change rather than a novel design, and it is the argument
+the original ranking lacked.
+
+**Correction to the security ledger:** `AdversarialSecurityRemediation_2026-07-29.md`
+lists **ENR-12** as "the daemon never provisions the enrollment secret,
+contradicting the module doc". The installer evidence above says the enrollment
+secret **is** provisioned. That row is stale or wrong and should be re-checked
+before anyone acts on it.
+
+### 1.5 Consequence — a phased split that removes two of the three blockers
+
+The three operator decisions in §5 were all attached to the *enforcement* half of
+enrollment-first. Splitting provisioning from enforcement defers two of them:
+
+- **Phase 1 — provision only.** Mint and wire the gossip secret exactly as the
+  enrollment secret is wired. No enforcement, no admission validation, no
+  membership migration, no recovery verb. Gossip *runs*. This needs only §5.1
+  (passphrase separation), and even that can default to parity-with-enrollment
+  with the residual stated.
+- **Phase 2 — enforcement, informed by Phase 1 data.** §5.2 asks whether existing
+  membership entries get migrated. **That question is currently unanswerable
+  because nobody can see the answer.** Once Phase 1 lands, the
+  `gossip_identity_mismatch` field shipped in `001c23b1` reports, per node,
+  whether membership publishes the node's real gossip verifying key — `true`,
+  `false`, or `unknown`. The observability built for this subsystem becomes the
+  instrument that decides its own enforcement policy.
+
+§4's five ship-blockers were all raised against enrollment-first. §4.1 (the fleet
+brick) and §4.4 (the decoy existence check) apply to **any** design and remain
+mandatory. §4.2, §4.3 and §4.5 are specific to the enrollment/admission half and
+fall out of Phase 1 scope entirely.
+
 ## 2. Direction chosen: enrollment-first
 
 Of three designs — **enrollment-first**, **provisioning-parity**, **lab-first** —
