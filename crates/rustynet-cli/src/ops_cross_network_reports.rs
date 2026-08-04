@@ -387,6 +387,33 @@ fn extract_optional_u64_inline_field(line: &str, key: &str) -> Result<Option<u64
     }
 }
 
+/// Gate one pass-report field: absent is a problem, and so is a disallowed
+/// value, reported distinctly so the operator is told which of the two
+/// happened.
+///
+/// Absence must never satisfy a gate guarding a PASS verdict. Only use this
+/// for fields BOTH `rustynet netcheck` and `rustynet status` emit — a field
+/// carried by just one of them would make whichever suites use the other
+/// producer permanently un-passable.
+fn require_pass_gate_field(
+    problems: &mut Vec<String>,
+    field: &str,
+    value: Option<&str>,
+    is_disallowed: impl Fn(&str) -> bool,
+    disallowed_message: &str,
+) {
+    match value {
+        None => problems.push(format!(
+            "path_evidence.{field} is missing; a pass report must carry it. Both \
+             `rustynet netcheck` and `rustynet status` emit this field, so its absence \
+             means the evidence line was truncated or is not a daemon status line — \
+             it does not mean there was no alarm"
+        )),
+        Some(value) if is_disallowed(value) => problems.push(disallowed_message.to_owned()),
+        Some(_) => {}
+    }
+}
+
 fn path_evidence_from_status_line(status_line: &str) -> Result<Value, String> {
     let path_mode = extract_inline_field(status_line, "path_mode")
         .ok_or_else(|| "status line missing path_mode".to_owned())?;
@@ -1870,45 +1897,71 @@ fn validate_report_payload(
                     "path_evidence.transport_socket_identity_local_addr must be a non-empty backend local address".to_owned(),
                 );
             }
-            if traversal_alarm_state
-                .as_deref()
-                .is_some_and(|value| matches!(value, "critical" | "error" | "missing"))
-            {
-                problems.push(
-                    "path_evidence.traversal_alarm_state must not be critical|error|missing for pass reports".to_owned(),
-                );
-            }
-            if dns_alarm_state
-                .as_deref()
-                .is_some_and(|value| matches!(value, "critical" | "error" | "missing"))
-            {
-                problems.push(
-                    "path_evidence.dns_alarm_state must not be critical|error|missing for pass reports".to_owned(),
-                );
-            }
+            // These gates decide whether a cross-network run may be recorded
+            // as a PASS. They used `is_some_and`, so an ABSENT field satisfied
+            // its gate — fail-open on a trust-reporting surface, which §10.4
+            // forbids: absence of evidence was read as evidence of absence.
+            //
+            // The four alarm fields below are emitted by BOTH `rustynet
+            // netcheck` and `rustynet status`, so requiring their presence
+            // cannot break any producer. `transport_socket_identity_local_addr`
+            // above already has this shape.
+            require_pass_gate_field(
+                &mut problems,
+                "traversal_alarm_state",
+                traversal_alarm_state.as_deref(),
+                |value| matches!(value, "critical" | "error" | "missing"),
+                "path_evidence.traversal_alarm_state must not be critical|error|missing for pass reports",
+            );
+            require_pass_gate_field(
+                &mut problems,
+                "dns_alarm_state",
+                dns_alarm_state.as_deref(),
+                |value| matches!(value, "critical" | "error" | "missing"),
+                "path_evidence.dns_alarm_state must not be critical|error|missing for pass reports",
+            );
+            require_pass_gate_field(
+                &mut problems,
+                "traversal_alarm_reason",
+                traversal_alarm_reason.as_deref(),
+                |value| value != "none",
+                "path_evidence.traversal_alarm_reason must equal none for pass reports",
+            );
+            require_pass_gate_field(
+                &mut problems,
+                "dns_alarm_reason",
+                dns_alarm_reason.as_deref(),
+                |value| value != "none",
+                "path_evidence.dns_alarm_reason must equal none for pass reports",
+            );
+
+            // `traversal_error` deliberately KEEPS the absence-tolerant shape,
+            // and the reason is a real producer rather than caution.
+            //
+            // It is emitted by `netcheck` only — it is not on the `status`
+            // line. Three of the four suites feed this validator
+            // `rustynet netcheck` output, but the soak suite feeds
+            // `rustynet status`
+            // (live_linux_cross_network_remote_exit_soak_test.sh, via
+            // `live_lab_status`). Requiring presence here would make that
+            // suite permanently un-passable — its report would never be
+            // written, and `collect_report_paths` requires it for readiness.
+            // Turning a real green run into a hard generation error is a worse
+            // outcome than the gap it would close.
+            //
+            // RESIDUAL, stated rather than hidden: a netcheck line truncated
+            // between field 62 (`dns_alarm_reason`) and field 68
+            // (`traversal_error`) still satisfies this one gate by absence.
+            // The four gates above catch every truncation earlier than 62.
+            // Closing this properly needs the producer recorded on the
+            // evidence, or the soak suite switched to `netcheck` and proven in
+            // the lab — neither belongs in a validator-only change.
             if traversal_error
                 .as_deref()
                 .is_some_and(|value| value != "none")
             {
                 problems.push(
                     "path_evidence.traversal_error must equal none for pass reports".to_owned(),
-                );
-            }
-            if traversal_alarm_reason
-                .as_deref()
-                .is_some_and(|value| value != "none")
-            {
-                problems.push(
-                    "path_evidence.traversal_alarm_reason must equal none for pass reports"
-                        .to_owned(),
-                );
-            }
-            if dns_alarm_reason
-                .as_deref()
-                .is_some_and(|value| value != "none")
-            {
-                problems.push(
-                    "path_evidence.dns_alarm_reason must equal none for pass reports".to_owned(),
                 );
             }
         }
@@ -3521,6 +3574,84 @@ mod tests {
                 "relay_samples must equal 0 for authoritative direct-path soak evidence"
             )),
             "expected soak relay-sample rejection, got: {errors:?}"
+        );
+    }
+
+    /// The false-green this gate exists to stop. Each of the five pass-gating
+    /// fields, when ABSENT, must be its own problem — previously `is_some_and`
+    /// let absence satisfy the gate, so a netcheck line truncated after its
+    /// mandatory prefix (`path_mode` is field 1; these are fields 59-68)
+    /// recorded a PASS carrying no alarm evidence whatsoever.
+    #[test]
+    fn validate_report_payload_rejects_pass_status_with_a_missing_alarm_field() {
+        // `traversal_error` is deliberately NOT in this list: it is
+        // netcheck-only, and the soak suite legitimately supplies a
+        // `rustynet status` line that lacks it. See the residual note at the
+        // gate.
+        for field in [
+            "traversal_alarm_state",
+            "dns_alarm_state",
+            "traversal_alarm_reason",
+            "dns_alarm_reason",
+        ] {
+            let temp_dir = TempDir::create().expect("temp dir");
+            let spec = report_spec_by_suite("cross_network_direct_remote_exit")
+                .expect("direct spec exists");
+            let report_path = temp_dir.path().join(spec.filename);
+            let mut payload =
+                report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
+            payload
+                .as_object_mut()
+                .expect("payload object")
+                .get_mut("path_evidence")
+                .and_then(Value::as_object_mut)
+                .expect("path evidence object")
+                .remove(field);
+
+            let errors =
+                validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
+
+            assert!(
+                errors
+                    .iter()
+                    .any(|entry| entry.contains(&format!("path_evidence.{field} is missing"))),
+                "a missing {field} must not satisfy a pass gate, got: {errors:?}"
+            );
+        }
+    }
+
+    /// The soak suite feeds this validator a `rustynet status` line, which
+    /// carries the four alarm fields but NOT `traversal_error`. Requiring
+    /// `traversal_error`'s presence would make that suite permanently
+    /// un-passable — its report would never be written, and readiness requires
+    /// it. This pins that a status-shaped payload still validates.
+    ///
+    /// Asserts `errors.is_empty()`, not merely the absence of one message: an
+    /// earlier version checked only that a specific string was missing, which
+    /// passed trivially when the fix was reverted and the string ceased to
+    /// exist. It had no discriminating power at all.
+    #[test]
+    fn validate_report_payload_accepts_a_status_shaped_payload_without_traversal_error() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let spec =
+            report_spec_by_suite("cross_network_remote_exit_soak").expect("soak spec exists");
+        let report_path = temp_dir.path().join(spec.filename);
+        let mut payload =
+            report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
+        payload
+            .as_object_mut()
+            .expect("payload object")
+            .get_mut("path_evidence")
+            .and_then(Value::as_object_mut)
+            .expect("path evidence object")
+            .remove("traversal_error");
+
+        let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
+
+        assert!(
+            errors.is_empty(),
+            "a `rustynet status` shaped payload must still validate — the soak suite \
+             supplies one and would otherwise be un-passable; got: {errors:?}"
         );
     }
 
