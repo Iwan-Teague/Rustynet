@@ -702,11 +702,26 @@ the specific thing that is invisible today.
     `transport_socket_identity_local_addr` uses `is_none_or`, treating absence as a
     problem.
 
-    Note when fixing: `traversal_error` is on **netcheck only**, not `status`, while
-    the CLI flag is named `--path-status-line`. Requiring its presence correctly
-    rejects a status line, so the message must say so or the next person meets a
-    confusing failure instead of a confusing pass. The three shipped callers pass
-    `"$client_netcheck"`, so requiring presence breaks none of them.
+    **CORRECTION — the sentence that stood here was wrong, and the error is worth
+    keeping visible.** It said there were three callers, all passing
+    `"$client_netcheck"`, so requiring `traversal_error`'s presence broke none of
+    them. There are **four**. The fourth is
+    `live_linux_cross_network_remote_exit_soak_test.sh:548`, which passes
+    `live_lab_status` output — i.e. `rustynet status`, which does **not** emit
+    `traversal_error`. Requiring its presence would have made the soak suite
+    permanently un-passable: its report is never written, and `collect_report_paths`
+    requires it for readiness. A real green run would have become a hard generation
+    error — strictly worse than the gap being closed. Caught by adversarial review
+    of the fix; the note had identified the exact hazard and then dismissed it on a
+    miscount.
+
+    Fixed in `ed1aa8a0` (amended): presence is required only for the four alarm
+    fields **both** producers emit — `traversal_alarm_state`,
+    `traversal_alarm_reason`, `dns_alarm_state`, `dns_alarm_reason`.
+    `traversal_error` keeps the absence-tolerant shape. **Residual, stated rather
+    than hidden:** a netcheck line truncated between field 62 and field 68 still
+    satisfies that one gate by absence. Closing it needs the producer recorded on
+    the evidence, or the soak suite moved to `netcheck` and proven in the lab.
 
 These are pre-existing (except 13 and 14, which are stated limits of what shipped),
 out of scope for a read-only observability change, and must not be silently bundled
