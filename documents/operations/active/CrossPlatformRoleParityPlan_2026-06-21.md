@@ -61,6 +61,39 @@ validator only (no live runtime) · ❌ untested / not implemented · 🔒 block
 | relay (live session forwarding) | ✅ | ✅ **lifecycle LIVE-PROVEN 2026-06-27** (orchestrate stage, run `livelab-1782571161`, commit `cd6a834`, `--relay-platform macos`): `validate_macos_relay_service_lifecycle` PASS — install/bootstrap → active (`/healthz` ok, `127.0.0.1:4501` bound) → stop/release (released after stop). The loopback `/healthz` wedge that blocked this was fixed by `574eaac` (the macOS PF killswitch now emits `pass quick on lo0 all` — previously it wedged loopback TCP, SYN_RCVD on `127.0.0.1:4501` → empty `/healthz`; verified in the live render path `render_macos_killswitch_pf_rules` phase10.rs, scoped to lo0 before the terminal `block drop out quick all`, at parity with the Linux killswitch's `oifname "lo" accept`). Earlier focused-proof on .210 2026-06-22 (`356f8a3`): `install-macos-relay` → relay `state=running`, `127.0.0.1:4501` bound, `/healthz={"status":"ok",...}` → `--uninstall` → released. Live cell `exercise_macos_relay_lifecycle_live` fixed (upload the static reviewed `com.rustynet.relay.plist` + run from a temp cwd since the bootstrap build dir is ephemeral; derive `--verifier-key` from the distributed trust verifier `trust-evidence.pub` written root-owned via `tee`, since `assignment.pub` is not distributed to macOS). **Live session forwarding remains HP-3-gated** (no live forwarding proven on ANY OS yet — the same cross-OS gate as the Linux ✅; macOS relay is now at lifecycle parity with Linux). | 🟠 SCM lifecycle **contract** only (`validate_windows_relay_service_lifecycle_contract`, "without guest mutation") — no live forwarding |
 | live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ✅ **LIVE-PROVEN 2026-07-04** (`livelab-1783135864-2fda3979d599`, commit `2fda397`): `validate_macos_role_transition` (`--role-switch-platform macos`) drove a real `LocalOnly` client->admin flip on `macos-utm-1` via `rustynet role set` + launchd bootout/bootstrap, asserted the new role via `role status`, ran `state refresh`, and asserted mesh peers did not regress across the flip (0 before/after, expected for a `--skip-linux-live-suite` run). `SignedMembership`-kind transitions (capability changes) are a separate follow-up. | ✅ **LIVE-PROVEN 2026-07-04** (`livelab-1783174602-844175f5ad2a`, commit `5516711`): `validate_windows_role_transition` drove a real `LocalOnly` client->admin flip on `windows-utm-1` via `rustynet role set` + `Stop-Service`/`Start-Service`, verified via `role status`, ran `state refresh`, and asserted mesh peers did not regress (0 before/after). The capability gap that blocked the first live run (`livelab-1783142381-8816bf73333b` FAIL — the installed Windows CLI had no daemon IPC client, and `update_node_role_env_file` didn't parse the `RUSTYNETD_DAEMON_ARGS_JSON` array format) was closed by `c51f00a`. See `CrossOsRoleSwitchPlan_2026-06-24.md` status header for the full history. |
 
+### 3.1 The Windows exit blocker is HARDWARE-SOLVED — the cell is unrun, not blocked (2026-08-04)
+
+The 🔒 on the Windows exit row reflects `windows-utm-1`, the Apple-Silicon UTM
+guest, where WinNAT genuinely cannot run (x86_64 emulated, no nested virt). That
+is not the only Windows guest in the lab.
+
+**`windows-x86-1` exists and is purpose-built for this cell.** From
+`vm_lab_inventory.json`: Windows 11 Pro 25H2 x86_64 on `ubuntu-kvm-1` (the
+x86-64 KVM box), `192.168.121.108`, `exit_capable: true`, and its own notes
+record **`New-NetNat` + `Get-NetNatSession` proven live 2026-07-24** — the exact
+primitive the UTM guest cannot provide. Toolchain is ready: rustc/cargo 1.88.0,
+MSVC Build Tools at `C:\BuildTools` with `link.exe` resolving through VsDevCmd
+(2026-07-25), key-auth as `labadmin` verified.
+
+The inventory states the remaining gap plainly: **"The active_exit / WinNAT cell
+run itself is still PENDING."** So this is queued work, not a blocker. The same
+applies to the Windows relay row — its 🟠 is a contract/dry-run validator
+"without guest mutation", which a real mutable x86-64 guest unblocks.
+
+Two operational notes for whoever runs it, both from the inventory record and
+both easy to lose an hour to: this guest **does not answer ICMP** (Defender
+blocks inbound echo), so judge reachability by TCP/22 or `virsh` domain state and
+never by ping; and its SSH password lives in the untracked secrets sidecar, which
+does not exist on a fresh checkout.
+
+**`blind_exit` on Windows is a different category and no hardware unblocks it.**
+It is refused in code — `rustynet-cli/src/main.rs:13924` returns "blind_exit role
+is supported on Linux/macOS only", and `rustynet-operator/src/role.rs:113`
+reverts to client. Proving it on Windows is a product decision plus an
+implementation, not a lab run. Whether "out of scope by design" survives this
+plan's own "no OS may be a capability limiter" mandate is an open question for
+the operator, not something a live-lab campaign can answer.
+
 ## 4. The gap is LIVE PROVING + a few real impls — not (mostly) missing framework
 
 The topology + validator **framework largely landed already** (see
