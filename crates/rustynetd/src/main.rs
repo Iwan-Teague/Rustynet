@@ -23,8 +23,9 @@ use rustynetd::daemon::{
     DaemonConfig, DaemonDataplaneMode, NodeRole, run_daemon, validate_anchor_bundle_pull_addr,
 };
 use rustynetd::key_material::{
-    initialize_encrypted_key_material, migrate_existing_private_key_material,
-    read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
+    encrypt_private_key_with_passphrase, initialize_encrypted_key_material,
+    migrate_existing_private_key_material, read_passphrase_file_explicit, remove_file_if_present,
+    store_passphrase_in_os_secure_store,
 };
 use rustynetd::linux_authenticode::collect_linux_authenticode_report;
 use rustynetd::linux_dns_failclosed::{
@@ -456,15 +457,116 @@ fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
 fn run_key_command(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err(
-            "key subcommand is required (supported: init, migrate, store-passphrase)".to_owned(),
+            "key subcommand is required (supported: init, init-gossip, migrate, store-passphrase)"
+                .to_owned(),
         );
     }
     match args[0].as_str() {
         "init" => run_key_init(&args[1..]),
+        "init-gossip" => run_key_init_gossip(&args[1..]),
         "migrate" => run_key_migrate(&args[1..]),
         "store-passphrase" => run_key_store_passphrase(&args[1..]),
         other => Err(format!("unknown key subcommand: {other}")),
     }
+}
+
+/// Bytes of raw entropy minted as the gossip signing secret.
+///
+/// The daemon never uses these bytes directly — `derive_gossip_signing_key`
+/// one-way-derives an Ed25519 signing key from them via HKDF and zeroizes the
+/// input, so this is seed material rather than a key. 32 bytes matches the HKDF
+/// output width and the enrollment secret's length.
+const GOSSIP_SIGNING_SECRET_LEN: usize = 32;
+
+/// Mint the gossip signing secret into the key-custody layer.
+///
+/// Deliberately a sibling of `key init` rather than a flag on it: the gossip
+/// secret is seed material for an HKDF, not a WireGuard keypair, so it needs no
+/// runtime private key and no public key file — the verifying key is derived at
+/// load time and never stored.
+///
+/// Custody matches the WireGuard encrypted private key exactly, which is the one
+/// secret this daemon already reads through `decrypt_private_key` as a non-root
+/// user. Two consequences that are easy to get wrong, both load-bearing:
+///
+/// * **The `--gossip-signing-secret` path is a naming input, not the file that is
+///   read.** `decrypt_private_key` derives the custody directory from its PARENT
+///   and a key id from `SHA-256` of the path string, then loads from the OS store
+///   or `<parent>/wg-private-<id>.enc`. Minting must therefore go through
+///   `encrypt_private_key_with_passphrase` with the SAME path, or the ids will
+///   not match and the daemon will refuse to start.
+/// * **The passphrase must be passed explicitly.** A root mint has neither
+///   `CREDENTIALS_DIRECTORY` nor `RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH`, and
+///   `resolve_passphrase_source` refuses to fall back to the configured path — so
+///   omitting `explicit_passphrase_path` is a hard error rather than a default.
+fn run_key_init_gossip(args: &[String]) -> Result<(), String> {
+    let mut secret_path = String::new();
+    let mut passphrase_path = DEFAULT_WG_KEY_PASSPHRASE_PATH.to_owned();
+    let mut force = false;
+
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--gossip-signing-secret") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--gossip-signing-secret requires a value".to_owned())?;
+                secret_path = value.clone();
+                index += 2;
+            }
+            Some("--passphrase-file") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--passphrase-file requires a value".to_owned())?;
+                passphrase_path = value.clone();
+                index += 2;
+            }
+            Some("--force") => {
+                force = true;
+                index += 1;
+            }
+            Some(flag) => return Err(format!("unknown key init-gossip argument: {flag}")),
+            None => break,
+        }
+    }
+
+    if secret_path.is_empty() {
+        return Err("--gossip-signing-secret is required".to_owned());
+    }
+    ensure_cli_path_absolute(&secret_path, "path")?;
+    ensure_cli_path_absolute(&passphrase_path, "path")?;
+
+    let secret_path = std::path::Path::new(&secret_path);
+    // `encrypt_private_key_with_passphrase` materialises the configured path
+    // alongside the custody artifact, so its presence is a valid necessary
+    // condition for "already minted". Overwriting without --force would rotate
+    // the node's gossip identity silently, which every peer would then reject.
+    if !force && secret_path.exists() {
+        return Err(
+            "gossip signing secret already exists; use --force to overwrite and rotate the gossip identity"
+                .to_owned(),
+        );
+    }
+
+    let mut secret = vec![0u8; GOSSIP_SIGNING_SECRET_LEN];
+    fill_random_bytes(&mut secret).map_err(|err| format!("gossip secret entropy failed: {err}"))?;
+    let passphrase_path = std::path::Path::new(&passphrase_path);
+    let result = encrypt_private_key_with_passphrase(
+        &secret,
+        secret_path,
+        passphrase_path,
+        Some(passphrase_path),
+    );
+    // Scrub the seed on every path: the daemon derives its signing key from
+    // these bytes, so they are as sensitive as the key itself until zeroed.
+    secret.fill(0);
+    result?;
+
+    println!(
+        "key init-gossip complete: gossip_signing_secret={}",
+        secret_path.display()
+    );
+    Ok(())
 }
 
 fn run_privileged_helper_command(args: &[String]) -> Result<(), String> {

@@ -36,6 +36,24 @@ const ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str = "/var/lib/rustynet/anchor-bundle-pul
 /// `enrollment_token::load_secret` requires this file to be EXACTLY 32 raw
 /// bytes (not hex/base64) with no group/world permission bits.
 const ENROLLMENT_SECRET_PATH: &str = "/var/lib/rustynet/keys/enrollment.secret";
+/// Gossip signing secret, minted by `rustynetd key init-gossip` during install.
+/// Must match `install::live_linux::GOSSIP_SIGNING_SECRET_PATH`. Lives beside the
+/// WireGuard encrypted key so it inherits the `wg-private-*.enc` ownership sweep
+/// — the custody layer derives the real artifact name from this path, so this
+/// file itself is a naming input plus a bootstrap precheck marker.
+const GOSSIP_SIGNING_SECRET_PATH: &str = "/var/lib/rustynet/keys/gossip.signing.secret";
+/// Value for `RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE`.
+///
+/// **Inert on Linux by design.** `resolve_passphrase_source` ignores the path it
+/// is handed and reads the process-global credential instead — the same one the
+/// WireGuard key uses (`Environment=RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH=%d/wg_key_passphrase`
+/// in the unit). The value still has to be absolute and non-empty because
+/// `validate_daemon_config` rejects both, and `build_gossip_node` rejects the
+/// secret path without its passphrase sibling. Pointing it at the credential the
+/// daemon actually reads keeps the env honest about the sharing rather than
+/// naming a file nothing opens.
+const GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH: &str =
+    "/run/credentials/rustynetd.service/wg_key_passphrase";
 const DEFAULT_EXIT_ROUTE_CIDR: &str = "0.0.0.0/0";
 const MAX_ASSIGNMENT_ROUTE_SCAN: usize = 4096;
 const MAX_ASSIGNMENT_PEER_SCAN: usize = 4096;
@@ -1070,6 +1088,37 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         env_entries.push((
             "RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH".to_owned(),
             anchor_bundle_pull_token_env,
+        ));
+    }
+
+    // Gossip signing secret, emitted ONLY as a pair and ONLY when the secret was
+    // actually minted. Three things make this shape mandatory rather than tidy:
+    //
+    // * `build_gossip_node` treats exactly-one-of-the-pair as a hard
+    //   `InvalidConfig`, and its result is propagated out of `DaemonRuntime::new`
+    //   — so a half-emitted pair does not disable gossip, it stops the daemon
+    //   starting. Every node in the field today has no gossip secret, which is
+    //   why this cannot be an unconditional default.
+    // * An EMPTY value is equally fatal: env parsing yields `Some(PathBuf::new())`
+    //   and `validate_daemon_config` rejects an empty path before the runtime is
+    //   built. So the pair is skipped entirely rather than emitted blank.
+    // * This file is rewritten WHOLESALE from `env_entries` on every install, so
+    //   the pair has to live here. Written anywhere else it would be silently
+    //   erased by the next `ops install-systemd` and gossip would revert to
+    //   `unconfigured` with no error.
+    //
+    // The env var names carry no `_PATH` suffix even though the daemon-side Rust
+    // constants are named `..._PATH_ENV`; the daemon reads these exact strings.
+    let gossip_secret_path = Path::new(GOSSIP_SIGNING_SECRET_PATH);
+    if gossip_secret_path.exists() {
+        set_owner_mode_if_exists(gossip_secret_path, daemon_uid, daemon_gid, 0o600)?;
+        env_entries.push((
+            "RUSTYNET_GOSSIP_SIGNING_SECRET".to_owned(),
+            display_path(gossip_secret_path),
+        ));
+        env_entries.push((
+            "RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE".to_owned(),
+            display_path(Path::new(GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH)),
         ));
     }
 

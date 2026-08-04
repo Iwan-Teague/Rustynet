@@ -108,9 +108,18 @@ fn prereq_commands(pkg: Option<PkgFamily>) -> Result<Vec<Vec<String>>, String> {
     }
 }
 
-/// Linux key custody: encrypted WG key + pubkey via `rustynetd key init`, then
-/// the passphrase encrypted into the two `.cred` blobs the systemd unit loads.
-/// Plaintext material is scrubbed. (Linux has no `key store-passphrase`.)
+/// Gossip signing secret path, shared by the installer mint and the daemon env.
+///
+/// Under `/var/lib/rustynet/keys` because `ops install-systemd` already chowns
+/// that directory to the daemon uid, and its `wg-private-*.enc` ownership sweep
+/// already matches the artifact name `key_custody_key_id` derives — so the
+/// gossip blob inherits the ownership repair for free.
+pub(crate) const GOSSIP_SIGNING_SECRET_PATH: &str = "/var/lib/rustynet/keys/gossip.signing.secret";
+
+/// Linux key custody: encrypted WG key + pubkey via `rustynetd key init`, the
+/// gossip signing secret via `key init-gossip`, then the passphrase encrypted
+/// into the two `.cred` blobs the systemd unit loads. Plaintext material is
+/// scrubbed. (Linux has no `key store-passphrase`.)
 fn setup_key_custody() -> Result<(), String> {
     ensure_dir("/run/rustynet", 0o770)?;
     ensure_dir("/var/lib/rustynet", 0o700)?;
@@ -138,6 +147,34 @@ fn setup_key_custody() -> Result<(), String> {
                 "/var/lib/rustynet/keys/wireguard.key.enc",
                 "--public-key",
                 "/var/lib/rustynet/keys/wireguard.pub",
+                "--passphrase-file",
+                passfile,
+                "--force",
+            ],
+        )?;
+
+        // Gossip signing secret, minted inside the SAME closure and with the
+        // SAME plaintext passphrase as the WireGuard key. Both are load-bearing:
+        //
+        // * same closure, so the scrub below covers the plaintext passphrase on
+        //   every exit path including an early failure here;
+        // * same passphrase, because `resolve_passphrase_source` is
+        //   process-global — it reads one credential for the whole daemon and
+        //   explicitly refuses to fall back to a per-secret path. A gossip
+        //   secret sealed under a different passphrase would be unloadable.
+        //
+        // Custody lands in /var/lib/rustynet/keys deliberately, NOT
+        // /etc/rustynet: the writer chmods its parent to 0700, which would strip
+        // group-execute from the 0750 directory holding the daemon-readable
+        // *.pub files, and the loader additionally requires the directory and
+        // blob to be owned by the daemon's own uid.
+        run(
+            RUSTYNETD,
+            &[
+                "key",
+                "init-gossip",
+                "--gossip-signing-secret",
+                GOSSIP_SIGNING_SECRET_PATH,
                 "--passphrase-file",
                 passfile,
                 "--force",
