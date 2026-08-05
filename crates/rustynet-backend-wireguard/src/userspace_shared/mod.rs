@@ -731,6 +731,14 @@ mod tests {
     /// fails on them, so the convention is the only guard. Sites that need a
     /// port nothing will ever bind — a fake peer endpoint — must use
     /// `unbound_peer_port` instead and not take a reservation at all.
+    /// A port for a backend that must never reach its bind.
+    ///
+    /// `validate_listen_port` rejects 0, so a placeholder still has to be a legal
+    /// port; this one is above the WireGuard default and below the ephemeral
+    /// ranges either OS hands out (macOS 49152+, Linux 32768+), so it cannot
+    /// collide with a real bind elsewhere in the suite.
+    const UNBOUND_PLACEHOLDER_PORT: u16 = 30_001;
+
     fn reserve_listen_port() -> (UdpSocket, u16) {
         let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
             .expect("ephemeral port should be available");
@@ -922,24 +930,41 @@ mod tests {
     #[test]
     fn linux_userspace_shared_backend_start_failure_before_tun_open_leaves_socket_unbound() {
         let private_key_path = write_invalid_private_key();
-        let listen_port = free_listen_port();
-        let mut backend = LinuxUserspaceSharedBackend::new_for_test(
-            "rustynet0",
-            private_key_path.to_string_lossy(),
-            listen_port,
-        )
-        .expect("backend should construct");
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend = backend_with_test_tun_lifecycle(
+            private_key_path.as_path(),
+            UNBOUND_PLACEHOLDER_PORT,
+            tun_lifecycle,
+        );
 
         let err = backend
             .start(runtime_context())
-            .expect_err("invalid private key should fail after socket bind");
+            .expect_err("an invalid private key must fail the start");
         assert_eq!(err.kind, BackendErrorKind::Internal);
         assert!(backend.authoritative_transport_identity().is_none());
         assert!(backend.worker_exit_count_for_test().is_none());
 
-        let rebound = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
-            .expect("listen port should have been released after startup rollback");
-        drop(rebound);
+        // What this test is really for: ORDER. The key is loaded before anything
+        // is acquired, so an invalid key must fail before the TUN is prepared and
+        // before the socket is bound — which is what the test's name asserts.
+        //
+        // It used to prove that by re-binding `listen_port` and expecting it free.
+        // That proved nothing: the key fails at `from_private_key_file`, ahead of
+        // the bind, so the port was never bound and a successful re-bind was
+        // guaranteed regardless of the code under test. It was worse than vacuous
+        // — it re-bound a port this process did not hold, so it could only ever
+        // fail because something else on the machine had taken it. The stale
+        // `expect` string it carried ("should fail after socket bind") was
+        // evidence the ordering had already drifted once.
+        //
+        // `prepare_calls: 0` asserts the ordering directly and cannot flake.
+        assert_eq!(
+            tun_state.snapshot().prepare_calls,
+            0,
+            "an invalid private key must fail before the TUN is prepared, which is \
+             also what guarantees the socket was never bound"
+        );
 
         let _ = fs::remove_file(private_key_path);
     }
@@ -1031,7 +1056,10 @@ mod tests {
             let recorded = backend
                 .recorded_peer_ciphertext_ingress_for_test()
                 .expect("ingress query should succeed");
-            if recorded.iter().any(|entry| entry.payload == b"pre-start-marker") {
+            if recorded
+                .iter()
+                .any(|entry| entry.payload == b"pre-start-marker")
+            {
                 Some(recorded)
             } else {
                 None
@@ -1858,13 +1886,14 @@ mod tests {
     #[test]
     fn linux_userspace_shared_backend_round_trip_fails_closed_after_shutdown() {
         let private_key_path = write_private_key([14; 32]);
-        let listen_port = free_listen_port();
+        let (listen_reserved, listen_port) = reserve_listen_port();
         let mut backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet0",
             private_key_path.to_string_lossy(),
             listen_port,
         )
         .expect("backend should construct");
+        backend.adopt_prebound_socket_for_test(listen_reserved);
         backend
             .start(runtime_context())
             .expect("backend should start successfully");
@@ -1885,7 +1914,7 @@ mod tests {
     #[test]
     fn linux_userspace_shared_backend_round_trip_rejects_configured_peer_endpoint() {
         let private_key_path = write_private_key([15; 32]);
-        let listen_port = free_listen_port();
+        let (listen_reserved, listen_port) = reserve_listen_port();
         let peer_socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .expect("peer socket should bind");
         let peer_addr = peer_socket.local_addr().expect("peer addr should resolve");
@@ -1895,6 +1924,7 @@ mod tests {
             listen_port,
         )
         .expect("backend should construct");
+        backend.adopt_prebound_socket_for_test(listen_reserved);
         backend
             .start(runtime_context())
             .expect("backend should start successfully");
@@ -2421,13 +2451,14 @@ mod tests {
     fn linux_userspace_shared_backend_same_local_port_after_restart_gets_new_transport_generation()
     {
         let private_key_path = write_private_key([19; 32]);
-        let listen_port = free_listen_port();
+        let (listen_reserved, listen_port) = reserve_listen_port();
         let mut backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet0",
             private_key_path.to_string_lossy(),
             listen_port,
         )
         .expect("backend should construct");
+        backend.adopt_prebound_socket_for_test(listen_reserved);
 
         backend
             .start(runtime_context())
@@ -2463,7 +2494,7 @@ mod tests {
     fn linux_userspace_shared_backend_programmed_state_does_not_update_handshake_without_engine_activity()
      {
         let local_private_key = write_private_key([21; 32]);
-        let listen_port = free_listen_port();
+        let (listen_reserved, listen_port) = reserve_listen_port();
         let initial_endpoint = SocketAddr::from(([127, 0, 0, 1], free_listen_port()));
         let updated_endpoint = SocketAddr::from(([127, 0, 0, 1], free_listen_port()));
         let peer_node = NodeId::new("peer-a").expect("valid node id");
@@ -2473,6 +2504,7 @@ mod tests {
             listen_port,
         )
         .expect("backend should construct");
+        backend.adopt_prebound_socket_for_test(listen_reserved);
         backend
             .start(runtime_context())
             .expect("backend should start successfully");
@@ -2539,13 +2571,14 @@ mod tests {
     #[test]
     fn linux_userspace_shared_backend_update_unconfigured_peer_fails_closed() {
         let local_private_key = write_private_key([23; 32]);
-        let listen_port = free_listen_port();
+        let (listen_reserved, listen_port) = reserve_listen_port();
         let mut backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet0",
             local_private_key.to_string_lossy(),
             listen_port,
         )
         .expect("backend should construct");
+        backend.adopt_prebound_socket_for_test(listen_reserved);
         backend
             .start(runtime_context())
             .expect("backend should start successfully");
@@ -2569,7 +2602,7 @@ mod tests {
     fn linux_userspace_shared_backend_duplicate_configure_replaces_peer_state_without_duplication()
     {
         let local_private_key = write_private_key([24; 32]);
-        let listen_port = free_listen_port();
+        let (listen_reserved, listen_port) = reserve_listen_port();
         let first_endpoint = SocketAddr::from(([127, 0, 0, 1], free_listen_port()));
         let second_endpoint = SocketAddr::from(([127, 0, 0, 1], free_listen_port()));
         let peer_node = NodeId::new("peer-a").expect("valid node id");
@@ -2579,6 +2612,7 @@ mod tests {
             listen_port,
         )
         .expect("backend should construct");
+        backend.adopt_prebound_socket_for_test(listen_reserved);
         backend
             .start(runtime_context())
             .expect("backend should start successfully");
@@ -2627,7 +2661,7 @@ mod tests {
         let right_private_key = [27; 32];
         let left_private_key_path = write_private_key(left_private_key);
         let right_private_key_path = write_private_key(right_private_key);
-        let left_port = free_listen_port();
+        let (left_reserved, left_port) = reserve_listen_port();
         let right_port = free_listen_port();
         let left_peer_node = NodeId::new("peer-right").expect("valid node id");
         let right_peer_node = NodeId::new("peer-left").expect("valid node id");
@@ -2637,6 +2671,7 @@ mod tests {
             left_port,
         )
         .expect("left backend should construct");
+        left_backend.adopt_prebound_socket_for_test(left_reserved);
         let mut right_backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet1",
             right_private_key_path.to_string_lossy(),
@@ -2743,7 +2778,7 @@ mod tests {
         let right_private_key = [29; 32];
         let left_private_key_path = write_private_key(left_private_key);
         let right_private_key_path = write_private_key(right_private_key);
-        let left_port = free_listen_port();
+        let (left_reserved, left_port) = reserve_listen_port();
         let right_port = free_listen_port();
         let left_peer_node = NodeId::new("peer-right").expect("valid node id");
         let right_peer_node = NodeId::new("peer-left").expect("valid node id");
@@ -2753,6 +2788,7 @@ mod tests {
             left_port,
         )
         .expect("left backend should construct");
+        left_backend.adopt_prebound_socket_for_test(left_reserved);
         let mut right_backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet1",
             right_private_key_path.to_string_lossy(),
@@ -2849,7 +2885,7 @@ mod tests {
         let right_private_key = [34; 32];
         let left_private_key_path = write_private_key(left_private_key);
         let right_private_key_path = write_private_key(right_private_key);
-        let left_port = free_listen_port();
+        let (left_reserved, left_port) = reserve_listen_port();
         let right_port = free_listen_port();
         let mut left_backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet0",
@@ -2857,6 +2893,7 @@ mod tests {
             left_port,
         )
         .expect("left backend should construct");
+        left_backend.adopt_prebound_socket_for_test(left_reserved);
         let mut right_backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet1",
             right_private_key_path.to_string_lossy(),
@@ -2947,7 +2984,7 @@ mod tests {
         let right_private_key = [36; 32];
         let left_private_key_path = write_private_key(left_private_key);
         let right_private_key_path = write_private_key(right_private_key);
-        let left_port = free_listen_port();
+        let (left_reserved, left_port) = reserve_listen_port();
         let right_port = free_listen_port();
         let mut left_backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet0",
@@ -2955,6 +2992,7 @@ mod tests {
             left_port,
         )
         .expect("left backend should construct");
+        left_backend.adopt_prebound_socket_for_test(left_reserved);
         let mut right_backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet1",
             right_private_key_path.to_string_lossy(),
@@ -3087,7 +3125,7 @@ mod tests {
     #[test]
     fn linux_userspace_shared_backend_relay_control_does_not_advance_peer_handshake() {
         let local_private_key = write_private_key([30; 32]);
-        let listen_port = free_listen_port();
+        let (listen_reserved, listen_port) = reserve_listen_port();
         let relay_socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .expect("relay socket should bind");
         let relay_addr = relay_socket
@@ -3100,6 +3138,7 @@ mod tests {
             listen_port,
         )
         .expect("backend should construct");
+        backend.adopt_prebound_socket_for_test(listen_reserved);
         backend
             .start(runtime_context())
             .expect("backend should start successfully");
@@ -3137,7 +3176,7 @@ mod tests {
         let right_private_key = [33; 32];
         let left_private_key_path = write_private_key(left_private_key);
         let right_private_key_path = write_private_key(right_private_key);
-        let left_port = free_listen_port();
+        let (left_reserved, left_port) = reserve_listen_port();
         let right_port = free_listen_port();
         let left_peer_node = NodeId::new("peer-right").expect("valid node id");
         let mut left_backend = LinuxUserspaceSharedBackend::new_for_test(
@@ -3146,6 +3185,7 @@ mod tests {
             left_port,
         )
         .expect("left backend should construct");
+        left_backend.adopt_prebound_socket_for_test(left_reserved);
         let mut right_backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet1",
             right_private_key_path.to_string_lossy(),
@@ -3232,7 +3272,7 @@ mod tests {
         let right_private_key = [35; 32];
         let left_private_key_path = write_private_key(left_private_key);
         let right_private_key_path = write_private_key(right_private_key);
-        let left_port = free_listen_port();
+        let (left_reserved, left_port) = reserve_listen_port();
         let right_port = free_listen_port();
         let left_peer_node = NodeId::new("peer-right").expect("valid node id");
         let mut left_backend = LinuxUserspaceSharedBackend::new_for_test(
@@ -3241,6 +3281,7 @@ mod tests {
             left_port,
         )
         .expect("left backend should construct");
+        left_backend.adopt_prebound_socket_for_test(left_reserved);
         let mut right_backend = LinuxUserspaceSharedBackend::new_for_test(
             "rustynet1",
             right_private_key_path.to_string_lossy(),
