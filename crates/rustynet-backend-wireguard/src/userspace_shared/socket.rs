@@ -55,6 +55,39 @@ impl AuthoritativeSocket {
         })
     }
 
+    /// Adopt a socket the caller already bound, instead of binding one here.
+    ///
+    /// Tests need to know the port before the backend exists — to wire it as a
+    /// peer endpoint, or to send to it. Deriving that port from a throwaway
+    /// `bind(0)` and letting the socket drop releases the port, so the real bind
+    /// later races every other process on the box for it; that is the flake this
+    /// exists to remove. Reserving the port by keeping the socket bound and
+    /// handing it over means the reservation is never released, so there is no
+    /// window to lose.
+    ///
+    /// Test-only. Production still binds the operator's configured port, and
+    /// must keep doing so — that path is what `AuthoritativeSocket::bind`
+    /// serves, and the fail-closed behaviour when the configured port is taken
+    /// is a contract, not an inconvenience.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub(crate) fn from_bound_socket(socket: UdpSocket) -> Result<Self, BackendError> {
+        socket.set_nonblocking(true).map_err(|err| {
+            BackendError::internal(format!(
+                "linux userspace-shared authoritative UDP socket nonblocking setup failed on a pre-bound socket: {err}"
+            ))
+        })?;
+        let cached_local_addr = socket.local_addr().map_err(|err| {
+            BackendError::internal(format!(
+                "linux userspace-shared authoritative UDP socket local_addr failed on a pre-bound socket: {err}"
+            ))
+        })?;
+        Ok(Self {
+            socket,
+            transport_generation: NEXT_TRANSPORT_GENERATION.fetch_add(1, Ordering::SeqCst),
+            cached_local_addr,
+        })
+    }
+
     pub(crate) fn local_addr(&self) -> Result<SocketAddr, BackendError> {
         Ok(self.cached_local_addr)
     }

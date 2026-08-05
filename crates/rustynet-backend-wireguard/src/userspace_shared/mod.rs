@@ -42,6 +42,14 @@ pub struct LinuxUserspaceSharedBackend {
     desired_exit_mode: ExitMode,
     #[cfg(any(test, feature = "test-harness"))]
     test_tun_state: Option<tun::TunTestState>,
+    /// A socket the caller bound and handed over, used for the FIRST bind.
+    ///
+    /// Fully qualified rather than imported: `test-harness` is off in some
+    /// `-D warnings` gate invocations, and a top-level `use std::net::UdpSocket`
+    /// would be an unused import there. Same reason `test_tun_state` above spells
+    /// out `tun::TunTestState`.
+    #[cfg(any(test, feature = "test-harness"))]
+    prebound_socket: Option<std::net::UdpSocket>,
 }
 
 impl LinuxUserspaceSharedBackend {
@@ -119,7 +127,27 @@ impl LinuxUserspaceSharedBackend {
             desired_exit_mode: ExitMode::Off,
             #[cfg(any(test, feature = "test-harness"))]
             test_tun_state: None,
+            #[cfg(any(test, feature = "test-harness"))]
+            prebound_socket: None,
         })
+    }
+
+    /// Hand this backend a socket the caller already bound, to be used for its
+    /// first bind instead of binding `listen_port` afresh.
+    ///
+    /// Deliberately a post-construction setter rather than a constructor
+    /// parameter: there are two construction funnels — `new_for_test` and
+    /// `new_with_tun_lifecycle`, the latter shared with production — and
+    /// threading a test-only argument through the production funnel to reach the
+    /// 19 tests that use it buys nothing that this does not.
+    ///
+    /// Only the first bind is served. A restart or a worker recovery re-enters
+    /// `start_runtime` and binds `listen_port` normally, which is what keeps the
+    /// same-address-across-restart contract intact.
+    #[cfg(any(test, feature = "test-harness"))]
+    #[doc(hidden)]
+    pub fn adopt_prebound_socket_for_test(&mut self, socket: std::net::UdpSocket) {
+        self.prebound_socket = Some(socket);
     }
 
     fn ensure_runtime_control(&self) -> Result<&RuntimeControl, BackendError> {
@@ -140,6 +168,20 @@ impl LinuxUserspaceSharedBackend {
             )
     }
 
+    /// Take the handed-over socket if there is one, otherwise bind `listen_port`.
+    ///
+    /// `&mut self` because the take must consume the reservation: serving a
+    /// second start from the same socket is impossible (it was moved into the
+    /// worker thread and dropped with it), and silently reusing a stale handle
+    /// would be worse than binding afresh.
+    fn acquire_authoritative_socket(&mut self) -> Result<AuthoritativeSocket, BackendError> {
+        #[cfg(any(test, feature = "test-harness"))]
+        if let Some(socket) = self.prebound_socket.take() {
+            return AuthoritativeSocket::from_bound_socket(socket);
+        }
+        AuthoritativeSocket::bind(self.listen_port)
+    }
+
     fn start_runtime(
         &mut self,
         context: RuntimeContext,
@@ -149,7 +191,7 @@ impl LinuxUserspaceSharedBackend {
         let tun_device = self
             .tun_lifecycle
             .prepare_and_open(&self.interface_name, &context)?;
-        let socket = match AuthoritativeSocket::bind(self.listen_port) {
+        let socket = match self.acquire_authoritative_socket() {
             Ok(socket) => socket,
             Err(err) => {
                 drop(tun_device);
@@ -670,6 +712,47 @@ mod tests {
         path
     }
 
+    /// Reserve a port by binding it and KEEPING the socket, returning both.
+    ///
+    /// The caller must bind the returned socket to a named variable and hand it
+    /// to the backend via `adopt_prebound_socket_for_test`. Two spellings look
+    /// equivalent and silently reintroduce the race this exists to remove,
+    /// because they drop the socket at the end of the statement and free the
+    /// port again — measured on this host, both let an immediate re-bind of the
+    /// same port succeed:
+    ///
+    /// ```text
+    /// let (_, port) = reserve_listen_port();   // WRONG: port released
+    /// let port = reserve_listen_port().1;      // WRONG: port released
+    /// let (_reserved, port) = reserve_listen_port();  // right
+    /// ```
+    ///
+    /// Neither wrong form is a compile error or a clippy warning, and no test
+    /// fails on them, so the convention is the only guard. Sites that need a
+    /// port nothing will ever bind — a fake peer endpoint — must use
+    /// `unbound_peer_port` instead and not take a reservation at all.
+    fn reserve_listen_port() -> (UdpSocket, u16) {
+        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .expect("ephemeral port should be available");
+        let port = socket.local_addr().expect("local addr").port();
+        (socket, port)
+    }
+
+    /// A port for an endpoint that nothing in this process will ever bind.
+    ///
+    /// Peer endpoints in these tests are addresses the backend is told about,
+    /// not sockets anyone opens. Allocating them through a real bind was always
+    /// pointless, and it was actively harmful: the probe released the port, so a
+    /// sibling test could bind it for real and turn a "goes nowhere" endpoint
+    /// into a live backend. A fixed value cannot do that. Distinct values per
+    /// call site matter where a test asserts one endpoint replaced another.
+    fn unbound_peer_port(distinct: u16) -> u16 {
+        // Above the WireGuard default and below the ephemeral ranges either OS
+        // hands out (macOS 49152+, Linux 32768+), so this cannot collide with a
+        // real bind in the suite.
+        30_000 + distinct
+    }
+
     fn free_listen_port() -> u16 {
         let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
             .expect("ephemeral port should be available");
@@ -904,6 +987,65 @@ mod tests {
             }
         );
 
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_adopts_the_reserved_socket_rather_than_rebinding_its_port() {
+        // Proves handover by IDENTITY, not by "it started successfully".
+        //
+        // A test that merely constructs backends from reserved sockets and
+        // checks they all start proves nothing: releasing the reservation also
+        // lets them all start, in a quiet process with nobody competing. That is
+        // exactly why the race survived this suite for so long.
+        //
+        // So: send a datagram to the reserved port BEFORE the backend starts. It
+        // lands in that socket's receive buffer. If the backend adopts the
+        // socket, the buffered datagram is still there and the engine records it
+        // as ciphertext ingress. If the backend instead re-binds the port, the
+        // reserved socket is dropped and the datagram is destroyed with it —
+        // zero ingress, deterministically, with no dependence on timing or on
+        // another process competing for the port.
+        let private_key_path = write_private_key([37; 32]);
+        let (reserved, listen_port) = reserve_listen_port();
+
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("sender socket should bind");
+        sender
+            .send_to(b"pre-start-marker", backend_loopback_addr(listen_port))
+            .expect("marker should be sent to the reserved port");
+
+        let mut backend = LinuxUserspaceSharedBackend::new_for_test(
+            "rustynet0",
+            private_key_path.to_string_lossy(),
+            listen_port,
+        )
+        .expect("backend should construct");
+        backend.adopt_prebound_socket_for_test(reserved);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start on the adopted socket");
+
+        let ingress = wait_for(Duration::from_secs(2), || {
+            let recorded = backend
+                .recorded_peer_ciphertext_ingress_for_test()
+                .expect("ingress query should succeed");
+            if recorded.iter().any(|entry| entry.payload == b"pre-start-marker") {
+                Some(recorded)
+            } else {
+                None
+            }
+        });
+        assert!(
+            ingress
+                .iter()
+                .any(|entry| entry.payload == b"pre-start-marker"),
+            "the datagram buffered in the reserved socket before start must survive, \
+             which is only true if the backend adopted that socket instead of re-binding its port"
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
         let _ = fs::remove_file(private_key_path);
     }
 
