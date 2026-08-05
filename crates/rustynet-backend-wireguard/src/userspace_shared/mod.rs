@@ -729,8 +729,8 @@ mod tests {
     ///
     /// Neither wrong form is a compile error or a clippy warning, and no test
     /// fails on them, so the convention is the only guard. Sites that need a
-    /// port nothing will ever bind — a fake peer endpoint — must use
-    /// `unbound_peer_port` instead and not take a reservation at all.
+    /// port nothing will ever bind — a fake peer endpoint — should not take a
+    /// reservation at all; a plain constant is both sufficient and safer.
     /// A port for a backend that must never reach its bind.
     ///
     /// `validate_listen_port` rejects 0, so a placeholder still has to be a legal
@@ -744,21 +744,6 @@ mod tests {
             .expect("ephemeral port should be available");
         let port = socket.local_addr().expect("local addr").port();
         (socket, port)
-    }
-
-    /// A port for an endpoint that nothing in this process will ever bind.
-    ///
-    /// Peer endpoints in these tests are addresses the backend is told about,
-    /// not sockets anyone opens. Allocating them through a real bind was always
-    /// pointless, and it was actively harmful: the probe released the port, so a
-    /// sibling test could bind it for real and turn a "goes nowhere" endpoint
-    /// into a live backend. A fixed value cannot do that. Distinct values per
-    /// call site matter where a test asserts one endpoint replaced another.
-    fn unbound_peer_port(distinct: u16) -> u16 {
-        // Above the WireGuard default and below the ephemeral ranges either OS
-        // hands out (macOS 49152+, Linux 32768+), so this cannot collide with a
-        // real bind in the suite.
-        30_000 + distinct
     }
 
     fn free_listen_port() -> u16 {
