@@ -4351,6 +4351,7 @@ fn help_text() -> String {
         "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--gossip-watermark <path>] [--gossip-signing-secret <path>] [--gossip-signing-secret-passphrase <path>] [--enrollment-secret <path>] [--enrollment-ledger <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--relay-fleet-bundle <path>] [--relay-fleet-watermark <path>] [--disable-relay-fleet] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--traversal-prior-rerank <true|false>] [--traversal-flap-breaker <true|false>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--relay-session-local-token-issuer <true|false>] [--relay-session-token-spool-dir <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--port-mapping-mode <auto|keepalive|disabled>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
+        "  rustynetd key init-gossip --gossip-signing-secret <path> [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>] [--keychain-service <name>] [--keychain-allow-any-app]",
         "  rustynetd anchor-bundle-pull-bind-check --addr <addr:port> [--allow-lan <true|false>] [--expect <accept|reject>]",
@@ -4498,6 +4499,98 @@ mod tests {
         HostEntrySelection, WindowsServiceOptions, select_host_entry,
     };
     use std::path::PathBuf;
+
+    /// The dispatcher's error string advertises `init-gossip`, so help must too —
+    /// otherwise the binary contradicts itself about its own surface.
+    #[test]
+    fn help_text_advertises_key_init_gossip() {
+        let help = help_text();
+        assert!(help.contains("key init-gossip"), "help must list the verb");
+        assert!(
+            help.contains("--gossip-signing-secret"),
+            "help must name the required flag"
+        );
+    }
+
+    /// The secret path is REQUIRED and has no default, deliberately: a default
+    /// would let a typo mint into the wrong custody directory, and the custody
+    /// layer derives its key id from the path STRING, so the daemon would then
+    /// look for a blob that was never written and refuse to start.
+    #[test]
+    fn key_init_gossip_requires_the_secret_path() {
+        let err = super::run_key_init_gossip(&[]).expect_err("must require the secret path");
+        assert!(
+            err.contains("--gossip-signing-secret is required"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn key_init_gossip_rejects_unknown_and_valueless_flags() {
+        let err = super::run_key_init_gossip(&["--nope".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown key init-gossip argument"),
+            "got: {err}"
+        );
+
+        let err = super::run_key_init_gossip(&["--gossip-signing-secret".to_owned()])
+            .expect_err("a flag without its value must be rejected");
+        assert!(err.contains("requires a value"), "got: {err}");
+    }
+
+    /// Relative paths are refused because the custody key id is derived from the
+    /// path string: the same relative path resolved from two working directories
+    /// is one secret to the minter and a different key id to the daemon.
+    #[test]
+    fn key_init_gossip_rejects_relative_paths() {
+        let err = super::run_key_init_gossip(&[
+            "--gossip-signing-secret".to_owned(),
+            "relative/gossip.secret".to_owned(),
+        ])
+        .expect_err("a relative secret path must be rejected");
+        assert!(err.to_lowercase().contains("absolute"), "got: {err}");
+
+        let err = super::run_key_init_gossip(&[
+            "--gossip-signing-secret".to_owned(),
+            "/tmp/gossip.secret".to_owned(),
+            "--passphrase-file".to_owned(),
+            "relative/pass".to_owned(),
+        ])
+        .expect_err("a relative passphrase path must be rejected");
+        assert!(err.to_lowercase().contains("absolute"), "got: {err}");
+    }
+
+    /// Without `--force`, an existing secret must not be silently overwritten.
+    /// Rotating the gossip identity fails SILENTLY — nothing publishes the gossip
+    /// verifying key, so the only symptom is bundles every peer rejects.
+    #[test]
+    fn key_init_gossip_refuses_to_overwrite_without_force() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynetd-gossip-force-guard-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let secret = dir.join("gossip.signing.secret");
+        std::fs::write(&secret, b"existing").expect("seed an existing secret");
+
+        let err = super::run_key_init_gossip(&[
+            "--gossip-signing-secret".to_owned(),
+            secret.to_string_lossy().into_owned(),
+        ])
+        .expect_err("an existing secret must not be overwritten without --force");
+        assert!(
+            err.contains("already exists") && err.contains("--force"),
+            "the error must name the flag that overrides it; got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&secret).expect("secret still readable"),
+            b"existing",
+            "the refusal must leave the existing secret untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn help_text_advertises_windows_service_host_flags() {
