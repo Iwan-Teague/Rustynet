@@ -1,6 +1,14 @@
 # I4 — traversal enforcement: what it needs, and why it cannot ship yet
 
-**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.**
+**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.** Revision 3, after
+two adversarial reviews. **Read §0 first**: the second review refuted four of revision 2's
+corrections, including its headline recommendation, so the sections below carry retractions
+inline. Nothing here is landable as written.
+
+A caution for whoever picks this up, because it has now held at every step: **the narrow
+supporting fact was correct each time; the conclusion drawn from it was not.** Treat every
+generalisation in this document as the weakest link, and re-read the code that *writes* a
+signal before relying on it.
 
 Scope: items 1–6 and 8 of `I4EnforcementFlipPlan_2026-07-30.md` §4. Item 7 (gossip
 status surface) shipped earlier and is out of scope.
@@ -10,7 +18,87 @@ would still program an attacker-chosen endpoint.** The ordering problem the task
 anticipated is real, larger than expected, and the blocking dependency is partly work
 that was only *designed* today. §1 states the result; §9 states what is landable now.
 
-## 0. Evidence provenance
+## 0. Revision 3 — what the second review retracted
+
+Revision 2's corrections were themselves reviewed, and four were wrong. Continuing the
+pattern this document family has shown at every step: **the narrow fact held, the
+conclusion drawn from it did not.** Retractions are kept, not deleted.
+
+**RETRACTED — the rejection of A3.1 (§3) rested on a false consequence.** Revision 2
+claimed deleting the attribution fallback would make the race never return `Direct` and
+so remove direct connectivity fleet-wide. The first half is right — `pairs[0]` is the
+only route to `Direct` *inside* `execute_ice_pair_race`. The consequence is wrong at the
+**caller**: `evaluate_traversal_probes` returns `Direct` without entering the race at all
+(`phase10.rs:5979-5981`, `ExistingFreshHandshake`), and the race's `FailClosed` is
+converted by the caller into a programmed Direct path (`phase10.rs:6122`, `:6125`)
+`[verified]`. So connectivity would not be lost.
+
+What A3.1 would actually do is different and worse: it reroutes every unattributed race
+into the one arm where the **raw sender-supplied `priority` integer** selects the
+endpoint — `.max_by_key(|candidate| candidate.priority)` at `phase10.rs:6113` — the very
+channel §3.1 notes is closed on the race path. **A3.1 is therefore viable only together
+with item 2** (closing the FailClosed arm), which §10 already lists. That pairing is a
+coherent option revision 2 never evaluated, and it is stronger than A3.3.
+
+**RETRACTED — A3.3 does not achieve its stated goal.** Revision 2 claimed it would mean
+"no consumer can mistake an unattributed handshake for endpoint proof". The proof surface
+is **reason-blind**: `live_proven: live_peer_count == programmed_peer_count &&
+programmed_peer_count > 0` (`daemon.rs:7461`), computed from path mode and freshness
+`[verified]`. After A3.3 an unattributed Direct endpoint still reports
+`path_live_proven=true`. Worse, A3.3 *creates* a mixed-reason fleet, and the aggregator
+hard-codes the literal for that case — `.unwrap_or("fresh_handshake_observed")` and
+`else { "fresh_handshake_observed".to_owned() }` (`daemon.rs:7395`, `:7398`) `[verified]`
+— so a fleet where **no** peer has the new reason would still print
+`path_reason=fresh_handshake_observed`. A3.3 is also not observable-neutral: it breaks
+named in-tree assertions at `daemon.rs:24967` and `:24984` `[agent]`. Any real fix must
+change the proof surface, not only the reason.
+
+**RETRACTED — §7's "the two conditions agree by construction" is false.** Statuses exist
+only for peers already programmed (`managed_peer_ids()`, `daemon.rs:6473`), while the
+reconcile path runs the authority call on the **new** peer vector
+(`daemon.rs:9323`) with the controller already `DataplaneApplied` `[verified]`. A newly
+added peer therefore has no status, the gated deny fires, and because the loop has no
+per-peer skip one new peer fails the whole vector into `restrict_recoverable` +
+`promote_to_permanent_if_over_limit`. The cold-start cycle is not closed — it is
+**relocated to every membership change**. A correct design needs a per-peer skip for
+never-yet-programmed peers, not a global state gate.
+
+**RETRACTED — §3.4 overstated its own contingency.** Revision 2 said the finding collapses
+if the handshake counter can only advance from the endpoint just probed. It does not:
+`send_probe` reprograms the backend endpoint for **every** pair before any poll
+(`phase10.rs:102-108`), so the endpoint "just probed" at poll time is `pairs[last]` while
+`pairs[0]` is credited. Misattribution follows from the send loop alone and **needs no
+roaming**. Revision 2's own §3.2 said this and §3.4 contradicted it. So §9's triage order
+("settle the empirical question first") was wrong — it is no longer load-bearing. Related
+nuance revision 2 missed: `supports_roaming: false` on the userspace-shared backends
+`[agent]`.
+
+**CORRECTED — §5.1 was too strong.** Only the **host** lanes lack a port. Both srflx
+lanes carry a real port inside the signed preimage —
+`out.extend_from_slice(&sa.port().to_be_bytes())` (`peer_gossip.rs:423`, `:427`,
+documented `:382`) `[verified]` — and srflx is direct-eligible. So a gossiped srflx
+candidate is already a signed, port-carrying, programmable endpoint, and finding C
+("item 1 is a signed wire-format change") applies to the host lane only.
+
+**CORRECTED — a `[verified]` tag with invented evidence.** Revision 2 wrote that the
+`handshake_endpoint` overrides were "`tests/ice_pair_race.rs:105`, `:480`, plus three
+`#[cfg(test)]` impls". Those three are impls of `SimultaneousOpenRuntime` that do **not**
+override `handshake_endpoint`; I conflated trait impls with method overrides and tagged it
+verified. The conclusion — no production override — is right and in fact stronger than
+stated, but the evidence as written was wrong.
+
+Also noted by review and accepted: A3.2 is **plausible** rather than impossible on the
+userspace-shared backend, which already has the source address at inbound demux
+(`find_node_id_by_endpoint`) but does not propagate it to the handshake record `[agent]`.
+It still requires widening a signature inside `crates/rustynet-backend-wireguard`, which
+this work must not touch.
+
+**Net effect on the recommendation.** §9's "land A3.3" is withdrawn. The candidate that
+survives review is **A3.1 + item 2 together**, and it needs a proof-surface change as
+well, per the A3.3 retraction. Nothing in this document is landable without that
+re-scoping, and none of it can be mutation-verified on this host.
+
+## 0a. Evidence provenance
 
 - `[verified]` — I read the cited line myself this session at commit `9859126c`.
 - `[computed]` — established by independent calculation.
@@ -428,25 +516,40 @@ So I4's deny rule must distinguish absent-because-unscoped from
 absent-because-unconverged. That distinction does not exist today and is new work. The
 same document also requires `index` mode to be "loud in status output, not silent".
 
-**Landable now:** §3's **A3.3** — not A3.1, which would brick direct connectivity (§3).
-Add a reason variant distinguishing "handshake advanced, endpoint not attributed" from
-`FreshHandshakeObserved`, keep the programming behaviour byte-for-byte identical, and
-exclude the new reason from the §4 attested predicate. Self-contained in `rustynetd`; no
-gossip, no wire change, no backend change; no connectivity delta. It is a strict
-prerequisite for items 3, 4 and 5, none of which can be trusted while an unattributed
-handshake is labelled as proof.
+**Nothing is landable as written.** Revision 2 recommended A3.3 here; §0 retracts that on
+two grounds — the proof surface (`live_proven`) is reason-blind, so A3.3 would not stop an
+unattributed endpoint reporting as proven, and A3.3 creates the mixed-reason case whose
+aggregate literal is hard-coded, so it would misreport. It also breaks named in-tree
+assertions, contrary to the "observable-neutral" claim.
 
-Two honest caveats on landing it. First, it is a **naming-and-predicate** change, not a
-security fix: it does not stop an attacker-nominated endpoint being programmed, because
-`send_probe` already programs every probed candidate today (§3.2). It stops that state
-being *promoted to proof* later. Second, **it cannot be mutation-verified on this host** —
-cargo wedges for hours under Gatekeeper saturation (§11) — and by the standing rule a
-behaviour change that cannot be shown to fail a specific test does not ship. So the
-deliverable here is the design; the commit waits for a machine that can run the suite.
+**The candidate that survives both reviews is A3.1 + item 2, taken together**, plus a
+proof-surface change:
 
-**Recommended triage order** once a working build host is available: settle §3.4's
-empirical question first, because a negative answer removes the motivation for A3.3
-entirely.
+1. **Item 2** — stop the `FailClosed` arm programming the max-priority candidate. Must come
+   first, because A3.1 alone reroutes unattributed races into exactly that arm, where the
+   raw sender-supplied `priority` integer selects the endpoint (`phase10.rs:6113`).
+2. **A3.1** — an unattributed handshake is not a `Direct` decision. Safe once item 2 has
+   closed the arm it would otherwise fall into, and it does **not** cost direct
+   connectivity: `ExistingFreshHandshake` returns `Direct` without entering the race
+   (`phase10.rs:5979-5981`), which covers the steady-state peer.
+3. **Proof surface** — `live_proven`/`path_live_proven` must stop treating
+   path-mode-plus-freshness as proof (`daemon.rs:7461`), and the hard-coded
+   `"fresh_handshake_observed"` aggregate fallback (`daemon.rs:7395`, `:7398`) must go.
+   Without this, items 1 and 2 leave the strongest proof-named surface still lying.
+
+This re-scoping has **not itself been reviewed**, and on this document's record that
+matters: every previously unreviewed recommendation here has been refuted. It should be
+attacked before it is built.
+
+Two constraints hold regardless. It cannot be mutation-verified on this host (cargo wedges
+under Gatekeeper saturation, §11), and by the standing rule a behaviour change that cannot
+be shown to fail a specific test does not ship. And item 4's deny needs a **per-peer skip**
+for never-yet-programmed peers, not the global state gate §7 proposed (§0).
+
+**Triage order** once a working build host exists: start with item 2, since it is the
+producer-side hole and is independent of attribution. §3.4's empirical question is **no
+longer a prerequisite** — §0 retracts that framing; misattribution follows from the send
+loop without any roaming assumption.
 
 **Not landable, and why:** items 1–2 (signed wire change + the unimplemented gossip
 identity work, §5–§6); item 3 alone (unsound without A3.1, §3); items 4–5 (depend on §3
