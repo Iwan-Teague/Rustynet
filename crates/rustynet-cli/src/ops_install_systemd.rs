@@ -1125,9 +1125,11 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     // So when the invariant does not hold, skip the pair: gossip stays dormant,
     // which is recoverable, instead of the node refusing to boot, which is not.
     let gossip_secret_path = Path::new(GOSSIP_SIGNING_SECRET_PATH);
-    let gossip_blob_is_swept =
-        gossip_secret_path.parent() == wireguard_encrypted_private_key_path.parent();
-    if gossip_secret_path.exists() && gossip_blob_is_swept {
+    if should_emit_gossip_env_pair(
+        gossip_secret_path,
+        wireguard_encrypted_private_key_path.as_path(),
+        gossip_secret_path.exists(),
+    ) {
         set_owner_mode_if_exists(gossip_secret_path, daemon_uid, daemon_gid, 0o600)?;
         // Emit the daemon's OWN constants rather than restating the strings.
         // The daemon-side identifiers are named `..._PATH_ENV` while their
@@ -2332,6 +2334,27 @@ fn set_owner_mode_on_key_custody_artifacts(
     Ok(())
 }
 
+/// Whether `ops install-systemd` should emit the gossip env pair.
+///
+/// Extracted so the decision is testable. The surrounding function needs root
+/// and a real system, so a test that only compared path constants passed even
+/// with the rule deleted — which is exactly what the first version of this
+/// test did.
+///
+/// Two necessary conditions. The secret must exist, and it must sit in the
+/// directory the ownership sweep covers — the parent of the WireGuard encrypted
+/// key, which is operator-overridable while the gossip path is fixed. Emitting
+/// without the second hands the daemon a secret it cannot read, and
+/// `build_gossip_node` turns that into a refusal to START.
+fn should_emit_gossip_env_pair(
+    gossip_secret_path: &Path,
+    wireguard_encrypted_private_key_path: &Path,
+    gossip_secret_exists: bool,
+) -> bool {
+    gossip_secret_exists
+        && gossip_secret_path.parent() == wireguard_encrypted_private_key_path.parent()
+}
+
 fn is_private_key_custody_artifact_name(file_name: &str) -> bool {
     const PREFIX: &[u8] = b"wg-private-";
     let bytes = file_name.as_bytes();
@@ -3088,31 +3111,30 @@ mod tests {
         );
     }
 
-    /// The env pair is emitted only when the gossip blob will actually be
-    /// chowned, which requires it to sit in the directory the sweep covers. That
-    /// directory follows `RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY`, which an operator
-    /// can move while the gossip path stays fixed.
+    /// Exercises the emit DECISION, not the constants around it.
     ///
-    /// Skipping is the fail-closed choice: emitting the pair anyway would hand
-    /// the daemon a secret it cannot read, and `build_gossip_node` turns that
-    /// into a refusal to START rather than a gossip outage. Dormant is
-    /// recoverable; a node that will not boot is not.
+    /// The first version compared the two parents directly and so passed with the
+    /// production rule deleted — a mutation removing the gate did not fail it.
+    /// Same tautology class this module already removed once. It now calls the
+    /// function the installer calls.
     #[test]
-    fn gossip_emit_gate_requires_the_swept_directory() {
+    fn gossip_env_pair_emits_only_from_the_swept_directory() {
         let gossip = std::path::Path::new(super::GOSSIP_SIGNING_SECRET_PATH);
-
         let default_wg = std::path::Path::new("/var/lib/rustynet/keys/wireguard.key.enc");
-        assert_eq!(
-            gossip.parent(),
-            default_wg.parent(),
-            "on the default layout the pair must be emitted"
-        );
-
         let moved_wg = std::path::Path::new("/srv/rustynet/keys/wireguard.key.enc");
-        assert_ne!(
-            gossip.parent(),
-            moved_wg.parent(),
-            "an overridden WireGuard key path must suppress the emit, not brick the daemon"
+
+        assert!(
+            super::should_emit_gossip_env_pair(gossip, default_wg, true),
+            "default layout with the secret present must emit"
+        );
+        assert!(
+            !super::should_emit_gossip_env_pair(gossip, default_wg, false),
+            "no secret means no pair, or the daemon gets a path to nothing"
+        );
+        assert!(
+            !super::should_emit_gossip_env_pair(gossip, moved_wg, true),
+            "an overridden WireGuard path leaves the blob unswept and root-owned; \
+             emitting anyway would stop the daemon booting"
         );
     }
 
