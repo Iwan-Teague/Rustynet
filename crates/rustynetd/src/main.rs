@@ -474,8 +474,17 @@ fn run_key_command(args: &[String]) -> Result<(), String> {
 ///
 /// The daemon never uses these bytes directly — `derive_gossip_signing_key`
 /// one-way-derives an Ed25519 signing key from them via HKDF and zeroizes the
-/// input, so this is seed material rather than a key. 32 bytes matches the HKDF
-/// output width and the enrollment secret's length.
+/// input, so this is seed material rather than a key.
+///
+/// **The HKDF input is 33 bytes, not 32.** `decrypt_private_key` appends a
+/// trailing newline to whatever it loads if one is absent, so the daemon derives
+/// from `<these 32 bytes> || b"\n"`. That is harmless for the daemon — the
+/// derivation is deterministic, so the node's gossip identity is stable across
+/// restarts — but it is a trap for anything that recomputes the verifying key
+/// independently. A deriver fed the 32 minted bytes gets a different key with
+/// probability 255/256, silently. Any future code that publishes this node's
+/// gossip verifying key (e.g. into membership's `node_pubkey_hex`) must derive
+/// it the way the daemon does, or read it from the daemon.
 const GOSSIP_SIGNING_SECRET_LEN: usize = 32;
 
 /// Mint the gossip signing secret into the key-custody layer.
@@ -549,7 +558,13 @@ fn run_key_init_gossip(args: &[String]) -> Result<(), String> {
     }
 
     let mut secret = vec![0u8; GOSSIP_SIGNING_SECRET_LEN];
-    fill_random_bytes(&mut secret).map_err(|err| format!("gossip secret entropy failed: {err}"))?;
+    // Scrub on the entropy-failure path too: `try_fill_bytes` leaves the buffer
+    // unspecified on error, so an early `?` here would drop a partially-filled
+    // entropy buffer without clearing it.
+    if let Err(err) = fill_random_bytes(&mut secret) {
+        secret.fill(0);
+        return Err(format!("gossip secret entropy failed: {err}"));
+    }
     let passphrase_path = std::path::Path::new(&passphrase_path);
     let result = encrypt_private_key_with_passphrase(
         &secret,

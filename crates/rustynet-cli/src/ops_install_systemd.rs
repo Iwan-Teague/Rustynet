@@ -16,7 +16,8 @@ use rustynet_dns_zone::canonicalize_dns_zone_name;
 use rustynetd::daemon::{
     DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
     DEFAULT_DNS_ZONE_NAME, DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH, DEFAULT_DNS_ZONE_WATERMARK_PATH,
-    DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS,
+    DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS, GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV,
+    GOSSIP_SIGNING_SECRET_PATH_ENV,
 };
 
 const ENV_DST: &str = "/etc/default/rustynetd";
@@ -1112,12 +1113,17 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     let gossip_secret_path = Path::new(GOSSIP_SIGNING_SECRET_PATH);
     if gossip_secret_path.exists() {
         set_owner_mode_if_exists(gossip_secret_path, daemon_uid, daemon_gid, 0o600)?;
+        // Emit the daemon's OWN constants rather than restating the strings.
+        // The daemon-side identifiers are named `..._PATH_ENV` while their
+        // values carry no `_PATH` suffix, so a restated literal is one typo away
+        // from a variable nothing reads and gossip silently stays dormant.
+        // Referencing the constants removes that drift class by construction.
         env_entries.push((
-            "RUSTYNET_GOSSIP_SIGNING_SECRET".to_owned(),
+            GOSSIP_SIGNING_SECRET_PATH_ENV.to_owned(),
             display_path(gossip_secret_path),
         ));
         env_entries.push((
-            "RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE".to_owned(),
+            GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV.to_owned(),
             display_path(Path::new(GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH)),
         ));
     }
@@ -2997,6 +3003,95 @@ mod tests {
                 "--traversal-stun-gather-timeout-ms ${RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS}"
             ),
             "rustynetd service template must pass traversal stun gather timeout to the daemon"
+        );
+    }
+
+    /// The installer mint and the installer env writer must name the SAME path,
+    /// because the custody layer derives the real artifact name from the path
+    /// STRING. A drift of even one character changes the derived key id, so the
+    /// daemon would look for a blob that was never written and refuse to start.
+    #[test]
+    fn gossip_secret_mint_and_env_paths_agree() {
+        assert_eq!(
+            super::GOSSIP_SIGNING_SECRET_PATH,
+            crate::install::live_linux::GOSSIP_SIGNING_SECRET_PATH,
+            "the mint path and the env path derive different key ids if they differ"
+        );
+    }
+
+    /// The secret must live where the installer already chowns to the daemon uid.
+    /// `/etc/rustynet` would brick the node twice: the custody writer chmods its
+    /// parent to 0700, stripping group-execute from a directory deliberately
+    /// 0750 that holds the daemon-readable `*.pub` files, and the loader requires
+    /// the directory to be owned by the effective uid while that one is root's.
+    #[test]
+    fn gossip_secret_lives_under_the_daemon_owned_key_directory() {
+        assert!(
+            super::GOSSIP_SIGNING_SECRET_PATH.starts_with("/var/lib/rustynet/keys/"),
+            "gossip secret must live in the daemon-owned key directory, got {}",
+            super::GOSSIP_SIGNING_SECRET_PATH
+        );
+        assert!(
+            !super::GOSSIP_SIGNING_SECRET_PATH.starts_with("/etc/rustynet"),
+            "/etc/rustynet is root-owned 0750 and would be chmodded to 0700 by the custody writer"
+        );
+    }
+
+    /// The installer emits the daemon's own constants, so drift is impossible by
+    /// construction. This pins the property those constants must have and that a
+    /// restated literal would get wrong: the identifiers are named `..._PATH_ENV`
+    /// but the VALUES carry no `_PATH` suffix.
+    #[test]
+    fn gossip_env_constants_carry_no_path_suffix() {
+        for value in [
+            super::GOSSIP_SIGNING_SECRET_PATH_ENV,
+            super::GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV,
+        ] {
+            assert!(
+                !value.ends_with("_PATH"),
+                "{value} would be a variable the daemon never reads"
+            );
+        }
+        assert_eq!(
+            super::GOSSIP_SIGNING_SECRET_PATH_ENV,
+            "RUSTYNET_GOSSIP_SIGNING_SECRET"
+        );
+    }
+
+    /// The ownership repair the design depends on is keyed off the WireGuard
+    /// encrypted key's PARENT: `set_owner_mode_on_key_custody_artifacts` sweeps
+    /// that directory for `wg-private-*.enc`, which is the shape
+    /// `key_custody_key_id` derives for any path. The gossip blob inherits that
+    /// sweep only while it shares the directory. Move it and the sweep silently
+    /// stops covering it, leaving a root-owned blob the daemon cannot read —
+    /// which is a refusal to start, not a gossip outage.
+    #[test]
+    fn gossip_secret_shares_the_swept_key_directory() {
+        let gossip_parent = std::path::Path::new(super::GOSSIP_SIGNING_SECRET_PATH)
+            .parent()
+            .expect("gossip secret path has a parent");
+        let wireguard_parent = std::path::Path::new("/var/lib/rustynet/keys/wireguard.key.enc")
+            .parent()
+            .expect("wireguard key path has a parent");
+        assert_eq!(
+            gossip_parent, wireguard_parent,
+            "the gossip blob is only chowned because it shares the swept directory"
+        );
+    }
+
+    /// The passphrase value is inert on Linux but must still be absolute and
+    /// non-empty: `validate_daemon_config` rejects both, and `build_gossip_node`
+    /// rejects a secret path whose passphrase sibling is missing.
+    #[test]
+    fn gossip_passphrase_env_value_is_absolute_and_non_empty() {
+        let value = super::GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH;
+        assert!(
+            !value.is_empty(),
+            "an empty value is rejected at config validation"
+        );
+        assert!(
+            std::path::Path::new(value).is_absolute(),
+            "a relative path is rejected at config validation, got {value}"
         );
     }
 

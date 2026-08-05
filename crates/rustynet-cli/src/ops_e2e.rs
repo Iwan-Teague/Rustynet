@@ -452,6 +452,33 @@ pub fn execute_ops_e2e_bootstrap_host(
             "rustynetd key init failed during e2e bootstrap",
         )?;
 
+        // Gossip signing secret. This has to be minted HERE, not only in
+        // `rustynet install`: lab guests bootstrap through this verb, pinned by
+        // the orchestrator's own test ("bootstrap must install the daemon via
+        // e2e-bootstrap-host"), so a mint that lives only in the product
+        // installer never runs on any machine the project can prove gossip on —
+        // `ops install-systemd` would find no secret, skip the env pair, and
+        // leave `build_gossip_node` returning None on every lab node.
+        //
+        // Same passphrase file as the WireGuard key above, deliberately:
+        // `resolve_passphrase_source` is process-global and refuses to fall back
+        // to a per-secret path, so a secret sealed under a different passphrase
+        // would be permanently unloadable.
+        run_status(
+            "rustynetd",
+            &[
+                "key",
+                "init-gossip",
+                "--gossip-signing-secret",
+                "/var/lib/rustynet/keys/gossip.signing.secret",
+                "--passphrase-file",
+                passphrase_path.as_str(),
+                "--force",
+            ],
+            &[],
+            "rustynetd key init-gossip failed during e2e bootstrap",
+        )?;
+
         // Provision the 32-byte HMAC enrollment secret. The daemon reads this at
         // enrollment request time (not at startup), so it doesn't fail the service
         // start if absent — but the live anchor enrollment test requires it.
