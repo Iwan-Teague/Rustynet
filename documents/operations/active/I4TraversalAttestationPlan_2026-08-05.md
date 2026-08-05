@@ -1,0 +1,490 @@
+# I4 — traversal enforcement: what it needs, and why it cannot ship yet
+
+**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.**
+
+Scope: items 1–6 and 8 of `I4EnforcementFlipPlan_2026-07-30.md` §4. Item 7 (gossip
+status surface) shipped earlier and is out of scope.
+
+**Headline result: I4 cannot be completed now, and one of its two published designs
+would still program an attacker-chosen endpoint.** The ordering problem the task
+anticipated is real, larger than expected, and the blocking dependency is partly work
+that was only *designed* today. §1 states the result; §9 states what is landable now.
+
+## 0. Evidence provenance
+
+- `[verified]` — I read the cited line myself this session at commit `9859126c`.
+- `[computed]` — established by independent calculation.
+- `[agent]` — reported by an investigating sub-agent, not re-read by me.
+- `[open]` — could not be established; recorded as a question.
+
+Line numbers in both predecessor plans have **drifted**; every citation below was
+re-located by symbol. Where a predecessor's number is wrong I give both.
+
+## 1. The result, up front
+
+Three findings, in descending order of consequence.
+
+**A. The corrected definition of "attested" is itself unsound.** The withdrawn plan's
+fix — accept only `reason ∈ {ExistingFreshHandshake, FreshHandshakeObserved}` — does not
+hold, because in production the race cannot attribute a handshake to an endpoint and
+credits `pairs[0]` by default. `FreshHandshakeObserved` therefore does not mean "this
+endpoint answered". §3.
+
+My first mechanism for A was **wrong and has been corrected** (§3.1): sender-supplied
+`priority` is discarded and recomputed on the race path. The harm survives via a class
+ladder in which a public victim IP outranks a legitimate RFC1918 candidate, made worse by
+foundation dedupe (only one remote address per lane is probed, §3.2). One empirical
+question could still collapse the whole finding, and it cannot be settled on this host
+(§3.4).
+
+**B. The approved parent plan's precondition for I4 is unmet.**
+`TraversalSelfSustenancePlan_2026-07-23.md` §6 requires return-routability active
+*before* enforcement programs from gossip, and §I3 marked that satisfied by
+inheritance from `traversal_probe_statuses`, "which already attests reachability"
+(§I3 lines 292-295, 317-325). It does not attest. So the guard §6 demands has never
+existed. §2.
+
+**C. Item 1 is a signed wire-format change, not plumbing**, and is transitively
+blocked on unimplemented work. §5, §6.
+
+## 2. "A probe status means the endpoint was proven" is still false — and worse than recorded
+
+Verified first, as the task required. `crates/rustynetd/src/phase10.rs:6109-6131`, the
+`TraversalDecision::FailClosed` arm, reached when the race is exhausted and nothing
+answered:
+
+```rust
+let endpoint = evaluation.direct_candidates.iter()
+    .max_by_key(|candidate| candidate.priority)
+    .map(|candidate| candidate.endpoint).ok_or_else(...)?;
+self.commit_verified_traversal_path_for_peer(node_id, PathMode::Direct)?;
+self.configure_traversal_paths(node_id, Some(endpoint), None)?;
+self.reconfigure_managed_peer(node_id, endpoint, PathMode::Direct)?;
+Ok(TraversalProbeReport {
+    decision: TraversalProbeDecision::Direct,
+    reason: TraversalProbeReason::DirectProbeExhaustedUnprovenDirect, ... })
+```
+
+All `[verified]`. Still true. Two additions to the record:
+
+- The predecessor's excerpt **omits `commit_verified_traversal_path_for_peer`**. A
+  function with **`verified`** in its name is called on the branch where nothing
+  answered. That is the predecessor's own §5 lesson occurring one line deeper than the
+  predecessor records it. (It is a path-mode transition that clears
+  `pending_path_mode`/`pending_since`, `phase10.rs:5786-5800` — misnamed, but it does
+  **not** persist proof, so it cannot serve item 5.) `[verified]`
+- `TraversalProbeDecision` is `Direct | Relay` (`phase10.rs:250-254`), so no consumer
+  can distinguish this from success. `[verified]`
+
+`priority` is sender-supplied: `TraversalCandidate { candidate_type, endpoint,
+relay_id, priority: u32 }` at `daemon.rs:2100-2106`, parsed from the signed bundle
+section. `[verified]`
+
+### 2.1 Freshness is per-peer; only endpoint coupling makes the good arms sound
+
+`traversal_handshake_is_fresh(&self, value: Option<u64>, now_unix)`
+(`daemon.rs:6944-6948`) takes a bare timestamp, sourced from
+`backend.peer_latest_handshake_unix(node_id)` — **node_id only, no endpoint**
+(`phase10.rs:5924`, `:5963`). `[verified]` So freshness alone proves a peer is
+reachable *somewhere*.
+
+The two attesting arms are nonetheless sound, but for a reason the predecessor never
+states:
+
+- `ExistingFreshHandshake` (`phase10.rs:5964-5986`) requires `!incumbent_demoted`
+  **and** `direct_candidates.iter().any(|c| c.endpoint == current_endpoint)` **and**
+  freshness, returning `selected_endpoint: current_endpoint` where `current_endpoint =
+  backend.current_peer_endpoint(node_id)`. WireGuard sets a peer's endpoint from an
+  *authenticated* source, so this is genuine return-routability. `[verified]`
+- `FreshHandshakeObserved` derives from `TraversalDecision::Direct { endpoint }`
+  (`phase10.rs:6070-6085`) — the race's own endpoint. `[verified]` **But see §3.**
+
+**Design consequence.** Any rule that keeps the reason check and drops the endpoint
+coupling silently reopens S3. The invariant is *endpoint attribution*, not freshness.
+
+### 2.2 Two more ways a status exists with nothing proven
+
+- **Non-due probes clone the status forward.** `daemon.rs:6630-6644` `[verified]`:
+  ```rust
+  if let Some(endpoint) = current_endpoint { retained.selected_endpoint = endpoint; }
+  retained.latest_handshake_unix = latest_handshake_unix.or(retained.latest_handshake_unix);
+  ```
+  `current_endpoint` is read from `self.controller.managed_peer_endpoint(...)` — what is
+  **programmed** `[agent]`. So `selected_endpoint` tracks what is programmed while
+  `decision`/`reason`/`attempts` ride forward from an arbitrarily old pass. The
+  predecessor cited `:6446-6459`; that range is now the hints/clear block.
+- **The handshake stamp is sticky.** `.or(...)` means once `Some`, the field never
+  returns to `None` `[verified]`. A peer dead for days keeps a non-`None` stamp; only
+  the freshness *comparison* ages it out, never the field. Any design reading the field
+  rather than comparing it inherits a permanently-populated value.
+- **Key presence carries almost no information**: the map is rebuilt wholesale each
+  pass and eleven distinct error paths `clear()` it entirely `[agent]`. A key means
+  only "this peer was managed on the last pass that completed", all-or-nothing across
+  peers — not a per-peer proof record.
+
+Additionally, `saturating_sub` makes a **future-dated** timestamp permanently fresh:
+`now_unix.saturating_sub(timestamp) <= window` yields 0 when `timestamp > now_unix`
+`[verified]`. Default window 30 s
+(`DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS`, `daemon.rs:310`) `[verified]`.
+
+## 3. The corrected "attested" rule is exploitable — endpoint attribution is the real gap
+
+This is finding A, and it is the reason item 3 cannot ship alone.
+
+1. Production uses the **parallel ICE-pair race**. `phase10.rs:6036-6053` builds
+   `Phase10PeerRuntime` and calls `engine.execute_ice_pair_race(...)`; the comment at
+   `:6042-6044` says "production probe path now uses the parallel ICE-pair race instead
+   of the older serial `execute_simultaneous_open`". `[verified]`
+2. `Phase10PeerRuntime` implements `SimultaneousOpenRuntime` at `phase10.rs:95-96`.
+   `[verified]`
+3. **`handshake_endpoint` appears nowhere in phase10.rs**, so the trait default applies:
+   `fn handshake_endpoint(&mut self) -> Result<Option<SocketEndpoint>, TraversalError> {
+   Ok(None) }` (`traversal.rs:714-716`), whose own doc says the default is for "runtimes
+   that don't track per-endpoint state". Every override in the tree is test-only
+   (`tests/ice_pair_race.rs:105`, `:480`, plus three `#[cfg(test)]` impls). `[verified]`
+4. So the race always takes the fallback (`traversal.rs:1725-1730`) `[verified]`:
+   ```rust
+   let winning_endpoint = match runtime.handshake_endpoint()? {
+       Some(endpoint) => endpoint,
+       None => crate::ice_priority::socket_addr_to_socket_endpoint(pairs[0].remote.addr),
+   };
+   ```
+5. The trigger is only that a **per-peer** counter advanced —
+   `handshake_advanced(observed_latest, latest) && handshake_is_fresh(...)`
+   (`traversal.rs:1722-1723`) `[verified]`. The counter resolves to
+   `wg show <if> latest-handshakes` keyed by **public key only**
+   (`rustynet-backend-wireguard/src/linux_command.rs:387-396`) `[agent]` — nothing in the
+   chain is endpoint-aware.
+
+### 3.1 Correction — my first mechanism for this was wrong
+
+An adversarial review refuted the mechanism I originally gave, and it was right. I had
+claimed `pairs[0]` is reachable by setting a large sender-supplied `priority`. **It is
+not, on the race path.** `prioritize_traversal_candidates` recomputes priority locally:
+
+```rust
+priority: ice_priority(kind, addr.ip()),   // ice_priority.rs:284
+```
+
+It reads only `candidate.source` and `candidate.endpoint`; **`candidate.priority` is
+never read** `[verified]`. The functions that do consume the sender's integer
+(`score_pair`, `score_candidate`) are reached only from `plan_direct_probes` /
+`plan_remote_probes`, which the race does not call `[agent]`.
+
+So the raw integer is **not** the channel. Recording the error rather than deleting it,
+because "the sender's priority field drives selection" is the intuitive reading and the
+next person will reach for it too. Where the sender's integer **is** load-bearing is the
+FailClosed arm's `.max_by_key(|candidate| candidate.priority)` (§2) — a different arm,
+a different reason code.
+
+### 3.2 The harm survives through a coarser channel, and is worse in two ways
+
+What a remote candidate controls is a **class ladder**, not an integer: `type_pref` from
+`source` plus `local_pref` from family and scope (`ice_priority.rs:73-88`, `136-144`).
+Concretely Host+Global-v4 = 2 122 317 823 versus Host+Private-v4 = 2 118 123 519
+`[agent]`. **A globally-routable victim IP declared `Host` outranks a legitimate RFC1918
+host candidate in the same lane** — and a victim IP is by definition globally routable.
+Pair priority is monotonic non-decreasing in the remote candidate's priority
+(`pair_priority`, `ice_priority.rs:149-155`) `[agent]`, so position 0 stays reachable by
+choosing `source: Host` with a global address.
+
+Two facts the review surfaced make this worse, not better:
+
+- **Foundation dedupe probes exactly one remote address per lane.**
+  `let key = (l.foundation.clone(), r.foundation.clone()); if seen_foundations.contains(&key) { continue; }`
+  (`ice_priority.rs:334-338`), with remote foundation `{prefix}-{kind}-{family}`
+  (`:280`) `[verified]`. So an injected candidate that wins its (kind, family) lane means
+  **the legitimate endpoint is never probed at all**.
+- **Probing already programs every candidate it touches.** `send_probe` calls
+  `reconfigure_managed_peer(&self.node_id, endpoint, PathMode::Direct)` before
+  `initiate_peer_handshake` (`phase10.rs:102-108`) `[verified]`. Attacker-nominated
+  endpoints are therefore installed into the backend **transiently today**, ahead of any
+  handshake evidence. The corrected-attested rule's incremental exposure is
+  **persistence of that programming**, not first-time programming — which is a smaller
+  delta than my original framing implied, and a larger pre-existing exposure.
+
+Timing confirms the misattribution is structural, and refines it: the loop fires the
+whole round before polling (`traversal.rs:1706-1721`) `[agent]`, with defaults
+`MAX_PAIRS = 24`, `ROUNDS = 3`, `ROUND_SPACING_MS = 80` `[agent]`, so multi-pair is the
+normal case. Because `send_probe` rewrites the endpoint per pair, the endpoint actually
+installed at poll time is `pairs[last]` while the endpoint *credited* is `pairs[0]` —
+the two need not even be the same candidate.
+
+### 3.3 Preconditions, stated honestly
+
+The attack is more constrained than my first framing implied `[agent]`: candidates must
+arrive in an **authority-signed** traversal bundle, so this is not an off-path network
+attacker; the race must be reached (`probe_due`, a validated signed coordination
+schedule, non-empty direct candidates, and the incumbent-fresh-handshake short-circuit
+must not fire); `pairs.len() > 1`; and the candidate must win its lane on class.
+`traversal_prior_rerank` is off by default `[agent]`, so `pairs[0]` is the pure RFC 8445
+top pair.
+
+Whether the signing authority ever ingests peer-self-reported candidates — i.e. whether
+the adversary is an ordinary mesh member or requires authority compromise — is `[open]`
+and sits outside this crate. **That question sets the severity**, and it should be
+answered before this is triaged.
+
+### 3.4 The one empirical question that could collapse this
+
+Everything above rests on the per-peer counter being able to advance for a reason other
+than the endpoint just probed. That follows from WireGuard roaming semantics and the
+backend advertising `supports_roaming: true` `[agent]`, but **no in-repo code proves it**
+and no test was run — cargo is unusable on this host (§11). **If `latest-handshakes` can
+only advance from the endpoint just probed, link 5 collapses and this whole finding goes
+with it.** It must be settled empirically before any code is written against §3.
+
+Note the existing mitigations do **not** cover this: `validate_traversal_candidate_ip`
+(`daemon.rs:14635-14683`) rejects only unspecified/loopback/multicast/link-local/broadcast
+for Host, and *requires* a global unicast address for ServerReflexive, so a public victim
+IP is admissible as either type; `reject_unreachable_candidates` accepts
+`Global | Private` for the same reason; and there is no validation at all between the
+race result and programming `[agent]`. An anti-mitigation: `race_outcome_classes`
+records the misattributed endpoint's class as a **win** in the persistent prior store
+`[agent]`, so the mistake is already being learned across sessions.
+
+**This is the third time a guard in this area would have shipped the harm it
+targeted** — the co-location gate, revision 1's attested rule, and now the corrected
+attested rule. The shared cause is unchanged: a signal trusted for its name.
+
+**Therefore item 3 must be paired with attribution.** Three options, and the obvious one
+is a trap:
+
+- **A3.1 — delete the fallback so an unattributable handshake is not `Direct`. DO NOT DO
+  THIS.** I proposed it first and it is wrong. Because `handshake_endpoint()` returns
+  `None` *unconditionally* in production (§3, link 3), **every** race outcome is
+  unattributable, so denying on `None` would make `execute_ice_pair_race` never return
+  `Direct` at all. Every peer would fall to relay or fail closed: a fleet-wide loss of
+  direct connectivity. The absence of attribution is total, not occasional — which is
+  precisely why the fallback was written.
+- **A3.2 — implement `handshake_endpoint` for `Phase10PeerRuntime`.** The correct fix,
+  and it needs a backend that can report which endpoint completed the last handshake.
+  The command backend cannot: `current_peer_endpoint` returns the **cached configured**
+  value rather than a read-back from `wg`
+  (`rustynet-backend-wireguard/src/linux_command.rs:489-495`) `[agent]`. Whether any
+  backend can is `[open]`, and the code lives in `crates/rustynet-backend-wireguard`,
+  which this work must not touch.
+- **A3.3 — separate the report from the predicate (landable, §9).** Leave the race's
+  behaviour exactly as it is, and stop *calling* its output proof: introduce a distinct
+  reason for "a handshake advanced but was not attributed to this endpoint", and exclude
+  that reason from the §4 attested predicate. Connectivity is unchanged because
+  programming still happens on the same branch; what changes is that no consumer can
+  mistake an unattributed handshake for endpoint proof.
+
+## 4. What "attested" must mean operationally
+
+Given §2.1 and §3, the operational definition is:
+
+> A peer P is **attested at endpoint E at time T** iff a WireGuard handshake completed
+> with P **and was attributed to E** by a mechanism the sender cannot influence, within
+> the freshness window ending at T.
+
+Which code writes that signal today: `phase10.rs:5979` (`ExistingFreshHandshake`,
+attribution via `current_peer_endpoint` — an authenticated source, sound) and
+`phase10.rs:6079` (`FreshHandshakeObserved`, attribution via the race — **unsound until
+§3 is fixed**). Nothing else writes a signal that could bear this meaning. The four
+non-attesting arms — `NoDirectCandidatesRelayArmed`, `CoordinationRequiredRelayArmed`,
+`DirectProbeExhaustedRelayArmed`, `DirectProbeExhaustedUnprovenDirect` — must never
+satisfy it `[agent, arms enumerated]`.
+
+A `Relay` decision attests the relay, not the peer; that distinction is already correct
+in the predecessor and is preserved here.
+
+## 5. Item 1 — wiring gossip candidates into an index
+
+**No gossip→traversal path exists.** Established by enumerating both ends rather than
+one grep `[agent]`, and spot-verified by me:
+
+- `build_verified_traversal_index` (`daemon.rs:7086`, predecessor said `:6902`) and
+  `traversal_direct_probe_candidates` (`daemon.rs:14837`, predecessor said `:14648`)
+  both read `self.traversal_hints`, whose sole writer loads a **signed local custody
+  file**; the network fetcher is inert (`traversal_url: None`) `[agent]`.
+- `applied_endpoints`' doc comment claims "Read by the connect path". Its only non-test
+  reader is the self-audit module `[agent]` — another signal trusted for its name.
+- The would-be bridge, `ice_priority::prioritize_candidate_set`, whose module header
+  advertises "a remote peer's **gossiped** `CandidateSet`", has **zero callers outside
+  its own file** `[verified]`.
+- The ingest result is discarded at `daemon.rs:5646` (predecessor said `:5587`); a
+  *second* call site (`daemon.rs:8527→8539`) does bind the summary but reads only
+  `source_node_id` and `sequence` for a log string `[agent]` — the "fourth caller used a
+  helper" hazard again.
+
+### 5.1 Gossip cannot express a programmable endpoint today
+
+**Host candidates carry no port, and the signature covers that absence.**
+`signing_preimage` emits 16 address bytes plus a literal zero port per host candidate
+(`peer_gossip.rs:414`, `:418`), documented at `:380-381` as "2 bytes port=0 padding"
+`[verified]`. Port 0 is then hard-rejected in three places: `traversal.rs:358`,
+`traversal.rs:1807`, `daemon.rs:14372` `[verified]`.
+
+So item 1 requires **either** a versioned signed wire-format change to carry host ports
+— the mixed-fleet migration class the predecessor's §2.3 already flagged, where an old
+daemon rejects a new-format bundle whole — **or** a global assumption that every peer
+listens on `DEFAULT_WG_LISTEN_PORT = 51820`, which is false for any peer with a
+non-default `wg_listen_port`. No per-peer listen port exists in gossip, `PeerConfig`, or
+membership `[agent]`.
+
+Two further gaps: **the relay lane is inexpressible** over gossip (four lanes, the
+preimage covers exactly those four), so gossip candidates can never satisfy the relay
+half of `select_runtime_traversal_endpoints` `[agent]`; and **`priority` must be
+invented**, which matters because it drives three `max_by_key` sites — and if every
+synthesized value in a class is equal, `max_by_key` silently becomes last-wins on
+iteration order `[agent]`.
+
+Naming hazard for implementers: there are **two** distinct `TraversalCandidate` types —
+`traversal.rs:35` (public, imported as `ProbeTraversalCandidate` at `daemon.rs:73`) and
+a private one at `daemon.rs:2100` `[verified]`.
+
+## 6. Item 1 is transitively blocked on today's gossip identity work
+
+Gossip keys peers on `[u8; 32]` (the Ed25519 verifying key); the traversal index keys on
+`NodeId` (a String). Nothing retains a reverse map, so a gossip candidate cannot be
+*filed* under the right index key without building one from verified membership
+`[agent]`.
+
+That map requires membership's `node_pubkey_hex` to hold the peer's **gossip verifying
+key**. It does not: it holds a WireGuard key or raw CSPRNG bytes. That is
+`GossipMembershipIdentityAlignment_2026-08-05.md` — committed today as **design only**,
+unimplemented, and itself blocked on a missing export primitive and a platform blocker
+(Windows cannot hold a gossip identity; macOS never mints one).
+
+**So items 1–2 sit behind unimplemented design work, exactly as the task suspected.**
+
+## 7. Item 4 — denying without deadlocking, and where the fail-open actually is
+
+The predecessor's §2.1 fail-open is precisely located. `apply_traversal_authority_to_peers`
+(`daemon.rs:6958-6962`, `&self`) ends `[verified]`:
+
+```rust
+if let Some(status) = self.traversal_probe_statuses.get(&peer.node_id) {
+    peer.endpoint = status.selected_endpoint;
+} else {
+    peer.endpoint = self.static_traversal_endpoint(bundle, &peer.node_id)?;
+}
+```
+
+The `else` branch is the control-plane endpoint. So "hold this peer" keeps the
+control-plane endpoint — the accept-via-either fail-open §6 forbids.
+
+**Cold start works *because of* that fallback**, and the deadlock is real
+`[agent, links individually cited]`: `sync_traversal_runtime_state` returns early unless
+state is `DataplaneApplied | ExitActive` (`daemon.rs:6441-6447`); the controller starts
+at `Init` (`phase10.rs:5132`); the unique first entry to the started set is
+`apply_dataplane_generation` (`phase10.rs:5322`/`:5327`, the two competing
+`transition_to` sites being behind `ensure_started`); and that runs only after the
+authority call returns `Ok` (`daemon.rs:7728→7747`, `9323→9352`). Turning the `else`
+into a deny closes the cycle — and `promote_to_permanent_if_over_limit`
+(`daemon.rs:9332`) escalates it to a **permanent** restriction.
+
+**Resolution (recommended).** Gate the deny on the same condition link 1 uses: deny only
+when `self.controller.state()` is already `DataplaneApplied | ExitActive` — i.e. only
+when a status *could* have existed — and keep the static fallback for the pre-started
+generation. The two conditions then agree by construction and steady state is not
+weakened. The trust posture conceded is explicit and bounded: for one generation the
+endpoint is *authority-verified* (signature over a custody bundle) but not
+*reachability-proven*. That concession must be stated in the plan of record, because it
+is exactly the kind of thing that later gets misread as proof.
+
+`apply_traversal_authority_to_peers` takes `&self` and therefore **cannot** record or
+expire attestation state `[verified]`; the writing must happen in
+`sync_traversal_runtime_state`, which is `&mut self`.
+
+## 8. Item 5 — persistent attestation state does not exist and must be built
+
+Nothing records "when this peer was last proven reachable" `[agent, swept]`. The closest
+candidate is `PeerTraversalPrior` (`peer_traversal_prior.rs:89-95`) — persisted as
+atomic JSON at `0o600` — but its fields are `last_success_class` (**which** class, never
+**when**), `per_class` Beta posteriors, and `updated_at_unix`, which is bumped on failure
+paths too `[verified]`. It is also explicitly fail-open on load and persist failure
+`[agent]`. Reusing it would repeat this area's characteristic error: adopting a store
+because its name suggests proof.
+
+Everything else is in-memory only and documented as such (`flap_breakers`,
+`quality_tracker`, `keepalive_estimators`) `[agent]`, and `live_proven` is derived at
+read time, never stored `[agent]`.
+
+So item 5 requires **new** state: per-peer `(endpoint, last_attributed_handshake_unix)`,
+written only by the §4-conforming arms, cleared on revocation, and persisted with the
+same atomic-rename + `0o600` discipline as `PeerPriorStore`. It must be **fail-closed on
+load failure** — the opposite of `PeerPriorStore` — because an unreadable attestation
+store must not read as "attested". The hold bound is then `now - last_attributed <=
+bound`, which satisfies item 5's requirement that a peer which stops gossiping ages out
+even though no new candidate expires.
+
+## 9. Item 8, and what is landable now
+
+**Item 8.** `GossipCandidateScopingPlan_2026-07-30.md` §2 fixes two operator-selectable
+modes, **`repush` default**, `index` opt-in `[verified]`. The mode changes what "missing
+from the index" means, and neither reading is "unreachable":
+
+- `repush`: R indexes what it receives, and upstreams filter. Missing = **nobody
+  forwarded it yet** — a convergence delay the doc itself acknowledges ("a permitted pair
+  may need more gossip rounds"). Fail-closed on missing converts slow convergence into an
+  outage, **in the default posture**.
+- `index`: missing **conflates** "no ACL right to P" (deny is correct) with "P never
+  gossiped" (deny is a liveness bug).
+
+So I4's deny rule must distinguish absent-because-unscoped from
+absent-because-unconverged. That distinction does not exist today and is new work. The
+same document also requires `index` mode to be "loud in status output, not silent".
+
+**Landable now:** §3's **A3.3** — not A3.1, which would brick direct connectivity (§3).
+Add a reason variant distinguishing "handshake advanced, endpoint not attributed" from
+`FreshHandshakeObserved`, keep the programming behaviour byte-for-byte identical, and
+exclude the new reason from the §4 attested predicate. Self-contained in `rustynetd`; no
+gossip, no wire change, no backend change; no connectivity delta. It is a strict
+prerequisite for items 3, 4 and 5, none of which can be trusted while an unattributed
+handshake is labelled as proof.
+
+Two honest caveats on landing it. First, it is a **naming-and-predicate** change, not a
+security fix: it does not stop an attacker-nominated endpoint being programmed, because
+`send_probe` already programs every probed candidate today (§3.2). It stops that state
+being *promoted to proof* later. Second, **it cannot be mutation-verified on this host** —
+cargo wedges for hours under Gatekeeper saturation (§11) — and by the standing rule a
+behaviour change that cannot be shown to fail a specific test does not ship. So the
+deliverable here is the design; the commit waits for a machine that can run the suite.
+
+**Recommended triage order** once a working build host is available: settle §3.4's
+empirical question first, because a negative answer removes the motivation for A3.3
+entirely.
+
+**Not landable, and why:** items 1–2 (signed wire change + the unimplemented gossip
+identity work, §5–§6); item 3 alone (unsound without A3.1, §3); items 4–5 (depend on §3
+for the signal and on new persistent state, §7–§8); item 6 (same signal); item 8 (needs
+the scoping modes built).
+
+## 10. §6 invariants touched
+
+| Change | §6 invariant | Effect |
+| --- | --- | --- |
+| A3.3 separate report from predicate | "Never program a self-asserted endpoint that has not passed return-routability (S3)" | Does **not** restore it — programming is unchanged (§3.2). It stops an unattributed handshake being promoted to proof, which is what §6 needs before I4 consumes the signal |
+| A3.2 real attribution (blocked) | same | Would restore it properly; needs a backend change this work must not make |
+| Item 2 close the FailClosed arm | same | Restores it on the producer side |
+| Item 4 gated deny | "Fail closed on missing/stale/unverifiable … exclusive precedence, each side fails closed independently" | Moves toward it; concedes one authority-verified generation at cold start (§7) — must be recorded, not silent |
+| Item 5 persistent attestation | "No widening of the 120 s / 300 s TTLs" | New bound must sit inside existing TTLs, not extend them |
+| Item 1 wire change | "No guard-free programming window (I3 before I4)" | Cannot be satisfied until §3 lands, since the guard §6 names never existed (§2) |
+| Item 8 mode reconciliation | "no fail-open path" | `repush`-default missing≠unreachable must not become accept-anyway |
+
+## 11. Could not establish
+
+- **The load-bearing one (§3.4): whether `latest-handshakes` can advance for a reason
+  other than the endpoint just probed.** A negative answer collapses §3 entirely. It
+  follows from roaming semantics and `supports_roaming: true` `[agent]`, but no in-repo
+  code proves it and no test could be run. Settle this before writing code against §3.
+- Whether the backend can report which endpoint completed the last handshake, i.e.
+  whether A3.2 is implementable. The command backend demonstrably cannot
+  (`current_peer_endpoint` returns the cached configured value) `[agent]`; the
+  userspace-shared backend is unaudited. Either way it lives in
+  `crates/rustynet-backend-wireguard`, which this work must not touch.
+- Whether the signing authority ingests peer-self-reported candidates, which determines
+  whether §3's adversary is an ordinary member or requires authority compromise — i.e.
+  it sets the severity (§3.3).
+- A worst-case staleness bound for the §2.2 clone-forward path; it depends on
+  `traversal_probe_due_decision` interacting with the flap breaker and reprobe interval
+  `[agent, explicitly not derived]`.
+- Whether an out-of-tree signing authority mints traversal bundles from observed gossip.
+  No in-repo writer does `[agent]`.
+- The `max_reconcile_failures` threshold governing §7's escalation to permanent
+  restriction `[agent, field seen, default unread]`.
+- Nothing here was compiled or tested: cargo is unusable on this host (macOS Gatekeeper
+  saturation wedges test-binary exec for hours). Every claim is static reading.
