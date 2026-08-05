@@ -288,12 +288,31 @@ Implemented in `37be86af` and follow-ups:
 
 ### 10.2 STILL OPEN — do not treat Phase 1 as finished
 
-1. **No provisioning path for an existing node.** The mint lives inside
-   `setup_key_custody`, which only succeeds on a virgin node: once
+1. **No provisioning path for an existing node — real, but a PHASE 2 item, not a
+   Phase 1 blocker.** The mint lives inside `setup_key_custody` and
+   `ops e2e-bootstrap-host`, both of which only succeed on a virgin node: once
    `ops install-systemd` has chowned `/var/lib/rustynet/keys` to the daemon uid, a
    root re-run of `rustynet install` fails `directory_uid == Uid::effective()` at
    `key init` — before reaching `key init-gossip`. There is no migration verb and no
-   documented manual procedure. Every already-installed node stays dormant.
+   documented manual procedure.
+
+   **Why it does not block Phase 1.** Phase 1's goal is to make gossip run on a
+   Linux *lab* node and prove it. Lab guests are provisioned fresh through
+   `ops e2e-bootstrap-host`, which now mints — so the acceptance in §6 is reachable
+   without a migration path. Already-installed *product* nodes staying dormant is a
+   real gap, but it belongs with the Phase 2 enforcement/rollout work rather than
+   being counted against Phase 1.
+
+   **Sketch for whoever picks it up**, so the next person does not re-derive it:
+   `ops install-systemd` already holds a plaintext bootstrap passphrase at
+   `/var/lib/rustynet/keys/wireguard.passphrase` and `secure_remove_file`s it at the
+   end (`ops_install_systemd.rs:572`, `:635`). A migration mint placed **before**
+   that removal would have the passphrase it needs. The open question is whether
+   that file is present on the paths that matter — the product installer seals its
+   passphrase at `/etc/rustynet/credentials/.wg-passphrase.tmp` instead — so
+   establish which bootstraps actually populate it **before** designing around it.
+   That is the same "grep a name, inherit another consumer's mechanics" trap this
+   plan has already fallen into twice (§0).
 2. **The gossip path is hardcoded; the WireGuard path it piggybacks on is not.**
    Every ownership repair is keyed off `RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY`, which is
    operator-overridable. Override it and the gossip blob stays root-owned while the
