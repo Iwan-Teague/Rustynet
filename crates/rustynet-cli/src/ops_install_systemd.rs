@@ -1110,8 +1110,24 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     //
     // The env var names carry no `_PATH` suffix even though the daemon-side Rust
     // constants are named `..._PATH_ENV`; the daemon reads these exact strings.
+    // The emit is additionally gated on the gossip secret sharing a directory
+    // with the WireGuard encrypted key, because that is the ONLY reason its
+    // custody blob gets chowned to the daemon uid: the sweep above runs over
+    // `wireguard_encrypted_private_key_path.parent()`, matching the
+    // `wg-private-*.enc` shape the key-id derivation emits for any path.
+    //
+    // That WireGuard path is operator-overridable via
+    // `RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY` while the gossip path is fixed. Point
+    // it elsewhere and the gossip blob is never swept — it stays root-owned, and
+    // the daemon's `directory_uid == Uid::effective()` check fails, which by
+    // §build_gossip_node is a refusal to START, not a gossip outage.
+    //
+    // So when the invariant does not hold, skip the pair: gossip stays dormant,
+    // which is recoverable, instead of the node refusing to boot, which is not.
     let gossip_secret_path = Path::new(GOSSIP_SIGNING_SECRET_PATH);
-    if gossip_secret_path.exists() {
+    let gossip_blob_is_swept =
+        gossip_secret_path.parent() == wireguard_encrypted_private_key_path.parent();
+    if gossip_secret_path.exists() && gossip_blob_is_swept {
         set_owner_mode_if_exists(gossip_secret_path, daemon_uid, daemon_gid, 0o600)?;
         // Emit the daemon's OWN constants rather than restating the strings.
         // The daemon-side identifiers are named `..._PATH_ENV` while their
@@ -1126,6 +1142,20 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
             GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV.to_owned(),
             display_path(Path::new(GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH)),
         ));
+    } else if gossip_secret_path.exists() {
+        // Say so. A secret that exists but is skipped is the surprising case,
+        // and silence here reads exactly like a successful install — which is
+        // how gossip stayed dormant unnoticed in the first place.
+        println!(
+            "warning: gossip signing secret at {} is NOT in the swept key directory {} \
+             (RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY overrides it); leaving gossip unconfigured \
+             rather than emitting a pair the daemon could not load",
+            gossip_secret_path.display(),
+            wireguard_encrypted_private_key_path
+                .parent()
+                .unwrap_or(Path::new("<none>"))
+                .display()
+        );
     }
 
     let mut rendered_env = String::new();
@@ -3055,6 +3085,34 @@ mod tests {
         assert_eq!(
             super::GOSSIP_SIGNING_SECRET_PATH_ENV,
             "RUSTYNET_GOSSIP_SIGNING_SECRET"
+        );
+    }
+
+    /// The env pair is emitted only when the gossip blob will actually be
+    /// chowned, which requires it to sit in the directory the sweep covers. That
+    /// directory follows `RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY`, which an operator
+    /// can move while the gossip path stays fixed.
+    ///
+    /// Skipping is the fail-closed choice: emitting the pair anyway would hand
+    /// the daemon a secret it cannot read, and `build_gossip_node` turns that
+    /// into a refusal to START rather than a gossip outage. Dormant is
+    /// recoverable; a node that will not boot is not.
+    #[test]
+    fn gossip_emit_gate_requires_the_swept_directory() {
+        let gossip = std::path::Path::new(super::GOSSIP_SIGNING_SECRET_PATH);
+
+        let default_wg = std::path::Path::new("/var/lib/rustynet/keys/wireguard.key.enc");
+        assert_eq!(
+            gossip.parent(),
+            default_wg.parent(),
+            "on the default layout the pair must be emitted"
+        );
+
+        let moved_wg = std::path::Path::new("/srv/rustynet/keys/wireguard.key.enc");
+        assert_ne!(
+            gossip.parent(),
+            moved_wg.parent(),
+            "an overridden WireGuard key path must suppress the emit, not brick the daemon"
         );
     }
 
