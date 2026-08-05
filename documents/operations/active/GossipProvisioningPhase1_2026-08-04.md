@@ -1,7 +1,21 @@
 # Gossip provisioning — Phase 1: make it run on a Linux lab node
 
-**Status:** PLAN, revision 2 — **revision 1 was refuted with four ship-blockers**
-and its central architectural claim was inverted. Not implemented.
+**Status:** **PARTIALLY IMPLEMENTED** — `37be86af` plus follow-up fixes. Revision 2
+of the plan; revision 1 was refuted with four ship-blockers and its central
+architectural claim inverted, and the implementation was then refuted again with
+two more. Read §10 before continuing: two blockers remain open, and the
+implementation **deviated from this plan's own §5 item 4** without recording it at
+the time.
+
+**Deviation, stated plainly.** §5 item 4 said "land mint + publish + read-back with
+enforcement OFF first, and prove it on two guests via a per-node systemd drop-in,
+**not the shipped unit**." The implementation went straight to the production
+installer and the `install-systemd` env writer. The consequence was exactly what
+lab-first would have caught: the mint was placed in `rustynet install`, which lab
+guests do not use — they bootstrap through `ops e2e-bootstrap-host` — so gossip
+would have stayed dormant on every machine the project can actually prove it on.
+Fixed by minting in the e2e bootstrap path too, but the plan was right and
+ignoring it cost a round.
 
 **Scope:** provision the gossip signing secret so `build_gossip_node` returns
 `Some` on a Linux lab node, and prove gossip does something real.
@@ -240,3 +254,62 @@ trust bypass, but a provisioning plan must say it.
 Windows rejects a configured gossip pair outright (`daemon.rs:11539-11547`); macOS
 `read_passphrase_file` hard-errors without `PASSPHRASE_KEYCHAIN_ACCOUNT_ENV`
 (`key_material.rs:80-83`, `:722-732`). Both are daemon-won't-start.
+
+
+## 10. Post-implementation review — what shipped, what did not
+
+Implemented in `37be86af` and follow-ups:
+
+- `rustynetd key init-gossip` — mints 32 CSPRNG bytes through
+  `encrypt_private_key_with_passphrase`, scrubs on every path including the
+  entropy-failure branch.
+- Minted in **both** installers: `install/live_linux.rs` (product) and
+  `ops_e2e.rs` (lab bootstrap). The second was missing initially and is what makes
+  the change provable at all.
+- `ops install-systemd` emits the env pair conditionally, using the **daemon's own
+  constants** (`GOSSIP_SIGNING_SECRET_PATH_ENV`, `..._PASSPHRASE_PATH_ENV`, now
+  `pub`) rather than restated literals, so the `_PATH`-suffix drift class is
+  removed by construction rather than tested for.
+
+### 10.1 Corrected during review
+
+- **The HKDF input is 33 bytes, not 32.** `decrypt_private_key` appends a trailing
+  newline if absent, so the daemon derives from `<32 minted bytes> || b"\n"`.
+  Harmless for the daemon (deterministic, so identity is stable across restarts)
+  but a **silent identity fork** for any independent deriver — which is precisely
+  what §7's follow-on work introduces. Documented at the constant.
+- **A tautological test.** `gossip_env_var_names_have_no_path_suffix` asserted a
+  property of two string literals declared inside the test, so the exact mistake it
+  named — emitting the `_PATH`-suffixed identifier name — would still have passed.
+  Replaced, and the underlying class removed by using the daemon constants.
+- **An untested load-bearing invariant.** The ownership sweep only covers the
+  gossip blob while it shares the WireGuard key's directory; nothing pinned that.
+  Now tested.
+
+### 10.2 STILL OPEN — do not treat Phase 1 as finished
+
+1. **No provisioning path for an existing node.** The mint lives inside
+   `setup_key_custody`, which only succeeds on a virgin node: once
+   `ops install-systemd` has chowned `/var/lib/rustynet/keys` to the daemon uid, a
+   root re-run of `rustynet install` fails `directory_uid == Uid::effective()` at
+   `key init` — before reaching `key init-gossip`. There is no migration verb and no
+   documented manual procedure. Every already-installed node stays dormant.
+2. **The gossip path is hardcoded; the WireGuard path it piggybacks on is not.**
+   Every ownership repair is keyed off `RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY`, which is
+   operator-overridable. Override it and the gossip blob stays root-owned while the
+   env pair is **still** emitted (the existence check uses the hardcoded path) —
+   which is a daemon that refuses to start.
+3. **`rustynetd-anchor.service` shares the env file but has no credential source.**
+   It loads `/etc/default/rustynetd` and runs `rustynetd daemon`, but declares no
+   `LoadCredentialEncrypted`, so the passphrase resolver hard-errors. Nothing
+   installs that unit today and it likely already fails on the WireGuard key for the
+   same reason — but this change makes it strictly worse.
+4. **Silent-dormant is relocated, not prevented.** Deleting the marker file makes the
+   next `ops install-systemd` drop the pair with no warning or log line.
+5. **`--force` is unconditional in both callers**, so a re-run silently rotates the
+   gossip identity. Symmetric with `key init`, but the consequences are not: a
+   rotated WireGuard identity fails loudly, a rotated gossip identity fails silently
+   because nothing publishes the gossip verifying key anywhere.
+6. **`key init-gossip` has no tests** — not the arg parser, the `--force` guard, the
+   secret length, or the absolute-path checks. And nothing pins that the mint and the
+   daemon derive the same key id, which the commit itself calls load-bearing.

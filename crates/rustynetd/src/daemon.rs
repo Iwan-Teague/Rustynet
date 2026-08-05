@@ -269,10 +269,10 @@ pub(crate) const GOSSIP_WATERMARK_PATH_ENV: &str = "RUSTYNET_GOSSIP_WATERMARK";
 /// `RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE` must be set together; setting
 /// one without the other is a hard startup config error. Unset ⇒ the gossip
 /// data plane stays dormant (pre-I1 default).
-pub(crate) const GOSSIP_SIGNING_SECRET_PATH_ENV: &str = "RUSTYNET_GOSSIP_SIGNING_SECRET";
+pub const GOSSIP_SIGNING_SECRET_PATH_ENV: &str = "RUSTYNET_GOSSIP_SIGNING_SECRET";
 /// I1b — env var matching the `--gossip-signing-secret-passphrase` CLI flag:
 /// path to the passphrase file for the encrypted gossip signing secret.
-pub(crate) const GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV: &str =
+pub const GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV: &str =
     "RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE";
 /// D2.7 — env var matching the `--enrollment-secret` CLI flag. The
 /// daemon loads a 32-byte HMAC secret from this path at bootstrap

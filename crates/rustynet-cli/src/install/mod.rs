@@ -14,7 +14,7 @@
 
 mod acquire;
 mod common;
-mod live_linux;
+pub(crate) mod live_linux;
 mod live_macos;
 mod live_windows;
 mod preflight;
