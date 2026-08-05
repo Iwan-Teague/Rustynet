@@ -47,7 +47,20 @@ Open, for planning: `CRY-03 CTL-02 CTL-04 CTL-05 CTL-07 ENR-04 ENR-06
 ENR-07 ENR-10…ENR-12 ENR-14 ENR-15 IPV-01 IPV-04…IPV-09 IPV-11 IPV-13 IPV-14 PF-06
 PF-07 PF-11 PF-12 PF-15 POL-11 POL-13 RLY-06 RLY-08 RLY-09 RLY-13 RLY-14 WIN-01
 WIN-02 WIN-04 WIN-06 WIN-09 WIN-10`. The ENR block is still the largest single
-cluster (8 of the 42).
+cluster (7 of the 41).
+
+**How to count this list, because two readers have now got it wrong.** The open
+list uses RANGE notation — `ENR-10…ENR-12` is three ids written as two tokens,
+`IPV-04…IPV-09` is six written as two. Counting visible tokens gives **36** and is
+wrong; expanding the ranges gives **41**, which is what the table says. A recount
+on 2026-08-05 confirmed the table: 111 dictionary row tokens, 8 ids appearing in
+both §1 (the do-not-apply warnings) and §3 (the status dictionary), so **103
+unique findings**, and **41 unique open ids** after expansion. The duplicate ids
+are deliberate structure, not drift — §1 and §3 serve different purposes — so do
+not "deduplicate" them.
+
+The prose above previously said "8 of the 42", which was an off-by-one against its
+own table.
 
 **Corrections applied 2026-07-30, second pass.** Two of them, both of which a
 reader would otherwise have acted on:
