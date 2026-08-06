@@ -1,6 +1,6 @@
 # I4 — traversal enforcement: what it needs, and why it cannot ship yet
 
-**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.** Revision 4, after
+**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.** Revision 5, after
 three rounds of adversarial review. **Read §0 first**: the second review refuted four of
 revision 2's corrections including its headline recommendation, and the third round
 refuted **all three steps of the chain revision 3 proposed in its place** (§0.0, §9.1), so
@@ -18,6 +18,80 @@ status surface) shipped earlier and is out of scope.
 would still program an attacker-chosen endpoint.** The ordering problem the task
 anticipated is real, larger than expected, and the blocking dependency is partly work
 that was only *designed* today. §1 states the result; §9 states what is landable now.
+
+## 0.00 Revision 5 — A3.2 was built, landed, reviewed, and REVERTED the same night
+
+A3.2 was implemented on 2026-08-07 (commit `01c20297`), passed all five mandatory
+gates including a 10367-test suite, carried three verified mutations, and was pushed.
+An adversarial review then found two blockers, both re-verified by hand, and it was
+reverted in `2fdc7f70`. **Do not re-attempt it from that design.** The gates were
+green and the change was still wrong, which is the point worth keeping.
+
+**BLOCKER 1 — `wg show <iface> dump` is not on the privileged-helper allowlist, and
+the failure lands on the WINNING path.** `validate_wg_args` is an exhaustive match
+with a deny catch-all; the only `show` arm is
+`crates/rustynetd/src/privileged_helper.rs:2068`
+(`["show", interface, "latest-handshakes"] if is_interface_name(interface) => Ok(())`),
+and everything else hits `:2108` `_ => Err("unsupported wg argument schema")`
+`[verified]`. The production Linux and macOS backends run `wg` through
+`PrivilegedCommandClient`, which validates client-side before the socket. Worse than a
+plain failure: `handshake_endpoint()` is called **only after** the race has already
+observed a fresh advanced handshake, so the error converts a *successful* direct path
+into `TraversalProbeFailed`, which propagates with `?` through
+`sync_traversal_runtime_state` into `restrict_recoverable` +
+`force_fail_closed_or_restrict`. Under enforcement the node fails closed the moment a
+direct path works. None of the six new tests could catch it: they all drive a
+`RecordingRunner`, never the privileged-helper runner.
+
+**BLOCKER 2 — the attribution was circular, and the new label asserted proof.**
+`send_probe` reprograms the kernel peer endpoint for every pair *before* any poll, and
+`DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS` is 24, so at poll time `peer->endpoint` is
+`pairs[23]` — written milliseconds earlier by the race itself. `wg show dump`'s
+endpoint column *is* that same `peer->endpoint`, and the parser cannot distinguish
+"the kernel roamed it" from "we wrote it". So the change moved the misattribution from
+index 0 to index 23 while *upgrading* the reason from `IcePairRaceHandshakeUnattributed`
+to `IcePairRaceHandshakeObserved`, which phase10 maps to `FreshHandshakeObserved`.
+**Before: wrong endpoint, honestly flagged unattributed. After: wrong endpoint,
+asserted as proof.** The atomicity argument in the commit body was a non-sequitur —
+reading two columns from one line proves they were *sampled* together, not that one
+*caused* the other.
+
+**What a correct A3.2 needs, therefore:** an allowlist arm for the `dump` form; a
+fail-soft call site so a backend error can never abort a winning race (treat `Err` as
+unattributed, never propagate); and — the hard part — a probe loop that does not
+clobber the very value it later reads. Observing between probes, or recording which
+endpoint was programmed at each observation, would give real attribution; reading back
+a field the loop just overwrote never can.
+
+## 0.01 The finding that outranks A3.2: the ICE race sends nothing on the default backends
+
+Surfaced by the same review and verified independently. `initiate_peer_handshake` has
+**no override in any of the three command backends** — `linux_command.rs`,
+`macos_command.rs` and `windows_command.rs` each define zero, so all three inherit the
+trait default `Ok(())` at `crates/rustynet-backend-api/src/lib.rs:274-279` `[verified]`.
+Only the two userspace-shared backends implement it
+(`userspace_shared/mod.rs:546`, via an in-process boringtun control handle).
+
+This is architectural, not an oversight: `linux_command.rs:546` states the adapter
+"exposes configuration and handshake queries but no authoritative packet-I/O handle",
+so it has nothing to send a datagram *with*.
+
+Consequence: on `DaemonBackend::Linux` and `::Macos` — the **default** modes —
+`send_probe` reprograms the peer endpoint, returns `Ok`, increments
+`traversal_probe_attempts`, and emits **zero WireGuard handshake datagrams**. The ICE
+pair race does not actively hole-punch on those backends; it cycles endpoints and
+observes whatever handshake happens for other reasons.
+
+**And the existing test does not catch it.** `daemon.rs:19733` is a source-text pin on
+the `DaemonBackend` dispatch block, whose own comment (`:19725-19729`) claims it exists
+to prevent exactly this. It cannot: the dispatch arms are all present and correct, and
+the no-op is one layer *below* them. This is the §2 warning — "do not trust a
+dispatch-layer pin to catch a missing backend impl" — holding true against the very
+test written for it.
+
+Recorded, not fixed: giving the command backends a real handshake trigger is a
+separate design question (there is no `wg` verb for it), and it plausibly explains more
+about traversal behaviour on Linux than anything in §3.
 
 ## 0.0 Revision 4 — the chain revision 3 proposed was reviewed, and all three steps failed
 
