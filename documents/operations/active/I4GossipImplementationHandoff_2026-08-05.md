@@ -790,3 +790,119 @@ So: **every behaviour change in §1 must be mutation-verified on a host that can
 6. Whether a real key migration distributes per rotation or once at the end. No migration sequencing exists in the tree to read (§3d).
 7. D1 through D5 (§3c) — five operator decisions. Do not decide any of them silently.
 8. Whether `crates/rustynet-backend-wireguard/` is still reserved for another agent (§5).
+
+---
+
+## 7. D1–D5 research round, 2026-08-06 — corrections that change the decisions
+
+Four analysis passes on D1–D5 were run, then two adversarial passes attacked their
+findings, and every load-bearing claim below was re-verified by hand at `7bf2648f`.
+**Two of the four original passes were materially wrong, and one of my own summaries was
+wrong twice.** Recording the corrections because the retraction is the transferable part.
+
+### 7.1 D1's cost premise is REFUTED — migration is far cheaper than the plan assumed
+
+The design work assumed a fleet migration means N separate signed updates, N epoch bumps,
+and a mesh-wide gossip outage while snapshots lag the ±2 skew window. The first half is
+right and the conclusion is wrong.
+
+`MembershipUpdateRecord` does carry exactly one operation
+(`crates/rustynet-control/src/membership.rs:453`, `pub operation: MembershipOperation,` —
+scalar, not a `Vec`) and the update chain does require `epoch_new == epoch_prev + 1`
+(`:482`) `[verified]`. **But updates are not the only ingest path.** The attested-snapshot
+path applies a whole verified state at once, and its only epoch constraint is
+*monotonicity*, not chain reachability —
+`crates/rustynet-control/src/membership.rs:1443-1449`:
+`if state.epoch < *prior_epoch { return Err(MembershipError::EpochRegression { ... }) }`
+plus a same-epoch fork check at `:1450`. There is **no requirement that the offered state
+be reachable from the prior one via an update chain** `[verified]`.
+
+So a migration is: apply N `RotateNodeKey` records locally on the authoring host, attest
+the resulting head **once**, distribute **once**. Any cost model counting N fleet-wide
+distributions or N per-node applications is wrong, and the ±2 skew window never binds.
+**This removes the main argument against migrate-all in D1, and it removes most of D5's
+operational-cost objection too.**
+
+### 7.2 D4's evidence was lab-only; its conclusion survives by a worse route
+
+An analysis pass reported that membership publishes the WireGuard public key on Linux as
+well as mac/win, citing the orchestrator collecting `/var/lib/rustynet/keys/wireguard.pub`.
+**That evidence is lab-only** — `crates/rustynet-cli/src/main.rs:81-82` gates the whole
+module: `#[cfg(feature = "vm-lab")]` / `mod vm_lab;`, and `vm-lab` is default-off (RNQ-17)
+`[verified]`.
+
+The conclusion nevertheless holds, by a different and worse mechanism: **no product path
+publishes the derived gossip key either.** Genesis publishes raw CSPRNG bytes that are
+zeroized and never persisted — `crates/rustynetd/src/main.rs:4129`
+`let node_pubkey_hex = encode_hex(&node_key_bytes);`, against the line immediately above
+it, `:4128`, where the approver goes through `.verifying_key()` `[verified]`. Every other
+product writer (`membership add-peer`, `propose-add`, `propose --operation add-node`,
+`enrollment admit`, `RotateNodeKey`) publishes an operator-supplied value. So lab and
+product do not even agree on which wrong value to publish.
+
+**Corrected framing for D4:** this is not a mac/win exception to a working contract. The
+contract is unimplemented everywhere. That makes D4 smaller than it looked.
+
+### 7.3 A sentinel (D4 option b) cannot do what it is for
+
+`gossip_identity_mismatch_state` returns `"unknown"` on the `gossip_node.is_none()` branch
+**before it ever reads `node_pubkey_hex`** (`crates/rustynetd/src/daemon.rs:5698-5701`)
+`[verified]`. On a platform with no gossip node — every macOS and Windows node — a sentinel
+is therefore invisible to the node publishing it, which is precisely the distinction option
+(b) exists to create. A sentinel would also have to be exactly 64 hex characters to survive
+`decode_hex_to_fixed::<32>` in `MembershipState::validate` and the `AddNode` reducer, i.e.
+shaped indistinguishably from a real key with no mechanical enforcement. **Do not adopt
+option (b) on the reasoning given in §3c.**
+
+### 7.4 The export primitive claim, corrected
+
+"No code exports the derived gossip verifying key" is too strong as written: the full 32
+bytes are broadcast in every gossip bundle (`crates/rustynetd/src/peer_gossip.rs:480`,
+`let source_node_id = signing_key.verifying_key().to_bytes();`), and the status line is a
+confirm-a-guess oracle. But there is **no operator-facing export** — no CLI verb, no file,
+no status field carrying the bytes; `key` offers only `init`, `init-gossip`, `migrate`,
+`store-passphrase` (`crates/rustynetd/src/main.rs:465-468`) `[verified]`. The practical
+conclusion stands: **item 12 is the unblocking prerequisite for every migration option.**
+
+### 7.5 NEW FINDING — `SetNodeCapabilities` is not owner-gated
+
+`requires_owner_signer` matches only `RotateApprover` and `SetQuorum`
+(`crates/rustynet-control/src/membership.rs:441-446`), enforced at `:1825-1826`
+`[verified]`. `SetNodeCapabilities` is absent, and its reducer arm replaces the capability
+vector wholesale with only a blind_exit immutability guard. So a set of approvers meeting
+`quorum_threshold` **with no Owner among them** can mint a capability grant including
+`ExitServer` / `RelayHost`. `documents/SecurityMinimumBar.md:310-312` states the opposite —
+"an anchor cannot self-promote — capability changes require an owner-signed membership
+bundle". **There is no negative test**: the only `OwnerSignatureRequired` test covers
+`RotateApprover` (`membership.rs:3290`, asserting at `:3331`), so this control has no
+verification method, contrary to §4 of the operating contract.
+
+**Scope, corrected twice — do not restate the stronger version.** An adversarial pass
+refuted two supporting claims I made when first reporting this:
+- "`:1825` is the only owner-gate in the tree" is **false**. There are four; the one that
+  matters is `crates/rustynet-control/src/membership.rs:1411-1414`, which rejects an
+  attestation carrying no signature from the *pinned* owner key `[verified]`. That
+  **closes the network path** — a guardian-only capability grant cannot propagate via
+  anchor bundle-pull.
+- `SecurityMinimumBar.md` §6.D.3 ("MUST emit an unsigned `MembershipUpdateRecord` for the
+  membership owner to sign + apply") is an **emitter** mandate on the role-transition flow,
+  not a verifier mandate. The correct hook is `:310-312`, quoted above.
+
+So the honest severity is **a defence-in-depth gap plus a missing verification method, not
+remote privilege escalation.** The adversary needs an approver key *and* local
+root/IPC-privileged access on each victim node. Shipped genesis creates exactly one Owner
+with `quorum_threshold: 1` (`crates/rustynetd/src/main.rs:4179-4187`), so the default
+deployment has no guardians and the gap is unreachable there.
+
+**Two consequences worth acting on.** First, D5 is the wrong unit of decision: the question
+is *which operations the owner gate covers*, and `SetNodeCapabilities` has a stronger claim
+to it than `RotateNodeKey` does. Decide the set, not one arm. Second, the local surface is
+wider than IPC: `load_membership_snapshot` verifies a SHA-256 digest computed over the
+file's own contents and `state.validate()`, with **no signature check**
+(`crates/rustynet-control/src/membership.rs:1124-1155`) `[verified]`. Anyone who can write
+the snapshot file gets that state loaded.
+
+**Open, and not answerable from the tree: does any operator workflow distribute membership
+snapshot files out-of-band** (scp, configuration management) rather than via
+`anchor bundle-pull`? If such a channel exists it bypasses the pinned-owner gate at
+`membership.rs:1411`, and this finding's severity rises accordingly. **Ask the operator.**
