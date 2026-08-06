@@ -105,6 +105,82 @@ struct Stage {
     args: Vec<String>,
 }
 
+/// Entry count in `target/debug/deps` above which the gate prunes the build
+/// cache before running anything else.
+///
+/// Cargo never removes stale per-codegen-unit object files, so `deps/` grows
+/// without bound across rebuilds. Measured on this checkout on 2026-08-06 it
+/// had reached 1,063,921 entries (1,042,787 `.o` files, 157.7 GiB), and at
+/// that size every *first* execution of a freshly built binary inside that
+/// directory stalled for 20-30 s at 0.00 s CPU while the platform assessed
+/// it — the same trivial binary written to a sibling directory started in
+/// 0.33 s, so the cost tracks the directory's entry count and not the
+/// binary's size. Because cargo-nextest executes every test binary just to
+/// enumerate its tests, that toll is paid once per binary before a single
+/// test runs: the full suite took ~2 h wall for 75 s of actual test time,
+/// and compilation was slowed too.
+///
+/// One full workspace build produces roughly 16k entries and a from-scratch
+/// rebuild costs about 3 minutes, so this limit allows roughly a dozen build
+/// generations before pruning, and pruning costs far less than tolerating
+/// the stall.
+const DEFAULT_DEPS_ENTRY_LIMIT: usize = 200_000;
+
+/// Decide whether the build cache should be pruned before gating.
+///
+/// Kept free of I/O so the policy is testable directly. A limit of zero
+/// disables pruning entirely, which is the documented escape hatch for a
+/// caller that would rather keep a large incremental cache.
+fn should_prune_build_cache(entry_count: usize, limit: usize, opted_out: bool) -> bool {
+    !opted_out && limit != 0 && entry_count > limit
+}
+
+/// Count the entries in `target/debug/deps`, or `None` when it does not exist
+/// yet (a clean checkout has nothing to prune).
+fn deps_entry_count() -> Option<usize> {
+    std::fs::read_dir("target/debug/deps")
+        .ok()
+        .map(|entries| entries.count())
+}
+
+/// Prune the build cache when it has grown large enough to slow the gate
+/// down more than a rebuild would cost. Returns true when a prune ran.
+fn prune_build_cache_if_oversized() -> bool {
+    let opted_out = std::env::var("XTASK_SKIP_TARGET_PRUNE")
+        .map(|value| value != "0")
+        .unwrap_or(false);
+    let limit = std::env::var("XTASK_DEPS_ENTRY_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DEPS_ENTRY_LIMIT);
+    let Some(count) = deps_entry_count() else {
+        return false;
+    };
+    if !should_prune_build_cache(count, limit, opted_out) {
+        return false;
+    }
+    eprintln!(
+        "xtask: target/debug/deps holds {count} entries (limit {limit}); \
+         running `cargo clean` first because a bloated deps directory slows \
+         every binary launch far more than a rebuild costs. \
+         Set XTASK_SKIP_TARGET_PRUNE=1 to keep the cache."
+    );
+    match Command::new("cargo").arg("clean").status() {
+        Ok(status) if status.success() => {
+            eprintln!("xtask: build cache pruned");
+            true
+        }
+        Ok(status) => {
+            eprintln!("xtask: cargo clean failed ({status}); continuing without pruning");
+            false
+        }
+        Err(err) => {
+            eprintln!("xtask: cargo clean could not run ({err}); continuing without pruning");
+            false
+        }
+    }
+}
+
 fn run_gates(rest: &[String]) -> i32 {
     let mut skip_test = false;
     let mut with_check = false;
@@ -169,6 +245,11 @@ fn run_gates(rest: &[String]) -> i32 {
         v.extend(scope.iter().cloned());
         v
     };
+
+    // Prune before any stage runs: a bloated deps directory taxes both
+    // compilation and every test-binary launch, so pruning first is what
+    // makes the rest of this run fast rather than merely tidy.
+    prune_build_cache_if_oversized();
 
     let mut stages = vec![Stage {
         label: "fmt",
@@ -721,8 +802,69 @@ fn utc_timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_affected_set, format_timing_row};
+    use super::{
+        DEFAULT_DEPS_ENTRY_LIMIT, compute_affected_set, format_timing_row, should_prune_build_cache,
+    };
     use std::collections::BTreeMap;
+
+    /// A deps directory at or below the limit must never trigger a prune:
+    /// the prune costs a full rebuild, so it may only fire once the
+    /// directory is genuinely oversized.
+    #[test]
+    fn build_cache_is_not_pruned_at_or_below_the_limit() {
+        assert!(!should_prune_build_cache(0, 100, false));
+        assert!(!should_prune_build_cache(99, 100, false));
+        assert!(
+            !should_prune_build_cache(100, 100, false),
+            "exactly at the limit is not over it"
+        );
+    }
+
+    /// Above the limit the prune must fire, otherwise the directory grows
+    /// without bound and every binary launch pays the assessment stall.
+    #[test]
+    fn build_cache_is_pruned_above_the_limit() {
+        assert!(should_prune_build_cache(101, 100, false));
+        assert!(should_prune_build_cache(
+            1_063_921,
+            DEFAULT_DEPS_ENTRY_LIMIT,
+            false
+        ));
+    }
+
+    /// Both escape hatches must hold even for a pathologically large
+    /// directory: an explicit opt-out, and a zero limit meaning "disabled".
+    #[test]
+    fn build_cache_prune_can_be_disabled() {
+        assert!(
+            !should_prune_build_cache(1_063_921, DEFAULT_DEPS_ENTRY_LIMIT, true),
+            "XTASK_SKIP_TARGET_PRUNE must suppress the prune"
+        );
+        assert!(
+            !should_prune_build_cache(1_063_921, 0, false),
+            "a zero limit must disable pruning entirely"
+        );
+    }
+
+    /// The default must sit above a healthy full build (~16k entries) so
+    /// routine work never triggers a rebuild, and below the measured
+    /// pathological size that caused the stall.
+    ///
+    /// Asserted through the predicate rather than by comparing the constant
+    /// directly: a bare constant comparison is evaluated at compile time and
+    /// rejected by `clippy::assertions_on_constants`, and pinning the
+    /// behaviour is what this test is actually for.
+    #[test]
+    fn default_deps_entry_limit_sits_between_healthy_and_pathological() {
+        assert!(
+            !should_prune_build_cache(16_421, DEFAULT_DEPS_ENTRY_LIMIT, false),
+            "a single healthy full build (~16.4k entries) must not trigger a prune"
+        );
+        assert!(
+            should_prune_build_cache(1_063_921, DEFAULT_DEPS_ENTRY_LIMIT, false),
+            "the measured pathological size must trigger a prune"
+        );
+    }
 
     fn dirs() -> Vec<(String, String)> {
         vec![
