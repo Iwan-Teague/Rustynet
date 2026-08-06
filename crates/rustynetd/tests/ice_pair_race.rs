@@ -433,8 +433,20 @@ fn ice_race_falls_back_to_top_priority_when_runtime_lacks_endpoint_attribution()
         )
         .expect("race runs");
     match result.decision {
-        TraversalDecision::Direct { endpoint, .. } => {
+        TraversalDecision::Direct { endpoint, reason } => {
             assert_eq!(endpoint, top_priority_remote);
+            // I4: the endpoint above is the top-priority FALLBACK, chosen
+            // because this runtime does not attribute the handshake to an
+            // endpoint. The reason must record that, so no consumer can read
+            // "handshake observed" as "this endpoint is the one that worked".
+            // Paired with `ice_race_picks_highest_priority_winning_endpoint`,
+            // whose runtime DOES attribute and must keep the attributed
+            // reason — that pair is what distinguishes this from a rename.
+            assert_eq!(
+                reason,
+                TraversalDecisionReason::IcePairRaceHandshakeUnattributed,
+                "an unattributed handshake must not report the attributed reason"
+            );
         }
         other => panic!("expected Direct, got {other:?}"),
     }

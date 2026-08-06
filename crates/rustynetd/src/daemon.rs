@@ -24365,9 +24365,12 @@ mod tests {
             .get(&exit_node)
             .expect("direct recovery status should exist");
         assert_eq!(recovered_status.decision, TraversalProbeDecision::Direct);
+        // Unattributed: no production runtime implements `handshake_endpoint`,
+        // so the recovered endpoint is the top-priority fallback, not a proven
+        // one, and the reason must not claim otherwise.
         assert_eq!(
             recovered_status.reason,
-            TraversalProbeReason::FreshHandshakeObserved
+            TraversalProbeReason::UnattributedHandshakeObserved
         );
         // A Direct decision now arms the re-probe floor too. This assertion
         // previously required `None`, which left the Direct arm of
@@ -24964,7 +24967,7 @@ mod tests {
         assert!(
             netcheck
                 .message
-                .contains("path_reason=fresh_handshake_observed")
+                .contains("path_reason=unattributed_handshake_observed")
         );
         assert!(
             netcheck
@@ -24981,7 +24984,7 @@ mod tests {
         assert!(
             netcheck
                 .message
-                .contains("traversal_probe_reason=fresh_handshake_observed")
+                .contains("traversal_probe_reason=unattributed_handshake_observed")
         );
         let direct_status = runtime
             .traversal_probe_statuses

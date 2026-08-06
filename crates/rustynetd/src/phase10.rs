@@ -266,6 +266,13 @@ impl TraversalProbeDecision {
 pub enum TraversalProbeReason {
     ExistingFreshHandshake,
     FreshHandshakeObserved,
+    /// I4 — the race observed a fresh handshake but the runtime could not
+    /// attribute it to an endpoint, so the programmed endpoint is the
+    /// top-priority pair rather than a proven one. This is the production
+    /// case today, because `handshake_endpoint` has no non-test
+    /// implementation; `FreshHandshakeObserved` is consequently
+    /// unreachable at runtime until real attribution lands.
+    UnattributedHandshakeObserved,
     DirectProbeExhaustedUnprovenDirect,
     NoDirectCandidatesRelayArmed,
     CoordinationRequiredRelayArmed,
@@ -277,6 +284,9 @@ impl TraversalProbeReason {
         match self {
             TraversalProbeReason::ExistingFreshHandshake => "existing_fresh_handshake",
             TraversalProbeReason::FreshHandshakeObserved => "fresh_handshake_observed",
+            TraversalProbeReason::UnattributedHandshakeObserved => {
+                "unattributed_handshake_observed"
+            }
             TraversalProbeReason::DirectProbeExhaustedUnprovenDirect => {
                 "direct_probe_exhausted_unproven_direct"
             }
@@ -6068,17 +6078,32 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         };
 
         match result.decision {
-            TraversalDecision::Direct {
-                endpoint,
-                reason: _,
-            } => {
+            TraversalDecision::Direct { endpoint, reason } => {
                 self.commit_verified_traversal_path_for_peer(node_id, PathMode::Direct)?;
                 self.configure_traversal_paths(node_id, Some(endpoint), evaluation.relay_endpoint)?;
                 self.reconfigure_managed_peer(node_id, endpoint, PathMode::Direct)?;
 
+                // Carry the engine's own reason through instead of asserting
+                // `FreshHandshakeObserved` for every Direct outcome. Only an
+                // endpoint-attributed outcome may claim the attributed
+                // reason: the ICE race attributes when the runtime reports a
+                // handshake endpoint, and the serial simultaneous-open path
+                // attributes by construction because it probes exactly one
+                // endpoint and observes immediately afterwards. Everything
+                // else degrades to the unattributed variant, so a future
+                // engine reason cannot silently inherit a proof-sounding
+                // label by being added to the enum.
+                let reason = match reason {
+                    TraversalDecisionReason::IcePairRaceHandshakeObserved
+                    | TraversalDecisionReason::SimultaneousOpenHandshakeObserved => {
+                        TraversalProbeReason::FreshHandshakeObserved
+                    }
+                    _ => TraversalProbeReason::UnattributedHandshakeObserved,
+                };
+
                 Ok(TraversalProbeReport {
                     decision: TraversalProbeDecision::Direct,
-                    reason: TraversalProbeReason::FreshHandshakeObserved,
+                    reason,
                     attempts: result.attempts,
                     selected_endpoint: endpoint,
                     latest_handshake_unix: result.latest_handshake_unix,
@@ -11309,7 +11334,12 @@ mod tests {
             .expect("probe should promote direct candidate");
 
         assert_eq!(report.decision, TraversalProbeDecision::Direct);
-        assert_eq!(report.reason, TraversalProbeReason::FreshHandshakeObserved);
+        // The phase10 runtime does not implement `handshake_endpoint`, so this
+        // race is unattributed and must not report the attributed reason.
+        assert_eq!(
+            report.reason,
+            TraversalProbeReason::UnattributedHandshakeObserved
+        );
         assert_eq!(report.attempts, 1);
         assert_eq!(report.selected_endpoint, direct_endpoint);
         assert_eq!(controller.peer_path(&peer_id), Some(PathMode::Direct));
