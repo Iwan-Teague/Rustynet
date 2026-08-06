@@ -535,9 +535,9 @@ pub fn decrypt_private_key(
     if key.is_empty() {
         return Err("decrypted key is empty".to_owned());
     }
-    if !key.ends_with(b"\n") {
-        key.push(b'\n');
-    }
+    // Shared with `decrypt_private_key_with_passphrase` so the two cannot
+    // drift: a divergence here changes the derived gossip identity silently.
+    key = append_key_terminator(key);
     Ok(key)
 }
 
@@ -547,6 +547,109 @@ pub fn encrypt_private_key(
     passphrase_path: &Path,
 ) -> Result<(), String> {
     encrypt_private_key_with_passphrase(private_key, encrypted_key_path, passphrase_path, None)
+}
+
+/// Decrypt an encrypted-at-rest key, optionally taking the passphrase from an
+/// explicitly supplied path rather than the configured credential source.
+///
+/// This is the read-side counterpart of `encrypt_private_key_with_passphrase`,
+/// and it exists because the plain `decrypt_private_key` cannot be used by an
+/// operator-facing verb: it resolves the passphrase through
+/// `resolve_passphrase_source`, which deliberately REFUSES the configured path
+/// as a fallback, so a caller holding a real passphrase file has no way to
+/// present it. The escape hatch existed only on the encrypt side, which left
+/// the mint able to write a secret that nothing could subsequently read back.
+///
+/// The trailing-newline behaviour is shared with `decrypt_private_key` on
+/// purpose and must not be "tidied" here: the daemon derives its gossip
+/// identity from the newline-appended bytes, so an exporter that strips it
+/// would print a key the daemon never uses.
+pub fn decrypt_private_key_with_passphrase(
+    encrypted_key_path: &Path,
+    passphrase_path: &Path,
+    explicit_passphrase_path: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+    let passphrase = match explicit_passphrase_path {
+        Some(path) => read_passphrase_file_explicit(path)?,
+        None => read_passphrase_file(passphrase_path)?,
+    };
+    // Fail closed on Windows if process startup cannot prove LocalMachine DPAPI
+    // protect/unprotect works, exactly as the configured-path decrypt does.
+    verify_dpapi_startup_self_test()?;
+    let manager = key_custody_manager(encrypted_key_path, passphrase)?;
+    let key_id = key_custody_key_id(encrypted_key_path);
+    let mut key = manager
+        .load_private_key(&key_id)
+        .map_err(|err| format!("decrypt encrypted key failed: {err}"))?;
+    if key.is_empty() {
+        return Err("decrypted key is empty".to_owned());
+    }
+    key = append_key_terminator(key);
+    Ok(key)
+}
+
+/// Append the trailing newline the daemon's key loader guarantees.
+///
+/// Split out so the rule is testable on every platform: the custody round trip
+/// around it cannot run on macOS, where `key_custody_manager` forces
+/// `RequireOsSecureStore` and reaches the real Keychain, but this rule is the
+/// part that silently changes a derived identity when it is wrong. 255 of 256
+/// random secrets do not end in `0x0a`, so a deriver fed the un-terminated
+/// bytes produces a different key with probability 255/256 — and the failure is
+/// silent, because both sides still produce a syntactically valid key.
+fn append_key_terminator(mut key: Vec<u8>) -> Vec<u8> {
+    if !key.ends_with(b"\n") {
+        key.push(b'\n');
+    }
+    key
+}
+
+/// Print-ready hex of the gossip verifying key this node publishes.
+///
+/// This is the value membership's `node_pubkey_hex` is supposed to carry, and
+/// until this existed there was no way to obtain it: the derived key never
+/// leaves the daemon except as an 8-byte log prefix, so an operator asked to
+/// put it into a signed membership record had nothing to copy. That made every
+/// gossip-identity migration option unimplementable rather than merely
+/// undecided.
+///
+/// Derivation is delegated to `derive_gossip_signing_key` unchanged. Do not
+/// reimplement HKDF here and do not strip the trailing newline: the daemon
+/// derives from the newline-terminated bytes (see `append_key_terminator`), so
+/// either divergence prints a key the daemon does not use, and prints it
+/// looking perfectly valid.
+///
+/// Never returns or logs the secret — only the public verifying key.
+pub fn export_gossip_verifying_key_hex(
+    encrypted_secret_path: &Path,
+    passphrase_path: &Path,
+    explicit_passphrase_path: Option<&Path>,
+) -> Result<String, String> {
+    let secret = decrypt_private_key_with_passphrase(
+        encrypted_secret_path,
+        passphrase_path,
+        explicit_passphrase_path,
+    )?;
+    Ok(gossip_verifying_key_hex_from_secret(secret))
+}
+
+/// Derive the published gossip verifying key from already-decrypted secret
+/// bytes, and render it as lowercase hex.
+///
+/// Split from the custody read so the derivation contract is testable on every
+/// platform: the encrypt/decrypt round trip cannot run on macOS, where
+/// `key_custody_manager` forces `RequireOsSecureStore` and reaches the real
+/// Keychain, but the part that silently produces a WRONG key — reimplementing
+/// the derivation, or feeding it differently terminated bytes — is testable
+/// everywhere.
+pub fn gossip_verifying_key_hex_from_secret(secret: Vec<u8>) -> String {
+    let signing_key = rustynet_control::derive_gossip_signing_key(secret);
+    signing_key
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn encrypt_private_key_with_passphrase(
@@ -1351,6 +1454,81 @@ fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, Stri
 
 #[cfg(test)]
 mod tests {
+    /// The daemon derives its gossip identity from the newline-TERMINATED
+    /// bytes, so the exporter must too. This is the mutation that silently
+    /// publishes a key the daemon never uses: 255 of 256 secrets do not end in
+    /// `0x0a`, and both variants still produce a syntactically valid key, so
+    /// nothing downstream would notice.
+    ///
+    /// Deliberately fixtured with a secret whose final byte is NOT `0x0a` — a
+    /// newline-terminated fixture makes the whole check vacuous, which is a
+    /// trap this repository has already shipped once.
+    #[test]
+    fn exported_gossip_key_derives_over_the_newline_terminated_secret() {
+        let raw = b"0123456789abcdef0123456789abcdeZ".to_vec();
+        assert_ne!(
+            *raw.last().expect("non-empty"),
+            b'\n',
+            "fixture must not already end in a newline or the pin is vacuous"
+        );
+
+        let exported =
+            super::gossip_verifying_key_hex_from_secret(super::append_key_terminator(raw.clone()));
+
+        let expected_key =
+            rustynet_control::derive_gossip_signing_key([raw.as_slice(), b"\n"].concat());
+        let expected: String = expected_key
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            exported, expected,
+            "the exporter must derive over exactly the bytes the daemon derives over"
+        );
+
+        // And it must NOT match a derivation over the un-terminated bytes,
+        // which is what a stripped or re-implemented exporter would produce.
+        let stripped_key = rustynet_control::derive_gossip_signing_key(raw);
+        let stripped: String = stripped_key
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_ne!(
+            exported, stripped,
+            "deriving over the un-terminated secret must produce a different key"
+        );
+    }
+
+    /// The terminator rule itself: append when absent, never double up.
+    #[test]
+    fn key_terminator_is_appended_only_when_absent() {
+        assert_eq!(super::append_key_terminator(b"abc".to_vec()), b"abc\n");
+        assert_eq!(
+            super::append_key_terminator(b"abc\n".to_vec()),
+            b"abc\n",
+            "an already-terminated secret must not gain a second newline"
+        );
+    }
+
+    /// The export must be lowercase hex of the 32-byte verifying key — the
+    /// shape `node_pubkey_hex` is decoded from. A different width or case
+    /// would be rejected downstream by `decode_hex_to_fixed::<32>`.
+    #[test]
+    fn exported_gossip_key_is_64_lowercase_hex_characters() {
+        let exported = super::gossip_verifying_key_hex_from_secret(b"seed-material\n".to_vec());
+        assert_eq!(exported.len(), 64, "32 bytes render as 64 hex characters");
+        assert!(
+            exported
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch)),
+            "membership decodes lowercase hex only, got {exported}"
+        );
+    }
+
     #[cfg(all(unix, not(target_os = "macos")))]
     use super::DEFAULT_PASSPHRASE_CREDENTIAL_NAME;
     #[cfg(not(windows))]
