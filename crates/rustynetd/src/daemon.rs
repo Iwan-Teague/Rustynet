@@ -6634,7 +6634,26 @@ impl DaemonRuntime {
                         remote_node_id.as_str()
                     )
                 })?;
+                // I4 item 8: the retained status carries a decision and reason
+                // earned on an arbitrarily old pass, while `selected_endpoint`
+                // is overwritten from whatever is programmed NOW. Left as-is
+                // that produces the tuple §4 forbids — an attesting reason,
+                // a refreshed handshake stamp, and an endpoint nothing in this
+                // pass proved — because the reason was earned at a DIFFERENT
+                // endpoint. Freshness is not the invariant; endpoint
+                // attribution is.
+                //
+                // So when the programmed endpoint has moved away from the one
+                // the retained reason was earned at, downgrade the reason
+                // rather than letting it describe the new endpoint. The
+                // decision is left alone: the peer really is still programmed
+                // Direct, and rewriting that here would fight the controller.
                 if let Some(endpoint) = current_endpoint {
+                    retained.reason = retained_reason_after_endpoint_move(
+                        retained.reason,
+                        retained.selected_endpoint,
+                        endpoint,
+                    );
                     retained.selected_endpoint = endpoint;
                 }
                 retained.latest_handshake_unix =
@@ -6741,11 +6760,32 @@ impl DaemonRuntime {
                         breaker.intensity()
                     );
                 }
+                // Only an endpoint-attributed outcome may be learned as a win.
+                // The unattributed variant reports the top-priority fallback
+                // rather than the endpoint that worked, so promoting its class
+                // would durably bias every later race for this peer on
+                // evidence that does not exist.
+                //
+                // `ExistingFreshHandshake` is deliberately NOT in this set even
+                // though it sounds like proof: its endpoint is the cached
+                // CONFIGURED value read back from the backend, and its
+                // freshness stamp is keyed by node id rather than by endpoint,
+                // so it says the peer is alive — not that this endpoint is why.
+                //
+                // Consequence, stated rather than hidden: until real endpoint
+                // attribution exists, no production race is attributed, so the
+                // prior store stops recording wins and keeps only `tried`.
+                // That costs the re-ranking optimisation and is the intended
+                // trade: learning nothing is recoverable, learning a wrong
+                // endpoint as a win is durable and self-reinforcing.
+                let attributed =
+                    matches!(report.reason, TraversalProbeReason::FreshHandshakeObserved);
                 let (winning_class, tried_classes) = race_outcome_classes(
                     &direct_candidates,
                     report.decision,
                     report.selected_endpoint,
                     handshake_fresh,
+                    attributed,
                 );
                 if !tried_classes.is_empty() {
                     self.peer_prior_store.record_outcome(
@@ -15879,11 +15919,53 @@ fn parse_host_cidr_addr(cidr: &str) -> Option<IpAddr> {
 /// deduped class set of the remote direct candidates; the winner is the
 /// class of the candidate matching the selected endpoint, only when the
 /// decision is Direct AND a fresh handshake backed it.
+/// I4 item 8: decide what reason a clone-forward status may keep once the
+/// programmed endpoint has moved.
+///
+/// The `!probe_due` path retains a decision and reason earned on an
+/// arbitrarily old pass while overwriting `selected_endpoint` with whatever is
+/// programmed now. Carrying an attesting reason across that overwrite produces
+/// the tuple §4 forbids: an attesting reason, a refreshed handshake stamp, and
+/// an endpoint that nothing in this pass proved — because the reason was
+/// earned at a different endpoint. Freshness is not the invariant here;
+/// endpoint attribution is.
+///
+/// Kept pure so the rule is testable without driving a full reconcile.
+fn retained_reason_after_endpoint_move(
+    retained_reason: TraversalProbeReason,
+    retained_endpoint: SocketEndpoint,
+    programmed_endpoint: SocketEndpoint,
+) -> TraversalProbeReason {
+    if programmed_endpoint == retained_endpoint {
+        return retained_reason;
+    }
+    match retained_reason {
+        TraversalProbeReason::FreshHandshakeObserved => {
+            TraversalProbeReason::UnattributedHandshakeObserved
+        }
+        other => other,
+    }
+}
+
+/// Classify a race outcome into the evidence the cross-session prior store
+/// learns from.
+///
+/// `attributed` is load-bearing and must not be dropped. A `Direct` decision
+/// with a fresh handshake is NOT by itself evidence that `selected_endpoint`
+/// worked: when the race could not attribute the handshake to an endpoint it
+/// reports the top-priority pair as a fallback, and crediting that as a win
+/// teaches the prior store to re-promote an endpoint nothing proved. The
+/// promotion is durable across sessions and feeds `prior_rerank_pairs`, so a
+/// single misattributed race biases every later race for that peer.
+///
+/// `tried` is unaffected: every probed candidate really was tried, whatever
+/// the outcome.
 fn race_outcome_classes(
     direct_candidates: &[ProbeTraversalCandidate],
     decision: TraversalProbeDecision,
     selected_endpoint: SocketEndpoint,
     handshake_fresh: bool,
+    attributed: bool,
 ) -> (
     Option<crate::peer_traversal_prior::CandidateClass>,
     Vec<crate::peer_traversal_prior::CandidateClass>,
@@ -15898,7 +15980,7 @@ fn race_outcome_classes(
             tried.push(class);
         }
     }
-    let winning = (decision == TraversalProbeDecision::Direct && handshake_fresh)
+    let winning = (decision == TraversalProbeDecision::Direct && handshake_fresh && attributed)
         .then(|| {
             direct_candidates
                 .iter()
@@ -15917,6 +15999,68 @@ fn race_outcome_classes(
 #[cfg(all(test, not(windows)))]
 mod tests {
     use std::collections::BTreeMap;
+
+    fn endpoint(addr: &str, port: u16) -> SocketEndpoint {
+        SocketEndpoint {
+            addr: addr.parse().expect("addr"),
+            port,
+        }
+    }
+
+    /// I4 item 8. The clone-forward overwrites `selected_endpoint` from what
+    /// is programmed now while retaining a reason earned earlier. When the
+    /// endpoint has moved, an attesting reason must not follow it — the reason
+    /// was earned somewhere else.
+    #[test]
+    fn retained_attesting_reason_is_downgraded_when_the_programmed_endpoint_moves() {
+        let earned_at = endpoint("203.0.113.1", 51820);
+        let programmed_now = endpoint("203.0.113.2", 51820);
+        assert_eq!(
+            super::retained_reason_after_endpoint_move(
+                TraversalProbeReason::FreshHandshakeObserved,
+                earned_at,
+                programmed_now,
+            ),
+            TraversalProbeReason::UnattributedHandshakeObserved,
+            "an attesting reason must not describe an endpoint it was not earned at"
+        );
+    }
+
+    /// The same endpoint means the reason still describes what it was earned
+    /// at, so it must survive — downgrading unconditionally would erase every
+    /// legitimate attestation on every non-due pass.
+    #[test]
+    fn retained_attesting_reason_survives_when_the_endpoint_is_unchanged() {
+        let same = endpoint("203.0.113.1", 51820);
+        assert_eq!(
+            super::retained_reason_after_endpoint_move(
+                TraversalProbeReason::FreshHandshakeObserved,
+                same,
+                same,
+            ),
+            TraversalProbeReason::FreshHandshakeObserved
+        );
+    }
+
+    /// Non-attesting reasons are already honest about proving nothing, so a
+    /// move must leave them untouched rather than relabel them.
+    #[test]
+    fn retained_non_attesting_reasons_are_left_alone_on_a_move() {
+        let earned_at = endpoint("203.0.113.1", 51820);
+        let moved = endpoint("203.0.113.9", 51820);
+        for reason in [
+            TraversalProbeReason::UnattributedHandshakeObserved,
+            TraversalProbeReason::DirectProbeExhaustedUnprovenDirect,
+            TraversalProbeReason::ExistingFreshHandshake,
+            TraversalProbeReason::NoDirectCandidatesRelayArmed,
+        ] {
+            assert_eq!(
+                super::retained_reason_after_endpoint_move(reason, earned_at, moved),
+                reason,
+                "{reason:?} must be carried through unchanged"
+            );
+        }
+    }
 
     #[test]
     fn race_outcome_classes_maps_decisions_to_prior_evidence() {
@@ -15948,6 +16092,7 @@ mod tests {
             TraversalProbeDecision::Direct,
             srflx_v4.endpoint,
             true,
+            true,
         );
         assert_eq!(winning, Some(CandidateClass::SrflxV4));
         assert_eq!(tried, vec![CandidateClass::HostV4, CandidateClass::SrflxV4]);
@@ -15959,14 +16104,37 @@ mod tests {
             TraversalProbeDecision::Direct,
             host_v4.endpoint,
             false,
+            true,
         );
         assert_eq!(winning, None);
+
+        // I4 item 7: Direct + fresh handshake but UNATTRIBUTED. The reported
+        // endpoint is the top-priority fallback, not the one that worked, so
+        // it must never be learned as a win — otherwise the prior store
+        // re-promotes it across sessions on evidence that does not exist.
+        let (winning, tried) = super::race_outcome_classes(
+            &candidates,
+            TraversalProbeDecision::Direct,
+            srflx_v4.endpoint,
+            true,
+            false,
+        );
+        assert_eq!(
+            winning, None,
+            "an unattributed race must not teach the prior store a winner"
+        );
+        assert_eq!(
+            tried,
+            vec![CandidateClass::HostV4, CandidateClass::SrflxV4],
+            "tried is unaffected: every probed candidate really was tried"
+        );
 
         // Relay fallback: no winner; every tried class records a failure.
         let (winning, tried) = super::race_outcome_classes(
             &candidates,
             TraversalProbeDecision::Relay,
             srflx_v4.endpoint,
+            true,
             true,
         );
         assert_eq!(winning, None);
@@ -15977,6 +16145,7 @@ mod tests {
             &[],
             TraversalProbeDecision::Direct,
             host_v4.endpoint,
+            true,
             true,
         );
         assert_eq!(winning, None);
