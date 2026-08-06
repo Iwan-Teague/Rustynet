@@ -106,6 +106,122 @@ record — every previously unreviewed recommendation here has been refuted, twi
 claims tagged as verified — that is a live caveat, not a formality. Attack it before
 building it.
 
+## R5 — the R4 chain was reviewed on 2026-08-06, and all three steps were refuted
+
+R4's caveat was correct. The chain was attacked by three independent adversarial reviews
+with distinct lenses (connectivity, attacker-chosen endpoint, proof surface), and every
+load-bearing link below was then re-verified by hand against the code at `8ffa3a6e`.
+**Do not build the R4 chain.** The full write-up, including which reviewer claims were
+themselves wrong, is in `I4TraversalAttestationPlan_2026-08-05.md` §0 (revision 4) and
+§9.1. In summary:
+
+- **Step 2 (A3.1) — refuted.** Its safety claim rests on `ExistingFreshHandshake`
+  returning `Direct` without entering the race. That guard is structurally unreachable
+  for a peer in relay mode: `sync`/`evaluate` re-arms relay *before* reading the
+  incumbent endpoint (`crates/rustynetd/src/phase10.rs:5955-5956`), that call reprograms
+  a `PathMode::Relay` peer to the relay address
+  (`crates/rustynetd/src/phase10.rs:5868-5877`), the guard then reads the endpoint back
+  from the backend (`:5959-5962`) and requires it to be a **direct** candidate
+  (`:5969-5972`) — while a relay endpoint is never in that list
+  (`crates/rustynetd/src/daemon.rs:14847`, `TraversalCandidateType::Relay => return None,`).
+  So the guard fires only for a peer that is *already* Direct. Since no production
+  runtime implements `handshake_endpoint`, after A3.1 the race never returns `Direct` in
+  production, so any peer that lands on relay stays there for the daemon's lifetime and a
+  healthy direct peer is demoted permanently by one stale-handshake blip. The only other
+  `PathMode::Direct` committer, `mark_direct_recovered`
+  (`crates/rustynetd/src/phase10.rs:5701`), has no production caller — all six call sites
+  sit after the `#[cfg(test)]` at `crates/rustynetd/src/phase10.rs:7082`.
+- **Step 1 (close the fail-closed arm) — refuted three ways.** There is no representable
+  "nothing programmed" outcome, so the only closure is `Err`, and `Err` is a **node-wide
+  egress kill**: `crates/rustynetd/src/daemon.rs:4978-4983` calls
+  `force_fail_closed_or_restrict`, reaching
+  `crates/rustynetd/src/phase10.rs:5557-5559` `self.system.block_all_egress()?;`. It also
+  makes the residue case strictly *worse*: `send_probe` reprograms the backend for every
+  probed pair (`crates/rustynetd/src/phase10.rs:98-105`) and nothing reverts it, so
+  removing the arm's overwrite leaves `pairs[last]` — a peer-supplied endpoint —
+  programmed permanently. And an identical `.max_by_key(|candidate| candidate.priority)`
+  survives on a path with no race at all:
+  `crates/rustynetd/src/daemon.rs:14688-14691` inside
+  `select_runtime_traversal_endpoints`, reached from `static_traversal_endpoint` at
+  `crates/rustynetd/src/daemon.rs:7016` whenever a peer has no probe status.
+- **Step 3 (proof surface) — refuted as scoped.** The description of `live_proven` is
+  accurate, but because no production runtime implements `handshake_endpoint`, requiring
+  attribution makes `path_live_proven` permanently false on every direct path
+  fleet-wide. That breaks, at minimum: the Windows mesh-join gate
+  (`scripts/bootstrap/windows/Verify-RustyNetWindowsBootstrap.ps1:756`, `:823` — invisible
+  to any `.rs` grep), `scripts/vm_lab/netns_daemon_path.sh:475`,
+  `scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh:329`,
+  `scripts/e2e/live_linux_cross_network_failback_roaming_test.sh:355` and `:485`,
+  `crates/rustynet-cli/src/ops_cross_network_reports.rs:1863`,
+  `crates/rustynet-cli/src/bin/live_linux_mixed_topology_test.rs:196`,
+  `crates/rustynet-cli/src/bin/live_chaos_crash_recovery_test.rs:665`, and the
+  §7-mandatory workspace unit test at `crates/rustynetd/src/daemon.rs:24979`.
+  Separately, `crates/rustynetd/src/daemon.rs:7398` is **not** a fallback: per
+  `:7383-7399` the empty case is unreachable in that arm, so the literal fires only when
+  two or more live direct peers carry *differing* reasons. It is a collapse of a
+  heterogeneous reason set, so "delete the literal" is an unspecified policy decision,
+  and no existing test reaches it — every `direct_active` test in the tree is single-peer.
+
+## R6 — this work cannot be landed from the origin macOS host, measured not assumed
+
+Re-measured 2026-08-06 with all ten UTM guests stopped, zero swap in use, and a warm
+build (`Finished` in 0.61 s):
+
+| Command | Result |
+| --- | --- |
+| `cargo --version` | 0.027 s |
+| `cargo fmt --all -- --check` | **passes, 3.7 s** |
+| `cargo nextest run --workspace --all-targets --all-features --locked --retries 0` | **killed at 68 min, no `Summary` line** |
+| the same, narrowed to **one** test via `-E 'test(=…)'` | **killed at 10 min, never completed** |
+
+Cargo itself is healthy; what is wedged is specifically **test-binary execution**. The
+signature is diagnostic: for the first ~30 minutes test binaries turned over in seconds,
+then the tail stalled with every binary at **0.0 % CPU in state `S`** for 3–16 minutes
+each while `syspolicyd` accumulated 227 minutes of CPU. Zero swap in use, so this is not
+memory thrashing — it is Gatekeeper validating each freshly built unsigned binary on
+exec.
+
+**The killed run left a 209-byte log with no `Summary` line and zero FAIL lines**, which
+reads exactly like a clean run. Per §5, absence of the runner's own summary means the gate
+did not run. It was not a pass and is not recorded as one.
+
+**But "this host cannot build" is the wrong conclusion, and it was the first one drawn
+here.** The tax was then measured directly, on a **prebuilt** binary with no cargo in the
+picture:
+
+| Exec of `target/debug/deps/ice_pair_race-<hash>` | Wall clock | CPU |
+| --- | --- | --- |
+| 1st | **25.559 s** | 0.00 s user, 0.00 s system |
+| 2nd | **0.007 s** | 0.00 s |
+| 3rd | **0.005 s** | 0.00 s |
+
+Twenty-five seconds of pure blocking to start a binary that does 0.00 s of work — and the
+validation is **cached per binary**, so the cost is paid once per freshly built binary,
+not once per exec. The workspace has ~155 test binaries, so a cold suite pays roughly
+155 × 25 s ≈ 65 minutes of Gatekeeper latency before the tests cost anything, which is
+exactly where the 68-minute run was when it was killed. It was not wedged; it was
+finishing paying. This also explains why `-E 'test(=…)'` did not help: nextest execs every
+binary with `--list` to resolve a filter, so even a single-test selection pays the full
+listing tax.
+
+**Consequence for this work.** Targeted mutation verification is *cheap* once a binary
+exists (milliseconds to re-run), and a full gate is slow but achievable — budget ~70–90
+minutes for a cold run, far less when only a few crates rebuilt. Items 1, 4, 6, 7, 8 and 9
+are all mutation-provable on macOS in principle: the daemon test module is
+`#[cfg(all(test, not(windows)))]` and `crates/rustynetd/tests/ice_pair_race.rs` carries no
+platform gate. **Do not record this host as unable to build.** Record it as one where the
+first exec of each newly built test binary costs ~25 s, and budget accordingly.
+
+**Additionally blocked by platform, even on a working macOS host.** Items 3, 11 and 12
+touch encrypted key custody, and their proofs cannot run on macOS at all: the item 3 test
+is `#[cfg(all(unix, not(target_os = "macos")))]`
+(`crates/rustynetd/src/daemon.rs:20156`, the function itself at `:20158` — the body's
+`:20156` anchor for the function has drifted by two lines), and `key_custody_manager` forces
+`OsStoreFallbackPolicy::RequireOsSecureStore` on macOS
+(`crates/rustynetd/src/key_material.rs:596-597`) so any encrypt/decrypt round trip reaches
+the real Keychain. These three need a Linux host specifically, not merely a host where
+cargo works.
+
 ---
 
 # I4 Traversal Attestation and Gossip Identity — Implementation Handoff

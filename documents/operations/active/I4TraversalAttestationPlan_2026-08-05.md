@@ -1,9 +1,10 @@
 # I4 — traversal enforcement: what it needs, and why it cannot ship yet
 
-**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.** Revision 3, after
-two adversarial reviews. **Read §0 first**: the second review refuted four of revision 2's
-corrections, including its headline recommendation, so the sections below carry retractions
-inline. Nothing here is landable as written.
+**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.** Revision 4, after
+three rounds of adversarial review. **Read §0 first**: the second review refuted four of
+revision 2's corrections including its headline recommendation, and the third round
+refuted **all three steps of the chain revision 3 proposed in its place** (§0.0, §9.1), so
+the sections below carry retractions inline. Nothing here is landable as written.
 
 A caution for whoever picks this up, because it has now held at every step: **the narrow
 supporting fact was correct each time; the conclusion drawn from it was not.** Treat every
@@ -17,6 +18,82 @@ status surface) shipped earlier and is out of scope.
 would still program an attacker-chosen endpoint.** The ordering problem the task
 anticipated is real, larger than expected, and the blocking dependency is partly work
 that was only *designed* today. §1 states the result; §9 states what is landable now.
+
+## 0.0 Revision 4 — the chain revision 3 proposed was reviewed, and all three steps failed
+
+Revision 3 closed §9 by recommending "A3.1 + item 2, taken together, plus a proof-surface
+change", and flagged that this re-scoping had not itself been reviewed. It has now been
+reviewed — three independent adversarial passes with distinct lenses, every load-bearing
+link re-verified by hand at commit `8ffa3a6e` — and the pattern held for a third time:
+**the narrow supporting facts were correct, and the conclusion drawn from them was not.**
+Details and the per-step evidence are in §9.1. The headline retractions:
+
+**RETRACTED — "A3.1 does not cost connectivity because `ExistingFreshHandshake` covers the
+steady-state peer".** The guard is structurally unreachable for a peer in relay mode.
+`evaluate_traversal_probes` re-arms relay *before* it reads the incumbent endpoint
+(`phase10.rs:5955-5956`); that call reprograms a `PathMode::Relay` peer to the relay
+address (`phase10.rs:5868-5877`); the guard then reads the endpoint back from the backend
+(`phase10.rs:5959-5962`) and requires it to be a **direct** candidate
+(`phase10.rs:5969-5972`), while a relay endpoint is never in that list
+(`daemon.rs:14847`, `TraversalCandidateType::Relay => return None,`) `[verified]`. So it
+fires only for a peer that is *already* Direct — it is not a promotion path. Since no
+production runtime implements `handshake_endpoint`, after A3.1 the race never returns
+`Direct` in production: a peer that lands on relay never returns to direct, and a healthy
+direct peer is permanently demoted by one stale-handshake blip. The only other
+`PathMode::Direct` committer, `mark_direct_recovered` (`phase10.rs:5701`), has no
+production caller — all six call sites are after the `#[cfg(test)]` at `phase10.rs:7082`
+`[verified]`.
+
+**RETRACTED — "start with item 2, since it is the producer-side hole and is independent of
+attribution".** Three separate defects. (i) There is no representable "nothing programmed"
+outcome, so the only closure is `Err`, and `Err` is a **node-wide egress kill**, not a
+per-peer denial: `daemon.rs:4978-4983` → `force_fail_closed_or_restrict` →
+`phase10.rs:5557-5559` `self.system.block_all_egress()?;` `[verified]`. (ii) It makes the
+residue case strictly worse — `send_probe` reprograms the backend for every probed pair
+(`phase10.rs:98-105`) and nothing reverts it, so deleting the arm's overwrite leaves
+`pairs[last]`, a peer-supplied endpoint, programmed permanently `[verified]`. (iii) An
+identical `.max_by_key(|candidate| candidate.priority)` survives on a path that runs no
+race at all — `daemon.rs:14688-14691` in `select_runtime_traversal_endpoints`, reached
+from `static_traversal_endpoint` at `daemon.rs:7016` for any peer with no probe status
+(first boot, post-restart, after any status clear) `[verified]`. Item 2 relocates the hole
+rather than closing it.
+
+**RETRACTED — "the proof surface must stop treating path-mode-plus-freshness as proof".**
+The *description* of `live_proven` is accurate (`daemon.rs:7461` carries no reason term),
+but the remedy is a demolition. Because no production runtime implements
+`handshake_endpoint`, requiring attribution makes `path_live_proven` permanently false on
+every direct path fleet-wide, breaking the Windows mesh-join gate
+(`scripts/bootstrap/windows/Verify-RustyNetWindowsBootstrap.ps1:756`, `:823`),
+`scripts/vm_lab/netns_daemon_path.sh:475`,
+`scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh:329`,
+`scripts/e2e/live_linux_cross_network_failback_roaming_test.sh:355` and `:485`,
+`crates/rustynet-cli/src/ops_cross_network_reports.rs:1863`,
+`crates/rustynet-cli/src/bin/live_linux_mixed_topology_test.rs:196`,
+`crates/rustynet-cli/src/bin/live_chaos_crash_recovery_test.rs:665`, and the §7-mandatory
+unit test at `daemon.rs:24979` `[verified]`. Note the four shell and PowerShell consumers
+are invisible to any `.rs` grep — the enumeration error this document family keeps making.
+
+**CORRECTED — `daemon.rs:7398` is not a fallback.** Per `daemon.rs:7383-7399` the empty
+case is unreachable in the `direct_active` arm, so the literal fires only when **two or
+more** live direct peers carry *differing* reasons. It is a collapse of a heterogeneous
+reason set onto one member's string, not a default. "Delete the literal" is therefore an
+unspecified policy decision (mixed marker? most-pessimistic member?), and no existing test
+reaches it — every `direct_active` test in the tree is single-peer and takes the
+`len() == 1` branch `[verified]`. Revision 3's `:7395` claim survives: that `.unwrap_or`
+is genuinely dead.
+
+**Also recorded: `live_proven` is already treated as unreliable elsewhere in the tree.**
+`crates/rustynet-cli/src/bin/live_linux_two_hop_test.rs:2052-2055` states it is
+"structurally unsatisfiable on shared-transport nodes … so it must never be used as a
+liveness gate" `[verified]`. Any future hardening of that field must reconcile with this
+precedent rather than tighten a signal one platform class already routes around.
+
+**What survived the third review, unrefuted.** The misattribution premise itself:
+`handshake_endpoint` has no production implementation — the `SimultaneousOpenRuntime` impl
+for `Phase10PeerRuntime` (`phase10.rs:95-117`) defines only `send_probe` and
+`latest_handshake_unix`, so the `Ok(None)` default at `traversal.rs:714` applies to every
+production race, and `pairs[0]` is credited while the backend last sat at `pairs[last]`
+`[verified]`. **The bug is real. Every remedy proposed so far is what fails.**
 
 ## 0. Revision 3 — what the second review retracted
 
@@ -537,9 +614,60 @@ proof-surface change:
    `"fresh_handshake_observed"` aggregate fallback (`daemon.rs:7395`, `:7398`) must go.
    Without this, items 1 and 2 leave the strongest proof-named surface still lying.
 
+**RETRACTED IN REVISION 4 — all three steps above were refuted. Do not build this chain.**
+The caveat that follows was correct, and the review it asked for has now happened. See
+§0.0 for the headline retractions and §9.1 for the per-step evidence. The three numbered
+steps above are kept only because the retraction is the transferable part.
+
 This re-scoping has **not itself been reviewed**, and on this document's record that
 matters: every previously unreviewed recommendation here has been refuted. It should be
 attacked before it is built.
+
+## 9.1 What the third review established, per step
+
+Three independent adversarial reviews (lenses: connectivity/reachability,
+attacker-chosen endpoint, proof surface and mutation-provability) on 2026-08-06, each
+required to cite `file:line` with quoted line text and told that an endorsement is a
+failed review. Every load-bearing link below was then re-verified by hand at `8ffa3a6e`;
+claims that did not survive that re-verification are recorded at the end.
+
+**Step 1 — close the fail-closed arm (`phase10.rs:6109-6131`). UNSAFE.** The arm is
+reachable only when no relay endpoint exists — `relay_or_fail_closed_for_race` returns
+`Relay` first whenever one is available (`traversal.rs:1768`), so step 1 targets exactly
+the relay-less topologies, including the same-LAN and hole-punched cross-network meshes
+this project has already proven. No non-`Direct`/`Relay` outcome is representable
+(`phase10.rs:251`, `phase10.rs:301`), so the only closure is `Err`, which is node-wide
+(§0.0). It also converts an overwritten bad endpoint into an unoverwritten one, and leaves
+`daemon.rs:14691` untouched.
+
+**Step 2 — A3.1. UNSAFE.** Its stated safety net is unreachable for relay peers, so it
+eliminates the only production promotion path to direct (§0.0). One reviewer traced the
+demotion concretely: a peer already Direct whose handshake goes stale re-races
+immediately (`daemon.rs:2229-2231`, `if was_fresh_when_last_evaluated { return true; }` —
+the reviewer cited `:2222-2224`, which is the explanatory comment, not the branch), the
+race now declines to return `Direct`, the caller
+commits `PathMode::Relay` (`phase10.rs:6085-6087`), and the peer is thereafter pinned.
+
+**Step 3 — proof surface. UNSAFE ONLY IN COMBINATION, and not landable as scoped.** Sound
+in isolation as a description; as a change it goes permanently false fleet-wide and breaks
+eight named consumers plus one mandatory unit test (§0.0). A second, wider hole it does
+not close was surfaced during the review and is recorded here because no item in the
+handoff cites it: the `FailClosed` arm installs `PathMode::Direct` to the highest-priority
+candidate that was **never probed** (`phase10.rs:6109-6127`), so a later fresh handshake
+makes the surface emit `path_reason=direct_probe_exhausted_unproven_direct` together with
+`path_live_proven=true` — "unproven" and "proven" on one line.
+
+**Reviewer claims that did not survive re-verification, recorded so they are not
+inherited.** One review reported that
+`crates/rustynetd/tests/ice_pair_race.rs:391` is the `#[test]` attribute with the function
+at `:392`, and presented this as a correction to the handoff. It is wrong: `grep -n` puts
+`fn ice_race_falls_back_to_top_priority_when_runtime_lacks_endpoint_attribution()` at
+**`:391`** exactly, with `#[test]` at `:390`. Its substantive observation — that the test
+discards the reason via `TraversalDecision::Direct { endpoint, .. }` at `:435-437` and so
+proves nothing about reasons today — is correct, but it is not a refutation of the
+handoff, which already asked for that assertion to be *added*. The same review's
+enumeration of `path_live_proven` consumers was also an undercount: it found the
+PowerShell gate but missed the four shell consumers listed in §0.0.
 
 Two constraints hold regardless. It cannot be mutation-verified on this host (cargo wedges
 under Gatekeeper saturation, §11), and by the standing rule a behaviour change that cannot
@@ -587,7 +715,47 @@ the scoping modes built).
   `[agent, explicitly not derived]`.
 - Whether an out-of-tree signing authority mints traversal bundles from observed gossip.
   No in-repo writer does `[agent]`.
-- The `max_reconcile_failures` threshold governing §7's escalation to permanent
-  restriction `[agent, field seen, default unread]`.
+- ~~The `max_reconcile_failures` threshold governing §7's escalation to permanent
+  restriction~~ **RESOLVED: `DEFAULT_MAX_RECONCILE_FAILURES = 5`, `daemon.rs:338`
+  `[verified]`.**
 - Nothing here was compiled or tested: cargo is unusable on this host (macOS Gatekeeper
   saturation wedges test-binary exec for hours). Every claim is static reading.
+  **Re-measured 2026-08-06, and the diagnosis is now precise rather than inferred.** With
+  all ten UTM guests stopped, zero swap in use and a warm build (`Finished` in 0.61 s):
+  `cargo --version` returns in 0.027 s and `cargo fmt --all -- --check` **passes in
+  3.7 s**, so cargo itself is healthy. What is wedged is specifically **test-binary
+  execution** — a full `cargo nextest run --workspace --all-targets --all-features
+  --locked --retries 0` was killed at **68 minutes with no `Summary` line**, and the same
+  command narrowed by `-E 'test(=…)'` to a **single** test was killed at **10 minutes**
+  without completing. The signature: binaries turned over in seconds for the first ~30
+  minutes, then the tail stalled with every test binary at **0.0 % CPU in state `S`** for
+  3–16 minutes each while `syspolicyd` accumulated 227 minutes of CPU, with zero swap in
+  use — Gatekeeper validating each freshly built unsigned binary on exec, not memory
+  thrashing. Note also that the killed run left a 209-byte log with no summary and zero
+  FAIL lines, which reads exactly like a clean run; it was not one.
+- **CORRECTION — "cargo is unusable here" is too strong, and the first version of this
+  entry drew exactly the wrong conclusion from the right measurement.** The tax was then
+  measured directly rather than inferred, by running one **prebuilt** test binary with no
+  cargo involved:
+
+  | Exec of `target/debug/deps/ice_pair_race-<hash>` | Wall clock | CPU |
+  | --- | --- | --- |
+  | 1st | **25.559 s** | 0.00 s user, 0.00 s system |
+  | 2nd | **0.007 s** | 0.00 s |
+  | 3rd | **0.005 s** | 0.00 s |
+
+  Twenty-five seconds of pure blocking to start a binary that then does 0.00 s of work —
+  and **the validation is cached per binary**, so the tax is paid **once per freshly built
+  binary**, not once per exec. That reframes everything: the workspace has ~155 test
+  binaries, so a cold suite pays roughly 155 × 25 s ≈ 65 minutes of pure Gatekeeper
+  latency *before* the tests themselves cost anything — which is precisely where the run
+  above was when it was killed at 68 minutes. It was not wedged; it was finishing paying.
+  It also explains why `-E 'test(=…)'` did not help: nextest must exec every binary with
+  `--list` to resolve the filter, so a single-test selection still pays the full listing
+  tax.
+
+  So on this host: `cargo fmt` (3.7 s) and single-binary verbs such as
+  `ops check-secrets-hygiene` (1 min, PASS) are fine; a full gate is slow but **not
+  impossible**; and targeted mutation verification is cheap once the binary exists,
+  because re-running it costs milliseconds. **Do not record this host as unable to build.
+  Record it as one where the first exec of each new test binary costs ~25 s.**
