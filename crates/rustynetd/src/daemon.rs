@@ -6774,7 +6774,7 @@ impl DaemonRuntime {
                 //
                 // Consequence, stated rather than hidden: until real endpoint
                 // attribution exists, no production race is attributed, so the
-                // prior store stops recording wins and keeps only `tried`.
+                // prior store stops recording wins for direct outcomes.
                 // That costs the re-ranking optimisation and is the intended
                 // trade: learning nothing is recoverable, learning a wrong
                 // endpoint as a win is durable and self-reinforcing.
@@ -6787,7 +6787,23 @@ impl DaemonRuntime {
                     handshake_fresh,
                     attributed,
                 );
-                if !tried_classes.is_empty() {
+                if !record_prior_outcome_is_meaningful(report.decision, handshake_fresh, attributed)
+                {
+                    // Deliberately record NOTHING rather than a no-winner
+                    // outcome. `PeerTraversalPrior::update` gives every tried
+                    // class `beta += 1.0` whenever the winner is `None`, so an
+                    // unattributed direct success would write pure failure
+                    // evidence against the very candidates that just carried a
+                    // working path — and because a class is penalised once per
+                    // race it appears in, the most frequently offered
+                    // candidates would decay fastest. That inverts the ranking
+                    // rather than neutralising it, which is worse than the
+                    // misattribution this change exists to stop.
+                    //
+                    // A Relay or exhausted outcome is different and still
+                    // recorded below: there the direct candidates genuinely
+                    // did fail, so the failure evidence is true.
+                } else if !tried_classes.is_empty() {
                     self.peer_prior_store.record_outcome(
                         remote_node_id.as_str(),
                         winning_class,
@@ -15919,6 +15935,29 @@ fn parse_host_cidr_addr(cidr: &str) -> Option<IpAddr> {
 /// deduped class set of the remote direct candidates; the winner is the
 /// class of the candidate matching the selected endpoint, only when the
 /// decision is Direct AND a fresh handshake backed it.
+/// Whether a race outcome carries usable evidence for the cross-session prior
+/// store.
+///
+/// `PeerTraversalPrior::update` treats "no winning class" as failure evidence
+/// for every tried class (`beta += 1.0`). That is correct for a relay or
+/// exhausted outcome, where the direct candidates really did fail. It is
+/// actively wrong for a direct success we could not attribute: the path
+/// worked, we simply do not know which endpoint carried it, and penalising
+/// every candidate would decay the most frequently offered classes fastest —
+/// inverting the ranking instead of leaving it neutral.
+///
+/// So an unattributed direct success records nothing at all.
+fn record_prior_outcome_is_meaningful(
+    decision: TraversalProbeDecision,
+    handshake_fresh: bool,
+    attributed: bool,
+) -> bool {
+    if decision == TraversalProbeDecision::Direct && handshake_fresh {
+        return attributed;
+    }
+    true
+}
+
 /// I4 item 8: decide what reason a clone-forward status may keep once the
 /// programmed endpoint has moved.
 ///
@@ -16005,6 +16044,45 @@ mod tests {
             addr: addr.parse().expect("addr"),
             port,
         }
+    }
+
+    /// An unattributed direct success must record NOTHING, not a no-winner
+    /// outcome. `PeerTraversalPrior::update` gives every tried class
+    /// `beta += 1.0` when the winner is `None`, so recording here would write
+    /// failure evidence against candidates that just carried a working path,
+    /// penalising the most frequently offered classes hardest.
+    #[test]
+    fn unattributed_direct_success_records_no_prior_evidence() {
+        assert!(
+            !super::record_prior_outcome_is_meaningful(TraversalProbeDecision::Direct, true, false),
+            "an unattributed direct success carries no usable evidence either way"
+        );
+    }
+
+    /// An attributed direct success is exactly what the store exists to learn.
+    #[test]
+    fn attributed_direct_success_records_prior_evidence() {
+        assert!(super::record_prior_outcome_is_meaningful(
+            TraversalProbeDecision::Direct,
+            true,
+            true
+        ));
+    }
+
+    /// Relay and non-fresh outcomes must keep recording: there the direct
+    /// candidates genuinely did fail, so the failure evidence is true and
+    /// suppressing it would stop the store learning anything at all.
+    #[test]
+    fn relay_and_unproven_outcomes_still_record_prior_failure_evidence() {
+        assert!(super::record_prior_outcome_is_meaningful(
+            TraversalProbeDecision::Relay,
+            true,
+            false
+        ));
+        assert!(
+            super::record_prior_outcome_is_meaningful(TraversalProbeDecision::Direct, false, false),
+            "the exhausted pseudo-direct arm really did fail its candidates"
+        );
     }
 
     /// I4 item 8. The clone-forward overwrites `selected_endpoint` from what
