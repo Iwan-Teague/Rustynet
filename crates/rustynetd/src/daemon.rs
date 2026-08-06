@@ -6787,8 +6787,11 @@ impl DaemonRuntime {
                     handshake_fresh,
                     attributed,
                 );
-                if !record_prior_outcome_is_meaningful(report.decision, handshake_fresh, attributed)
-                {
+                if !record_prior_outcome_is_meaningful(
+                    report.decision,
+                    handshake_fresh,
+                    winning_class,
+                ) {
                     // Deliberately record NOTHING rather than a no-winner
                     // outcome. `PeerTraversalPrior::update` gives every tried
                     // class `beta += 1.0` whenever the winner is `None`, so an
@@ -15946,14 +15949,31 @@ fn parse_host_cidr_addr(cidr: &str) -> Option<IpAddr> {
 /// every candidate would decay the most frequently offered classes fastest —
 /// inverting the ranking instead of leaving it neutral.
 ///
-/// So an unattributed direct success records nothing at all.
+/// So a direct success with no winning class records nothing at all.
+///
+/// The predicate keys on whether a winning class was actually produced, NOT on
+/// whether the race reported an attributed reason. The two are not equivalent
+/// and the difference is a live hazard: `race_outcome_classes` also yields no
+/// winner when the attributed endpoint is not among the offered candidates —
+/// a peer that roamed mid-race and completed its handshake from an address the
+/// signed bundle never advertised. Keying on the reason would let that case
+/// through and write failure evidence for every class on a successful race,
+/// which is the exact defect this predicate exists to prevent, merely with a
+/// narrower trigger.
+///
+/// Takes the winning class itself rather than a bool so the call site CANNOT
+/// pass the wrong thing: an earlier version took `attributed: bool` and the
+/// call site passed the reason-derived flag, which type-checked and reproduced
+/// the very defect the predicate exists to prevent. A test can only catch that
+/// wiring if it drives the whole reconcile pass; the type catches it at compile
+/// time.
 fn record_prior_outcome_is_meaningful(
     decision: TraversalProbeDecision,
     handshake_fresh: bool,
-    attributed: bool,
+    winning_class: Option<crate::peer_traversal_prior::CandidateClass>,
 ) -> bool {
     if decision == TraversalProbeDecision::Direct && handshake_fresh {
-        return attributed;
+        return winning_class.is_some();
     }
     true
 }
@@ -16054,19 +16074,61 @@ mod tests {
     #[test]
     fn unattributed_direct_success_records_no_prior_evidence() {
         assert!(
-            !super::record_prior_outcome_is_meaningful(TraversalProbeDecision::Direct, true, false),
+            !super::record_prior_outcome_is_meaningful(TraversalProbeDecision::Direct, true, None),
             "an unattributed direct success carries no usable evidence either way"
         );
     }
 
-    /// An attributed direct success is exactly what the store exists to learn.
+    /// An attributed direct success WITH a winning class is exactly what the
+    /// store exists to learn.
     #[test]
     fn attributed_direct_success_records_prior_evidence() {
         assert!(super::record_prior_outcome_is_meaningful(
             TraversalProbeDecision::Direct,
             true,
-            true
+            Some(crate::peer_traversal_prior::CandidateClass::HostV4)
         ));
+    }
+
+    /// The case that makes this predicate key on the winner rather than on the
+    /// reason: a race can be attributed and still yield NO winning class, when
+    /// the attributed endpoint is not among the offered candidates — a peer
+    /// that roamed mid-race and handshook from an address the signed bundle
+    /// never advertised. Keying on the reason would let that through and write
+    /// failure evidence for every class on a successful race.
+    #[test]
+    fn attributed_direct_success_without_a_winning_class_records_nothing() {
+        use crate::peer_traversal_prior::CandidateClass;
+        use crate::traversal::CandidateSource;
+
+        let offered = super::ProbeTraversalCandidate {
+            endpoint: endpoint("198.51.100.1", 51820),
+            source: CandidateSource::Host,
+            priority: 900,
+            observed_at_unix: 1,
+        };
+        // Attributed, fresh, Direct — but the endpoint is one the bundle never
+        // offered, so no class can be derived for it.
+        let (winning, tried) = super::race_outcome_classes(
+            &[offered],
+            TraversalProbeDecision::Direct,
+            endpoint("203.0.113.77", 41641),
+            true,
+            true,
+        );
+        assert_eq!(
+            winning, None,
+            "an off-set endpoint yields no winning class even when attributed"
+        );
+        assert_eq!(tried, vec![CandidateClass::HostV4]);
+        assert!(
+            !super::record_prior_outcome_is_meaningful(
+                TraversalProbeDecision::Direct,
+                true,
+                winning
+            ),
+            "no winning class means no honest evidence, so record nothing"
+        );
     }
 
     /// Relay and non-fresh outcomes must keep recording: there the direct
@@ -16077,10 +16139,10 @@ mod tests {
         assert!(super::record_prior_outcome_is_meaningful(
             TraversalProbeDecision::Relay,
             true,
-            false
+            None
         ));
         assert!(
-            super::record_prior_outcome_is_meaningful(TraversalProbeDecision::Direct, false, false),
+            super::record_prior_outcome_is_meaningful(TraversalProbeDecision::Direct, false, None),
             "the exhausted pseudo-direct arm really did fail its candidates"
         );
     }
