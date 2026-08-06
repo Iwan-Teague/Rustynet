@@ -114,22 +114,6 @@ impl<'a, B: TunnelBackend, S: DataplaneSystem> SimultaneousOpenRuntime
             .peer_latest_handshake_unix(&self.node_id)
             .map_err(|err| TraversalError::ProbeSend(format!("peer_latest_handshake_unix: {err}")))
     }
-
-    /// I4/A3.2: forward the backend's observed handshake endpoint so the race
-    /// can credit the endpoint that actually completed the handshake instead
-    /// of falling back to the top-priority pair.
-    ///
-    /// Before this existed the trait default returned `Ok(None)` for every
-    /// production race, so `pairs[0]` was always credited while `send_probe`
-    /// had left the backend configured with `pairs[last]`. A backend that
-    /// still cannot observe the endpoint keeps returning `None`, and the race
-    /// reports the unattributed reason rather than a false attribution.
-    fn handshake_endpoint(&mut self) -> Result<Option<SocketEndpoint>, TraversalError> {
-        self.controller
-            .backend
-            .handshake_endpoint(&self.node_id)
-            .map_err(|err| TraversalError::ProbeSend(format!("handshake_endpoint: {err}")))
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
