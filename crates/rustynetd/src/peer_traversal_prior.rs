@@ -147,7 +147,17 @@ impl PeerTraversalPrior {
     }
 }
 
-const STORE_VERSION: u32 = 1;
+/// On-disk schema version for the prior store.
+///
+/// Bumped to 2 to invalidate stores poisoned by a defect that recorded a
+/// no-winner outcome for every unattributed direct success, giving every tried
+/// candidate class failure evidence on paths that were in fact working. A
+/// version mismatch makes `try_load` return `None`, so an affected store is
+/// discarded and rebuilt rather than carried forward. The bump is required
+/// because decay only runs inside `update`: once the defect's own fix stops
+/// calling `update` for those outcomes, a poisoned posterior would otherwise
+/// never decay back and would stay wrong for the life of the file.
+const STORE_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreBody {
@@ -289,6 +299,51 @@ mod tests {
     };
     use crate::traversal::CandidateSource;
     use std::net::IpAddr;
+
+    /// A store written under a different schema version must be discarded, not
+    /// carried forward. This is what makes a version bump an actual cleanup
+    /// mechanism: stores poisoned by a past recording defect are only
+    /// invalidated if a foreign version really does fail to load, and because
+    /// decay runs solely inside `update`, a poisoned posterior that survived
+    /// would never recover on its own.
+    #[test]
+    fn prior_store_rejects_a_foreign_schema_version() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-prior-store-version-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("peer_traversal_priors.json");
+
+        let mut store = PeerPriorStore::load_or_empty(path.clone());
+        store.record_outcome("peer-a", Some(CandidateClass::HostV4), &[], 100);
+        store.persist().expect("persist should succeed");
+        assert_eq!(
+            PeerPriorStore::load_or_empty(path.clone()).len(),
+            1,
+            "a store at the current version must load back"
+        );
+
+        // Rewrite the body with a version this build does not accept, keeping
+        // the digest line consistent so the version check is what rejects it
+        // rather than the integrity check.
+        let raw = std::fs::read_to_string(&path).expect("read store");
+        let body = raw.lines().next().expect("body line");
+        let foreign = body.replace(
+            &format!("\"version\":{}", super::STORE_VERSION),
+            "\"version\":999",
+        );
+        assert_ne!(foreign, body, "the version field must have been rewritten");
+        let digest = super::hex_digest(foreign.as_bytes());
+        std::fs::write(&path, format!("{foreign}\ndigest_sha256={digest}\n")).expect("write");
+
+        assert_eq!(
+            PeerPriorStore::load_or_empty(path).len(),
+            0,
+            "a foreign schema version must load as an empty store"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn candidate_class_maps_source_and_family_and_excludes_relay() {
