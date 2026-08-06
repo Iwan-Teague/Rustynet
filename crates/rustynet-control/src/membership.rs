@@ -438,10 +438,35 @@ impl MembershipOperation {
         }
     }
 
+    /// Operations that need the membership owner's signature in addition to
+    /// quorum.
+    ///
+    /// The original pair changes *who can authorise*: rotating an approver or
+    /// moving the quorum threshold. The two added here change what a signed
+    /// membership record can *grant*, which the security minimum bar treats
+    /// the same way:
+    ///
+    /// * `SetNodeCapabilities` grants mesh authority — a node without
+    ///   `ExitServer` is refused an exit assignment, so granting it is a
+    ///   privilege change. `SecurityMinimumBar.md` states capability changes
+    ///   require an owner-signed bundle and that an anchor cannot
+    ///   self-promote; before this arm existed no code enforced that, and the
+    ///   requirement had no verification method at all.
+    /// * `RotateNodeKey` writes `node_pubkey_hex`, which is the node's gossip
+    ///   trust anchor: the verifying key every peer uses to authenticate that
+    ///   node's gossip. Substituting it is substituting an identity.
+    ///
+    /// This costs nothing in the shipped default, where genesis mints a single
+    /// Owner approver and `quorum_threshold` is 1, so quorum already implies
+    /// the owner; and nothing on the automated paths, which already sign with
+    /// the owner key.
     fn requires_owner_signer(&self) -> bool {
         matches!(
             self,
-            MembershipOperation::RotateApprover(_) | MembershipOperation::SetQuorum { .. }
+            MembershipOperation::RotateApprover(_)
+                | MembershipOperation::SetQuorum { .. }
+                | MembershipOperation::SetNodeCapabilities { .. }
+                | MembershipOperation::RotateNodeKey { .. }
         )
     }
 }
@@ -3329,6 +3354,171 @@ mod tests {
         let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
             .expect_err("owner signature should be required");
         assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Build a signed update for `operation` against `state`, signed by the
+    /// named approvers. Shared by the owner-gate tests so each one differs
+    /// only in the operation and the signer set.
+    fn signed_update_for(
+        state: &MembershipState,
+        candidate: &MembershipState,
+        update_id: &str,
+        target: &str,
+        operation: MembershipOperation,
+        signers: &[(&str, u8)],
+    ) -> SignedMembershipUpdate {
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: update_id.to_owned(),
+            operation,
+            target: target.to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 140,
+            expires_at_unix: 640,
+            reason_code: "owner-gate-test".to_owned(),
+            policy_context: None,
+        };
+        let approver_signatures = signers
+            .iter()
+            .map(|(id, seed)| {
+                let key = SigningKey::from_bytes(&[*seed; 32]);
+                sign_update_record(&record, id, &key).expect("sign")
+            })
+            .collect();
+        SignedMembershipUpdate {
+            record,
+            approver_signatures,
+        }
+    }
+
+    /// Granting a mesh capability is a privilege change, so quorum alone must
+    /// not be enough. `SecurityMinimumBar.md` requires an owner-signed bundle
+    /// for capability changes and states an anchor cannot self-promote; until
+    /// this arm existed nothing enforced either claim, and the control had no
+    /// verification method.
+    #[test]
+    fn owner_signature_required_for_set_node_capabilities() {
+        let state = base_state();
+        let mut candidate = state.clone();
+        candidate.nodes[0].capabilities =
+            crate::roles::canonicalize_role_capabilities([RoleCapability::ExitServer]);
+        // The reducer stamps the node's updated_at_unix from the operation's
+        // created_at_unix, so the expected root must carry it too.
+        candidate.nodes[0].updated_at_unix = 140;
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-set-caps",
+            "node-a",
+            MembershipOperation::SetNodeCapabilities {
+                node_id: "node-a".to_owned(),
+                capabilities: vec![RoleCapability::ExitServer],
+            },
+            &[("guardian-1", 2), ("guardian-2", 3)],
+        );
+
+        let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect_err("a guardian-only quorum must not grant a mesh capability");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// The same update signed by the owner must still apply, or the gate would
+    /// have made capability changes impossible rather than owner-gated.
+    #[test]
+    fn owner_signed_set_node_capabilities_is_accepted() {
+        let state = base_state();
+        let mut candidate = state.clone();
+        candidate.nodes[0].capabilities =
+            crate::roles::canonicalize_role_capabilities([RoleCapability::ExitServer]);
+        // The reducer stamps the node's updated_at_unix from the operation's
+        // created_at_unix, so the expected root must carry it too.
+        candidate.nodes[0].updated_at_unix = 140;
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-set-caps-owner",
+            "node-a",
+            MembershipOperation::SetNodeCapabilities {
+                node_id: "node-a".to_owned(),
+                capabilities: vec![RoleCapability::ExitServer],
+            },
+            &[("owner-1", 1), ("guardian-1", 2)],
+        );
+
+        let applied =
+            apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+                .expect("an owner-signed capability change must still apply");
+        assert!(
+            applied.nodes[0]
+                .capabilities
+                .contains(&RoleCapability::ExitServer),
+            "the capability must actually be granted"
+        );
+    }
+
+    /// `node_pubkey_hex` is the node's gossip trust anchor — the verifying key
+    /// peers authenticate its gossip against — so rotating it substitutes an
+    /// identity and needs the owner, not quorum alone.
+    #[test]
+    fn owner_signature_required_for_rotate_node_key() {
+        let state = base_state();
+        let replacement = hex_encode(SigningKey::from_bytes(&[11; 32]).verifying_key().as_bytes());
+        let mut candidate = state.clone();
+        candidate.nodes[0].node_pubkey_hex = replacement.clone();
+        candidate.nodes[0].updated_at_unix = 140;
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-rotate-node-key",
+            "node-a",
+            MembershipOperation::RotateNodeKey {
+                node_id: "node-a".to_owned(),
+                new_pubkey_hex: replacement,
+            },
+            &[("guardian-1", 2), ("guardian-2", 3)],
+        );
+
+        let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect_err("a guardian-only quorum must not substitute a node's gossip identity");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// The owner-signed rotation must still apply: a fleet key migration runs
+    /// through exactly this path, so breaking it would block the migration the
+    /// gate is meant to protect.
+    #[test]
+    fn owner_signed_rotate_node_key_is_accepted() {
+        let state = base_state();
+        let replacement = hex_encode(SigningKey::from_bytes(&[11; 32]).verifying_key().as_bytes());
+        let mut candidate = state.clone();
+        candidate.nodes[0].node_pubkey_hex = replacement.clone();
+        candidate.nodes[0].updated_at_unix = 140;
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-rotate-node-key-owner",
+            "node-a",
+            MembershipOperation::RotateNodeKey {
+                node_id: "node-a".to_owned(),
+                new_pubkey_hex: replacement.clone(),
+            },
+            &[("owner-1", 1), ("guardian-1", 2)],
+        );
+
+        let applied =
+            apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+                .expect("an owner-signed key rotation must still apply");
+        assert_eq!(
+            applied.nodes[0].node_pubkey_hex, replacement,
+            "the rotated key must actually be installed"
+        );
     }
 
     #[test]
