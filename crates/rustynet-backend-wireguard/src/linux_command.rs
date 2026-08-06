@@ -395,6 +395,33 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
         let public_key = encode_wg_public_key_base64(&peer.public_key);
         parse_peer_latest_handshake_unix(&output.stdout, &public_key, self.peers.len().max(1))
     }
+
+    /// I4/A3.2: report the endpoint the peer's latest handshake came from.
+    ///
+    /// Deliberately NOT `self.peers.get(node_id).map(|peer| peer.endpoint)` —
+    /// that is the value we last configured, which during an ICE pair race is
+    /// simply the last pair probed. Reading `wg show <iface> dump` reports what
+    /// the kernel actually recorded for the peer, which after a successful
+    /// handshake is the address the peer authenticated from.
+    fn handshake_endpoint_observed(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        let peer = self
+            .peers
+            .get(node_id)
+            .ok_or_else(|| BackendError::invalid_input("peer is not configured"))?;
+        let public_key = encode_wg_public_key_base64(&peer.public_key);
+        let output = self.runner.run_capture(
+            "wg",
+            &[
+                "show".to_owned(),
+                self.interface_name.clone(),
+                "dump".to_owned(),
+            ],
+        )?;
+        parse_peer_dump_handshake_endpoint(&output.stdout, &public_key, self.peers.len().max(1))
+    }
 }
 
 impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBackend<R> {
@@ -500,6 +527,14 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
     ) -> Result<Option<u64>, BackendError> {
         self.ensure_running()?;
         self.read_peer_latest_handshake_unix(node_id)
+    }
+
+    fn handshake_endpoint(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        self.ensure_running()?;
+        self.handshake_endpoint_observed(node_id)
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
@@ -658,6 +693,100 @@ pub(crate) fn parse_peer_latest_handshake_unix(
     }
 
     Ok(matched.flatten())
+}
+
+/// I4/A3.2: extract the endpoint a peer's most recent handshake was observed
+/// from, out of `wg show <iface> dump`.
+///
+/// `dump` is used rather than `latest-handshakes` because it reports the
+/// endpoint and the handshake timestamp on the SAME line, read in one command
+/// invocation. That atomicity is the whole point: the two values must describe
+/// the same observation, or pairing them would reintroduce the misattribution
+/// this exists to remove.
+///
+/// Fails closed to `Ok(None)` — meaning "unattributed" — whenever the peer is
+/// absent, the endpoint column is `(none)`, or the handshake timestamp is zero.
+/// The last case matters most: reporting an endpoint for a peer that has never
+/// completed a handshake would attribute a handshake that never happened.
+///
+/// Peer lines carry 8 tab-separated fields (public-key, preshared-key,
+/// endpoint, allowed-ips, latest-handshake, rx, tx, persistent-keepalive);
+/// the leading interface line carries 4 (private-key, public-key, listen-port,
+/// fwmark) and is skipped by field count rather than by position, so a future
+/// extra interface line cannot silently shift the parse.
+pub(crate) fn parse_peer_dump_handshake_endpoint(
+    stdout: &str,
+    expected_public_key: &str,
+    max_lines: usize,
+) -> Result<Option<SocketEndpoint>, BackendError> {
+    if stdout.len() > WG_LATEST_HANDSHAKES_MAX_BYTES {
+        return Err(BackendError::internal(format!(
+            "wg dump output exceeded {WG_LATEST_HANDSHAKES_MAX_BYTES} bytes"
+        )));
+    }
+
+    let mut lines_seen = 0usize;
+    let mut matched: Option<Option<SocketEndpoint>> = None;
+    for raw_line in stdout.lines() {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        lines_seen = lines_seen.saturating_add(1);
+        if lines_seen > max_lines.saturating_add(1) {
+            return Err(BackendError::internal(
+                "wg dump output exceeded expected peer count",
+            ));
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        // The interface line has 4 fields; peer lines have 8. Anything else is
+        // a format we did not expect, and guessing at it would be worse than
+        // reporting nothing.
+        if fields.len() == 4 {
+            continue;
+        }
+        if fields.len() != 8 {
+            return Err(BackendError::internal(
+                "wg dump line did not carry the expected field count",
+            ));
+        }
+        if fields[0] != expected_public_key {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(BackendError::internal(
+                "wg dump output contained duplicate peer entries",
+            ));
+        }
+        let endpoint_raw = fields[2];
+        let handshake_unix = fields[4].parse::<u64>().map_err(|err| {
+            BackendError::internal(format!("wg dump timestamp parse failed: {err}"))
+        })?;
+        if handshake_unix == 0 || endpoint_raw == "(none)" {
+            matched = Some(None);
+            continue;
+        }
+        matched = Some(parse_wg_endpoint(endpoint_raw));
+    }
+
+    Ok(matched.flatten())
+}
+
+/// Parse WireGuard's endpoint rendering into a `SocketEndpoint`.
+///
+/// Delegates to the standard `SocketAddr` parser, which already handles both
+/// `ADDR:PORT` and the bracketed `[V6]:PORT` form wireguard emits. An
+/// unparseable value yields `None` (unattributed) rather than an error: a
+/// backend that cannot read the endpoint must not fail the probe, it must
+/// decline to attribute.
+fn parse_wg_endpoint(value: &str) -> Option<SocketEndpoint> {
+    value
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|addr| SocketEndpoint {
+            addr: addr.ip(),
+            port: addr.port(),
+        })
 }
 
 pub(crate) fn encode_wg_public_key_base64(value: &[u8; 32]) -> String {
@@ -850,6 +979,117 @@ mod tests {
 
         let stats = backend.stats();
         assert!(stats.is_err());
+    }
+
+    /// I4/A3.2. The dump line carries the endpoint the kernel recorded, which
+    /// after a handshake is where the peer authenticated from — NOT the value
+    /// we last configured. This is the whole point of the method.
+    #[test]
+    fn dump_parser_reports_the_endpoint_the_handshake_came_from() {
+        let dump = "priv\tpub\t51820\toff\n\
+                    peer-key\t(none)\t203.0.113.7:41641\t10.0.0.2/32\t1735689600\t0\t0\toff\n";
+        let endpoint = parse_peer_dump_handshake_endpoint(dump, "peer-key", 4)
+            .expect("dump should parse")
+            .expect("a handshaked peer must report its endpoint");
+        assert_eq!(endpoint.port, 41641);
+        assert_eq!(endpoint.addr.to_string(), "203.0.113.7");
+    }
+
+    /// Fail closed: a peer that has never completed a handshake must report
+    /// nothing. Reporting its configured endpoint here would attribute a
+    /// handshake that never happened, which is the defect class this method
+    /// exists to remove.
+    #[test]
+    fn dump_parser_reports_nothing_when_no_handshake_has_occurred() {
+        let dump = "priv\tpub\t51820\toff\n\
+                    peer-key\t(none)\t203.0.113.7:41641\t10.0.0.2/32\t0\t0\t0\toff\n";
+        assert_eq!(
+            parse_peer_dump_handshake_endpoint(dump, "peer-key", 4).expect("dump should parse"),
+            None,
+            "a zero handshake timestamp must not attribute an endpoint"
+        );
+    }
+
+    /// A peer with no endpoint yet is likewise unattributed rather than an
+    /// error: the probe must continue, it just may not credit anything.
+    #[test]
+    fn dump_parser_reports_nothing_for_an_absent_endpoint() {
+        let dump = "priv\tpub\t51820\toff\n\
+                    peer-key\t(none)\t(none)\t10.0.0.2/32\t1735689600\t0\t0\toff\n";
+        assert_eq!(
+            parse_peer_dump_handshake_endpoint(dump, "peer-key", 4).expect("dump should parse"),
+            None
+        );
+    }
+
+    /// IPv6 endpoints arrive bracketed; they must round-trip, or attribution
+    /// would silently degrade to unattributed on every v6 path.
+    #[test]
+    fn dump_parser_handles_bracketed_ipv6_endpoints() {
+        let dump = "priv\tpub\t51820\toff\n\
+                    peer-key\t(none)\t[2001:db8::7]:41641\t10.0.0.2/32\t1735689600\t0\t0\toff\n";
+        let endpoint = parse_peer_dump_handshake_endpoint(dump, "peer-key", 4)
+            .expect("dump should parse")
+            .expect("v6 endpoint must be attributed");
+        assert_eq!(endpoint.port, 41641);
+        assert_eq!(endpoint.addr.to_string(), "2001:db8::7");
+    }
+
+    /// Only the requested peer may be credited. Crediting a sibling peer's
+    /// endpoint would be a cross-peer misattribution.
+    #[test]
+    fn dump_parser_selects_the_requested_peer_only() {
+        let dump = "priv\tpub\t51820\toff\n\
+                    other-key\t(none)\t198.51.100.1:1111\t10.0.0.3/32\t1735689600\t0\t0\toff\n\
+                    peer-key\t(none)\t203.0.113.7:41641\t10.0.0.2/32\t1735689600\t0\t0\toff\n";
+        let endpoint = parse_peer_dump_handshake_endpoint(dump, "peer-key", 4)
+            .expect("dump should parse")
+            .expect("requested peer must be found");
+        assert_eq!(endpoint.port, 41641);
+    }
+
+    /// The per-backend proof the dispatch pin cannot give: this exercises the
+    /// real `TunnelBackend::handshake_endpoint` on the Linux adapter through a
+    /// programmed `wg show dump`. If this adapter ever silently falls back to
+    /// the defaulted trait method it returns `None` and this fails — which is
+    /// exactly the defaulted-method regression class a source-text dispatch
+    /// pin cannot detect.
+    #[test]
+    fn linux_backend_handshake_endpoint_reads_the_live_dump_not_the_configured_value() {
+        let dump = "priv\tpub\t51820\toff\n\
+                    "
+        .to_owned()
+            + &encode_wg_public_key_base64(&sample_peer("peer-a").public_key)
+            + "\t(none)\t203.0.113.7:41641\t10.0.0.2/32\t1735689600\t0\t0\toff\n";
+        let runner = RecordingRunner::default().capture_output(
+            "wg",
+            &["show".to_owned(), "rustynet0".to_owned(), "dump".to_owned()],
+            &dump,
+            "",
+        );
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+        backend
+            .configure_peer(sample_peer("peer-a"))
+            .expect("peer configure should work");
+
+        let observed = backend
+            .handshake_endpoint(&NodeId::new("peer-a").expect("node id"))
+            .expect("handshake endpoint read should succeed")
+            .expect("a handshaked peer must attribute an endpoint");
+        assert_eq!(
+            observed.addr.to_string(),
+            "203.0.113.7",
+            "the adapter must report the endpoint from the live dump"
+        );
+        assert_ne!(
+            observed,
+            sample_peer("peer-a").endpoint,
+            "reporting the CONFIGURED endpoint would defeat attribution entirely"
+        );
     }
 
     #[test]

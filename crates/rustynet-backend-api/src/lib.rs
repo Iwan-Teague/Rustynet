@@ -218,6 +218,28 @@ pub trait TunnelBackend: Send + Sync {
     fn peer_latest_handshake_unix(&mut self, node_id: &NodeId)
     -> Result<Option<u64>, BackendError>;
 
+    /// I4/A3.2: the endpoint the peer's most recent handshake was actually
+    /// observed from, as opposed to the endpoint we last *configured*.
+    ///
+    /// This exists because the two are not the same and conflating them is a
+    /// misattribution. The ICE pair race reprograms the peer endpoint once per
+    /// probed pair, so at poll time the configured endpoint is merely the last
+    /// pair tried; without this method the race credits the top-priority pair
+    /// for a handshake that some other endpoint may have completed. Do not
+    /// implement this by returning the configured value — `current_peer_endpoint`
+    /// already does that, and returning it here would make an unproven endpoint
+    /// look proven, which is the exact defect this method exists to remove.
+    ///
+    /// A backend that cannot observe the responding endpoint must keep this
+    /// default and return `Ok(None)`, which callers treat as unattributed.
+    /// Returning `None` is always safe; returning a wrong `Some` is not.
+    fn handshake_endpoint(
+        &mut self,
+        _node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        Ok(None)
+    }
+
     /// FIS-0004: coarse per-peer path health. Backends without per-peer
     /// quality data (command-based) return `Ok(None)` — no data is no
     /// signal, never a fabricated `Healthy`.
