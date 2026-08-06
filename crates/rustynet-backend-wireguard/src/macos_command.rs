@@ -482,6 +482,34 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
         parse_peer_latest_handshake_unix(&output.stdout, &public_key, self.peers.len().max(1))
     }
 
+    /// I4/A3.2 — see the Linux adapter for the full rationale. Reads the live
+    /// endpoint from `wg show <iface> dump` rather than returning the value we
+    /// last configured, so an ICE pair race credits the endpoint that actually
+    /// completed the handshake.
+    fn read_peer_handshake_endpoint(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        let peer = self
+            .peers
+            .get(node_id)
+            .ok_or_else(|| BackendError::invalid_input("peer is not configured"))?;
+        let public_key = encode_wg_public_key_base64(&peer.public_key);
+        let output = self.runner.run_capture(
+            "wg",
+            &[
+                "show".to_owned(),
+                self.interface_name.clone(),
+                "dump".to_owned(),
+            ],
+        )?;
+        crate::linux_command::parse_peer_dump_handshake_endpoint(
+            &output.stdout,
+            &public_key,
+            self.peers.len().max(1),
+        )
+    }
+
     fn apply_peer_config_to_wg(&mut self, peer: &PeerConfig) -> Result<(), BackendError> {
         let allowed_ips = peer.allowed_ips.join(",");
         let endpoint = render_peer_endpoint(peer.endpoint);
@@ -648,6 +676,14 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
     ) -> Result<Option<u64>, BackendError> {
         self.ensure_running()?;
         self.read_peer_latest_handshake_unix(node_id)
+    }
+
+    fn handshake_endpoint(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        self.ensure_running()?;
+        self.read_peer_handshake_endpoint(node_id)
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {

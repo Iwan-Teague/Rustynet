@@ -3225,6 +3225,29 @@ impl TunnelBackend for DaemonBackend {
         }
     }
 
+    /// I4/A3.2. Every variant must forward explicitly: a variant that silently
+    /// inherited the trait default would report `None` forever, which reads as
+    /// "unattributed" and quietly disables endpoint attribution for that whole
+    /// backend. That failure is invisible at this layer, so the dispatch is
+    /// pinned by a source-text test and by per-backend tests.
+    fn handshake_endpoint(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.handshake_endpoint(node_id),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.handshake_endpoint(node_id),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.handshake_endpoint(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.handshake_endpoint(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.handshake_endpoint(node_id),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.handshake_endpoint(node_id),
+        }
+    }
+
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.remove_peer(node_id),

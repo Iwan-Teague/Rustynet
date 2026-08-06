@@ -393,6 +393,34 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         parse_peer_latest_handshake_unix(&output.stdout, &public_key, self.peers.len().max(1))
     }
 
+    /// I4/A3.2 — see the Linux adapter for the full rationale. Reads the live
+    /// endpoint from `wg.exe show <tunnel> dump` rather than returning the
+    /// value we last configured, so an ICE pair race credits the endpoint that
+    /// actually completed the handshake.
+    fn read_peer_handshake_endpoint(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        let peer = self
+            .peers
+            .get(node_id)
+            .ok_or_else(|| BackendError::invalid_input("peer is not configured"))?;
+        let public_key = encode_wg_public_key_base64(&peer.public_key);
+        let output = self.runner.run_capture(
+            self.wg_exe_path.to_string_lossy().as_ref(),
+            &[
+                "show".to_owned(),
+                self.tunnel_name.clone(),
+                "dump".to_owned(),
+            ],
+        )?;
+        crate::linux_command::parse_peer_dump_handshake_endpoint(
+            &output.stdout,
+            &public_key,
+            self.peers.len().max(1),
+        )
+    }
+
     fn read_transfer_totals(&mut self) -> Result<(u64, u64), BackendError> {
         let output = self.runner.run_capture(
             self.wg_exe_path.to_string_lossy().as_ref(),
@@ -489,6 +517,14 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
     ) -> Result<Option<u64>, BackendError> {
         self.ensure_running()?;
         self.read_peer_latest_handshake_unix(node_id)
+    }
+
+    fn handshake_endpoint(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<SocketEndpoint>, BackendError> {
+        self.ensure_running()?;
+        self.read_peer_handshake_endpoint(node_id)
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
