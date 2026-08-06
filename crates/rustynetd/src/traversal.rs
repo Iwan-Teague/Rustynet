@@ -619,10 +619,27 @@ pub enum TraversalDecisionReason {
     DirectProbeExhaustedFailClosed,
     /// D5.5 — the ICE-pair race runner sent every pair in a round
     /// concurrently and observed a fresh handshake before the round
-    /// budget elapsed. The winning pair (selected by RFC 8445 pair
-    /// priority + endpoint attribution when the runtime provides
-    /// it) is carried in the `Direct` variant's `endpoint` field.
+    /// budget elapsed, **and** the runtime attributed that handshake to a
+    /// specific endpoint. The winning endpoint is carried in the `Direct`
+    /// variant's `endpoint` field and is the endpoint that actually
+    /// completed the handshake.
     IcePairRaceHandshakeObserved,
+    /// I4 — as `IcePairRaceHandshakeObserved`, except the runtime could
+    /// not say *which* endpoint completed the handshake, so the reported
+    /// endpoint is the top-priority pair rather than a proven one.
+    ///
+    /// This is the production case today: `handshake_endpoint` has no
+    /// non-test implementation, so the trait default returns `Ok(None)`
+    /// and the race falls back to `pairs[0]` while `send_probe` has
+    /// already reprogrammed the backend to every pair in turn, ending at
+    /// `pairs[last]`. A consumer must therefore NOT treat this reason as
+    /// evidence that the reported endpoint is the one that worked.
+    ///
+    /// Splitting the reason is deliberately not a fix on its own — see
+    /// `documents/operations/active/I4TraversalAttestationPlan_2026-08-05.md`
+    /// §0.0. It exists so a later attested predicate can distinguish the
+    /// two cases at all.
+    IcePairRaceHandshakeUnattributed,
 }
 
 impl TraversalDecisionReason {
@@ -642,6 +659,9 @@ impl TraversalDecisionReason {
             }
             TraversalDecisionReason::IcePairRaceHandshakeObserved => {
                 "ice_pair_race_handshake_observed"
+            }
+            TraversalDecisionReason::IcePairRaceHandshakeUnattributed => {
+                "ice_pair_race_handshake_unattributed"
             }
         }
     }
@@ -1722,16 +1742,26 @@ impl TraversalEngine {
             if handshake_advanced(observed_latest, latest)
                 && handshake_is_fresh(latest, now_unix, handshake_freshness_secs)
             {
-                let winning_endpoint = match runtime.handshake_endpoint()? {
-                    Some(endpoint) => endpoint,
-                    None => {
-                        crate::ice_priority::socket_addr_to_socket_endpoint(pairs[0].remote.addr)
-                    }
+                // The reason is selected by the SAME match that selects the
+                // endpoint, so the two can never disagree: an attributed
+                // endpoint carries the attributed reason, and the
+                // top-priority fallback carries the unattributed one. Keeping
+                // these in one match is what stops a later consumer reading
+                // "handshake observed" as "this endpoint is proven".
+                let (winning_endpoint, winning_reason) = match runtime.handshake_endpoint()? {
+                    Some(endpoint) => (
+                        endpoint,
+                        TraversalDecisionReason::IcePairRaceHandshakeObserved,
+                    ),
+                    None => (
+                        crate::ice_priority::socket_addr_to_socket_endpoint(pairs[0].remote.addr),
+                        TraversalDecisionReason::IcePairRaceHandshakeUnattributed,
+                    ),
                 };
                 return Ok(SimultaneousOpenResult {
                     decision: TraversalDecision::Direct {
                         endpoint: winning_endpoint,
-                        reason: TraversalDecisionReason::IcePairRaceHandshakeObserved,
+                        reason: winning_reason,
                     },
                     attempts: total_attempts,
                     latest_handshake_unix: latest,
@@ -3367,9 +3397,13 @@ mod tests {
         match result.decision {
             TraversalDecision::Direct { endpoint, reason } => {
                 assert_eq!(endpoint, remote_candidates[0].endpoint);
+                // `FinalRoundHandshakeRuntime` does not override
+                // `handshake_endpoint`, so the trait default returns
+                // `Ok(None)` and the endpoint above is the top-priority
+                // fallback rather than a proven one. The reason must say so.
                 assert_eq!(
                     reason,
-                    TraversalDecisionReason::IcePairRaceHandshakeObserved
+                    TraversalDecisionReason::IcePairRaceHandshakeUnattributed
                 );
             }
             other => panic!("final-round handshake must yield Direct, got {other:?}"),
