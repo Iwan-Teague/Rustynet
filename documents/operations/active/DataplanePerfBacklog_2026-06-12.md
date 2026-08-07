@@ -98,6 +98,54 @@ and size the buffer to cap+1 so oversized frames are cleanly dropped, not
 truncated. Revisit only if RAM-bound on a large relay; treat as a frame-size
 protocol change, not a perf knob.
 
+## 1.9) Payload-size sweep for the engine hot path (2026-08-07)
+
+Phase-0 measurement scaffolding for the "is any CPU-bound loop here worth SIMD
+or hand assembly" question. **No production path changed** — this is a dev-only
+criterion bench behind the existing `test-harness` feature, added so that
+decision rests on measured before/after numbers rather than intuition.
+
+The two existing fixed-1400-byte benches are kept under their original names so
+historical numbers stay comparable. Two grouped benches sweep payload sizes
+`[64, 256, 576, 1024, 1400]` — `engine_encrypt_outbound/<len>` (outbound
+encrypt) and `engine_forward_roundtrip/<len>` (full encrypt-then-decrypt). All
+sizes sit at or below the safe bring-up tunnel MTU so none exercises
+fragmentation, which would make the per-size numbers incomparable.
+
+The point of a sweep rather than a single size is that one fixed size cannot
+separate fixed per-packet overhead from cost proportional to payload, and that
+split is exactly what decides whether vectorising the AEAD would move anything.
+
+`Throughput::Bytes` is denominated in **plaintext** length deliberately: it
+reports payload goodput, which is the unit a capacity question is asked in.
+Ciphertext on the wire is larger by the 16-byte Poly1305 tag plus the transport
+header, so a ciphertext-denominated figure would flatter the small sizes.
+
+Run with:
+
+```
+cargo bench -p rustynet-backend-wireguard --features test-harness --bench dataplane_engine
+```
+
+**Provenance and scope, recorded honestly.** This was recovered from a
+three-week-old stash (`416f9384`) during a stash triage. The original work also
+declared criterion benches for `rustynet-crypto` (ed25519 verify) and
+`rustynet-nas` (SHA-256), but **their source files were never saved** — they
+were untracked when the stash was taken, so the stash carried the `Cargo.toml`
+`[[bench]]` declarations without the benches themselves and would not have
+built. Only the engine half was recoverable, so the crypto and nas primitive
+benches remain unwritten.
+
+The stash's doc text also referenced a companion note,
+`AssemblyOptimizationResearch_2026-07-04.md`. **That file does not exist
+anywhere in the tree** — it was presumably untracked and lost with the bench
+sources. The reference is recorded here rather than reproduced as a link, so
+this section does not introduce a dead one.
+
+The stash's copy of `bench_support.rs` was also three weeks stale and would have
+reverted intervening API changes, so the two accessors were re-applied as a diff
+rather than restored wholesale.
+
 ## 2) Remaining items (ordered)
 
 ### P1 — Engine outcome sink (remove the last per-frame copy in each direction)

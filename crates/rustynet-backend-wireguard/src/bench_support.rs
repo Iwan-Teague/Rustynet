@@ -231,6 +231,23 @@ impl DataplaneEnginePair {
         }
     }
 
+    /// Replace the plaintext sample with a fresh in-subnet IPv4 packet
+    /// of `len` bytes so a bench can sweep message sizes and report
+    /// per-size throughput. `len` is clamped up to a 20-byte IPv4
+    /// header. Call once per size, outside the measured loop; the
+    /// handshake state is untouched so encrypt/forward keep working.
+    pub fn set_sample_len(&mut self, len: usize) {
+        self.sample = sample_ipv4_packet(len);
+    }
+
+    /// Current plaintext sample length in bytes — the correct
+    /// denominator for `Throughput::Bytes` (payload goodput; ciphertext
+    /// adds the 16-byte Poly1305 tag plus transport header on the wire).
+    #[must_use]
+    pub fn sample_len(&self) -> usize {
+        self.sample.len()
+    }
+
     /// Encrypt the sample plaintext through the sender engine and
     /// return the produced ciphertext payload (outbound hot path).
     /// Returns `None` if the engine produced no data frame this call
