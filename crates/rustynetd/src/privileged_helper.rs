@@ -1449,6 +1449,25 @@ fn is_allowed_ips_token(value: &str) -> bool {
     !value.is_empty() && value.split(',').all(is_cidr_token)
 }
 
+/// `wg set ... persistent-keepalive <interval>` interval token (FIS-0015).
+///
+/// Deliberately NOT [`is_u16_token`]: that helper rejects `0` because a port of
+/// zero is meaningless, whereas `0` is wg's documented "disable keepalive"
+/// value and `PeerConfig::persistent_keepalive_secs` is an `Option<u16>` whose
+/// `Some(0)` renders exactly that. Rejecting it here would reproduce the very
+/// failure this arm exists to prevent — a fail-closed denial of peer
+/// configuration rather than a degraded keepalive.
+///
+/// The permitted domain is therefore wg's own: decimal `0..=65535`. Requiring
+/// every byte to be an ASCII digit additionally rejects the sign-prefixed forms
+/// Rust's integer parser would otherwise accept (`+21`), keeping the token
+/// canonical.
+fn is_wg_keepalive_secs_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u16>().is_ok()
+}
+
 fn is_anchor_name_token(value: &str) -> bool {
     if !(value.starts_with("com.apple/rustynet_g")
         || value == "com.rustynet/blind_exit"
@@ -2097,6 +2116,44 @@ fn validate_wg_args(args: &[&str]) -> Result<(), String> {
             && is_wg_public_key_token(public_key)
             && is_wg_endpoint_token(endpoint)
             && is_allowed_ips_token(allowed_ips) =>
+        {
+            Ok(())
+        }
+        // Same peer-configure shape with the FIS-0015 adaptive-keepalive tail.
+        // `configure_peer` appends `persistent-keepalive <interval>` in all
+        // three command backends the moment
+        // `PeerConfig::persistent_keepalive_secs` is `Some`, so without this arm
+        // switching the adaptive-keepalive rollout on would fail peer
+        // configuration outright on the Linux and macOS production backends
+        // (both validate here, client-side, before the helper socket) rather
+        // than merely forgo the keepalive.
+        [
+            "set",
+            interface,
+            "peer",
+            public_key,
+            "endpoint",
+            endpoint,
+            "allowed-ips",
+            allowed_ips,
+            "persistent-keepalive",
+            keepalive_secs,
+        ] if is_interface_name(interface)
+            && is_wg_public_key_token(public_key)
+            && is_wg_endpoint_token(endpoint)
+            && is_allowed_ips_token(allowed_ips)
+            && is_wg_keepalive_secs_token(keepalive_secs) =>
+        {
+            Ok(())
+        }
+        // Endpoint-only re-point, with no `allowed-ips` tail: the shape
+        // `update_peer_endpoint` emits when NAT traversal promotes a peer to a
+        // directly reachable address. It deliberately does not carry the
+        // keepalive tail, because no backend emits that combination.
+        ["set", interface, "peer", public_key, "endpoint", endpoint]
+            if is_interface_name(interface)
+                && is_wg_public_key_token(public_key)
+                && is_wg_endpoint_token(endpoint) =>
         {
             Ok(())
         }
@@ -3044,6 +3101,270 @@ mod tests {
             &["show", "rustynet0", "latest-handshakes"],
         )
         .expect("wg latest-handshakes schema should be accepted");
+    }
+
+    /// The exact argv `configure_peer` builds once
+    /// `PeerConfig::persistent_keepalive_secs` is `Some` (FIS-0015).
+    fn wg_keepalive_args(keepalive_secs: &'static str) -> [&'static str; 10] {
+        [
+            "set",
+            "rustynet0",
+            "peer",
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+            "endpoint",
+            "198.51.100.7:51820",
+            "allowed-ips",
+            "100.64.0.7/32",
+            "persistent-keepalive",
+            keepalive_secs,
+        ]
+    }
+
+    #[test]
+    fn validate_request_accepts_persistent_keepalive_schema() {
+        for keepalive_secs in ["25", "0", "65535"] {
+            validate_request(
+                PrivilegedCommandProgram::Wg,
+                &wg_keepalive_args(keepalive_secs),
+            )
+            .unwrap_or_else(|err| panic!("keepalive {keepalive_secs} should be accepted: {err}"));
+        }
+    }
+
+    #[test]
+    fn validate_request_rejects_out_of_schema_persistent_keepalive_value() {
+        // Widening the allowlist must not weaken the token guard: anything that
+        // is not a canonical decimal in wg's `0..=65535` domain stays denied,
+        // including the sign-prefixed form Rust's integer parser accepts and the
+        // shell/path metacharacters the boundary exists to keep out.
+        for keepalive_secs in [
+            "65536",      // above u16
+            "-1",         // negative
+            "+21",        // parses as 21, but is not canonical
+            "21s",        // unit suffix
+            "twenty-one", // non-numeric
+            "2 1",        // embedded whitespace
+            "21; rm -rf /",
+            "$(id)",
+            "../../etc/passwd",
+        ] {
+            let err = validate_request(
+                PrivilegedCommandProgram::Wg,
+                &wg_keepalive_args(keepalive_secs),
+            )
+            .expect_err("out-of-schema keepalive value should be rejected");
+            assert!(
+                err.contains("unsupported wg argument schema"),
+                "keepalive {keepalive_secs:?} rejected with unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_request_rejects_empty_persistent_keepalive_value() {
+        // An empty interval is denied one layer earlier than the schema arm, by
+        // the generic empty-argument guard, so it carries that message instead.
+        // Pinned separately rather than folded into the schema cases above so a
+        // regression that moved the empty token past the hygiene check and into
+        // the token guard would still have to be a deliberate change.
+        let err = validate_request(PrivilegedCommandProgram::Wg, &wg_keepalive_args(""))
+            .expect_err("empty keepalive value should be rejected");
+        assert!(
+            err.contains("empty argument"),
+            "empty keepalive rejected with unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_request_rejects_unknown_trailing_token_after_allowed_ips() {
+        // The keepalive arm is exact, not a prefix match: an unreviewed tail
+        // attached to the same peer-configure shape stays default-denied.
+        let err = validate_request(
+            PrivilegedCommandProgram::Wg,
+            &[
+                "set",
+                "rustynet0",
+                "peer",
+                "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+                "endpoint",
+                "198.51.100.7:51820",
+                "allowed-ips",
+                "100.64.0.7/32",
+                "preshared-key",
+                "/etc/rustynet/psk",
+            ],
+        )
+        .expect_err("unreviewed trailing wg tokens should be rejected");
+        assert!(err.contains("unsupported wg argument schema"));
+    }
+
+    /// Drives the REAL command backend through the REAL allowlist.
+    ///
+    /// The defect this pins was a coupling failure, not a logic error in either
+    /// half: the backend appended `persistent-keepalive <n>` while the allowlist
+    /// had no arm for it, and each side's own tests passed. Only a test that
+    /// runs one against the other can catch that, so this runner validates every
+    /// argv the backend emits instead of recording it.
+    use rustynet_backend_api::BackendError;
+    use rustynet_backend_wireguard::{
+        LinuxWireguardBackend, WireguardCommandOutput, WireguardCommandRunner,
+    };
+
+    /// Rejections are recorded through a shared handle because the backend owns
+    /// its runner and exposes no accessor.
+    type RejectedArgv = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<String>, String)>>>;
+
+    #[derive(Default)]
+    struct AllowlistValidatingRunner {
+        rejected: RejectedArgv,
+    }
+
+    impl WireguardCommandRunner for AllowlistValidatingRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+            let _ = self.run_capture(program, args)?;
+            Ok(())
+        }
+
+        fn run_capture(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<WireguardCommandOutput, BackendError> {
+            // Mirrors `PrivilegedHelperWireguardRunner`'s program mapping and
+            // its validate-before-socket ordering, minus the socket.
+            let helper_program = match program {
+                "ip" => PrivilegedCommandProgram::Ip,
+                "wg" => PrivilegedCommandProgram::Wg,
+                "ifconfig" => PrivilegedCommandProgram::Ifconfig,
+                "route" => PrivilegedCommandProgram::Route,
+                "wireguard-go" => PrivilegedCommandProgram::WireguardGo,
+                "kill" => PrivilegedCommandProgram::Kill,
+                other => {
+                    return Err(BackendError::invalid_input(format!(
+                        "unexpected program {other}"
+                    )));
+                }
+            };
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            if let Err(err) = validate_request(helper_program, &arg_refs) {
+                self.rejected
+                    .lock()
+                    .expect("rejection log should not be poisoned")
+                    .push((program.to_owned(), args.to_vec(), err.clone()));
+                return Err(BackendError::internal(err));
+            }
+            Ok(WireguardCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn allowlist_accepts_every_argv_the_linux_backend_emits_with_keepalive_enabled() {
+        use rustynet_backend_api::{
+            NodeId, PeerConfig, RuntimeContext, SocketEndpoint, TunnelBackend,
+        };
+
+        let rejected: RejectedArgv = RejectedArgv::default();
+        let mut backend = LinuxWireguardBackend::new(
+            AllowlistValidatingRunner {
+                rejected: std::sync::Arc::clone(&rejected),
+            },
+            "rustynet0",
+            "/etc/rustynet/wg.key",
+            51820,
+        )
+        .expect("backend should construct");
+        backend
+            .start(RuntimeContext {
+                local_node: NodeId::new("local-node").expect("valid node id"),
+                interface_name: "rustynet0".to_owned(),
+                mesh_cidr: "100.64.0.1/32".to_owned(),
+                local_cidr: "100.64.0.1/32".to_owned(),
+            })
+            .expect("start argv should be allowlisted");
+
+        let node_id = NodeId::new("peer-a").expect("valid node id");
+        let endpoint = SocketEndpoint {
+            addr: "203.0.113.10".parse().expect("valid ip"),
+            port: 51820,
+        };
+        // FIS-0015 switched ON: this is the case that fails without the
+        // persistent-keepalive arm.
+        backend
+            .configure_peer(PeerConfig {
+                node_id: node_id.clone(),
+                endpoint,
+                public_key: [7; 32],
+                allowed_ips: vec!["100.64.1.0/24".to_owned()],
+                persistent_keepalive_secs: Some(25),
+            })
+            .expect("keepalive-enabled peer configure argv should be allowlisted");
+
+        // Traversal promoting the peer to a direct address — the endpoint-only
+        // shape, which carries no `allowed-ips` tail.
+        backend
+            .update_peer_endpoint(
+                &node_id,
+                SocketEndpoint {
+                    addr: "198.51.100.7".parse().expect("valid ip"),
+                    port: 51820,
+                },
+            )
+            .expect("endpoint-only update argv should be allowlisted");
+
+        backend
+            .remove_peer(&node_id)
+            .expect("peer removal argv should be allowlisted");
+
+        let rejected = rejected
+            .lock()
+            .expect("rejection log should not be poisoned");
+        assert!(
+            rejected.is_empty(),
+            "backend emitted argv the allowlist denies: {rejected:?}"
+        );
+    }
+
+    #[test]
+    fn validate_request_accepts_endpoint_only_peer_update_schema() {
+        // `update_peer_endpoint`'s shape, emitted when NAT traversal promotes a
+        // peer to a direct address.
+        validate_request(
+            PrivilegedCommandProgram::Wg,
+            &[
+                "set",
+                "rustynet0",
+                "peer",
+                "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+                "endpoint",
+                "198.51.100.7:51820",
+            ],
+        )
+        .expect("endpoint-only peer update schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_rejects_endpoint_only_peer_update_with_bad_endpoint() {
+        for endpoint in ["198.51.100.7", "198.51.100.7:0", "198.51.100.7:51820; id"] {
+            let err = validate_request(
+                PrivilegedCommandProgram::Wg,
+                &[
+                    "set",
+                    "rustynet0",
+                    "peer",
+                    "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+                    "endpoint",
+                    endpoint,
+                ],
+            )
+            .expect_err("malformed endpoint should be rejected");
+            assert!(
+                err.contains("unsupported wg argument schema"),
+                "endpoint {endpoint:?} rejected with unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
