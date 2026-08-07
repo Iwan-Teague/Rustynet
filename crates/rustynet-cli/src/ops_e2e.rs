@@ -586,6 +586,14 @@ pub fn execute_ops_e2e_bootstrap_host(
                 "/etc/rustynet/membership.owner.key",
                 "--owner-signing-key-passphrase-file",
                 passphrase_path.as_str(),
+                // Publish the node's REAL derived gossip verifying key rather
+                // than the invented one. Safe here because the gossip mint runs
+                // earlier in this same function, in the same process on the
+                // same host, so the secret exists by the time genesis reads it.
+                "--gossip-signing-secret",
+                "/var/lib/rustynet/keys/gossip.signing.secret",
+                "--gossip-signing-secret-passphrase-file",
+                passphrase_path.as_str(),
                 "--node-id",
                 node_id.as_str(),
                 "--network-id",
