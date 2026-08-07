@@ -376,3 +376,6 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2026-07-20T13:59:08Z,537e190,dirty,check,-p rustynet-cli,1,pass
 2026-07-20T13:59:09Z,537e190,dirty,clippy,-p rustynet-cli,1,pass
 2026-07-20T14:01:09Z,537e190,dirty,test,-p rustynet-cli,120,pass
+2026-08-07T20:45:21Z,adeea15e,dirty,fmt,workspace,2,pass
+2026-08-07T20:46:00Z,adeea15e,dirty,clippy,workspace,38,pass
+2026-08-07T20:49:02Z,adeea15e,dirty,test,workspace,181,pass
