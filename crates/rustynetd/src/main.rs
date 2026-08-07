@@ -4083,6 +4083,10 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     let mut node_id = read_hostname_short();
     let mut network_id = "local-net".to_owned();
     let mut force = false;
+    // D4/genesis: when supplied, the genesis node's published `node_pubkey_hex`
+    // is derived from this secret instead of being invented.
+    let mut gossip_signing_secret_path: Option<String> = None;
+    let mut gossip_signing_secret_passphrase_path: Option<String> = None;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -4096,6 +4100,22 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
             }
             Some("--log") => {
                 log_path = args.get(index + 1).ok_or("--log requires a value")?.clone();
+                index += 2;
+            }
+            Some("--gossip-signing-secret") => {
+                gossip_signing_secret_path = Some(
+                    args.get(index + 1)
+                        .ok_or("--gossip-signing-secret requires a value")?
+                        .clone(),
+                );
+                index += 2;
+            }
+            Some("--gossip-signing-secret-passphrase-file") => {
+                gossip_signing_secret_passphrase_path = Some(
+                    args.get(index + 1)
+                        .ok_or("--gossip-signing-secret-passphrase-file requires a value")?
+                        .clone(),
+                );
                 index += 2;
             }
             Some("--watermark") => {
@@ -4142,6 +4162,53 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
             None => break,
         }
     }
+
+    // Resolve the genesis node's published key BEFORE the closure so a failure
+    // to read a secret the caller explicitly named aborts genesis rather than
+    // silently falling back to an invented value.
+    //
+    // Genesis has always published 32 raw CSPRNG bytes here, zeroized on the
+    // way out and never persisted — a public key for which no private key
+    // exists anywhere, so no migration can ever recover it. Contrast the
+    // approver key on the line below, which goes through `.verifying_key()` and
+    // whose private half IS persisted. When a gossip secret is supplied the
+    // node now publishes its real derived gossip verifying key, which is what
+    // `node_pubkey_hex` is supposed to carry.
+    //
+    // Absence is still tolerated rather than fatal, deliberately: Windows
+    // cannot hold a gossip identity at all (the daemon rejects a configured
+    // secret because the transport is unix-only), and the shipped Windows
+    // anchor bootstrap genesises a node. Making absence fatal would break that
+    // path. The fallback is announced rather than silent, because a published
+    // key with no private counterpart is a defect whether or not it is
+    // convenient.
+    let derived_node_pubkey_hex = match gossip_signing_secret_path.as_deref() {
+        Some(secret_path) => {
+            let passphrase_path = gossip_signing_secret_passphrase_path.as_deref().ok_or(
+                "--gossip-signing-secret requires --gossip-signing-secret-passphrase-file",
+            )?;
+            ensure_cli_path_absolute(secret_path, "path")?;
+            ensure_cli_path_absolute(passphrase_path, "path")?;
+            let secret_path = std::path::Path::new(secret_path);
+            let passphrase_path = std::path::Path::new(passphrase_path);
+            Some(
+                rustynetd::key_material::export_gossip_verifying_key_hex(
+                    secret_path,
+                    passphrase_path,
+                    Some(passphrase_path),
+                )
+                .map_err(|err| format!("genesis gossip verifying key derivation failed: {err}"))?,
+            )
+        }
+        None => {
+            eprintln!(
+                "warning: no --gossip-signing-secret supplied; the genesis node's \
+                 node_pubkey_hex will be random bytes with no private counterpart and cannot \
+                 be used as a gossip trust anchor"
+            );
+            None
+        }
+    };
 
     ensure_cli_path_absolute(&snapshot_path, "snapshot path")?;
     ensure_cli_path_absolute(&log_path, "log path")?;
@@ -4196,7 +4263,9 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     let init_result = (|| -> Result<(String, String), String> {
         let approver_signing = SigningKey::from_bytes(&approver_key_bytes);
         let approver_pubkey_hex = encode_hex(approver_signing.verifying_key().as_bytes());
-        let node_pubkey_hex = encode_hex(&node_key_bytes);
+        let node_pubkey_hex = derived_node_pubkey_hex
+            .clone()
+            .unwrap_or_else(|| encode_hex(&node_key_bytes));
         let owner_approver_id = format!("{node_id}-owner");
 
         persist_owner_signing_key_encrypted(
@@ -6268,6 +6337,38 @@ mod tests {
             err.contains("--node-id"),
             "should show first missing arg: {err}"
         );
+    }
+
+    #[test]
+    fn membership_init_gossip_secret_requires_its_passphrase() {
+        // A secret without its passphrase must be refused rather than silently
+        // falling back to the invented key: a caller that named a secret meant
+        // to publish a real gossip identity, and quietly publishing an
+        // unrecoverable one instead is the defect this flag exists to remove.
+        let err = super::run_membership_init(&[
+            "--gossip-signing-secret".to_owned(),
+            "/abs/gossip.secret".to_owned(),
+        ])
+        .expect_err("a secret without its passphrase must be refused");
+        assert!(
+            err.contains("--gossip-signing-secret-passphrase-file"),
+            "the error must name the missing flag, got: {err}"
+        );
+    }
+
+    /// Relative paths are refused for the same reason the mint refuses them:
+    /// the custody key id is derived from the path string, so the same relative
+    /// path resolved from two working directories is a different key id.
+    #[test]
+    fn membership_init_gossip_paths_must_be_absolute() {
+        let err = super::run_membership_init(&[
+            "--gossip-signing-secret".to_owned(),
+            "relative/gossip.secret".to_owned(),
+            "--gossip-signing-secret-passphrase-file".to_owned(),
+            "/abs/pass".to_owned(),
+        ])
+        .expect_err("a relative secret path must be refused");
+        assert!(err.to_lowercase().contains("absolute"), "got: {err}");
     }
 
     #[test]
