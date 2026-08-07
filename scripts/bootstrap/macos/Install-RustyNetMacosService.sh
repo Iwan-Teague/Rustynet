@@ -252,6 +252,31 @@ if [[ -f "${STATE_ROOT}/keys/wireguard.key.enc" ]]; then
   fi
 fi
 
+# ── D4: gossip signing secret ────────────────────────────────────────────────
+#
+# Emitted only when the secret actually exists. Both variables must be set
+# together — the daemon treats a one-sided pair as a hard startup config error,
+# so a half-emitted pair turns a dormant gossip plane into a node that refuses
+# to boot. Unset means gossip stays dormant, which is recoverable.
+#
+# The variable NAMES carry no `_PATH` suffix even though the daemon-side Rust
+# constants are named `..._PATH_ENV`. Copying the identifier name instead of its
+# value sets a variable the daemon never reads, and gossip then stays silently
+# dormant with everything looking correctly configured. The systemd installer
+# avoids this by referencing the daemon's own constants; this script cannot, so
+# the literals are spelled out here and this comment is the guard.
+GOSSIP_ENV_FRAGMENT=""
+if [[ -f "${STATE_ROOT}/keys/gossip.signing.secret" ]]; then
+  GOSSIP_ENV_FRAGMENT="        <key>RUSTYNET_GOSSIP_SIGNING_SECRET</key>
+        <string>${STATE_ROOT}/keys/gossip.signing.secret</string>
+        <key>RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE</key>
+        <string>${STATE_ROOT}/bootstrap/wireguard.passphrase</string>"
+else
+  # Say so. A skipped pair reads exactly like a successful install, which is how
+  # gossip stayed dormant unnoticed on Linux before the same gap was closed.
+  echo "note: no gossip signing secret at ${STATE_ROOT}/keys/gossip.signing.secret; gossip stays dormant" >&2
+fi
+
 # ── Audited Linux→macOS plist flag parity (HIGH 4 reviewer fold-in) ──────────
 #
 # Linux systemd unit (scripts/systemd/rustynetd.service) passes a superset of
@@ -409,6 +434,7 @@ ${FAIL_CLOSED_SSH_PLIST_FRAGMENT}
         <key>RUSTYNET_WG_BINARY_PATH</key>
         <string>${BREW_PREFIX}/bin/wg</string>
 ${WG_KEYCHAIN_ENV_FRAGMENT}
+${GOSSIP_ENV_FRAGMENT}
     </dict>
 </dict>
 </plist>

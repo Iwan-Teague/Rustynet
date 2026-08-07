@@ -41,6 +41,22 @@ const RUNTIME_KEY: &str = "/usr/local/var/rustynet/keys/wireguard.key";
 const ENCRYPTED_KEY: &str = "/usr/local/var/rustynet/keys/wireguard.key.enc";
 const PUBLIC_KEY: &str = "/usr/local/var/rustynet/keys/wireguard.pub";
 const PASSPHRASE_FILE: &str = "/usr/local/var/rustynet/bootstrap/wireguard.passphrase";
+/// D4: macOS mints a gossip signing secret so the node can publish a real
+/// gossip verifying key as its membership `node_pubkey_hex`.
+///
+/// It lives beside the WireGuard encrypted key on purpose. Both are sealed
+/// under the same passphrase — `read_passphrase_file` short-circuits to the
+/// keychain on macOS and ignores the path argument, so one keychain account
+/// covers both secrets — and the daemon's loader requires the directory and
+/// blob to be owned by its own uid, which the existing keys-directory
+/// ownership handoff below already arranges. Pointing this elsewhere would
+/// leave the blob root-owned and turn a gossip outage into a refusal to start.
+///
+/// Windows deliberately has no equivalent: the daemon rejects a configured
+/// gossip secret under `cfg(not(unix))` because the transport is unix-only,
+/// so minting one there would make the node fail to boot.
+pub(crate) const GOSSIP_SIGNING_SECRET_PATH: &str =
+    "/usr/local/var/rustynet/keys/gossip.signing.secret";
 const SYSTEM_KEYCHAIN: &str = "/Library/Keychains/System.keychain";
 
 /// The reviewed macOS service-install script, embedded so the installer needs no
@@ -267,6 +283,30 @@ fn setup_key_custody(node_id: &str, wg: &Path) -> Result<(), String> {
             ));
         }
 
+        // D4: mint the gossip signing secret while the plaintext passphrase
+        // file still exists. It is scrubbed immediately after this closure, and
+        // the mint needs it: the passphrase must be passed explicitly because
+        // `resolve_passphrase_source` refuses to fall back to the configured
+        // path, so minting after the scrub would fail rather than prompt.
+        //
+        // `--force` matches the WireGuard key init directly above. Re-running
+        // the installer regenerates the passphrase, so no secret survives a
+        // re-install intact anyway; refusing here would fail the install rather
+        // than preserve an identity. A re-mint rotates the node's gossip
+        // identity, which membership must then follow with a key rotation.
+        run(
+            RUSTYNETD,
+            &[
+                "key",
+                "init-gossip",
+                "--gossip-signing-secret",
+                GOSSIP_SIGNING_SECRET_PATH,
+                "--passphrase-file",
+                PASSPHRASE_FILE,
+                "--force",
+            ],
+        )?;
+
         // Owned-identity keychain store (no --keychain-allow-any-app): only the
         // re-signed rustynetd may read this passphrase back.
         run(
@@ -451,6 +491,68 @@ mod tests {
         assert!(
             INSTALL_SERVICE_SCRIPT.contains("<key>RunAtLoad</key>"),
             "plist body missing"
+        );
+    }
+
+    /// D4. The plist must carry the daemon's gossip env VALUES, not the names
+    /// of the Rust constants that hold them. The constants are called
+    /// `..._PATH_ENV` while their values carry no `_PATH` suffix, so copying
+    /// the identifier sets a variable the daemon never reads and gossip stays
+    /// silently dormant with the install looking entirely correct. That exact
+    /// drift already happened once on Linux.
+    #[test]
+    fn macos_plist_emits_the_daemon_gossip_env_variable_names() {
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<key>RUSTYNET_GOSSIP_SIGNING_SECRET</key>"),
+            "gossip secret env var missing from the plist"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<key>RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE</key>"),
+            "gossip passphrase env var missing from the plist"
+        );
+        // Guard against the `_PATH`-suffixed identifier being pasted in.
+        assert!(
+            !INSTALL_SERVICE_SCRIPT.contains("RUSTYNET_GOSSIP_SIGNING_SECRET_PATH"),
+            "the plist must use the env var VALUE, never the `_PATH_ENV` identifier"
+        );
+    }
+
+    /// Both variables must be emitted from the same branch. The daemon treats a
+    /// one-sided secret/passphrase pair as a hard startup config error, so a
+    /// half-emitted pair converts a dormant gossip plane into a node that
+    /// refuses to boot — strictly worse than not configuring it.
+    #[test]
+    fn macos_plist_gossip_env_pair_is_emitted_together_and_gated_on_the_secret() {
+        let fragment_start = INSTALL_SERVICE_SCRIPT
+            .find("GOSSIP_ENV_FRAGMENT=\"        <key>RUSTYNET_GOSSIP_SIGNING_SECRET</key>")
+            .expect("the gossip fragment must be assigned in one place");
+        let fragment_end = INSTALL_SERVICE_SCRIPT[fragment_start..]
+            .find("\"\n")
+            .expect("the fragment assignment must terminate");
+        let fragment = &INSTALL_SERVICE_SCRIPT[fragment_start..fragment_start + fragment_end];
+        assert!(
+            fragment.contains("RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE"),
+            "both variables must be set by the same assignment, got: {fragment}"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT
+                .contains("if [[ -f \"${STATE_ROOT}/keys/gossip.signing.secret\" ]]; then"),
+            "the pair must be gated on the secret actually existing"
+        );
+        // Assigning the fragment is not enough: it must be interpolated into
+        // the daemon plist body. A fragment built and never emitted leaves
+        // gossip dormant while the install looks completely correct, which is
+        // the precise failure this whole wiring exists to avoid.
+        let plist_env_block = INSTALL_SERVICE_SCRIPT
+            .find("${WG_KEYCHAIN_ENV_FRAGMENT}")
+            .expect("the daemon plist must interpolate the keychain fragment");
+        let after = &INSTALL_SERVICE_SCRIPT[plist_env_block..];
+        let block_end = after
+            .find("</dict>")
+            .expect("the plist env dict must terminate");
+        assert!(
+            after[..block_end].contains("${GOSSIP_ENV_FRAGMENT}"),
+            "the gossip fragment must be interpolated into the plist env dict, not merely assigned"
         );
     }
 }
