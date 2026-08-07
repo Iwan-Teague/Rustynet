@@ -1,9 +1,13 @@
 # I4 — traversal enforcement: what it needs, and why it cannot ship yet
 
-**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.** Revision 6, after
-four rounds of adversarial review.
+**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.** Revision 7, after
+five rounds of adversarial review.
 
-**Read §0.000 first.** It closes item 6 (endpoint attribution) as unachievable with
+**Read §0.0000 first** — it refutes revision 6's own surviving recommendation (item 2,
+"make the command backends honest") before any code was written, and narrows what is
+left of it.
+
+**Then read §0.000.** It closes item 6 (endpoint attribution) as unachievable with
 this observation surface, reframes §0.01 as a deliberate architectural decision rather
 than a defect, records a live allowlist defect that breaks traversal probing on
 enforced Linux and macOS nodes at HEAD, and adds a hard prohibition: a
@@ -26,6 +30,84 @@ status surface) shipped earlier and is out of scope.
 would still program an attacker-chosen endpoint.** The ordering problem the task
 anticipated is real, larger than expected, and the blocking dependency is partly work
 that was only *designed* today. §1 states the result; §9 states what is landable now.
+
+## 0.0000 Revision 7 — item 2 ("make the command backends honest") is REFUTED as written
+
+Revision 6 closed items 5 and 6 and left four recommendations. Recommendation 2 — skip the
+ICE race when the backend is blocked and take the relay/fail-closed path — was designed in
+full and attacked by four independent adversarial reviews plus a verifying judge on
+2026-08-07, at HEAD `adeea15e`. **All four reviews returned REFUTED. No code was written.**
+That is the process working: `01c20297` was written, gated, landed and reverted; this was
+killed at the design stage instead.
+
+### The load-bearing error, which is the SAME shape as the previous four
+
+The plan's verified fact: `initiate_peer_handshake` is the inherited no-op on all three
+command backends (overrides exist only at `userspace_shared/mod.rs:546`,
+`userspace_shared/runtime.rs:631`, `userspace_shared_macos/mod.rs:637`,
+`userspace_shared_macos/runtime.rs:672`) `[verified]`. So the race sends nothing.
+
+**That kills only the SEND half.** The race is simultaneously a 240 ms *passive detector*:
+`traversal.rs:1740-1744` is the only producer of `TraversalDecision::Direct`, and it
+decides on `runtime.latest_handshake_unix()`, which on every command backend is a **live
+`wg show <if> latest-handshakes` shell-out**, not a cache (`linux_command.rs:387-394`;
+identical at `macos_command.rs:473-480`) `[verified]`. Deleting the race deletes the
+observation — the only way one of these nodes can ever promote to Direct.
+
+Once again: the narrow supporting fact was correct; the conclusion drawn from it was not.
+
+### Surviving blockers, each independently re-verified by the judge
+
+1. **B1 — the Direct arm is an observation, not a consequence of our sends.** Above.
+2. **B2 — with `relay_client == None` the gate makes `PathMode::Relay` ABSORBING.** The
+   gate always returns Relay (`traversal.rs:1816`); the only non-race Direct short-circuit
+   cannot fire because relay candidates are excluded from `direct_candidates`
+   (`daemon.rs:14891`); and the peer re-probes forever back into the gate
+   (`daemon.rs:2234`). Today an observed handshake advance is the escape. The patch removes it.
+3. **B3 — that same topology forces `path_live_proven=false` permanently**, and it IS
+   hard-gated: relay liveness requires a relay *session* (`daemon.rs:7376-7383`), which
+   cannot exist without a relay client, so `daemon.rs:7509` is false forever and
+   `ops_cross_network_reports.rs:1323-1325` rejects the evidence outright.
+4. **B4 — the proposed edit trips clippy** (8 parameters vs the default threshold of 7; no
+   `clippy.toml` exists). Bundle the two reasons into a struct instead.
+5. **B5 — the proposed test suite cannot detect its own core mutation.** Every fixture sets
+   `backend_probe_blocked` by hand, so hard-coding the real daemon wiring to `false` leaves
+   the whole suite green with the gate dead in production.
+
+### What is left, and the measurement that gates it
+
+A narrowed form survives — gate on `backend_probe_blocked && relay_endpoint.is_none()`,
+where the fall-through is FailClosed→Direct rather than an absorbing Relay, and where
+`relay_or_fail_closed_for_race` still performs the `latest_handshake_unix` read
+(`traversal.rs:1824`, `:1834`) so the observation half is preserved. Derive the predicate
+from the property actually being reasoned about (the inherited `initiate_peer_handshake`
+no-op), NOT from `transport_socket_identity_blocker` — that value is filtered on unrelated
+config at `daemon.rs:4143-4146`, so two identical Windows nodes take opposite branches.
+
+**Do not implement any of it until this is measured.** The single riskiest assumption is
+that `wg set <if> peer <k> endpoint <a>` emits no handshake initiation on a command
+backend — i.e. that the 24 rewrites per round are pure cost. **The repo argues both ways
+and settles neither**: `daemon.rs:20086-20096` records that with the no-op trigger "zero
+WireGuard handshake datagrams reached the wire on any platform", while `daemon.rs:2205-2213`
+states "each re-race forces a WireGuard handshake" at a measured ~6 handshakes/second on a
+live cross-network path whose backend is not named.
+
+The measurement: on ONE command-backend node, tcpdump the WireGuard UDP port across ≥30
+reconcile ticks with the daemon otherwise idle, and log the destination of every handshake
+initiation. If initiations reach more than the single `max_by_key(priority)` host
+candidate, **abandon the patch entirely** — the storm is a working NAT search, and the
+correct fix is instead to make it cheap by skipping the unconditional
+`refresh_peer_endpoint_routes_and_attest` (`phase10.rs:6265`) when the bypass-destination
+*set* is unchanged. Note the earlier "≥2 distinct endpoints inside one 240 ms race" framing
+is unrunnable by construction (`MAX_PAIRS=24 / ROUNDS=3 / ROUND_SPACING_MS=80` at
+`traversal.rs:62-64` plus WireGuard's own initiation pacing), so it would return green
+regardless of the truth — measure over ≥60 s instead.
+
+Landing evidence must include one Windows or explicit `--backend *-command` traversal run.
+The Linux lab and macOS service installs both run userspace-shared
+(`macos_service_hardening.rs:243-245`), so green gates on this repo's usual legs prove
+nothing about the population this change affects — which is exactly the
+`01c20297`→`2fdc7f70` shape.
 
 ## 0.000 Revision 6 — item 5 is not a defect, item 6 is closed, and A3.2 would have leaked the private key
 
