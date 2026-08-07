@@ -35,6 +35,34 @@ const REPLAY_PROBE_ALIAS: &str = "gatewayreplay";
 const SOAK_SSH_RETRY_ATTEMPTS: u32 = 20;
 const SOAK_SSH_RETRY_SLEEP_SECS: u64 = 15;
 
+/// Canonical `install` argv for the `/etc/rustynet` config directory.
+///
+/// Owner **root**, group **rustynetd** — never the reverse. The daemon needs
+/// group traverse to read the `*.pub` verifier files that live here, while the
+/// encrypted signing secrets alongside them are root-owned and are decrypted by
+/// root-run `ops` commands. Key custody requires the directory AND the key file
+/// to both be owned by the EFFECTIVE uid of the reader
+/// (`rustynet-crypto/src/lib.rs`), so a rustynetd-owned directory makes every
+/// root-run decrypt of `/etc/rustynet/assignment.signing.secret` fail closed.
+///
+/// This exists as a single helper rather than an inline argv at each call site
+/// because the inline form is exactly how the two orders drifted apart: the
+/// arguments are a multi-line array literal, so `"-o", "rustynetd"` never
+/// appears on one line and no single-line grep can spot a reversal.
+fn etc_rustynet_install_dir_args() -> [&'static str; 9] {
+    [
+        "install",
+        "-d",
+        "-m",
+        "0750",
+        "-o",
+        "root",
+        "-g",
+        "rustynetd",
+        "/etc/rustynet",
+    ]
+}
+
 fn main() {
     if let Err(err) = run() {
         let code = classify_live_lab_error(err.as_str());
@@ -1191,20 +1219,7 @@ fn install_dns_bundle_with_options(
         || {
             ctx.scp_to(verifier_local, client_host, "/tmp/rn-dns-zone.pub")?;
             ctx.scp_to(bundle_local, client_host, "/tmp/rn-dns-zone.bundle")?;
-            ctx.run_root(
-                client_host,
-                &[
-                    "install",
-                    "-d",
-                    "-m",
-                    "0750",
-                    "-o",
-                    "rustynetd",
-                    "-g",
-                    "root",
-                    "/etc/rustynet",
-                ],
-            )?;
+            ctx.run_root(client_host, &etc_rustynet_install_dir_args())?;
             ctx.run_root(
                 client_host,
                 &[
@@ -1363,20 +1378,7 @@ fn install_traversal_bundle(
 ) -> Result<(), String> {
     ctx.scp_to(traversal_pub_local, host, "/tmp/rn-traversal.pub")?;
     ctx.scp_to(traversal_bundle_local, host, "/tmp/rn-traversal.bundle")?;
-    ctx.run_root(
-        host,
-        &[
-            "install",
-            "-d",
-            "-m",
-            "0750",
-            "-o",
-            "rustynetd",
-            "-g",
-            "root",
-            "/etc/rustynet",
-        ],
-    )?;
+    ctx.run_root(host, &etc_rustynet_install_dir_args())?;
     ctx.run_root(
         host,
         &[
@@ -2897,6 +2899,7 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
+    use super::etc_rustynet_install_dir_args;
     use super::live_lab_support::LiveLabPlatform;
     use super::{
         Config, ManagedDnsRecordTemplate, ManagedPeerSpec, assignment_bundle_path,
@@ -2911,6 +2914,32 @@ mod tests {
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+
+    /// Regression guard: these two flags were inverted (`-o rustynetd -g root`),
+    /// which chowned `/etc/rustynet` to the daemon uid at the start of this
+    /// stage. Every later root-run decrypt of the assignment signing secret in
+    /// that directory then failed the key-custody
+    /// `directory_uid == effective uid` check, and the stage failed on the
+    /// condition it had created itself. Live-captured 2026-08-07T17:26:14Z.
+    #[test]
+    fn etc_rustynet_install_dir_is_root_owned_with_rustynetd_group() {
+        assert_eq!(
+            etc_rustynet_install_dir_args(),
+            [
+                "install",
+                "-d",
+                "-m",
+                "0750",
+                "-o",
+                "root",
+                "-g",
+                "rustynetd",
+                "/etc/rustynet",
+            ],
+            "reversing owner/group here fails every root-run key-custody read \
+             under /etc/rustynet"
+        );
+    }
 
     fn base_config() -> Config {
         Config {
