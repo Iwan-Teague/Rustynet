@@ -7445,18 +7445,7 @@ impl DaemonRuntime {
             "mixed_active"
         };
         let live_reason = match live_mode {
-            "direct_active" => {
-                if direct_live_reasons.len() == 1 {
-                    direct_live_reasons
-                        .iter()
-                        .next()
-                        .copied()
-                        .unwrap_or("fresh_handshake_observed")
-                        .to_owned()
-                } else {
-                    "fresh_handshake_observed".to_owned()
-                }
-            }
+            "direct_active" => aggregate_direct_live_reason(&direct_live_reasons),
             "relay_active" => "relay_selected_endpoint_with_fresh_handshake".to_owned(),
             "mixed_active" => {
                 if live_peer_count < programmed_peer_count {
@@ -15938,6 +15927,33 @@ fn parse_host_cidr_addr(cidr: &str) -> Option<IpAddr> {
 /// deduped class set of the remote direct candidates; the winner is the
 /// class of the candidate matching the selected endpoint, only when the
 /// decision is Direct AND a fresh handshake backed it.
+/// Reason string reported when a fleet's live direct peers do not agree.
+///
+/// Deliberately NOT one of the per-peer reasons: no single peer's state
+/// describes the fleet, and reusing an attesting one is exactly the fail-open
+/// this exists to remove.
+const MIXED_DIRECT_REASONS: &str = "mixed_direct_reasons";
+
+/// Collapse the reasons of all live direct peers into the one string the node
+/// reports for the whole fleet.
+///
+/// The previous rule reported the attesting literal whenever the set held two
+/// or more distinct reasons, so a fleet with one attributed peer and one
+/// unattributed peer laundered into a clean attestation — an aggregate claiming
+/// proof no member had established. That is a default-allow read on a
+/// trust-adjacent signal.
+///
+/// Now a disagreeing fleet reports its own non-attesting marker, and the empty
+/// set (unreachable in this arm today, because a live direct peer always
+/// contributes a reason) reports it too rather than defaulting to proof.
+fn aggregate_direct_live_reason(reasons: &std::collections::BTreeSet<&str>) -> String {
+    let mut iter = reasons.iter();
+    match (iter.next(), iter.next()) {
+        (Some(only), None) => (*only).to_owned(),
+        _ => MIXED_DIRECT_REASONS.to_owned(),
+    }
+}
+
 /// Whether a race outcome carries usable evidence for the cross-session prior
 /// store.
 ///
@@ -16064,6 +16080,54 @@ mod tests {
             addr: addr.parse().expect("addr"),
             port,
         }
+    }
+
+    /// A fleet whose live direct peers disagree must NOT report an attesting
+    /// reason. The previous rule returned the attesting literal for any set of
+    /// two or more, so one attributed peer plus one unattributed peer laundered
+    /// into a clean attestation the fleet had never established.
+    #[test]
+    fn disagreeing_direct_reasons_do_not_report_an_attesting_aggregate() {
+        let mut reasons = std::collections::BTreeSet::new();
+        reasons.insert("fresh_handshake_observed");
+        reasons.insert("unattributed_handshake_observed");
+        let aggregate = super::aggregate_direct_live_reason(&reasons);
+        assert_eq!(aggregate, super::MIXED_DIRECT_REASONS);
+        assert_ne!(
+            aggregate, "fresh_handshake_observed",
+            "a disagreeing fleet must never claim the attesting reason"
+        );
+    }
+
+    /// A fleet that genuinely agrees reports the reason its peers share —
+    /// otherwise a uniformly attributed fleet would lose its attestation.
+    #[test]
+    fn unanimous_direct_reasons_are_reported_verbatim() {
+        let mut reasons = std::collections::BTreeSet::new();
+        reasons.insert("fresh_handshake_observed");
+        assert_eq!(
+            super::aggregate_direct_live_reason(&reasons),
+            "fresh_handshake_observed"
+        );
+
+        let mut unattributed = std::collections::BTreeSet::new();
+        unattributed.insert("unattributed_handshake_observed");
+        assert_eq!(
+            super::aggregate_direct_live_reason(&unattributed),
+            "unattributed_handshake_observed"
+        );
+    }
+
+    /// The empty set is unreachable in this arm today, because a live direct
+    /// peer always contributes a reason. It must still fail closed rather than
+    /// default to proof, since that is precisely the shape of the defect above.
+    #[test]
+    fn empty_direct_reason_set_does_not_default_to_proof() {
+        let reasons = std::collections::BTreeSet::new();
+        assert_eq!(
+            super::aggregate_direct_live_reason(&reasons),
+            super::MIXED_DIRECT_REASONS
+        );
     }
 
     /// An unattributed direct success must record NOTHING, not a no-winner

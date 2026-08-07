@@ -1748,7 +1748,25 @@ impl TraversalEngine {
                 // top-priority fallback carries the unattributed one. Keeping
                 // these in one match is what stops a later consumer reading
                 // "handshake observed" as "this endpoint is proven".
-                let (winning_endpoint, winning_reason) = match runtime.handshake_endpoint()? {
+                //
+                // Fail SOFT, never `?`. This branch is the one taken when the
+                // race has already SUCCEEDED — a fresh handshake advanced. An
+                // error here is a failure to *describe* that success, not a
+                // failure of it, and propagating would abort a winning race:
+                // the error travels to `sync_traversal_runtime_state`, whose
+                // caller responds in enforced mode by restricting the node and
+                // forcing it closed. That would fail a node at the exact moment
+                // a direct path started working, which is how an earlier
+                // attribution attempt would have taken down every enforced node
+                // and why it was reverted.
+                //
+                // A backend that cannot answer therefore yields the same
+                // unattributed outcome as one that answers `None`. This is
+                // inert today because no production runtime implements the
+                // method, and it is written now precisely so it cannot become
+                // live later by surprise.
+                let attributed_endpoint = runtime.handshake_endpoint().unwrap_or(None);
+                let (winning_endpoint, winning_reason) = match attributed_endpoint {
                     Some(endpoint) => (
                         endpoint,
                         TraversalDecisionReason::IcePairRaceHandshakeObserved,
@@ -3297,6 +3315,92 @@ mod tests {
     /// immediately after the final sends and this exact case fell through
     /// to the relay fallback, discarding an entire round of probes
     /// unobserved.
+    #[test]
+    fn ice_pair_race_survives_a_handshake_endpoint_error_on_the_winning_path() {
+        // A backend that ERRORS when asked which endpoint completed the
+        // handshake must not abort a race that already succeeded. The error is
+        // a failure to DESCRIBE the win, not a failure of it, and propagating
+        // would travel to sync_traversal_runtime_state, whose caller in
+        // enforced mode restricts the node and forces it closed — failing a
+        // node at the exact moment a direct path starts working.
+        struct ErroringEndpointRuntime {
+            handshake_unix: u64,
+            polls: u32,
+        }
+        impl SimultaneousOpenRuntime for ErroringEndpointRuntime {
+            fn send_probe(
+                &mut self,
+                _endpoint: SocketEndpoint,
+                _round: u8,
+            ) -> Result<(), TraversalError> {
+                Ok(())
+            }
+
+            fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError> {
+                // First poll establishes the baseline; the next shows an
+                // advance, so the race takes the winning branch.
+                self.polls = self.polls.saturating_add(1);
+                Ok((self.polls > 1).then_some(self.handshake_unix))
+            }
+
+            fn handshake_endpoint(&mut self) -> Result<Option<SocketEndpoint>, TraversalError> {
+                Err(TraversalError::ProbeSend(
+                    "backend cannot report the handshake endpoint".to_owned(),
+                ))
+            }
+        }
+
+        struct NoopWaiter;
+        impl SimultaneousOpenWaiter for NoopWaiter {
+            fn wait(&mut self, _duration: Duration) {}
+        }
+
+        let engine = TraversalEngine::new(TraversalEngineConfig::default()).expect("engine");
+        let now = 1_700_000_200u64;
+        let mut runtime = ErroringEndpointRuntime {
+            handshake_unix: now,
+            polls: 0,
+        };
+        let mut waiter = NoopWaiter;
+        let schedule = CoordinationSchedule {
+            session_id: [7u8; 16],
+            nonce: [8u8; 16],
+            probe_start_unix: now,
+            wait_duration: Duration::ZERO,
+        };
+        let local_candidates = vec![candidate([10, 0, 0, 10], 51820, CandidateSource::Host, 900)];
+        let remote_candidates = vec![candidate([10, 0, 0, 1], 51820, CandidateSource::Host, 900)];
+
+        let result = engine
+            .execute_ice_pair_race(
+                &mut runtime,
+                &mut waiter,
+                schedule,
+                local_candidates.as_slice(),
+                remote_candidates.as_slice(),
+                &[1u8; 32],
+                &[2u8; 32],
+                None,
+                now,
+                120,
+                None,
+                None,
+            )
+            .expect("an endpoint-report error must NOT fail the race");
+
+        match result.decision {
+            TraversalDecision::Direct { endpoint, reason } => {
+                assert_eq!(endpoint, remote_candidates[0].endpoint);
+                assert_eq!(
+                    reason,
+                    TraversalDecisionReason::IcePairRaceHandshakeUnattributed,
+                    "an unanswerable backend must degrade to unattributed, not to proof"
+                );
+            }
+            other => panic!("the race still won; expected Direct, got {other:?}"),
+        }
+    }
+
     #[test]
     fn ice_pair_race_final_round_observation_window_yields_direct() {
         #[derive(Clone, Default)]
