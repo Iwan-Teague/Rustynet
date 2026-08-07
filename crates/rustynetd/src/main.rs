@@ -457,13 +457,14 @@ fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
 fn run_key_command(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err(
-            "key subcommand is required (supported: init, init-gossip, migrate, store-passphrase)"
+            "key subcommand is required (supported: init, init-gossip, show-gossip-key, migrate, store-passphrase)"
                 .to_owned(),
         );
     }
     match args[0].as_str() {
         "init" => run_key_init(&args[1..]),
         "init-gossip" => run_key_init_gossip(&args[1..]),
+        "show-gossip-key" => run_key_show_gossip_key(&args[1..]),
         "migrate" => run_key_migrate(&args[1..]),
         "store-passphrase" => run_key_store_passphrase(&args[1..]),
         other => Err(format!("unknown key subcommand: {other}")),
@@ -581,6 +582,75 @@ fn run_key_init_gossip(args: &[String]) -> Result<(), String> {
         "key init-gossip complete: gossip_signing_secret={}",
         secret_path.display()
     );
+    Ok(())
+}
+
+/// Print the gossip verifying key this node publishes, as lowercase hex.
+///
+/// This is the value a signed membership record's `node_pubkey_hex` is supposed
+/// to carry. Until this verb existed the derived key never left the daemon
+/// except as an eight-byte log prefix, so an operator asked to place it in a
+/// membership update had nothing to copy — which made every gossip-identity
+/// migration unimplementable rather than merely undecided.
+///
+/// Reads only. It never mints, never rotates, and never prints the secret.
+/// Like the mint, the passphrase is passed explicitly: `resolve_passphrase_source`
+/// refuses to fall back to the configured path, so a root invocation with
+/// neither `CREDENTIALS_DIRECTORY` nor the credential env var set would
+/// otherwise fail with a confusing refusal rather than reading the file it was
+/// handed.
+fn run_key_show_gossip_key(args: &[String]) -> Result<(), String> {
+    let mut secret_path = String::new();
+    let mut passphrase_path = DEFAULT_WG_KEY_PASSPHRASE_PATH.to_owned();
+
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--gossip-signing-secret") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--gossip-signing-secret requires a value".to_owned())?;
+                secret_path = value.clone();
+                index += 2;
+            }
+            Some("--passphrase-file") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--passphrase-file requires a value".to_owned())?;
+                passphrase_path = value.clone();
+                index += 2;
+            }
+            Some(flag) => return Err(format!("unknown key show-gossip-key argument: {flag}")),
+            None => break,
+        }
+    }
+
+    if secret_path.is_empty() {
+        return Err("--gossip-signing-secret is required".to_owned());
+    }
+    ensure_cli_path_absolute(&secret_path, "path")?;
+    ensure_cli_path_absolute(&passphrase_path, "path")?;
+
+    let secret_path = std::path::Path::new(&secret_path);
+    // Distinguish "never minted" from "cannot read". They call for opposite
+    // operator actions — run the mint, versus fix custody or permissions — and
+    // collapsing them into one failure is what makes this class of problem hard
+    // to diagnose in the field.
+    if !secret_path.exists() {
+        return Err(format!(
+            "gossip signing secret not found at {}; run `rustynetd key init-gossip` first",
+            secret_path.display()
+        ));
+    }
+    let passphrase_path = std::path::Path::new(&passphrase_path);
+    let hex = rustynetd::key_material::export_gossip_verifying_key_hex(
+        secret_path,
+        passphrase_path,
+        Some(passphrase_path),
+    )
+    .map_err(|err| format!("gossip verifying key export failed: {err}"))?;
+
+    println!("{hex}");
     Ok(())
 }
 
@@ -4352,6 +4422,7 @@ fn help_text() -> String {
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key init-gossip --gossip-signing-secret <path> [--passphrase-file <path>] [--force]",
+        "  rustynetd key show-gossip-key --gossip-signing-secret <path> [--passphrase-file <path>]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>] [--keychain-service <name>] [--keychain-allow-any-app]",
         "  rustynetd anchor-bundle-pull-bind-check --addr <addr:port> [--allow-lan <true|false>] [--expect <accept|reject>]",
@@ -4522,6 +4593,81 @@ mod tests {
         assert!(
             err.contains("--gossip-signing-secret is required"),
             "got: {err}"
+        );
+    }
+
+    /// The export verb must refuse the same malformed input the mint does —
+    /// it is the read-side counterpart and shares the custody path, so a
+    /// relative path would resolve to a different key id here than the daemon
+    /// uses, silently exporting the wrong node's key or nothing at all.
+    #[test]
+    fn key_show_gossip_key_rejects_missing_unknown_and_relative_paths() {
+        let err = super::run_key_show_gossip_key(&[]).expect_err("must require the secret path");
+        assert!(
+            err.contains("--gossip-signing-secret is required"),
+            "got: {err}"
+        );
+
+        let err = super::run_key_show_gossip_key(&["--nope".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown key show-gossip-key argument"),
+            "got: {err}"
+        );
+
+        let err = super::run_key_show_gossip_key(&["--gossip-signing-secret".to_owned()])
+            .expect_err("a flag without its value must be rejected");
+        assert!(err.contains("requires a value"), "got: {err}");
+
+        let err = super::run_key_show_gossip_key(&[
+            "--gossip-signing-secret".to_owned(),
+            "relative/gossip.secret".to_owned(),
+        ])
+        .expect_err("a relative secret path must be rejected");
+        assert!(err.to_lowercase().contains("absolute"), "got: {err}");
+    }
+
+    /// "Never minted" and "cannot read" call for opposite operator actions —
+    /// run the mint, versus fix custody or permissions — so they must not
+    /// collapse into one message. This pins the not-minted arm specifically.
+    #[test]
+    fn key_show_gossip_key_reports_a_missing_secret_distinctly() {
+        let absent = std::env::temp_dir().join(format!(
+            "rustynet-absent-gossip-secret-{}.enc",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&absent);
+        let err = super::run_key_show_gossip_key(&[
+            "--gossip-signing-secret".to_owned(),
+            absent.display().to_string(),
+        ])
+        .expect_err("an absent secret must be reported, not silently exported");
+        assert!(
+            err.contains("not found") && err.contains("init-gossip"),
+            "the not-minted error must name the remedy, got: {err}"
+        );
+    }
+
+    /// The verb must be reachable and advertised: an export primitive nobody
+    /// can invoke is the state this work exists to leave behind.
+    #[test]
+    fn key_show_gossip_key_is_dispatched_and_documented() {
+        let err = super::run_key_command(&[]).expect_err("a bare key command must error");
+        assert!(
+            err.contains("show-gossip-key"),
+            "the subcommand list must advertise the verb, got: {err}"
+        );
+        let help = super::help_text();
+        assert!(
+            help.contains("key show-gossip-key --gossip-signing-secret"),
+            "help must document the verb"
+        );
+        // Dispatch reaches the verb rather than the unknown-subcommand arm.
+        let err = super::run_key_command(&["show-gossip-key".to_owned()])
+            .expect_err("the verb still validates its own arguments");
+        assert!(
+            err.contains("--gossip-signing-secret is required"),
+            "dispatch must reach the verb, got: {err}"
         );
     }
 
