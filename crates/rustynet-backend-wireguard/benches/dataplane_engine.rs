@@ -10,9 +10,19 @@
 //! tokio runtime — it calls the engine seam directly via
 //! `bench_support` (feature-gated, never in production builds).
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rustynet_backend_wireguard::bench_support::{DataplaneEnginePair, SAMPLE_PLAINTEXT_LEN};
 use std::hint::black_box;
+
+/// Plaintext sizes swept by the throughput benches.
+///
+/// All sit at or below the safe bring-up tunnel MTU, so none of them
+/// exercises fragmentation — that is a separate concern and would make the
+/// per-size numbers incomparable. The point of the sweep is to show how much
+/// of the per-packet cost is fixed overhead versus proportional to payload,
+/// which a single fixed size cannot answer: it is the input to deciding
+/// whether any of this is worth SIMD or hand assembly at all.
+const SWEEP_SIZES: [usize; 5] = [64, 256, 576, 1024, 1400];
 
 fn bench_encrypt(c: &mut Criterion) {
     let mut pair = DataplaneEnginePair::handshaken();
@@ -32,6 +42,47 @@ fn bench_forward_roundtrip(c: &mut Criterion) {
             black_box(delivered);
         });
     });
+}
+
+/// Outbound encrypt cost across payload sizes.
+///
+/// `Throughput::Bytes` uses the PLAINTEXT length deliberately: it reports
+/// payload goodput, which is the number a capacity question is asked in.
+/// Ciphertext on the wire is larger by the 16-byte Poly1305 tag plus the
+/// transport header, so a ciphertext-denominated figure would flatter the
+/// small sizes.
+fn bench_encrypt_sizes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine_encrypt_outbound");
+    let mut pair = DataplaneEnginePair::handshaken();
+    for len in SWEEP_SIZES {
+        pair.set_sample_len(len);
+        group.throughput(Throughput::Bytes(pair.sample_len() as u64));
+        group.bench_function(BenchmarkId::from_parameter(len), |b| {
+            b.iter(|| {
+                let ciphertext = pair.encrypt_sample();
+                black_box(ciphertext);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Full encrypt-then-decrypt round trip across payload sizes — the cost a
+/// forwarded packet actually pays end to end, as opposed to encrypt alone.
+fn bench_forward_sizes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine_forward_roundtrip");
+    let mut pair = DataplaneEnginePair::handshaken();
+    for len in SWEEP_SIZES {
+        pair.set_sample_len(len);
+        group.throughput(Throughput::Bytes(pair.sample_len() as u64));
+        group.bench_function(BenchmarkId::from_parameter(len), |b| {
+            b.iter(|| {
+                let delivered = pair.forward_one();
+                black_box(delivered);
+            });
+        });
+    }
+    group.finish();
 }
 
 /// P4 (DataplanePerfBacklog): parameterised peer-count case named by the
@@ -88,7 +139,8 @@ fn bench_find_node_id_by_endpoint_hit_peers64(c: &mut Criterion) {
 criterion_group! {
     name = dataplane;
     config = Criterion::default().sample_size(200);
-    targets = bench_encrypt, bench_forward_roundtrip, bench_forward_roundtrip_64_peers,
+    targets = bench_encrypt, bench_forward_roundtrip, bench_encrypt_sizes,
+        bench_forward_sizes, bench_forward_roundtrip_64_peers,
         bench_has_endpoint_miss_peers64, bench_find_node_id_by_endpoint_hit_peers64
 }
 criterion_main!(dataplane);
