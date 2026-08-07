@@ -342,7 +342,15 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        let root = PathBuf::from(format!("/tmp/rustynet-peer-store-tests.{unique}.{counter}"));
+        // The process id is required, not decorative: cargo-nextest runs every
+        // test in its own process, so `TEST_ID_COUNTER` is always 0 and the
+        // timestamp alone can collide between two concurrently starting test
+        // processes. A collision lets one test's `cleanup()` delete the
+        // directory another test is still using.
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!(
+            "rustynet-peer-store-tests.{pid}.{unique}.{counter}"
+        ));
         let config_dir = root.join("config");
         let peers_file = config_dir.join("peers.db");
         (root, config_dir, peers_file)

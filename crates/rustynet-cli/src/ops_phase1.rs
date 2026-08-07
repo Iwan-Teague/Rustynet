@@ -2453,7 +2453,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("{prefix}-{now_nanos}-{counter}{suffix}"))
+        // The process id is required, not decorative: cargo-nextest runs every
+        // test in its own process, so `TEST_ID_COUNTER` is always 0 and the
+        // timestamp alone can collide between two concurrently starting test
+        // processes, letting one test clobber another's temporary files.
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("{prefix}-{pid}-{now_nanos}-{counter}{suffix}"))
     }
 
     #[test]
