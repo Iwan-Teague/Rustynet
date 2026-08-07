@@ -15,7 +15,8 @@
 > uncommitted worktrees as if it were `main` — that is what produced QH-12's wrong counts
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
-> This register has **15** items, not 13 (`README.md` undercounts).
+> This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
+> then claimed; it has since grown to **35** (QH-01 through QH-35, contiguous).
 
 ## Purpose
 
@@ -1499,6 +1500,45 @@ a hand-edited inventory then goes unflagged), or sample dirty-state *before* the
 mutates anything and record that. The second preserves the signal; the first is a
 one-line change. Worth checking whether any historical `dirty:*` reading is
 trustworthy before relying on one.
+
+---
+
+### QH-35 — The privileged-helper allowlist and the code that builds the argv are tested only against themselves, so a shape mismatch stays invisible until the feature is switched on
+**Severity: medium-high (one instance was a live traversal-path denial, one blocks a
+release-gated feature). Confidence: VERIFIED 2026-08-07, both instances fixed in
+`16de276f`.**
+
+`validate_wg_args` (`privileged_helper.rs`) is an exact-match allowlist with a deny
+catch-all, and `PrivilegedCommandClient::run_capture` runs it **client-side, before
+the socket**. So any argv shape the backends build but the allowlist does not name is
+not a helper-side rejection — it is a `BackendError` on the caller's own thread.
+
+Two such shapes existed simultaneously, and **each half's own tests passed**:
+
+1. **`persistent-keepalive <n>` (FIS-0015).** All three command backends append it the
+   moment `PeerConfig::persistent_keepalive_secs` is `Some`. Latent only because the
+   field defaults to `None` — switching the adaptive-keepalive rollout on would have
+   failed peer configuration outright rather than degraded to no keepalive.
+2. **The endpoint-only `set <iface> peer <key> endpoint <ep>` re-point**, which
+   `update_peer_endpoint` emits with no `allowed-ips` tail. **Not** gated behind an
+   off-by-default field: it is reached from the traversal path in `phase10.rs` whenever
+   a peer is promoted to a directly reachable address, on both the Linux and macOS
+   command backends. Open question worth answering: which `DaemonBackendMode` the
+   traversal-proven live runs used, since the userspace-shared backends bypass this
+   validator entirely and would mask the failure.
+
+The structural point is that neither backend tests nor validator tests can catch this
+class — only a test that drives one against the other can, which is what
+`allowlist_accepts_every_argv_the_linux_backend_emits_with_keepalive_enabled` now does.
+**Before adding any new `wg`/`ip`/`pfctl` invocation, or any new optional field that
+appends a token, check the allowlist arm in the same change.** Widen it deliberately
+and keep the token guards: the boundary is exact, not a prefix match, and the shipped
+adversarial corpus in `privileged_helper_allowlist_audit.rs` must gain matching
+allow *and* deny cases so the check also holds on deployed binaries.
+
+Note `wg show <iface> dump` is still absent from the allowlist by choice — its only
+caller invokes `wg` directly rather than through the helper, so it has no caller behind
+it yet. It will need an arm when the endpoint-attribution work lands.
 
 ---
 
