@@ -1,10 +1,18 @@
 # I4 — traversal enforcement: what it needs, and why it cannot ship yet
 
-**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.** Revision 5, after
-three rounds of adversarial review. **Read §0 first**: the second review refuted four of
-revision 2's corrections including its headline recommendation, and the third round
-refuted **all three steps of the chain revision 3 proposed in its place** (§0.0, §9.1), so
-the sections below carry retractions inline. Nothing here is landable as written.
+**DESIGN ONLY. NOT APPROVED. NO PRODUCTION CODE PROPOSED AS WRITTEN.** Revision 6, after
+four rounds of adversarial review.
+
+**Read §0.000 first.** It closes item 6 (endpoint attribution) as unachievable with
+this observation surface, reframes §0.01 as a deliberate architectural decision rather
+than a defect, records a live allowlist defect that breaks traversal probing on
+enforced Linux and macOS nodes at HEAD, and adds a hard prohibition: a
+`wg show <iface> dump` allowlist arm would expose the interface private key.
+
+Then read §0 onward for the earlier rounds: the second review refuted four of revision
+2's corrections including its headline recommendation, and the third refuted **all
+three steps of the chain revision 3 proposed in its place** (§0.0, §9.1). The sections
+below carry their retractions inline. Nothing here is landable as written.
 
 A caution for whoever picks this up, because it has now held at every step: **the narrow
 supporting fact was correct each time; the conclusion drawn from it was not.** Treat every
@@ -18,6 +26,162 @@ status surface) shipped earlier and is out of scope.
 would still program an attacker-chosen endpoint.** The ordering problem the task
 anticipated is real, larger than expected, and the blocking dependency is partly work
 that was only *designed* today. §1 states the result; §9 states what is landable now.
+
+## 0.000 Revision 6 — item 5 is not a defect, item 6 is closed, and A3.2 would have leaked the private key
+
+A plan to fix "the ICE race emits no handshake datagrams on the command backends"
+(§0.01) and to re-attempt A3.2 was written on 2026-08-07 and attacked by two
+adversarial reviews before any code was written. **Both halves of that plan were
+refuted.** Every claim below was re-verified by hand afterwards. The plan is not
+recorded; its refutation is, because the refutation is what transfers.
+
+### The reframing: §0.01 describes a deliberate decision, not an oversight
+
+`poll_stun_results` returns early when the backend declares itself
+non-authoritative — `crates/rustynetd/src/daemon.rs:5932-5936`:
+`if self.transport_socket_identity_blocker.is_some() || …stun_servers.is_empty() { return; }`
+`[verified]`. All three command backends set that blocker
+(`linux_command.rs:544-547`, `macos_command.rs`, `windows_command.rs`), and the
+Linux one states why: the adapter has "no authoritative packet-I/O handle or
+backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay
+bootstrap/refresh on the real peer-traffic transport".
+
+**Consequence: on a command backend the race never gathers a server-reflexive
+candidate at all.** It only ever holds host/LAN candidates, where NAT punching is
+neither needed nor possible. No STUN, no relay bootstrap and no handshake
+origination are therefore **one decision, not three omissions**, and §0.01's
+finding is a symptom of it rather than an independent bug.
+
+This also settles by reading what §0.01 proposed to settle by measurement: the
+cross-network hole-punch this project has measured **cannot** have used a command
+backend, because such a backend never produces a srflx candidate.
+
+### RETRACTED — "give the command backends a handshake trigger"
+
+The plan proposed a `nudge_peer_handshake` sending one datagram toward the peer's
+overlay address. It cannot work, for reasons that are protocol-level rather than
+implementation detail:
+
+- WireGuard rate-limits initiation to one per `REKEY_TIMEOUT`, which is **5
+  seconds** (`third_party/boringtun/src/noise/timers.rs:22`), and suppresses a
+  repeat while one is in flight (`third_party/boringtun/src/noise/mod.rs:438-439`,
+  `if self.handshake.is_in_progress() && !force_resend`) `[verified]`. Kernel
+  WireGuard exposes no force-resend, and the privileged-helper allowlist grants no
+  command that would provide one.
+- The race fires up to 24 pairs × 3 rounds inside ~240 ms
+  (`traversal.rs:62-64`). So the nudge would yield **at most one initiation for
+  the entire 72-probe race**, aimed at `pairs[0]` of round 0.
+- Kernel WireGuard stores **one endpoint per peer**, so 24 candidates cannot be in
+  flight concurrently by construction — the "parallel race" is unachievable on a
+  command backend regardless of trigger.
+
+The failure mode this would have produced is the one this document family keeps
+producing: a packet capture showing "zero became one", a proof obligation reading
+as met, gates passing, and a race still 1/72 functional. It would also make a
+deliberately non-authoritative backend *look* like it punched, which is precisely
+what the blocker exists to prevent.
+
+### CORRECTED — the rejection of the userspace-shared backend was wrong
+
+The plan rejected routing traversal through userspace-shared because
+`supports_roaming` is `false` there. That field has **exactly one reader in the
+entire repository** — a test assertion at `crates/rustynetd/src/daemon.rs:17624`
+`[verified]`. There are no production readers. The rejection therefore rested on a
+field nothing consults, and it rejected the only backends that could ever
+implement `handshake_endpoint`, since they are the only ones that own the socket.
+
+### Item 6 is CLOSED: attribution and parallel racing are mutually exclusive here
+
+The plan's replacement for A3.2 was a "confirmation round" — on observing a
+handshake advance, program the reported endpoint and verify a handshake against it
+specifically. It cannot fire. The confirmation runs immediately after the winning
+guard, so a valid session already exists, and WireGuard will not rekey for
+`REKEY_AFTER_TIME` = **120 s** (`third_party/boringtun/src/noise/timers.rs:19`)
+`[verified]` — 500× the entire 240 ms race budget.
+
+So the confirmation's causal path is *closed* while its coincidental path is
+*open*: the only events that can advance the handshake during the window are ones
+the confirmation did not cause — in-flight responses from the 72 earlier probes,
+or the peer's own initiation, which this repo measured at ~6 handshakes/second on
+a live cross-network path (`crates/rustynetd/src/daemon.rs:2220-2225`). A check
+that can only ever succeed by coincidence is not proof.
+
+**Recorded conclusion: with this observation surface, endpoint attribution and
+parallel racing cannot both be had.** Serial probing would attribute for free but
+trades away simultaneous-open, which is the mechanism marginal-NAT topologies
+need. Item 6 is closed rather than re-scoped. What is lost is the FIS-0009
+prior-store re-ranking optimisation, which is a performance feature and not a
+security control; direct paths are simply unattested, and the reason variants
+already say so honestly.
+
+### CRITICAL — never add a `wg show <iface> dump` allowlist arm
+
+`dump` prints the interface **private key** as field 0 of its first line, and
+every peer's preshared key as field 1 of each peer line. This is not inference:
+the reverted A3.2 commit's own parser doc says "the leading interface line carries
+4 (private-key, public-key, listen-port, fwmark)" and its own test fixture is
+`"priv\tpub\t51820\toff\n…"` `[verified]`.
+
+Skipping that line in the parser does not stop it crossing the privileged-helper
+boundary into an unzeroized `String` in daemon memory. The existing allowlist is
+deliberately structured so the daemon only ever handles the private key **by
+path** (`privileged_helper.rs`, the `["set", interface, "private-key",
+private_key_path]` arm). A `dump` arm would hand it back in plaintext — a §4 and
+§10.6 violation, and the most secret-dense output `wg` can produce.
+
+**So the reverted A3.2 was worse than recorded in §0.00: alongside its two
+blockers, it would have pulled the interface private key into daemon memory.** If
+an endpoint read-back is ever needed, `wg show <iface> endpoints` yields
+peer/endpoint pairs without key material — unverified locally (`wg` is not
+installed on the dev host) and to be confirmed on a lab guest.
+
+### LIVE DEFECT at HEAD — the endpoint-only argv is not allowlisted
+
+`update_peer_endpoint` emits a **six**-token argv with no `allowed-ips` tail
+(`crates/rustynet-backend-wireguard/src/linux_command.rs:474-484`), and `HEAD`'s
+`validate_wg_args` has no matching arm — its only `endpoint` arm requires the
+`allowed-ips` tail, so the six-token form hits the deny catch-all `[verified]`.
+Validation is client-side, before the socket, and the production Linux/macOS
+backends are hard-wired to the helper.
+
+**So `send_probe` cannot complete its first line on an enforced Linux or macOS
+node: it errors at `reconfigure_managed_peer` before `initiate_peer_handshake` is
+ever reached.** This is more severe than §0.01, invalidates any measurement of
+"does the race emit handshakes" taken before it is fixed, and bypasses
+`relay_or_fail_closed_for_race` entirely — there is no relay fallback on this
+path. The fix is written but uncommitted at time of writing.
+
+### Also recorded, not yet fixed
+
+- **Mixed-fleet fail-open at the proof surface.** When two or more live direct
+  peers carry differing reasons, the aggregate reports the *attesting* literal, so
+  one attributed peer plus one unattributed peer launders into a clean
+  attestation. One line, no boundary change; see §0.0's `daemon.rs:7398` entry,
+  which described the same code without naming the fail-open.
+- **A loaded `?` on the winning path.** `traversal.rs`'s
+  `match runtime.handshake_endpoint()?` sits inside the branch taken when the race
+  has *succeeded*. It is inert only because no production implementation exists;
+  the moment one does, a backend error fails the reconcile exactly when a direct
+  path starts working — how A3.2 would have failed every enforced node. Make it
+  fail-soft regardless of whether attribution is ever implemented.
+- **Route-flush storm on the probe path.** Every endpoint reprogram calls
+  `refresh_peer_endpoint_routes_and_attest` (`phase10.rs:6264-6265`) `[verified]`,
+  which flushes and rebuilds routing table 51820 and re-asserts the killswitch —
+  up to 72 times inside a 240 ms round budget, each momentarily blackholing the
+  default route on an exit client. Unmeasured and uninstrumented.
+
+### The recommendation this leaves
+
+1. Commit the endpoint-only allowlist arm first; nothing else in this area is
+   measurable until it lands.
+2. Make the command backends honest rather than giving them a synthetic trigger:
+   when the backend is blocked, skip the ICE race and take the existing
+   relay/fail-closed path with a named reason. That also removes the route-flush
+   storm and the misleading `traversal_probe_attempts` increments.
+3. Treat real traversal on Linux/macOS as meaning the userspace-shared backend,
+   which is where it already demonstrably works.
+4. Fix the mixed-fleet fail-open and defuse the `?`. Both are cheap and worth more
+   than item 6 was.
 
 ## 0.00 Revision 5 — A3.2 was built, landed, reviewed, and REVERTED the same night
 
