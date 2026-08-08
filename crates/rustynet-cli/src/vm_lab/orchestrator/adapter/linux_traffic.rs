@@ -219,6 +219,121 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
     Ok(hex)
 }
 
+/// The unix user the daemon runs as, and therefore the ONLY user that can read
+/// its key custody artifacts.
+const DAEMON_USER: &str = "rustynetd";
+/// Encrypted gossip signing secret, minted by `key init-gossip` during install.
+const GOSSIP_SECRET_PATH: &str = "/var/lib/rustynet/keys/gossip.signing.secret";
+/// The daemon's passphrase, materialised by systemd `LoadCredentialEncrypted`.
+/// It exists ONLY while `rustynetd.service` is running.
+const GOSSIP_PASSPHRASE_PATH: &str = "/run/credentials/rustynetd.service/wg_key_passphrase";
+/// Emitted by the readiness guard when the unit is not active. A literal marker
+/// rather than a bare exit code, so the failure is distinguishable from a
+/// custody or parse failure in the collector's error text.
+const GOSSIP_DAEMON_INACTIVE_MARKER: &str = "RN_GOSSIP_DAEMON_INACTIVE";
+
+/// Validate a gossip verifying key as exported by `rustynetd key show-gossip-key`.
+///
+/// This is the value signed membership's `node_pubkey_hex` is supposed to carry.
+/// Publishing anything else — in practice the node's WireGuard public key — makes
+/// every peer reject that node's gossip as an unknown source.
+///
+/// NOTE the `VerifyingKey::from_bytes` check is NOT a control that distinguishes a
+/// gossip key from a WireGuard key: it decompresses with no canonicity and no
+/// low-order check, and passes roughly half of arbitrary 32-byte strings. It is a
+/// cheap well-formedness filter that happens to reject the measured real-world
+/// wrong value. The thing that actually separates aligned from unaligned is which
+/// CLI flag the caller uses.
+pub fn parse_gossip_verifying_key_hex(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 {
+        return Err(format!(
+            "gossip verifying key must be 64 hex chars, got {}",
+            trimmed.len()
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
+        return Err("gossip verifying key must be lowercase hex".to_owned());
+    }
+    let mut bytes = [0u8; 32];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        let pair = trimmed
+            .get(index * 2..index * 2 + 2)
+            .ok_or_else(|| "gossip verifying key truncated".to_owned())?;
+        *slot = u8::from_str_radix(pair, 16)
+            .map_err(|err| format!("gossip verifying key hex decode failed: {err}"))?;
+    }
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+        .map_err(|err| format!("gossip verifying key is not a valid Ed25519 point: {err}"))?;
+    Ok(trimmed.to_owned())
+}
+
+/// The remote shell command that exports this node's gossip verifying key.
+///
+/// Two things here are load-bearing and neither is obvious:
+///
+/// * `-u rustynetd` is MANDATORY. Key custody requires the key directory AND the
+///   key file to be owned by the EFFECTIVE uid, with no root exemption
+///   (`rustynet-crypto/src/lib.rs`), and `/var/lib/rustynet/keys` is owned by the
+///   daemon user. Plain `sudo` (euid 0) fails with "key custody permission check
+///   failed", which misleadingly reads as a file-mode problem.
+/// * the readiness guard uses `systemctl is-active` WITHOUT `--quiet`, because
+///   `--quiet` suppresses the only text and the marker below is what lets the
+///   collector name this cause. The passphrase is a systemd credential that
+///   exists only while the unit runs, so a stopped daemon is a distinct, common,
+///   and otherwise very confusing failure.
+pub fn gossip_export_remote_command() -> String {
+    format!(
+        "systemctl is-active {unit} || {{ echo {marker}; exit 64; }}; \
+         sudo -n -u {user} /usr/local/bin/rustynetd key show-gossip-key \
+         --gossip-signing-secret {secret} \
+         --passphrase-file {passphrase}",
+        unit = "rustynetd",
+        marker = GOSSIP_DAEMON_INACTIVE_MARKER,
+        user = DAEMON_USER,
+        secret = GOSSIP_SECRET_PATH,
+        passphrase = GOSSIP_PASSPHRASE_PATH,
+    )
+}
+
+/// Collect this node's gossip verifying key, retrying to the same ~40 s deadline
+/// [`collect_node_id`] uses and for the same reason: this runs in the
+/// `CollectPubkeys` stage right after bootstrap, and systemd reports the unit
+/// active before the daemon has finished coming up. The credential directory
+/// this reads from only exists while the unit runs, so a restart-backoff window
+/// would otherwise be a hard failure.
+///
+/// Fails CLOSED. There is deliberately no fallback to the WireGuard key: a node
+/// that cannot prove its gossip identity must not get a membership entry that
+/// claims one.
+pub fn collect_gossip_verifying_key(conn: &NodeConnection) -> Result<String, AdapterError> {
+    let command = gossip_export_remote_command();
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        let attempt_err = match ssh::run_remote(conn, command.as_str(), SHORT_TIMEOUT) {
+            Ok(raw) if raw.contains(GOSSIP_DAEMON_INACTIVE_MARKER) => AdapterError::Protocol {
+                message: "gossip key export: rustynetd.service is not active, so its \
+                          systemd credential directory does not exist"
+                    .to_owned(),
+            },
+            Ok(raw) => match parse_gossip_verifying_key_hex(raw.as_str()) {
+                Ok(hex) => return Ok(hex),
+                Err(message) => AdapterError::Protocol {
+                    message: format!("gossip key export: {message}"),
+                },
+            },
+            Err(err) => err,
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(attempt_err);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
 /// Read the local `node_id` from the running daemon via `rustynet status`.
 pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
     // /run/rustynet/ is mode 770 root:rustynetd; the daemon control socket
@@ -1059,6 +1174,107 @@ fn verify_no_key_material(path: &std::path::Path) -> Result<(), AdapterError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod gossip_export_tests {
+    use super::*;
+
+    /// The value a real joiner actually published on 2026-08-07: its WireGuard
+    /// public key, base64 `bTBlI5pgTTFLS8PxcJusqiERqjIWgenxPspuRLrjfCU=`.
+    const MEASURED_WIREGUARD_KEY_HEX: &str =
+        "6d3065239a604d314b4bc3f1709bacaa2111aa321681e9f13eca6e44bae37c25";
+
+    /// Derived gossip verifying key exported by `key show-gossip-key` on a real
+    /// lab node, captured 2026-08-08.
+    const MEASURED_GOSSIP_KEY_HEX: &str =
+        "bd81fa4685670b898baa216ddc210221800ce55f8d9a2354e27ecb6db3256d42";
+
+    #[test]
+    fn parse_gossip_verifying_key_rejects_the_measured_wireguard_key() {
+        // Self-check FIRST: this fixture is only meaningful because it genuinely
+        // fails Ed25519 decompression. Roughly half of arbitrary 32-byte strings
+        // pass, so a carelessly chosen fixture makes this test vacuous.
+        let mut bytes = [0u8; 32];
+        for (index, slot) in bytes.iter_mut().enumerate() {
+            let pair = &MEASURED_WIREGUARD_KEY_HEX[index * 2..index * 2 + 2];
+            *slot = u8::from_str_radix(pair, 16).expect("fixture is hex");
+        }
+        assert!(
+            ed25519_dalek::VerifyingKey::from_bytes(&bytes).is_err(),
+            "fixture must genuinely fail decompression or this test proves nothing"
+        );
+
+        let err = parse_gossip_verifying_key_hex(MEASURED_WIREGUARD_KEY_HEX)
+            .expect_err("a WireGuard key must be refused as a gossip verifying key");
+        assert!(
+            err.contains("Ed25519"),
+            "error must name the point check, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_gossip_verifying_key_accepts_a_real_exported_key() {
+        assert_eq!(
+            parse_gossip_verifying_key_hex(MEASURED_GOSSIP_KEY_HEX)
+                .expect("a real exported gossip key must be accepted"),
+            MEASURED_GOSSIP_KEY_HEX
+        );
+    }
+
+    #[test]
+    fn parse_gossip_verifying_key_trims_but_does_not_normalise_case() {
+        assert_eq!(
+            parse_gossip_verifying_key_hex(&format!("  {MEASURED_GOSSIP_KEY_HEX}\n"))
+                .expect("surrounding whitespace must be tolerated"),
+            MEASURED_GOSSIP_KEY_HEX
+        );
+        // Uppercase is refused rather than lowercased: the value is compared
+        // byte-for-byte against membership elsewhere, so silently normalising
+        // here would hide a producer emitting a different spelling.
+        parse_gossip_verifying_key_hex(&MEASURED_GOSSIP_KEY_HEX.to_uppercase())
+            .expect_err("uppercase hex must be refused, not normalised");
+    }
+
+    #[test]
+    fn parse_gossip_verifying_key_rejects_wrong_length() {
+        parse_gossip_verifying_key_hex("").expect_err("empty must be refused");
+        parse_gossip_verifying_key_hex(&MEASURED_GOSSIP_KEY_HEX[..62])
+            .expect_err("short input must be refused");
+    }
+
+    #[test]
+    fn gossip_export_command_runs_as_the_daemon_user_with_a_readable_readiness_marker() {
+        let command = gossip_export_remote_command();
+        assert!(
+            command.contains("key show-gossip-key"),
+            "must invoke the export verb: {command}"
+        );
+        // The uid switch is the whole reason this command works; custody compares
+        // against the effective uid with no root exemption.
+        assert!(
+            command.contains("-u rustynetd"),
+            "must run as the daemon user: {command}"
+        );
+        assert!(
+            command.contains(GOSSIP_SECRET_PATH) && command.contains(GOSSIP_PASSPHRASE_PATH),
+            "must name both custody paths: {command}"
+        );
+        assert!(
+            command.contains(GOSSIP_DAEMON_INACTIVE_MARKER),
+            "must emit the readiness marker: {command}"
+        );
+        // `--quiet` would suppress the only text the collector can key on.
+        assert!(
+            !command.contains("is-active --quiet"),
+            "readiness check must not be quiet: {command}"
+        );
+        // The WireGuard key is what this whole change exists to stop publishing.
+        assert!(
+            !command.contains("wireguard.pub"),
+            "must not read the WireGuard key: {command}"
+        );
+    }
 }
 
 #[cfg(test)]
