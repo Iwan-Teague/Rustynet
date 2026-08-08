@@ -877,6 +877,7 @@ mod tests {
             stage_outcomes: HashMap::new(),
             node_ids: HashMap::new(),
             collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
             network_id: "test-net".to_owned(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,

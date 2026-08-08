@@ -5,7 +5,8 @@ use std::time::Duration;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
+    AdapterError, BundleKind, GossipIdentity, MembershipOwnerKey, MembershipSnapshot,
+    NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
 use rustynet_control::membership::MEMBERSHIP_SCHEMA_VERSION;
@@ -76,14 +77,25 @@ pub fn init_membership_snapshot(
             continue;
         }
         let node_id_arg = shell_safe_arg(&peer.node_id)?;
-        let pubkey_arg = hex_32_safe_arg(&peer.public_key_hex)?;
+        // Membership publishes the GOSSIP key. `hex_32_safe_arg` is kept on both
+        // branches: the value crosses SSH into a root shell, so the shape guard
+        // must not be lost just because the source changed.
+        let (pubkey_flag, pubkey_arg) = match &peer.gossip_identity {
+            GossipIdentity::Published(gossip_hex) => {
+                ("--client-gossip-pubkey-hex", hex_32_safe_arg(gossip_hex)?)
+            }
+            GossipIdentity::DeferredPlatform => (
+                "--client-pubkey-hex-unaligned-wireguard",
+                hex_32_safe_arg(&peer.public_key_hex)?,
+            ),
+        };
         let capabilities_arg = shell_safe_arg(&role_capability_csv(&peer.capabilities))?;
         ssh::run_remote(
             conn,
             &format!(
                 "sudo -n /usr/local/bin/rustynet ops e2e-membership-add \
                  --client-node-id '{node_id_arg}' \
-                 --client-pubkey-hex '{pubkey_arg}' \
+                 {pubkey_flag} '{pubkey_arg}' \
                  --capabilities '{capabilities_arg}' \
                  --owner-approver-id '{owner_approver_id_arg}'"
             ),

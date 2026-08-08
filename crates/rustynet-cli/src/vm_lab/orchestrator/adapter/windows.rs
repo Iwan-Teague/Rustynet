@@ -14,8 +14,9 @@ use crate::vm_lab::orchestrator::adapter::windows_traffic;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
-    NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+    AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+    MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+    ValidatorReport, WireguardPublicKey,
 };
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
@@ -151,6 +152,11 @@ impl NodeAdapter for WindowsNodeAdapter {
     fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
         let hex = windows_traffic::collect_wireguard_public_key(&self.conn)?;
         Ok(WireguardPublicKey(hex))
+    }
+
+    fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+        // Windows has no gossip transport at all: the daemon refuses a configured gossip secret because the transport is unix-only.
+        Ok(GossipIdentity::DeferredPlatform)
     }
 
     fn collect_node_id(&self) -> Result<NodeId, AdapterError> {

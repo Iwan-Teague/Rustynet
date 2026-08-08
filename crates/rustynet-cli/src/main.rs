@@ -1498,7 +1498,7 @@ enum OpsCommand {
     #[cfg(feature = "vm-lab")]
     E2eMembershipAdd {
         client_node_id: String,
-        client_pubkey_hex: String,
+        identity: ops_e2e::MembershipGossipIdentity,
         capabilities: String,
         owner_approver_id: String,
     },
@@ -5745,14 +5745,46 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             ssh_allow_cidrs: parser.required("--ssh-allow-cidrs")?,
         }),
         #[cfg(feature = "vm-lab")]
-        "e2e-membership-add" => Ok(OpsCommand::E2eMembershipAdd {
-            client_node_id: parser.required("--client-node-id")?,
-            client_pubkey_hex: parser.required("--client-pubkey-hex")?,
-            capabilities: parser
-                .value("--capabilities")
-                .unwrap_or_else(|| "client".to_owned()),
-            owner_approver_id: parser.required("--owner-approver-id")?,
-        }),
+        "e2e-membership-add" => {
+            // `node_pubkey_hex` is the node's GOSSIP verifying key. The legacy
+            // spelling is refused outright rather than mapped to either branch,
+            // because silently treating it as one or the other is exactly how
+            // every non-genesis node came to publish its WireGuard key.
+            if parser.value("--client-pubkey-hex").is_some() {
+                return Err("--client-pubkey-hex is no longer accepted: pass \
+                            --client-gossip-pubkey-hex with the node's derived gossip \
+                            verifying key (rustynetd key show-gossip-key), or \
+                            --client-pubkey-hex-unaligned-wireguard on a platform that \
+                            cannot yet produce one"
+                    .to_owned());
+            }
+            let identity = match (
+                parser.value("--client-gossip-pubkey-hex"),
+                parser.value("--client-pubkey-hex-unaligned-wireguard"),
+            ) {
+                (Some(_), Some(_)) => {
+                    return Err("--client-gossip-pubkey-hex and \
+                                --client-pubkey-hex-unaligned-wireguard are mutually \
+                                exclusive"
+                        .to_owned());
+                }
+                (Some(hex), None) => ops_e2e::MembershipGossipIdentity::Gossip(hex),
+                (None, Some(hex)) => ops_e2e::MembershipGossipIdentity::UnalignedWireguard(hex),
+                (None, None) => {
+                    return Err("one of --client-gossip-pubkey-hex or \
+                                --client-pubkey-hex-unaligned-wireguard is required"
+                        .to_owned());
+                }
+            };
+            Ok(OpsCommand::E2eMembershipAdd {
+                client_node_id: parser.required("--client-node-id")?,
+                identity,
+                capabilities: parser
+                    .value("--capabilities")
+                    .unwrap_or_else(|| "client".to_owned()),
+                owner_approver_id: parser.required("--owner-approver-id")?,
+            })
+        }
         #[cfg(feature = "vm-lab")]
         "e2e-membership-set-capabilities" => Ok(OpsCommand::E2eMembershipSetCapabilities {
             node_id: parser.required("--node-id")?,
@@ -9478,12 +9510,12 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::E2eMembershipAdd {
             client_node_id,
-            client_pubkey_hex,
+            identity,
             capabilities,
             owner_approver_id,
         } => ops_e2e::execute_ops_e2e_membership_add(
             client_node_id,
-            client_pubkey_hex,
+            identity,
             capabilities,
             owner_approver_id,
         ),
@@ -20583,7 +20615,7 @@ fn help_text() -> String {
         "  ops seed-macos-anchor-token",
         "  ops e2e-bootstrap-windows --node-id <id> --network-id <id> --passphrase-file <absolute-path>",
         "  ops e2e-enforce-host --role <role> --node-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]>",
-        "  ops e2e-membership-add --client-node-id <id> --client-pubkey-hex <hex> --owner-approver-id <id> [--capabilities <csv>]",
+        "  ops e2e-membership-add --client-node-id <id> (--client-gossip-pubkey-hex <hex> | --client-pubkey-hex-unaligned-wireguard <hex>) --owner-approver-id <id> [--capabilities <csv>]",
         "  ops e2e-membership-set-capabilities --node-id <id> --capabilities <csv> --owner-approver-id <id>",
         "  ops e2e-issue-assignments --exit-node-id <id> --client-node-id <id> --exit-endpoint <host:port> --client-endpoint <host:port> --exit-pubkey-hex <hex> --client-pubkey-hex <hex> [--artifact-dir <absolute-path>]",
         "  ops e2e-issue-assignment-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
@@ -25969,7 +26001,7 @@ mod tests {
             "e2e-membership-add".to_owned(),
             "--client-node-id".to_owned(),
             "client-node".to_owned(),
-            "--client-pubkey-hex".to_owned(),
+            "--client-gossip-pubkey-hex".to_owned(),
             "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_owned(),
             "--owner-approver-id".to_owned(),
             "exit-node-owner".to_owned(),

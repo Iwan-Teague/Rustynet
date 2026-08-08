@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 use std::time::Duration;
 
+// Single definition, deliberately: `ops_e2e` compiles in every build while
+// `vm_lab` is feature-gated, so the validator has to live there or the two copies
+// drift.
+use crate::ops_e2e::parse_gossip_verifying_key_hex;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
@@ -231,45 +235,6 @@ const GOSSIP_PASSPHRASE_PATH: &str = "/run/credentials/rustynetd.service/wg_key_
 /// rather than a bare exit code, so the failure is distinguishable from a
 /// custody or parse failure in the collector's error text.
 const GOSSIP_DAEMON_INACTIVE_MARKER: &str = "RN_GOSSIP_DAEMON_INACTIVE";
-
-/// Validate a gossip verifying key as exported by `rustynetd key show-gossip-key`.
-///
-/// This is the value signed membership's `node_pubkey_hex` is supposed to carry.
-/// Publishing anything else — in practice the node's WireGuard public key — makes
-/// every peer reject that node's gossip as an unknown source.
-///
-/// NOTE the `VerifyingKey::from_bytes` check is NOT a control that distinguishes a
-/// gossip key from a WireGuard key: it decompresses with no canonicity and no
-/// low-order check, and passes roughly half of arbitrary 32-byte strings. It is a
-/// cheap well-formedness filter that happens to reject the measured real-world
-/// wrong value. The thing that actually separates aligned from unaligned is which
-/// CLI flag the caller uses.
-pub fn parse_gossip_verifying_key_hex(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    if trimmed.len() != 64 {
-        return Err(format!(
-            "gossip verifying key must be 64 hex chars, got {}",
-            trimmed.len()
-        ));
-    }
-    if !trimmed
-        .chars()
-        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-    {
-        return Err("gossip verifying key must be lowercase hex".to_owned());
-    }
-    let mut bytes = [0u8; 32];
-    for (index, slot) in bytes.iter_mut().enumerate() {
-        let pair = trimmed
-            .get(index * 2..index * 2 + 2)
-            .ok_or_else(|| "gossip verifying key truncated".to_owned())?;
-        *slot = u8::from_str_radix(pair, 16)
-            .map_err(|err| format!("gossip verifying key hex decode failed: {err}"))?;
-    }
-    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
-        .map_err(|err| format!("gossip verifying key is not a valid Ed25519 point: {err}"))?;
-    Ok(trimmed.to_owned())
-}
 
 /// The remote shell command that exports this node's gossip verifying key.
 ///

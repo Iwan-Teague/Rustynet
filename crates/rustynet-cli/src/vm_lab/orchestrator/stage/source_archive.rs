@@ -246,6 +246,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
             network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),

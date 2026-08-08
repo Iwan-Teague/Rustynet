@@ -7,8 +7,9 @@ use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
-    NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+    AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+    MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+    ValidatorReport, WireguardPublicKey,
 };
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
@@ -87,6 +88,11 @@ impl NodeAdapter for AndroidNodeAdapter {
     fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
         Err(android_unsupported())
     }
+    fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+        // not constructible in a real run; the factory returns UnsupportedPlatform.
+        Ok(GossipIdentity::DeferredPlatform)
+    }
+
     fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
         Err(android_unsupported())
     }

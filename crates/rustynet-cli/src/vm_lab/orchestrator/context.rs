@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
-use crate::vm_lab::orchestrator::error::{StageOutcome, WireguardPublicKey};
+use crate::vm_lab::orchestrator::error::{GossipIdentity, StageOutcome, WireguardPublicKey};
 use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 use crate::vm_lab::orchestrator::stage::StageId;
 use serde::{Deserialize, Serialize};
 
-pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 3;
+pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 4;
 
 pub const ENV_ORCHESTRATOR_DIALECT: &str = "RUSTYNET_ORCHESTRATOR_DIALECT";
 
@@ -38,6 +38,8 @@ struct PersistedOrchestrationContext {
     assignments: Vec<NodeRoleAssignment>,
     node_ids: BTreeMap<String, String>,
     collected_pubkeys: BTreeMap<String, WireguardPublicKey>,
+    #[serde(default)]
+    collected_gossip_identities: BTreeMap<String, GossipIdentity>,
     membership_snapshot: Option<Vec<u8>>,
     mesh_ips: BTreeMap<String, String>,
     endpoints: BTreeMap<String, String>,
@@ -173,6 +175,9 @@ pub struct OrchestrationContext {
     pub stage_outcomes: HashMap<StageId, StageOutcome>,
     /// Collected `WireGuard` public keys, keyed by node alias.
     pub collected_pubkeys: HashMap<String, WireguardPublicKey>,
+    /// What each node publishes into membership's `node_pubkey_hex`. Kept
+    /// separate from `collected_pubkeys`, which still feeds the real tunnel.
+    pub collected_gossip_identities: HashMap<String, GossipIdentity>,
     /// Mesh network identifier passed to the bootstrap env.
     pub network_id: String,
     /// Pre-generated node IDs, keyed by alias.
@@ -206,6 +211,7 @@ impl OrchestrationContext {
             report_dir,
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
             network_id,
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
@@ -237,6 +243,11 @@ impl OrchestrationContext {
             assignments: self.assignments.clone(),
             node_ids: self.node_ids.clone().into_iter().collect(),
             collected_pubkeys: self.collected_pubkeys.clone().into_iter().collect(),
+            collected_gossip_identities: self
+                .collected_gossip_identities
+                .clone()
+                .into_iter()
+                .collect(),
             membership_snapshot: self.membership_snapshot.clone(),
             mesh_ips: self.mesh_ips.clone().into_iter().collect(),
             endpoints: self.endpoints.clone().into_iter().collect(),
@@ -318,6 +329,7 @@ impl OrchestrationContext {
             report_dir,
             stage_outcomes: HashMap::new(),
             collected_pubkeys: snapshot.collected_pubkeys.into_iter().collect(),
+            collected_gossip_identities: snapshot.collected_gossip_identities.into_iter().collect(),
             network_id: snapshot.network_id,
             node_ids: snapshot.node_ids.into_iter().collect(),
             ssh_allow_cidrs: snapshot.ssh_allow_cidrs,

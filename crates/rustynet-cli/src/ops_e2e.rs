@@ -1905,9 +1905,65 @@ fn resolve_windows_install_source_root() -> Result<PathBuf, String> {
     std::env::current_dir().map_err(|err| format!("failed to resolve working directory: {err}"))
 }
 
+/// Which kind of key a membership-add is publishing into `node_pubkey_hex`.
+///
+/// That field is contractually the node's derived GOSSIP verifying key. Every
+/// non-genesis producer historically published the node's WireGuard public key
+/// instead, so those nodes' gossip was rejected as an unknown source by every
+/// peer. The two variants are spelled out at each call site rather than inferred,
+/// so the remaining unaligned producers stay greppable instead of blending in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipGossipIdentity {
+    /// The node's derived gossip verifying key — the contractual value.
+    Gossip(String),
+    /// The node's WireGuard public key, published because this platform cannot
+    /// yet produce a gossip identity (Windows has no gossip transport; the lab
+    /// macOS path never mints a secret).
+    UnalignedWireguard(String),
+}
+
+/// Validate a gossip verifying key as exported by `rustynetd key show-gossip-key`.
+///
+/// Lives here rather than beside its lab caller because `ops_e2e` compiles in
+/// every build while `vm_lab` is feature-gated, and one definition is what stops
+/// the two drifting.
+///
+/// NOTE the `VerifyingKey::from_bytes` check is NOT a control that distinguishes a
+/// gossip key from a WireGuard key: it decompresses with no canonicity and no
+/// low-order check, and accepts roughly half of arbitrary 32-byte strings. It is a
+/// well-formedness filter that happens to reject the measured real-world wrong
+/// value. What actually separates aligned from unaligned is which flag the caller
+/// used.
+pub fn parse_gossip_verifying_key_hex(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 {
+        return Err(format!(
+            "gossip verifying key must be 64 hex chars, got {}",
+            trimmed.len()
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
+        return Err("gossip verifying key must be lowercase hex".to_owned());
+    }
+    let mut bytes = [0u8; 32];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        let pair = trimmed
+            .get(index * 2..index * 2 + 2)
+            .ok_or_else(|| "gossip verifying key truncated".to_owned())?;
+        *slot = u8::from_str_radix(pair, 16)
+            .map_err(|err| format!("gossip verifying key hex decode failed: {err}"))?;
+    }
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+        .map_err(|err| format!("gossip verifying key is not a valid Ed25519 point: {err}"))?;
+    Ok(trimmed.to_owned())
+}
+
 pub fn execute_ops_e2e_membership_add(
     client_node_id: String,
-    client_pubkey_hex: String,
+    identity: MembershipGossipIdentity,
     capabilities: String,
     owner_approver_id: String,
 ) -> Result<String, String> {
@@ -1918,7 +1974,17 @@ pub fn execute_ops_e2e_membership_add(
         &rustynet_control::roles::parse_role_capability_csv(&capabilities)
             .map_err(|err| err.to_string())?,
     );
-    ensure_hex_32("client-pubkey-hex", client_pubkey_hex.as_str())?;
+    // The aligned branch gets the stricter check; the unaligned branch keeps the
+    // historical one, because a WireGuard key is not an Ed25519 point and would
+    // fail the aligned validation by construction.
+    let client_pubkey_hex = match &identity {
+        MembershipGossipIdentity::Gossip(hex) => parse_gossip_verifying_key_hex(hex)
+            .map_err(|err| format!("client-gossip-pubkey-hex rejected: {err}"))?,
+        MembershipGossipIdentity::UnalignedWireguard(hex) => {
+            ensure_hex_32("client-pubkey-hex-unaligned-wireguard", hex.as_str())?;
+            hex.clone()
+        }
+    };
 
     // Phase 27 reviewer fold-in (BLOCKER 2 — CWE-367):
     // The previous implementation staged the signing passphrase tempfile
@@ -4060,6 +4126,41 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_wg_pub_hex = base64_to_hex(exit_wg_pub.as_str())?;
     let client_wg_pub_hex = base64_to_hex(client_wg_pub.as_str())?;
 
+    // The joiner's GOSSIP verifying key. This is a SECOND value, not a
+    // replacement: `client_wg_pub_hex` still feeds the real WireGuard peer
+    // configuration through `e2e-issue-assignments` below, while membership must
+    // publish this one.
+    //
+    // `program = "sudo"` with an explicit `-u` is required because the shared
+    // remote helper emits `sudo -S` with no uid switch, and key custody compares
+    // the key directory and file owner against the EFFECTIVE uid with no root
+    // exemption — so the plain root form fails with an error that reads like a
+    // file-mode problem. Fails closed: no fallback to the WireGuard key.
+    let client_gossip_pubkey_hex = parse_gossip_verifying_key_hex(
+        capture_remote_program_output(
+            ssh_opts.as_slice(),
+            client_target.qualified.as_str(),
+            None,
+            "sudo",
+            &[
+                "-n",
+                "-u",
+                "rustynetd",
+                "/usr/local/bin/rustynetd",
+                "key",
+                "show-gossip-key",
+                "--gossip-signing-secret",
+                "/var/lib/rustynet/keys/gossip.signing.secret",
+                "--passphrase-file",
+                "/run/credentials/rustynetd.service/wg_key_passphrase",
+            ],
+            &[],
+            false,
+        )?
+        .as_str(),
+    )
+    .map_err(|err| format!("collect client gossip verifying key: {err}"))?;
+
     let owner_approver_id = format!("{}-owner", config.exit_node_id);
     run_remote_rustynet_ops_command(
         ssh_opts.as_slice(),
@@ -4070,8 +4171,8 @@ pub fn execute_ops_run_debian_two_node_e2e(
             "e2e-membership-add",
             "--client-node-id",
             config.client_node_id.as_str(),
-            "--client-pubkey-hex",
-            client_wg_pub_hex.as_str(),
+            "--client-gossip-pubkey-hex",
+            client_gossip_pubkey_hex.as_str(),
             "--capabilities",
             "client",
             "--owner-approver-id",
