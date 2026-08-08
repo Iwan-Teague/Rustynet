@@ -1542,6 +1542,52 @@ it yet. It will need an arm when the endpoint-attribution work lands.
 
 ---
 
+### QH-36 — Gossip peer registration is additive-only, so a node's key rotation leaves the OLD key registered for the process lifetime and revocation removes only the NEW one
+
+**Verified against `58b19ce4`.** Raised by the review of
+`GossipProducerAlignmentIncrement1_2026-08-08.md`, which cannot land until this is
+filed, because that increment *is* a key change for every already-provisioned node.
+
+Three facts, each read:
+
+- `daemon.rs:5507-5511` documents the behaviour in its own comment — peers absent from
+  membership are **not** unregistered; the sync is additive only.
+- `gossip_runtime.rs:314` — `register_peer` is a plain `self.peers.insert(...)`. A new
+  key for an existing node **adds** an entry; it does not replace one, because the map
+  is keyed by the 32-byte gossip id, not by the membership `node_id`.
+- `gossip_runtime.rs:329-330` — `unregister_peer` keys solely on that id, and no-ops on
+  a peer membership never names.
+
+So for a node whose published key changes from W to G, W stays registered for the
+lifetime of the daemon process, and a later revocation of that node removes only G.
+
+**Severity, stated honestly rather than inflated.** In the specific case the alignment
+increment creates, W is a WireGuard X25519 public key for which no Ed25519 private key
+exists, so nothing can sign as W and the stale entry is inert. The defect is real for
+the *general* rotation case — `MembershipOperation::RotateNodeKey` — where the old key
+is a genuine gossip key whose private half does exist. That is a revocation gap, not a
+theoretical one, and it is the reason this is filed before the increment rather than
+after.
+
+**The additive behaviour is DELIBERATE, and the obvious fix would regress it.**
+`daemon.rs:5508-5512` gives the reason in full: *"an in-flight D2.7 enrollee is
+consume-registered before its membership admit lands, and dropping it here would break
+the enrollment bootstrap ordering. Absence is not revocation; explicit revocation is
+what removes a peer."* So "compute the desired set and unregister the difference" —
+the first fix anyone will reach for, and the one this entry originally proposed — would
+drop every enrollee in the window between consume-registration and membership admit.
+Recorded because that is the trap, not a footnote.
+
+**Fix shape (not implemented, and needs its own design):** the gap is specifically a
+*superseded key for a node membership still names* — which is distinguishable from
+*a node membership does not name yet*. A sync that unregisters only ids belonging to a
+node_id whose membership entry now carries a different key would close the rotation
+gap without touching the enrollment window. That requires a node_id→gossip_id reverse
+map the runtime does not currently keep, which is why this is a design item rather than
+a one-line fix. A restart masks the gap, which is why it has not been noticed.
+
+---
+
 ## Related documents
 
 - `NodeEngineFlipDispositions_2026-07-24.md` — D1 carries the two_hop mechanism,
