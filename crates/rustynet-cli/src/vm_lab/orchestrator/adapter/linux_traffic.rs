@@ -245,14 +245,17 @@ const GOSSIP_DAEMON_INACTIVE_MARKER: &str = "RN_GOSSIP_DAEMON_INACTIVE";
 ///   (`rustynet-crypto/src/lib.rs`), and `/var/lib/rustynet/keys` is owned by the
 ///   daemon user. Plain `sudo` (euid 0) fails with "key custody permission check
 ///   failed", which misleadingly reads as a file-mode problem.
-/// * the readiness guard uses `systemctl is-active` WITHOUT `--quiet`, because
-///   `--quiet` suppresses the only text and the marker below is what lets the
-///   collector name this cause. The passphrase is a systemd credential that
-///   exists only while the unit runs, so a stopped daemon is a distinct, common,
-///   and otherwise very confusing failure.
+/// * the readiness guard MUST use `--quiet`. Without it `systemctl is-active`
+///   prints `active` on success, and that lands on the same stdout the key is
+///   read from — the collector then sees 71 chars instead of 64 and every node
+///   fails. Found by a live run, not by review. `--quiet` costs nothing here
+///   because the marker below is a separate `echo` that fires on the failure
+///   branch regardless. The passphrase is a systemd credential that exists only
+///   while the unit runs, so a stopped daemon is a distinct, common, and
+///   otherwise very confusing failure worth naming.
 pub fn gossip_export_remote_command() -> String {
     format!(
-        "systemctl is-active {unit} || {{ echo {marker}; exit 64; }}; \
+        "systemctl is-active --quiet {unit} || {{ echo {marker}; exit 64; }}; \
          sudo -n -u {user} /usr/local/bin/rustynetd key show-gossip-key \
          --gossip-signing-secret {secret} \
          --passphrase-file {passphrase}",
@@ -1229,10 +1232,13 @@ mod gossip_export_tests {
             command.contains(GOSSIP_DAEMON_INACTIVE_MARKER),
             "must emit the readiness marker: {command}"
         );
-        // `--quiet` would suppress the only text the collector can key on.
+        // MUST be quiet: a bare `systemctl is-active` prints `active` onto the
+        // same stdout the key is parsed from, which made every node fail with
+        // "got 71" on the first live run. The marker is a separate echo on the
+        // failure branch, so quieting the success path loses nothing.
         assert!(
-            !command.contains("is-active --quiet"),
-            "readiness check must not be quiet: {command}"
+            command.contains("is-active --quiet"),
+            "readiness check must be quiet or it pollutes the key stdout: {command}"
         );
         // The WireGuard key is what this whole change exists to stop publishing.
         assert!(
