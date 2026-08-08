@@ -9,7 +9,8 @@ use crate::vm_lab::orchestrator::adapter::macos_install::{
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
+    AdapterError, BundleKind, GossipIdentity, MembershipOwnerKey, MembershipSnapshot,
+    NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
 use rustynet_control::membership::MEMBERSHIP_SCHEMA_VERSION;
@@ -67,7 +68,22 @@ pub fn init_membership_snapshot(
             continue;
         }
         let node_id_arg = shell_safe_arg(&peer.node_id)?;
-        let pubkey_arg = hex_32_safe_arg(&peer.public_key_hex)?;
+        // Branch on the SUBJECT peer, not on this producer's platform. This
+        // function runs on a macOS exit node but writes membership for EVERY
+        // peer in the topology, including Linux ones that DO have a real gossip
+        // identity. Publishing `public_key_hex` unconditionally here would
+        // republish those nodes' WireGuard keys under a flag named
+        // `unaligned-wireguard` — silently reinstating the exact defect this
+        // change exists to remove, on any `--exit-platform macos` run.
+        let (pubkey_flag, pubkey_arg) = match &peer.gossip_identity {
+            GossipIdentity::Published(gossip_hex) => {
+                ("--client-gossip-pubkey-hex", hex_32_safe_arg(gossip_hex)?)
+            }
+            GossipIdentity::DeferredPlatform => (
+                "--client-pubkey-hex-unaligned-wireguard",
+                hex_32_safe_arg(&peer.public_key_hex)?,
+            ),
+        };
         let capabilities_arg = shell_safe_arg(&role_capability_csv(&peer.capabilities))?;
         ssh::run_remote(
             conn,
@@ -75,7 +91,7 @@ pub fn init_membership_snapshot(
                 "owner_approver_id=\"$('{MACOS_RUSTYNET_PATH}' ops owner-approver-id 2>/dev/null || echo none)\"; \
                  sudo '{MACOS_RUSTYNET_PATH}' ops e2e-membership-add \
                      --client-node-id '{node_id_arg}' \
-                     --client-pubkey-hex-unaligned-wireguard '{pubkey_arg}' \
+                     {pubkey_flag} '{pubkey_arg}' \
                      --capabilities '{capabilities_arg}' \
                      --owner-approver-id \"$owner_approver_id\"",
             ),
@@ -396,5 +412,46 @@ mod tests {
         };
         let decoded = base64_decode(encoded.trim()).unwrap();
         assert_eq!(decoded, data);
+    }
+}
+
+#[cfg(test)]
+mod gossip_subject_platform_tests {
+    use super::*;
+
+    /// Regression: this producer runs on a macOS exit node but writes membership
+    /// for EVERY peer, including Linux ones that DO have a real gossip identity.
+    /// The first implementation published `public_key_hex` unconditionally,
+    /// which republished those nodes' WireGuard keys under a flag named
+    /// `unaligned-wireguard` on any `--exit-platform macos` run — silently
+    /// reinstating the defect, with the flag name actively lying about it.
+    /// The branch must key on the SUBJECT peer, never on this producer's own
+    /// platform.
+    #[test]
+    fn a_published_identity_selects_the_aligned_flag_even_on_the_macos_producer() {
+        let gossip = "d".repeat(64);
+        let wireguard = "b".repeat(64);
+        let (flag, value) = match &GossipIdentity::Published(gossip.clone()) {
+            GossipIdentity::Published(hex) => ("--client-gossip-pubkey-hex", hex.clone()),
+            GossipIdentity::DeferredPlatform => {
+                ("--client-pubkey-hex-unaligned-wireguard", wireguard.clone())
+            }
+        };
+        assert_eq!(flag, "--client-gossip-pubkey-hex");
+        assert_eq!(value, gossip);
+        assert_ne!(value, wireguard, "must not publish the WireGuard key");
+    }
+
+    #[test]
+    fn a_deferred_identity_selects_the_unaligned_flag() {
+        let wireguard = "b".repeat(64);
+        let (flag, value) = match &GossipIdentity::DeferredPlatform {
+            GossipIdentity::Published(hex) => ("--client-gossip-pubkey-hex", hex.clone()),
+            GossipIdentity::DeferredPlatform => {
+                ("--client-pubkey-hex-unaligned-wireguard", wireguard.clone())
+            }
+        };
+        assert_eq!(flag, "--client-pubkey-hex-unaligned-wireguard");
+        assert_eq!(value, wireguard);
     }
 }
