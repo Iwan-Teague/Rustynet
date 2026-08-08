@@ -282,17 +282,24 @@ pub fn collect_gossip_verifying_key(conn: &NodeConnection) -> Result<String, Ada
     let deadline = std::time::Instant::now() + Duration::from_secs(40);
     loop {
         let attempt_err = match ssh::run_remote(conn, command.as_str(), SHORT_TIMEOUT) {
-            Ok(raw) if raw.contains(GOSSIP_DAEMON_INACTIVE_MARKER) => AdapterError::Protocol {
-                message: "gossip key export: rustynetd.service is not active, so its \
-                          systemd credential directory does not exist"
-                    .to_owned(),
-            },
             Ok(raw) => match parse_gossip_verifying_key_hex(raw.as_str()) {
                 Ok(hex) => return Ok(hex),
                 Err(message) => AdapterError::Protocol {
                     message: format!("gossip key export: {message}"),
                 },
             },
+            // The readiness guard exits 64, so an inactive daemon arrives HERE
+            // as an Err, never as an Ok carrying the marker — checking the Ok
+            // arm for it (as the first draft did) is dead code. The marker
+            // survives in the error's stdout tail, so match on the rendered
+            // error to give the cause a name.
+            Err(err) if err.to_string().contains(GOSSIP_DAEMON_INACTIVE_MARKER) => {
+                AdapterError::Protocol {
+                    message: "gossip key export: rustynetd.service is not active, so its \
+                              systemd credential directory does not exist"
+                        .to_owned(),
+                }
+            }
             Err(err) => err,
         };
         if std::time::Instant::now() >= deadline {

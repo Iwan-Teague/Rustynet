@@ -3583,18 +3583,35 @@ stage_membership_setup() {
     # Membership publishes the node's GOSSIP verifying key, not its WireGuard
     # key. Collected here rather than in the pubkey TSV because that file is read
     # by two other consumers that legitimately want the WireGuard value.
-    # `-u rustynetd` is mandatory: key custody compares the key owner against the
-    # effective uid with no root exemption.
-    if ! gossip_hex="$(live_lab_run_root "$target" "root sudo -n -u rustynetd /usr/local/bin/rustynetd key show-gossip-key --gossip-signing-secret /var/lib/rustynet/keys/gossip.signing.secret --passphrase-file /run/credentials/rustynetd.service/wg_key_passphrase" | tr -d '[:space:]')"; then
-      echo "failed to export gossip verifying key for ${node_id}" >&2
-      return 1
-    fi
-    if [[ ! "$gossip_hex" =~ ^[0-9a-f]{64}$ ]]; then
-      echo "gossip verifying key for ${node_id} is not 64 lowercase hex chars" >&2
-      return 1
+    #
+    # GUARDED BY SUBJECT PLATFORM. This loop walks every node in the topology,
+    # and a macOS or Windows guest has no /usr/local/bin/rustynetd, no rustynetd
+    # unix user and no systemd credential directory — running the export against
+    # one aborts the whole run, because membership_setup is a hard stage.
+    local node_platform pubkey_flag pubkey_value
+    node_platform="$(node_platform_for_label "${_label}")" || return 1
+    if [[ "$node_platform" == "linux" ]]; then
+      # `-u rustynetd` is mandatory: key custody compares the key owner against
+      # the effective uid with no root exemption. `--quiet` is mandatory too, or
+      # `active` lands on the same stdout the key is read from.
+      if ! gossip_hex="$(live_lab_run_root "$target" "root sudo -n -u rustynetd /usr/local/bin/rustynetd key show-gossip-key --gossip-signing-secret /var/lib/rustynet/keys/gossip.signing.secret --passphrase-file /run/credentials/rustynetd.service/wg_key_passphrase" | tr -d '[:space:]')"; then
+        echo "failed to export gossip verifying key for ${node_id}" >&2
+        return 1
+      fi
+      if [[ ! "$gossip_hex" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "gossip verifying key for ${node_id} is not 64 lowercase hex chars" >&2
+        return 1
+      fi
+      pubkey_flag="--client-gossip-pubkey-hex"
+      pubkey_value="$gossip_hex"
+    else
+      # Deferred platform: publishes its WireGuard key under the flag that says
+      # so, exactly as the Rust dialect's GossipIdentity::DeferredPlatform does.
+      pubkey_flag="--client-pubkey-hex-unaligned-wireguard"
+      pubkey_value="$pub_hex"
     fi
     local add_out add_rc
-    add_out="$(live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-gossip-pubkey-hex '${gossip_hex}' --owner-approver-id '${owner_approver_id}' --capabilities '${node_caps}'" 2>&1)"
+    add_out="$(live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' ${pubkey_flag} '${pubkey_value}' --owner-approver-id '${owner_approver_id}' --capabilities '${node_caps}'" 2>&1)"
     add_rc=$?
     if [[ $add_rc -ne 0 ]]; then
       if printf '%s' "$add_out" | grep -qF "already exists"; then
