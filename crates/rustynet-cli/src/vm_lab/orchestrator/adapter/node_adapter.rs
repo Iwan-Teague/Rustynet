@@ -6,8 +6,9 @@ use crate::vm_lab::DaemonProbeOp;
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
-    NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+    AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+    MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+    ValidatorReport, WireguardPublicKey,
 };
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
@@ -153,6 +154,13 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
 
     fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError>;
     fn collect_node_id(&self) -> Result<NodeId, AdapterError>;
+
+    /// What this node publishes into signed membership's `node_pubkey_hex`.
+    ///
+    /// Deliberately has NO default implementation: a new adapter must state
+    /// whether it can produce a real gossip identity, rather than silently
+    /// inheriting one answer or the other.
+    fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError>;
 
     /// Gather node-identity evidence for the §4.7 challenge, tagged with its
     /// [`IdentityEvidence::provenance`] so [`adjudicate_identity`] can require a

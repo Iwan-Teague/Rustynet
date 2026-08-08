@@ -720,8 +720,9 @@ mod failure_diagnostics_tests {
     use crate::vm_lab::DaemonProbeOp;
     use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
     use crate::vm_lab::orchestrator::error::{
-        AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
-        NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+        AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+        MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+        ValidatorReport, WireguardPublicKey,
     };
     use crate::vm_lab::orchestrator::source_archive::SourceArchive;
     use serde_json::Value;
@@ -780,6 +781,11 @@ mod failure_diagnostics_tests {
         fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
             unimplemented!()
         }
+        fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+            // test double; it collects nothing from a real node.
+            Ok(GossipIdentity::DeferredPlatform)
+        }
+
         fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
             unimplemented!()
         }

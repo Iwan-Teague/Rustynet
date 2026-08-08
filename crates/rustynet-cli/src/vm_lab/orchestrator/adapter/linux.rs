@@ -13,8 +13,9 @@ use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
-    NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+    AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+    MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+    ValidatorReport, WireguardPublicKey,
 };
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
@@ -137,6 +138,13 @@ impl NodeAdapter for LinuxNodeAdapter {
     fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
         let hex = linux_traffic::collect_wireguard_public_key(&self.conn)?;
         Ok(WireguardPublicKey(hex))
+    }
+
+    fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+        // Linux mints a gossip secret at install, so this must succeed. Fails
+        // CLOSED: no fallback to the WireGuard key.
+        let hex = linux_traffic::collect_gossip_verifying_key(&self.conn)?;
+        Ok(GossipIdentity::Published(hex))
     }
 
     fn collect_node_id(&self) -> Result<NodeId, AdapterError> {

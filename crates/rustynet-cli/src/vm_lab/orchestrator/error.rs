@@ -31,13 +31,32 @@ pub struct MembershipSnapshot {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a node can publish into signed membership's `node_pubkey_hex`.
+///
+/// That field is contractually the node's derived GOSSIP verifying key, and a
+/// node publishing anything else has its gossip rejected by every peer as an
+/// unknown source. Deliberately has **no `Default`**: a node must state which of
+/// these it is, so a platform cannot reach the aligned branch by omission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GossipIdentity {
+    /// The node's real derived gossip verifying key.
+    Published(String),
+    /// This platform cannot produce a gossip identity yet, so it publishes its
+    /// WireGuard key and its gossip stays dormant. Windows has no gossip
+    /// transport at all; the lab macOS path never mints a secret.
+    DeferredPlatform,
+}
+
 pub struct NodeMembershipPeer {
     pub alias: String,
     pub role: NodeRole,
     pub capabilities: Vec<RoleCapability>,
     pub node_id: String,
     pub public_key_hex: String,
+    /// Kept ALONGSIDE `public_key_hex`, never replacing it: the WireGuard value
+    /// still configures the real tunnel, while this one is what membership
+    /// publishes.
+    pub gossip_identity: GossipIdentity,
 }
 
 impl NodeMembershipPeer {

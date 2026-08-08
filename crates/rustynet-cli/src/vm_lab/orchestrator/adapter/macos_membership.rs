@@ -75,7 +75,7 @@ pub fn init_membership_snapshot(
                 "owner_approver_id=\"$('{MACOS_RUSTYNET_PATH}' ops owner-approver-id 2>/dev/null || echo none)\"; \
                  sudo '{MACOS_RUSTYNET_PATH}' ops e2e-membership-add \
                      --client-node-id '{node_id_arg}' \
-                     --client-pubkey-hex '{pubkey_arg}' \
+                     --client-pubkey-hex-unaligned-wireguard '{pubkey_arg}' \
                      --capabilities '{capabilities_arg}' \
                      --owner-approver-id \"$owner_approver_id\"",
             ),

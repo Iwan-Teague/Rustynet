@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
-use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::error::{GossipIdentity, StageOutcome};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -31,6 +31,7 @@ impl OrchestrationStage for CollectPubkeysStage {
         struct NodeData {
             alias: String,
             pubkey: Result<WireguardPublicKey, String>,
+            gossip: Result<GossipIdentity, String>,
             node_id: Result<String, String>,
             mesh_ip: Option<String>,
             endpoint: String,
@@ -40,29 +41,33 @@ impl OrchestrationStage for CollectPubkeysStage {
         let data: Vec<NodeData> = aliases
             .iter()
             .map(|alias| {
-                let (pubkey, node_id, mesh_ip, endpoint) = match ctx.adapters.get(alias.as_str()) {
-                    Some(adapter) => {
-                        let pk = adapter
-                            .collect_wireguard_public_key()
-                            .map_err(|e| e.to_string());
-                        let nid = adapter
-                            .collect_node_id()
-                            .map(|n| n.0)
-                            .map_err(|e| e.to_string());
-                        let mip = adapter.collect_mesh_ip().ok();
-                        let ep = adapter.endpoint();
-                        (pk, nid, mip, ep)
-                    }
-                    None => (
-                        Err(format!("no adapter for '{alias}'")),
-                        Err(format!("no adapter for '{alias}'")),
-                        None,
-                        "0.0.0.0:51820".to_owned(),
-                    ),
-                };
+                let (pubkey, gossip, node_id, mesh_ip, endpoint) =
+                    match ctx.adapters.get(alias.as_str()) {
+                        Some(adapter) => {
+                            let pk = adapter
+                                .collect_wireguard_public_key()
+                                .map_err(|e| e.to_string());
+                            let gk = adapter.collect_gossip_identity().map_err(|e| e.to_string());
+                            let nid = adapter
+                                .collect_node_id()
+                                .map(|n| n.0)
+                                .map_err(|e| e.to_string());
+                            let mip = adapter.collect_mesh_ip().ok();
+                            let ep = adapter.endpoint();
+                            (pk, gk, nid, mip, ep)
+                        }
+                        None => (
+                            Err(format!("no adapter for '{alias}'")),
+                            Err(format!("no adapter for '{alias}'")),
+                            Err(format!("no adapter for '{alias}'")),
+                            None,
+                            "0.0.0.0:51820".to_owned(),
+                        ),
+                    };
                 NodeData {
                     alias: alias.clone(),
                     pubkey,
+                    gossip,
                     node_id,
                     mesh_ip,
                     endpoint,
@@ -78,6 +83,16 @@ impl OrchestrationStage for CollectPubkeysStage {
                     ctx.collected_pubkeys.insert(d.alias.clone(), pk);
                 }
                 Err(e) => errors.push(format!("{}: pubkey: {e}", d.alias)),
+            }
+            match d.gossip {
+                Ok(identity) => {
+                    ctx.collected_gossip_identities
+                        .insert(d.alias.clone(), identity);
+                }
+                // Fails CLOSED: no fallback to the WireGuard key. A node that
+                // cannot prove its gossip identity must not get a membership
+                // entry claiming one.
+                Err(e) => errors.push(format!("{}: gossip_identity: {e}", d.alias)),
             }
             match d.node_id {
                 Ok(nid) => {
@@ -113,6 +128,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
             network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),

@@ -13844,7 +13844,7 @@ fn run_macos_orchestration_stages(
             let add_script = format!(
                 "set -eu; sudo -n rustynet ops e2e-membership-add \
                  --client-node-id {node_id} \
-                 --client-pubkey-hex {pubkey} \
+                 --client-pubkey-hex-unaligned-wireguard {pubkey} \
                  --capabilities {capabilities} \
                  --owner-approver-id {approver}",
                 node_id = shell_quote(macos_node_id),
@@ -24606,7 +24606,7 @@ fn amend_membership_for_windows_node(
     let add_script = format!(
         "set -eu; sudo -n rustynet ops e2e-membership-add \
          --client-node-id {node_id} \
-         --client-pubkey-hex {pubkey} \
+         --client-pubkey-hex-unaligned-wireguard {pubkey} \
          --capabilities client \
          --owner-approver-id {approver}",
         node_id = shell_quote(windows_node_id),

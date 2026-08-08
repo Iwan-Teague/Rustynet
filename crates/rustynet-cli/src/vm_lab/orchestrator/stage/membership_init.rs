@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
-use crate::vm_lab::orchestrator::error::{NodeMembershipPeer, StageOutcome};
+use crate::vm_lab::orchestrator::error::{GossipIdentity, NodeMembershipPeer, StageOutcome};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -110,12 +110,31 @@ pub(crate) fn build_membership_peers(
                 .product_capabilities_for_platform(&platform)
                 .map_err(|err| format!("membership capability mapping failed: {err}"))?;
 
+            // Absence is an error for EVERY node, and a deferred identity is an
+            // error specifically for Linux — which mints a gossip secret at
+            // install, so "deferred" there means the collector failed rather
+            // than the platform being unable.
+            let gossip_identity = ctx
+                .collected_gossip_identities
+                .get(&assignment.alias)
+                .ok_or_else(|| format!("missing gossip identity for '{}'", assignment.alias))?
+                .clone();
+            if platform == VmGuestPlatform::Linux
+                && matches!(gossip_identity, GossipIdentity::DeferredPlatform)
+            {
+                return Err(format!(
+                    "'{}' is Linux but reported no gossip identity; Linux mints one at install",
+                    assignment.alias
+                ));
+            }
+
             Ok(NodeMembershipPeer {
                 alias: assignment.alias.clone(),
                 role: assignment.role.clone(),
                 capabilities,
                 node_id: node_id.clone(),
                 public_key_hex,
+                gossip_identity,
             })
         })
         .collect()
@@ -137,6 +156,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
             network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
@@ -169,6 +189,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
             network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
@@ -190,11 +211,96 @@ mod tests {
         ctx.node_ids
             .insert("client-1".to_owned(), "client-node-id".to_owned());
 
+        // Deliberately DIFFERENT from the WireGuard keys: the whole point of this
+        // change is that membership publishes a second, distinct value.
+        let exit_gossip = "c".repeat(64);
+        let client_gossip = "d".repeat(64);
+        ctx.collected_gossip_identities.insert(
+            "exit-1".to_owned(),
+            GossipIdentity::Published(exit_gossip.clone()),
+        );
+        ctx.collected_gossip_identities.insert(
+            "client-1".to_owned(),
+            GossipIdentity::Published(client_gossip.clone()),
+        );
+
         let peers = build_membership_peers(&ctx).unwrap();
         let client = peers.iter().find(|p| p.alias == "client-1").unwrap();
         assert_eq!(client.node_id, "client-node-id");
         assert_eq!(client.public_key_hex, client_key);
         assert_eq!(client.public_key_hex.len(), 64);
+        // The two keys must be threaded side by side, never conflated: the
+        // WireGuard value still configures the real tunnel.
+        assert_eq!(
+            client.gossip_identity,
+            GossipIdentity::Published(client_gossip),
+            "membership must carry the gossip key, not the WireGuard key"
+        );
+    }
+
+    /// Absence is an error, not a default. Without this the collector could fail
+    /// silently and the node would join publishing whatever happened to be there.
+    #[test]
+    fn build_membership_peers_fails_when_gossip_identity_is_missing() {
+        let mut ctx = base_ctx_with_one_client();
+        ctx.collected_gossip_identities.remove("client-1");
+        let err = match build_membership_peers(&ctx) {
+            Ok(_) => panic!("a node with no collected gossip identity must fail closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("missing gossip identity"),
+            "error must name the cause, got: {err}"
+        );
+    }
+
+    /// A Linux node reporting `DeferredPlatform` means the collector failed, not
+    /// that the platform cannot mint — Linux mints at install. Accepting it would
+    /// silently republish the WireGuard key, which is the original defect.
+    #[test]
+    fn build_membership_peers_rejects_a_deferred_identity_on_linux() {
+        let mut ctx = base_ctx_with_one_client();
+        ctx.collected_gossip_identities
+            .insert("client-1".to_owned(), GossipIdentity::DeferredPlatform);
+        let err = match build_membership_peers(&ctx) {
+            Ok(_) => panic!("Linux must not be allowed to defer its gossip identity"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("is Linux but reported no gossip identity"),
+            "error must name the cause, got: {err}"
+        );
+    }
+
+    fn base_ctx_with_one_client() -> OrchestrationContext {
+        let mut ctx = OrchestrationContext {
+            assignments: vec![NodeRoleAssignment {
+                alias: "client-1".to_owned(),
+                role: NodeRole::Client,
+            }],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: std::env::temp_dir(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            orchestrator_dialect: None,
+        };
+        ctx.collected_pubkeys
+            .insert("client-1".to_owned(), WireguardPublicKey("b".repeat(64)));
+        ctx.node_ids
+            .insert("client-1".to_owned(), "client-node-id".to_owned());
+        ctx.collected_gossip_identities.insert(
+            "client-1".to_owned(),
+            GossipIdentity::Published("d".repeat(64)),
+        );
+        ctx
     }
 
     #[test]
@@ -209,6 +315,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
             network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),

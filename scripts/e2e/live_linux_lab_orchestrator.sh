@@ -3551,7 +3551,7 @@ quote_env() {
 }
 
 stage_membership_setup() {
-  local exit_target exit_node_id target node_id pub_hex owner_approver_id
+  local exit_target exit_node_id target node_id pub_hex owner_approver_id gossip_hex
   exit_target="$(node_target_for_label exit)"
   exit_node_id="$(node_id_for_label exit)"
   owner_approver_id="${exit_node_id}-owner"
@@ -3580,8 +3580,21 @@ stage_membership_setup() {
     else
       node_caps="client,relay_host,exit_server"
     fi
+    # Membership publishes the node's GOSSIP verifying key, not its WireGuard
+    # key. Collected here rather than in the pubkey TSV because that file is read
+    # by two other consumers that legitimately want the WireGuard value.
+    # `-u rustynetd` is mandatory: key custody compares the key owner against the
+    # effective uid with no root exemption.
+    if ! gossip_hex="$(live_lab_run_root "$target" "root sudo -n -u rustynetd /usr/local/bin/rustynetd key show-gossip-key --gossip-signing-secret /var/lib/rustynet/keys/gossip.signing.secret --passphrase-file /run/credentials/rustynetd.service/wg_key_passphrase" | tr -d '[:space:]')"; then
+      echo "failed to export gossip verifying key for ${node_id}" >&2
+      return 1
+    fi
+    if [[ ! "$gossip_hex" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "gossip verifying key for ${node_id} is not 64 lowercase hex chars" >&2
+      return 1
+    fi
     local add_out add_rc
-    add_out="$(live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}' --capabilities '${node_caps}'" 2>&1)"
+    add_out="$(live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-gossip-pubkey-hex '${gossip_hex}' --owner-approver-id '${owner_approver_id}' --capabilities '${node_caps}'" 2>&1)"
     add_rc=$?
     if [[ $add_rc -ne 0 ]]; then
       if printf '%s' "$add_out" | grep -qF "already exists"; then

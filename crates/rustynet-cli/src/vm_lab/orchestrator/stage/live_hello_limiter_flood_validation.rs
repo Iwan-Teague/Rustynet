@@ -115,6 +115,7 @@ mod tests {
             assignments: vec![],
             node_ids: HashMap::new(),
             collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),

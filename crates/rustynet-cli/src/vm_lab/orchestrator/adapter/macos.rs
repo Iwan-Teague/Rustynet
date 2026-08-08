@@ -13,8 +13,9 @@ use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{
-    AdapterError, BundleKind, InstallReport, MembershipOwnerKey, MembershipSnapshot, NodeId,
-    NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport, WireguardPublicKey,
+    AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+    MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+    ValidatorReport, WireguardPublicKey,
 };
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
@@ -154,6 +155,11 @@ impl NodeAdapter for MacosNodeAdapter {
     fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
         let hex = macos_traffic::collect_wireguard_public_key(&self.conn)?;
         Ok(WireguardPublicKey(hex))
+    }
+
+    fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+        // the lab macOS bootstrap scripts never run `key init-gossip`, so no secret exists to export.
+        Ok(GossipIdentity::DeferredPlatform)
     }
 
     fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
