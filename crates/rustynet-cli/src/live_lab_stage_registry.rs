@@ -760,6 +760,23 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Rust-engine gossip convergence: proves a node is registered as a gossip
+    // peer, has verified at least one signed bundle from a peer, reports no
+    // identity mismatch, and is rejecting nothing as an unknown source. This is
+    // the regression guard for membership publishing each node's derived gossip
+    // verifying key rather than its WireGuard public key.
+    //
+    // `direct_platform` rather than `logical`: gossip is unix-only, so this is
+    // an OS-specific cell that earns its own `linux_stage_gossip_peer_convergence`
+    // column, not a shared stage resolved per platform.
+    StageSpec {
+        name: "gossip_convergence_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        stream: PlatformStream::Linux,
+        direct_platform: Some(("linux", "gossip_peer_convergence")),
+        ..DEFAULT_SPEC
+    },
     // Rust-engine authenticode: the canonical Linux daemon self-check
     // folded into a first-class OrchestrationStage — validates that the
     // daemon reports an honest authenticode verdict (applicable: false on
@@ -2934,7 +2951,7 @@ mod tests {
             *counts.entry(stage.tier().as_str()).or_default() += 1;
         }
         let expected: BTreeMap<&'static str, usize> = [
-            ("t0_core", 19),
+            ("t0_core", 20),
             ("t1_role", 18),
             ("t2_resilience", 13),
             ("t3_cross_os", 1),

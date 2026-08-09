@@ -24827,6 +24827,12 @@ pub const LINUX_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 /// reason as [`LINUX_RUSTYNETD_PATH`].
 pub const LINUX_RUSTYNET_RELAY_PATH: &str = "/usr/local/bin/rustynet-relay";
 
+/// Canonical install path of the `rustynet` CLI on Linux peers. Pinned for the
+/// same reason as [`LINUX_RUSTYNETD_PATH`]. Distinct from it because some
+/// validators read state the DAEMON owns but only the CLI surfaces — the gossip
+/// counters ride on the daemon's IPC `status` response.
+pub const LINUX_RUSTYNET_CLI_PATH: &str = "/usr/local/bin/rustynet";
+
 /// Build the POSIX-shell invocation that calls one of the `linux-*-check`
 /// subcommands on the live Linux peer. Centralizes argv-only discipline
 /// so every stage helper goes through the same audited path: the
@@ -40790,8 +40796,8 @@ mod tests {
         // key_custody_validation + mesh_status_validation + authenticode_validation +
         // ipv6_leak_validation + exit_demotion_residue_validation +
         // exit_dns_failclosed_validation + exit_nat_lifecycle_validation +
-        // blind_exit_dataplane_validation.
-        assert_eq!(cli_ids.len(), 58);
+        // blind_exit_dataplane_validation + gossip_convergence_validation.
+        assert_eq!(cli_ids.len(), 59);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

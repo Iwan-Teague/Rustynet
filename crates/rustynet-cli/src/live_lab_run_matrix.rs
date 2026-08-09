@@ -151,6 +151,7 @@ const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_key_custody_check",
     "macos_stage_key_custody_check",
     "windows_stage_key_custody_check",
+    "linux_stage_gossip_peer_convergence",
     "linux_stage_mesh_status_check",
     "macos_stage_mesh_status_check",
     "windows_stage_mesh_status_check",
@@ -3792,6 +3793,7 @@ mod registry_equivalence_tests {
             | "validate_macos_ipv6_leak" => Some(("macos", "exit_handoff")),
             "validate_macos_exit_dns_failclosed" => Some(("macos", "managed_dns")),
             "validate_macos_role_transition" => Some(("macos", "role_transition")),
+            "gossip_convergence_validation" => Some(("linux", "gossip_peer_convergence")),
             "validate_linux_relay_service_lifecycle" => Some(("linux", "relay_service_lifecycle")),
             "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
             "validate_linux_exit_nat_lifecycle"
@@ -4170,7 +4172,16 @@ mod registry_equivalence_tests {
         ];
         for name in probe_names() {
             let bare = name.rsplit("::").next().unwrap_or(name);
-            let expected: Vec<String> = if oracle_is_rust_native(bare) {
+            let expected: Vec<String> = if bare == "gossip_convergence_validation" {
+                // First rust-native stage that is LINUX-ONLY by product
+                // constraint rather than lab convenience: the gossip transport
+                // is unix-only, so the daemon refuses a configured secret
+                // elsewhere. The blanket "rust-native implies all three
+                // platforms" rule below does not hold for it, and emitting
+                // macos/windows columns that can only ever read `skip` would be
+                // noise rather than evidence.
+                vec!["linux".into()]
+            } else if oracle_is_rust_native(bare) {
                 vec!["linux".into(), "macos".into(), "windows".into()]
             } else {
                 match bare {

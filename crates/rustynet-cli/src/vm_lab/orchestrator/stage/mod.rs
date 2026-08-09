@@ -25,6 +25,7 @@ pub mod exit_dns_failclosed_validation;
 pub mod exit_handoff;
 pub mod exit_nat_lifecycle_validation;
 pub mod final_cleanup;
+pub mod gossip_convergence_validation;
 pub mod install;
 pub mod ipv6_leak_validation;
 pub mod key_custody_validation;
@@ -156,6 +157,10 @@ define_stage_catalog! {
     // Mesh-status self-check: peers visible, no stale state — core mesh
     // health / reachability evidence, not a role capability.
     MeshStatusValidation => "mesh_status_validation" @ Live / T0Core,
+    // Gossip peer convergence: registered, accepting signed bundles, no
+    // unknown-source rejections. Core mesh health like mesh_status, not a role
+    // capability — a wrong GREEN here means the epidemic is silently dead.
+    GossipConvergenceValidation => "gossip_convergence_validation" @ Live / T0Core,
     // Windows binary-signing (Authenticode) verification — binary-trust
     // control, so security tier.
     AuthenticodeValidation => "authenticode_validation" @ Live / T4Security,

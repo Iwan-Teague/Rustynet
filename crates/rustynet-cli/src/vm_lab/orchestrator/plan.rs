@@ -64,6 +64,7 @@ use crate::vm_lab::orchestrator::stage::exit_dns_failclosed_validation::ExitDnsF
 use crate::vm_lab::orchestrator::stage::exit_handoff::ExitHandoffStage;
 use crate::vm_lab::orchestrator::stage::exit_nat_lifecycle_validation::ExitNatLifecycleValidationStage;
 use crate::vm_lab::orchestrator::stage::final_cleanup::FinalCleanupStage;
+use crate::vm_lab::orchestrator::stage::gossip_convergence_validation::GossipConvergenceValidationStage;
 use crate::vm_lab::orchestrator::stage::install::BootstrapHostsStage;
 use crate::vm_lab::orchestrator::stage::ipv6_leak_validation::Ipv6LeakValidationStage;
 use crate::vm_lab::orchestrator::stage::key_custody_validation::KeyCustodyValidationStage;
@@ -315,6 +316,9 @@ impl PlanBuilder {
                     }
                     StageId::KeyCustodyValidation => Box::new(KeyCustodyValidationStage),
                     StageId::MeshStatusValidation => Box::new(MeshStatusValidationStage),
+                    StageId::GossipConvergenceValidation => {
+                        Box::new(GossipConvergenceValidationStage)
+                    }
                     StageId::AuthenticodeValidation => Box::new(AuthenticodeValidationStage),
                     StageId::Ipv6LeakValidation => Box::new(Ipv6LeakValidationStage),
                     // Deploy the rustynet-relay sibling service onto every
@@ -431,9 +435,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_58_stages() {
+    fn build_returns_59_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 58, "plan must contain exactly 58 stages");
+        assert_eq!(stages.len(), 59, "plan must contain exactly 59 stages");
     }
 
     #[test]
@@ -441,7 +445,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        assert_eq!(ids.len(), 67, "chaos-enabled plan must contain 67 stages");
+        assert_eq!(ids.len(), 68, "chaos-enabled plan must contain 67 stages");
         for chaos_id in PlanBuilder::chaos_suite_stages() {
             assert!(
                 ids.contains(&chaos_id),
@@ -467,7 +471,7 @@ mod tests {
         // Opt-in and out of the default plan (like chaos): default 58 + 4.
         assert_eq!(
             ids.len(),
-            62,
+            63,
             "negative-control-enabled plan must contain 62 stages"
         );
         for control_id in PlanBuilder::negative_control_suite_stages() {
@@ -496,14 +500,14 @@ mod tests {
     }
 
     #[test]
-    fn negative_control_and_chaos_stack_to_71_stages() {
+    fn negative_control_and_chaos_stack_to_72_stages() {
         let stages = PlanBuilder::new()
             .with_enable_chaos_suite(true)
             .with_enable_negative_control(true)
             .build();
         assert_eq!(
             stages.len(),
-            71,
+            72,
             "58 default + 9 chaos + 4 negative-control"
         );
     }
@@ -530,10 +534,10 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 58 total - 29 live-suite stages - 11 cross-network stages - 1 soak stage = 17.
+        // 59 total - 30 live-suite stages - 11 cross-network stages - 1 soak stage = 17.
         assert_eq!(
             ids.len(),
-            58 - PlanBuilder::live_suite_stages().len()
+            59 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -575,7 +579,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            58 - PlanBuilder::live_suite_stages().len()
+            59 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -619,6 +623,7 @@ mod tests {
                 StageId::ServiceHardeningValidation,
                 StageId::KeyCustodyValidation,
                 StageId::MeshStatusValidation,
+                StageId::GossipConvergenceValidation,
                 StageId::AuthenticodeValidation,
                 StageId::Ipv6LeakValidation,
                 StageId::DeployRelayService,
@@ -665,7 +670,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_soak(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        assert_eq!(ids.len(), 57);
+        assert_eq!(ids.len(), 58);
         assert!(!ids.contains(&StageId::LiveExtendedSoakValidation));
         assert!(ids.contains(&StageId::LiveMixedTopologyValidation));
         assert!(ids.contains(&StageId::CrossNetworkPreflight));
@@ -685,7 +690,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            58 - PlanBuilder::cross_network_suite_stages().len()
+            59 - PlanBuilder::cross_network_suite_stages().len()
         );
         for dropped in PlanBuilder::cross_network_suite_stages() {
             assert!(
