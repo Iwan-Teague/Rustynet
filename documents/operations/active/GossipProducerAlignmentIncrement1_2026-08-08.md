@@ -1,7 +1,46 @@
 # Gossip producer alignment — increment 1
 
-**REVIEWED DESIGN, REVISION 2. NOT YET IMPLEMENTED.** Drafted 2026-08-08 against HEAD
-`2afcd57d`.
+**IMPLEMENTED AND LIVE-PROVEN 2026-08-09.** S1–S11 all landed. Revision 2 of the design
+is preserved below unchanged, including the parts review corrected, because the record
+of *which claim broke* is the transferable part.
+
+**Status of each step:**
+
+| Step | State |
+| --- | --- |
+| S1–S7, S11 | Landed `f2d0e795` / `a696992e`; two blockers fixed in `43c1e03b` / `f9b86aa5` |
+| S8, S9 | Landed `f3b89f01` — stage `gossip_convergence_validation`, Live suite / T0Core |
+| **S8b** | **Deliberately not done.** The stage is `state_machine_only`, i.e. `--node` only, matching `mesh_status_validation` and every other rust-native validator. The bash dialect keeps its own per-check validators. I-6's "both dialects" is hereby narrowed rather than left ambiguous. |
+| S10 | Proven twice — see below |
+
+**Live proof.** Run `gossip-convergence-stage-20260809` at `f3b89f01`: 59 stages,
+**37 passed, 0 failed**, `linux_stage_gossip_peer_convergence = pass` in the ledger.
+Earlier, by hand at `43c1e03b`: the joiner's published `node_pubkey_hex` is byte-identical
+to its own `show-gossip-key` output, and the exit node logs
+`gossip_accept source=ba6c9bd6…` with accepts climbing 0→3→5 and zero
+`gossip_reject_unknown_source` since daemon start — where before it rejected
+continuously at `peers=0`.
+
+**Two bugs got past this reviewed plan.** Neither was caught by review, and one was
+caused *by* the plan:
+
+1. **The plan's own advice was wrong.** It told the implementer not to use
+   `systemctl is-active --quiet`, reasoning that `--quiet` would suppress the failure
+   marker. The marker is a separate `echo` on the failure branch and fires regardless.
+   Without `--quiet`, `is-active` prints `active` onto the same stdout the key is parsed
+   from, and every node failed with `got 71`. **The unit test asserted the plan's wrong
+   rule and passed, pinning the bug.** Found only by a live run.
+2. **`macos_membership.rs` branched on the wrong axis.** It published every peer's
+   WireGuard key unconditionally. That producer runs on a macOS *exit* node but writes
+   membership for **every** peer, so any `--exit-platform macos` run silently
+   republished Linux nodes' real gossip identities as WireGuard keys, under a flag
+   named `unaligned-wireguard`. **The correct axis is the SUBJECT peer, not the
+   producer's platform** — and both earlier review rounds counted callers by producer
+   platform, so neither could see it.
+
+---
+
+**REVIEWED DESIGN, REVISION 2 (as written 2026-08-08 against HEAD `2afcd57d`).**
 
 Revision 1 was adversarially reviewed twice: once as a design (four lenses + a
 verifying judge, five blockers) and once as a written document (three lenses + a judge,
