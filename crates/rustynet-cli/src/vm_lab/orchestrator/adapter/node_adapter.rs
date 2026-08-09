@@ -55,6 +55,10 @@ pub(crate) const REQUIRED_DAEMON_LAUNCH_FLAGS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleValidatorKind {
     RuntimeAcls,
+    /// Gossip peer convergence. Linux-only by product constraint, not lab
+    /// convenience: the gossip transport is unix-only and the daemon refuses a
+    /// configured secret elsewhere.
+    GossipConvergence,
     ServiceHardening,
     KeyCustody,
     Authenticode,
@@ -221,7 +225,15 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         run_typed_role_validator(self, kind, expected_node_id)
     }
 
-    fn supports_role_validator(&self, _kind: RoleValidatorKind) -> bool {
+    fn supports_role_validator(&self, kind: RoleValidatorKind) -> bool {
+        // Most validators run on every desktop platform, so the default is
+        // platform-only. GossipConvergence is the exception and must consult
+        // `kind`: gossip is unix-only, so claiming support on Windows would turn
+        // a reported-skip into a hard failure.
+        if matches!(kind, RoleValidatorKind::GossipConvergence) {
+            return crate::vm_lab::orchestrator::role_validation::gossip_convergence::
+                gossip_convergence_runtime_implemented(self.platform());
+        }
         matches!(
             self.platform(),
             VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
@@ -434,7 +446,8 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
 ) -> Result<(), AdapterError> {
     use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
     use crate::vm_lab::orchestrator::role_validation::{
-        authenticode, dns_failclosed, key_custody, mesh_status, runtime_acls, service_hardening,
+        authenticode, dns_failclosed, gossip_convergence, key_custody, mesh_status, runtime_acls,
+        service_hardening,
     };
 
     const WINDOWS_DAEMON: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
@@ -523,6 +536,21 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
         (RoleValidatorKind::MeshStatus, VmGuestPlatform::Windows) => {
             mesh_status::validate_windows_mesh_status(&*shell, daemon_path, alias)
         }
+        // The CLI, not the daemon: the gossip counters ride on the daemon's IPC
+        // `status` response and `rustynet` is what surfaces it.
+        (RoleValidatorKind::GossipConvergence, VmGuestPlatform::Linux) => {
+            gossip_convergence::validate_linux_gossip_convergence(
+                &*shell,
+                crate::vm_lab::LINUX_RUSTYNET_CLI_PATH,
+                alias,
+            )
+        }
+        (RoleValidatorKind::GossipConvergence, VmGuestPlatform::Macos)
+        | (RoleValidatorKind::GossipConvergence, VmGuestPlatform::Windows) => Err(
+            "gossip convergence is unix-only and not minted on these lab platforms; \
+             the stage reports this as a named skip rather than dispatching"
+                .to_owned(),
+        ),
         (RoleValidatorKind::DnsFailclosed, VmGuestPlatform::Linux) => {
             dns_failclosed::validate_linux_dns_failclosed(&*shell, daemon_path, alias)
         }
