@@ -3592,9 +3592,15 @@ stage_membership_setup() {
     node_platform="$(node_platform_for_label "${_label}")" || return 1
     if [[ "$node_platform" == "linux" ]]; then
       # `-u rustynetd` is mandatory: key custody compares the key owner against
-      # the effective uid with no root exemption. `--quiet` is mandatory too, or
-      # `active` lands on the same stdout the key is read from.
-      if ! gossip_hex="$(live_lab_run_root "$target" "root sudo -n -u rustynetd /usr/local/bin/rustynetd key show-gossip-key --gossip-signing-secret /var/lib/rustynet/keys/gossip.signing.secret --passphrase-file /run/credentials/rustynetd.service/wg_key_passphrase" | tr -d '[:space:]')"; then
+      # the effective uid with no root exemption.
+      #
+      # The readiness guard uses `--quiet` for the same reason the Rust dialect
+      # does: without it `systemctl is-active` prints `active` onto the same
+      # stdout the key is read from, and the export parses six characters too
+      # many. It exists at all because the passphrase is a systemd credential
+      # that only exists while the unit runs, which is otherwise a baffling
+      # failure.
+      if ! gossip_hex="$(live_lab_run_root "$target" "root systemctl is-active --quiet rustynetd && root sudo -n -u rustynetd /usr/local/bin/rustynetd key show-gossip-key --gossip-signing-secret /var/lib/rustynet/keys/gossip.signing.secret --passphrase-file /run/credentials/rustynetd.service/wg_key_passphrase" | tr -d '[:space:]')"; then
         echo "failed to export gossip verifying key for ${node_id}" >&2
         return 1
       fi
