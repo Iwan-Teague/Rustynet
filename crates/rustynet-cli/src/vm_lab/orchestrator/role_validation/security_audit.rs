@@ -82,11 +82,14 @@ pub const LINUX_SECURITY_AUDITS: &[(&str, &str, AuditEvaluator)] = &[
     ),
 ];
 
-/// True only where security-audit validation runs live today (Linux). macOS /
-/// Windows nodes are reported-skipped — named on disk, never a silent pass —
-/// until their audit surfaces are proven, mirroring `relay_validation`'s posture
-/// gate. (macOS/Windows have their own dedicated security-validator stages in
-/// the bash-arm path today; folding those into the Rust engine is later work.)
+/// True on every desktop platform: the audits dispatch through the adapter's
+/// [`RemoteShellHost`] seam, which Linux, macOS and Windows all implement.
+///
+/// Do not read this as "live-proven on all three". It is a *runtime-support*
+/// gate, not an evidence claim: as of 2026-08-10 only Linux has ever executed
+/// this stage in a recorded `--node` run, because no macOS or Windows node has
+/// been present in one. A non-desktop platform (iOS/Android) has no daemon audit
+/// surface and is reported-skipped — named on disk, never a silent pass.
 pub fn security_audit_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(
         platform,
@@ -94,26 +97,124 @@ pub fn security_audit_runtime_implemented(platform: VmGuestPlatform) -> bool {
     )
 }
 
-/// Run the eight Linux daemon self-audits through the shell seam, applying each
-/// audit's typed evaluator. Returns `Err` with the first failing audit's detail
-/// (fail-closed) or `Ok(())` when all eight pass — where "pass" means the
-/// evaluator's full contract (`overall_ok` AND the anti-vacuity guards: no empty
-/// corpus, no vacuous/reject-all baseline, no too-thin battery), not merely the
-/// daemon's `overall_ok` flag.
+/// The verdict for ONE Tier-0 audit on ONE node.
+///
+/// `Blocked` is deliberately distinct from `Failed`: it means the control was
+/// never exercised (the daemon subcommand could not be dispatched at all), which
+/// is not the same evidentiary claim as "the control was exercised and the
+/// daemon violated it". Both fail the stage; only `Failed` asserts a violation.
+/// Collapsing the two would let an unreachable host read as eight security
+/// failures, or — worse, in the other direction — let an unexercised control
+/// inherit a neighbouring control's pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditVerdict {
+    Passed,
+    Failed(String),
+    Blocked(String),
+}
+
+impl AuditVerdict {
+    /// The run-matrix status string this verdict records. `blocked` outranks
+    /// both `skip` and `pass` in the recorder's precedence (see `status_rank`),
+    /// so an unexercised control can never let a platform read green.
+    pub fn matrix_status(&self) -> &'static str {
+        match self {
+            AuditVerdict::Passed => "pass",
+            AuditVerdict::Failed(_) => "fail",
+            AuditVerdict::Blocked(_) => "blocked",
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            AuditVerdict::Passed => None,
+            AuditVerdict::Failed(detail) | AuditVerdict::Blocked(detail) => Some(detail.as_str()),
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        matches!(self, AuditVerdict::Passed)
+    }
+}
+
+/// One audit's outcome on one node, in the shape the per-control artifact and
+/// the run-matrix recorder both consume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditResult {
+    /// The matrix-friendly label — byte-identical to the `{platform}_{label}`
+    /// run-matrix column suffix.
+    pub audit_id: &'static str,
+    pub verdict: AuditVerdict,
+}
+
+/// Run all eight daemon self-audits through the shell seam, applying each
+/// audit's typed evaluator, and return a verdict for EVERY audit.
+///
+/// "Pass" means the evaluator's full contract (`overall_ok` AND the anti-vacuity
+/// guards: no empty corpus, no vacuous/reject-all baseline, no too-thin battery),
+/// not merely the daemon's `overall_ok` flag.
+///
+/// RUN-ALL, NOT FAIL-FAST — a deliberate change from the earlier fail-fast loop,
+/// and the reason it is safe: fail-closed is a property of the STAGE outcome,
+/// which [`security_audits_ok`] still derives from "did every audit pass". It was
+/// never a property of the loop. Stopping at the first failure left the other
+/// seven controls with no verdict at all, and the run matrix then recorded them
+/// as `not_run` — a column value that asserts "no node of this platform was in
+/// the run", which is false and materially misleading on a run where the node was
+/// present and the control simply was not reached.
+pub fn run_security_audits(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Vec<AuditResult> {
+    LINUX_SECURITY_AUDITS
+        .iter()
+        .map(|(label, subcommand, evaluate)| {
+            let argv = [daemon_path, *subcommand, "--no-fail-on-drift"];
+            let verdict = match shell.run_argv(&argv, &[], &[]) {
+                Err(err) => AuditVerdict::Blocked(format!(
+                    "{label}: dispatch of `{subcommand}` failed: {err}"
+                )),
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    match evaluate(alias, &stdout) {
+                        Ok(_) => AuditVerdict::Passed,
+                        Err(detail) => {
+                            AuditVerdict::Failed(format!("{label} (`{subcommand}`): {detail}"))
+                        }
+                    }
+                }
+            };
+            AuditResult {
+                audit_id: label,
+                verdict,
+            }
+        })
+        .collect()
+}
+
+/// Fail-closed reduction of a node's audit results to the stage's verdict:
+/// `Err` with every non-passing audit's detail if ANY audit did not pass.
+pub fn security_audits_ok(results: &[AuditResult]) -> Result<(), String> {
+    let problems: Vec<String> = results
+        .iter()
+        .filter_map(|result| result.verdict.detail().map(str::to_owned))
+        .collect();
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
+/// Back-compatible wrapper: run every audit and reduce to the fail-closed
+/// stage verdict, discarding the per-control detail.
 pub fn validate_linux_security_audits(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
     alias: &str,
 ) -> Result<(), String> {
-    for (label, subcommand, evaluate) in LINUX_SECURITY_AUDITS {
-        let argv = [daemon_path, subcommand, "--no-fail-on-drift"];
-        let out = shell
-            .run_argv(&argv, &[], &[])
-            .map_err(|err| format!("{label}: dispatch of `{subcommand}` failed: {err}"))?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        evaluate(alias, &stdout).map_err(|detail| format!("{label} (`{subcommand}`): {detail}"))?;
-    }
-    Ok(())
+    security_audits_ok(&run_security_audits(shell, daemon_path, alias))
 }
 
 #[cfg(test)]
@@ -219,6 +320,49 @@ mod tests {
             err.contains("dispatch of `membership-revoke-audit` failed"),
             "error must attribute the dispatch failure: {err}"
         );
+    }
+
+    #[test]
+    fn every_audit_gets_a_verdict_even_when_the_first_one_fails() {
+        // The regression this pins: the loop used to stop at the first failure,
+        // so seven controls got no verdict at all and the run matrix recorded
+        // them as `not_run` — a value that asserts no node of that platform was
+        // in the run. Here the node IS in the run and every control must be
+        // accounted for.
+        let mock = MockShellHost::new();
+        let results = run_security_audits(&mock, TEST_DAEMON, "deb-1");
+        assert_eq!(
+            results.len(),
+            LINUX_SECURITY_AUDITS.len(),
+            "every audit must produce a verdict, not just the ones before the first failure"
+        );
+        for (result, (label, _, _)) in results.iter().zip(LINUX_SECURITY_AUDITS) {
+            assert_eq!(result.audit_id, *label, "verdicts must stay in audit order");
+            assert!(
+                matches!(result.verdict, AuditVerdict::Blocked(_)),
+                "an undispatchable audit is BLOCKED (not exercised), never failed or passed: {:?}",
+                result.verdict
+            );
+        }
+        // Fail-closed is preserved at the stage level regardless.
+        assert!(security_audits_ok(&results).is_err());
+    }
+
+    #[test]
+    fn a_blocked_audit_is_never_reported_as_a_pass() {
+        let results = vec![
+            AuditResult {
+                audit_id: "policy_default_deny",
+                verdict: AuditVerdict::Passed,
+            },
+            AuditResult {
+                audit_id: "enrollment_replay",
+                verdict: AuditVerdict::Blocked("dispatch failed".into()),
+            },
+        ];
+        assert_eq!(results[0].verdict.matrix_status(), "pass");
+        assert_eq!(results[1].verdict.matrix_status(), "blocked");
+        assert!(security_audits_ok(&results).is_err());
     }
 
     #[test]
