@@ -1588,6 +1588,46 @@ a one-line fix. A restart masks the gap, which is why it has not been noticed.
 
 ---
 
+### QH-37 — A logical CSV column merges its stages with `pass` outranking `skip`, so `linux_stage_cross_network=pass` has ALWAYS meant "2 of 11 ran"
+
+**Verified against `cfb7a87e` by direct count, not inference.** Same class as QH-07 (the
+`two_hop` alias contamination CLAUDE.md §12.3 warns about) — different column, still
+live, and unlike QH-07 it is not fixed at the source.
+
+`status_rank` (`crates/rustynet-cli/src/live_lab_run_matrix.rs:2145-2150`) ranks
+`fail => 8`, `pass => 4`, `skip => 3`. When several stages share one logical column the
+highest rank wins, so a single pass outranks any number of skips. `fail` correctly
+dominates; `skip` does not.
+
+Measured across the four most recent runs:
+
+| Run | cross_network stages | ledger column |
+| --- | --- | --- |
+| `s0-probe-live-20260808` | pass 2 / skip 9 | **pass** |
+| `gossip-producer-proof-20260808` | pass 0 / skip 11 | skip |
+| `gossip-producer-proof2-20260808` | pass 2 / skip 9 | **pass** |
+| `gossip-convergence-stage-20260809` | pass 2 / skip 9 | **pass** |
+
+The only two that ever run are `cross_network_preflight` and
+`cross_network_nat_classification`. The other nine need a second physical network.
+
+**Why it matters more than it looks.** Every judgement about lab state reads this
+ledger. A reader — including an agent writing a handover — sees `cross_network=pass`
+and concludes the cross-network suite is green, when in practice 9 of 11 stages have
+never executed in that run. This document's author made exactly that error in a report
+on 2026-08-07 before catching it here.
+
+**Fix shape (not implemented):** make `skip` dominate `pass` in a logical merge, the way
+`fail` already does — a partially-skipped set must not read green. One function plus
+tests, no lab run. Do this BEFORE adding roles to un-skip stages: the result of that
+work is unreadable while the column can lie.
+
+**Caution for whoever fixes it:** flipping the rank will change historical rows'
+*interpretation*, not the stored data. Do not retro-edit the ledger; the committed rows
+are evidence of what the tooling said at the time.
+
+---
+
 ## Related documents
 
 - `NodeEngineFlipDispositions_2026-07-24.md` — D1 carries the two_hop mechanism,
