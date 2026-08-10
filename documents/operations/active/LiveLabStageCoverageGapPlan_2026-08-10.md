@@ -37,247 +37,249 @@ were **not** re-verified line by line and remain pre-review.
 
 ---
 
-**Status: PLAN, pre-review.** Written against `HEAD = bb5d467b`, clean tree.
-Every claim below was verified by reading the code or parsing the ledger at that
-commit; the verification method is named inline so a reviewer can re-run it. Where
-a claim is inferred rather than executed, it is tagged **INFERRED**.
+**Status: REVISION 2 — adversarially reviewed, one blocker and four material
+errors folded in. Increment I1 is IMPLEMENTED (`27e49d54`); I2–I4 are specified
+and open.**
+
+Revision 1 was written against `bb5d467b` and adversarially reviewed the same
+day. The review returned **1 BLOCKER, 4 MAJOR, 4 MINOR**, and confirmed eight
+claims that survived attack. Corrections are folded in below and tagged
+**[REVIEW]** rather than silently applied, because on this document family the
+transferable lesson has always been *which* claim broke.
+
+> Revision 1 was also destroyed on disk mid-session by a concurrent agent's
+> working-tree operation before it was ever committed. It was reconstructed from
+> the review. Commit a plan document as soon as it is written; an uncommitted
+> file in this repository is not durable.
 
 ## 0. Why this plan exists, and what it corrects
 
 The prevailing account in the doc tree is that live-lab stage coverage is missing
-in bulk: `FullTodoInventory_2026-07-28.md` §Wave-3 records the cross-OS
-adversarial security stages as "OPEN entirely … none ported to macOS/Windows",
-and lists HP-3 relay packet-forwarding and the nas/llm live evidence chain as the
-two largest unbuilt items.
+in bulk: `FullTodoInventory_2026-07-28.md` records the cross-OS adversarial
+security stages as "OPEN entirely … none ported to macOS/Windows", and lists
+HP-3 relay packet-forwarding and the nas/llm live evidence chain as the two
+largest unbuilt items.
 
-**That account is partly stale.** Three of its four claims do not survive contact
-with the code at `bb5d467b`:
+**That account is partly stale.** Verified at `bb5d467b`:
 
 1. The cross-OS adversarial security stages **are** ported and **do** run on the
-   engine of record. `security_audit_validation` executes the eight Tier-0 daemon
-   self-audits on Linux, macOS **and** Windows
-   (`stage/security_audit_validation.rs:52-98`; the platform gate
-   `security_audit_runtime_implemented` admits all three,
-   `role_validation/security_audit.rs:90-95`). It passed in the most recent run.
-2. The three formerly-inert chaos scaffolds are **implemented** — 1223, 1296 and
-   1169 lines respectively — and the `--node` engine carries all nine
-   `chaos_*` StageIds (`stage/mod.rs`), delegating to those binaries
-   (`stage/chaos.rs:60-189`).
+   engine of record. `security_audit_validation` dispatches the eight Tier-0
+   daemon self-audits, and its platform gate admits Linux, macOS and Windows
+   (`role_validation/security_audit.rs:93-98`).
+   **[REVIEW — M3]** The gate is *runtime support*, not evidence. Only Linux has
+   ever executed this stage in a recorded run: the run cited as proof
+   (`gossip-convergence-stage-20260809`) had two Debian nodes and nothing else.
+   Revision 1 stated this as "executes on Linux, macOS and Windows", which
+   overclaims. The review also found **two doc comments asserting the opposite of
+   their own code** — both claimed macOS/Windows are reported-skipped on a gate
+   that has admitted all three since `6429a872`. Both corrected in `27e49d54`.
+2. The formerly-inert chaos scaffolds are **implemented** and the `--node` engine
+   carries all nine `chaos_*` StageIds, dispatching real fault-injection
+   binaries (`stage/chaos.rs:133-190`, correctly passing `--features vm-lab`).
+   **[REVIEW — MINOR]** At least **five** scaffolds were converted, not three:
+   `live_chaos_privileged_boundary_test.rs:5` and
+   `live_chaos_membership_adversarial_test.rs:5` also record the conversion.
 3. `extended_soak`, the negative-control suite and the cross-network suite all
    exist in the `--node` vocabulary.
 
-What is *actually* missing is narrower, and one item is not a coverage gap at all
-but a **recording** gap that makes the ledger under-report work the engine really
-does. That distinction is the reason this plan exists: the previous ledger defect
-(QH-37) made columns read **greener** than reality; G3 below is its mirror image,
-making them read **redder**. Both corrupt the same evidence base.
+What is actually missing is narrower, and the largest item is not a coverage gap
+at all but a **recording** gap that made the ledger under-report work the engine
+really does. QH-37 made columns read **greener** than reality; G3 below was its
+mirror image, making them read **redder**.
 
-### Verification commands used
+### How to re-verify
 
 - Ledger tallies: quote-aware `csv.DictReader` over
-  `documents/operations/live_lab_node_run_matrix.csv` (106 rows). Per §12.3, a
-  `awk -F,` read of this file is wrong by construction.
+  `documents/operations/live_lab_node_run_matrix.csv` (106 rows, 267 columns).
+  Per §12.3 an `awk -F,` read of this file is wrong by construction.
 - Stage vocabulary: the `=> "…"` wire-name arms in
-  `crates/rustynet-cli/src/vm_lab/orchestrator/stage/mod.rs`.
-- Dispatch reality: `stages[]` in
-  `artifacts/live_lab/gossip-convergence-stage-20260809/run_summary.json`
-  (59 stages, the 2026-08-09 run at `f3b89f01`).
+  `vm_lab/orchestrator/stage/mod.rs`.
+- Dispatch reality: `stages[]` in a run's `run_summary.json`.
 
-## 1. The gaps, with evidence
+## 1. The gaps
 
 ### G1 — nas / llm have zero live stages on any engine
 
-**VERIFIED.** No `StageId`, no stage module, no registry entry, and no
-`live_*` binary matches `nas` or `llm`. The `--node` wire-name list contains
-neither. Both product crates exist and are gated
-(`rustynet-nas`, `rustynet-llm-gateway`, plus `nas_default_deny_gates.sh`,
-`llm_default_deny_gates.sh`, `llm_exit_coexistence_gates.sh`), so this is
-missing **stage** code, not missing product code. Matches
-`ServiceHostingRolesRoadmap_2026-06-11.md` §7 row M5, still `☐ open`.
+**VERIFIED, survived review.** No `StageId`, no stage module, no registry entry,
+no binary. Both product crates exist and are gated
+(`nas_default_deny_gates.sh`, `llm_default_deny_gates.sh`,
+`llm_exit_coexistence_gates.sh`), so this is missing **stage** code, not missing
+product code. Matches `ServiceHostingRolesRoadmap_2026-06-11.md` §7 row M5.
 
 ### G2 — no relay frame-forwarding proof on the `--node` engine (HP-3)
 
-**VERIFIED.** `relay_validation` proves **lifecycle only** — its own doc comment
-says so: service active, datapath UDP port bound, health TCP port bound,
-`/healthz` returns ok, then stop/restart
-(`stage/relay_validation.rs:10-34`). No frame is ever forwarded.
+**VERIFIED, survived review.** `relay_validation` proves lifecycle only — service
+active, ports bound, `/healthz` ok, stop/restart (`stage/relay_validation.rs:10-34`;
+zero occurrences of forward/frame/payload/plaintext in the validator body). The
+bash dialect's `validate_linux_relay_forwards_frame` (registry `:1849`, impl
+`vm_lab/mod.rs:16459`) has **never run** — `linux_relay_forwards_frame` is
+`not_run` in all 106 rows.
 
-The bash dialect has a forwarding stage — `validate_linux_relay_forwards_frame`
-(registry line 1849, `proves: PROVES_RELAY_FORWARDING = ["HP-3", "RPT-01"]`),
-implemented at `vm_lab/mod.rs:16459` (`exercise_linux_relay_forwards_frame`). It
-has **never run**: `linux_relay_forwards_frame` is `not_run` in **all 106** rows.
-So relay forwarding is unproven on every OS and every engine — consistent with
-the doc tree calling HP-3 "the single biggest looks-done-but-isn't gap".
+**[REVIEW — MINOR]** `role_validation/relay.rs:142-144` already documents this
+gap and scopes the forwarded-frame proof to "Wave 4". Cite it rather than
+inferring.
 
-### G3 — 40+ ledger columns are structurally unreachable on `--node` (recording gap)
+### G3 — ledger columns structurally unreachable on `--node` (recording gap)
 
-**VERIFIED, and this is the highest-value item.** Every per-control check column
-is `not_run` in all 106 rows — including all 24 cells of the eight Tier-0 audits
-× three platforms:
+**VERIFIED, survived review, and CLOSED for the audit family by I1.**
 
-```
-linux_membership_revoke_applies      not_run ×106
-linux_policy_default_deny            not_run ×106
-linux_privileged_helper_allowlist    not_run ×106
-… and the macos_* / windows_* triplets of each, plus
-linux_relay_forwards_frame           not_run ×106
-```
+All 24 `{platform}_{audit_id}` cells and `linux_relay_forwards_frame` were
+`not_run` in all 106 rows. The work was being done: the eight audit identifiers
+in `LINUX_SECURITY_AUDITS` are byte-identical to the column suffixes, and each is
+accepted only on its typed evaluator's full contract, not the daemon's
+`overall_ok` flag. The columns stayed empty because `special:` is declared on the
+**bash-dialect** stage names, which the `--node` engine never emits, while the
+aggregate stage it does emit owns no column at all — the registry's own comment
+at `live_lab_stage_registry.rs:685-696` calls the mapping "a follow-up".
 
-The work **is being done**. `validate_linux_security_audits` runs eight named
-audits whose identifiers are byte-identical to the column suffixes —
-`membership_revoke_applies`, `revoked_peer_denied_e2e`,
-`membership_signature_forgery`, `privileged_helper_allowlist`,
-`policy_default_deny`, `gossip_revoked_readmit`, `enrollment_replay`,
-`blind_exit_reversal_denied` (`role_validation/security_audit.rs:44-80`) — and
-each is accepted only on its typed evaluator's full contract, not merely the
-daemon's `overall_ok` flag (`:97-102`).
-
-The columns stay empty because `special:` is declared on the **bash-dialect**
-stage names (`validate_linux_membership_revoke_applies`, …) which the `--node`
-engine never emits. The engine emits one aggregate stage, `security_audit_validation`,
-which owns **no** column at all — there is no `*_security_audit*` column in the
-ledger.
-
-Consequence: a reviewer reading the `--node` ledger concludes eight security
-controls are unproven on all three platforms, when in fact they passed. This
-is QH-37 inverted, and it is worse for release decisions than QH-37 was, because
-it hides *real* evidence rather than inventing fake evidence.
+**[REVIEW — M4]** Revision 1 said "40+ columns" and scoped I1 to 24 without
+naming the remainder. **I1 closes 24 of roughly 49.** Still open, same root
+cause, not covered: `linux_{runtime_acls, service_hardening, authenticode,
+key_custody, membership_genesis, mesh_status}`, the macOS/Windows counterparts of
+those, `{linux,macos,windows}_hello_limiter_flood`, `macos_pf_killswitch`,
+`macos_keychain_key_custody`, `windows_named_pipe_acl`,
+`windows_dpapi_key_custody`. The sharpest case is `linux_key_custody`: the
+2026-08-09 run **produced `live_key_custody_report.json`** and the column still
+reads `not_run` in every row. Tracked as **I5** below.
 
 ### G4 — chaos, negative-control and soak have never been dispatched
 
-**VERIFIED as a selection gap, not a code gap.** `chaos` is `not_run` in
-106/106 rows on all three platforms; `extended_soak` has never passed on any OS.
-Their `EnableRule`s (`ChaosSuite`, `NegativeControlSuite`, `SoakSuite`) are
-opt-in and no recorded run selected them. `SoakSuite` additionally ANDs with
-`!skip_linux_live_suite` (`live_lab_stage_registry.rs:329-331`), so a targeted
-mac/win run can never carry soak by design.
+**VERIFIED as never-dispatched — but the cause was wrong.**
 
-Nothing needs writing here. What is missing is a **run profile** that turns them
-on, which is a prerequisite for the 24/7 goal: an unattended loop that never
-selects the chaos or soak suites cannot converge them.
+**[REVIEW — B1, BLOCKER]** Revision 1 said "nothing needs writing here; what is
+missing is a run profile". False. All nine chaos stages declare
+`dependencies: &[StageId::LiveMixedTopologyValidation]` (`stage/chaos.rs:48-50`),
+and the runner skips any stage whose dependency failed or skipped
+(`orchestrator/runner.rs:32`). `live_mixed_topology_validation` has **never
+passed** — `skip 97 / not_run 9` on Linux — and was `skipped` in the most recent
+run. So flipping the chaos selector produces **nine cascade-skips**, and
+revision 1's acceptance criterion ("a dry-run plan lists them as enabled") is
+satisfiable while the actual goal is not. **Enabled ≠ dispatched.**
+
+Corrected: I4 must first make `live_mixed_topology_validation` pass, or
+deliberately re-parent the chaos dependency. Its acceptance is a **chaos report
+artifact with a non-skipped outcome**, never a plan listing.
 
 ### G5 — cross-OS relay is posture-gated off, not unimplemented
 
 **VERIFIED.** `deploy_relay_service` and `relay_validation` report-skip macOS and
-Windows relay nodes on `NodeRole::is_supported_for_platform`
-(`stage/relay_validation.rs:31-34`), named in a `reported_skips.json`, never a
-silent pass. So the mac/win relay cells are gated by a posture flag awaiting
-evidence, not by absent code. **INFERRED:** flipping that flag without the
-evidence it gates would be a fail-open change; this plan does not touch it.
+Windows relay nodes on `NodeRole::is_supported_for_platform`, named in a
+`reported_skips.json`, never a silent pass. Gated by a flag awaiting evidence,
+not by absent code. This plan does not touch that flag — flipping it without the
+evidence it gates would be a fail-open change.
 
 ## 2. Non-goals
 
-- Do **not** flip `is_supported_for_platform` (G5) — that flag gates on evidence
-  this plan does not produce.
-- Do **not** re-run or re-interpret `live_two_hop_validation`: 0 lifetime passes,
-  and 35 historical `two_hop=pass` rows are contaminated by the alias removed in
+Reviewed and confirmed honest.
+
+- Do not flip `is_supported_for_platform` (G5).
+- Do not re-run or re-interpret `live_two_hop_validation`: 0 lifetime passes, and
+  35 historical `two_hop=pass` rows are contaminated by the alias removed in
   QH-37.
-- Do **not** touch the frozen bash archive or the bash-dialect stages. Bash is
-  being retired (`BashRetirementPlan_2026-07-24.md`); adding to it is waste.
-- No product-code change. Every increment here is orchestrator/stage/recorder
-  code plus tests.
+- Do not extend the frozen bash archive or its dialect — bash is being retired
+  (`BashRetirementPlan_2026-07-24.md`).
+- No product-code change. Every increment is orchestrator/stage/recorder code
+  plus tests.
 
-## 3. Increments, in dependency order
+## 3. Increments
 
-Each increment is independently committable and independently gated. Ordering is
-by evidence-value per unit of risk: G3 first because it costs the least and
-unblocks honest reading of every subsequent run.
+### I1 — Per-control recording for the eight Tier-0 audits — **DONE** (`27e49d54`)
 
-### I1 — Make the eight Tier-0 audits addressable per control, per platform (G3)
+Landed:
 
-**Problem restated:** one aggregate stage outcome cannot populate 24 per-control
-columns.
+1. `run_security_audits` returns a verdict for **every** audit; `security_audits_ok`
+   reduces to the fail-closed stage verdict. The old fail-fast loop left seven
+   controls with no verdict, which is precisely how they were recorded `not_run`.
+2. A third verdict, `Blocked`, distinct from `Failed` — **[REVIEW — M1]** revision
+   1's four-value rule had no branch for an audit that was never reached, so the
+   natural implementation would have left those columns at `not_run`, which
+   asserts "no node of that platform was in the run" about a run where the node
+   was present. `blocked` maps to the recorder's existing rank-5 status, above
+   both `skip` and `pass`.
+3. The stage writes `security_audit_validation.per_control.json`; the recorder
+   populates `{platform}_{audit_id}` from it. Multi-node resolution reuses
+   `set_status`'s worst-wins merge, so one node failing a control keeps that
+   platform's column from reading green — the QH-37 precedence, applied
+   deliberately. **[REVIEW — item 6]** confirmed this matches `fdbdee18` rather
+   than contradicting it.
+4. A stale artifact cannot manufacture evidence: columns are populated only when
+   the stage actually appears in the run's stage list.
+5. Two doc comments that contradicted their own code, corrected (M3).
 
-1. Change `validate_linux_security_audits` to return a per-audit result vector
-   (`Vec<(&'static str /*audit id*/, AuditOutcome)>`) instead of collapsing to
-   `Result<(), String>`. The fail-closed contract is preserved: the caller still
-   fails the stage if **any** audit failed.
-2. `SecurityAuditValidationStage::execute` writes
-   `security_audit_validation.per_control.json` into the report directory:
-   `{alias, platform, audit_id, status, detail}` per row.
-3. Teach the run-matrix recorder to populate `{platform}_{audit_id}` from that
-   artifact.
+**[REVIEW — item 7]** confirmed I1 was implementable as designed: the recorder
+already receives `report_dir` and already reads per-stage artifacts from it, so
+this is an established pattern, not new plumbing. The review named this "the
+sharpest available blocker and it does not land."
 
-**The column-resolution rule, stated so a reviewer can attack it:**
+**[REVIEW — MINOR]** The `skip` branch of the original rule is dead on the three
+desktop platforms — `reported_skips` populates only for iOS/Android, which have
+no columns. The implementation therefore does not emit `skip` at all.
 
-- `pass` — that audit ran on at least one node of that platform and every node
-  of that platform passed it.
-- `fail` — that audit ran on ≥1 node of that platform and any node failed it.
-- `skip` — a node of that platform was in the run but the audit was
-  reported-skipped for it.
-- `not_run` — no node of that platform was in the run.
+Evidence: 20 tests, and four mutations verified to discriminate —
+`Blocked→"pass"` (fails `a_blocked_audit_is_never_reported_as_a_pass`),
+dispatch-guard removed (fails `controls_are_ignored_when_the_stage_did_not_dispatch`),
+fail-fast restored (fails `every_audit_gets_a_verdict_even_when_the_first_one_fails`,
+1 verdict vs 8), single-row truncation (fails both column tests).
 
-**`fail` outranks `pass`, and `skip` outranks `pass`** — the QH-37 precedence,
-applied deliberately rather than inherited. A partial platform must never read
-green.
+### I2 — Relay frame-forwarding stage on `--node` (G2)
 
-**Acceptance:** a Linux `--node` run at HEAD populates 8 Linux columns with
-`pass` and leaves the 16 macOS/Windows cells `not_run`. Unit tests cover all four
-resolution branches plus the mixed pass/fail-across-nodes case.
+1. New `StageId::RelayForwardingValidation`, `dependencies: [RelayValidation]`,
+   per-node over `Relay`-role nodes.
+2. Port the proof shape of `exercise_linux_relay_forwards_frame` onto the adapter
+   `RemoteShellHost` seam so it is cross-OS by construction.
+3. The assertion must be **ciphertext-only forwarding** — a frame submitted at
+   one peer emerges at the other and the relay never observes plaintext. "Bytes
+   moved" does not discharge HP-3/RPT-01.
+4. `proves: PROVES_RELAY_FORWARDING`.
 
-**Risk:** this makes previously-empty columns carry values, so any tooling that
-reads "`not_run` everywhere" as a sentinel will change behaviour. Grep for
-readers of these column names before landing.
-
-### I2 — Relay frame-forwarding stage on the `--node` engine (G2)
-
-1. New `StageId::RelayForwardingValidation` → wire name
-   `relay_forwarding_validation`, group `Live`, tier `T4Security`,
-   `dependencies: [RelayValidation]`, `fanout: PerNode` over `Relay`-role nodes.
-2. Implementation ports the proof shape of `exercise_linux_relay_forwards_frame`
-   (`vm_lab/mod.rs:16459`) onto the adapter `RemoteShellHost` seam so it is
-   cross-OS by construction rather than Linux-only.
-3. The assertion must be **ciphertext-only forwarding**: a frame submitted at one
-   peer emerges at the other, and the relay never observes plaintext. A stage
-   that proves only "bytes moved" does not discharge HP-3/RPT-01.
-4. `proves: PROVES_RELAY_FORWARDING`. Registry entry with a `special` column
-   `{platform}_relay_forwards_frame`, resolved by the I1 rule.
-5. Report-skip macOS/Windows on the same posture gate as `relay_validation`
-   (per §2 non-goal — named skip, never silent).
-
-**Acceptance:** with a Linux relay elected, the stage runs and its outcome
-reaches `linux_relay_forwards_frame`. A run with no relay node is a skip-noop
-pass, matching `relay_validation`'s empty-assignment behaviour.
-
-**Risk:** this is the first stage to assert on datapath payload rather than
-posture; if the existing bash exercise depends on Linux-only tooling, the
-cross-OS seam is more work than a port. **INFERRED** — confirm by reading
-`exercise_linux_relay_forwards_frame` fully before writing.
+**[REVIEW — M2, MAJOR]** Revision 1 asked for a `special` column templated per
+platform. `StageSpec.special` is `Option<&'static str>` — **one fixed column
+string** (`live_lab_stage_registry.rs:390`); every existing per-platform security
+column is a separate bash-dialect StageSpec. Also, only
+`linux_relay_forwards_frame` exists: `macos_` and `windows_` counterparts are
+**absent from `DEFAULT_MATRIX_COLUMNS`**. So I2 must (a) add the missing columns
+to `DEFAULT_MATRIX_COLUMNS`, and (b) pick **one** mechanism — three
+`direct_platform` specs, or the I1 artifact reader — not `special`. The schema
+change is loud, not silent (`every_registry_stage_column_reference_exists_in_the_csv_schema`
+fails), but it was unplanned work.
 
 ### I3 — nas and llm live stages (G1)
 
-Two role deployments and two validations, mirroring the relay pair:
+`deploy_nas_service` / `nas_validation`, `deploy_llm_service` / `llm_validation`,
+mirroring the relay pair. Validation asserts, per `SecurityMinimumBar` §6.E
+(E1–E4): **default-deny** reachability, **tunnel-only** exposure, and for `llm`
+the exit-coexistence guard. The default-deny assertion is primary and must be a
+**negative** test — proving refusal, not that the service answers.
 
-1. `deploy_nas_service` / `nas_validation`; `deploy_llm_service` /
-   `llm_validation`. StageIds, modules, registry entries, columns
-   `{platform}_stage_nas` / `_llm`.
-2. Validation asserts, per the roles' own security bar (`SecurityMinimumBar` §6.E,
-   E1–E4): **default-deny** reachability (an unauthorised peer is refused),
-   **tunnel-only** exposure (no LAN-bound listener), and for `llm` the
-   exit-coexistence guard.
-3. The default-deny assertion is the primary one and must be a **negative**
-   test — proving refusal, not merely proving the service answers.
+Same M2 correction applies: no `{platform}_stage_nas` / `_llm` column exists;
+adding them to `DEFAULT_MATRIX_COLUMNS` is part of the increment.
 
-**Acceptance:** with a nas (resp. llm) node elected, both stages run green on
-Linux; the default-deny assertion is shown to fail when the deny rule is removed
-(mutation-proven, per §0 of the 2026-08-07 handover — a green gate is not proof).
+Highest-effort increment. If the role cannot be elected by an existing selector,
+this also needs a topology selector, widening the change into the wrapper.
 
-**Risk:** highest-effort increment. If the role cannot be elected by an existing
-selector, this also needs a topology selector, which widens the change surface
-into the wrapper.
+### I4 — Make chaos / negative-control / soak actually dispatch (G4)
 
-### I4 — A suite profile that the 24/7 loop can select (G4)
+**Reordered by the review from "trivial" to "gated".** First establish why
+`live_mixed_topology_validation` has never passed — it has never been *attempted*,
+so step one is run-and-triage, not fix. Then either make it pass or re-parent the
+chaos dependency deliberately. Only then is a suite selector meaningful.
 
-Add a single selector that turns on chaos + negative-control + soak together for
-an unattended full run, so the autonomous loop has one thing to choose. No new
-stage code.
+Acceptance: a chaos report artifact with a non-skipped outcome. Not a plan
+listing.
 
-**Acceptance:** a dry-run plan at HEAD lists the nine chaos stages, the four
-negative-control stages and `extended_soak` as enabled.
+Note `SoakSuite` additionally ANDs with `!skip_linux_live_suite`
+(`live_lab_stage_registry.rs:329-331`), so a targeted mac/win run can never carry
+soak by design.
 
-**Risk:** low code risk, but the first real chaos dispatch in 106 runs will
-likely surface stage-level failures. That is the point; it must not be
-pre-emptively softened into a warning.
+### I5 — Generalise the artifact→column mechanism to the remaining ~25 columns
+
+**[REVIEW — M4]** I1 fixed the audit family by hand. The same root cause leaves
+roughly 25 further columns unreachable, `linux_key_custody` being the clearest
+(its report artifact is produced and the column still reads `not_run`). Either
+generalise the per-control artifact convention to every validator stage, or
+enumerate the remainder and map them individually. Do not leave this implicit —
+it is the difference between "the ledger under-reports one family" and "the
+ledger under-reports half the security surface".
 
 ## 4. Definition of done
 
@@ -286,16 +288,15 @@ Per §9 of the operating contract, and additionally:
 - No increment records a column as `pass` that a partial or skipped run produced
   (the QH-37 invariant, in both directions).
 - Every new stage names its `proves:` control IDs.
-- Each increment's claim is backed by a gate run **and**, for the security
-  assertions in I1–I3, a verified mutation: break the control, watch the stage go
-  red, restore it. Commit messages state the mutation that was actually run, not
-  one that was planned.
-- `documents/operations/active/README.md` updated in the same change.
+- Each increment's claim is backed by a gate run **and** a verified mutation:
+  break the control, watch the stage go red, restore it. Commit messages state
+  the mutation that was actually run, not one that was planned.
+- Doc indexes updated in the same change.
 
-## 5. What this plan explicitly does not close
+## 5. What this plan does not close
 
-Even fully executed, the following remain open and no increment here touches
-them: Windows has never bootstrapped on `--node`; `live_mixed_topology_validation`
-is 0-for-106 because it was never attempted; macOS exit/blind_exit/anchor have
-never been elected on `--node`. Those are run-and-triage work, not stage-authoring
-work, and they dominate the remaining distance to G2 parity.
+Even fully executed: Windows has never bootstrapped on `--node`;
+`live_mixed_topology_validation` is 0-for-106 because it was never attempted;
+macOS exit/blind_exit/anchor have never been elected on `--node`. Those are
+run-and-triage work, not stage-authoring work, and they dominate the remaining
+distance to G2 parity. I4 now depends on the second of them.
