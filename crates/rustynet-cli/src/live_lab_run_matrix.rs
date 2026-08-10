@@ -2140,14 +2140,39 @@ fn merge_status(existing: &str, next: &str) -> String {
     }
 }
 
+/// Precedence when several stages merge into one logical CSV column.
+///
+/// **`skip` outranks `pass` deliberately (QH-37).** Several stages share one
+/// column, and the merge keeps the highest rank, so a column is a summary of a
+/// SET. With `pass` on top, one passing stage hid any number of skipped ones:
+/// `linux_stage_cross_network` read `pass` on every run where 2 of its 11
+/// stages ran and 9 skipped, and `managed_dns` read `pass` on 44 runs where the
+/// bundle distribution passed while the actual DNS validation never executed.
+/// Measured across the committed ledger, not inferred. A partially-skipped set
+/// must not read green, for the same reason `fail` already dominates: the column
+/// is read as evidence that the thing was proven.
+///
+/// This is the aggregate-merge sibling of the alias contamination CLAUDE.md
+/// §12.3 warns about. It changes how historical rows are INTERPRETED, never the
+/// stored data — the committed rows remain evidence of what the tooling said at
+/// the time, and must not be retro-edited.
+///
+/// Known latent gap, deliberately NOT fixed here: `not_proven` — a node-scope
+/// fail that could not be attributed to a specific node (`:794`) — is not in
+/// `normalize_status`, so it falls to `unknown` (rank 2) and would also be
+/// masked by a pass. It co-occurs with `pass` in **zero** merged columns today,
+/// and closing it means changing `normalize_status`, which is also a WRITE path
+/// (`:1125`, `:1562`, `:1881`). That is a data-format change and does not belong
+/// bundled into this one. Recorded in QH-37.
 fn status_rank(status: &str) -> u8 {
     match normalize_status(status) {
         "fail" => 8,
         "timed_out" => 7,
         "aborted" => 6,
         "blocked" => 5,
-        "pass" => 4,
-        "skip" => 3,
+        // skip ABOVE pass — see the note above.
+        "skip" => 4,
+        "pass" => 3,
         "reused" => 2,
         "unknown" => 2,
         "not_run" => 1,
@@ -4596,11 +4621,58 @@ mod conclusion_barrier_tests {
         assert_eq!(normalize_status("aborted"), "aborted");
         assert_eq!(normalize_status("timed_out"), "timed_out");
         assert_eq!(normalize_status("timeout"), "timed_out");
-        // Worst-wins ordering: fail > timed_out > aborted > blocked > pass.
+        // Worst-wins ordering: fail > timed_out > aborted > blocked > skip > pass.
         assert!(status_rank("fail") > status_rank("timed_out"));
         assert!(status_rank("timed_out") > status_rank("aborted"));
         assert!(status_rank("aborted") > status_rank("blocked"));
-        assert!(status_rank("blocked") > status_rank("pass"));
+        assert!(status_rank("blocked") > status_rank("skip"));
+        assert!(status_rank("skip") > status_rank("pass"));
+    }
+
+    /// QH-37. A logical column summarises a SET of stages, so one pass must not
+    /// speak for stages that never ran.
+    #[test]
+    fn skip_outranks_pass_so_a_partially_skipped_column_never_reads_green() {
+        use super::merge_status;
+        assert_eq!(merge_status("pass", "skip"), "skip");
+        // Order-independent: the merge folds in arrival order, and a column that
+        // read green only because the passes happened to arrive last would be
+        // the same bug wearing a different hat.
+        assert_eq!(merge_status("skip", "pass"), "skip");
+    }
+
+    /// The exact shape that made this defect visible: `cross_network` has 11
+    /// contributing stages, of which only `cross_network_preflight` and
+    /// `cross_network_nat_classification` run on a single-network lab. Every
+    /// committed row showing `linux_stage_cross_network=pass` is this set.
+    #[test]
+    fn the_measured_cross_network_shape_folds_to_skip_not_pass() {
+        use super::merge_status;
+        let observed = [
+            "pass", "skip", "skip", "skip", "skip", "skip", "pass", "skip", "skip",
+        ];
+        let folded = observed.iter().fold(String::new(), |acc, next| {
+            if acc.is_empty() {
+                (*next).to_owned()
+            } else {
+                merge_status(&acc, next)
+            }
+        });
+        assert_eq!(
+            folded, "skip",
+            "2-of-11 must not render as a pass; that is what QH-37 records"
+        );
+    }
+
+    /// `fail` must still dominate everything, including the new skip rank —
+    /// raising skip must not accidentally let a partially-skipped set hide a
+    /// real failure.
+    #[test]
+    fn fail_still_dominates_skip_and_pass() {
+        use super::merge_status;
+        assert_eq!(merge_status("skip", "fail"), "fail");
+        assert_eq!(merge_status("fail", "skip"), "fail");
+        assert_eq!(merge_status("pass", "fail"), "fail");
     }
 
     #[test]
