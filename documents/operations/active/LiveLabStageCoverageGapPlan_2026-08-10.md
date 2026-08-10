@@ -215,11 +215,60 @@ sharpest available blocker and it does not land."
 desktop platforms — `reported_skips` populates only for iOS/Android, which have
 no columns. The implementation therefore does not emit `skip` at all.
 
-Evidence: 20 tests, and four mutations verified to discriminate —
-`Blocked→"pass"` (fails `a_blocked_audit_is_never_reported_as_a_pass`),
-dispatch-guard removed (fails `controls_are_ignored_when_the_stage_did_not_dispatch`),
-fail-fast restored (fails `every_audit_gets_a_verdict_even_when_the_first_one_fails`,
-1 verdict vs 8), single-row truncation (fails both column tests).
+**The implementation was itself adversarially reviewed** (`8de6f497` folds the
+result in). The review's flagged priority — whether recording a dispatch error as
+`blocked` is a fail-open downgrade of a real security failure — was **refuted,
+with proof**: `posix_run_argv` wraps the remote command as
+`set +e; …; rc=$?; printf 'CODE:%d\n' "$rc"`, so a non-zero exit from an audit
+returns `Ok(RemoteExitStatus { code })` and **never** `Err`. A daemon that runs
+and violates a control therefore reaches the typed evaluator and is recorded
+`Failed`; a missing daemon (rc=127) and a `sudo -n` refusal (rc=1) likewise. Only
+transport-level errors yield `Blocked`. Also confirmed under attack: `blocked`
+ranks 5, above `skip` 4 and `pass` 3; all 24 columns exist; no caller depended on
+fail-fast; `StageFanout::PerNode` does not re-execute the stage per node, so the
+single end-of-stage write cannot be clobbered; no secrets reach the artifact's
+`detail`; no `unwrap`/`expect` in the new production paths.
+
+Three majors did land and are fixed in `8de6f497`:
+
+1. **A stale artifact could green-wash a reused report directory.** The write was
+   guarded on a non-empty verdict list, so a rerun into the same report dir with
+   every node unreachable left the *previous* invocation's artifact for the
+   recorder to read as this run's evidence — `pass` for controls never exercised,
+   on a run whose stage failed. Report-dir reuse is a supported flow
+   (resume / rerun-stage / run-only). The write is now unconditional.
+2. **The tests did not discriminate the regression the change exists to prevent.**
+   The old loop fail-fasted on *both* a dispatch error and an evaluator
+   rejection; the run-all test used an unprogrammed mock, so all eight verdicts
+   were `Blocked` and a mutation that fail-fasts only on `Failed` **survived the
+   entire suite**. Now covered by `a_failing_audit_does_not_stop_the_remaining_seven`.
+3. **Run-all multiplied a dead host's cost eightfold** (180 s transport timeout
+   each, stage deadline opt-in). A host-level dispatch error now stops
+   re-dialling and marks the rest `Blocked` as not-attempted — same verdicts, one
+   timeout.
+
+Plus, from the same review: the reduction denies a short result set instead of
+reducing an empty one to `Ok`; `platform_tag` returns `Option` from an exhaustive
+match so a future platform cannot be charged to the linux columns; the evidence
+write is atomic and its failure fails the stage; the reader rejects an
+unrecognised `schema_version`; and the second stale doc comment — which
+`27e49d54`'s message wrongly claimed to have fixed — is fixed.
+
+Evidence: 30 tests, and **nine** mutations verified to discriminate. Original
+four: `Blocked→"pass"`, dispatch-guard removed, fail-fast restored (1 verdict vs
+8), single-row truncation. Post-review five: conditional write restored (fails
+`a_run_that_exercises_nothing_still_overwrites_a_stale_artifact`), fail-fast on
+`Failed` only (fails `a_failing_audit_does_not_stop_the_remaining_seven`, 1 vs 8 —
+**this is the mutation that previously survived**), schema gate removed, fail-open
+`_ => Some("linux")` platform default, host-level early-stop removed.
+
+**Still open from the review, not fixed here:** `blocked` is not in the lab
+monitor's `is_decisive` set (`rustynet-lab-monitor/src/data/run_matrix.rs:601`),
+so it is dropped from `total_stages` and renders as `NotRun` — an unexercised
+control currently makes the TUI's completion ratio look *better*, and the
+fail-vs-not-exercised distinction is invisible there. This change is `blocked`'s
+first writer into these columns, so the defect is newly reachable. That crate is
+workspace-excluded and gated separately (`./scripts/ci/lab_monitor_gates.sh`).
 
 ### I2 — Relay frame-forwarding stage on `--node` (G2)
 

@@ -598,11 +598,21 @@ pub fn load_recent_runs(repo_root: &Path, n: usize) -> Result<Vec<RunSummary>> {
             for (idx, col_name) in &stage_cols {
                 let v = row.get(*idx).unwrap_or("").trim();
                 let is_pass = v == "pass";
-                let is_decisive = matches!(v, "pass" | "fail" | "not_run" | "na" | "");
                 // Only "skip"/"skipped" -- the orchestrator itself deciding
                 // this doesn't apply to this run's topology/flags -- is
                 // excluded entirely; everything else counts toward total.
-                if !is_decisive {
+                //
+                // This was written as an ALLOW-list that omitted every status
+                // the recorder ranks above `skip`: blocked, aborted, timed_out,
+                // not_proven, reused, unknown. Those were dropped from the
+                // denominator, so a control that was attempted and did not
+                // demonstrate anything made the completion ratio look BETTER
+                // than a control that plainly failed. Inverted to the deny-list
+                // the comment always described. `blocked` in particular is now
+                // reachable: it is what the per-control security recorder writes
+                // for a control that could not be exercised.
+                let is_excluded = matches!(v, "skip" | "skipped");
+                if is_excluded {
                     continue;
                 }
                 total += 1;
@@ -758,11 +768,28 @@ pub fn load_sparklines(
                         .iter()
                         .filter_map(|col| header_index(col))
                         .filter_map(|idx| row.get(idx))
-                        .find(|v| matches!(*v, "pass" | "fail"))
+                        .find(|v| {
+                            matches!(
+                                *v,
+                                "pass"
+                                    | "fail"
+                                    | "blocked"
+                                    | "aborted"
+                                    | "timed_out"
+                                    | "not_proven"
+                            )
+                        })
                         .unwrap_or("");
                     match val {
                         "pass" => CellOutcome::Pass,
-                        "fail" => CellOutcome::Fail,
+                        // Not-green-and-attempted renders as Fail rather than
+                        // NotRun. None of these asserts a violation the way
+                        // `fail` does, but rendering them as NotRun hid a cell
+                        // that was reached and proved nothing behind the same
+                        // glyph as a cell that was never part of the run.
+                        "fail" | "blocked" | "aborted" | "timed_out" | "not_proven" => {
+                            CellOutcome::Fail
+                        }
                         _ => CellOutcome::NotRun,
                     }
                 })
@@ -1330,6 +1357,28 @@ mod tests {
         assert_eq!(runs[1].passed_stages, 3);
         assert_eq!(runs[1].total_stages, 3);
         assert_eq!(runs[1].last_passed_stage, "linux_stage_exit_handoff");
+    }
+
+    #[test]
+    fn a_blocked_stage_counts_against_the_ratio_rather_than_improving_it() {
+        // `blocked` means the control was attempted and demonstrated nothing.
+        // It was previously omitted from the allow-list that decided what
+        // counts, so it vanished from the denominator entirely and a run with
+        // a blocked control scored HIGHER than the same run with a failed one.
+        // Only skip is legitimately excluded.
+        let dir = tempfile::tempdir().unwrap();
+        write_matrix_csv(
+            dir.path(),
+            "run_id,overall_result,linux_stage_bootstrap,linux_policy_default_deny,\
+             linux_enrollment_replay\n\
+             run-1,fail,pass,blocked,skip\n",
+        );
+        let runs = load_recent_runs(dir.path(), 1).unwrap();
+        assert_eq!(runs[0].passed_stages, 1);
+        assert_eq!(
+            runs[0].total_stages, 2,
+            "blocked must stay in the denominator; only skip is excluded"
+        );
     }
 
     #[test]
