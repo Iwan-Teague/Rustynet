@@ -160,3 +160,101 @@ lets an empty string win, and watch the right test go red.
   actually ran.
 - The forward-only limitation is stated in the register **and** in the code comment, so a
   future reader does not treat pre-fix rows as chronological.
+
+---
+
+# REVISION 2 — adversarial review folded in (2026-08-10)
+
+Reviewed by four independent lenses plus a verifying judge. Verdict: **fit to implement
+after the MUST changes; no rethink from the premise.** Both halves of the premise were
+independently re-verified, the choice of "make it chronological" over "rename" was upheld,
+and no existing test pins the old rule. The defects were all in **scope and wiring**, not
+the thesis — but two of them would have shipped a regression.
+
+## The two that would have shipped a regression
+
+**M1 — C2's time merge was status-blind.** Proven on a real fixture:
+`artifacts/live_lab/20260411T190200Z_handoff_retry_working_tree/state/stages.tsv` has
+`live_role_switch_matrix` recorded three times — `pass@18:26:41Z`, `fail@18:34:52Z`,
+`fail@18:42:26Z`. C2 as written ("keep the earliest non-empty time") would merge to
+**`fail @ 18:26:41Z` — the start time of the attempt that PASSED**, and then name that stage
+as the run's first failure using a timestamp from a successful run. Mirroring the verifier
+at `:449-453` would have replicated the bug, because **the verifier has it too**.
+
+Corrected rule: **keep the earliest start among the records carrying the WINNING status.**
+Incrementally — if the incoming status outranks the existing, take the incoming time; if
+equal, take the earlier; if lower, keep the existing. On the fixture that yields
+`fail @ 18:34:52Z`, the start of the first genuinely failing attempt. Fix both sites.
+
+Engine divergence worth recording: `--node` upserts one row per stage
+(`live_lab_stage_recorder.rs:128-140`) so duplicates are a bash-arm artifact
+(`scripts/e2e/live_linux_lab_orchestrator.sh:1240-1248`). Corpus-wide there are exactly 2
+dirs with a duplicated stage name and exactly 1 with the hazardous pass-then-fail shape —
+rare, but it is the shape that produces a confidently wrong triage pointer.
+
+**M2 — C4 was simultaneously inert and dangerous.** `agreement_with_ledger_row`
+(`live_lab_evidence_verifier.rs:703-704`) **gates nothing**: `valid` at `:706` is
+`p41 && p42 && p45 && p46`, and `exit_code` (`:940-948`) reads only `valid`. Repo-wide, the
+field appears in the struct, its assignment, and one rendered line. So C4 as written adds a
+comparison nothing reads. Making it *enforce* is worse without scoping, because the ledger's
+evidence set is a strict **superset** of the verifier's — ledger reads tsv + orchestrate +
+`extra_stage_outcomes` + the barrier; the verifier reads tsv + orchestrate only
+(`:461-472`) — and `extra_stage_outcomes` carries real `fail` values in production
+(`vm_lab/mod.rs:30536-30538`). Ungated and enforcing would hard-fail correct runs.
+
+**C4 is therefore DEFERRED, not implemented.** Doing it properly means moving the comparison
+to a `p45`-style property check beside `:899-904` *and* gating it on provenance (the row's
+`git_commit`) so re-verifying a pre-fix row does not compare chronological against
+alphabetical. That is a second change with its own evidence burden. Implementing half of it
+is worse than none.
+
+## Corrections to this plan's own claims
+
+- **§2 was wrong about ORDER.** `orchestrate_result.json` carries no per-stage *time* but its
+  `outcomes` array is a sequential push (`vm_lab/mod.rs:994`, `:1084`) and therefore carries
+  execution **order** — verified across all 317 report dirs holding both artifacts, with
+  **0** violations against `stages.tsv` timestamps. Orchestrate-only failures are not
+  order-less; under this fix they remain **name-ordered**, and that residual is stated rather
+  than hidden.
+- **§1's impact claim replaced with measurement.** 90 of 106 rows populated (exact); 23 of
+  those have an absent local `report_dir` and 2 point at reused dirs. On the **65 replayable
+  failing rows the new rule changes 0 answers**, and the replayed alphabetical value matches
+  the stored value 65/65. Across all **517 failing report dirs on disk it changes 16** (3.1%),
+  of which **11** turn on the empty-last arm. So the case for this fix is §0's
+  divergence-by-construction argument, not a large measured delta — say so.
+- **§1's monitor citations were wrong.** `app.rs:71` and `:268` are `#[cfg(test)]` markers.
+  The live consumers are `app.rs:216-223` (`failing_section`, reached at `:1787`) and
+  `ui/prev_runs_panel.rs:91-92`.
+- **The alias question (C4's INFERRED tag) is settled: both sides carry the alias, comparing
+  raw is correct, and normalising would be a defect** that masks genuine future drift. Ledger
+  keeps `row[0]` verbatim (`:1561`, `:2370`); the verifier keys `merged` on the unstripped
+  name (`:442`, `:461-466`). Empirically 0 of 90 populated values contain `::`. The real
+  false-disagreement risk was never aliasing — it is the source-set asymmetry above.
+- **Premise confirmed host-side, with one caveat to record.** Exactly two writers of
+  `stages.tsv` exist and neither runs on a guest. But `unix_now()` is `SystemTime::now()`, so
+  an NTP step on the driving host mid-run makes `started_at` non-monotonic. The invariant is
+  "one host clock, assumed not to step" — not "UTC therefore fine."
+- **§4's stub deferral was right, its consumer list incomplete** — `earliest_stage_time` also
+  feeds `build_run_id` (`:1487`), the ledger's primary identifier. Rather than leave a stub
+  that C1 half-arms, **the dead stub is deleted and its always-`None` fallthrough inlined** —
+  a pure no-op refactor that removes the drift surface without touching
+  `run_started_utc` semantics.
+
+## Found in passing, filed not fixed
+
+- **The QH-37 rank fix was never mirrored.** `status_rank` ranks `skip`(4) above `pass`(3)
+  (`live_lab_run_matrix.rs:2267-2285`) while the verifier's `StatusClass::rank` ranks
+  `Pass`(4) above `Skip`(3) (`live_lab_evidence_verifier.rs:110-125`). `fdbdee18` touched one
+  file. The two engines therefore disagree on merge precedence one function away from the
+  code this plan edits — the same class of defect, unresolved.
+- **Most triage tooling reads the FROZEN bash archive, so this fix does not reach it:**
+  `lab_state.rs:2217/:2298/:6049`, `ai_agent.rs:1760/:4434`, `main.rs:4653`. Notably
+  `ai_agent.rs:1722-1732` **auto-selects the next lab cell** from this field and reads the
+  frozen file. Cross-row comparators exist at `run_history.rs:267` and
+  `lab_state.rs:3931-3941` (STUCK vs CHURNING), so a verdict spanning the boundary commit
+  should be discounted.
+
+## Scope actually implemented
+
+C1 (with the stub deleted), C2 corrected per M1 **at both sites**, C3, and C5 tests including
+the three-record pass/fail/fail fixture. **C4 deferred** with the reasons above.
