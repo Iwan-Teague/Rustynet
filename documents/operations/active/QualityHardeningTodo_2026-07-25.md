@@ -1588,7 +1588,7 @@ a one-line fix. A restart masks the gap, which is why it has not been noticed.
 
 ---
 
-### QH-37 — A logical CSV column merges its stages with `pass` outranking `skip`, so `linux_stage_cross_network=pass` has ALWAYS meant "2 of 11 ran"
+### QH-37 — RESOLVED `fdbdee18` — A logical CSV column merged its stages with `pass` outranking `skip`, so `linux_stage_cross_network=pass` had ALWAYS meant "2 of 11 ran"
 
 **Verified against `cfb7a87e` by direct count, not inference.** Same class as QH-07 (the
 `two_hop` alias contamination CLAUDE.md §12.3 warns about) — different column, still
@@ -1622,9 +1622,27 @@ on 2026-08-07 before catching it here.
 tests, no lab run. Do this BEFORE adding roles to un-skip stages: the result of that
 work is unreadable while the column can lie.
 
-**Caution for whoever fixes it:** flipping the rank will change historical rows'
-*interpretation*, not the stored data. Do not retro-edit the ledger; the committed rows
-are evidence of what the tooling said at the time.
+**Caution for whoever reads the history:** the fix changes how historical rows are
+*interpreted*, not the stored data. The committed rows were NOT retro-edited; they are
+evidence of what the tooling said at the time.
+
+**RESOLVED in `fdbdee18`.** `skip` now outranks `pass`; `fail` still dominates both,
+pinned by its own test. Blast radius measured BEFORE the change: **67 of 2944**
+run×column pairs change interpretation — 44 `managed_dns`, 12 `anchor`, 9
+`cross_network`, 1 `bootstrap`, 1 `exit_handoff`. Each was inspected and every one is a
+genuine false green, not a newly introduced false red: the 44 `managed_dns` cases are
+`distribute_dns_zone` **pass** + `live_managed_dns_validation` **skip**, i.e. the bundle
+was distributed while the validation never ran. Statuses that never co-occur with `pass`
+in a merged column (`not_run`, `reused`) were left alone — measured at 0 occurrences
+each.
+
+**Latent sibling, deliberately NOT fixed here.** `not_proven` — a node-scope fail that
+could not be attributed to a specific node (`live_lab_run_matrix.rs:794`) — is absent
+from `normalize_status`, so it falls to `unknown` (rank 2) and a `pass` would mask it.
+It co-occurs with `pass` in **zero** merged columns today, and closing it means editing
+`normalize_status`, which is also a WRITE path (`:1125`, `:1562`, `:1881`). That is a
+data-format change and was kept out of an evidence-integrity fix on purpose. Worth
+doing; worth doing separately, with its own measurement.
 
 ---
 
