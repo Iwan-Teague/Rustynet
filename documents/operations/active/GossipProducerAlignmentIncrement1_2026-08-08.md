@@ -179,6 +179,13 @@ unrelated reason.
 **Required probe before S9 is trusted:** on every lab macOS guest,
 `test -f /usr/local/var/rustynet/keys/gossip.signing.secret`.
 
+**PROBE RUN 2026-08-10 on `macos-utm-1` (macOS 26.5, arm64): ABSENT.** So the inertness
+claim holds for this guest and the risk is retired *for this lab*, not in general — the
+plist still gates on file existence, so any guest that has ever run `rustynet install`
+must be re-probed before its S9 result is trusted. Note the guest's inventory
+`ssh_target` was stale (`192.168.65.101`, a subnet that does not exist on this host);
+its real address is `192.168.64.18`, refreshed via `--update-inventory-live-ips`.
+
 This increment adds **no** platform filter to `gossip_peer_registrations_from_membership`
 (`gossip_runtime.rs:845-870` — no platform or capability term). It routes deferred
 platforms through an explicitly-spelled flag so the gap is greppable, and defers the
