@@ -441,16 +441,33 @@ pub fn verify(config: &VerifierConfig) -> Result<VerdictReport, String> {
             merged
                 .entry(stage.to_owned())
                 .and_modify(|existing| {
-                    if class.rank() >= existing.class.rank() {
+                    // QH-22 correction: the time must follow the STATUS, not be
+                    // chosen independently of it. Taking the earliest start
+                    // unconditionally attributes the winning status to the start
+                    // of a DIFFERENT attempt — proven on real data, where
+                    // `live_role_switch_matrix` is recorded pass@18:26:41Z,
+                    // fail@18:34:52Z, fail@18:42:26Z
+                    // (artifacts/live_lab/20260411T190200Z_handoff_retry_working_tree).
+                    // The old rule paired the merged `fail` with 18:26:41Z, the
+                    // start of the attempt that PASSED, and could then order that
+                    // stage ahead of the genuine root cause.
+                    //
+                    // So: a higher-ranking incoming status brings its own time; an
+                    // equal-ranking one takes the earlier of the two; a
+                    // lower-ranking one leaves the winner's time alone.
+                    let incoming_rank = class.rank();
+                    let existing_rank = existing.class.rank();
+                    if incoming_rank > existing_rank {
                         existing.class = class;
-                    }
-                    // Earliest recorded start wins, so a timestamp survives being
-                    // merged with a timestamp-less source (QH-22).
-                    if !started_at.is_empty()
-                        && (existing.started_at.is_empty()
-                            || started_at < existing.started_at.as_str())
-                    {
                         existing.started_at = started_at.to_owned();
+                    } else if incoming_rank == existing_rank {
+                        existing.class = class;
+                        if !started_at.is_empty()
+                            && (existing.started_at.is_empty()
+                                || started_at < existing.started_at.as_str())
+                        {
+                            existing.started_at = started_at.to_owned();
+                        }
                     }
                 })
                 .or_insert(MergedOutcome {

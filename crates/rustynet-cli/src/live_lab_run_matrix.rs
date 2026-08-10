@@ -394,6 +394,12 @@ struct StageEvidence {
     stage: String,
     status: String,
     artifacts: Vec<String>,
+    /// QH-22: stage start, host-side, from `stages.tsv` column 6. Empty for
+    /// the sources that carry no time (`orchestrate_result.json`,
+    /// `extra_stage_outcomes`, and the conclusion barrier's synthesized
+    /// outcomes). Fixed-width UTC (`YYYY-MM-DDTHH:MM:SSZ`), so lexical order
+    /// IS chronological order — see `first_failed_stage`.
+    started_at: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1123,6 +1129,8 @@ fn build_live_lab_run_matrix_values(
             .map(|outcome| StageEvidence {
                 stage: outcome.stage.clone(),
                 status: normalize_status(outcome.status.as_str()).to_owned(),
+                // No time on this source; sorts last among failures (QH-22).
+                started_at: String::new(),
                 artifacts: outcome.artifacts.clone(),
             }),
     );
@@ -1335,6 +1343,7 @@ fn apply_conclusion_barrier(
     {
         if !recorded.contains(planned.name.as_str()) {
             stages.push(StageEvidence {
+                started_at: String::new(),
                 stage: planned.name.clone(),
                 status: "aborted".to_owned(),
                 artifacts: Vec::new(),
@@ -1561,6 +1570,9 @@ fn read_stage_evidence(path: &Path) -> Result<Vec<StageEvidence>, String> {
             stage: row[0].clone(),
             status: normalize_status(row[2].as_str()).to_owned(),
             artifacts: vec![row[4].clone()],
+            // Column 6 is `started_at` (`live_lab_stage_recorder::to_tsv`);
+            // the `len() >= 8` filter above guarantees it is present.
+            started_at: row[6].clone(),
         })
         .collect())
 }
@@ -1605,6 +1617,7 @@ fn read_orchestrator_outcome_evidence(path: &Path) -> Result<Vec<StageEvidence>,
                 })
                 .unwrap_or_default();
             Some(StageEvidence {
+                started_at: String::new(),
                 stage,
                 status,
                 artifacts,
@@ -2313,6 +2326,7 @@ fn dedupe_stage_evidence(stages: &mut Vec<StageEvidence>) {
         by_stage
             .entry(stage.stage.clone())
             .and_modify(|existing| {
+                existing.started_at = merged_start_time(existing, &stage).unwrap_or_default();
                 existing.status = merge_status(existing.status.as_str(), stage.status.as_str());
                 existing.artifacts.extend(stage.artifacts.clone());
                 existing.artifacts.sort();
@@ -2321,6 +2335,44 @@ fn dedupe_stage_evidence(stages: &mut Vec<StageEvidence>) {
             .or_insert(stage);
     }
     stages.extend(by_stage.into_values());
+}
+
+/// The start time that belongs with the MERGED status of two records for the
+/// same stage — earliest start among the records carrying the *winning* status.
+///
+/// Taking the earliest time unconditionally is wrong, and not theoretically:
+/// `artifacts/live_lab/20260411T190200Z_handoff_retry_working_tree/state/stages.tsv`
+/// records `live_role_switch_matrix` three times — `pass@18:26:41Z`,
+/// `fail@18:34:52Z`, `fail@18:42:26Z`. The merged status is `fail`; the earliest
+/// time overall belongs to the attempt that PASSED. Pairing them would name the
+/// stage as the run's first failure using a timestamp from a successful run,
+/// and could order it ahead of the genuine root cause.
+///
+/// So the time follows the status: a higher-ranking incoming status carries its
+/// own time in, an equal-ranking one takes the earlier of the two, and a
+/// lower-ranking one leaves the winner's time alone.
+fn merged_start_time(existing: &StageEvidence, incoming: &StageEvidence) -> Option<String> {
+    let existing_rank = status_rank(existing.status.as_str());
+    let incoming_rank = status_rank(incoming.status.as_str());
+    let pick = match incoming_rank.cmp(&existing_rank) {
+        std::cmp::Ordering::Greater => incoming.started_at.clone(),
+        std::cmp::Ordering::Less => existing.started_at.clone(),
+        std::cmp::Ordering::Equal => {
+            earlier_non_empty(existing.started_at.as_str(), incoming.started_at.as_str())
+        }
+    };
+    (!pick.is_empty()).then_some(pick)
+}
+
+/// Earlier of two fixed-width UTC stamps, treating empty as "no information"
+/// rather than as an early time.
+fn earlier_non_empty(a: &str, b: &str) -> String {
+    match (a.trim().is_empty(), b.trim().is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => b.to_owned(),
+        (false, true) => a.to_owned(),
+        (false, false) => a.min(b).to_owned(),
+    }
 }
 
 fn overall_result(report_state: &Option<Value>, stages: &[StageEvidence]) -> String {
@@ -2363,10 +2415,41 @@ fn overall_result(report_state: &Option<Value>, stages: &[StageEvidence]) -> Str
     }
 }
 
+/// The run's first failure, in CHRONOLOGICAL order (QH-22).
+///
+/// This used to be `.find(|s| s.status == "fail")` over a vec that
+/// `dedupe_stage_evidence` rebuilt from a `BTreeMap`, i.e. the ALPHABETICALLY
+/// first failure, under a name that reads as chronological. It named `cleanup`
+/// — a downstream artifact-collector bug — on a run whose actual root cause was
+/// `preflight` failing four seconds earlier, and triage started at the wrong
+/// stage.
+///
+/// The key matches `live_lab_evidence_verifier`'s (equal fail-set, verified):
+/// an empty `started_at` sorts LAST, so a stage carrying no time can never
+/// outrank one that does; ties fall back to the name, which keeps the result
+/// deterministic and — when two stages share a second — reproduces the old
+/// alphabetical answer exactly.
+///
+/// Lexical comparison is chronological ONLY because every producer emits
+/// fixed-width UTC (`iso8601_utc_from_unix`, unconditional 20 chars). Verified
+/// across the corpus: 12,016 of 12,016 non-empty stamps conform, and no `fail`
+/// row has an empty one. A producer that ever emitted an offset or local time
+/// would break this silently.
+///
+/// The clock is the DRIVING HOST's, never a guest's, so guest clock skew cannot
+/// reorder this. The remaining assumption is that the host clock does not step
+/// mid-run (`unix_now` is `SystemTime::now`).
 fn first_failed_stage(stages: &[StageEvidence]) -> Option<String> {
     stages
         .iter()
-        .find(|stage| stage.status == "fail")
+        .filter(|stage| stage.status == "fail")
+        .min_by(|a, b| {
+            a.started_at
+                .is_empty()
+                .cmp(&b.started_at.is_empty())
+                .then_with(|| a.started_at.cmp(&b.started_at))
+                .then_with(|| a.stage.cmp(&b.stage))
+        })
         .map(|stage| stage.stage.clone())
 }
 
@@ -2411,6 +2494,18 @@ fn earliest_stage_time(
     })
 }
 
+/// DELIBERATELY INERT — always `None`, so both callers fall back to their own
+/// path (`earliest_stage_time` re-reads `stages.tsv`; `build_run_id` stamps
+/// `unix_now`).
+///
+/// QH-22 gave `StageEvidence` a `started_at`, which makes this implementable
+/// for the first time. It is still not implemented, on purpose: it feeds
+/// `run_started_utc` / `run_finished_utc` — the ledger's upsert key AND the
+/// verifier's row-lookup key — and `build_run_id`, the ledger's primary
+/// identifier, whose stamp would change shape from a unix second count to a
+/// compacted UTC string. Every existing `run_id` has the former shape. That is
+/// a separate behavioural change with its own evidence burden; do not fold it
+/// into a triage-ordering fix.
 fn earliest_stage_time_from_rows(_stages: &[StageEvidence], _started: bool) -> Option<String> {
     None
 }
@@ -3157,6 +3252,7 @@ mod tests {
             report_dir.path(),
             &targets,
             &[StageEvidence {
+                started_at: String::new(),
                 stage: "validate_windows_role_transition".to_owned(),
                 status: "pass".to_owned(),
                 artifacts: Vec::new(),
@@ -3177,6 +3273,7 @@ mod tests {
             report_dir.path(),
             &targets,
             &[StageEvidence {
+                started_at: String::new(),
                 stage: "validate_macos_role_transition".to_owned(),
                 status: "fail".to_owned(),
                 artifacts: Vec::new(),
@@ -3347,6 +3444,7 @@ mod tests {
         ]
         .into_iter()
         .map(|stage| StageEvidence {
+            started_at: String::new(),
             stage: stage.to_owned(),
             status: "pass".to_owned(),
             artifacts: Vec::new(),
@@ -3367,6 +3465,7 @@ mod tests {
             .collect();
         let mut values = BTreeMap::new();
         let stages = [StageEvidence {
+            started_at: String::new(),
             stage: "validate_macos_blind_exit".to_owned(),
             status: "pass".to_owned(),
             artifacts: Vec::new(),
@@ -3396,6 +3495,7 @@ mod tests {
             bootstrap_role: "relay".to_owned(),
         }];
         let baseline = [StageEvidence {
+            started_at: String::new(),
             stage: "validate_baseline_runtime".to_owned(),
             status: "pass".to_owned(),
             artifacts: Vec::new(),
@@ -3406,6 +3506,7 @@ mod tests {
         assert_eq!(values.get("linux_client"), None);
 
         let role_proof = [StageEvidence {
+            started_at: String::new(),
             stage: "relay_validation".to_owned(),
             status: "pass".to_owned(),
             artifacts: Vec::new(),
@@ -4557,6 +4658,7 @@ mod conclusion_barrier_tests {
 
     fn evidence(stage: &str, status: &str) -> StageEvidence {
         StageEvidence {
+            started_at: String::new(),
             stage: stage.to_owned(),
             status: status.to_owned(),
             artifacts: Vec::new(),
@@ -5040,11 +5142,13 @@ mod conclusion_barrier_tests {
     use std::path::Path as StdPath;
 
     use crate::live_lab_run_matrix::{
-        DEFAULT_MATRIX_COLUMNS, populate_security_audit_control_values,
+        DEFAULT_MATRIX_COLUMNS, dedupe_stage_evidence, first_failed_stage,
+        populate_security_audit_control_values,
     };
 
     fn security_audit_stage(status: &str) -> Vec<StageEvidence> {
         vec![StageEvidence {
+            started_at: String::new(),
             stage: "security_audit_validation".to_owned(),
             status: status.to_owned(),
             artifacts: Vec::new(),
@@ -5208,6 +5312,117 @@ mod conclusion_barrier_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    fn ev(stage: &str, status: &str, started_at: &str) -> StageEvidence {
+        StageEvidence {
+            stage: stage.to_owned(),
+            status: status.to_owned(),
+            artifacts: Vec::new(),
+            started_at: started_at.to_owned(),
+        }
+    }
+
+    #[test]
+    fn first_failed_stage_is_chronological_not_alphabetical() {
+        // The documented misdirection: `cleanup` (a downstream artifact-collector
+        // bug) was named while `preflight` had failed four seconds earlier, so
+        // triage started at the wrong stage. Alphabetically `cleanup` wins;
+        // chronologically `preflight` does.
+        let stages = [
+            ev("cleanup", "fail", "2026-07-25T18:52:23Z"),
+            ev("preflight", "fail", "2026-07-25T18:52:19Z"),
+        ];
+        assert_eq!(
+            first_failed_stage(&stages).as_deref(),
+            Some("preflight"),
+            "the EARLIER failure must be named, not the alphabetically first"
+        );
+    }
+
+    #[test]
+    fn a_timestamped_failure_outranks_an_untimestamped_one() {
+        // Sources without a time (orchestrate_result.json, extra_stage_outcomes)
+        // must never outrank a stage that actually recorded one, regardless of
+        // name order.
+        let stages = [
+            ev("aaa_no_time", "fail", ""),
+            ev("zzz_timed", "fail", "2026-07-25T18:52:19Z"),
+        ];
+        assert_eq!(
+            first_failed_stage(&stages).as_deref(),
+            Some("zzz_timed"),
+            "an empty started_at must sort LAST, not first"
+        );
+    }
+
+    #[test]
+    fn untimestamped_failures_fall_back_to_a_deterministic_name_order() {
+        let stages = [ev("zzz", "fail", ""), ev("aaa", "fail", "")];
+        assert_eq!(first_failed_stage(&stages).as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn a_same_second_tie_is_deterministic_and_matches_the_old_answer() {
+        // Stamps are 1-second granularity, so ties are possible. The name
+        // tiebreak keeps the result stable AND reproduces the previous
+        // alphabetical answer exactly when times are equal.
+        let stages = [
+            ev("zzz", "fail", "2026-07-25T18:52:19Z"),
+            ev("aaa", "fail", "2026-07-25T18:52:19Z"),
+        ];
+        assert_eq!(first_failed_stage(&stages).as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn passing_stages_are_never_selected_however_early() {
+        let stages = [
+            ev("early_pass", "pass", "2026-07-25T18:00:00Z"),
+            ev("late_fail", "fail", "2026-07-25T19:00:00Z"),
+        ];
+        assert_eq!(first_failed_stage(&stages).as_deref(), Some("late_fail"));
+        assert_eq!(first_failed_stage(&[ev("ok", "pass", "")]), None);
+    }
+
+    #[test]
+    fn dedupe_pairs_the_merged_status_with_the_winning_attempts_start() {
+        // Real fixture, byte-for-byte from
+        // artifacts/live_lab/20260411T190200Z_handoff_retry_working_tree/state/stages.tsv:
+        // the same stage recorded pass, then fail, then fail. Taking the earliest
+        // time unconditionally pairs the merged `fail` with 18:26:41Z -- the start
+        // of the attempt that PASSED.
+        let mut stages = vec![
+            ev("live_role_switch_matrix", "pass", "2026-04-11T18:26:41Z"),
+            ev("live_role_switch_matrix", "fail", "2026-04-11T18:34:52Z"),
+            ev("live_role_switch_matrix", "fail", "2026-04-11T18:42:26Z"),
+        ];
+        dedupe_stage_evidence(&mut stages);
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].status, "fail");
+        assert_eq!(
+            stages[0].started_at, "2026-04-11T18:34:52Z",
+            "the merged fail must carry the first FAILING attempt's start, \
+             never the passing attempt's"
+        );
+    }
+
+    #[test]
+    fn dedupe_keeps_the_earlier_start_among_equal_status_records() {
+        let mut stages = vec![
+            ev("s", "fail", "2026-04-11T18:42:26Z"),
+            ev("s", "fail", "2026-04-11T18:34:52Z"),
+        ];
+        dedupe_stage_evidence(&mut stages);
+        assert_eq!(stages[0].started_at, "2026-04-11T18:34:52Z");
+    }
+
+    #[test]
+    fn dedupe_does_not_let_a_timestampless_source_erase_a_real_start() {
+        // orchestrate_result.json and extra_stage_outcomes carry no time. Merging
+        // one in must not blank a start the TSV recorded.
+        let mut stages = vec![ev("s", "fail", "2026-04-11T18:34:52Z"), ev("s", "fail", "")];
+        dedupe_stage_evidence(&mut stages);
+        assert_eq!(stages[0].started_at, "2026-04-11T18:34:52Z");
+    }
+
     #[test]
     fn a_skip_cascaded_stage_does_not_ingest_a_previous_invocations_artifact() {
         // The stage skip-cascades when a dependency skips. Its `execute` never
@@ -5250,6 +5465,7 @@ mod conclusion_barrier_tests {
             ]),
         );
         let other = vec![StageEvidence {
+            started_at: String::new(),
             stage: "cleanup".to_owned(),
             status: "pass".to_owned(),
             artifacts: Vec::new(),
