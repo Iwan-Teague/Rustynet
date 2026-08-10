@@ -2167,6 +2167,9 @@ fn merge_status(existing: &str, next: &str) -> String {
 fn status_rank(status: &str) -> u8 {
     match normalize_status(status) {
         "fail" => 8,
+        // Same rank as `fail`: it is a failure that could not be pinned on a
+        // specific node, so it must never be outranked by a pass.
+        "not_proven" => 8,
         "timed_out" => 7,
         "aborted" => 6,
         "blocked" => 5,
@@ -2186,6 +2189,11 @@ fn normalize_status(status: &str) -> &str {
         "passed" | "pass" | "success" | "succeeded" => "pass",
         "failed" | "fail" | "error" => "fail",
         "skipped" | "skip" => "skip",
+        // Written by `attributable_node_status` into the PER-NODE ledger: a
+        // node-scope fail whose summary does not name this alias, so the run
+        // failed but this node cannot be blamed for it. Recognised here so it
+        // survives as itself rather than degrading to `unknown`.
+        "not_proven" => "not_proven",
         "reused" | "reuse" => "reused",
         "blocked" => "blocked",
         // Finding 3: the conclusion barrier's terminal states — a planned
@@ -4673,6 +4681,29 @@ mod conclusion_barrier_tests {
         assert_eq!(merge_status("skip", "fail"), "fail");
         assert_eq!(merge_status("fail", "skip"), "fail");
         assert_eq!(merge_status("pass", "fail"), "fail");
+    }
+
+    /// `not_proven` is a fail that could not be pinned on a specific node.
+    ///
+    /// It is written ONLY into the per-node ledger today
+    /// (`attributable_node_status`, whose single production caller is
+    /// `write_node_stage_result_ledgers`), so it never reaches this merge — I
+    /// measured 0 occurrences in the run-matrix CSV against 74 in the per-stage
+    /// CSV. This pins the behaviour anyway, so that if a later change ever does
+    /// route it here it fails closed instead of silently degrading to `unknown`
+    /// (rank 2) and being outranked by a pass.
+    #[test]
+    fn not_proven_is_ranked_with_fail_and_survives_normalisation() {
+        use super::{merge_status, normalize_status, status_rank};
+        assert_eq!(
+            normalize_status("not_proven"),
+            "not_proven",
+            "must not degrade to `unknown`; it is a failure, not an unrecognised token"
+        );
+        assert_eq!(status_rank("not_proven"), status_rank("fail"));
+        assert_eq!(merge_status("pass", "not_proven"), "not_proven");
+        assert_eq!(merge_status("not_proven", "pass"), "not_proven");
+        assert_eq!(merge_status("skip", "not_proven"), "not_proven");
     }
 
     #[test]
