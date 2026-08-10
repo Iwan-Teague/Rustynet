@@ -70,7 +70,14 @@ largest unbuilt items.
    ever executed this stage in a recorded run: the run cited as proof
    (`gossip-convergence-stage-20260809`) had two Debian nodes and nothing else.
    Revision 1 stated this as "executes on Linux, macOS and Windows", which
-   overclaims. The review also found **two doc comments asserting the opposite of
+   overclaims — **but revision 2's correction over-corrected.** Measured
+   2026-08-10 across the run artifacts: **macOS HAS executed this stage and
+   passed** (run `live-lab-direct-1784500192`, 2026-07-19, five Linux nodes plus
+   one macOS, `security_audit_validation = pass`, no `reported_skips.json` — and
+   `outcome_for` forces `Skipped` if any node is reported-skipped, so the macOS
+   node was genuinely audited). **Windows** is the platform that has never
+   reached this stage. Consequence for sequencing: adding the macOS guest to the
+   next re-baseline closes **16 of 24** per-control columns, not 8. The review also found **two doc comments asserting the opposite of
    their own code** — both claimed macOS/Windows are reported-skipped on a gate
    that has admitted all three since `6429a872`. Both corrected in `27e49d54`.
 2. The formerly-inert chaos scaffolds are **implemented** and the `--node` engine

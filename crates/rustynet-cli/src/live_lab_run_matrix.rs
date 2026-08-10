@@ -1957,9 +1957,21 @@ fn populate_security_audit_control_values(
     report_dir: &Path,
     stages: &[StageEvidence],
 ) {
-    let dispatched = stages
-        .iter()
-        .any(|stage| strip_node_alias_prefix(stage.stage.as_str()) == "security_audit_validation");
+    // The stage must be present AND actually dispatched. Presence alone is not
+    // enough: a skip-cascaded stage still appears in `stages.tsv` with status
+    // `skipped`, and its `execute` never runs, so it never rewrites the
+    // artifact. On a reused report directory (resume / rerun-stage / run-only)
+    // a name-only guard would then read the PREVIOUS invocation's artifact as
+    // this run's evidence and record `pass` for controls this run never
+    // exercised. Same green-washing failure as the conditional write, reached
+    // by a different door.
+    let dispatched = stages.iter().any(|stage| {
+        strip_node_alias_prefix(stage.stage.as_str()) == "security_audit_validation"
+            && matches!(
+                normalize_status(stage.status.as_str()),
+                "pass" | "fail" | "blocked" | "aborted" | "timed_out" | "not_proven"
+            )
+    });
     if !dispatched {
         return;
     }
@@ -5193,6 +5205,36 @@ mod conclusion_barrier_tests {
         )
         .expect("write");
         assert!(control_values(&root, &security_audit_stage("fail")).is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_skip_cascaded_stage_does_not_ingest_a_previous_invocations_artifact() {
+        // The stage skip-cascades when a dependency skips. Its `execute` never
+        // runs, so it never rewrites the artifact -- but the stage name IS still
+        // present in stages.tsv with status `skipped`. On a reused report dir a
+        // name-only guard would read the prior invocation's artifact as this
+        // run's evidence and record `pass` for controls never exercised.
+        let root = temp_report_dir("sec-audit-skip-cascade");
+        write_per_control(
+            &root,
+            serde_json::json!([
+                {"alias": "deb-1", "platform": "linux", "audit_id": "policy_default_deny", "status": "pass"},
+            ]),
+        );
+        for status in ["skip", "skipped", "not_run"] {
+            assert!(
+                control_values(&root, &security_audit_stage(status)).is_empty(),
+                "a `{status}` stage must not ingest a stale artifact"
+            );
+        }
+        // A stage that really did dispatch still ingests normally.
+        assert_eq!(
+            control_values(&root, &security_audit_stage("fail"))
+                .get("linux_policy_default_deny")
+                .map(String::as_str),
+            Some("pass")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
