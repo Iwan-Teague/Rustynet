@@ -6,13 +6,19 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::security_audit::{
-    security_audit_runtime_implemented, validate_linux_security_audits,
+    AuditResult, run_security_audits, security_audit_runtime_implemented, security_audits_ok,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const WINDOWS_RUSTYNETD_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
 
 const REPORTED_SKIPS_FILENAME: &str = "security_audit_validation.reported_skips.json";
+
+/// Per-control evidence artifact. The run-matrix recorder reads this to
+/// populate the twenty-four `{platform}_{audit_id}` security columns, which the
+/// aggregate stage outcome alone cannot address — one stage status cannot carry
+/// eight independent control verdicts.
+pub const PER_CONTROL_FILENAME: &str = "security_audit_validation.per_control.json";
 
 /// Prove every node's daemon passes the eight Tier-0 adversarial self-audits —
 /// membership-revoke, revoked-peer-denied, membership-signature,
@@ -56,6 +62,8 @@ impl OrchestrationStage for SecurityAuditValidationStage {
         }
 
         let mut failures: Vec<String> = Vec::new();
+        // (alias, platform tag, per-audit verdicts) for the per-control artifact.
+        let mut per_control: Vec<(String, &'static str, Vec<AuditResult>)> = Vec::new();
         // (alias, platform) reported-skipped because security-audit validation is
         // not yet live-supported on their platform via the Rust engine.
         let mut reported_skips: Vec<(String, String)> = Vec::new();
@@ -88,13 +96,18 @@ impl OrchestrationStage for SecurityAuditValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_linux_security_audits(&*shell, daemon_path, alias) {
+            let results = run_security_audits(&*shell, daemon_path, alias);
+            if let Err(e) = security_audits_ok(&results) {
                 failures.push(format!("{alias}: {e}"));
             }
+            per_control.push((alias.clone(), platform_tag(platform), results));
         }
 
         if !reported_skips.is_empty() {
             write_reported_skips_note(ctx, &reported_skips);
+        }
+        if !per_control.is_empty() {
+            write_per_control_evidence(ctx, &per_control);
         }
         outcome_for(&failures, &reported_skips)
     }
@@ -132,6 +145,48 @@ fn write_reported_skips_note(ctx: &OrchestrationContext, reported_skips: &[(Stri
     let _ = std::fs::write(&path, reported_skips_json_bytes(reported_skips));
 }
 
+/// The run-matrix column prefix for a platform. Only the three desktop
+/// platforms have security columns; anything else is reported-skipped before
+/// this is reached, so it never contributes a row.
+fn platform_tag(platform: VmGuestPlatform) -> &'static str {
+    match platform {
+        VmGuestPlatform::Macos => "macos",
+        VmGuestPlatform::Windows => "windows",
+        _ => "linux",
+    }
+}
+
+fn per_control_json_bytes(rows: &[(String, &'static str, Vec<AuditResult>)]) -> Vec<u8> {
+    let controls: Vec<serde_json::Value> = rows
+        .iter()
+        .flat_map(|(alias, platform, results)| {
+            results.iter().map(move |result| {
+                serde_json::json!({
+                    "alias": alias,
+                    "platform": platform,
+                    "audit_id": result.audit_id,
+                    "status": result.verdict.matrix_status(),
+                    "detail": result.verdict.detail().unwrap_or_default(),
+                })
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "stage": "security_audit_validation",
+        "schema_version": 1,
+        "controls": controls,
+    });
+    serde_json::to_vec_pretty(&body).unwrap_or_default()
+}
+
+fn write_per_control_evidence(
+    ctx: &OrchestrationContext,
+    rows: &[(String, &'static str, Vec<AuditResult>)],
+) {
+    let path = ctx.report_dir.join(PER_CONTROL_FILENAME);
+    let _ = std::fs::write(&path, per_control_json_bytes(rows));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +213,97 @@ mod tests {
             ),
             StageOutcome::Failed(_)
         ));
+    }
+
+    use crate::vm_lab::orchestrator::role_validation::security_audit::{
+        AuditResult, AuditVerdict, LINUX_SECURITY_AUDITS,
+    };
+
+    fn results(verdicts: &[(&'static str, AuditVerdict)]) -> Vec<AuditResult> {
+        verdicts
+            .iter()
+            .map(|(audit_id, verdict)| AuditResult {
+                audit_id,
+                verdict: verdict.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn per_control_artifact_carries_one_row_per_audit_per_node() {
+        let rows = vec![
+            (
+                "deb-1".to_string(),
+                "linux",
+                results(&[
+                    ("policy_default_deny", AuditVerdict::Passed),
+                    ("enrollment_replay", AuditVerdict::Passed),
+                ]),
+            ),
+            (
+                "mac-1".to_string(),
+                "macos",
+                results(&[("policy_default_deny", AuditVerdict::Passed)]),
+            ),
+        ];
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&per_control_json_bytes(&rows)).expect("valid json");
+        let controls = parsed["controls"].as_array().expect("controls array");
+        assert_eq!(controls.len(), 3);
+        assert_eq!(controls[0]["platform"], "linux");
+        assert_eq!(controls[0]["audit_id"], "policy_default_deny");
+        assert_eq!(controls[0]["status"], "pass");
+        assert_eq!(controls[2]["platform"], "macos");
+    }
+
+    #[test]
+    fn per_control_artifact_distinguishes_failed_from_blocked() {
+        let rows = vec![(
+            "deb-1".to_string(),
+            "linux",
+            results(&[
+                (
+                    "policy_default_deny",
+                    AuditVerdict::Failed("violation observed".into()),
+                ),
+                (
+                    "enrollment_replay",
+                    AuditVerdict::Blocked("dispatch failed".into()),
+                ),
+            ]),
+        )];
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&per_control_json_bytes(&rows)).expect("valid json");
+        let controls = parsed["controls"].as_array().expect("controls array");
+        assert_eq!(controls[0]["status"], "fail");
+        assert_eq!(controls[1]["status"], "blocked");
+        // The detail must survive: a bare status cannot be triaged.
+        assert_eq!(controls[1]["detail"], "dispatch failed");
+    }
+
+    #[test]
+    fn every_audit_id_matches_a_real_run_matrix_column_on_every_desktop_platform() {
+        // The whole point of the artifact is that `{platform}_{audit_id}`
+        // addresses a real column. If a label drifts, the recorder silently
+        // drops the row (set_status ignores unknown keys) and the control goes
+        // back to reading `not_run` — the exact defect this closes.
+        let schema: Vec<&str> = crate::live_lab_run_matrix::DEFAULT_MATRIX_COLUMNS.to_vec();
+        for (label, _, _) in LINUX_SECURITY_AUDITS {
+            for platform in ["linux", "macos", "windows"] {
+                let column = format!("{platform}_{label}");
+                assert!(
+                    schema.contains(&column.as_str()),
+                    "no run-matrix column `{column}` for audit `{label}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn platform_tag_maps_the_three_desktop_platforms() {
+        assert_eq!(platform_tag(VmGuestPlatform::Linux), "linux");
+        assert_eq!(platform_tag(VmGuestPlatform::Macos), "macos");
+        assert_eq!(platform_tag(VmGuestPlatform::Windows), "windows");
     }
 
     #[test]

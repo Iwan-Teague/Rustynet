@@ -38,7 +38,7 @@ const NODE_STAGE_COLUMNS: &[&str] = &[
     "error_detail",
 ];
 
-const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
+pub(crate) const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "run_id",
     "run_started_utc",
     "run_finished_utc",
@@ -1933,6 +1933,77 @@ fn populate_stage_values(
         let unaliased = strip_node_alias_prefix(stage.stage.as_str());
         set_special_stage_values(values, schema, fallback_platform, unaliased, status);
     }
+
+    populate_security_audit_control_values(values, schema, report_dir, stages);
+}
+
+/// Populate the twenty-four `{platform}_{audit_id}` security columns from the
+/// `security_audit_validation` stage's per-control artifact.
+///
+/// The aggregate stage status cannot address these columns — one status cannot
+/// carry eight independent control verdicts — so on the `--node` engine they sat
+/// at `not_run` for every recorded run even while the controls were being
+/// exercised and passing. A column is written ONLY from a real per-control
+/// verdict; a platform with no node in the run is never written at all, so it
+/// keeps its `not_run` default, which is then the truth rather than an artefact.
+///
+/// Multi-node resolution is [`set_status`]'s existing worst-wins merge: `fail`
+/// and `blocked` both outrank `pass`, so one node failing a control, or one node
+/// on which the control could not be exercised, prevents that platform's column
+/// from reading green.
+fn populate_security_audit_control_values(
+    values: &mut BTreeMap<String, String>,
+    schema: &BTreeSet<String>,
+    report_dir: &Path,
+    stages: &[StageEvidence],
+) {
+    let dispatched = stages
+        .iter()
+        .any(|stage| strip_node_alias_prefix(stage.stage.as_str()) == "security_audit_validation");
+    if !dispatched {
+        return;
+    }
+    for control in read_security_audit_controls(report_dir) {
+        set_status(
+            values,
+            schema,
+            format!("{}_{}", control.platform, control.audit_id).as_str(),
+            control.status.as_str(),
+        );
+    }
+}
+
+struct SecurityAuditControl {
+    platform: String,
+    audit_id: String,
+    status: String,
+}
+
+/// Read the per-control artifact. A missing, unreadable, or malformed file
+/// yields no rows: the columns then stay at their `not_run` default rather than
+/// inheriting a guessed status. Rows missing any of the three required fields
+/// are dropped individually for the same reason.
+fn read_security_audit_controls(report_dir: &Path) -> Vec<SecurityAuditControl> {
+    let path = report_dir.join("security_audit_validation.per_control.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(controls) = parsed.get("controls").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    controls
+        .iter()
+        .filter_map(|entry| {
+            Some(SecurityAuditControl {
+                platform: entry.get("platform")?.as_str()?.to_owned(),
+                audit_id: entry.get("audit_id")?.as_str()?.to_owned(),
+                status: entry.get("status")?.as_str()?.to_owned(),
+            })
+        })
+        .collect()
 }
 
 fn populate_role_result_values(
@@ -4933,6 +5004,148 @@ mod conclusion_barrier_tests {
         let body = std::fs::read_to_string(&path).expect("node-stage CSV");
         assert_eq!(body.lines().count(), 2, "header + one replacement row");
         assert!(body.contains("rocky-utm-1") && body.contains(",pass,"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    use std::collections::BTreeSet;
+    use std::path::Path as StdPath;
+
+    use crate::live_lab_run_matrix::{
+        DEFAULT_MATRIX_COLUMNS, populate_security_audit_control_values,
+    };
+
+    fn security_audit_stage(status: &str) -> Vec<StageEvidence> {
+        vec![StageEvidence {
+            stage: "security_audit_validation".to_owned(),
+            status: status.to_owned(),
+            artifacts: Vec::new(),
+        }]
+    }
+
+    fn write_per_control(dir: &StdPath, controls: serde_json::Value) {
+        std::fs::write(
+            dir.join("security_audit_validation.per_control.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "stage": "security_audit_validation",
+                "schema_version": 1,
+                "controls": controls,
+            }))
+            .expect("serialize"),
+        )
+        .expect("write per-control artifact");
+    }
+
+    fn control_values(dir: &StdPath, stages: &[StageEvidence]) -> BTreeMap<String, String> {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        populate_security_audit_control_values(&mut values, &schema, dir, stages);
+        values
+    }
+
+    #[test]
+    fn per_control_artifact_populates_the_platform_security_columns() {
+        let root = temp_report_dir("sec-audit-controls");
+        write_per_control(
+            &root,
+            serde_json::json!([
+                {"alias": "deb-1", "platform": "linux", "audit_id": "policy_default_deny", "status": "pass"},
+                {"alias": "deb-1", "platform": "linux", "audit_id": "enrollment_replay", "status": "pass"},
+            ]),
+        );
+        let values = control_values(&root, &security_audit_stage("pass"));
+        assert_eq!(
+            values.get("linux_policy_default_deny").map(String::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            values.get("linux_enrollment_replay").map(String::as_str),
+            Some("pass")
+        );
+        // A platform with no node in the run is never written, so it keeps its
+        // `not_run` default rather than inheriting another platform's verdict.
+        assert!(!values.contains_key("macos_policy_default_deny"));
+        assert!(!values.contains_key("windows_policy_default_deny"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn one_failing_node_prevents_its_platform_column_reading_green() {
+        let root = temp_report_dir("sec-audit-worst-wins");
+        write_per_control(
+            &root,
+            serde_json::json!([
+                {"alias": "deb-1", "platform": "linux", "audit_id": "policy_default_deny", "status": "pass"},
+                {"alias": "deb-2", "platform": "linux", "audit_id": "policy_default_deny", "status": "fail"},
+            ]),
+        );
+        let values = control_values(&root, &security_audit_stage("fail"));
+        assert_eq!(
+            values.get("linux_policy_default_deny").map(String::as_str),
+            Some("fail"),
+            "a pass on one node must not outrank a fail on another"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unexercised_control_records_blocked_not_pass_and_not_not_run() {
+        // The audits run all-eight rather than fail-fast precisely so an
+        // unreached control gets a verdict. `blocked` outranks `pass`, and it
+        // is distinct from `not_run`, which asserts no node of that platform
+        // was in the run at all.
+        let root = temp_report_dir("sec-audit-blocked");
+        write_per_control(
+            &root,
+            serde_json::json!([
+                {"alias": "deb-1", "platform": "linux", "audit_id": "policy_default_deny", "status": "pass"},
+                {"alias": "deb-1", "platform": "linux", "audit_id": "gossip_revoked_readmit", "status": "blocked"},
+            ]),
+        );
+        let values = control_values(&root, &security_audit_stage("fail"));
+        assert_eq!(
+            values
+                .get("linux_gossip_revoked_readmit")
+                .map(String::as_str),
+            Some("blocked")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_missing_or_malformed_artifact_writes_no_column() {
+        let root = temp_report_dir("sec-audit-missing");
+        // Missing entirely.
+        assert!(control_values(&root, &security_audit_stage("fail")).is_empty());
+        // Present but malformed: must not panic, must not guess.
+        std::fs::write(
+            root.join("security_audit_validation.per_control.json"),
+            b"{ not json",
+        )
+        .expect("write");
+        assert!(control_values(&root, &security_audit_stage("fail")).is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn controls_are_ignored_when_the_stage_did_not_dispatch() {
+        // A stale artifact left in a report directory must not manufacture
+        // evidence for a run whose plan never included the stage.
+        let root = temp_report_dir("sec-audit-undispatched");
+        write_per_control(
+            &root,
+            serde_json::json!([
+                {"alias": "deb-1", "platform": "linux", "audit_id": "policy_default_deny", "status": "pass"},
+            ]),
+        );
+        let other = vec![StageEvidence {
+            stage: "cleanup".to_owned(),
+            status: "pass".to_owned(),
+            artifacts: Vec::new(),
+        }];
+        assert!(control_values(&root, &other).is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }
