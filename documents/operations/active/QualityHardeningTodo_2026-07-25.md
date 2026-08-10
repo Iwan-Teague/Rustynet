@@ -1636,13 +1636,28 @@ was distributed while the validation never ran. Statuses that never co-occur wit
 in a merged column (`not_run`, `reused`) were left alone — measured at 0 occurrences
 each.
 
-**Latent sibling, deliberately NOT fixed here.** `not_proven` — a node-scope fail that
-could not be attributed to a specific node (`live_lab_run_matrix.rs:794`) — is absent
-from `normalize_status`, so it falls to `unknown` (rank 2) and a `pass` would mask it.
-It co-occurs with `pass` in **zero** merged columns today, and closing it means editing
-`normalize_status`, which is also a WRITE path (`:1125`, `:1562`, `:1881`). That is a
-data-format change and was kept out of an evidence-integrity fix on purpose. Worth
-doing; worth doing separately, with its own measurement.
+**The "latent sibling" this entry originally claimed was WRONG, and the correction is
+the useful part.** It said `not_proven` — a node-scope fail that could not be attributed
+to a specific node — was absent from `normalize_status`, fell to `unknown` (rank 2), and
+would therefore also be masked by a `pass`. The first half is true; the conclusion is
+not. **It cannot be masked, because it never reaches the merge.**
+`attributable_node_status` (`live_lab_run_matrix.rs:794`) has exactly ONE production
+caller, `write_node_stage_result_ledgers`, which writes the PER-NODE ledger — one row per
+node×stage, nothing merges. Measured: **74** occurrences in
+`live_lab_node_stage_results.csv`, **0** in `live_lab_node_run_matrix.csv`, and every run
+containing one already carries `overall_result=fail`. No stage source emits it either —
+0 hits across every `run_summary.json`.
+
+That mistake is the same shape this register keeps recording: a correct narrow fact (the
+word is missing from the vocabulary) driving a conclusion about behaviour, without
+checking whether the value ever reaches the function.
+
+**Hardened anyway in the follow-up commit**, because the guard is free and the measurement
+proved it changes nothing on disk: `not_proven` is now recognised by `normalize_status`
+and ranked WITH `fail`, so if a later change ever does route it into a merged column it
+fails closed instead of degrading to `unknown` and being outranked by a pass. Pinned by
+`not_proven_is_ranked_with_fail_and_survives_normalisation`, whose doc records that it
+guards a currently-unreachable path.
 
 ---
 
