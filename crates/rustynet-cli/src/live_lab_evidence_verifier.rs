@@ -1353,6 +1353,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_retried_stage_is_dated_by_its_failing_attempt_not_its_passing_one() {
+        // QH-22 follow-up. The merge used to pick the earliest start
+        // independently of the status it merged to, so a stage recorded
+        // pass -> fail -> fail carried the PASSING attempt's start into the
+        // merged `fail`. Real shape, from
+        // artifacts/live_lab/20260411T190200Z_handoff_retry_working_tree:
+        // live_role_switch_matrix pass@18:26:41Z, fail@18:34:52Z, fail@18:42:26Z.
+        //
+        // Dating the fail 18:26:41Z would order it AHEAD of a genuine earlier
+        // failure and hand triage the wrong stage — the exact defect QH-22 is
+        // about, reintroduced one function away.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (report_dir, ledger) = valid_pass_fixture(tmp.path());
+        write_stages_tsv_timed(
+            &report_dir,
+            &[
+                ("live_role_switch_matrix", "pass", "2026-04-11T18:26:41Z"),
+                ("live_role_switch_matrix", "fail", "2026-04-11T18:34:52Z"),
+                ("live_role_switch_matrix", "fail", "2026-04-11T18:42:26Z"),
+                // Fails AFTER the retried stage's passing attempt but BEFORE its
+                // first failing one. It is the true earliest failure and must be
+                // named; it can only lose if the retry is mis-dated 18:26:41Z.
+                ("preflight", "fail", "2026-04-11T18:30:00Z"),
+            ],
+        );
+        let report = run_verify(&report_dir, &ledger);
+        assert_eq!(report.recomputed_overall_result, "fail");
+        assert_eq!(
+            report.recomputed_first_failed_stage.as_deref(),
+            Some("preflight"),
+            "the retried stage must be dated by its first FAILING attempt \
+             (18:34:52Z), not by the attempt that passed (18:26:41Z)"
+        );
+    }
+
     // ── (d) reused/skipped are never a pass (§4.2) ──────────────────────
 
     #[test]
