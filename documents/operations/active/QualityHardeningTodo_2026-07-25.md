@@ -1661,6 +1661,48 @@ guards a currently-unreachable path.
 
 ---
 
+### QH-38 — `spawn_with_timeout` lets the child inherit the test harness's stdout/stderr, so its tests are flagged LEAK under nextest — intermittently
+
+**Observed 2026-08-10** in a full gate run at `cadbf631`:
+`Summary [78.189s] 10461 tests run: 10461 passed (1 leaky), 2 skipped`, the leaky one
+being
+`LEAK [0.713s] rustynet-cli::bin/rustynet-cli vm_lab::overnight::executor::tests::spawn_with_timeout_returns_exit_status_for_a_fast_command`.
+The two immediately preceding full runs (10453 and 10459 tests) reported **no** leaky
+test on the same machine, so it is **intermittent**, not deterministic.
+
+**Verified mechanism.** `spawn_with_timeout`
+(`crates/rustynet-cli/src/vm_lab/overnight/executor.rs:607-618`) sets
+`.process_group(0)` and does **not** redirect stdio, so the child inherits the test
+binary's stdout/stderr. Its sibling `spawn_capture_with_timeout` (`:647-655`) does the
+opposite — `.stdout(Stdio::piped())` / `.stderr(Stdio::piped())` — and is not implicated.
+The poll loop sleeps 500 ms between `try_wait` calls (`:641`), which is consistent with
+the measured 0.713 s for a command (`true`) that exits in about a millisecond.
+
+**Inference, labelled as such:** nextest flags LEAK when a descendant still holds the
+test's stdout/stderr after the test returns. Inherited stdio plus an own process group is
+the shape that produces that, and the run duration says the loop took at least one 500 ms
+nap before observing the exit. I did not instrument nextest to confirm the exact trigger.
+
+**Why it is worth more than a warning.** The test PASSED, and one leaky test is not a
+failure. But this repo runs ~10.4k tests as a process per test under one global
+concurrency pool, and a leaked child holding an inherited pipe is precisely the shape
+that produces order-dependent flakiness — the class CLAUDE.md §7 already records
+(`mixed_platform_repo_sync_scripts_do_not_cross_dispatch` failing only under load, green
+in isolation under both runners). An intermittent LEAK today is a flaky suite later.
+
+**Affected tests:** `:982` (`…fast_command`) and `:990`
+(`zero_timeout_waits_for_completion`) both spawn `true` through the un-piped path; `:971`
+spawns `sleep 30` and exercises the kill path. Production callers are `:810`
+(un-piped, same shape) and `:447` (the piped variant, unaffected).
+
+**Fix shape (not implemented):** give `spawn_with_timeout` the same
+`Stdio::piped()`/`Stdio::null()` treatment its capture sibling already has, so no child
+inherits the harness pipes. Check first whether any production caller *relies* on the
+child writing to the parent's console — `:810` is the one to read — because piping would
+silence it, and that is a behaviour change rather than pure hygiene.
+
+---
+
 ## Related documents
 
 - `NodeEngineFlipDispositions_2026-07-24.md` — D1 carries the two_hop mechanism,
