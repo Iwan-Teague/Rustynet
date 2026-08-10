@@ -86,9 +86,13 @@ pub const LINUX_SECURITY_AUDITS: &[(&str, &str, AuditEvaluator)] = &[
 /// [`RemoteShellHost`] seam, which Linux, macOS and Windows all implement.
 ///
 /// Do not read this as "live-proven on all three". It is a *runtime-support*
-/// gate, not an evidence claim: as of 2026-08-10 only Linux has ever executed
-/// this stage in a recorded `--node` run, because no macOS or Windows node has
-/// been present in one. A non-desktop platform (iOS/Android) has no daemon audit
+/// gate, not an evidence claim. Measured 2026-08-10: **macOS has executed this
+/// stage and passed** — e.g. run `live-lab-direct-1784500192` (2026-07-19, five
+/// Linux nodes plus one macOS) recorded `security_audit_validation = pass` with
+/// NO `reported_skips.json`, and `outcome_for` forces `Skipped` whenever any
+/// node is reported-skipped, so the macOS node was genuinely audited. **Windows
+/// has not**, because no Windows node has yet reached this stage in a recorded
+/// `--node` run. A non-desktop platform (iOS/Android) has no daemon audit
 /// surface and is reported-skipped — named on disk, never a silent pass.
 pub fn security_audit_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(

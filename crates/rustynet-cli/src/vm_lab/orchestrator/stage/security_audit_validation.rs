@@ -43,9 +43,10 @@ pub const PER_CONTROL_SCHEMA_VERSION_FIELD: &str = "schema_version";
 /// a non-desktop platform (iOS/Android), which has no daemon audit surface, is
 /// **reported-skipped** — named in
 /// `security_audit_validation.reported_skips.json`, never a silent pass. Note
-/// that admitting a platform is runtime support, not evidence: as of 2026-08-10
-/// only Linux has ever executed this stage in a recorded `--node` run. A run with
-/// no nodes is a skip-noop pass.
+/// that admitting a platform is runtime support, not evidence — though macOS has
+/// in fact executed this stage and passed (2026-07-19, run
+/// `live-lab-direct-1784500192`); Windows has not yet reached it in a recorded
+/// `--node` run. A run with no nodes is a skip-noop pass.
 pub struct SecurityAuditValidationStage;
 
 impl OrchestrationStage for SecurityAuditValidationStage {
