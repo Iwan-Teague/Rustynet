@@ -1046,7 +1046,41 @@ suffices; the left operand `$dnsRules.Count` is already safe because `$dnsRules`
 array-initialised.
 
 ### QH-22 — `first_failed_stage` is ALPHABETICAL, not chronological, and its name says otherwise
-**Severity: medium. Confidence: VERIFIED — resolved by code read; the computation is correct, the naming is the defect.**
+**Severity: medium. Confidence: VERIFIED.**
+
+> **RESOLVED 2026-08-10, FORWARD-ONLY.** Both halves now select the chronologically first
+> failure. The verifier half landed earlier; the ledger half landed in `b5286769` (plus
+> follow-ups) — `StageEvidence` gained `started_at` from `stages.tsv` column 6 and
+> `first_failed_stage` selects with the verifier's key `(is_blank, started_at, stage)`, empty
+> sorting LAST. Plan and full review record:
+> [`QH22LedgerChronologyPlan_2026-08-10.md`](./QH22LedgerChronologyPlan_2026-08-10.md).
+>
+> **The text below is preserved but two of its claims are now stale.** (1) "The computation is
+> correct, the naming is the defect" was true when written and is no longer the whole story:
+> the verifier was subsequently made chronological while the ledger was not, so the two
+> producers of one field came to disagree *by construction* — which is why the fix emits a
+> genuinely chronological value rather than renaming the field. (2) The described verifier
+> behaviour ("selects the first `Fail` while iterating `merged`… in key-sorted order", cites
+> `:529-532`, `:428`) has not described the code since the verifier half landed.
+>
+> **Forward-only:** the 90 populated rows extant at the fix keep their alphabetical values and
+> were not rewritten. The column carries mixed semantics across the boundary commit — do not
+> compare it across that boundary, and do not read a pre-fix row as chronological.
+>
+> **Evidence.** 8 ledger + 2 verifier tests. Mutations verified to discriminate: revert to the
+> alphabetical `find` (1 vs 8 ordering), invert the empty-sorts-last comparison, restore the
+> status-blind time merge at each site independently. Two defects found by adversarial review
+> of the *implementation* and fixed before landing: the higher-rank merge arm erased a real
+> timestamp when the winning record carried none (reintroducing this very misdirection), and
+> `not_proven` — ranked WITH `fail` — satisfied neither consumer's literal `"fail"` test, so a
+> merged `not_proven` made a failed run report NOT-failed. Both pinned by tests.
+>
+> **Adjacent, still open:** the QH-37 rank fix was never mirrored — `status_rank` ranks
+> `skip`(4) above `pass`(3) while the verifier's `StatusClass::rank` ranks `Pass`(4) above
+> `Skip`(3). Unreachable for *this* field (`fail` is rank 8 in both) but a live divergence one
+> function away. Also: most triage tooling (`lab_state.rs`, `ai_agent.rs`, the flake report)
+> reads the FROZEN bash archive, so this fix does not reach it — notably the auto-retarget at
+> `ai_agent.rs:1722-1732`, which picks the next lab cell from this field.
 
 Observed: both the ledger and the A2 evidence verifier report `first failed: cleanup`, while
 `state/stages.tsv` shows `preflight` failing at 18:52:19 and `cleanup` at 18:52:23 — i.e.
