@@ -20,6 +20,13 @@ const REPORTED_SKIPS_FILENAME: &str = "security_audit_validation.reported_skips.
 /// eight independent control verdicts.
 pub const PER_CONTROL_FILENAME: &str = "security_audit_validation.per_control.json";
 
+/// Schema version of the per-control artifact, and the field it is stamped in.
+/// The recorder rejects an unrecognised version rather than guessing at a shape
+/// it does not know — a report directory can legitimately be written by one
+/// binary and recorded by another.
+pub const PER_CONTROL_SCHEMA_VERSION: u64 = 1;
+pub const PER_CONTROL_SCHEMA_VERSION_FIELD: &str = "schema_version";
+
 /// Prove every node's daemon passes the eight Tier-0 adversarial self-audits —
 /// membership-revoke, revoked-peer-denied, membership-signature,
 /// privileged-helper-allowlist, policy-default-deny, gossip-revoked-readmit,
@@ -31,11 +38,14 @@ pub const PER_CONTROL_FILENAME: &str = "security_audit_validation.per_control.js
 /// before its security posture is meaningful) and before the traffic matrix.
 /// These are node-posture checks, so it applies to every node regardless of
 /// role. Each audit is accepted only on an explicit `overall_ok: true`
-/// (fail-closed). A macOS / Windows node is **reported-skipped** — named in
-/// `security_audit_validation.reported_skips.json`, never a silent pass — on the
-/// [`security_audit_runtime_implemented`] posture gate (those OSes have their own
-/// dedicated security-validator stages in the bash-arm path; folding them into
-/// the Rust engine is later work). A run with no nodes is a skip-noop pass.
+/// (fail-closed). The [`security_audit_runtime_implemented`] posture gate admits
+/// all three desktop platforms, so a macOS or Windows node IS audited here; only
+/// a non-desktop platform (iOS/Android), which has no daemon audit surface, is
+/// **reported-skipped** — named in
+/// `security_audit_validation.reported_skips.json`, never a silent pass. Note
+/// that admitting a platform is runtime support, not evidence: as of 2026-08-10
+/// only Linux has ever executed this stage in a recorded `--node` run. A run with
+/// no nodes is a skip-noop pass.
 pub struct SecurityAuditValidationStage;
 
 impl OrchestrationStage for SecurityAuditValidationStage {
@@ -96,18 +106,33 @@ impl OrchestrationStage for SecurityAuditValidationStage {
                     continue;
                 }
             };
+            let Some(tag) = platform_tag(platform) else {
+                // Unreachable today (the posture gate above excludes every
+                // platform without a column set), but fail loudly rather than
+                // charge one platform's verdicts to another's columns.
+                failures.push(format!(
+                    "{alias}: no run-matrix column prefix for platform {platform:?}"
+                ));
+                continue;
+            };
             let results = run_security_audits(&*shell, daemon_path, alias);
             if let Err(e) = security_audits_ok(&results) {
                 failures.push(format!("{alias}: {e}"));
             }
-            per_control.push((alias.clone(), platform_tag(platform), results));
+            per_control.push((alias.clone(), tag, results));
         }
 
         if !reported_skips.is_empty() {
             write_reported_skips_note(ctx, &reported_skips);
         }
-        if !per_control.is_empty() {
-            write_per_control_evidence(ctx, &per_control);
+        // Written UNCONDITIONALLY, including the empty case. A report directory
+        // is legitimately reused (resume / rerun-stage / run-only), and leaving a
+        // previous invocation's artifact in place would let the recorder read it
+        // as THIS run's evidence — recording `pass` for controls that were never
+        // exercised, on a run where the stage failed. That is the green-washing
+        // direction, the exact defect class this artifact exists to close.
+        if let Err(e) = write_per_control_evidence(ctx, &per_control) {
+            failures.push(format!("per-control security evidence not written: {e}"));
         }
         outcome_for(&failures, &reported_skips)
     }
@@ -148,11 +173,16 @@ fn write_reported_skips_note(ctx: &OrchestrationContext, reported_skips: &[(Stri
 /// The run-matrix column prefix for a platform. Only the three desktop
 /// platforms have security columns; anything else is reported-skipped before
 /// this is reached, so it never contributes a row.
-fn platform_tag(platform: VmGuestPlatform) -> &'static str {
+fn platform_tag(platform: VmGuestPlatform) -> Option<&'static str> {
+    // EXHAUSTIVE deliberately: a `_` arm would silently merge a newly supported
+    // platform into the LINUX columns, contaminating one platform's evidence
+    // with another's and producing no error. Adding a variant must break this
+    // match instead.
     match platform {
-        VmGuestPlatform::Macos => "macos",
-        VmGuestPlatform::Windows => "windows",
-        _ => "linux",
+        VmGuestPlatform::Linux => Some("linux"),
+        VmGuestPlatform::Macos => Some("macos"),
+        VmGuestPlatform::Windows => Some("windows"),
+        VmGuestPlatform::Ios | VmGuestPlatform::Android => None,
     }
 }
 
@@ -173,7 +203,7 @@ fn per_control_json_bytes(rows: &[(String, &'static str, Vec<AuditResult>)]) -> 
         .collect();
     let body = serde_json::json!({
         "stage": "security_audit_validation",
-        "schema_version": 1,
+        PER_CONTROL_SCHEMA_VERSION_FIELD.to_string(): PER_CONTROL_SCHEMA_VERSION,
         "controls": controls,
     });
     serde_json::to_vec_pretty(&body).unwrap_or_default()
@@ -182,9 +212,13 @@ fn per_control_json_bytes(rows: &[(String, &'static str, Vec<AuditResult>)]) -> 
 fn write_per_control_evidence(
     ctx: &OrchestrationContext,
     rows: &[(String, &'static str, Vec<AuditResult>)],
-) {
+) -> Result<(), String> {
     let path = ctx.report_dir.join(PER_CONTROL_FILENAME);
-    let _ = std::fs::write(&path, per_control_json_bytes(rows));
+    crate::vm_lab::orchestrator::context::atomic_write_fsync(
+        &path,
+        &per_control_json_bytes(rows),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -300,10 +334,58 @@ mod tests {
     }
 
     #[test]
-    fn platform_tag_maps_the_three_desktop_platforms() {
-        assert_eq!(platform_tag(VmGuestPlatform::Linux), "linux");
-        assert_eq!(platform_tag(VmGuestPlatform::Macos), "macos");
-        assert_eq!(platform_tag(VmGuestPlatform::Windows), "windows");
+    fn a_run_that_exercises_nothing_still_overwrites_a_stale_artifact() {
+        // Report directories are reused (resume / rerun-stage / run-only). If a
+        // rerun in which no node was reachable left the previous invocation's
+        // artifact in place, the recorder would read it as THIS run's evidence
+        // and record `pass` for controls that were never exercised on a run
+        // whose stage failed. The write is therefore unconditional.
+        let report_dir = std::env::temp_dir().join(format!(
+            "rustynet-sec-audit-stale-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&report_dir).expect("report dir");
+        let path = report_dir.join(PER_CONTROL_FILENAME);
+        std::fs::write(&path, br#"{"schema_version":1,"controls":[{"alias":"deb-1","platform":"linux","audit_id":"policy_default_deny","status":"pass"}]}"#)
+            .expect("seed a previous invocation's artifact");
+
+        let ctx = OrchestrationContext {
+            assignments: Vec::new(),
+            adapters: std::collections::HashMap::new(),
+            source_archive: None,
+            report_dir: report_dir.clone(),
+            stage_outcomes: std::collections::HashMap::new(),
+            collected_pubkeys: std::collections::HashMap::new(),
+            collected_gossip_identities: std::collections::HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: std::collections::HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: std::collections::HashMap::new(),
+            endpoints: std::collections::HashMap::new(),
+            orchestrator_dialect: None,
+        };
+        write_per_control_evidence(&ctx, &[]).expect("evidence write must succeed");
+
+        let written = std::fs::read_to_string(&path).expect("artifact");
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("valid json");
+        assert!(
+            parsed["controls"].as_array().expect("controls").is_empty(),
+            "the stale claim must be erased, not left behind: {written}"
+        );
+        let _ = std::fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn platform_tag_maps_the_three_desktop_platforms_and_no_others() {
+        assert_eq!(platform_tag(VmGuestPlatform::Linux), Some("linux"));
+        assert_eq!(platform_tag(VmGuestPlatform::Macos), Some("macos"));
+        assert_eq!(platform_tag(VmGuestPlatform::Windows), Some("windows"));
+        // A platform with no security columns must yield None, so the caller
+        // fails loudly instead of charging its verdicts to the linux columns.
+        assert_eq!(platform_tag(VmGuestPlatform::Ios), None);
+        assert_eq!(platform_tag(VmGuestPlatform::Android), None);
     }
 
     #[test]

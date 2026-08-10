@@ -13,7 +13,7 @@
 //! passing.
 
 use crate::vm_lab::VmGuestPlatform;
-use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::orchestrator::remote_shell::{RemoteShellError, RemoteShellHost};
 
 /// Signature every Tier-0 audit evaluator shares:
 /// `(node_alias, raw_json) -> Ok(summary) | Err(reason)`. These evaluators are
@@ -147,6 +147,19 @@ pub struct AuditResult {
     pub verdict: AuditVerdict,
 }
 
+/// True for a dispatch error that is a property of the HOST rather than of this
+/// particular audit — the transport is down, or the connection failed. Such an
+/// error will recur identically for every remaining audit, so re-attempting them
+/// buys no evidence and costs one full transport timeout each (180 s apiece, and
+/// the stage deadline is opt-in). An audit-specific error is not host-level and
+/// does not stop the sweep.
+fn is_host_level_dispatch_error(err: &RemoteShellError) -> bool {
+    matches!(
+        err,
+        RemoteShellError::Transport { .. } | RemoteShellError::Network { .. }
+    )
+}
+
 /// Run all eight daemon self-audits through the shell seam, applying each
 /// audit's typed evaluator, and return a verdict for EVERY audit.
 ///
@@ -167,35 +180,63 @@ pub fn run_security_audits(
     daemon_path: &str,
     alias: &str,
 ) -> Vec<AuditResult> {
-    LINUX_SECURITY_AUDITS
-        .iter()
-        .map(|(label, subcommand, evaluate)| {
-            let argv = [daemon_path, *subcommand, "--no-fail-on-drift"];
-            let verdict = match shell.run_argv(&argv, &[], &[]) {
-                Err(err) => AuditVerdict::Blocked(format!(
-                    "{label}: dispatch of `{subcommand}` failed: {err}"
+    let mut results = Vec::with_capacity(LINUX_SECURITY_AUDITS.len());
+    let mut host_down: Option<String> = None;
+    for (label, subcommand, evaluate) in LINUX_SECURITY_AUDITS {
+        // Once the host itself is unreachable, every remaining audit gets a
+        // verdict WITHOUT another 180 s transport timeout. The verdict is still
+        // `Blocked`, so the columns behave identically; only the cost changes.
+        if let Some(cause) = &host_down {
+            results.push(AuditResult {
+                audit_id: label,
+                verdict: AuditVerdict::Blocked(format!(
+                    "{label}: not attempted after a host-level dispatch failure ({cause})"
                 )),
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    match evaluate(alias, &stdout) {
-                        Ok(_) => AuditVerdict::Passed,
-                        Err(detail) => {
-                            AuditVerdict::Failed(format!("{label} (`{subcommand}`): {detail}"))
-                        }
+            });
+            continue;
+        }
+        let argv = [daemon_path, *subcommand, "--no-fail-on-drift"];
+        let verdict = match shell.run_argv(&argv, &[], &[]) {
+            Err(err) => {
+                if is_host_level_dispatch_error(&err) {
+                    host_down = Some(format!("on `{subcommand}`: {err}"));
+                }
+                AuditVerdict::Blocked(format!("{label}: dispatch of `{subcommand}` failed: {err}"))
+            }
+            Ok(out) => {
+                // A non-zero exit from the audit itself arrives here as `Ok`, so
+                // a real violation reaches the typed evaluator and is recorded
+                // `Failed`. Only a dispatch-level error yields `Blocked`.
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                match evaluate(alias, &stdout) {
+                    Ok(_) => AuditVerdict::Passed,
+                    Err(detail) => {
+                        AuditVerdict::Failed(format!("{label} (`{subcommand}`): {detail}"))
                     }
                 }
-            };
-            AuditResult {
-                audit_id: label,
-                verdict,
             }
-        })
-        .collect()
+        };
+        results.push(AuditResult {
+            audit_id: label,
+            verdict,
+        });
+    }
+    results
 }
 
 /// Fail-closed reduction of a node's audit results to the stage's verdict:
 /// `Err` with every non-passing audit's detail if ANY audit did not pass.
 pub fn security_audits_ok(results: &[AuditResult]) -> Result<(), String> {
+    // Default-deny on a short result set: a caller that produced fewer verdicts
+    // than there are audits has not exercised the full battery, and an empty
+    // set must never reduce to "everything passed" (§10.4).
+    if results.len() != LINUX_SECURITY_AUDITS.len() {
+        return Err(format!(
+            "security-audit battery incomplete: {} of {} controls produced a verdict",
+            results.len(),
+            LINUX_SECURITY_AUDITS.len()
+        ));
+    }
     let problems: Vec<String> = results
         .iter()
         .filter_map(|result| result.verdict.detail().map(str::to_owned))
@@ -346,6 +387,84 @@ mod tests {
         }
         // Fail-closed is preserved at the stage level regardless.
         assert!(security_audits_ok(&results).is_err());
+    }
+
+    #[test]
+    fn a_failing_audit_does_not_stop_the_remaining_seven() {
+        // The regression the run-all change exists to prevent, on the branch the
+        // other test cannot reach. `every_audit_gets_a_verdict_even_when_the_first_one_fails`
+        // uses an unprogrammed mock, so all eight verdicts are Blocked and a
+        // fail-fast-on-Failed mutation survives it. Here audit #1 is programmed
+        // with a report its typed evaluator REJECTS, and the remaining seven
+        // must still be dispatched and recorded.
+        let mock = MockShellHost::new();
+        mock.program_run_response(
+            &audit_argv("membership-revoke-audit"),
+            exit_ok(r#"{"schema_version": 999}"#),
+        );
+        let results = run_security_audits(&mock, TEST_DAEMON, "deb-1");
+        assert_eq!(
+            results.len(),
+            LINUX_SECURITY_AUDITS.len(),
+            "a FAILED audit must not truncate the battery"
+        );
+        assert!(
+            matches!(results[0].verdict, AuditVerdict::Failed(_)),
+            "audit #1 was exercised and rejected, so it is Failed (not Blocked): {:?}",
+            results[0].verdict
+        );
+        for result in &results[1..] {
+            assert!(
+                matches!(result.verdict, AuditVerdict::Blocked(_)),
+                "audits after a FAILED one must still be attempted: {} was {:?}",
+                result.audit_id,
+                result.verdict
+            );
+        }
+        assert!(security_audits_ok(&results).is_err());
+    }
+
+    #[test]
+    fn a_host_level_dispatch_failure_stops_re_dialling_but_still_verdicts_every_control() {
+        // A dead host must cost ONE transport timeout, not eight — while every
+        // control still gets a Blocked verdict so no column falls back to
+        // `not_run` (which would assert the node was never in the run).
+        let mock = MockShellHost::new();
+        let results = run_security_audits(&mock, TEST_DAEMON, "deb-1");
+        assert_eq!(results.len(), LINUX_SECURITY_AUDITS.len());
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r.verdict, AuditVerdict::Blocked(_)))
+        );
+        // Exactly one audit was actually dialled; the rest are marked
+        // not-attempted rather than each paying its own timeout.
+        let not_attempted = results
+            .iter()
+            .filter(|r| {
+                r.verdict.detail().is_some_and(|d| {
+                    d.contains("not attempted after a host-level dispatch failure")
+                })
+            })
+            .count();
+        assert_eq!(
+            not_attempted,
+            LINUX_SECURITY_AUDITS.len() - 1,
+            "only the first audit should have been dialled against a dead host"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_battery_is_denied_rather_than_reduced_to_ok() {
+        // Default-deny: a short result set must never reduce to "all passed".
+        assert!(security_audits_ok(&[]).is_err());
+        assert!(
+            security_audits_ok(&[AuditResult {
+                audit_id: "policy_default_deny",
+                verdict: AuditVerdict::Passed,
+            }])
+            .is_err()
+        );
     }
 
     #[test]

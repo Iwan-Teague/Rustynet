@@ -1984,13 +1984,30 @@ struct SecurityAuditControl {
 /// inheriting a guessed status. Rows missing any of the three required fields
 /// are dropped individually for the same reason.
 fn read_security_audit_controls(report_dir: &Path) -> Vec<SecurityAuditControl> {
-    let path = report_dir.join("security_audit_validation.per_control.json");
+    let path = report_dir
+        .join(crate::vm_lab::orchestrator::stage::security_audit_validation::PER_CONTROL_FILENAME);
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return Vec::new();
     };
+    // Reject an unrecognised schema rather than guessing at a shape this build
+    // does not know. A report directory can be written by one binary and
+    // recorded by another (host-launched runs, reused report dirs), and every
+    // sibling evaluator in this family hard-rejects a version it does not
+    // support. Dropping to zero rows leaves the columns `not_run`, which is the
+    // safe direction.
+    let version = parsed
+        .get(crate::vm_lab::orchestrator::stage::security_audit_validation::PER_CONTROL_SCHEMA_VERSION_FIELD)
+        .and_then(|v| v.as_u64());
+    if version
+        != Some(
+            crate::vm_lab::orchestrator::stage::security_audit_validation::PER_CONTROL_SCHEMA_VERSION,
+        )
+    {
+        return Vec::new();
+    }
     let Some(controls) = parsed.get("controls").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -5110,6 +5127,56 @@ mod conclusion_barrier_tests {
                 .get("linux_gossip_revoked_readmit")
                 .map(String::as_str),
             Some("blocked")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_empty_artifact_erases_a_previous_invocations_claim() {
+        // Report directories are legitimately reused (resume / rerun-stage /
+        // run-only). A rerun in which nothing was exercised writes an EMPTY
+        // controls array, and that must clear the earlier claim rather than
+        // leaving it to be read as this run's evidence.
+        let root = temp_report_dir("sec-audit-reuse");
+        write_per_control(
+            &root,
+            serde_json::json!([
+                {"alias": "deb-1", "platform": "linux", "audit_id": "policy_default_deny", "status": "pass"},
+            ]),
+        );
+        assert_eq!(
+            control_values(&root, &security_audit_stage("pass"))
+                .get("linux_policy_default_deny")
+                .map(String::as_str),
+            Some("pass")
+        );
+        write_per_control(&root, serde_json::json!([]));
+        assert!(
+            control_values(&root, &security_audit_stage("fail")).is_empty(),
+            "a zero-verdict rerun must not inherit the previous invocation's pass"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unrecognised_schema_version_writes_no_column() {
+        let root = temp_report_dir("sec-audit-schema");
+        std::fs::write(
+            root.join("security_audit_validation.per_control.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "stage": "security_audit_validation",
+                "schema_version": 999,
+                "controls": [
+                    {"alias": "deb-1", "platform": "linux",
+                     "audit_id": "policy_default_deny", "status": "pass"}
+                ],
+            }))
+            .expect("serialize"),
+        )
+        .expect("write");
+        assert!(
+            control_values(&root, &security_audit_stage("pass")).is_empty(),
+            "an unknown schema must be rejected, not guessed at"
         );
         let _ = std::fs::remove_dir_all(root);
     }
