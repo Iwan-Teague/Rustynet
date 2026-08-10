@@ -235,10 +235,12 @@ is worse than none.
   an NTP step on the driving host mid-run makes `started_at` non-monotonic. The invariant is
   "one host clock, assumed not to step" — not "UTC therefore fine."
 - **§4's stub deferral was right, its consumer list incomplete** — `earliest_stage_time` also
-  feeds `build_run_id` (`:1487`), the ledger's primary identifier. Rather than leave a stub
-  that C1 half-arms, **the dead stub is deleted and its always-`None` fallthrough inlined** —
-  a pure no-op refactor that removes the drift surface without touching
-  `run_started_utc` semantics.
+  feeds `build_run_id` (`:1487`), the ledger's primary identifier. Deleting the stub was
+  attempted and **reverted**: `build_run_id` calls it directly as a second caller, and
+  implementing it would change the run-id stamp from a unix second count to a compacted UTC
+  string, which every existing `run_id` contradicts. **The stub is KEPT, inert, with the
+  reason recorded on it.** (An earlier draft of this section claimed it was deleted; it was
+  not, and the behaviour is byte-equivalent to before.)
 
 ## Found in passing, filed not fixed
 
@@ -256,5 +258,27 @@ is worse than none.
 
 ## Scope actually implemented
 
-C1 (with the stub deleted), C2 corrected per M1 **at both sites**, C3, and C5 tests including
-the three-record pass/fail/fail fixture. **C4 deferred** with the reasons above.
+C1 (stub KEPT inert, see above), C2 corrected per M1 **at both sites**, C3, and the C5 tests.
+**C4 deferred** with the reasons above.
+
+### Second review round (implementation)
+
+The implementation was itself adversarially reviewed and shipped **one regression**, which is
+now fixed: the corrected merge's higher-rank arm took the incoming record's time
+*unconditionally*, so a higher-ranking record carrying NO time erased a real one. The sources
+are asymmetric — `stages.tsv` carries times, `orchestrate_result.json` and
+`extra_stage_outcomes` never do and are always merged second — so a `pass` restated as `fail`
+by a timeless source lost its start, sorted LAST under the empty-last rule, and pointed triage
+at a later stage. QH-22's own misdirection, reintroduced by its fix. A timeless record is a
+second REPORT of one attempt, not a second ATTEMPT: it restates the outcome and must not
+re-date the stage. Fixed at both sites; **none of the four original tests caught it**, so the
+branch is now pinned at both.
+
+Two more from the same review: `not_proven` is ranked WITH `fail` by `status_rank` but both
+consumers tested the literal string `"fail"`, so a `not_proven` winning a merge made the run
+report NOT-failed and name no first failure — the hardening had converted "masked by a pass"
+into "erases the fail". Both now share one `is_failure_status` predicate (0 of 14,695 recorded
+rows carry `not_proven`, so no existing verdict changes). And the emptiness test was
+inconsistent — `.trim().is_empty()` in one place, bare `.is_empty()` in two others — which
+mattered because a whitespace-only stamp sorts BELOW a digit and would have won the race
+outright; one `is_blank` helper now covers all three.

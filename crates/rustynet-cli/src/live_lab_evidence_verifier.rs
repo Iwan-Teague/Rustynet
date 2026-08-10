@@ -459,7 +459,16 @@ pub fn verify(config: &VerifierConfig) -> Result<VerdictReport, String> {
                     let existing_rank = existing.class.rank();
                     if incoming_rank > existing_rank {
                         existing.class = class;
-                        existing.started_at = started_at.to_owned();
+                        // ...and brings its own time ONLY if it has one. A
+                        // timeless source (orchestrate_result.json) is a second
+                        // REPORT of this attempt, not a second ATTEMPT; it can
+                        // restate the outcome but must never erase the start
+                        // `stages.tsv` recorded. Blanking it made the failure
+                        // sort LAST and pointed triage at a later stage — the
+                        // very misdirection QH-22 is about.
+                        if !started_at.is_empty() {
+                            existing.started_at = started_at.to_owned();
+                        }
                     } else if incoming_rank == existing_rank {
                         existing.class = class;
                         if !started_at.is_empty()
@@ -1109,6 +1118,28 @@ mod tests {
         std::fs::write(dir.join(STAGES_TSV_RELATIVE_PATH), body).expect("write stages.tsv");
     }
 
+    /// Write `orchestration/orchestrate_result.json` — the source that carries a
+    /// stage OUTCOME but never a stage TIME.
+    fn write_orchestrate_outcomes(dir: &Path, rows: &[(&str, &str)]) {
+        let orchestration = dir.join("orchestration");
+        std::fs::create_dir_all(&orchestration).expect("mkdir orchestration");
+        let outcomes: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(stage, status)| {
+                serde_json::json!({ "stage": stage, "status": status, "artifacts": [] })
+            })
+            .collect();
+        std::fs::write(
+            orchestration.join("orchestrate_result.json"),
+            serde_json::json!({
+                "command": "vm-lab-orchestrate-live-lab",
+                "outcomes": outcomes,
+            })
+            .to_string(),
+        )
+        .expect("write orchestrate_result");
+    }
+
     fn write_marker(dir: &Path, run_complete: bool, run_passed: bool) {
         let state = dir.join("state");
         std::fs::create_dir_all(&state).expect("mkdir state");
@@ -1386,6 +1417,33 @@ mod tests {
             Some("preflight"),
             "the retried stage must be dated by its first FAILING attempt \
              (18:34:52Z), not by the attempt that passed (18:26:41Z)"
+        );
+    }
+
+    #[test]
+    fn a_timeless_second_report_cannot_erase_the_start_it_outranks() {
+        // The asymmetry that makes this reachable: stages.tsv carries times,
+        // orchestrate_result.json never does, and it is always merged second.
+        // A `pass` in the TSV restated as `fail` by the timeless source used to
+        // blank the recorded start, which under the empty-last rule sent the
+        // real first failure to the BACK of the ordering.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (report_dir, ledger) = valid_pass_fixture(tmp.path());
+        write_stages_tsv_timed(
+            &report_dir,
+            &[
+                ("preflight", "pass", "2026-07-25T18:00:00Z"),
+                ("cleanup", "fail", "2026-07-25T19:00:00Z"),
+            ],
+        );
+        write_orchestrate_outcomes(&report_dir, &[("preflight", "fail")]);
+        let report = run_verify(&report_dir, &ledger);
+        assert_eq!(report.recomputed_overall_result, "fail");
+        assert_eq!(
+            report.recomputed_first_failed_stage.as_deref(),
+            Some("preflight"),
+            "the timeless report restates preflight as failed; its 18:00:00Z start \
+             must survive so it still sorts ahead of cleanup at 19:00:00Z"
         );
     }
 

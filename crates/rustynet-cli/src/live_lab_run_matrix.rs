@@ -2326,7 +2326,9 @@ fn dedupe_stage_evidence(stages: &mut Vec<StageEvidence>) {
         by_stage
             .entry(stage.stage.clone())
             .and_modify(|existing| {
-                existing.started_at = merged_start_time(existing, &stage).unwrap_or_default();
+                if let Some(merged) = merged_start_time(existing, &stage) {
+                    existing.started_at = merged;
+                }
                 existing.status = merge_status(existing.status.as_str(), stage.status.as_str());
                 existing.artifacts.extend(stage.artifacts.clone());
                 existing.artifacts.sort();
@@ -2351,23 +2353,51 @@ fn dedupe_stage_evidence(stages: &mut Vec<StageEvidence>) {
 /// So the time follows the status: a higher-ranking incoming status carries its
 /// own time in, an equal-ranking one takes the earlier of the two, and a
 /// lower-ranking one leaves the winner's time alone.
+/// `None` means "leave the existing start alone" — NOT "blank it". The
+/// distinction is load-bearing: an earlier revision returned the merged value
+/// unconditionally and the caller `unwrap_or_default()`d it, so a
+/// higher-ranking record that carried NO time silently erased a real one.
+///
+/// That mattered because the sources are asymmetric. `stages.tsv` carries
+/// times; `orchestrate_result.json` and `extra_stage_outcomes` never do, and
+/// they are always merged second. A timeless record is a second REPORT of the
+/// same attempt, not a second ATTEMPT — it can restate the outcome but it
+/// cannot re-date the stage. Erasing the time made the failure sort LAST under
+/// the empty-last rule and pointed triage at a later stage: QH-22's own
+/// misdirection, reintroduced by its fix.
 fn merged_start_time(existing: &StageEvidence, incoming: &StageEvidence) -> Option<String> {
     let existing_rank = status_rank(existing.status.as_str());
     let incoming_rank = status_rank(incoming.status.as_str());
-    let pick = match incoming_rank.cmp(&existing_rank) {
-        std::cmp::Ordering::Greater => incoming.started_at.clone(),
-        std::cmp::Ordering::Less => existing.started_at.clone(),
-        std::cmp::Ordering::Equal => {
-            earlier_non_empty(existing.started_at.as_str(), incoming.started_at.as_str())
+    match incoming_rank.cmp(&existing_rank) {
+        // The incoming status wins, and brings its own time WHEN IT HAS ONE.
+        std::cmp::Ordering::Greater => {
+            (!is_blank(incoming.started_at.as_str())).then(|| incoming.started_at.clone())
         }
-    };
-    (!pick.is_empty()).then_some(pick)
+        // The existing status wins; its time stands.
+        std::cmp::Ordering::Less => None,
+        // Same status class — genuinely the same kind of outcome, so the
+        // earlier of the two starts is the one that outcome began at.
+        std::cmp::Ordering::Equal => {
+            let pick =
+                earlier_non_empty(existing.started_at.as_str(), incoming.started_at.as_str());
+            (!pick.is_empty()).then_some(pick)
+        }
+    }
+}
+
+/// A stamp is "blank" if it is empty OR whitespace-only. `sanitize` maps tab,
+/// newline and CR to spaces (`live_lab_stage_recorder`), and the bash arm
+/// interpolates the value unvalidated, so a whitespace-only stamp is
+/// producible — and ' ' (0x20) sorts BELOW '2' (0x32), so treating it as a
+/// real time would let a garbage stamp win the first-failure race outright.
+fn is_blank(stamp: &str) -> bool {
+    stamp.trim().is_empty()
 }
 
 /// Earlier of two fixed-width UTC stamps, treating empty as "no information"
 /// rather than as an early time.
 fn earlier_non_empty(a: &str, b: &str) -> String {
-    match (a.trim().is_empty(), b.trim().is_empty()) {
+    match (is_blank(a), is_blank(b)) {
         (true, true) => String::new(),
         (true, false) => b.to_owned(),
         (false, true) => a.to_owned(),
@@ -2375,9 +2405,27 @@ fn earlier_non_empty(a: &str, b: &str) -> String {
     }
 }
 
+/// Statuses that mean "this run did not prove what it set out to prove".
+///
+/// `not_proven` is ranked WITH `fail` by [`status_rank`] (571b3036) so it fails
+/// closed in a merged column — but both consumers tested the literal string
+/// `"fail"`, so an equal-ranking `not_proven` arriving second WON the merge and
+/// then satisfied neither test: the run reported not-failed and named no first
+/// failure. The hardening had converted "masked by a pass" into "erases the
+/// fail", which is strictly worse. One predicate, so the two cannot drift.
+///
+/// Measured before widening: `not_proven` appears in 0 of 14,695 recorded stage
+/// rows, so no existing verdict changes.
+fn is_failure_status(status: &str) -> bool {
+    matches!(normalize_status(status), "fail" | "not_proven")
+}
+
 fn overall_result(report_state: &Option<Value>, stages: &[StageEvidence]) -> String {
     // Terminal stage failure always dominates a claimed report-state pass.
-    if stages.iter().any(|stage| stage.status == "fail") {
+    if stages
+        .iter()
+        .any(|stage| is_failure_status(stage.status.as_str()))
+    {
         return "fail".to_owned();
     }
     // Finding 3: a run whose planned stages evaporated must not read as a
@@ -2439,15 +2487,20 @@ fn overall_result(report_state: &Option<Value>, stages: &[StageEvidence]) -> Str
 /// The clock is the DRIVING HOST's, never a guest's, so guest clock skew cannot
 /// reorder this. The remaining assumption is that the host clock does not step
 /// mid-run (`unix_now` is `SystemTime::now`).
+///
+/// FORWARD-ONLY. Rows written before this change hold the ALPHABETICALLY first
+/// failure and were not rewritten, exactly as QH-37's alias removal was
+/// forward-only. 90 of the 106 rows extant at the fix are in that state, so the
+/// column carries mixed semantics across the boundary commit: do not compare
+/// this field across it, and do not read a pre-fix row as chronological.
 fn first_failed_stage(stages: &[StageEvidence]) -> Option<String> {
     stages
         .iter()
-        .filter(|stage| stage.status == "fail")
+        .filter(|stage| is_failure_status(stage.status.as_str()))
         .min_by(|a, b| {
-            a.started_at
-                .is_empty()
-                .cmp(&b.started_at.is_empty())
-                .then_with(|| a.started_at.cmp(&b.started_at))
+            is_blank(a.started_at.as_str())
+                .cmp(&is_blank(b.started_at.as_str()))
+                .then_with(|| a.started_at.trim().cmp(b.started_at.trim()))
                 .then_with(|| a.stage.cmp(&b.stage))
         })
         .map(|stage| stage.stage.clone())
@@ -5415,12 +5468,70 @@ mod conclusion_barrier_tests {
     }
 
     #[test]
-    fn dedupe_does_not_let_a_timestampless_source_erase_a_real_start() {
-        // orchestrate_result.json and extra_stage_outcomes carry no time. Merging
-        // one in must not blank a start the TSV recorded.
+    fn dedupe_keeps_a_real_start_when_an_equal_status_record_has_none() {
         let mut stages = vec![ev("s", "fail", "2026-04-11T18:34:52Z"), ev("s", "fail", "")];
         dedupe_stage_evidence(&mut stages);
         assert_eq!(stages[0].started_at, "2026-04-11T18:34:52Z");
+    }
+
+    #[test]
+    fn a_timeless_higher_ranking_record_cannot_erase_a_real_start() {
+        // THE branch the first round of tests missed. stages.tsv carries times;
+        // orchestrate_result.json and extra_stage_outcomes never do, and they are
+        // always merged second. A `pass` restated as `fail` by a timeless source
+        // must keep its recorded start -- blanking it sends the failure to the
+        // BACK of the empty-last ordering, which is QH-22's misdirection again.
+        let mut stages = vec![ev("s", "pass", "2026-07-25T18:00:00Z"), ev("s", "fail", "")];
+        dedupe_stage_evidence(&mut stages);
+        assert_eq!(stages[0].status, "fail");
+        assert_eq!(
+            stages[0].started_at, "2026-07-25T18:00:00Z",
+            "a timeless report restates the outcome; it cannot re-date the stage"
+        );
+    }
+
+    #[test]
+    fn the_timeless_restatement_still_wins_the_first_failure_race() {
+        // End to end: the whole point of keeping the start is the ORDERING.
+        let mut stages = vec![
+            ev("preflight", "pass", "2026-07-25T18:00:00Z"),
+            ev("preflight", "fail", ""),
+            ev("cleanup", "fail", "2026-07-25T19:00:00Z"),
+        ];
+        dedupe_stage_evidence(&mut stages);
+        assert_eq!(
+            first_failed_stage(&stages).as_deref(),
+            Some("preflight"),
+            "preflight failed first and its start is known; it must not sort last"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_stamp_is_treated_as_no_time_not_as_an_early_one() {
+        // ' ' (0x20) sorts below '2' (0x32), so a garbage stamp would otherwise
+        // win the race outright. sanitize() maps tab/newline/CR to spaces, so
+        // this shape is producible.
+        let stages = [
+            ev("blank_stamp", "fail", "   "),
+            ev("real", "fail", "2026-07-25T19:00:00Z"),
+        ];
+        assert_eq!(first_failed_stage(&stages).as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn a_merged_not_proven_cannot_erase_a_failure() {
+        // status_rank ranks not_proven WITH fail, and merge_status uses >=, so a
+        // not_proven arriving second wins the merge. Both consumers used to test
+        // the literal "fail", so the run then reported NOT-failed and named no
+        // first failure -- the hardening had turned "masked by a pass" into
+        // "erases the fail".
+        let mut stages = vec![
+            ev("s", "fail", "2026-07-25T18:00:00Z"),
+            ev("s", "not_proven", "2026-07-25T18:00:00Z"),
+        ];
+        dedupe_stage_evidence(&mut stages);
+        assert_eq!(super::overall_result(&None, &stages), "fail");
+        assert_eq!(first_failed_stage(&stages).as_deref(), Some("s"));
     }
 
     #[test]
