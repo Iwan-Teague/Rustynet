@@ -1832,6 +1832,60 @@ recorded before and is now measured on the `--node` engine.
 on a host with no daemon; only the mesh-status fix addresses that. Prove each with the
 negative case FIRST — make the check fail before trusting any green.
 
+**ATTEMPT 1 (`744be8bb`) WAS REVERTED (`609ae2e7`). Read this before trying again.**
+
+It did two things: armed `--max-age-seconds 120` on all three mesh-status checks, and removed
+`DaemonProbeOp::MeshStatus` from the baseline probe set. Adversarial review found two
+blockers, both verified against the code afterwards. **All gates were green — fmt, clippy,
+10,535 tests — and caught neither.**
+
+1. **The freshness bound is armed against a snapshot that is not periodically rewritten.**
+   `persist_state` (`daemon.rs:9126`, called at `:9472`) sits INSIDE an apply block gated on
+   `FailClosed || Recoverable || assignment_changed || membership_changed ||
+   local_route_reconcile_pending` (`daemon.rs:9298-9304`). On a quiescent healthy node none
+   of the five holds, the block is skipped, and the snapshot's age grows without bound.
+   The reconcile loop ticks every second; **apply does not**, and the commit's "therefore"
+   was a non-sequitur. It looked right because in a continuous run the
+   `enforce_baseline_runtime` → `mesh_status_validation` window is 10–19 s (measured across
+   all 12 runs carrying both). But the documented fast-iteration loop —
+   `--skip-setup` / `--rerun-stage` against a reused setup dir, 12–25 min/iter
+   (`LiveLabExecutionEfficiencyPlan_2026-06-20.md:35`) — would fail **healthy** nodes by
+   6–12x. A false red is no better than the false green it replaced.
+2. **Removing the probe loses mesh coverage on two paths.** `mesh_status_validation` depends
+   on `KeyCustodyValidation` (`stage/mesh_status_validation.rs:36`), which **skipped in the
+   cascade of the very run that motivated this entry** — so the stage made sole authority
+   did not run, while the probe deleted for being redundant did. Separately it is
+   `@ Live` while `validate_baseline_runtime` is `@ Setup` (`stage/mod.rs:149`, `:159`), so
+   `--skip-linux-live-suite` — the documented mac/win inner loop — drops it from the plan
+   entirely, leaving **zero** mesh coverage and not even a reported-skip artifact.
+
+Two further findings, both making the removal worse than neutral:
+
+- **The stated justification was factually wrong.** The commit claimed the baseline path
+  "never deserializes, so no evaluator-side guard can ever reach it". The evaluator runs on
+  the **guest daemon** and collapses to `overall_ok` (`windows_mesh_status.rs:126-129`),
+  which the substring match reads. A bound passed to that probe **would** have taken effect
+  — which is exactly what REVISION 2 above prescribed and the commit contradicted.
+- **It was fail-open.** The probe was not assertion-free: the `Missing`,
+  `IntegrityMismatch` and `InvalidFormat` arms push drift reasons **unconditionally**,
+  outside the `if let Some(max_age)` gate (`windows_mesh_status.rs:148-158`). A node whose
+  state file was wiped, unreadable or tampered previously FAILED the baseline stage and
+  would now PASS it.
+
+**And the tests did not discriminate what mattered.** They asserted the argv's shape, so a
+semantically useless bound (`86400`) passes them, and nothing binds the orchestrator's flag
+string to the daemon's parser — the two live in different crates with no shared pin.
+
+**For the next attempt — resolve the scope question FIRST.** Freshness is not a sound
+liveness signal here because the snapshot is change-driven, and daemon liveness is already
+proven on the dedicated path by the §4.7 identity challenge. So the honest question is what
+mesh-status *can* assert: today it genuinely asserts the snapshot exists, verifies its
+integrity digest and parses — and `peer_ids` cannot be asserted against node ids (CIDRs, see
+REVISION 2). It may be that the correct outcome is **not to manufacture an assertion at all**
+but to stop over-reading its green, i.e. to fix how `macos_stage_baseline_runtime` is
+interpreted rather than what the probe does. Decide that before writing code. If a bound is
+used, justify it against the reuse loops, not only against continuous runs.
+
 **Two things this entry did not record, both larger than the flag.**
 
 1. **macOS declares `/etc/resolv.conf` non-authoritative.** The file itself states it "is not
