@@ -18,8 +18,10 @@
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
 > then claimed; it has since grown to **41** (QH-01 through QH-41, contiguous).
 > QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
-> live run — two macOS false-greens and a rollback-ordering fail-open, plus the
-> lab-network drift that blocks every mixed-OS run.
+> live run — one macOS false-green (mesh-status) plus one dead assertion (DNS),
+> a rollback-ordering fail-open, and the lab-network drift that blocks every
+> mixed-OS run. QH-39's framing and both its acceptance criteria were corrected
+> the same day; read its inline notes before implementing it.
 
 ## Purpose
 
@@ -1763,9 +1765,13 @@ daemon, for two DIFFERENT reasons:
   content-free check.** `collect_macos_dns_failclosed_snapshot` sets
   `loopback_resolver_advertised` **hardcoded `true`** whenever the file reads
   (`macos_dns_failclosed.rs:117-138`), never deriving it from the parsed nameservers. That
-  makes the drift branch that consumes it (`:81-86`) **unreachable** whenever
-  `resolv_conf_present` is true, and publishes a field into the evidence JSON that is not
-  derived from anything observed. The leak check at `:87` still works, so this is not
+  makes the drift branch consuming it (`:81-86`) unreachable **from the collector** — the
+  `Err` arm that sets the flag false also sets `resolv_conf_present` false, which
+  early-returns at `:72` before ever reaching `:81` — and publishes a field into the
+  evidence JSON that is not derived from anything observed. **Not dead *code*:** the struct
+  derives `Deserialize` and two unit tests (`:270-288`, `:407-430`) exercise the branch
+  directly, so every coverage tool reports it as covered. A dead *assertion* that looks
+  covered is harder to find than dead code, which is the point. The leak check at `:87` still works, so this is not
   "passes when a leak exists". The genuine gap is narrower and worth stating exactly: the
   check verifies `resolv.conf` **posture** and nothing verifies a resolver is actually
   **listening** on loopback — which is why it returned
@@ -1788,18 +1794,56 @@ recorded before and is now measured on the `--node` engine.
 
 **Acceptance, per check — they do not share one.**
 
-- **DNS:** `loopback_resolver_advertised` must be DERIVED from the parsed nameservers, so
-  the `:81-86` branch becomes reachable and the reported field means something. Whether the
-  check should additionally prove a resolver is *listening* is a separate scope question:
-  it would make the check depend on daemon liveness, which is a different property from DNS
-  posture. Decide it explicitly rather than by accident.
-- **mesh-status:** must assert on real expectations. Note `build_argv(op, daemon_path)`
-  (`vm_lab/mod.rs:11338`) has no parameter capable of carrying peer ids today, so "pass the
-  expected peer ids the orchestrator already knows" — as this entry originally put it — is
-  not a small change, and may not be the right one given a dedicated
-  `mesh_status_validation` stage already exists.
+> **The prescriptions below are REVISION 2.** Revision 1's two criteria were reviewed and
+> both were wrong — in opposite directions. They are replaced, not amended, and the reasons
+> are recorded because this register has already had to strike one false retraction (QH-07).
 
-Prove each with the negative case FIRST — make the check fail before trusting any green.
+- **DNS.** Revision 1 said "derive `loopback_resolver_advertised` from the parsed
+  nameservers". **That is a tautology and must not be implemented.** If every nameserver is
+  loopback the derived flag is true and `:81-86` never fires; if any is not, `:87` already
+  emits a reason. Under either `.all()` or `.any()` the branch can never independently
+  change a verdict — the "fix" would leave the assertion exactly as dead while looking
+  repaired. The only derivations that carry new information come from an **independent**
+  source: `scutil --dns` (macOS's actual resolver configuration), or probing that something
+  answers on loopback:53. Either that, or **delete the field and its branch** as the
+  redundancy they are. Deleting is honest; deriving from the same data is not.
+- **mesh-status.** Revision 1 said the fix "is not a small change" because
+  `build_argv(op, daemon_path)` (`vm_lab/mod.rs:11338`) cannot carry peer ids. The
+  signature claim is true and the conclusion is **wrong**: the plumbing already exists at
+  both ends and only `build_argv` is narrow.
+  - Daemon side: `macos-mesh-status-check` **already accepts** `--state-path`,
+    `--expected-peer-id` (singular, repeatable) and `--max-age-seconds`
+    (`rustynetd/src/main.rs:1758-1784`), threaded through `MacosMeshStatusOptions` into the
+    evaluator.
+  - Orchestrator side: `MeshStatusOverrides` (`vm_lab/mod.rs:26433-26441`) and
+    `build_linux_mesh_status_extra_args` (`:26308-26323`) **already emit those flags**,
+    exposed as `--mesh-status-expected-peer-ids` (`rustynet-cli/src/main.rs:4589`).
+
+  So this is a **plumbing job** — give the `--node` probe path access to the same overrides
+  the other path already uses — not a design job. Revision 1 would have sent an implementer
+  to design a mechanism that exists.
+
+  **The deflection to the dedicated stage does not hold either.** `mesh_status_validation`'s
+  validator (`role_validation/mesh_status.rs:41-54`) also passes no peer ids and no max-age,
+  so it carries the identical vacuous-`Ok` defect; it adds only an identity challenge on the
+  node's own id. And it **skipped on macOS in the very run that motivated this entry**.
+
+**The entry is not closed by the DNS half alone.** Its title is about checks that go green
+on a host with no daemon; only the mesh-status fix addresses that. Prove each with the
+negative case FIRST — make the check fail before trusting any green.
+
+**Two things this entry did not record, both larger than the flag.**
+
+1. **macOS declares `/etc/resolv.conf` non-authoritative.** The file itself states it "is not
+   consulted for DNS hostname resolution … by most processes on this system", and the module
+   doc concedes the point and defers `scutil --dns` to "a future slice"
+   (`macos_dns_failclosed.rs:10-13`). So a green macOS DNS check attests the posture of a
+   file macOS says is mostly not used. That is a scope problem, not a flag problem, and it
+   subsumes the whole DNS item above.
+2. **`validate_baseline_runtime` accepts any probe on a raw substring match** for
+   `"overall_ok": true` (`adapter/ssh.rs:584-589`) — no schema-version check, no
+   drift-consistency check, unlike the typed evaluators the dedicated stages use. Every one
+   of its six probes inherits that weakness, not just these two.
 
 ### QH-40 — launchd SIGTERMs the privileged helper BEFORE the daemon, so every macOS rollback path fails while the process still exits 0
 
