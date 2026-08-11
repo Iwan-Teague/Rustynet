@@ -1,6 +1,21 @@
 # QH-41 — the network evidence artifact is recorded blind — plan (revision 3) — 2026-08-11
 
-**Status: PLAN, pre-review.** Written against `HEAD = 667723db`, clean tree. Supersedes
+> **OUTCOME 2026-08-11: the one-line flip proposed here was REFUTED and NOT implemented.**
+> Review established that the audit runs *before* readiness, so collecting guests there would
+> record healthy-but-unpowered guests as unreachable, arm an unbounded SSH before shutdown
+> handlers and stage deadlines exist, turn `--dry-run` into a live fleet sweep, and use the
+> operator's `~/.ssh/known_hosts` rather than the run's.
+>
+> What shipped instead is disclosure: the artifact now carries `guest_observation` and, when
+> skipped, an `evidence_limitations` entry naming the unevaluated finding class. A first
+> attempt also downgraded `overall_status`, which was reverted — three callers hardcode
+> `--skip-guests` and the orchestrate gate stops on any non-`pass`, so it made
+> `ensure_lab_ready(profile=…)` permanently unsatisfiable once the stale labels are repaired.
+>
+> **Filed as QH-42**, not QH-41 — QH-41 is the vmnet bridge split, a different defect the two
+> were conflated with. Commits `9dd878ca`, `6cb4a8b5`, `a14c5227`.
+
+**Status: PLAN — superseded by the outcome note above.** Written against `HEAD = 667723db`, clean tree. Supersedes
 `QH41CrossBackendL2SplitPlan_2026-08-11.md`, both revisions of which were refuted — revision 1
 proposed building a preflight that exists, revision 2 claimed nothing runs it when the
 orchestrate path already does. Read that document's refutation header before this one; the

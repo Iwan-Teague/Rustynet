@@ -16,7 +16,7 @@
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
-> then claimed; it has since grown to **41** (QH-01 through QH-41, contiguous).
+> then claimed; it has since grown to **42** (QH-01 through QH-42, contiguous).
 > QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
 > live run — one macOS false-green (mesh-status) plus one dead assertion (DNS),
 > a rollback-ordering fail-open, and the lab-network drift that blocks every
@@ -1954,6 +1954,51 @@ mixed-OS coverage, and it is separate from QH-39/QH-40.
 boot order alone can move a guest between bridges and make inventory addresses look stale.
 Fix by putting the guest back on the shared adapter, then re-verify with a bidirectional
 ping before spending run time.
+
+### QH-42 — the network-evidence artifact rendered a verdict over a silently truncated finding set
+
+**Severity: medium. Confidence: VERIFIED — reproduced on the live fleet and fixed
+2026-08-11 (`9dd878ca`, corrected by `6cb4a8b5` and `a14c5227`).**
+
+Split out of QH-41, which is a *different* defect (the vmnet bridge split). The two were
+conflated while investigating that entry.
+
+**Mechanism.** The network audit runs on every orchestrate launch
+(`orchestrator/native.rs:1023`, from `:147` and `mod.rs:11990`) with `skip_guests: true`
+(`:1031`). Every guest is then stamped `"skipped"`, and `detect_offfleet_subnet_findings`
+drops any guest that is not `collected` (`network_audit.rs:884-885`) — so the off-fleet / L2
+finding class **cannot fire**. The run still rendered a verdict and wrote it into
+`orchestration/vm_network_evidence.json`, attached to the ledger row. Measured across all 16
+orchestrate evidence artifacts on disk: **0/11 guests collected on 16/16**, and the artifact
+disclosed nothing about it. A reader saw network evidence attached to a run and reasonably
+concluded the underlay had been checked.
+
+**Fix: disclose, do not gate.** The artifact now carries `guest_observation`
+(`collected`/`skipped`) and, when skipped, an `evidence_limitations` entry naming the
+unevaluated class.
+
+**What was tried and reverted, because it is the obvious move and will be tried again.**
+Downgrading `overall_status` to `not_run` on a truncated run makes two wired operator paths
+**permanently unsatisfiable**: three callers hardcode `--skip-guests`
+(`rustynet-mcp/src/bin/lab_state.rs:5582`, `:5738`, `:6023`) and the orchestrate gate stops a
+run on ANY non-`pass` status, not just `fail` (`native.rs:1064-1068`). The moment the
+inventory's stale labels are repaired — the repair this register recommends — a healthy fleet
+would fail `ensure_lab_ready(profile=…)` with nothing left to fix and no way to clear it. The
+reason is recorded on `overall_status_from_findings` itself.
+
+**Also worth knowing before trusting `off_fleet_subnet` for anything.** Its "fleet management
+plane" is chosen by vote among `network_group` labels, currently a **4–4 tie** broken by
+comparing CIDR *strings* (`network_audit.rs:873-876`) — so `192.168.121.0/24` wins only
+because `'1' < '6'`. Three of the voting labels are ones the same audit reports as
+`stale_network_group`. Repairing them **inverts the entire finding set**. The tie-break and
+the stale labels both need dealing with before that finding gates anything.
+
+**Not fixed here:** flipping `skip_guests` so the class can actually fire. The audit runs
+before readiness — before guests are powered on and before live IPs are refreshed — so it
+would record healthy guests as unreachable, arm an unbounded SSH before shutdown handlers and
+stage deadlines exist, turn `--dry-run` into a live fleet sweep, and authenticate with the
+operator's `~/.ssh/known_hosts` rather than the run's. If live observation is wanted it
+belongs **after** readiness, as a stage, scoped to the elected nodes.
 
 ## Related documents
 
