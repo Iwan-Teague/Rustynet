@@ -280,6 +280,12 @@ pub struct VmNetworkEvidence {
     pub overall_status: NetworkEvidenceStatus,
     pub status_reason: String,
     pub evidence_limitations: Vec<String>,
+    /// QH-41: whether the guests were actually observed on this run, or only
+    /// the host and inventory were. Machine-readable counterpart to the
+    /// limitation string, so a consumer can distinguish "checked and clean"
+    /// from "never looked" without parsing prose. Additive field; readers that
+    /// ignore unknown keys are unaffected.
+    pub guest_observation: String,
 }
 
 // --- Pure parsers (fixture-testable, no process execution) ---
@@ -1195,9 +1201,43 @@ pub fn detect_substrate_findings(sources: &[SubstrateSourceObservation]) -> Vec<
 }
 
 /// Compute the overall external status from the findings.
+/// Whether this run actually observed the guests, or only the host and the
+/// inventory. Guest observation is what makes the L2 / off-fleet findings
+/// reachable at all, so a verdict rendered without it is a verdict over a
+/// SILENTLY TRUNCATED finding set (QH-41).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestObservation {
+    Collected,
+    Skipped,
+}
+
+impl GuestObservation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuestObservation::Collected => "collected",
+            GuestObservation::Skipped => "skipped",
+        }
+    }
+}
+
+/// Render the run's verdict. Refuses to return `Pass` when the guests were not
+/// observed under a *selected* profile.
+///
+/// QH-41: with guest collection skipped, every guest is stamped `"skipped"` and
+/// `detect_offfleet_subnet_findings` drops it, so the off-fleet / L2 findings
+/// cannot fire — yet the run still rendered `pass` and wrote that verdict into
+/// an evidence artifact attached to the ledger row. "The checks I ran passed"
+/// is not "the checks passed" when a whole class was never executed. Missing
+/// input must not read as a pass (§10.4).
+///
+/// Scoped to `profile_selected` deliberately: a profile-less invocation makes no
+/// compliance claim, so truncation there is not a false pass. And the downgrade
+/// is to `NotRun`, not `Fail` — nothing was observed to be wrong; the claim was
+/// simply not established.
 pub fn overall_status_from_findings(
     findings: &[AuditFinding],
     profile_selected: bool,
+    guest_observation: GuestObservation,
 ) -> (NetworkEvidenceStatus, String) {
     let error_count = findings
         .iter()
@@ -1222,6 +1262,14 @@ pub fn overall_status_from_findings(
                 "the scenario substrate for the selected profile is not prepared; no evidence claim".to_owned(),
             );
         }
+    }
+    if profile_selected && guest_observation == GuestObservation::Skipped {
+        return (
+            NetworkEvidenceStatus::NotRun,
+            "guest observation was skipped, so the off-fleet / L2 finding class was never \
+             evaluated; no pass claim is made"
+                .to_owned(),
+        );
     }
     (
         NetworkEvidenceStatus::Pass,
@@ -1848,8 +1896,13 @@ fn run_network_observation(
             .then_with(|| a.subject.cmp(&b.subject))
     });
 
+    let guest_observation = if skip_guests {
+        GuestObservation::Skipped
+    } else {
+        GuestObservation::Collected
+    };
     let (overall_status, status_reason) =
-        overall_status_from_findings(&findings, selected.is_some());
+        overall_status_from_findings(&findings, selected.is_some(), guest_observation);
 
     let (git_commit, git_dirty) = git_head_and_dirty(repo_root);
     let generated_at_epoch_secs = SystemTime::now()
@@ -1900,11 +1953,27 @@ fn run_network_observation(
         findings,
         overall_status,
         status_reason,
-        evidence_limitations: vec![
-            "read-only audit: reports observed state; it proves no dataplane behavior".to_owned(),
-            "management reachability is not dataplane proof (rulebook §3)".to_owned(),
-            "single-host observation cannot prove remote-network independence".to_owned(),
-        ],
+        guest_observation: guest_observation.as_str().to_owned(),
+        evidence_limitations: {
+            let mut limitations = vec![
+                "read-only audit: reports observed state; it proves no dataplane behavior"
+                    .to_owned(),
+                "management reachability is not dataplane proof (rulebook §3)".to_owned(),
+                "single-host observation cannot prove remote-network independence".to_owned(),
+            ];
+            // QH-41: the artifact previously disclosed nothing about this, so a
+            // reader saw network evidence attached to a run and reasonably
+            // concluded the underlay had been checked. It had not: with guest
+            // observation skipped the off-fleet / L2 findings cannot fire at all.
+            if guest_observation == GuestObservation::Skipped {
+                limitations.push(
+                    "guest observation SKIPPED: the off-fleet / L2 finding class was not \
+                     evaluated, so this artifact reports host and inventory findings only"
+                        .to_owned(),
+                );
+            }
+            limitations
+        },
     };
     Ok(ObservationRun {
         evidence,
@@ -2072,6 +2141,60 @@ pub fn execute_ops_vm_lab_network_preflight(
 
 #[cfg(test)]
 mod tests {
+
+    // ── QH-41: a verdict over a truncated finding set ────────────────────
+
+    #[test]
+    fn a_skipped_guest_observation_cannot_render_pass_under_a_profile() {
+        // The defect: with guest observation skipped, every guest is stamped
+        // "skipped" and detect_offfleet_subnet_findings drops it, so the
+        // off-fleet / L2 class cannot fire -- yet the run still rendered `pass`
+        // and wrote that verdict into an artifact attached to the ledger row.
+        // "The checks I ran passed" is not "the checks passed".
+        let (status, reason) = overall_status_from_findings(&[], true, GuestObservation::Skipped);
+        assert_eq!(status, NetworkEvidenceStatus::NotRun);
+        assert!(
+            reason.contains("guest observation was skipped"),
+            "the reason must name the truncation: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_collected_guest_observation_still_passes_on_a_clean_run() {
+        let (status, _) = overall_status_from_findings(&[], true, GuestObservation::Collected);
+        assert_eq!(status, NetworkEvidenceStatus::Pass);
+    }
+
+    #[test]
+    fn a_profileless_run_is_unaffected_by_truncation() {
+        // A profile-less invocation makes no compliance claim, so a truncated
+        // finding set there is not a false pass. Scoping the downgrade matters:
+        // without it, every ad-hoc `--skip-guests` invocation would report
+        // not_run and the signal would be ignored as noise.
+        let (status, _) = overall_status_from_findings(&[], false, GuestObservation::Skipped);
+        assert_eq!(status, NetworkEvidenceStatus::Pass);
+    }
+
+    #[test]
+    fn a_real_error_still_outranks_the_truncation_downgrade() {
+        // Truncation must not mask a finding that DID fire. Fail is a stronger
+        // claim than not_run and has to win.
+        let findings = vec![AuditFinding::error("stale_network_group", "vm-1", "stale")];
+        let (status, _) = overall_status_from_findings(&findings, true, GuestObservation::Skipped);
+        assert_eq!(status, NetworkEvidenceStatus::Fail);
+    }
+
+    #[test]
+    fn the_downgrade_is_not_run_rather_than_fail() {
+        // Nothing was observed to be WRONG -- the claim was simply not
+        // established. Reporting `fail` would invent a defect; reporting `pass`
+        // would invent evidence. `not_run` is the only honest verdict, and it is
+        // the one the taxonomy already has for "no evidence claim".
+        let (status, _) = overall_status_from_findings(&[], true, GuestObservation::Skipped);
+        assert_ne!(status, NetworkEvidenceStatus::Fail);
+        assert_ne!(status, NetworkEvidenceStatus::Pass);
+        assert_eq!(status, NetworkEvidenceStatus::NotRun);
+    }
     use super::super::network_profile::parse_network_profile_toml;
     use super::*;
 
@@ -2262,7 +2385,8 @@ mod tests {
         let mut findings = detect_profile_drift_findings(&profile, &vms);
         assert!(findings.iter().any(|f| f.kind == "scenario_nic_missing"));
         findings.retain(|f| f.severity != FindingSeverity::Error);
-        let (status, _) = overall_status_from_findings(&findings, true);
+        let (status, _) =
+            overall_status_from_findings(&findings, true, GuestObservation::Collected);
         assert_eq!(status, NetworkEvidenceStatus::NotRun);
     }
 
@@ -2276,7 +2400,8 @@ mod tests {
         )];
         let findings = detect_profile_drift_findings(&profile, &vms);
         assert!(findings.iter().any(|f| f.kind == "backend_not_supported"));
-        let (status, _) = overall_status_from_findings(&findings, true);
+        let (status, _) =
+            overall_status_from_findings(&findings, true, GuestObservation::Collected);
         assert_eq!(status, NetworkEvidenceStatus::NotSupported);
     }
 
