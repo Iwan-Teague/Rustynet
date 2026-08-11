@@ -280,7 +280,7 @@ pub struct VmNetworkEvidence {
     pub overall_status: NetworkEvidenceStatus,
     pub status_reason: String,
     pub evidence_limitations: Vec<String>,
-    /// QH-41: whether the guests were actually observed on this run, or only
+    /// QH-42: whether the guests were actually observed on this run, or only
     /// the host and inventory were. Machine-readable counterpart to the
     /// limitation string, so a consumer can distinguish "checked and clean"
     /// from "never looked" without parsing prose. Additive field; readers that
@@ -1204,7 +1204,7 @@ pub fn detect_substrate_findings(sources: &[SubstrateSourceObservation]) -> Vec<
 /// Whether this run actually observed the guests, or only the host and the
 /// inventory. Guest observation is what makes the L2 / off-fleet findings
 /// reachable at all, so a verdict rendered without it is a verdict over a
-/// SILENTLY TRUNCATED finding set (QH-41).
+/// SILENTLY TRUNCATED finding set (QH-42).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestObservation {
     Collected,
@@ -1249,7 +1249,7 @@ impl GuestObservation {
 /// `evidence_limitations`), where a consumer can act on it without it becoming
 /// an unclearable stop.
 ///
-/// QH-41: with guest collection skipped, every guest is stamped `"skipped"` and
+/// QH-42: with guest collection skipped, every guest is stamped `"skipped"` and
 /// `detect_offfleet_subnet_findings` drops it, so the off-fleet / L2 findings
 /// cannot fire — yet the run still rendered `pass` and wrote that verdict into
 /// an evidence artifact attached to the ledger row. "The checks I ran passed"
@@ -1974,7 +1974,7 @@ fn run_network_observation(
                 "management reachability is not dataplane proof (rulebook §3)".to_owned(),
                 "single-host observation cannot prove remote-network independence".to_owned(),
             ];
-            // QH-41: the artifact previously disclosed nothing about this, so a
+            // QH-42: the artifact previously disclosed nothing about this, so a
             // reader saw network evidence attached to a run and reasonably
             // concluded the underlay had been checked. It had not: with guest
             // observation skipped the off-fleet / L2 findings cannot fire at all.
