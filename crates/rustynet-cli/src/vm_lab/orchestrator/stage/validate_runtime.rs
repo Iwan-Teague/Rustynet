@@ -21,22 +21,6 @@ impl ValidateBaselineRuntimeStage {
     }
 }
 
-// MeshStatus deliberately ABSENT (QH-39). This path adjudicates a probe
-// by substring-matching `"overall_ok": true` in the raw stdout
-// (`adapter/ssh.rs:584-589`) — it never deserializes, so no evaluator-side
-// guard can ever reach it. That made it a strictly WEAKER duplicate of the
-// dedicated `mesh_status_validation` stage, which applies the typed
-// evaluator AND the §4.7 identity challenge. Keeping both meant the weaker
-// one minted `macos_stage_baseline_runtime = pass` for a node that reached
-// no peer. The mesh verdict now comes from the dedicated stage only.
-pub(crate) const BASELINE_PROBE_OPS: &[crate::vm_lab::DaemonProbeOp] = &[
-    crate::vm_lab::DaemonProbeOp::RuntimeAcls,
-    crate::vm_lab::DaemonProbeOp::ServiceHardening,
-    crate::vm_lab::DaemonProbeOp::KeyCustody,
-    crate::vm_lab::DaemonProbeOp::Authenticode,
-    crate::vm_lab::DaemonProbeOp::DnsFailclosed,
-];
-
 impl OrchestrationStage for ValidateBaselineRuntimeStage {
     fn id(&self) -> StageId {
         StageId::ValidateBaselineRuntime
@@ -57,7 +41,14 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         use crate::vm_lab::DaemonProbeOp;
 
-        const OPS: &[DaemonProbeOp] = BASELINE_PROBE_OPS;
+        const OPS: &[DaemonProbeOp] = &[
+            DaemonProbeOp::RuntimeAcls,
+            DaemonProbeOp::ServiceHardening,
+            DaemonProbeOp::KeyCustody,
+            DaemonProbeOp::Authenticode,
+            DaemonProbeOp::MeshStatus,
+            DaemonProbeOp::DnsFailclosed,
+        ];
 
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
 
@@ -137,37 +128,6 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
 
 #[cfg(test)]
 mod tests {
-    use crate::vm_lab::DaemonProbeOp;
-
-    #[test]
-    fn baseline_probe_ops_exclude_mesh_status() {
-        // QH-39. This path adjudicates by substring-matching `"overall_ok": true`
-        // in raw stdout, so it never deserializes and no evaluator guard can
-        // reach it. It was a strictly weaker duplicate of the dedicated
-        // mesh_status_validation stage, and its vacuous green minted
-        // macos_stage_baseline_runtime = pass for a node that reached no peer.
-        assert!(
-            !super::BASELINE_PROBE_OPS.contains(&DaemonProbeOp::MeshStatus),
-            "mesh verdict must come from the dedicated stage, not this weaker probe"
-        );
-        assert_eq!(super::BASELINE_PROBE_OPS.len(), 5);
-    }
-
-    #[test]
-    fn baseline_probe_ops_have_no_duplicates() {
-        // Re-adding MeshStatus by any route -- including a second entry under a
-        // different name -- must break here rather than silently restore the
-        // duplicate adjudication.
-        let mut seen: Vec<String> = super::BASELINE_PROBE_OPS
-            .iter()
-            .map(|op| format!("{op:?}"))
-            .collect();
-        let before = seen.len();
-        seen.sort();
-        seen.dedup();
-        assert_eq!(seen.len(), before, "duplicate probe op in the baseline set");
-    }
-
     use super::*;
     use std::collections::HashMap;
 
