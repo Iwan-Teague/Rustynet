@@ -1742,17 +1742,35 @@ silence it, and that is a behaviour change rather than pure hygiene.
 
 ### QH-39 — two macOS baseline checks return `overall_ok: true` on a host with NO daemon running, and that green reaches the ledger
 
-**Severity: HIGH. Confidence: VERIFIED — both reproduced live on `macos-utm-1`
-2026-08-11 with `pgrep rustynetd` finding no process.**
+**Severity: HIGH (mesh-status) / medium (DNS). Confidence: VERIFIED — both reproduced live
+on `macos-utm-1` 2026-08-11 with `pgrep rustynetd` finding no process.**
+
+> **FRAMING CORRECTED 2026-08-11, same day as filing.** This entry originally said "two of
+> them assert nothing". **That is true of `mesh-status` and FALSE of the DNS check**, which
+> does real work: `evaluate_macos_dns_failclosed` (`macos_dns_failclosed.rs:41-58`) requires
+> **every** nameserver to be loopback, so a public resolver in `resolv.conf` genuinely fails
+> it, as do a missing file (`:67-73`) and an empty nameserver list (`:74-80`). Lumping the
+> two together overstated the DNS half and would have pointed an implementer at the wrong
+> fix. They are different defects with different severities and different remedies; the
+> corrected descriptions are below. The original claim is left visible rather than deleted,
+> per this register's own norm on retracted findings.
 
 `validate_baseline_runtime` runs six `DaemonProbeOp`s that map to `macos-*-check`
-subcommands (`vm_lab/mod.rs:11420-11432`). Two of them assert nothing:
+subcommands (`vm_lab/mod.rs:11420-11432`). Two of them return green on a host with no
+daemon, for two DIFFERENT reasons:
 
-- **`macos-dns-failclosed-check`** parses `/etc/resolv.conf` and sets
+- **`macos-dns-failclosed-check` — a DEAD ASSERTION and a lying report field, not a
+  content-free check.** `collect_macos_dns_failclosed_snapshot` sets
   `loopback_resolver_advertised` **hardcoded `true`** whenever the file reads
-  (`macos_dns_failclosed.rs:117-138`). Run live against a daemon-less host it returned
+  (`macos_dns_failclosed.rs:117-138`), never deriving it from the parsed nameservers. That
+  makes the drift branch that consumes it (`:81-86`) **unreachable** whenever
+  `resolv_conf_present` is true, and publishes a field into the evidence JSON that is not
+  derived from anything observed. The leak check at `:87` still works, so this is not
+  "passes when a leak exists". The genuine gap is narrower and worth stating exactly: the
+  check verifies `resolv.conf` **posture** and nothing verifies a resolver is actually
+  **listening** on loopback — which is why it returned
   `{"overall_ok": true, "nameservers": ["127.0.0.1"], "loopback_resolver_advertised": true,
-  "drift_reasons": []}`.
+  "drift_reasons": []}` against a daemon-less host.
 - **`mesh-status`** is invoked with only `--no-fail-on-drift` — no `--expected-peer-ids`,
   no `--max-age-seconds`. The `Ok` branch then performs **zero assertions**
   (`windows_mesh_status.rs:162-186`), so `overall_ok: true` means "a state file exists and
@@ -1768,10 +1786,20 @@ evidence until this is fixed.
 This is the MeshStatus-without-expected-peer-id false-green resurfacing; it has been
 recorded before and is now measured on the `--node` engine.
 
-**Acceptance:** each check must fail on a host with no daemon running. `mesh-status` must
-be passed the expected peer ids the orchestrator already knows, and must assert on them.
-Prove it with the negative case first — run the check against a stopped daemon and watch it
-go red — before trusting any subsequent green.
+**Acceptance, per check — they do not share one.**
+
+- **DNS:** `loopback_resolver_advertised` must be DERIVED from the parsed nameservers, so
+  the `:81-86` branch becomes reachable and the reported field means something. Whether the
+  check should additionally prove a resolver is *listening* is a separate scope question:
+  it would make the check depend on daemon liveness, which is a different property from DNS
+  posture. Decide it explicitly rather than by accident.
+- **mesh-status:** must assert on real expectations. Note `build_argv(op, daemon_path)`
+  (`vm_lab/mod.rs:11338`) has no parameter capable of carrying peer ids today, so "pass the
+  expected peer ids the orchestrator already knows" — as this entry originally put it — is
+  not a small change, and may not be the right one given a dedicated
+  `mesh_status_validation` stage already exists.
+
+Prove each with the negative case FIRST — make the check fail before trusting any green.
 
 ### QH-40 — launchd SIGTERMs the privileged helper BEFORE the daemon, so every macOS rollback path fails while the process still exits 0
 
