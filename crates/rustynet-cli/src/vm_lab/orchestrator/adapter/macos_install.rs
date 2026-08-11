@@ -297,36 +297,87 @@ pub fn install_daemon_from_workdir(
     })
 }
 
-/// Poll the remote macOS host for the rustynetd Unix socket to appear.
-/// Used by install_daemon and install_daemon_from_workdir to bridge the
-/// gap between launchctl returning and the daemon actually being ready.
-fn wait_for_macos_daemon_socket(conn: &NodeConnection) -> Result<(), AdapterError> {
-    let socket = "/private/var/run/rustynet/rustynetd.sock";
-    // 40 iterations × 1 s = 40 s total — comfortably longer than the
-    // observed worst-case daemon startup on the lab VM and aligned with
-    // the Linux install-systemd timeout.  Probe via `test -S`
-    // (Unix-domain socket) to avoid false positives on placeholder
-    // files left by a crashed previous run.
-    // Probe in short bursts over SEPARATE SSH connections rather than one long
-    // 40 s connection. The daemon perturbs the host network as it comes up
-    // (binding the userspace-shared utun, reconcile touching routes), which can
-    // drop a single in-flight SSH session (observed: bootstrap_hosts failing
-    // with ssh `exit 255` even though the daemon was healthy and the socket
-    // present). Re-establishing the connection each burst means one transient
-    // drop no longer fails the whole wait. ~8 bursts × (8 s probe + 2 s pause)
-    // ≈ 80 s budget, comfortably longer than observed daemon startup.
-    let probe = format!(
+/// Wait until the remote macOS daemon is LIVE — i.e. it answers on its control
+/// socket with its own identity — after a launchd bootstrap or plist reload.
+/// Used by install_daemon, install_daemon_from_workdir and the enforce path to
+/// bridge the gap between launchctl returning and the daemon actually serving.
+///
+/// PROVES LIVENESS, NOT EXISTENCE. This previously probed `test -S <socket>`,
+/// which asks only whether the path is an `S_IFSOCK` inode. That is not a
+/// readiness signal here, for a reason that makes it fail every time rather
+/// than occasionally: **rustynetd does not unlink its socket on shutdown**, so
+/// after any successful first start the inode survives every subsequent
+/// restart-in-place. `test -S` was therefore satisfied by the DEAD
+/// predecessor's socket and the wait returned immediately.
+///
+/// Measured on `macos-utm-1`, run `percontrol-rebaseline-20260811`: the plist
+/// reload booted the daemon out at 08:01:18Z, launchd respawned it at
+/// 08:01:20Z, and it bound its socket at 08:01:26Z (socket inode birth-time) —
+/// but this wait had already returned, so `dns_failclosed_validation` probed at
+/// 08:01:24Z and got `ECONNREFUSED`, taking nine dependent stages down with it.
+/// `ECONNREFUSED` rather than `ENOENT` is itself the tell: the path existed and
+/// nothing was listening.
+///
+/// The probe now runs the same query the §4.7 identity challenge uses
+/// (`rustynet status` over the control socket, see
+/// `macos_traffic::query_live_identity`) and additionally requires a parseable
+/// `node_id`, so the gate proves exactly what the next stage will demand —
+/// a daemon that answers and knows who it is — rather than a weaker proxy for
+/// it. A socket that exists but refuses, or answers without an identity, is
+/// NOT ready.
+///
+/// Probe in short bursts over SEPARATE SSH connections rather than one long
+/// connection. The daemon perturbs the host network as it comes up (binding the
+/// userspace-shared utun, reconcile touching routes), which can drop a single
+/// in-flight SSH session (observed: bootstrap_hosts failing with ssh `exit 255`
+/// even though the daemon was healthy). Re-establishing the connection each
+/// burst means one transient drop no longer fails the whole wait. ~8 bursts ×
+/// (8 s probe + 2 s pause) ≈ 80 s budget, comfortably longer than the observed
+/// ~6 s bind and than the 10-30 s worst case this path was written for.
+/// Marker the in-guest probe echoes once `rustynet status` has exited 0.
+const DAEMON_LIVE_MARKER: &str = "daemon-live";
+
+/// Whether a readiness-probe transcript proves the daemon is LIVE.
+///
+/// Two conditions, both required. The marker alone proves only that `rustynet
+/// status` exited 0; the parseable `node_id` proves the daemon actually
+/// reported an identity, which is precisely what the §4.7 identity challenge
+/// gating every role validator will demand seconds later. Anything else — a
+/// refusing socket, a daemon still initialising, or the OLD probe's
+/// `socket-ready` token — is NOT ready.
+fn daemon_probe_reports_live(output: &str) -> bool {
+    output.contains(DAEMON_LIVE_MARKER) && ssh::parse_status_node_id(output).is_some()
+}
+
+/// The in-guest readiness probe: retry `rustynet status` against the control
+/// socket, echoing [`DAEMON_LIVE_MARKER`] on the first success.
+///
+/// Every interpolated value is a compile-time constant — no untrusted input
+/// reaches this command string.
+fn macos_daemon_readiness_probe() -> String {
+    format!(
         "for i in $(seq 1 8); do \
-            if {SUDO_N} test -S {socket}; then echo socket-ready; exit 0; fi; \
+            if out=$({SUDO_N} env RUSTYNET_DAEMON_SOCKET={MACOS_DAEMON_SOCKET} \
+                {MACOS_RUSTYNET_PATH} status 2>/dev/null); then \
+                printf '%s\\n' \"$out\"; echo {DAEMON_LIVE_MARKER}; exit 0; \
+            fi; \
             sleep 1; \
          done; \
-         echo socket-missing; exit 1"
-    );
+         echo daemon-unreachable; exit 1"
+    )
+}
+
+fn wait_for_macos_daemon_socket(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let probe = macos_daemon_readiness_probe();
     let mut last_status = String::from("no probe attempt completed");
     for attempt in 1..=8 {
         match ssh::run_remote(conn, &probe, Duration::from_secs(30)) {
-            Ok(output) if output.contains("socket-ready") => return Ok(()),
-            Ok(_) => last_status = "socket not present yet".to_string(),
+            Ok(output) if daemon_probe_reports_live(&output) => return Ok(()),
+            Ok(output) if output.contains(DAEMON_LIVE_MARKER) => {
+                last_status =
+                    "daemon answered but reported no node_id (still initialising)".to_string();
+            }
+            Ok(_) => last_status = "daemon not answering on its control socket yet".to_string(),
             // Transient SSH failure (e.g. exit 255 while the daemon briefly
             // perturbs the network) — re-establish the connection and retry.
             Err(err) => last_status = format!("ssh probe error: {err}"),
@@ -337,7 +388,8 @@ fn wait_for_macos_daemon_socket(conn: &NodeConnection) -> Result<(), AdapterErro
     }
     Err(AdapterError::Protocol {
         message: format!(
-            "macOS daemon socket {socket} failed to appear after 8 retried probes (~80 s) post launchd bootstrap: {last_status}"
+            "macOS daemon at {MACOS_DAEMON_SOCKET} did not become LIVE after 8 retried probes \
+             (~80 s) post launchd bootstrap: {last_status}"
         ),
     })
 }
@@ -2061,6 +2113,81 @@ mod tests {
                 && !BOOTSTRAP_SCRIPT
                     .contains("install -d -m 0755 -o root -g rustynetd \"${trust_dir}\""),
             "seed_trust_evidence must not regress to 0755 root:rustynetd on the trust dir"
+        );
+    }
+
+    fn live_status_transcript(node_id: &str) -> String {
+        // Shape of a real `rustynet status` reply, followed by the marker the
+        // in-guest probe loop echoes on exit 0.
+        // `parse_status_field` splits on whitespace and matches `key=value`.
+        format!("node_id={node_id} role=client peers=2\ndaemon-live\n")
+    }
+
+    #[test]
+    fn a_refusing_socket_is_not_live() {
+        // THE regression this replaced. On macos-utm-1 the dead predecessor's
+        // socket inode survived a restart-in-place, `test -S` passed, and
+        // dns_failclosed_validation then hit ECONNREFUSED 2 s before the
+        // successor bound. The transcript of that state must read NOT live.
+        let refused = "error [transient_failure (70)]: daemon unreachable: connect \
+             /private/var/run/rustynet/rustynetd.sock failed: Connection refused (os error 61)\n\
+             daemon-unreachable\n";
+        assert!(!daemon_probe_reports_live(refused));
+    }
+
+    #[test]
+    fn the_old_existence_token_alone_is_not_live() {
+        // Guards against reverting to an existence check by any route: the old
+        // probe's success token proves only that an inode is a socket.
+        assert!(!daemon_probe_reports_live("socket-ready\n"));
+    }
+
+    #[test]
+    fn answering_without_an_identity_is_not_live() {
+        // The daemon can accept a connection while still initialising and reply
+        // without a node_id. The identity challenge that gates every role
+        // validator would reject that moments later, so the gate must too.
+        assert!(!daemon_probe_reports_live(
+            "role=client peers=0\ndaemon-live\n"
+        ));
+    }
+
+    #[test]
+    fn an_identity_without_the_marker_is_not_live() {
+        // A node_id scraped from anywhere other than a successful status call
+        // (a cached file, a log line) must not satisfy the gate on its own.
+        // NOTE the `=` form. With `node_id: ...` this passed for the WRONG
+        // reason -- the parser found no identity at all -- so it proved nothing
+        // about the marker being required.
+        assert!(!daemon_probe_reports_live("node_id=macos-client-1\n"));
+    }
+
+    #[test]
+    fn a_daemon_that_answers_with_its_identity_is_live() {
+        assert!(daemon_probe_reports_live(&live_status_transcript(
+            "macos-client-1"
+        )));
+    }
+
+    #[test]
+    fn the_readiness_probe_queries_the_daemon_rather_than_stat_ing_a_path() {
+        // Pin the mechanism, not just the verdict: the probe must invoke
+        // `rustynet status` against the control socket. A future edit that
+        // reverts to `test -S` -- which a dead predecessor's socket satisfies
+        // permanently, because rustynetd does not unlink on shutdown -- must
+        // break here.
+        let probe = macos_daemon_readiness_probe();
+        assert!(
+            probe.contains(MACOS_RUSTYNET_PATH) && probe.contains("status"),
+            "probe must query the daemon: {probe}"
+        );
+        assert!(
+            probe.contains(MACOS_DAEMON_SOCKET),
+            "probe must target the control socket: {probe}"
+        );
+        assert!(
+            !probe.contains("test -S"),
+            "probe must not fall back to an existence check: {probe}"
         );
     }
 
