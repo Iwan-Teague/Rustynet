@@ -1211,6 +1211,21 @@ pub enum GuestObservation {
     Skipped,
 }
 
+/// Which observation this run performed.
+///
+/// Trivial, and extracted deliberately: inverting this one expression restores
+/// the original defect in full — the artifact would read `"collected"` while
+/// every guest was skipped, so the disclosure would actively lie — and it
+/// SURVIVED the first version of these tests, which only exercised the pure
+/// verdict function and never the wiring that feeds it.
+pub fn guest_observation_for(skip_guests: bool) -> GuestObservation {
+    if skip_guests {
+        GuestObservation::Skipped
+    } else {
+        GuestObservation::Collected
+    }
+}
+
 impl GuestObservation {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1248,7 +1263,6 @@ impl GuestObservation {
 pub fn overall_status_from_findings(
     findings: &[AuditFinding],
     profile_selected: bool,
-    guest_observation: GuestObservation,
 ) -> (NetworkEvidenceStatus, String) {
     let error_count = findings
         .iter()
@@ -1899,13 +1913,9 @@ fn run_network_observation(
             .then_with(|| a.subject.cmp(&b.subject))
     });
 
-    let guest_observation = if skip_guests {
-        GuestObservation::Skipped
-    } else {
-        GuestObservation::Collected
-    };
+    let guest_observation = guest_observation_for(skip_guests);
     let (overall_status, status_reason) =
-        overall_status_from_findings(&findings, selected.is_some(), guest_observation);
+        overall_status_from_findings(&findings, selected.is_some());
 
     let (git_commit, git_dirty) = git_head_and_dirty(repo_root);
     let generated_at_epoch_secs = SystemTime::now()
@@ -2204,27 +2214,19 @@ mod tests {
     }
 
     #[test]
-    fn the_verdict_does_not_downgrade_on_a_skipped_observation() {
-        // Pins the decision NOT to gate on truncation. Three callers hardcode
-        // --skip-guests and the orchestrate gate stops on any non-pass, so a
-        // downgrade here makes ensure_lab_ready permanently unsatisfiable once the
-        // inventory's stale labels are repaired. This test exists so a future
-        // change cannot reintroduce that without deleting it deliberately.
-        let (status, _) = overall_status_from_findings(&[], true, GuestObservation::Skipped);
-        assert_eq!(
-            status,
-            NetworkEvidenceStatus::Pass,
-            "truncation is DISCLOSED, not gated -- see the note on overall_status_from_findings"
-        );
+    fn the_observation_flag_is_not_inverted() {
+        // THE mutation that survived the previous suite. Inverting this makes the
+        // artifact claim "collected" for a run in which every guest was skipped --
+        // the original defect restored, with the disclosure actively lying.
+        assert_eq!(guest_observation_for(true), GuestObservation::Skipped);
+        assert_eq!(guest_observation_for(false), GuestObservation::Collected);
     }
 
     #[test]
     fn a_real_error_still_fails_regardless_of_observation() {
         let findings = vec![AuditFinding::error("stale_network_group", "vm-1", "stale")];
-        for observation in [GuestObservation::Skipped, GuestObservation::Collected] {
-            let (status, _) = overall_status_from_findings(&findings, true, observation);
-            assert_eq!(status, NetworkEvidenceStatus::Fail);
-        }
+        let (status, _) = overall_status_from_findings(&findings, true);
+        assert_eq!(status, NetworkEvidenceStatus::Fail);
     }
     use super::super::network_profile::parse_network_profile_toml;
     use super::*;
@@ -2416,8 +2418,7 @@ mod tests {
         let mut findings = detect_profile_drift_findings(&profile, &vms);
         assert!(findings.iter().any(|f| f.kind == "scenario_nic_missing"));
         findings.retain(|f| f.severity != FindingSeverity::Error);
-        let (status, _) =
-            overall_status_from_findings(&findings, true, GuestObservation::Collected);
+        let (status, _) = overall_status_from_findings(&findings, true);
         assert_eq!(status, NetworkEvidenceStatus::NotRun);
     }
 
@@ -2431,8 +2432,7 @@ mod tests {
         )];
         let findings = detect_profile_drift_findings(&profile, &vms);
         assert!(findings.iter().any(|f| f.kind == "backend_not_supported"));
-        let (status, _) =
-            overall_status_from_findings(&findings, true, GuestObservation::Collected);
+        let (status, _) = overall_status_from_findings(&findings, true);
         assert_eq!(status, NetworkEvidenceStatus::NotSupported);
     }
 
