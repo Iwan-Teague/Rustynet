@@ -16,7 +16,10 @@
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
-> then claimed; it has since grown to **35** (QH-01 through QH-35, contiguous).
+> then claimed; it has since grown to **41** (QH-01 through QH-41, contiguous).
+> QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
+> live run — two macOS false-greens and a rollback-ordering fail-open, plus the
+> lab-network drift that blocks every mixed-OS run.
 
 ## Purpose
 
@@ -1736,6 +1739,95 @@ child writing to the parent's console — `:810` is the one to read — because 
 silence it, and that is a behaviour change rather than pure hygiene.
 
 ---
+
+### QH-39 — two macOS baseline checks return `overall_ok: true` on a host with NO daemon running, and that green reaches the ledger
+
+**Severity: HIGH. Confidence: VERIFIED — both reproduced live on `macos-utm-1`
+2026-08-11 with `pgrep rustynetd` finding no process.**
+
+`validate_baseline_runtime` runs six `DaemonProbeOp`s that map to `macos-*-check`
+subcommands (`vm_lab/mod.rs:11420-11432`). Two of them assert nothing:
+
+- **`macos-dns-failclosed-check`** parses `/etc/resolv.conf` and sets
+  `loopback_resolver_advertised` **hardcoded `true`** whenever the file reads
+  (`macos_dns_failclosed.rs:117-138`). Run live against a daemon-less host it returned
+  `{"overall_ok": true, "nameservers": ["127.0.0.1"], "loopback_resolver_advertised": true,
+  "drift_reasons": []}`.
+- **`mesh-status`** is invoked with only `--no-fail-on-drift` — no `--expected-peer-ids`,
+  no `--max-age-seconds`. The `Ok` branch then performs **zero assertions**
+  (`windows_mesh_status.rs:162-186`), so `overall_ok: true` means "a state file exists and
+  parses". `macos-utm-1` recorded `MeshStatus: passed` while reaching no peer at all.
+
+**Why it matters beyond the two checks.** Both greens propagate into
+`macos_stage_baseline_runtime = pass` in the `--node` ledger. Run
+`percontrol-rebaseline-20260811` carries that value for a node whose daemon was mid-restart
+and whose network was partitioned from every peer. Any parity claim resting on
+`macos_stage_baseline_runtime` is therefore unearned, and the column cannot be used as
+evidence until this is fixed.
+
+This is the MeshStatus-without-expected-peer-id false-green resurfacing; it has been
+recorded before and is now measured on the `--node` engine.
+
+**Acceptance:** each check must fail on a host with no daemon running. `mesh-status` must
+be passed the expected peer ids the orchestrator already knows, and must assert on them.
+Prove it with the negative case first — run the check against a stopped daemon and watch it
+go red — before trusting any subsequent green.
+
+### QH-40 — launchd SIGTERMs the privileged helper BEFORE the daemon, so every macOS rollback path fails while the process still exits 0
+
+**Severity: HIGH (fail-closed). Confidence: VERIFIED from the guest's unified log,
+run `percontrol-rebaseline-20260811`.**
+
+On a plist reload, launchd signalled `com.rustynet.privileged-helper` (pid 16607) at
+`01:01:18.984` guest-local and `com.rustynet.daemon` (pid 16611) at `01:01:18.985` — the
+helper **one millisecond earlier**. The daemon's shutdown rollback then ran with no helper
+to talk to, and logged:
+
+> `rollback dns protection: rollback failed: firewall apply failed: … privileged helper
+> response read failed: truncated frame header` … `backend shutdown: … privileged helper
+> connect failed (…rustynetd-privileged.sock): Connection refused (os error 61)` …
+> `exit-mode rollback failed` … `cleanup failed` … `interface cleanup failed`
+
+Every teardown path failed — DNS protection, firewall, exit-mode, interface cleanup — and
+launchd still recorded `exited due to exit(0)`.
+
+**Why this is the most serious item from that run.** §4 requires fail-closed behaviour and
+§10.7 treats exit-NAT residue as a release blocker. Here the residue is invisible: no stage
+observed it, the daemon reported clean exit, and the run matrix shows nothing. A macOS node
+that reloads its plist can therefore leave firewall and DNS state behind with no signal
+anywhere.
+
+**Open questions, not yet investigated:** whether the ordering is fixed or racy; whether
+the helper should outlive the daemon by design (it plainly must, if the daemon needs it to
+roll back); and whether the daemon should refuse to report exit(0) when rollback failed.
+That last one is the fail-closed question and should be answered first.
+
+### QH-41 — `macos-utm-1` is on an isolated vmnet bridge, so every mixed-OS run fails its traffic matrix deterministically
+
+**Severity: medium (lab configuration, not product). Confidence: VERIFIED — measured
+bidirectionally 2026-08-11 with no daemon running and no rustynet PF rules loaded.**
+
+The host has two bridges: `bridge100` = 192.168.64.1 (members `vmenet0`, `vmenet1`) and
+`bridge101` = 192.168.65.1 (member `vmenet2`, flags include **PRIVATE**). `macos-utm-1`'s
+`en0` sits on the private bridge at 192.168.65.101; its second NIC `en1` is `status:
+inactive`, `media: none`, DHCP `INACTIVE`. Both Debian guests are on `bridge100`.
+
+Measured: mac → `192.168.64.4` and `.10` 100% loss, mac → its own gateway `192.168.65.1`
+0% loss; debian-2 → `192.168.65.101` 100% loss, debian-2 → `192.168.64.1` 0% loss. With
+`pfctl -s rules` showing only `com.apple` anchors and `pfctl -a com.rustynet -s rules`
+empty, so nothing Rustynet did causes it.
+
+The inventory records `live_ips: ["192.168.65.101", "192.168.64.18", …]` — the guest used
+to be on the shared network, so this is drift, not a permanent property.
+
+**Consequence:** `traffic_test_matrix` fails on every mixed-OS run, taking the rest of the
+Linux suite with it, and no cross-OS stage can pass. This is the immediate blocker on
+mixed-OS coverage, and it is separate from QH-39/QH-40.
+
+**Note the boot-order interaction:** whichever backend starts first takes 192.168.64.x, so
+boot order alone can move a guest between bridges and make inventory addresses look stale.
+Fix by putting the guest back on the shared adapter, then re-verify with a bidirectional
+ping before spending run time.
 
 ## Related documents
 
