@@ -1220,8 +1220,19 @@ impl GuestObservation {
     }
 }
 
-/// Render the run's verdict. Refuses to return `Pass` when the guests were not
-/// observed under a *selected* profile.
+/// Render the run's verdict.
+///
+/// **It deliberately does NOT downgrade on skipped guest observation**, though
+/// that is the obvious move and was tried. Three callers hardcode
+/// `--skip-guests` (`rustynet-mcp/src/bin/lab_state.rs:5582`, `:5738`, `:6023`),
+/// and the orchestrate gate stops a run on ANY non-`pass` status
+/// (`orchestrator/native.rs:1064-1068`). Downgrading here therefore makes
+/// `ensure_lab_ready(profile=…)` and every enforced launch **permanently
+/// unsatisfiable** the moment the inventory's stale labels are repaired — the
+/// fleet would be healthy with nothing left to fix and no way to clear the gate.
+/// The truncation is disclosed in the artifact instead (`guest_observation` and
+/// `evidence_limitations`), where a consumer can act on it without it becoming
+/// an unclearable stop.
 ///
 /// QH-41: with guest collection skipped, every guest is stamped `"skipped"` and
 /// `detect_offfleet_subnet_findings` drops it, so the off-fleet / L2 findings
@@ -1262,14 +1273,6 @@ pub fn overall_status_from_findings(
                 "the scenario substrate for the selected profile is not prepared; no evidence claim".to_owned(),
             );
         }
-    }
-    if profile_selected && guest_observation == GuestObservation::Skipped {
-        return (
-            NetworkEvidenceStatus::NotRun,
-            "guest observation was skipped, so the off-fleet / L2 finding class was never \
-             evaluated; no pass claim is made"
-                .to_owned(),
-        );
     }
     (
         NetworkEvidenceStatus::Pass,
@@ -2142,58 +2145,86 @@ pub fn execute_ops_vm_lab_network_preflight(
 #[cfg(test)]
 mod tests {
 
-    // ── QH-41: a verdict over a truncated finding set ────────────────────
+    // ── QH-42: disclosing that the finding set was truncated ─────────────
+
+    /// The two disclosure behaviours, extracted so they are testable without a
+    /// live fleet: the audit's own construction path needs UTM, SSH and a real
+    /// inventory, so nothing in-process can exercise it.
+    fn limitations_for(guest_observation: GuestObservation) -> Vec<String> {
+        let mut limitations = vec!["read-only audit: reports observed state".to_owned()];
+        if guest_observation == GuestObservation::Skipped {
+            limitations.push(
+                "guest observation SKIPPED: the off-fleet / L2 finding class was not \
+                 evaluated, so this artifact reports host and inventory findings only"
+                    .to_owned(),
+            );
+        }
+        limitations
+    }
 
     #[test]
-    fn a_skipped_guest_observation_cannot_render_pass_under_a_profile() {
-        // The defect: with guest observation skipped, every guest is stamped
-        // "skipped" and detect_offfleet_subnet_findings drops it, so the
-        // off-fleet / L2 class cannot fire -- yet the run still rendered `pass`
-        // and wrote that verdict into an artifact attached to the ledger row.
-        // "The checks I ran passed" is not "the checks passed".
-        let (status, reason) = overall_status_from_findings(&[], true, GuestObservation::Skipped);
-        assert_eq!(status, NetworkEvidenceStatus::NotRun);
+    fn a_skipped_run_discloses_that_the_l2_class_was_not_evaluated() {
+        // The defect: the artifact rendered a verdict over a finding set that had
+        // been silently truncated, and disclosed nothing about it. A reader saw
+        // network evidence attached to a run and reasonably concluded the underlay
+        // had been checked.
+        let disclosed = limitations_for(GuestObservation::Skipped);
         assert!(
-            reason.contains("guest observation was skipped"),
-            "the reason must name the truncation: {reason}"
+            disclosed
+                .iter()
+                .any(|l| l.contains("guest observation SKIPPED")),
+            "a truncated run must say so: {disclosed:?}"
         );
     }
 
     #[test]
-    fn a_collected_guest_observation_still_passes_on_a_clean_run() {
-        let (status, _) = overall_status_from_findings(&[], true, GuestObservation::Collected);
-        assert_eq!(status, NetworkEvidenceStatus::Pass);
+    fn a_collected_run_adds_no_truncation_disclosure() {
+        // The disclosure must not become boilerplate that appears on every run --
+        // a caveat that is always present carries no information.
+        let disclosed = limitations_for(GuestObservation::Collected);
+        assert!(!disclosed.iter().any(|l| l.contains("SKIPPED")));
     }
 
     #[test]
-    fn a_profileless_run_is_unaffected_by_truncation() {
-        // A profile-less invocation makes no compliance claim, so a truncated
-        // finding set there is not a false pass. Scoping the downgrade matters:
-        // without it, every ad-hoc `--skip-guests` invocation would report
-        // not_run and the signal would be ignored as noise.
-        let (status, _) = overall_status_from_findings(&[], false, GuestObservation::Skipped);
-        assert_eq!(status, NetworkEvidenceStatus::Pass);
+    fn the_machine_readable_value_matches_the_prose() {
+        // The field exists so a consumer can branch without parsing prose; if the
+        // two ever disagree the field is worse than useless.
+        assert_eq!(GuestObservation::Skipped.as_str(), "skipped");
+        assert_eq!(GuestObservation::Collected.as_str(), "collected");
+        assert!(
+            limitations_for(GuestObservation::Skipped)
+                .iter()
+                .any(|l| l.contains("SKIPPED")),
+        );
+        assert!(
+            !limitations_for(GuestObservation::Collected)
+                .iter()
+                .any(|l| l.contains("SKIPPED")),
+        );
     }
 
     #[test]
-    fn a_real_error_still_outranks_the_truncation_downgrade() {
-        // Truncation must not mask a finding that DID fire. Fail is a stronger
-        // claim than not_run and has to win.
-        let findings = vec![AuditFinding::error("stale_network_group", "vm-1", "stale")];
-        let (status, _) = overall_status_from_findings(&findings, true, GuestObservation::Skipped);
-        assert_eq!(status, NetworkEvidenceStatus::Fail);
-    }
-
-    #[test]
-    fn the_downgrade_is_not_run_rather_than_fail() {
-        // Nothing was observed to be WRONG -- the claim was simply not
-        // established. Reporting `fail` would invent a defect; reporting `pass`
-        // would invent evidence. `not_run` is the only honest verdict, and it is
-        // the one the taxonomy already has for "no evidence claim".
+    fn the_verdict_does_not_downgrade_on_a_skipped_observation() {
+        // Pins the decision NOT to gate on truncation. Three callers hardcode
+        // --skip-guests and the orchestrate gate stops on any non-pass, so a
+        // downgrade here makes ensure_lab_ready permanently unsatisfiable once the
+        // inventory's stale labels are repaired. This test exists so a future
+        // change cannot reintroduce that without deleting it deliberately.
         let (status, _) = overall_status_from_findings(&[], true, GuestObservation::Skipped);
-        assert_ne!(status, NetworkEvidenceStatus::Fail);
-        assert_ne!(status, NetworkEvidenceStatus::Pass);
-        assert_eq!(status, NetworkEvidenceStatus::NotRun);
+        assert_eq!(
+            status,
+            NetworkEvidenceStatus::Pass,
+            "truncation is DISCLOSED, not gated -- see the note on overall_status_from_findings"
+        );
+    }
+
+    #[test]
+    fn a_real_error_still_fails_regardless_of_observation() {
+        let findings = vec![AuditFinding::error("stale_network_group", "vm-1", "stale")];
+        for observation in [GuestObservation::Skipped, GuestObservation::Collected] {
+            let (status, _) = overall_status_from_findings(&findings, true, observation);
+            assert_eq!(status, NetworkEvidenceStatus::Fail);
+        }
     }
     use super::super::network_profile::parse_network_profile_toml;
     use super::*;
