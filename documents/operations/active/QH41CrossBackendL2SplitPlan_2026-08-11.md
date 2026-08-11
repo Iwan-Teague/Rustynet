@@ -1,142 +1,143 @@
-# QH-41 — the cross-backend vmnet L2 split — plan — 2026-08-11
+# QH-41 — wire the existing network preflight into the run path — plan — 2026-08-11
 
-**Status: PLAN, pre-review.** Written against `HEAD = 401a93d6`, clean tree. Every claim was
-verified by reading config or measuring the host at that commit; the method is named inline
-so a reviewer can re-run it rather than trust it.
+**Status: PLAN (REVISION 2), pre-review.** Written against `HEAD = 5fa191f1`, clean tree.
+Every claim below was produced by running the tool or reading the code at that commit; the
+exact command is given so a reviewer re-runs rather than trusts.
 
-## 0. What QH-41 said, and what is actually true
+## 0. Revision 1 was wrong, and wrong in an instructive way
 
-QH-41 as filed describes `macos-utm-1` sitting on an isolated vmnet bridge and calls it
-**lab drift** — "the inventory's own `live_ips` record shows the guest used to be on the
-shared network", implying someone changed a setting and it can be changed back.
+Revision 1 proposed **building** a preflight that groups elected nodes by backend and fails
+on a cross-backend L2 split. Before review it was discovered that this already exists — not
+approximately, but exactly, and twice over:
 
-**That is wrong, and it is the load-bearing error in the entry.** Measured on the host:
+| already shipped | what it does |
+| --- | --- |
+| `ops vm-lab-network-audit` | resolves each VM's backend and NIC mode, compares live addresses against the fleet plane, emits typed findings |
+| `ops vm-lab-network-preflight --profile <p>` | the **read-only fail-closed gate** over the same engine — its own doc says "a run must stop before deployment or signed-state mutation"; exits non-zero |
+| `--require-same-network` + `ensure_inventory_entries_share_network` (`vm_lab/mod.rs:33747`) | refuses when selected VMs span `network_group`s |
 
-| VM | `Backend` | `Mode` | lands on |
-| --- | --- | --- | --- |
-| `macOS` (macos-utm-1) | **`Apple`** | `Shared` | `bridge101` — sole member `vmenet2`, flags `PRIVATE,VIRTIO` |
-| `debian-headless-2` | `QEMU` | `Shared` | `bridge100` |
-| `debian-headless-4` | `QEMU` | `Shared` | `bridge100` |
-| `Fedora`, and four more | `QEMU` | `Shared` | `bridge100` (7 vmenet members total) |
+**This was the fourth consecutive time in this session that a plan proposed building
+something the repository already had.** The pattern is now the finding: diagnosis has been
+reliable, and the reach for new code before searching for existing code has not. Recorded
+here because it is the transferable part.
 
-**Both sides are already set to `Shared`.** The split is not a misconfiguration to revert:
-UTM's Apple-Virtualization backend and its QEMU backend each get their **own** vmnet shared
-network, so "Shared" names two different L2 segments depending on backend. Verified by
-reading `config.plist` for each VM (`plutil -p …/config.plist`) and by `ifconfig` bridge
-membership.
+The audit already states Revision 1's central conclusion, as its own repair text:
 
-The repo already knows this distinction exists — `network_profile.rs:138-151` parses
-attachment modes per `UtmBackend`, `:205` gates `(Apple, Shared|Bridged)`, and
-`backend_multi_nic_support` (`:215-220`) records Apple multi-NIC as **`Unproven`**. What is
-missing is anything that *checks* the resulting topology before a run spends 20 minutes on it.
+> "the attachment mode is already correct, so a mode rewrite (`vm-lab-network-prepare`)
+> alone will not move it onto the fleet plane"
 
-**Therefore: changing the network mode cannot fix this, and no amount of boot-order care
-fixes it either.** Boot order decides which bridge claims `192.168.64.x` versus
-`192.168.65.x`; it does not merge them. The earlier handover's "boot the Debians first"
-advice addresses the *addressing* symptom, not the partition.
+**So the entire remaining gap is one thing: nothing runs the gate.** Verified — no reference
+to `network_preflight` exists anywhere under `vm_lab/orchestrator/`, and none in the
+orchestrate path in `vm_lab/mod.rs`. The only preflight stage in the plan is
+`CrossNetworkPreflight`, which is the NAT/STUN cross-network probe, a different thing.
 
-Corroborating measurement from the implementation review of the previous item, re-stated
-because it rules out the obvious workaround: host-level routing between the two bridges does
-**not** work — `ping -S 192.168.64.1 192.168.65.101` is 100% loss with forwarding enabled,
-because vmnet drops foreign-source packets.
+## 1. What the gate says about this lab right now
 
-## 1. What this costs today
+```
+rustynet ops vm-lab-network-preflight \
+  --inventory documents/operations/active/vm_lab_inventory.json \
+  --profile mgmt_shared_smoke_v1
+```
 
-Run `percontrol-rebaseline-20260811` spent ~10 minutes reaching `traffic_test_matrix`, failed
-it, and skip-cascaded the remainder. The failure surfaced as a mesh/dataplane symptom, which
-is why it was initially attributed to Rustynet rather than to the lab. Every mixed-OS run on
-this host will do the same until the topology changes.
+Exits **1**, `overall_status=fail`, 8 error findings, and correctly resolves
+`macos-utm-1 backend=apple` against every other guest `backend=qemu`. Two kinds:
 
-## 2. The honest split: what is an operator decision, and what is code
+- **5 × `off_fleet_subnet`** — every local UTM guest, including both Debians, is off "the
+  fleet management plane 192.168.121.0/24 (shared by 4 inventory nodes)".
+- **3 × `stale_network_group`** — `macos-utm-1`, `debian-headless-4` and `fedora-utm-1`
+  carry labels that do not contain their own recorded addresses.
 
-**The lab remedy is an operator decision with real trade-offs, and this plan does not take
-it.** The options, with the reason each is not obviously right:
+**The stale labels matter beyond tidiness: they disarm the same-network gate that does
+exist.** `debian-headless-4` (192.168.64.10) and `macos-utm-1` (192.168.65.101) both carry
+`lan-192.168.0.0/24`, so `--require-same-network` would *affirmatively certify* two guests on
+different bridges as same-network — while failing the two Debians that genuinely share a
+bridge, because `debian-headless-2` carries a different label. Enabling that flag against
+today's metadata is worse than leaving it off.
 
-- **(a) Bridge the whole fleet to the physical LAN.** Puts every guest on one L2. But the
-  fleet was *deliberately* migrated Bridged→Shared (192.168.64.x) by the VM connectivity
-  program, and `network_prepare.rs` denies `en0` as a bridge target, so this reverses a
-  considered decision and touches every guest.
-- **(b) Move the Linux guests to the Apple backend** so they join `bridge101`. Linux does run
-  under Apple Virtualization, but changing a VM's backend is not a setting flip — disk and
-  boot configuration differ — and `backend_multi_nic_support` already records Apple
-  multi-NIC as `Unproven`, which the dual-plane rulebook depends on.
-- **(c) Accept that macOS cannot share L2 with QEMU guests on this host**, and prove
-  mixed-OS dataplane parity on the second host (`ubuntu-kvm-1`) instead, where guests are
-  KVM and share one bridge.
-- **(d) Run the macOS guest bridged while the rest stay Shared.** Does not help — it would be
-  on the physical LAN, still partitioned from `192.168.64.x`.
+## 2. The problem this plan has to solve, not dodge
 
-**A macOS guest cannot be moved to QEMU at all** on Apple Silicon; macOS guests require Apple
-Virtualization. So (b) and (c) are the only options that keep a macOS node in a mixed-OS
-mesh, and both are the operator's call.
+**Wiring the gate as-is blocks every run on this host, today.** All five local UTM guests are
+`off_fleet_subnet`, so a hard gate refuses even an all-Debian run — and the two Debians
+demonstrably *can* reach each other (both on `192.168.64.x`; the 2026-08-11 run bootstrapped,
+distributed bundles and passed 15 stages across them).
 
-**What IS code, and what this plan implements:** the lab currently discovers the partition
-the expensive way — by failing a dataplane stage twenty minutes in, with a symptom that
-misattributes the cause. That is a tooling defect independent of which remedy the operator
-picks, and fixing it is worthwhile under every option above.
+It would also have refused run `percontrol-rebaseline-20260811` at preflight — the run that
+produced the **first-ever population of 16 per-control security columns**, which had gone
+unrecorded across the previous 106 runs. A gate that would have destroyed the only new
+evidence in months is not obviously an improvement, and this plan must not pretend otherwise.
+
+The resolution is **scope**, not severity. The gate currently judges the whole inventory; a
+run only needs the nodes it elects to be able to reach each other.
 
 ## 3. The change
 
-### C1 — a preflight that fails loudly on a cross-backend L2 split
+### C1 — run the gate over the ELECTED nodes only
 
-Add a check that runs in `preflight`, before any guest work, that:
+Invoke the existing engine from `preflight`, restricted to the aliases this run elects.
+`debian-2 + debian-4` → both on `192.168.64.x` → PASS. `debian-2 + debian-4 + macos-utm-1` →
+spans two vmnet L2s → FAIL, before a single guest is touched.
 
-1. Resolves each elected node's UTM backend from its `config.plist` (`Backend` key —
-   `Apple` / `QEMU`), reusing `UtmBackend` and the parsing already in `network_profile.rs`
-   rather than adding a second vocabulary.
-2. Groups the elected nodes by (backend, attachment mode).
-3. **Fails closed** when a run elects nodes in more than one group AND the run requires
-   inter-node reachability — naming the partition, both groups, and the remedy options from
-   §2 rather than a bare error.
+The "fleet management plane" is derived by majority across the inventory, which the four
+remote KVM guests dominate. Scoping to elected nodes removes that dependence entirely: the
+question becomes "can these nodes reach each other", which is the question the run actually
+depends on.
 
-**Fail-closed rule:** if a node's backend cannot be determined, that is a FAILURE, not a
-pass. An undetermined backend is exactly the case where the check is most needed.
+### C2 — per-finding disposition, not one verdict
 
-**Why preflight and not a dataplane stage:** the information is available before a single
-guest is touched, and the whole cost of this defect is that it is currently discovered late.
+- **`off_fleet_subnet` among elected nodes, spanning more than one L2** → **FAIL**. This is
+  QH-41 exactly, and it is fatal to the run.
+- **`off_fleet_subnet` where all elected nodes are on ONE segment** (even if that segment is
+  not the inventory-majority plane) → **PASS with a recorded note**. They can reach each
+  other; that is what matters.
+- **`stale_network_group`** → **WARN, never fail.** It is a metadata defect. Failing a run
+  because a label is stale would block work for a reason that has no bearing on whether the
+  nodes can talk — and the label is exactly what should not be trusted.
+- **findings about non-elected VMs** → ignored for gating, recorded in the artifact.
 
-### C2 — do not fail a run that does not need it
+### C3 — fail-closed on undetermined, with one bounded exception
 
-A single-platform run (all QEMU) must be unaffected, as must a run that elects one node.
-`--skip-linux-live-suite` mac/win cells still need the mesh, so they are NOT exempt. The
-check keys on "more than one group among the ELECTED nodes", not on the fleet.
+If an elected node's segment cannot be determined, **fail**. The exception, which must be
+explicit rather than incidental: a node with **no local UTM bundle** (a remote KVM guest
+reached over libvirt) has no local config to read, and failing those would block every
+mixed-host run. Those are **not gated** and are named in the artifact as ungated. That
+exception is a known hole, and stating it is the point.
 
-**Deliberate:** there is no override flag. An operator who wants to run anyway can elect a
-single-backend topology. A skip flag here would be a way to re-acquire exactly the silent
-false-attribution this removes.
+### C4 — fix the three stale labels
 
-### C3 — correct QH-41's own text
+Correct them from the observed addresses so `--require-same-network` stops being actively
+misleading. The inventory must not be hand-edited (§12.3), so this goes through the
+supported refresh path; if that path does not update `network_group` — it appears not to —
+say so and treat it as a separate defect rather than hand-editing.
 
-The entry calls this "lab drift … the guest used to be on the shared network". It is a
-backend property, not drift. The `live_ips` history it cites (`192.168.64.18`,
-`192.168.0.210`) is evidence the guest has been on other networks in other configurations,
-not that a setting was changed under the current one. Correct it in the same change.
+## 4. What this does NOT do
 
-## 4. What this explicitly does NOT do
+- **No VM is mutated.** No backend switch, no NIC re-creation, no MAC regeneration. Those are
+  the audit's own repair instructions and they are the operator's call — with a real risk of
+  losing SSH to a guest.
+- **It does not make mixed-OS runs work.** After this, a mixed-OS run fails in ~30 seconds
+  with the reason instead of ~20 minutes with a misleading dataplane symptom. That is the
+  whole claim.
+- **No new detection logic.** Every finding used here already exists.
+- **No override flag.** An operator who wants to run anyway elects a single-segment topology.
 
-- **It does not mutate any VM.** No backend switch, no mode change, no adapter edit. Those
-  are §2's operator decisions and carry a real risk of losing SSH access to a guest.
-- **It does not claim to fix mixed-OS coverage.** After this change, mixed-OS runs on this
-  host still cannot pass a dataplane stage — they will simply say so in 30 seconds instead of
-  20 minutes, and say why. That is the entire claim.
-- **It does not touch `network_prepare.rs` or the dual-plane rulebook.**
+## 5. Tests, each with the mutation that proves it discriminates
 
-## 5. Tests
-
-1. Two elected nodes, one `Apple` and one `QEMU` → preflight FAILS, message names both
-   groups. *Mutation:* make the grouping compare mode only, ignoring backend → passes → test
-   fails.
-2. Two elected nodes, both `QEMU` `Shared` → preflight PASSES. *Mutation:* fail on any
-   multi-node run → test fails.
-3. One elected node, `Apple` → PASSES (nothing to partition). *Mutation:* fail on any Apple
-   node → test fails.
-4. A node whose backend cannot be determined → FAILS closed. *Mutation:* default the unknown
-   backend to `QEMU` → test fails.
-5. The failure message names at least one concrete remedy from §2. *Mutation:* reduce it to a
-   bare "topology mismatch" → test fails.
+1. Two elected nodes on one segment → PASS. *Mutation:* gate on the inventory-majority plane
+   instead of the elected set → fails (both Debians are off that plane).
+2. Elected nodes spanning two segments → FAIL, message naming both nodes and both segments.
+   *Mutation:* compare `network_group` labels instead of observed addresses → passes, because
+   the two stale labels match.
+3. `stale_network_group` alone → PASS with the warning recorded. *Mutation:* treat every
+   error finding as fatal → fails.
+4. One elected node → PASS. *Mutation:* fail on any run whose nodes are off the majority
+   plane → fails.
+5. An elected node with no determinable segment and a local bundle → FAIL. *Mutation:*
+   default unknown to "same segment" → fails.
+6. An elected remote (non-UTM) node → not gated, named ungated in the artifact. *Mutation:*
+   gate it → fails.
 
 ## 6. Definition of done
 
-All §7 gates green; each test mutation-proven; QH-41 corrected in the same change; and the
-plan's own central claim — that both VMs are set to `Shared` and differ only by backend —
-re-verifiable by the two commands named in §0.
+All §7 gates green; every test mutation-proven; QH-41 corrected to say the detection exists
+and only the wiring was missing; and the two commands in §0/§1 re-runnable by a reviewer to
+reproduce the measurements this plan rests on.
