@@ -1,6 +1,30 @@
 # QH-41 — wire the existing network preflight into the run path — plan — 2026-08-11
 
-**Status: PLAN (REVISION 2), pre-review.** Written against `HEAD = 5fa191f1`, clean tree.
+> **REVIEWED AND REFUTED 2026-08-11 — REDUNDANT FOR THE FIFTH TIME.**
+> §0 said "nothing runs the gate". That is FALSE. `native.rs:1023` already calls
+> `execute_ops_vm_lab_network_audit` inside `ensure_orchestration_network_profile_record`,
+> from both entry points (`native.rs:147` for `--node`, `mod.rs:11990`), and already enforces
+> it fail-closed at `:1043-1071` when `--network-profile <id>` is explicit
+> (`enforced: !derived`, `network_profile.rs:1248`).
+>
+> **The gate is BLIND, and that is the actual gap — two config bits, not a call site.**
+> `native.rs:1031` passes `skip_guests: true`, and `detect_offfleet_subnet_findings` skips any
+> guest that was not collected, so the L2 findings can never fire. Measured on this plan's own
+> cited run: `orchestration/vm_network_evidence.json` has **11/11 guests skipped, zero
+> `off_fleet_subnet`**, and `network_profile.json` records `derived: true, enforced: false`.
+> 103 of 107 ledger rows carry the profile id — the recording has run for months; the L2 check
+> never has.
+>
+> Two further defects in the remedy: **C2 can false-PASS**, because the audit exposes the
+> address and not the segment (two PRIVATE-flagged ports on one bridge share a /24 and cannot
+> forward to each other; the evidence file itself disclaims proving dataplane behaviour). And
+> **C3 inverts the value**: `windows-utm-1` has a local UTM bundle so the exemption misses it,
+> while guest observation returns `not_supported` for Windows (`network_audit.rs:1587-1598`) —
+> so every run electing it would fail preflight permanently, with §5 test 5 asserting that
+> regression is correct. Meanwhile `windows-x86-1` is libvirt, so C3 exempts it and the
+> highest-value pending work is gated by nothing.
+
+**Status: PLAN (REVISION 2) — REFUTED, superseded by the note above.** Written against `HEAD = 5fa191f1`, clean tree.
 Every claim below was produced by running the tool or reading the code at that commit; the
 exact command is given so a reviewer re-runs rather than trusts.
 
