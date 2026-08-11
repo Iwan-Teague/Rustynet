@@ -1,6 +1,41 @@
 # QH-40 — the macOS shutdown rollback fails and the process still reports success — plan — 2026-08-11
 
-**Status: PLAN, pre-review.** Written against `HEAD = a419e77e`, clean tree. Every claim was
+> **REVIEWED AND REFUTED 2026-08-11. DO NOT IMPLEMENT C1 OR C2 AS WRITTEN.**
+> §0's correction of QH-40 survived and should land. The remedy did not: this plan
+> replaced one wrong mechanism with another.
+>
+> 1. **The root cause is not the 20 ms race.** The same signature appears at ~25 distinct
+>    shutdowns from 2026-07-03 to 2026-08-11 — a 20 ms margin does not recur deterministically
+>    for five weeks. Decisively: the FIRST rollback step failed with `truncated frame header`
+>    while the helper was still **alive** (it died 1.019 s later); only later steps got
+>    `Connection refused`. Both QH-40 and this plan quoted that log line with its own
+>    explanatory clause cut — the daemon's own diagnostic says a truncated frame "is usually
+>    the helper's own I/O timeout elapsing while it runs a privileged command". The same
+>    failure occurs on `bootstrap_apply_failed` and `membership_reconcile_failed`, paths with
+>    **no teardown in flight at all**.
+> 2. **C1's 30 s bound is unreachable.** launchd logs `scheduling cleanup in 5 sec after
+>    sending Terminated: 15`, and the daemon plist declares no `ExitTimeOut`, so the 5 s
+>    default governs — while the helper runs with `--timeout-ms 30000`, 6x that budget. A poll
+>    would observe "job gone" *because of the SIGKILL* and report success.
+> 3. **C2 introduces a key-custody regression.** Returning `Err` at the shutdown site skips
+>    `scrub_runtime_wireguard_key_after_bootstrap` (`daemon.rs:10938`), leaving plaintext
+>    WireGuard key material on disk — a §4 violation created by the fix. It would also print
+>    `rustynetd startup failed` on a shutdown path.
+> 4. **§4's severity call is refuted by the log line this plan itself quoted.** The elided
+>    clause includes `rollback nat forwarding: rollback failed: restore macOS
+>    net.inet.ip.forwarding failed`, and `phase10.rs:3316` confirms rollback is what restores
+>    that sysctl to 0. So a failed rollback leaves **host IP forwarding enabled and exit NAT
+>    rules installed** — strictly MORE open, not "broken-closed". §10.7 (exit NAT residue is a
+>    release blocker) applies directly and QH-40's HIGH severity is if anything understated.
+>
+> **What a correct attempt must start from:** the helper I/O timeout, not the teardown; the
+> 5 s launchd SIGKILL ceiling as a hard constraint on any wait; and the fact that nothing on
+> the macOS launchd path observes the daemon's exit code at all (`KeepAlive` is unconditional;
+> the only `daemon_exit_code` consumer is Windows-only, `bootstrap/windows.rs:781`). A
+> zero-schema durable signal may already exist — the residue itself is readable, and
+> `macos_exit_nat_lifecycle.rs:60` already reads `net.inet.ip.forwarding`.
+
+**Status: PLAN — REFUTED, superseded by the note above.** Written against `HEAD = a419e77e`, clean tree. Every claim was
 produced by reading the code or re-querying the guest's unified log; the command is named so
 a reviewer re-runs rather than trusts.
 
