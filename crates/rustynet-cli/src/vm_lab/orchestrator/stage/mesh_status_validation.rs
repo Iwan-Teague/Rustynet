@@ -16,9 +16,13 @@ const REPORTED_SKIPS_FILENAME: &str = "mesh_status_validation.reported_skips.jso
 /// Runs after `key_custody_validation` and before the relay/traffic stages.
 /// This is a per-node posture check, so it applies to every node regardless
 /// of role. Accepted only on an explicit `overall_ok: true` (fail-closed).
-/// A macOS / Windows node is **reported-skipped** — named in
-/// `mesh_status_validation.reported_skips.json`, never a silent pass — on
-/// the [`mesh_status_runtime_implemented`] posture gate.
+/// The [`mesh_status_runtime_implemented`] posture gate admits **all three**
+/// desktop platforms, so a macOS or Windows node IS checked here; only a
+/// platform outside that set is **reported-skipped** — named in
+/// `mesh_status_validation.reported_skips.json`, never a silent pass. (This
+/// comment previously claimed macOS and Windows were skipped, which the gate
+/// has not done for some time; the false text was reproduced verbatim into
+/// every run artifact.)
 pub struct MeshStatusValidationStage;
 
 impl OrchestrationStage for MeshStatusValidationStage {
@@ -92,8 +96,9 @@ fn reported_skips_json_bytes(reported_skips: &[(String, String)]) -> Vec<u8> {
     let body = serde_json::json!({
         "stage": "mesh_status_validation",
         "reported_skipped_mesh_status": skipped,
-        "reason": "Mesh-status check runs live on Linux through the Rust engine; \
-                   non-Linux nodes are reported-skipped (named, never a silent pass)",
+        "reason": "Mesh-status check runs live on Linux, macOS and Windows through the \
+                   Rust engine; a node outside those platforms is reported-skipped (named, \
+                   never a silent pass)",
     });
     serde_json::to_vec_pretty(&body).unwrap_or_default()
 }
