@@ -593,7 +593,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("membership"),
-        cross_os: Some("cross_os_membership_convergence"),
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 120,
         ..DEFAULT_SPEC
@@ -603,7 +602,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("membership"),
-        cross_os: Some("cross_os_membership_convergence"),
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -639,7 +637,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("traversal"),
-        cross_os: Some("cross_os_direct_path"),
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -649,7 +646,6 @@ pub const STAGES: &[StageSpec] = &[
         state_machine_only: true,
         group: StageGroup::Bootstrap,
         logical: Some("managed_dns"),
-        cross_os: Some("cross_os_dns"),
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
         ..DEFAULT_SPEC
@@ -2920,6 +2916,86 @@ mod tests {
     /// Linux+macOS+Windows) carries the cross-OS bar, and re-tiering it away
     /// without a replacement would silently empty the tier.
     #[test]
+    /// A cross-OS column asserts that two GUESTS reached each other. A stage
+    /// whose success only demonstrates a host->guest push cannot establish that,
+    /// because the orchestrator host owns every lab bridge — the push succeeds
+    /// across a total guest-to-guest severance.
+    ///
+    /// Measured before this rule existed: `cross_os_direct_path` read `pass` on
+    /// 10 rows fed ONLY by `distribute_traversal`, while `cross_os_peer_visibility`
+    /// — the one column fed by a real reachability validator — read `fail` on 9 of
+    /// those same rows. `cross_os_direct_path`, `cross_os_dns` and
+    /// `cross_os_membership_convergence` had byte-identical 107-value vectors.
+    ///
+    /// The axis is the DIRECTION OF THE PROOF, not the stage group. The two
+    /// mesh-join validators are `Bootstrap` and legitimately feed a cross-OS
+    /// column because they validate guest-side state; a group-based rule would
+    /// have stripped them and broken the only column that works. Anything else in
+    /// `Pre`/`Bootstrap` must justify itself by being added here deliberately.
+    #[test]
+    fn only_guest_validating_bootstrap_stages_may_feed_a_cross_os_column() {
+        const ALLOWED: &[&str] = &["validate_macos_mesh_join", "validate_windows_mesh_join"];
+        for spec in STAGES {
+            let Some(column) = spec.cross_os else {
+                continue;
+            };
+            if column == "cross_os_bootstrap" {
+                // Honest by name: its feeders ARE the setup phase.
+                continue;
+            }
+            if matches!(spec.group, StageGroup::Pre | StageGroup::Bootstrap) {
+                assert!(
+                    ALLOWED.contains(&spec.name),
+                    "stage `{}` is {:?} and feeds `{column}`, but only guest-validating \
+                     stages may feed a cross-OS column; a host->guest push cannot prove \
+                     guest-to-guest reachability. Add it to ALLOWED only if it genuinely \
+                     validates guest-side state.",
+                    spec.name,
+                    spec.group,
+                );
+            }
+        }
+    }
+
+    /// The four distribution stages must feed NO cross-OS column. Asserted on the
+    /// registry spec rather than on `oracle_cross_os_column`, deliberately: QH-07
+    /// landed a fix in the historical oracle and left the production mapping
+    /// untouched, and its own commit warns that editing both sides at once leaves
+    /// every equivalence test green. Only a spec-side assertion discriminates.
+    #[test]
+    fn distribution_stages_feed_no_cross_os_column() {
+        for name in [
+            "distribute_traversal",
+            "distribute_dns_zone",
+            "membership_init",
+            "distribute_membership",
+        ] {
+            let spec = find_stage(name).unwrap_or_else(|| panic!("{name} missing from registry"));
+            assert_eq!(
+                spec.cross_os, None,
+                "`{name}` proves a host->guest push only; it must not feed a cross-OS column"
+            );
+        }
+    }
+
+    /// The two columns C1 leaves unfed stay in the schema reading `not_run`, which
+    /// is the truth — nothing measures them — and marks where a validator is owed.
+    /// Pinned so a later change cannot quietly re-feed them from a push.
+    #[test]
+    fn direct_path_and_membership_convergence_have_no_feeders() {
+        for column in ["cross_os_direct_path", "cross_os_membership_convergence"] {
+            let feeders: Vec<&str> = STAGES
+                .iter()
+                .filter(|s| s.cross_os == Some(column))
+                .map(|s| s.name)
+                .collect();
+            assert!(
+                feeders.is_empty(),
+                "`{column}` is owed a real reachability validator, not a push: {feeders:?}"
+            );
+        }
+    }
+
     fn cross_os_family_stages_are_tiered_t3_cross_os() {
         use crate::vm_lab::orchestrator::stage::StageId;
         for stage in StageId::ALL {

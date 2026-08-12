@@ -4230,8 +4230,6 @@ mod registry_equivalence_tests {
             | "cleanup_hosts"
             | "bootstrap_hosts"
             | "collect_pubkeys" => Some("cross_os_bootstrap"),
-            "membership_init" | "distribute_membership" => Some("cross_os_membership_convergence"),
-            "distribute_traversal" => Some("cross_os_direct_path"),
             "live_mixed_topology" | "validate_windows_mesh_join" | "validate_macos_mesh_join" => {
                 Some("cross_os_peer_visibility")
             }
@@ -4247,7 +4245,6 @@ mod registry_equivalence_tests {
             "live_lan_toggle" => Some("cross_os_lan_toggle"),
             "live_role_switch_matrix" | "role_switch_matrix" => Some("cross_os_role_switch"),
             "live_managed_dns"
-            | "distribute_dns_zone"
             | "validate_windows_dns_failclosed"
             | "validate_macos_exit_dns_failclosed" => Some("cross_os_dns"),
             "traffic_test_matrix" => Some("cross_os_peer_visibility"),
