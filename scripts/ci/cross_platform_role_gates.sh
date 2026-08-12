@@ -9,6 +9,42 @@ set -euo pipefail
 
 echo "Running cross-platform role CI gates..."
 
+# --features vm-lab is REQUIRED, not decoration: the vm_lab:: modules filtered
+# below sit behind that default-off feature (RNQ-17), so without it every
+# filter matches zero tests -- and `cargo test` exits 0 on an empty match, so
+# the gate would report success having checked nothing. run_cli_test asserts a
+# non-zero pass count so an empty match can never read as a pass.
+assert_at_least_one_pass() {
+  local out="$1"; shift
+  if ! printf '%s\n' "$out" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
+    echo "GATE DEFECT: test filter matched zero tests: $*" >&2
+    return 1
+  fi
+}
+
+run_cli_test() {
+  local out
+  out="$(cargo test -p rustynet-cli --features vm-lab --bin rustynet-cli "$@" 2>&1)" || {
+    printf '%s\n' "$out"
+    return 1
+  }
+  assert_at_least_one_pass "$out" "$@"
+}
+
+# role_cli is declared in lib.rs (`pub mod role_cli;`) and NOT in main.rs, so a
+# --bin filter can never match its tests. That is a second, independent defect
+# with the same silent-pass effect as the missing feature, and it is why these
+# three filters had never run. ops_install_* is the mirror image -- bin-only --
+# and vm_lab is in both, so each target below is chosen, not incidental.
+run_cli_lib_test() {
+  local out
+  out="$(cargo test -p rustynet-cli --features vm-lab --lib "$@" 2>&1)" || {
+    printf '%s\n' "$out"
+    return 1
+  }
+  assert_at_least_one_pass "$out" "$@"
+}
+
 required_files=(
   crates/rustynet-cli/src/vm_lab/topology.rs
   crates/rustynet-cli/src/ops_install_systemd_exit.rs
@@ -84,34 +120,34 @@ rg -q 'validate_linux_exit_dns_failclosed' crates/rustynet-cli/src/vm_lab/mod.rs
 # Unit tests covering the surfaces above. Each `-p rustynet-cli` test
 # target is a single hermetic binary, so the gate doesn't need a live
 # VM lab to run; it is safe in PR-time CI.
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   vm_lab::topology::tests:: -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_lib_test \
   role_cli::tests::admin_to_exit_advertises_default_route_then_deploys_exit_preflight -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_lib_test \
   role_cli::tests::exit_to_admin_undeploys_exit_preflight_then_retracts_default_route -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_lib_test \
   role_cli::tests::pre_d11a_surface_matrix -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   ops_install_systemd_exit::tests:: -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   ops_install_macos_exit::tests:: -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   vm_lab::tests::evaluate_macos_exit_nat_lifecycle_artifact_accepts_reviewed_payload -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   vm_lab::tests::evaluate_macos_exit_dns_failclosed_artifact_dir_accepts_reviewed_payloads -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   vm_lab::tests::evaluate_macos_exit_killswitch_precedence_artifact_accepts_reviewed_payload -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   vm_lab::tests::macos_exit_nat_lifecycle_producer_to_validator_round_trip -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   vm_lab::tests::macos_exit_nat_lifecycle_producer_round_trip_rejects_forwarding_not_restored -- --nocapture
 cargo test -p rustynetd --lib macos_exit_nat_lifecycle:: -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   vm_lab::tests::linux_exit_nat_lifecycle_producer_to_validator_round_trip -- --nocapture
 cargo test -p rustynetd --lib linux_exit_nat_lifecycle:: -- --nocapture
 cargo test -p rustynetd --lib linux_exit_dns_failclosed:: -- --nocapture
-cargo test -p rustynet-cli --bin rustynet-cli \
+run_cli_test \
   vm_lab::tests::evaluate_linux_exit_dns_failclosed_artifact_dir_accepts_reviewed_payloads -- --nocapture
 
 echo "Cross-platform role CI gates: PASS"

@@ -9,6 +9,13 @@ set -euo pipefail
 # test invocation with a module-prefix filter; the 'test result: ok.'
 # assertion ensures the filter matched at least one test (cargo exits 0
 # on an empty match).
+#
+# --features vm-lab is REQUIRED, not optional. Every module this script
+# filters on lives behind that feature, which is default-off (RNQ-17), so
+# without it each filter matches zero tests. The assertion above then fires
+# on the first group and the gate never reaches the invariants it exists to
+# pin -- it fails closed rather than false-greening, but it checks nothing
+# either way.
 
 echo "Running Rust-native orchestrator engine gates..."
 
@@ -23,7 +30,7 @@ assert_at_least_one_pass() {
 run_orch() {
   local out label="$1"; shift
   echo "  -- $label"
-  out="$(cargo test -p rustynet-cli --bin rustynet-cli "$@" 2>&1)" || {
+  out="$(cargo test -p rustynet-cli --features vm-lab --bin rustynet-cli "$@" 2>&1)" || {
     printf '%s\n' "$out"
     return 1
   }
