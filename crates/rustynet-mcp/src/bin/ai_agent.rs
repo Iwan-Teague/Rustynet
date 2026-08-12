@@ -9342,6 +9342,51 @@ mod tests {
     // opens by planting DIFFERENT, mutually exclusive sentinel content in
     // each, so reading the wrong one can never look like a pass.
 
+    /// A temp tree that is unique per run and removed even when a test panics.
+    ///
+    /// Mirrors the helper `lab_state.rs` grew for its ledger tests (b3b07342),
+    /// for the same two reasons, both load-bearing and neither provided by a
+    /// hand-built `$TMPDIR/<name>-<pid>` path:
+    ///
+    /// * **Unique under either runner.** `cargo test` runs a binary's tests as
+    ///   threads in ONE process, so `process::id()` is shared between them,
+    ///   while nextest runs a process per test, so a process-local counter is
+    ///   always 0. Only pid + nanos + counter together are unique under both.
+    /// * **Removed on panic.** Cleaning up on a test's last line leaks the tree
+    ///   whenever an assertion fires. Thirteen such leftovers accumulated while
+    ///   writing these very tests. They pile up in a directory shared with every
+    ///   other process on the host, which invites a glob cleanup; a removal
+    ///   landing mid-test makes these tests fail with ENOENT on a ledger they
+    ///   had already written successfully.
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(prefix: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()));
+            // A recycled pid can leave a tree behind. Start from nothing so no
+            // inherited file can influence the result.
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Both ledgers, distinguishable by construction: sentinel run_ids and
     /// inverted pass/fail on the columns the chooser and the reporter read.
     fn write_both_ledgers(root: &Path) {
@@ -9376,9 +9421,10 @@ mod tests {
 
     #[test]
     fn target_chooser_reads_the_live_node_ledger_only() {
-        let tmp = std::env::temp_dir().join(format!("ai-ledger-target-{}", std::process::id()));
-        write_both_ledgers(&tmp);
-        let s = server_rooted(&tmp);
+        let tmp = TempRoot::new("ai-ledger-target");
+        let tmp = tmp.path();
+        write_both_ledgers(tmp);
+        let s = server_rooted(tmp);
 
         let rows = s
             .read_run_matrix_rows()
@@ -9414,14 +9460,14 @@ mod tests {
             "the recorded reason must name the ledger that drove it; got: {}",
             target.reason
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn lab_run_status_defaults_to_node_and_labels_every_read() {
-        let tmp = std::env::temp_dir().join(format!("ai-ledger-status-{}", std::process::id()));
-        write_both_ledgers(&tmp);
-        let s = server_rooted(&tmp);
+        let tmp = TempRoot::new("ai-ledger-status");
+        let tmp = tmp.path();
+        write_both_ledgers(tmp);
+        let s = server_rooted(tmp);
 
         for (label, args) in [
             ("no engine arg", json!({"limit": 5})),
@@ -9454,14 +9500,14 @@ mod tests {
             arch.contains("FROZEN ARCHIVE") && arch.contains("live_lab_run_matrix.csv"),
             "archive read must be self-labelling; got: {arch}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn lab_run_status_rejects_an_unknown_engine() {
-        let tmp = std::env::temp_dir().join(format!("ai-ledger-badengine-{}", std::process::id()));
-        write_both_ledgers(&tmp);
-        let s = server_rooted(&tmp);
+        let tmp = TempRoot::new("ai-ledger-badengine");
+        let tmp = tmp.path();
+        write_both_ledgers(tmp);
+        let s = server_rooted(tmp);
         // 'bash' is a plausible typo for 'bash_archive'. Answering it from the
         // default would hand back node rows under an archive-shaped request.
         let err = s
@@ -9481,18 +9527,18 @@ mod tests {
             dispatched.starts_with("ERROR:"),
             "dispatch must surface the rejection; got: {dispatched}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn absent_node_ledger_never_falls_back_to_the_archive() {
-        let tmp = std::env::temp_dir().join(format!("ai-ledger-nofallback-{}", std::process::id()));
-        write_both_ledgers(&tmp);
+        let tmp = TempRoot::new("ai-ledger-nofallback");
+        let tmp = tmp.path();
+        write_both_ledgers(tmp);
         // Remove ONLY the live ledger — the archive stays right next to it,
         // which is exactly when a fallback would fire.
         std::fs::remove_file(tmp.join("documents/operations/live_lab_node_run_matrix.csv"))
             .unwrap();
-        let s = server_rooted(&tmp);
+        let s = server_rooted(tmp);
 
         // Reporter: hard error naming the ledger it wanted, never archive rows.
         let err = s
@@ -9520,7 +9566,6 @@ mod tests {
             "no focused cell may be inferred; got: {}",
             target.reason
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
