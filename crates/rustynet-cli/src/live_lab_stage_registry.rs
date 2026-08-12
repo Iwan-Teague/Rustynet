@@ -2957,6 +2957,27 @@ mod tests {
         }
     }
 
+    /// Every entry in the allow-list must actually feed a cross-OS column.
+    ///
+    /// Without this the list can rot: strip a mesh-join validator's mapping and
+    /// the rule above still passes (nothing feeds, so nothing is flagged) while
+    /// `cross_os_peer_visibility` quietly loses a feeder. An allow-list naming
+    /// stages that no longer do the thing it permits is worse than no list —
+    /// it reads as coverage that is not there. Found by mutation-testing the
+    /// rule above.
+    #[test]
+    fn every_allow_listed_stage_still_feeds_a_cross_os_column() {
+        for name in ["validate_macos_mesh_join", "validate_windows_mesh_join"] {
+            let spec = find_stage(name).unwrap_or_else(|| panic!("{name} missing from registry"));
+            assert_eq!(
+                spec.cross_os,
+                Some("cross_os_peer_visibility"),
+                "`{name}` is allow-listed to feed a cross-OS column; if it no longer does, \
+                 remove it from ALLOWED rather than leaving a list entry that means nothing"
+            );
+        }
+    }
+
     /// The four distribution stages must feed NO cross-OS column. Asserted on the
     /// registry spec rather than on `oracle_cross_os_column`, deliberately: QH-07
     /// landed a fix in the historical oracle and left the production mapping
