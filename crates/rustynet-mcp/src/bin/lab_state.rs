@@ -13,10 +13,11 @@
 #![forbid(unsafe_code)]
 
 use rustynet_mcp::{
-    CommandOutcome, GetPromptResult, McpServer, Prompt, PromptArgument, ServerInfo, Tool,
-    ToolCallResult, json_schema_array_string, json_schema_boolean, json_schema_object,
-    json_schema_string, prompt_text, read_file_capped, run_server, run_with_timeout, spawn_logged,
-    tail_file, text_content, tool_error, tool_success, truncate_output, truncate_tail,
+    CommandOutcome, GetPromptResult, LedgerEngine, McpServer, Prompt, PromptArgument, ServerInfo,
+    Tool, ToolCallResult, engine_schema_property, json_schema_array_string, json_schema_boolean,
+    json_schema_object, json_schema_string, prompt_text, read_file_capped, run_server,
+    run_with_timeout, spawn_logged, tail_file, text_content, tool_error, tool_success,
+    truncate_output, truncate_tail,
 };
 use serde_json::{Value, json};
 use socket2::{Domain, SockAddr, Socket, Type};
@@ -3875,115 +3876,6 @@ fn classify_guest_network_path(owning_interfaces: &[String]) -> &'static str {
 fn apple_script_string_literal(s: &str) -> String {
     let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
-}
-
-/// Which orchestrator engine's evidence ledger a run-matrix read targets.
-///
-/// The two engines write SEPARATE ledgers on purpose, and reading the wrong one
-/// is not a cosmetic mistake — it is how dead evidence gets presented as
-/// current. Measured on this tree, the `linux_stage_two_hop` column reads
-/// 56 pass / 17 fail across the archive's 549 rows and 35 pass / 27 fail across
-/// the `--node` ledger's 107 — the same column name, two different engines, two
-/// different answers. A caller that cannot tell which file produced a row cannot
-/// tell which engine the number describes.
-///
-/// (Separately, do not read either column as proof the chained-exit path works.
-/// Per `CLAUDE.md` §12.3, the `--node` column's passes are contaminated by a
-/// since-removed `traffic_test_matrix` alias, and the underlying
-/// `live_two_hop_validation` stage has a lifetime record of 0 pass. The
-/// per-stage truth lives in `live_lab_node_stage_results.csv` and in the
-/// stage's own report artifact — that is a distinct hazard from this one, and
-/// picking the right ledger does not fix it.)
-///
-/// Two rules follow, and both are enforced below rather than documented:
-/// - the DEFAULT is always [`LedgerEngine::Node`], the live ledger
-///   (`CLAUDE.md` §2: "current work appends here and tooling reads here");
-/// - every rendered read is SELF-LABELLING via [`LedgerEngine::banner`], so an
-///   engine attribution never has to be inferred from the tool name, the
-///   caller's memory, or which binary happens to be installed.
-///
-/// There is deliberately no cross-engine fallback: a missing ledger is an
-/// error, never a silent read of the other engine's file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LedgerEngine {
-    /// `documents/operations/live_lab_node_run_matrix.csv` — the Rust `--node`
-    /// engine's ledger. THE live one; current runs append here.
-    Node,
-    /// `documents/operations/live_lab_run_matrix.csv` — the legacy bash
-    /// orchestrator's ledger. FROZEN: `--node` no longer appends to it, so its
-    /// newest row only gets staler. Readable for history, never for "does this
-    /// stage pass today".
-    BashArchive,
-}
-
-impl LedgerEngine {
-    /// Repo-relative path of this engine's ledger.
-    fn rel_path(self) -> &'static str {
-        match self {
-            Self::Node => "documents/operations/live_lab_node_run_matrix.csv",
-            Self::BashArchive => "documents/operations/live_lab_run_matrix.csv",
-        }
-    }
-
-    /// The `engine` argument value that selects this ledger.
-    fn arg_value(self) -> &'static str {
-        match self {
-            Self::Node => "node",
-            Self::BashArchive => "bash_archive",
-        }
-    }
-
-    /// Header block prepended to every rendered read, so the output states its
-    /// own provenance. The archive variant is deliberately loud.
-    fn banner(self) -> String {
-        match self {
-            Self::Node => format!(
-                "**Engine:** `--node` (Rust orchestrator) — LIVE ledger `{}`.\n\n",
-                self.rel_path()
-            ),
-            Self::BashArchive => format!(
-                "> ⚠️ **FROZEN ARCHIVE — legacy bash orchestrator, NOT current evidence.**\n\
-                 > Source: `{}`. The `--node` engine never appends here, so these rows only\n\
-                 > get staler, and a `pass` here says nothing about the engine in use today:\n\
-                 > the `linux_stage_two_hop` column reads 56 pass / 17 fail in this archive\n\
-                 > and 35 pass / 27 fail in the `--node` ledger. For current coverage re-run\n\
-                 > with `engine=\"node\"` (the default).\n\n",
-                self.rel_path()
-            ),
-        }
-    }
-
-    /// Resolve the `engine` argument. Absent → [`Self::Node`] (the live
-    /// ledger). An unrecognized value is a hard error, never a fallback: a
-    /// typo'd engine silently answering from the default would reintroduce
-    /// exactly the misattribution this type exists to prevent.
-    fn from_args(args: Option<&Value>) -> Result<Self, String> {
-        match arg_str(args, "engine").map(str::trim) {
-            None | Some("") => Ok(Self::Node),
-            Some(v) if v.eq_ignore_ascii_case(Self::Node.arg_value()) => Ok(Self::Node),
-            Some(v) if v.eq_ignore_ascii_case(Self::BashArchive.arg_value()) => {
-                Ok(Self::BashArchive)
-            }
-            Some(other) => Err(format!(
-                "Unknown engine '{other}'. Valid: '{}' (default — the live Rust `--node` \
-                 ledger) or '{}' (the FROZEN legacy bash-orchestrator archive).",
-                Self::Node.arg_value(),
-                Self::BashArchive.arg_value()
-            )),
-        }
-    }
-}
-
-/// The `engine` selector's JSON-schema property, shared by every tool that
-/// exposes it so the two descriptions cannot drift apart.
-fn engine_schema_property() -> Value {
-    json_schema_string(
-        "Which engine's evidence ledger to read: 'node' (DEFAULT — the live Rust --node ledger \
-         documents/operations/live_lab_node_run_matrix.csv, where current runs append) or \
-         'bash_archive' (the FROZEN legacy bash-orchestrator ledger \
-         documents/operations/live_lab_run_matrix.csv, history only — its rows are NOT evidence \
-         about the engine in use today). Output is labelled with the engine either way.",
-    )
 }
 
 /// RFC4180-aware single-line CSV split (handles quoted fields with commas).
