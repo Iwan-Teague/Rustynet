@@ -9354,7 +9354,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
     fn job_state_completion_record_beats_pid() {
         // PID 1 (init) — completion record must win regardless, proving the
         // pid-reuse hazard cannot mask a finished run over a long loop.
-        let tmp = std::env::temp_dir().join(format!("mcp-jobstate-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-jobstate");
         let report = tmp.join("report");
         std::fs::create_dir_all(report.join("state")).unwrap();
         let srv = test_server(&tmp);
@@ -9378,7 +9378,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             srv.job_state("j", 999_999_999, &report)
                 .starts_with("ended")
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -9386,7 +9385,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         // No completion record + a LIVE pid: the verdict must hinge on the
         // recorded pid_start token. Matching identity → running; a mismatch (the
         // recycled-pid case) → ended, NOT a false "running" forever.
-        let tmp = std::env::temp_dir().join(format!("mcp-pididentity-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-pididentity");
         let srv = test_server(&tmp);
         std::fs::create_dir_all(srv.jobs_dir()).unwrap();
         let report = tmp.join("rep");
@@ -9428,13 +9427,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             srv.job_state("recycled", mypid, &report)
                 .starts_with("ended")
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn prune_jobs_keeps_recent_skips_running() {
-        let tmp = std::env::temp_dir().join(format!("mcp-prune-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-prune");
         let srv = test_server(&tmp);
         std::fs::create_dir_all(srv.jobs_dir()).unwrap();
         // 3 finished jobs (completed report_state + dead pid), created 0,1,2.
@@ -9465,7 +9462,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert!(srv.job_record_path("j2").exists());
         assert!(!srv.job_record_path("j1").exists());
         assert!(!srv.job_record_path("j0").exists());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -9671,7 +9667,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
     #[test]
     fn get_lab_topology_digest_and_resolution() {
-        let tmp = std::env::temp_dir().join(format!("mcp-topo-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-topo");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -9699,13 +9695,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             inv.contains("<redacted>"),
             "redacted inventory should mark secret fields"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn report_dir_inputs_are_confined_to_repo() {
-        let tmp = std::env::temp_dir().join(format!("mcp-confine-{}", std::process::id()));
-        let outside = std::env::temp_dir().join(format!("mcp-outside-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-confine");
+        let outside = TempRoot::new("mcp-outside");
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         let srv = test_server(&tmp);
@@ -9718,14 +9713,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let rel = srv.list_report_artifacts(Some(&json!({"report_dir": "../outside"})));
         assert_eq!(rel.is_error, Some(true));
         assert!(rel.content[0].text.contains("repo root"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
     fn start_live_lab_run_rejects_second_running_job() {
-        let tmp = std::env::temp_dir().join(format!("mcp-jobcap-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-jobcap");
         let srv = test_server(&tmp);
         std::fs::create_dir_all(srv.jobs_dir()).unwrap();
         let report = tmp.join("rep");
@@ -9757,12 +9749,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             "got: {}",
             res.content[0].text
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn alias_to_utm_resolves_fields() {
-        let tmp = std::env::temp_dir().join(format!("mcp-a2u-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-a2u");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -9777,7 +9768,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert_eq!(ip, "192.168.0.200");
         assert_eq!(port, 22);
         assert!(srv.alias_to_utm("nope").is_none());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A UTM-only listing must never read as "the whole lab" once a second host
@@ -9786,7 +9776,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
     /// an operator hunting a phantom inventory bug. The two cases must differ.
     #[test]
     fn utm_resolution_error_distinguishes_absent_from_non_utm_backed() {
-        let tmp = std::env::temp_dir().join(format!("mcp-ure-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-ure");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -9814,8 +9804,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert!(libvirt.contains("libvirt"), "{libvirt}");
         assert!(libvirt.contains("ubuntu-kvm-1"), "{libvirt}");
         assert!(libvirt.contains("vm-lab-start"), "{libvirt}");
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -9827,7 +9815,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
     #[test]
     fn inventory_alias_for_platform_finds_desktop_vms() {
-        let tmp = std::env::temp_dir().join(format!("mcp-inv-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-inv");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -9845,12 +9833,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             Some("mac-1")
         );
         assert_eq!(srv.inventory_alias_for_platform("linux"), None);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn wait_for_job_returns_immediately_when_completed() {
-        let tmp = std::env::temp_dir().join(format!("mcp-wait-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-wait");
         let report = tmp.join("rep");
         std::fs::create_dir_all(report.join("state")).unwrap();
         std::fs::write(
@@ -9872,7 +9859,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         let res = srv.wait_for_job(Some(&json!({"job_id":"w1","timeout_secs":10})));
         assert!(res.content[0].text.contains("passed"));
         assert!(res.content[0].text.contains("finished"));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -9906,7 +9892,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
     #[test]
     fn grep_report_finds_matches_case_insensitive() {
-        let tmp = std::env::temp_dir().join(format!("mcp-grep-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-grep");
         let rd = tmp.join("rep");
         std::fs::create_dir_all(rd.join("logs")).unwrap();
         std::fs::write(rd.join("logs/a.log"), "all good\nFATAL: boom\nmore\n").unwrap();
@@ -9925,12 +9911,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             !txt.contains("b.log"),
             "non-matching file excluded; got: {txt}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn get_stage_log_reads_matching_row_and_log() {
-        let tmp = std::env::temp_dir().join(format!("mcp-stagelog-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-stagelog");
         let rd = tmp.join("rep");
         std::fs::create_dir_all(rd.join("state")).unwrap();
         std::fs::create_dir_all(rd.join("logs")).unwrap();
@@ -9960,12 +9945,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             !txt.contains("bootstrap stage"),
             "non-matching row excluded; got: {txt}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn loop_journal_appends_and_reads_back() {
-        let tmp = std::env::temp_dir().join(format!("mcp-journal-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-journal");
         std::fs::create_dir_all(&tmp).unwrap();
         let srv = test_server(&tmp);
         // empty first
@@ -9995,7 +9979,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             srv.write_loop_note(Some(&json!({"note":"  "}))).is_error,
             Some(true)
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -10007,7 +9990,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
     #[test]
     fn get_run_progress_reports_tail_and_artifacts() {
-        let tmp = std::env::temp_dir().join(format!("mcp-prog-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-prog");
         let report = tmp.join("rep");
         std::fs::create_dir_all(report.join("logs")).unwrap();
         std::fs::write(report.join("logs/x.log"), "stage out\n").unwrap();
@@ -10038,12 +10021,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         );
         // neither job_id nor report_dir → error
         assert_eq!(srv.get_run_progress(None).is_error, Some(true));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn find_untested_work_classifies_coverage() {
-        let tmp = std::env::temp_dir().join(format!("mcp-untested-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-untested");
         let dir = tmp.join("documents/operations");
         std::fs::create_dir_all(&dir).unwrap();
         // a=pass→fail (regressed), b=fail,fail (never passed), c=not_run (never run),
@@ -10094,7 +10076,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             !macos.contains("linux_stage_a"),
             "os=macos excludes linux cells; got: {macos}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ── Which ledger does each run-matrix tool read? ───────────────────
@@ -10171,6 +10152,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
     impl Drop for TempRoot {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Deref so a call site that already treats its root as a path -- `&tmp`
+    // passed where `&Path` is expected, `tmp.join(..)` -- converts by changing
+    // only the line that builds it. Without this the conversion would touch
+    // every use of every root rather than one line per test.
+    impl std::ops::Deref for TempRoot {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    // Deref alone is not enough: a generic `P: AsRef<Path>` parameter -- which
+    // is how std::fs takes paths -- does NOT deref-coerce, so `create_dir_all(&tmp)`
+    // needs this even though `test_server(&tmp)` does not.
+    impl AsRef<Path> for TempRoot {
+        fn as_ref(&self) -> &Path {
+            &self.0
         }
     }
 
@@ -10448,7 +10450,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
     #[test]
     fn diagnose_profileless_empty_dir_errors_closed() {
-        let tmp = std::env::temp_dir().join(format!("mcp-diag-empty-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-diag-empty");
         std::fs::create_dir_all(&tmp).unwrap();
         let srv = test_server(&tmp);
         let result = srv.diagnose_profileless_run(&tmp, None, false);
@@ -10462,12 +10464,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             text.contains("no diagnosable evidence"),
             "error must mention no evidence; got: {text}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn diagnose_profileless_with_stages_tsv_and_orchestrate_result() {
-        let tmp = std::env::temp_dir().join(format!("mcp-diag-tsv-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-diag-tsv");
         let orch_dir = tmp.join("orchestration");
         let state_dir = tmp.join("state");
         std::fs::create_dir_all(&orch_dir).unwrap();
@@ -10516,12 +10517,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             text.to_lowercase().contains("membership"),
             "must mention failed stage membership; got: {text}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn diagnose_profileless_with_failure_digest() {
-        let tmp = std::env::temp_dir().join(format!("mcp-diag-digest-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-diag-digest");
         let state_dir = tmp.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
 
@@ -10558,12 +10558,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             text.contains("First failure"),
             "must have first-failure section; got: {text}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn diagnose_profileless_stage_filter_log() {
-        let tmp = std::env::temp_dir().join(format!("mcp-diag-filter-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-diag-filter");
         let state_dir = tmp.join("state");
         let logs_dir = tmp.join("logs");
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -10589,12 +10588,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             text.contains("bootstrap completed"),
             "must include stage log tail; got: {text}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn diagnose_profileless_collect_artifacts_notes_unsupported() {
-        let tmp = std::env::temp_dir().join(format!("mcp-diag-collect-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-diag-collect");
         std::fs::create_dir_all(&tmp).unwrap();
 
         let orch = json!({
@@ -10626,14 +10624,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             text.to_lowercase().contains("collect_artifacts"),
             "must note collect_artifacts not supported without profile; got: {text}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ── start_live_lab_run mutually-exclusive validation ────────────────
 
     #[test]
     fn start_live_lab_run_rejects_nodes_with_role_platform_selector() {
-        let tmp = std::env::temp_dir().join(format!("mcp-reject-selector-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-reject-selector");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(inv_dir.join("vm_lab_inventory.json"), r#"{"entries":[]}"#).unwrap();
@@ -10667,8 +10664,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             "nodes + macos_promote_exit must error; got: {:?}",
             result2.content
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ── Rust-engine synthesis from role-platform selectors ──────────────
@@ -10815,7 +10810,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
     #[test]
     fn inventory_linux_lab_roles_reads_only_linux_entries_with_both_fields() {
-        let tmp = std::env::temp_dir().join(format!("mcp-linux-lab-roles-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-linux-lab-roles");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -10839,7 +10834,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             ],
             "must skip the no-lab_role Linux entry and every platform-tagged (mac/win) entry"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -10848,8 +10842,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         // topology (empty inventory, no explicit guest) used to silently emit the
         // raw --relay-platform flag and spawn the legacy bash arm. It must now
         // fail closed with a clear message instead.
-        let tmp =
-            std::env::temp_dir().join(format!("mcp-selector-failclosed-{}", std::process::id()));
+        let tmp = TempRoot::new("mcp-selector-failclosed");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(inv_dir.join("vm_lab_inventory.json"), r#"{"entries":[]}"#).unwrap();
@@ -10871,7 +10864,5 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             text.contains("no --node topology could be synthesized"),
             "error must explain the synthesis failure; got: {text}"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
