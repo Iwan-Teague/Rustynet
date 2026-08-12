@@ -3997,12 +3997,9 @@ mod tests {
         }
         for column in [
             "cross_os_bootstrap",
-            "cross_os_membership_convergence",
             "cross_os_peer_visibility",
-            "cross_os_direct_path",
             "cross_os_relay_path",
             "cross_os_exit_path",
-            "cross_os_dns",
             "cross_os_role_switch",
             "cross_os_anchor_bundle_pull",
         ] {
@@ -4010,6 +4007,25 @@ mod tests {
                 values.get(column).map(String::as_str),
                 Some("pass"),
                 "{column} must be populated from rust-native StageId evidence"
+            );
+        }
+        // QH-43: these three are deliberately UNFED. Their only feeders were
+        // host->guest distribution pushes, which cannot establish guest-to-guest
+        // reachability -- the orchestrator host owns every lab bridge, so the push
+        // succeeds across a total severance. `not_run` is now the truth: nothing
+        // measures them. This fixture previously asserted `pass` for all three on
+        // the strength of those pushes, which is exactly the false green QH-43
+        // removes. They are owed real validators (blocked on QH-41).
+        for column in [
+            "cross_os_direct_path",
+            "cross_os_membership_convergence",
+            "cross_os_dns",
+        ] {
+            assert_eq!(
+                values.get(column).map(String::as_str),
+                None,
+                "{column} must NOT be populated: its feeders were pushes, not reachability \
+                 proofs (QH-43). A `pass` here means a distribution stage was re-mapped."
             );
         }
         let _ = fs::remove_dir_all(root);

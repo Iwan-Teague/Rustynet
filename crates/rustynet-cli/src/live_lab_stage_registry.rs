@@ -2904,18 +2904,6 @@ mod tests {
         );
     }
 
-    /// A1 anti-drift gate for the class the spec §3 records: the earlier
-    /// PROSE tier map omitted cross_os_membership_convergence /
-    /// peer_visibility / direct_path / lan_toggle. Both sides here derive
-    /// from the catalog (no hand-list): every stage whose wire name is in
-    /// the `cross_os_*` family must be tiered T3CrossOs. No `cross_os_*`
-    /// wire name exists in the `--node` dialect TODAY (those are the
-    /// bash/wrapper aggregate cells) — the prefix gate arms the moment one
-    /// lands — so the second assertion keeps T3 alive meanwhile:
-    /// live_mixed_topology_validation (which hard-requires
-    /// Linux+macOS+Windows) carries the cross-OS bar, and re-tiering it away
-    /// without a replacement would silently empty the tier.
-    #[test]
     /// A cross-OS column asserts that two GUESTS reached each other. A stage
     /// whose success only demonstrates a host->guest push cannot establish that,
     /// because the orchestrator host owns every lab bridge — the push succeeds
@@ -3017,6 +3005,18 @@ mod tests {
         }
     }
 
+    /// A1 anti-drift gate for the class the spec §3 records: the earlier
+    /// PROSE tier map omitted cross_os_membership_convergence /
+    /// peer_visibility / direct_path / lan_toggle. Both sides here derive
+    /// from the catalog (no hand-list): every stage whose wire name is in
+    /// the `cross_os_*` family must be tiered T3CrossOs. No `cross_os_*`
+    /// wire name exists in the `--node` dialect TODAY (those are the
+    /// bash/wrapper aggregate cells) — the prefix gate arms the moment one
+    /// lands — so the second assertion keeps T3 alive meanwhile:
+    /// live_mixed_topology_validation (which hard-requires
+    /// Linux+macOS+Windows) carries the cross-OS bar, and re-tiering it away
+    /// without a replacement would silently empty the tier.
+    #[test]
     fn cross_os_family_stages_are_tiered_t3_cross_os() {
         use crate::vm_lab::orchestrator::stage::StageId;
         for stage in StageId::ALL {
