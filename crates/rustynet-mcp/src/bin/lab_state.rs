@@ -3881,9 +3881,19 @@ fn apple_script_string_literal(s: &str) -> String {
 ///
 /// The two engines write SEPARATE ledgers on purpose, and reading the wrong one
 /// is not a cosmetic mistake — it is how dead evidence gets presented as
-/// current. `linux_stage_two_hop` reads 56 pass in the bash archive and 0 pass /
-/// 81 fail in the `--node` ledger for the same column name, so a caller that
-/// cannot tell which file produced a row cannot tell whether the stage works.
+/// current. Measured on this tree, the `linux_stage_two_hop` column reads
+/// 56 pass / 17 fail across the archive's 549 rows and 35 pass / 27 fail across
+/// the `--node` ledger's 107 — the same column name, two different engines, two
+/// different answers. A caller that cannot tell which file produced a row cannot
+/// tell which engine the number describes.
+///
+/// (Separately, do not read either column as proof the chained-exit path works.
+/// Per `CLAUDE.md` §12.3, the `--node` column's passes are contaminated by a
+/// since-removed `traffic_test_matrix` alias, and the underlying
+/// `live_two_hop_validation` stage has a lifetime record of 0 pass. The
+/// per-stage truth lives in `live_lab_node_stage_results.csv` and in the
+/// stage's own report artifact — that is a distinct hazard from this one, and
+/// picking the right ledger does not fix it.)
 ///
 /// Two rules follow, and both are enforced below rather than documented:
 /// - the DEFAULT is always [`LedgerEngine::Node`], the live ledger
@@ -3934,9 +3944,10 @@ impl LedgerEngine {
             Self::BashArchive => format!(
                 "> ⚠️ **FROZEN ARCHIVE — legacy bash orchestrator, NOT current evidence.**\n\
                  > Source: `{}`. The `--node` engine never appends here, so these rows only\n\
-                 > get staler, and a `pass` here says nothing about the engine in use today\n\
-                 > (`linux_stage_two_hop`: 56 pass in this archive, 0 pass in the `--node`\n\
-                 > ledger). For current coverage re-run with `engine=\"node\"` (the default).\n\n",
+                 > get staler, and a `pass` here says nothing about the engine in use today:\n\
+                 > the `linux_stage_two_hop` column reads 56 pass / 17 fail in this archive\n\
+                 > and 35 pass / 27 fail in the `--node` ledger. For current coverage re-run\n\
+                 > with `engine=\"node\"` (the default).\n\n",
                 self.rel_path()
             ),
         }
