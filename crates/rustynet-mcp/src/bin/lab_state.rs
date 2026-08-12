@@ -10237,11 +10237,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         dir
     }
 
+    /// A temp tree that is unique per run and removed even when a test panics.
+    ///
+    /// Both properties are load-bearing, and a hand-built path has neither:
+    ///
+    /// * **Unique under either runner.** `cargo test` runs a binary's tests as
+    ///   threads in ONE process, so `process::id()` is shared between them,
+    ///   while nextest runs a process per test, so a process-local counter is
+    ///   always 0. Only pid + nanos + counter together are unique under both.
+    /// * **Removed on panic.** Cleaning up on a test's last line leaks the tree
+    ///   whenever an assertion fires — five such leftovers were found on this
+    ///   machine. They accumulate in a directory shared with every other
+    ///   process on the host, which invites a glob cleanup such as
+    ///   `rm -rf "$TMPDIR"/mcp-ledger-*`; a removal landing mid-test makes
+    ///   these tests fail with ENOENT on a ledger they had already written.
+    ///   Measured: 4 failures in 12 runs with such a deleter running
+    ///   concurrently, 0 in 12 without.
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(prefix: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("{prefix}-{}-{nanos}-{seq}", std::process::id()));
+            // A recycled pid can leave a tree behind. Start from nothing so no
+            // inherited file can influence the result.
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn run_matrix_tools_default_to_the_live_node_ledger() {
-        let tmp = std::env::temp_dir().join(format!("mcp-ledger-default-{}", std::process::id()));
-        write_both_ledgers(&tmp);
-        let srv = test_server(&tmp);
+        let tmp = TempRoot::new("mcp-ledger-default");
+        write_both_ledgers(tmp.path());
+        let srv = test_server(tmp.path());
 
         // Each entry: (label, rendered output). All three must show the node
         // ledger's sentinel and never the archive's.
@@ -10306,14 +10351,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             "work finder must rank two_hop off the node ledger's 0-pass history; got: {}",
             renders[4].1
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn archive_is_read_only_on_explicit_request_and_labels_itself() {
-        let tmp = std::env::temp_dir().join(format!("mcp-ledger-archive-{}", std::process::id()));
-        write_both_ledgers(&tmp);
-        let srv = test_server(&tmp);
+        let tmp = TempRoot::new("mcp-ledger-archive");
+        write_both_ledgers(tmp.path());
+        let srv = test_server(tmp.path());
 
         for (label, out) in [
             (
@@ -10345,14 +10389,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
                 "{label} archive read must be self-labelling; got: {out}"
             );
         }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn unknown_engine_errors_instead_of_silently_defaulting() {
-        let tmp = std::env::temp_dir().join(format!("mcp-ledger-badengine-{}", std::process::id()));
-        write_both_ledgers(&tmp);
-        let srv = test_server(&tmp);
+        let tmp = TempRoot::new("mcp-ledger-badengine");
+        write_both_ledgers(tmp.path());
+        let srv = test_server(tmp.path());
         // 'bash' is a plausible typo for 'bash_archive'. Answering it from the
         // default ledger would hand back node rows under an archive-shaped
         // request — the misattribution the selector exists to prevent.
@@ -10382,19 +10425,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
                 "{label} must not have read any ledger; got: {text}"
             );
         }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn absent_node_ledger_errors_and_never_falls_back_to_the_archive() {
-        let tmp =
-            std::env::temp_dir().join(format!("mcp-ledger-nofallback-{}", std::process::id()));
-        let dir = write_both_ledgers(&tmp);
+        let tmp = TempRoot::new("mcp-ledger-nofallback");
+        let dir = write_both_ledgers(tmp.path());
         // Only the live ledger goes missing — the archive is still right there,
         // which is exactly when a fallback would fire and render frozen rows as
         // current.
         std::fs::remove_file(dir.join("live_lab_node_run_matrix.csv")).unwrap();
-        let srv = test_server(&tmp);
+        let srv = test_server(tmp.path());
         for (label, r) in [
             ("get_run_matrix", srv.call_tool("get_run_matrix", None)),
             ("get_run_trend", srv.get_run_trend(None)),
@@ -10416,7 +10457,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
                 "{label} must never fall back to the frozen archive; got: {text}"
             );
         }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
