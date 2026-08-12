@@ -1946,13 +1946,23 @@ empty, so nothing Rustynet did causes it.
 The inventory records `live_ips: ["192.168.65.101", "192.168.64.18", …]` — the guest used
 to be on the shared network, so this is drift, not a permanent property.
 
+> **CORRECTED 2026-08-12 — the "drift" claim above is WRONG, and it is my error.** Measured
+> with `plutil -p` on each `config.plist`: `macOS.utm` is `Mode = "Shared"`, `Backend =
+> "Apple"`; every Linux guest is `Mode = "Shared"`, `Backend = "QEMU"`. **Both sides are
+> already on "Shared".** UTM's Apple-Virtualization and QEMU backends each get their OWN vmnet
+> shared network, so "Shared" names two different L2 segments depending on backend. The repair
+> prescribed below — "put the guest back on the shared adapter" — is therefore a **no-op**, and
+> a reviewer reasoning from this entry reached a wrong conclusion because of it. The split is a
+> backend property; no mode change and no boot-order care merges the two bridges.
+
 **Consequence:** `traffic_test_matrix` fails on every mixed-OS run, taking the rest of the
 Linux suite with it, and no cross-OS stage can pass. This is the immediate blocker on
 mixed-OS coverage, and it is separate from QH-39/QH-40.
 
 **Note the boot-order interaction:** whichever backend starts first takes 192.168.64.x, so
 boot order alone can move a guest between bridges and make inventory addresses look stale.
-Fix by putting the guest back on the shared adapter, then re-verify with a bidirectional
+Fix (SUPERSEDED — see the correction above; kept for the record) by putting the guest back on
+the shared adapter, then re-verify with a bidirectional
 ping before spending run time.
 
 ### QH-42 — the network-evidence artifact rendered a verdict over a silently truncated finding set
