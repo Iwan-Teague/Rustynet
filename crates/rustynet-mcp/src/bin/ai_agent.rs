@@ -56,9 +56,9 @@
 #![forbid(unsafe_code)]
 
 use rustynet_mcp::{
-    McpServer, ServerInfo, Tool, ToolCallResult, json_schema_boolean, json_schema_object,
-    json_schema_string, repo_root, run_server, run_with_timeout, spawn_logged, tail_file,
-    text_content, tool_error, truncate_output,
+    LedgerEngine, McpServer, ServerInfo, Tool, ToolCallResult, engine_schema_property,
+    json_schema_boolean, json_schema_object, json_schema_string, repo_root, run_server,
+    run_with_timeout, spawn_logged, tail_file, text_content, tool_error, truncate_output,
 };
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -1727,7 +1727,11 @@ impl AiAgentServer {
             {
                 return self.target_from_key(
                     key,
-                    &format!("latest run failed at `{failed}`; retry focused cell"),
+                    &format!(
+                        "latest run failed at `{failed}`; retry focused cell \
+                         (per the live `--node` ledger `{}`)",
+                        LedgerEngine::Node.rel_path()
+                    ),
                 );
             }
 
@@ -1745,20 +1749,46 @@ impl AiAgentServer {
                 if !status.contains("pass") && !status.contains('✅') {
                     return self.target_from_key(
                         key,
-                        &format!("matrix cell `{cell}` is not currently pass (`{}`)", g(cell)),
+                        &format!(
+                            "matrix cell `{cell}` is not currently pass (`{}`) in the live \
+                             `--node` ledger `{}`",
+                            g(cell),
+                            LedgerEngine::Node.rel_path()
+                        ),
                     );
                 }
             }
         }
 
-        self.target_from_key("full", "no failing focused cell found; run full matrix")
+        // Reached either because every tracked cell is green in the LIVE ledger
+        // or because that ledger is absent. Both mean "run everything" — the
+        // reason names the ledger so the distinction is never guessed at.
+        self.target_from_key(
+            "full",
+            &format!(
+                "no failing focused cell in the live `--node` ledger `{}` (or it is absent); \
+                 run full matrix",
+                LedgerEngine::Node.rel_path()
+            ),
+        )
     }
 
+    /// Read the LIVE `--node` evidence ledger for the target chooser.
+    ///
+    /// Node-only, and deliberately WITHOUT an engine selector — unlike
+    /// `tool_lab_run_status`, which reports history and may legitimately be
+    /// pointed at the frozen archive. This feeds [`Self::next_live_lab_target`],
+    /// which DECIDES WHAT THE LAB RUNS NEXT, and there is no valid reason to
+    /// pick a target off an engine that no longer runs. Reading the archive here
+    /// is what made the loop skip cells the bash orchestrator had proven and the
+    /// `--node` engine never had (see [`LedgerEngine`] for the measured split).
     fn read_run_matrix_rows(&self) -> Result<Option<RunMatrixRows>, String> {
-        let path = self
-            .repo_root
-            .join("documents/operations/live_lab_run_matrix.csv");
+        let path = self.repo_root.join(LedgerEngine::Node.rel_path());
         if !path.is_file() {
+            // Absent live ledger → `None`, which makes the caller choose the
+            // FULL matrix. That is the conservative answer for a chooser (run
+            // everything rather than assume anything is green), and it is NOT a
+            // cross-engine fallback: the archive is never opened here.
             return Ok(None);
         }
         let body = rustynet_mcp::read_file_capped(&path, 16 * 1024 * 1024)?;
@@ -4423,17 +4453,31 @@ impl AiAgentServer {
         Ok(out)
     }
 
+    /// Render recent run-matrix rows.
+    ///
+    /// Unlike [`Self::read_run_matrix_rows`] this is a REPORTING tool, so it
+    /// takes the `engine` selector: history from the frozen bash archive is a
+    /// legitimate thing to ask for, it just must never be mistaken for current
+    /// evidence. Default is the live `--node` ledger and every rendering is
+    /// self-labelling (see [`LedgerEngine`]).
     fn tool_lab_run_status(&self, args: &Value) -> Result<String, String> {
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
             .map(|n| n.clamp(1, 50) as usize)
             .unwrap_or(10);
-        let path = self
-            .repo_root
-            .join("documents/operations/live_lab_run_matrix.csv");
+        let engine = LedgerEngine::from_args(Some(args))?;
+        let path = self.repo_root.join(engine.rel_path());
         if !path.is_file() {
-            return Ok("# live-lab run matrix\n\n(not found)\n".to_string());
+            // Fail closed, and NEVER read the other engine's file: a "(not
+            // found)" body that the caller skims as "no runs yet" is the same
+            // wrong conclusion by a quieter route.
+            return Err(format!(
+                "Run matrix `{}` (engine '{}') not found at {}.",
+                engine.rel_path(),
+                engine.arg_value(),
+                path.display()
+            ));
         }
         let body = rustynet_mcp::read_file_capped(&path, 8_000_000)?;
         let mut lines = body.lines();
@@ -4451,9 +4495,10 @@ impl AiAgentServer {
         let rows: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
         let start = rows.len().saturating_sub(limit);
         let mut out = format!(
-            "# Live-lab run matrix — last {} of {} runs\n\n",
+            "# Live-lab run matrix — last {} of {} runs\n\n{}",
             rows.len().min(limit),
-            rows.len()
+            rows.len(),
+            engine.banner()
         );
         // report_dir is surfaced so it can be passed to lab_run_detail /
         // lab_stage_log / lab_report_grep / lab_report_artifacts.
@@ -7011,9 +7056,12 @@ fn agent_tool_definitions() -> Value {
             "Summarize recent live-lab runs from the run matrix: per run the start time, git \
              commit, overall pass/fail, first-failed stage, and the linux two_hop / relay stage \
              status. Use to answer 'what is the latest live-lab result' or 'did stage X pass \
-             recently'. Read-only.",
+             recently'. Defaults to the LIVE Rust --node ledger; engine='bash_archive' reads the \
+             frozen legacy bash-orchestrator ledger instead (history only — NOT evidence about \
+             the engine in use today). Output always names the engine it came from. Read-only.",
             json!({
-                "limit": {"type": "integer", "description": "How many most-recent runs to show (default 10, max 50)"}
+                "limit": {"type": "integer", "description": "How many most-recent runs to show (default 10, max 50)"},
+                "engine": engine_schema_property()
             }),
             &[],
         ),
@@ -9273,13 +9321,238 @@ mod tests {
 
     #[test]
     fn lab_run_status_reads_the_matrix() {
-        // The run matrix is a tracked repo file → summarize it (or cleanly report
-        // not-found); never error or escape the repo.
+        // The live --node ledger is a tracked repo file → summarize it, labelled
+        // with the engine it came from; never escape the repo.
         let s = server();
         let out = s
             .tool_lab_run_status(&json!({"limit": 3}))
             .expect("lab_run_status ok");
         assert!(out.contains("run matrix"));
+        assert!(
+            out.contains("live_lab_node_run_matrix.csv"),
+            "default read must name the LIVE ledger; got: {out}"
+        );
+    }
+
+    // ── Which ledger does each run-matrix reader open? ─────────────────
+    //
+    // The two engines keep SEPARATE ledgers whose identically-named columns
+    // disagree (`linux_stage_two_hop`: 56 pass in the frozen bash archive vs
+    // 35 in the live --node ledger). These tests pin the file each reader
+    // opens by planting DIFFERENT, mutually exclusive sentinel content in
+    // each, so reading the wrong one can never look like a pass.
+
+    /// Both ledgers, distinguishable by construction: sentinel run_ids and
+    /// inverted pass/fail on the columns the chooser and the reporter read.
+    fn write_both_ledgers(root: &Path) {
+        let dir = root.join("documents/operations");
+        std::fs::create_dir_all(&dir).unwrap();
+        // NODE (live): latest run FAILED at `macos_relay_service_lifecycle`,
+        // which maps unambiguously to the `macos_relay` target — distinct from
+        // the `macos_exit` cell the later cell-scan would pick, so the chooser's
+        // answer identifies WHICH branch, off WHICH file, produced it.
+        // The sentinel rides in `report_dir` because that is a column the
+        // reporter actually renders (`run_id` is not in its table).
+        std::fs::write(
+            dir.join("live_lab_node_run_matrix.csv"),
+            "run_id,run_started_utc,git_commit,overall_result,first_failed_stage,\
+             linux_stage_two_hop,linux_stage_relay_service_lifecycle,report_dir,macos_exit\n\
+             NODE-SENTINEL-1,2026-08-12T00:00:00Z,abc1234567,fail,macos_relay_service_lifecycle,\
+             fail,fail,/tmp/NODE-SENTINEL-1-report,fail\n",
+        )
+        .unwrap();
+        // BASH ARCHIVE (frozen): everything green, no failed stage. If a reader
+        // opens this file the chooser falls through to "full" instead of
+        // `macos_relay`, and the reporter renders passes — both unmistakable.
+        std::fs::write(
+            dir.join("live_lab_run_matrix.csv"),
+            "run_id,run_started_utc,git_commit,overall_result,first_failed_stage,\
+             linux_stage_two_hop,linux_stage_relay_service_lifecycle,report_dir,macos_exit\n\
+             ARCHIVE-SENTINEL-1,2026-01-01T00:00:00Z,def7654321,pass,,\
+             pass,pass,/tmp/ARCHIVE-SENTINEL-1-report,pass\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn target_chooser_reads_the_live_node_ledger_only() {
+        let tmp = std::env::temp_dir().join(format!("ai-ledger-target-{}", std::process::id()));
+        write_both_ledgers(&tmp);
+        let s = server_rooted(&tmp);
+
+        let rows = s
+            .read_run_matrix_rows()
+            .expect("read ok")
+            .expect("live ledger present");
+        let flat = format!("{:?}", rows.1);
+        assert!(
+            flat.contains("NODE-SENTINEL-1"),
+            "chooser must read the LIVE --node ledger; got: {flat}"
+        );
+        assert!(
+            !flat.contains("ARCHIVE-SENTINEL"),
+            "chooser must never read the frozen archive; got: {flat}"
+        );
+
+        // And the decision built on it: the live ledger's failing relay stage
+        // must drive the target. Off the archive every cell is pass, so a
+        // wrong-file read would fall through to the full matrix instead.
+        let target = s.next_live_lab_target(None).expect("target ok");
+        assert_eq!(
+            target.key, "macos_relay",
+            "target must come from the live ledger's failed stage, not the \
+             cell-scan and not the all-green archive (reason: {})",
+            target.reason
+        );
+        assert!(
+            target.reason.contains("macos_relay_service_lifecycle"),
+            "the reason must cite the live ledger's failure; got: {}",
+            target.reason
+        );
+        assert!(
+            target.reason.contains("live_lab_node_run_matrix.csv"),
+            "the recorded reason must name the ledger that drove it; got: {}",
+            target.reason
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn lab_run_status_defaults_to_node_and_labels_every_read() {
+        let tmp = std::env::temp_dir().join(format!("ai-ledger-status-{}", std::process::id()));
+        write_both_ledgers(&tmp);
+        let s = server_rooted(&tmp);
+
+        for (label, args) in [
+            ("no engine arg", json!({"limit": 5})),
+            ("engine=node", json!({"limit": 5, "engine": "node"})),
+        ] {
+            let out = s.tool_lab_run_status(&args).expect("ok");
+            assert!(
+                out.contains("NODE-SENTINEL-1") && out.contains("live_lab_node_run_matrix.csv"),
+                "{label} must read + name the LIVE ledger; got: {out}"
+            );
+            assert!(
+                !out.contains("ARCHIVE-SENTINEL") && !out.contains("FROZEN ARCHIVE"),
+                "{label} must not surface archive rows or the archive banner; got: {out}"
+            );
+        }
+
+        // The archive is reachable, but only on request, and it says so loudly.
+        let arch = s
+            .tool_lab_run_status(&json!({"limit": 5, "engine": "bash_archive"}))
+            .expect("ok");
+        assert!(
+            arch.contains("ARCHIVE-SENTINEL-1"),
+            "engine=bash_archive must read the archive; got: {arch}"
+        );
+        assert!(
+            !arch.contains("NODE-SENTINEL"),
+            "must not blend the two ledgers; got: {arch}"
+        );
+        assert!(
+            arch.contains("FROZEN ARCHIVE") && arch.contains("live_lab_run_matrix.csv"),
+            "archive read must be self-labelling; got: {arch}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn lab_run_status_rejects_an_unknown_engine() {
+        let tmp = std::env::temp_dir().join(format!("ai-ledger-badengine-{}", std::process::id()));
+        write_both_ledgers(&tmp);
+        let s = server_rooted(&tmp);
+        // 'bash' is a plausible typo for 'bash_archive'. Answering it from the
+        // default would hand back node rows under an archive-shaped request.
+        let err = s
+            .tool_lab_run_status(&json!({"engine": "bash"}))
+            .expect_err("unknown engine must error");
+        assert!(
+            err.contains("node") && err.contains("bash_archive"),
+            "error must name the valid engines; got: {err}"
+        );
+        assert!(
+            !err.contains("SENTINEL"),
+            "must not have read any ledger; got: {err}"
+        );
+        // And it surfaces to the grounded agent as an error, not as empty data.
+        let dispatched = s.dispatch_agent_tool("lab_run_status", &json!({"engine": "bash"}));
+        assert!(
+            dispatched.starts_with("ERROR:"),
+            "dispatch must surface the rejection; got: {dispatched}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn absent_node_ledger_never_falls_back_to_the_archive() {
+        let tmp = std::env::temp_dir().join(format!("ai-ledger-nofallback-{}", std::process::id()));
+        write_both_ledgers(&tmp);
+        // Remove ONLY the live ledger — the archive stays right next to it,
+        // which is exactly when a fallback would fire.
+        std::fs::remove_file(tmp.join("documents/operations/live_lab_node_run_matrix.csv"))
+            .unwrap();
+        let s = server_rooted(&tmp);
+
+        // Reporter: hard error naming the ledger it wanted, never archive rows.
+        let err = s
+            .tool_lab_run_status(&json!({"limit": 3}))
+            .expect_err("absent live ledger must error");
+        assert!(
+            err.contains("live_lab_node_run_matrix.csv") && !err.contains("ARCHIVE-SENTINEL"),
+            "must name the missing live ledger and read nothing else; got: {err}"
+        );
+
+        // Chooser: degrades to the FULL matrix (run everything), which is the
+        // conservative target — and still never opens the archive.
+        assert!(
+            s.read_run_matrix_rows().expect("read ok").is_none(),
+            "absent live ledger must yield no rows, not archive rows"
+        );
+        let target = s.next_live_lab_target(None).expect("target ok");
+        assert_eq!(
+            target.key, "full",
+            "no live ledger → run everything, never a cell inferred from elsewhere (reason: {})",
+            target.reason
+        );
+        assert!(
+            !target.reason.contains("macos_relay_service_lifecycle"),
+            "no focused cell may be inferred; got: {}",
+            target.reason
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn engine_selector_is_declared_only_on_the_reporting_tool() {
+        let defs = agent_tool_definitions();
+        let arr = defs.as_array().expect("tool defs are an array");
+        let has_engine = |d: &Value| {
+            d["function"]["parameters"]["properties"]
+                .get("engine")
+                .is_some()
+        };
+        let status = arr
+            .iter()
+            .find(|d| d["function"]["name"].as_str() == Some("lab_run_status"))
+            .expect("lab_run_status is advertised");
+        assert!(
+            has_engine(status),
+            "lab_run_status reports history, so it must advertise the engine selector it honours"
+        );
+        // There is no agent-facing tool for the target chooser, and none may
+        // gain an engine knob by accident: any OTHER tool advertising `engine`
+        // would be promising a selection nothing implements.
+        for d in arr {
+            let name = d["function"]["name"].as_str().unwrap_or("");
+            if name == "lab_run_status" {
+                continue;
+            }
+            assert!(
+                !has_engine(d),
+                "`{name}` advertises an `engine` arg nothing honours"
+            );
+        }
     }
 
     #[test]
