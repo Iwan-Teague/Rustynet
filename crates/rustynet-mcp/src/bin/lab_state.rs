@@ -10174,6 +10174,67 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         }
     }
 
+    /// Pins the three fields of a [`TempRoot`] name and the Drop cleanup.
+    ///
+    /// Each field defeats a collision the others cannot: `cargo test` runs a
+    /// binary's tests as threads in ONE process, so the pid alone cannot
+    /// separate two of them; nextest runs a process per test, so the
+    /// process-local counter is always 0 there and cannot separate them
+    /// either. A scheme that silently loses a field still looks fine until it
+    /// collides, which is why this is pinned rather than trusted.
+    ///
+    /// Deliberately NOT asserted: the counter's absolute value. It is
+    /// process-global, so what it starts at depends on which tests ran first,
+    /// and a sibling thread can take a value between the two constructions
+    /// below. Only strict monotonicity survives that, and `fetch_add`
+    /// guarantees it under any interleaving.
+    #[test]
+    fn temp_root_name_carries_pid_and_counter_and_drop_removes_the_tree() {
+        let a = TempRoot::new("mcp-temproot-probe");
+        let b = TempRoot::new("mcp-temproot-probe");
+
+        let name = |r: &TempRoot| {
+            r.path()
+                .file_name()
+                .expect("temp root always has a final component")
+                .to_string_lossy()
+                .to_string()
+        };
+        let (name_a, name_b) = (name(&a), name(&b));
+        assert_ne!(
+            name_a, name_b,
+            "the same prefix twice in one process must not collide"
+        );
+
+        // Fields counted from the END, because the prefix itself contains '-'.
+        // Position is what makes this catch a DROPPED field and not just a
+        // changed one: losing nanos shifts the pid out of slot 2.
+        let field =
+            |n: &str, from_end: usize| n.rsplit('-').nth(from_end).unwrap_or_default().to_string();
+        assert_eq!(
+            field(&name_a, 2),
+            std::process::id().to_string(),
+            "pid must stay in its slot so two concurrent processes cannot collide; got: {name_a}"
+        );
+
+        let seq = |n: &str| field(n, 0).parse::<u64>().ok();
+        let (seq_a, seq_b) = (seq(&name_a), seq(&name_b));
+        assert!(
+            matches!((seq_a, seq_b), (Some(x), Some(y)) if y > x),
+            "the trailing counter must advance per construction; got {name_a} then {name_b}"
+        );
+
+        let path = a.path().to_path_buf();
+        std::fs::create_dir_all(path.join("documents/operations"))
+            .expect("temp root must be usable");
+        assert!(path.exists());
+        drop(a);
+        assert!(
+            !path.exists(),
+            "Drop is what makes a PANICKING test clean up; without it the tree leaks"
+        );
+    }
+
     #[test]
     fn run_matrix_tools_default_to_the_live_node_ledger() {
         let tmp = TempRoot::new("mcp-ledger-default");
