@@ -2206,22 +2206,35 @@ impl LabStateServer {
     }
 
     /// Summarize the trend across the last N run-matrix rows (converging or stuck?).
+    ///
+    /// Reads the LIVE `--node` ledger by default; `engine="bash_archive"` opts
+    /// explicitly into the frozen bash-orchestrator history. Every rendering
+    /// states which one it came from (see [`LedgerEngine`]).
     fn get_run_trend(&self, args: Option<&Value>) -> ToolCallResult {
         let limit = args
             .and_then(|a| a.get("limit"))
             .and_then(|v| v.as_u64())
             .unwrap_or(10)
             .clamp(1, 200) as usize;
-        let matrix_path = self
-            .repo_root
-            .join("documents/operations/live_lab_run_matrix.csv");
+        let engine = match LedgerEngine::from_args(args) {
+            Ok(e) => e,
+            Err(e) => return tool_error(&e),
+        };
+        let banner = engine.banner();
+        let matrix_path = self.repo_root.join(engine.rel_path());
         let content = match std::fs::read_to_string(&matrix_path) {
             Ok(c) => c,
-            Err(e) => return tool_error(&format!("Cannot read run matrix: {e}")),
+            Err(e) => {
+                return tool_error(&format!(
+                    "Cannot read run matrix `{}` ({}): {e}",
+                    engine.rel_path(),
+                    engine.arg_value()
+                ));
+            }
         };
         let mut lines = content.lines();
         let Some(header_line) = lines.next() else {
-            return tool_success("# Run trend\n\nMatrix is empty.\n");
+            return tool_success(&format!("# Run trend\n\n{banner}Matrix is empty.\n"));
         };
         let header = split_csv_line(header_line);
         let col = |name: &str| header.iter().position(|h| h == name);
@@ -2240,7 +2253,9 @@ impl LabStateServer {
             .map(split_csv_line)
             .collect();
         if all.is_empty() {
-            return tool_success("# Run trend\n\nNo data rows in the matrix yet.\n");
+            return tool_success(&format!(
+                "# Run trend\n\n{banner}No data rows in the matrix yet.\n"
+            ));
         }
         let cell =
             |row: &[String], i: usize| row.get(i).map(|s| s.trim().to_string()).unwrap_or_default();
@@ -2255,7 +2270,7 @@ impl LabStateServer {
         let verdict = trend_verdict(&verdict_rows);
 
         let mut out = format!(
-            "# Run trend (last {} of {} runs)\n\n**Verdict:** {verdict}\n\n| run_id | commit | result | first_failed_stage |\n|---|---|---|---|\n",
+            "# Run trend (last {} of {} runs)\n\n{banner}**Verdict:** {verdict}\n\n| run_id | commit | result | first_failed_stage |\n|---|---|---|---|\n",
             recent.len(),
             all.len()
         );
@@ -2290,19 +2305,34 @@ impl LabStateServer {
     /// cell DOWN the whole run-matrix history and surface what still needs to be
     /// proven green — regressed, never-passed, never-run, stale-green — so an
     /// agent can be handed a target instead of hunting for work.
+    ///
+    /// Reads the LIVE `--node` ledger ONLY, and unlike `get_run_trend` /
+    /// `get_run_matrix` it takes NO engine selector. Those two report history,
+    /// where the frozen archive is a legitimate thing to ask for; this one
+    /// DECIDES WHAT TO WORK ON NEXT, and there is no valid reason to rank the
+    /// next target against an engine that no longer runs. Ranking against the
+    /// archive is precisely the failure this tool used to have: it retired
+    /// `linux_stage_two_hop` as green off 56 bash-era passes while the `--node`
+    /// engine had never passed it once. For archive history, call
+    /// `get_run_matrix` with `engine="bash_archive"`.
     fn find_untested_work(&self, args: Option<&Value>) -> ToolCallResult {
         let os_filter = arg_str(args, "os").map(|s| s.to_ascii_lowercase());
         let include_green = arg_bool(args, "include_green");
-        let path = self
-            .repo_root
-            .join("documents/operations/live_lab_run_matrix.csv");
+        let engine = LedgerEngine::Node;
+        let banner = engine.banner();
+        let path = self.repo_root.join(engine.rel_path());
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(e) => return tool_error(&format!("Cannot read run matrix: {e}")),
+            Err(e) => {
+                return tool_error(&format!(
+                    "Cannot read run matrix `{}`: {e}",
+                    engine.rel_path()
+                ));
+            }
         };
         let mut lines = content.lines();
         let Some(header_line) = lines.next() else {
-            return tool_success("# Untested work\n\nMatrix is empty.\n");
+            return tool_success(&format!("# Untested work\n\n{banner}Matrix is empty.\n"));
         };
         let header = split_csv_line(header_line);
         let run_idx = header.iter().position(|h| h == "run_id");
@@ -2315,7 +2345,9 @@ impl LabStateServer {
             .map(split_csv_line)
             .collect();
         if rows.is_empty() {
-            return tool_success("# Untested work\n\nNo data rows in the matrix yet.\n");
+            return tool_success(&format!(
+                "# Untested work\n\n{banner}No data rows in the matrix yet.\n"
+            ));
         }
         let total = rows.len();
         let stale_window = 15usize;
@@ -2383,7 +2415,7 @@ impl LabStateServer {
         }
 
         let mut out = format!(
-            "# Untested / failing work ({total} runs analyzed{})\n\n",
+            "# Untested / failing work ({total} runs analyzed{})\n\n{banner}",
             os_filter
                 .as_ref()
                 .map(|f| format!(", os={f}"))
@@ -3845,6 +3877,104 @@ fn apple_script_string_literal(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+/// Which orchestrator engine's evidence ledger a run-matrix read targets.
+///
+/// The two engines write SEPARATE ledgers on purpose, and reading the wrong one
+/// is not a cosmetic mistake — it is how dead evidence gets presented as
+/// current. `linux_stage_two_hop` reads 56 pass in the bash archive and 0 pass /
+/// 81 fail in the `--node` ledger for the same column name, so a caller that
+/// cannot tell which file produced a row cannot tell whether the stage works.
+///
+/// Two rules follow, and both are enforced below rather than documented:
+/// - the DEFAULT is always [`LedgerEngine::Node`], the live ledger
+///   (`CLAUDE.md` §2: "current work appends here and tooling reads here");
+/// - every rendered read is SELF-LABELLING via [`LedgerEngine::banner`], so an
+///   engine attribution never has to be inferred from the tool name, the
+///   caller's memory, or which binary happens to be installed.
+///
+/// There is deliberately no cross-engine fallback: a missing ledger is an
+/// error, never a silent read of the other engine's file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerEngine {
+    /// `documents/operations/live_lab_node_run_matrix.csv` — the Rust `--node`
+    /// engine's ledger. THE live one; current runs append here.
+    Node,
+    /// `documents/operations/live_lab_run_matrix.csv` — the legacy bash
+    /// orchestrator's ledger. FROZEN: `--node` no longer appends to it, so its
+    /// newest row only gets staler. Readable for history, never for "does this
+    /// stage pass today".
+    BashArchive,
+}
+
+impl LedgerEngine {
+    /// Repo-relative path of this engine's ledger.
+    fn rel_path(self) -> &'static str {
+        match self {
+            Self::Node => "documents/operations/live_lab_node_run_matrix.csv",
+            Self::BashArchive => "documents/operations/live_lab_run_matrix.csv",
+        }
+    }
+
+    /// The `engine` argument value that selects this ledger.
+    fn arg_value(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::BashArchive => "bash_archive",
+        }
+    }
+
+    /// Header block prepended to every rendered read, so the output states its
+    /// own provenance. The archive variant is deliberately loud.
+    fn banner(self) -> String {
+        match self {
+            Self::Node => format!(
+                "**Engine:** `--node` (Rust orchestrator) — LIVE ledger `{}`.\n\n",
+                self.rel_path()
+            ),
+            Self::BashArchive => format!(
+                "> ⚠️ **FROZEN ARCHIVE — legacy bash orchestrator, NOT current evidence.**\n\
+                 > Source: `{}`. The `--node` engine never appends here, so these rows only\n\
+                 > get staler, and a `pass` here says nothing about the engine in use today\n\
+                 > (`linux_stage_two_hop`: 56 pass in this archive, 0 pass in the `--node`\n\
+                 > ledger). For current coverage re-run with `engine=\"node\"` (the default).\n\n",
+                self.rel_path()
+            ),
+        }
+    }
+
+    /// Resolve the `engine` argument. Absent → [`Self::Node`] (the live
+    /// ledger). An unrecognized value is a hard error, never a fallback: a
+    /// typo'd engine silently answering from the default would reintroduce
+    /// exactly the misattribution this type exists to prevent.
+    fn from_args(args: Option<&Value>) -> Result<Self, String> {
+        match arg_str(args, "engine").map(str::trim) {
+            None | Some("") => Ok(Self::Node),
+            Some(v) if v.eq_ignore_ascii_case(Self::Node.arg_value()) => Ok(Self::Node),
+            Some(v) if v.eq_ignore_ascii_case(Self::BashArchive.arg_value()) => {
+                Ok(Self::BashArchive)
+            }
+            Some(other) => Err(format!(
+                "Unknown engine '{other}'. Valid: '{}' (default — the live Rust `--node` \
+                 ledger) or '{}' (the FROZEN legacy bash-orchestrator archive).",
+                Self::Node.arg_value(),
+                Self::BashArchive.arg_value()
+            )),
+        }
+    }
+}
+
+/// The `engine` selector's JSON-schema property, shared by every tool that
+/// exposes it so the two descriptions cannot drift apart.
+fn engine_schema_property() -> Value {
+    json_schema_string(
+        "Which engine's evidence ledger to read: 'node' (DEFAULT — the live Rust --node ledger \
+         documents/operations/live_lab_node_run_matrix.csv, where current runs append) or \
+         'bash_archive' (the FROZEN legacy bash-orchestrator ledger \
+         documents/operations/live_lab_run_matrix.csv, history only — its rows are NOT evidence \
+         about the engine in use today). Output is labelled with the engine either way.",
+    )
+}
+
 /// RFC4180-aware single-line CSV split (handles quoted fields with commas).
 fn split_csv_line(line: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -4873,23 +5003,29 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "get_run_matrix".into(),
-                description: "Read the live-lab run matrix (CSV evidence ledger) — recent runs with OS/role/stage coverage and pass/fail.".into(),
+                description: "Read the live-lab run matrix (CSV evidence ledger) — recent runs with OS/role/stage coverage and pass/fail. Defaults to the LIVE Rust --node ledger; engine='bash_archive' reads the frozen legacy bash-orchestrator ledger instead (history only). Output always names the engine it came from.".into(),
                 input_schema: json_schema_object(
-                    json!({"limit": json!({"type": "integer", "description": "Recent rows (default: 20)"})}),
+                    json!({
+                        "limit": json!({"type": "integer", "description": "Recent rows (default: 20)"}),
+                        "engine": engine_schema_property(),
+                    }),
                     vec![],
                 ),
             },
             Tool {
                 name: "get_run_trend".into(),
-                description: "Trend across the last N matrix rows: a one-line verdict (GREEN — stable / JUST GREEN / STUCK at <stage> / MOVING) plus a compact run_id/commit/result/first_failed_stage table. Use it to decide whether the loop is converging — 'STUCK at X' means keep patching that stage; 'MOVING' means each fix advanced the run; two greens means done. Cheaper than get_run_matrix for loop control.".into(),
+                description: "Trend across the last N matrix rows: a one-line verdict (GREEN — stable / JUST GREEN / STUCK at <stage> / MOVING) plus a compact run_id/commit/result/first_failed_stage table. Use it to decide whether the loop is converging — 'STUCK at X' means keep patching that stage; 'MOVING' means each fix advanced the run; two greens means done. Cheaper than get_run_matrix for loop control. Defaults to the LIVE Rust --node ledger; engine='bash_archive' trends the frozen legacy bash-orchestrator ledger instead (history only). Output always names the engine it came from.".into(),
                 input_schema: json_schema_object(
-                    json!({"limit": json!({"type": "integer", "description": "Recent rows to analyze (default: 10, max 200)"})}),
+                    json!({
+                        "limit": json!({"type": "integer", "description": "Recent rows to analyze (default: 10, max 200)"}),
+                        "engine": engine_schema_property(),
+                    }),
                     vec![],
                 ),
             },
             Tool {
                 name: "find_untested_work".into(),
-                description: "Coverage-driven WORK FINDER: aggregates every per-OS-stage and cross-OS cell DOWN the whole run-matrix history → a prioritized queue of what still needs proving green: 🔴 REGRESSED (passed before, latest fail), 🟠 NEVER-PASSED (only ever failed), ⚪ NEVER-RUN (untested; some unsupported-by-design), 🟡 STALE-GREEN (passed only in old runs). Hands the agent a target instead of making it hunt. Filter by os (linux|macos|windows|cross); include_green lists currently-green cells. Pair with explain_stage + get_platform_support.".into(),
+                description: "Coverage-driven WORK FINDER: aggregates every per-OS-stage and cross-OS cell DOWN the whole run-matrix history → a prioritized queue of what still needs proving green: 🔴 REGRESSED (passed before, latest fail), 🟠 NEVER-PASSED (only ever failed), ⚪ NEVER-RUN (untested; some unsupported-by-design), 🟡 STALE-GREEN (passed only in old runs). Hands the agent a target instead of making it hunt. Filter by os (linux|macos|windows|cross); include_green lists currently-green cells. Pair with explain_stage + get_platform_support. Reads the LIVE Rust --node ledger ONLY and takes no engine selector — a next target is never chosen from the frozen bash archive (use get_run_matrix engine='bash_archive' for that history).".into(),
                 input_schema: json_schema_object(
                     json!({
                         "os": json_schema_string("Filter to one OS: linux | macos | windows | cross (cross-OS scenarios)"),
@@ -6044,14 +6180,19 @@ impl McpServer for LabStateServer {
                     .and_then(|a| a.get("limit"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(20) as usize;
-                let matrix_path = self
-                    .repo_root
-                    .join("documents/operations/live_lab_run_matrix.csv");
+                let engine = match LedgerEngine::from_args(args) {
+                    Ok(e) => e,
+                    Err(e) => return tool_error(&e),
+                };
+                let matrix_path = self.repo_root.join(engine.rel_path());
                 match std::fs::read_to_string(&matrix_path) {
                     Ok(content) => {
                         let lines: Vec<&str> = content.lines().collect();
                         let total = lines.len().saturating_sub(1);
-                        let mut result = format!("# Live Lab Run Matrix ({total} total runs)\n\n");
+                        let mut result = format!(
+                            "# Live Lab Run Matrix ({total} total runs)\n\n{}",
+                            engine.banner()
+                        );
                         if lines.is_empty() {
                             result.push_str("Matrix is empty.\n");
                         } else {
@@ -6070,7 +6211,11 @@ impl McpServer for LabStateServer {
                         }
                         tool_success(&result)
                     }
-                    Err(e) => tool_error(&format!("Cannot read run matrix: {e}")),
+                    Err(e) => tool_error(&format!(
+                        "Cannot read run matrix `{}` ({}): {e}",
+                        engine.rel_path(),
+                        engine.arg_value()
+                    )),
                 }
             }
 
@@ -10000,10 +10145,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         std::fs::create_dir_all(&dir).unwrap();
         // a=pass→fail (regressed), b=fail,fail (never passed), c=not_run (never run),
         // cross_os_x=pass,pass (green).
+        // Fixture goes in the LIVE `--node` ledger — the only file this tool
+        // reads (see `find_untested_work` and the path-pinning tests below).
         let csv = "run_id,linux_stage_a,linux_stage_b,linux_stage_c,cross_os_x\n\
                    r1,pass,fail,not_run,pass\n\
                    r2,fail,fail,not_run,pass\n";
-        std::fs::write(dir.join("live_lab_run_matrix.csv"), csv).unwrap();
+        std::fs::write(dir.join("live_lab_node_run_matrix.csv"), csv).unwrap();
         let srv = test_server(&tmp);
         let t = srv.find_untested_work(None).content[0].text.clone();
         // regressed section names a; never-passed names b; never-run names c.
@@ -10045,6 +10192,252 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             "os=macos excludes linux cells; got: {macos}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Which ledger does each run-matrix tool read? ───────────────────
+    //
+    // The two engines keep SEPARATE ledgers and their rows disagree about the
+    // same column names (`linux_stage_two_hop`: 56 pass in the bash archive, 0
+    // pass in the live `--node` ledger). These tests pin the file each tool
+    // opens by planting DIFFERENT, mutually exclusive sentinel content in each
+    // ledger, so reading the wrong one can never look like a pass.
+
+    /// Both ledgers, distinguishable by construction: sentinel run_ids and
+    /// inverted pass/fail on a shared stage column.
+    fn write_both_ledgers(root: &Path) -> std::path::PathBuf {
+        let dir = root.join("documents/operations");
+        std::fs::create_dir_all(&dir).unwrap();
+        // NODE (live): the stage has never passed.
+        std::fs::write(
+            dir.join("live_lab_node_run_matrix.csv"),
+            "run_id,git_commit,overall_result,first_failed_stage,linux_stage_two_hop\n\
+             NODE-SENTINEL-1,abc1234567,fail,two_hop,fail\n\
+             NODE-SENTINEL-2,abc1234567,fail,two_hop,fail\n",
+        )
+        .unwrap();
+        // BASH ARCHIVE (frozen): the same stage reads green.
+        std::fs::write(
+            dir.join("live_lab_run_matrix.csv"),
+            "run_id,git_commit,overall_result,first_failed_stage,linux_stage_two_hop\n\
+             ARCHIVE-SENTINEL-1,def7654321,pass,,pass\n\
+             ARCHIVE-SENTINEL-2,def7654321,pass,,pass\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn run_matrix_tools_default_to_the_live_node_ledger() {
+        let tmp = std::env::temp_dir().join(format!("mcp-ledger-default-{}", std::process::id()));
+        write_both_ledgers(&tmp);
+        let srv = test_server(&tmp);
+
+        // Each entry: (label, rendered output). All three must show the node
+        // ledger's sentinel and never the archive's.
+        let renders = [
+            (
+                "get_run_matrix (no engine arg)",
+                srv.call_tool("get_run_matrix", None).content[0]
+                    .text
+                    .clone(),
+            ),
+            (
+                "get_run_matrix engine=node",
+                srv.call_tool("get_run_matrix", Some(json!({"engine": "node"})))
+                    .content[0]
+                    .text
+                    .clone(),
+            ),
+            (
+                "get_run_trend (no engine arg)",
+                srv.get_run_trend(None).content[0].text.clone(),
+            ),
+            (
+                "get_run_trend engine=node",
+                srv.get_run_trend(Some(&json!({"engine": "node"}))).content[0]
+                    .text
+                    .clone(),
+            ),
+            (
+                "find_untested_work",
+                srv.find_untested_work(None).content[0].text.clone(),
+            ),
+            (
+                // find_untested_work has NO engine selector: an engine arg is
+                // inert, it must NOT open the archive.
+                "find_untested_work with a stray engine=bash_archive arg",
+                srv.find_untested_work(Some(&json!({"engine": "bash_archive"})))
+                    .content[0]
+                    .text
+                    .clone(),
+            ),
+        ];
+        for (label, out) in &renders {
+            assert!(
+                out.contains("live_lab_node_run_matrix.csv"),
+                "{label} must read the LIVE --node ledger; got: {out}"
+            );
+            assert!(
+                !out.contains("ARCHIVE-SENTINEL"),
+                "{label} must NOT surface frozen bash-archive rows; got: {out}"
+            );
+            assert!(
+                !out.contains("FROZEN ARCHIVE"),
+                "{label} read the node ledger, so no archive warning; got: {out}"
+            );
+        }
+        // The two row-rendering tools show the node rows verbatim; the work
+        // finder aggregates, so it reports the never-passed cell instead.
+        assert!(renders[0].1.contains("NODE-SENTINEL-1"), "{}", renders[0].1);
+        assert!(renders[2].1.contains("NODE-SENTINEL-2"), "{}", renders[2].1);
+        assert!(
+            renders[4].1.contains("linux_stage_two_hop"),
+            "work finder must rank two_hop off the node ledger's 0-pass history; got: {}",
+            renders[4].1
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn archive_is_read_only_on_explicit_request_and_labels_itself() {
+        let tmp = std::env::temp_dir().join(format!("mcp-ledger-archive-{}", std::process::id()));
+        write_both_ledgers(&tmp);
+        let srv = test_server(&tmp);
+
+        for (label, out) in [
+            (
+                "get_run_matrix",
+                srv.call_tool("get_run_matrix", Some(json!({"engine": "bash_archive"})))
+                    .content[0]
+                    .text
+                    .clone(),
+            ),
+            (
+                "get_run_trend",
+                srv.get_run_trend(Some(&json!({"engine": "bash_archive"})))
+                    .content[0]
+                    .text
+                    .clone(),
+            ),
+        ] {
+            assert!(
+                out.contains("ARCHIVE-SENTINEL"),
+                "{label} engine=bash_archive must read the archive; got: {out}"
+            );
+            assert!(
+                !out.contains("NODE-SENTINEL"),
+                "{label} must not blend in node rows; got: {out}"
+            );
+            // Self-labelling: the caller can never mistake this for live evidence.
+            assert!(
+                out.contains("FROZEN ARCHIVE") && out.contains("live_lab_run_matrix.csv"),
+                "{label} archive read must be self-labelling; got: {out}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn unknown_engine_errors_instead_of_silently_defaulting() {
+        let tmp = std::env::temp_dir().join(format!("mcp-ledger-badengine-{}", std::process::id()));
+        write_both_ledgers(&tmp);
+        let srv = test_server(&tmp);
+        // 'bash' is a plausible typo for 'bash_archive'. Answering it from the
+        // default ledger would hand back node rows under an archive-shaped
+        // request — the misattribution the selector exists to prevent.
+        for (label, r) in [
+            (
+                "get_run_matrix",
+                srv.call_tool("get_run_matrix", Some(json!({"engine": "bash"}))),
+            ),
+            (
+                "get_run_trend",
+                srv.get_run_trend(Some(&json!({"engine": "bash"}))),
+            ),
+        ] {
+            assert_eq!(
+                r.is_error,
+                Some(true),
+                "{label} must reject an unknown engine; got: {:?}",
+                r.content
+            );
+            let text = r.content[0].text.clone();
+            assert!(
+                text.contains("node") && text.contains("bash_archive"),
+                "{label} error must name the valid engines; got: {text}"
+            );
+            assert!(
+                !text.contains("SENTINEL"),
+                "{label} must not have read any ledger; got: {text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn absent_node_ledger_errors_and_never_falls_back_to_the_archive() {
+        let tmp =
+            std::env::temp_dir().join(format!("mcp-ledger-nofallback-{}", std::process::id()));
+        let dir = write_both_ledgers(&tmp);
+        // Only the live ledger goes missing — the archive is still right there,
+        // which is exactly when a fallback would fire and render frozen rows as
+        // current.
+        std::fs::remove_file(dir.join("live_lab_node_run_matrix.csv")).unwrap();
+        let srv = test_server(&tmp);
+        for (label, r) in [
+            ("get_run_matrix", srv.call_tool("get_run_matrix", None)),
+            ("get_run_trend", srv.get_run_trend(None)),
+            ("find_untested_work", srv.find_untested_work(None)),
+        ] {
+            assert_eq!(
+                r.is_error,
+                Some(true),
+                "{label} must fail closed when the live ledger is absent; got: {:?}",
+                r.content
+            );
+            let text = r.content[0].text.clone();
+            assert!(
+                text.contains("live_lab_node_run_matrix.csv"),
+                "{label} error must name the ledger it wanted; got: {text}"
+            );
+            assert!(
+                !text.contains("ARCHIVE-SENTINEL"),
+                "{label} must never fall back to the frozen archive; got: {text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn engine_selector_is_declared_only_where_it_is_honoured() {
+        let srv = test_server(Path::new("/nonexistent"));
+        let tools = srv.tools();
+        let prop = |name: &str| -> Option<bool> {
+            let t = tools.iter().find(|t| t.name == name)?;
+            Some(
+                t.input_schema
+                    .get("properties")
+                    .and_then(|p| p.get("engine"))
+                    .is_some(),
+            )
+        };
+        // Declared where the arg is read...
+        for name in ["get_run_matrix", "get_run_trend"] {
+            assert_eq!(
+                prop(name),
+                Some(true),
+                "{name} must advertise the engine selector it honours"
+            );
+        }
+        // ...and NOT on the work finder, which is node-only by design. An
+        // advertised-but-ignored arg would promise archive selection the tool
+        // does not perform.
+        assert_eq!(
+            prop("find_untested_work"),
+            Some(false),
+            "find_untested_work is node-only and must not advertise an engine selector"
+        );
+        let _ = srv;
     }
 
     // ── Diagnose profile-less (Rust --node) runs ────────────────────────
