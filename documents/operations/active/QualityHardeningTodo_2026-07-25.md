@@ -16,7 +16,7 @@
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
-> then claimed; it has since grown to **42** (QH-01 through QH-42, contiguous).
+> then claimed; it has since grown to **43** (QH-01 through QH-43, contiguous).
 > QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
 > live run — one macOS false-green (mesh-status) plus one dead assertion (DNS),
 > a rollback-ordering fail-open, and the lab-network drift that blocks every
@@ -2009,6 +2009,52 @@ would record healthy guests as unreachable, arm an unbounded SSH before shutdown
 stage deadlines exist, turn `--dry-run` into a live fleet sweep, and authenticate with the
 operator's `~/.ssh/known_hosts` rather than the run's. If live observation is wanted it
 belongs **after** readiness, as a stage, scoped to the elected nodes.
+
+### QH-43 — three cross-OS columns reported a host→guest push under names promising guest↔guest reachability
+
+**Severity: HIGH (evidence integrity). Confidence: VERIFIED — measured, fixed 2026-08-12.**
+
+Third instance of the class QH-07 and QH-37 belong to: a column whose *name* promises a
+property its *feeder* does not measure.
+
+**Measured before the fix.** `cross_os_direct_path` read **`pass` on 10 rows**, fed by exactly
+one stage — `distribute_traversal`, a Bootstrap-group host→guest SSH push. On **9 of those same
+rows** `cross_os_peer_visibility` — the only cross-OS column fed by a real reachability
+validator — read `fail`. `cross_os_direct_path`, `cross_os_dns` and
+`cross_os_membership_convergence` had **byte-identical 107-value vectors**, because
+`cross_os_dns`'s three "real" validators are all `state_machine_only: false` (bash-dialect
+names the `--node` engine never emits), so the push was the only thing that ever wrote it.
+
+The mechanism: the orchestrator host owns **every** lab bridge, so a host→guest push succeeds
+across a total guest-to-guest severance. `distribute_traversal` cannot fail for the reason its
+column name implies. Independently corroborated by QH-41's bidirectional measurement.
+
+**Fix.** The four distribution stages (`distribute_traversal`, `distribute_dns_zone`,
+`membership_init`, `distribute_membership`) no longer feed any cross-OS column, at the registry
+AND at `oracle_cross_os_column` in lockstep — the latter is pinned by a named CI gate
+(`scripts/ci/orchestrator_engine_gates.sh:59`), which the plan initially claimed could not
+break. Guarded by three tests asserting against the **registry spec**, because QH-07's own
+commit warns that editing both sides at once leaves every equivalence test green.
+
+**The guard's axis is the direction of the proof, not the stage group.** A group-based rule
+flags SIX stages, and the two extras — `validate_macos_mesh_join`, `validate_windows_mesh_join`
+— are Bootstrap-group validators that legitimately measure guest-side state and feed the one
+column that works. A blunter rule would have broken it.
+
+**FORWARD-ONLY.** The 10 historical `pass` values in each of the three columns stay wrong.
+Do not read any pre-2026-08-12 row of `cross_os_direct_path`, `cross_os_dns` or
+`cross_os_membership_convergence` as evidence of anything.
+
+**Two columns are now deliberately unfed** — `cross_os_direct_path` and
+`cross_os_membership_convergence` read `not_run`, which is the truth. They are owed a real
+validator: a guest↔guest reachability probe and a membership-convergence assertion read from
+the guests. **Both are blocked on QH-41** — the vmnet backend split means no cross-OS
+reachability validator can pass in this lab until it is resolved.
+
+**Known cost, accepted:** `find_untested_work` (`rustynet-mcp/src/bin/lab_state.rs:2323-2414`)
+classifies unfed columns as never-run and emits them as suggested lab targets, so these two
+become permanently unsatisfiable suggestions until a validator exists.
+`cross_os_anchor_enrollment` is the pre-existing instance — zero feeders, `not_run` on 107/107.
 
 ## Related documents
 
