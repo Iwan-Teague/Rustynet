@@ -1,6 +1,45 @@
 # Cross-OS ledger columns measure the wrong thing — plan — 2026-08-12
 
-**Status: PLAN, pre-review.** Written against `HEAD = 56919423`, clean tree. Every number
+> **REVISION 2 — adversarially reviewed; 2 blockers and 3 majors folded in.** The diagnosis
+> survived intact, including every lifetime figure and the mechanism (an alternative
+> hypothesis — that the 10 passes came from single-platform runs where the two-platform guard
+> short-circuited — was tested and **refuted**: all 10 rows are two-platform with a real macOS
+> guest, and 9 of them carry `cross_os_peer_visibility = fail` on the *same row*). The remedy
+> did not survive. Corrections:
+>
+> 1. **C3's invariant flags SIX stages, not four** — and the two extras are
+>    `validate_macos_mesh_join` and `validate_windows_mesh_join`, both `StageGroup::Bootstrap`,
+>    both feeding `cross_os_peer_visibility`, the one column §0 credits as honest. The rule as
+>    written would have broken it. **`StageGroup` is not a proxy for "measures a real
+>    property"** — that was an unstated assumption and these two are the counter-example. The
+>    criterion is the *direction of the proof*: a stage whose success is a host→guest **push**
+>    may not feed a guest↔guest column; a stage that validates guest-side state may.
+> 2. **C1 DOES break a CI gate; §3's claim that it cannot is false.**
+>    `oracle_cross_os_column` (`live_lab_run_matrix.rs:4225`) is a hand-maintained mirror of
+>    this mapping, pinned by `registry_matches_historical_rust_native_and_cross_os_and_special`
+>    (`:4419`), which runs as a named gate at `scripts/ci/orchestrator_engine_gates.sh:59`. It
+>    reads the *registry*, not the ledger — which is why "nothing reads the ledger" was true and
+>    irrelevant. **QH-07 hit this exact trap** and its commit warns that editing both sides at
+>    once leaves all six equivalence tests green, so the oracle edit must be paired with a
+>    spec-side assertion.
+> 3. **THREE columns become unfed, not two.** Verified: the 107-value vectors of
+>    `cross_os_direct_path`, `cross_os_dns` and `cross_os_membership_convergence` are
+>    **byte-identical**. `cross_os_dns`'s "three real validators" are all
+>    `state_machine_only: false` — bash-dialect names the `--node` engine never emits — so the
+>    push has been the only thing that ever wrote it.
+> 4. **Unfed columns are not inert.** `find_untested_work` (`lab_state.rs:2323-2414`) sorts
+>    every coverage column into never_run/never_passed/… and emits a *suggested next lab
+>    target*, which the autonomous loop consumes. Unfed columns become permanently
+>    unsatisfiable targets. The precedent already exists: `cross_os_anchor_enrollment` has zero
+>    feeders and reads `not_run` on **107/107** rows.
+> 5. **Proposed test 4 already exists** verbatim at `live_lab_stage_registry.rs:2469`, with a
+>    sharper rationale (`cross_os` is `traffic_test_matrix`'s only check-qualifying field, so
+>    dropping it would silently demote the stage to not-a-check). Dropped.
+> 6. **QH-41 is the blocker on the owed validators** — the mac/QEMU vmnet split is a permanent
+>    backend property, so no real `cross_os_direct_path` validator can pass in this lab until it
+>    is resolved. C2's "marks where a validator is owed" is right but the debt is blocked.
+
+**Status: PLAN (REVISION 2), reviewed.** Written against `HEAD = 56919423`, clean tree. Every number
 below was produced by parsing the ledger with `csv.DictReader` or by reading the registry at
 that commit.
 
@@ -66,12 +105,24 @@ truth — "nothing measured this" — and they mark where a real validator is ow
 would erase the gap rather than expose it. Record in the register which validator each is
 waiting for.
 
-### C3 — a structural guard so this cannot regress
+### C3 — a structural guard, on the right axis
 
-A test asserting: **no stage in `StageGroup::Pre` or `StageGroup::Bootstrap` may declare a
-`cross_os` mapping, except the `cross_os_bootstrap` column itself.** That is the invariant the
-three defects above all violate in different ways, and it is checkable from the registry with
-no runtime data.
+**Not** "no Pre/Bootstrap stage may feed a cross-OS column" — that flags the two mesh-join
+validators, which legitimately measure a guest-side property.
+
+The invariant is the **direction of the proof**: a stage whose success only demonstrates a
+host→guest transfer may not feed a column asserting guest↔guest reachability. Encoded as a
+characterization test with an explicit, commented allow-list of the Bootstrap-group stages
+permitted to feed a cross-OS column (`validate_macos_mesh_join`, `validate_windows_mesh_join`)
+and an assertion that the four distribution stages feed none. A future stage must add itself
+to the list consciously.
+
+### C3b — edit the oracle in lockstep, and assert the spec side
+
+`oracle_cross_os_column` (`live_lab_run_matrix.rs:4225`) must lose the same four arms, or
+`scripts/ci/orchestrator_engine_gates.sh:59` goes red. Per QH-07's own warning, editing both
+sides alone proves nothing — so C3's assertion must read the **registry spec**, not the
+oracle.
 
 ### C4 — `cross_os_relay_path` is a DECISION, not obviously a fix
 
