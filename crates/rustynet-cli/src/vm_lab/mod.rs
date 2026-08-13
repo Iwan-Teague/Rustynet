@@ -44820,6 +44820,53 @@ directory = "vendor"
         cleanup_temp_inventory(path.as_path());
     }
 
+    /// The real inventory's `network_group` labels must agree with the measured
+    /// L2 topology, because `--require-same-network` gates on them and returns
+    /// `Err` before any stage runs.
+    ///
+    /// Measured on the live lab 2026-08-13: `debian-headless-2` (192.168.64.4)
+    /// and `debian-headless-4` (192.168.64.10) share the QEMU-backend vmnet and
+    /// reach each other. `macos-utm-1` (192.168.65.101) is on the
+    /// Apple-Virtualization vmnet, served by a different host bridge; from the
+    /// Linux side it cannot reach even the host's own 192.168.65.1, and
+    /// traceroute dies at hop 1 with no reply.
+    ///
+    /// Both halves are asserted because a wrong label inverts this gate in BOTH
+    /// directions, and each direction fails in a way the other would hide.
+    /// Before the labels were corrected, the first assertion failed (two guests
+    /// on one L2 were rejected as "spanning multiple network groups") while the
+    /// second passed for the wrong reason (a genuinely split pair was accepted).
+    /// A single-direction test would have looked healthy either way.
+    #[test]
+    fn real_inventory_network_groups_match_the_measured_l2_topology() {
+        let inventory_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("documents/operations/active/vm_lab_inventory.json");
+        let inventory =
+            load_inventory(inventory_path.as_path()).expect("the real inventory must load");
+        let pick = |alias: &str| {
+            inventory
+                .iter()
+                .find(|entry| entry.alias == alias)
+                .unwrap_or_else(|| panic!("inventory must still contain {alias}"))
+                .clone()
+        };
+
+        let same_plane = [pick("debian-headless-2"), pick("debian-headless-4")];
+        ensure_inventory_entries_share_network(&same_plane).expect(
+            "two guests measured on the same QEMU vmnet must satisfy --require-same-network",
+        );
+
+        let split_plane = [pick("debian-headless-4"), pick("macos-utm-1")];
+        let err = ensure_inventory_entries_share_network(&split_plane).expect_err(
+            "a QEMU-vmnet guest and the Apple-vmnet guest have no L3 path and must be rejected",
+        );
+        assert!(
+            err.contains("multiple network groups"),
+            "rejection must name the network-group split; got: {err}"
+        );
+    }
+
     #[test]
     fn live_lab_profile_writer_renders_inventory_backed_targets() {
         let unique = super::unique_suffix();

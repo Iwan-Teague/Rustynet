@@ -65,7 +65,7 @@
       "exit_capable": false,
       "lab_role": "client",
       "last_known_ip": "192.168.64.10",
-      "last_known_network": "lan-192.168.0.0/24",
+      "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
         "192.168.64.10",
         "10.230.76.58",
@@ -78,7 +78,7 @@
         "fe80::cadd:6589:4e14:8590"
       ],
       "mesh_ip": "100.64.0.4",
-      "network_group": "lan-192.168.0.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
       "node_id": "aux-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
@@ -110,7 +110,7 @@
       "include_in_all": false,
       "lab_role": "macos_client",
       "last_known_ip": "192.168.65.101",
-      "last_known_network": "lan-192.168.0.0/24",
+      "last_known_network": "utm-shared-192.168.65.0/24",
       "live_ips": [
         "192.168.65.101",
         "192.168.64.18",
@@ -118,7 +118,7 @@
         "192.168.0.210"
       ],
       "mesh_ip": "100.64.0.7",
-      "network_group": "lan-192.168.0.0/24",
+      "network_group": "utm-shared-192.168.65.0/24",
       "node_id": "macos-client-1",
       "os": "macOS 26.5 (arm64)",
       "parent_device": "iwan's MacBook Pro",
@@ -164,14 +164,14 @@
       "exit_capable": false,
       "lab_role": "fedora_client",
       "last_known_ip": "192.168.64.103",
-      "last_known_network": "lan-10.230.76.0/24",
+      "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
         "192.168.64.103",
         "192.168.64.20",
         "10.230.76.59"
       ],
       "mesh_ip": "100.64.0.8",
-      "network_group": "lan-10.230.76.0/24",
+      "network_group": "utm-shared-192.168.64.0/24",
       "node_id": "fedora-client-1",
       "os": "Fedora Linux 44 (Server Edition, aarch64)",
       "parent_device": "iwan's MacBook Pro",
