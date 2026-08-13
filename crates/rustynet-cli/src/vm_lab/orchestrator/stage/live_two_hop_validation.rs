@@ -35,14 +35,30 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
         // stage previously fail-closed on the missing 'entry' role; it only
         // surfaced once blind_exit_dataplane_validation (its dependency) began
         // reporting Skipped instead of Failed.
-        if alias_matching_label(ctx, "entry").is_none()
-            || ssh_params_for_second_client(ctx).is_err()
-        {
-            return StageOutcome::Skipped(
-                "no node in this topology carries the `extra` or `aux` role that the two-hop \
-                 path uses as its second client"
-                    .to_owned(),
-            );
+        // Report WHICH precondition is missing. An earlier version named only
+        // the second-client half of this two-condition guard, so a topology that
+        // simply lacked an `entry` node was told to add an `extra`/`aux` node —
+        // sending the reader to the wrong remedy, which is the failure mode the
+        // skip-reason work exists to remove.
+        let missing_entry = alias_matching_label(ctx, "entry").is_none();
+        let missing_second_client = ssh_params_for_second_client(ctx).is_err();
+        if missing_entry || missing_second_client {
+            let reason = match (missing_entry, missing_second_client) {
+                (true, true) => {
+                    "two-hop needs an `entry` hop and a second client, and this topology has \
+                     neither: no node carries the `entry` role, and none carries `extra` or `aux`"
+                }
+                (true, false) => {
+                    "two-hop needs an `entry` hop to route through: no node in this topology \
+                     carries the `entry` role (a `relay` node does not satisfy it)"
+                }
+                (false, true) => {
+                    "two-hop needs a second client: no node in this topology carries the \
+                     `extra` or `aux` role"
+                }
+                (false, false) => unreachable!("guard only entered when one is missing"),
+            };
+            return StageOutcome::Skipped(reason.to_owned());
         }
         let exit_params = match ssh_params_for_role(ctx, "exit") {
             Ok(p) => p,
