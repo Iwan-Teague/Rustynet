@@ -1,126 +1,140 @@
 # `traffic_test_matrix` fails on a vmnet L2 split — diagnosis and plan — 2026-08-13
 
-**Status: PLAN, unreviewed.** Diagnosis is measured, not inferred; every number below came from
-a live probe on 2026-08-13 or a quote-aware read of the 110-row `--node` ledger.
+> **REVISION 2 — adversarially reviewed. The proposed remedy was WRONG and is withdrawn.**
+> The diagnosis survived; option C did not. Corrections, each verified against the tree:
+>
+> 1. **Option C is dead in this lab.** A relay candidate on an RFC1918 address is rejected at
+>    traversal-bundle *parse* time (`rustynetd/daemon.rs:14699-14705`), and the check is called
+>    with `?` inside the per-candidate decode loop (`:14402`), so it aborts the **entire bundle** —
+>    not just that candidate. Every address available here is private (192.168.8/64/65/121.x).
+>    Minting such a candidate would be *worse* than doing nothing: it would invalidate the
+>    traversal bundle and break the Debian↔Debian paths that currently work.
+> 2. **The lab cannot even express a relay candidate.** `RELAY_SPEC` has zero hits repo-wide; the
+>    only issuer the lab uses emits one `Host` and an optional `ServerReflexive`, both with
+>    `relay_id: None` (`ops_e2e.rs:3728`). A test at `ops_e2e.rs:7694` pins the absence.
+> 3. **`traffic_test_matrix` asserts reachability only** — the §5 Q1 question, answered
+>    favourably. It pings `ctx.mesh_ips` and accepts only `TrafficTestResult::Reachable`
+>    (`traffic_test_matrix.rs:136`, `:148`); nothing reads a path mode, endpoint or Direct/Relay
+>    decision. So a relayed mesh *would* have satisfied it — C fails on feasibility, not on
+>    semantics.
+> 4. **"Not a Rustynet defect" was half wrong**, and the wrong half is load-bearing. See §1.2.
+> 5. **"The control plane is healthy" was overstated.** See §1.3.
+
+**Status: PLAN (REVISION 2), reviewed. Proposed remedy is now the one-guest bridge experiment (§4).**
 
 ## 0. The failure
 
-`traffic_test_matrix` is the sole failing stage in three consecutive runs
-(`rebaseline-20260813c/e/f`, each 21 pass / 1 fail / 36 skip). It fails identically each time:
-100% packet loss **in both directions** between `macos-utm-1` and both Debian nodes, while the
-two Debian nodes reach each other. `default-deny` is reported INCONCLUSIVE — correctly, since a
-node that reached no peer cannot attribute a blocked egress to policy.
+Sole failing stage in four consecutive runs (`rebaseline-20260813c/e/f`, `relay-coverage-20260813h`):
+100% loss **both directions** between `macos-utm-1` and both Debian nodes, while the Debians reach
+each other. `default-deny` reports INCONCLUSIVE — correctly, since a node that reached no peer
+cannot attribute a blocked egress to policy.
 
 ## 1. Diagnosis — measured
 
-**This is not a Rustynet defect.** There is no IP path between the two guests, so WireGuard has
-nothing to handshake over.
-
 | probe | result |
 | --- | --- |
-| `macos-utm-1` interfaces | one: `en0` = 192.168.65.101, gateway 192.168.65.1 |
-| macOS → 192.168.64.4 / .10 | unreachable |
+| `macos-utm-1` | one interface `en0` = 192.168.65.101, gw 192.168.65.1, UTM `backend=apple`, host `bridge101` |
+| Linux guests | 192.168.64.0/24, `backend=qemu`, host `bridge100` |
 | debian → 192.168.65.101 | unreachable |
-| debian → **192.168.65.1** (the host's *own* address on the other bridge) | **unreachable** |
-| `traceroute` debian → 192.168.65.101 | dies at hop 1, no reply |
+| debian → **192.168.65.1** (host's own address on the other bridge) | **unreachable** |
+| `traceroute` debian → macOS | dies at hop 1, no reply |
 | host `net.inet.ip.forwarding` | already `1` |
-| host bridges | `bridge100` = 192.168.64.1 (7 QEMU members), `bridge101` = 192.168.65.1 (1 member, flags include `PRIVATE`) |
 
-Debian cannot reach the host's own address on the other bridge, so this is host-level isolation
-between two vmnet networks, not a routing gap. The backend split is the cause and is permanent:
-`vm-lab-network-audit` reports `macos-utm-1 backend=apple` and every other guest `backend=qemu`.
-A macOS guest cannot run under QEMU on Apple Silicon, so it cannot join the QEMU vmnet.
+Host-level isolation between two vmnet networks, not a routing gap. Permanent: a macOS guest
+cannot run under QEMU on Apple Silicon, so it cannot join the QEMU vmnet.
 
-This also **settles an open question** carried on this stage from an earlier run, which proposed
-two hypotheses — split-default routes capturing the handshake, or the tunnel never handshaking.
-It is the second, and for a reason neither hypothesis named: the endpoints are mutually
-unreachable, so no handshake is ever attempted.
+Settles an open question this stage carried: it is **not** split-default routes capturing the
+handshake — the endpoints are mutually unreachable, so no handshake is attempted.
 
-**What the macOS node does have** (same runs, all passing): `mesh_status_validation`,
-`runtime_acls_validation`, `key_custody_validation`, `service_hardening_validation`,
-`dns_failclosed_validation`. The control plane is healthy; only the dataplane has no underlay.
+### 1.1 The escape hatch, measured
 
-### 1.1 The escape hatch, also measured
+Both planes reach the physical LAN and internet through their vmnet NATs — TCP OPEN from *each*
+of `macos-utm-1` and `debian-headless-2` to `192.168.8.1:80` and `192.168.8.147:22`. So a common
+dial-**out** rendezvous exists, though neither can be dialled **into** from the other.
 
-Both planes reach the physical LAN and the internet through their respective vmnet NATs:
+Caveat the review added and the plan must carry: only **TCP** was measured. The relay control
+port is **UDP** 4500 plus an allocated UDP range (`rustynet-relay/src/main.rs:167`, `:429`), so
+UDP traversal of both vmnet NATs is **assumed, not measured**.
 
-| from | 192.168.8.1:80 (LAN router) | 192.168.8.147:22 (host) | 1.1.1.1 |
-| --- | --- | --- | --- |
-| `macos-utm-1` | **TCP OPEN** | **TCP OPEN** | reachable |
-| `debian-headless-2` | **TCP OPEN** | **TCP OPEN** | reachable |
+### 1.2 "Not a Rustynet defect" — corrected
 
-So a **common rendezvous exists that both sides can dial *out* to**, even though neither can be
-dialled *in* to from the other. That is precisely the shape this project's zero-ingress relay
-role is designed for.
+The *immediate* failure is environmental. But three real product/tooling defects were surfaced
+and must not be absolved by that sentence:
+
+- the traversal issuer cannot express a relay candidate at all (§ Rev-2 item 2);
+- the daemon's relay-session config is unreachable in every deployment — `load_relay_client`
+  returns `Ok(None)` (`daemon.rs:3993`) unless env/CLI knobs that **nothing** in the repo sets;
+- `linux_relay_forwards_frame` is unreachable under the default `--node` engine while its ledger
+  column silently reads `not_run` — now **111 of 111 rows**.
+
+### 1.3 "The control plane is healthy" — corrected
+
+Four of the five macOS validations are genuine but purely **local posture** (`runtime_acls`,
+`service_hardening`, `key_custody`, `dns_failclosed`); none touches peer reachability. The fifth,
+`mesh_status_validation`, is **vacuous as invoked**: the orchestrator dispatches
+`argv = [daemon_path, "macos-mesh-status-check"]` with no arguments
+(`role_validation/mesh_status.rs:45-47`), so there is no `--expected-peer-id` and no
+`--max-age-seconds`, and it passes whenever the state file exists, parses and passes integrity.
+This is the "MeshStatus false-green without expected-peer-id" hazard the repo already knows.
+
+Honest wording: *four local-posture checks pass; the fifth proves only that the state file loads.*
 
 ## 2. Options
 
 | # | Option | Verdict |
 | --- | --- | --- |
-| A | Host `pf` change to permit inter-bridge forwarding | **Rejected.** Needs the operator's password (host `sudo` is not passwordless), it is a host security-settings change, and vmnet re-applies its own rules on VM restart — a fix that can silently revert is worse than none, because the next green run would be unexplained. |
-| B | Re-home the fleet to Bridged on one L2 | **Rejected for now.** Largest blast radius (every guest's NIC), and it reverses a deliberate Bridged→Shared migration whose rationale must be recovered before reversing it. Keep as fallback. |
-| C | **Route mac↔Linux through a relay reachable from both planes** | **Proposed.** No host security change; uses the product's own zero-ingress design; both planes provably reach a common rendezvous. |
-| D | Scope macOS out of the same-LAN matrix | **Rejected.** Defers a release-blocking parity mandate and makes the matrix assert less than it appears to. |
+| A | Host `pf` change | **Rejected** — needs the operator's password, and is a host security-settings change. (Rev 1 also claimed vmnet re-applies rules on restart; that was **unmeasured** and is withdrawn as a reason.) |
+| B | Re-home to Bridged | **PROPOSED, scoped to one guest** — see §4. |
+| C | Relay between the planes | **Rejected** — `daemon.rs:14699-14705`. Not merely unhelpful: minting a private relay candidate invalidates the whole bundle. |
+| D | Scope macOS out | **Rejected** — defers a release-blocking mandate. |
 
-## 3. The risk that must not be buried
+## 3. What the relay run did establish
 
-**Option C rests on a mechanism this project has never demonstrated.** Quote-aware read of all
-110 `--node` ledger rows:
+`relay-coverage-20260813h` (row 111) elected `fedora-utm-1:relay` and raised coverage 21 → **24
+passes**: `deploy_relay_service` pass, `relay_validation` pass, `cross_os_relay_path` pass,
+`macos_stage_relay_service_lifecycle` pass. Relay **lifecycle** works.
 
-| column | lifetime |
-| --- | --- |
-| `linux_relay_forwards_frame` | **`not_run` × 110 — never once executed** |
-| `macos_relay` | `not_run` × 110 |
-| `windows_relay` | `not_run` × 110 |
-| `macos_relay_alias` / `_node_id` / `_target` | empty × 110 |
-| `linux_relay` | 14 pass / 5 skip / 91 not_run |
-| `cross_os_relay_path` | 3 pass / 13 skip / 94 not_run |
+`linux_relay_forwards_frame` remained `not_run` — confirming empirically that it is unreachable
+from the `--node` engine, not merely unelected.
 
-Relay *service lifecycle* has passed (the process starts and binds). Relay **frame forwarding**
-has never run on any OS. So C is not "use the existing relay path" — it is "prove the relay path
-for the first time, and then use it". The plan must be honest that this is two pieces of work,
-and that the first may itself fail.
+## 4. Proposed change — bridge ONE guest
 
-## 4. Proposed change
+Put **`macos-utm-1` only** on a Bridged NIC at 192.168.8.x. Not the fleet.
 
-**C1 — prove relay frame forwarding on Linux first.** Elect a Linux relay in a normal same-LAN
-topology, where all nodes can already reach each other, and make `linux_relay_forwards_frame`
-execute and pass. This isolates "does relaying work at all" from "does relaying bridge the
-vmnet split". If C1 fails, C is dead and B becomes the plan.
+Rationale: the Debians already dial *out* to 192.168.8.x successfully (measured). macOS→192.168.64.4
+would still fail, but WireGuard needs only **one** side to initiate — the daemon models endpoint
+roaming explicitly (`traversal.rs:925 on_endpoint_roamed`, pinned by
+`direct_session_survives_endpoint_roam` at `:2215`) — so a Debian-initiated handshake should
+establish the session and macOS replies to the observed source.
 
-**C2 — place a relay where both planes can reach it.** No current VM qualifies: every QEMU
-guest is on 192.168.64.0/24 (invisible to macOS) and the macOS guest is on 192.168.65.0/24
-(invisible to the rest). Options, to be settled by review:
-  - give one Linux guest a second, Bridged NIC on 192.168.8.0/24;
-  - run the relay on the host at 192.168.8.147 (proven reachable from both, but puts a lab
-    service on the operator's machine);
-  - a dedicated LAN-attached VM.
-Note both guests reach the LAN through **NAT**, so the relay must accept inbound on the LAN side
-while both nodes dial out to it. That matches the zero-ingress design, but must be verified
-rather than assumed.
+- **Blast radius:** one guest, versus every NIC for full B. Recovery is documented
+  (`scripts/vm_lab/probe_and_recover_local_utm.sh`).
+- **Cost:** one NIC change + `--update-inventory-live-ips` + one ~13 min run.
+- **Residual risk, stated:** `reconfigure_managed_peer` (`phase10.rs:6246-6268`) may re-program
+  the configured endpoint over the roamed one. This experiment is precisely what answers that.
+- **Prerequisite:** recover the Bridged→Shared migration rationale first (§5) — it is the one
+  input that could invalidate both this and full B.
 
-**C3 — make the topology legible.** Already landed on 2026-08-13: the `network_group` labels now
-say which L2 each node is on, and `--require-same-network` correctly rejects a mac+Linux pair.
-No further work; recorded here because C2 depends on it.
+## 5. Prior art to reconcile
 
-## 5. Open questions for review
-
-1. **Does `traffic_test_matrix` accept a relayed path, or does it assert directness?** If the
-   stage requires a direct peer path, C makes the mesh work and the stage still red, and the
-   plan is wrong. This is the single question that decides whether C is a fix at all — settle it
-   from the stage implementation, not from the stage name.
-2. Is C1 achievable at all, given `linux_relay_forwards_frame` has never run? Is it unimplemented,
-   unreachable in the current stage graph, or merely never elected?
-3. For C2, which relay placement — and does putting a lab service on the operator host violate
-   the orchestrator/product separation rule?
-4. Should B's Bridged→Shared migration rationale be recovered before B is ruled out? If the
-   original reason no longer applies, B may be simpler and more honest than C.
-5. Does the killswitch prevent a relay guest from forwarding, the way it blocks a rustynetd host
-   from acting as a router? If so, C2 needs a relay that is not also a mesh node.
+- `VmLabNetworkStandard.md:26` documents this split and asserts "the macOS guest joins over the
+  host route" — **refuted** by measurement (debian cannot reach 192.168.65.1). Its stable-address
+  table is also stale in four rows (macos `.2` vs `.101`; fedora `.20` vs `.103`; rocky `.22` vs
+  `.105`; windows `.14` vs `.25`). Correct in the same change.
+- `QH41CrossBackendL2SplitPlan_2026-08-11.md` — the predecessor; reconcile rather than duplicate.
+- QH-42 — the audit's modal-plane heuristic.
 
 ## 6. Definition of done
 
-`traffic_test_matrix` passes with `macos-utm-1` in the topology, by a mechanism that is
-*explained* rather than incidental; `linux_relay_forwards_frame` has executed and passed at least
-once; the run-matrix row is verified against the stage's own report artifact rather than the
-column; and no host firewall state was changed to achieve it.
+`traffic_test_matrix` passes with `macos-utm-1` in the topology; the mechanism is confirmed by a
+**separate path-evidence read** (handshake endpoint / `path_programmed_mode`), because this stage
+reads no path field and a green cannot distinguish mechanisms on its own; no host firewall state
+was changed. Note the stage writes **no report artifact** — its evidence is the recorder's
+`stages.tsv` row plus `logs/traffic_test_matrix.log`.
+
+## 7. Separate defects to file (out of scope here)
+
+1. `mesh_status_validation` dispatches with no expected-peer/max-age → vacuous pass on every OS.
+2. `linux_relay_forwards_frame` unreachable under `--node` while its column reads `not_run`.
+3. `select_relay_forward_test_topology` ignores `include_in_all` and permits a relay whose
+   `network_group` differs from both peers'; it should fail loud at selection.
