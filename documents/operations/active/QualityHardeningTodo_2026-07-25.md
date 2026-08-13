@@ -2197,6 +2197,53 @@ stage that genuinely needs prior state must keep its gate, or it will produce co
 broken mesh. Do not treat converting a skip into a run as progress in itself — the value is more
 real verdicts per run, and some newly unblocked stages will legitimately fail.
 
+### QH-49 — the LAN-toggle stage hardcodes the SSH username, so it cannot drive a non-Debian guest
+
+**Severity: medium. FIXED (fix landed with this entry); it had never been exercised before.**
+
+`live_lan_toggle_validation` drives three guests — exit, client, and an aux/extra/entry node it
+promotes to the blind-exit posture. Both helpers that resolve those targets took the HOST from the
+node's own adapter but supplied a HARDCODED username:
+
+```rust
+// alias_matching_label — used for exit AND client
+let user = match adapter.platform() {
+    VmGuestPlatform::Windows => "admin",
+    _ => "debian",
+};
+// find_blind_exit
+user: "debian".to_owned(),
+```
+
+`SshConnectionParams` carries the real `user: Option<String>` from the inventory, and it was
+discarded in both places. On an all-Debian topology the hardcoded value happens to be right, which is
+why this survived: the defect only appears once a non-Debian guest lands in one of those three roles.
+
+**Measured on run `qh46-series-20260813z`** (38 passed / 1 failed / 20 skipped), where this was the
+only failing stage:
+
+```
+remote command failed on debian@192.168.64.103:22:
+  debian@192.168.64.103: Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password)
+```
+
+`192.168.64.103` is `fedora-utm-1`. The inventory recorded `ssh_user=fedora` correctly the whole
+time — so this was one node's username dialled against another node's address.
+
+**Fix:** a single `resolve_ssh_user(inventory_user, platform)` used by both helpers, preferring the
+inventory value and trimming it, with the previous hardcoded values retained ONLY as the
+absent/blank fallback. The fallback deliberately does not adopt the `root`/`admin`/`administrator`
+triple that the sibling `ssh_params_for_role` uses in `chaos.rs` / `cross_network.rs`: changing an
+untested fallback is a different change from fixing "the real username was available and thrown
+away", and bundling them would make any regression here impossible to attribute. That divergence
+between the two families of helper is worth reconciling separately.
+
+**Note on how it surfaced.** This stage only ran because `live_two_hop_validation` SKIPPED rather
+than failed on that run, letting the dependency chain continue — the effect QH-48 predicts. It also
+produced a zero-byte `live_lan_toggle.log`: the stage's binary-output capture worked, the binary
+simply wrote nothing before dying, so the whole diagnosis came from the failure digest's
+`condensed_result`.
+
 ### QH-47 — NAT rules are applied without ever flushing conntrack
 
 **Severity: medium.** Not lab-only; it affects any node that gains or changes an exit/relay role
@@ -2227,8 +2274,71 @@ Whether this is QH-46's cause is a separate question, tracked there.
 
 ### QH-46 — two-hop proof: the client reaches the entry but never the final exit
 
-**Status: OPEN, root shape measured. REVISED — the first filing's hypothesis was refuted by
-its own follow-up measurement, and is corrected here rather than left standing.**
+**Status: ROOT CAUSE CONFIRMED 2026-08-14 — firewalld rejects the hairpin AFTER Rustynet has
+accepted it. This is a PRODUCT defect on RHEL-family hosts, not a lab or test defect. The earlier
+hypotheses recorded further down were refuted by their own follow-up measurements and are kept, with
+their corrections, so the reasoning is auditable.**
+
+Rustynet installs its forward chain at `type filter hook forward priority 0` and appends the relay
+hairpin allow `iifname rustynet0 oifname rustynet0 counter accept` (`phase10.rs:2265-2294`). In
+netfilter a base chain's `accept` is `NF_ACCEPT` — "continue to the next base chain at this hook" —
+not a final verdict. A chain at the same hook with a higher priority number still runs on the same
+packet and can drop it.
+
+Measured directly on the entry (`fedora-utm-1`, 192.168.64.103):
+
+```
+systemctl is-active firewalld  ->  active
+
+table inet firewalld {
+  chain filter_FORWARD {
+    type filter hook forward priority filter + 10; policy accept;
+    ct state { established, related } accept
+    ct status dnat accept
+    iifname "lo" accept
+    ct state invalid drop
+    ip6 daddr { ... } reject with icmpv6 addr-unreachable
+    jump filter_FORWARD_POLICIES
+    reject with icmpx admin-prohibited          <-- the hairpin dies here
+  }
+}
+
+firewall-cmd --get-active-zones                 ->  FedoraServer (default), interfaces: enp0s1
+firewall-cmd --get-zone-of-interface=rustynet0  ->  no zone
+```
+
+`rustynet0` is created at runtime by the daemon, not by NetworkManager, so firewalld binds it to no
+zone; `filter_FORWARD_POLICIES` does not accept it and the chain falls through to its final `reject`.
+The packet is destroyed BETWEEN the FORWARD and POSTROUTING hooks. That is exactly why the hairpin
+forward counter advances while the hairpin masquerade counter stays at zero — the masquerade sits on
+a later hook the packet never reaches. No rule Rustynet installs is wrong; the one it needs to
+survive belongs to another firewall.
+
+**This accounts for the whole history of the stage.** Across every dataplane-bearing two-hop report
+on disk, the only runs that recorded a genuinely forwarded reply (TTL 63, exactly one hop) had a
+**Debian** entry, on 2026-06-27. Every run whose entry was a firewalld-family guest (Rocky, later
+Fedora) produced either a decrement-0 reply that bypassed the entry via the since-removed direct
+client-to-exit peer, or no reply at all. Debian does not run firewalld by default; Fedora, RHEL,
+Rocky, Alma and CentOS do. The `--node` engine elects Fedora or Rocky as entry, which is why this
+stage has never passed on it while the frozen bash archive shows passes.
+
+**Scope — release-blocking, not lab hygiene.** Any RHEL-family host running the distribution default
+cannot serve as a Rustynet relay or exit forwarder. The product has no awareness of firewalld
+anywhere: the only references are the lab bootstrap
+(`scripts/bootstrap/linux/rn_bootstrap.sh:404-421`), which opens `51820/udp` for INPUT and does
+nothing about the forward path, and a test asserting the bootstrap does not stop firewalld. This
+contradicts the parity mandate that no OS may be a capability limiter.
+
+**Fix direction — NOT implemented; it changes host firewall state and needs plan-then-adversarial
+review.** Industry precedent is to place the tunnel interface in a firewalld zone that permits it
+(Tailscale does this for `tailscale0`). Note precisely what that does and does not concede:
+Rustynet's own priority-0 chain keeps `policy drop` and continues to enforce default-deny and its
+ACLs, so the change stops firewalld rejecting traffic Rustynet has ALREADY authorised rather than
+authorising anything new. It still mutates host firewall configuration, so it must go through the
+privileged helper as an argv-only, strictly validated operation with its own narrow allowlist entry
+(§4), must fail closed when firewalld is present but the operation fails, and must be a no-op where
+firewalld is absent. Do NOT fix this in the lab bootstrap alone — that converts a real product gap
+into a lab-only workaround and hides it from every user on a RHEL-family host.
 
 `live_two_hop_validation` reached its own verdict for the first time in
 `qh45-final-20260813u`, after three blockers were cleared in sequence: the vmnet split
