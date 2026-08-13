@@ -8656,14 +8656,7 @@ mod tests {
 
     #[test]
     fn diagnose_host_lab_network_reports_no_entries_for_unknown_alias() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-diagnose-host-net-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-diagnose-host-net");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -8674,7 +8667,6 @@ mod tests {
         let srv = test_server(&tmp);
         let result = srv.diagnose_host_lab_network(Some("does-not-exist"));
         assert!(result.is_error.unwrap_or(false));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -8712,14 +8704,7 @@ mod tests {
 
     #[test]
     fn apply_host_route_fix_rejects_unknown_alias() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-fix-host-net-unknown-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-fix-host-net-unknown");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -8730,24 +8715,15 @@ mod tests {
         let srv = test_server(&tmp);
         let result = srv.apply_host_route_fix("does-not-exist");
         assert!(result.is_error.unwrap_or(false));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn apply_host_route_fix_rejects_missing_alias_param() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-fix-host-net-empty-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-fix-host-net-empty");
         std::fs::create_dir_all(tmp.join("documents/operations/active")).unwrap();
         let srv = test_server(&tmp);
         let result = srv.apply_host_route_fix("");
         assert!(result.is_error.unwrap_or(false));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -8810,14 +8786,7 @@ mod tests {
         // probe derive from, so `ssh_transport_opts()` can never regress to
         // StrictHostKeyChecking=no (which would weaken the tunnel AND re-open the
         // tunnel-accepts / probe-rejects host-key divergence).
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-ssh-transport-opts-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-ssh-transport-opts");
         std::fs::create_dir_all(&tmp).unwrap();
         let srv = test_server(&tmp);
         let opts = srv.ssh_transport_opts();
@@ -8830,7 +8799,6 @@ mod tests {
             !opts.iter().any(|o| o == "StrictHostKeyChecking=no"),
             "transport opts must never disable host-key checking: {opts:?}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -8962,14 +8930,7 @@ mod tests {
 
     #[test]
     fn vm_internet_tunnel_pid_round_trips_through_state_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-vm-inet-roundtrip-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-vm-inet-roundtrip");
         std::fs::create_dir_all(&tmp).unwrap();
 
         assert_eq!(read_vm_internet_tunnel_pid(&tmp, "fedora-utm-1"), None);
@@ -8980,20 +8941,11 @@ mod tests {
         );
         remove_vm_internet_tunnel_state(&tmp, "fedora-utm-1");
         assert_eq!(read_vm_internet_tunnel_pid(&tmp, "fedora-utm-1"), None);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn vm_internet_tunnel_state_is_scoped_per_alias() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-vm-inet-scoped-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-vm-inet-scoped");
         std::fs::create_dir_all(&tmp).unwrap();
 
         write_vm_internet_tunnel_pid(&tmp, "fedora-utm-1", 111).unwrap();
@@ -9003,8 +8955,6 @@ mod tests {
         remove_vm_internet_tunnel_state(&tmp, "fedora-utm-1");
         assert_eq!(read_vm_internet_tunnel_pid(&tmp, "fedora-utm-1"), None);
         assert_eq!(read_vm_internet_tunnel_pid(&tmp, "ubuntu-utm-1"), Some(222));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -9015,14 +8965,7 @@ mod tests {
 
     #[test]
     fn set_vm_internet_access_rejects_unknown_alias() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-vm-inet-unknown-alias-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-vm-inet-unknown-alias");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -9033,19 +8976,11 @@ mod tests {
         let srv = test_server(&tmp);
         let result = srv.set_vm_internet_access(Some(&json!({"alias": "does-not-exist"})));
         assert!(result.is_error.unwrap_or(false));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn set_vm_internet_access_rejects_unknown_action() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-vm-inet-bad-action-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-vm-inet-bad-action");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -9057,19 +8992,11 @@ mod tests {
         let result =
             srv.set_vm_internet_access(Some(&json!({"alias": "deb-1", "action": "reset"})));
         assert!(result.is_error.unwrap_or(false));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn set_vm_internet_access_rejects_alias_missing_ssh_fields() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-vm-inet-missing-fields-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-vm-inet-missing-fields");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -9080,19 +9007,11 @@ mod tests {
         let srv = test_server(&tmp);
         let result = srv.set_vm_internet_access(Some(&json!({"alias": "no-ssh-info"})));
         assert!(result.is_error.unwrap_or(false));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn set_vm_internet_access_status_reports_no_tunnel_when_none_tracked() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-vm-inet-status-none-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-vm-inet-status-none");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         // 192.0.2.1 is TEST-NET-1 (RFC 5737): guaranteed unroutable, so the
@@ -9114,19 +9033,11 @@ mod tests {
             .map(|c| c.text.as_str())
             .unwrap_or("");
         assert!(text.contains("tunnel: not active"));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn set_vm_internet_access_disable_is_idempotent_when_nothing_tracked() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mcp-vm-inet-disable-noop-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = TempRoot::new("mcp-vm-inet-disable-noop");
         let inv_dir = tmp.join("documents/operations/active");
         std::fs::create_dir_all(&inv_dir).unwrap();
         std::fs::write(
@@ -9138,7 +9049,6 @@ mod tests {
         let result =
             srv.set_vm_internet_access(Some(&json!({"alias": "deb-1", "action": "disable"})));
         assert!(!result.is_error.unwrap_or(false));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
