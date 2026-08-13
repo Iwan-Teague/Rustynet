@@ -2251,16 +2251,36 @@ Traffic forwards (36 packets) and is never SNATed (0 packets), so the exit keeps
 client's mesh source address, has no peer claiming it, and its replies leave via the LAN default
 route — which is what `two_hop_reply_ttl: -1` records.
 
-**Why the rule cannot match here.** This lab runs the userspace backend
-(`transport_socket_identity_label=wireguard-linux-userspace-shared-authoritative-transport`).
-The decrypted hairpin packet is forwarded `rustynet0 → rustynet0` in the filter path, then read by
-the userspace process, re-encrypted, and emitted as a **locally-generated UDP datagram on the
-physical interface**. Nothing carrying `iifname rustynet0 oifname rustynet0` ever reaches the nat
-postrouting hook. The rule presumes kernel WireGuard, where the forwarded packet traverses
-postrouting on the tunnel device.
+**CORRECTION — the mechanism I first recorded here was wrong.** I wrote that the rule cannot match
+because the userspace backend re-encrypts the packet and emits it on the physical interface. That
+conflates two different packets. `rustynet0` is a real TUN device under the userspace backend too,
+and a kernel forward *out* a TUN device does traverse the nat postrouting hook with
+`oifname "rustynet0"`. The re-encrypted UDP datagram is a separate, locally generated packet. The
+observation below stands; the explanation I attached to it does not, and no fix should be built on
+it.
 
-This is a coherent explanation for a stage with no recorded pass: the mechanism it depends on is
-backend-conditional, and the backend in use is the one where it does not work.
+**What is actually established:** the rule is installed, `serving_exit_node=true`, and the rule's
+counter is zero. That is all.
+
+**A second reading argues against even "the hairpin traffic is forwarding".** The filter counter is
+2808 bytes over 36 packets — exactly 78 bytes per packet. A default `ping` echo is 84 bytes on the
+wire. So those 36 packets are most likely NOT the probe; they look like some other tunnel-to-tunnel
+flow (gossip or keepalive) transiting the entry. If so, the probe packets may never reach the
+forward path at all, which is a different defect from "forwarded but not SNATed".
+
+**Two candidate explanations remain, and they need different fixes:**
+1. The nat hook is only traversed by packets in conntrack state NEW; established flows get their
+   binding replayed without re-entering the chain. If the probe's flow was established before the
+   rule existed, the counter stays zero and the SNAT is never applied.
+2. The probe traffic never reaches the entry's forward path, and the 36 packets are unrelated
+   traffic — in which case the entry's firewall is not where the defect is.
+
+**The decisive test** (must run mid-stage; `final_cleanup` is `always_run` and removes these tables):
+on the entry, sample the filter and nat hairpin counters in ONE command, immediately before and
+after a single deliberate client-to-exit probe, and record the deltas. A nat delta of zero against a
+filter delta of one probe's worth of packets isolates (1); no delta in either isolates (2). Counters
+from different runs are not comparable, and a byte-per-packet figure that does not match the probe
+size means the counter is measuring something else.
 
 **Not yet established, and it decides the fix:** whether this is (a) a genuine backend gap — the
 SNAT needs a different expression under userspace WG, or the return route must be supplied some
