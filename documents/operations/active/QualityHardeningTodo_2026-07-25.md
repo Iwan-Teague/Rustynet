@@ -2225,9 +2225,36 @@ the kernel tool reports `Unable to access interface: Operation not supported`. U
 `rustynet status` (`managed_peer_endpoints`) and `ip route get`, which is what produced the
 capture above.
 
-**What the fix must decide:** whether a two-hop topology is supposed to give the exit a peer
-entry (or an entry-side `AllowedIPs` covering the client subnet) so replies route back through
-the entry — and if so, which component owns emitting it: `distribute_assignments`' ALLOW_SPEC,
-the traversal bundle, or the two-hop stage's own re-issue step. This is a topology/authority
-question, not a firewall one, and it should be answered before any code changes.
+**CORRECTION — the exit's missing client peer is BY DESIGN, not the bug.** The two-hop test
+states the intended mechanism in its own source
+(`bin/live_linux_two_hop_test.rs`, above the ALLOW_SPEC):
+
+> entry masquerades the hairpin (`phase10.rs:2285-2299`) — that SNAT is what gives the final exit
+> a route to the requester, since after this strip its peers carry only `entry/32` and
+> `second_client/32`.
+
+So the exit is *supposed* to see the entry as the source; the return path comes from the entry's
+hairpin **SNAT**, not from a client peer entry. My earlier framing — "decide whether the exit
+should get a peer entry" — asked a question the design had already answered, and would have led
+to changing signed-bundle topology to fix something that is not a topology defect.
+
+**Where that leaves it.** The hairpin masquerade rule is
+`add rule ip <nat table> postrouting iifname X oifname X counter masquerade` — precisely the rule
+the privileged-helper allowlist refused before QH-45's second arm. With both arms landed the NAT
+apply is clean (no `nat apply failed` and no `unsupported nft` in the run logs), yet the proof
+still reports `end_to_end_reachable=false`. So the rule installs and the traffic still does not
+complete.
+
+**Next step, and the capture that settles it:** both the forward and NAT hairpin rules are gated
+by `allow_tunnel_relay_forward`, which derives from
+`relay_with_upstream = exit_mode == FullTunnel && serve_exit_node` (`phase10.rs:5242`). Capture
+on the ENTRY node, mid-stage: `serving_exit_node`, and the postrouting chain's counter. Two
+outcomes, two different fixes:
+
+- counter at 0 packets → the SNAT is installed but not matching, so the hairpin traffic is not
+  taking the path the rule describes;
+- rule absent → `allow_tunnel_relay_forward` is false on the entry, i.e. the entry is not being
+  told it serves an exit, which is an assignment/role question rather than a firewall one.
+
+Do not change signed-bundle topology before that capture distinguishes them.
 
