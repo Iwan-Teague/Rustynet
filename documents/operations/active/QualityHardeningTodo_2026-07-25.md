@@ -2154,3 +2154,44 @@ and a local-only redirect target).
 **Not reproducible without an `entry` node.** Fedora has passed as `relay` in prior runs; it is
 the `entry` role's rule path that trips this, which is why it stayed hidden until a five-node
 topology could elect one.
+
+### QH-46 — two-hop dataplane proof fails with every node healthy
+
+**Status: OPEN, first time the stage has ever reached its own verdict.**
+
+`qh45-final-20260813u` is the first run in which `live_two_hop_validation` executed to
+completion. It reports:
+
+```
+[two-hop] data-plane proof summary
+end_to_end_reachable=false  per_hop_ttl_decrement=none  per_hop_ttl_decrement_ok=false
+```
+
+**Everything upstream is healthy**, which is what makes this interesting rather than routine.
+From the stage's own captured status on the exit node:
+
+- `path_live_proven=true`, `path_programmed_direct_peers=2`, `path_live_direct_peers=2`
+- `traversal_authority=enforced_v1`, `traversal_probe_result=direct`, `traversal_alarm_state=ok`
+- `dns_zone_state=valid`, `dns_alarm_state=ok`
+- `gossip_state=active`, `gossip_identity_mismatch=false`
+- entry (`fedora-utm-1`) holds both hops as managed peers:
+  `debian-headless-2-bootstrap/192.168.64.4:51820+debian-headless-4-bootstrap/192.168.64.10:51820`
+
+So control plane, traversal, DNS and gossip are all green on every node, and the failure is
+specifically that traffic does not traverse client → entry → exit.
+
+**Not a regression.** This stage has never passed: the ledger's lifetime record for
+`linux_stage_two_hop` carries zero passes attributable to a real two-hop proof (see QH-07 for why
+the column's apparent passes are contaminated by a since-removed alias). It reached its verdict
+for the first time only after three blockers were cleared in sequence — the vmnet split (topology),
+the entry-role election (QH-45's precondition), and the nft allowlist refusals (QH-45).
+
+**What the evidence already rules out:** node health, traversal authority, DNS, gossip identity,
+and the dataplane apply path. `per_hop_ttl_decrement=none` is the sharpest clue — no TTL
+decrement was observed at all, which suggests packets are not being forwarded by the entry hop
+rather than being forwarded and dropped later.
+
+**First step:** determine whether the entry node forwards at all — `ip_forward` state, the
+`forward` chain's counters (now that `counter` is permitted on that rule, the packet count is
+readable), and whether the client's route actually selects the entry as next hop rather than
+reaching the exit directly.
