@@ -1758,7 +1758,14 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "accept",
         ] if is_owned_failclosed_table_token(table)
             && is_interface_name(incoming_interface)
-            && is_interface_name(outgoing_interface) =>
+            && is_interface_name(outgoing_interface)
+            // Hairpin only. The emitter passes one interface into both slots, so
+            // requiring equality matches the caller exactly and keeps this arm a
+            // SHAPE rather than a pattern. It reduces no authority — the sibling
+            // arm above still grants the more general A→B form without `counter`
+            // — so this is intent, not a boundary tightening; claiming otherwise
+            // would overstate it.
+            && incoming_interface == outgoing_interface =>
         {
             Ok(())
         }
@@ -1960,6 +1967,36 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         ] if is_owned_nat_table_token(table)
             && is_interface_name(incoming_interface)
             && is_interface_name(outgoing_interface) =>
+        {
+            Ok(())
+        }
+        // As above, with a `counter` statement — the NAT half of the same
+        // entry/relay hairpin. Adding only the `forward` counter arm left this
+        // one refused, so the run simply died one step later in
+        // `apply_nat_forwarding` instead of `apply_firewall_killswitch`, with the
+        // error string changing and nothing else. Both emitters are gated by the
+        // same `allow_tunnel_relay_forward` flag, so they always appear together.
+        //
+        // Grants no authority the arm above did not: same table and interface
+        // guards, same fixed arity, and `counter` affects neither match nor
+        // verdict. Hairpin-only for the same reason as the forward arm — the
+        // emitter passes one interface into both slots.
+        [
+            "add",
+            "rule",
+            "ip",
+            table,
+            "postrouting",
+            "iifname",
+            incoming_interface,
+            "oifname",
+            outgoing_interface,
+            "counter",
+            "masquerade",
+        ] if is_owned_nat_table_token(table)
+            && is_interface_name(incoming_interface)
+            && is_interface_name(outgoing_interface)
+            && incoming_interface == outgoing_interface =>
         {
             Ok(())
         }
@@ -3527,6 +3564,90 @@ mod tests {
     /// pure statement affecting neither match nor verdict — so the negative cases
     /// below are what prove the arm is narrow rather than a loosening: an
     /// unowned table, a malformed interface name, and `counter` without a verdict
+    /// The NAT half of the same hairpin, and its near-misses.
+    ///
+    /// Allowlisting only the `forward` counter arm did not fix QH-45: both
+    /// emitters are gated by the same flag, so the run merely died one step later
+    /// in NAT apply instead of firewall apply. A fix that moves an error string
+    /// is not a fix, and this test is what would have caught that.
+    #[test]
+    fn postrouting_counter_masquerade_is_allowed_only_as_a_hairpin() {
+        validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "ip",
+                "rustynet_nat_g2",
+                "postrouting",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "rustynet0",
+                "counter",
+                "masquerade",
+            ],
+        )
+        .expect("the entry/relay NAT hairpin must be accepted");
+
+        let cross_iface = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "ip",
+                "rustynet_nat_g2",
+                "postrouting",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "eth0",
+                "counter",
+                "masquerade",
+            ],
+        )
+        .expect_err("this arm is hairpin-only; differing interfaces must not match it");
+        assert!(cross_iface.contains("unsupported nft add rule argument schema"));
+
+        let unowned = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "ip",
+                "not_ours",
+                "postrouting",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "rustynet0",
+                "counter",
+                "masquerade",
+            ],
+        )
+        .expect_err("a table we do not own must still be refused");
+        assert!(unowned.contains("unsupported nft add rule argument schema"));
+
+        let wildcard = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "ip",
+                "rustynet_nat_g2",
+                "postrouting",
+                "iifname",
+                "*",
+                "oifname",
+                "*",
+                "counter",
+                "masquerade",
+            ],
+        )
+        .expect_err("an nft wildcard interface must never be accepted");
+        assert!(wildcard.contains("unsupported nft add rule argument schema"));
+    }
+
     /// must all still be refused.
     #[test]
     fn forward_counter_accept_is_allowed_only_in_its_exact_narrow_shape() {
