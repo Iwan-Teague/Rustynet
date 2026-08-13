@@ -86,7 +86,9 @@ impl OrchestrationStage for ActiveExitStage {
         let exit_platform = exit_adapter.platform();
         if !active_exit_runtime_implemented(exit_platform) {
             write_reported_skip_note(ctx, &exit_alias, exit_platform);
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(format!(
+                "active-exit runtime is not implemented for {exit_platform:?}"
+            ));
         }
 
         // 1. Activate exit-serving: instruct the daemon to advertise 0.0.0.0/0,
@@ -139,7 +141,9 @@ impl OrchestrationStage for ActiveExitStage {
             })();
             if let Err(reason) = egress_ok {
                 write_reported_skip_note_egress(ctx, &exit_alias, client_alias.as_str(), &reason);
-                return StageOutcome::Skipped;
+                return StageOutcome::Skipped(format!(
+                    "egress precondition not met on {exit_alias}: {reason}"
+                ));
             }
         }
 

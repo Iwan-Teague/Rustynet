@@ -288,14 +288,14 @@ pub(crate) fn rust_native_vm_lab_stage_outcome(
         status: match outcome {
             StageOutcome::Passed => VmLabStageStatus::Pass,
             StageOutcome::Failed(_) => VmLabStageStatus::Fail,
-            StageOutcome::Skipped | StageOutcome::NotRun | StageOutcome::Reused { .. } => {
+            StageOutcome::Skipped(..) | StageOutcome::NotRun | StageOutcome::Reused { .. } => {
                 VmLabStageStatus::Skipped
             }
         },
         summary: match outcome {
             StageOutcome::Passed => String::new(),
             StageOutcome::Failed(err) => err.clone(),
-            StageOutcome::Skipped => "skipped".to_owned(),
+            StageOutcome::Skipped(reason) => format!("skipped: {reason}"),
             StageOutcome::NotRun => "not_run: omitted by focused invocation".to_owned(),
             StageOutcome::Reused { evidence_sha256 } => {
                 format!("reused prior pass evidence sha256={evidence_sha256}")
@@ -429,7 +429,7 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
         let (status, rc, summary) = match outcome {
             StageOutcome::Passed => ("pass", "0", String::new()),
             StageOutcome::Failed(err) => ("fail", "1", err.clone()),
-            StageOutcome::Skipped => ("skipped", "", String::new()),
+            StageOutcome::Skipped(reason) => ("skipped", "", reason.clone()),
             StageOutcome::NotRun => ("not_run", "", "omitted by focused invocation".to_owned()),
             StageOutcome::Reused { evidence_sha256 } => (
                 "reused",
@@ -978,7 +978,7 @@ where
         .filter(|(_, o)| {
             matches!(
                 o,
-                StageOutcome::Skipped | StageOutcome::NotRun | StageOutcome::Reused { .. }
+                StageOutcome::Skipped(..) | StageOutcome::NotRun | StageOutcome::Reused { .. }
             )
         })
         .count();

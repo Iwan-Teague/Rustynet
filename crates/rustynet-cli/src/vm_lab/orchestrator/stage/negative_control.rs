@@ -357,7 +357,7 @@ pub(crate) fn adjudicate_daemon_kill_outcome(recorded: &StageOutcome) -> KillCon
     match recorded {
         StageOutcome::Passed => KillControlOutcome::FalseGreenUnderKill,
         StageOutcome::Failed(_)
-        | StageOutcome::Skipped
+        | StageOutcome::Skipped(..)
         | StageOutcome::NotRun
         | StageOutcome::Reused { .. } => KillControlOutcome::StageDidNotPass,
     }
@@ -2216,7 +2216,9 @@ mod tests {
     fn daemon_kill_non_pass_outcomes_pass_the_control() {
         for recorded in [
             StageOutcome::Failed("daemon killed".to_owned()),
-            StageOutcome::Skipped,
+            StageOutcome::Skipped(
+                "preconditions for this stage are not met in this topology".to_owned(),
+            ),
             StageOutcome::NotRun,
             StageOutcome::Reused {
                 evidence_sha256: "abc".to_owned(),

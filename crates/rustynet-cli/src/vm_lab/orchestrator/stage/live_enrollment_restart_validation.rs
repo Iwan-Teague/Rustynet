@@ -34,7 +34,9 @@ impl OrchestrationStage for LiveEnrollmentRestartValidationStage {
         // two_hop incomplete-topology skip and the role-gated live-suite
         // stages. A missing `exit` (the enrolling admin) remains a hard fail.
         if !ctx.assignments.iter().any(|a| a.role.as_str() == "aux") {
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "no node in this topology is assigned the aux role".to_owned(),
+            );
         }
         let admin_params = match ssh_params_for_role(ctx, "exit") {
             Ok(p) => p,

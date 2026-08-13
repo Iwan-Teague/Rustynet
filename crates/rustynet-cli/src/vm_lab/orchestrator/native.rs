@@ -677,7 +677,9 @@ pub(crate) fn execute_rust_native_orchestration(
                 .filter(|(_, o)| {
                     matches!(
                         o,
-                        StageOutcome::Skipped | StageOutcome::NotRun | StageOutcome::Reused { .. }
+                        StageOutcome::Skipped(..)
+                            | StageOutcome::NotRun
+                            | StageOutcome::Reused { .. }
                     )
                 })
                 .count()
@@ -747,7 +749,7 @@ pub(crate) fn execute_rust_native_orchestration(
         .filter(|(_, o)| {
             matches!(
                 o,
-                StageOutcome::Skipped | StageOutcome::NotRun | StageOutcome::Reused { .. }
+                StageOutcome::Skipped(..) | StageOutcome::NotRun | StageOutcome::Reused { .. }
             )
         })
         .count();

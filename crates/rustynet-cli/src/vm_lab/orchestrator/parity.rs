@@ -71,7 +71,9 @@ pub fn build_live_lab_run_report(
         .map(|(id, outcome)| {
             let (rec, error_detail) = match outcome {
                 StageOutcome::Passed => (StageOutcomeRecord::Passed, None),
-                StageOutcome::Skipped | StageOutcome::NotRun => (StageOutcomeRecord::Skipped, None),
+                StageOutcome::Skipped(..) | StageOutcome::NotRun => {
+                    (StageOutcomeRecord::Skipped, None)
+                }
                 StageOutcome::Reused { evidence_sha256 } => (
                     StageOutcomeRecord::Skipped,
                     Some(format!("reused prior evidence sha256={evidence_sha256}")),

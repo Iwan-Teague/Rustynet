@@ -62,11 +62,13 @@ impl OrchestrationStage for RelayValidationStage {
             .collect();
 
         // No Relay nodes in this lab → nothing to validate. Skip-noop:
-        // StageOutcome::Skipped (not Passed) so the run goes Partial —
+        // `StageOutcome::Skipped` (not Passed) so the run goes Partial —
         // this stage was not exercised, and a false-green Pass would
         // mask the gap.
         if relay_aliases.is_empty() {
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "no node in this topology is assigned the relay role".to_owned(),
+            );
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -134,7 +136,10 @@ fn outcome_for(failures: &[String], reported_skips: &[(String, String)]) -> Stag
     if !failures.is_empty() {
         StageOutcome::Failed(failures.join("; "))
     } else if !reported_skips.is_empty() {
-        StageOutcome::Skipped
+        StageOutcome::Skipped(format!(
+            "no node executed this validation; {} node(s) reported a runtime skip",
+            reported_skips.len()
+        ))
     } else {
         StageOutcome::Passed
     }
@@ -237,9 +242,13 @@ mod tests {
     #[test]
     fn empty_assignments_skips_skip_noop() {
         let mut ctx = empty_ctx();
-        assert_eq!(
-            RelayValidationStage.execute(&mut ctx),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                RelayValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            RelayValidationStage.execute(&mut ctx)
         );
     }
 
@@ -259,9 +268,13 @@ mod tests {
                 role: NodeRole::Client,
             },
         ];
-        assert_eq!(
-            RelayValidationStage.execute(&mut ctx),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                RelayValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            RelayValidationStage.execute(&mut ctx)
         );
     }
 
@@ -272,10 +285,10 @@ mod tests {
         // build_live_lab_run_report maps to RunStatus::Partial (honest: this
         // stage did not fully prove every relay node, so the run is not green).
         let reported_skips = vec![("relay-win".to_owned(), "Windows".to_owned())];
-        assert_eq!(
-            outcome_for(&[], &reported_skips),
-            StageOutcome::Skipped,
-            "reported-skip + no failures must be Skipped, not Passed"
+        assert!(
+            matches!(outcome_for(&[], &reported_skips), StageOutcome::Skipped(_)),
+            "reported-skip + no failures must be Skipped, not Passed; got {:?}",
+            outcome_for(&[], &reported_skips)
         );
     }
 

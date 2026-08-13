@@ -134,7 +134,7 @@ impl StateMachineRunner {
                     .map_or(StageOutcome::NotRun, |digest| StageOutcome::Reused {
                         evidence_sha256: digest.clone(),
                     });
-                if outcome.is_blocking() || matches!(outcome, StageOutcome::Skipped) {
+                if outcome.is_blocking() || matches!(outcome, StageOutcome::Skipped(..)) {
                     blocked.insert(id.clone());
                 }
                 observer.stage_finished(&id, &outcome);
@@ -143,12 +143,19 @@ impl StateMachineRunner {
                 continue;
             }
 
-            let dep_blocked = stage.dependencies().iter().any(|dep| {
-                blocked.contains(dep)
+            // Keep the blocking dependency's NAME, not just the fact that one
+            // exists: a cascade skip that cannot say what it is waiting on is
+            // indistinguishable from "this role was never elected", and those
+            // have opposite remedies. This is the shape behind the documented
+            // enabled-is-not-dispatched incident, where a whole suite
+            // cascade-skipped behind a dependency that had never passed.
+            let blocking_dep = stage.dependencies().iter().find(|dep| {
+                blocked.contains(*dep)
                     || ctx
                         .outcome_of(dep)
                         .is_some_and(super::error::StageOutcome::is_blocking)
             });
+            let dep_blocked = blocking_dep.is_some();
 
             // `always_run` teardown stages (e.g. final cleanup) are exempt from
             // the dependency skip-cascade: they must run even when an earlier
@@ -157,9 +164,14 @@ impl StateMachineRunner {
             // They still respect the explicit-skip set handled above.
             if dep_blocked && !stage.always_run() {
                 blocked.insert(id.clone());
-                observer.stage_finished(&id, &StageOutcome::Skipped);
-                results.push((id.clone(), StageOutcome::Skipped));
-                ctx.record_outcome(id, StageOutcome::Skipped);
+                let reason = blocking_dep.map_or_else(
+                    || "a dependency did not pass".to_owned(),
+                    |dep| format!("dependency `{dep}` did not pass, so this stage never ran"),
+                );
+                let outcome = StageOutcome::Skipped(reason);
+                observer.stage_finished(&id, &outcome);
+                results.push((id.clone(), outcome.clone()));
+                ctx.record_outcome(id, outcome);
                 continue;
             }
 
@@ -170,9 +182,12 @@ impl StateMachineRunner {
                 && flag.load(Ordering::Acquire)
                 && !stage.always_run()
             {
-                observer.stage_finished(&id, &StageOutcome::Skipped);
-                results.push((id.clone(), StageOutcome::Skipped));
-                ctx.record_outcome(id, StageOutcome::Skipped);
+                let outcome = StageOutcome::Skipped(
+                    "shutdown was requested before this stage started".to_owned(),
+                );
+                observer.stage_finished(&id, &outcome);
+                results.push((id.clone(), outcome.clone()));
+                ctx.record_outcome(id, outcome);
                 continue;
             }
 
@@ -433,10 +448,13 @@ mod tests {
             ),
             "expected Failed for PrepareSourceArchive"
         );
-        assert_eq!(
-            outcome_of(&StageId::VerifySshReachability),
-            Some(&StageOutcome::Skipped),
-            "stage depending on failed stage must be skipped"
+        assert!(
+            matches!(
+                outcome_of(&StageId::VerifySshReachability),
+                Some(StageOutcome::Skipped(_))
+            ),
+            "stage depending on failed stage must be skipped; got {:?}",
+            outcome_of(&StageId::VerifySshReachability)
         );
     }
 
@@ -547,10 +565,13 @@ mod tests {
             "a pre-set shutdown flag must prevent a non-always_run stage's execute() from \
              ever being called"
         );
-        assert_eq!(
-            outcome_of(&StageId::Preflight),
-            Some(&StageOutcome::Skipped),
-            "a pending stage must be recorded Skipped once the shutdown flag is observed"
+        assert!(
+            matches!(
+                outcome_of(&StageId::Preflight),
+                Some(StageOutcome::Skipped(_))
+            ),
+            "a pending stage must be recorded Skipped once the shutdown flag is observed; got {:?}",
+            outcome_of(&StageId::Preflight)
         );
         assert_eq!(
             cleanup_runs.load(Ordering::SeqCst),
@@ -764,9 +785,13 @@ mod tests {
             outcome_of(&StageId::Preflight),
             Some(StageOutcome::Failed(_))
         ));
-        assert_eq!(
-            outcome_of(&StageId::PrepareSourceArchive),
-            Some(&StageOutcome::Skipped)
+        assert!(
+            matches!(
+                outcome_of(&StageId::PrepareSourceArchive),
+                Some(StageOutcome::Skipped(_))
+            ),
+            "expected a skip; got {:?}",
+            outcome_of(&StageId::PrepareSourceArchive)
         );
         assert_eq!(
             outcome_of(&StageId::CleanupHosts),
@@ -818,10 +843,13 @@ mod tests {
         let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
 
         assert_eq!(outcome_of(&StageId::Preflight), Some(&StageOutcome::NotRun));
-        assert_eq!(
-            outcome_of(&StageId::PrepareSourceArchive),
-            Some(&StageOutcome::Skipped),
-            "dependent of explicitly-skipped stage must also be skipped"
+        assert!(
+            matches!(
+                outcome_of(&StageId::PrepareSourceArchive),
+                Some(StageOutcome::Skipped(_))
+            ),
+            "dependent of explicitly-skipped stage must also be skipped; got {:?}",
+            outcome_of(&StageId::PrepareSourceArchive)
         );
     }
 

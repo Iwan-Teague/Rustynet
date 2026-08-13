@@ -43,7 +43,11 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
         // incomplete-topology skips.
         let blind_exit_params = match find_blind_exit(ctx) {
             Ok(p) => p,
-            Err(_) => return StageOutcome::Skipped,
+            Err(_) => {
+                return StageOutcome::Skipped(
+                    "no blind_exit node is available in this topology".to_owned(),
+                );
+            }
         };
         let platform = platform_for_node(ctx, &exit_params.alias);
         let exit_node_id = node_id_for_alias(ctx, &exit_params.alias);

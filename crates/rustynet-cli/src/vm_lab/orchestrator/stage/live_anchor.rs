@@ -37,15 +37,29 @@ impl OrchestrationStage for LiveAnchorStage {
         };
         let second_anchor = match ssh_params_for_role(ctx, "entry") {
             Ok(params) => params,
-            Err(_) => return StageOutcome::Skipped,
+            Err(_) => {
+                return StageOutcome::Skipped(
+                    "no second anchor/entry node is available in this topology".to_owned(),
+                );
+            }
         };
         let leaf_client = match ssh_params_for_role(ctx, "aux") {
             Ok(params) => params,
-            Err(_) => return StageOutcome::Skipped,
+            Err(_) => {
+                return StageOutcome::Skipped(
+                    "no node in this topology is assigned the aux role the anchor leaf needs"
+                        .to_owned(),
+                );
+            }
         };
         let enrollee = match ssh_params_for_role(ctx, "extra") {
             Ok(params) => params,
-            Err(_) => return StageOutcome::Skipped,
+            Err(_) => {
+                return StageOutcome::Skipped(
+                    "no node in this topology is assigned the extra role the anchor enrollee needs"
+                        .to_owned(),
+                );
+            }
         };
 
         let anchor_node_id = match node_id_for_role(ctx, "exit") {
