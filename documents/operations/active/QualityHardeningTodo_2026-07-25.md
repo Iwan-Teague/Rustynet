@@ -2155,6 +2155,48 @@ and a local-only redirect target).
 the `entry` role's rule path that trips this, which is why it stayed hidden until a five-node
 topology could elect one.
 
+### QH-48 — the live suite is a linear dependency chain, so each run surfaces at most one defect
+
+**Severity: medium (throughput, not correctness).** Nothing here is wrong in a released binary; it
+governs how fast defects can be found.
+
+Measured on run `qh46-snat-20260813x` (33 passed / 1 failed / 24 skipped): **21 of the 24 skips
+descend from the single `live_two_hop_validation` failure.** Only four are genuine topology gaps
+(`blind_exit` x2, `anchor_validation`, `admin_issue` — no node in the topology holds those roles).
+
+The declared dependencies form a strictly linear chain, each stage naming exactly its predecessor:
+
+```
+live_two_hop_validation
+  -> live_managed_dns_validation -> live_network_flap_validation
+  -> live_reboot_recovery_validation -> live_secrets_not_in_logs_validation
+  -> live_key_custody_validation -> live_enrollment_restart_validation
+  -> live_lan_toggle_validation -> live_mixed_topology_validation
+  -> live_anchor + 10 x cross_network_*
+```
+
+`is_blocking` is `Failed | NotRun` and the runner propagates `blocked` transitively, so one failure
+blocks every descendant. That is the designed behaviour, not a bug in the runner.
+
+**Why it is still worth changing.** Some links are genuine data dependencies — `live_managed_dns_validation`
+does validate against the multi-hop topology that `live_two_hop_validation` establishes. Most are
+not: `live_key_custody_validation` does not require that secrets were absent from logs, and
+`live_lan_toggle_validation` does not require an enrollment restart. Those pairs encode *ordering* as
+*gating*. The cost is that a ~17-minute run yields at most one new defect, so N defects need N runs.
+
+**A correction to an earlier framing in this ledger:** the cross-network stages were previously
+described as skipped for want of a cross-network substrate. On this run they were skipped by the
+cascade and never attempted, so their substrate requirement is untested, not confirmed.
+
+**Fix direction (needs plan + adversarial review before any code):** separate "runs after" from
+"requires the predecessor to have passed". Destructive stages — reboot recovery, network flap —
+plausibly need serialising against each other, and that ordering must survive; what should not
+survive is an unrelated stage being gated on an unrelated predecessor's verdict. Correct the
+individual declarations to reflect true data dependencies rather than deleting gating wholesale: a
+stage that genuinely needs prior state must keep its gate, or it will produce confident garbage on a
+broken mesh. Do not treat converting a skip into a run as progress in itself — the value is more
+real verdicts per run, and some newly unblocked stages will legitimately fail.
+
 ### QH-47 — NAT rules are applied without ever flushing conntrack
 
 **Severity: medium.** Not lab-only; it affects any node that gains or changes an exit/relay role
