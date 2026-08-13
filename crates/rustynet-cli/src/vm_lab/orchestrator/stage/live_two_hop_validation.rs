@@ -38,7 +38,9 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
         if alias_matching_label(ctx, "entry").is_none()
             || ssh_params_for_second_client(ctx).is_err()
         {
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "the topology lacks the second client the two-hop path requires".to_owned(),
+            );
         }
         let exit_params = match ssh_params_for_role(ctx, "exit") {
             Ok(p) => p,
@@ -319,9 +321,13 @@ mod tests {
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
         };
-        assert_eq!(
-            LiveTwoHopValidationStage.execute(&mut ctx),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                LiveTwoHopValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            LiveTwoHopValidationStage.execute(&mut ctx)
         );
     }
 }

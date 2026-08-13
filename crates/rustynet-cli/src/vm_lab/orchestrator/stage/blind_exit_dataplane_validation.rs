@@ -62,7 +62,9 @@ impl OrchestrationStage for BlindExitDataplaneValidationStage {
             // No blind_exit node in this topology — nothing to validate. Skipped
             // (not Passed) so the evidence does not promise a dataplane check
             // that never ran; mirrors the `blind_exit` deploy stage.
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "no node in this topology is assigned the blind_exit role".to_owned(),
+            );
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -112,7 +114,10 @@ fn outcome_for(failures: &[String], reported_skips: &[(String, String)]) -> Stag
     if !failures.is_empty() {
         StageOutcome::Failed(failures.join("; "))
     } else if !reported_skips.is_empty() {
-        StageOutcome::Skipped
+        StageOutcome::Skipped(format!(
+            "no node executed this validation; {} node(s) reported a runtime skip",
+            reported_skips.len()
+        ))
     } else {
         StageOutcome::Passed
     }
@@ -148,9 +153,13 @@ mod tests {
 
     #[test]
     fn outcome_reported_skip_only_is_skipped() {
-        assert_eq!(
-            outcome_for(&[], &[("mac-1".into(), "Macos".into())]),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                outcome_for(&[], &[("mac-1".into(), "Macos".into())]),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            outcome_for(&[], &[("mac-1".into(), "Macos".into())])
         );
     }
 
@@ -210,9 +219,13 @@ mod tests {
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
         };
-        assert_eq!(
-            BlindExitDataplaneValidationStage.execute(&mut ctx),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                BlindExitDataplaneValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            BlindExitDataplaneValidationStage.execute(&mut ctx)
         );
     }
 }

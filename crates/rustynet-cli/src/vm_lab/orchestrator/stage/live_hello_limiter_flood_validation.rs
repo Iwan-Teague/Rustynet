@@ -33,7 +33,9 @@ impl OrchestrationStage for LiveHelloLimiterFloodValidationStage {
             .map(|a| a.alias.clone())
             .collect();
         if relay_aliases.is_empty() {
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "no node in this topology is assigned the relay role".to_owned(),
+            );
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -96,7 +98,10 @@ impl OrchestrationStage for LiveHelloLimiterFloodValidationStage {
         if !failures.is_empty() {
             StageOutcome::Failed(failures.join("; "))
         } else if !reported_skips.is_empty() {
-            StageOutcome::Skipped
+            StageOutcome::Skipped(format!(
+                "no node executed this validation; {} node(s) reported a runtime skip",
+                reported_skips.len()
+            ))
         } else {
             StageOutcome::Passed
         }
@@ -146,9 +151,13 @@ mod tests {
     #[test]
     fn empty_assignments_skips() {
         let mut ctx = empty_ctx();
-        assert_eq!(
-            LiveHelloLimiterFloodValidationStage.execute(&mut ctx),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                LiveHelloLimiterFloodValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            LiveHelloLimiterFloodValidationStage.execute(&mut ctx)
         );
     }
 }

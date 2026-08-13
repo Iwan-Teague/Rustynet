@@ -77,7 +77,10 @@ fn outcome_for(failures: &[String], reported_skips: &[(String, String)]) -> Stag
     if !failures.is_empty() {
         StageOutcome::Failed(failures.join("; "))
     } else if !reported_skips.is_empty() {
-        StageOutcome::Skipped
+        StageOutcome::Skipped(format!(
+            "no node executed this validation; {} node(s) reported a runtime skip",
+            reported_skips.len()
+        ))
     } else {
         StageOutcome::Passed
     }
@@ -113,9 +116,13 @@ mod tests {
 
     #[test]
     fn outcome_reported_skip_only_is_skipped() {
-        assert_eq!(
-            outcome_for(&[], &[("mac-1".into(), "Macos".into())]),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                outcome_for(&[], &[("mac-1".into(), "Macos".into())]),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            outcome_for(&[], &[("mac-1".into(), "Macos".into())])
         );
     }
 

@@ -260,7 +260,9 @@ fn run_cross_network_stage(
     spec: &CrossNetworkStageSpec,
 ) -> StageOutcome {
     if !options.enable_suite {
-        return StageOutcome::Skipped;
+        return StageOutcome::Skipped(
+            "the cross-network suite is not enabled for this run".to_owned(),
+        );
     }
     if options.nat_profiles.is_empty() || options.required_nat_profiles.is_empty() {
         return StageOutcome::Failed(
@@ -320,7 +322,9 @@ fn run_nat_classification(
     options: &CrossNetworkOptions,
 ) -> StageOutcome {
     if options.substrate != CrossNetworkSubstrate::Netns {
-        return StageOutcome::Skipped;
+        return StageOutcome::Skipped(
+            "this stage requires the netns cross-network substrate".to_owned(),
+        );
     }
     let host = match remote_host_for_role(ctx, "exit") {
         Ok(host) => host,
@@ -396,7 +400,9 @@ fn run_nat_classification(
 
 fn run_nat_matrix(ctx: &OrchestrationContext, options: &CrossNetworkOptions) -> StageOutcome {
     if options.substrate != CrossNetworkSubstrate::Vxlan {
-        return StageOutcome::Skipped;
+        return StageOutcome::Skipped(
+            "this stage requires a cross-network substrate that supports the NAT matrix".to_owned(),
+        );
     }
     let mut cmd = cargo_ops_command("validate-cross-network-nat-matrix");
     cmd.arg("--artifact-dir")
@@ -421,15 +427,26 @@ fn run_script_stage(
     spec: &CrossNetworkStageSpec,
 ) -> StageOutcome {
     if options.substrate != CrossNetworkSubstrate::Vxlan {
-        return StageOutcome::Skipped;
+        return StageOutcome::Skipped(
+            "this stage requires the vxlan cross-network substrate".to_owned(),
+        );
     }
     let topology = match CrossNetworkTopology::resolve(ctx) {
         Ok(topology) => topology,
-        Err(TopologyError::MissingRole(_)) => return StageOutcome::Skipped,
+        Err(TopologyError::MissingRole(())) => {
+            return StageOutcome::Skipped(
+                "cross-network topology requires a role that no node in this topology is assigned"
+                    .to_owned(),
+            );
+        }
         Err(TopologyError::Message(err)) => return StageOutcome::Failed(err),
     };
     if !topology.distinct_underlay_prefixes() {
-        return StageOutcome::Skipped;
+        return StageOutcome::Skipped(
+            "cross-network requires the nodes to sit on distinct underlay prefixes; this \
+             topology puts them on one"
+                .to_owned(),
+        );
     }
 
     let stage_dir = ctx.report_dir.join(spec.name);

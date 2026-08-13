@@ -41,7 +41,9 @@ impl OrchestrationStage for LiveExtendedSoakValidationStage {
             .all(|label| ssh_params_for_role(ctx, label).is_ok())
             && ssh_params_for_second_client(ctx).is_ok();
         if !complete {
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "the topology lacks the second client this soak requires".to_owned(),
+            );
         }
         match run_extended_soak(ctx) {
             Ok(()) => StageOutcome::Passed,

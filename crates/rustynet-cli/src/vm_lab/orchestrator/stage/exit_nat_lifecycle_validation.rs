@@ -61,7 +61,9 @@ impl OrchestrationStage for ExitNatLifecycleValidationStage {
         if !exit_nat_lifecycle_runtime_implemented(platform) {
             let reported_skips = vec![(alias, format!("{platform:?}"))];
             write_reported_skips_note(ctx, &reported_skips);
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(format!(
+                "exit NAT lifecycle validation is not implemented for {platform:?}"
+            ));
         }
         let shell = match adapter.shell_host() {
             Ok(shell) => shell,
@@ -108,7 +110,10 @@ fn outcome_for(failures: &[String], reported_skips: &[(String, String)]) -> Stag
     if !failures.is_empty() {
         StageOutcome::Failed(failures.join("; "))
     } else if !reported_skips.is_empty() {
-        StageOutcome::Skipped
+        StageOutcome::Skipped(format!(
+            "no node executed this validation; {} node(s) reported a runtime skip",
+            reported_skips.len()
+        ))
     } else {
         StageOutcome::Passed
     }
@@ -152,9 +157,13 @@ mod tests {
 
     #[test]
     fn outcome_reported_skip_only_is_skipped() {
-        assert_eq!(
-            outcome_for(&[], &[("mac-1".into(), "Macos".into())]),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                outcome_for(&[], &[("mac-1".into(), "Macos".into())]),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            outcome_for(&[], &[("mac-1".into(), "Macos".into())])
         );
     }
 

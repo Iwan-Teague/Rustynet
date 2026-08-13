@@ -47,7 +47,9 @@ impl OrchestrationStage for LiveMixedTopologyValidationStage {
             })
         });
         if !all_platforms_assigned {
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "not every platform in the matrix is assigned a node in this topology".to_owned(),
+            );
         }
         let linux = match find_platform_node(ctx, VmGuestPlatform::Linux) {
             Ok(p) => p,

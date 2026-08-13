@@ -115,11 +115,13 @@ impl OrchestrationStage for AnchorValidationStage {
             .collect();
 
         // No Anchor nodes in this lab → nothing to validate. Skip-noop:
-        // StageOutcome::Skipped (not Passed) so the run goes Partial —
+        // `StageOutcome::Skipped` (not `Passed`) so the run goes Partial —
         // this stage was not exercised, and a false-green Pass would
         // mask the gap.
         if anchor_aliases.is_empty() {
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "no node in this topology is assigned the anchor role".to_owned(),
+            );
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -222,7 +224,10 @@ fn outcome_for(failures: &[String], runtime_skips: &[(String, String)]) -> Stage
     if !failures.is_empty() {
         StageOutcome::Failed(failures.join("; "))
     } else if !runtime_skips.is_empty() {
-        StageOutcome::Skipped
+        StageOutcome::Skipped(format!(
+            "no node executed this validation; {} node(s) reported a runtime skip",
+            runtime_skips.len()
+        ))
     } else {
         StageOutcome::Passed
     }
@@ -305,9 +310,13 @@ mod tests {
     #[test]
     fn empty_assignments_skips_skip_noop() {
         let mut ctx = empty_ctx();
-        assert_eq!(
-            AnchorValidationStage.execute(&mut ctx),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                AnchorValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            AnchorValidationStage.execute(&mut ctx)
         );
     }
 
@@ -327,9 +336,13 @@ mod tests {
                 role: NodeRole::Client,
             },
         ];
-        assert_eq!(
-            AnchorValidationStage.execute(&mut ctx),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                AnchorValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            AnchorValidationStage.execute(&mut ctx)
         );
     }
 
@@ -361,10 +374,10 @@ mod tests {
         // stage did not fully prove every anchor, so the run is not green —
         // even though capability-advertisement passed on every OS).
         let runtime_skips = vec![("anchor-win".to_owned(), "Windows".to_owned())];
-        assert_eq!(
-            outcome_for(&[], &runtime_skips),
-            StageOutcome::Skipped,
-            "runtime reported-skip + no failures must be Skipped, not Passed"
+        assert!(
+            matches!(outcome_for(&[], &runtime_skips), StageOutcome::Skipped(_)),
+            "runtime reported-skip + no failures must be Skipped, not Passed; got {:?}",
+            outcome_for(&[], &runtime_skips)
         );
     }
 
@@ -475,9 +488,13 @@ mod tests {
         // the bytes are not observable on a subsequent read), so a
         // read-back assertion would be testing the sandbox, not the stage.
         let mut ctx = empty_ctx();
-        assert_eq!(
-            AnchorValidationStage.execute(&mut ctx),
-            StageOutcome::Skipped
+        assert!(
+            matches!(
+                AnchorValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "expected a skip; got {:?}",
+            AnchorValidationStage.execute(&mut ctx)
         );
     }
 }

@@ -33,7 +33,9 @@ impl OrchestrationStage for AdminIssueStage {
             .collect();
 
         if admin_aliases.is_empty() {
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "no node in this topology is assigned the admin role".to_owned(),
+            );
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -88,6 +90,9 @@ mod tests {
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
         };
-        assert_eq!(AdminIssueStage.execute(&mut ctx), StageOutcome::Skipped);
+        assert!(matches!(
+            AdminIssueStage.execute(&mut ctx),
+            StageOutcome::Skipped(_)
+        ));
     }
 }

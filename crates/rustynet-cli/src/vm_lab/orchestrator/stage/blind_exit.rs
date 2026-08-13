@@ -37,7 +37,9 @@ impl OrchestrationStage for BlindExitStage {
             .collect();
 
         if blind_exit_aliases.is_empty() {
-            return StageOutcome::Skipped;
+            return StageOutcome::Skipped(
+                "no node in this topology is assigned the blind exit role".to_owned(),
+            );
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -84,7 +86,10 @@ impl OrchestrationStage for BlindExitStage {
         if !failures.is_empty() {
             StageOutcome::Failed(failures.join("; "))
         } else if !reported_skips.is_empty() {
-            StageOutcome::Skipped
+            StageOutcome::Skipped(format!(
+                "no node executed this validation; {} node(s) reported a runtime skip",
+                reported_skips.len()
+            ))
         } else {
             StageOutcome::Passed
         }
@@ -114,6 +119,9 @@ mod tests {
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
         };
-        assert_eq!(BlindExitStage.execute(&mut ctx), StageOutcome::Skipped);
+        assert!(matches!(
+            BlindExitStage.execute(&mut ctx),
+            StageOutcome::Skipped(_)
+        ));
     }
 }

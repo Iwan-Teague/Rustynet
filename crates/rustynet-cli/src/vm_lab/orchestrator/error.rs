@@ -211,7 +211,22 @@ impl std::error::Error for StageError {}
 pub enum StageOutcome {
     Passed,
     Failed(String),
-    Skipped,
+    /// Not executed, with the reason WHY — which is the whole point of the
+    /// payload.
+    ///
+    /// `Failed` has always explained itself and `Skipped` never did, so a run
+    /// reporting 33 skips gave no way to tell "no node was assigned this role"
+    /// (fix: elect a role) from "its platform is absent" (fix: add a guest)
+    /// from "a dependency never passed" (fix: upstream, and the skip is a
+    /// cascade) from "unsupported on this backend" (not fixable) from
+    /// "the operator excluded it". Those have completely different remedies and
+    /// three of them looked identical in the evidence.
+    ///
+    /// The payload is mandatory rather than optional precisely so an
+    /// unexplained skip cannot be written: an `Option` would be `None` the first
+    /// time someone was in a hurry, which is how the field arrived empty on
+    /// 33 of 33 stages.
+    Skipped(String),
     /// Deliberately not executed in this invocation. Unlike `Skipped`, this is
     /// an operator-selected focused-run omission and blocks dependencies.
     NotRun,
@@ -232,7 +247,7 @@ impl StageOutcome {
             self,
             StageOutcome::Passed
                 | StageOutcome::Failed(_)
-                | StageOutcome::Skipped
+                | StageOutcome::Skipped(..)
                 | StageOutcome::NotRun
                 | StageOutcome::Reused { .. }
         )
