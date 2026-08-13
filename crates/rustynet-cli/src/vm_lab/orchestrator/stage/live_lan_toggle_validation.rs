@@ -101,11 +101,20 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
         .arg("--log-path")
         .arg(&log_path);
 
-        match cmd.status() {
-            Ok(status) if status.success() => StageOutcome::Passed,
-            Ok(status) => {
-                StageOutcome::Failed(format!("live_linux_lan_toggle_test exited with {status}"))
-            }
+        // `.output()` not `.status()`: `.status()` discards the binary's
+        // stdout/stderr, so a failure could only ever report an exit code. That
+        // is what produced "exited with exit status: 1" beside a 0-byte log, with
+        // the actual reason unrecoverable from the run's own evidence.
+        match cmd.output() {
+            Ok(output) if output.status.success() => StageOutcome::Passed,
+            Ok(output) => StageOutcome::Failed(
+                crate::vm_lab::orchestrator::stage::format_stage_binary_failure(
+                    "live_linux_lan_toggle_test",
+                    output.status,
+                    &output.stdout,
+                    &output.stderr,
+                ),
+            ),
             Err(e) => {
                 StageOutcome::Failed(format!("failed to run live_linux_lan_toggle_test: {e}"))
             }
