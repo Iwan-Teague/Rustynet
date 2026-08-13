@@ -2195,11 +2195,39 @@ seconds across 11 attempts, so this is durable, not a startup race.
 `per_hop_ttl_decrement=-1` is likewise not "no forwarding observed" — it is arithmetic on a probe
 that received no reply at all.
 
-**Next step:** determine why the final exit's mesh address is unreachable from the client while
-the entry's is not. Specifically, whether the client's WireGuard peer set routes the exit's mesh
-IP via the entry at all, or whether the topology is wired with a direct client→exit peer that is
-itself down — the second client's status showed a direct
-`managed_peer_endpoints=debian-headless-2-bootstrap/192.168.64.4:51820`, which is worth
-reconciling against what a two-hop path is supposed to look like. Capture the client's peer set
-and AllowedIPs live, since `final_cleanup` is `always_run` and erases it.
+**ROOT CAUSE (confirmed live):** the final exit has **no return route to the client's mesh
+address**, so replies leak out the physical LAN interface and die.
+
+Captured on the exit during the stage:
+
+```
+node_role=admin  serving_exit_node=true  path_programmed_peer_count=2
+managed_peer_endpoints=fedora-utm-1-bootstrap/192.168.64.103:51820+rocky-utm-1-bootstrap/192.168.64.105:51820
+
+ip route get 100.124.191.164        # the client's mesh address
+  → via 192.168.64.1 dev enp0s1     # the LAN gateway, NOT rustynet0
+```
+
+Nothing in the exit's peer set claims `100.124.191.164`. Its peers are the entry
+(`fedora-utm-1`) and the second client (`rocky-utm-1`); the two-hop client
+(`debian-headless-4`) appears nowhere, so no `AllowedIPs` entry installs a tunnel route for it.
+Return traffic therefore matches the default route and egresses `enp0s1` toward the LAN gateway,
+where `100.64.0.0/10` is unroutable and is dropped.
+
+That accounts for every observation without contradiction: the client's route to both mesh
+addresses is identical (`dev rustynet0 table 51820`), the entry genuinely forwards
+(27 packets / 2052 bytes on the hairpin rule), the entry's own mesh address answers with TTL 64,
+and only the exit's address never replies. The request path works; the reply path does not exist.
+
+**Note on instrumentation:** `wg show` cannot inspect this — the lab runs the userspace backend
+(`transport_socket_identity_label=wireguard-linux-userspace-shared-authoritative-transport`), so
+the kernel tool reports `Unable to access interface: Operation not supported`. Use
+`rustynet status` (`managed_peer_endpoints`) and `ip route get`, which is what produced the
+capture above.
+
+**What the fix must decide:** whether a two-hop topology is supposed to give the exit a peer
+entry (or an entry-side `AllowedIPs` covering the client subnet) so replies route back through
+the entry — and if so, which component owns emitting it: `distribute_assignments`' ALLOW_SPEC,
+the traversal bundle, or the two-hop stage's own re-issue step. This is a topology/authority
+question, not a firewall one, and it should be answered before any code changes.
 
