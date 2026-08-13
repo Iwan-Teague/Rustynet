@@ -2066,3 +2066,46 @@ become permanently unsatisfiable suggestions until a validator exists.
 - `LinuxVmHostPlan_2026-07-14.md` — the remote-host lab work that surfaced QH-10.
 - `CLAUDE.md` / `AGENTS.md` §3, §4, §7, §10.2, §10.4, §10.6 — the constraints
   these items enforce.
+
+### QH-44 — four of five lab guests silently lost their SSH `authorized_keys`
+
+**Status: OPEN, diagnosed only as far as ruling causes out.**
+
+Across one session (2026-08-13) four of the five reachable UTM guests failed the
+orchestrator's readiness gate with the identical signature — TCP/22 open, publickey
+rejected:
+
+```
+<alias> ready process_present=true live_ip=<ip> ssh_port_status=open ssh_auth_status=failed-exit-255
+```
+
+`macos-utm-1`, `fedora-utm-1`, `rocky-utm-1` and `ubuntu-utm-1` each needed the key
+re-primed from the untracked secrets sidecar before any run could start. Only
+`debian-headless-2` / `-4` were unaffected. Each recovery cost a failed run plus a
+guest restart, so this is the single largest source of wasted lab wall-clock in that
+session.
+
+**Ruled out so far:**
+
+- **Not the orchestrator's teardown.** `cleanup_runtime_state` removes only
+  `/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet*`
+  (`adapter/linux_install.rs:358`); nothing under it touches `~/.ssh`. A repo-wide
+  grep for `authorized_keys` in lab code finds only the Windows access-bootstrap
+  helper and cloud-init seed templates.
+- **Not cloud-init re-seeding.** `ubuntu-utm-1` reports `cloud-init` as `not-found`
+  with no unit installed, yet it had still lost its key.
+
+**Not yet established:** whether the guests are being restored from a snapshot, were
+provisioned before the current key existed, or something else removes the file. The
+readiness gate reports the symptom correctly and fails closed, which is right — the
+gap is that nothing records WHEN the key disappeared, so the window cannot be
+correlated with a run.
+
+**Why it matters beyond convenience:** the readiness gate's restart-and-retry cannot
+fix an auth failure, so the run aborts after a full VM restart cycle. A guest that
+loses its key is effectively out of the fleet until a human primes it, which silently
+shrinks every topology and is indistinguishable, in the run matrix, from a guest that
+was never selected.
+
+**Suggested first step:** record `~/.ssh/authorized_keys` mtime and a hash in the
+discovery summary, so the next occurrence carries a timestamp to correlate against.
