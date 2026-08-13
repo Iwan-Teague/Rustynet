@@ -2155,6 +2155,34 @@ and a local-only redirect target).
 the `entry` role's rule path that trips this, which is why it stayed hidden until a five-node
 topology could elect one.
 
+### QH-47 — NAT rules are applied without ever flushing conntrack
+
+**Severity: medium.** Not lab-only; it affects any node that gains or changes an exit/relay role
+while traffic is already flowing.
+
+`nftables` nat chains are traversed only for the first packet of a flow. Once conntrack confirms a
+flow, its NAT binding (or absence of one) is fixed, and later packets never re-enter the nat hook.
+The dataplane recreates its nat table per generation — the table name carries a generation suffix,
+e.g. `rustynet_nat_g2` — and deletes the previous one, but **nothing flushes conntrack anywhere in
+the daemon**. Searching `crates/rustynetd/src/` for `conntrack` returns three matches, all of them
+`ct state established,related accept` rules; none is a flush.
+
+Consequence: a flow established before a masquerade rule is installed is never masqueraded, for as
+long as conntrack keeps the entry alive. Because an entry is refreshed by each packet, a steady
+traffic stream keeps a stale, un-NATed binding alive indefinitely rather than ageing it out.
+
+This also changes how the rule counters must be read when diagnosing. The forward chain is ordered
+`ct state established,related accept` first, so both the hairpin forward counter and the nat chain
+observe only NEW-state packets. A non-zero forward counter alongside a zero nat counter is therefore
+consistent with the nat table having been created after those packets flowed, and is not by itself
+evidence that the nat rule is malformed.
+
+**Fix direction (not yet implemented):** flush the affected conntrack entries after a NAT change, at
+minimum those for the tunnel subnet. Any such flush must go through the privileged-helper allowlist
+as an argv-only invocation with validated arguments (§4); it must not be built by string
+construction, and it is not a weakening of the allowlist to add a narrowly shaped entry for it.
+Whether this is QH-46's cause is a separate question, tracked there.
+
 ### QH-46 — two-hop proof: the client reaches the entry but never the final exit
 
 **Status: OPEN, root shape measured. REVISED — the first filing's hypothesis was refuted by
