@@ -39,7 +39,9 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
             || ssh_params_for_second_client(ctx).is_err()
         {
             return StageOutcome::Skipped(
-                "the topology lacks the second client the two-hop path requires".to_owned(),
+                "no node in this topology carries the `extra` or `aux` role that the two-hop \
+                 path uses as its second client"
+                    .to_owned(),
             );
         }
         let exit_params = match ssh_params_for_role(ctx, "exit") {
