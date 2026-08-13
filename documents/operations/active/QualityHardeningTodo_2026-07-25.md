@@ -2352,6 +2352,18 @@ exit's mesh IP, the exit receives it carrying the client's source address, no pe
 address, and the reply leaves by the LAN default route. The design is coherent and the masquerade is
 load-bearing. What remains unexplained is only why its counter is zero.
 
+**THE TWO COUNTERS ARE NOT COMPARABLE — this probably dissolves the anomaly.** The forward rule is in
+table `inet rustynet_g2`. The `inet` family matches IPv4 *and* IPv6, and that rule carries no
+address-family qualifier, so it counts both. The masquerade is in `ip rustynet_nat_g2`, which is
+IPv4-only. IPv6 traffic therefore increments the forward counter and can never reach the nat table,
+by design and with nothing wrong.
+
+The measured size fits that reading: 40 bytes of IPv6 header + 8 of UDP + 30 of payload = 78, which
+is exactly the per-packet figure. So the 36 packets are plausibly IPv6 gossip transiting the entry,
+and `forward 36 / nat 0` is not evidence of a defect at all. Any future comparison of these two
+counters must first establish that both are observing the same address family; otherwise it compares
+a v4+v6 counter against a v4-only one and manufactures a contradiction.
+
 **The decisive test** is a TIME SERIES, not a single sample: poll the entry's filter and nat hairpin
 counters together every 10s for the whole stage, so the probe window is captured wherever it falls.
 A filter delta with no matching nat delta means the SNAT chain is not being traversed (candidate 1,
