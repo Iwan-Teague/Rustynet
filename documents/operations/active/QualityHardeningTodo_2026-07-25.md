@@ -2109,3 +2109,48 @@ was never selected.
 
 **Suggested first step:** record `~/.ssh/authorized_keys` mtime and a hash in the
 discovery summary, so the next occurrence carries a timestamp to correlate against.
+
+### QH-45 — the `entry` role emits an nft rule the privileged helper's allowlist rejects
+
+**Status: OPEN, fully diagnosed. The fix is SECURITY-SENSITIVE and must not be a quick widen.**
+
+First seen in `enroll-diag-20260813r`, the first run in which `live_two_hop_validation` ever
+executed (it needs an `entry` node, which no prior topology elected).
+
+Chain, measured end to end:
+
+```
+live_two_hop_validation fail
+  → root command failed for fedora@192.168.64.103:22 with status 65 (EX_DATAERR)
+  → last step reached: "[two-hop] advertising default route on final exit and entry relay"
+  → fedora rustynetd: restrict_recoverable: reconcile dataplane apply failed:
+      firewall apply failed: i/o failed: unsupported nft add rule argument schema
+  → systemctl is-active rustynetd → inactive
+```
+
+**The helper is behaving correctly.** `privileged_helper.rs:1954` is an explicit allowlist: every
+`nft add rule` argv is matched against known-good schemas and anything unmatched is refused. That
+is the §4 privileged-boundary control (argv-only exec, strict input validation) working as
+designed. The daemon then fails closed and stops, which is also correct.
+
+The defect is that the `entry` role's dataplane emits a rule shape the allowlist does not carry.
+
+**Why the obvious fix is wrong.** Widening the allowlist to accept whatever `entry` emits would
+relax a privileged-boundary control to make a test pass — the definition of a happy-pass edit on
+the most security-sensitive surface in the daemon. The allowlist entries are deliberately
+narrow (the DNS-redirect arm, for example, pins a fixed daddr, a fixed dport, matching l4proto
+and a local-only redirect target).
+
+**What the fix must establish first, in this order:**
+
+1. **Which exact argv is rejected.** Not yet captured — the helper logs the refusal but the run
+   evidence does not carry the offending argument vector. Capturing it is step one, and is itself
+   an evidence gap worth closing.
+2. **Whether that rule is legitimate for `entry` at all.** An entry/relay hop forwarding for
+   peers may need a shape no other role needs — or may be emitting something it should not.
+3. **Only then**, if legitimate, a new allowlist arm as narrowly bounded as its siblings, with
+   the same style of pinned literals, plus a negative test proving a near-miss is still refused.
+
+**Not reproducible without an `entry` node.** Fedora has passed as `relay` in prior runs; it is
+the `entry` role's rule path that trips this, which is why it stayed hidden until a five-node
+topology could elect one.
