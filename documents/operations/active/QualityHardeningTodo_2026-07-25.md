@@ -2155,43 +2155,51 @@ and a local-only redirect target).
 the `entry` role's rule path that trips this, which is why it stayed hidden until a five-node
 topology could elect one.
 
-### QH-46 — two-hop dataplane proof fails with every node healthy
+### QH-46 — two-hop proof: the client reaches the entry but never the final exit
 
-**Status: OPEN, first time the stage has ever reached its own verdict.**
+**Status: OPEN, root shape measured. REVISED — the first filing's hypothesis was refuted by
+its own follow-up measurement, and is corrected here rather than left standing.**
 
-`qh45-final-20260813u` is the first run in which `live_two_hop_validation` executed to
-completion. It reports:
+`live_two_hop_validation` reached its own verdict for the first time in
+`qh45-final-20260813u`, after three blockers were cleared in sequence: the vmnet split
+(topology), the missing `entry` role, and the nft allowlist refusals (QH-45). It fails:
 
 ```
-[two-hop] data-plane proof summary
 end_to_end_reachable=false  per_hop_ttl_decrement=none  per_hop_ttl_decrement_ok=false
 ```
 
-**Everything upstream is healthy**, which is what makes this interesting rather than routine.
-From the stage's own captured status on the exit node:
+**The structured report isolates it precisely** (`live_two_hop_report.json`):
 
-- `path_live_proven=true`, `path_programmed_direct_peers=2`, `path_live_direct_peers=2`
-- `traversal_authority=enforced_v1`, `traversal_probe_result=direct`, `traversal_alarm_state=ok`
-- `dns_zone_state=valid`, `dns_alarm_state=ok`
-- `gossip_state=active`, `gossip_identity_mismatch=false`
-- entry (`fedora-utm-1`) holds both hops as managed peers:
-  `debian-headless-2-bootstrap/192.168.64.4:51820+debian-headless-4-bootstrap/192.168.64.10:51820`
+```
+baseline_entry_mesh_ipv4:     100.123.159.114   baseline_reply_ttl: 64    <- entry REACHABLE
+two_hop_final_exit_mesh_ipv4: 100.80.169.183    two_hop_reply_ttl: -1     <- exit NOT reachable
+end_to_end_probe_target: 1.1.1.1                end_to_end_reachable: false
+path_readiness: 11 attempts over 96s, never became reachable
+```
 
-So control plane, traversal, DNS and gossip are all green on every node, and the failure is
-specifically that traffic does not traverse client → entry → exit.
+So the shape is **client → entry works; entry → final exit does not**. The stage waited 96
+seconds across 11 attempts, so this is durable, not a startup race.
 
-**Not a regression.** This stage has never passed: the ledger's lifetime record for
-`linux_stage_two_hop` carries zero passes attributable to a real two-hop proof (see QH-07 for why
-the column's apparent passes are contaminated by a since-removed alias). It reached its verdict
-for the first time only after three blockers were cleared in sequence — the vmnet split (topology),
-the entry-role election (QH-45's precondition), and the nft allowlist refusals (QH-45).
+### Two hypotheses this entry previously carried, both refuted by measurement
 
-**What the evidence already rules out:** node health, traversal authority, DNS, gossip identity,
-and the dataplane apply path. `per_hop_ttl_decrement=none` is the sharpest clue — no TTL
-decrement was observed at all, which suggests packets are not being forwarded by the entry hop
-rather than being forwarded and dropped later.
+1. **"Packets are not being forwarded by the entry."** False. Sampled live on the entry during
+   the stage, the hairpin rule shows real traffic:
+   `iifname "rustynet0" oifname "rustynet0" counter packets 27 bytes 2052 accept`, with
+   `ip_forward=1`. Traffic transits the entry; it just never reaches the final exit. (That
+   counter is readable only because QH-45 allowlisted the `counter` token — the fix that made
+   the stage runnable also made it diagnosable.)
+2. **"`ip_forward=0` at stage start is a race."** False. The stage enables forwarding itself via
+   its `advertising default route on final exit and entry relay` step; samples that straddle
+   that step see the transition, which is normal sequencing.
 
-**First step:** determine whether the entry node forwards at all — `ip_forward` state, the
-`forward` chain's counters (now that `counter` is permitted on that rule, the packet count is
-readable), and whether the client's route actually selects the entry as next hop rather than
-reaching the exit directly.
+`per_hop_ttl_decrement=-1` is likewise not "no forwarding observed" — it is arithmetic on a probe
+that received no reply at all.
+
+**Next step:** determine why the final exit's mesh address is unreachable from the client while
+the entry's is not. Specifically, whether the client's WireGuard peer set routes the exit's mesh
+IP via the entry at all, or whether the topology is wired with a direct client→exit peer that is
+itself down — the second client's status showed a direct
+`managed_peer_endpoints=debian-headless-2-bootstrap/192.168.64.4:51820`, which is worth
+reconciling against what a two-hop path is supposed to look like. Capture the client's peer set
+and AllowedIPs live, since `final_cleanup` is `always_run` and erases it.
+
