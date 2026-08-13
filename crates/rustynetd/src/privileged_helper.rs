@@ -1731,6 +1731,37 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
+        // As above, with a `counter` statement. The entry/relay hop emits this
+        // shape (`iifname rustynet0 oifname rustynet0 counter accept`) so a
+        // two-hop path can be observed; without this arm the helper refused it,
+        // the daemon failed closed, and live_two_hop_validation could not run
+        // (QH-45).
+        //
+        // This grants NO additional authority, which is why it is a separate,
+        // equally-narrow arm rather than a loosening of the one above. `counter`
+        // is a pure nftables statement: it increments packet/byte counters and
+        // affects neither the match nor the verdict. The semantically identical
+        // rule WITHOUT `counter` is already permitted directly above, under the
+        // same three constraints — owned fail-closed table, and both interface
+        // names well-formed — all of which are re-applied here unchanged.
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "forward",
+            "iifname",
+            incoming_interface,
+            "oifname",
+            outgoing_interface,
+            "counter",
+            "accept",
+        ] if is_owned_failclosed_table_token(table)
+            && is_interface_name(incoming_interface)
+            && is_interface_name(outgoing_interface) =>
+        {
+            Ok(())
+        }
         // blind_exit mesh-scoped final-hop allow: forward from the tunnel to
         // the egress interface ONLY when the source address is inside the
         // bounded mesh CIDR (`ip`/`ip6 saddr <cidr>`). The daemon
@@ -3488,6 +3519,111 @@ mod tests {
     /// diagnosable only by reading daemon source and guessing (QH-45). But `wg`
     /// argv can carry a private key, so the same disclosure there would be a
     /// secrets leak out of the most sensitive surface in the daemon. The
+    /// The entry/relay hairpin forward rule is accepted, and near-misses are not.
+    ///
+    /// The accepted shape is the exact argv the helper refused in QH-45, which
+    /// stopped fedora's daemon and made live_two_hop_validation unrunnable. It
+    /// grants no authority the sibling arm did not already grant — `counter` is a
+    /// pure statement affecting neither match nor verdict — so the negative cases
+    /// below are what prove the arm is narrow rather than a loosening: an
+    /// unowned table, a malformed interface name, and `counter` without a verdict
+    /// must all still be refused.
+    #[test]
+    fn forward_counter_accept_is_allowed_only_in_its_exact_narrow_shape() {
+        validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g2",
+                "forward",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "rustynet0",
+                "counter",
+                "accept",
+            ],
+        )
+        .expect("the entry/relay hairpin forward rule must be accepted");
+
+        let unowned = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "not_ours",
+                "forward",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "rustynet0",
+                "counter",
+                "accept",
+            ],
+        )
+        .expect_err("a table we do not own must still be refused");
+        assert!(unowned.contains("unsupported nft add rule argument schema"));
+
+        let bad_iface = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g2",
+                "forward",
+                "iifname",
+                "rustynet0; rm -rf /",
+                "oifname",
+                "rustynet0",
+                "counter",
+                "accept",
+            ],
+        )
+        .expect_err("a malformed interface name must still be refused");
+        assert!(bad_iface.contains("unsupported nft add rule argument schema"));
+
+        let no_verdict = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g2",
+                "forward",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "rustynet0",
+                "counter",
+            ],
+        )
+        .expect_err("counter without a verdict must still be refused");
+        assert!(no_verdict.contains("unsupported nft add rule argument schema"));
+
+        let drop_swapped = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g2",
+                "forward",
+                "iifname",
+                "rustynet0",
+                "oifname",
+                "rustynet0",
+                "counter",
+                "masquerade",
+            ],
+        )
+        .expect_err("a different verdict must not ride in on this arm");
+        assert!(drop_swapped.contains("unsupported nft add rule argument schema"));
+    }
+
     /// asymmetry is deliberate and this test is what keeps it.
     #[test]
     fn nft_refusal_names_the_argv_and_wg_refusal_never_does() {
