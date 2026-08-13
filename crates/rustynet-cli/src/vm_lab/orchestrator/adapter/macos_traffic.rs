@@ -20,8 +20,32 @@ const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 /// and plist paths because `launchctl bootout` behavior differs depending on
 /// whether the job was bootstrapped by label or file path. Then TERM/KILL as a
 /// backstop and wait on the real processes, not launchd state.
+///
+/// `launchctl disable` on the daemon label is load-bearing and is NOT redundant
+/// with the `bootout` above it. `bootout` unloads the job now; it does nothing
+/// about later boots. Teardown deliberately deletes the signed trust artifacts
+/// (see [`cleanup_runtime_state`]) while leaving the plist installed, and that
+/// plist carries `RunAtLoad` and `KeepAlive`. So without a persistent disable,
+/// the next boot of a torn-down guest starts a daemon whose `--trust-evidence`
+/// path was purged: it fails closed with `EX_DATAERR`, `KeepAlive` respawns it,
+/// and the node crash-loops until someone re-provisions. That was measured on
+/// macos-utm-1 at 81 spawns, with `launchctl print-disabled` reporting the label
+/// still `enabled` and the trust file gone.
+///
+/// This is the macOS analogue of the Linux path's
+/// `systemctl disable --now "$unit"`, which clears the boot-time symlink and is
+/// why no Linux guest has ever shown this failure.
+///
+/// Only the daemon label is disabled, deliberately: it is the ONLY label the
+/// bootstrap re-enables (`Install-RustyNetMacosService.sh` runs
+/// `launchctl enable system/com.rustynet.daemon`, idempotent by its own note).
+/// Disabling anchor/exit/relay/privileged-helper as well would strand them with
+/// nothing to turn them back on, converting this fix into a worse bug. The
+/// privileged helper also does not read trust state -- it stayed up throughout
+/// the observed crash loop -- so it has no reason to be disabled.
 const MACOS_LAUNCHD_STOP_COMMAND: &str = "sudo -n launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
      sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.daemon.plist 2>/dev/null || true; \
+     sudo -n launchctl disable system/com.rustynet.daemon 2>/dev/null || true; \
      sudo -n launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true; \
      sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.privileged-helper.plist 2>/dev/null || true; \
      sudo -n launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
@@ -779,6 +803,38 @@ mod tests {
             !cmd.contains("while read"),
             "reset must not pipe into `while read` (inner sudo drains the pipe)"
         );
+    }
+
+    /// Teardown must persistently disable the daemon, and disable NOTHING else.
+    ///
+    /// Both halves are failure modes that have bitten. Too little: `bootout`
+    /// alone leaves `RunAtLoad`/`KeepAlive` armed against trust artifacts this
+    /// same teardown deletes, so the guest crash-loops on `EX_DATAERR` at its
+    /// next boot -- measured at 81 spawns on macos-utm-1. Too much: only
+    /// `system/com.rustynet.daemon` is ever re-enabled (by
+    /// `Install-RustyNetMacosService.sh`), so disabling any other label strands
+    /// it permanently with nothing to turn it back on.
+    #[test]
+    fn macos_teardown_disables_the_daemon_and_only_the_daemon() {
+        let cmd = MACOS_LAUNCHD_STOP_COMMAND;
+        assert!(
+            cmd.contains("launchctl disable system/com.rustynet.daemon"),
+            "teardown deletes the trust artifacts but leaves the plist installed with \
+             RunAtLoad+KeepAlive; without a persistent disable the guest crash-loops \
+             on EX_DATAERR at next boot"
+        );
+        for label in [
+            "com.rustynet.privileged-helper",
+            "com.rustynet.anchor",
+            "com.rustynet.relay",
+            "com.rustynet.exit",
+        ] {
+            assert!(
+                !cmd.contains(&format!("launchctl disable system/{label}")),
+                "{label} is never re-enabled by the bootstrap, so disabling it here \
+                 would strand it permanently; only the daemon label may be disabled"
+            );
+        }
     }
 
     #[test]
