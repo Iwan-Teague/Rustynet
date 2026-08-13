@@ -2262,25 +2262,33 @@ it.
 **What is actually established:** the rule is installed, `serving_exit_node=true`, and the rule's
 counter is zero. That is all.
 
-**A second reading argues against even "the hairpin traffic is forwarding".** The filter counter is
-2808 bytes over 36 packets — exactly 78 bytes per packet. A default `ping` echo is 84 bytes on the
-wire. So those 36 packets are most likely NOT the probe; they look like some other tunnel-to-tunnel
-flow (gossip or keepalive) transiting the entry. If so, the probe packets may never reach the
-forward path at all, which is a different defect from "forwarded but not SNATed".
+**SAMPLING FLAW — the 78-byte inference is void.** The capture fired 60s after the stage started,
+but `path_readiness` alone runs ~96s before the probe sends its first ping. The sample therefore
+almost certainly predates any probe traffic, and the 36 packets at 78 bytes each are whatever was
+flowing at that moment (gossip). "No 84-byte packets in the counter" says nothing about whether
+pings were forwarded later. A single mid-stage sample cannot answer this question; only a
+time series across the probe window can.
 
-**Two candidate explanations remain, and they need different fixes:**
-1. The nat hook is only traversed by packets in conntrack state NEW; established flows get their
-   binding replayed without re-entering the chain. If the probe's flow was established before the
-   rule existed, the counter stays zero and the SNAT is never applied.
-2. The probe traffic never reaches the entry's forward path, and the 36 packets are unrelated
-   traffic — in which case the entry's firewall is not where the defect is.
+**Topology is confirmed correct, from the node status lines of run `qh46-snat-20260813x`:**
 
-**The decisive test** (must run mid-stage; `final_cleanup` is `always_run` and removes these tables):
-on the entry, sample the filter and nat hairpin counters in ONE command, immediately before and
-after a single deliberate client-to-exit probe, and record the deltas. A nat delta of zero against a
-filter delta of one probe's worth of packets isolates (1); no delta in either isolates (2). Counters
-from different runs are not comparable, and a byte-per-packet figure that does not match the probe
-size means the counter is measuring something else.
+| node | role | peers |
+| --- | --- | --- |
+| debian-headless-4 | client | entry only (fedora) |
+| fedora-utm-1 | entry, `serving_exit_node=true` | exit + client |
+| debian-headless-2 | final exit | entry + second client, no client peer (per ALLOW_SPEC) |
+
+So the failure mode the SNAT exists to prevent is real and correctly identified: the client pings the
+exit's mesh IP, the exit receives it carrying the client's source address, no peer claims that
+address, and the reply leaves by the LAN default route. The design is coherent and the masquerade is
+load-bearing. What remains unexplained is only why its counter is zero.
+
+**The decisive test** is a TIME SERIES, not a single sample: poll the entry's filter and nat hairpin
+counters together every 10s for the whole stage, so the probe window is captured wherever it falls.
+A filter delta with no matching nat delta means the SNAT chain is not being traversed (candidate 1,
+conntrack state). No delta in either across the entire stage means the probe never reaches the
+entry (candidate 2). It must run mid-stage because `final_cleanup` is `always_run` and removes these
+tables, and both counters must come from one sample because counters from different runs are not
+comparable.
 
 **Not yet established, and it decides the fix:** whether this is (a) a genuine backend gap — the
 SNAT needs a different expression under userspace WG, or the return route must be supplied some
