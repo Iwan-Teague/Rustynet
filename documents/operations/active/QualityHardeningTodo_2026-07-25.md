@@ -2225,36 +2225,52 @@ the kernel tool reports `Unable to access interface: Operation not supported`. U
 `rustynet status` (`managed_peer_endpoints`) and `ip route get`, which is what produced the
 capture above.
 
-**CORRECTION — the exit's missing client peer is BY DESIGN, not the bug.** The two-hop test
-states the intended mechanism in its own source
-(`bin/live_linux_two_hop_test.rs`, above the ALLOW_SPEC):
+**ROOT CAUSE (confirmed, same-sample): the hairpin SNAT the design depends on can never match
+under the userspace WireGuard backend.**
+
+The exit's missing client peer is BY DESIGN. The two-hop test states the intended mechanism above
+its own ALLOW_SPEC:
 
 > entry masquerades the hairpin (`phase10.rs:2285-2299`) — that SNAT is what gives the final exit
 > a route to the requester, since after this strip its peers carry only `entry/32` and
 > `second_client/32`.
 
-So the exit is *supposed* to see the entry as the source; the return path comes from the entry's
-hairpin **SNAT**, not from a client peer entry. My earlier framing — "decide whether the exit
-should get a peer entry" — asked a question the design had already answered, and would have led
-to changing signed-bundle topology to fix something that is not a topology defect.
+So the return path is supposed to come from the entry's SNAT. Captured on the entry, mid-stage,
+in a SINGLE sample (counters from different runs are not comparable):
 
-**Where that leaves it.** The hairpin masquerade rule is
-`add rule ip <nat table> postrouting iifname X oifname X counter masquerade` — precisely the rule
-the privileged-helper allowlist refused before QH-45's second arm. With both arms landed the NAT
-apply is clean (no `nat apply failed` and no `unsupported nft` in the run logs), yet the proof
-still reports `end_to_end_reachable=false`. So the rule installs and the traffic still does not
-complete.
+```
+serving_exit_node=true      exit_node=debian-headless-2-bootstrap
 
-**Next step, and the capture that settles it:** both the forward and NAT hairpin rules are gated
-by `allow_tunnel_relay_forward`, which derives from
-`relay_with_upstream = exit_mode == FullTunnel && serve_exit_node` (`phase10.rs:5242`). Capture
-on the ENTRY node, mid-stage: `serving_exit_node`, and the postrouting chain's counter. Two
-outcomes, two different fixes:
+FILTER  inet rustynet_g2 / forward:
+  iifname "rustynet0" oifname "rustynet0" counter packets 36 bytes 2808 accept
+NAT     ip rustynet_nat_g2 / postrouting:
+  iifname "rustynet0" oifname "rustynet0" counter packets 0 bytes 0 masquerade
+```
 
-- counter at 0 packets → the SNAT is installed but not matching, so the hairpin traffic is not
-  taking the path the rule describes;
-- rule absent → `allow_tunnel_relay_forward` is false on the entry, i.e. the entry is not being
-  told it serves an exit, which is an assignment/role question rather than a firewall one.
+Traffic forwards (36 packets) and is never SNATed (0 packets), so the exit keeps seeing the
+client's mesh source address, has no peer claiming it, and its replies leave via the LAN default
+route — which is what `two_hop_reply_ttl: -1` records.
 
-Do not change signed-bundle topology before that capture distinguishes them.
+**Why the rule cannot match here.** This lab runs the userspace backend
+(`transport_socket_identity_label=wireguard-linux-userspace-shared-authoritative-transport`).
+The decrypted hairpin packet is forwarded `rustynet0 → rustynet0` in the filter path, then read by
+the userspace process, re-encrypted, and emitted as a **locally-generated UDP datagram on the
+physical interface**. Nothing carrying `iifname rustynet0 oifname rustynet0` ever reaches the nat
+postrouting hook. The rule presumes kernel WireGuard, where the forwarded packet traverses
+postrouting on the tunnel device.
+
+This is a coherent explanation for a stage with no recorded pass: the mechanism it depends on is
+backend-conditional, and the backend in use is the one where it does not work.
+
+**Not yet established, and it decides the fix:** whether this is (a) a genuine backend gap — the
+SNAT needs a different expression under userspace WG, or the return route must be supplied some
+other way — or (b) a lab configuration issue, i.e. two-hop is only expected to pass on the kernel
+backend and the lab should elect that backend for this stage. Settle it before writing code; both
+`allow_tunnel_relay_forward` gating and the ALLOW_SPEC strip are correct as written under (a),
+and untouched under (b).
+
+**Instrumentation notes for whoever continues:** `wg show` cannot inspect a userspace interface
+(`Operation not supported`) — use `rustynet status`. `final_cleanup` is `always_run`, so all of
+the above must be captured mid-stage. Counters must be read in one sample; comparing a filter
+counter from one run against a nat counter from another proves nothing.
 
