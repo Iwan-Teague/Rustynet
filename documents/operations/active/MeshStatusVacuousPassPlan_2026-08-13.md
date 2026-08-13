@@ -1,6 +1,33 @@
 # `mesh_status_validation` passes vacuously — plan — 2026-08-13
 
-**Status: PLAN, unreviewed.** Every claim is a code citation read at `548c5d13`.
+> **REVISION 2 — C1 IS UNIMPLEMENTABLE AS WRITTEN. Found by answering this plan's own §5 Q1
+> before touching code, which is the only reason it was caught.**
+>
+> The snapshot field named `peer_ids` does not contain peers. It is a serialization alias for
+> advertised route CIDRs:
+>
+> ```rust
+> // daemon.rs:9129  (write)
+> peer_ids: self.advertised_routes.iter().cloned().collect::<Vec<_>>(),
+> // daemon.rs:9196  (load, round-trips straight back)
+> self.advertised_routes = snapshot.peer_ids.into_iter().collect::<BTreeSet<_>>();
+> // daemon.rs:3750  advertised_routes: BTreeSet<String>, populated by `advertised_routes.insert(cidr)` (:8405, :8438)
+> ```
+>
+> The whole snapshot is `timestamp_unix`, `peer_ids`(=routes), `selected_exit_node`,
+> `lan_access_enabled` (`resilience.rs:38`) — it carries **no peer identity information at all**.
+>
+> So passing `--expected-peer-id <node_id>` compares a node id against a CIDR and can never
+> match. C1 would have replaced a vacuous pass with a **permanent false failure** on every node —
+> strictly worse, and it would have been diagnosed as a real outage.
+>
+> `--max-age-seconds` is unaffected: the timestamp is real. That half of C1 stands.
+>
+> **This makes the defect deeper than "the orchestrator forgot a flag".** The check is
+> structurally incapable of validating peers, because the data it inspects is not peers. The
+> daemon's `--expected-peer-id` flag is itself latently wrong for the same reason.
+
+**Status: PLAN (REVISION 2). C1 blocked; C2 stands.** Every claim is a code citation read at `548c5d13`.
 
 ## 0. The defect
 
