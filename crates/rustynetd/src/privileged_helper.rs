@@ -1659,6 +1659,17 @@ fn validate_nft_add_chain_args(args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Rejections name the offending argv, deliberately.
+///
+/// A refusal that says only "unsupported nft add rule argument schema" tells an
+/// operator that the privileged boundary held, and nothing about WHAT was
+/// refused — which left a real defect (an `entry`-role rule shape this allowlist
+/// does not carry) diagnosable only by reading the daemon source and guessing.
+///
+/// Safe for THESE arguments specifically, and the scope is the point: `nft` rule
+/// argv carries table/chain names, addresses, ports, protocols and marks — rule
+/// SHAPE, never key material. `wg` argv can carry private keys, so its validator
+/// must NOT copy this; it is left disclosing nothing.
 fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
     match args {
         [
@@ -1951,7 +1962,10 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
-        _ => Err("unsupported nft add rule argument schema".to_owned()),
+        _ => Err(format!(
+            "unsupported nft add rule argument schema: {}",
+            args.join(" ")
+        )),
     }
 }
 
@@ -3465,6 +3479,38 @@ mod tests {
         )
         .expect_err("non-numeric port in wg listen rule must be rejected");
         assert!(err.contains("unsupported nft add rule argument schema"));
+    }
+
+    /// The nft refusal must NAME the rejected argv, and `wg` must NOT.
+    ///
+    /// Both halves are the point. Without the argv, a refusal says only that the
+    /// privileged boundary held — which left a real `entry`-role rule shape
+    /// diagnosable only by reading daemon source and guessing (QH-45). But `wg`
+    /// argv can carry a private key, so the same disclosure there would be a
+    /// secrets leak out of the most sensitive surface in the daemon. The
+    /// asymmetry is deliberate and this test is what keeps it.
+    #[test]
+    fn nft_refusal_names_the_argv_and_wg_refusal_never_does() {
+        let nft_err = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &["add", "rule", "inet", "bogus_table", "some_chain"],
+        )
+        .expect_err("an unknown nft rule shape must be refused");
+        assert!(
+            nft_err.contains("bogus_table") && nft_err.contains("some_chain"),
+            "the nft refusal must name what was rejected so it can be diagnosed; got: {nft_err}"
+        );
+
+        let secret = "SECRETKEYMATERIAL0000000000000000000000000000";
+        let wg_err = validate_request(
+            PrivilegedCommandProgram::Wg,
+            &["set", "wg0", "private-key", secret],
+        )
+        .expect_err("an unknown wg shape must be refused");
+        assert!(
+            !wg_err.contains(secret),
+            "a wg refusal must never echo its arguments; got: {wg_err}"
+        );
     }
 
     #[test]
