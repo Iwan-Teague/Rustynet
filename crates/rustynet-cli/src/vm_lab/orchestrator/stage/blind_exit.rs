@@ -38,7 +38,7 @@ impl OrchestrationStage for BlindExitStage {
 
         if blind_exit_aliases.is_empty() {
             return StageOutcome::Skipped(
-                "no node in this topology is assigned the blind exit role".to_owned(),
+                "no node in this topology is assigned the blind_exit role".to_owned(),
             );
         }
 
