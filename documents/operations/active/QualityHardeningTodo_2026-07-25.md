@@ -2314,7 +2314,52 @@ would strengthen the control beyond the defect being fixed, so it is recorded ra
 
 ### QH-51 — network-flap recovery: the handshake never returns after the block is lifted
 
-**Status: OPEN, first verdict reached.** Newly surfaced on run `qh46-firewalld-20260814c`
+**Status: OPEN — REFINED 2026-08-14. The stage is STRUCTURALLY UNPASSABLE as written, independently
+of daemon behaviour. Do not attempt another daemon-side fix until the measurement is repaired.**
+
+Run `qh51-keepalive-20260814d` reports:
+
+```
+timings.baseline_handshake_age_s = 18446744073709551615   <-- u64::MAX at BASELINE
+checks.wg_disruption_confirmed   = pass
+checks.wg_handshake_recovered    = fail
+```
+
+`u64::MAX` **before any block is applied**. The age is unreadable at every point in the stage, not
+just after the flap, so `disruption_confirmed` passes trivially (`u64::MAX >= 30`) while
+`wg_handshake_recovered` can never pass (`u64::MAX < 30` is never true). The stage cannot report
+success no matter what the daemon does.
+
+**Mechanism.** The daemon renders the field as the literal string `"none"` when there is no live
+handshake (`daemon.rs:6092`, netcheck; the same shape at `:8092` for status):
+
+```rust
+path_state.latest_live_handshake_unix
+    .map_or_else(|| "none".to_owned(), |value| value.to_string());
+```
+
+`parse_handshake_age_s_from_netcheck` (`live_linux_network_flap_test.rs:350`) parses with
+`.parse::<u64>().ok()`, so `"none"` fails to parse, the `if let Some(ts)` arm never matches, and
+control falls through to the function's trailing `u64::MAX`. That value is therefore returned for
+THREE different states — token absent, token present as `"none"`, and clock skew (`now < ts`) — which
+the stage then treats as a single enormous age.
+
+**Consequences, in the order they should be fixed:**
+
+1. **The measurement must distinguish "unreadable" from "old".** A metric that cannot be read is not
+   evidence of disruption, and mapping it to a maximal age manufactures a passing check out of
+   missing data. Until this is fixed, `wg_disruption_confirmed = pass` on this stage means nothing.
+2. **Then establish why the client reports no live handshake at BASELINE**, when
+   `live_two_hop_validation` passes on the same run and therefore proves traffic is flowing through
+   it. Either `latest_live_handshake_unix` is only populated for peers that completed a traversal
+   probe (so a bundle-programmed peer legitimately reports `none`), or the client genuinely has no
+   live-proven handshake while forwarding. Those are different defects and the fix differs.
+
+**Already landed and NOT the cause:** managed peers now carry a 25s persistent keepalive
+(`MANAGED_PEER_PERSISTENT_KEEPALIVE_SECS`). That was a real dormant-feature defect — the privileged
+helper had validated and emitted the argument since FIS-0015 while the only `Some(..)` in the
+repository was a helper unit test — and it is correct on its own merits. It did not change this
+stage's verdict, and given the measurement defect above it COULD not have. Newly surfaced on run `qh46-firewalld-20260814c`
 (35 passed / 1 failed / 23 skipped) — this stage had been cascade-blocked behind
 `live_two_hop_validation` and had never run to its own verdict before [[QH-46]] was fixed.
 
