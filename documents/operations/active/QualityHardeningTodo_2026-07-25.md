@@ -2314,7 +2314,36 @@ would strengthen the control beyond the defect being fixed, so it is recorded ra
 
 ### QH-51 — network-flap recovery: the handshake never returns after the block is lifted
 
-**Status: OPEN — 3 of 4 checks pass. The roaming hypothesis was TESTED and REFUTED (2026-08-14).**
+**Status: OPEN — 3 of 4 checks pass. TWO hypotheses now tested and REFUTED (2026-08-14).**
+
+Refuted #1 — roaming churn destroying the record (run `qh51-roam-20260814h`).
+Refuted #2 — the keepalive never reaching the tunnel (run `qh51-keepalive-applied-20260814i`):
+`baseline=72 ok=true`, `disruption_confirmed=true`, `recovery_arrived=FALSE`.
+
+Both fixes are correct independently and stay. Both predicted recovery. Neither produced it.
+
+**STOP FIXING AND MEASURE.** Two consecutive falsified predictions mean the remaining cause is not
+where code reading suggests, and a third guess is not worth its risk. The next step is a capture, not
+a patch.
+
+**The specific thing to suspect first, and why it was missed.** The stage reads
+`traversal_probe_latest_handshake_unix`, which is populated from `traversal_probe_statuses` — the
+TRAVERSAL PROBE's record, NOT the backend's handshake telemetry directly. So the metric only refreshes
+when a probe actually runs. If probing is suppressed after the flap, handshakes could be resuming
+perfectly well and this field would still never update. The journal shows the flap breaker driven to
+`open` at intensity 0.97 for this peer on every affected run. `daemon.rs:6885` was checked and gates
+only the QUALITY re-race — but `traversal_probe_due` was NOT checked, and it is the function that
+decides whether a probe runs at all.
+
+**The capture that settles it** (run mid-stage; `final_cleanup` is `always_run`): on the client,
+every 5s across the recovery poll, record `traversal_probe_result`, `traversal_probe_attempts`,
+`traversal_probe_next_reprobe_unix`, and `traversal_probe_latest_handshake_unix` together in ONE
+sample. Rising `attempts` with a stale timestamp means probes run but record nothing. Static
+`attempts` with `next_reprobe_unix` in the past means probing is suppressed — look at
+`traversal_probe_due` and the breaker. Do not compare values across runs, and do not read the
+pass/fail from a ledger column.
+
+**Do NOT widen the recovery assertion.** It is the only check proving the tunnel comes back.
 
 I predicted the endpoint-rebuild churn was destroying the handshake record faster than it could be
 written, and that fixing it would produce recovery. Run `qh51-roam-20260814h`, with that fix live:
