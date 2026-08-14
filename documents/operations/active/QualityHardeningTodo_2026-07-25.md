@@ -2328,6 +2328,35 @@ That flip from `pass` to `fail` on identical tunnel behaviour is the proof the r
 check no longer manufactures confirmation out of an unreadable metric. The stage still fails, but it
 now fails for a true reason instead of passing for a false one.
 
+**Daemon-side cause ISOLATED to the userspace backend's handshake telemetry (2026-08-14).** The call
+chain, traced end to end:
+
+```
+netcheck path_latest_live_handshake_unix / traversal_probe_latest_handshake_unix
+  <- daemon.rs:7344-7370   from self.traversal_probe_statuses[peer].latest_handshake_unix
+  <- phase10.rs:111        controller.backend.peer_latest_handshake_unix(node_id)
+  <- backend-userspace/lib.rs:160          delegates to LinuxUserspaceSharedBackend
+  <- userspace_shared/mod.rs:496           control.peer_latest_handshake_unix(node_id)
+  <- userspace_shared/runtime.rs:589       self.handshake_telemetry.latest_handshake(node_id)
+```
+
+Note the KERNEL backend reads this with `wg show <iface> latest-handshakes`
+(`linux_command.rs:379-397`), which cannot inspect a userspace interface — so the userspace path
+deliberately does NOT use it and keeps its own `HandshakeTelemetry` instead. That telemetry is
+recorded at three sites in `runtime.rs` (`:656` on initiate, `:841`, and `:874` inside
+`process_inbound_ciphertext`), so both directions are covered in principle, and each records only
+when the engine returns `Some(observed_handshake)`.
+
+**So the open question is narrow and specific:** why does `HandshakeTelemetry` hold nothing for the
+client's peer on a run where `live_two_hop_validation` passes and therefore proves encrypted traffic
+is flowing through that client. Either the engine returns `None` for the handshake shapes this peer
+actually performs, or the telemetry is cleared (`clear_peer`, `:564`/`:616`) by something in the
+reconcile path. Both are testable against the existing unit tests in that module without a lab run.
+
+**Deliberately NOT attempted here.** This is the crypto/dataplane path, and a speculative change to
+handshake accounting is exactly the shape of edit this project treats as release-blocking when it
+goes wrong. It needs its own implementation pass with the module's own tests, not a tail-end patch.
+
 **What the repaired instrument reveals — the real, remaining defect.** The client reports
 `path_live_peer_count=0` and NO readable handshake timestamp, at baseline, on a run where
 `live_two_hop_validation` passes and therefore proves traffic is flowing. So the daemon never records
