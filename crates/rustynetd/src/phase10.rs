@@ -869,6 +869,53 @@ impl LinuxCommandSystem {
         )))
     }
 
+    /// Make a foreign host firewall stop destroying traffic this daemon has
+    /// already authorised (QH-46).
+    ///
+    /// Our forward chain runs at `hook forward priority 0`, but a base chain's
+    /// `accept` only means "continue to the next base chain at this hook".
+    /// firewalld installs its own chain at `filter + 10`, ending in
+    /// `reject with icmpx admin-prohibited`, and the tunnel device — created at
+    /// runtime by this daemon, not by NetworkManager — is bound to no zone, so
+    /// forwarded tunnel traffic falls through to that reject and dies BETWEEN
+    /// the FORWARD and POSTROUTING hooks. A reject is terminal, so no rule we
+    /// add later can rescue it.
+    ///
+    /// This runs only for a node that actually forwards
+    /// (`allow_tunnel_relay_forward`), and it FAILS CLOSED: if firewalld is
+    /// present, or its presence could not be determined, and the interface is
+    /// not confirmed bound afterwards, the firewall apply fails rather than
+    /// leaving the node advertising a forwarding role whose traffic another
+    /// firewall silently discards. A host with no firewalld is a no-op.
+    fn ensure_host_firewall_admits_forwarding(&mut self) -> Result<(), SystemError> {
+        use crate::linux_firewalld_zone::{FirewalldPosture, FirewalldZoneOp, FirewalldZoneSpec};
+
+        let spec = FirewalldZoneSpec::new(FirewalldZoneOp::Bind, self.interface_name.as_str())
+            .map_err(SystemError::PrerequisiteCheckFailed)?;
+        let argv = spec.encode();
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let output = self.run_capture(
+            PrivilegedCommandProgram::LinuxFirewalldZone,
+            borrowed.as_slice(),
+        )?;
+        let posture = FirewalldPosture::parse(output.stdout.trim())
+            .map_err(|err| SystemError::FirewallApplyFailed(format!("firewalld posture: {err}")))?;
+        if !posture.forwarding_unobstructed() {
+            return Err(SystemError::FirewallApplyFailed(format!(
+                "host firewall would discard forwarded tunnel traffic: firewalld {} and interface \
+                 {} is not bound to its default zone{}",
+                posture.presence.as_str(),
+                self.interface_name,
+                posture
+                    .default_zone
+                    .as_deref()
+                    .map(|zone| format!(" ({zone})"))
+                    .unwrap_or_default()
+            )));
+        }
+        Ok(())
+    }
+
     fn run_allow_failure(&self, program: PrivilegedCommandProgram, args: &[&str]) {
         let _ = self.run_capture(program, args);
     }
@@ -2300,6 +2347,9 @@ impl DataplaneSystem for LinuxCommandSystem {
                 PrivilegedCommandProgram::Nft,
                 &["delete", "table", "inet", previous.as_str()],
             );
+        }
+        if self.allow_tunnel_relay_forward {
+            self.ensure_host_firewall_admits_forwarding()?;
         }
         Ok(())
     }
@@ -6419,6 +6469,9 @@ fn resolve_binary_path_for_program(
         )),
         PrivilegedCommandProgram::MacosPfLoad => Err(SystemError::PrerequisiteCheckFailed(
             "macos-pf-load is an in-process builtin and has no external binary".to_owned(),
+        )),
+        PrivilegedCommandProgram::LinuxFirewalldZone => Err(SystemError::PrerequisiteCheckFailed(
+            "linux-firewalld-zone is an in-process builtin and has no external binary".to_owned(),
         )),
     }
 }
