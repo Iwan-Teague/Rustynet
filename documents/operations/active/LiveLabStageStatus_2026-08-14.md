@@ -75,7 +75,32 @@ refreshes inside the 180s poll, while `tunnel_active=true` and `membership_intac
    `PeerConfig` site in the daemon and it sets `Some(25)`
 6. Handshake record being deleted — eliminated: it now survives both an unchanged reconcile and a roam
 
-**Leading remaining hypothesis (UNVERIFIED): the metric is PACED, not dead.** `traversal_probe_due`
+**HYPOTHESIS 8 (current, fits every observation): a 35s block does not invalidate the session, so
+there is no second handshake to record.**
+
+The capture on `qh51-capture2-20260814k` settled that the metric is NOT merely paced — the probe path
+runs each reconcile (`next_reprobe_unix` advances 30s per sample, and only the probe-ran path re-arms
+it at `daemon.rs:6838`; the not-due branch at `:6631` retains the old value). It writes
+`latest_handshake_unix` from the backend every pass, and the backend reports `none` throughout.
+
+The timer plumbing is complete and correct: `poll_peer_timers` ticks every 1s (`runtime.rs:827`,
+called at `:1164`), `update_peer_timers` sends what boringtun emits via `drive_outbound_result`, and
+every observed handshake IS recorded (`:850-854`). So nothing is dropping handshakes.
+
+Which leaves: **no handshake occurs at all.** WireGuard rekeys at ~120s; a 35-second block does not
+expire the session. When the block lifts, traffic resumes on the SAME session, `update_timers` emits
+keepalives rather than a handshake, `drive_outbound_result` observes nothing to record, and the
+record — cleared during the disruption — is never repopulated.
+
+If that is right, the stage's premise is wrong rather than the daemon: it induces a 35s outage and
+then demands a NEW handshake as proof of recovery, when correct WireGuard behaviour is to resume
+without one. The honest fix is then to prove recovery by DATA flowing (which is what "recovered"
+actually means), not by a handshake timestamp — and that is a stricter, more meaningful assertion,
+not a weaker one. VERIFY FIRST: confirm what cleared the record during the block (nothing in
+`configure_peer` should now, so look at `remove_peer`), and confirm no handshake occurs post-unblock
+before changing the stage.
+
+**Superseded hypothesis (REFUTED by the capture): the metric is PACED, not dead.** `traversal_probe_due`
 backs off for a handshake that was already stale at the previous evaluation — exactly the state a 35s
 block produces — and the field the stage reads only refreshes when a probe runs. If the back-off
 exceeds the 180s poll, the tunnel can genuinely recover while the metric never refreshes inside the
