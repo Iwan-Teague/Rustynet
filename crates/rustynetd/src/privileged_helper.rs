@@ -107,6 +107,15 @@ pub enum PrivilegedCommandProgram {
     /// rule text, file path, or anchor name supplied by the daemon is ever
     /// loaded — this closes the `pfctl -f` boundary (audit major #5).
     MacosPfLoad,
+    /// In-helper firewalld zone builtin (`linux_firewalld_zone`). NOT an
+    /// external binary. Binds the tunnel interface to firewalld's EFFECTIVE
+    /// DEFAULT ZONE at runtime, over the D-Bus zone API, so that firewalld's own
+    /// forward chain (which runs AFTER ours and ends in a reject) stops
+    /// destroying traffic this daemon already authorised. The zone name is not
+    /// expressible by the caller: the helper always sends the empty string and
+    /// firewalld resolves the default server-side, so `trusted` and every other
+    /// zone are unrepresentable rather than merely validated against (QH-46).
+    LinuxFirewalldZone,
 }
 
 impl PrivilegedCommandProgram {
@@ -126,6 +135,9 @@ impl PrivilegedCommandProgram {
             }
             PrivilegedCommandProgram::MacosPfLoad => {
                 crate::macos_pf_load_spec::MACOS_PF_LOAD_PROGRAM
+            }
+            PrivilegedCommandProgram::LinuxFirewalldZone => {
+                crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM
             }
         }
     }
@@ -147,6 +159,9 @@ impl PrivilegedCommandProgram {
             _ if value == crate::macos_pf_load_spec::MACOS_PF_LOAD_PROGRAM => {
                 Some(PrivilegedCommandProgram::MacosPfLoad)
             }
+            _ if value == crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM => {
+                Some(PrivilegedCommandProgram::LinuxFirewalldZone)
+            }
             _ => None,
         }
     }
@@ -157,7 +172,9 @@ impl PrivilegedCommandProgram {
     fn is_builtin(self) -> bool {
         matches!(
             self,
-            PrivilegedCommandProgram::DnsFailclosedFile | PrivilegedCommandProgram::MacosPfLoad
+            PrivilegedCommandProgram::DnsFailclosedFile
+                | PrivilegedCommandProgram::MacosPfLoad
+                | PrivilegedCommandProgram::LinuxFirewalldZone
         )
     }
 
@@ -190,9 +207,9 @@ impl PrivilegedCommandProgram {
             // candidate set fails closed if it ever reaches binary resolution.
             // (The macOS pf-load builtin internally resolves `pfctl` via the
             // Pfctl candidate set, not this one.)
-            PrivilegedCommandProgram::DnsFailclosedFile | PrivilegedCommandProgram::MacosPfLoad => {
-                &[]
-            }
+            PrivilegedCommandProgram::DnsFailclosedFile
+            | PrivilegedCommandProgram::MacosPfLoad
+            | PrivilegedCommandProgram::LinuxFirewalldZone => &[],
         }
     }
 
@@ -1007,6 +1024,8 @@ fn execute_builtin(
             })
         }
         PrivilegedCommandProgram::MacosPfLoad => execute_macos_pf_load(args),
+        #[cfg(not(windows))]
+        PrivilegedCommandProgram::LinuxFirewalldZone => execute_linux_firewalld_zone(args),
         // No other builtins exist; fail closed if one is added without a handler.
         _ => Err(format!("no in-process handler for builtin {program}")),
     }
@@ -1028,6 +1047,230 @@ fn execute_macos_pf_load(args: &[&str]) -> Result<PrivilegedCommandOutput, Strin
         stdout: String::new(),
         stderr: String::new(),
     })
+}
+
+/// Run the `linux-firewalld-zone` builtin (QH-46).
+///
+/// # Why D-Bus and not `firewall-cmd`
+///
+/// `firewall-cmd --add-interface` routes through a path that writes
+/// `connection.zone` into `/etc/NetworkManager/system-connections/*.nmconnection`
+/// — a third daemon's on-disk configuration, which then outlives this daemon's
+/// uninstall and role demotion. The D-Bus `addInterface` method has no such
+/// branch. Going through the bus removes that persistence hazard by mechanism
+/// rather than mitigating it afterwards, and keeps a python CLI out of a
+/// privileged exec path.
+///
+/// # What crosses the boundary
+///
+/// Every token in every argv below is a helper-owned constant except the
+/// interface name, which `validate_request` already constrained to a plausible
+/// device name that is not the loopback, and which is re-checked here against
+/// sysfs so that only a VIRTUAL device (a tunnel, not a physical NIC) can be
+/// bound. The zone is always the empty string, which firewalld resolves to the
+/// effective default zone server-side, so no zone name is expressible at all.
+#[cfg(not(windows))]
+fn execute_linux_firewalld_zone(args: &[&str]) -> Result<PrivilegedCommandOutput, String> {
+    use crate::linux_firewalld_zone::{
+        FirewalldPosture, FirewalldPresence, FirewalldZoneOp, FirewalldZoneSpec,
+    };
+
+    let spec = FirewalldZoneSpec::decode(args)?;
+    let busctl = resolve_busctl_binary()?;
+
+    // 1. Presence. This is backend-independent: it asks the bus who owns the
+    //    name, so it is correct whether firewalld drives nftables or iptables.
+    let owner = run_busctl(
+        &busctl,
+        &[
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameHasOwner",
+            "s",
+            "org.fedoraproject.FirewallD1",
+        ],
+    );
+    let presence = match owner {
+        Ok(out) if out.contains("true") => FirewalldPresence::Running,
+        Ok(out) if out.contains("false") => FirewalldPresence::Absent,
+        // A probe that could not be completed must NOT be reported as absence:
+        // that is precisely the fail-open this builtin exists to prevent.
+        _ => FirewalldPresence::Unknown,
+    };
+
+    if presence == FirewalldPresence::Absent {
+        // Nothing to coexist with. Report and mutate nothing.
+        let posture = FirewalldPosture {
+            presence,
+            default_zone: None,
+            interface_bound: None,
+        };
+        return Ok(PrivilegedCommandOutput {
+            status: 0,
+            stdout: posture.encode(),
+            stderr: String::new(),
+        });
+    }
+
+    let default_zone = run_busctl(
+        &busctl,
+        &[
+            "call",
+            "org.fedoraproject.FirewallD1",
+            "/org/fedoraproject/FirewallD1",
+            "org.fedoraproject.FirewallD1",
+            "getDefaultZone",
+        ],
+    )
+    .ok()
+    .and_then(|out| extract_busctl_string(out.as_str()));
+
+    if spec.op == FirewalldZoneOp::Bind {
+        // Only a virtual device may be bound. A physical NIC is already in a
+        // zone by the operator's own configuration and is none of our business.
+        require_virtual_network_device(spec.interface.as_str())?;
+        // `addInterface` is idempotent from our side: ZONE_ALREADY_SET means the
+        // desired end state already holds, which the verification below settles
+        // authoritatively either way.
+        let _ = run_busctl(
+            &busctl,
+            &[
+                "call",
+                "org.fedoraproject.FirewallD1",
+                "/org/fedoraproject/FirewallD1",
+                "org.fedoraproject.FirewallD1.zone",
+                "addInterface",
+                "ss",
+                "",
+                spec.interface.as_str(),
+            ],
+        );
+    } else if spec.op == FirewalldZoneOp::Unbind {
+        let _ = run_busctl(
+            &busctl,
+            &[
+                "call",
+                "org.fedoraproject.FirewallD1",
+                "/org/fedoraproject/FirewallD1",
+                "org.fedoraproject.FirewallD1.zone",
+                "removeInterface",
+                "ss",
+                "",
+                spec.interface.as_str(),
+            ],
+        );
+    }
+
+    // Re-read the binding rather than trusting the mutation's exit status. The
+    // question the caller actually needs answered is "is it bound NOW", and a
+    // command that succeeded but had no effect must not read as success.
+    let bound = run_busctl(
+        &busctl,
+        &[
+            "call",
+            "org.fedoraproject.FirewallD1",
+            "/org/fedoraproject/FirewallD1",
+            "org.fedoraproject.FirewallD1.zone",
+            "queryInterface",
+            "ss",
+            "",
+            spec.interface.as_str(),
+        ],
+    )
+    .ok()
+    .and_then(|out| {
+        if out.contains("true") {
+            Some(true)
+        } else if out.contains("false") {
+            Some(false)
+        } else {
+            None
+        }
+    });
+
+    let posture = FirewalldPosture {
+        presence,
+        default_zone,
+        interface_bound: bound,
+    };
+    Ok(PrivilegedCommandOutput {
+        status: 0,
+        stdout: posture.encode(),
+        stderr: String::new(),
+    })
+}
+
+/// Resolve `busctl` from a fixed private candidate list.
+///
+/// Deliberately NOT a nameable `PrivilegedCommandProgram`: the daemon must never
+/// be able to ask the helper to run `busctl` with arguments of its choosing, so
+/// the only argv that ever reaches it are the constants above.
+#[cfg(not(windows))]
+fn resolve_busctl_binary() -> Result<PathBuf, String> {
+    for candidate in ["/usr/bin/busctl", "/bin/busctl"] {
+        let path = Path::new(candidate);
+        if path.exists()
+            && let Ok(validated) = validate_privileged_program_binary(path, "busctl")
+        {
+            return Ok(validated);
+        }
+    }
+    Err("busctl not available for firewalld zone management".to_owned())
+}
+
+#[cfg(not(windows))]
+fn run_busctl(busctl: &Path, args: &[&str]) -> Result<String, String> {
+    let mut argv: Vec<&str> = vec!["--system", "--json=short"];
+    argv.extend_from_slice(args);
+    let output = std::process::Command::new(busctl)
+        .args(&argv)
+        .output()
+        .map_err(|err| format!("busctl invocation failed: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "busctl call failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Extract the first string payload from a `busctl --json=short` reply.
+#[cfg(not(windows))]
+fn extract_busctl_string(payload: &str) -> Option<String> {
+    let marker = "\"data\":[";
+    let start = payload.find(marker)? + marker.len();
+    let rest = &payload[start..];
+    let open = rest.find('"')? + 1;
+    let rest = &rest[open..];
+    let close = rest.find('"')?;
+    let value = &rest[..close];
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+/// Refuse to touch anything that is not a virtual network device.
+///
+/// A tunnel this daemon created lives under `devices/virtual/net/` in sysfs; a
+/// physical NIC does not. Binding a physical interface is never something this
+/// builtin should do, so it is refused at the boundary rather than trusted to
+/// never be requested.
+#[cfg(not(windows))]
+fn require_virtual_network_device(interface: &str) -> Result<(), String> {
+    let link = std::fs::canonicalize(format!("/sys/class/net/{interface}"))
+        .map_err(|err| format!("interface {interface:?} not present in sysfs: {err}"))?;
+    let path = link.to_string_lossy();
+    if !path.contains("devices/virtual/net/") {
+        return Err(format!(
+            "refusing firewalld zone bind for non-virtual interface {interface:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Path of the root-only spool directory the helper writes rendered `pf`
@@ -1323,7 +1566,19 @@ pub fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Res
         PrivilegedCommandProgram::Kill => validate_kill_args(args),
         PrivilegedCommandProgram::DnsFailclosedFile => validate_dns_failclosed_file_args(args),
         PrivilegedCommandProgram::MacosPfLoad => validate_macos_pf_load_args(args),
+        PrivilegedCommandProgram::LinuxFirewalldZone => validate_linux_firewalld_zone_args(args),
     }
+}
+
+/// Validate the `linux-firewalld-zone` builtin. Decode success IS the
+/// validation, exactly as for `macos-pf-load`: the grammar is two `key=value`
+/// tokens (`op`, `interface`) with duplicate and unknown-key rejection, the op
+/// is an exact match against three literals with no default arm, and the
+/// interface must be a plausible device name that is not the loopback.
+///
+/// There is no zone token to validate, because the caller cannot express one.
+fn validate_linux_firewalld_zone_args(args: &[&str]) -> Result<(), String> {
+    crate::linux_firewalld_zone::FirewalldZoneSpec::decode(args).map(|_| ())
 }
 
 /// Validate the `macos-pf-load` builtin: the arguments must decode into a
