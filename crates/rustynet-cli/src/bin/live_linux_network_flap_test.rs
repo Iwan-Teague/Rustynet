@@ -290,8 +290,51 @@ fn run() -> Result<(), String> {
     let recovery_start = std::time::Instant::now();
     let mut recovery_arrived = false;
     let mut recovery_time_s = 0u64;
+    // Recovery is proven by DATA CROSSING THE TUNNEL, with the handshake stamp
+    // kept only as corroboration.
+    //
+    // A handshake alone is the wrong oracle here, and demanding it made this
+    // stage unpassable for a reason that is correct WireGuard behaviour rather
+    // than a defect. A session rekeys after roughly 120s; this stage blocks
+    // egress for 35. So when the block lifts the session is still valid and
+    // traffic resumes on it — boringtun's timers emit keepalives, not a
+    // handshake, so there is no new handshake to observe and no timestamp to
+    // record. The daemon was doing the right thing and the assertion could not
+    // see it (QH-51, hypothesis 8; seven earlier hypotheses are recorded in
+    // LiveLabStageStatus_2026-08-14.md as eliminated).
+    //
+    // Pinging the exit's mesh address FROM the client exercises the encrypted
+    // path end to end: it must be encrypted by this peer's live session,
+    // traverse the tunnel, and be answered. That is a STRICTER proof than a
+    // timestamp — a stale-but-present handshake stamp proves nothing about
+    // whether packets move, while a reply cannot be produced without a working
+    // session. If the tunnel genuinely fails to recover, this fails.
+    let exit_mesh_ipv4 = ctx
+        .capture_root_allow_failure(&exit_host, &["rustynet", "status"])
+        .ok()
+        .and_then(|out| {
+            out.split_whitespace()
+                .find_map(|token| token.strip_prefix("assigned_cidr="))
+                .and_then(|cidr| cidr.split('/').next())
+                .map(str::to_owned)
+        });
+    logger.line(format!(
+        "[network-flap] exit mesh ipv4 for data probe: {}",
+        exit_mesh_ipv4.as_deref().unwrap_or("<unresolved>")
+    ))?;
+
     for _ in 0..36 {
         std::thread::sleep(std::time::Duration::from_secs(5));
+        if let Some(target) = exit_mesh_ipv4.as_deref()
+            && ctx
+                .capture_root_allow_failure(&client_host, &["ping", "-c", "2", "-W", "2", target])
+                .is_ok_and(|out| out.contains(" 0% packet loss") || out.contains("2 received"))
+        {
+            recovery_arrived = true;
+            recovery_time_s = recovery_start.elapsed().as_secs();
+            logger.line("[network-flap] recovery proven by data crossing the tunnel")?;
+            break;
+        }
         let post_nc = ctx
             .capture_root_allow_failure(&client_host, &["rustynet", "netcheck"])
             .unwrap_or_default();
