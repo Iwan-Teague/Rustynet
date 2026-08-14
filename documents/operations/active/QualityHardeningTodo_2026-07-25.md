@@ -2314,7 +2314,37 @@ would strengthen the control beyond the defect being fixed, so it is recorded ra
 
 ### QH-51 — network-flap recovery: the handshake never returns after the block is lifted
 
-**Status: OPEN — MEASUREMENT REPAIRED 2026-08-14, daemon-side cause now isolated and unmasked.**
+**Status: OPEN — three of four checks now pass; only recovery detection remains (2026-08-14).**
+
+Progression across runs, each figure from the stage's own log:
+
+| run | baseline | disruption_confirmed | recovery |
+| --- | --- | --- | --- |
+| `qh46-firewalld-20260814c` | `u64::MAX` (unreadable) | `pass` — on missing data | false |
+| `qh51-measure-20260814e` | `unreadable` | `fail` — honest | false |
+| `qh51-session-20260814f` | **`70` — READABLE** | false | false |
+| `qh51-final-20260814g` | readable | **`true`** | **false** |
+
+The baseline became readable the moment the session-rebuild fix landed, which is the direct evidence
+that fix works: handshake telemetry now survives reconcile instead of being wiped every cycle.
+
+**What remains, precisely.** After the block is lifted the handshake record never becomes readable
+again within the 180s poll, while `tunnel_active=true` and `membership_intact=true`. The likely
+mechanism, NOT yet confirmed: the post-disruption traversal re-race keeps supplying a NEW endpoint,
+so `configure_peer` legitimately reports `Replaced` on each pass, rebuilds the session and clears the
+record again — meaning the record is destroyed as fast as it is created. That is consistent with the
+journal showing the flap breaker driven to `open` at intensity 0.97 for this peer.
+
+**Do not "fix" this by widening the recovery check.** Recovery is the one assertion in this stage
+that must stay strict: it is the only thing proving the tunnel actually comes back. The next step is
+to determine whether the endpoint genuinely changes after unblock (making each rebuild correct, in
+which case the churn itself is the defect) or whether the same endpoint is being re-applied through a
+path that bypasses the `Unchanged` comparison — for example `update_peer_endpoint` rather than
+`configure_peer`. Capture the client's `traversal_probe_endpoint` and
+`traversal_probe_latest_handshake_unix` every 5s across the recovery window; a changing endpoint
+proves the first, a constant one proves the second.
+
+**Superseded status:**, daemon-side cause now isolated and unmasked.**
 
 The instrument is fixed and the stage is now honest. Run `qh51-measure-20260814e`:
 
