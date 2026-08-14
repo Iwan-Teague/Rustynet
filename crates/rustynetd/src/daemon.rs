@@ -13110,6 +13110,37 @@ fn persist_trust_watermark(
 // instead of re-deriving a weaker, --output-scoped notion of prior state.
 // See documents/operations/active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md.
 
+/// Persistent-keepalive interval for every managed peer, in seconds.
+///
+/// WireGuard is silent by design: a peer with nothing to send sends nothing, and
+/// a handshake is initiated only when there is traffic. That is fine on a stable
+/// link and wrong everywhere else in this product's target environment — behind
+/// NAT the mapping expires, and after ANY disruption neither side re-establishes
+/// until something happens to generate traffic.
+///
+/// It was measured rather than assumed. `live_network_flap_validation` blocks
+/// the client's WireGuard output, waits for the session to lapse, lifts the
+/// block, and then polls for recovery for 180 seconds. The handshake never came
+/// back: the client sat at `path_live_peer_count=0` and
+/// `path_reason=direct_handshake_unproven` with the tunnel nominally up and
+/// membership intact (QH-51, run `qh46-firewalld-20260814c`).
+///
+/// 25s is WireGuard's own recommended value and comfortably inside the common
+/// NAT UDP timeout.
+///
+/// NOT to be confused with [`crate::keepalive::KeepaliveEstimator`] (FIS-0015),
+/// which adaptively sizes RELAY-SESSION gaps from observed binding survival.
+/// That estimator drives relay sessions, not WireGuard's per-peer
+/// `persistent-keepalive`, and its output is not applicable here: this value is
+/// written into the peer at configure time, whereas the estimator's changes
+/// continuously. The two are complementary, and a later change could feed one
+/// into the other only by also re-configuring the peer as it moves. The privileged helper already validated and emitted this
+/// argument (FIS-0015) — `persistent_keepalive_secs` was simply never populated
+/// anywhere in production: before this change the ONLY `Some(..)` for that field
+/// in the entire repository was in a helper unit test, so the feature was built,
+/// gated, tested at the boundary, and then left dormant.
+const MANAGED_PEER_PERSISTENT_KEEPALIVE_SECS: u16 = 25;
+
 fn load_auto_tunnel_bundle(
     path: &Path,
     verifier_key_path: &Path,
@@ -13412,7 +13443,7 @@ fn load_auto_tunnel_bundle(
             },
             public_key,
             allowed_ips,
-            persistent_keepalive_secs: None,
+            persistent_keepalive_secs: Some(MANAGED_PEER_PERSISTENT_KEEPALIVE_SECS),
         });
     }
 
@@ -16073,6 +16104,7 @@ fn race_outcome_classes(
 
 #[cfg(all(test, not(windows)))]
 mod tests {
+
     use std::collections::BTreeMap;
 
     fn endpoint(addr: &str, port: u16) -> SocketEndpoint {
@@ -18581,6 +18613,51 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .expect("trust evidence permissions should be secure");
         }
+    }
+
+    /// QH-51: a peer loaded from a real signed bundle must carry a persistent
+    /// keepalive.
+    ///
+    /// WireGuard is silent unless it has traffic to send, so without this a peer
+    /// never re-handshakes after a disruption. That is not hypothetical: the
+    /// network-flap stage blocked the client's WireGuard output, lifted the
+    /// block, and polled 180s for a recovery that never arrived, with the client
+    /// stuck at `path_live_peer_count=0` (run `qh46-firewalld-20260814c`).
+    ///
+    /// This asserts the loaded PeerConfig rather than the constant, so it fails
+    /// if the field stops being populated — which is exactly how the defect
+    /// existed: the helper had validated and emitted the argument since
+    /// FIS-0015, while the only `Some(..)` in the repository was a helper test.
+    #[test]
+    fn loaded_bundle_peers_carry_a_persistent_keepalive() {
+        let test_dir = secure_test_dir("rustynetd-keepalive-peer");
+        std::fs::create_dir_all(&test_dir).expect("test dir should be creatable");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let verifier_path = test_dir.join("assignment.pub");
+        write_auto_tunnel_file(&assignment_path, &verifier_path, "daemon-local", 1, false);
+
+        let envelope = load_auto_tunnel_bundle(
+            &assignment_path,
+            &verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("fixture bundle should load");
+
+        assert!(
+            !envelope.bundle.peers.is_empty(),
+            "fixture must produce at least one peer"
+        );
+        for peer in &envelope.bundle.peers {
+            assert_eq!(
+                peer.persistent_keepalive_secs,
+                Some(super::MANAGED_PEER_PERSISTENT_KEEPALIVE_SECS),
+                "peer {} must carry a persistent keepalive",
+                peer.node_id.as_str()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 
     fn write_auto_tunnel_file(
