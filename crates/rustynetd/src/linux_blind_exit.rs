@@ -169,10 +169,22 @@ pub fn evaluate_linux_blind_exit_ruleset(
 
     // No NAT translation anywhere — blind_exit is "blind" precisely because it
     // never rewrites the mesh source.
-    if normalized.iter().any(|line| line.contains("masquerade"))
-        || normalized.iter().any(|line| line.contains(" snat "))
-        || normalized.iter().any(|line| line.contains(" dnat "))
-    {
+    //
+    // The scan stays HOST-WIDE on purpose. A `masquerade` installed by another
+    // firewall (a firewalld zone with masquerading enabled, say) rewrites this
+    // node's egress just as effectively as one of ours would, so narrowing this
+    // to Rustynet's own table would convert a true positive into a fail-open on
+    // exactly the hosts most likely to have one.
+    //
+    // What it must NOT do is confuse a conntrack MATCH with a NAT STATEMENT.
+    // `ct status dnat accept` tests whether a packet's flow was translated by
+    // someone; it performs no translation. Stock firewalld ships three such
+    // lines in `filter_FORWARD` (measured on `fedora-utm-1`), so a bare
+    // `contains(" dnat ")` made this control impossible to satisfy on any
+    // firewalld host — the check failed for a reason unrelated to NAT, which is
+    // a false positive on a release-blocking control. `ct status` expressions
+    // are therefore removed before the NAT keywords are looked for.
+    if normalized.iter().any(|line| line_performs_nat(line)) {
         reasons.push(
             "blind_exit nft ruleset must not contain NAT (masquerade/snat/dnat) rules".to_owned(),
         );
@@ -283,6 +295,88 @@ fn validate_nft_table_name(value: &str) -> Result<(), String> {
 /// collapse whitespace. Each transform is idempotent so it can only make a
 /// correct rule match — never mask a real difference (mirrors the macOS
 /// `normalize_pf_rule` rationale).
+/// Does this normalized rule line actually PERFORM NAT?
+///
+/// Replaces a substring scan for `"masquerade"` / `" snat "` / `" dnat "`, which
+/// was wrong in both directions on a real host:
+///
+/// * FALSE POSITIVE — nftables uses `dnat`/`snat` as conntrack status flags as
+///   well as NAT statements. `ct status dnat accept` tests whether some other
+///   party translated a flow and translates nothing itself. Stock firewalld
+///   ships three such lines in `filter_FORWARD` (measured on `fedora-utm-1`), so
+///   the old scan made this control impossible to satisfy on ANY firewalld host,
+///   failing for a reason unrelated to NAT.
+/// * FALSE NEGATIVE — the space-delimited substrings never matched a keyword in
+///   the FIRST token, because `normalize_nft_rule` strips indentation. An
+///   unconditional `dnat to 10.0.0.1` rule therefore passed a control whose
+///   entire purpose is to reject it.
+///
+/// A NAT statement is recognised structurally instead: `masquerade` as a bare
+/// token, or `snat`/`dnat` followed by `to` (optionally via a family qualifier,
+/// as in `dnat ip to 10.0.0.1`). Requiring the `to` is what keeps a chain or set
+/// merely NAMED `dnat` from tripping the control.
+///
+/// The scan deliberately remains HOST-WIDE. A `masquerade` installed by another
+/// firewall rewrites this node's egress just as effectively as one of ours, so
+/// narrowing it to Rustynet's own table would convert a true positive into a
+/// fail-open on exactly the hosts most likely to carry one.
+fn line_performs_nat(line: &str) -> bool {
+    let stripped = strip_ct_status_expressions(line);
+    let tokens: Vec<&str> = stripped.split_whitespace().collect();
+    if tokens.iter().any(|token| *token == "masquerade") {
+        return true;
+    }
+    tokens.iter().enumerate().any(|(idx, token)| {
+        if *token != "snat" && *token != "dnat" {
+            return false;
+        }
+        // `dnat to <addr>` or a family-qualified `dnat ip to <addr>`.
+        tokens.get(idx + 1) == Some(&"to") || tokens.get(idx + 2) == Some(&"to")
+    })
+}
+
+/// Remove `ct status <flags>` expressions from an already-normalized rule line.
+///
+/// nftables uses `dnat` and `snat` as BOTH conntrack status flags (a read-only
+/// match: `ct status dnat accept`) and NAT statements (`dnat to 10.0.0.1`). The
+/// blind-exit control cares only about the second kind, so the first is stripped
+/// before the keyword scan. Everything else on the line is preserved, so a real
+/// NAT statement sharing a line with a `ct status` match is still caught.
+///
+/// Handles both spellings nft emits: a single flag (`ct status dnat`) and a set
+/// (`ct status { dnat, snat }`). An unterminated set consumes to end of line,
+/// which fails safe: the remainder of a malformed line cannot smuggle a NAT
+/// statement past the scan, because a truncated line yields fewer keywords, and
+/// the separate structural checks below still require the exact allow rules to
+/// be present.
+fn strip_ct_status_expressions(line: &str) -> String {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(tokens.len());
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        if tokens[idx] == "ct" && tokens.get(idx + 1) == Some(&"status") {
+            idx += 2;
+            match tokens.get(idx) {
+                Some(&"{") => {
+                    while idx < tokens.len() && tokens[idx] != "}" {
+                        idx += 1;
+                    }
+                    // Step past the closing brace when there is one.
+                    if idx < tokens.len() {
+                        idx += 1;
+                    }
+                }
+                Some(_) => idx += 1,
+                None => {}
+            }
+            continue;
+        }
+        kept.push(tokens[idx]);
+        idx += 1;
+    }
+    kept.join(" ")
+}
+
 fn normalize_nft_rule(line: &str) -> String {
     line.split('#')
         .next()
@@ -299,6 +393,101 @@ mod tests {
 
     fn config() -> LinuxBlindExitConfig {
         LinuxBlindExitConfig::new("rustynet0", "eth0", "100.64.0.0/10").unwrap()
+    }
+
+    /// A conntrack STATUS MATCH is not a NAT statement. Stock firewalld ships
+    /// three of these in `filter_FORWARD`; before this distinction existed the
+    /// blind-exit control could not pass on any firewalld host, failing for a
+    /// reason that had nothing to do with NAT.
+    #[test]
+    fn ct_status_dnat_match_is_not_treated_as_nat() {
+        assert!(!line_performs_nat("ct status dnat accept"));
+        assert!(!line_performs_nat("ct status snat accept"));
+        assert!(!line_performs_nat("ct status { dnat, snat } accept"));
+        // The real line, verbatim from a Fedora guest's ruleset.
+        assert!(!line_performs_nat(&normalize_nft_rule(
+            "\t\tct status dnat accept"
+        )));
+    }
+
+    /// The other half of the same defect: the old space-delimited substring scan
+    /// could not see a keyword in the FIRST token, because normalization strips
+    /// indentation. An unconditional redirect-style rule slipped through a
+    /// control whose whole purpose is to reject it.
+    #[test]
+    fn nat_statement_is_caught_even_as_the_leading_token() {
+        assert!(line_performs_nat("dnat to 10.0.0.1"));
+        assert!(line_performs_nat("snat to 192.0.2.1"));
+        assert!(line_performs_nat("masquerade"));
+        assert!(line_performs_nat(&normalize_nft_rule(
+            "\t\tdnat to 10.0.0.1"
+        )));
+    }
+
+    /// Family-qualified NAT statements and NAT sharing a line with a ct match
+    /// must both still be caught.
+    #[test]
+    fn family_qualified_and_mixed_lines_still_count_as_nat() {
+        assert!(line_performs_nat("ip daddr 1.2.3.4 dnat ip to 10.0.0.1"));
+        assert!(line_performs_nat("oifname eth0 masquerade"));
+        // A genuine NAT statement is not hidden by a ct status match beside it.
+        assert!(line_performs_nat("ct status dnat oifname eth0 masquerade"));
+    }
+
+    /// A chain or set merely NAMED `dnat` performs no translation. Requiring the
+    /// `to` keyword is what keeps this from becoming a new false positive.
+    #[test]
+    fn a_chain_named_dnat_is_not_a_nat_statement() {
+        assert!(!line_performs_nat("chain dnat {"));
+        assert!(!line_performs_nat("jump dnat"));
+    }
+
+    /// The evaluator as a whole must accept a compliant blind_exit ruleset that
+    /// coexists with firewalld's conntrack matches — the end-to-end shape of the
+    /// release blocker.
+    #[test]
+    fn compliant_ruleset_passes_alongside_firewalld_ct_status_lines() {
+        let ruleset = "\
+table inet firewalld {
+  chain filter_FORWARD {
+    ct state { established, related } accept
+    ct status dnat accept
+    reject with icmpx admin-prohibited
+  }
+}
+table inet rustynet_g3 {
+  chain forward {
+    ct state established,related accept
+    iifname \"rustynet0\" oifname \"eth0\" ip saddr 100.64.0.0/10 accept
+  }
+}";
+        let reasons = evaluate_linux_blind_exit_ruleset(ruleset, &config());
+        assert!(
+            !reasons.iter().any(|r| r.contains("must not contain NAT")),
+            "firewalld ct-status lines must not read as NAT: {reasons:?}"
+        );
+    }
+
+    /// And a REAL foreign masquerade must still fail the control, because it
+    /// rewrites this node's egress regardless of which firewall installed it.
+    #[test]
+    fn foreign_masquerade_still_fails_the_control() {
+        let ruleset = "\
+table ip firewalld {
+  chain nat_POSTROUTING {
+    oifname \"eth0\" masquerade
+  }
+}
+table inet rustynet_g3 {
+  chain forward {
+    iifname \"rustynet0\" oifname \"eth0\" ip saddr 100.64.0.0/10 accept
+  }
+}";
+        let reasons = evaluate_linux_blind_exit_ruleset(ruleset, &config());
+        assert!(
+            reasons.iter().any(|r| r.contains("must not contain NAT")),
+            "a foreign masquerade must still fail blind_exit: {reasons:?}"
+        );
     }
 
     #[test]
