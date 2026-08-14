@@ -552,6 +552,18 @@ pub trait DataplaneSystem {
     fn apply_routes(&mut self, routes: &[Route]) -> Result<(), SystemError>;
     fn rollback_routes(&mut self) -> Result<(), SystemError>;
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError>;
+    /// QH-53: ask the host firewall (firewalld, when present) to admit
+    /// forwarded tunnel traffic for a node serving a forwarding role. Runs
+    /// AFTER backend start (the tunnel interface must exist for the zone
+    /// bind) and before generation commit; the controller gates it on
+    /// `serve_exit_node`.
+    ///
+    /// Deliberately NOT defaulted: the production `RuntimeSystem` dispatches
+    /// trait methods arm-by-arm, so a defaulted method would let a missing
+    /// dispatch arm silently no-op this enforcement on the real daemon while
+    /// every DryRun-driven test stays green. A new system type must decide
+    /// explicitly.
+    fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError>;
     fn rollback_firewall(&mut self) -> Result<(), SystemError>;
     fn apply_nat_forwarding(
         &mut self,
@@ -676,6 +688,12 @@ impl DataplaneSystem for DryRunSystem {
 
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError> {
         self.step("apply_firewall_killswitch")
+    }
+
+    fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        // Through step() on purpose: fail_operation-driven tests must be able
+        // to fail this stage and prove the controller propagates it.
+        self.step("admit_host_firewall_forwarding")
     }
 
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
@@ -881,12 +899,16 @@ impl LinuxCommandSystem {
     /// the FORWARD and POSTROUTING hooks. A reject is terminal, so no rule we
     /// add later can rescue it.
     ///
-    /// This runs only for a node that actually forwards
-    /// (`allow_tunnel_relay_forward`), and it FAILS CLOSED: if firewalld is
-    /// present, or its presence could not be determined, and the interface is
-    /// not confirmed bound afterwards, the firewall apply fails rather than
-    /// leaving the node advertising a forwarding role whose traffic another
-    /// firewall silently discards. A host with no firewalld is a no-op.
+    /// Runs via `admit_host_firewall_forwarding` AFTER backend start — the
+    /// zone bind needs the tunnel interface to exist in sysfs, and the
+    /// killswitch stage runs before the interface is created (QH-53) — and
+    /// the controller gates it on `serve_exit_node`, which covers relay-with-
+    /// upstream, terminal exit, and blind_exit alike. It FAILS CLOSED: if
+    /// firewalld is present, or its presence could not be determined, and the
+    /// interface is not confirmed bound afterwards, the generation apply
+    /// fails before commit rather than leaving the node advertising a
+    /// forwarding role whose traffic another firewall silently discards. A
+    /// host with no firewalld is a no-op.
     fn ensure_host_firewall_admits_forwarding(&mut self) -> Result<(), SystemError> {
         use crate::linux_firewalld_zone::{FirewalldPosture, FirewalldZoneOp, FirewalldZoneSpec};
 
@@ -2348,10 +2370,22 @@ impl DataplaneSystem for LinuxCommandSystem {
                 &["delete", "table", "inet", previous.as_str()],
             );
         }
-        if self.allow_tunnel_relay_forward {
-            self.ensure_host_firewall_admits_forwarding()?;
-        }
         Ok(())
+    }
+
+    // QH-53: the firewalld zone bind is deliberately NOT part of the
+    // killswitch apply. It needs the tunnel interface to exist, and the
+    // killswitch runs before backend start creates it — binding here failed
+    // every cold bootstrap of a forwarding node on a firewalld host. The bind
+    // lives in admit_host_firewall_forwarding, called by the controller
+    // after backend start.
+
+    fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        // Role gating (serve_exit_node) lives at the controller call site so
+        // the stage is visible in DryRun op ordering; when called, always
+        // verify — an unconditional check cannot be silently skipped by a
+        // stale local flag.
+        self.ensure_host_firewall_admits_forwarding()
     }
 
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
@@ -3395,6 +3429,12 @@ impl DataplaneSystem for MacosCommandSystem {
         self.generation = generation;
     }
 
+    fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        // firewalld is Linux-only; on macOS the PF anchor design owns
+        // coexistence with the host firewall. Nothing to admit here.
+        Ok(())
+    }
+
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         for anchor in self.list_owned_anchors()? {
             self.run_allow_failure(
@@ -4378,6 +4418,14 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.generation = generation;
     }
 
+    fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        // firewalld is Linux-only. The Windows analogue of this defect class
+        // (a foreign WFP filter at a competing weight discarding authorised
+        // forwarded traffic) is tracked in the parity plan; when it gains an
+        // enforcement point, it belongs here.
+        Ok(())
+    }
+
     fn reconcile_exit_nat_residue(&mut self, serving_exit: bool) -> Result<(), SystemError> {
         // §10.7: a node that crashed while serving as a Windows exit and restarts
         // as a client must self-heal the fixed-name `New-NetNat` instance and the
@@ -4982,6 +5030,15 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.admit_host_firewall_forwarding(),
+            RuntimeSystem::Linux(system) => system.admit_host_firewall_forwarding(),
+            RuntimeSystem::Macos(system) => system.admit_host_firewall_forwarding(),
+            RuntimeSystem::Windows(system) => system.admit_host_firewall_forwarding(),
+        }
+    }
+
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.rollback_firewall(),
@@ -5307,6 +5364,31 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 self.force_fail_closed("backend_start_failed")?;
                 return Err(err.into());
             }
+        }
+
+        // QH-53: the firewalld zone bind needs the tunnel interface to exist
+        // in sysfs, so it must run AFTER backend start (which creates the
+        // interface) — binding from the pre-start killswitch failed every
+        // cold bootstrap of a forwarding node on a firewalld host. It still
+        // runs BEFORE generation commit, so a host firewall that would
+        // discard forwarded traffic fails the apply before the role is ever
+        // advertised (the QH-46 guarantee). Gated on serve_exit_node, which
+        // covers relay-with-upstream (FullTunnel && serve), a terminal exit,
+        // AND blind_exit (both exit_mode Off): all of them forward through
+        // the same FORWARD hook a foreign firewall can reject, so the
+        // narrower relay_with_upstream gate would leave exits unbound.
+        if options.serve_exit_node
+            && let Err(err) = self.system.admit_host_firewall_forwarding()
+        {
+            let rollback_result =
+                self.rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
+            let fail_closed_result = self.force_fail_closed("host_firewall_admit_failed");
+            if let Err(rollback_err) = rollback_result {
+                let _ = fail_closed_result;
+                return Err(rollback_err);
+            }
+            fail_closed_result?;
+            return Err(err.into());
         }
 
         if options.serve_exit_node
@@ -7209,56 +7291,114 @@ mod tests {
         );
     }
 
-    /// QH-46: the firewalld coexistence check must be ON the Linux firewall
-    /// apply path, gated on the relay-forward role.
+    /// QH-53/QH-46: the firewalld coexistence check must run AFTER backend
+    /// start (the zone bind needs the tunnel interface to exist in sysfs),
+    /// BEFORE the serving stages, gated on `serve_exit_node` — and it must be
+    /// GONE from the pre-start killswitch, where it failed every cold
+    /// bootstrap of a forwarding node on a firewalld host (QH-53).
     ///
-    /// The posture grammar is thoroughly tested in `linux_firewalld_zone`; what
-    /// this pins is that `apply_firewall_killswitch` actually CALLS
-    /// `ensure_host_firewall_admits_forwarding` for a forwarding node, and that
-    /// the check fails the apply rather than warning. Like the IPV-10 pin above,
-    /// this is a source pin because the behavioural twins of this test are
-    /// `cfg(target_os = "linux")` and never run on the macOS CI leg, so an
-    /// unwiring would be invisible there.
+    /// Source pin, like the IPV-10 pin above: the behavioural twins are
+    /// `cfg(target_os = "linux")` and invisible on the macOS CI leg. The
+    /// backend-start ordering is ALSO only pinnable here — backend calls are
+    /// not `DataplaneSystem` ops, so no DryRun order test can see them.
     #[test]
-    fn linux_firewall_apply_checks_host_firewall_when_forwarding() {
+    fn linux_firewall_admit_runs_after_backend_start_and_never_in_the_killswitch() {
         let source = include_str!("phase10.rs");
+        // Bound every search to real code: this test's own string literals
+        // would otherwise satisfy (or violate) the pins.
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
 
-        let at = source
-            .find("self.ensure_host_firewall_admits_forwarding()?;")
-            .expect("the Linux firewall apply must call ensure_host_firewall_admits_forwarding");
-
-        // The call must be gated on the relay-forward role: a plain client has
-        // no business binding interfaces into firewalld zones.
-        let window = &source[at.saturating_sub(120)..at];
+        // (a) The controller call site: directly after backend start, before
+        // the exit-serving preflight, gated on serve_exit_node.
+        let call_at = code
+            .find("self.system.admit_host_firewall_forwarding()")
+            .expect("the controller must call admit_host_firewall_forwarding");
+        let start_at = code
+            .find("self.backend.start(context)")
+            .expect("the controller must start the backend");
+        let preflight_at = code
+            .find("self.system.preflight_exit_serving")
+            .expect("the controller must preflight exit serving");
         assert!(
-            window.contains("if self.allow_tunnel_relay_forward"),
-            "the firewalld coexistence check must be gated on allow_tunnel_relay_forward"
+            start_at < call_at,
+            "the host-firewall admit must run AFTER backend start — the zone \
+             bind needs the tunnel interface backend start creates (QH-53)"
+        );
+        assert!(
+            call_at - start_at < 1600,
+            "the admit call must sit directly after the backend-start match, \
+             not merely somewhere later in the apply"
+        );
+        assert!(
+            call_at < preflight_at,
+            "the host-firewall admit must run BEFORE the serving stages"
+        );
+        let gate_window = &code[call_at.saturating_sub(120)..call_at];
+        assert!(
+            gate_window.contains("if options.serve_exit_node"),
+            "the admit must be gated on serve_exit_node: terminal exit, \
+             blind_exit and relay-with-upstream all forward through the same \
+             FORWARD hook a foreign firewall can reject"
         );
 
-        // And it must sit inside the Linux apply_firewall_killswitch — the
-        // nearest preceding method heading, with no other method boundary in
-        // between, in a body that drives nft (the Linux firewall program).
-        let before = &source[..at];
+        // (b) The Linux impl delegates to the audited check, from inside
+        // admit_host_firewall_forwarding itself.
+        let ensure_call = code
+            .find("self.ensure_host_firewall_admits_forwarding()")
+            .expect("the Linux impl must delegate to the audited check");
+        let before = &code[..ensure_call];
         let fn_start = before
-            .rfind("fn apply_firewall_killswitch")
-            .expect("an apply_firewall_killswitch implementation must precede the call");
-        let between = &before[fn_start..];
+            .rfind("fn admit_host_firewall_forwarding")
+            .expect("the delegate must live in admit_host_firewall_forwarding");
         assert!(
-            !between.contains("\n    fn "),
-            "the firewalld check must be called from apply_firewall_killswitch itself, \
-             not from a later method"
-        );
-        assert!(
-            between.contains("PrivilegedCommandProgram::Nft"),
-            "this must be the Linux apply_firewall_killswitch, which drives nft"
+            !before[fn_start..].contains("\n    fn "),
+            "the delegate call must be inside admit_host_firewall_forwarding itself"
         );
 
-        // The check itself must consult the audited posture evaluator and fail
-        // the apply, not reimplement a weaker local test or downgrade to a log.
-        let body_at = source
+        // (c) NEGATIVE pin: the Linux killswitch body must no longer bind
+        // firewalld — bind-before-interface-creation IS the QH-53 defect.
+        // Select the Linux body as the only apply_firewall_killswitch
+        // implementation that drives nft.
+        let mut searched = 0usize;
+        let mut nft_bodies = 0usize;
+        while let Some(rel) = code[searched..].find("fn apply_firewall_killswitch") {
+            let fn_at = searched + rel;
+            let after = &code[fn_at..];
+            let body_end = after[1..]
+                .find("\n    fn ")
+                .map(|end| end + 1)
+                .unwrap_or(after.len());
+            let body = &after[..body_end];
+            if body.contains("PrivilegedCommandProgram::Nft") {
+                nft_bodies += 1;
+                assert!(
+                    !body.contains("ensure_host_firewall_admits_forwarding"),
+                    "the pre-start killswitch must not bind firewalld: the \
+                     tunnel interface does not exist yet at that point (QH-53)"
+                );
+            }
+            searched = fn_at + 1;
+        }
+        assert_eq!(
+            nft_bodies, 1,
+            "exactly one apply_firewall_killswitch body drives nft (the Linux one)"
+        );
+
+        // (d) The production RuntimeSystem dispatch must forward the Linux
+        // arm — a missing or stubbed arm would silently no-op the enforcement
+        // on the real daemon while every DryRun-driven test stays green.
+        assert!(
+            code.contains(
+                "RuntimeSystem::Linux(system) => system.admit_host_firewall_forwarding()"
+            ),
+            "the RuntimeSystem Linux arm must dispatch admit_host_firewall_forwarding"
+        );
+
+        // (e) The audited check itself keeps its fail-closed shape.
+        let body_at = code
             .find("fn ensure_host_firewall_admits_forwarding")
             .expect("the firewalld coexistence check must exist");
-        let body: String = source[body_at..].chars().take(1800).collect();
+        let body: String = code[body_at..].chars().take(2400).collect();
         assert!(
             body.contains("FirewalldPosture::parse"),
             "the check must parse the builtin's structured posture line"
@@ -7269,7 +7409,7 @@ mod tests {
         );
         assert!(
             body.contains("FirewallApplyFailed"),
-            "an obstructed forward path must fail the firewall apply, not warn"
+            "an obstructed forward path must fail the apply, not warn"
         );
     }
 
@@ -9464,7 +9604,117 @@ mod tests {
             relay_position < firewall_position,
             "set_relay_forwarding must run BEFORE apply_firewall_killswitch \
              (relay at {relay_position}, firewall at {firewall_position}) or the \
-             firewalld coexistence gate never sees the forwarding role"
+             hairpin forward rule is never emitted"
+        );
+
+        // QH-53 ordering: the firewalld admit stage must run after the
+        // killswitch (backend start sits between them — it is not a system op,
+        // so the source pin carries that half) and before the serving stages.
+        let admit_position = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "admit_host_firewall_forwarding")
+            .expect("a serving apply must admit host-firewall forwarding");
+        let preflight_position = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "preflight_exit_serving")
+            .expect("a serving apply must preflight exit serving");
+        assert!(
+            firewall_position < admit_position && admit_position < preflight_position,
+            "the firewalld admit must run between the killswitch and the \
+             serving preflight (killswitch {firewall_position}, admit \
+             {admit_position}, preflight {preflight_position})"
+        );
+    }
+
+    /// QH-53 gate, absence direction: a node that serves nothing must never
+    /// run the firewalld admit stage — the zone bind is a forwarding-role
+    /// concern, and firewalld's zone is the only inbound filter on the tunnel
+    /// of a plain client.
+    #[test]
+    fn client_apply_never_admits_host_firewall_forwarding() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("plain client apply should succeed");
+
+        assert!(
+            !controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "admit_host_firewall_forwarding"),
+            "a non-serving apply must not run the firewalld admit stage: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// QH-53 propagation: a failed firewalld admit must fail the WHOLE apply
+    /// closed, before any generation commit — a swallowed error here would be
+    /// the exact silently-tunnel-less-forwarder defect the stage exists to
+    /// prevent.
+    #[test]
+    fn host_firewall_admit_failure_fails_the_apply_closed() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default().fail_on("admit_host_firewall_forwarding"),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let err = controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("a failed firewalld admit must fail the apply");
+
+        assert!(matches!(err, Phase10Error::System(_)));
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "block_all_egress"),
+            "fail-closed must block egress: {:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller.backend.started,
+            "the started backend must be rolled back when the admit fails"
         );
     }
 
@@ -9568,10 +9818,17 @@ mod tests {
         );
     }
 
-    /// QH-46 behavioural twins of `linux_firewall_apply_checks_host_firewall_when_forwarding`:
-    /// drive the real `apply_firewall_killswitch` through the helper protocol
-    /// with a scripted firewalld posture and prove the apply FAILS CLOSED when
-    /// the host firewall would discard forwarded tunnel traffic.
+    /// QH-46/QH-53 behavioural twins of
+    /// `linux_firewall_admit_runs_after_backend_start_and_never_in_the_killswitch`:
+    /// drive the real `admit_host_firewall_forwarding` stage through the
+    /// helper protocol with a scripted firewalld posture and prove it FAILS
+    /// CLOSED when the host firewall would discard forwarded tunnel traffic.
+    ///
+    /// Driving the stage directly is equivalent to the production path only
+    /// while `ensure_host_firewall_admits_forwarding` reads nothing the
+    /// killswitch prelude sets up — today it reads `interface_name` and the
+    /// privileged client alone. If it ever grows such a dependency, these
+    /// twins silently diverge from production; re-check this note then.
     ///
     /// Every log assertion goes through `LINUX_FIREWALLD_ZONE_PROGRAM` (the
     /// same constant `as_str()` returns), never a string literal, so a program
@@ -9699,16 +9956,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn relay_forward_firewall_apply_fails_closed_when_firewalld_leaves_tunnel_unbound() {
+    fn forwarding_admit_fails_closed_when_firewalld_leaves_tunnel_unbound() {
         let socket_path = phase10_test_socket_path("fwzu");
         let (commands, stop, helper_thread, mut system) = firewalld_scripted_system(
             &socket_path,
             "rustynet0",
             "presence=running default_zone=public bound=false",
         );
-        DataplaneSystem::set_relay_forwarding(&mut system, true);
-
-        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+        let result = DataplaneSystem::admit_host_firewall_forwarding(&mut system);
 
         stop.store(true, Ordering::Relaxed);
         helper_thread
@@ -9741,15 +9996,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn relay_forward_firewall_apply_fails_closed_on_unparseable_posture() {
+    fn forwarding_admit_fails_closed_on_unparseable_posture() {
         // An empty or garbled posture line must surface as a failed apply,
         // never as "firewalld absent, nothing to do".
         let socket_path = phase10_test_socket_path("fwzg");
         let (_commands, stop, helper_thread, mut system) =
             firewalld_scripted_system(&socket_path, "rustynet0", "");
-        DataplaneSystem::set_relay_forwarding(&mut system, true);
-
-        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+        let result = DataplaneSystem::admit_host_firewall_forwarding(&mut system);
 
         stop.store(true, Ordering::Relaxed);
         helper_thread
@@ -9774,7 +10027,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn relay_forward_firewall_apply_fails_closed_when_binding_state_is_unknown() {
+    fn forwarding_admit_fails_closed_when_binding_state_is_unknown() {
         // The real builtin emits `presence=running` with NO bound token when
         // the zone query itself fails. Unknown binding state must read as
         // obstructed — mapping it to "clear" is precisely the fail-open class
@@ -9785,9 +10038,7 @@ mod tests {
             "rustynet0",
             "presence=running default_zone=public",
         );
-        DataplaneSystem::set_relay_forwarding(&mut system, true);
-
-        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+        let result = DataplaneSystem::admit_host_firewall_forwarding(&mut system);
 
         stop.store(true, Ordering::Relaxed);
         helper_thread
@@ -9808,7 +10059,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn relay_forward_firewall_apply_fails_closed_when_firewalld_builtin_errors() {
+    fn forwarding_admit_fails_closed_when_firewalld_builtin_errors() {
         // A transport/builtin failure (busctl missing, helper refusal) reaches
         // the daemon as a client Err, not a posture line. Swallowing that Err
         // and returning Ok would be the canonical fail-open; this is the only
@@ -9816,9 +10067,7 @@ mod tests {
         let socket_path = phase10_test_socket_path("fwze");
         let (stop, helper_thread) = spawn_privileged_firewalld_error_helper(&socket_path);
         let mut system = firewalld_client_system(&socket_path, "rustynet0");
-        DataplaneSystem::set_relay_forwarding(&mut system, true);
-
-        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+        let result = DataplaneSystem::admit_host_firewall_forwarding(&mut system);
 
         stop.store(true, Ordering::Relaxed);
         helper_thread
@@ -9837,7 +10086,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn relay_forward_firewall_apply_passes_when_tunnel_bound_to_default_zone() {
+    fn forwarding_admit_passes_when_tunnel_bound_to_default_zone() {
         // Non-default interface name on purpose: with the production-default
         // `rustynet0` this assert could not distinguish the interface FIELD
         // from a hardcoded literal in the enforcement code.
@@ -9847,9 +10096,7 @@ mod tests {
             "rnqh46",
             "presence=running default_zone=public bound=true",
         );
-        DataplaneSystem::set_relay_forwarding(&mut system, true);
-
-        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+        let result = DataplaneSystem::admit_host_firewall_forwarding(&mut system);
 
         stop.store(true, Ordering::Relaxed);
         helper_thread
@@ -9874,13 +10121,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn relay_forward_firewall_apply_passes_when_firewalld_absent() {
+    fn forwarding_admit_passes_when_firewalld_absent() {
         let socket_path = phase10_test_socket_path("fwza");
         let (_commands, stop, helper_thread, mut system) =
             firewalld_scripted_system(&socket_path, "rustynet0", "presence=absent");
-        DataplaneSystem::set_relay_forwarding(&mut system, true);
-
-        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+        let result = DataplaneSystem::admit_host_firewall_forwarding(&mut system);
 
         stop.store(true, Ordering::Relaxed);
         helper_thread
@@ -9893,22 +10138,23 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn firewall_apply_without_relay_forward_never_touches_firewalld() {
-        // The zone bind is scoped to forwarding roles: a plain client must not
-        // bind interfaces into firewalld zones (firewalld's zone is the ONLY
-        // inbound filter on the tunnel device — see QH-46). This test pins
-        // ZERO firewalld interaction, query included, for a non-forwarding
-        // node: a future benign posture-probe here is overturning a decision,
-        // not fixing a flake.
+    fn firewall_killswitch_apply_never_drives_the_firewalld_builtin() {
+        // QH-53 regression lock, behavioural layer: even with relay forwarding
+        // enabled, the pre-start killswitch must not touch firewalld — the
+        // tunnel interface does not exist at killswitch time on a cold
+        // bootstrap, so a bind there fails every forwarding node on a
+        // firewalld host. The bind belongs to admit_host_firewall_forwarding,
+        // which the controller runs after backend start.
         //
         // Deliberately uses the all-success capture helper with NO scripted
-        // firewalld response: if the gate is mutated away, the unscripted
+        // firewalld response: if the bind is ever moved back, the unscripted
         // firewalld command comes back with an empty posture and the apply
-        // FAILS on the parse — so this test detects the mutation twice, via
+        // FAILS on the parse — so this test detects the regression twice, via
         // the Ok expectation and via the absence assert.
         let socket_path = phase10_test_socket_path("fwzn");
         let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
         let mut system = firewalld_client_system(&socket_path, "rustynet0");
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
 
         let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
 
@@ -9918,13 +10164,13 @@ mod tests {
             .expect("helper thread should join cleanly");
         let _ = std::fs::remove_file(&socket_path);
 
-        result.expect("a non-forwarding firewall apply should succeed untouched by firewalld");
+        result.expect("the killswitch apply should succeed without firewalld involvement");
         let command_log = commands.lock().expect("command log should lock").clone();
         assert!(
             !command_log
                 .iter()
                 .any(|cmd| cmd.contains(crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM)),
-            "a non-forwarding node must never drive the firewalld zone builtin: {command_log:?}"
+            "the pre-start killswitch must never drive the firewalld zone builtin: {command_log:?}"
         );
     }
 
