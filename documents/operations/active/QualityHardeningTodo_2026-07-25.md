@@ -2335,6 +2335,21 @@ perfectly well and this field would still never update. The journal shows the fl
 only the QUALITY re-race — but `traversal_probe_due` was NOT checked, and it is the function that
 decides whether a probe runs at all.
 
+**Suspect ELIMINATED by reading, 2026-08-14:** `traversal_probe_due` (`daemon.rs`) contains NO
+breaker consult. Probing is paced by `next_reprobe_unix` and by handshake freshness, and the flap
+breaker gates only the quality re-race at `:6885`. So probes are NOT suppressed after the flap, and
+the metric's failure to refresh is not a probe-scheduling problem. That removes the leading suspect
+named above and leaves "no handshake is occurring, or it occurs and the backend records nothing" as
+the live question.
+
+**One INTERACTION worth checking first, created by this session's own fixes.** The keepalive is
+applied only in `Tunn::new`, and the new `Unchanged` disposition deliberately stops rebuilding the
+tunnel for an unchanged peer. On a fresh daemon start the peer is `Added` and therefore gets the
+keepalive, so this should be benign — but it has NOT been verified on a live node, and if any path
+configures a peer before its keepalive is known, that peer keeps a keepalive-less tunnel for the
+lifetime of the process. Confirm on the client with `rustynet status` that the configured peer
+actually carries a 25s keepalive before assuming the daemon is emitting them.
+
 **The capture that settles it** (run mid-stage; `final_cleanup` is `always_run`): on the client,
 every 5s across the recovery poll, record `traversal_probe_result`, `traversal_probe_attempts`,
 `traversal_probe_next_reprobe_unix`, and `traversal_probe_latest_handshake_unix` together in ONE
