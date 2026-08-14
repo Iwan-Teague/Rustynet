@@ -2350,6 +2350,27 @@ configures a peer before its keepalive is known, that peer keeps a keepalive-les
 lifetime of the process. Confirm on the client with `rustynet status` that the configured peer
 actually carries a 25s keepalive before assuming the daemon is emitting them.
 
+**Two MORE suspects eliminated by reading, 2026-08-14:**
+* boringtun timers ARE pumped — `engine.rs:452` calls `Tunn::update_timers`, so keepalives and
+  handshake retries do fire. Not a dormant-clock problem.
+* The keepalive DOES reach the client's peer — `daemon.rs:13438` is the ONLY production `PeerConfig`
+  construction site in the daemon (every other match is a test helper), and it sets `Some(25)`.
+
+**Leading remaining hypothesis, UNVERIFIED — the metric is paced, not dead.** `traversal_probe_due`
+returns `status.next_reprobe_unix.is_none_or(|next| now_unix >= next)` for a handshake that was
+ALREADY stale at the previous evaluation — which is exactly the state after a 35s block. So the probe
+is deliberately BACKED OFF, and the field the stage reads only refreshes when a probe runs. If the
+back-off exceeds the stage's 180s recovery poll, the tunnel can genuinely recover while the metric
+never refreshes inside the window. That would make this a measurement-window problem rather than a
+recovery failure, and it is consistent with `tunnel_active=true` and `membership_intact=true` on
+every failing run.
+
+**How to settle it without changing the assertion:** capture `traversal_probe_next_reprobe_unix` and
+`traversal_probe_attempts` on the client across the recovery poll. If `next_reprobe_unix` sits beyond
+the poll window and `attempts` does not rise, the tunnel's recovery is simply not being sampled — and
+the correct fix is to make the stage observe recovery through something that is not probe-paced (or
+to force a reprobe), NOT to relax what counts as recovered.
+
 **The capture that settles it** (run mid-stage; `final_cleanup` is `always_run`): on the client,
 every 5s across the recovery poll, record `traversal_probe_result`, `traversal_probe_attempts`,
 `traversal_probe_next_reprobe_unix`, and `traversal_probe_latest_handshake_unix` together in ONE
