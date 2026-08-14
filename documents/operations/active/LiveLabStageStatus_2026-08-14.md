@@ -148,3 +148,72 @@ not just Linux. Nothing in this session addressed that. Specifically open:
   role while traffic flows.
 * **QH-48** — the live suite is a strictly linear dependency chain, so one failure blocks ~19 stages
   and a 17-minute run surfaces at most one defect.
+
+## Run 39 (`qh51-peerprobe-20260814p`) — KILLED EXTERNALLY, answered nothing
+
+The peer-probe discriminating experiment (commit `9ac63abd`) NEVER RAN. The run was externally
+SIGTERMed at 11:07:44Z, ~296s into `live_managed_dns_validation`: the orchestrator's own stdout
+records `rust orchestrator: received SIGTERM/SIGINT — 25 stage(s) skipped`, and the in-flight
+stage's `cargo run` child died with `exit signal: 15 (SIGTERM)`. Everything downstream — including
+`live_network_flap_validation` — was cascade-skipped. 33 stages passed before the kill, among them
+`live_two_hop_validation` (second consecutive pass; the QH-46 firewalld fix keeps holding).
+
+Do NOT read the `live_managed_dns_validation` fail row as a stage or product defect:
+
+* No RNQ-07 deadline was armed (the direct CLI defaults `--stage-timeout-secs` to 0, and a deadline
+  kill would have recorded `timed_out`, not `fail`).
+* The stage was mid-normal bundle propagation (4th of 4 peers) when killed; the same stage passed
+  all 11 prior runs on 2026-08-14 in 245–281s.
+* The kill correlates with the handover session's teardown: the run was `nohup`ed from that
+  session's shell, and `nohup` does NOT give the child its own process group, so reaping the
+  session's background task TERMed the whole tree. The orchestrator survived long enough to run
+  `always_run` cleanup because it handles SIGTERM; the cargo child did not.
+
+**Launch-path lesson (recorded so it is not re-learned):** the "reload-proof, own process group"
+protection described in CLAUDE.md §12.5 belongs to the MCP launch path only. A direct-CLI run
+launched from an agent session's shell dies with that session unless the orchestrator is wrapped in
+its own session/process group (e.g. a `python3 os.setsid()` exec wrapper). Run 40 uses exactly that.
+
+Triage: recorded against stub `livelab-1786705680-c7eb8a1f00e5::live_managed_dns_validation`
+(no code change; environmental kill; relaunch).
+
+## Run 40 (`qh51-peerprobe2-20260814q`) — probe target fixed, and a NEW defect found underneath
+
+35 pass / 1 fail (`live_network_flap_validation` only) / 23 skipped. `live_two_hop_validation`
+passed again (third consecutive). Launched setsid-isolated after run 39's kill; no external
+interference this time.
+
+The peer-probe retarget (`9ac63abd`) did its job: the probe host resolved to the ENTRY
+(`fedora@192.168.64.103`). But the probe printed `<unresolved>` again — and this time the discovery
+command is NOT at fault. Verified directly on the guest: `ip` resolves fine on Fedora
+(`/usr/bin/ip`, PATH fine, command exits cleanly). The interface it was asked about did not exist.
+
+**The entry was tunnel-less for the whole flap window.** From fedora's journal (UTC):
+
+* 11:36:00 — `managed_dns` bundle propagation restarts fedora's daemon (2s stop→start gap).
+* 11:36:02 — the restarted daemon logs
+  `restrict_recoverable: dataplane bootstrap apply failed: system error: i/o failed: interface
+  "rustynet0" not present in sysfs: No such file or directory` — the error text of
+  `require_virtual_network_device` (privileged_helper.rs:1264), i.e. the QH-46 firewalld-bind
+  builtin refusing to bind an interface that does not exist yet.
+* 11:36–11:41 — the daemon reports `runtime bootstrap complete` and then sits with NO tunnel
+  interface until cleanup stops it. `restrict_recoverable` never actually recovers the dataplane;
+  nothing retries the apply.
+
+So `recovery_arrived=false` in run 40 says nothing about client session recovery — the client's
+peer had no tunnel. Hypothesis 8 remains OPEN, still neither established nor refuted.
+
+**The defect class (new, introduced with the QH-46 fix on `dda439a2`):** the firewalld zone bind
+runs at the tail of `apply_firewall_killswitch` (phase10.rs:2351), which by design runs BEFORE
+tunnel interface creation. When the bind runs on a firewalld host and the interface does not exist
+yet, the helper's virtual-device guard fails the whole apply, and the daemon parks in
+`restrict_recoverable` with no retry. Debian nodes escape because `presence=Absent` short-circuits
+before the device check (privileged_helper.rs:1103). The same fedora daemon restarted cleanly at
+11:32:04 (21s gap) and fatally at 11:36:02 (2s gap) with identical role state — a race, likely
+against interface teardown/creation timing, not a deterministic ordering bug. NOT yet planned or
+fixed; needs the PLAN → ADVERSARIAL REVIEW cycle. Also note the separate observations from the
+same window: traversal `bundle replay detected` / `signature verification failed`
+restrict_recoverable events at 11:33–11:35, and a pre-existing `force_fail_closed failed ...
+truncated frame header` spam loop on fedora at 10:31Z.
+
+Triage: recorded against stub `livelab-1786707675-c7eb8a1f00e5::live_network_flap_validation`.
