@@ -67,8 +67,10 @@ all confirmed in code:
 | build | your prebuilt binary | `cargo run` (recompiles working tree) |
 | target dir | workspace `target/` | `CARGO_TARGET_DIR=target-livelab` (avoids lock contention) |
 
-The `*_platform` selectors (`exit_platform` etc.) route to the **legacy bash orchestrator**, not the
-Rust engine. Use `nodes` if you are verifying `--node`.
+The MCP's `*_platform` selectors DO drive the Rust engine — `start_live_lab_run` auto-synthesizes a
+`--node` topology from them (`lab_state.rs:6317-6341`, `synthesize_nodes_from_platform_selectors`
+at `:4079`). The tool's own description strings still claim legacy bash and are STALE. Only the raw
+CLI `--exit-platform` flags are bash-only, and the MCP never emits them.
 
 ### Rebuild the orchestrator before every verification run
 
@@ -102,9 +104,12 @@ The running binary here predates commit `37b9690e` (2026-07-29), which resolves 
 tracks the run. MCP runs only appear to work because they pass absolute paths.
 
 **`rustynet-lab-monitor` has NO freshness gate** — `check_mcp_binaries_fresh.sh` covers only
-`crates/rustynet-mcp`, so the monitor rotted invisibly for three weeks. Rebuild it between runs
-(`./scripts/ci/lab_monitor_gates.sh`; the crate is workspace-EXCLUDED, 269 tests). Note `--fix` on the
-MCP freshness script takes the **shared workspace target lock**, so do not run it during a lab run.
+`crates/rustynet-mcp`, so the monitor rotted invisibly for three weeks. Rebuild with `cd crates/rustynet-lab-monitor && cargo build` — its own workspace and `Cargo.lock`.
+`./scripts/ci/lab_monitor_gates.sh` GATES it (fmt/clippy/check/test, ~270 tests) but runs `cargo
+check`, so it never produces a binary. Note `check_mcp_binaries_fresh.sh` is itself a `cargo run`, so it takes the **shared workspace target
+lock with or without `--fix`** — do not run it at all during a lab run. (`bin/rustynet-mcp-lab-state`
+is currently stale: Aug 13 09:11 vs source Aug 13 10:42. The staleness cannot affect run
+correctness — `start_live_lab_run` shells to `cargo run` — only the tool surface.)
 
 ---
 
@@ -129,11 +134,15 @@ IPv6; an `ip` table is IPv4-only. Comparing them manufactures contradictions —
 an IPv6 gossip packet, not evidence about pings.
 
 **Verify a field name before parsing it.** A probe here silently resolved to `<unresolved>` for a
-whole run because it parsed `assigned_cidr=` out of `rustynet status`, a field that does not exist.
+whole run because it parsed `assigned_cidr=` out of `rustynet status`. The field is REAL (an
+auto-tunnel-bundle key, `daemon.rs:12671`) but `rustynet status` does not emit it — "exists" and
+"emitted here" are different questions.
 Copy a discovery method that already works (`mesh_ipv4_discovery_command` in the two-hop stage).
 
-**`--node` role names.** `entry` is an ALIAS for `relay`; the second client must be `aux` or `extra`,
-not `client`. Getting this wrong makes `live_two_hop_validation` SKIP with a precise reason — read it.
+**`--node` role names.** `entry` and `relay` are DISTINCT roles — a `relay` node does NOT satisfy the
+two-hop `entry` requirement (`live_two_hop_validation.rs:52`, `role.rs:288-289`). Some stage lookups
+accept either via an explicit fallback list (`&["relay", "entry"]`); that is a fallback, not aliasing.
+The second client must be `aux` or `extra`, not `client`. Getting this wrong makes `live_two_hop_validation` SKIP with a precise reason — read it.
 
 **Ledger columns lie in both directions.** Confirm the row exists and is attributed to the right
 commit, then take pass/fail from the stage's own report artifact. Parse the CSVs quote-aware.
@@ -142,7 +151,13 @@ commit, then take pass/fail from the stage's own report artifact. Parse the CSVs
 
 ## 4. What landed, and the one thing that did not
 
-### Fixed and verified (all mutation-proven)
+### Fixed and verified
+
+QH-49/50/51 are mutation-proven. **QH-46 is LIVE-proven, NOT mutation-proven** — and it has a real
+gap: its grammar/posture layer is unit-tested (`linux_firewalld_zone.rs`, 9 tests) but the
+enforcement point `ensure_host_firewall_admits_forwarding` (`phase10.rs:890`) and its
+`allow_tunnel_relay_forward` gate (`:2351`) have **no test**. That violates CLAUDE.md §4
+(1 enforcement point + 1 verification test). Close it.
 
 * **QH-46 — firewalld.** Rustynet's forward chain is `hook forward priority 0`; firewalld's is
   `filter + 10` and runs AFTER, ending in `reject`. `NF_ACCEPT` means "continue to the next base
@@ -157,8 +172,15 @@ commit, then take pass/fail from the stage's own report artifact. Parse the CSVs
   * **NOT `firewall-cmd`**: it writes `connection.zone` into NetworkManager's on-disk config, which
     outlives uninstall. The D-Bus method has no such branch.
   * The zone is UNREPRESENTABLE in the helper grammar — always the empty string, resolved server-side.
-  * **Result: `live_two_hop_validation` passed for the first time in the `--node` engine's history.**
-    `two_hop_reply_ttl=63` on a Fedora entry — the same value Debian entries produced in June.
+  * **Result: `live_two_hop_validation` passed for the first time in the RECORDED `--node` history**
+    (the per-stage ledger only starts 2026-07-10). `two_hop_reply_ttl=63`, `per_hop_ttl_decrement=1`
+    on a Fedora entry — matching the pre-registered expected value in
+    `NodeEngineFlipDispositions_2026-07-24.md:223`. No June artifact exists on disk; do not claim one.
+    The attribution proof is the adjacent-commit pair: `qh49-verify-20260814b` @ `1d271015` FAILED,
+    `qh46-firewalld-20260814c` @ `dda439a2` (the firewalld fix) PASSED. Quote-aware parse of
+    `live_lab_node_stage_results.csv`: 291 skip / 121 fail / 50 pass, all 50 on 2026-08-14. Do NOT
+    cite `linux_stage_two_hop` in the run matrix — 35 of its pass rows are the `traffic_test_matrix`
+    alias contamination (CLAUDE.md §12.3).
 * **QH-49** — LAN-toggle hardcoded the SSH username, so any non-Debian guest was dialled as `debian@`.
 * **QH-50** — blind-exit NAT scan read `ct status dnat` (a conntrack MATCH) as NAT, and missed a
   leading-token `dnat to`. Wrong in both directions. Fixed the MATCHER, deliberately keeping the scan
@@ -177,15 +199,21 @@ stage blocks egress for 35s. So when the block lifts the session is still valid,
 it, and boringtun emits keepalives rather than a handshake — there is no new handshake to observe.
 The stage demanded one as proof of recovery.
 
-**In flight at handover:** run `qh51-datapath2-20260814n` tests a recovery proof based on DATA
-crossing the tunnel (ping the exit's mesh IP from the client) rather than a handshake timestamp. That
-is STRICTER — a reply cannot be produced without a live session, whereas a stale-but-present
-timestamp proves nothing about whether packets move.
+**HYPOTHESIS 8 IS NOW WEAKENED — read this before building on it.** Run
+`qh51-datapath2-20260814n` added a recovery proof based on DATA crossing the tunnel (ping the exit's
+mesh IP from the client) instead of a handshake timestamp. The probe RESOLVED its target this time
+(`exit mesh ipv4 for data probe: 100.80.169.183`, versus `<unresolved>` in the inert previous
+attempt) and **still reported `recovery_arrived=false`**. So data does not cross the tunnel within
+the 180s poll either — the original handshake assertion was not merely blind, and "the test's premise
+is wrong" is NOT established.
 
-**Unverified, and it must be checked before trusting hypothesis 8:** what cleared the handshake
-record during the block (nothing in `configure_peer` should, after the fixes above — look at
-`remove_peer`), and whether a handshake genuinely never occurs post-unblock. "The test is wrong" is
-the most self-flattering possible conclusion after seven failures; treat it with suspicion.
+**Crucial caveat on that probe, which must be resolved before concluding anything.** The stage's
+`--exit-host` resolves to the `exit` ROLE (`live_network_flap_validation.rs:30`) =
+`debian-headless-2`, but the client's actual WireGuard peer is the ENTRY (`fedora-utm-1`). So the
+probe crosses TWO hops and can fail for entry-forwarding reasons entirely unrelated to the client's
+session recovering — i.e. the QH-46 failure class. **Before trusting a negative result, re-target the
+probe at the client's OWN peer (the entry's mesh IP) to separate "client session did not recover"
+from "entry stopped forwarding".** That single change is the highest-value next experiment.
 
 **Do NOT widen the recovery assertion to make the suite green.** It is the only check proving the
 tunnel comes back.
@@ -200,15 +228,77 @@ tunnel comes back.
    gate — nothing covers it today.
 3. **Cross-platform parity — the larger release blocker.** Linux is only the reference.
    * `windows-utm-1` (192.168.64.25) is powered on and on the SAME network as the Linux guests, but
-     **port 22 is closed** — it is the only `.64` host that does not answer SSH. Fix that and it can
-     join the existing topology directly.
+     **port 22 is closed** — the only `.64` host that does not answer SSH. Fixing that unblocks the
+     Windows **client/admin/relay** cells ONLY: this guest has no WinNAT/HNS and no nested virt
+     (`CrossPlatformRoleParityPlan_2026-06-21.md:67,176`), so the Windows **exit** cell needs
+     `windows-x86-1` (192.168.121.108 on `ubuntu-kvm-1`) — a different network, so it also needs the
+     cross-network path.
    * `macos-utm-1` (192.168.65.101) is up and reachable but on a **different vmnet** (`.65` vs `.64`)
      because macOS UTM uses the Apple backend. A mixed mesh needs the cross-network path; no
      network-mode change fixes it.
-   * **`userspace_shared_macos` may need the QH-51 session/roaming fixes mirrored** — they landed in
-     `userspace_shared` only. NOT checked. Do this before assuming macOS benefits.
+   * **`userspace_shared_macos` needs NO mirroring — CHECKED.** It imports the same `UserspaceEngine`
+     (`userspace_shared_macos/runtime.rs:18-22`), so the `Tunn::new` keepalive pass-through,
+     `Unchanged` and `EndpointMoved` are inherited by construction, and its `configure_peer` already
+     clears telemetry only on `Replaced` (`:584`). QH-51a is in `daemon.rs`, platform-independent.
    * **QH-46's Windows analogue is unexamined** — the defect CLASS (a foreign filter at the same hook
      silently discarding traffic we authorised) has an obvious counterpart in WFP filter weights.
 4. **QH-47** — nothing flushes conntrack when NAT rules change.
 5. **QH-48** — the suite is a linear dependency chain; one failure blocks ~19 stages, so a
-   17-minute run surfaces at most one defect.
+   ~24-minute run (18.7-29.1 min measured across the eleven 2026-08-14 runs) surfaces at most one
+   defect.
+
+
+---
+
+## 6. Operational facts a successor needs
+
+**HEAD this document describes:** `e73a0d7e`. Run→commit anchors for the QH-46 attribution:
+`qh49-verify-20260814b` @ `1d271015` (two_hop FAILED) → `qh46-firewalld-20260814c` @ `dda439a2`
+(two_hop PASSED, firewalld fix present).
+
+**Find an in-flight run:**
+```bash
+ps -eo pid=,args= -ww | grep '[v]m-lab-orchestrate-live-lab'   # argv carries --report-dir
+```
+
+**Where the verdicts live.** `<report-dir>/state/stages.tsv` is the AUTHORITATIVE per-run verdict
+list (59 rows on this topology) — the headline pass/fail/skip counts come from there, not from the
+orchestrator's stdout. Also in `state/`: `live_lab_node_stage_results.csv`, `nodes.tsv`,
+`orchestration_context.json`. Per-stage detail is `<report-dir>/<stage>_report.json` +
+`logs/<stage>.log`.
+
+**Pending triage stubs (the launch gate reads these):**
+```bash
+jq -r 'select(.patch == null) | "\(.ts_utc)  \(.stub_id)"' \
+  documents/operations/live_lab_stage_triage.jsonl | sort
+```
+
+**The orchestrator binary.** This session built it to a session-scoped scratchpad
+(`.../scratchpad/orch<N>`, incrementing per rebuild) — a path a successor CANNOT reconstruct. Build
+your own and keep it somewhere stable; `target/debug/rustynet-cli` is fine if you accept that any
+`cargo build` overwrites it.
+
+**`--source-mode` defaults to `working-tree`** (`vm_lab/mod.rs:28945`), and the direct CLI emits **no
+untracked-file warning** (the MCP does, via `untracked_crate_files`). A fix in a NEW file under
+`crates/` silently does not deploy — `git add` it first, or check with the MCP's `what_will_deploy`.
+
+**Four launch paths, not two.** Direct CLI; MCP `start_live_lab_run`; MCP
+`launch_live_lab_on_host` (remote host — and it DOES accept `host_known_hosts`); and
+`ai_lab_run` (deterministic worker + auto-triage, CLAUDE.md §12.5). The latter three share
+singleton/reconcile machinery the direct path bypasses entirely.
+
+**Gates (CLAUDE.md §7) — not covered elsewhere in this document.** Before landing:
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+`cargo test --workspace --all-targets --all-features`, plus `cargo audit` / `cargo deny`. Note
+`--workspace` SKIPS `crates/rustynet-lab-monitor`, `fuzz/` and `gui/` (separate workspaces); CI adds
+`--locked`; and `cargo run -p rustynet-xtask -- gates` dirties the tracked
+`documents/operations/gate_timings.csv`.
+
+**Dirty-tree hazard.** A running lab auto-appends to tracked files (`live_lab_node_run_matrix.csv`,
+`live_lab_node_stage_results.csv`, `live_lab_stage_triage.jsonl`). NEVER `git add -A`; add explicit
+paths. Check `git rev-list --count HEAD..origin/main` is 0 before committing, and do not take a
+"dirty state" evidence reading mid-run.
+
+**The cross-network substrate is UNTESTED, not confirmed.** All 11 `cross_network_*` stages are in
+the cascade behind the single failure, so nothing has established whether the `.65`/`.64` vmnet split
+is actually workable for a mac cell — only that it is the route that would have to work.
