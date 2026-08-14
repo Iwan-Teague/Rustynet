@@ -2312,6 +2312,50 @@ the scope, so the scan stays host-wide.
 **Follow-up not bundled here:** the scan does not recognise `redirect`, which is also NAT. Adding it
 would strengthen the control beyond the defect being fixed, so it is recorded rather than smuggled in.
 
+### QH-51 — network-flap recovery: the handshake never returns after the block is lifted
+
+**Status: OPEN, first verdict reached.** Newly surfaced on run `qh46-firewalld-20260814c`
+(35 passed / 1 failed / 23 skipped) — this stage had been cascade-blocked behind
+`live_two_hop_validation` and had never run to its own verdict before [[QH-46]] was fixed.
+
+The stage blocks WireGuard's UDP output on the client, waits for the keepalive to lapse, confirms the
+disruption, removes the block, then polls for handshake recovery:
+
+```
+[network-flap] blocking WG UDP output port 51820 on client
+[network-flap] block rule added=true
+[network-flap] waiting 35s for keepalive to expire
+[network-flap] mid_handshake_age_s=18446744073709551615 disruption_confirmed=true
+[network-flap] removing block rule
+[network-flap] polling for WG handshake recovery
+[network-flap] recovery_arrived=false recovery_time_s=0
+[network-flap] tunnel_active=true membership_intact=true
+```
+
+So the tunnel is up and membership is intact, but no fresh handshake is observed after the block is
+lifted.
+
+**Two separate things to run down, and they must not be conflated:**
+
+1. **`mid_handshake_age_s = 18446744073709551615` is `u64::MAX`**, not an age. That is a sentinel or
+   an unsigned underflow (`now - last_handshake` with `last_handshake` in the future or zero) leaking
+   into a field the stage then reasons about. It happens to produce the right verdict here —
+   "extremely old" reads as disrupted — which is exactly what makes it dangerous: a value that is
+   wrong for the right reason will keep passing until it silently isn't. Fix the arithmetic
+   regardless of whether it is this stage's cause.
+2. **Why no handshake returns.** WireGuard re-handshakes when it has traffic to send, and the stage
+   explicitly waits for the keepalive to lapse first. Worth establishing, in this order: whether a
+   persistent keepalive is actually configured on the client peer after the flap; whether the peer's
+   endpoint survived the block or was demoted; and whether anything generates traffic during the
+   recovery poll at all. A poll that observes a silent tunnel proves nothing about recovery.
+
+**One contributing factor already ruled OUT as the cause.** The journal shows
+`flap breaker for peer fedora-utm-1-bootstrap half_open -> open (intensity 0.97)`, and an open
+breaker is real: `daemon.rs:6885` skips the re-race while it is not closed. But it gates only the
+QUALITY-TRIGGERED re-race, not WireGuard's own handshake, so it cannot by itself explain a missing
+handshake. It may still matter if recovery depends on re-selecting an endpoint — do not dismiss it,
+but do not treat it as the answer either.
+
 ### QH-46 — two-hop proof: the client reaches the entry but never the final exit
 
 **Status: FIXED and LIVE-PROVEN 2026-08-14. `live_two_hop_validation` PASSED for the first time in
