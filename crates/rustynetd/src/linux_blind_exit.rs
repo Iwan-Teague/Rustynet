@@ -316,14 +316,21 @@ fn validate_nft_table_name(value: &str) -> Result<(), String> {
 /// as in `dnat ip to 10.0.0.1`). Requiring the `to` is what keeps a chain or set
 /// merely NAMED `dnat` from tripping the control.
 ///
+/// Requiring `to` is ALSO what makes the conntrack matches safe, with no need to
+/// pre-strip `ct status` expressions: in `ct status dnat accept` the flag is
+/// followed by `accept`, and in `ct status { dnat, snat } accept` by a comma or
+/// brace. A stripping pass was written first and then removed — mutation testing
+/// showed disabling it changed no verdict, because this rule already covers
+/// every spelling nft emits. If the `to` requirement is ever relaxed, that
+/// analysis has to be redone.
+///
 /// The scan deliberately remains HOST-WIDE. A `masquerade` installed by another
 /// firewall rewrites this node's egress just as effectively as one of ours, so
 /// narrowing it to Rustynet's own table would convert a true positive into a
 /// fail-open on exactly the hosts most likely to carry one.
 fn line_performs_nat(line: &str) -> bool {
-    let stripped = strip_ct_status_expressions(line);
-    let tokens: Vec<&str> = stripped.split_whitespace().collect();
-    if tokens.iter().any(|token| *token == "masquerade") {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.contains(&"masquerade") {
         return true;
     }
     tokens.iter().enumerate().any(|(idx, token)| {
@@ -333,48 +340,6 @@ fn line_performs_nat(line: &str) -> bool {
         // `dnat to <addr>` or a family-qualified `dnat ip to <addr>`.
         tokens.get(idx + 1) == Some(&"to") || tokens.get(idx + 2) == Some(&"to")
     })
-}
-
-/// Remove `ct status <flags>` expressions from an already-normalized rule line.
-///
-/// nftables uses `dnat` and `snat` as BOTH conntrack status flags (a read-only
-/// match: `ct status dnat accept`) and NAT statements (`dnat to 10.0.0.1`). The
-/// blind-exit control cares only about the second kind, so the first is stripped
-/// before the keyword scan. Everything else on the line is preserved, so a real
-/// NAT statement sharing a line with a `ct status` match is still caught.
-///
-/// Handles both spellings nft emits: a single flag (`ct status dnat`) and a set
-/// (`ct status { dnat, snat }`). An unterminated set consumes to end of line,
-/// which fails safe: the remainder of a malformed line cannot smuggle a NAT
-/// statement past the scan, because a truncated line yields fewer keywords, and
-/// the separate structural checks below still require the exact allow rules to
-/// be present.
-fn strip_ct_status_expressions(line: &str) -> String {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    let mut kept: Vec<&str> = Vec::with_capacity(tokens.len());
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        if tokens[idx] == "ct" && tokens.get(idx + 1) == Some(&"status") {
-            idx += 2;
-            match tokens.get(idx) {
-                Some(&"{") => {
-                    while idx < tokens.len() && tokens[idx] != "}" {
-                        idx += 1;
-                    }
-                    // Step past the closing brace when there is one.
-                    if idx < tokens.len() {
-                        idx += 1;
-                    }
-                }
-                Some(_) => idx += 1,
-                None => {}
-            }
-            continue;
-        }
-        kept.push(tokens[idx]);
-        idx += 1;
-    }
-    kept.join(" ")
 }
 
 fn normalize_nft_rule(line: &str) -> String {
