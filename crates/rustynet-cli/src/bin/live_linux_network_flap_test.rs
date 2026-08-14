@@ -309,13 +309,26 @@ fn run() -> Result<(), String> {
     // timestamp — a stale-but-present handshake stamp proves nothing about
     // whether packets move, while a reply cannot be produced without a working
     // session. If the tunnel genuinely fails to recover, this fails.
+    // Read the mesh address off the TUNNEL INTERFACE, the way the two-hop stage
+    // already does successfully (`live_linux_two_hop_test.rs`
+    // `mesh_ipv4_discovery_command`). An earlier attempt here parsed an
+    // `assigned_cidr=` token out of `rustynet status` — a field name that was
+    // assumed rather than checked, and does not appear in that output. The probe
+    // silently resolved to `<unresolved>` and never ran, so the run neither
+    // proved nor disproved anything.
     let exit_mesh_ipv4 = ctx
-        .capture_root_allow_failure(&exit_host, &["rustynet", "status"])
+        .capture_root_allow_failure(
+            &exit_host,
+            &["ip", "-4", "-o", "addr", "show", "dev", "rustynet0"],
+        )
         .ok()
         .and_then(|out| {
+            // `... inet 100.80.169.183/32 scope global rustynet0`
             out.split_whitespace()
-                .find_map(|token| token.strip_prefix("assigned_cidr="))
+                .skip_while(|token| *token != "inet")
+                .nth(1)
                 .and_then(|cidr| cidr.split('/').next())
+                .filter(|addr| addr.starts_with("100."))
                 .map(str::to_owned)
         });
     logger.line(format!(
