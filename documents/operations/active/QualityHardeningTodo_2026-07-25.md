@@ -2314,7 +2314,41 @@ would strengthen the control beyond the defect being fixed, so it is recorded ra
 
 ### QH-51 — network-flap recovery: the handshake never returns after the block is lifted
 
-**Status: OPEN — three of four checks now pass; only recovery detection remains (2026-08-14).**
+**Status: OPEN — 3 of 4 checks pass. The roaming hypothesis was TESTED and REFUTED (2026-08-14).**
+
+I predicted the endpoint-rebuild churn was destroying the handshake record faster than it could be
+written, and that fixing it would produce recovery. Run `qh51-roam-20260814h`, with that fix live:
+
+```
+baseline_handshake_age_s = 68           ok=true
+mid_handshake_age_s      = unreadable   disruption_confirmed=true
+recovery_arrived         = false        <-- prediction FALSIFIED
+```
+
+The roaming fix is correct on its own merits and stays (a WireGuard session is keyed by the static
+keys, not the address; rebuilding a live tunnel because a peer moved is wrong regardless). But it was
+NOT what blocked recovery. Record this as refuted so nobody re-runs the same reasoning.
+
+**What is now established by elimination.** The record survives an unchanged reconcile (baseline is
+readable, 68s) and survives roaming, yet after the block lifts NO handshake is recorded within the
+180s poll. So the remaining question is no longer "what deletes the record" — it is **"why does no
+handshake occur, or occur without being recorded, after the client's egress is restored"**.
+
+Three candidates, in the order they are cheapest to test, none yet checked:
+1. **The handshake is never initiated.** `initiate_handshake` is driven by the daemon; if nothing
+   calls it for this peer after the block lifts, and no outbound traffic is generated during the
+   poll, WireGuard has no reason to speak. The 25s persistent keepalive should defeat this — verify
+   it actually reached the peer config on the live node (`wg`-equivalent state via `rustynet status`),
+   because a keepalive that is set but not applied looks identical from here.
+2. **The handshake occurs but is not recorded.** `record_authenticated_handshake` fires only when the
+   engine returns `Some(observed)`; check whether the response-message path (as opposed to the
+   initiation path) returns it.
+3. **The flap breaker suppresses re-initiation.** It reaches `open` at intensity 0.97 for this peer.
+   `daemon.rs:6885` gates only the quality re-race, but confirm no other consult point gates
+   initiation.
+
+**Do NOT widen the recovery assertion.** It is the only check proving the tunnel comes back; the
+whole stage is worthless without it.; only recovery detection remains (2026-08-14).**
 
 Progression across runs, each figure from the stage's own log:
 
