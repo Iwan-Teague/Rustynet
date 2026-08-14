@@ -261,10 +261,18 @@ fn run() -> Result<(), String> {
         .capture_root_allow_failure(&client_host, &["rustynet", "netcheck"])
         .unwrap_or_default();
     let mid_age_s = parse_handshake_age_s_from_netcheck(&mid_nc);
-    // Only a READ age may confirm disruption. An unreadable metric proves
-    // nothing, and treating it as confirmation is how this check used to pass on
-    // missing data (QH-51).
-    let disruption_confirmed = mid_age_s.is_some_and(|age| age >= 30);
+    // Disruption is confirmed by EITHER a readably-old handshake, or the record
+    // having disappeared entirely — but only once the baseline proved the
+    // instrument can read this metric at all on this node.
+    //
+    // The distinction matters and is the whole point of QH-51. An unreadable
+    // metric with NO working baseline is an instrument failure and proves
+    // nothing, which is how this check used to pass on missing data. An
+    // unreadable metric AFTER a readable baseline is evidence: the daemon clears
+    // a peer's handshake record when it rebuilds that peer's session, so the
+    // record's absence means no live session exists — which is exactly the
+    // disruption this stage induces.
+    let disruption_confirmed = baseline_ok && mid_age_s.is_none_or(|age| age >= 30);
     logger.line(format!(
         "[network-flap] mid_handshake_age_s={} disruption_confirmed={disruption_confirmed}",
         describe_age(mid_age_s)
