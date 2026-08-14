@@ -2314,10 +2314,30 @@ would strengthen the control beyond the defect being fixed, so it is recorded ra
 
 ### QH-46 — two-hop proof: the client reaches the entry but never the final exit
 
-**Status: ROOT CAUSE CONFIRMED 2026-08-14 — firewalld rejects the hairpin AFTER Rustynet has
-accepted it. This is a PRODUCT defect on RHEL-family hosts, not a lab or test defect. The earlier
-hypotheses recorded further down were refuted by their own follow-up measurements and are kept, with
-their corrections, so the reasoning is auditable.**
+**Status: FIXED and LIVE-PROVEN 2026-08-14. `live_two_hop_validation` PASSED for the first time in
+the recorded history of the `--node` engine**, on run `qh46-firewalld-20260814c`, with a
+firewalld-family (Fedora) entry node — the only topology in which the test is meaningful.
+
+From the stage's own report artifact, not a ledger column:
+
+```
+end_to_end_reachable       = True     (was False)
+baseline_reply_ttl         = 64
+two_hop_reply_ttl          = 63       (was -1)
+per_hop_ttl_decrement      = 1        (was none)
+per_hop_ttl_decrement_ok   = True
+path_readiness_attempts    = 1        (was 11 attempts over 96s, never reachable)
+path_readiness_waited_secs = 2        (was 96)
+entry_host                 = fedora@192.168.64.103
+```
+
+TTL 63 is exactly one forwarding hop, and it is the SAME value the historical Debian-entry runs of
+2026-06-27 produced. That is what closes the diagnosis: firewalld was the entire difference, and a
+firewalld-family node now forwards identically to one that never ran firewalld. Run result overall:
+35 passed / 1 failed / 23 skipped, the remaining failure being `live_network_flap_validation`, a
+stage that had been cascade-blocked behind this one and reached its own verdict for the first time.
+
+The root cause, the fix, and the refuted hypotheses are kept below so the reasoning stays auditable.**
 
 Rustynet installs its forward chain at `type filter hook forward priority 0` and appends the relay
 hairpin allow `iifname rustynet0 oifname rustynet0 counter accept` (`phase10.rs:2265-2294`). In
