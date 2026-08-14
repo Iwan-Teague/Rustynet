@@ -146,7 +146,7 @@ fn run() -> Result<(), String> {
     // Use `rustynet netcheck` which reports the daemon's last live handshake
     // timestamp via path_latest_live_handshake_unix.
     logger.line("[network-flap] waiting for baseline WG handshake (up to 300s)")?;
-    let mut baseline_age_s = u64::MAX;
+    let mut baseline_age_s: Option<u64> = None;
     for attempt in 0..60u32 {
         let nc_result = ctx.capture_root_allow_failure(&client_host, &["rustynet", "netcheck"]);
         let client_err = nc_result
@@ -155,7 +155,7 @@ fn run() -> Result<(), String> {
             .map(|e| e.chars().take(120).collect::<String>());
         let nc_out = nc_result.unwrap_or_default();
         baseline_age_s = parse_handshake_age_s_from_netcheck(&nc_out);
-        if baseline_age_s < 180 {
+        if baseline_age_s.is_some_and(|age| age < 180) {
             break;
         }
         if attempt == 0 || attempt == 11 || attempt == 23 {
@@ -179,9 +179,13 @@ fn run() -> Result<(), String> {
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
-    let baseline_ok = baseline_age_s < 180;
+    // An UNREADABLE baseline is a failure of this stage's own instrument, not a
+    // property of the tunnel, and it must be reported as such rather than
+    // silently standing in for "very old".
+    let baseline_ok = baseline_age_s.is_some_and(|age| age < 180);
     logger.line(format!(
-        "[network-flap] baseline_handshake_age_s={baseline_age_s} ok={baseline_ok}"
+        "[network-flap] baseline_handshake_age_s={} ok={baseline_ok}",
+        describe_age(baseline_age_s)
     ))?;
     // Post-poll failure dump: capture full WG + gossip state to understand
     // why handshake never established.
@@ -257,9 +261,13 @@ fn run() -> Result<(), String> {
         .capture_root_allow_failure(&client_host, &["rustynet", "netcheck"])
         .unwrap_or_default();
     let mid_age_s = parse_handshake_age_s_from_netcheck(&mid_nc);
-    let disruption_confirmed = mid_age_s >= 30;
+    // Only a READ age may confirm disruption. An unreadable metric proves
+    // nothing, and treating it as confirmation is how this check used to pass on
+    // missing data (QH-51).
+    let disruption_confirmed = mid_age_s.is_some_and(|age| age >= 30);
     logger.line(format!(
-        "[network-flap] mid_handshake_age_s={mid_age_s} disruption_confirmed={disruption_confirmed}"
+        "[network-flap] mid_handshake_age_s={} disruption_confirmed={disruption_confirmed}",
+        describe_age(mid_age_s)
     ))?;
 
     // ── Stage 5: remove block rule ────────────────────────────────────────────
@@ -280,7 +288,7 @@ fn run() -> Result<(), String> {
             .capture_root_allow_failure(&client_host, &["rustynet", "netcheck"])
             .unwrap_or_default();
         let post_age = parse_handshake_age_s_from_netcheck(&post_nc);
-        if post_age < 30 {
+        if post_age.is_some_and(|age| age < 30) {
             recovery_arrived = true;
             recovery_time_s = recovery_start.elapsed().as_secs();
             break;
@@ -311,7 +319,7 @@ fn run() -> Result<(), String> {
         "[network-flap] membership_intact={membership_intact}"
     ))?;
 
-    let overall_pass = baseline_ok && recovery_arrived && membership_intact;
+    let overall_pass = baseline_ok && disruption_confirmed && recovery_arrived && membership_intact;
 
     // ── Write report ──────────────────────────────────────────────────────────
     // Called IN-PROCESS, not via `cargo run … ops …`. The subprocess form built
@@ -321,7 +329,7 @@ fn run() -> Result<(), String> {
     rustynet_cli::ops_live_lab_orchestrator::execute_ops_write_live_linux_network_flap_report(
         rustynet_cli::ops_live_lab_orchestrator::WriteLiveLinuxNetworkFlapReportConfig {
             report_path: report_path.clone(),
-            baseline_handshake_age_s: baseline_age_s,
+            baseline_handshake_age_s: baseline_age_s.unwrap_or(u64::MAX),
             flap_duration_s,
             disruption_confirmed: pass_fail(disruption_confirmed).to_owned(),
             recovery_handshake_arrived: pass_fail(recovery_arrived).to_owned(),
@@ -347,25 +355,60 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn parse_handshake_age_s_from_netcheck(netcheck_out: &str) -> u64 {
-    // `rustynet netcheck` emits space-separated key=value tokens including
-    // `path_latest_live_handshake_unix=<unix_ts>`.
+/// Age in seconds of the peer handshake the daemon last observed, or `None`
+/// when the metric could not be read at all.
+///
+/// # Why the raw probe timestamp, and not `path_latest_live_handshake_unix`
+///
+/// `path_latest_live_handshake_unix` is FRESHNESS-GATED: `daemon.rs:7344-7370`
+/// only populates it when `traversal_handshake_is_fresh` holds, and renders it
+/// as the literal string `"none"` otherwise. It therefore cannot express an age
+/// — it reports a timestamp while fresh and disappears once stale.
+///
+/// This stage previously parsed that field with `.parse::<u64>().ok()`, so
+/// `"none"` failed to parse, the match arm never fired, and control fell through
+/// to a trailing `u64::MAX`. That single value stood for THREE different states
+/// (token absent, token `"none"`, and `now < ts` clock skew), and the stage then
+/// treated it as an enormous age. The consequence was a stage that could not
+/// pass and whose passing check was meaningless: `baseline_handshake_age_s` read
+/// `18446744073709551615` BEFORE any block was applied, so
+/// `wg_disruption_confirmed` succeeded trivially on unreadable data while
+/// `wg_handshake_recovered` could never succeed at all (QH-51, measured on runs
+/// `qh46-firewalld-20260814c` and `qh51-keepalive-20260814d`).
+///
+/// `traversal_probe_latest_handshake_unix` is the same underlying observation
+/// WITHOUT the freshness gate, so it ages continuously and can be subtracted
+/// from now. Returning `Option` keeps "unreadable" distinct from "old", because
+/// missing data must never be reported as evidence of disruption.
+fn parse_handshake_age_s_from_netcheck(netcheck_out: &str) -> Option<u64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    for token in netcheck_out.split_whitespace() {
-        if let Some(ts) = token
-            .strip_prefix("path_latest_live_handshake_unix=")
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            if ts == 0 || now == 0 || now < ts {
-                return u64::MAX;
-            }
-            return now - ts;
-        }
+        .ok()?;
+    if now == 0 {
+        return None;
     }
-    u64::MAX
+    for token in netcheck_out.split_whitespace() {
+        let Some(raw) = token.strip_prefix("traversal_probe_latest_handshake_unix=") else {
+            continue;
+        };
+        // `none`, `multiple` (a multi-peer summary), and anything else
+        // non-numeric are UNREADABLE, not old.
+        let Ok(ts) = raw.parse::<u64>() else {
+            return None;
+        };
+        if ts == 0 || now < ts {
+            return None;
+        }
+        return Some(now - ts);
+    }
+    None
+}
+
+/// Render an optional age for the log, keeping "unreadable" visibly distinct
+/// from any number.
+fn describe_age(age: Option<u64>) -> String {
+    age.map_or_else(|| "unreadable".to_owned(), |value| value.to_string())
 }
 
 fn pass_fail(ok: bool) -> &'static str {
