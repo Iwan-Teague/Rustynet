@@ -55,6 +55,14 @@ impl OrchestrationStage for LiveNetworkFlapValidationStage {
             .to_str()
             .unwrap_or("live_network_flap_report.json");
         let log_path_str = log_path.to_str().unwrap_or("live_network_flap.log");
+        // The client's actual WireGuard peer is the ENTRY when the topology has
+        // one, not the final exit. Probing the exit crosses TWO hops, so a
+        // failure there cannot distinguish "this client's session did not
+        // recover" from "the entry stopped forwarding" — the QH-46 failure
+        // class. Fall back to the exit only in a topology with no entry, where
+        // the exit IS the client's peer.
+        let peer_params = ssh_params_for_role(ctx, "entry").unwrap_or_else(|_| exit_params.clone());
+        let peer_target = format!("{}@{}", peer_params.user, peer_params.host);
         let identity_file = exit_params.identity_file.to_str().unwrap_or("");
 
         let result = std::process::Command::new("cargo")
@@ -74,6 +82,8 @@ impl OrchestrationStage for LiveNetworkFlapValidationStage {
                 &exit_target,
                 "--exit-node-id",
                 &exit_node_id,
+                "--peer-host",
+                &peer_target,
                 "--client-host",
                 &client_target,
                 "--client-node-id",
@@ -107,6 +117,7 @@ impl OrchestrationStage for LiveNetworkFlapValidationStage {
     }
 }
 
+#[derive(Clone)]
 struct ResolvedParams {
     alias: String,
     host: String,

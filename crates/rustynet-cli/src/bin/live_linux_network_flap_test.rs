@@ -54,6 +54,9 @@ fn run() -> Result<(), String> {
     let mut ssh_identity_file = String::new();
     let mut exit_host = String::new();
     let mut client_host = String::new();
+    // The client's own WireGuard peer. Distinct from `exit_host`, which in a
+    // two-hop topology is one hop FURTHER on (QH-51).
+    let mut peer_host = String::new();
     let mut _exit_node_id = String::new();
     let mut _client_node_id = String::new();
     let mut report_path = root_dir.join("artifacts/live_lab/live_linux_network_flap_report.json");
@@ -69,6 +72,10 @@ fn run() -> Result<(), String> {
             "--exit-host" => {
                 idx += 1;
                 exit_host = req(&args, idx, "--exit-host")?;
+            }
+            "--peer-host" => {
+                idx += 1;
+                peer_host = req(&args, idx, "--peer-host")?;
             }
             "--client-host" => {
                 idx += 1;
@@ -316,9 +323,17 @@ fn run() -> Result<(), String> {
     // assumed rather than checked, and does not appear in that output. The probe
     // silently resolved to `<unresolved>` and never ran, so the run neither
     // proved nor disproved anything.
+    // Probe the client's OWN PEER, not the final exit. Same command whose output
+    // format is already proven (it resolved a target on run
+    // `qh51-datapath2-20260814n`); only the host differs.
+    let probe_host = if peer_host.is_empty() {
+        &exit_host
+    } else {
+        &peer_host
+    };
     let exit_mesh_ipv4 = ctx
         .capture_root_allow_failure(
-            &exit_host,
+            probe_host,
             &["ip", "-4", "-o", "addr", "show", "dev", "rustynet0"],
         )
         .ok()
@@ -332,7 +347,7 @@ fn run() -> Result<(), String> {
                 .map(str::to_owned)
         });
     logger.line(format!(
-        "[network-flap] exit mesh ipv4 for data probe: {}",
+        "[network-flap] peer mesh ipv4 for data probe (host {probe_host}): {}",
         exit_mesh_ipv4.as_deref().unwrap_or("<unresolved>")
     ))?;
 
