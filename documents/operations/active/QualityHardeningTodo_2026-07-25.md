@@ -2866,3 +2866,59 @@ and untouched under (b).
 the above must be captured mid-stage. Counters must be read in one sample; comparing a filter
 counter from one run against a nat counter from another proves nothing.
 
+
+### QH-52 — the firewalld zone bind is never undone: role demotion leaves the binding behind
+
+Found by adversarial review of the [[QH-46]] enforcement tests, not by a failure. `FirewalldZoneOp`
+has `Bind`, `Unbind` and `Query`, but the daemon's ONLY constructor call site is the `Bind` in
+`ensure_host_firewall_admits_forwarding` (phase10.rs:893) — `Unbind` and `Query` have zero callers.
+A node that stops forwarding (relay/exit demotion, `rollback_firewall` phase10.rs:2357) never
+removes the interface-to-zone binding. The residue is bounded — the binding is runtime-only
+(the D-Bus method deliberately avoids the persistent NetworkManager write) and dies with
+firewalld or the interface — but the asymmetry violates the §10.7 shape ("undeploy before
+revocation") and should either gain an `Unbind` call on the demotion path or a documented
+decision that the bounded residue is acceptable.
+
+### QH-53 — REGRESSION from the QH-46 fix: firewalld bind races interface creation on daemon
+restart, and a failed bootstrap apply is never retried
+
+**Two defects compounding, live-proven on run `qh51-peerprobe2-20260814q` (fedora, 11:36:02Z):**
+
+1. `ensure_host_firewall_admits_forwarding` runs at the tail of `apply_firewall_killswitch`
+   (phase10.rs:2351), which runs BEFORE tunnel interface creation (fail-closed-first ordering).
+   On a firewalld host the builtin's virtual-device guard
+   (`require_virtual_network_device`, privileged_helper.rs:1264) then refuses the bind if
+   `rustynet0` does not exist yet, failing the WHOLE dataplane apply. The same fedora daemon
+   restarted cleanly at 11:32:04 (21s stop→start gap) and fatally at 11:36:02 (2s gap) with the
+   same role state — a race against interface teardown/creation timing, not deterministic
+   ordering. Debian-family hosts escape only because `presence=Absent` short-circuits before the
+   device check (privileged_helper.rs:1103).
+2. When the bootstrap apply fails, the daemon logs `restrict_recoverable: dataplane bootstrap
+   apply failed`, then reports `runtime bootstrap complete` and sits with NO tunnel interface
+   indefinitely (observed 5+ minutes until the run's cleanup) — `restrict_recoverable` has no
+   retry loop for the dataplane apply. A forwarding node on a firewalld distribution can
+   therefore drop out of the mesh on any fast daemon restart and stay out silently.
+
+Consequence for [[QH-51]]: run 40's `recovery_arrived=false` is contaminated (the client's peer
+was tunnel-less), so flap hypothesis 8 remains open. The trigger in the lab is `managed_dns`
+bundle propagation, which restarts each node's daemon with a ~2s gap.
+
+Fix is NOT designed yet — needs the full PLAN → ADVERSARIAL REVIEW cycle. The candidate space to
+evaluate there: bind at interface-up time instead of killswitch time (ordering change), retry the
+bind once the interface exists (scoped retry), or a bounded dataplane-apply retry in
+`restrict_recoverable` (fixes the class, not just this instance). Do not weaken the
+virtual-device guard or the fail-closed verdict to make the race disappear.
+
+**[[QH-46]] enforcement-test closure (2026-08-14).** The §4 gap the handover flagged is closed:
+`ensure_host_firewall_admits_forwarding` and its `allow_tunnel_relay_forward` gate now carry a
+cross-platform source-pin test (`linux_firewall_apply_checks_host_firewall_when_forwarding`,
+IPV-10 pattern), seven `cfg(linux)` behavioural tests through the real helper protocol (fail
+closed on unbound / unparseable / unknown-binding / builtin-error postures; pass on bound /
+absent; a plain client never drives the builtin), an operation-order assertion on
+`relay_with_upstream_enables_tunnel_forwarding_path`, and five helper-side boundary tests
+(grammar incl. zone-token rejection — the zone stays unrepresentable — builtin classification,
+binary-resolution refusal, token round-trip). Mutation-proven on BOTH platforms: macOS caught
+delete-call, gut-check, remove-gate, controller-reorder; the Debian guest caught swallow-Err,
+missing-bound-as-clear, hardcoded-interface, and Bind→Query. All 14 tests pass on the guest.
+Residual, deliberate: the D-Bus executor `execute_linux_firewalld_zone` itself remains
+live-lab-only coverage.
