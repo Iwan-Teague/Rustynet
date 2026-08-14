@@ -3012,6 +3012,105 @@ mod tests {
         );
     }
 
+    // ---- linux-firewalld-zone builtin: privileged-boundary negative tests ----
+    //
+    // QH-46: the D-Bus executor itself (`execute_linux_firewalld_zone`) is
+    // exercised only in the live lab — these pin the D-Bus-free boundary
+    // layers: the argv grammar the helper enforces, the builtin classification,
+    // and the binary-resolution refusal.
+
+    #[test]
+    fn linux_firewalld_zone_builtin_permits_exactly_the_two_token_grammar() {
+        for op in ["query", "bind", "unbind"] {
+            let op_token = format!("op={op}");
+            assert!(
+                validate_request(
+                    PrivilegedCommandProgram::LinuxFirewalldZone,
+                    &[op_token.as_str(), "interface=rustynet0"],
+                )
+                .is_ok(),
+                "helper must permit the reviewed grammar for op {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_firewalld_zone_builtin_rejects_zone_and_malformed_tokens() {
+        // The ZONE is deliberately unrepresentable in this grammar — it is
+        // always resolved server-side to the effective default zone. A caller
+        // that could name a zone could name `trusted`, which would disable
+        // firewalld's inbound filtering on the tunnel entirely (the exact
+        // decision QH-46 documents rejecting). Every argv below must be
+        // refused at validation.
+        for bad in [
+            &["op=bind", "interface=rustynet0", "zone=trusted"][..],
+            &["op=bind", "interface=rustynet0", "zone=public"][..],
+            &["op=bind", "interface=lo"][..],
+            &["op=bind", "interface=../etc"][..],
+            &["op=bind", "interface="][..],
+            &["op=bind"][..],
+            &["interface=rustynet0"][..],
+            &["op=BIND", "interface=rustynet0"][..],
+            &["op=detach", "interface=rustynet0"][..],
+            &["op=bind", "op=bind", "interface=rustynet0"][..],
+            &["op=bind", "interface=rustynet0", "interface=rustynet0"][..],
+            &["op bind", "interface=rustynet0"][..],
+        ] {
+            assert!(
+                validate_request(PrivilegedCommandProgram::LinuxFirewalldZone, bad).is_err(),
+                "helper must reject firewalld zone argv {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_firewalld_zone_builtin_never_resolves_an_external_binary() {
+        // The builtin must never reach the exec path; resolve_binary must fail
+        // closed and is_builtin must classify it as in-process.
+        assert!(PrivilegedCommandProgram::LinuxFirewalldZone.is_builtin());
+        let err = PrivilegedCommandProgram::LinuxFirewalldZone
+            .resolve_binary()
+            .expect_err("builtin must have no external binary");
+        assert!(err.contains("builtin"), "{err}");
+    }
+
+    #[test]
+    fn linux_firewalld_zone_program_token_round_trips() {
+        let program = PrivilegedCommandProgram::LinuxFirewalldZone;
+        assert_eq!(
+            program.as_str(),
+            crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM
+        );
+        assert_eq!(
+            PrivilegedCommandProgram::parse(program.as_str()),
+            Some(program)
+        );
+    }
+
+    #[test]
+    fn handle_request_rejects_zone_token_before_any_side_effect() {
+        // A zone-bearing argv is rejected at validation — it never reaches the
+        // in-process executor, so no D-Bus call is ever attempted.
+        let response = handle_request(HelperRequest {
+            program: crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM.to_owned(),
+            args: vec![
+                "op=bind".to_owned(),
+                "interface=rustynet0".to_owned(),
+                "zone=trusted".to_owned(),
+            ],
+        });
+        assert!(!response.ok, "zone-bearing argv must fail");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unknown firewalld zone token"),
+            "must be the grammar rejection, not an executor/D-Bus error: {:?}",
+            response.error
+        );
+    }
+
     #[test]
     fn dns_redirect_validation_is_tightly_scoped() {
         use super::validate_nft_args;

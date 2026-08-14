@@ -9442,6 +9442,30 @@ mod tests {
                 .iter()
                 .any(|op| op == "set_relay_forwarding:true")
         );
+
+        // QH-46 ordering: the firewalld coexistence check inside
+        // apply_firewall_killswitch fires only if relay forwarding was enabled
+        // FIRST. Presence of both ops is not enough — swapping the two calls in
+        // the controller would leave every system-level test green while
+        // production never enforces the check.
+        let relay_position = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "set_relay_forwarding:true")
+            .expect("relay forwarding op must be recorded");
+        let firewall_position = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "apply_firewall_killswitch")
+            .expect("firewall apply op must be recorded");
+        assert!(
+            relay_position < firewall_position,
+            "set_relay_forwarding must run BEFORE apply_firewall_killswitch \
+             (relay at {relay_position}, firewall at {firewall_position}) or the \
+             firewalld coexistence gate never sees the forwarding role"
+        );
     }
 
     #[test]
@@ -9548,9 +9572,15 @@ mod tests {
     /// drive the real `apply_firewall_killswitch` through the helper protocol
     /// with a scripted firewalld posture and prove the apply FAILS CLOSED when
     /// the host firewall would discard forwarded tunnel traffic.
+    ///
+    /// Every log assertion goes through `LINUX_FIREWALLD_ZONE_PROGRAM` (the
+    /// same constant `as_str()` returns), never a string literal, so a program
+    /// rename breaks the presence asserts loudly instead of leaving the
+    /// absence assert vacuously green.
     #[cfg(target_os = "linux")]
     fn firewalld_scripted_system(
         socket_path: &Path,
+        interface: &str,
         posture_stdout: &str,
     ) -> (
         Arc<Mutex<Vec<String>>>,
@@ -9561,7 +9591,7 @@ mod tests {
         let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
             socket_path,
             vec![(
-                "linux-firewalld-zone".to_owned(),
+                crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM.to_owned(),
                 PrivilegedCommandOutput {
                     status: 0,
                     stdout: posture_stdout.to_owned(),
@@ -9569,11 +9599,17 @@ mod tests {
                 },
             )],
         );
+        let system = firewalld_client_system(socket_path, interface);
+        (commands, stop, helper_thread, system)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn firewalld_client_system(socket_path: &Path, interface: &str) -> LinuxCommandSystem {
         let client =
             PrivilegedCommandClient::new(socket_path.to_path_buf(), Duration::from_secs(2))
                 .expect("privileged client should initialize");
         let mut system = LinuxCommandSystem::new(
-            "rustynet0",
+            interface,
             "enp0s9",
             LinuxDataplaneMode::HybridNative,
             Some(client),
@@ -9582,7 +9618,83 @@ mod tests {
         )
         .expect("linux command system should initialize");
         DataplaneSystem::set_generation(&mut system, 1);
-        (commands, stop, helper_thread, system)
+        system
+    }
+
+    /// Helper that answers the firewalld builtin with a PROTOCOL error (the
+    /// shape a busctl failure or refused request takes at the client), and
+    /// every other command with empty success. Exercises the `?` on
+    /// `run_capture` inside `ensure_host_firewall_admits_forwarding`, which the
+    /// posture-scripting tests never can (their fake always answers success).
+    #[cfg(target_os = "linux")]
+    fn spawn_privileged_firewalld_error_helper(
+        socket_path: &Path,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        let listener = UnixListener::bind(socket_path).unwrap_or_else(|err| {
+            panic!(
+                "test helper socket should bind at {}: {err}",
+                socket_path.display()
+            )
+        });
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test helper socket permissions should be settable at {}: {err}",
+                    socket_path.display()
+                )
+            });
+        listener
+            .set_nonblocking(true)
+            .expect("test helper socket should be non-blocking");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
+                        let request = match crate::privileged_helper::read_request(&mut stream) {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let _ = crate::privileged_helper::write_response(
+                                    &mut stream,
+                                    crate::privileged_helper::HelperResponse::error(err),
+                                );
+                                continue;
+                            }
+                        };
+                        let response = if request
+                            .program
+                            .contains(crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM)
+                        {
+                            crate::privileged_helper::HelperResponse::error(
+                                "scripted firewalld builtin failure".to_owned(),
+                            )
+                        } else {
+                            crate::privileged_helper::HelperResponse::success(
+                                0,
+                                String::new(),
+                                String::new(),
+                            )
+                        };
+                        let _ = crate::privileged_helper::write_response(&mut stream, response);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (stop, handle)
     }
 
     #[cfg(target_os = "linux")]
@@ -9591,6 +9703,7 @@ mod tests {
         let socket_path = phase10_test_socket_path("fwzu");
         let (commands, stop, helper_thread, mut system) = firewalld_scripted_system(
             &socket_path,
+            "rustynet0",
             "presence=running default_zone=public bound=false",
         );
         DataplaneSystem::set_relay_forwarding(&mut system, true);
@@ -9605,18 +9718,23 @@ mod tests {
 
         match result {
             Err(SystemError::FirewallApplyFailed(message)) => assert!(
-                message.contains("firewalld"),
-                "the failure must name the obstructing firewall: {message}"
+                // The :904 obstruction branch specifically — not the :902 parse
+                // branch — so deleting only the forwarding_unobstructed() check
+                // cannot hide behind a parse error from another test.
+                message.contains("host firewall would discard forwarded tunnel traffic"),
+                "the failure must come from the obstruction verdict: {message}"
             ),
             other => panic!(
                 "firewall apply must fail closed when firewalld leaves the tunnel unbound: {other:?}"
             ),
         }
         let command_log = commands.lock().expect("command log should lock").clone();
+        let bind_command = format!(
+            "{} op=bind interface=rustynet0",
+            crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM
+        );
         assert!(
-            command_log
-                .iter()
-                .any(|cmd| cmd.contains("linux-firewalld-zone op=bind interface=rustynet0")),
+            command_log.iter().any(|cmd| cmd.contains(&bind_command)),
             "the apply must have asked the builtin to bind the tunnel interface: {command_log:?}"
         );
     }
@@ -9628,7 +9746,7 @@ mod tests {
         // never as "firewalld absent, nothing to do".
         let socket_path = phase10_test_socket_path("fwzg");
         let (_commands, stop, helper_thread, mut system) =
-            firewalld_scripted_system(&socket_path, "");
+            firewalld_scripted_system(&socket_path, "rustynet0", "");
         DataplaneSystem::set_relay_forwarding(&mut system, true);
 
         let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
@@ -9639,18 +9757,94 @@ mod tests {
             .expect("helper thread should join cleanly");
         let _ = std::fs::remove_file(&socket_path);
 
+        match result {
+            Err(SystemError::FirewallApplyFailed(message)) => assert!(
+                // The :902 parse branch specifically — replacing the parse
+                // failure with a defaulted posture is a distinct mutation from
+                // deleting the obstruction check, and each branch has its own
+                // detecting test.
+                message.contains("firewalld posture"),
+                "the failure must come from the posture parse: {message}"
+            ),
+            other => {
+                panic!("an unparseable firewalld posture must fail the apply closed: {other:?}")
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relay_forward_firewall_apply_fails_closed_when_binding_state_is_unknown() {
+        // The real builtin emits `presence=running` with NO bound token when
+        // the zone query itself fails. Unknown binding state must read as
+        // obstructed — mapping it to "clear" is precisely the fail-open class
+        // QH-46 exists to prevent.
+        let socket_path = phase10_test_socket_path("fwzq");
+        let (_commands, stop, helper_thread, mut system) = firewalld_scripted_system(
+            &socket_path,
+            "rustynet0",
+            "presence=running default_zone=public",
+        );
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        match result {
+            Err(SystemError::FirewallApplyFailed(message)) => assert!(
+                message.contains("host firewall would discard forwarded tunnel traffic"),
+                "unknown binding state must fail via the obstruction verdict: {message}"
+            ),
+            other => panic!(
+                "firewall apply must fail closed when the binding state is unknown: {other:?}"
+            ),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relay_forward_firewall_apply_fails_closed_when_firewalld_builtin_errors() {
+        // A transport/builtin failure (busctl missing, helper refusal) reaches
+        // the daemon as a client Err, not a posture line. Swallowing that Err
+        // and returning Ok would be the canonical fail-open; this is the only
+        // test that ever makes the firewalld request itself fail.
+        let socket_path = phase10_test_socket_path("fwze");
+        let (stop, helper_thread) = spawn_privileged_firewalld_error_helper(&socket_path);
+        let mut system = firewalld_client_system(&socket_path, "rustynet0");
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Deliberately variant-agnostic: today this surfaces as SystemError::Io
+        // from the client; pinning that shape would couple the test to
+        // transport plumbing. What must hold is that the apply FAILS.
         assert!(
-            matches!(result, Err(SystemError::FirewallApplyFailed(_))),
-            "an unparseable firewalld posture must fail the apply closed: {result:?}"
+            result.is_err(),
+            "a failed firewalld builtin request must fail the apply closed: {result:?}"
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn relay_forward_firewall_apply_passes_when_tunnel_bound_to_default_zone() {
+        // Non-default interface name on purpose: with the production-default
+        // `rustynet0` this assert could not distinguish the interface FIELD
+        // from a hardcoded literal in the enforcement code.
         let socket_path = phase10_test_socket_path("fwzb");
         let (commands, stop, helper_thread, mut system) = firewalld_scripted_system(
             &socket_path,
+            "rnqh46",
             "presence=running default_zone=public bound=true",
         );
         DataplaneSystem::set_relay_forwarding(&mut system, true);
@@ -9664,12 +9858,17 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         result.expect("firewall apply should succeed once the tunnel is bound");
+        // This log assertion is the test's entire M1-detection value (under a
+        // deleted call the apply still returns Ok) — do not "simplify" it away.
         let command_log = commands.lock().expect("command log should lock").clone();
+        let bind_command = format!(
+            "{} op=bind interface=rnqh46",
+            crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM
+        );
         assert!(
-            command_log
-                .iter()
-                .any(|cmd| cmd.contains("linux-firewalld-zone op=bind interface=rustynet0")),
-            "the apply must have asked the builtin to bind the tunnel interface: {command_log:?}"
+            command_log.iter().any(|cmd| cmd.contains(&bind_command)),
+            "the apply must bind the CONFIGURED tunnel interface, not a hardcoded one: \
+             {command_log:?}"
         );
     }
 
@@ -9678,7 +9877,7 @@ mod tests {
     fn relay_forward_firewall_apply_passes_when_firewalld_absent() {
         let socket_path = phase10_test_socket_path("fwza");
         let (_commands, stop, helper_thread, mut system) =
-            firewalld_scripted_system(&socket_path, "presence=absent");
+            firewalld_scripted_system(&socket_path, "rustynet0", "presence=absent");
         DataplaneSystem::set_relay_forwarding(&mut system, true);
 
         let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
@@ -9696,13 +9895,20 @@ mod tests {
     #[test]
     fn firewall_apply_without_relay_forward_never_touches_firewalld() {
         // The zone bind is scoped to forwarding roles: a plain client must not
-        // bind interfaces into firewalld zones (its inbound tunnel filter is
-        // firewalld's only inbound filter on the device — see QH-46).
+        // bind interfaces into firewalld zones (firewalld's zone is the ONLY
+        // inbound filter on the tunnel device — see QH-46). This test pins
+        // ZERO firewalld interaction, query included, for a non-forwarding
+        // node: a future benign posture-probe here is overturning a decision,
+        // not fixing a flake.
+        //
+        // Deliberately uses the all-success capture helper with NO scripted
+        // firewalld response: if the gate is mutated away, the unscripted
+        // firewalld command comes back with an empty posture and the apply
+        // FAILS on the parse — so this test detects the mutation twice, via
+        // the Ok expectation and via the absence assert.
         let socket_path = phase10_test_socket_path("fwzn");
-        let (commands, stop, helper_thread, mut system) = firewalld_scripted_system(
-            &socket_path,
-            "presence=running default_zone=public bound=false",
-        );
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let mut system = firewalld_client_system(&socket_path, "rustynet0");
 
         let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
 
@@ -9717,7 +9923,7 @@ mod tests {
         assert!(
             !command_log
                 .iter()
-                .any(|cmd| cmd.contains("linux-firewalld-zone")),
+                .any(|cmd| cmd.contains(crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM)),
             "a non-forwarding node must never drive the firewalld zone builtin: {command_log:?}"
         );
     }
