@@ -2314,7 +2314,31 @@ would strengthen the control beyond the defect being fixed, so it is recorded ra
 
 ### QH-51 — network-flap recovery: the handshake never returns after the block is lifted
 
-**Status: OPEN — REFINED 2026-08-14. The stage is STRUCTURALLY UNPASSABLE as written, independently
+**Status: OPEN — MEASUREMENT REPAIRED 2026-08-14, daemon-side cause now isolated and unmasked.**
+
+The instrument is fixed and the stage is now honest. Run `qh51-measure-20260814e`:
+
+```
+[network-flap] baseline_handshake_age_s=unreadable ok=false
+[network-flap] mid_handshake_age_s=unreadable disruption_confirmed=false
+checks.wg_disruption_confirmed = fail      <-- was `pass`, on missing data
+```
+
+That flip from `pass` to `fail` on identical tunnel behaviour is the proof the repair works: the
+check no longer manufactures confirmation out of an unreadable metric. The stage still fails, but it
+now fails for a true reason instead of passing for a false one.
+
+**What the repaired instrument reveals — the real, remaining defect.** The client reports
+`path_live_peer_count=0` and NO readable handshake timestamp, at baseline, on a run where
+`live_two_hop_validation` passes and therefore proves traffic is flowing. So the daemon never records
+a probe handshake for this peer even while the tunnel demonstrably works. The next step is to
+establish why `traversal_probe_statuses` carries no timestamp for the client's peer — whether the
+probe never runs for a bundle-programmed peer, or runs and records nothing — and NOT to touch the
+stage again. Note also that `traversal_probe_latest_handshake_unix` renders as the literal
+`multiple` on a node with more than one peer, so any per-node aggregate is the wrong source for a
+per-peer age; a per-peer field is needed.
+
+**Superseded note, kept for the record.** The stage is STRUCTURALLY UNPASSABLE as written, independently
 of daemon behaviour. Do not attempt another daemon-side fix until the measurement is repaired.**
 
 Run `qh51-keepalive-20260814d` reports:
