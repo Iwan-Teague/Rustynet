@@ -7209,6 +7209,70 @@ mod tests {
         );
     }
 
+    /// QH-46: the firewalld coexistence check must be ON the Linux firewall
+    /// apply path, gated on the relay-forward role.
+    ///
+    /// The posture grammar is thoroughly tested in `linux_firewalld_zone`; what
+    /// this pins is that `apply_firewall_killswitch` actually CALLS
+    /// `ensure_host_firewall_admits_forwarding` for a forwarding node, and that
+    /// the check fails the apply rather than warning. Like the IPV-10 pin above,
+    /// this is a source pin because the behavioural twins of this test are
+    /// `cfg(target_os = "linux")` and never run on the macOS CI leg, so an
+    /// unwiring would be invisible there.
+    #[test]
+    fn linux_firewall_apply_checks_host_firewall_when_forwarding() {
+        let source = include_str!("phase10.rs");
+
+        let at = source
+            .find("self.ensure_host_firewall_admits_forwarding()?;")
+            .expect("the Linux firewall apply must call ensure_host_firewall_admits_forwarding");
+
+        // The call must be gated on the relay-forward role: a plain client has
+        // no business binding interfaces into firewalld zones.
+        let window = &source[at.saturating_sub(120)..at];
+        assert!(
+            window.contains("if self.allow_tunnel_relay_forward"),
+            "the firewalld coexistence check must be gated on allow_tunnel_relay_forward"
+        );
+
+        // And it must sit inside the Linux apply_firewall_killswitch — the
+        // nearest preceding method heading, with no other method boundary in
+        // between, in a body that drives nft (the Linux firewall program).
+        let before = &source[..at];
+        let fn_start = before
+            .rfind("fn apply_firewall_killswitch")
+            .expect("an apply_firewall_killswitch implementation must precede the call");
+        let between = &before[fn_start..];
+        assert!(
+            !between.contains("\n    fn "),
+            "the firewalld check must be called from apply_firewall_killswitch itself, \
+             not from a later method"
+        );
+        assert!(
+            between.contains("PrivilegedCommandProgram::Nft"),
+            "this must be the Linux apply_firewall_killswitch, which drives nft"
+        );
+
+        // The check itself must consult the audited posture evaluator and fail
+        // the apply, not reimplement a weaker local test or downgrade to a log.
+        let body_at = source
+            .find("fn ensure_host_firewall_admits_forwarding")
+            .expect("the firewalld coexistence check must exist");
+        let body: String = source[body_at..].chars().take(1800).collect();
+        assert!(
+            body.contains("FirewalldPosture::parse"),
+            "the check must parse the builtin's structured posture line"
+        );
+        assert!(
+            body.contains("forwarding_unobstructed"),
+            "the check must consult the audited forwarding_unobstructed verdict"
+        );
+        assert!(
+            body.contains("FirewallApplyFailed"),
+            "an obstructed forward path must fail the firewall apply, not warn"
+        );
+    }
+
     /// A management CIDR must be a bounded operator range, not a default route.
     ///
     /// PF-02 / WIN-05 and the Linux nft twin: this one value becomes the match
@@ -9477,6 +9541,184 @@ mod tests {
             delete_old_index,
             handoff_commands.len().saturating_sub(1),
             "old generation table prune must happen as the final handoff command"
+        );
+    }
+
+    /// QH-46 behavioural twins of `linux_firewall_apply_checks_host_firewall_when_forwarding`:
+    /// drive the real `apply_firewall_killswitch` through the helper protocol
+    /// with a scripted firewalld posture and prove the apply FAILS CLOSED when
+    /// the host firewall would discard forwarded tunnel traffic.
+    #[cfg(target_os = "linux")]
+    fn firewalld_scripted_system(
+        socket_path: &Path,
+        posture_stdout: &str,
+    ) -> (
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        LinuxCommandSystem,
+    ) {
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            socket_path,
+            vec![(
+                "linux-firewalld-zone".to_owned(),
+                PrivilegedCommandOutput {
+                    status: 0,
+                    stdout: posture_stdout.to_owned(),
+                    stderr: String::new(),
+                },
+            )],
+        );
+        let client =
+            PrivilegedCommandClient::new(socket_path.to_path_buf(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        DataplaneSystem::set_generation(&mut system, 1);
+        (commands, stop, helper_thread, system)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relay_forward_firewall_apply_fails_closed_when_firewalld_leaves_tunnel_unbound() {
+        let socket_path = phase10_test_socket_path("fwzu");
+        let (commands, stop, helper_thread, mut system) = firewalld_scripted_system(
+            &socket_path,
+            "presence=running default_zone=public bound=false",
+        );
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        match result {
+            Err(SystemError::FirewallApplyFailed(message)) => assert!(
+                message.contains("firewalld"),
+                "the failure must name the obstructing firewall: {message}"
+            ),
+            other => panic!(
+                "firewall apply must fail closed when firewalld leaves the tunnel unbound: {other:?}"
+            ),
+        }
+        let command_log = commands.lock().expect("command log should lock").clone();
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("linux-firewalld-zone op=bind interface=rustynet0")),
+            "the apply must have asked the builtin to bind the tunnel interface: {command_log:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relay_forward_firewall_apply_fails_closed_on_unparseable_posture() {
+        // An empty or garbled posture line must surface as a failed apply,
+        // never as "firewalld absent, nothing to do".
+        let socket_path = phase10_test_socket_path("fwzg");
+        let (_commands, stop, helper_thread, mut system) =
+            firewalld_scripted_system(&socket_path, "");
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            matches!(result, Err(SystemError::FirewallApplyFailed(_))),
+            "an unparseable firewalld posture must fail the apply closed: {result:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relay_forward_firewall_apply_passes_when_tunnel_bound_to_default_zone() {
+        let socket_path = phase10_test_socket_path("fwzb");
+        let (commands, stop, helper_thread, mut system) = firewalld_scripted_system(
+            &socket_path,
+            "presence=running default_zone=public bound=true",
+        );
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        result.expect("firewall apply should succeed once the tunnel is bound");
+        let command_log = commands.lock().expect("command log should lock").clone();
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains("linux-firewalld-zone op=bind interface=rustynet0")),
+            "the apply must have asked the builtin to bind the tunnel interface: {command_log:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relay_forward_firewall_apply_passes_when_firewalld_absent() {
+        let socket_path = phase10_test_socket_path("fwza");
+        let (_commands, stop, helper_thread, mut system) =
+            firewalld_scripted_system(&socket_path, "presence=absent");
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        result.expect("firewall apply should succeed with no firewalld to coexist with");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn firewall_apply_without_relay_forward_never_touches_firewalld() {
+        // The zone bind is scoped to forwarding roles: a plain client must not
+        // bind interfaces into firewalld zones (its inbound tunnel filter is
+        // firewalld's only inbound filter on the device — see QH-46).
+        let socket_path = phase10_test_socket_path("fwzn");
+        let (commands, stop, helper_thread, mut system) = firewalld_scripted_system(
+            &socket_path,
+            "presence=running default_zone=public bound=false",
+        );
+
+        let result = DataplaneSystem::apply_firewall_killswitch(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        result.expect("a non-forwarding firewall apply should succeed untouched by firewalld");
+        let command_log = commands.lock().expect("command log should lock").clone();
+        assert!(
+            !command_log
+                .iter()
+                .any(|cmd| cmd.contains("linux-firewalld-zone")),
+            "a non-forwarding node must never drive the firewalld zone builtin: {command_log:?}"
         );
     }
 
