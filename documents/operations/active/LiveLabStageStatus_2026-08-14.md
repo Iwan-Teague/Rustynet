@@ -88,6 +88,21 @@ daemon records nothing.
 
 **Do NOT widen the recovery assertion.** It is the only check proving the tunnel comes back.
 
+**The capture was ATTEMPTED on run `qh51-capture-20260814j` and FAILED — do not repeat these two
+mistakes.** It produced a single empty sample and exited:
+
+1. `2>/dev/null` on the ssh invocation swallowed the error, so an empty line was indistinguishable
+   from a failed command. This is the THIRD time suppressed stderr has cost a reading in this
+   investigation. Capture stderr (`2>&1`) and print it.
+2. The loop's exit condition matched `recovery_arrived=` in the orchestrator log, which was already
+   present from an earlier line, so the poll ended after one iteration. Gate the exit on a
+   NEW occurrence (record the line count first, or match the stage's own log file rather than the
+   orchestrator's).
+
+Also note the daemon is UNREACHABLE after the run (`/run/rustynet/rustynetd.sock` is gone —
+`final_cleanup` is `always_run`), so this cannot be sampled retroactively. It must run mid-stage or
+not at all.
+
 ### Cross-platform — the larger blocker, untouched
 
 `CrossPlatformRoleParityPlan_2026-06-21.md` requires every role live-proven on **macOS AND Windows**,
