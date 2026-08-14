@@ -2272,6 +2272,46 @@ as an argv-only invocation with validated arguments (§4); it must not be built 
 construction, and it is not a weakening of the allowlist to add a narrowly shaped entry for it.
 Whether this is QH-46's cause is a separate question, tracked there.
 
+### QH-50 — blind_exit NAT scan could not pass on a firewalld host, and missed a real NAT rule
+
+**Severity: high (release-blocking on RHEL-family). FIXED and mutation-proven.** Found while designing
+the [[QH-46]] fix; independent of it.
+
+`evaluate_linux_blind_exit_ruleset` scans the host ruleset and must find no NAT, because a blind exit
+never rewrites the mesh source. It looked for the substrings `"masquerade"`, `" snat "` and
+`" dnat "`. That was wrong in BOTH directions on a real host:
+
+* **False positive.** nftables uses `dnat`/`snat` as conntrack status FLAGS as well as NAT
+  STATEMENTS. `ct status dnat accept` tests whether some other party translated a flow and translates
+  nothing itself. Stock firewalld ships three such lines in `filter_FORWARD` — measured on
+  `fedora-utm-1` while diagnosing QH-46 — so `rustynetd linux-blind-exit-dataplane-check` could not
+  be satisfied on ANY firewalld host, failing for a reason unrelated to NAT.
+* **False negative.** The space-delimited substrings could never match a keyword in the FIRST token,
+  because `normalize_nft_rule` strips indentation. An unconditional `dnat to 10.0.0.1` rule passed a
+  control whose entire purpose is to reject it.
+
+**Fix:** recognise a NAT statement structurally — `masquerade` as a bare token, or `snat`/`dnat`
+followed by `to`, optionally through a family qualifier (`dnat ip to ...`). Requiring the `to` keeps a
+chain merely NAMED `dnat` from tripping the control, and is also what makes the conntrack matches
+safe without any pre-stripping pass.
+
+**Divergence from the reviewed plan, deliberate.** The design review proposed fixing this by narrowing
+the capture to Rustynet's own `inet rustynet_g*` table. That would remove the false positive by making
+the control blind to FOREIGN NAT — and a firewalld zone with masquerading enabled rewrites this node's
+egress exactly as effectively as one of our own rules would. Narrowing scope converts a true positive
+into a fail-open on precisely the hosts most likely to carry one. The defect was in the MATCHER, not
+the scope, so the scan stays host-wide.
+
+**Verification.** Eight tests, three mutations:
+* disabling the (initially written) `ct status` stripping pass changed NO verdict — all tests stayed
+  green, proving that code was redundant, so it was removed rather than propped up with a test;
+* removing the `to` requirement fails 3 tests (exit 101);
+* restoring the original substring semantics fails 4 tests (exit 101), including the leading-token
+  false negative.
+
+**Follow-up not bundled here:** the scan does not recognise `redirect`, which is also NAT. Adding it
+would strengthen the control beyond the defect being fixed, so it is recorded rather than smuggled in.
+
 ### QH-46 — two-hop proof: the client reaches the entry but never the final exit
 
 **Status: ROOT CAUSE CONFIRMED 2026-08-14 — firewalld rejects the hairpin AFTER Rustynet has
