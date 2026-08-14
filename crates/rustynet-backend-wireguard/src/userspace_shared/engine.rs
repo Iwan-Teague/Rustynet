@@ -55,6 +55,21 @@ pub(crate) trait EngineIoSink {
 pub(crate) enum ConfigurePeerDisposition {
     Added,
     Replaced,
+    /// The peer was already configured with identical material, so nothing was
+    /// rebuilt and the live session was left untouched.
+    ///
+    /// This exists because `Replaced` used to be returned for ANY re-configure
+    /// of an existing peer — it was decided purely by "did this node id already
+    /// have an endpoint" — while `configure_peer` unconditionally built a fresh
+    /// `Tunn`. A reconcile pass that re-applied an unchanged peer therefore tore
+    /// down and rebuilt the crypto session every cycle, and the runtime, seeing
+    /// `Replaced`, cleared that peer's handshake telemetry along with it.
+    ///
+    /// The visible effect was a node whose liveness metrics were permanently
+    /// dead while traffic flowed perfectly well: `path_live_peer_count=0` and no
+    /// readable handshake age, because each rebuild re-handshaked and the record
+    /// never survived long enough to be read (QH-51).
+    Unchanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -265,6 +280,29 @@ impl UserspaceEngine {
             .iter()
             .map(|cidr| AllowedIpNetwork::parse(cidr))
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Re-applying identical material must NOT disturb the live session.
+        //
+        // Everything compared here is what a `Tunn` is built from, so if all of
+        // it matches, rebuilding would produce a session equivalent to the one
+        // already running — at the cost of discarding its handshake state and,
+        // via the runtime's `Replaced` arm, its handshake telemetry. Comparison
+        // is exact rather than approximate: a difference in ANY of the three
+        // falls through to the rebuild path below.
+        //
+        // Note the allowed-IP comparison is ORDER-SENSITIVE, deliberately. The
+        // stored form is the parsed sequence, and treating a reordering as
+        // "unchanged" would silently keep a session whose routing table entry
+        // the caller had just rewritten. A reorder is rare and a rebuild is
+        // correct-but-wasteful; the reverse error would be correctness-losing.
+        if let Some(existing) = self.peer_states.get(&peer.node_id)
+            && existing.peer_static_public == peer_static_public
+            && existing.endpoint == endpoint
+            && existing.allowed_ips == allowed_ips
+        {
+            return Ok(ConfigurePeerDisposition::Unchanged);
+        }
+
         let tunnel_index = self.allocate_tunnel_index()?;
         let tunnel = Tunn::new(
             self.local_static_private.clone(),
@@ -1291,6 +1329,89 @@ mod tests {
 
     /// Configure a peer with an explicit node id / endpoint / allowed-ips so
     /// tests can construct duplicate-endpoint scenarios precisely.
+    /// QH-51: re-applying identical peer material must not rebuild the session.
+    ///
+    /// The reconcile loop configures peers repeatedly. While ANY re-configure of
+    /// an existing peer reported `Replaced`, each pass built a fresh `Tunn` and
+    /// the runtime cleared that peer's handshake telemetry, so liveness read
+    /// permanently dead on nodes that were passing traffic.
+    #[test]
+    fn reconfiguring_an_identical_peer_is_unchanged_and_keeps_the_session() {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let mut engine = fresh_engine(7);
+        let node_id = NodeId::new("peer-a").expect("node id");
+        let config = PeerConfig {
+            node_id: node_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.7".parse().expect("ip"),
+                port: 51820,
+            },
+            public_key: [3u8; 32],
+            allowed_ips: vec!["100.64.0.2/32".to_owned()],
+            persistent_keepalive_secs: Some(25),
+        };
+
+        assert_eq!(
+            engine.configure_peer(&config).expect("first configure"),
+            super::ConfigurePeerDisposition::Added
+        );
+        // The session identity must survive an identical re-apply.
+        let index_before = engine
+            .peer_states
+            .get(&node_id)
+            .expect("peer present")
+            .tunnel_index;
+        assert_eq!(
+            engine.configure_peer(&config).expect("second configure"),
+            super::ConfigurePeerDisposition::Unchanged
+        );
+        let index_after = engine
+            .peer_states
+            .get(&node_id)
+            .expect("peer still present")
+            .tunnel_index;
+        assert_eq!(
+            index_before, index_after,
+            "an unchanged re-apply must not allocate a new tunnel"
+        );
+    }
+
+    /// The other half: material that ACTUALLY changed must still rebuild, so a
+    /// stale handshake timestamp can never be carried onto a new session.
+    #[test]
+    fn changed_peer_material_still_reports_replaced() {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let base = |pubkey: u8, port: u16, cidr: &str| PeerConfig {
+            node_id: NodeId::new("peer-b").expect("node id"),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.8".parse().expect("ip"),
+                port,
+            },
+            public_key: [pubkey; 32],
+            allowed_ips: vec![cidr.to_owned()],
+            persistent_keepalive_secs: None,
+        };
+
+        for (label, changed) in [
+            ("public key", base(9, 51820, "100.64.0.3/32")),
+            ("endpoint", base(4, 51821, "100.64.0.3/32")),
+            ("allowed ips", base(4, 51820, "100.64.0.4/32")),
+        ] {
+            let mut engine = fresh_engine(8);
+            assert_eq!(
+                engine
+                    .configure_peer(&base(4, 51820, "100.64.0.3/32"))
+                    .expect("first configure"),
+                super::ConfigurePeerDisposition::Added
+            );
+            assert_eq!(
+                engine.configure_peer(&changed).expect("second configure"),
+                super::ConfigurePeerDisposition::Replaced,
+                "a changed {label} must rebuild the session"
+            );
+        }
+    }
+
     fn configure_peer_at(
         engine: &mut UserspaceEngine,
         name: &str,
@@ -1510,7 +1631,7 @@ mod tests {
         assert!(engine.has_endpoint(endpoint_1));
 
         // Re-configure the SAME node id at a different endpoint (the
-        // `ConfigurePeerDisposition::Replaced` path), as happens on a
+        // `super::ConfigurePeerDisposition::Replaced` path), as happens on a
         // control-plane peer-config update.
         let replaced = configure_peer_at(&mut engine, "peer-re", endpoint_2, 0x55, "100.64.5.0/24");
         assert_eq!(replaced, peer);

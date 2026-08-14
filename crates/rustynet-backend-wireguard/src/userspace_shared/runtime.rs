@@ -560,6 +560,17 @@ impl RuntimeState {
         let disposition = self.engine.configure_peer(&peer)?;
         let node_id = peer.node_id.clone();
         self.peers.insert(node_id.clone(), peer);
+        // Clear the handshake record only when the session was genuinely
+        // rebuilt. `Replaced` means a new `Tunn` exists, so any earlier
+        // timestamp belongs to a dead session and keeping it would make
+        // `handshake_fresh` lie about a peer that has not completed a handshake
+        // on its current session.
+        //
+        // `Unchanged` is the opposite case and must NOT clear: nothing was
+        // rebuilt, the live session is still the one that produced that
+        // timestamp. Before `Unchanged` existed, every reconcile of an unchanged
+        // peer landed here and wiped the record, which is why liveness read dead
+        // on nodes that were passing traffic (QH-51).
         if matches!(disposition, ConfigurePeerDisposition::Replaced) {
             self.handshake_telemetry.clear_peer(&node_id);
         }
