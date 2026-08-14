@@ -2347,7 +2347,48 @@ recorded at three sites in `runtime.rs` (`:656` on initiate, `:841`, and `:874` 
 `process_inbound_ciphertext`), so both directions are covered in principle, and each records only
 when the engine returns `Some(observed_handshake)`.
 
-**So the open question is narrow and specific:** why does `HandshakeTelemetry` hold nothing for the
+**MECHANISM IDENTIFIED 2026-08-14 — session churn on reconcile wipes the handshake record.**
+
+`runtime.rs:560-566` clears the telemetry whenever the engine reports `Replaced`:
+
+```rust
+let disposition = self.engine.configure_peer(&peer)?;
+if matches!(disposition, ConfigurePeerDisposition::Replaced) {
+    self.handshake_telemetry.clear_peer(&node_id);
+}
+```
+
+and `engine.rs:280-288` decides that disposition purely by whether the peer already existed:
+
+```rust
+let disposition = if previous_endpoint.is_some() {
+    ConfigurePeerDisposition::Replaced
+} else {
+    ConfigurePeerDisposition::Added
+};
+```
+
+`Replaced` therefore means "this peer was already configured", NOT "its key changed". Note the clear
+itself is locally CORRECT: `configure_peer` builds a fresh `Tunn::new(...)` on every call
+(`engine.rs:~266`), so the crypto session really is torn down and rebuilt and any earlier handshake
+timestamp really is stale.
+
+**So the defect is upstream of the clear:** the reconcile path calls `configure_peer` for a peer
+whose configuration has not changed, which rebuilds the WireGuard session and discards the handshake
+record every cycle. That accounts for every observation at once — `path_live_peer_count=0`
+permanently, no readable handshake age at baseline, and traffic nevertheless flowing (each rebuild
+re-handshakes, so the data path recovers while the record never survives long enough to be read).
+
+**The fix is a session-lifecycle change, and it must not be rushed.** The correct shape is for
+`configure_peer` to be a no-op when the peer's material has not changed (same public key, same
+allowed IPs, same endpoint), so an unchanged reconcile neither rebuilds `Tunn` nor clears telemetry —
+NOT to weaken the clear, which would leave a stale timestamp attached to a genuinely new session and
+make `handshake_fresh` lie. Verify with the module's own unit tests: configure the same peer twice
+and assert the disposition and that a recorded handshake survives the second call, then assert it is
+still cleared when the public key or allowed IPs actually change. This sits in the crypto/dataplane
+path, so it needs its own implementation pass with those tests written first.
+
+**Superseded framing:** why does `HandshakeTelemetry` hold nothing for the
 client's peer on a run where `live_two_hop_validation` passes and therefore proves encrypted traffic
 is flowing through that client. Either the engine returns `None` for the handshake shapes this peer
 actually performs, or the telemetry is cleared (`clear_peer`, `:564`/`:616`) by something in the
