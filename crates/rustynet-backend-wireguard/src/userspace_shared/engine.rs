@@ -55,6 +55,19 @@ pub(crate) trait EngineIoSink {
 pub(crate) enum ConfigurePeerDisposition {
     Added,
     Replaced,
+    /// Only the peer's ENDPOINT changed, so it was moved in place and the live
+    /// session was kept.
+    ///
+    /// A WireGuard session is keyed by the two static keys, not by the address
+    /// it is reached at — roaming is a first-class part of the protocol, and
+    /// `update_peer_endpoint` already relocates a peer without disturbing its
+    /// tunnel. Rebuilding on an endpoint change therefore destroyed a perfectly
+    /// valid session, and (via the runtime's `Replaced` arm) its handshake
+    /// record with it. That is what kept the network-flap stage from ever
+    /// observing recovery: after the block lifted, the re-race supplied fresh
+    /// endpoints and each one wiped the record as fast as a handshake could
+    /// write it (QH-51).
+    EndpointMoved,
     /// The peer was already configured with identical material, so nothing was
     /// rebuilt and the live session was left untouched.
     ///
@@ -297,10 +310,18 @@ impl UserspaceEngine {
         // correct-but-wasteful; the reverse error would be correctness-losing.
         if let Some(existing) = self.peer_states.get(&peer.node_id)
             && existing.peer_static_public == peer_static_public
-            && existing.endpoint == endpoint
             && existing.allowed_ips == allowed_ips
         {
-            return Ok(ConfigurePeerDisposition::Unchanged);
+            if existing.endpoint == endpoint {
+                return Ok(ConfigurePeerDisposition::Unchanged);
+            }
+            // Same keys, same routing, different address: this is roaming, not a
+            // new peer. Move it in place exactly as `update_peer_endpoint` does
+            // and keep the session — rebuilding here would discard a live
+            // tunnel, and with it the handshake record, for a change WireGuard
+            // is designed to absorb.
+            self.update_peer_endpoint(&peer.node_id, peer.endpoint)?;
+            return Ok(ConfigurePeerDisposition::EndpointMoved);
         }
 
         let tunnel_index = self.allocate_tunnel_index()?;
@@ -1376,6 +1397,54 @@ mod tests {
         );
     }
 
+    /// QH-51 recovery: an endpoint-only change is ROAMING and must keep the
+    /// session.
+    ///
+    /// A WireGuard session is keyed by the static keys, not the address. After
+    /// the flap block lifted, the re-race supplied fresh endpoints; while each
+    /// one rebuilt the tunnel, the handshake record was wiped as fast as a
+    /// handshake could write it, so recovery could never be observed.
+    #[test]
+    fn endpoint_only_change_moves_the_peer_and_keeps_its_session() {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let mut engine = fresh_engine(11);
+        let node_id = NodeId::new("peer-roam").expect("node id");
+        let at = |port: u16| PeerConfig {
+            node_id: NodeId::new("peer-roam").expect("node id"),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.9".parse().expect("ip"),
+                port,
+            },
+            public_key: [5u8; 32],
+            allowed_ips: vec!["100.64.0.5/32".to_owned()],
+            persistent_keepalive_secs: None,
+        };
+
+        assert_eq!(
+            engine.configure_peer(&at(51820)).expect("configure"),
+            super::ConfigurePeerDisposition::Added
+        );
+        let index_before = engine
+            .peer_states
+            .get(&node_id)
+            .expect("peer present")
+            .tunnel_index;
+
+        assert_eq!(
+            engine.configure_peer(&at(51999)).expect("roam"),
+            super::ConfigurePeerDisposition::EndpointMoved
+        );
+        let state = engine
+            .peer_states
+            .get(&node_id)
+            .expect("peer still present");
+        assert_eq!(
+            state.tunnel_index, index_before,
+            "roaming must not rebuild the tunnel"
+        );
+        assert_eq!(state.endpoint.port(), 51999, "endpoint must have moved");
+    }
+
     /// The other half: material that ACTUALLY changed must still rebuild, so a
     /// stale handshake timestamp can never be carried onto a new session.
     #[test]
@@ -1394,7 +1463,6 @@ mod tests {
 
         for (label, changed) in [
             ("public key", base(9, 51820, "100.64.0.3/32")),
-            ("endpoint", base(4, 51821, "100.64.0.3/32")),
             ("allowed ips", base(4, 51820, "100.64.0.4/32")),
         ] {
             let mut engine = fresh_engine(8);
