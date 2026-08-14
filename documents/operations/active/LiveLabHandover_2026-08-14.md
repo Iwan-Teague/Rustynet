@@ -302,3 +302,74 @@ paths. Check `git rev-list --count HEAD..origin/main` is 0 before committing, an
 **The cross-network substrate is UNTESTED, not confirmed.** All 11 `cross_network_*` stages are in
 the cascade behind the single failure, so nothing has established whether the `.65`/`.64` vmnet split
 is actually workable for a mac cell — only that it is the route that would have to work.
+
+
+---
+
+## 7. HANDOVER STATE — read this first
+
+**Commit handed over on: `9ac63abd`** ("Probe the client's own peer for flap recovery, not the final
+exit"). Push it if `git rev-list --count origin/main..HEAD` is non-zero — it was 1 at handover.
+
+### A run is IN FLIGHT right now
+
+| | |
+| --- | --- |
+| run id | `qh51-peerprobe-20260814p` |
+| report dir | `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/qh51-peerprobe-20260814p` |
+| stdout log | session scratchpad `liverun39.log` (session-scoped; use the report dir instead) |
+| orchestrator | built from `9ac63abd`, holds locks on all 5 Linux guests |
+| find it | `ps -eo pid=,args= -ww \| grep '[v]m-lab-orchestrate-live-lab'` |
+
+**Do not start another run until it exits** — it holds all five guest locks.
+
+**What it is testing (the discriminating experiment).** The flap stage's data-path recovery probe was
+re-targeted from the final exit to the client's OWN peer (`entry` role). Probing the exit crossed TWO
+hops, so a failure could not distinguish "this client's session did not recover" from "the entry
+stopped forwarding" — the QH-46 failure class. Read:
+
+```bash
+grep -E 'peer mesh ipv4|recovery_arrived|recovery proven' \
+  artifacts/live_lab/qh51-peerprobe-20260814p/live_network_flap_validation.log
+```
+
+* **`recovery_arrived=true`** → the client's session DOES recover; the earlier two-hop failure was
+  forwarding, and hypothesis 8 (the stage demanded a handshake that correct WireGuard behaviour never
+  produces after a 35s block) stands. The stage should then pass.
+* **`recovery_arrived=false` with a resolved peer IP** → the session genuinely does not recover. That
+  is a REAL daemon defect and the original assertion was right. Do NOT weaken it; diagnose.
+* **`<unresolved>`** → the probe was inert again; the discovery command failed on the entry host.
+  Fix that before reading anything else into the result.
+
+Whatever it returns, **append the outcome to `LiveLabStageStatus_2026-08-14.md`** and record a triage
+patch for the stage before the next run, or the launch gate will refuse.
+
+### Uncommitted at handover — deliberate, do not commit blindly
+
+`git status` shows three modified TRACKED files:
+`live_lab_node_run_matrix.csv`, `live_lab_node_stage_results.csv`, `live_lab_stage_triage.jsonl`.
+These are auto-appended by the RUNNING lab. Let the run finish, then commit them as evidence with
+explicit paths. **Never `git add -A`** — other sessions share this working tree.
+
+### Immediate next actions, in order
+
+1. **Read run 39's verdict** (above) and act on whichever of the three branches it lands in.
+2. **Rebuild the TUI** so it stops reporting IDLE:
+   `cd crates/rustynet-lab-monitor && cargo build` (own workspace; the gate script only checks, it
+   does not build). Do it between runs — it takes the target lock.
+3. **Close the QH-46 test gap.** `ensure_host_firewall_admits_forwarding` (`phase10.rs:890`) and its
+   `allow_tunnel_relay_forward` gate (`:2351`) have NO test, which violates CLAUDE.md §4. The fix is
+   live-proven but not unit-proven.
+4. **Run the full §7 gates.** The ~30 commits landed today were gated per-crate (fmt/clippy/targeted
+   tests), NOT with a full `cargo test --workspace --all-targets --all-features`. Do that before
+   treating today's work as release-ready, and remember `--workspace` skips
+   `crates/rustynet-lab-monitor`, `fuzz/` and `gui/`.
+5. **Cross-platform parity** — the larger release blocker, untouched (§5).
+
+### Do not repeat these
+
+* Do not widen the flap stage's recovery assertion to make the suite green. It is the only check
+  proving the tunnel comes back.
+* Do not re-run the seven eliminated QH-51 hypotheses (listed in the status doc).
+* Do not trust `linux_stage_two_hop` in the run matrix — 35 of its pass rows are alias contamination.
+* Do not parse a field name you have not seen emitted. That wasted a full run today.
