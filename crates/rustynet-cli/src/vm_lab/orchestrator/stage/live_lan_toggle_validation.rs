@@ -129,6 +129,35 @@ struct ResolvedParams {
     identity_file: PathBuf,
 }
 
+/// Resolve the SSH username for a lab guest: the inventory's value when it has
+/// one, and only otherwise a per-platform default.
+///
+/// Both helpers in this file used to IGNORE the inventory entirely and hardcode
+/// `"debian"` for every non-Windows guest. That is correct only on an all-Debian
+/// topology, so the bug was invisible until a run put a Fedora node in one of
+/// these three roles: the stage then dialled `debian@<fedora's address>` and
+/// died with `Permission denied (publickey,...)` — one node's username against
+/// another node's host. Measured on run `qh46-series-20260813z`, where
+/// `live_lan_toggle_validation` was the only failing stage and the inventory
+/// recorded `fedora-utm-1 -> ssh_user=fedora` correctly all along.
+///
+/// The fallback deliberately preserves the previous hardcoded values rather than
+/// adopting the `root`/`admin`/`administrator` triple its sibling
+/// `ssh_params_for_role` uses elsewhere. Changing an untested fallback is a
+/// separate behavioural change from fixing "the real username was available and
+/// thrown away", and bundling the two would make a regression here impossible to
+/// attribute.
+fn resolve_ssh_user(inventory_user: Option<&str>, platform: VmGuestPlatform) -> String {
+    if let Some(user) = inventory_user.map(str::trim).filter(|u| !u.is_empty()) {
+        return user.to_owned();
+    }
+    match platform {
+        VmGuestPlatform::Windows => "admin",
+        _ => "debian",
+    }
+    .to_owned()
+}
+
 fn alias_matching_label(ctx: &OrchestrationContext, label: &str) -> Result<ResolvedParams, String> {
     let assignment = ctx
         .assignments
@@ -142,14 +171,11 @@ fn alias_matching_label(ctx: &OrchestrationContext, label: &str) -> Result<Resol
     let params = adapter
         .ssh_connection_params()
         .ok_or_else(|| format!("no SSH params for {}", assignment.alias))?;
-    let user = match adapter.platform() {
-        VmGuestPlatform::Windows => "admin",
-        _ => "debian",
-    };
+    let user = resolve_ssh_user(params.user.as_deref(), adapter.platform());
     Ok(ResolvedParams {
         alias: assignment.alias.clone(),
         host: params.host.clone(),
-        user: user.to_owned(),
+        user,
         identity_file: params.identity_file.clone(),
     })
 }
@@ -173,7 +199,7 @@ fn find_blind_exit(ctx: &OrchestrationContext) -> Result<ResolvedParams, String>
                 return Ok(ResolvedParams {
                     alias: assignment.alias.clone(),
                     host: params.host.clone(),
-                    user: "debian".to_owned(),
+                    user: resolve_ssh_user(params.user.as_deref(), adapter.platform()),
                     identity_file: params.identity_file.clone(),
                 });
             }
@@ -229,5 +255,56 @@ mod tests {
     #[test]
     fn fanout_is_once() {
         assert_eq!(LiveLanToggleValidationStage.fanout(), StageFanout::Once);
+    }
+
+    /// The regression this stage actually died on: a Fedora guest reached over
+    /// SSH as `debian`. The inventory carries the right username; the resolver
+    /// must use it rather than a per-platform guess.
+    #[test]
+    fn inventory_username_wins_over_the_platform_default() {
+        assert_eq!(
+            resolve_ssh_user(Some("fedora"), VmGuestPlatform::Linux),
+            "fedora"
+        );
+        assert_eq!(
+            resolve_ssh_user(Some("rocky"), VmGuestPlatform::Linux),
+            "rocky"
+        );
+        assert_eq!(
+            resolve_ssh_user(Some("ubuntu"), VmGuestPlatform::Linux),
+            "ubuntu"
+        );
+        // A Windows guest with an explicit username is not overridden either.
+        assert_eq!(
+            resolve_ssh_user(Some("labadmin"), VmGuestPlatform::Windows),
+            "labadmin"
+        );
+    }
+
+    /// Absent or blank inventory data falls back to the previous hardcoded
+    /// values, so this fix cannot regress a topology that relied on them.
+    #[test]
+    fn missing_or_blank_username_falls_back_to_the_platform_default() {
+        assert_eq!(resolve_ssh_user(None, VmGuestPlatform::Linux), "debian");
+        assert_eq!(resolve_ssh_user(None, VmGuestPlatform::Windows), "admin");
+        // Whitespace-only is treated as absent, not dialled as an empty user.
+        assert_eq!(
+            resolve_ssh_user(Some("   "), VmGuestPlatform::Linux),
+            "debian"
+        );
+        assert_eq!(
+            resolve_ssh_user(Some(""), VmGuestPlatform::Windows),
+            "admin"
+        );
+    }
+
+    /// Surrounding whitespace in an inventory value must not reach the SSH
+    /// target string, where it would produce `" fedora"@host`.
+    #[test]
+    fn inventory_username_is_trimmed() {
+        assert_eq!(
+            resolve_ssh_user(Some("  fedora \n"), VmGuestPlatform::Linux),
+            "fedora"
+        );
     }
 }
