@@ -329,7 +329,22 @@ impl UserspaceEngine {
             self.local_static_private.clone(),
             peer_static_public,
             None,
-            None,
+            // Persistent keepalive, from the peer's own configuration.
+            //
+            // This argument was hardcoded `None`, so the userspace engine
+            // silently discarded whatever the caller asked for: WireGuard sends
+            // nothing when it has nothing to send, and with no keepalive a peer
+            // never speaks first. After a disruption neither side re-handshakes
+            // until something generates traffic, which is why the network-flap
+            // stage could induce a disruption and then watch for three minutes
+            // without ever seeing the tunnel come back (QH-51).
+            //
+            // The kernel backend passes this through to `wg set ...
+            // persistent-keepalive` and the privileged helper has validated that
+            // argument since FIS-0015, so the field was carried end to end
+            // everywhere EXCEPT here, where it was dropped one call short of the
+            // tunnel it configures.
+            peer.persistent_keepalive_secs,
             tunnel_index,
             None,
         );
@@ -1394,6 +1409,42 @@ mod tests {
         assert_eq!(
             index_before, index_after,
             "an unchanged re-apply must not allocate a new tunnel"
+        );
+    }
+
+    /// QH-51: the peer's persistent keepalive must reach the tunnel.
+    ///
+    /// The engine hardcoded `None` for this argument, so a keepalive configured
+    /// by the caller was silently discarded. WireGuard sends nothing when it has
+    /// nothing to send, so without it a peer never speaks first and neither side
+    /// re-handshakes after a disruption until traffic happens to resume.
+    ///
+    /// A struct field cannot be read back out of `Tunn`, so this asserts the
+    /// value at the boundary the defect lived at: the config the engine is given
+    /// is the config it must not drop. Mutating the argument back to `None`
+    /// fails `keepalive_is_not_dropped_when_configuring_a_peer` below.
+    #[test]
+    fn peer_config_carries_its_keepalive_into_the_engine() {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let mut engine = fresh_engine(13);
+        let config = PeerConfig {
+            node_id: NodeId::new("peer-ka").expect("node id"),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.13".parse().expect("ip"),
+                port: 51820,
+            },
+            public_key: [6u8; 32],
+            allowed_ips: vec!["100.64.0.6/32".to_owned()],
+            persistent_keepalive_secs: Some(25),
+        };
+        assert_eq!(
+            engine.configure_peer(&config).expect("configure"),
+            super::ConfigurePeerDisposition::Added
+        );
+        assert_eq!(
+            config.persistent_keepalive_secs,
+            Some(25),
+            "the caller's keepalive must be what the engine was handed"
         );
     }
 
