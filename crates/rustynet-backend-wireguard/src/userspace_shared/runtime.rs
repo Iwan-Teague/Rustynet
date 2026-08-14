@@ -566,9 +566,10 @@ impl RuntimeState {
         // `handshake_fresh` lie about a peer that has not completed a handshake
         // on its current session.
         //
-        // `Unchanged` is the opposite case and must NOT clear: nothing was
-        // rebuilt, the live session is still the one that produced that
-        // timestamp. Before `Unchanged` existed, every reconcile of an unchanged
+        // `Unchanged` and `EndpointMoved` are the opposite case and must NOT
+        // clear: nothing was rebuilt, the live session is still the one that
+        // produced that timestamp, and a peer that merely roamed has not stopped
+        // being handshaked. Before `Unchanged` existed, every reconcile of an unchanged
         // peer landed here and wiped the record, which is why liveness read dead
         // on nodes that were passing traffic (QH-51).
         if matches!(disposition, ConfigurePeerDisposition::Replaced) {
