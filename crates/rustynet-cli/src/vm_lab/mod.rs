@@ -40541,6 +40541,18 @@ mod tests {
 
     pub(super) fn cleanup_temp_inventory(path: &Path) {
         if let Some(parent) = path.parent() {
+            // Same fail-closed guard as cleanup_temp_path: every current
+            // caller passes a path inside its own unique subdirectory, and
+            // this assert keeps it that way — a root-level path would make
+            // this remove_dir_all(temp_dir()) and sweep other tests' live
+            // fixtures.
+            assert_ne!(
+                parent,
+                std::env::temp_dir().as_path(),
+                "cleanup_temp_inventory would remove the shared temp dir itself; \
+                 give the fixture its own unique subdirectory: {}",
+                path.display()
+            );
             let _ = fs::remove_dir_all(parent);
         }
     }
