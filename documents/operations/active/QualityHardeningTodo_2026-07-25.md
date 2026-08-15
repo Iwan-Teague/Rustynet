@@ -2983,3 +2983,16 @@ delete-call, gut-check, remove-gate, controller-reorder; the Debian guest caught
 missing-bound-as-clear, hardcoded-interface, and Bind→Query. All 14 tests pass on the guest.
 Residual, deliberate: the D-Bus executor `execute_linux_firewalld_zone` itself remains
 live-lab-only coverage.
+
+### QH-56 — five live-lab stages still hardcode the `debian` SSH username
+
+Run `qh53-liveproof-20260815a`: `live_enrollment_restart_validation`, reached for the first time
+once the QH-46/QH-53 fixes unblocked the cascade, failed dialing `debian@192.168.64.105`
+(rocky-utm-1, user `rocky`). [[QH-49]]'s fix introduced `resolve_ssh_user` (inventory username
+first, platform fallback) but left it private to the LAN-toggle stage. Still hardcoding
+`_ => "debian"`: `stage/chaos.rs:235`, `stage/cross_network.rs:1036`,
+`stage/live_enrollment_restart_validation.rs:135`, `stage/live_anchor.rs:193`,
+`stage/live_mixed_topology_validation.rs:158`. Every one of them fails the same way the moment
+its role lands on a Fedora/Rocky/Ubuntu/macOS guest. Fix: hoist `resolve_ssh_user` into
+`stage/mod.rs`, use it at all six sites (LAN-toggle keeps it as its fallback), unit-test the
+shared helper, and let the next run prove `live_enrollment_restart_validation` live.

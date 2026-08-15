@@ -217,3 +217,29 @@ restrict_recoverable events at 11:33–11:35, and a pre-existing `force_fail_clo
 truncated frame header` spam loop on fedora at 10:31Z.
 
 Triage: recorded against stub `livelab-1786707675-c7eb8a1f00e5::live_network_flap_validation`.
+
+## Run 41 (`qh53-liveproof-20260815a`) — QH-53 LIVE-PROVEN, flap PASSES, QH-51 RESOLVED
+
+39 pass / 1 fail / 19 skipped — the deepest the `--node` cascade has ever reached. Launched on
+main at `f2cd7d09` (the QH-53 fix landed and gated).
+
+**`live_network_flap_validation` PASSED for the first time in `--node` history.** From the
+stage's own artifact: the peer probe resolved the entry's mesh IP (`100.123.159.114` — the entry
+SURVIVED the managed_dns restart, which is the QH-53 fix doing its job live), and
+`recovery proven by data crossing the tunnel`, `recovery_arrived=true recovery_time_s=6`.
+
+**QH-51 is thereby resolved, and the answer is the one nobody could see:** the client's session
+recovery was NEVER broken — data crosses within 6 seconds of the block lifting once the client's
+peer is actually alive. Every historical `recovery_arrived=false` was a broken ENTRY underneath
+the probe: first the firewalld FORWARD reject (QH-46), then the restart race that left the entry
+tunnel-less (QH-53). Hypothesis 8 (the stage's premise is wrong) is closed alongside hypotheses
+1-7: the premise was fine; the instrument was measuring a dead peer.
+
+**The cascade's next defect, exactly as QH-48 predicts:** `live_enrollment_restart_validation`,
+reached for the first time, failed with `Permission denied` dialing `debian@192.168.64.105` —
+that address is rocky-utm-1 (user `rocky`). The stage's `alias_matching_label` hardcodes
+`"debian"` for every non-Windows guest (live_enrollment_restart_validation.rs:135). This is
+QH-49's defect class: that fix repaired only the LAN-toggle stage and left `resolve_ssh_user`
+private to it. Five stages still hardcode the username (chaos.rs:235, cross_network.rs:1036,
+live_enrollment_restart_validation.rs:135, live_anchor.rs:193, live_mixed_topology_validation.rs:158)
+— filed as QH-56; fix is the mechanical port of the QH-49 pattern to a shared helper.
