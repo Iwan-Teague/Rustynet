@@ -3022,3 +3022,86 @@ set must cover BOTH LANs for the transition window, or the toggle must be driven
 toggle-immune path; (2) nothing bounds a management-CIDR assignment whose LAN never appears —
 the daemon faithfully re-derives the dead bypass forever. Fix needs the full plan + adversarial
 review cycle; the fail-closed posture itself behaved correctly and must not be weakened.
+
+### QH-58 — Cross Platform CI was red for months on ten independent test-hermeticity defects
+
+Main's CI had not been fully green since 2026-03-03 — five and a half months. Investigated
+2026-08-15 across all legs; ten distinct causes, all fixed the same day (commits
+`bf84290c`..`767b32a3`):
+
+1. **The `/tmp` sweep (both macOS victims).** One test's marker file lived directly in
+   `temp_dir()`, and `cleanup_temp_path` removes the marker's PARENT — an error-swallowed
+   `remove_dir_all` of the entire shared temp namespace, latent since 2026-05-25. It randomly
+   destroyed other tests' uniquely-named fixtures mid-run: on GH macOS runners the near-
+   deterministic nextest schedule landed the sweep window on `transition_local_utm_vm_accepts_
+   timeout_when_vm_reaches_stopped_state` or `rust_native_reuse_seal_rejects_modified_stage_log`
+   (wall-clock overlap proven in three runs' logs), and on ubuntu-kvm-1 it killed a discovery
+   test's inventory mid-read. Fixed: marker in its own unique dir; `cleanup_temp_path` AND
+   `cleanup_temp_inventory` now fail closed (assert) on a temp-dir-rooted parent —
+   mutation-proven (a root-level marker panics the sweeping test with the guard's message).
+2. **CRLF vs `include_str!` (Windows, deterministic since 2026-07-30).** The relay clock source
+   pin's LF-joined needle never matched a CRLF checkout. Fixed: normalize before searching, plus
+   `.gitattributes` forcing LF for `*.rs` so every source pin is checkout-invariant.
+3. **Ephemeral port inside the default dataplane range (Windows, ~61% flake since 2026-07-28).**
+   The relay control-packet test probed a port from the OS dynamic range, which overlaps the
+   default 50000-59999 dataplane range; `validate()` rejects the config, and Windows's
+   sequential allocator made all 16 retries fail together. Fixed: the test pins the range to
+   1024-5119.
+4. **Machine identity baked into a fixture (ubuntu-kvm-1 only).** The hosts-declaration test
+   used the real ubuntu-kvm-1 record, and `resolved_connect_uri` deliberately collapses to
+   `qemu:///system` on that very host. Fixed: synthetic host_id + RFC 6761 `.invalid` hostname.
+5. **`safe.directory` discarded by the MCP git tools' hardened env (Debian container).**
+   `GIT_CONFIG_GLOBAL=/dev/null` also dropped the CI checkout's dubious-ownership exemption
+   (git honors `safe.directory` only from system/global config FILES); every read-only git tool
+   died in the uid-mismatched container — masked until the QH-46-era clippy failure was fixed.
+   Fixed: the hardened env points at a minimal owned config containing only `safe.directory=*`,
+   keeping all other isolation.
+
+6. **Runner-independent Linux probes asserted empty (Debian, unmasked next).** The sysinfo
+   every-tool-unavailable test asserted empty interfaces and DNS resolvers — but on Linux
+   `observe_interfaces` reads `/sys/class/net` and `observe_dns` reads `/etc/resolv.conf` by
+   design. Could never pass on Linux; expectations now cfg-split, tool-driven asserts unchanged.
+7. **Root runner takes the root arm (Debian container, unmasked next).** The local-peer
+   authorization test asserted the socket-owner arm, but a root peer legitimately authorizes
+   via the preceding root arm. The sibling denial test was already root-guarded; the allows
+   test now asserts the arm actually taken in each environment.
+8. **The custody round-trip pair was BORN FAILING (all Linux).** The credential-only passphrase
+   control (`2dc39fca`, 2026-03-04) refuses a configured direct path unless
+   `RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH`/`CREDENTIALS_DIRECTORY` names the source, and
+   the unsafe-forbid workspace means no test can set env — so the two daemon custody tests
+   (added 2026-04-02 and 2026-07-23) never once passed on Linux: cfg'd off macOS where
+   development runs, module excluded on Windows, and fail-fast masking upstream on Debian.
+   Fixed with a `cfg(test)` thread-local credential-path override consulted at the same
+   decision point the env variable feeds — non-test builds byte-identical, every downstream
+   check unchanged, and the tests now exercise the exact production decrypt chain in the
+   explicit-credential mode systemd uses.
+
+9. **Self-written "untrusted" fixtures are root-owned under a root runner (two twins).** The
+   symlink-to-untrusted-target tests in key_material and phase10 write their own target, so a
+   root runner makes it root-owned and the must-be-root-owned rejection can never fire (the
+   privileged_helper sibling was already root-guarded). Fixed by chowning the fixture to nobody
+   when root — the same rejection asserts in every environment.
+10. **The socket poll-budget test raced datagram arrival (macOS, rare flake).** It sent
+   budget+3 datagrams over real loopback and asserted the FIRST poll ingested exactly the
+   budget; arrival is not synchronous with send_to. Now polls until drained, asserting the
+   per-poll cap on every iteration plus at least one capped poll.
+
+**PROVEN GREEN: run 31898492213 (2026-08-15, commit `767b32a3`) — all four legs success.**
+
+The masking structure is why this looked like one bug: nextest is fail-fast, so each leg showed
+only its first victim; compile-stage failures (the `type_complexity` lint) hid the test layer
+entirely; and per-OS cfg gates hid Linux-only breakage from macOS development. **The last fully
+green Cross Platform CI run was 2026-03-03 — the day before the custody control landed.** Every
+fix keeps the original assertions' meaning intact; none weakens a fail-closed control.
+
+### QH-59 — FIXED: the overnight executor's group kill was broken or catastrophic on Ubuntu
+
+`spawn_with_timeout`/`spawn_capture_with_timeout` killed a timed-out agent's process group with
+`kill -KILL -<pgid>` — no `--`. Ubuntu 24.04's procps `kill` parses the bare negative as its
+FIRST DIGIT (`-12345` → `kill(-1?2345…)` → `-1`): a wedged tree either survives the timeout
+(non-1 leading digit, exit 0, nothing killed) or, with a leading-1 pgid, becomes
+`kill(-1, SIGKILL)` — SIGKILL to every process the user may signal, empirically confirmed via
+strace in an ubuntu:24.04 container. Debian's and macOS's kill parse the bare form correctly,
+which is why CI never caught it; the box's full-suite failures (three "parallelism" tests) were
+collateral of this blast. Fixed with `--` before the pgid (verified on all three platforms);
+the wedged-process test on the box went from days-red to a 1.0s pass.
