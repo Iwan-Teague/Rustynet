@@ -1,7 +1,31 @@
 #![allow(dead_code)]
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+
+/// Resolve the SSH username for a lab guest: the inventory's value when it has
+/// one, and only otherwise a per-platform default.
+///
+/// Hoisted out of the LAN-toggle stage (QH-49) after QH-56: stages that
+/// hardcoded "debian" for every non-Windows guest dialled one node's username
+/// against another node's host the moment a role landed on a Fedora/Rocky
+/// guest, and died with Permission denied. The inventory records the real
+/// username; throwing it away is the bug. The fallback deliberately preserves
+/// the LAN-toggle stage's historical values rather than unifying with the
+/// "administrator"/"admin" defaults some stages use - changing an untested
+/// fallback is a separate behavioural change from fixing "the real username
+/// was available and thrown away".
+pub(crate) fn resolve_ssh_user(inventory_user: Option<&str>, platform: VmGuestPlatform) -> String {
+    if let Some(user) = inventory_user.map(str::trim).filter(|u| !u.is_empty()) {
+        return user.to_owned();
+    }
+    match platform {
+        VmGuestPlatform::Windows => "admin",
+        _ => "debian",
+    }
+    .to_owned()
+}
 
 pub mod active_exit;
 pub mod admin_issue;

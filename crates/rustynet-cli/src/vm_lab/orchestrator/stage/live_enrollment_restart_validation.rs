@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
@@ -130,14 +129,13 @@ fn alias_matching_label(ctx: &OrchestrationContext, label: &str) -> Result<Resol
     let params = adapter
         .ssh_connection_params()
         .ok_or_else(|| format!("no SSH params for {}", assignment.alias))?;
-    let user = match adapter.platform() {
-        VmGuestPlatform::Windows => "admin",
-        _ => "debian",
-    };
+    // QH-56: the inventory records each guest's real username - hardcoding
+    // "debian" dialled rocky-utm-1 as debian@ and died with Permission denied.
+    let user = super::resolve_ssh_user(params.user.as_deref(), adapter.platform());
     Ok(ResolvedParams {
         alias: assignment.alias.clone(),
         host: params.host.clone(),
-        user: user.to_owned(),
+        user,
         identity_file: params.identity_file.clone(),
     })
 }

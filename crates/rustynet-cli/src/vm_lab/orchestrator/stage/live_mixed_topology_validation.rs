@@ -153,10 +153,8 @@ fn find_platform_node(
             let params = adapter
                 .ssh_connection_params()
                 .ok_or_else(|| format!("no SSH params for {}", assignment.alias))?;
-            let user = match platform {
-                VmGuestPlatform::Windows => "admin",
-                _ => "debian",
-            };
+            // QH-56: consult the inventory username before any platform default.
+            let user = super::resolve_ssh_user(params.user.as_deref(), platform);
             let target = format!("{user}@{}", params.host);
             let node_id = ctx
                 .node_ids
