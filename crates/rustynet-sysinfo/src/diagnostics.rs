@@ -1562,9 +1562,21 @@ mod tests {
         let runner = RecordingRunner::new(); // no fixtures => Unavailable for all
         let report = observe_with(&runner);
 
-        assert!(report.interfaces.is_empty());
+        // Interfaces and DNS are runner-independent on Linux by design:
+        // observe_interfaces reads /sys/class/net and observe_dns reads
+        // /etc/resolv.conf directly — filesystem reads that keep working
+        // precisely when every TOOL is missing, which is the safer
+        // diagnostic posture. Asserting emptiness for them would assert the
+        // host has no interfaces and no resolv.conf — never true on a real
+        // Linux machine, which is why this test could not pass on any Linux
+        // runner once the fail-fast failures upstream of it were fixed.
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(report.interfaces.is_empty());
+            assert!(report.dns.resolvers.is_empty());
+        }
+
         assert!(report.routes.is_empty());
-        assert!(report.dns.resolvers.is_empty());
         assert!(report.listening_sockets.is_empty());
         assert!(!report.firewall.active);
         assert!(!report.firewall.queried);
