@@ -20621,6 +20621,12 @@ mod tests {
             std::fs::set_permissions(&passphrase_path, std::fs::Permissions::from_mode(0o600))
                 .expect("passphrase permissions should be restrictive");
         }
+        // Routes the resolver exactly the way systemd's
+        // RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH does; without it no
+        // in-process test can pass the credential-only custody control.
+        let _credential = crate::key_material::passphrase_test_support::CredentialPathOverride::set(
+            passphrase_path.clone(),
+        );
         encrypt_private_key(
             plaintext_secret,
             secret_path.as_path(),
@@ -20801,6 +20807,12 @@ mod tests {
             std::fs::set_permissions(&passphrase_path, std::fs::Permissions::from_mode(0o600))
                 .expect("passphrase permissions should be restrictive");
         }
+        // Routes the resolver exactly the way systemd's
+        // RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH does; without it no
+        // in-process test can pass the credential-only custody control.
+        let _credential = crate::key_material::passphrase_test_support::CredentialPathOverride::set(
+            passphrase_path.clone(),
+        );
         encrypt_private_key(
             expected_runtime_key,
             encrypted_key_path.as_path(),
@@ -31469,7 +31481,16 @@ mod tests {
         let outcome = authorize_local_peer(&a, current_uid, &socket_path)
             .expect("same-uid peer must authorise");
         assert_eq!(outcome.peer_uid, current_uid);
-        assert_eq!(outcome.via, super::LocalAuthVia::SocketOwnerUid);
+        if current_uid == 0 {
+            // Under a root test runner (CI containers) the root arm wins
+            // before the socket-owner comparison — the same grant, attributed
+            // to the earlier arm. The sibling denial test already guards for
+            // root; this keeps an assertion in both environments instead of
+            // skipping.
+            assert_eq!(outcome.via, super::LocalAuthVia::Root);
+        } else {
+            assert_eq!(outcome.via, super::LocalAuthVia::SocketOwnerUid);
+        }
     }
 
     #[test]
