@@ -13415,6 +13415,14 @@ mod tests {
             .expect("target should be executable");
         std::os::unix::fs::symlink(&target, &symlink).expect("symlink should be creatable");
 
+        // Under a root test runner the file just written IS root-owned and
+        // the ownership rejection cannot fire; chown it to nobody (which
+        // root may do) so the same assertion holds in every environment.
+        if nix::unistd::Uid::effective().is_root() {
+            std::os::unix::fs::chown(&target, Some(65534), Some(65534))
+                .expect("root can chown the target to nobody");
+        }
+
         let err = validate_binary_path(
             symlink.to_str().expect("symlink path should be utf8"),
             PrivilegedCommandProgram::Nft,
