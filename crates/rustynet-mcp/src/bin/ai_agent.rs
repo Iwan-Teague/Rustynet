@@ -4328,7 +4328,7 @@ impl AiAgentServer {
         let git_env: &[(&str, &str)] = &[
             ("GIT_PAGER", "cat"),
             ("PAGER", "cat"),
-            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_GLOBAL", hardened_git_config_global()),
             ("GIT_CONFIG_SYSTEM", "/dev/null"),
             ("GIT_CONFIG_PARAMETERS", ""),
             ("GIT_TERMINAL_PROMPT", "0"),
@@ -4891,7 +4891,7 @@ impl AiAgentServer {
                 &[
                     ("GIT_PAGER", "cat"),
                     ("PAGER", "cat"),
-                    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                    ("GIT_CONFIG_GLOBAL", hardened_git_config_global()),
                     ("GIT_CONFIG_SYSTEM", "/dev/null"),
                     ("GIT_CONFIG_PARAMETERS", ""),
                     ("GIT_TERMINAL_PROMPT", "0"),
@@ -6790,6 +6790,30 @@ impl AiAgentServer {
 
 fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)?.as_str()
+}
+
+/// Path of the minimal global gitconfig every read-only git subprocess uses.
+///
+/// Blanking global config with /dev/null also discards the `safe.directory`
+/// exemption CI checkouts rely on, and git honors safe.directory ONLY from
+/// system/global config files (never `-c` and never plain environment
+/// variables) — so on a container whose checkout uid differs from the
+/// process uid (GitHub's Debian job), every read-only git tool died with
+/// "dubious ownership". This file restores exactly that one exemption while
+/// keeping pagers, aliases, filters and prompts isolated; trusting
+/// any-ownership is scoped to read-only subprocesses run inside the server's
+/// own repo_root. Falls back to full isolation if the file cannot be
+/// written (read-only git then still works wherever ownership matches).
+fn hardened_git_config_global() -> &'static str {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let path =
+            std::env::temp_dir().join(format!("rustynet-mcp-gitconfig-{}.ini", std::process::id()));
+        if std::fs::write(&path, "[safe]\n\tdirectory = *\n").is_err() {
+            return "/dev/null".to_owned();
+        }
+        path.to_string_lossy().into_owned()
+    })
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
