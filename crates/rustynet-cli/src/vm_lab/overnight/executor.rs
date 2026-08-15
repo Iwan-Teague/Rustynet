@@ -633,6 +633,14 @@ fn spawn_with_timeout(
                     // — no unsafe/libc). Best-effort, then reap the direct child.
                     let _ = Command::new("kill")
                         .arg("-KILL")
+                        // `--` is load-bearing: Ubuntu 24.04's procps kill
+                        // parses a bare `-12345` as `-1` plus discarded
+                        // digits, which either no-ops the group kill (the
+                        // wedged tree survives) or, for a leading-1 pgid,
+                        // becomes kill(-1, SIGKILL) and slaughters every
+                        // process the user may signal. With `--` all three
+                        // lab platforms parse the full negative pgid.
+                        .arg("--")
                         .arg(format!("-{pgid}"))
                         .status();
                     let _ = child.wait();
@@ -681,6 +689,14 @@ fn spawn_capture_with_timeout(
                     let pgid = child.id() as i64;
                     let _ = Command::new("kill")
                         .arg("-KILL")
+                        // `--` is load-bearing: Ubuntu 24.04's procps kill
+                        // parses a bare `-12345` as `-1` plus discarded
+                        // digits, which either no-ops the group kill (the
+                        // wedged tree survives) or, for a leading-1 pgid,
+                        // becomes kill(-1, SIGKILL) and slaughters every
+                        // process the user may signal. With `--` all three
+                        // lab platforms parse the full negative pgid.
+                        .arg("--")
                         .arg(format!("-{pgid}"))
                         .status();
                     let _ = child.wait();

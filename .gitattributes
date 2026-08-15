@@ -1,0 +1,4 @@
+# Force LF for Rust sources on every platform: include_str!-based source
+# pins compare byte content, and a CRLF Windows checkout diverges from every
+# other leg (broke the relay clock pin on each Windows CI run).
+*.rs text eol=lf

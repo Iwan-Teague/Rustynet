@@ -2926,7 +2926,15 @@ mod tests {
     /// it guards is the specific regression: reintroducing a substituted value.
     #[test]
     fn no_consumer_substitutes_a_value_for_an_unavailable_clock() {
-        let source = include_str!("transport.rs");
+        // Normalized before searching: a Windows checkout materialises this
+        // file with CRLF (no .gitattributes forced LF historically), and the
+        // LF-joined needles below would never match — the pin then fails as
+        // "the test module must exist" on every Windows CI run.
+        let source = include_str!("transport.rs").replace(
+            "
+", "
+",
+        );
         // Slice at the test MODULE, not the first `#[cfg(test)]`: there are
         // `#[cfg(test)]` attributes on production helpers earlier in the file, and
         // anchoring on those silently truncates the slice to nothing -- which made

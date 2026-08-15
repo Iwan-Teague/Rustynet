@@ -5393,6 +5393,16 @@ mod daemon {
                         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                         port,
                     ),
+                    // The probed control port comes from the OS dynamic range
+                    // (49152-65535), which overlaps the DEFAULT dataplane
+                    // range 50000-59999 — validate() then rejects the config.
+                    // Windows allocates dynamic ports sequentially, so once
+                    // the cursor sits inside the overlap ALL 16 retries fail
+                    // and the test flaps red (~61% of runs). Pin the dataplane
+                    // range to a band an ephemeral port can never occupy; the
+                    // band must hold at least max_total_sessions (4096) ports.
+                    port_range_start: 1024,
+                    port_range_end: 5119,
                     health_bind_addr: None,
                     ..RelayConfig::default()
                 };
