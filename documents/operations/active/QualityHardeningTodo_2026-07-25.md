@@ -3006,3 +3006,19 @@ fallback-correct stages keep their own `default_ssh_user` values untouched — t
 is a separate behavioural change. Helper is unit-proven; the call-site wiring is proven live by
 the next run reaching `live_enrollment_restart_validation` with a `rocky@` dial (same proof shape
 QH-49 used).
+
+### QH-57 — the LAN-toggle stage saws off the branch it sits on, and the bad state persists
+
+Run `qh56-enrollment-20260815b`: `live_lan_toggle_validation` moved the client's management CIDR
+to the toggle LAN (`192.168.18.0/24`); the full-tunnel management bypass followed; every
+host↔guest packet then routed into the tunnel (`ip route get 192.168.64.1` → `dev rustynet0
+table 51820`, proven live), including the stage's OWN SSH session, which died mid-toggle. The
+toggle-back never ran and the toggle-LAN CIDR persisted in signed state across daemon restarts
+and a full power cycle (g3→g7). Cleanup could not reach the client; recovery required
+out-of-band `utmctl exec` (stop the daemon, drop the `ip rule`).
+
+Two sub-defects: (1) the stage's transition plan has no reachability continuity — the management
+set must cover BOTH LANs for the transition window, or the toggle must be driven over a
+toggle-immune path; (2) nothing bounds a management-CIDR assignment whose LAN never appears —
+the daemon faithfully re-derives the dead bypass forever. Fix needs the full plan + adversarial
+review cycle; the fail-closed posture itself behaved correctly and must not be weakened.

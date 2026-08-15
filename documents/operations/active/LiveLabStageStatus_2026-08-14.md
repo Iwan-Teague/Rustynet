@@ -243,3 +243,33 @@ QH-49's defect class: that fix repaired only the LAN-toggle stage and left `reso
 private to it. Five stages still hardcode the username (chaos.rs:235, cross_network.rs:1036,
 live_enrollment_restart_validation.rs:135, live_anchor.rs:193, live_mixed_topology_validation.rs:158)
 — filed as QH-56; fix is the mechanical port of the QH-49 pattern to a shared helper.
+
+## Run 42 (`qh56-enrollment-20260815b`) — QH-56 live-proven; the toggle stage cuts its own branch
+
+39 pass / 2 fail / 18 skipped on main at `2607d294`. **`live_enrollment_restart_validation`
+PASSED on its first post-fix run** — the QH-56 wiring is live-proven (the stage dialled
+rocky-utm-1 with the inventory username).
+
+The cascade then reached `live_lan_toggle_validation`, which failed and took `cleanup` down with
+it. Mechanism, proven live on the wedged client (debian-headless-4):
+
+* The stage issues signed LAN-toggle assignments that move the client's management CIDR to the
+  simulated second LAN, `192.168.18.0/24`. The full-tunnel bypass follows the management CIDR:
+  policy table 51820 ended up as `default dev rustynet0` + bypass routes for `192.168.18.0/24`
+  and the exit peer only. `ip route get 192.168.64.1` → `dev rustynet0 table 51820`: every
+  host↔guest packet dove into the tunnel. Guest↔guest kept working (peer-endpoint bypass + mesh),
+  which is what made this look like a host-side vmnet wedge at first.
+* The stage's own SSH session rides the LAN it toggles away — it died mid-stage
+  (`Connection reset by peer`), the toggle-back never ran, and the wrong CIDR PERSISTED in signed
+  state across daemon restarts AND a full VM power cycle (generations g3→g7 all re-derived the
+  18.x bypass). `cleanup` then timed out against the unreachable client.
+* Recovery: `systemctl stop rustynetd` + drop `ip rule` pref 10000 via `utmctl exec` (SSH cannot
+  reach a wedged client, by construction). The killswitch nft rules were NOT the blocker —
+  `oifname enp0s1 accept` admits replies; the routing bypass was.
+
+Filed as QH-57. The stage needs a design pass (plan + adversarial review): a LAN-toggle that
+moves the management CIDR must either keep BOTH LANs in the management set for the transition,
+drive the toggle from a path that survives it (utmctl exec, or a peer), or bound the assignment
+with an auto-revert the daemon applies when the new LAN never materialises. Do not paper over it
+by exempting SSH from the tunnel — that would be a fail-open hole in the exact control the stage
+exists to prove.
