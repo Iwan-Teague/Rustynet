@@ -2989,10 +2989,20 @@ live-lab-only coverage.
 Run `qh53-liveproof-20260815a`: `live_enrollment_restart_validation`, reached for the first time
 once the QH-46/QH-53 fixes unblocked the cascade, failed dialing `debian@192.168.64.105`
 (rocky-utm-1, user `rocky`). [[QH-49]]'s fix introduced `resolve_ssh_user` (inventory username
-first, platform fallback) but left it private to the LAN-toggle stage. Still hardcoding
-`_ => "debian"`: `stage/chaos.rs:235`, `stage/cross_network.rs:1036`,
-`stage/live_enrollment_restart_validation.rs:135`, `stage/live_anchor.rs:193`,
-`stage/live_mixed_topology_validation.rs:158`. Every one of them fails the same way the moment
-its role lands on a Fedora/Rocky/Ubuntu/macOS guest. Fix: hoist `resolve_ssh_user` into
-`stage/mod.rs`, use it at all six sites (LAN-toggle keeps it as its fallback), unit-test the
-shared helper, and let the next run prove `live_enrollment_restart_validation` live.
+first, platform fallback) but left it private to the LAN-toggle stage.
+
+**Corrected sweep (the first filing overstated):** of the five `_ => "debian"` matches, three —
+`stage/chaos.rs`, `stage/cross_network.rs`, `stage/live_anchor.rs` — are the FALLBACK arm of a
+correct `params.user.unwrap_or_else(default_ssh_user(...))` pattern and were never broken. The
+genuinely broken sites, which ignored the inventory entirely, were exactly two:
+`stage/live_enrollment_restart_validation.rs:135` and
+`stage/live_mixed_topology_validation.rs:158`.
+
+**FIXED 2026-08-15:** `resolve_ssh_user` hoisted into `stage/mod.rs` (QH-49 doc and trimming
+semantics preserved), both broken sites now consult the inventory username, the LAN-toggle stage
+imports the shared helper, and its unit tests exercise the shared symbol. The three
+fallback-correct stages keep their own `default_ssh_user` values untouched — their
+"administrator"/"admin" defaults differ from the LAN-toggle's, and changing an untested fallback
+is a separate behavioural change. Helper is unit-proven; the call-site wiring is proven live by
+the next run reaching `live_enrollment_restart_validation` with a `rocky@` dial (same proof shape
+QH-49 used).
