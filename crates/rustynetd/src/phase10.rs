@@ -9583,11 +9583,12 @@ mod tests {
                 .any(|op| op == "set_relay_forwarding:true")
         );
 
-        // QH-46 ordering: the firewalld coexistence check inside
-        // apply_firewall_killswitch fires only if relay forwarding was enabled
-        // FIRST. Presence of both ops is not enough — swapping the two calls in
-        // the controller would leave every system-level test green while
-        // production never enforces the check.
+        // Ordering: the killswitch emits the relay hairpin nft rule only if
+        // set_relay_forwarding ran FIRST (the firewalld coexistence check
+        // moved OUT of the killswitch to admit_host_firewall_forwarding —
+        // QH-53). Presence of both ops is not enough — swapping the two calls
+        // in the controller would leave every system-level test green while
+        // production never emits the hairpin.
         let relay_position = controller
             .system
             .operations
@@ -9834,17 +9835,24 @@ mod tests {
     /// same constant `as_str()` returns), never a string literal, so a program
     /// rename breaks the presence asserts loudly instead of leaving the
     /// absence assert vacuously green.
+    ///
+    /// The harness tuple: (command log, stop flag, helper thread, system
+    /// under test). Named because CI's clippy (unlike the pinned local
+    /// toolchain's) rejects the inline four-tuple as type_complexity.
+    #[cfg(target_os = "linux")]
+    type ScriptedFirewalldHarness = (
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        LinuxCommandSystem,
+    );
+
     #[cfg(target_os = "linux")]
     fn firewalld_scripted_system(
         socket_path: &Path,
         interface: &str,
         posture_stdout: &str,
-    ) -> (
-        Arc<Mutex<Vec<String>>>,
-        Arc<AtomicBool>,
-        std::thread::JoinHandle<()>,
-        LinuxCommandSystem,
-    ) {
+    ) -> ScriptedFirewalldHarness {
         let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
             socket_path,
             vec![(
