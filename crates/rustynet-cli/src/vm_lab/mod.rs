@@ -40713,6 +40713,17 @@ mod tests {
 
     fn cleanup_temp_path(path: &Path) {
         if let Some(parent) = path.parent() {
+            // Fail closed on a path rooted directly in the shared temp dir:
+            // removing its parent would be remove_dir_all(temp_dir()) — a
+            // sweep of EVERY same-UID temp entry, including other tests'
+            // in-flight fixtures. A panic here is a test bug surfacing, not
+            // flakiness to tolerate.
+            assert_ne!(
+                parent,
+                std::env::temp_dir().as_path(),
+                "cleanup_temp_path would remove the shared temp dir itself;                  give the fixture its own unique subdirectory: {}",
+                path.display()
+            );
             let _ = fs::remove_dir_all(parent);
         }
     }
@@ -52382,10 +52393,17 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
 
     #[test]
     fn rust_orchestrator_mixed_desktop_topology_delegates_to_bash_wrapper() {
-        let marker = std::env::temp_dir().join(format!(
-            "rustynet-rust-orchestrator-mixed-{}.marker",
+        // The marker lives in its OWN unique directory, never directly in
+        // temp_dir(): cleanup_temp_path removes the marker's PARENT, and a
+        // root-level marker made that remove_dir_all(/tmp) — a recursive,
+        // error-swallowed sweep of every same-UID temp entry that randomly
+        // destroyed OTHER tests' uniquely-named fixtures mid-run.
+        let marker_dir = std::env::temp_dir().join(format!(
+            "rustynet-rust-orchestrator-mixed-{}.dir",
             super::unique_suffix()
         ));
+        fs::create_dir_all(&marker_dir).expect("marker dir should exist");
+        let marker = marker_dir.join("executed.marker");
         let script = write_temp_executable(
             format!(
                 "#!/bin/sh\nprintf 'mixed-desktop\\n' > {}\nexit 0\n",
