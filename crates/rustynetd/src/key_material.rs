@@ -810,8 +810,63 @@ fn validate_secret_file_security(
 // Only the `#[cfg(not(windows))]` `read_passphrase_from_source` calls this;
 // Windows resolves its passphrase through the DPAPI blob path instead.
 #[cfg(not(windows))]
+/// Test-only stand-in for `RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH`.
+///
+/// The workspace forbids unsafe code, so tests cannot call
+/// `std::env::set_var` — and no in-process test could therefore ever route
+/// through `resolve_passphrase_source` successfully, which is how the two
+/// daemon custody round-trip tests were born failing on Linux. The override
+/// feeds the SAME decision point the env variable feeds, so every
+/// downstream check (existence, permission validation, the
+/// direct-fallback refusal) runs unchanged, and it does not exist in
+/// non-test builds: the production enforcement point is byte-identical.
+#[cfg(test)]
+// The only consumers are the daemon custody round-trip tests, which are
+// gated `cfg(all(unix, not(target_os = "macos")))` — on the macOS and
+// Windows test builds this module compiles (the resolver references it)
+// but nothing constructs the guard.
+#[allow(dead_code)]
+pub(crate) mod passphrase_test_support {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static CREDENTIAL_PATH_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// RAII guard: the override lasts until the guard drops, restoring any
+    /// prior value. Thread-local, so parallel tests cannot see each other's
+    /// credentials under either `cargo test` (threads) or nextest
+    /// (processes).
+    pub(crate) struct CredentialPathOverride {
+        prior: Option<PathBuf>,
+    }
+
+    impl CredentialPathOverride {
+        pub(crate) fn set(path: PathBuf) -> Self {
+            let prior = CREDENTIAL_PATH_OVERRIDE.with(|slot| slot.replace(Some(path)));
+            CredentialPathOverride { prior }
+        }
+    }
+
+    impl Drop for CredentialPathOverride {
+        fn drop(&mut self) {
+            let prior = self.prior.take();
+            CREDENTIAL_PATH_OVERRIDE.with(|slot| *slot.borrow_mut() = prior);
+        }
+    }
+
+    pub(super) fn current() -> Option<PathBuf> {
+        CREDENTIAL_PATH_OVERRIDE.with(|slot| slot.borrow().clone())
+    }
+}
+
 fn resolve_passphrase_source(configured_path: &Path) -> Result<PathBuf, String> {
     let explicit = std::env::var(PASSPHRASE_CREDENTIAL_PATH_ENV).ok();
+    #[cfg(test)]
+    let explicit = passphrase_test_support::current()
+        .map(|path| path.to_string_lossy().into_owned())
+        .or(explicit);
     let directory = std::env::var(SYSTEMD_CREDENTIALS_DIRECTORY_ENV).ok();
     resolve_passphrase_source_from_env(configured_path, explicit.as_deref(), directory.as_deref())
 }
