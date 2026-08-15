@@ -40881,6 +40881,15 @@ mod tests {
 
     /// A guest referencing a declared host_id inherits that host's transport, so
     /// one record re-points every guest on that machine.
+    ///
+    /// The fixture identity is deliberately synthetic (`test-kvm-remote`, an
+    /// RFC 6761 `.invalid` hostname): an earlier version used the real
+    /// ubuntu-kvm-1 record verbatim, and `resolved_connect_uri` collapses a
+    /// host's URI to `qemu:///system` when the machine running the tests IS
+    /// that host — so the test failed on the actual lab box while passing
+    /// everywhere else. What this test proves (hosts[] supplies the transport,
+    /// not the default) is identity-independent; the collapse behaviour keeps
+    /// its own dedicated tests.
     #[test]
     fn hosts_declaration_resolves_controller_connect_uri_by_host_id() {
         let path = write_temp_inventory(
@@ -40888,9 +40897,9 @@ mod tests {
   "version": 1,
   "hosts": [
     {
-      "host_id": "ubuntu-kvm-1",
+      "host_id": "test-kvm-remote",
       "kind": "libvirt",
-      "connect_uri": "qemu+ssh://ubuntu-server@ubuntu-headless/system",
+      "connect_uri": "qemu+ssh://labuser@test-kvm-remote.invalid/system",
       "guest_subnet": "192.168.121.0/24"
     },
     { "host_id": "mac-utm-1", "kind": "local_utm" }
@@ -40904,7 +40913,7 @@ mod tests {
       "controller": {
         "type": "libvirt",
         "domain": "linux-x86-client-1",
-        "host_id": "ubuntu-kvm-1"
+        "host_id": "test-kvm-remote"
       }
     }
   ]
@@ -40914,7 +40923,7 @@ mod tests {
         assert_eq!(hosts.len(), 2);
         let kvm = hosts
             .iter()
-            .find(|host| host.host_id == "ubuntu-kvm-1")
+            .find(|host| host.host_id == "test-kvm-remote")
             .expect("host present");
         assert_eq!(kvm.kind, LabHostKind::Libvirt);
         assert_eq!(kvm.guest_subnet.as_deref(), Some("192.168.121.0/24"));
@@ -40927,7 +40936,7 @@ mod tests {
                 // resolved from hosts[], not the qemu:///system default
                 assert_eq!(
                     connect_uri,
-                    "qemu+ssh://ubuntu-server@ubuntu-headless/system"
+                    "qemu+ssh://labuser@test-kvm-remote.invalid/system"
                 );
             }
             other => panic!("expected libvirt controller, got {other:?}"),
