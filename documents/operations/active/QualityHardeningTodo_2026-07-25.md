@@ -2903,11 +2903,72 @@ Consequence for [[QH-51]]: run 40's `recovery_arrived=false` is contaminated (th
 was tunnel-less), so flap hypothesis 8 remains open. The trigger in the lab is `managed_dns`
 bundle propagation, which restarts each node's daemon with a ~2s gap.
 
-Fix is NOT designed yet — needs the full PLAN → ADVERSARIAL REVIEW cycle. The candidate space to
-evaluate there: bind at interface-up time instead of killswitch time (ordering change), retry the
-bind once the interface exists (scoped retry), or a bounded dataplane-apply retry in
-`restrict_recoverable` (fixes the class, not just this instance). Do not weaken the
-virtual-device guard or the fail-closed verdict to make the race disappear.
+~~Fix is NOT designed yet~~ — superseded: the fix went through the full PLAN → ADVERSARIAL REVIEW
+→ IMPLEMENT → REVIEW cycle and landed 2026-08-15 (see the FIX LANDED section below). The
+investigation additionally established this was never a race within one apply: the ordering was
+deterministic (bind strictly before `backend.start`, the only interface creator), and every
+historical success was a warm re-apply against an already-live interface. The virtual-device
+guard and the fail-closed verdict were NOT weakened.
+
+**QH-53 FIX LANDED (2026-08-15) — unit- and mutation-proven; live proof pending the next lab run.**
+The zone bind is now its own `DataplaneSystem` stage, `admit_host_firewall_forwarding`, called by
+the controller AFTER `backend.start` (which creates the interface) and before the serving stages,
+still ahead of generation commit — so an obstructing host firewall fails the apply before the
+role is advertised, and the 1s reconcile retry can now converge instead of re-entering a
+deterministically broken ordering. Scoping note: "advertised" here means the generation commit +
+on-Ok daemon sync (gossip data-plane sync also runs at the membership-apply and refresh seams
+regardless of dataplane state, but that is mesh participation, not forwarding-role advertisement —
+peers route to an exit from their own signed bundles).
+
+Review-driven hardenings beyond the ordering move:
+
+* **The gate is `serve_exit_node`, not `relay_with_upstream`.** A terminal exit and `blind_exit`
+  (both `exit_mode Off`) forward through the same FORWARD hook firewalld rejects; the original
+  QH-46 gate left them unbound — never observed live only because the lab's exits are
+  Debian-family. Until a firewalld-family (Fedora/Rocky) exit topology runs live, the exit-shaped
+  cell is unit-proven only.
+* **Single controller gate, deliberate.** The Linux impl verifies unconditionally when called;
+  a kept impl-level `allow_tunnel_relay_forward` gate would silently no-op the stage for exactly
+  the terminal-exit/blind_exit cases the widening covers (their flag is false). Failure direction
+  of the unconditional check is strictly more fail-closed.
+* **The trait method is deliberately NOT defaulted.** The production `RuntimeSystem` dispatches
+  trait methods arm-by-arm; with a defaulted method, an omitted dispatch arm would silently
+  no-op the enforcement on the real daemon while every DryRun-driven test stayed green. The
+  source pin additionally pins the Linux dispatch arm text.
+
+Verification: 12 mutations, all caught — macOS (delete call site, remove controller gate,
+relocate the call above backend.start, swallow the controller error, stub the RuntimeSystem arm,
+reintroduce the killswitch tail call, gut the check) and the Debian guest (swallow the
+run_capture error, missing-bound-as-clear, hardcoded interface, Bind→Query swap, reintroduce the
+tail call at the behavioural layer). Full rustynetd suite 2055 passed on macOS; the 10
+admit-stage tests pass on the Debian guest; full Linux workspace suite on ubuntu-kvm-1 shows
+only 5 pre-existing environment/concurrency failures in rustynet-cli vm_lab tests, unrelated
+(they fail or collide identically on clean main; filed separately).
+
+### QH-54 — worker-death recovery recreates the tunnel interface without re-binding firewalld
+
+`recover_runtime_after_worker_exit` (userspace_shared/mod.rs:214-265) does `ip link del` +
+recreate with no firewalld re-bind. firewalld's runtime zone binding may not survive the
+delete/recreate, so a forwarding node that survives a worker crash can lose its bind until the
+next full apply. Pre-existing (the old pre-start bind had the same hole); made explicit by the
+[[QH-53]] review. Availability-only, never fail-open: on a firewalld host a lost bind surfaces
+as the next apply failing closed. Needs either a re-bind hook in the recovery path or a periodic
+posture assert.
+
+### QH-55 — a failed dataplane apply degrades into a silent 1-second retry loop
+
+Cluster of observability defects around `restrict_recoverable`, live-observed during the QH-53
+diagnosis: (i) after `DEFAULT_MAX_RECONCILE_FAILURES = 5` the restriction promotes to Permanent
+(daemon.rs:9645-9652) and `restrict_recoverable` becomes a silent no-op (9613-9616) while the
+FailClosed leg keeps retrying every second with no log of its own (9476-9483); (ii)
+`refresh_signed_state_with_reason` RESETS `reconcile_failures` (daemon.rs:5077), un-promoting
+the permanence and restarting the silent cycle; (iii) the pre-expiry refresh scheduler
+self-disables once the on-disk traversal bundle goes stale (hints cleared to None,
+daemon.rs:4968-4976), so "signed state refresh completed" lines simply stop; (iv) `run_daemon`
+logs "runtime bootstrap complete" unconditionally after a FAILED bootstrap
+(daemon.rs:10380-10381). Together: a wedged node looks quiet, not broken. Fix direction:
+bounded, LOUD retries (`resilience.rs` policy per its adoption rule), a terminal
+operator-visible state, and an honest bootstrap-outcome log line.
 
 **[[QH-46]] enforcement-test closure (2026-08-14).** The §4 gap the handover flagged is closed:
 `ensure_host_firewall_admits_forwarding` and its `allow_tunnel_relay_forward` gate now carry a
