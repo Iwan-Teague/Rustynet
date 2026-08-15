@@ -1374,20 +1374,41 @@ mod tests {
                 .expect("datagram should send");
         }
 
-        state
-            .poll_authoritative_socket()
-            .expect("first socket poll should succeed");
+        // The datagrams cross a real loopback socket, so arrival is not
+        // synchronous with send_to: asserting the FIRST poll ingests exactly
+        // the budget raced the kernel and flaked on loaded CI runners. The
+        // budget property is that no single poll may ingest more than
+        // MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK; poll until everything has
+        // drained (bounded), asserting the per-poll cap on every iteration.
+        let expected_total = MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK + 3;
+        let mut seen = 0usize;
+        let mut capped_polls = 0usize;
+        for _ in 0..200 {
+            state
+                .poll_authoritative_socket()
+                .expect("socket poll should succeed");
+            let now = state.recorded_peer_ciphertext_ingress().len();
+            let delta = now - seen;
+            assert!(
+                delta <= MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK,
+                "a single poll ingested {delta} datagrams, exceeding the                  per-tick budget of {MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK}"
+            );
+            if delta == MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK {
+                capped_polls += 1;
+            }
+            seen = now;
+            if seen == expected_total {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(
-            state.recorded_peer_ciphertext_ingress().len(),
-            MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK
+            seen, expected_total,
+            "all datagrams must eventually drain within the poll budget"
         );
-
-        state
-            .poll_authoritative_socket()
-            .expect("second socket poll should drain remaining datagrams");
-        assert_eq!(
-            state.recorded_peer_ciphertext_ingress().len(),
-            MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK + 3
+        assert!(
+            capped_polls >= 1,
+            "with budget+3 datagrams in flight at least one poll must hit              the cap, proving the budget actually split the drain"
         );
     }
 
