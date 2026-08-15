@@ -807,9 +807,6 @@ fn validate_secret_file_security(
     Ok(())
 }
 
-// Only the `#[cfg(not(windows))]` `read_passphrase_from_source` calls this;
-// Windows resolves its passphrase through the DPAPI blob path instead.
-#[cfg(not(windows))]
 /// Test-only stand-in for `RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH`.
 ///
 /// The workspace forbids unsafe code, so tests cannot call
@@ -820,7 +817,7 @@ fn validate_secret_file_security(
 /// downstream check (existence, permission validation, the
 /// direct-fallback refusal) runs unchanged, and it does not exist in
 /// non-test builds: the production enforcement point is byte-identical.
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 // The only consumers are the daemon custody round-trip tests, which are
 // gated `cfg(all(unix, not(target_os = "macos")))` — on the macOS and
 // Windows test builds this module compiles (the resolver references it)
@@ -861,6 +858,9 @@ pub(crate) mod passphrase_test_support {
     }
 }
 
+// Only the `#[cfg(not(windows))]` `read_passphrase_from_source` calls this;
+// Windows resolves its passphrase through the DPAPI blob path instead.
+#[cfg(not(windows))]
 fn resolve_passphrase_source(configured_path: &Path) -> Result<PathBuf, String> {
     let explicit = std::env::var(PASSPHRASE_CREDENTIAL_PATH_ENV).ok();
     #[cfg(test)]

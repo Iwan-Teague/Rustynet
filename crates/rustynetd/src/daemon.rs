@@ -31547,6 +31547,15 @@ mod tests {
             std::process::id()
         ));
         let outcome = authorize_local_peer(&a, owner_uid, &socket_path);
+        if nix::unistd::Uid::effective().is_root() {
+            // A root test runner's peer uid is 0, and the root arm grants
+            // before any owner or group comparison — mismatched owner uid
+            // included. Assert the arm actually taken instead of skipping,
+            // matching the allows-sibling's root branch.
+            let grant = outcome.expect("a root peer always authorises");
+            assert_eq!(grant.via, super::LocalAuthVia::Root);
+            return;
+        }
         assert!(
             outcome.is_err(),
             "any peer-cred outcome with mismatched owner uid must fail closed"
