@@ -3,7 +3,9 @@ use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+use crate::vm_lab::orchestrator::stage::{
+    OrchestrationStage, StageFanout, StageId, resolve_ssh_user,
+};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -127,35 +129,6 @@ struct ResolvedParams {
     host: String,
     user: String,
     identity_file: PathBuf,
-}
-
-/// Resolve the SSH username for a lab guest: the inventory's value when it has
-/// one, and only otherwise a per-platform default.
-///
-/// Both helpers in this file used to IGNORE the inventory entirely and hardcode
-/// `"debian"` for every non-Windows guest. That is correct only on an all-Debian
-/// topology, so the bug was invisible until a run put a Fedora node in one of
-/// these three roles: the stage then dialled `debian@<fedora's address>` and
-/// died with `Permission denied (publickey,...)` — one node's username against
-/// another node's host. Measured on run `qh46-series-20260813z`, where
-/// `live_lan_toggle_validation` was the only failing stage and the inventory
-/// recorded `fedora-utm-1 -> ssh_user=fedora` correctly all along.
-///
-/// The fallback deliberately preserves the previous hardcoded values rather than
-/// adopting the `root`/`admin`/`administrator` triple its sibling
-/// `ssh_params_for_role` uses elsewhere. Changing an untested fallback is a
-/// separate behavioural change from fixing "the real username was available and
-/// thrown away", and bundling the two would make a regression here impossible to
-/// attribute.
-fn resolve_ssh_user(inventory_user: Option<&str>, platform: VmGuestPlatform) -> String {
-    if let Some(user) = inventory_user.map(str::trim).filter(|u| !u.is_empty()) {
-        return user.to_owned();
-    }
-    match platform {
-        VmGuestPlatform::Windows => "admin",
-        _ => "debian",
-    }
-    .to_owned()
 }
 
 fn alias_matching_label(ctx: &OrchestrationContext, label: &str) -> Result<ResolvedParams, String> {
