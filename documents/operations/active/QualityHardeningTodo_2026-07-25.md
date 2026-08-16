@@ -3146,3 +3146,19 @@ or an on-link/FIB probe at apply time via `resolve_route_interface_for_ip` (phas
 Security-design change: refusing a config narrows management access (fail-closed direction),
 but the refusal semantics on nodes with legitimately off-link management (cross-network
 topologies!) need the full plan + adversarial review cycle before any code.
+
+### QH-61 — bare `rustynet` argv heads die under sudo on RHEL-family guests
+
+Run `qh57-lantoggle-20260816a` (the QH-57 live proof: client survived role enforcement with SSH
+intact for the first time; 40 passes, a run record): the LAN-toggle stage's next layer was
+`sudo: rustynet: command not found` on rocky-utm-1. Rocky's `secure_path` is
+`/sbin:/bin:/usr/sbin:/usr/bin` — no `/usr/local/bin` — so any bare `rustynet` argv head run
+via `sudo -n sh -lc` fails on RHEL-family guests while Debian masks the trap. Proven live: the
+binary exists at `/usr/local/bin/rustynet`, the user shell resolves it, sudo does not. The
+LAN-toggle binary is fixed (all 15 sites → the shared `REMOTE_RUSTYNET_BIN`); the SAME bare
+shape remains in seven other stage binaries, latent until a role lands on a non-Debian guest:
+`live_linux_anchor_test.rs`, `live_linux_enrollment_restart_test.rs`,
+`live_linux_reboot_recovery_test.rs`, `live_linux_server_ip_bypass_test.rs`,
+`live_linux_network_flap_test.rs`, `live_linux_control_surface_exposure_test.rs`,
+`live_linux_endpoint_hijack_test.rs` (plus `collect_network_discovery_info.rs`, non-sudo).
+Sweep them file-by-file (each needs import and shape care), mirroring the LAN-toggle commit.
