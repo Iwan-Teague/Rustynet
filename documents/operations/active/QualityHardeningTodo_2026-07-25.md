@@ -3105,3 +3105,44 @@ strace in an ubuntu:24.04 container. Debian's and macOS's kill parse the bare fo
 which is why CI never caught it; the box's full-suite failures (three "parallelism" tests) were
 collateral of this blast. Fixed with `--` before the pgid (verified on all three platforms);
 the wedged-process test on the box went from days-red to a 1.0s pass.
+
+**QH-57 FIXED (2026-08-16) — with two corrections to the original filing.** The management CIDR
+was never signed state: it travels stage → `e2e-enforce-host --ssh-allow-cidrs` →
+`/etc/default/rustynetd` (`RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS`, carried forward on every
+reinstall by `env_string_or_existing_default`) → daemon flag; the signed artifact in the wedge
+was only the full-tunnel assignment. And the client died during "Enforcing runtime roles" —
+before any LAN toggling — the moment full-tunnel policy routing engaged with a bypass list
+containing only the stale CIDR. The stale value's source was the test binary's hardcoded
+default `192.168.18.0/24` (the bash-era lab LAN), which the stage wrapper never overrode even
+though the orchestrator auto-derives the correct per-run CIDRs and the two_hop stage already
+threads them. The stage had never completed its assertions on the `--node` engine: 0 pass /
+475 skip / 12 fail in 487 recorded rows.
+
+The fix threads `ctx.ssh_allow_cidrs` through the stage with two_hop's entry validation,
+removes the default from the binary (required flag + choke-point validation rejecting empty,
+default-route entries, and overlap with the synthetic `LAN_TEST_CIDR`), and sweeps the class:
+the reboot-recovery binary's identical default is gone (its nested two-hop subcheck enforces
+the value; its wrapper now threads ctx), the extended soak's `0.0.0.0/0` fallback is a
+fail-closed error, and the managed-dns wrapper threads the real value instead of an inertly
+hardcoded `0.0.0.0/0`. Validation helpers are unit-tested; mutations (restore either default,
+gut either validation, restore the soak fallback) are all caught. Sub-defect (1) — transition
+reachability continuity — is thereby resolved for the real failure mode: the enforced CIDR now
+IS the live LAN. The dormant out-of-band channel (`LIVE_LAB_ENABLE_UTM_TRANSPORT`,
+live_lab_support/mod.rs:125-160) is noted as the recovery-channel option for any future stage
+that must genuinely move a node off its management LAN. Live proof: the next run must carry
+the client through role enforcement with SSH intact and reach the stage's eight checks — a
+first for the `--node` engine.
+
+### QH-60 — nothing validates a management CIDR against live interface addressing
+
+Sub-defect (2) of [[QH-57]], now its own item: the daemon accepts a management CIDR covering
+none of its interfaces — `ManagementCidr::FromStr` checks only syntax and bounded-operator-range
+containment, `validate_daemon_config` only non-emptiness, and the bypass route pins the
+configured egress interface without checking the CIDR is on-link. A wrong-but-plausible CIDR
+therefore silently disconnects management on any full-tunnel node (QH-57's exact failure,
+minus the stale-default source, which is fixed). Attach-point candidates from the
+investigation: the `FromStr` choke point all three backends funnel through (phase10.rs:189),
+or an on-link/FIB probe at apply time via `resolve_route_interface_for_ip` (phase10.rs:1130).
+Security-design change: refusing a config narrows management access (fail-closed direction),
+but the refusal semantics on nodes with legitimately off-link management (cross-network
+topologies!) need the full plan + adversarial review cycle before any code.
