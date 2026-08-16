@@ -528,7 +528,7 @@ fn run() -> Result<(), String> {
     ctx.run_root(
         &exit_host,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "materialize-signing-passphrase",
             "--output",
@@ -675,7 +675,12 @@ fn run() -> Result<(), String> {
     logger.line("Advertising default route on exit")?;
     ctx.retry_root(
         &exit_host,
-        &["rustynet", "route", "advertise", "0.0.0.0/0"],
+        &[
+            live_lab_support::REMOTE_RUSTYNET_BIN,
+            "route",
+            "advertise",
+            "0.0.0.0/0",
+        ],
         10,
         2,
     )?;
@@ -700,7 +705,10 @@ fn run() -> Result<(), String> {
 
     std::thread::sleep(std::time::Duration::from_secs(5));
 
-    let client_status_off_initial = ctx.capture_root(&client_host, &["rustynet", "status"])?;
+    let client_status_off_initial = ctx.capture_root(
+        &client_host,
+        &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+    )?;
     logger.block("Initial client status", &client_status_off_initial)?;
 
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
@@ -726,7 +734,10 @@ fn run() -> Result<(), String> {
         45,
     )?;
     let client_status_off = ctx
-        .capture_root(&client_host, &["rustynet", "status"])
+        .capture_root(
+            &client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+        )
         .unwrap_or_default();
 
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
@@ -766,7 +777,10 @@ fn run() -> Result<(), String> {
         false
     };
     let client_status_on = ctx
-        .capture_root(&client_host, &["rustynet", "status"])
+        .capture_root(
+            &client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+        )
         .unwrap_or_default();
     let client_route_on = ctx
         .capture(&client_host, &route_to_target_argv(platform))
@@ -795,7 +809,10 @@ fn run() -> Result<(), String> {
         45,
     )?;
     let client_status_off_final = ctx
-        .capture_root(&client_host, &["rustynet", "status"])
+        .capture_root(
+            &client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+        )
         .unwrap_or_default();
 
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
@@ -806,7 +823,10 @@ fn run() -> Result<(), String> {
             "fail"
         };
     let blind_exit_status = ctx
-        .capture_root(&blind_exit_host, &["rustynet", "status"])
+        .capture_root(
+            &blind_exit_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+        )
         .unwrap_or_default();
 
     let client_plaintext_check = no_plaintext_passphrase_check(&ctx, &client_host)?;
@@ -1341,7 +1361,7 @@ fn run_lan_access_command(
 
     let enable_flag = if enable { "true" } else { "false" };
     let mut args = vec![
-        "rustynet",
+        live_lab_support::REMOTE_RUSTYNET_BIN,
         "ops",
         "apply-lan-access-coupling",
         "--enable",
@@ -1408,7 +1428,8 @@ fn wait_for_lan_access_state(
             refresh_config,
             last_traversal_refresh_unix,
         )?;
-        if let Ok(status) = ctx.capture_root(target, &["rustynet", "status"])
+        if let Ok(status) =
+            ctx.capture_root(target, &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"])
             && status.contains(expected)
         {
             return Ok(true);
@@ -1864,7 +1885,7 @@ fn refresh_dns_zone_bundles(
         ctx.run_root(
             config.signer_host,
             &[
-                "rustynet",
+                live_lab_support::REMOTE_RUSTYNET_BIN,
                 "dns",
                 "zone",
                 "issue",
@@ -1939,7 +1960,7 @@ fn refresh_signed_state(ctx: &LiveLabContext, target: &str) -> Result<(), String
         &[
             "env",
             "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "state",
             "refresh",
         ],
@@ -1954,8 +1975,15 @@ fn refresh_signed_state_now(ctx: &LiveLabContext, target: &str) -> Result<(), St
 
 fn refresh_trust_evidence(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
     ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)?;
-    ctx.run_root(target, &["rustynet", "ops", "refresh-signed-trust"])
-        .map(|_| ())
+    ctx.run_root(
+        target,
+        &[
+            live_lab_support::REMOTE_RUSTYNET_BIN,
+            "ops",
+            "refresh-signed-trust",
+        ],
+    )
+    .map(|_| ())
 }
 
 fn issue_assignment_bundles_from_env(
@@ -1968,7 +1996,7 @@ fn issue_assignment_bundles_from_env(
     ctx.run_root(
         target,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "e2e-issue-assignment-bundles-from-env",
             "--env-file",
@@ -1989,7 +2017,7 @@ fn issue_traversal_bundles_from_env(
     ctx.run_root(
         target,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "e2e-issue-traversal-bundles-from-env",
             "--env-file",
@@ -2011,7 +2039,7 @@ fn enforce_host(
     ctx.run_root(
         target,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "e2e-enforce-host",
             "--role",
