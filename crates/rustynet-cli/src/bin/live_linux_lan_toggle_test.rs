@@ -191,6 +191,46 @@ fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
     }
 }
 
+/// QH-57 choke-point validation: every spawner (the Rust stage wrapper, the
+/// extended-soak stage, the bash orchestrator, manual invocation) funnels
+/// through this binary, so the values that wedge a lab node are rejected
+/// here regardless of caller.
+///
+/// Empty means the flag was omitted - there is deliberately no default (see
+/// the parse block). A default-route entry would make the management bypass
+/// cover everything and nothing: `apply_fail_closed_management_bypass_routes`
+/// installs one underlay route per entry, and a `/0` entry claims the whole
+/// address space while the full-tunnel default in the same table swallows
+/// the real management LAN. An entry overlapping LAN_TEST_CIDR would put a
+/// bypass route to the synthetic LAN's probe target into table 51820,
+/// corrupting both the LAN-ON and LAN-OFF assertions this test exists for.
+fn validate_ssh_allow_cidrs(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(
+            "missing required argument: --ssh-allow-cidrs (pass the run's real \
+             management CIDRs, e.g. 192.168.64.0/24; QH-57)"
+                .to_owned(),
+        );
+    }
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        if entry == "0.0.0.0/0" || entry == "::/0" {
+            return Err(format!(
+                "--ssh-allow-cidrs entry {entry} is a default route; on a \
+                 full-tunnel node it cannot scope the management bypass (QH-57)"
+            ));
+        }
+        if entry == LAN_TEST_CIDR {
+            return Err(format!(
+                "--ssh-allow-cidrs entry {entry} overlaps the synthetic \
+                 LAN_TEST_CIDR; the toggle probes would ride the management \
+                 bypass and corrupt the on/off assertions"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let root_dir = repo_root()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -201,7 +241,13 @@ fn run() -> Result<(), String> {
     let mut exit_node_id = String::from("exit-49");
     let mut client_node_id = String::from("client-65");
     let mut blind_exit_node_id = String::from("client-51");
-    let mut ssh_allow_cidrs = String::from("192.168.18.0/24");
+    // QH-57: deliberately NO default. The old default (192.168.18.0/24, the
+    // bash-era lab LAN) is exactly the value that wedged the client: a
+    // full-tunnel node derives its management bypass routes from this list,
+    // and a list that covers none of the real underlay sends every
+    // host<->guest packet - including the SSH session driving this test -
+    // into the tunnel.
+    let mut ssh_allow_cidrs = String::new();
     let mut ssh_identity_file = String::new();
     let mut report_path = root_dir.join("artifacts/phase10/live_linux_lan_toggle_report.json");
     let mut log_path = root_dir.join("artifacts/phase10/source/live_linux_lan_toggle.log");
@@ -271,6 +317,7 @@ fn run() -> Result<(), String> {
         print_usage();
         return Err("missing required argument: --ssh-identity-file".to_owned());
     }
+    validate_ssh_allow_cidrs(&ssh_allow_cidrs)?;
 
     // Wave 2 (W2-C): the lan-toggle / blind_exit stage is now cross-OS. The
     // Linux-only dispatcher gate is removed; `platform` is threaded through
@@ -2149,6 +2196,32 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ssh_allow_cidrs_validation_rejects_the_qh57_wedge_shapes() {
+        assert!(super::validate_ssh_allow_cidrs("").is_err());
+        assert!(super::validate_ssh_allow_cidrs("   ").is_err());
+        assert!(super::validate_ssh_allow_cidrs("0.0.0.0/0").is_err());
+        assert!(super::validate_ssh_allow_cidrs("192.168.64.0/24,::/0").is_err());
+        assert!(super::validate_ssh_allow_cidrs(super::LAN_TEST_CIDR).is_err());
+        assert!(super::validate_ssh_allow_cidrs("192.168.64.0/24").is_ok());
+        assert!(super::validate_ssh_allow_cidrs("192.168.64.0/24, 10.0.7.0/24").is_ok());
+    }
+
+    #[test]
+    fn ssh_allow_cidrs_has_no_baked_in_default() {
+        // A literal default here is exactly what wedged the client in QH-57:
+        // the needle is assembled at runtime so this test's own source cannot
+        // satisfy the negative assertion.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let banned = format!("ssh_allow_cidrs = String::from(\"{}\")", "192.168.18.0/24");
+        assert!(
+            !source.contains(banned.as_str()),
+            "the ssh-allow-cidrs default must stay removed (QH-57)"
+        );
+        let required = format!("let mut ssh_allow_cidrs = String::{}();", "new");
+        assert!(source.contains(required.as_str()));
+    }
+
     use super::{
         AssignmentAuthorityScope, LiveLabPlatform, ManagedDnsRecordTemplate, daemon_socket_path,
         is_macos_utun_iface_name, killswitch_drop_table_present, killswitch_dump_argv,

@@ -64,7 +64,9 @@ fn run() -> Result<(), String> {
     let mut second_client_host = String::new();
     let mut second_client_node_id = String::new();
     let mut known_hosts: Option<PathBuf> = None;
-    let mut ssh_allow_cidrs = "192.168.18.0/24".to_owned();
+    // QH-57: no default - the old 192.168.18.0/24 (bash-era LAN) reaches a
+    // nested two_hop spawn that enforces it onto four nodes.
+    let mut ssh_allow_cidrs = String::new();
     let mut report_path =
         root_dir.join("artifacts/live_lab/live_linux_reboot_recovery_report.json");
     let mut log_path = root_dir.join("artifacts/live_lab/live_linux_reboot_recovery.log");
@@ -141,6 +143,23 @@ fn run() -> Result<(), String> {
         return Err(
             "missing required argument: --ssh-identity-file, --exit-host, --client-host".to_owned(),
         );
+    }
+    if ssh_allow_cidrs.trim().is_empty() {
+        print_usage();
+        return Err(
+            "missing required argument: --ssh-allow-cidrs (pass the run's real \
+             management CIDRs, e.g. 192.168.64.0/24; QH-57)"
+                .to_owned(),
+        );
+    }
+    for entry in ssh_allow_cidrs.split(',') {
+        let entry = entry.trim();
+        if entry == "0.0.0.0/0" || entry == "::/0" {
+            return Err(format!(
+                "--ssh-allow-cidrs entry {entry} is a default route; on a \
+                 full-tunnel node it cannot scope the management bypass (QH-57)"
+            ));
+        }
     }
 
     for path in [report_path.parent(), log_path.parent()]
