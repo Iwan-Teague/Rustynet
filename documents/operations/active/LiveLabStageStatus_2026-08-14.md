@@ -273,3 +273,22 @@ drive the toggle from a path that survives it (utmctl exec, or a peer), or bound
 with an auto-revert the daemon applies when the new LAN never materialises. Do not paper over it
 by exempting SSH from the tunnel — that would be a fail-open hole in the exact control the stage
 exists to prove.
+
+## Run 44 (`qh61-sudopath-20260816b`) — ZERO FAILURES: 44 pass / 0 fail / 15 skipped
+
+The first zero-failure run in the `--node` engine's recorded history, on main at `5510b726`.
+
+* **`live_lan_toggle_validation` PASSED** — first pass in its 488-row lifetime, live-proving both
+  QH-57 (the stage now threads the run's real management CIDRs; the client survived role
+  enforcement with SSH intact) and QH-61 (absolute `REMOTE_RUSTYNET_BIN` invocations survive
+  Rocky's `/usr/local/bin`-less sudo secure_path).
+* **`extended_soak` PASSED on its first-ever execution** — previously unreachable behind the
+  lan-toggle cascade.
+* Every one of the 15 skips is topology-conditional: mac/win stages need those platforms elected
+  into the topology (`--macos-vm` / `--windows-vm` / role-platform selectors), the cross-network
+  family needs `live_mixed_topology_validation`, and the anchor/admin/blind_exit cells need those
+  roles assigned. Nothing is failure-cascaded.
+
+The Linux live suite on this five-guest topology is, for the first time, fully green end to end.
+The remaining frontier is exactly the parity mandate: elect macOS and Windows nodes and drive the
+same suite through the mixed and cross-network stages.
