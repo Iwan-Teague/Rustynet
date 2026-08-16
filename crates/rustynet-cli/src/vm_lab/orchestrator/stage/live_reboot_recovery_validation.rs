@@ -70,6 +70,10 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
                 "--",
                 "--ssh-identity-file",
                 identity_file,
+                // QH-57 class sweep: the binary's nested two-hop subcheck
+                // enforces this value; the binary now requires it.
+                "--ssh-allow-cidrs",
+                &ctx.ssh_allow_cidrs,
                 "--exit-host",
                 &exit_target,
                 "--exit-node-id",

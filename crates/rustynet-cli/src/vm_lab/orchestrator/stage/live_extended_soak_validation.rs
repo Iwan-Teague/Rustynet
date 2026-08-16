@@ -70,11 +70,11 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
 
     let identity_file = exit.identity_file.to_string_lossy().into_owned();
     let known_hosts = exit.known_hosts.to_string_lossy().into_owned();
-    let ssh_allow_cidrs = if ctx.ssh_allow_cidrs.trim().is_empty() {
-        "0.0.0.0/0".to_owned()
-    } else {
-        ctx.ssh_allow_cidrs.clone()
-    };
+    // QH-57: refuse the 0.0.0.0/0 substitute this fallback used to inject.
+    // The soak spawns two_hop / exit-handoff / lan-toggle / reboot subchecks
+    // that ENFORCE this value onto nodes, and a default-route management
+    // CIDR is exactly the wedge class QH-57 documents. Fail closed instead.
+    let ssh_allow_cidrs = soak_ssh_allow_cidrs(&ctx.ssh_allow_cidrs)?;
 
     run_substep(
         "extended_soak pre-reboot two-hop",
@@ -348,8 +348,35 @@ fn ssh_params_for_second_client(ctx: &OrchestrationContext) -> Result<ResolvedPa
     Err("extended_soak requires an aux or extra node for second-client checks".to_owned())
 }
 
+/// QH-57: the soak's subchecks enforce this value onto live nodes, so an
+/// empty run context must fail the stage rather than degrade to 0.0.0.0/0.
+/// Unit-testable on purpose - deleting the rejection must fail a test.
+fn soak_ssh_allow_cidrs(ctx_value: &str) -> Result<String, String> {
+    let value = ctx_value.trim();
+    if value.is_empty() {
+        return Err("extended soak requires the run's management CIDRs \
+             (ctx.ssh_allow_cidrs is empty); refusing the 0.0.0.0/0 \
+             substitute that wedges full-tunnel nodes (QH-57)"
+            .to_owned());
+    }
+    Ok(value.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn soak_ssh_allow_cidrs_refuses_the_default_route_substitute() {
+        // Deleting the rejection and restoring the old 0.0.0.0/0 fallback
+        // must fail this test: the soak's subchecks enforce the value onto
+        // live nodes (QH-57).
+        let err = super::soak_ssh_allow_cidrs("").expect_err("empty ctx must fail closed");
+        assert!(err.contains("0.0.0.0/0"));
+        assert_eq!(
+            super::soak_ssh_allow_cidrs("192.168.64.0/24").as_deref(),
+            Ok("192.168.64.0/24")
+        );
+    }
+
     use super::*;
 
     #[test]

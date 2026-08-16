@@ -48,7 +48,17 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
         let report_path = ctx.report_dir.join(REPORT_FILENAME);
         let log_path = ctx.report_dir.join("live_managed_dns.log");
 
-        let ssh_allow_cidrs = "0.0.0.0/0";
+        // The managed-dns binary never enforces this value onto a node (it
+        // is metadata for its report only), so the old hardcoded 0.0.0.0/0
+        // was inert - but that inertness was an undocumented coupling to the
+        // binary's internals. Thread the run's real value when the
+        // orchestrator derived one; keep the inert literal only as the
+        // empty-context fallback. (QH-57 class sweep.)
+        let ssh_allow_cidrs = if ctx.ssh_allow_cidrs.trim().is_empty() {
+            "0.0.0.0/0"
+        } else {
+            ctx.ssh_allow_cidrs.as_str()
+        };
 
         let signer_target = format!("{}@{}", signer_params.user, signer_params.host);
         let client_target = format!("{}@{}", client_params.user, client_params.host);

@@ -70,6 +70,16 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
             .to_string_lossy()
             .into_owned();
 
+        // QH-57: fail before touching any node if the run context cannot
+        // supply a usable management CIDR - the two_hop stage's precedent.
+        // The binary re-validates (it is the choke point for every spawner);
+        // this stage-side check just turns the error into a clean stage
+        // failure with no cargo spawn.
+        let ssh_allow_cidrs = match stage_ssh_allow_cidrs(&ctx.ssh_allow_cidrs) {
+            Ok(value) => value,
+            Err(reason) => return StageOutcome::Failed(reason),
+        };
+
         let mut cmd = Command::new("cargo");
         cmd.args([
             "run",
@@ -98,6 +108,8 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
         .arg(&client_node_id)
         .arg("--blind-exit-node-id")
         .arg(&blind_exit_node_id)
+        .arg("--ssh-allow-cidrs")
+        .arg(&ssh_allow_cidrs)
         .arg("--report-path")
         .arg(&report_path)
         .arg("--log-path")
@@ -122,6 +134,31 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
             }
         }
     }
+}
+
+/// QH-57: the run's management CIDRs, validated for the two lethal shapes
+/// before any node is touched. Empty means the orchestrator could not derive
+/// them; a default-route entry cannot scope the full-tunnel management
+/// bypass. Kept as its own function so the rejection is unit-testable.
+fn stage_ssh_allow_cidrs(ctx_value: &str) -> Result<String, String> {
+    let value = ctx_value.trim();
+    if value.is_empty() {
+        return Err(
+            "lan-toggle requires the run's management CIDRs (ctx.ssh_allow_cidrs \
+             is empty); refusing to fall back to a stale default (QH-57)"
+                .to_owned(),
+        );
+    }
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        if entry == "0.0.0.0/0" || entry == "::/0" {
+            return Err(format!(
+                "lan-toggle refuses management CIDR entry {entry}: a default \
+                 route cannot scope the full-tunnel management bypass (QH-57)"
+            ));
+        }
+    }
+    Ok(value.to_owned())
 }
 
 struct ResolvedParams {
@@ -199,6 +236,18 @@ fn node_id_for_alias(ctx: &OrchestrationContext, alias: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stage_ssh_allow_cidrs_fails_closed_on_empty_and_default_route() {
+        assert!(super::stage_ssh_allow_cidrs("").is_err());
+        assert!(super::stage_ssh_allow_cidrs("  ").is_err());
+        assert!(super::stage_ssh_allow_cidrs("0.0.0.0/0").is_err());
+        assert!(super::stage_ssh_allow_cidrs("192.168.64.0/24,::/0").is_err());
+        assert_eq!(
+            super::stage_ssh_allow_cidrs(" 192.168.64.0/24 ").as_deref(),
+            Ok("192.168.64.0/24")
+        );
+    }
+
     use super::*;
 
     #[test]
