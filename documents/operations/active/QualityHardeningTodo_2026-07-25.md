@@ -2955,6 +2955,732 @@ next full apply. Pre-existing (the old pre-start bind had the same hole); made e
 as the next apply failing closed. Needs either a re-bind hook in the recovery path or a periodic
 posture assert.
 
+**`--node` test-surface clarification (2026-08-17).** Do not count
+`chaos_daemon_fault` as QH-54 proof. Its Rust `--node` stage invokes
+`live_chaos_daemon_fault_test`, which kills or SIGSTOP/SIGCONTs the *whole* systemd daemon, then
+observes service/socket recovery plus client-side no-plaintext-egress. That starts a new daemon;
+it cannot exercise `recover_runtime_after_worker_exit`, which is reached only when a still-running
+backend receives the worker-unavailable control error. The existing test-only seam is correctly
+kept out of the shipping daemon: a next-TUN-receive error causes the worker to exit, then the
+daemon tests prove authoritative transport becomes unavailable and a bounded authoritative
+round-trip recovers it. Re-checked at `dea73a75`: both
+`daemon_runtime_linux_userspace_shared_backend_recovers_authoritative_transport_after_worker_exit`
+and its macOS counterpart pass under `cargo test -p rustynetd --lib --all-features --locked`.
+
+The current production call graph serializes backend operations through `&mut self`; a repository
+search found `RuntimeControl::clone()` only in backend tests. Those tests already reject a second
+concurrent round-trip and prove shutdown cancels an in-flight round-trip. Therefore no general
+shutdown race is claimed here. Keep any future configure/stats/send-versus-shutdown stress test as
+a regression guard for this cloneable internal control, not as a confirmed production defect. The
+actual open coverage is the post-recovery firewalld binding. Do not add a production IPC/SSH
+"crash worker" control merely to make it live-lab-testable. A future `--node` stage may consume a
+read-only recovery-status artifact only after the backend contract and a safe fault mechanism
+exist; until then it must not claim QH-54 live proof.
+
+**`--node` placement constraint (2026-08-17).** Even once QH-54 has a safe test surface, it must
+not be added to the current chaos macro merely because it is a fault test. All nine chaos stages
+and every cross-network stage declare `live_mixed_topology_validation` as their sole prerequisite.
+That stage intentionally returns `Skipped` unless Linux, macOS, and Windows are all assigned, and
+the runner then recursively skip-cascades its descendants. A worker-recovery/firewalld check would
+therefore be silently unavailable on the Linux-only firewalld lab where this defect is most
+actionable. Focused runner, plan, and chaos metadata tests pass at `dea73a75` and confirm both
+the cascade and the nine-stage macro shape.
+
+The future item should be a dedicated, capability-gated validation with its own evidence artifact:
+baseline runtime healthy; recovery event observed through a read-only contract; firewalld binding
+queried after recreation; then the authoritative transport and dataplane verdict rechecked. Its
+true prerequisites and any destructive ordering belong in the QH-48 design which separates
+"runs after" from "must have passed". Do not borrow `live_mixed_topology_validation` as a generic
+ordering anchor, and do not claim this as live proof until the fault mechanism, rebind fix, and
+stage artifact all exist.
+
+**Shared UDP transport lifecycle deep dive (2026-08-17; source + focused-test grounded).** The
+Standalone consolidation: [Shared UDP / Relay Transport Deep Dive — 2026-08-17](SharedUdpRelayTransportDeepDive_2026-08-17.md).
+
+core D3 ownership model is sound. The userspace runtime owns one `AuthoritativeSocket`; peer
+ciphertext, STUN request/response, relay hello, and relay keepalive all use that socket. The
+backend rejects an authoritative round trip aimed at a configured peer endpoint, so a control
+reply cannot consume peer ciphertext. `RelayClient` has no production socket fallback: its
+convenience establish/keepalive methods fail and the daemon supplies backend round-trip/send
+closures. Command-only backends remain explicitly blocked rather than pretending that a second
+same-port UDP socket is authority.
+
+The subtler lifecycle boundary is **socket incarnation**, not local address. Each userspace socket
+receives a process-local monotonic `transport_generation`; a restart/recovery can bind the same
+address and port while receiving a new generation. The Linux test deliberately proves exactly
+that shape, and both Linux/macOS tests prove generation replacement. Internally, an outstanding
+round trip carries the generation and a late packet cannot satisfy the new waiter; that is good.
+But `AuthoritativeTransportIdentity`, `AuthoritativeTransportResponse`, daemon `status`, and
+`netcheck` expose only label + local address. A live observer therefore cannot distinguish the
+old socket from a recovered socket that reused the port. The existing daemon recovery tests prove
+only unavailable -> available plus a successful round trip, not that the reported socket
+incarnation changed.
+
+This matters operationally after an in-process recovery. `with_runtime_recovery` recreates the
+socket and returns the retried operation normally, but provides no recovery/lifecycle event to
+`DaemonRuntime`. Cached STUN observations and candidates refresh on their normal 60-second
+schedule; daemon endpoint-change detection observes traversal hints and gateway state, not the
+authoritative socket incarnation. Existing relay-session objects are likewise retained. A NAT may
+preserve the mapping for the same local tuple, so stale state is **not claimed as a proven live
+failure**; it is simply no longer proven valid after a new socket and may delay recovery or
+advertise a stale srflx candidate. Ciphertext-only/fail-closed behavior is unchanged.
+The relay validates hello, data, and keepalive traffic against its recorded source tuple, so a
+reused local port alone cannot establish post-rollover relay-session continuity.
+
+**Recommended lifecycle contract — design before implementation.** Add an opaque, process-local
+transport-incarnation value to the authoritative identity/response contract (not a security
+credential and not cross-daemon persistent state). When the explicit daemon recovery coordinator
+observes unavailable -> available with a new incarnation, it should: clear cached STUN observations and
+srflx candidates; schedule STUN immediately; discard relay-session/pending-keepalive state whose
+continuity is no longer evidenced; and force the normal signed traversal re-probe/re-establishment
+path. Emit the incarnation in the read-only status/netcheck output so the future `--node` stage
+can record before/unavailable/after evidence without a diagnostic fault-control surface. Add Linux
+and macOS tests for same-port recovery, immediate invalidation, fresh STUN observation, and relay
+session re-establishment. Do not equate a reused local port with continuity.
+
+**Worker-control hardening (separate follow-up, not a confirmed production defect).** Recovery
+currently recognizes a dead worker by two exact `BackendErrorKind::Internal` message strings; the
+backend error taxonomy has no worker-unavailable variant. Editing either string can silently turn
+a detectable worker exit into an opaque availability failure. Add a typed
+worker-unavailable/indeterminate classification before any recovery behavior, preserving all other
+`Internal` errors as non-retryable. Only the daemon-owned coordinator may recover; no caller gets
+permission to retry its original operation. The Linux/macOS runtime worker also uses an unbounded command
+channel and drains commands until empty before timers/UDP/TUN polling. Production backend calls
+currently serialize through `&mut self`, and repository search found `RuntimeControl::clone()` only
+in tests, so command-flood starvation is not claimed as a present production incident. Still,
+before this internal control is ever shared, retain commands-first ordering but bound both command
+admission and commands drained per tick, with explicit overload/closing semantics and parity tests.
+Do not add caller timeouts alone: an ambiguous timeout after a queued mutation would require an
+epoch/acknowledgement contract first.
+
+**External-practice check and implementation shape (2026-08-17; online research, not live-lab
+proof).** This direction matches published practice from large secure-network operators. Tailscale
+states that STUN and tunnel traffic must use the *same* socket because each socket can receive a
+different NAT mapping, and it treats relay as required fallback for hard or hostile networks
+([NAT traversal guide](https://tailscale.com/blog/how-nat-traversal-works)). Cloudflare describes
+UDP tuple changes caused by NAT rebinding as breaking tuple-only connection tracking; QUIC avoids
+that only because its authenticated protocol owns a separate connection identifier
+([Cloudflare QUIC analysis](https://blog.cloudflare.com/the-road-to-quic/)). Rustynet's relay is
+tuple-bound and its existing protocol has no equivalent migration identifier, therefore it should
+reset/re-register rather than invent continuity from an unchanged port. This is a correctness and
+availability decision, not a claim that the reused-port case is an attack or proven outage.
+
+The standards and operators also reject a universal timer assumption. RFC 4787 defines UDP mapping
+as a session/tuple property, allows endpoint-dependent mappings, and requires clients to tolerate
+port preservation *and* non-preservation
+([RFC 4787](https://datatracker.ietf.org/doc/html/rfc4787.html)). Cloudflare notes real UDP NAT
+timeouts can be arbitrary and short
+([stateful UDP operations](https://blog.cloudflare.com/the-road-to-quic/)); Tailscale's active
+periodic re-STUN interval is roughly 20--26 seconds in its
+[current open-source client](https://github.com/tailscale/tailscale/blob/main/wgengine/magicsock/magicsock.go#L3688-L3717), whereas
+Rustynet's normal interval is 60 seconds. Do **not** globally copy either value: recovery must
+schedule an immediate, rate-limited re-probe; a future normal keepalive interval requires measured
+live-lab NAT coverage, battery/packet-budget analysis, and a separately approved policy. Fortinet
+exposes both per-service UDP idle timers and concurrent UDP-session limits in its CGNAT/firewall
+products ([session-timer guide](https://docs.fortinet.com/document/fortigate/7.4.6/fortinet-carrier-grade-nat-field-reference-architecture-guide/863546/session-timers)). That reinforces that an
+application cannot infer NAT state from its own bound port.
+
+**P1 implementation: one authoritative transport transition.** First add an opaque
+`TransportIncarnation(u64)` to `AuthoritativeTransportIdentity`; it is process-local, monotonically
+changes whenever the backend creates a new authoritative socket, and is neither persistent identity
+nor a security token. Every authoritative operation must report the captured incarnation: extend
+round-trip receipts/responses, and make send return a small receipt or a fresh identity. This is
+diagnostic evidence for the later explicit coordinator; it does **not** make a hidden
+`with_runtime_recovery` safe. That helper must be removed/replaced so no recovery occurs in an
+authoritative operation, non-authoritative query, or desired-state operation without daemon
+quarantine first. Backend adapters unable to prove a stable incarnation expose an `Unobservable`
+capability plus an explicit recovery event; a repeated unobservable identity read is not itself a
+rollover event.
+
+Add one daemon-owned `observe_authoritative_transport(identity)` transition function. It persists
+the last `{backend label, local address, incarnation}` only in runtime memory. First observation is
+baseline. `available -> unavailable`, `unavailable -> available`, or a changed known incarnation
+creates exactly one `TransportRolledOver` event per observed identity. An unobservable backend
+emits the same event only when its explicit recovery signal occurs. On this event, in order:
+
+1. Stop advertising old server-reflexive candidates; clear cached STUN observations/candidates.
+2. Invalidate relay registration/session and pending keepalive state; retain encrypted tunnel keys
+   and peer configuration.
+3. Mark traversal `probing`, enqueue one immediate STUN round (coalesce duplicate transitions),
+   then publish signed candidates only from fresh STUN results. Re-register relay independently as
+   soon as the new authoritative transport is usable.
+4. Emit structured status/netcheck fields: current incarnation, transition reason, count, time,
+   STUN freshness, and relay registration state. Do not expose a fault-injection operation.
+
+Run this observer at daemon bootstrap and immediately after the explicit coordinator recovery
+call. Every backend operation, including stats/path/handshake reads and desired-state operations,
+must instead report its worker fault without healing it. Do not rely on a periodic status read,
+because a query can otherwise heal a worker before relay work begins. Debounce recovery storms by
+known incarnation: same incarnation is no-op; distinct incarnations each invalidate; exponential
+backoff applies to failed STUN/relay work, never to discovering a transition. This is analogous to
+Tailscale's practice of publishing endpoints observed from the actual socket and retaining relay
+fallback when direct path cannot be proven
+([relay/netcheck example](https://tailscale.com/blog/peer-relays-international-networks)).
+
+**P1 proof plan.** Add Linux + macOS deterministic tests which inject one worker failure before
+STUN and separately before relay send. Assert: local port may stay equal; incarnation changes;
+old candidate immediately disappears from read-only status; exactly one immediate STUN probe is
+scheduled; no old relay keepalive is emitted; successful new STUN observation leads to one normal
+re-registration. Repeat with worker failure during path-quality and handshake queries: event and
+quarantine must complete before the next relay/STUN operation. Race test: delayed old-generation
+STUN or relay response cannot repopulate state. Compatibility test: an unobservable backend never
+reports false continuity or produces a periodic invalidation storm. Live-lab gate later: record
+before/unavailable/after incarnation, candidate age, STUN round count, and relay registration
+result under the existing `--node` evidence model.
+
+**P2 implementation: typed worker loss; no string branch.** Add
+`BackendErrorKind::WorkerUnavailable`; attach operation class and last known runtime incarnation in
+the daemon's separate `TransportFault` record, not an ad-hoc parse of `BackendError.message`.
+Worker send failure, dropped reply, and shutdown completion create that kind; retain causal
+OS/channel text only for logs. No low-level `with_runtime_recovery` call retries it implicitly:
+the daemon recovery coordinator consumes the typed loss, quarantines lifecycle state,
+reconstructs once, then runs only a high-level operation explicitly classified as safe. All other
+`Internal` errors remain non-retryable. An epoch/operation ID aids diagnosis but cannot prove an
+admitted mutation executed before the worker died; return `Indeterminate` unless a desired-state
+reconcile proves the outcome. Regression tests must mutate log text while recovery still works,
+then verify a generic `Internal` error does **not** recover. This removes a hidden availability
+regression class without widening retry scope.
+
+**P3 implementation: bounded control only when concurrency arrives.** Current single mutable
+backend owner keeps command pressure low. If a shared controller is introduced, replace unbounded
+`mpsc::channel` with bounded admission and a per-tick control budget. `try_send` returning full
+must yield a typed `Busy` **before admission**; it is safe to retry with bounded backoff. Once
+admitted, mutations receive one epoch/operation acknowledgement and may not be silently dropped.
+Worker loop services at most `CONTROL_BUDGET` commands, then timer/UDP/TUN budgets; record queue
+depth, admission rejection, longest wait, and per-class service time. Reserve/control-rate-limit
+capacity for recovery and shutdown. The exact numbers come from benchmark and soak data, not a
+guess. This follows operational pattern used by secure-network providers: Fortinet explicitly
+limits concurrent UDP session state, and Tailscale describes fair queueing, overload protection,
+and rate limiting for shared relay resources
+([FortiProxy session limits](https://docs.fortinet.com/document/fortiproxy/7.2.11/cli-reference/163620/config-firewall-shaper-per-ip-shaper),
+[Tailscale relay controls](https://tailscale.com/blog/free-plan)). Add deterministic flood tests
+showing UDP/TUN timers still run, queue memory is capped, shutdown wins, and no accepted mutation
+is duplicated across recovery. Do not implement this before P2's acknowledgement semantics.
+
+**Adversarial correction — lifecycle implementation gates (2026-08-17; read-only source review).
+This supersedes any broader transparent-retry reading above.** The present
+`with_runtime_recovery` reruns any closure after replacement, while the worker sends an
+authoritative round trip before creating its waiter. That is unsafe for a relay hello: the relay
+consumes its nonce before creating a session and rejects replay. If the first hello reaches the
+relay but its ACK is lost when the worker dies, retrying the same token is rejected; retrying a new
+token consumes another one-use artifact and leaves the client unable to prove which session/ACK won
+the race. A fresh accepted hello replaces the prior *same-pair* server session and the relay's
+post-commit prune later reclaims its allocation, so this is not claimed as a permanent server leak.
+It remains an ambiguous client outcome and consumes recovery inventory. Therefore **no generic
+automatic retry** may cover stateful relay hello, registration, allocation, or other externally
+visible non-idempotent operation. Return a typed `TransportChanged`/`Indeterminate { operation_id,
+old_epoch }` result instead. The daemon then begins explicit recovery with a new,
+cryptographically fresh attempt. Protocol-level server deduplication is a separate option, not an
+assumption; it needs an attempt key and exact response replay/ack correlation.
+
+An identity/receipt observed only *after* a recovered send is also too late to meet the earlier
+"no old keepalive" requirement: a retry could have transmitted that old-session keepalive already.
+Backend recovery must instead provide a pre-retry lifecycle outcome, or refuse to retry any
+session-bound command. On such an outcome the daemon invalidates relay state first, then sends a
+new registration/keepalive only under the new incarnation. `Known(u64)` and `Unobservable` are
+separate capabilities: treating every `Unknown` identity read as a changed incarnation would cause
+continuous STUN/relay churn, while coalescing it would hide recovery. An unobservable backend needs
+an explicit recovery event and conservative invalidation only when that event occurs.
+
+Relay registration must **not** wait for fresh STUN. STUN produces candidate advertisements;
+relay registration is independent fallback and must resume once the fresh authoritative socket is
+usable, including when STUN is blocked. In parallel, clear old srflx candidates, issue one fresh
+STUN transaction with a new transaction/attempt identifier, and publish candidate changes only
+from that new result. Current relay ACK processing lacks an attempt/nonce correlation field, so a
+delayed parseable old ACK can satisfy a new wait after same-port rebind. Add server-echoed attempt
+IDs before claiming delayed ACK resistance. Do not describe this correlation as cryptographic
+authentication, and do not add server deduplication merely to obtain it.
+
+Typed `WorkerUnavailable` remains required, but an epoch plus operation ID cannot by itself prove
+whether the worker mutated state before dying: current mutators can execute before their in-memory
+reply. Automatic replay is restricted to captured desired-state/convergent setters which are safe
+to reconcile. All other admitted commands return `Indeterminate`; caller/daemon recovery must
+choose an explicit query/reconcile path. Tests must prove altered diagnostic strings do not affect
+recovery, generic `Internal` errors do not recover, and worker death after execution/before reply
+is never reported as a successful acknowledgement.
+
+If P3 later adds a bounded queue, reserve capacity alone is insufficient. Shutdown/recovery needs
+an out-of-band priority/cancellation lane plus a closing-admission bit: reject new normal commands,
+service close before ordinary FIFO work, and resolve every already-admitted request. Add a full
+normal-queue + shutdown/recovery test, alongside flood fairness, memory-cap, and no-duplicate
+mutation tests. Deferring P3 remains correct while production retains one mutable backend owner.
+
+**Adversarial evidence pointers.** Generic retry: `userspace_shared/mod.rs:267`; send-before-wait:
+`userspace_shared/runtime.rs:727`; relay nonce/session/replay handling:
+`rustynet-relay/src/transport.rs:326,340-376,467-470`; daemon keepalive:
+`rustynetd/src/daemon.rs:6344`; relay send closure:
+`rustynetd/src/relay_client.rs:705-729`; independent relay re-establish:
+`rustynetd/src/daemon.rs:6941`; STUN candidate path:
+`rustynetd/src/daemon.rs:5922-5963,6309+`; round-trip current-generation matching:
+`userspace_shared/runtime.rs:986-1014`; relay ACK parsing:
+`rustynetd/src/relay_client.rs:487-575,998-1030`. The reviewer made no edits or test claims.
+
+**Relay recovery state-machine deep dive (2026-08-17; source + protocol research, design only).**
+The ambiguity is now traced end to end. `RelayClient` consumes a pre-issued token artifact before
+sending its hello (`relay_client.rs:169-228,487-552`); the userspace worker sends a round-trip
+datagram before recording its response waiter (`userspace_shared/runtime.rs:695-745`); generic
+`with_runtime_recovery` then recreates the runtime and replays the same payload
+(`userspace_shared/mod.rs:267-283,568-583`; macOS parity at
+`userspace_shared_macos/mod.rs:281-297,659-674`). The relay durably records the nonce before it
+allocates a session (`rustynet-relay/src/transport.rs:326-376`), and current 19-byte hello ACK
+carries only `session_id` + `allocated_port` (`relay_client.rs:998-1030`). Thus a lost ACK has an
+exactly-once/at-least-once boundary: client cannot know whether the first hello committed, while a
+late old ACK is indistinguishable from an ACK for a newer pending hello from the same relay address.
+
+Two scope corrections matter. A fresh accepted hello for the same ordered node pair removes the
+previous server session (`transport.rs:347,829-844`), and the relay's following inactive-allocation
+prune aborts/removes the old port task (`main.rs:649-670,850-906`). No persistent allocation leak
+is claimed. Conversely, server tuple binding has no socket-incarnation concept: first ciphertext
+binds a session to a source tuple, later keepalive accepts that exact tuple, and a replacement
+socket that happens to reuse it is indistinguishable to the relay
+(`transport.rs:560-590,635-647`). A changed mapped port fails tuple validation. Rustynet must not
+infer continuity from either outcome. Also, the client keepalive comment saying relay "should echo
+or acknowledge" is stale: production relay consumes the 5-byte keepalive silently and sends no
+ACK (`relay_client.rs:686-731`; `rustynet-relay/src/main.rs:781-786`).
+
+**Recommended first contract — explicit recovery, not server idempotency.** Split current generic
+recovery into one daemon-owned recovery coordinator, not a desired-state path and a hidden
+protocol-I/O path. No `TunnelBackend` operation may recreate the runtime implicitly. Every caller
+of current `with_runtime_recovery` returns typed `WorkerUnavailable` without a second operation;
+the coordinator first quarantines traversal/relay state, then invokes a new
+`recover_authoritative_transport()` which performs only socket/runtime reconstruction and returns
+`Known(TransportIncarnation)`. It subsequently drives one high-level desired-state reconcile where
+that is safe. This makes a worker loss during a path sample, handshake query, or configuration call
+as visible as a loss during relay I/O. Authoritative round trips and sends never replay payload
+merely because recovery occurred. Generic `Internal` remains non-retryable. Audit every current
+`with_runtime_recovery` caller before changing it: `initiate_peer_handshake` is also a network send
+and cannot be silently grouped with local desired-state setters without a separate proof.
+
+The daemon transition is:
+
+```text
+RelayActive(I0)
+  -- authoritative I/O reports worker loss --> Indeterminate / quiesced
+  -- close local relay sessions; suppress old candidates and keepalives --> Recovering
+  -- recover_authoritative_transport() --> SocketReady(I1)
+  -- fresh relay hello + fresh token --> RelayActive(I1)
+  -- fresh STUN transaction (independent, parallel) --> candidates for I1
+```
+
+`RelayClientSession` must retain the incarnation that created it. No selected relay endpoint or
+client `last_activity` update survives the `Indeterminate` transition. Relay registration begins
+as soon as `I1` exists; STUN re-probe/publishing proceeds independently and may fail without
+blocking relay fallback. The backend may restore encrypted WireGuard desired state while the daemon
+keeps old traversal/relay observations quarantined. Status must show old/new incarnation,
+transition reason/time/count, relay state (`quiesced`, `registering`, `active`), candidate
+freshness, and fresh matching-token inventory. This is an implementation contract, not a new IPC
+fault-control surface.
+
+**Relay wire change required for correctness.** Reuse the existing 16-byte, unique signed relay
+token nonce as the client attempt correlation value: include it in `RelayHelloAck`, and require an
+exact match to the hello's token nonce before the client records a session. Keep source-address
+checking. This rejects a delayed ACK from a prior fresh-token attempt, but it does **not**
+authenticate the ACK; nonce echo is visible to any observer of the hello. ACK origin
+authentication needs separately distributed relay signing/MAC key material and is out of scope for
+the first recovery fix. Do not make the nonce replay store implicitly idempotent in this slice: it
+currently survives relay restart while sessions/allocated ports do not. Returning an old ACK merely
+because a durable nonce is known could point a recovered client to a dead allocation. A future
+idempotent-hello design must atomically retain canonical request digest, live session/allocation
+state, and semantically equivalent ACK response, with restart behavior explicitly defined.
+
+This matches established reliability practice. AWS recommends caller-provided request identifiers
+and semantically equivalent retry responses only where a server can bind identity, parameters, and
+outcome atomically ([AWS idempotent APIs](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/)). That invariant is absent here, so explicit recovery is safer.
+STUN provides the contrasting safe pattern: responses echo a 96-bit transaction ID; a client checks
+it before accepting a response ([RFC 8489](https://datatracker.ietf.org/doc/html/rfc8489)). After
+an unproven socket rollover, issuing a fresh STUN transaction ID is a conservative Rustynet
+inference, not a claim that RFC 8489 forbids retransmission when the numeric local address is
+unchanged.
+
+**Token-inventory contract.** Local signing can mint a new token after an indeterminate hello.
+Pre-issued mode intentionally deletes an artifact before send, so ACK loss spends a valid artifact
+whether or not the relay committed. It is secure/fail-closed but can turn one worker loss into a
+relay outage if no matching fresh token remains. Report matching usable-token count and earliest
+expiry per `(node, peer, relay)` tuple, plus a low-watermark/replenishment alarm. Before automatic
+re-establishment, attempt an actual atomic issue/claim and fail closed if it cannot obtain a fresh
+artifact; a directory count is advisory because scan/expiry/removal are not a reservation protocol.
+If operations requires a guaranteed recovery reserve, design a durable atomic claim/lease protocol
+first. Otherwise leave relay unavailable with an explicit
+`token_inventory_exhausted_after_indeterminate_hello` status. Do not reuse the consumed artifact
+or silently switch to daemon-local signing, which is deliberately mutually exclusive with
+pre-issued mode.
+
+**Required deterministic test matrix before implementation closes.** Linux and macOS each need:
+
+1. Worker death before command dequeue; no hello sent; recovery produces `I1`; fresh hello works.
+2. Worker death after first hello send but before reply; relay accepts first hello, ACK is held;
+   caller receives indeterminate, never automatic duplicate; a fresh-token hello replaces it.
+3. Delayed ACK from attempt N arrives while N+1 waits; nonce mismatch rejects it; matching N+1 ACK
+   alone installs endpoint/session `I1`.
+4. Same-port and changed-port rebind paths; old session is never locally trusted; fresh registration
+   succeeds and the old relay allocation is pruned.
+5. One-way keepalive interrupted mid-send; no `last_activity` success record, no old-session retry,
+   then re-register. STUN loss in the same transition cannot block relay re-registration.
+6. Pre-issued token inventory 0/1/reserve: artifact consumption, low-watermark status, explicit
+   depletion error, no reuse; local-signer parity. Relay restart during the sequence cannot make a
+   nonce-only old ACK valid.
+7. Worker death during `peer_latest_handshake_unix` or path-quality query; coordinator quarantine
+   reaches `I1` before any later relay/STUN I/O on both OS implementations.
+8. ACK-delivered active relay then relay process restart while worker remains `I0`; local UDP
+   keepalive send alone cannot retain `active`, bounded liveness confirmation triggers re-register.
+9. Old/new client × old/new relay wire matrix: strict 19-byte legacy parser remains safe, while
+   negotiated new protocol requires nonce-matched hello ACK and confirmed keepalive response.
+
+Add a loop/property test that interleaves delayed packets, worker death, identical local port reuse,
+and daemon ticks; assert at most one locally selected relay session per peer/incarnation and no
+accepted ACK without the pending attempt nonce. Run parity tests under both userspace backends,
+then only a separately designed `--node` lab stage can establish NAT/relay behavior outside test
+harnesses.
+
+**Second adversarial review — two P0 corrections (2026-08-17; read-only source review).** The
+first state machine was still too narrow: `with_runtime_recovery` wraps non-authoritative
+`peer_latest_handshake_unix` and `peer_path_quality` calls on both Linux and macOS, while daemon
+path-quality polling runs before relay work. A worker loss in one of those queries can recreate the
+socket, reuse its port, and leave old relay/STUN state live before the next keepalive. The revised
+single coordinator contract above is mandatory: *all* backend recovery first returns a typed loss;
+daemon quarantine consumes it; only then may controlled runtime recovery create `I1` or any later
+operation run. A per-operation receipt is insufficient if another recovery path can run first.
+Add both-OS fault tests for worker exit during handshake/path query, asserting `I1` event, no old
+candidate publication, and zero old-session keepalive before re-registration.
+
+Relay restart is an independent P0. Relay nonce storage may persist, but sessions and allocated
+sockets are process memory. After an ACK-delivered session, relay restart can erase the allocation
+while the client remains on `I0`; a UDP `send_to` keepalive still succeeds locally and current code
+updates client `last_activity`, even though the restarted relay silently drops it. Session refresh
+is otherwise driven near token expiry. Nonce echo prevents a stale ACK from selecting an old
+session; it does not prove an established allocation still exists. Split client timestamps into
+`last_sent` and `last_confirmed`. Introduce a versioned, bounded relay-liveness probe/ACK which the
+relay sends only after a valid currently bound session tuple; require its session ID + fresh probe
+nonce + current incarnation before updating confirmed liveness. Missed confirmation transitions
+`active -> suspect -> quiesced`, then fresh-token registration, with configured bounded backoff.
+Relayed authenticated ciphertext can count as positive liveness only when it maps to the current
+session/incarnation. Never treat local UDP send success as relay liveness.
+
+The ACK/keepalive changes require an explicit rollout design. Existing hello ACK parser rejects any
+length other than 19 bytes and server emits exactly 19 bytes; appending a nonce would break old
+clients. Advertise an authenticated relay-protocol version/capability through signed fleet/control
+metadata (or a separately versioned hello/ACK message), then test old/new client × old/new relay.
+New recovery correctness must be enabled only for negotiated new protocol; legacy mode is
+`unconfirmed` and must not falsely claim the stronger recovery/liveness guarantee. The token spool
+counter is likewise observability only: `read_dir` + validation + delete has no durable reservation
+semantic. Actual issue must atomically claim one artifact and fail closed; a guaranteed reserve
+needs its own durable claim/lease design, including crash behavior.
+
+**Second-review evidence pointers.** Hidden query recovery: Linux
+`userspace_shared/mod.rs:462-583`, macOS `userspace_shared_macos/mod.rs:552-675`; daemon polling
+before relay work: `rustynetd/src/daemon.rs:6344,6523-6533,6848-6871`. Relay runtime cleanup:
+`rustynet-relay/src/transport.rs:194-256`, `rustynet-relay/src/main.rs:514-529`; silent local-send
+keepalive/accounting: `rustynetd/src/relay_client.rs:705-729`,
+`rustynetd/src/daemon.rs:6398-6439`; default token refresh: `daemon.rs:251-254,6933-6938`.
+Rollout wire strictness: `relay_client.rs:998-1030`, `rustynet-relay/src/main.rs:701-706`.
+The reviewer cleared no-generic-retry, nonce echo as correlation-not-authentication, tuple
+conservatism, STUN/relay independence, no nonce-store idempotence without durable session state,
+and Linux/macOS held-ACK parity tests. Reviewer made no code/test changes.
+
+**Implementation blueprint — transport failure ownership (2026-08-17; proposed contract,
+not yet implemented).** This is deliberately more prescriptive than the findings above so that
+an implementation cannot accidentally reintroduce a hidden retry through a different backend
+method.
+
+1. In `crates/rustynet-backend-api/src/lib.rs`, add
+   `BackendErrorKind::WorkerUnavailable` plus `BackendError::worker_unavailable(...)`. It means
+   *an operation may not have run, may have sent a datagram, or may have mutated runtime state; its
+   result is indeterminate*. It is not a synonym for `Internal`, and callers must switch on the
+   enum rather than current Linux/macOS message-substring helpers. Audit exhaustive `match` sites
+   in both platforms and any UI/status conversion.
+2. Add `TransportIncarnation` to `AuthoritativeTransportIdentity`, represented as
+   `Known(u64)` or `Unobservable`. `Known` is allocated on **every** authoritative socket creation
+   (including initial backend start); a changed known value following explicit recovery denotes a
+   replacement. It is not derived from IP/port/label. `Unobservable` is a capability result, not
+   a change notification: receipt of `Unobservable` never itself causes re-registration. Preserve
+   `local_addr` and `label` for diagnostics; equality of either is never evidence that incarnation
+   stayed the same.
+3. Add `TunnelBackend::recover_authoritative_transport(&mut self) ->
+   Result<AuthoritativeTransportIdentity, BackendError>`. Its default returns fail-closed
+   `Internal`/unsupported. Only shared-userspace backends implement it. It rejects a healthy,
+   unlatched runtime with `AlreadyRunning` (or an explicit no-change receipt); it must never make
+   an I1 socket merely because a caller asked. When fault-latched it reconstructs runtime and
+   reapplies already captured backend desired state; it must not transmit relay/STUN protocol
+   frames, invoke daemon callbacks, or replay an operation closure. `Phase10Controller` and the
+   `DaemonBackend` match arms forward this method beside their existing authoritative
+   identity/round-trip/send forwarding (`phase10.rs:6315-6339`; `daemon.rs:3327-3414`).
+4. Replace Linux and macOS `with_runtime_recovery` with a non-retrying dispatch helper plus a
+   **failure latch**. On detected worker loss, set the latch before returning
+   `WorkerUnavailable`; while latched, *every backend call which dispatches work to the runtime*
+   returns that same typed error without touching a socket or calling `ensure_runtime_control`. This includes configuration,
+   peer endpoint/status/quality/handshake operations, routes, exit state, authoritative send and
+   authoritative round trip. `recover_authoritative_transport` is sole operation allowed to clear
+   latch, and only after it has returned new `Known(I1)` successfully. A failed recovery retains
+   latch. This is stronger than "remember to catch errors in relay code": it makes a missed daemon
+   call site fail closed instead of silently performing I/O on an unobserved replacement socket.
+5. Change current worker-exit paths to create `WorkerUnavailable` at source. In particular,
+   request-channel disconnection, reply-channel loss after worker exit,
+   `fail_outstanding_round_trip`, and every error which makes the worker return from its
+   authoritative-socket/TUN/timer polling loop must retain this kind plus causal text rather than
+   manufacture the current platform-specific `Internal` strings
+   (`userspace_shared/runtime.rs:1151-1184`; macOS parity `runtime.rs:1296-1329`). Remove
+   `is_runtime_worker_unavailable` string classification only after all producers/tests use the
+   enum. A malformed relay packet, timeout, rejection, or a per-request send error which leaves
+   the worker alive remains its own error and must not trigger socket recovery. The criterion is
+   worker survival, not whether the immediate source happened to be socket/TUN I/O.
+
+**Daemon coordinator — exact ordering and operation classes.** `DaemonRuntime`, not
+`RelayClient`, must own the one recovery gate because `sync_traversal_runtime_state` first calls
+path-quality polling, then touches sessions/keepalives, while relay establishment is later in the
+same tick (`daemon.rs:6344-6445,6917-6994`). Introduce one private coordinator, for example
+`handle_authoritative_transport_fault(op, backend_error)`, reached immediately whenever a
+`WorkerUnavailable` escapes a controller operation. Do not convert this error to a string:
+`RelayClientError::AuthoritativeTransport(String)` must become a variant carrying `BackendError`,
+and closure sites at `daemon.rs:6409-6414,6968-6973` must preserve it until coordinator dispatch.
+
+Required algorithm, serialized by existing mutable daemon ownership:
+
+```text
+0. Recognize only BackendErrorKind::WorkerUnavailable. All other errors keep current policy.
+1. Capture prior identity/status once; increment failure metric and record operation class.
+2. Quarantine before any recovery call:
+   close every local RelayClient session; clear relay keepalive/probe state;
+   suppress relay endpoint selection; remove I0 STUN observations/candidates from publication;
+   mark traversal statuses "transport_indeterminate". Do not send an old keepalive.
+3. Call controller.recover_authoritative_transport() exactly once for this fault episode.
+   Failure leaves traversal quiesced and returns an operator-visible retry/backoff result.
+4. Validate returned Known(I1) differs from prior Known(I0). If Unobservable is supported for a
+   backend, use explicit successful recovery event as the transition; never synthesize rollover
+   from status polling. Store I1 once for this daemon tick/status snapshot.
+5. Verify that recovery replayed staged backend desired state exactly once; do **not** issue a
+   second backend reconcile from the daemon. Then schedule daemon traversal reconciliation: fresh
+   relay registration with a fresh token and fresh STUN transaction(s) independently. Neither
+   waits for the other. Do not resume candidate publication or endpoint selection until artifacts
+   are tagged I1.
+6. Resolve caller by operation class; never retry original protocol payload:
+   * RelayHello / relay liveness round trip / authoritative send / WireGuard handshake send:
+     report Indeterminate and let fresh high-level reconciliation decide later.
+   * Read-only peer query: return unavailable for this tick; next scheduled poll uses I1.
+   * Captured, convergent desired-state setter: run only once through post-recovery reconcile,
+     never by rerunning original closure; report its final result separately.
+```
+
+Replace the current optional `authoritative_transport_identity(&self) -> Option<_>` status API
+with a daemon-visible `AuthoritativeTransportState`, preferably
+`Ready(identity) | Faulted { prior_identity, since } | Unsupported { blocker }`; it must never
+silently map a latched fault to `None`, because `None` currently also means unsupported. This is a
+read-only coordinator/backend snapshot, not a runtime-dispatch operation, so it remains available
+while the latch blocks I/O. Capture it once when rendering status; current repeated identity reads
+can otherwise render mutually inconsistent fields during a transition. Status and metrics must
+include prior/current incarnation, fault operation, recovery count/time, relay quiesce reason,
+stale-artifact count, and token inventory. The coordinator must run before later traversal code in
+the tick. `poll_path_quality` therefore cannot swallow a worker-unavailable result; it must
+surface it to the gate. A backend failure latch still protects the invariant if a future call site
+is missed.
+
+**Desired-state staging rule.** Current shared-backend desired maps are updated after a successful
+runtime reply (`userspace_shared/mod.rs:462-467,470-485,521-539`; macOS parity), which loses
+intent when the worker executes a convergent mutation then dies before its reply. Before enqueue,
+validate pure input and stage convergent desired intent in a separate desired-state record (or
+write the existing desired map before dispatch with a reversible definite-error path). On
+`WorkerUnavailable`, retain staged intent; recovery replays that staged record once. On a definite
+pre-admission/validation error, roll it back. Do not label any other ambiguous failure successful.
+The daemon's post-recovery work verifies this one replay and rebuilds traversal state only; it does
+not invoke the same backend mutation a second time. This rule applies to peer config/endpoints,
+routes and exit state, but never turns relay hello, keepalive/probe, or handshake send into
+desired-state work.
+
+**Implementation blueprint — relay session state and v2 messages.** Replace
+`RelayClientSession.last_activity` (`relay_client.rs:73-96`) with distinct evidence. Minimum
+fields are: `transport_incarnation`, negotiated `wire_version`, `state` (`Establishing`, `Active`,
+`Suspect`, `Quiesced`), `last_datagram_sent`, `last_relay_confirmed`, and optional
+`pending_probe { nonce, sent_at, deadline }`. A current-incarnation, nonce-matched relay liveness
+ACK is the primary confirmation. Authenticated ciphertext can update `last_relay_confirmed` only
+when implementation can prove it maps to this selected session and incarnation. A fresh peer
+handshake timestamp alone is not enough evidence, so the current unconditional
+`relay_client.touch_session()` for relay-selected peers (`daemon.rs:6358-6367`) must not become a
+substitute for relay liveness.
+
+Reserve protocol codes `0x11..=0x14`; do not append to strict v1 formats:
+
+```text
+0x11 RelayHelloV2       = same canonical signed-token hello body as v1, new type byte
+0x12 RelayHelloAckV2    = type | session_id[16] | allocated_port_be[2] | token_nonce[16]  (35 B)
+0x13 RelayProbeV2       = type | session_id[16] | probe_nonce[16]                         (33 B)
+0x14 RelayProbeAckV2    = type | session_id[16] | probe_nonce[16]                         (33 B)
+```
+
+`RelayHelloAck`/serialization in `rustynet-relay/src/transport.rs` and `main.rs` must carry the
+accepted token nonce. Client retains issued token nonce until result handling, requires exact
+source address, exact v2 message length, non-zero session/port, and exact nonce before installing
+session. A prior-attempt ACK therefore cannot satisfy current attempt. This is request-response
+correlation, **not relay authentication**: retain existing source filtering; do not claim secrecy
+or integrity from an echoed nonce. V1 stays exactly 19 bytes (`0x02 | session_id | port`) and v1
+parsers must reject every v2 frame/length as they do today.
+
+**Critical D3 demux rule for probes.** Do **not** target allocated relay port through current
+generic `authoritative_transport_round_trip`. That port is installed as WireGuard peer endpoint
+(`RelayClientSession::effective_endpoint`, `relay_client.rs:237-244`; daemon programming around
+`daemon.rs:6604-6605`), so runtime correctly rejects it
+(`userspace_shared/runtime.rs:976-984`, macOS parity). Relaxing that rejection would be worse:
+the current generic waiter consumes every datagram from its remote before WireGuard processing
+(`runtime.rs:867-905,986-1014`), so peer ciphertext could be stolen by a control waiter.
+
+V2 therefore requires a new **narrow backend-owned multiplexed-control capability**, not a
+generic exception or caller-supplied response predicate. Add a typed
+`AuthoritativeControlKind::RelayLivenessV2` request with target, 33-byte `0x13` probe and its
+complete expected 33-byte `0x14 | session_id | probe_nonce` ACK. Only this kind may target a
+configured peer endpoint. In both runtime implementations, an outstanding probe delivers a
+datagram only when all conditions hold: same remote address, same socket generation, exact
+33-byte length, `0x14` discriminator, and constant-time/full byte equality to the precomputed
+expected ACK. Every non-match continues to `engine.process_inbound_ciphertext`; no packet is
+dropped merely because it came from a relay peer endpoint. Keep generic round-trip peer-endpoint
+rejection unchanged. The API must not accept an arbitrary callback/prefix supplied by daemon code;
+that would recreate the interception primitive this design excludes.
+
+This probe still goes to allocated relay port, so it exercises/control-refreshes that NAT mapping
+and the live allocation task. Add allocated-port task handling for `0x13`: authorize tuple, then
+send exact `0x14` ACK from the same allocated-port socket. It must not be handled on relay control
+port: under endpoint-dependent NAT, a control-port probe can have a different mapped tuple and
+does not prove allocated-port liveness. The exact random nonce means a WireGuard frame or malformed
+packet cannot be accepted as a probe response; it instead reaches normal engine processing.
+
+Permit one pending probe per session, cap one synchronous probe per daemon traversal tick, and set
+a short bounded deadline in configuration. On timeout, wrong source, wrong length, wrong session
+ID, or wrong nonce, do not update confirmation. Transition `Active -> Suspect`; after configured
+bounded consecutive misses, `Suspect -> Quiesced`, delete local session, and schedule a fresh-token
+registration with backoff. Local `send_to` success updates only `last_datagram_sent`; it never
+confirms allocation or resets miss count. This replaces the stale "relay should echo" comment and
+the current success-driven `last_activity` update (`relay_client.rs:686-729`).
+
+Relay handling for a probe must use an explicit `authorize_probe_from_tuple`, not make
+`touch_session_from_tuple` silently weaker. It accepts only a live, unexpired session and either
+the exact bound tuple or, when unbound, the same-IP first-tuple rule already used for first
+ciphertext (`transport.rs:560-590,635-647`); in the latter case it records that tuple before ACK.
+Any other tuple/session/expired frame is silently dropped. Respond at most once per accepted
+probe; ACK equals request length, and no error response is emitted. This avoids a response
+amplifier and preserves current source-binding threshold. After relay restart there is no live
+session, so no ACK: client cannot mistake local outbound UDP success for liveness.
+
+**Rollout and control-plane contract.** Current signed relay-fleet format is strictly
+`version=1`: parser rejects any other version and any unknown key; descriptor has only
+`relay_id, region, endpoint, priority, capacity, enabled`
+(`rustynet-control/src/lib.rs:1456-1532,4060-4260`). It cannot safely carry an optional v2 bit.
+Do **not** mutate a v1 signed payload in place or publish fleet v2 to old clients: old daemons
+will fail closed on their sole traversal bundle.
+
+Recommended zero-outage path: add a separate, same-trust-root signed relay-capabilities bundle.
+Its canonical, versioned payload binds each `relay_id` **and exact endpoint** to a bounded sorted
+set of supported relay wire versions and normal generated/expiry/nonce/signature fields. New
+daemon verifies both the existing fleet membership and capability binding before V2 use; absent,
+expired, invalid, or non-intersecting capability means V1 only. Old daemon ignores the separate
+artifact and continues its verified v1 fleet. Deploy in strict order:
+
+1. Ship new relay binary supporting v1 and v2, but advertise only v1.
+2. Ship new daemon/control parser with v1 fallback and full parser/canonicalization tests.
+3. Publish short-lived signed capability records for verified v2 relays; confirm every selected
+   endpoint maps to its record before enabling v2 there.
+4. Enable V2 per relay. New clients negotiate highest common version; old clients keep v1.
+5. Expose `legacy_unconfirmed` for v1. Do not advertise v2 recovery/liveness guarantees there.
+6. Retire v1 only after fleet telemetry proves no legacy clients, using explicit maintenance policy.
+
+A single relay-fleet v2 format remains possible only as an announced breaking migration after all
+clients can parse it. It is not this fix's default. Capability data, v2 hello, and probe behavior
+must be feature-gated together; sending `0x11` merely because a client was upgraded is forbidden.
+
+**Token and relay-restart semantics.** Add inventory reporting keyed by `(node, peer, relay)`:
+eligible count, earliest expiry, observation time, and low-watermark. Label scans advisory.
+`PreissuedRelaySessionTokenIssuer::issue_token` is the real claim point because it validates then
+removes its matching artifact before transmission. Do not treat a file count as a reserve. A
+guaranteed reserve needs separately designed atomic move/lease, durable outcome record, fsync and
+crash-reaper semantics; do not smuggle it into this recovery change. For an indeterminate hello,
+do not reuse its artifact; ask issuer for a new one or remain quiesced with precise depletion
+status. Do not call local signing fallback from pre-issued mode.
+
+Never add nonce-only server idempotency here. Durable nonce storage outlives process-memory
+sessions/allocation tasks, so replaying stored ACK after restart can return a dead port. A future
+idempotent hello requires one atomic durable record containing nonce, canonical request digest,
+session/allocation lifecycle, response, and explicit restart semantics. V2 probe is required even
+after ACK delivery because restart can erase all allocations while client socket stays I0.
+
+**Required test hooks and acceptance gates.** Existing `RuntimeTestState` only counts worker exit
+(`userspace_shared/runtime.rs:1073-1085`; macOS `1218-1230`); add deterministic fault points,
+not timing sleeps: `BeforeCommandDequeue`, `AfterCommandDequeueBeforeSend`, and
+`AfterDatagramSendBeforeReplyOrWaiter`. The last point proves actual hello delivery followed by an
+indeterminate client outcome. Implement equivalent hooks/parity assertions in both userspace
+backends. Keep fault injection test-only and fail worker through normal cleanup/error paths.
+
+Required named test groups before merge:
+
+1. `backend_api`: every exhaustive `BackendErrorKind` conversion recognizes
+   `WorkerUnavailable`; shared backend latches, rejects all operation families, recovers only by
+   explicit method, then reports I1; Linux/macOS parity. Generic round-trip to a configured peer
+   endpoint remains rejected. While a typed V2 probe is outstanding at that endpoint, a real or
+   synthetic WireGuard ciphertext datagram and every wrong-length/wrong-nonce `0x14` frame reaches
+   normal engine processing; only byte-for-byte expected ACK completes control request.
+2. `daemon`: query-induced worker loss reaches coordinator before keepalive; assert no I0 relay
+   send, no I0 candidate publication, relay registration starts before/without successful STUN;
+   status snapshot records one coherent transition.
+3. `relay_client`: v1 exact 19-byte compatibility; v2 exact-size parsing; held ACK N rejected
+   while N+1 pending; source/session/nonce mismatch rejected; local send never increases confirmed
+   liveness; one outstanding probe limit and timeout state transitions.
+4. `rustynet-relay`: probe exact-bound success; first same-IP probe binding success; different-IP
+   and expired/unknown session silent drop; one response no larger than request; v1 behavior
+   untouched. Test accepted hello then process restart then local I0 probe receives no ACK.
+5. End-to-end deterministic sequence: accept hello, drop ACK, kill worker after send, recover I1,
+   establish fresh-token session; inject stale ACK; restart relay after a confirmed session; require
+   bounded quiesce/re-registration. Run Linux and macOS shared backends, both pre-issued and local
+   issuer modes. Assert no duplicate local selected session for `(peer, incarnation)`.
+6. `rustynet-control` capability bundle: canonical sort, duplicate/unknown field rejection,
+   signature failure, expiry, relay ID/endpoint mismatch, absent fallback V1, and rollout matrix
+   old/new client × v1/v2 relay. Test a v1 parser still rejects v2 fleet payload, proving staged
+   rollout assumption rather than accidentally relying on compatibility.
+
+Merge order: typed failure/latch + coordinator tests first; then v2 server/client parser tests;
+then signed capability artifact; then enabled rollout. P3 command queue work remains separate:
+it must not land inside this P0/P1 reliability change.
+
+**Third adversarial review — blueprint corrections incorporated (2026-08-17; read-only,
+no code/test changes).** The first blueprint incorrectly sent V2 probe through generic
+`authoritative_transport_round_trip` to allocated relay port. That port is exactly the configured
+WireGuard peer endpoint, and runtime rightly refuses generic round trips there; worse, generic
+response delivery runs before ciphertext demux and would consume arbitrary datagrams from the
+peer. The corrected blueprint above keeps that rejection, specifies an exact-ACK,
+backend-owned `RelayLivenessV2` multiplexer, and requires a regression proving interleaved peer
+ciphertext remains with the WireGuard engine. A control-port-only probe was rejected too: on
+endpoint-dependent NAT it can prove a different mapping, not live allocated-port forwarding.
+
+The review also found four contract details now resolved above. (1) Errors in authoritative socket,
+TUN, or timer polling currently terminate worker; if an error causes that exit, it must surface
+`WorkerUnavailable` with cause and latch, rather than masquerade as ordinary socket I/O. (2) Current
+identity API returns `Option`, so it cannot represent a typed latched fault; status now requires
+`Ready | Faulted | Unsupported` rather than silently mapping fault to unsupported. (3) Current
+desired maps mutate only after replies, so recovery cannot replay a mutation whose worker reply was
+lost; convergent desired intent must be staged before enqueue and replayed once. (4) socket
+generation is assigned at every socket creation, including initial startup; recovery must reject a
+healthy/unlatched request so it cannot create a new incarnation before daemon quarantine.
+
+**Third-review evidence pointers.** Peer endpoint selected from relay session:
+`rustynetd/src/relay_client.rs:237-244`; daemon applies it around `daemon.rs:6604-6605`; generic
+round-trip rejection: `userspace_shared/runtime.rs:976-984` and macOS parity; pre-engine generic
+response dispatch: `runtime.rs:867-905,986-1014`; terminal worker polling paths:
+`runtime.rs:1151-1184`, macOS `1296-1329`; optional identity API:
+`backend-api/src/lib.rs:260-265`, controller `phase10.rs:6315-6317`; post-reply desired map
+updates: Linux `userspace_shared/mod.rs:462-539`, macOS parity; generation allocation:
+`userspace_shared/socket.rs:20,51-55` and macOS `socket.rs:21,56-60`. Reviewer made no source
+edits and did not run tests.
+
+**Focused baseline recheck (2026-08-17, no new implementation).** Passed:
+`cargo test -p rustynet-relay --lib --locked test_replayed_nonce_rejected` (one-use relay nonce);
+`cargo test -p rustynetd --lib --locked
+preissued_relay_session_token_issuer_consumes_matching_signed_token` (artifact is deleted before
+the transport send); and `cargo test -p rustynet-backend-wireguard --lib --all-features --locked
+linux_userspace_shared_backend_relay_round_trip_and_send_use_same_transport_generation_as_peer_path`
+(peer, relay round trip, and relay send share one generation). These are source-contract baselines,
+not proof of the proposed worker-loss/held-ACK state machine. No product code or new test changed.
+
+**Recheck evidence (2026-08-17, `dea73a75`).** `cargo test -p
+rustynet-backend-wireguard --lib --all-features --locked transport_generation` passed 5 focused
+tests, including Linux/macOS generation rollover and Linux same-generation peer/STUN/relay proof.
+Both daemon worker-exit recovery tests pass under `cargo test -p rustynetd --lib --all-features
+--locked`, one exact test each for Linux and macOS. No live-lab claim follows from these unit and
+test-harness checks.
+
 ### QH-55 — a failed dataplane apply degrades into a silent 1-second retry loop
 
 Cluster of observability defects around `restrict_recoverable`, live-observed during the QH-53
