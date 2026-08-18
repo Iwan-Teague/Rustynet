@@ -1464,6 +1464,74 @@ mod tests {
         resolved_target_address_from_ssh_g, scp_failure_is_transient, strip_host_port, target_port,
     };
 
+    /// QH-61 regression lock: no live-lab stage binary may spawn `rustynet` by
+    /// bare name. Rocky's sudo `secure_path` omits `/usr/local/bin`, so a bare
+    /// head dies as "command not found" the moment a role lands on a RHEL-family
+    /// guest while Debian silently masks it (proven live, run
+    /// `qh57-lantoggle-20260816a`). Every stage binary that drives guests
+    /// through this support layer is listed here; the needle is assembled at
+    /// runtime so this file cannot satisfy its own negative assertion.
+    #[test]
+    fn stage_binaries_never_spawn_rustynet_by_bare_name() {
+        let sources: [(&str, &str); 9] = [
+            (
+                "live_linux_lan_toggle_test.rs",
+                include_str!("../live_linux_lan_toggle_test.rs"),
+            ),
+            (
+                "live_linux_enrollment_restart_test.rs",
+                include_str!("../live_linux_enrollment_restart_test.rs"),
+            ),
+            (
+                "live_linux_reboot_recovery_test.rs",
+                include_str!("../live_linux_reboot_recovery_test.rs"),
+            ),
+            (
+                "live_linux_network_flap_test.rs",
+                include_str!("../live_linux_network_flap_test.rs"),
+            ),
+            (
+                "live_linux_control_surface_exposure_test.rs",
+                include_str!("../live_linux_control_surface_exposure_test.rs"),
+            ),
+            (
+                "live_linux_endpoint_hijack_test.rs",
+                include_str!("../live_linux_endpoint_hijack_test.rs"),
+            ),
+            (
+                "live_linux_server_ip_bypass_test.rs",
+                include_str!("../live_linux_server_ip_bypass_test.rs"),
+            ),
+            (
+                "live_linux_two_hop_test.rs",
+                include_str!("../live_linux_two_hop_test.rs"),
+            ),
+            (
+                "live_linux_managed_dns_test.rs",
+                include_str!("../live_linux_managed_dns_test.rs"),
+            ),
+        ];
+        // The banned shape is a bare "rustynet" string literal as an argv head.
+        let needle = format!("\"{}\",", "rustynet");
+        let mut offenders = Vec::new();
+        for (name, source) in sources {
+            // Only inspect the production half: test modules legitimately
+            // build fake shells around bare names.
+            let production = source
+                .find("#[cfg(test)]")
+                .map(|at| &source[..at])
+                .unwrap_or(source);
+            let hits = production.matches(needle.as_str()).count();
+            if hits > 0 {
+                offenders.push(format!("{name}: {hits} bare `rustynet` argv head(s)"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use REMOTE_RUSTYNET_BIN, never a bare `rustynet` argv head (QH-61): {offenders:?}"
+        );
+    }
+
     #[test]
     fn scp_failure_is_transient_retries_connection_level_and_network_faults() {
         // ssh connection-level error (exit 255) is always transient.

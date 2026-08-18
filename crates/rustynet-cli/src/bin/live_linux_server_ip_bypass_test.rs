@@ -174,7 +174,7 @@ fn run() -> Result<(), String> {
     ctx.retry_root(
         &probe_host,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "e2e-http-probe-client",
             "--host",
@@ -190,7 +190,10 @@ fn run() -> Result<(), String> {
         1,
     )?;
 
-    let client_status = ctx.capture_root(&client_host, &["rustynet", "status"])?;
+    let client_status = ctx.capture_root(
+        &client_host,
+        &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+    )?;
     let client_internet_route = ctx
         .capture(&client_host, &["ip", "-4", "route", "get", "1.1.1.1"])
         .unwrap_or_default();
@@ -209,7 +212,7 @@ fn run() -> Result<(), String> {
     let probe_self_test = ctx.capture_root_allow_failure(
         &probe_host,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "e2e-http-probe-client",
             "--host",
@@ -225,7 +228,7 @@ fn run() -> Result<(), String> {
     let probe_from_client_output = ctx.capture_root_allow_failure(
         &client_host,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "e2e-http-probe-client",
             "--host",
@@ -242,7 +245,7 @@ fn run() -> Result<(), String> {
         .run_root(
             &client_host,
             &[
-                "rustynet",
+                live_lab_support::REMOTE_RUSTYNET_BIN,
                 "ops",
                 "e2e-http-probe-client",
                 "--host",

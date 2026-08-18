@@ -231,7 +231,7 @@ fn run() -> Result<(), String> {
         remote_dns_probe_output = ctx.capture_root_allow_failure(
             &probe_host,
             &[
-                "rustynet",
+                live_lab_support::REMOTE_RUSTYNET_BIN,
                 "ops",
                 "e2e-dns-query",
                 "--server",
@@ -248,7 +248,7 @@ fn run() -> Result<(), String> {
             .run_root(
                 &probe_host,
                 &[
-                    "rustynet",
+                    live_lab_support::REMOTE_RUSTYNET_BIN,
                     "ops",
                     "e2e-dns-query",
                     "--server",
