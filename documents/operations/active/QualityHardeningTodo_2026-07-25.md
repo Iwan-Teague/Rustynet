@@ -3888,3 +3888,13 @@ shape remains in seven other stage binaries, latent until a role lands on a non-
 `live_linux_network_flap_test.rs`, `live_linux_control_surface_exposure_test.rs`,
 `live_linux_endpoint_hijack_test.rs` (plus `collect_network_discovery_info.rs`, non-sudo).
 Sweep them file-by-file (each needs import and shape care), mirroring the LAN-toggle commit.
+
+**QH-61 SWEEP COMPLETE (2026-08-17).** All seven sibling binaries plus `collect_network_discovery_info`
+now use `REMOTE_RUSTYNET_BIN` — 37 production sites across eight files (the anchor test's two
+fake-shell test invocations deliberately untouched). A source pin in `live_lab_support`
+(`stage_binaries_never_spawn_rustynet_by_bare_name`) scans every stage binary's production
+half for the banned shape with a runtime-assembled needle; mutation-proven (reintroducing one
+bare head names the offending file). The lab live-proved the mechanism on run 44 (lan_toggle
+pass after the same fix); the siblings inherit it by construction and are unit-locked, not
+separately live-proven — each will be exercised the first time its role lands on a Fedora/Rocky
+guest.
