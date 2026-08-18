@@ -128,7 +128,7 @@ fn run() -> Result<(), String> {
     let token_raw = ctx.capture_root_allow_failure(
         &admin_host,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "generate-enrollment-token",
             "--ttl-seconds",
@@ -170,7 +170,7 @@ fn run() -> Result<(), String> {
     let _ = ctx.capture_root_allow_failure(
         &enrollee_host,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "consume-enrollment-token",
             "--token",
@@ -202,11 +202,17 @@ fn run() -> Result<(), String> {
 
     // ── Stage 5: determine enrollment outcome ─────────────────────────────────
     let peer_list = ctx
-        .capture_root_allow_failure(&admin_host, &["rustynet", "peer", "list"])
+        .capture_root_allow_failure(
+            &admin_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "peer", "list"],
+        )
         .unwrap_or_default();
     // Grab enrollee's node ID from the enrollee's own state.
     let enrollee_id = ctx
-        .capture_root_allow_failure(&enrollee_host, &["rustynet", "ops", "show-node-id"])
+        .capture_root_allow_failure(
+            &enrollee_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "ops", "show-node-id"],
+        )
         .unwrap_or_default();
     let enrollee_id = enrollee_id.trim();
 
@@ -222,7 +228,14 @@ fn run() -> Result<(), String> {
 
     // ── Stage 6: membership integrity check ───────────────────────────────────
     let integrity_out = ctx
-        .capture_root_allow_failure(&admin_host, &["rustynet", "ops", "verify-membership"])
+        .capture_root_allow_failure(
+            &admin_host,
+            &[
+                live_lab_support::REMOTE_RUSTYNET_BIN,
+                "ops",
+                "verify-membership",
+            ],
+        )
         .unwrap_or_default();
     let membership_integrity = if integrity_out.contains("ok") || integrity_out.contains("valid") {
         "pass"

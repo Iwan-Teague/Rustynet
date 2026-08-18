@@ -140,7 +140,7 @@ fn run() -> Result<(), String> {
         let wg_show = ctx.capture_root_allow_failure(host, &["wg", "show", "all"]);
         // rustynet status shows tunnel state from the daemon perspective.
         let status = ctx
-            .capture_root_allow_failure(host, &["rustynet", "status"])
+            .capture_root_allow_failure(host, &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"])
             .unwrap_or_default();
         let status_snip: String = status.chars().take(200).collect();
         logger.line(format!(
@@ -155,7 +155,10 @@ fn run() -> Result<(), String> {
     logger.line("[network-flap] waiting for baseline WG handshake (up to 300s)")?;
     let mut baseline_age_s: Option<u64> = None;
     for attempt in 0..60u32 {
-        let nc_result = ctx.capture_root_allow_failure(&client_host, &["rustynet", "netcheck"]);
+        let nc_result = ctx.capture_root_allow_failure(
+            &client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "netcheck"],
+        );
         let client_err = nc_result
             .as_ref()
             .err()
@@ -167,8 +170,10 @@ fn run() -> Result<(), String> {
         }
         if attempt == 0 || attempt == 11 || attempt == 23 {
             let client_nc: String = nc_out.chars().take(300).collect();
-            let exit_nc_result =
-                ctx.capture_root_allow_failure(&exit_host, &["rustynet", "netcheck"]);
+            let exit_nc_result = ctx.capture_root_allow_failure(
+                &exit_host,
+                &[live_lab_support::REMOTE_RUSTYNET_BIN, "netcheck"],
+            );
             let exit_err = exit_nc_result
                 .as_ref()
                 .err()
@@ -201,7 +206,10 @@ fn run() -> Result<(), String> {
         for (label, host) in [("client", &client_host), ("exit", &exit_host)] {
             let wg_all = ctx.capture_root_allow_failure(host, &["wg", "show", "all"]);
             let status = ctx
-                .capture_root_allow_failure(host, &["rustynet", "status"])
+                .capture_root_allow_failure(
+                    host,
+                    &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+                )
                 .unwrap_or_default();
             let status_snip: String = status.chars().take(300).collect();
             let journal = ctx
@@ -265,7 +273,10 @@ fn run() -> Result<(), String> {
 
     // ── Stage 4: confirm no new handshake ─────────────────────────────────────
     let mid_nc = ctx
-        .capture_root_allow_failure(&client_host, &["rustynet", "netcheck"])
+        .capture_root_allow_failure(
+            &client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "netcheck"],
+        )
         .unwrap_or_default();
     let mid_age_s = parse_handshake_age_s_from_netcheck(&mid_nc);
     // Disruption is confirmed by EITHER a readably-old handshake, or the record
@@ -364,7 +375,10 @@ fn run() -> Result<(), String> {
             break;
         }
         let post_nc = ctx
-            .capture_root_allow_failure(&client_host, &["rustynet", "netcheck"])
+            .capture_root_allow_failure(
+                &client_host,
+                &[live_lab_support::REMOTE_RUSTYNET_BIN, "netcheck"],
+            )
             .unwrap_or_default();
         let post_age = parse_handshake_age_s_from_netcheck(&post_nc);
         if post_age.is_some_and(|age| age < 30) {
@@ -382,7 +396,10 @@ fn run() -> Result<(), String> {
     // recovery.  `rustynet status` is the canonical user-facing command;
     // `show-gossip-epoch` is not a valid subcommand on deployed builds.
     let status_out = ctx
-        .capture_root_allow_failure(&exit_host, &["rustynet", "status"])
+        .capture_root_allow_failure(
+            &exit_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+        )
         .unwrap_or_default();
     let tunnel_active = status_out.contains("ExitActive")
         || status_out.contains("active")
@@ -391,7 +408,14 @@ fn run() -> Result<(), String> {
 
     // ── Stage 8: membership integrity ────────────────────────────────────────
     let integrity_out = ctx
-        .capture_root_allow_failure(&exit_host, &["rustynet", "ops", "verify-membership"])
+        .capture_root_allow_failure(
+            &exit_host,
+            &[
+                live_lab_support::REMOTE_RUSTYNET_BIN,
+                "ops",
+                "verify-membership",
+            ],
+        )
         .unwrap_or_default();
     let membership_intact = integrity_out.contains("ok") || integrity_out.contains("valid");
     logger.line(format!(

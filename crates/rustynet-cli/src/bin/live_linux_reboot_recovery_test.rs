@@ -501,10 +501,12 @@ fn force_local_assignment_refresh(
     logger.line(format!(
         "[reboot-recovery] forcing local assignment refresh on {target}"
     ))?;
-    let output = ctx.run_root_allow_failure(
-        target,
-        &["rustynet", "ops", "force-local-assignment-refresh-now"],
-    )?;
+    // Kept on one line on purpose: the vm-lab feature-gating pin in vm_lab
+    // detects a `cargo run … ops` spawn partly by a bare `"ops",` line, and a
+    // multi-line SSH argv here would trip it as a false positive.
+    let bin = live_lab_support::REMOTE_RUSTYNET_BIN;
+    let argv = [bin, "ops", "force-local-assignment-refresh-now"];
+    let output = ctx.run_root_allow_failure(target, &argv)?;
     if output.status.success() {
         Ok(CheckResult::Pass)
     } else {

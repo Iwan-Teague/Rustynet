@@ -147,7 +147,7 @@ fn run() -> Result<(), String> {
         &[
             "env",
             &format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "status",
         ],
     )?;
@@ -156,7 +156,7 @@ fn run() -> Result<(), String> {
         &[
             "env",
             &format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "netcheck",
         ],
     )?;
@@ -210,7 +210,7 @@ fn run() -> Result<(), String> {
     ctx.run_root(
         &client_host,
         &[
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "ops",
             "rewrite-assignment-peer-endpoint-ip",
             "--assignment-path",
@@ -236,7 +236,7 @@ fn run() -> Result<(), String> {
         &[
             "env",
             &format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "status",
         ],
     )?;
@@ -245,7 +245,7 @@ fn run() -> Result<(), String> {
         &[
             "env",
             &format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "netcheck",
         ],
     )?;
@@ -278,7 +278,7 @@ fn run() -> Result<(), String> {
         &[
             "env",
             &format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
-            "rustynet",
+            live_lab_support::REMOTE_RUSTYNET_BIN,
             "status",
         ],
     )?;

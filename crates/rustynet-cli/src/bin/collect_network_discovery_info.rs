@@ -544,7 +544,9 @@ fn resolve_node_id_from_runtime_status() -> Option<String> {
     Command::new("sudo")
         .args(["-n", "env"])
         .arg(format!("RUSTYNET_DAEMON_SOCKET={socket}"))
-        .args(["rustynet", "status"])
+        // Absolute path: sudo's secure_path omits /usr/local/bin on RHEL-family
+        // hosts, so a bare `rustynet` dies as "command not found" (QH-61).
+        .args(["/usr/local/bin/rustynet", "status"])
         .output()
         .ok()
         .and_then(command_output_stdout_if_success)

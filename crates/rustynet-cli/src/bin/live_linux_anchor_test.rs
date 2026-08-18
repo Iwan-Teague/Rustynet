@@ -1366,7 +1366,7 @@ fn validate_anchor_enrollment_endpoint(
         let pre_status = run_argv_capture_stdout(
             shell,
             &[
-                "rustynet",
+                REMOTE_RUSTYNET_BIN,
                 "membership",
                 "status",
                 "--snapshot",
@@ -1397,7 +1397,7 @@ fn validate_anchor_enrollment_endpoint(
         let token = run_argv_capture_stdout(
             shell,
             &[
-                "rustynet",
+                REMOTE_RUSTYNET_BIN,
                 "enrollment",
                 "mint",
                 "--secret",
@@ -1413,7 +1413,7 @@ fn validate_anchor_enrollment_endpoint(
         let wrong_secret_verify = shell
             .run_argv(
                 &[
-                    "rustynet",
+                    REMOTE_RUSTYNET_BIN,
                     "enrollment",
                     "verify",
                     "--secret",
@@ -1435,7 +1435,7 @@ fn validate_anchor_enrollment_endpoint(
         let bogus_verify = shell
             .run_argv(
                 &[
-                    "rustynet",
+                    REMOTE_RUSTYNET_BIN,
                     "enrollment",
                     "verify",
                     "--secret",
@@ -1460,7 +1460,7 @@ fn validate_anchor_enrollment_endpoint(
         let wrong_token_admit = shell
             .run_argv(
                 &[
-                    "rustynet",
+                    REMOTE_RUSTYNET_BIN,
                     "enrollment",
                     "admit",
                     "--token",
@@ -1504,7 +1504,7 @@ fn validate_anchor_enrollment_endpoint(
         let bad_approver_token = run_argv_capture_stdout(
             shell,
             &[
-                "rustynet",
+                REMOTE_RUSTYNET_BIN,
                 "enrollment",
                 "mint",
                 "--secret",
@@ -1520,7 +1520,7 @@ fn validate_anchor_enrollment_endpoint(
         let bad_approver_admit = shell
             .run_argv(
                 &[
-                    "rustynet",
+                    REMOTE_RUSTYNET_BIN,
                     "enrollment",
                     "admit",
                     "--token",
@@ -1563,7 +1563,7 @@ fn validate_anchor_enrollment_endpoint(
         let positive_admit = shell
             .run_argv(
                 &[
-                    "rustynet",
+                    REMOTE_RUSTYNET_BIN,
                     "enrollment",
                     "admit",
                     "--token",
@@ -1610,7 +1610,7 @@ fn validate_anchor_enrollment_endpoint(
         let post_status = run_argv_capture_stdout(
             shell,
             &[
-                "rustynet",
+                REMOTE_RUSTYNET_BIN,
                 "membership",
                 "status",
                 "--snapshot",
