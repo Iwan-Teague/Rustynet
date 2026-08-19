@@ -3494,6 +3494,31 @@ mod tests {
         .expect("ip -6 route show table 51820 schema should be accepted");
     }
 
+    // QH-60: the anchoring check in apply_fail_closed_management_bypass_routes
+    // observes egress addresses through the helper; the scripted-helper test
+    // harness bypasses this validator, so this pin is what fails if the arm is
+    // deleted (the daemon would then fail closed on every full-tunnel apply).
+    #[test]
+    fn validate_request_accepts_egress_addr_show_schema_for_anchoring() {
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["-4", "-o", "addr", "show", "dev", "enp0s9"],
+        )
+        .expect("ip -4 -o addr show dev <iface> schema should be accepted");
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["-6", "-o", "addr", "show", "dev", "enp0s9"],
+        )
+        .expect("ip -6 -o addr show dev <iface> schema should be accepted");
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["-4", "-o", "addr", "show", "dev", "bad name"],
+        )
+        .expect_err("non-interface token must be rejected");
+        validate_request(PrivilegedCommandProgram::Ip, &["-4", "-o", "addr", "show"])
+            .expect_err("addr show without an explicit dev pin must be rejected");
+    }
+
     #[test]
     fn validate_request_accepts_linux_userspace_shared_tuntap_schema() {
         validate_request(
