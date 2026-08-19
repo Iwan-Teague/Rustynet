@@ -2355,6 +2355,10 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
         }
         ["-4", "route", "show", "table", "51820"] => Ok(()),
         ["-6", "route", "show", "table", "51820"] => Ok(()),
+        // QH-60: read-only egress address observation for the management
+        // bypass anchoring check.
+        ["-4", "-o", "addr", "show", "dev", interface] if is_interface_name(interface) => Ok(()),
+        ["-6", "-o", "addr", "show", "dev", interface] if is_interface_name(interface) => Ok(()),
         [
             "-6",
             "route",

@@ -140,6 +140,15 @@ impl BootSshCidr {
                 "ip6"
             }
         };
+        // QH-60: the boot check and the daemon consume the SAME env value,
+        // but this parser used to accept shapes the daemon's ManagementCidr
+        // refuses — including 0.0.0.0/0. That split-brain installed an
+        // unrestricted port-22 boot rule and THEN the daemon exited
+        // InvalidConfig, leaving the broad rule live. Funnel through the
+        // same bounded-operator-range validator so the two parsers cannot
+        // drift apart.
+        crate::macos_pf_mesh_cidr::validate_mesh_egress_source_cidr(s)
+            .map_err(|err| format!("boot ssh allow CIDR rejected: {err}"))?;
         Ok(Self {
             family,
             cidr: s.to_owned(),
@@ -697,6 +706,34 @@ fn collect_linux_killswitch_boot_report_inner(iface_name: &str) -> LinuxKillswit
 
 #[cfg(test)]
 mod tests {
+    /// QH-60 drift pin: the boot parser must reject exactly the shapes the
+    /// daemon's ManagementCidr rejects — the two consume the SAME env value,
+    /// and their earlier drift let a 0.0.0.0/0 install an unrestricted
+    /// port-22 boot rule while the daemon exited InvalidConfig.
+    #[test]
+    fn boot_ssh_cidr_rejects_what_management_cidr_rejects() {
+        for banned in ["0.0.0.0/0", "::/0", "8.8.8.0/24"] {
+            assert!(
+                super::BootSshCidr::parse(banned).is_err(),
+                "boot parser must reject {banned}"
+            );
+        }
+        for allowed in ["192.168.64.0/24", "10.0.0.0/8", "fd00::/8", "100.64.0.0/10"] {
+            assert!(
+                super::BootSshCidr::parse(allowed).is_ok(),
+                "boot parser must keep accepting {allowed}"
+            );
+        }
+        // Source pin: the alignment must stay routed through the shared
+        // validator, not a reimplementation that can drift again.
+        let source = include_str!("linux_killswitch_boot.rs");
+        let needle = format!("validate_mesh_egress_source_{}", "cidr");
+        assert!(
+            source.contains(needle.as_str()),
+            "BootSshCidr::parse must call the shared containment validator"
+        );
+    }
+
     use super::*;
 
     fn ok_snapshot() -> LinuxKillswitchBootSnapshot {

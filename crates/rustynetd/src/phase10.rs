@@ -524,6 +524,14 @@ impl From<SystemError> for Phase10Error {
 pub trait DataplaneSystem {
     fn set_generation(&mut self, _generation: u64) {}
     fn set_relay_forwarding(&mut self, _enabled: bool) {}
+    /// QH-60 apply-scoped context: whether THIS generation engages
+    /// full-tunnel policy routing (the `ip rule … table 51820` lookup). The
+    /// management-bypass anchoring check refuses a dead carve-out only when
+    /// that rule will actually be installed. Deliberately NOT defaulted: the
+    /// production `RuntimeSystem` dispatches arm-by-arm, and a defaulted
+    /// no-op would let a missing arm silently pin `engaged=false` — the
+    /// check would then never refuse, which is the fail-open direction.
+    fn set_full_tunnel_engaged(&mut self, engaged: bool);
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         Ok(())
     }
@@ -657,6 +665,11 @@ impl DataplaneSystem for DryRunSystem {
             .push(format!("set_relay_forwarding:{enabled}"));
     }
 
+    fn set_full_tunnel_engaged(&mut self, engaged: bool) {
+        self.operations
+            .push(format!("set_full_tunnel_engaged:{engaged}"));
+    }
+
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         self.step("prune_owned_tables")
     }
@@ -764,6 +777,66 @@ impl DataplaneSystem for DryRunSystem {
     }
 }
 
+/// Parse `ip -4 -o addr show dev <if>` output into connected
+/// (address, prefix) pairs. Token-scanned: the `inet` keyword is located by
+/// value, never by fixed column (QH-60 verification matrix).
+fn parse_connected_v4_prefixes(stdout: &str) -> Vec<(std::net::Ipv4Addr, u8)> {
+    let mut connected = Vec::new();
+    for line in stdout.lines() {
+        let mut tokens = line.split_whitespace();
+        while let Some(token) = tokens.next() {
+            if token != "inet" {
+                continue;
+            }
+            let Some(cidr) = tokens.next() else { break };
+            let Some((addr_raw, prefix_raw)) = cidr.split_once('/') else {
+                break;
+            };
+            if let (Ok(addr), Ok(prefix)) = (
+                addr_raw.parse::<std::net::Ipv4Addr>(),
+                prefix_raw.parse::<u8>(),
+            ) && prefix <= 32
+            {
+                connected.push((addr, prefix));
+            }
+            break;
+        }
+    }
+    connected
+}
+
+/// True iff two IPv4 CIDRs share any address: their network bits agree under
+/// the SHORTER prefix.
+fn v4_cidrs_overlap(
+    a: std::net::Ipv4Addr,
+    a_prefix: u8,
+    b: std::net::Ipv4Addr,
+    b_prefix: u8,
+) -> bool {
+    let shared = a_prefix.min(b_prefix).min(32);
+    if shared == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - u32::from(shared));
+    (u32::from(a) & mask) == (u32::from(b) & mask)
+}
+
+fn join_management_cidrs(cidrs: &[ManagementCidr]) -> String {
+    cidrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn join_connected_prefixes(connected: &[(std::net::Ipv4Addr, u8)]) -> String {
+    connected
+        .iter()
+        .map(|(addr, prefix)| format!("{addr}/{prefix}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxCommandSystem {
     interface_name: String,
@@ -778,6 +851,8 @@ pub struct LinuxCommandSystem {
     prior_ipv4_forwarding: Option<bool>,
     prior_ipv6_disabled: Option<bool>,
     allow_tunnel_relay_forward: bool,
+    /// QH-60 apply-scoped context; set by the controller before the stages.
+    full_tunnel_engaged: bool,
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
     wg_listen_port: u16,
     /// Port the rustynet resolver binds on loopback (default 53535). The
@@ -847,6 +922,7 @@ impl LinuxCommandSystem {
             prior_ipv4_forwarding: None,
             prior_ipv6_disabled: None,
             allow_tunnel_relay_forward: false,
+            full_tunnel_engaged: false,
             traversal_bootstrap_allow_endpoints: Vec::new(),
             wg_listen_port: 0,
             dns_resolver_port: 0,
@@ -1101,11 +1177,112 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
+    /// QH-60: the management bypass is structurally on-link — the route is
+    /// `ip route replace <cidr> dev <egress> table 51820` with no `via` — so
+    /// a CIDR set overlapping no connected prefix on the egress interface
+    /// describes a carve-out that cannot deliver replies. Engaging
+    /// full-tunnel policy routing with a provably dead carve-out black-holes
+    /// management (the QH-57 wedge). Refuse the apply instead, BEFORE the
+    /// `ip rule … table 51820` engagement: the node stays reachable and the
+    /// reconcile loop retries, so a DHCP race self-heals and the transient
+    /// restricted state clears on the first successful apply.
+    ///
+    /// The quorum is IPv4-only while IPv6 parity is unsupported: each
+    /// generation hard-disables IPv6 AFTER the routes stage, so a v6 quorum
+    /// would pass on the first apply and refuse forever after. Under any
+    /// exit mode other than FullTunnel the rule-51820 lookup is never
+    /// installed, a wrong list is inert, and refusal would brick mesh-join
+    /// for exit-less nodes — warn and install instead.
+    fn ensure_management_bypass_anchored(&mut self) -> Result<(), SystemError> {
+        let output = self
+            .run_capture(
+                PrivilegedCommandProgram::Ip,
+                &[
+                    "-4",
+                    "-o",
+                    "addr",
+                    "show",
+                    "dev",
+                    self.egress_interface.as_str(),
+                ],
+            )
+            .map_err(|err| {
+                SystemError::RouteApplyFailed(format!(
+                    "management bypass anchoring: egress address observation failed on {} \
+                     (fail closed; recoverable, the reconcile loop will retry): {err}",
+                    self.egress_interface
+                ))
+            })?;
+        if !output.success() {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "management bypass anchoring: egress address observation exited {} on {} \
+                 (fail closed; recoverable, the reconcile loop will retry): {}",
+                output.status,
+                self.egress_interface,
+                output.stderr.trim()
+            )));
+        }
+        let connected = parse_connected_v4_prefixes(output.stdout.as_str());
+        let mut anchored_any = false;
+        let mut unanchored: Vec<String> = Vec::new();
+        for cidr in &self.fail_closed_ssh_allow_cidrs {
+            match cidr.address {
+                IpAddr::V4(v4) => {
+                    let hit = connected
+                        .iter()
+                        .any(|(net, prefix)| v4_cidrs_overlap(v4, cidr.prefix, *net, *prefix));
+                    if hit {
+                        anchored_any = true;
+                    } else {
+                        unanchored.push(cidr.to_string());
+                    }
+                }
+                IpAddr::V6(_) => {
+                    eprintln!(
+                        "rustynetd: management CIDR {cidr} is IPv6 and excluded from the \
+                         bypass anchoring quorum while IPv6 parity is unsupported"
+                    );
+                }
+            }
+        }
+        if anchored_any {
+            for cidr in &unanchored {
+                eprintln!(
+                    "rustynetd: management CIDR {cidr} overlaps no connected prefix on {} — \
+                     its on-link bypass route cannot deliver to that range",
+                    self.egress_interface
+                );
+            }
+            return Ok(());
+        }
+        if !self.full_tunnel_engaged {
+            eprintln!(
+                "rustynetd: no management CIDR overlaps a connected prefix on {} \
+                 (configured: [{}]; connected: [{}]); inert without full-tunnel, but a \
+                 full-tunnel apply would refuse this carve-out (QH-60)",
+                self.egress_interface,
+                join_management_cidrs(&self.fail_closed_ssh_allow_cidrs),
+                join_connected_prefixes(&connected),
+            );
+            return Ok(());
+        }
+        Err(SystemError::RouteApplyFailed(format!(
+            "no management CIDR overlaps a connected prefix on {} (configured: [{}]; \
+             connected: [{}]); engaging full-tunnel policy routing would black-hole \
+             management, refusing before the table-51820 rule engages (QH-60; \
+             recoverable, the reconcile loop will retry)",
+            self.egress_interface,
+            join_management_cidrs(&self.fail_closed_ssh_allow_cidrs),
+            join_connected_prefixes(&connected),
+        )))
+    }
+
     fn apply_fail_closed_management_bypass_routes(&mut self) -> Result<(), SystemError> {
         self.expected_management_bypass_routes.clear();
         if !self.fail_closed_ssh_allow {
             return Ok(());
         }
+        self.ensure_management_bypass_anchored()?;
         for cidr in &self.fail_closed_ssh_allow_cidrs {
             // Management SSH must stay on the underlay interface. Resolving the
             // current FIB here can return the tunnel once exit-mode policy
@@ -2126,6 +2303,10 @@ impl DataplaneSystem for LinuxCommandSystem {
 
     fn set_relay_forwarding(&mut self, enabled: bool) {
         self.allow_tunnel_relay_forward = enabled;
+    }
+
+    fn set_full_tunnel_engaged(&mut self, engaged: bool) {
+        self.full_tunnel_engaged = engaged;
     }
 
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
@@ -3435,6 +3616,11 @@ impl DataplaneSystem for MacosCommandSystem {
         Ok(())
     }
 
+    fn set_full_tunnel_engaged(&mut self, _engaged: bool) {
+        // The QH-60 wedge is policy-routing-shaped; macOS management
+        // survival rides pf rules, not table-51820 routes. No context needed.
+    }
+
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         for anchor in self.list_owned_anchors()? {
             self.run_allow_failure(
@@ -4426,6 +4612,11 @@ impl DataplaneSystem for WindowsCommandSystem {
         Ok(())
     }
 
+    fn set_full_tunnel_engaged(&mut self, _engaged: bool) {
+        // The QH-60 wedge is policy-routing-shaped; Windows management
+        // survival rides WFP/netsh rules, not table-51820 routes.
+    }
+
     fn reconcile_exit_nat_residue(&mut self, serving_exit: bool) -> Result<(), SystemError> {
         // §10.7: a node that crashed while serving as a Windows exit and restarts
         // as a client must self-heal the fixed-name `New-NetNat` instance and the
@@ -4955,6 +5146,15 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn set_full_tunnel_engaged(&mut self, engaged: bool) {
+        match self {
+            RuntimeSystem::DryRun(system) => system.set_full_tunnel_engaged(engaged),
+            RuntimeSystem::Linux(system) => system.set_full_tunnel_engaged(engaged),
+            RuntimeSystem::Macos(system) => system.set_full_tunnel_engaged(engaged),
+            RuntimeSystem::Windows(system) => system.set_full_tunnel_engaged(engaged),
+        }
+    }
+
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.prune_owned_tables(),
@@ -5349,6 +5549,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         let relay_with_upstream =
             options.exit_mode == ExitMode::FullTunnel && options.serve_exit_node;
         self.system.set_relay_forwarding(relay_with_upstream);
+        self.system
+            .set_full_tunnel_engaged(options.exit_mode == ExitMode::FullTunnel);
         if let Err(err) = self.system.apply_firewall_killswitch() {
             // Pre-start killswitch application failed: fail closed FIRST (and
             // propagate if even that fails), then surface the original error.
@@ -9608,6 +9810,19 @@ mod tests {
              hairpin forward rule is never emitted"
         );
 
+        // QH-60: the apply must communicate the full-tunnel decision to the
+        // system before the stages run, or the anchoring check can never
+        // refuse. Presence of the op with the right VALUE is the wiring
+        // proof; the Linux behavioural tests prove what the value does.
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "set_full_tunnel_engaged:true"),
+            "a FullTunnel apply must engage the anchoring context"
+        );
+
         // QH-53 ordering: the firewalld admit stage must run after the
         // killswitch (backend start sits between them — it is not a system op,
         // so the source pin carries that half) and before the serving stages.
@@ -9866,6 +10081,272 @@ mod tests {
         );
         let system = firewalld_client_system(socket_path, interface);
         (commands, stop, helper_thread, system)
+    }
+
+    // ── QH-60: management-bypass anchoring ──────────────────────────────
+    #[test]
+    fn v4_cidr_overlap_matrix() {
+        use std::net::Ipv4Addr;
+        let ip = |s: &str| s.parse::<Ipv4Addr>().expect("ipv4");
+        // /32 inside a connected /24 — the admin-workstation pin — overlaps.
+        assert!(super::v4_cidrs_overlap(
+            ip("192.168.64.5"),
+            32,
+            ip("192.168.64.20"),
+            24
+        ));
+        // Disjoint /24s (the QH-57 wedge) do not.
+        assert!(!super::v4_cidrs_overlap(
+            ip("192.168.18.0"),
+            24,
+            ip("192.168.64.20"),
+            24
+        ));
+        // A /0 overlaps everything.
+        assert!(super::v4_cidrs_overlap(
+            ip("0.0.0.0"),
+            0,
+            ip("10.1.2.3"),
+            24
+        ));
+        // Identical prefixes overlap.
+        assert!(super::v4_cidrs_overlap(
+            ip("10.0.7.0"),
+            24,
+            ip("10.0.7.9"),
+            24
+        ));
+        // Adjacent /25 halves of one /24 do not.
+        assert!(!super::v4_cidrs_overlap(
+            ip("10.0.7.0"),
+            25,
+            ip("10.0.7.128"),
+            25
+        ));
+    }
+
+    #[test]
+    fn parse_connected_v4_prefixes_reads_inet_tokens_not_columns() {
+        let out = "2: enp0s9    inet 192.168.64.20/24 brd 192.168.64.255 scope global dynamic enp0s9\n\
+                   2: enp0s9    inet6 fe80::1/64 scope link\n\
+                   3: enp0s9    inet 10.0.7.9/16 scope global secondary enp0s9:0\n\
+                   garbage line without keyword\n";
+        let parsed = super::parse_connected_v4_prefixes(out);
+        assert_eq!(
+            parsed,
+            vec![
+                ("192.168.64.20".parse().expect("ip"), 24),
+                ("10.0.7.9".parse().expect("ip"), 16),
+            ]
+        );
+        assert!(super::parse_connected_v4_prefixes("").is_empty());
+    }
+
+    /// Scripted system for the anchoring tests: fail-closed SSH allow is ON
+    /// with the given CIDRs, and the egress address observation answers with
+    /// the given `ip -o addr show` output.
+    #[cfg(target_os = "linux")]
+    fn anchoring_system(
+        socket_path: &Path,
+        cidrs: &[&str],
+        engaged: bool,
+        addr_show_stdout: &str,
+        addr_show_status: i32,
+    ) -> (
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        LinuxCommandSystem,
+    ) {
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            socket_path,
+            vec![(
+                "addr show".to_owned(),
+                PrivilegedCommandOutput {
+                    status: addr_show_status,
+                    stdout: addr_show_stdout.to_owned(),
+                    stderr: if addr_show_status == 0 {
+                        String::new()
+                    } else {
+                        "scripted observation failure".to_owned()
+                    },
+                },
+            )],
+        );
+        let client =
+            PrivilegedCommandClient::new(socket_path.to_path_buf(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+        let parsed = cidrs
+            .iter()
+            .map(|c| c.parse::<ManagementCidr>().expect("management cidr"))
+            .collect::<Vec<_>>();
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            true,
+            parsed,
+        )
+        .expect("linux command system should initialize");
+        DataplaneSystem::set_generation(&mut system, 1);
+        DataplaneSystem::set_full_tunnel_engaged(&mut system, engaged);
+        (commands, stop, helper_thread, system)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_anchoring_case(
+        prefix: &str,
+        cidrs: &[&str],
+        engaged: bool,
+        stdout: &str,
+        status: i32,
+    ) -> (Result<(), SystemError>, Vec<String>) {
+        let socket_path = phase10_test_socket_path(prefix);
+        let (commands, stop, helper_thread, mut system) =
+            anchoring_system(&socket_path, cidrs, engaged, stdout, status);
+        let result = DataplaneSystem::apply_routes(&mut system, &[]);
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        let log = commands.lock().expect("command log should lock").clone();
+        (result, log)
+    }
+
+    #[cfg(target_os = "linux")]
+    const QH60_CONNECTED: &str =
+        "2: enp0s9    inet 192.168.64.20/24 brd 192.168.64.255 scope global dynamic enp0s9\n";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_tunnel_apply_refuses_unanchored_management_cidrs() {
+        // The QH-57 byte-for-byte scenario: configured 192.168.18.0/24, live
+        // LAN 192.168.64.0/24, full-tunnel engaging.
+        let (result, log) =
+            run_anchoring_case("q60a", &["192.168.18.0/24"], true, QH60_CONNECTED, 0);
+        match result {
+            Err(SystemError::RouteApplyFailed(message)) => {
+                assert!(message.contains("QH-60"), "{message}");
+                assert!(message.contains("192.168.18.0/24"), "{message}");
+                assert!(message.contains("192.168.64.20/24"), "{message}");
+                assert!(message.contains("recoverable"), "{message}");
+            }
+            other => panic!("unanchored full-tunnel apply must refuse: {other:?}"),
+        }
+        assert!(
+            !log.iter()
+                .any(|cmd| cmd.contains("route replace 192.168.18.0/24")),
+            "no bypass route may install after refusal: {log:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_tunnel_apply_accepts_anchored_management_cidrs() {
+        let (result, log) =
+            run_anchoring_case("q60b", &["192.168.64.0/24"], true, QH60_CONNECTED, 0);
+        result.expect("anchored full-tunnel apply should succeed");
+        assert!(
+            log.iter()
+                .any(|cmd| cmd.contains("route replace 192.168.64.0/24")),
+            "the bypass route must install: {log:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn admin_workstation_slash32_inside_connected_prefix_anchors() {
+        // The review's blocking case: a /32 pin inside the on-link /24
+        // contains no local address but overlaps the connected prefix.
+        let (result, _log) =
+            run_anchoring_case("q60c", &["192.168.64.5/32"], true, QH60_CONNECTED, 0);
+        result.expect("a /32 inside the connected prefix must anchor");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_mode_unanchored_warns_and_installs() {
+        // Without full-tunnel the rule-51820 lookup never engages; a wrong
+        // list is inert and refusal would brick mesh-join for exit-less
+        // nodes. Mutation target: removing the full_tunnel gate makes this
+        // test fail.
+        let (result, log) =
+            run_anchoring_case("q60d", &["192.168.18.0/24"], false, QH60_CONNECTED, 0);
+        result.expect("off-mode apply must warn, not refuse");
+        assert!(
+            log.iter()
+                .any(|cmd| cmd.contains("route replace 192.168.18.0/24")),
+            "off-mode still installs the (inert) route: {log:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partial_anchor_installs_all_routes() {
+        let (result, log) = run_anchoring_case(
+            "q60e",
+            &["192.168.18.0/24", "192.168.64.0/24"],
+            true,
+            QH60_CONNECTED,
+            0,
+        );
+        result.expect("a partially anchored list should succeed");
+        assert!(
+            log.iter()
+                .any(|cmd| cmd.contains("route replace 192.168.18.0/24"))
+        );
+        assert!(
+            log.iter()
+                .any(|cmd| cmd.contains("route replace 192.168.64.0/24"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_address_output_classifies_as_unanchored_not_observation_error() {
+        // The DHCP race: device up, no address yet — exit 0, empty stdout.
+        let (result, _log) = run_anchoring_case("q60f", &["192.168.64.0/24"], true, "", 0);
+        match result {
+            Err(SystemError::RouteApplyFailed(message)) => {
+                assert!(
+                    message.contains("connected: []"),
+                    "must land in the no-anchor arm naming zero addresses: {message}"
+                );
+                assert!(
+                    !message.contains("observation"),
+                    "must not be classified as an observation failure: {message}"
+                );
+            }
+            other => panic!("empty address output under full-tunnel must refuse: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observation_error_fails_closed() {
+        let (result, _log) = run_anchoring_case("q60g", &["192.168.64.0/24"], true, "", 1);
+        match result {
+            Err(SystemError::RouteApplyFailed(message)) => {
+                assert!(message.contains("observation"), "{message}");
+            }
+            other => panic!("a failed observation must refuse the apply: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v6_only_management_list_refuses_under_full_tunnel() {
+        // v6 entries are excluded from the quorum while IPv6 parity is off
+        // (the generation strips v6 addresses after the routes stage), so an
+        // all-v6 list has an empty quorum and cannot anchor.
+        let (result, _log) =
+            run_anchoring_case("q60h", &["fd12:3456::/32"], true, QH60_CONNECTED, 0);
+        assert!(
+            matches!(result, Err(SystemError::RouteApplyFailed(_))),
+            "an all-IPv6 management list must refuse under full-tunnel: {result:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
