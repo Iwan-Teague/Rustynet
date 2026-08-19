@@ -3873,6 +3873,49 @@ Security-design change: refusing a config narrows management access (fail-closed
 but the refusal semantics on nodes with legitimately off-link management (cross-network
 topologies!) need the full plan + adversarial review cycle before any code.
 
+**QH-60 CLOSED (2026-08-19).** Full plan + adversarial review cycle completed (design doc in
+session scratchpad; three-lens investigation + review with two blocking amendments applied).
+Shape landed: an apply-time anchoring check in `apply_fail_closed_management_bypass_routes`
+(phase10.rs `ensure_management_bypass_anchored`), not a `FromStr` change — the parser stays
+pure and the check runs where the environment-dependent fact lives. A management CIDR is
+ANCHORED iff it overlaps a connected IPv4 prefix on the egress interface (overlap, not
+contains-an-address, so a /32 admin-workstation pin inside the on-link /24 anchors); observed
+via the privileged helper (`ip -4 -o addr show dev <egress>`, two new read-only argv arms with
+the interface-name guard). If no CIDR anchors AND the apply's exit mode is FullTunnel (plumbed
+via a new non-defaulted `set_full_tunnel_engaged` trait method, DryRun-asserted), the apply
+refuses BEFORE the table-51820 rule engages — QH-57's byte-for-byte scenario becomes a loud,
+recoverable red (the reconcile loop retries) instead of a self-cut SSH. Under Off, unanchored
+entries warn and install (refusal would brick mesh-join for exit-less nodes). IPv6 entries are
+excluded from the quorum while IPv6 parity is off; an all-v6 list refuses under full-tunnel.
+Observation failure (spawn error or non-zero exit) fails closed. Same change-set: the boot
+parser `BootSshCidr::parse` now applies `validate_mesh_egress_source_cidr`, closing the /0
+split-brain where the boot rule installed an unrestricted port-22 accept and the daemon then
+exited InvalidConfig leaving it live; a drift pin asserts the boot parser rejects what the
+daemon parser rejects. Evidence: commits `70e22434` + `3aca4c16`; 28 targeted tests green on
+Linux (debian-headless-4) and all macOS-runnable ones locally; full `rustynetd` suite 2053/2053
+on Linux, 2260/0 locally (`--all-targets --all-features`); clippy `-D warnings` clean. Mutation
+matrix all CAUGHT (7/7): delete the check call, neuter the overlap predicate, remove the
+FullTunnel gate, swallow the observation error (each fails its Linux test); drop the controller
+plumbing (DryRun wiring assertion fails), delete the argv arms (validator pin fails — added
+because the scripted-helper harness bypasses `validate_ip_args`), drop the boot alignment
+(drift pin fails). The cross-network off-link concern from the original entry dissolved under
+investigation: the bypass route is emitted dev-only (no `via`), so gateway-routed management
+never worked through this mechanism, and the cross-network shared list always contains each
+node's own /24 — refusal costs no working topology. macOS/Windows have no equivalent wedge
+(management survival rides pf/WFP rules, not policy routes) — documented, not implemented.
+Live proof rides the next green-lit run: every full-tunnel node exercises the check on each
+generation apply. Follow-up filed as [[QH-62]] (Windows installer drops `-SshAllowCidrs`).
+
+### QH-62 — Windows installer validates then discards `-SshAllowCidrs`
+
+Found by the QH-60 investigation (lens B claim 2): the Windows installer declares and
+validates an `-SshAllowCidrs` parameter, then never threads it into the installed service
+environment — the operator's input is silently discarded. Windows management survival rides
+WFP rules rather than the Linux policy-routing bypass, so this is not a QH-57-shaped wedge,
+but a validated-then-dropped operator input is a defect regardless: either thread it to the
+WFP management allow (parity with the Linux env pair) or remove the parameter and document
+why. Needs the Windows installer + `rustynet-windows-native` WFP surface read before choosing.
+
 ### QH-61 — bare `rustynet` argv heads die under sudo on RHEL-family guests
 
 Run `qh57-lantoggle-20260816a` (the QH-57 live proof: client survived role enforcement with SSH
