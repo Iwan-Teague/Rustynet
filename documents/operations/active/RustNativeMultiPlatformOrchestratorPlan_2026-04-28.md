@@ -17,6 +17,18 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 > unless it maps to a qualifying matrix row. W5.6 default flip and W5.7 bash
 > removal remain blocked.
 
+> **Routing correction (2026-08-17; code + focused-test grounded):** W5.6's
+> *narrow* default flip shipped in `aeb7c68f`. When a command carries only the
+> legacy Linux role flags, has no explicit `--node`, no platform selector,
+> topology profile, macOS/Windows node option, or bash lock, the dispatcher
+> translates the roles to `--node` assignments and uses the Rust engine. Explicit
+> `--node` and `--run-only` also use it. Topology-profile, platform-selector, and
+> macOS/Windows legacy shapes remain on bash because native fidelity is not yet
+> established; `--legacy-bash-orchestrator` remains the rollback lever. This is
+> routing behavior, **not** parity or live-proof evidence. Re-checked at
+> `dea73a75`: all eight `w56_flip_*` unit tests pass under `cargo test -p
+> rustynet-cli --lib --features vm-lab --locked w56_flip_`.
+
 > **Topology contract (operator decision, 2026-07-10):** Rustynet is a
 > full-mesh product. Every enrolled node must be able to communicate directly
 > with every other enrolled node when signed default-deny policy grants that
