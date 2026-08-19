@@ -41,17 +41,20 @@ network experiment. Preserve fail-closed behavior if any proposal cannot meet it
 | One D3 UDP owner is correct but rollover is hidden | Expose process-local incarnation and explicit lifecycle state | API compatibility for command/Windows backends; status consumers | Linux/macOS same-port rollover, coherent one-snapshot status |
 | Generic recovery replays relay hello | Failure latch + daemon-only recovery; return `WorkerUnavailable` / indeterminate | Whether a smaller error taxonomy can retain all causal detail | Held-ACK + worker-death test; no duplicate hello |
 | Path query can hide rollover | Latch every runtime-dispatch call; coordinator runs before later traversal I/O | Complete audit of controller/daemon call sites | Query-fault test: no I0 keepalive/candidate publication |
-| I0 relay endpoint is replayed into I1 | Split baseline peer config from traversal endpoint overlay | Exact Phase10/backend API split; safe disabled posture where no direct endpoint exists | I1 timer/handshake never targets stale allocated relay port |
-| Recovery bypasses endpoint-route/attestation path | Paused peer-egress recovery barrier before route/exit-policy attest | QH-48/QH-46 ordering, full-tunnel behavior, failure rollback | No I1 peer/relay/STUN egress before attest; route failure remains quiesced |
-| Send success is mistaken for relay liveness | Track local send, probe reachability, trusted handshake separately | Exact trusted-handshake evidence capture and policy freshness bounds | Relay restart + spoofed ACK cannot promote trusted live |
+| I0 relay endpoint is replayed into I1 | Split immutable validated baseline from traversal endpoint overlay | Exact Phase10/backend API split; safe disabled posture where no direct endpoint exists | I1 timer/handshake never targets stale allocated relay port |
+| Peer activation/switch can precede correct endpoint policy | Common staged activation transaction for initial apply, endpoint change, recovery | Pre-authorisation/rollback semantics per OS; interaction with worker-loss latch | New endpoint never egresses before its bypass/PF policy; failure never leaves divergent backend/system state |
+| Recovery bypasses endpoint-route/attestation path | Whole-runtime quiesced recovery barrier before route/exit-policy attest | QH-48/QH-46 ordering, full-tunnel behavior, failure rollback | No I1 peer/relay/STUN ingress-processing or egress before attest; route failure remains quiesced |
+| Send success is mistaken for relay liveness | Track local send, probe reachability, authenticated peer reachability separately | Exact semantic handshake capture and relay-control-authentication design | Relay restart + spoofed ACK cannot promote peer reachability/control confirmation |
+| Handshake timestamp is cached, approximate telemetry | Semantic session-established event with monotonic overlay/session-bound epoch | Wrapper predicate vs upstream BoringTun event; all result variants | Cookie/data/error/old-port traffic never refreshes attested selected-path reachability |
 | Generic round trip cannot touch peer endpoint | Narrow typed V2 mux with full expected-ACK comparison | API shape that remains backend-owned and cannot become arbitrary interception callback | Interleaved ciphertext/wrong ACK reaches WireGuard engine |
 | V2 probe could first-bind a session tuple | Probe accepts only already-bound exact tuple | Separate security design for existing ciphertext first-bind rule | Attacker probe race cannot bind allocation |
 | Hello ACK has no request correlation | V2 ACK echoes token nonce | Whether signed relay ACK is worth a later protocol version | Delayed ACK N cannot complete attempt N+1 |
-| Probe ACK is forgeable after nonce observation | Label it unauthenticated reachability only | Authenticated relay-control response options; threat model for on-path actors | Only endpoint-bound authenticated I1 handshake promotes trusted live |
-| One runtime round-trip slot | Shared scheduler/permit; typed pre-admission `Busy` | Permit lifetime/API ergonomics; scheduling priorities under load | Busy sends nothing, deletes no token, counts no miss |
+| Probe ACK is forgeable after nonce observation | Label it unauthenticated reachability only | Authenticated relay-control response options; threat model for on-path actors | Only current-overlay endpoint-bound I1 handshake promotes selected-path peer reachability |
+| Relay has no signing identity for control ACKs | Defer control-session confirmation; retain separate evidence labels | Dedicated key distribution/rotation/cost design, if product needs claim | No policy treats unsigned ACK or peer handshake as relay-control proof |
+| One runtime round-trip slot | Incarnation-scoped scheduler/permit; typed pre-admission `Busy` | Permit lifetime/cancel/recovery semantics; scheduling priorities under load | Busy sends nothing, deletes no token, counts no miss |
 | Desired replay can fail mid-recovery | Revisioned convergent baseline reconciliation | Durable vs memory-only desired revision persistence | Kill worker after Nth replay; later recovery converges |
 | Pre-issued token inventory is advisory | Claim token only after admission permit; report inventory | Durable reservation/lease only if operations truly needs guarantee | Busy/fault paths do not reuse/delete wrong artifact |
-| Fleet v1 is strict | Separate signed capabilities bundle, v1 fallback | New artifact distribution/ownership and maintenance migration | Watermark replay/rollback + old/new matrix |
+| Fleet v1 is strict | Separate signed capability + explicit signed protocol policy | Whether time-bounded legacy compatibility is permitted by requirements | Watermark replay/rollback + strict/legacy old/new matrix |
 | V2 requires shared backend mux | Gate V2 on Ready transport + backend mux capability | In-memory/test semantics and Windows/command compatibility | No `0x11`/`0x13` from unsupported backend |
 | Hello/token parser permits trailing bytes | Exact full-frame parser consumption for v1 and v2 | Canonical extension strategy if protocol later needs fields | Corpus rejects trailing/duplicate/unknown input |
 | Normal timer values are environment-dependent | Immediate rate-limited recovery only; defer normal interval change | `--node` NAT coverage, packet/battery cost, operator policy | Lab evidence; separate policy review |
@@ -124,7 +127,8 @@ survive restart. Relay can restart, client can remain I0, local send can succeed
 can look active until token refresh.
 
 Relay needs bounded reachability evidence plus endpoint-bound authenticated handshake evidence for
-trusted liveness. Local send is only a local send fact.
+selected-path peer reachability; a separate authenticated control design is needed for relay-session
+ownership. Local send is only a local send fact.
 
 ### P0 — allocated-port probe cannot use generic round trip
 
@@ -142,14 +146,14 @@ relay endpoint and `path=Relay`. Relay selection writes allocated relay port thr
 unproven relay allocation before fresh registration. Worker timers or handshake sends could then
 emit I1 traffic to the stale endpoint, defeating quarantine.
 
-Split baseline peer desired state from transient traversal endpoint overlay. Baseline contains key,
-allowed IPs, keepalive, and stable direct endpoint. Overlay contains direct/relay candidates,
-selected path, selected endpoint, and authoritative incarnation. Before reconstruction coordinator
-must clear relay overlay and stage baseline/direct endpoint in Phase10 and backend desired state
-**without runtime I/O**. Recovery replays only baseline revision. Install relay endpoint only after
-fresh I1 registration; tag it I1. Current `PeerConfig` requires endpoint, so baseline replay uses
-`ManagedPeer.direct_endpoint`, never old relay endpoint. If no safe direct baseline exists, require
-explicit disabled/quiesced backend posture; do not invent placeholder endpoint.
+Split immutable validated baseline peer desired state from transient traversal endpoint overlay.
+Baseline contains key, allowed IPs, keepalive, and only a separately validated stable direct endpoint
+when one exists. Overlay contains dynamic direct/relay candidates, selected path, selected endpoint,
+and authoritative incarnation. Before reconstruction coordinator must clear relay overlay and stage
+baseline/direct endpoint in Phase10 and backend desired state **without runtime I/O**. Recovery
+replays only baseline revision. Install relay endpoint only after fresh I1 registration; tag it I1.
+If no safe baseline endpoint exists, require explicit disabled/quiesced backend posture; do not invent
+placeholder endpoint.
 
 #### Focus exploration: baseline vs traversal-overlay split
 
@@ -166,12 +170,13 @@ endpoint is transient:
 ```text
 BaselinePeerDesiredState {
   peer_crypto_and_routes: PeerConfig minus transient endpoint,
-  baseline_direct_endpoint: Option<SocketEndpoint>,
+  validated_baseline_direct_endpoint: Option<ValidatedEndpoint>,
   desired_revision,
 }
 
 TraversalEndpointOverlay {
-  direct_candidates,
+  direct_candidates: Vec<EndpointCandidate { endpoint, trust_source, signed_bundle_fingerprint,
+                                             expiry, candidate_revision }>,
   selected_direct_endpoint,
   relay_endpoint,
   selected_path,
@@ -181,9 +186,9 @@ TraversalEndpointOverlay {
 ```
 
 `PeerConfig` can remain internally required by constructing it only at runtime-apply time. A
-baseline direct endpoint produces normal `PeerConfig`; no baseline endpoint produces a formal
-quiesced peer transport mode that retains cryptographic configuration but suppresses endpoint-driven
-timers/handshakes. Placeholder/loopback/relay endpoints are prohibited.
+validated baseline direct endpoint produces normal `PeerConfig`; no baseline endpoint produces a
+formal quiesced peer transport mode that retains cryptographic configuration but suppresses
+endpoint-driven timers/handshakes. Placeholder/loopback/relay endpoints are prohibited.
 
 Add three deliberately distinct operations, names illustrative and subject to API review:
 
@@ -191,7 +196,7 @@ Add three deliberately distinct operations, names illustrative and subject to AP
 2. `apply_traversal_overlay(...)`: applies a selected direct or I<n> relay endpoint to healthy
    runtime, then records overlay as applied.
 3. `quarantine_traversal_overlay_for_recovery(I0)`: pure mutation which removes I0 relay overlay,
-   resets current path to baseline-direct or quiesced, and invalidates route/attestation cache for
+   resets current path to validated-baseline-direct or quiesced, and invalidates route/attestation cache for
    refresh after I1 is ready.
 
 Coordinator calls (3) while backend latch blocks runtime work, then calls explicit recovery.
@@ -199,15 +204,22 @@ Recovery builds runtime only from latest baseline revision; it does not know rel
 I1 relay registration later calls (2). `Phase10Controller::reconfigure_managed_peer` cannot be
 reused for (3): it queries/updates backend and therefore violates no-runtime-I/O quarantine.
 
-**Explore before choosing exact types.** Validate whether baseline direct endpoint is genuinely
-stable across signed traversal updates, whether quiesced mode must suppress backend-native
-persistent keepalive and route bypass, and how attest/route refresh behaves while no endpoint is
-applied. Prefer a small explicit `PeerTransportMode::Quiesced` over a magic endpoint. A second
-review must compare this model with storing overlay solely in daemon and reconstructing Phase10 after
-recovery; choose the variant that preserves route fail-closed behavior with least duplicated state.
-`UserspaceEngine::configure_peer` constructs `Tunn` with configured persistent keepalive and runtime
-timer polling drives those tunnels (`engine.rs:285-377`; `runtime.rs:830-855`), so quiesced cannot
-be represented as ordinary `PeerConfig` with dummy endpoint.
+**Critical correction — `ManagedPeer.direct_endpoint` is not baseline.** Current traversal code
+mutates it whenever a supplied direct endpoint arrives, including while relay is selected
+(`phase10.rs:5992-6022`, especially `:6004-6008`). It carries no source, expiry, signed-bundle
+fingerprint, or overlay/session epoch. Therefore it is a dynamic candidate cache, not stable desired
+state; recovery must never use it as a baseline merely because it is named `direct_endpoint`.
+
+**Explore before choosing exact types.** Identify whether any endpoint meets immutable baseline
+criteria after signature/freshness validation, whether that provenance must be durable, whether
+quiesced mode must suppress backend-native persistent keepalive and route bypass, and how
+attest/route refresh behaves while no endpoint is applied. Prefer a small explicit
+`PeerTransportMode::Quiesced` over a magic endpoint. A second review must compare this model with
+storing overlay solely in daemon and reconstructing Phase10 after recovery; choose the variant that
+preserves route fail-closed behavior with least duplicated state. `UserspaceEngine::configure_peer`
+constructs `Tunn` with configured persistent keepalive and runtime timer polling drives those
+tunnels (`engine.rs:285-377`; `runtime.rs:830-855`), so quiesced cannot be represented as ordinary
+`PeerConfig` with dummy endpoint.
 
 **Additional ordering risk.** Normal Phase10 endpoint change calls backend update then
 `refresh_peer_endpoint_routes_and_attest`, which rolls routes back, applies peer-endpoint bypass
@@ -219,20 +231,85 @@ before bypass/attestation refresh completes.
 **Proposal to explore.** Add a recovery barrier. Prefer applying/attesting staged baseline endpoint
 routes while no worker exists, then construct/configure fresh runtime; this avoids a new paused-worker
 API if route policy does not require fresh socket state. If that ordering is not valid, create fresh
-runtime in paused peer-egress mode, apply/attest routes, configure baseline peers, then release
-timer/handshake egress. On system route/attestation failure, do not create runtime or stop/retain it
-quiesced and report fail-closed recovery failure. Relay/STUN work begins only after barrier success.
-This is a sequencing proposal, not permission to change firewall/route ordering without QH-48/QH-46
-invariants review.
+runtime in a **whole-runtime quiesced** mode, apply/attest routes, configure baseline peers, then
+release runtime traffic. Timer/explicit-handshake suppression alone is insufficient: UDP polling can
+accept a WireGuard initiation and `process_inbound_ciphertext` can emit a response, while TUN polling
+can call `inject_plaintext_packet` and emit ciphertext (`runtime.rs:865-905,923+`; `engine.rs:555-620`).
+Until release, do not poll peer UDP/TUN engine paths and reject/defer all authoritative STUN/relay
+control admission; configuration/reconciliation commands may run only if they cannot send. On system
+route/attestation failure, do not create runtime or stop/retain it quiesced and report fail-closed
+recovery failure. Relay/STUN work begins only after barrier success. This is a sequencing proposal,
+not permission to change firewall/route ordering without QH-48/QH-46 invariants review.
 
 **Gate.** Instrument operation order under full-tunnel and direct modes. Assert no peer ciphertext,
 persistent keepalive, relay hello, or STUN leaves I1 before baseline bypass/exit-policy attest
-succeeds; inject route-refresh failure and assert no egress plus visible quiesced state.
+succeeds. While paused, inject a WireGuard initiation and TUN plaintext: neither may call
+`RuntimeIoSink::send_ciphertext`, decrypt/forward peer traffic, or establish a control wait. Inject
+route-refresh failure and assert no egress plus visible quiesced state.
 
 **Gate.** Fault with relay selected; assert pure quarantine changes no socket traffic, I1 recovery
-configures direct/quiesced baseline only, engine timers/handshakes never use old allocated relay
-port, and fresh relay selection is I1-tagged. Repeat with absent direct endpoint and with route/
-attestation refresh failure.
+configures only independently validated baseline or quiesced state, engine timers/handshakes never
+use old allocated relay port or an un-revalidated dynamic direct candidate, and fresh relay selection
+is I1-tagged. Repeat with absent baseline endpoint, expired/cross-bundle dynamic candidate, and
+route/attestation refresh failure.
+
+### P0 — endpoint transition currently refreshes policy from stale peer state
+
+**Observed.** `Phase10Controller::reconfigure_managed_peer` builds an updated local `peer`, calls
+`backend.update_peer_endpoint(node_id, endpoint)`, then calls
+`refresh_peer_endpoint_routes_and_attest()`, which derives its peer list from the unchanged
+`self.managed_peers`; only after that does it insert the updated peer
+(`phase10.rs:6378-6412`). Thus the backend may use new endpoint **E1** while system bypass/PF
+policy is calculated from old endpoint **E0**. On macOS, this is an exact `SocketAddr` PF egress
+allow-list, so E1 can be dropped by fail-closed policy (`phase10.rs:3515-3534`). Linux/Windows
+also derive endpoint bypass routes from supplied peer endpoints (`phase10.rs:2181-2210,4487-4510`).
+
+This is not only an endpoint-change or recovery concern. Initial
+`apply_generation_stages` configures every peer in live backend before it rolls back/applies endpoint
+bypass and system routes (`phase10.rs:5509-5535`). Once the configure reply returns, worker polling
+can drive timer, inbound-UDP response, or TUN-originated ciphertext paths. A recovery-only barrier
+would leave initial apply with the same pre-policy egress window.
+
+Direct roaming and relay selection call the same endpoint helper.
+Several traversal paths make a second `reconfigure_managed_peer` call after the first update; that
+does not repair policy because the second call sees backend already at E1 and returns after merely
+storing state (`phase10.rs:5992-6022,6070-6160,6190-6250`). If route refresh/assertion fails,
+backend endpoint has already changed and `rollback_routes` may have removed prior policy. Do not
+use the current helper as recovery-barrier evidence.
+
+**Proposal — candidate-state endpoint transaction.** Replace update-then-refresh with one explicit
+operation, shared by initial apply, endpoint change, and recovery, that owns both a prospective
+`ManagedPeer` snapshot and host policy transition. Exact API and order require review, but it must
+meet these invariants:
+
+1. Validate candidate endpoint/path and construct `next_managed_peers` before backend I/O.
+2. Prepare endpoint bypass/PF policy from an explicit snapshot containing E1. During transition it
+   may need a constrained union of E0 and E1 so existing authenticated traffic does not lose its
+   bypass before backend commit; never permit an arbitrary caller-provided endpoint.
+3. Apply/attest candidate system policy before allowing backend endpoint E1 to send. Then update
+   backend endpoint and commit in-memory endpoint state as one logical generation.
+4. Prune E0 only after backend confirms E1 and post-commit policy attests. If backend update is
+   indeterminate/worker-loss, preserve enough restrictive policy to quarantine, latch recovery,
+   and avoid a speculative runtime rollback send.
+5. Any pre-commit policy error leaves backend E0 and state unchanged. Any later error exposes a
+   typed quiesced/faulted outcome; never claim route policy or path commit succeeded.
+
+This describes required properties, not a permission to pre-allow E1 or change firewall ordering.
+E1 must already have passed signed/traversal validation. A reviewer must decide whether temporary
+E0+E1 policy is acceptable under each OS's least-privilege model, or whether peer egress must be
+paused during an atomic replacement. Initial apply, endpoint updates, and recovery need this common
+transaction or a separately proven common paused mode; none may call existing configure/reconfigure
+helpers unchanged.
+
+**Gate.** Linux/macOS/Windows mock-system ordering tests assert: candidate E1 policy installation
+and `assert_exit_policy` precede the first E1-capable backend send; policy input includes E1, not
+only E0; route/PF prepare failure makes zero backend mutation; failure after backend dispatch
+latches/quarantines rather than reports path success; cleanup only removes E0 after E1 is committed.
+Add initial-apply, direct-roam, relay-selection, and recovery cases, including full-tunnel
+PF/killswitch state. Mock operation order alone is insufficient: instrument worker
+`RuntimeIoSink::send_ciphertext`/authoritative sends and show zero pre-commit engine/control egress.
+A source-inspection regression should fail if `refresh_peer_endpoint_routes_and_attest` still reads a
+map updated only after the backend endpoint mutation.
 
 ### P1 — hello ACK lacks attempt correlation
 
@@ -379,7 +456,7 @@ Required serialized flow:
    - clear relay keepalive/probe state;
    - suppress relay endpoint selection;
    - remove I0 STUN observations/candidates from publication;
-   - clear Phase10 relay overlay, reset path to baseline/direct, and stage this in backend desired
+   - clear Phase10 relay overlay, reset path to validated baseline or quiesced, and stage this in backend desired
      state without runtime I/O;
    - mark traversal transport_indeterminate;
    - send no old-session keepalive.
@@ -443,47 +520,116 @@ wire_version
 state = Establishing | Active | Suspect | Quiesced
 last_datagram_sent
 last_probe_reachability
-last_authenticated_relay_handshake
+last_authenticated_selected_endpoint_peer_event
 pending_probe { nonce, sent_at, deadline }?
 ```
 
-Probe ACK is **unauthenticated reachability**, not trusted relay liveness: an observer able to learn
-session/probe nonce can spoof valid-shaped ACK. It may schedule another probe or defer immediate
-re-registration, but cannot promote trusted/active path, satisfy fail-closed policy, or reset an
-authentication freshness deadline. `RelayTrustedLive` requires authenticated WireGuard handshake
-evidence explicitly bound to selected allocated endpoint and I1; capture source endpoint plus
-incarnation when engine authenticates handshake. A peer handshake timestamp without that endpoint
-binding is insufficient.
+Probe ACK is **unauthenticated reachability**, not relay-control confirmation or authenticated
+selected-path peer reachability: an observer able to learn session/probe nonce can spoof valid-shaped
+ACK. It may schedule another probe or defer immediate re-registration, but cannot promote a
+trusted/available path, satisfy fail-closed policy, or reset an authentication freshness deadline.
+An endpoint-bound I1 WireGuard session event can support only selected-path peer reachability;
+capture source endpoint plus incarnation when engine establishes session. A peer handshake timestamp
+without that endpoint binding is insufficient.
 
 **Observed telemetry gap.** Current engine returns only `(NodeId, unix_timestamp)` after inbound
 authentication, while runtime has `remote_addr` and `transport_generation` then discards both when
 recording handshake telemetry (`engine.rs:528-565`; `runtime.rs:865-905`; `handshake.rs:15+`).
 Current `peer_latest_handshake_unix` cannot prove selected relay endpoint or incarnation.
 
-**Proposal.** Replace timestamp-only internal event with
-`AuthenticatedHandshakeEvidence { node_id, remote_addr, transport_incarnation, observed_unix,
-direction }`. Record only after a newly authenticated **inbound** WireGuard event, invalidate on I1
-transition, and expose a read-only bounded latest-evidence query. `RelayTrustedLive` requires
-evidence whose endpoint equals selected allocated relay endpoint and whose incarnation equals I1.
+**Proposal.** Do not derive trusted evidence from `time_since_last_handshake` at all. Introduce an
+internal, process-local semantic event/epoch, illustrative shape:
 
-Do not manufacture this evidence from outbound initiation or timer work. Current
+```text
+AuthenticatedSessionEstablished {
+  node_id,
+  remote_addr,
+  transport_incarnation,
+  handshake_evidence_epoch, // monotonic, not wall-clock proof
+  observed_at: Instant,
+}
+```
+
+Current source supports a narrow predicate to investigate: pre-parse only a WireGuard
+`HandshakeInit` or `HandshakeResponse`; call BoringTun; emit event only for the successful,
+session-establishing result (currently `WriteToNetwork`). Vendored BoringTun stores a session then
+returns `WriteToNetwork` for valid init and valid response; invalid handling is `TunnResult::Err`
+(`third_party/boringtun/src/noise/mod.rs:320-369`). Do **not** use `not Err` alone. Current
+`drive_inbound_result` returns a cached `authenticated_handshake_unix` after every decapsulation
+path, including data/cookie/old session and its error path (`engine.rs:555-620,916-938`), so it is
+not a fresh-handshake event. It can re-record a historical approximate Unix second without any new
+session.
+
+Backend event carries exact remote address/incarnation; daemon validates it against its own current
+traversal overlay while serializing session replacement. It must bind promotion to selected relay
+path, exact allocated endpoint, I1 incarnation, exact `relay_session_id`, `overlay_revision`, and
+local `handshake_evidence_epoch`. Invalidate/advance overlay state before every relay-session
+replacement, endpoint/path change, close, quarantine, and I1 recovery. Incarnation plus endpoint
+alone is insufficient: an old event can otherwise be mistaken for a same-I session refresh or
+allocated-port reuse. Keep engine demux behavior intact: receiver-index responses intentionally
+route before endpoint match; a valid delayed old-port response may be processed by engine but must
+never attest current relay overlay.
+
+**Claim boundary.** An endpoint-bound WireGuard session event proves only
+`AuthenticatedPeerReachableViaSelectedEndpoint`: the configured peer authenticated over that UDP
+endpoint. It does **not** prove that a particular relay process owns/retains the current control
+allocation: session ID is not authenticated inside WireGuard traffic, and current ProbeAck/hello
+nonce echo are correlation/reachability, not relay authentication. Therefore do not call this event
+`RelayTrustedLive`. Define `RelayControlSessionConfirmed` only after a separate authenticated
+relay-control design exists (for example, relay identity-bound response reviewed under a future
+protocol version). Any policy needing both properties must require both; current V2 can report data
+plane reachability and unauthenticated probe reachability separately, never silently merge them.
+
+Do not manufacture evidence from outbound initiation/timer work. Current
 `drive_outbound_result`/`update_peer_timers` reads `time_since_last_handshake` after emitting a
 keepalive/rekey, which can repeat a prior handshake timestamp without new peer authentication
-(`engine.rs:396-475,916-938,1006-1014`). Inbound handling must detect a newly advanced authenticated
-handshake observation before committing endpoint evidence; repeated data/old timestamp must not
-refresh trusted-liveness age.
+(`engine.rs:396-475,916-938,1006-1014`).
 
-**Explore/Gate.** Verify outbound handshake/timer events can supply equally reliable endpoint
-evidence (default: they cannot), determine whether BoringTun exposes sufficiently precise
-new-handshake signal beyond seconds-granularity stats, preserve privacy in status, and never classify
-direct handshake as relay success. Inject authenticated direct/relay packets across I0/I1 plus
-keepalive/rekey without new peer reply; only fresh I1 selected-relay inbound evidence may promote
-trusted state.
+**Explore/Gate.** This wrapper-level semantic predicate needs an implementation review against all
+BoringTun result variants/version upgrades; an upstream explicit session-established event may be
+clearer. Preserve privacy in status, use monotonic age rather than wall time for in-process liveness,
+and never classify direct handshake as relay-session success. Inject successful init/response,
+cookie, data, malformed packet, keepalive/rekey, and delayed response from old allocated port across
+I0/I1 and same-I relay refresh. Only successful current-I1/current-session/current-overlay
+exact-endpoint event may promote **authenticated selected-endpoint peer reachability**; all other
+packets may retain normal engine handling but must not refresh it. Add forced same-I allocated-port
+reuse/session replacement: prior evidence cannot promote new session.
 
 Allow one pending probe/session, one synchronous probe/traversal tick, bounded deadline. Exact ACK
 records unauthenticated reachability. Wrong source/length/session/nonce or timeout does not.
 Bounded misses move `Active -> Suspect -> Quiesced` only under explicit policy; local send and probe
-ACK alone cannot assert trusted active state. Local send updates only `last_datagram_sent`.
+ACK alone cannot assert authenticated peer reachability or relay-control confirmation. Local send
+updates only `last_datagram_sent`.
+
+#### Deferred design: authenticated relay-control session confirmation
+
+**Observed.** Current relay configuration contains a control-plane **verifier** public key and no
+relay signing/identity key (`rustynet-relay/src/main.rs:140-180,423-448`). The relay uses that key to
+admit signed client tokens, then emits an unsigned hello ACK containing session ID and allocated port
+(`main.rs:680-720`). Current V2 nonce echo would improve attempt correlation only; it cannot prove
+relay identity or session ownership. Giving relay the control-plane signing key is prohibited: it
+would blur a verifier-only forwarding service into a control-plane authority.
+
+**Proposal status: defer; not a V2 prerequisite unless product policy explicitly needs this claim.**
+The safe immediate vocabulary is: `LocalSend`, `UnauthenticatedProbeReachability`, and
+`AuthenticatedPeerReachableViaSelectedEndpoint`. Do not synthesize a fourth "confirmed relay" state
+from these. Existing peer reachability may be sufficient to decide whether ciphertext is flowing;
+control-session ownership is a stronger distinct property.
+
+If a future requirement truly needs `RelayControlSessionConfirmed`, first create a dedicated design
+review covering identity provisioning, rotation/revocation, endpoint binding, key custody, DoS cost,
+and old-client policy. One candidate is a **new, separately versioned** relay identity public key
+bound to relay ID/endpoint in signed fleet/capability state, with a relay signature over a canonical
+fresh control transcript. That is only a candidate: per-probe signature cost and key distribution may
+make it unsuitable. Do not derive an HMAC/MAC from token nonce/session ID: these travel in plaintext
+and do not establish a relay-held secret. Do not add an unreviewed custom crypto construction or
+smuggle a TLS/QUIC side channel around D3 ownership.
+
+**Gate before any future implementation.** Require a threat model plus signed-key anti-rollback/
+rotation tests; exact canonical transcript and domain-separation tests; replay across session,
+endpoint, relay ID, incarnation, and probe nonce; invalid/old key and restart behavior; rate/CPU
+limits; and strict/legacy client matrix. Until then no policy may use control-session confirmation as
+an availability proof, and V2's unsigned ProbeAck stays explicitly unauthenticated.
 
 ### Narrow allocated-port control multiplexer
 
@@ -551,6 +697,38 @@ before token issue and assert no artifact deletion/no UDP send. Current single m
 makes overlap uncommon, but runtime already protects this invariant and new protocol must preserve
 it.
 
+**Permit lifecycle is part of correctness, not ergonomics.** Current runtime reserves an atomic
+slot before enqueuing (`runtime.rs:295-309,390-399`), and worker sends before waiter installation
+(`:690-745`). Pre-issued issuer removes the artifact before transport (`relay_client.rs:169-228`).
+The proposal therefore needs an explicit, incarnation-scoped ownership model, e.g.:
+
+```text
+RoundTripAdmissionPermit {
+  runtime_instance_id, transport_incarnation, permit_id,
+  acquired_at, deadline,
+  phase: Held | TokenClaimed | Submitted | Resolved | Cancelled,
+}
+```
+
+`Drop`/cancel may release only matching `(runtime_instance_id, permit_id)`, never a bare global
+boolean; a late I0 permit release must not clear I1 admission. Bound holding time and reject an
+expired unsubmitted permit so token-spool scan/validation cannot monopolize the sole slot. Submission
+uses the already-owned permit, not a second acquire. No opaque queued request survives deadline,
+cancel, or recovery.
+
+Outcomes are deliberately asymmetric:
+
+- `Busy` before claim: no artifact deletion, no this-job datagram, no liveness miss.
+- cancellation/expiry before claim: same; release matching permit.
+- worker loss after artifact claim but before known send: artifact remains permanently retired;
+  report a non-successful indeterminate/consumed operation and never reuse it.
+- worker loss after send or before ACK: protocol attempt indeterminate; same token never retries.
+- recovery replacement invalidates all I0 permits; fresh I1 scheduling starts from state, not a
+  destructor/queued I0 command.
+
+This is a proposal. Review whether a durable reservation is justified; do not pretend deletion can
+be reversed safely after an uncertain worker failure.
+
 The runtime state must represent generic and V2 control waits as variants of one
 `OutstandingRoundTripState`, not two optional fields. Daemon scheduler keeps no unbounded request
 queue. It coalesces work and selects at most one blocking request per traversal turn, in this order:
@@ -566,8 +744,25 @@ field or publish fleet-v2 in place: older daemons fail closed on sole traversal 
 
 Recommended zero-outage path: separate same-trust-root signed capabilities bundle. Canonical record
 binds exact relay ID + endpoint to bounded sorted supported wire versions plus version/generated/
-expiry/nonce/signature. New daemon requires verified v1 fleet membership and matching capability for
-V2. Missing/expired/invalid capability means V1 only. Old daemon ignores separate artifact.
+expiry/nonce/signature. This needs a separately signed protocol-policy decision; do **not** make
+missing/expired/invalid V2 capability automatically mean V1 after a V2-required path was selected.
+Requirements prohibit parallel direct/relay legacy-fallback runtime logic and require authenticated,
+fresh traversal endpoint state plus leak prevention (`documents/Requirements.md:67,202-203,239`).
+
+Proposed policy modes, subject to product/security review:
+
+- `V2Required`: requires verified v1 fleet membership, fresh matching V2 capability,
+  `AuthoritativeTransportState::Ready(I<n>)`, and narrow-mux backend support. Any missing/invalid
+  prerequisite makes relay unavailable/quiesced with operator-visible reason; no V1 datagram is
+  emitted as fallback.
+- `LegacyCompatibility`: an explicit, signed, scoped, time-bounded migration policy selected before
+  any relay attempt. It selects V1 only, records `legacy_unconfirmed`, and cannot satisfy V2
+  recovery/liveness guarantees, authenticated relay-control confirmation, or protected-mode
+  availability claims. It is not an automatic retry/downgrade from a failed V2 attempt.
+
+Whether `LegacyCompatibility` is acceptable at all needs an explicit Requirements decision; safest
+end-state is `V2Required` only. Existing old daemons may ignore a separate capability artifact, but
+they must be contained by rollout policy rather than used to justify a hidden new-client fallback.
 
 Capabilities bundle needs same persisted, digest-aware anti-rollback watermark as current signed
 relay fleet: reject lower `{generated_at, nonce}`, reject equal watermark with differing payload
@@ -575,19 +770,22 @@ digest, and retain watermark across daemon restart. Reuse fleet bootstrap trust/
 do not make capability a weaker parallel trust path. Tests cover stale, equal-different, replayed,
 and restarted daemon cases.
 
-V2 negotiation additionally requires all of: valid fleet membership, fresh matching capability,
-`AuthoritativeTransportState::Ready(I1)`, and backend advertisement that it supports the narrow V2
-mux. Command/opaque backends, including current Windows command backend, advertise no mux and must
-never emit `0x11`, `0x13`, or V2 endpoint selection even if signed fleet capability says V2.
+V2 negotiation additionally requires all `V2Required` prerequisites above. Command/opaque
+backends, including current Windows command backend, advertise no mux and must never emit `0x11`,
+`0x13`, or V2 endpoint selection even if signed fleet capability says V2. Under `V2Required`, that
+is a quiesced relay outcome, not a V1 retry; under an explicitly selected legacy policy, V1 is chosen
+before dispatch and remains visibly unconfirmed.
 
 Deployment:
 
-1. Deploy relay supporting v1/v2, advertise v1 only.
-2. Deploy daemon/control parser with v1 fallback/capability parser.
+1. Deploy relay supporting v1/v2; signed policy remains explicit V1-only legacy compatibility.
+2. Deploy daemon/control parser plus capability/protocol-policy verifier; do not auto-negotiate
+   fallback on errors.
 3. Publish short-lived signed capability records after endpoint verification.
-4. Enable v2 per relay; new clients negotiate highest common version.
-5. Label v1 `legacy_unconfirmed`; no v2 guarantee claim.
-6. Retire v1 only via explicit maintenance policy after telemetry shows no legacy clients.
+4. Canary `V2Required` only where all prerequisites are present; fault/missing capability quiesces.
+5. Keep V1 only under explicitly scoped legacy policy, labeled `legacy_unconfirmed`; it makes no
+   trusted-liveness/protected-mode claim.
+6. Retire V1 via explicit maintenance policy after telemetry proves no legacy-policy clients.
 
 Capability, V2 hello, and V2 probe are one feature gate. Upgraded client does not send `0x11`
 merely because binary supports it.
@@ -624,7 +822,13 @@ Required gates:
 2. Terminal worker errors: socket/TUN/timer exit reports `WorkerUnavailable` with cause.
 3. Daemon: query-triggered loss quarantines before keepalive; no I0 candidate publish/relay send;
    relay registration starts even if STUN fails; status coherent. Fault while relay selected must
-   replay baseline/direct endpoint only: I1 timer/handshake traffic never targets I0 relay port.
+   replay validated baseline/quiesced state only: I1 timer/handshake traffic never targets I0 relay
+   port or an un-revalidated dynamic direct candidate.
+   Peer activation is separately transactional: initial apply, E1 transition, and recovery all bind
+   bypass/PF policy plus exit-policy assertion before backend E1 can emit. Pre-commit policy failure
+   makes no backend change; post-dispatch worker loss is visibly latched/quiesced. Run initial,
+   direct-roam, relay-selection, recovery, and full-tunnel cases on Linux/macOS/Windows system mocks
+   with runtime egress instrumentation, not only recorded system operations.
 4. Hello: accepted first send + held ACK + worker death gives no automatic duplicate; fresh token
    recovery; stale ACK N rejected while N+1 pending.
 5. Parsers: v1 exact 19-byte compatibility; v2 exact length/source/session/nonce behavior; v1/v2
@@ -632,18 +836,25 @@ Required gates:
 6. Mux: generic peer-endpoint round trip remains rejected. While v2 probe outstanding, ciphertext
    and wrong ACK frames reach engine; only byte-for-byte expected ACK completes control.
    STUN/hello/probe share one global slot; injected Busy sends nothing, consumes no pre-issued token,
-   and does not count as a liveness miss or worker failure.
+   and does not count as a liveness miss or worker failure. Permit lifecycle: cancel/expiry before
+   claim releases matching I<n> permit only; worker loss after claim retires artifact; late I0 Drop
+   cannot release I1 slot; no permit/job survives recovery or deadline.
 7. Relay: V2 probe exact-bound tuple success; unbound/other/expired/unknown silent; one response
    no larger than request; restart produces no ACK. V2 probe never first-binds: attacker probe race
    cannot bind allocation ahead of legitimate ciphertext. Existing ciphertext first-bind is tracked
    as a separate residual-security case, not expanded by probe.
-8. End-to-end: hello/held-ACK/worker death/I1/fresh token; stale packet injection; trusted
-   endpoint-bound WireGuard handshake then relay restart; bounded quiesce/re-registration. Run both
-   backends and pre-issued/local issuers.
+8. End-to-end: hello/held-ACK/worker death/I1/fresh token; stale packet injection; authenticated
+   peer reachability bound to selected endpoint then relay restart; bounded quiesce/re-registration.
+   Run both backends and pre-issued/local issuers. Do not call this relay-control confirmation.
 9. Control: capability canonicalization, duplicate/unknown field, signature, expiry, ID/endpoint
-   mismatch, absent v1 fallback, persisted watermark replay/rollback across restart, command/Windows
-   no-mux gate, old/new client × v1/v2 relay matrix. Spoofed valid-shaped ProbeAck cannot promote
-   `RelayTrustedLive` without I1 endpoint-bound authenticated WireGuard handshake.
+   mismatch, persisted watermark replay/rollback across restart, command/Windows no-mux gate, and
+   old/new client × v1/v2 relay matrix under both `V2Required` and explicitly signed legacy policy.
+   Assert strict missing/invalid/unsupported states quiesce without V1 control datagram; assert
+   legacy policy selects only V1 before attempt and never promotes trusted/live. Spoofed valid-shaped ProbeAck cannot promote
+   authenticated peer reachability or relay-control confirmation. Cookie/data/error,
+   old-port delayed response, timer/keepalive, and same-I old-overlay session traffic cannot refresh
+   selected-endpoint peer-reachability state; only semantic session-established event bound to
+   current I1/session/endpoint/overlay epoch can.
 
 `--node` live-lab comes after deterministic proof. Capture before/unavailable/after incarnation,
 candidate ages, STUN count, relay registration, probe reachability, endpoint-bound authenticated
@@ -651,7 +862,7 @@ handshake, token inventory, endpoint. Lab validates environment, not state-machi
 
 ## Adversarial review record
 
-Four read-only adversarial reviews ran. Corrections incorporated:
+Five read-only adversarial reviews ran. Corrections incorporated:
 
 - generic retry unsafe for relay hello;
 - query recovery can roll socket before relay work;
@@ -667,11 +878,24 @@ Four read-only adversarial reviews ran. Corrections incorporated:
 - healthy recovery cannot manufacture new incarnation.
 - recovery must not replay stale I0 relay endpoint; split baseline desired peer state from overlay;
 - V2 probe is never first-bind authority; existing first-ciphertext binding remains separate risk;
-- probe ACK is unauthenticated reachability, not trusted relay liveness;
+- probe ACK is unauthenticated reachability, not selected-path peer reachability or relay-control
+  confirmation;
 - desired-state recovery is revisioned at-least-once convergence, not globally exactly once;
 - capability bundle needs persisted digest-aware anti-rollback watermark and backend mux gate;
 - v1/v2 hello and embedded token parsers must consume complete canonical input; and
 - generic/control waits share one slot, with a pre-token admission permit and typed Busy outcome.
+- endpoint transition cannot refresh policy from stale managed-peer state: use candidate snapshot,
+  explicit common initial/transition/recovery transaction, and fail-closed/quiesced failure
+  semantics; timer-only runtime pause also leaks via UDP/TUN engine paths.
+- cached `ManagedPeer.direct_endpoint` is dynamic candidate state, not recovery baseline; preserve
+  candidate provenance/expiry and revalidate or quiesce.
+- WireGuard session evidence proves peer reachability at selected endpoint, not relay-control session
+  ownership; bind semantic session event to I<n>, relay session ID, overlay revision, endpoint, and
+  local epoch.
+- admission permit needs matching instance/permit release, deadline/cancel rules, I0 invalidation,
+  and irreversible post-claim token semantics.
+- missing/invalid V2 capability needs explicit strict-versus-time-bounded-legacy policy, never
+  automatic V2-attempt fallback.
 
 Fourth-review evidence: shared backend recovery reconfigures stored peers
 (`userspace_shared/mod.rs:239-249`) while endpoint updates persist selected endpoint in
@@ -685,6 +909,24 @@ Fleet watermark uses digest-aware order (`daemon.rs:14107-14126`); capabilities 
 guard. Relay outer hello/token parsing currently accepts trailing bytes
 (`rustynet-relay/src/main.rs:1249-1260,1347-1364`). Existing command/opaque backend guard remains fail-closed around
 `daemon.rs:6941-6949`. Review made no code/test changes.
+
+Fifth-review evidence: `reconfigure_managed_peer` updates backend endpoint before route/PF refresh,
+but refresh reads pre-update `managed_peers` and insertion happens last
+(`phase10.rs:6378-6412`). macOS endpoint policy is an exact socket egress allow-list
+(`phase10.rs:3515-3534`); Linux/Windows derive endpoint bypass policy from the supplied peer list
+(`phase10.rs:2181-2210,4487-4510`). Initial apply configures peers before bypass/system routes
+(`phase10.rs:5509-5535`). Worker UDP ingress and TUN ingress can each emit peer ciphertext, not just
+timer polling (`runtime.rs:830-955,1164-1178`). `ManagedPeer.direct_endpoint` mutates from supplied
+traversal candidate (`phase10.rs:5992-6022`), so it lacks baseline provenance. Current decap result
+reports cached stats after any decap (`engine.rs:528-620,1006-1014`), whereas vendored BoringTun
+valid init/response stores session and returns `WriteToNetwork`
+(`third_party/boringtun/src/noise/mod.rs:318-369`). Existing receiver-index demux admits
+pre-endpoint responses (`engine.rs:536-542`). Pre-issued token artifact is deleted before transport
+(`relay_client.rs:169-228`). Requirements prohibit a hidden legacy/fallback traversal path and
+require authenticated/fresh endpoint state and leak protection (`Requirements.md:67,202-203,239`).
+Review conclusion: recovery barrier must not rely on current helpers until prospective-state
+transaction, full runtime pause, provenance, session evidence, permit lifecycle, and strict rollout
+semantics are independently designed and tested.
 
 ## Baseline evidence
 
@@ -702,12 +944,15 @@ No source implementation/new tests were added by this investigation.
 
 ## Recommended merge order
 
-1. Typed worker loss, failure latch, staged desired state, coordinator tests.
-2. Incarnation/status contract and Linux/macOS recovery parity.
-3. V2 hello ACK correlation plus parser/server tests.
-4. Narrow V2 allocated-port mux plus ciphertext-interleaving tests.
-5. Relay liveness/restart tests.
-6. Signed capability artifact and staged rollout.
-7. Controlled `--node` live-lab validation.
+1. Fix common initial-apply/endpoint-transition/recovery candidate-state policy transaction, with
+   Linux/macOS/Windows runtime-egress and failure tests. Do not build recovery barrier on current
+   helpers.
+2. Typed worker loss, failure latch, staged desired state, coordinator tests.
+3. Incarnation/status contract and Linux/macOS recovery parity.
+4. V2 hello ACK correlation plus parser/server tests.
+5. Narrow V2 allocated-port mux plus ciphertext-interleaving tests.
+6. Relay liveness/restart tests.
+7. Signed capability artifact and staged rollout.
+8. Controlled `--node` live-lab validation.
 
 Keep P3 queue/backpressure independent from this P0/P1 reliability change.
