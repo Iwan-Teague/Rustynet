@@ -43,7 +43,7 @@ Line numbers reference `start.sh` and `crates/rustynet-cli/src/main.rs` as of
    parse-fused-to-IO shell into testable pure functions.
 3. **Maintainability and test coverage.** ~4.5k lines of untested bash
    become unit-tested Rust. This dovetails with
-   [TestCoverageImprovementPlan_2026-05-24.md](./TestCoverageImprovementPlan_2026-05-24.md).
+   [TestCoverageImprovementPlan_2026-05-24.md](../operations/active/TestCoverageImprovementPlan_2026-05-24.md).
 
 ## 2. Current state (verified inventory)
 

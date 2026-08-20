@@ -44,7 +44,7 @@ Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4
 > **Engine quality audit (2026-07-10):** The 17 verified robustness, security,
 > evidence-integrity, race, maintainability, concurrency, and product-separation
 > findings are tracked in
-> [`RustNativeNodeOrchestratorQualityAudit_2026-07-10.md`](./RustNativeNodeOrchestratorQualityAudit_2026-07-10.md).
+> [`RustNativeNodeOrchestratorQualityAudit_2026-07-10.md`](../operations/active/RustNativeNodeOrchestratorQualityAudit_2026-07-10.md).
 > That document is the dated implementation backlog for engine-quality work;
 > it is not live evidence and does not alter the parity status recorded here.
 

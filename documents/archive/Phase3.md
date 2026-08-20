@@ -1,10 +1,10 @@
 # Rustynet Phase 3 Plan (Linux Data Plane MVP and Backend Conformance)
 
 ## 0) Document Relationship and Scope
-- This plan extends identity/control outputs from [Phase2.md](./Phase2.md).
-- Requirement ownership remains in [Requirements.md](./Requirements.md).
+- This plan extends identity/control outputs from [Phase2.md](../Phase2.md).
+- Requirement ownership remains in [Requirements.md](../Requirements.md).
 - Phase 3 outputs are prerequisites for [Phase4.md](./Phase4.md).
-- If this plan conflicts with [Requirements.md](./Requirements.md), requirements take precedence.
+- If this plan conflicts with [Requirements.md](../Requirements.md), requirements take precedence.
 
 ## 1) Phase 3 Objective
 Deliver secure Linux mesh connectivity using a modular WireGuard backend implementation with conformance checks.

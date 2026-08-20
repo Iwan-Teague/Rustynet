@@ -37,7 +37,7 @@ No service-hosting plumbing exists yet; this is net-new on top of the D12 preset
 
 ## 2) Defects / risks to avoid (carry-over lessons)
 
-These come from the existing security ledgers ([`SecurityAndQualityAudit_2026-06-10.md`](./SecurityAndQualityAudit_2026-06-10.md), [`SecurityReview_2026-05-24.md`](./SecurityReview_2026-05-24.md)) and apply directly to service-hosting roles:
+These come from the existing security ledgers ([`SecurityAndQualityAudit_2026-06-10.md`](../../archive/SecurityAndQualityAudit_2026-06-10.md), [`SecurityReview_2026-05-24.md`](./SecurityReview_2026-05-24.md)) and apply directly to service-hosting roles:
 
 | Risk | Source lesson | Mitigation in D13 |
 |---|---|---|
@@ -141,5 +141,5 @@ UTM inventory + orchestrator wrappers: [`UTMVirtualMachineInventory_2026-03-31.m
 - Roadmap: [`ServiceHostingRolesRoadmap_2026-06-11.md`](./ServiceHostingRolesRoadmap_2026-06-11.md)
 - Pattern precedent: [`AnchorNodeRoleDesign_2026-05-21.md`](./AnchorNodeRoleDesign_2026-05-21.md) · [`NodeRoleTaxonomy_2026-05-21.md`](./NodeRoleTaxonomy_2026-05-21.md) · [`PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md`](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 - Execution: [`RustynetDataplaneExecutionPlan_2026-05-18.md`](./RustynetDataplaneExecutionPlan_2026-05-18.md) (D13)
-- Risk carry-over: [`SecurityAndQualityAudit_2026-06-10.md`](./SecurityAndQualityAudit_2026-06-10.md) · [`SecurityReview_2026-05-24.md`](./SecurityReview_2026-05-24.md)
+- Risk carry-over: [`SecurityAndQualityAudit_2026-06-10.md`](../../archive/SecurityAndQualityAudit_2026-06-10.md) · [`SecurityReview_2026-05-24.md`](./SecurityReview_2026-05-24.md)
 - Evidence: [`../LiveLabRunMatrix.md`](../LiveLabRunMatrix.md) · [`UTMVirtualMachineInventory_2026-03-31.md`](./UTMVirtualMachineInventory_2026-03-31.md)

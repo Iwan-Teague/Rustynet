@@ -2,9 +2,9 @@
 
 ## 0) Document Relationship and Scope
 - This plan extends scale/commercial outputs from [Phase7.md](./Phase7.md).
-- Requirement ownership remains in [Requirements.md](./Requirements.md).
+- Requirement ownership remains in [Requirements.md](../Requirements.md).
 - Phase 8 outputs are prerequisites for [Phase9.md](./Phase9.md).
-- If this plan conflicts with [Requirements.md](./Requirements.md), requirements take precedence.
+- If this plan conflicts with [Requirements.md](../Requirements.md), requirements take precedence.
 
 ## 1) Phase 8 Objective
 Raise trust posture through external validation, key custody hardening, privacy controls, and compliance operations.

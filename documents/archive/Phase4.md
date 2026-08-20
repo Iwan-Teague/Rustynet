@@ -2,9 +2,9 @@
 
 ## 0) Document Relationship and Scope
 - This plan extends mesh baseline outputs from [Phase3.md](./Phase3.md).
-- Requirement ownership remains in [Requirements.md](./Requirements.md).
+- Requirement ownership remains in [Requirements.md](../Requirements.md).
 - Phase 4 outputs are prerequisites for [Phase5.md](./Phase5.md).
-- If this plan conflicts with [Requirements.md](./Requirements.md), requirements take precedence.
+- If this plan conflicts with [Requirements.md](../Requirements.md), requirements take precedence.
 
 ## 1) Phase 4 Objective
 Deliver core end-user network features: exit-node routing, LAN access toggling, and Magic DNS.

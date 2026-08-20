@@ -1,5 +1,9 @@
 # Rustynet Master Work Plan — 2026-03-22
 
+> **SUPERSEDED as the repository-wide roll-up (2026-08-19).** The role of
+> "repo-wide remaining work" is now owned by `FullTodoInventory_2026-07-28.md`.
+> This document is retained for section structure and history.
+
 ## Execution Scope
 
 ```text

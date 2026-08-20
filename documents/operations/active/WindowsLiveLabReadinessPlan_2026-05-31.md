@@ -8,7 +8,7 @@ full matrix).
 This doc owns the *Windows-before-live-lab* status picture. It does **not**
 duplicate the detailed design ledgers — it points at them:
 
-- IPC / service access recovery: [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
+- IPC / service access recovery: [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](../../archive/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 - Tunnel connectivity gap vs Linux (W1-W4): [HomelabConnectivityParityDeltaPlan_2026-05-21.md](./HomelabConnectivityParityDeltaPlan_2026-05-21.md)
 - Exit / relay roles on Windows: [WindowsExitAndRelayDeltaPlan_2026-05-10.md](./WindowsExitAndRelayDeltaPlan_2026-05-10.md)
 - OS-agnostic orchestrator + Windows peer: [OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md](./OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md)

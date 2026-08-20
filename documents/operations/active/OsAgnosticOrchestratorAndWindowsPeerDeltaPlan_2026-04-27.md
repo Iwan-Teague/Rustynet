@@ -57,12 +57,12 @@ When this plan disagrees with one of them, fix this plan, not the other.
   prove before it counts as working." This delta does not relax that bar; it
   only adds the orchestrator-side dispatch and parity stages that let a
   Windows guest be tested in a peer slot once the backend exists.
-- [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
+- [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](../../archive/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
   — Windows UTM access / SSH / callback bootstrapping. This delta consumes
   whatever guest-access path that plan stabilizes; it does not replace it.
 - [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
   — historical cross-platform gap analysis. Treat as background context.
-- [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
+- [ShellToRustMigrationPlan_2026-03-06.md](../../archive/ShellToRustMigrationPlan_2026-03-06.md)
   — bash→Rust migration of `start.sh` privileged subflows and evidence
   pipelines. The orchestrator-stage dispatch work in this delta is the next
   natural step after that plan; it migrates the **live-lab orchestration
@@ -422,7 +422,7 @@ complete.
 ## 10) Status Tracker
 
 Update this section as work lands. Use the same "Agent Update Rules" as
-[ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
+[ShellToRustMigrationPlan_2026-03-06.md](../../archive/ShellToRustMigrationPlan_2026-03-06.md)
 §"Agent Update Rules": exact file paths, exact verification commands,
 exact artifact paths, residual risk, and blockers if any. Mark
 conservatively.
@@ -490,7 +490,7 @@ conservatively.
       observe daemon refusal) is owned by stage W1.2.
   - Blocker / prerequisite: none for W1.1; W1.2 depends on the Windows
     UTM access path stabilized by
-    [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md).
+    [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](../../archive/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md).
 - [x] W1.2a Daemon-side dispatchable subcommand
       `rustynetd windows-runtime-acls-check`
   - Changed files:
@@ -562,7 +562,7 @@ conservatively.
     - Live-guest evidence (drift the ACL on a real Windows VM and observe
       orchestrator-side `Fail` w/ the right root identified) is the missing
       end-to-end proof. Owned by the next live-lab run, which depends on
-      [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
+      [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](../../archive/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
       stabilizing the UTM access path.
     - The stage assumes the installed binary lives at
       `C:\Program Files\RustyNet\rustynetd.exe`. If a future bootstrap
@@ -3142,8 +3142,8 @@ This delta closes only when **all** are true:
 - No TODO/FIXME/placeholders in the shipped code.
 - The existing related ledgers
   ([WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md),
-  [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md),
-  [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md))
+  [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](../../archive/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md),
+  [ShellToRustMigrationPlan_2026-03-06.md](../../archive/ShellToRustMigrationPlan_2026-03-06.md))
   reference the relevant outcomes of this delta and remain self-consistent.
 
 Posture promotion of Windows in the release matrix is **not** in this
@@ -3153,7 +3153,7 @@ delta's DoD. That is owned by
 ## 12) Agent Update Rules
 
 Same rules as
-[ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
+[ShellToRustMigrationPlan_2026-03-06.md](../../archive/ShellToRustMigrationPlan_2026-03-06.md)
 §"Agent Update Rules":
 
 1. Update this document immediately after each materially completed slice;

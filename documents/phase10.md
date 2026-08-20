@@ -1,7 +1,7 @@
 # Rustynet Phase 10 Plan (Production Exit-Node Dataplane Enablement)
 
 ## 0) Document Relationship and Precedence
-- This plan extends [Phase9.md](./Phase9.md) and converts simulated dataplane behavior into real encrypted packet transport for exit-node usage.
+- This plan extends [Phase9.md](./archive/Phase9.md) and converts simulated dataplane behavior into real encrypted packet transport for exit-node usage.
 - [Requirements.md](./Requirements.md) remains normative source of truth.
 - [SecurityMinimumBar.md](./SecurityMinimumBar.md) remains release-blocking.
 - If conflict exists, the stricter security interpretation applies and lower-precedence docs must be updated.

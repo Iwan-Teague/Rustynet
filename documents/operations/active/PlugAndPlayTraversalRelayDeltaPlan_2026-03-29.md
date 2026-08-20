@@ -3,6 +3,10 @@
 **Repository Root:** `workspace root`
 **Scope:** Production-grade, secure, plug-and-play cross-network connectivity with direct UDP when possible and ciphertext-only relay fallback when direct is not provable.
 
+> **HISTORICAL (2026-08-19).** The traversal/relay defect sections it documents
+> are largely closed by `RustynetDataplaneExecutionPlan_2026-05-18.md` D2–D4 and
+> the cross-network traversal ledgers; retained as the historical defect inventory.
+
 ## Execution Scope
 ```text
 You are the implementation agent for the remaining plug-and-play connectivity work in this repository.

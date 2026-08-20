@@ -109,7 +109,7 @@ If historical notes later in the file conflict with this block, the AI prompt, o
 - Prefer explicit operator-visible failure over silent partial success.
 
 Related format-hardening plan:
-- [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)
+- [SerializationFormatHardeningPlan_2026-03-25.md](../active/SerializationFormatHardeningPlan_2026-03-25.md)
 
 ## Completed In This Pass
 

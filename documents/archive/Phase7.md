@@ -2,9 +2,9 @@
 
 ## 0) Document Relationship and Scope
 - This plan extends product expansion outputs from [Phase6.md](./Phase6.md).
-- Requirement ownership remains in [Requirements.md](./Requirements.md).
+- Requirement ownership remains in [Requirements.md](../Requirements.md).
 - Phase 7 outputs are prerequisites for [Phase8.md](./Phase8.md).
-- If this plan conflicts with [Requirements.md](./Requirements.md), requirements take precedence.
+- If this plan conflicts with [Requirements.md](../Requirements.md), requirements take precedence.
 
 ## 1) Phase 7 Objective
 Scale the platform architecture and add commercial control primitives for broader customer readiness.
