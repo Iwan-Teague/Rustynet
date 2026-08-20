@@ -1105,11 +1105,20 @@ where
         }
     }
 
-    let has_not_run = inputs
+    let not_proven = inputs
         .results
         .iter()
-        .any(|(_, o)| matches!(o, StageOutcome::NotRun));
-    let candidate_pass = failed == 0 && !has_not_run && evidence_errors.is_empty();
+        .filter(|(_, o)| matches!(o, StageOutcome::NotProven { .. }))
+        .count();
+    // A run is a pass candidate only if NO stage produced a BLOCKING outcome —
+    // Failed, NotRun, OR NotProven — and no evidence error occurred. Gating on
+    // `is_blocking()` (rather than an ad-hoc failed/not_run pair) is what makes a
+    // NotProven leaf demote the run (§2.2: NotProven never converts to pass) and
+    // auto-covers any future blocking variant. The prior `failed == 0 &&
+    // !has_not_run` form silently omitted NotProven, letting a NotProven leaf
+    // reach run_passed=true — the exact non-pass collapse L0 forbids.
+    let has_blocking = inputs.results.iter().any(|(_, o)| o.is_blocking());
+    let candidate_pass = !has_blocking && evidence_errors.is_empty();
 
     // 6. reuse-evidence seal — only meaningful for a pass candidate.
     if candidate_pass
@@ -1135,7 +1144,7 @@ where
         .unwrap_or_else(|_| scenario::verdict::RUN_LEVEL_NO_PLAN_DIGEST.to_owned());
     let will_pass = candidate_pass && evidence_errors.is_empty();
     let verdict_detail = format!(
-        "{passed} passed, {failed} failed, {skipped} skipped; {} evidence error(s)",
+        "{passed} passed, {failed} failed, {not_proven} not_proven, {skipped} skipped; {} evidence error(s)",
         evidence_errors.len()
     );
     let candidate_verdict = scenario::verdict::EvidenceVerdict::run_level(
@@ -1665,6 +1674,72 @@ mod finalize_tests {
         assert!(
             !read_report_state(dir).expect("state").run_passed,
             "a failed stage must leave run_passed=false"
+        );
+    }
+
+    /// P0 regression: a NotProven leaf stage (no Failed, no NotRun, no evidence
+    /// error) must NOT reach run_passed=true. NotProven is a blocking non-pass;
+    /// the finalizer's pass gate previously omitted it (checked only failed==0 &&
+    /// !has_not_run), so a NotProven run silently passed. It must now record a
+    /// Rejected verdict and leave run_passed=false — §2.2 "NotProven never
+    /// converts to pass".
+    #[test]
+    fn not_proven_stage_demotes_the_run_and_writes_a_rejected_verdict() {
+        use crate::vm_lab::orchestrator::error::ReasonCode;
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let emitted = vec![
+            (StageId::Preflight, StageOutcome::Passed),
+            (
+                StageId::TrafficTestMatrix,
+                StageOutcome::NotProven {
+                    reason: ReasonCode::MissingWitness,
+                    detail: "no ping counter captured".to_owned(),
+                },
+            ),
+        ];
+        prepare_report_dir(dir, &emitted);
+
+        let ctx = make_ctx(dir);
+        let os_versions = HashMap::new();
+        let targets = node_targets();
+        let inputs = RustNativeFinalizeInputs {
+            ctx: &ctx,
+            run_instance_id: "test-run-instance",
+            results: &emitted,
+            node_targets: &targets,
+            os_versions: &os_versions,
+            readiness_outcomes: Vec::new(),
+            context_binding: Some(make_binding(dir)),
+            prior_evidence_errors: Vec::new(),
+            run_started_unix: 100,
+            run_started_utc: "2026-01-01T00:00:00Z",
+            source_mode: "working-tree",
+            repo_ref: None,
+            skip_live_suite: false,
+            skip_soak: true,
+            skip_cross_network: true,
+        };
+        let res = finalize_rust_native_run(inputs, |_outcomes| Ok("stub-matrix".to_owned()));
+        assert!(res.is_ok(), "a not_proven stage still finalizes: {res:?}");
+
+        let verdict = scenario::verdict::read_evidence_verdict(dir).expect("verdict written");
+        assert!(
+            !verdict.is_pass(),
+            "a NotProven leaf must record a non-pass verdict"
+        );
+        assert!(
+            scenario::verdict::authorize_release(
+                &verdict,
+                "test-run-instance",
+                scenario::verdict::RUN_LEVEL_NO_PLAN_DIGEST,
+            )
+            .is_none(),
+            "a NotProven run must never authorize a release"
+        );
+        assert!(
+            !read_report_state(dir).expect("state").run_passed,
+            "a NotProven leaf must leave run_passed=false (the P0 fail-open fix)"
         );
     }
 
