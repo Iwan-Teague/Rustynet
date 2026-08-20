@@ -12,6 +12,7 @@ pub mod plan;
 pub mod readiness;
 pub mod remote_shell;
 pub mod report;
+pub mod resolved_plan;
 pub mod role;
 pub mod role_assignment;
 pub mod role_validation;
