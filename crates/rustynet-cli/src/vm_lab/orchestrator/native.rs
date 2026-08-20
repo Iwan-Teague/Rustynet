@@ -141,6 +141,16 @@ pub(crate) fn execute_rust_native_orchestration(
         )
     })?;
 
+    // Take the exclusive report-dir lease and mint this invocation's run
+    // instance id (§3.1.1). Held for the whole run via `_run_lease` — dropping
+    // it (or the process dying) releases the advisory flock. Acquired AFTER
+    // `ensure_report_dir_fresh` so the lock file never trips the freshness
+    // check, and for every path (fresh, run-only, resume/rerun) so two
+    // orchestrator runs can never race the same report dir's recorder. A live
+    // holder aborts here with a named error instead of corrupting stages.tsv.
+    let run_lease = orchestrator::run_instance::acquire_report_dir_lease(report_dir.as_path())?;
+    let run_instance_id = run_lease.run_instance_id().as_str().to_owned();
+
     // The run's network profile is resolved and recorded (or, on resume,
     // digest-verified against the manifests) before anything else runs;
     // profile drift after launch fails closed (rulebook §15.4).
@@ -638,6 +648,7 @@ pub(crate) fn execute_rust_native_orchestration(
         report_dir: report_dir.as_path(),
         started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
         errors: std::cell::RefCell::new(Vec::new()),
+        run_instance_id: Some(run_instance_id.clone()),
     };
     let pre_cleanup_diagnostics = |hook_ctx: &orchestrator::context::OrchestrationContext,
                                    prior: &[(orchestrator::stage::StageId, StageOutcome)]|

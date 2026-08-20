@@ -706,9 +706,8 @@ impl StageObserver for TimeoutAwareStageRecorder<'_> {
             &summary,
             &started,
             &now,
-            // Generation binding threaded in from native.rs in the following
-            // L0.2 increment.
-            None,
+            // Generation binding: same run id as the wrapped recorder.
+            self.inner.run_instance_id.as_deref(),
         ) {
             self.inner.errors.borrow_mut().push(format!(
                 "record terminal timed_out outcome for stage '{name}' failed: {err}"
@@ -1310,6 +1309,7 @@ mod deadline_tests {
             report_dir: report_dir.as_path(),
             started_at: RefCell::new(HashMap::new()),
             errors: RefCell::new(Vec::new()),
+            run_instance_id: None,
         };
         let observer = TimeoutAwareStageRecorder::new(&recorder, Arc::clone(&ledger));
         let mut ctx = make_ctx(report_dir.clone());

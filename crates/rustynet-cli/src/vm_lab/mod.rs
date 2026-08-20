@@ -54692,6 +54692,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             report_dir: &tmp,
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
+            run_instance_id: None,
         };
         rec.stage_started(&StageId::TrafficTestMatrix);
         rec.stage_finished(
@@ -54752,6 +54753,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             report_dir: &tmp,
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
+            run_instance_id: None,
         };
         recorder.stage_started(&StageId::Preflight);
         recorder.stage_finished(&StageId::Preflight, &StageOutcome::Passed);

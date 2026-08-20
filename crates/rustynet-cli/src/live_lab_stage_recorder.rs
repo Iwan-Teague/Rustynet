@@ -152,6 +152,25 @@ pub(crate) fn read_rows(report_dir: &Path) -> Vec<StageRow> {
     }
 }
 
+/// The `stages.tsv` rows written by ONE run instance. A native reader that needs
+/// current-generation evidence filters to `run_instance_id`; a row from a prior
+/// generation (a resume/rerun reuses the report dir and leaves behind rows for
+/// stages it did not touch) or a legacy/bash row (`None`) is foreign and
+/// excluded, so a stale terminal row can never be read as fresh proof
+/// (`LiveLabTestCoverageImplementationDesign` §3.1.1). The candidate/final
+/// verifier and finalizer consume this in later L0 slices; the recorder stamps
+/// the id today.
+#[allow(dead_code)] // consumed by the evidence verifier / finalizer (L0.5/L0.6)
+pub(crate) fn read_current_generation_rows(
+    report_dir: &Path,
+    run_instance_id: &str,
+) -> Vec<StageRow> {
+    read_rows(report_dir)
+        .into_iter()
+        .filter(|row| row.run_instance_id.as_deref() == Some(run_instance_id))
+        .collect()
+}
+
 /// Atomically UPSERT one row keyed by stage name (replace-or-append), then
 /// rewrite `stages.tsv` via tmp+rename so a concurrent reader never sees a
 /// partial file. SINGLE-WRITER contract: exactly one process/thread records a
@@ -520,6 +539,36 @@ mod tests {
         // An explicit empty 9th column is also `None` (empty string ⇔ absent).
         let empty_ninth = "preflight\thard\tpass\t0\t/l\tok\tT0\tT1\t";
         assert_eq!(StageRow::parse(empty_ninth).unwrap().run_instance_id, None);
+    }
+
+    #[test]
+    fn current_generation_rows_exclude_foreign_and_legacy_rows() {
+        // Models a resume/rerun that reuses a report dir: rows from the current
+        // run instance, an untouched prior generation, and a legacy/bash row all
+        // coexist. Only the current generation's rows are current evidence.
+        let dir = temp_report_dir("generation");
+        let fin = |stage: &str, id: Option<&str>| {
+            record_stage_finish(&dir, stage, "hard", "pass", "0", "", "", "T0", "T1", id).unwrap();
+        };
+        fin("preflight", Some("gen-current"));
+        fin("bootstrap_hosts", Some("gen-prior")); // untouched prior generation
+        fin("membership_init", None); // legacy/bash row
+
+        let current = read_current_generation_rows(&dir, "gen-current");
+        let names: Vec<&str> = current.iter().map(|r| r.stage.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["preflight"],
+            "only the current generation's rows are current evidence; a foreign-id \
+             or legacy (None) row must be excluded so a stale row is never read as fresh proof"
+        );
+
+        // A foreign generation sees only its own row, never the current one.
+        let prior = read_current_generation_rows(&dir, "gen-prior");
+        assert_eq!(
+            prior.iter().map(|r| r.stage.as_str()).collect::<Vec<_>>(),
+            vec!["bootstrap_hosts"]
+        );
     }
 
     #[test]
