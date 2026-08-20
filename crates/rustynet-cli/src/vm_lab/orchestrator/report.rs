@@ -36,6 +36,10 @@ pub enum StageOutcomeRecord {
     Passed,
     Failed,
     Skipped,
+    /// A required observation was missing or unattributable — a blocking
+    /// non-pass, kept distinct from `Skipped` so an evidence gap can never be
+    /// read as a legitimate profile omission. Serializes as `not_proven`.
+    NotProven,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

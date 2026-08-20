@@ -207,6 +207,53 @@ impl fmt::Display for StageError {
 
 impl std::error::Error for StageError {}
 
+/// Typed classification for a [`StageOutcome::NotProven`]. The code is the
+/// classification that drives remediation and evidence accounting; a free-form
+/// detail string is supporting context only, never the classification (an
+/// `Option`-of-string would have arrived empty the first time someone was in a
+/// hurry, exactly the failure `Skipped`'s mandatory payload was added to
+/// prevent). Each variant is a *distinct* remediation:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasonCode {
+    /// A required witness/observation was never produced (fix: run the probe).
+    MissingWitness,
+    /// Evidence exists but cannot be attributed to the intended node or run
+    /// instance — wrong node id, or a foreign/prior generation (fix: bind it).
+    Unattributable,
+    /// Evidence exists but belongs to a prior run generation and is stale for
+    /// this invocation (fix: re-run producing current-generation evidence).
+    StaleEvidence,
+    /// Evidence exists but could not be read or parsed (fix: repair the
+    /// producer/schema).
+    UnreadableEvidence,
+    /// Two independent witnesses disagree (fix: resolve which is authoritative).
+    ContradictoryEvidence,
+    /// A fault was requested but its application could not be independently
+    /// verified — unverified fault application is never a pass (fix: prove the
+    /// fault took effect).
+    FaultUnverified,
+    /// A capability required by a release-selected cell is absent. Distinct from
+    /// `Skipped`, which asserts the *profile* legitimately does not claim the
+    /// scenario; here the release cell DOES claim it and it is missing.
+    RequiredCapabilityAbsent,
+}
+
+impl ReasonCode {
+    /// Stable snake_case token recorded verbatim into evidence artifacts
+    /// (TSV/JSON/CSV) and parsed back by the verifier. Never localize.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasonCode::MissingWitness => "missing_witness",
+            ReasonCode::Unattributable => "unattributable",
+            ReasonCode::StaleEvidence => "stale_evidence",
+            ReasonCode::UnreadableEvidence => "unreadable_evidence",
+            ReasonCode::ContradictoryEvidence => "contradictory_evidence",
+            ReasonCode::FaultUnverified => "fault_unverified",
+            ReasonCode::RequiredCapabilityAbsent => "required_capability_absent",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageOutcome {
     Passed,
@@ -235,11 +282,25 @@ pub enum StageOutcome {
     Reused {
         evidence_sha256: String,
     },
+    /// A required observation is missing or unattributable, so the stage's
+    /// exact claim could not be proven. Distinct from `Skipped` (which asserts
+    /// the scenario is outside the selected profile) and from `Failed` (which
+    /// disproves an invariant): `NotProven` says "we do not know", and that is
+    /// a **blocking** non-pass that must never be converted to skip or pass.
+    /// The typed `ReasonCode` is the classification; `detail` is supporting
+    /// context only.
+    NotProven {
+        reason: ReasonCode,
+        detail: String,
+    },
 }
 
 impl StageOutcome {
     pub fn is_blocking(&self) -> bool {
-        matches!(self, StageOutcome::Failed(_) | StageOutcome::NotRun)
+        matches!(
+            self,
+            StageOutcome::Failed(_) | StageOutcome::NotRun | StageOutcome::NotProven { .. }
+        )
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -250,6 +311,60 @@ impl StageOutcome {
                 | StageOutcome::Skipped(..)
                 | StageOutcome::NotRun
                 | StageOutcome::Reused { .. }
+                | StageOutcome::NotProven { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn not_proven(reason: ReasonCode) -> StageOutcome {
+        StageOutcome::NotProven {
+            reason,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn not_proven_is_a_blocking_terminal_non_pass() {
+        let np = not_proven(ReasonCode::MissingWitness);
+        // Blocking: a NotProven prerequisite must cascade-block dependents,
+        // exactly like Failed/NotRun — never like Skipped (which does not block).
+        assert!(np.is_blocking(), "NotProven must block dependents");
+        assert!(np.is_terminal(), "NotProven is a terminal state");
+        // It is NOT a pass and NOT a skip.
+        assert!(!matches!(np, StageOutcome::Passed));
+        // Skipped is deliberately non-blocking; NotProven must not be confused
+        // with it — a regression that made NotProven non-blocking would let an
+        // evidence gap silently satisfy a truth prerequisite.
+        assert!(!StageOutcome::Skipped("out of profile".into()).is_blocking());
+    }
+
+    #[test]
+    fn reason_code_tokens_are_stable_and_distinct() {
+        // These tokens are written into TSV/JSON/CSV evidence and parsed back
+        // by the verifier; a silent rename would orphan historical evidence.
+        let all = [
+            (ReasonCode::MissingWitness, "missing_witness"),
+            (ReasonCode::Unattributable, "unattributable"),
+            (ReasonCode::StaleEvidence, "stale_evidence"),
+            (ReasonCode::UnreadableEvidence, "unreadable_evidence"),
+            (ReasonCode::ContradictoryEvidence, "contradictory_evidence"),
+            (ReasonCode::FaultUnverified, "fault_unverified"),
+            (
+                ReasonCode::RequiredCapabilityAbsent,
+                "required_capability_absent",
+            ),
+        ];
+        for (code, token) in all {
+            assert_eq!(code.as_str(), token);
+        }
+        // All tokens distinct.
+        let mut seen = std::collections::HashSet::new();
+        for (code, _) in all {
+            assert!(seen.insert(code.as_str()), "duplicate reason token");
+        }
     }
 }

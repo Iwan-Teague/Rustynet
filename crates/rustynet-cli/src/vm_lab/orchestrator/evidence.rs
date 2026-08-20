@@ -288,6 +288,7 @@ pub(crate) fn rust_native_vm_lab_stage_outcome(
         status: match outcome {
             StageOutcome::Passed => VmLabStageStatus::Pass,
             StageOutcome::Failed(_) => VmLabStageStatus::Fail,
+            StageOutcome::NotProven { .. } => VmLabStageStatus::NotProven,
             StageOutcome::Skipped(..) | StageOutcome::NotRun | StageOutcome::Reused { .. } => {
                 VmLabStageStatus::Skipped
             }
@@ -299,6 +300,13 @@ pub(crate) fn rust_native_vm_lab_stage_outcome(
             StageOutcome::NotRun => "not_run: omitted by focused invocation".to_owned(),
             StageOutcome::Reused { evidence_sha256 } => {
                 format!("reused prior pass evidence sha256={evidence_sha256}")
+            }
+            StageOutcome::NotProven { reason, detail } => {
+                if detail.is_empty() {
+                    format!("not_proven: {}", reason.as_str())
+                } else {
+                    format!("not_proven: {} ({detail})", reason.as_str())
+                }
             }
         },
         artifacts: vec![
@@ -435,6 +443,19 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
                 "reused",
                 "",
                 format!("validated prior pass sha256={evidence_sha256}"),
+            ),
+            // A blocking non-pass, but not a process-exit failure — rc stays
+            // empty like the other non-`fail` states; the `not_proven` status
+            // token carries the non-green verdict, and the reason code leads
+            // the summary so the classification is never lost.
+            StageOutcome::NotProven { reason, detail } => (
+                "not_proven",
+                "",
+                if detail.is_empty() {
+                    reason.as_str().to_owned()
+                } else {
+                    format!("{} ({detail})", reason.as_str())
+                },
             ),
         };
         let started = self

@@ -347,19 +347,22 @@ impl KillControlOutcome {
 
 /// Adjudicate control (c): under a mid-stage daemon kill the targeted stage's
 /// recorded outcome MUST NOT be a pass. Any non-pass terminal state
-/// (`Failed`/`Skipped`/`NotRun`/`Reused`) satisfies the control; a `Passed`
-/// under the kill is a false-green and fails the control.
+/// (`Failed`/`Skipped`/`NotRun`/`Reused`/`NotProven`) satisfies the control; a
+/// `Passed` under the kill is a false-green and fails the control.
 ///
 /// Note the strictness: a `Reused` outcome is NOT a pass and so satisfies the
 /// control, but it must never be *read as* a fresh pass — matching the §4.2
-/// terminal-state taxonomy the A2 verifier enforces.
+/// terminal-state taxonomy the A2 verifier enforces. `NotProven` likewise
+/// satisfies the control: the kill left the claim unproven, which is the
+/// correct non-green verdict.
 pub(crate) fn adjudicate_daemon_kill_outcome(recorded: &StageOutcome) -> KillControlOutcome {
     match recorded {
         StageOutcome::Passed => KillControlOutcome::FalseGreenUnderKill,
         StageOutcome::Failed(_)
         | StageOutcome::Skipped(..)
         | StageOutcome::NotRun
-        | StageOutcome::Reused { .. } => KillControlOutcome::StageDidNotPass,
+        | StageOutcome::Reused { .. }
+        | StageOutcome::NotProven { .. } => KillControlOutcome::StageDidNotPass,
     }
 }
 

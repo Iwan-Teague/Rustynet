@@ -79,6 +79,16 @@ pub fn build_live_lab_run_report(
                     Some(format!("reused prior evidence sha256={evidence_sha256}")),
                 ),
                 StageOutcome::Failed(msg) => (StageOutcomeRecord::Failed, Some(msg.clone())),
+                // A blocking non-pass kept distinct from `Skipped` — an evidence
+                // gap must never aggregate as a legitimate profile omission.
+                StageOutcome::NotProven { reason, detail } => (
+                    StageOutcomeRecord::NotProven,
+                    Some(if detail.is_empty() {
+                        format!("not_proven: {}", reason.as_str())
+                    } else {
+                        format!("not_proven: {} ({detail})", reason.as_str())
+                    }),
+                ),
             };
             StageReport {
                 stage_id: id.as_str().to_owned(),
@@ -93,10 +103,15 @@ pub fn build_live_lab_run_report(
     let any_failed = stages
         .iter()
         .any(|s| s.outcome == StageOutcomeRecord::Failed);
+    // A `NotProven` stage is a blocking non-pass: the run did not prove its
+    // claim, so it dominates to `Failed` — never softened to `Partial`.
+    let any_not_proven = stages
+        .iter()
+        .any(|s| s.outcome == StageOutcomeRecord::NotProven);
     let any_skipped = stages
         .iter()
         .any(|s| s.outcome == StageOutcomeRecord::Skipped);
-    let overall_status = if any_failed {
+    let overall_status = if any_failed || any_not_proven {
         RunStatus::Failed
     } else if any_skipped {
         RunStatus::Partial
@@ -187,12 +202,12 @@ fn run_status_from_str(raw: &str) -> Option<RunStatus> {
 }
 
 /// `overall_status` derived from a stage list, matching [`build_live_lab_run_report`]:
-/// any `Failed` → `Failed`, else any `Skipped` → `Partial`, else `Passed`.
+/// any `Failed` or `NotProven` (both blocking non-pass) → `Failed`, else any
+/// `Skipped` → `Partial`, else `Passed`.
 fn derive_overall_status(stages: &[StageReport]) -> RunStatus {
-    if stages
-        .iter()
-        .any(|s| s.outcome == StageOutcomeRecord::Failed)
-    {
+    if stages.iter().any(|s| {
+        s.outcome == StageOutcomeRecord::Failed || s.outcome == StageOutcomeRecord::NotProven
+    }) {
         RunStatus::Failed
     } else if stages
         .iter()
@@ -298,6 +313,7 @@ fn report_from_orchestrate_result(report_dir: &Path) -> Option<(RunStatus, Vec<S
                 Some(StageStatus::Fail | StageStatus::Aborted | StageStatus::TimedOut) => {
                     StageOutcomeRecord::Failed
                 }
+                Some(StageStatus::NotProven) => StageOutcomeRecord::NotProven,
                 Some(StageStatus::Skipped | StageStatus::NotRun | StageStatus::Reused) => {
                     StageOutcomeRecord::Skipped
                 }
@@ -409,6 +425,7 @@ fn report_from_stages_tsv(report_dir: &Path) -> Result<(RunStatus, Vec<StageRepo
             Some(StageStatus::Fail | StageStatus::Aborted | StageStatus::TimedOut) => {
                 StageOutcomeRecord::Failed
             }
+            Some(StageStatus::NotProven) => StageOutcomeRecord::NotProven,
             Some(StageStatus::Skipped | StageStatus::NotRun | StageStatus::Reused) => {
                 StageOutcomeRecord::Skipped
             }
@@ -872,6 +889,32 @@ mod tests {
             stages: stages_in,
             node_statuses: nodes.into_iter().collect::<HashMap<_, _>>(),
         }
+    }
+
+    #[test]
+    fn not_proven_stage_forces_overall_failed_never_partial() {
+        // A run whose only non-pass is a NotProven stage did not prove its
+        // claim: it must read Failed, never Partial (which reads "some skips,
+        // basically fine") and never Passed. This is the release-truth
+        // invariant — an evidence gap can never present as green-ish.
+        let stages = vec![
+            stage("preflight", StageOutcomeRecord::Passed),
+            stage("mesh_status_validation", StageOutcomeRecord::NotProven),
+        ];
+        assert_eq!(derive_overall_status(&stages), RunStatus::Failed);
+
+        // NotProven must dominate a Skipped that would otherwise soften to
+        // Partial — order-independent.
+        let mixed = vec![
+            stage("a", StageOutcomeRecord::Skipped),
+            stage("b", StageOutcomeRecord::NotProven),
+        ];
+        assert_eq!(derive_overall_status(&mixed), RunStatus::Failed);
+
+        // Sanity: a run with only Skipped is Partial (NotProven is doing real
+        // work in the assertions above, not just always-Failed).
+        let only_skips = vec![stage("a", StageOutcomeRecord::Skipped)];
+        assert_eq!(derive_overall_status(&only_skips), RunStatus::Partial);
     }
 
     #[test]

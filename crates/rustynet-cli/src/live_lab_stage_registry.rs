@@ -195,6 +195,11 @@ pub enum StageStatus {
     NotApplicable,
     TimedOut,
     Aborted,
+    /// A required observation was missing or unattributable, so the stage's
+    /// exact claim could not be proven. Terminal, failure-ranked, and never
+    /// GREEN — a blocking non-pass, distinct from both `Fail` (invariant
+    /// disproved) and `Skipped` (scenario outside the selected profile).
+    NotProven,
 }
 
 impl StageStatus {
@@ -211,6 +216,7 @@ impl StageStatus {
             StageStatus::NotApplicable => "not_applicable",
             StageStatus::TimedOut => "timed_out",
             StageStatus::Aborted => "aborted",
+            StageStatus::NotProven => "not_proven",
         }
     }
 
@@ -237,6 +243,7 @@ pub fn parse_stage_status(raw: &str) -> Option<StageStatus> {
         "na" | "n/a" | "not_applicable" | "not-applicable" => Some(StageStatus::NotApplicable),
         "timed_out" | "timedout" | "timeout" => Some(StageStatus::TimedOut),
         "aborted" | "abort" => Some(StageStatus::Aborted),
+        "not_proven" | "not-proven" | "notproven" => Some(StageStatus::NotProven),
         _ => None,
     }
 }
@@ -2736,6 +2743,7 @@ mod tests {
             StageStatus::NotApplicable,
             StageStatus::TimedOut,
             StageStatus::Aborted,
+            StageStatus::NotProven,
         ] {
             assert_eq!(parse_stage_status(status.as_str()), Some(status));
         }
@@ -2746,6 +2754,18 @@ mod tests {
         assert_eq!(parse_stage_status("not_run"), Some(StageStatus::NotRun));
         assert_eq!(parse_stage_status("n/a"), Some(StageStatus::NotApplicable));
         assert_eq!(parse_stage_status("timeout"), Some(StageStatus::TimedOut));
+        // NotProven canonical + dialects; its token is stable and never a skip.
+        assert_eq!(StageStatus::NotProven.as_str(), "not_proven");
+        assert_eq!(
+            parse_stage_status("not-proven"),
+            Some(StageStatus::NotProven)
+        );
+        assert_eq!(
+            parse_stage_status("NOTPROVEN"),
+            Some(StageStatus::NotProven)
+        );
+        assert_ne!(parse_stage_status("not_proven"), Some(StageStatus::Skipped));
+        assert!(StageStatus::NotProven.is_terminal());
         // Unknown strings are a caller decision, not a silent bucket.
         assert_eq!(parse_stage_status("exploded"), None);
         // Terminality: only pending/running are non-terminal.
