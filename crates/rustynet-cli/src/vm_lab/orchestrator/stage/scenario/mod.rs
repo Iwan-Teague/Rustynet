@@ -23,6 +23,7 @@
 
 pub mod artifact;
 pub mod pass_certificate;
+pub mod registry;
 pub mod schema;
 pub mod verdict;
 
