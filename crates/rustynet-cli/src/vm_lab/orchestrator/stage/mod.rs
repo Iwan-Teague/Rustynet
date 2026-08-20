@@ -309,9 +309,26 @@ pub trait OrchestrationStage: Send + Sync {
     fn id(&self) -> StageId;
     fn name(&self) -> &str;
 
-    /// Stages that must pass before this one runs.
-    /// Failure or skip of a dependency triggers skip-cascade on this stage.
+    /// TRUTH PREREQUISITES: stages that must PASS before this one runs. A
+    /// failure or skip of one triggers skip-cascade on this stage (§3.1).
+    ///
+    /// This is the interim rule for every un-migrated stage: its `dependencies`
+    /// are all truth prerequisites (the historical, conservative behaviour). A
+    /// migrated scenario stage that needs a predecessor only *ordered* before
+    /// it — without gating on its pass — declares that in
+    /// [`ordering_after`](Self::ordering_after) instead, never here.
     fn dependencies(&self) -> &[StageId];
+
+    /// ORDERING-ONLY edges: stages this one must run AFTER, purely for
+    /// destructive/shared-resource serialisation — it does NOT require them to
+    /// pass and is NOT skip-cascaded when one fails (§3.1). An ordering edge to
+    /// a stage not in the plan is ignored (rule 3: an omitted ordering
+    /// predecessor never becomes an implicit requirement); a stage that cannot
+    /// safely run without a predecessor must list it in
+    /// [`dependencies`](Self::dependencies) instead. Default: none.
+    fn ordering_after(&self) -> &[StageId] {
+        &[]
+    }
 
     /// Which roles this stage operates on. Empty slice = all roles.
     fn applies_to_roles(&self) -> &[NodeRole];
