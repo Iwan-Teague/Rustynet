@@ -16,9 +16,16 @@ use serde::Deserialize;
 
 use crate::data::stage_manifest::{NATIVE_EXECUTION_DIALECT, NativeRunManifest};
 
+/// The one accepted candidate-verdict schema version (mirror of the CLI's
+/// `EVIDENCE_VERDICT_SCHEMA_VERSION`). A future/unknown version is a
+/// producer/version error, never a plausible pass (§3.4).
+pub const EVIDENCE_VERDICT_SCHEMA_VERSION: u64 = 1;
+
 /// Subset of the CLI's `evidence_verdict.v1.json` the monitor cross-checks.
 #[derive(Debug, Clone, Deserialize)]
 struct EvidenceVerdictDoc {
+    #[serde(default)]
+    schema_version: u64,
     #[serde(default)]
     run_instance_id: String,
     #[serde(default)]
@@ -43,8 +50,14 @@ pub enum UnverifiedReason {
     NotNativeRun,
     /// A `native_run` block declaring an unrecognized dialect (producer error).
     WrongDialect(String),
+    /// A `native_run` block with an empty run instance or plan digest — a
+    /// degenerate/producer-error identity that must not verify (all-empty fields
+    /// would otherwise match an all-empty verdict).
+    DegenerateIdentity,
     /// No readable candidate verdict artifact.
     NoVerdict,
+    /// The candidate verdict declares an unsupported schema version.
+    VerdictUnknownSchema(u64),
     /// The verdict was rejected/unavailable/other (carries the raw value).
     VerdictNotPassed(String),
     /// The verdict binds to a different run instance than the manifest.
@@ -107,12 +120,24 @@ pub fn verify_run(
             generation,
         );
     }
+    // A degenerate native block with an empty run instance or plan digest must
+    // not verify — otherwise an all-empty identity would trivially match an
+    // all-empty verdict and green the run.
+    if native_run.run_instance_id.is_empty() || native_run.resolved_plan_digest.is_empty() {
+        return RunVerification::unverified(UnverifiedReason::DegenerateIdentity, generation);
+    }
 
     let verdict: EvidenceVerdictDoc =
         match read_json(&report_dir.join("state/evidence_verdict.v1.json")) {
             Some(v) => v,
             None => return RunVerification::unverified(UnverifiedReason::NoVerdict, generation),
         };
+    if verdict.schema_version != EVIDENCE_VERDICT_SCHEMA_VERSION {
+        return RunVerification::unverified(
+            UnverifiedReason::VerdictUnknownSchema(verdict.schema_version),
+            generation,
+        );
+    }
     if verdict.verdict != "passed" {
         return RunVerification::unverified(
             UnverifiedReason::VerdictNotPassed(verdict.verdict),
@@ -168,7 +193,7 @@ mod tests {
         std::fs::write(
             state.join("evidence_verdict.v1.json"),
             format!(
-                "{{\"run_instance_id\":\"{run}\",\"plan_digest\":\"{digest}\",\"verdict\":\"{verdict}\"}}"
+                "{{\"schema_version\":1,\"run_instance_id\":\"{run}\",\"plan_digest\":\"{digest}\",\"verdict\":\"{verdict}\"}}"
             ),
         )
         .unwrap();
@@ -277,6 +302,39 @@ mod tests {
         assert_eq!(
             verify_run(dir.path(), Some(&nr), &pass_set(&[])).reason,
             Some(UnverifiedReason::WrongDialect("legacy_bash_v0".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_degenerate_empty_identity_native_block_never_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        // An all-empty native identity paired with an all-empty verdict must not
+        // be allowed to trivially match and green the run.
+        write_verdict(dir.path(), "", "", "passed");
+        write_report_state(dir.path(), true);
+        let nr = native("native_node_v1", "", "", &[]);
+        assert_eq!(
+            verify_run(dir.path(), Some(&nr), &pass_set(&[])).reason,
+            Some(UnverifiedReason::DegenerateIdentity)
+        );
+    }
+
+    #[test]
+    fn an_unknown_verdict_schema_version_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        // A future/unknown verdict schema with an otherwise-passing body.
+        std::fs::write(
+            state.join("evidence_verdict.v1.json"),
+            r#"{"schema_version":2,"run_instance_id":"run-1","plan_digest":"digest-1","verdict":"passed"}"#,
+        )
+        .unwrap();
+        write_report_state(dir.path(), true);
+        let nr = native("native_node_v1", "run-1", "digest-1", &[]);
+        assert_eq!(
+            verify_run(dir.path(), Some(&nr), &pass_set(&[])).reason,
+            Some(UnverifiedReason::VerdictUnknownSchema(2))
         );
     }
 }

@@ -1279,7 +1279,11 @@ impl App {
         self.run_verification().reason.map(|reason| match reason {
             NotNativeRun => "not a native --node run".to_owned(),
             WrongDialect(dialect) => format!("unrecognized execution dialect '{dialect}'"),
+            DegenerateIdentity => "native run has an empty run/plan identity".to_owned(),
             NoVerdict => "no candidate verifier verdict yet".to_owned(),
+            VerdictUnknownSchema(version) => {
+                format!("candidate verdict schema v{version} is unsupported")
+            }
             VerdictNotPassed(verdict) => format!("candidate verdict is '{verdict}', not passed"),
             VerdictRunMismatch => "verdict belongs to a different run instance".to_owned(),
             VerdictPlanMismatch => "verdict belongs to a different resolved plan".to_owned(),
@@ -4633,7 +4637,7 @@ mod tests {
         std::fs::create_dir_all(&state).expect("state dir");
         std::fs::write(
             state.join("evidence_verdict.v1.json"),
-            r#"{"run_instance_id":"run-1","plan_digest":"d1","verdict":"passed"}"#,
+            r#"{"schema_version":1,"run_instance_id":"run-1","plan_digest":"d1","verdict":"passed"}"#,
         )
         .unwrap();
         std::fs::write(state.join("report_state.json"), r#"{"run_passed":true}"#).unwrap();
@@ -4675,6 +4679,17 @@ mod tests {
         ));
         assert!(!app.run_is_release_scope());
         assert!(app.run_scope_banner().unwrap().contains("ADJUDICATION"));
+
+        // An UNRECOGNIZED plan_kind (producer/version error) is a native run
+        // (plan_kind Some) but neither release scope NOR a recognized scoped
+        // kind — so the header renders its non-green "unrecognized plan kind"
+        // branch, never green (the L0.7d header-gate fix).
+        app.run_manifest = Some(manifest_from_json(
+            &native_manifest_json().replace("standard", "sneaky_release"),
+        ));
+        assert_eq!(app.run_plan_kind(), Some("sneaky_release"));
+        assert!(!app.run_is_release_scope());
+        assert_eq!(app.run_scope_banner(), None);
 
         // A bash run has no plan kind, no scope, no banner.
         app.run_manifest = Some(manifest_from_json(r#"{"run_mode":"full","stages":[]}"#));
