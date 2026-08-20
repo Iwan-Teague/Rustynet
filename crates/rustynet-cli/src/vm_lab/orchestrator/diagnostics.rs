@@ -706,6 +706,9 @@ impl StageObserver for TimeoutAwareStageRecorder<'_> {
             &summary,
             &started,
             &now,
+            // Generation binding threaded in from native.rs in the following
+            // L0.2 increment.
+            None,
         ) {
             self.inner.errors.borrow_mut().push(format!(
                 "record terminal timed_out outcome for stage '{name}' failed: {err}"

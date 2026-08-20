@@ -422,6 +422,9 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
             &log_path.to_string_lossy(),
             "",
             &now,
+            // Generation binding: the minting run's id is threaded in from
+            // native.rs in the following L0.2 increment.
+            None,
         ) {
             self.record_error("record start", name, err);
         }
@@ -505,6 +508,9 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
             &summary,
             &started,
             &now,
+            // Generation binding: threaded in from native.rs in the following
+            // L0.2 increment.
+            None,
         ) {
             self.record_error("record terminal outcome", name, err);
         }

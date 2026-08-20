@@ -15,18 +15,24 @@
 //! implementation, the two pipelines become indistinguishable to every
 //! consumer.
 //!
-//! FORMAT — deliberately the EXISTING 8-column v1 layout the bash
-//! orchestrator already writes and every consumer already parses positionally
-//! (`stage \t severity \t status \t rc \t log_path \t summary \t started_at
-//! \t finished_at`), with NO header/marker line — so a recorder-written file
-//! is byte-shape-identical to a bash-written one and every reader (the
-//! monitor, the run-summary/failure-digest tools) handles it unchanged. A
-//! `running` status row is the only new thing; it already surfaces as a live
-//! spinner via the monitor's existing status lookup, and it is transient
-//! (replaced by the terminal outcome), so end-of-run readers only ever see
-//! terminal rows. (An earlier `#schema_version=2` marker was dropped: the bash
-//! conclusion tools parse every non-empty line and do not skip comments, so a
-//! marker line would have been ingested as a bogus stage row.)
+//! FORMAT — the original 8 positional columns the bash orchestrator writes and
+//! every consumer parses positionally (`stage \t severity \t status \t rc \t
+//! log_path \t summary \t started_at \t finished_at`), plus a 9th
+//! `run_instance_id` column (L0.2 generation binding,
+//! `LiveLabTestCoverageImplementationDesign_2026-08-19` §3.1.1) — with NO
+//! header/marker line. The 9th column is a TRAILING addition, so every existing
+//! reader (the monitor, the run-summary/failure-digest tools) still handles a
+//! row unchanged: they gate on `cols.len() < 3` and read fields by index, so a
+//! trailing column is ignored where not yet consumed. A legacy/bash row has no
+//! 9th column and parses with `run_instance_id: None`; a native row carries the
+//! minting run's id so a later generation cannot read it as fresh evidence.
+//! (This trailing-column approach was chosen precisely because an earlier
+//! `#schema_version=2` marker line was dropped: the bash conclusion tools parse
+//! every non-empty line and do not skip comments, so a marker line would have
+//! been ingested as a bogus stage row.) A `running` status row surfaces as a
+//! live spinner via the monitor's existing status lookup and is transient
+//! (replaced by the terminal outcome), so end-of-run readers only see terminal
+//! rows.
 //!
 //! Boundary note: tooling-layer code (§8/§10.3 untouched) — nothing here is
 //! consumed by domain, policy, or daemon crates.
@@ -41,9 +47,17 @@ pub const STAGES_TSV_RELATIVE_PATH: &str = "state/stages.tsv";
 /// is the live one the realtime contract adds.
 pub const STATUS_RUNNING: &str = "running";
 
-/// One `stages.tsv` row in the 8-column v1-positional layout. `pub(crate)`
-/// (fields included) so the §4.8 evidence verifier reads the raw rows through
-/// this one canonical parser instead of forking a second TSV reader.
+/// One `stages.tsv` row. `pub(crate)` (fields included) so the §4.8 evidence
+/// verifier reads the raw rows through this one canonical parser instead of
+/// forking a second TSV reader.
+///
+/// Layout is the original 8 positional columns plus a 9th, `run_instance_id`
+/// (L0.2 generation binding, `LiveLabTestCoverageImplementationDesign` §3.1.1).
+/// The 9th is a trailing addition, so both existing parsers already tolerate it
+/// (they gate on `cols.len() < 3` and read fields by index): a legacy/bash row
+/// has no 9th column and parses with `run_instance_id: None`, and a native row
+/// carries the minting run's id so a later generation cannot read it as fresh
+/// evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StageRow {
     pub(crate) stage: String,
@@ -54,14 +68,19 @@ pub(crate) struct StageRow {
     pub(crate) summary: String,
     pub(crate) started_at: String,
     pub(crate) finished_at: String,
+    /// The native run instance that wrote this row; `None` for a legacy/bash
+    /// row with no 9th column. Empty string on disk ⇔ `None`.
+    pub(crate) run_instance_id: Option<String>,
 }
 
 impl StageRow {
     fn to_tsv(&self) -> String {
         // Every field sanitized so an embedded tab/newline can never shift
-        // the positional columns a downstream reader depends on.
+        // the positional columns a downstream reader depends on. The 9th
+        // column is empty (not absent) for a `None` run instance, keeping the
+        // row a fixed 9-field shape.
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             sanitize(&self.stage),
             sanitize(&self.severity),
             sanitize(&self.status),
@@ -70,11 +89,13 @@ impl StageRow {
             sanitize(&self.summary),
             sanitize(&self.started_at),
             sanitize(&self.finished_at),
+            sanitize(self.run_instance_id.as_deref().unwrap_or("")),
         )
     }
 
     /// Parse one line. `None` for the schema marker, blank lines, or any line
-    /// with fewer than 3 columns (matching the monitor's own tolerance).
+    /// with fewer than 3 columns (matching the monitor's own tolerance). A
+    /// legacy 8-column row parses with `run_instance_id: None`.
     fn parse(line: &str) -> Option<StageRow> {
         if line.is_empty() || line.starts_with('#') {
             return None;
@@ -84,6 +105,15 @@ impl StageRow {
             return None;
         }
         let get = |idx: usize| cols.get(idx).copied().unwrap_or("").to_owned();
+        // Absent (8-col legacy) or empty 9th column ⇔ `None`.
+        let run_instance_id = {
+            let raw = get(8);
+            if raw.trim().is_empty() {
+                None
+            } else {
+                Some(raw)
+            }
+        };
         Some(StageRow {
             stage: get(0),
             severity: get(1),
@@ -93,6 +123,7 @@ impl StageRow {
             summary: get(5),
             started_at: get(6),
             finished_at: get(7),
+            run_instance_id,
         })
     }
 }
@@ -160,6 +191,7 @@ fn upsert_row(report_dir: &Path, row: StageRow) -> Result<(), String> {
 /// Record that `stage` has STARTED: upsert a `running` row with no rc and no
 /// finished_at. Idempotent — a second start for the same stage just refreshes
 /// the running row.
+#[allow(clippy::too_many_arguments)]
 pub fn record_stage_start(
     report_dir: &Path,
     stage: &str,
@@ -167,6 +199,7 @@ pub fn record_stage_start(
     log_path: &str,
     summary: &str,
     started_at: &str,
+    run_instance_id: Option<&str>,
 ) -> Result<(), String> {
     upsert_row(
         report_dir,
@@ -179,6 +212,7 @@ pub fn record_stage_start(
             summary: summary.to_owned(),
             started_at: started_at.to_owned(),
             finished_at: String::new(),
+            run_instance_id: run_instance_id.map(str::to_owned),
         },
     )
 }
@@ -196,6 +230,7 @@ pub fn record_stage_finish(
     summary: &str,
     started_at: &str,
     finished_at: &str,
+    run_instance_id: Option<&str>,
 ) -> Result<(), String> {
     upsert_row(
         report_dir,
@@ -208,6 +243,7 @@ pub fn record_stage_finish(
             summary: summary.to_owned(),
             started_at: started_at.to_owned(),
             finished_at: finished_at.to_owned(),
+            run_instance_id: run_instance_id.map(str::to_owned),
         },
     )
 }
@@ -264,6 +300,8 @@ pub fn execute_ops_record_stage_start(config: RecordStageStartConfig) -> Result<
         &config.log_path,
         &config.summary,
         &config.started_at,
+        // Bash-dialect rows carry no run instance (legacy 8-column semantics).
+        None,
     )?;
     Ok(format!("recorded start: {}", config.stage))
 }
@@ -279,6 +317,8 @@ pub fn execute_ops_record_stage_finish(config: RecordStageFinishConfig) -> Resul
         &config.summary,
         &config.started_at,
         &config.finished_at,
+        // Bash-dialect rows carry no run instance (legacy 8-column semantics).
+        None,
     )?;
     Ok(format!(
         "recorded finish: {} = {}",
@@ -317,6 +357,7 @@ mod tests {
             "/logs/preflight.log",
             "verify",
             "T0",
+            None,
         )
         .unwrap();
         let raw = read_raw(&dir);
@@ -343,6 +384,7 @@ mod tests {
             "/logs/preflight.log",
             "verify",
             "T0",
+            None,
         )
         .unwrap();
         record_stage_finish(
@@ -355,6 +397,7 @@ mod tests {
             "verify",
             "T0",
             "T1",
+            None,
         )
         .unwrap();
         let data_rows: Vec<String> = read_raw(&dir)
@@ -377,9 +420,21 @@ mod tests {
     #[test]
     fn multiple_stages_serialize_with_at_most_one_running() {
         let dir = temp_report_dir("multi");
-        record_stage_start(&dir, "preflight", "hard", "", "", "T0").unwrap();
-        record_stage_finish(&dir, "preflight", "hard", "pass", "0", "", "", "T0", "T1").unwrap();
-        record_stage_start(&dir, "bootstrap_hosts", "hard", "", "", "T1").unwrap();
+        record_stage_start(&dir, "preflight", "hard", "", "", "T0", None).unwrap();
+        record_stage_finish(
+            &dir,
+            "preflight",
+            "hard",
+            "pass",
+            "0",
+            "",
+            "",
+            "T0",
+            "T1",
+            None,
+        )
+        .unwrap();
+        record_stage_start(&dir, "bootstrap_hosts", "hard", "", "", "T1", None).unwrap();
         assert_eq!(active_stage(&dir).as_deref(), Some("bootstrap_hosts"));
         let data_rows: Vec<String> = read_raw(&dir)
             .lines()
@@ -402,6 +457,7 @@ mod tests {
             "line1\tinjected\ncol\r more",
             "T0",
             "T1",
+            None,
         )
         .unwrap();
         let row = read_raw(&dir)
@@ -410,7 +466,7 @@ mod tests {
             .unwrap()
             .to_owned();
         let cols: Vec<&str> = row.split('\t').collect();
-        assert_eq!(cols.len(), 8, "sanitized summary keeps exactly 8 columns");
+        assert_eq!(cols.len(), 9, "sanitized summary keeps exactly 9 columns");
         assert_eq!(cols[0], "s");
         assert_eq!(cols[2], "fail");
         assert!(!cols[5].contains('\t') && !cols[5].contains('\n'));
@@ -420,6 +476,50 @@ mod tests {
     fn active_stage_is_none_without_a_file() {
         let dir = temp_report_dir("empty");
         assert_eq!(active_stage(&dir), None);
+    }
+
+    #[test]
+    fn run_instance_id_round_trips_and_a_legacy_8_column_row_parses_as_none() {
+        // A native row carries the minting run's id in a 9th column.
+        let dir = temp_report_dir("run_instance");
+        record_stage_finish(
+            &dir,
+            "preflight",
+            "hard",
+            "pass",
+            "0",
+            "/l",
+            "ok",
+            "T0",
+            "T1",
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        let row = read_raw(&dir)
+            .lines()
+            .find(|l| !l.starts_with('#'))
+            .unwrap()
+            .to_owned();
+        let cols: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cols.len(), 9);
+        assert_eq!(cols[8], "0123456789abcdef0123456789abcdef");
+        let parsed = StageRow::parse(&row).expect("parse native row");
+        assert_eq!(
+            parsed.run_instance_id.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+
+        // A legacy 8-column row (no 9th column) parses with `None` — the
+        // trailing column is a tolerant addition, not a required field.
+        let legacy = "preflight\thard\tpass\t0\t/l\tok\tT0\tT1";
+        let legacy_row = StageRow::parse(legacy).expect("parse legacy 8-col row");
+        assert_eq!(legacy_row.run_instance_id, None);
+        assert_eq!(legacy_row.stage, "preflight");
+        assert_eq!(legacy_row.finished_at, "T1");
+
+        // An explicit empty 9th column is also `None` (empty string ⇔ absent).
+        let empty_ninth = "preflight\thard\tpass\t0\t/l\tok\tT0\tT1\t";
+        assert_eq!(StageRow::parse(empty_ninth).unwrap().run_instance_id, None);
     }
 
     #[test]
