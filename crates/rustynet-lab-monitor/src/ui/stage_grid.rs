@@ -108,8 +108,10 @@ fn render_planned_with_statuses(
     // §3.4 VerifiedPass, run-level half: computed once for the whole grid. No
     // group renders release-green unless the run itself is verified (native
     // dialect, passed+bound candidate verdict, final promotion, current-gen
-    // cleanup). A bash/unverified/in-progress run leaves this false.
-    let run_verified = app.run_verified();
+    // cleanup) AND it is a release-scope (Standard) plan — a Focused/Adjudication
+    // run proves only its named scope and never renders release-green (§3.4 rule
+    // 5). A bash/unverified/in-progress/scoped run leaves this false.
+    let run_verified = app.run_verified() && app.run_is_release_scope();
     for (idx, group) in app.planned_stage_groups().into_iter().enumerate().take(3) {
         let mut lines = Vec::new();
         if group.stages.is_empty() {
