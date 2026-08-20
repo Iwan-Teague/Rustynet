@@ -1239,17 +1239,20 @@ impl App {
         })
     }
 
-    /// The run-level half of `VerifiedPass` (§3.4): true only when the current
-    /// run is a native run whose candidate verdict passed for this exact run and
-    /// plan, was finally promoted (`report_state.run_passed`), and whose required
-    /// cleanup ran this generation. A bash/setup run, or any missing, rejected,
-    /// foreign, or unpromoted artifact, is not verified — so no group can render
-    /// release-green on it. Reads the run's own report-dir artifacts; never
-    /// panics and treats an unreadable artifact as not-verified.
-    pub fn run_verified(&self) -> bool {
+    /// The full run-level verification for the current run (§3.4). A bash/setup
+    /// run, or a run with no loaded report dir, is `NotNativeRun`; otherwise the
+    /// artifacts are cross-checked. Never panics; an unreadable artifact is a
+    /// reason, never a pass.
+    fn run_verification(&self) -> crate::data::run_verification::RunVerification {
         let report_dir = match self.run_manifest_dir.as_ref() {
             Some(report_dir) => report_dir,
-            None => return false,
+            None => {
+                return crate::data::run_verification::RunVerification {
+                    verified: false,
+                    reason: Some(crate::data::run_verification::UnverifiedReason::NotNativeRun),
+                    run_instance_id: None,
+                };
+            }
         };
         let native_run = self
             .run_manifest
@@ -1257,7 +1260,65 @@ impl App {
             .and_then(|manifest| manifest.native_run.as_ref());
         let current_gen_pass = self.current_generation_pass_stages();
         crate::data::run_verification::verify_run(report_dir, native_run, &current_gen_pass)
-            .verified
+    }
+
+    /// The run-level half of `VerifiedPass` (§3.4): true only when the current
+    /// run is a native run whose candidate verdict passed for this exact run and
+    /// plan, was finally promoted (`report_state.run_passed`), and whose required
+    /// cleanup ran this generation. A bash/setup run, or any missing, rejected,
+    /// foreign, or unpromoted artifact, is not verified — so no group can render
+    /// release-green on it.
+    pub fn run_verified(&self) -> bool {
+        self.run_verification().verified
+    }
+
+    /// A one-line human reason the run is NOT release-verified, for the header's
+    /// "verification pending" indicator. `None` when the run IS verified.
+    pub fn run_verification_reason(&self) -> Option<String> {
+        use crate::data::run_verification::UnverifiedReason::*;
+        self.run_verification().reason.map(|reason| match reason {
+            NotNativeRun => "not a native --node run".to_owned(),
+            WrongDialect(dialect) => format!("unrecognized execution dialect '{dialect}'"),
+            NoVerdict => "no candidate verifier verdict yet".to_owned(),
+            VerdictNotPassed(verdict) => format!("candidate verdict is '{verdict}', not passed"),
+            VerdictRunMismatch => "verdict belongs to a different run instance".to_owned(),
+            VerdictPlanMismatch => "verdict belongs to a different resolved plan".to_owned(),
+            NotPromoted => "run not finally promoted (run_passed=false)".to_owned(),
+            CleanupIncomplete(stage) => format!("required cleanup '{stage}' not a current pass"),
+        })
+    }
+
+    /// The current run's plan kind (`standard` | `focused` | `adjudication`) from
+    /// its native manifest block; `None` on a bash/setup run.
+    pub fn run_plan_kind(&self) -> Option<&str> {
+        self.run_manifest
+            .as_ref()?
+            .native_run
+            .as_ref()
+            .map(|native_run| native_run.plan_kind.as_str())
+    }
+
+    /// Whether the current run is a RELEASE-scope run — a Standard plan. A Focused
+    /// or Adjudication run proves only its named stage/control and must never
+    /// render as a full-suite or release-green run (§3.4 rule 5), so the grid
+    /// gates release-green on this in addition to `run_verified`.
+    pub fn run_is_release_scope(&self) -> bool {
+        self.run_plan_kind() == Some("standard")
+    }
+
+    /// A scope banner for a Focused/Adjudication run — these can prove their
+    /// named scope but never present as a full-suite or release-green run, so the
+    /// header labels them explicitly. `None` for a Standard or bash run.
+    pub fn run_scope_banner(&self) -> Option<String> {
+        match self.run_plan_kind()? {
+            "focused" => {
+                Some("SCOPE: FOCUSED — named target proved only, not a release run".to_owned())
+            }
+            "adjudication" => {
+                Some("SCOPE: ADJUDICATION — control proved only, not a release run".to_owned())
+            }
+            _ => None,
+        }
     }
 
     /// Whether `stage` is even *possible* for the current target config
@@ -4588,6 +4649,53 @@ mod tests {
         // Demote the promotion marker → not verified.
         std::fs::write(state.join("report_state.json"), r#"{"run_passed":false}"#).unwrap();
         assert!(!app.run_verified(), "an unpromoted run is not verified");
+    }
+
+    #[test]
+    fn a_focused_or_adjudication_run_is_scoped_never_release_green() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        // Standard = release scope, no banner.
+        app.run_manifest = Some(manifest_from_json(native_manifest_json()));
+        assert_eq!(app.run_plan_kind(), Some("standard"));
+        assert!(app.run_is_release_scope());
+        assert_eq!(app.run_scope_banner(), None);
+
+        // Focused = scoped proof, gets a banner, and is NEVER release scope — so
+        // the grid cannot render it release-green (§3.4 rule 5).
+        app.run_manifest = Some(manifest_from_json(
+            &native_manifest_json().replace("standard", "focused"),
+        ));
+        assert_eq!(app.run_plan_kind(), Some("focused"));
+        assert!(!app.run_is_release_scope());
+        assert!(app.run_scope_banner().unwrap().contains("FOCUSED"));
+
+        // Adjudication = scoped proof, gets a banner, never release scope.
+        app.run_manifest = Some(manifest_from_json(
+            &native_manifest_json().replace("standard", "adjudication"),
+        ));
+        assert!(!app.run_is_release_scope());
+        assert!(app.run_scope_banner().unwrap().contains("ADJUDICATION"));
+
+        // A bash run has no plan kind, no scope, no banner.
+        app.run_manifest = Some(manifest_from_json(r#"{"run_mode":"full","stages":[]}"#));
+        assert_eq!(app.run_plan_kind(), None);
+        assert!(!app.run_is_release_scope());
+        assert_eq!(app.run_scope_banner(), None);
+    }
+
+    #[test]
+    fn run_verification_reason_names_the_missing_predicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.run_manifest_dir = Some(dir.path().to_path_buf());
+        // A native run with no verdict on disk names the missing verdict.
+        app.run_manifest = Some(manifest_from_json(native_manifest_json()));
+        let reason = app.run_verification_reason().expect("unverified");
+        assert!(reason.contains("verdict"), "reason: {reason}");
+
+        // A bash run says it is not a native run; a verified run has no reason.
+        app.run_manifest = Some(manifest_from_json(r#"{"run_mode":"full","stages":[]}"#));
+        assert!(app.run_verification_reason().unwrap().contains("native"));
     }
 
     #[test]

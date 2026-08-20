@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -173,7 +173,40 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     bottom.push(Span::styled(" 2s stages / 5s active VMs", value));
     let bottom_line = Line::from(bottom);
 
-    let p = Paragraph::new(vec![top, run_line, bottom_line, Line::from("")]);
+    // Fourth line — the settled-vs-verified distinction (§3.4 rule 4) and the
+    // Focused/Adjudication scope banner (rule 5), reusing the header's trailing
+    // spacer row (the area is capped at 4 rows). A Focused/Adjudication run is
+    // labelled as a scoped proof, never a release run; a native Standard run
+    // shows whether its release evidence is verified yet or still pending (with
+    // the specific missing predicate); a bash/legacy run keeps the blank spacer,
+    // since native release-verification does not apply to it.
+    let verification_line = if let Some(banner) = app.run_scope_banner() {
+        Line::from(Span::styled(
+            banner,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else if app.run_plan_kind().is_some() {
+        if app.run_verified() {
+            Line::from(Span::styled(
+                "VERIFIED: release evidence complete",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            let reason = app.run_verification_reason().unwrap_or_default();
+            Line::from(vec![
+                Span::styled("VERIFICATION PENDING:", title),
+                Span::styled(format!(" {reason}"), Style::default().fg(Color::White)),
+            ])
+        }
+    } else {
+        Line::from("")
+    };
+
+    let p = Paragraph::new(vec![top, run_line, bottom_line, verification_line]);
     f.render_widget(p, area);
 }
 
