@@ -327,6 +327,11 @@ pub(crate) struct RustNativeStageRecorder<'a> {
     pub(crate) report_dir: &'a Path,
     pub(crate) started_at: std::cell::RefCell<std::collections::HashMap<String, String>>,
     pub(crate) errors: std::cell::RefCell<Vec<String>>,
+    /// The run instance minted by this invocation's report-dir lease. Every
+    /// `stages.tsv` row this recorder writes is stamped with it so a later
+    /// generation cannot read the row as fresh evidence (L0.2 §3.1.1). `None`
+    /// only in tests that exercise the recorder without a lease.
+    pub(crate) run_instance_id: Option<String>,
 }
 
 pub(crate) fn write_rust_native_node_stage_plan(
@@ -422,9 +427,8 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
             &log_path.to_string_lossy(),
             "",
             &now,
-            // Generation binding: the minting run's id is threaded in from
-            // native.rs in the following L0.2 increment.
-            None,
+            // Generation binding: stamp the row with this invocation's run id.
+            self.run_instance_id.as_deref(),
         ) {
             self.record_error("record start", name, err);
         }
@@ -508,9 +512,8 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
             &summary,
             &started,
             &now,
-            // Generation binding: threaded in from native.rs in the following
-            // L0.2 increment.
-            None,
+            // Generation binding: stamp the row with this invocation's run id.
+            self.run_instance_id.as_deref(),
         ) {
             self.record_error("record terminal outcome", name, err);
         }
@@ -1184,6 +1187,7 @@ mod finalize_tests {
             report_dir,
             started_at: RefCell::new(HashMap::new()),
             errors: RefCell::new(Vec::new()),
+            run_instance_id: None,
         };
         let id = StageId::Preflight;
 
@@ -1220,6 +1224,7 @@ mod finalize_tests {
             report_dir,
             started_at: RefCell::new(HashMap::new()),
             errors: RefCell::new(Vec::new()),
+            run_instance_id: None,
         };
         recorder.stage_started(id);
         recorder.stage_finished(id, outcome);
