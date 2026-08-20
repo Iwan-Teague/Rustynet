@@ -48,7 +48,44 @@ pub struct StageManifest {
     /// (whose topology comes from selectors + inventory, not `--node`).
     #[serde(default)]
     pub node_assignments: Vec<ManifestNodeAssignment>,
+    /// Present only for a Rust `--node` (native) run; `None` on the bash/wrapper
+    /// path. It carries the run-identity and resolved-plan binding the monitor
+    /// needs to evaluate a stage/run for `VerifiedPass` under the strict native
+    /// rules (execution dialect, run instance, plan kind + digest, required
+    /// cleanup). `#[serde(default)]` keeps a bash manifest — which never emits
+    /// this block — readable, and its presence is itself the dialect signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_run: Option<NativeRunManifest>,
 }
+
+/// The native-dialect run binding recorded in the manifest (§3.4). The stage
+/// selection/omission itself is NOT duplicated here — it is the existing
+/// `stages` list's `enabled`/`skip_reason` — so there is one source for
+/// enablement. This block adds only what the shared manifest did not already
+/// carry: the dialect marker and the run/plan identity a monitor cross-checks
+/// against `state/stages.tsv` (generation) and `state/resolved_plan.json`
+/// (digest, kind, cleanup) before rendering a stage green.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NativeRunManifest {
+    /// Always `native_node_v1` when emitted; a legacy dialect presented as
+    /// native, or any other value, is a producer error to the monitor.
+    pub execution_dialect: String,
+    /// This run's instance id (the report-dir lease id, §3.1.1). Must match the
+    /// `run_instance_id` on the current-generation `stages.tsv` rows.
+    pub run_instance_id: String,
+    /// `standard` | `focused` | `adjudication` — the resolved plan kind.
+    pub plan_kind: String,
+    /// SHA-256 digest of the resolved plan (`state/resolved_plan.json`). Binds
+    /// the manifest to the exact plan the run was resolved from.
+    pub resolved_plan_digest: String,
+    /// The canonical stage ids the resolved plan marks as mandatory cleanup —
+    /// each must be a current-generation pass for the run to be a release pass.
+    pub required_cleanup_stage_ids: Vec<String>,
+}
+
+/// The one accepted native execution dialect. A manifest `native_run` whose
+/// `execution_dialect` is any other value is a producer/version error.
+pub const NATIVE_EXECUTION_DIALECT: &str = "native_node_v1";
 
 /// One `<alias>:<role>` assignment from a Rust `--node` run, recorded in the
 /// manifest so consumers render the current run's topology (emit-don't-infer).
@@ -82,6 +119,15 @@ pub struct ManifestSelectors {
     pub skip_linux_live_suite: bool,
     pub chaos_suite: bool,
     pub cross_network_suite: bool,
+    // The remaining suite selectors, recorded so a verifier can re-derive the
+    // full enablement decision from the manifest alone (anti-shrink cross-check).
+    // `#[serde(default)]` keeps a pre-existing manifest without them readable.
+    #[serde(default)]
+    pub soak_suite: bool,
+    #[serde(default)]
+    pub negative_control_suite: bool,
+    #[serde(default)]
+    pub local_gate_suite: bool,
 }
 
 impl From<&TargetSelectors> for ManifestSelectors {
@@ -99,6 +145,9 @@ impl From<&TargetSelectors> for ManifestSelectors {
             skip_linux_live_suite: selectors.skip_linux_live_suite,
             chaos_suite: selectors.chaos_suite,
             cross_network_suite: selectors.cross_network_suite,
+            soak_suite: selectors.soak_suite,
+            negative_control_suite: selectors.negative_control_suite,
+            local_gate_suite: selectors.local_gate_suite,
         }
     }
 }
@@ -220,6 +269,10 @@ pub fn build_stage_manifest(
         // Populated by the Rust `--node` path via
         // `ensure_stage_manifest_with_plan`; empty on the bash/wrapper path.
         node_assignments: Vec::new(),
+        // Native-dialect binding, set by the `--node` full-run path (see
+        // `ensure_stage_manifest_with_plan`); `None` on the bash/wrapper path and
+        // on a native setup-only/run-only run (no resolved plan, no release claim).
+        native_run: None,
     }
 }
 
@@ -302,11 +355,13 @@ pub fn ensure_stage_manifest_with_plan(
     selectors: &TargetSelectors,
     active_plan: &std::collections::HashSet<String>,
     node_assignments: &[ManifestNodeAssignment],
+    native_run: Option<NativeRunManifest>,
 ) -> Result<(PathBuf, bool), String> {
     let path = report_dir.join(STAGE_MANIFEST_RELATIVE_PATH);
     let newly_created = !path.exists();
     let mut manifest = build_stage_manifest(run_command, run_mode, selectors, Some(active_plan));
     manifest.node_assignments = node_assignments.to_vec();
+    manifest.native_run = native_run;
     let path = write_stage_manifest(report_dir, &manifest)?;
     Ok((path, newly_created))
 }
@@ -611,6 +666,7 @@ mod tests {
             &TargetSelectors::default(),
             &plan,
             &assignments,
+            None,
         )
         .expect("emit manifest");
         assert!(written);
@@ -631,6 +687,60 @@ mod tests {
     }
 
     #[test]
+    fn manifest_selectors_carry_every_suite_flag() {
+        // The recorded selector snapshot must include the soak / negative-control
+        // / local-gate suites, or a verifier reconstructing the expected plan from
+        // the manifest under-counts the enabled set (the L0.4c-iii anti-shrink
+        // cross-check reads these).
+        let selectors = ManifestSelectors::from(&full_selectors());
+        assert!(selectors.soak_suite);
+        assert!(selectors.negative_control_suite);
+        assert!(selectors.local_gate_suite);
+        let json = serde_json::to_string(&selectors).expect("serialize");
+        let back: ManifestSelectors = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(selectors, back);
+        assert!(back.soak_suite && back.negative_control_suite && back.local_gate_suite);
+    }
+
+    #[test]
+    fn native_run_block_round_trips_and_bash_path_omits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = rust_plan();
+        let native = NativeRunManifest {
+            execution_dialect: NATIVE_EXECUTION_DIALECT.to_owned(),
+            run_instance_id: "run-xyz".to_owned(),
+            plan_kind: "standard".to_owned(),
+            resolved_plan_digest: "deadbeefcafe".to_owned(),
+            required_cleanup_stage_ids: vec!["teardown_full".to_owned()],
+        };
+        ensure_stage_manifest_with_plan(
+            dir.path(),
+            "vm-lab-orchestrate-live-lab",
+            "full",
+            &TargetSelectors::default(),
+            &plan,
+            &[],
+            Some(native.clone()),
+        )
+        .expect("emit native manifest");
+        let manifest = read_stage_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(manifest.native_run.as_ref(), Some(&native));
+        assert_eq!(
+            manifest.native_run.as_ref().unwrap().execution_dialect,
+            NATIVE_EXECUTION_DIALECT
+        );
+
+        // The bash/wrapper path never emits the native block.
+        let bash = build_stage_manifest(
+            "live-linux-lab-orchestrator",
+            "full",
+            &TargetSelectors::default(),
+            None,
+        );
+        assert!(bash.native_run.is_none());
+    }
+
+    #[test]
     fn rust_plan_manifest_replaces_prior_invocation_in_reused_report_dir() {
         let dir = tempfile::tempdir().unwrap();
         let first_plan = rust_plan();
@@ -641,6 +751,7 @@ mod tests {
             &TargetSelectors::default(),
             &first_plan,
             &[],
+            None,
         )
         .expect("first manifest");
 
@@ -652,6 +763,7 @@ mod tests {
             &TargetSelectors::default(),
             &second_plan,
             &[],
+            None,
         )
         .expect("replacement manifest");
 

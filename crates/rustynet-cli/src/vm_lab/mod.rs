@@ -9890,6 +9890,7 @@ mod reconcile_barrier_exempt_tests {
             selectors: ManifestSelectors::default(),
             stages,
             node_assignments: Vec::new(),
+            native_run: None,
         };
         write_stage_manifest(dir, &manifest).expect("write manifest");
     }
