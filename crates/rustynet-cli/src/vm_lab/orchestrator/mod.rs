@@ -15,6 +15,7 @@ pub mod report;
 pub mod role;
 pub mod role_assignment;
 pub mod role_validation;
+pub mod run_instance;
 pub mod runner;
 pub mod source_archive;
 pub mod stage;
