@@ -15,7 +15,7 @@
 //! the same graph always produces the same digest regardless of input order.
 #![allow(dead_code)] // consumed by native.rs plan construction + the verifier in L0.4c
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageId};
@@ -197,6 +197,114 @@ pub fn write_resolved_plan(report_dir: &Path, plan: &ResolvedPlan) -> Result<(),
             path.display()
         )
     })
+}
+
+/// The recorded resolved plan, read back from `resolved_plan.json`. Kept as
+/// strings (not `StageId`) because the verifier compares against an
+/// independently-derived plan by digest and by the enabled id set, and a
+/// recorded id that is not even a known stage must be reportable rather than a
+/// parse failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedPlan {
+    pub schema_version: u64,
+    pub kind: String,
+    pub digest: String,
+    pub enabled: Vec<String>,
+}
+
+/// Read back `resolved_plan.json`. A missing file, malformed JSON, or an unknown
+/// schema version is an error — the verifier fails closed rather than treating
+/// an unreadable plan as "no shrink".
+pub fn read_recorded_plan(report_dir: &Path) -> Result<RecordedPlan, String> {
+    let path = report_dir.join(RESOLVED_PLAN_RELATIVE_PATH);
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read resolved_plan {}: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("parse resolved_plan {}: {e}", path.display()))?;
+    let schema_version = v
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("resolved_plan {} missing schema_version", path.display()))?;
+    if schema_version != RESOLVED_PLAN_SCHEMA_VERSION {
+        return Err(format!(
+            "resolved_plan {} has unsupported schema_version {schema_version} (expected {RESOLVED_PLAN_SCHEMA_VERSION})",
+            path.display()
+        ));
+    }
+    let kind = v
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("resolved_plan {} missing kind", path.display()))?
+        .to_owned();
+    let digest = v
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("resolved_plan {} missing digest", path.display()))?
+        .to_owned();
+    let enabled = v
+        .get("enabled")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("resolved_plan {} missing enabled list", path.display()))?
+        .iter()
+        .map(|x| {
+            x.as_str().map(str::to_owned).ok_or_else(|| {
+                format!(
+                    "resolved_plan {} enabled has a non-string id",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RecordedPlan {
+        schema_version,
+        kind,
+        digest,
+        enabled,
+    })
+}
+
+/// Verify the runner's RECORDED plan matches an INDEPENDENTLY-derived expected
+/// plan (§3.1.3). The `expected` plan must be resolved fresh from
+/// `StageId::ALL` + the raw selectors — NOT read from the recorded artifact —
+/// so this comparison detects a plan the runner shrank (or grew) between
+/// selection and recording, which a self-consistency check on the manifest
+/// alone cannot see.
+///
+/// Exact digest equality is the pass condition. On mismatch it names the
+/// specific stages the recorded plan DROPPED (a shrink — the dangerous case) or
+/// ADDED, so the failure points at the exact divergence rather than just "the
+/// digests differ".
+pub fn verify_recorded_matches_expected(
+    expected: &ResolvedPlan,
+    recorded: &RecordedPlan,
+) -> Result<(), String> {
+    if recorded.schema_version != RESOLVED_PLAN_SCHEMA_VERSION {
+        return Err(format!(
+            "recorded plan schema_version {} is unsupported (expected {RESOLVED_PLAN_SCHEMA_VERSION})",
+            recorded.schema_version
+        ));
+    }
+    if recorded.digest == expected.digest {
+        return Ok(());
+    }
+    let expected_enabled: BTreeSet<&str> = expected.enabled.iter().map(StageId::as_str).collect();
+    let recorded_enabled: BTreeSet<&str> = recorded.enabled.iter().map(String::as_str).collect();
+    let dropped: Vec<&str> = expected_enabled
+        .difference(&recorded_enabled)
+        .copied()
+        .collect();
+    let added: Vec<&str> = recorded_enabled
+        .difference(&expected_enabled)
+        .copied()
+        .collect();
+    Err(format!(
+        "recorded plan does not match the independently-derived expected plan \
+         (digest {} != {}); dropped/shrunk stages: [{}]; unexpected added stages: [{}]",
+        recorded.digest,
+        expected.digest,
+        dropped.join(", "),
+        added.join(", "),
+    ))
 }
 
 fn sort_ids(ids: &mut [StageId]) {
@@ -562,6 +670,100 @@ mod tests {
             .collect();
         let expected: Vec<String> = plan.enabled.iter().map(|s| s.as_str().to_owned()).collect();
         assert_eq!(enabled, expected, "enabled list must round-trip exactly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn recorded_from(plan: &ResolvedPlan) -> RecordedPlan {
+        RecordedPlan {
+            schema_version: RESOLVED_PLAN_SCHEMA_VERSION,
+            kind: plan.kind.as_str().to_owned(),
+            digest: plan.digest.clone(),
+            enabled: plan.enabled.iter().map(|s| s.as_str().to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_faithfully_recorded_plan_verifies() {
+        let g = sample_graph();
+        let expected = resolve(
+            &g,
+            &PlanSelection::Focused {
+                targets: vec![StageId::ExitHandoff],
+            },
+            &[],
+        )
+        .unwrap();
+        let recorded = recorded_from(&expected);
+        assert!(verify_recorded_matches_expected(&expected, &recorded).is_ok());
+    }
+
+    #[test]
+    fn a_shrunk_recorded_plan_is_rejected_and_names_the_dropped_stage() {
+        let g = sample_graph();
+        let expected = resolve(
+            &g,
+            &PlanSelection::Focused {
+                targets: vec![StageId::ExitHandoff],
+            },
+            &[],
+        )
+        .unwrap();
+        // Simulate the runner recording a plan that dropped a truth prerequisite
+        // (the P0 shrink): recompute enabled without Preflight, with a stale
+        // digest that no longer matches.
+        let mut recorded = recorded_from(&expected);
+        recorded
+            .enabled
+            .retain(|s| s != StageId::Preflight.as_str());
+        recorded.digest = "0".repeat(64); // any digest != expected
+        let err = verify_recorded_matches_expected(&expected, &recorded).unwrap_err();
+        assert!(
+            err.contains(StageId::Preflight.as_str()) && err.contains("dropped"),
+            "the rejection must name the dropped stage: {err}"
+        );
+    }
+
+    #[test]
+    fn an_injected_stage_in_the_recorded_plan_is_rejected_and_named() {
+        let g = sample_graph();
+        let expected = resolve(
+            &g,
+            &PlanSelection::Focused {
+                targets: vec![StageId::Preflight],
+            },
+            &[],
+        )
+        .unwrap();
+        let mut recorded = recorded_from(&expected);
+        recorded
+            .enabled
+            .push(StageId::ExitHandoff.as_str().to_owned());
+        recorded.digest = "1".repeat(64);
+        let err = verify_recorded_matches_expected(&expected, &recorded).unwrap_err();
+        assert!(
+            err.contains(StageId::ExitHandoff.as_str()) && err.contains("added"),
+            "the rejection must name the unexpected added stage: {err}"
+        );
+    }
+
+    #[test]
+    fn read_recorded_plan_rejects_an_unknown_schema_version() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-recorded-plan-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        std::fs::write(
+            dir.join(RESOLVED_PLAN_RELATIVE_PATH),
+            br#"{"schema_version": 999, "kind": "standard", "digest": "x", "enabled": []}"#,
+        )
+        .unwrap();
+        let err = read_recorded_plan(&dir).unwrap_err();
+        assert!(
+            err.contains("schema_version"),
+            "must reject unknown version: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
