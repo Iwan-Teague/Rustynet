@@ -22,6 +22,18 @@
       "alt_ssh_endpoints": [
         "ubuntu-server@172.23.56.5"
       ]
+    },
+    {
+      "host_id": "lenovo-bot",
+      "kind": "libvirt",
+      "connect_uri": "qemu+ssh://ubuntu@192.168.0.29/system",
+      "guest_subnet": "192.168.0.0/24",
+      "notes": "Lenovo, Intel i3-4170 2C/4T, 8GiB; THIN host (Linux guests only, no nested-virt/Windows); guests BRIDGED onto LAN via br0/hostbr (real 192.168.0.x IPs, not NAT)",
+      "repo_dir": "/home/ubuntu/Rustynet",
+      "pool_disk_model": "MTFDDAK120MBB-1A",
+      "alt_ssh_endpoints": [
+        "ubuntu@lenovo-bot"
+      ]
     }
   ],
   "entries": [
@@ -323,6 +335,50 @@
         "host_id": "ubuntu-kvm-1"
       },
       "notes": "Fedora 42 x86-64 cloud guest on the KVM box; NetworkManager active + firewalld available (distinct network/firewall stack vs Debian — native x86-64 coverage of the NM/firewalld path, cf the enforce_baseline_runtime NM regression). key-auth via fedora user (box host key). Needs provision_guest_toolchain (dnf) before a rustynet build."
+    },
+    {
+      "alias": "lenovo-client-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.0.30",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.0.30",
+      "last_known_network": "192.168.0.0/24",
+      "network_group": "bridge-192.168.0.0/24",
+      "node_id": "lenovo-client-1",
+      "lab_role": "linux_client",
+      "parent_device": "lenovo-bot (x86_64 KVM host)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "lenovo-client-1",
+        "host_id": "lenovo-bot"
+      },
+      "mesh_ip": "100.64.0.13"
+    },
+    {
+      "alias": "lenovo-exit-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.0.31",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.0.31",
+      "last_known_network": "192.168.0.0/24",
+      "network_group": "bridge-192.168.0.0/24",
+      "node_id": "lenovo-exit-1",
+      "lab_role": "linux_exit",
+      "parent_device": "lenovo-bot (x86_64 KVM host)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "lenovo-exit-1",
+        "host_id": "lenovo-bot"
+      },
+      "mesh_ip": "100.64.0.14",
+      "exit_capable": true,
+      "relay_capable": false
     }
   ]
 }
