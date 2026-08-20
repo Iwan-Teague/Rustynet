@@ -281,6 +281,11 @@ pub(crate) fn cell_for_status(status: &str) -> (&'static str, Style) {
         | crate::data::stage_reader::StageStatus::TimedOut => {
             ("[✗✗]", Style::default().fg(Color::Red))
         }
+        // Unproven: terminal and failure-ranked, but visibly distinct from a
+        // hard fail (a claim that could not be PROVEN, not one disproved).
+        crate::data::stage_reader::StageStatus::NotProven => {
+            ("[‼‼]", Style::default().fg(Color::Red))
+        }
         crate::data::stage_reader::StageStatus::Running => (
             spinner_glyph(),
             Style::default()

@@ -40,6 +40,10 @@ pub enum StageStatus {
     NotApplicable,
     TimedOut,
     Aborted,
+    /// The orchestrator could not PROVE the stage's claim (a typed `ReasonCode`
+    /// on the native side). It is terminal, failure-ranked, and never a pass,
+    /// satisfied, or group-green — an unproven stage is not a passing stage.
+    NotProven,
     Unknown,
 }
 
@@ -56,6 +60,7 @@ impl StageStatus {
             "na" | "n/a" | "not_applicable" | "not-applicable" => Self::NotApplicable,
             "timed_out" | "timedout" | "timeout" => Self::TimedOut,
             "aborted" | "abort" => Self::Aborted,
+            "not_proven" | "not-proven" | "notproven" => Self::NotProven,
             _ => Self::Unknown,
         }
     }
@@ -65,7 +70,10 @@ impl StageStatus {
     }
 
     pub fn is_failure(self) -> bool {
-        matches!(self, Self::Fail | Self::TimedOut | Self::Aborted)
+        matches!(
+            self,
+            Self::Fail | Self::TimedOut | Self::Aborted | Self::NotProven
+        )
     }
 
     pub fn is_satisfied(self) -> bool {
@@ -737,6 +745,17 @@ mod tests {
             assert!(!status.is_terminal());
             assert!(!status.is_satisfied());
             assert!(!status.is_failure());
+        }
+    }
+
+    #[test]
+    fn not_proven_status_parses_and_ranks_as_a_failure_never_a_pass() {
+        for raw in ["not_proven", "not-proven", "notproven", "NOT_PROVEN"] {
+            let status = StageStatus::parse(raw);
+            assert_eq!(status, StageStatus::NotProven, "raw {raw:?}");
+            assert!(status.is_terminal(), "not_proven is terminal");
+            assert!(status.is_failure(), "not_proven is failure-ranked");
+            assert!(!status.is_satisfied(), "not_proven is never satisfied");
         }
     }
 
