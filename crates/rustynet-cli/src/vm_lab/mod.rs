@@ -2604,6 +2604,9 @@ pub(crate) enum VmLabStageStatus {
     Pass,
     Fail,
     Skipped,
+    /// A required observation was missing or unattributable — a blocking
+    /// non-pass, never collapsed into `Skipped`. Serializes as `not_proven`.
+    NotProven,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9599,6 +9602,7 @@ fn vm_lab_stage_status_progress_label(status: &VmLabStageStatus) -> &'static str
         VmLabStageStatus::Pass => "PASS",
         VmLabStageStatus::Fail => "FAIL",
         VmLabStageStatus::Skipped => "SKIP",
+        VmLabStageStatus::NotProven => "NOT_PROVEN",
     }
 }
 
@@ -30502,6 +30506,10 @@ fn stage_status_from_record(record: &LiveLabStageRecord) -> VmLabStageStatus {
     match record.status.as_str() {
         "pass" => VmLabStageStatus::Pass,
         "fail" => VmLabStageStatus::Fail,
+        // A recorded evidence gap is a blocking non-pass; it must NOT fall
+        // through the wildcard into `Skipped`, which reads as a legitimate
+        // profile omission.
+        "not_proven" => VmLabStageStatus::NotProven,
         _ => VmLabStageStatus::Skipped,
     }
 }
@@ -30539,6 +30547,7 @@ fn live_lab_matrix_stage_outcomes_from_vm_lab(
                 // Canonical taxonomy (finding 3) — see the StageOutcome
                 // converter above.
                 VmLabStageStatus::Skipped => "skipped",
+                VmLabStageStatus::NotProven => "not_proven",
             }
             .to_owned(),
             artifacts: outcome.artifacts.clone(),
