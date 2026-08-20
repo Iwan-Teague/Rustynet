@@ -7,13 +7,14 @@
 //! silently shrink its own claim: the truth-prerequisite closure is mandatory,
 //! cleanup is unconditional, and an explicit skip of a selected target or its
 //! closure is refused. The manifest and `node_stage_plan.json` must later equal
-//! this resolved plan exactly, and the verifier reconstructs it independently to
-//! detect a shrunk plan (that wiring + the independent reconstruction is L0.4c).
+//! this resolved plan exactly, and the finalizer reconstructs it independently
+//! from the recorded selectors to detect a shrunk plan
+//! ([`verify_recorded_plan_not_shrunk`], the wired anti-shrink gate).
 //!
 //! Determinism: every id list the resolver emits is sorted by `as_str()`, and
 //! the digest is a SHA-256 over that canonical form, so the same selection over
 //! the same graph always produces the same digest regardless of input order.
-#![allow(dead_code)] // consumed by native.rs plan construction + the verifier in L0.4c
+#![allow(dead_code)] // consumed by native.rs plan construction + the wired anti-shrink verifier (verify_recorded_plan_not_shrunk, called from the finalizer)
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -305,6 +306,61 @@ pub fn verify_recorded_matches_expected(
         dropped.join(", "),
         added.join(", "),
     ))
+}
+
+/// The LIVE anti-plan-shrink gate (§3.1.3, §6 item 15, L0.4c-iii). Independently
+/// reconstruct the expected plan for a full native run FRESH from `StageId::ALL` +
+/// the manifest's recorded `ManifestSelectors` — the same `PlanBuilder`/`suite()`
+/// catalog the runner used, but built here, NOT read from the recorded artifact —
+/// resolve it, and reject a recorded `resolved_plan.json` that dropped a required
+/// stage (the dangerous shrink) or added an unexpected one. This is what turns the
+/// [`verify_recorded_matches_expected`] primitive into an enforced gate; without a
+/// caller the recorded plan was only ever compared against a self-authored copy of
+/// its own digest.
+///
+/// Scope and faithfulness:
+/// - Full native runs only. A `setup_only`/`run_only` run legitimately shrinks the
+///   plan (`filter_rust_native_stages_for_mode`) and emits no resolved plan, and a
+///   bash run has no `native_run` block — both return `Ok(())` (nothing to verify).
+/// - The recorded suite bools already fold in `!skip_live_suite` (recorded that way
+///   in native.rs), and `PlanBuilder::build()` re-applies `!skip_live_suite` to
+///   each — an idempotent re-AND — so passing the folded bools reproduces the exact
+///   membership the runner built, with no false positive on a legitimate run.
+/// - Runtime-only `PlanBuilder` inputs (source mode, rebuild set, parallelism,
+///   shutdown flag) do not affect stage membership or the plan digest, so the
+///   defaults from `PlanBuilder::new()` are used.
+///
+/// The manifest's `native_run.resolved_plan_digest` binds the manifest to the
+/// stage catalog at the run's commit, so the reconstruction (which links against
+/// that same compiled catalog) is valid at the commit that produced the run.
+pub fn verify_recorded_plan_not_shrunk(report_dir: &Path) -> Result<(), String> {
+    let manifest = match crate::live_lab_stage_manifest::read_stage_manifest(report_dir)? {
+        Some(manifest) => manifest,
+        None => return Ok(()),
+    };
+    // Only a full native run carries a resolved plan to check.
+    if manifest.run_mode != "full" || manifest.native_run.is_none() {
+        return Ok(());
+    }
+    let selectors = &manifest.selectors;
+    let cross_network = crate::vm_lab::orchestrator::stage::cross_network::CrossNetworkOptions {
+        enable_suite: selectors.cross_network_suite,
+        ..Default::default()
+    };
+    let expected_stages = crate::vm_lab::orchestrator::plan::PlanBuilder::new()
+        .with_skip_live_suite(selectors.skip_linux_live_suite)
+        .with_enable_chaos_suite(selectors.chaos_suite)
+        .with_enable_negative_control(selectors.negative_control_suite)
+        .with_skip_soak(!selectors.soak_suite)
+        .with_cross_network_options(cross_network)
+        .build();
+    let graph = StageGraph::from_stages(&expected_stages);
+    let selection = PlanSelection::Standard {
+        stages: expected_stages.iter().map(|stage| stage.id()).collect(),
+    };
+    let expected = resolve(&graph, &selection, &[])?;
+    let recorded = read_recorded_plan(report_dir)?;
+    verify_recorded_matches_expected(&expected, &recorded)
 }
 
 fn sort_ids(ids: &mut [StageId]) {
@@ -744,6 +800,117 @@ mod tests {
             err.contains(StageId::ExitHandoff.as_str()) && err.contains("added"),
             "the rejection must name the unexpected added stage: {err}"
         );
+    }
+
+    // ---- End-to-end anti-shrink gate (verify_recorded_plan_not_shrunk) ----
+
+    fn full_run_selectors() -> crate::live_lab_stage_registry::TargetSelectors {
+        // A full run with every suite on and the live suite kept (skip_live =
+        // false), so the recorded folded bools equal the un-folded ones.
+        crate::live_lab_stage_registry::TargetSelectors {
+            skip_linux_live_suite: false,
+            chaos_suite: true,
+            cross_network_suite: true,
+            soak_suite: true,
+            negative_control_suite: true,
+            local_gate_suite: false,
+            ..Default::default()
+        }
+    }
+
+    /// Build a real resolved plan from PlanBuilder, exactly as the runner and the
+    /// anti-shrink reconstruction do (folded suite bools; `skip_soak = !soak`).
+    fn build_real_plan(
+        skip_live: bool,
+        chaos: bool,
+        cross: bool,
+        soak: bool,
+        neg: bool,
+    ) -> ResolvedPlan {
+        let cross_network =
+            crate::vm_lab::orchestrator::stage::cross_network::CrossNetworkOptions {
+                enable_suite: cross,
+                ..Default::default()
+            };
+        let stages = crate::vm_lab::orchestrator::plan::PlanBuilder::new()
+            .with_skip_live_suite(skip_live)
+            .with_enable_chaos_suite(chaos)
+            .with_enable_negative_control(neg)
+            .with_skip_soak(!soak)
+            .with_cross_network_options(cross_network)
+            .build();
+        let graph = StageGraph::from_stages(&stages);
+        let selection = PlanSelection::Standard {
+            stages: stages.iter().map(|stage| stage.id()).collect(),
+        };
+        resolve(&graph, &selection, &[]).expect("resolve")
+    }
+
+    fn write_manifest(dir: &Path, run_mode: &str, with_native: bool) {
+        let native = with_native.then(|| crate::live_lab_stage_manifest::NativeRunManifest {
+            execution_dialect: crate::live_lab_stage_manifest::NATIVE_EXECUTION_DIALECT.to_owned(),
+            run_instance_id: "run-1".to_owned(),
+            plan_kind: "standard".to_owned(),
+            resolved_plan_digest: "d".to_owned(),
+            required_cleanup_stage_ids: vec![],
+        });
+        // verify_recorded_plan_not_shrunk reads only selectors/run_mode/native_run,
+        // not the stage list, so an empty active plan is fine.
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        crate::live_lab_stage_manifest::ensure_stage_manifest_with_plan(
+            dir,
+            "vm-lab-orchestrate-live-lab",
+            run_mode,
+            &full_run_selectors(),
+            &empty,
+            &[],
+            native,
+        )
+        .expect("write manifest");
+    }
+
+    #[test]
+    fn verify_recorded_plan_not_shrunk_passes_a_faithful_full_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        write_manifest(dir, "full", true);
+        // The recorded plan matches what the selectors demand (the full set).
+        let plan = build_real_plan(false, true, true, true, true);
+        write_resolved_plan(dir, &plan).expect("write plan");
+        verify_recorded_plan_not_shrunk(dir).expect("a faithful full-run plan verifies");
+    }
+
+    #[test]
+    fn verify_recorded_plan_not_shrunk_rejects_a_shrunk_plan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        // The manifest claims a full run (live suite kept)...
+        write_manifest(dir, "full", true);
+        // ...but the recorded plan was built with the live suite skipped — a
+        // shrink the manifest's own selectors do not permit.
+        let shrunk = build_real_plan(true, true, true, true, true);
+        write_resolved_plan(dir, &shrunk).expect("write plan");
+        let err = verify_recorded_plan_not_shrunk(dir)
+            .expect_err("a plan smaller than its selectors demand must be rejected");
+        assert!(
+            err.contains("does not match") && err.contains("dropped"),
+            "the rejection must name the divergence: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_recorded_plan_not_shrunk_noops_for_non_full_or_bash_runs() {
+        // A setup-only run legitimately shrinks and carries no resolved plan.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_manifest(tmp.path(), "setup_only", true);
+        verify_recorded_plan_not_shrunk(tmp.path()).expect("setup_only no-ops");
+        // A bash run has no native_run block.
+        let tmp2 = tempfile::tempdir().expect("tempdir");
+        write_manifest(tmp2.path(), "full", false);
+        verify_recorded_plan_not_shrunk(tmp2.path()).expect("a bash run no-ops");
+        // No manifest at all → nothing to verify.
+        let tmp3 = tempfile::tempdir().expect("tempdir");
+        verify_recorded_plan_not_shrunk(tmp3.path()).expect("absent manifest no-ops");
     }
 
     #[test]

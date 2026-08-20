@@ -817,6 +817,7 @@ pub(crate) enum EvidenceWriter {
     ParityInput,
     ArtifactCompleteness,
     ContextPersist,
+    PlanIntegrity,
     ReuseSeal,
     CandidateVerdict,
     MatrixAppend,
@@ -1103,6 +1104,20 @@ where
         {
             evidence_errors.push(format!("persist orchestration context failed: {err}"));
         }
+    }
+
+    // 5.5. Anti-plan-shrink gate (§3.1.3, L0.4c-iii): independently reconstruct
+    // the expected plan from the recorded selectors and reject a recorded
+    // resolved_plan.json that was shrunk (dropped a required stage) or grown.
+    // Full native runs only — the check no-ops for setup-only/run-only/bash — so
+    // it is gated on `context_binding` (present only for a full run). A mismatch
+    // is an evidence error, so the run demotes: no pass verdict, no
+    // run_passed=true, no matrix pass row.
+    if inputs.context_binding.is_some()
+        && let Err(err) = evidence_fault_gate(EvidenceWriter::PlanIntegrity)
+            .and_then(|()| orchestrator::resolved_plan::verify_recorded_plan_not_shrunk(report_dir))
+    {
+        evidence_errors.push(format!("recorded plan integrity check failed: {err}"));
     }
 
     let not_proven = inputs
@@ -1470,6 +1485,11 @@ mod finalize_tests {
             false,
             "orchestration context",
         );
+    }
+
+    #[test]
+    fn fault_at_plan_integrity_demotes() {
+        assert_fault_demotes(EvidenceWriter::PlanIntegrity, false, "plan integrity");
     }
 
     #[test]
