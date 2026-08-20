@@ -22,6 +22,7 @@
 #![allow(dead_code)] // consumed by the scenario evaluator + verifier in L0.4/L0.5
 
 pub mod artifact;
+pub mod schema;
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::error::ReasonCode;
@@ -30,7 +31,11 @@ use crate::vm_lab::orchestrator::role::NodeRole;
 /// The class of a scenario assertion — fixes what KIND of proof it carries so
 /// the verifier recomputes it from the right raw witnesses (§3.3). A scenario
 /// cannot self-report an assertion true; the class routes it to a recomputation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The serde tokens are snake_case and match [`AssertionClass::as_str`] exactly,
+/// so the `scenario.v1` on-disk form and the in-code token never drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AssertionClass {
     /// Proves the intended node identity was exercised (expected-node-id
     /// challenge), not merely that a name was logged.
@@ -242,6 +247,21 @@ mod tests {
             AssertionClass::PerformanceMeasurement.as_str(),
             "performance_measurement"
         );
+        // The serde token must equal `as_str` for EVERY variant, so the
+        // scenario.v1 on-disk form and the in-code token can never drift (the
+        // multi-word variant is the real risk).
+        for class in AssertionClass::ALL {
+            let serde_token = serde_json::to_value(class)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                serde_token,
+                class.as_str(),
+                "serde token must match as_str for {class:?}"
+            );
+        }
     }
 
     #[test]
