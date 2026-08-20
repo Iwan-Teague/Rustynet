@@ -24,6 +24,7 @@
 pub mod artifact;
 pub mod pass_certificate;
 pub mod schema;
+pub mod verdict;
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::error::ReasonCode;
