@@ -187,7 +187,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ))
-    } else if app.run_plan_kind().is_some() {
+    } else if app.run_is_release_scope() {
+        // A native Standard (release-scope) run: GREEN only when release-verified,
+        // else the specific missing predicate. Gating on run_is_release_scope()
+        // (not run_plan_kind().is_some()) is required — the grid greens only for
+        // a release-scope run, and a header that greened for any native run
+        // (including an absent/unrecognized plan_kind, which is #[serde(default)]
+        // = "") would contradict the grid and present a non-Standard run as
+        // release evidence.
         if app.run_verified() {
             Line::from(Span::styled(
                 "VERIFIED: release evidence complete",
@@ -202,6 +209,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(format!(" {reason}"), Style::default().fg(Color::White)),
             ])
         }
+    } else if app.run_plan_kind().is_some() {
+        // A native run whose plan_kind is neither "standard" nor a recognized
+        // scoped kind (absent or unrecognized) — a producer/version error, never
+        // release-green (§3.4: an absent required field is a producer error).
+        Line::from(Span::styled(
+            "SCOPE: unrecognized plan kind — not a release run",
+            Style::default().fg(Color::Yellow),
+        ))
     } else {
         Line::from("")
     };
