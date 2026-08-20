@@ -824,6 +824,7 @@ pub(crate) fn execute_rust_native_orchestration(
     finalize_rust_native_run(
         RustNativeFinalizeInputs {
             ctx: &ctx,
+            run_instance_id: run_instance_id.as_str(),
             results: &results,
             node_targets: &node_targets,
             os_versions: &os_versions,
