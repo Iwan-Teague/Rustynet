@@ -23,6 +23,24 @@ pub struct StageOutcome {
     pub summary: String,
     #[serde(default)]
     pub artifacts: Vec<String>,
+    /// The run instance that recorded this row (native TSV 9th column, §3.1.1).
+    /// `None` for a legacy/bash-dialect row (empty or absent 9th column) and for
+    /// an outcome read from `orchestrate_result.json` (which carries no run
+    /// instance). Used to filter to the CURRENT generation so a stale prior-run
+    /// row in a reused report dir cannot be counted as this run's evidence.
+    #[serde(default)]
+    pub run_instance_id: Option<String>,
+}
+
+impl StageOutcome {
+    /// True iff this row was recorded by the given current run instance
+    /// (§3.1.1 generation binding). A row with no run instance — a legacy/bash
+    /// dialect row, or an outcome from `orchestrate_result.json` — is never the
+    /// current native generation, so it is excluded from a native run's
+    /// current-generation evidence rather than being counted as a stale pass.
+    pub fn is_current_generation(&self, current_run_instance_id: &str) -> bool {
+        self.run_instance_id.as_deref() == Some(current_run_instance_id)
+    }
 }
 
 /// Monitor-side view of the orchestrator's closed status taxonomy. Kept in
@@ -359,6 +377,13 @@ fn read_live_stages_tsv(report_dir: &Path) -> Result<Vec<StageOutcome>> {
                 .get(4)
                 .map(|p| vec![(*p).to_owned()])
                 .unwrap_or_default(),
+            // 9th column (index 8): the native run instance id. Empty or absent
+            // means a legacy/bash-dialect row — carried as None, not a generation.
+            run_instance_id: cols
+                .get(8)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
         });
     }
     Ok(outcomes)
@@ -465,6 +490,7 @@ mod tests {
             status: "pass".to_owned(),
             summary: String::new(),
             artifacts: Vec::new(),
+            run_instance_id: None,
         }];
 
         let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
@@ -541,6 +567,7 @@ mod tests {
             status: status.to_owned(),
             summary: String::new(),
             artifacts: Vec::new(),
+            run_instance_id: None,
         }
     }
 
@@ -593,6 +620,7 @@ mod tests {
             status: "pass".to_owned(),
             summary: String::new(),
             artifacts: Vec::new(),
+            run_instance_id: None,
         }];
 
         let stage = infer_active_stage(dir.path(), &ordered, &outcomes).expect("stage");
@@ -757,6 +785,32 @@ mod tests {
             assert!(status.is_failure(), "not_proven is failure-ranked");
             assert!(!status.is_satisfied(), "not_proven is never satisfied");
         }
+    }
+
+    #[test]
+    fn stages_tsv_ninth_column_is_read_as_the_run_instance_and_filters_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        // A native 9-column row (index 8 = run_instance_id) and a legacy
+        // 6-column row (no 9th column) in the same file.
+        std::fs::write(
+            state.join("stages.tsv"),
+            "preflight\thard\tpass\t0\t/tmp/p.log\tverify\t\t\trun-abc\n\
+             legacy_stage\thard\tpass\t0\t/tmp/l.log\told",
+        )
+        .expect("stages.tsv");
+
+        let outcomes = read_live_stages_tsv(dir.path()).expect("read");
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].run_instance_id.as_deref(), Some("run-abc"));
+        assert_eq!(outcomes[1].run_instance_id, None, "legacy row has no gen");
+
+        // Generation binding: only the row stamped with the current run instance
+        // is this run's evidence; a legacy/foreign row is not.
+        assert!(outcomes[0].is_current_generation("run-abc"));
+        assert!(!outcomes[0].is_current_generation("run-other"));
+        assert!(!outcomes[1].is_current_generation("run-abc"));
     }
 
     #[test]

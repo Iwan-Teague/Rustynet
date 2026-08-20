@@ -40,6 +40,35 @@ pub struct RunStageManifest {
     /// finalized run's roles so VM STATUS reflects the CURRENT run live.
     #[serde(default)]
     pub node_assignments: Vec<ManifestNodeAssignment>,
+    /// Present only for a native `--node` full run (the CLI's L0.7a addition);
+    /// absent on a bash/wrapper or setup-only run. It is the run/plan identity the
+    /// monitor cross-checks before rendering a stage/run release-green (§3.4). Its
+    /// presence is the dialect signal — a run without it is never VerifiedPass.
+    #[serde(default)]
+    pub native_run: Option<NativeRunManifest>,
+}
+
+/// The one accepted native execution dialect (mirror of the CLI's
+/// `live_lab_stage_manifest::NATIVE_EXECUTION_DIALECT`). A `native_run` block
+/// with any other `execution_dialect` is a producer/version error, never green.
+pub const NATIVE_EXECUTION_DIALECT: &str = "native_node_v1";
+
+/// The native-dialect run binding (mirror of the CLI's `NativeRunManifest`).
+/// Deserialized tolerantly; the fields the monitor consumes for VerifiedPass are
+/// the dialect marker, the run instance, the resolved-plan digest, and the
+/// required cleanup ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct NativeRunManifest {
+    #[serde(default)]
+    pub execution_dialect: String,
+    #[serde(default)]
+    pub run_instance_id: String,
+    #[serde(default)]
+    pub plan_kind: String,
+    #[serde(default)]
+    pub resolved_plan_digest: String,
+    #[serde(default)]
+    pub required_cleanup_stage_ids: Vec<String>,
 }
 
 /// One `<alias>:<role>` assignment recorded by the Rust `--node` orchestrator.
