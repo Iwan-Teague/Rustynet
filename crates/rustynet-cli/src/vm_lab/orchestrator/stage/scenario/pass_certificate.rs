@@ -203,6 +203,18 @@ pub fn evaluate(
         verified.push(req.id.to_owned());
     }
 
+    // A contract that names no required assertion cannot certify a pass: there is
+    // no independent claim to verify, so the loop above proved nothing. An empty
+    // required set is NotProven, never Passed — a backstop against a contract
+    // author shipping a contract with zero required assertions.
+    if verified.is_empty() {
+        return Assessment::NotProven(
+            ReasonCode::MissingWitness,
+            "contract names no required assertion; a pass needs at least one proven claim"
+                .to_owned(),
+        );
+    }
+
     // A pass without cleanup is rejected; a failed residual check is a hard
     // taint, not a NotProven.
     if scenario.cleanup.is_empty() {
@@ -332,6 +344,34 @@ mod tests {
                 assert_eq!(cert.run_identity(), RUN);
             }
             other => panic!("expected Passed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_contract_with_no_required_assertion_is_not_proven_never_a_pass() {
+        // A contract that names zero required assertions proves nothing — the
+        // per-assertion loop runs zero times — so it must be NotProven, never a
+        // Passed on the strength of only the targets/cleanup gates.
+        let root = temp_root("noreq");
+        let s = scenario_with_artifact(&root, b"marker-42");
+        let empty_contract = ScenarioEvidenceContract {
+            contract_version: 1,
+            required_assertions: vec![],
+        };
+        match evaluate(
+            &root,
+            &s,
+            &empty_contract,
+            CONTRACT_DIGEST,
+            RUN,
+            1024,
+            &passing_recomputers(),
+        ) {
+            Assessment::NotProven(ReasonCode::MissingWitness, d) => {
+                assert!(d.contains("no required assertion"), "{d}")
+            }
+            other => panic!("expected NotProven(MissingWitness), got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
     }

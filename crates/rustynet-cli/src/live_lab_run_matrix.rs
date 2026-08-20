@@ -2286,11 +2286,16 @@ fn status_rank(status: &str) -> u8 {
         "timed_out" => 7,
         "aborted" => 6,
         "blocked" => 5,
+        // unknown/malformed ABOVE pass: an unrecognized status is a
+        // data-integrity non-pass (a torn write or tampered token) and must
+        // never be masked by a co-occurring pass in a merge (§2.2 "malformed/
+        // unknown ... never satisfy a ... release claim"). Ranked with `blocked`
+        // — a non-pass that is not itself a specific stage failure.
+        "unknown" => 5,
         // skip ABOVE pass — see the note above.
         "skip" => 4,
         "pass" => 3,
         "reused" => 2,
-        "unknown" => 2,
         "not_run" => 1,
         "na" => 0,
         _ => 0,
@@ -4972,6 +4977,19 @@ mod conclusion_barrier_tests {
         assert_eq!(merge_status("pass", "not_proven"), "not_proven");
         assert_eq!(merge_status("not_proven", "pass"), "not_proven");
         assert_eq!(merge_status("skip", "not_proven"), "not_proven");
+    }
+
+    #[test]
+    fn an_unknown_status_is_never_masked_by_a_co_occurring_pass() {
+        use super::{merge_status, status_rank};
+        // §2.2: a malformed/unrecognized status is a data-integrity non-pass and
+        // must outrank a pass in a merge, or a torn/tampered token would be
+        // silently swallowed by a co-occurring pass.
+        assert!(status_rank("unknown") > status_rank("pass"));
+        assert_eq!(merge_status("pass", "unknown"), "unknown");
+        assert_eq!(merge_status("unknown", "pass"), "unknown");
+        // A real, specific failure still outranks an unknown.
+        assert_eq!(merge_status("unknown", "fail"), "fail");
     }
 
     #[test]
