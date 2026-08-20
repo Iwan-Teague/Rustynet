@@ -322,8 +322,16 @@ fn topological_order_unchecked(
     let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
 
     for (i, stage) in stages.iter().enumerate() {
-        for dep in stage.dependencies() {
-            if let Some(&dep_idx) = id_to_idx.get(dep) {
+        // The topological order is the UNION of truth-prerequisite edges
+        // (`dependencies`) and ordering-only edges (`ordering_after`). Both
+        // constrain WHEN a stage runs; only `dependencies` gates on the
+        // predecessor's outcome (skip-cascade lives in `skip_decision`, which
+        // reads only `dependencies`). An `ordering_after` edge to a stage not
+        // in this plan is silently ignored — the same `if let Some` guard the
+        // dependency loop uses — so an omitted ordering predecessor never
+        // becomes an implicit requirement (§3.1 rule 3).
+        for edge in stage.dependencies().iter().chain(stage.ordering_after()) {
+            if let Some(&dep_idx) = id_to_idx.get(edge) {
                 adj[dep_idx].push(i);
                 in_degree[i] += 1;
             }
@@ -371,6 +379,7 @@ mod tests {
         id: StageId,
         name: &'static str,
         deps: Vec<StageId>,
+        ordering_after: Vec<StageId>,
         outcome: StageOutcome,
         always_run: bool,
         panics: bool,
@@ -385,6 +394,9 @@ mod tests {
         }
         fn dependencies(&self) -> &[StageId] {
             &self.deps
+        }
+        fn ordering_after(&self) -> &[StageId] {
+            &self.ordering_after
         }
         fn applies_to_roles(&self) -> &[NodeRole] {
             &[]
@@ -410,6 +422,7 @@ mod tests {
             id,
             name: "pass",
             deps,
+            ordering_after: vec![],
             outcome: StageOutcome::Passed,
             always_run: false,
             panics: false,
@@ -421,6 +434,7 @@ mod tests {
             id,
             name: "fail",
             deps,
+            ordering_after: vec![],
             outcome: StageOutcome::Failed("test failure".to_owned()),
             always_run: false,
             panics: false,
@@ -434,6 +448,7 @@ mod tests {
             id,
             name: "always_run",
             deps,
+            ordering_after: vec![],
             outcome: StageOutcome::Passed,
             always_run: true,
             panics: false,
@@ -447,9 +462,28 @@ mod tests {
             id,
             name: "panic",
             deps,
+            ordering_after: vec![],
             outcome: StageOutcome::Passed,
             always_run: false,
             panics: true,
+        })
+    }
+
+    /// A stage with a pure ordering-only edge (never skip-cascaded). `outcome`
+    /// lets a test set the DEPENDENT's own result.
+    fn ordering_after_stage(
+        id: StageId,
+        ordering_after: Vec<StageId>,
+        outcome: StageOutcome,
+    ) -> Box<dyn OrchestrationStage> {
+        Box::new(MockStage {
+            id,
+            name: "ordering_after",
+            deps: vec![],
+            ordering_after,
+            outcome,
+            always_run: false,
+            panics: false,
         })
     }
 
@@ -459,6 +493,79 @@ mod tests {
             PathBuf::from("/tmp/test-report"),
             "test-net".to_owned(),
         )
+    }
+
+    // ── §3.1 prerequisite/order split ─────────────────────────────────────────
+
+    #[test]
+    fn ordering_after_does_not_skip_cascade_on_a_failed_predecessor() {
+        // A(fail); B is ordered-after A. B must STILL run — an ordering-only
+        // edge serialises B after A but does not gate on A's outcome (§3.1).
+        // Contrast `skip_cascade_blocks_dependents_of_failing_stage`, where a
+        // `dependencies` edge to a failed stage DOES cascade-skip the dependent.
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            fail_stage(StageId::Preflight, vec![]),
+            ordering_after_stage(
+                StageId::VerifySshReachability,
+                vec![StageId::Preflight],
+                StageOutcome::Passed,
+            ),
+        ];
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut make_ctx())
+            .expect("run");
+        let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
+        assert!(matches!(
+            outcome_of(&StageId::Preflight),
+            Some(StageOutcome::Failed(_))
+        ));
+        assert_eq!(
+            outcome_of(&StageId::VerifySshReachability),
+            Some(&StageOutcome::Passed),
+            "an ordering_after edge must NOT skip-cascade when its predecessor fails"
+        );
+    }
+
+    #[test]
+    fn ordering_after_still_orders_the_dependent_after_its_predecessor() {
+        // Insert the dependent FIRST to prove ordering is by edges, not
+        // insertion order: it must still run after its ordering predecessor.
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            ordering_after_stage(
+                StageId::VerifySshReachability,
+                vec![StageId::Preflight],
+                StageOutcome::Passed,
+            ),
+            pass_stage(StageId::Preflight, vec![]),
+        ];
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut make_ctx())
+            .expect("run");
+        let order: Vec<&StageId> = results.iter().map(|(i, _)| i).collect();
+        let pos = |id: &StageId| order.iter().position(|x| *x == id).unwrap();
+        assert!(
+            pos(&StageId::Preflight) < pos(&StageId::VerifySshReachability),
+            "ordering_after must place the dependent after its predecessor; order was {order:?}"
+        );
+    }
+
+    #[test]
+    fn ordering_after_to_a_stage_not_in_the_plan_is_ignored_not_an_error() {
+        // An ordering edge to an absent stage is silently dropped (rule 3),
+        // unlike a missing `dependencies` target which fails plan validation.
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![ordering_after_stage(
+            StageId::Preflight,
+            vec![StageId::ExitHandoff],
+            StageOutcome::Passed,
+        )];
+        let results = StateMachineRunner::new(stages)
+            .expect("an ordering edge to an absent stage must not fail plan validation")
+            .run(&mut make_ctx())
+            .expect("run");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, StageOutcome::Passed);
     }
 
     // ── Skip-cascade tests ────────────────────────────────────────────────────
