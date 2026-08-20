@@ -21,6 +21,8 @@
 //! of contracted scenarios starts empty and grows as scenarios adopt it.
 #![allow(dead_code)] // consumed by the scenario evaluator + verifier in L0.4/L0.5
 
+pub mod artifact;
+
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::error::ReasonCode;
 use crate::vm_lab::orchestrator::role::NodeRole;
