@@ -27,6 +27,15 @@ impl StageObserver for NoopObserver {
 type PreCleanupHook<'a> =
     dyn Fn(&OrchestrationContext, &[(StageId, StageOutcome)]) -> Result<(), String> + 'a;
 
+/// The result of [`StateMachineRunner::skip_decision`]: the terminal outcome to
+/// record for a skipped stage, plus whether it should mark the stage `blocked`
+/// so its own dependents cascade. `None` from `skip_decision` means "do not
+/// skip — execute the stage".
+struct SkipDecision {
+    outcome: StageOutcome,
+    mark_blocked: bool,
+}
+
 /// Drives stages in dependency order with skip-cascade.
 ///
 /// Skip-cascade rule: if a stage fails or is skipped, every stage that lists
@@ -127,67 +136,20 @@ impl StateMachineRunner {
                 }
             }
 
-            if self.explicit_skips.contains(&id) {
-                let outcome = self
-                    .reused_skips
-                    .get(&id)
-                    .map_or(StageOutcome::NotRun, |digest| StageOutcome::Reused {
-                        evidence_sha256: digest.clone(),
-                    });
-                if outcome.is_blocking() || matches!(outcome, StageOutcome::Skipped(..)) {
+            // Every skip source is funnelled through one decision so the
+            // `always_run` exemption is applied EXACTLY ONCE, ahead of them all
+            // (see `skip_decision`). Previously the explicit-skip branch was
+            // checked before the exemption, so `--rerun-stage X` — which marks
+            // every stage after X as an explicit skip — silently skipped a
+            // trailing `always_run` cleanup stage and left this run's
+            // killswitch/NAT residue on the guest (a release-blocker fail-open).
+            if let Some(decision) = self.skip_decision(stage.as_ref(), ctx, &blocked) {
+                if decision.mark_blocked {
                     blocked.insert(id.clone());
                 }
-                observer.stage_finished(&id, &outcome);
-                results.push((id.clone(), outcome.clone()));
-                ctx.record_outcome(id, outcome);
-                continue;
-            }
-
-            // Keep the blocking dependency's NAME, not just the fact that one
-            // exists: a cascade skip that cannot say what it is waiting on is
-            // indistinguishable from "this role was never elected", and those
-            // have opposite remedies. This is the shape behind the documented
-            // enabled-is-not-dispatched incident, where a whole suite
-            // cascade-skipped behind a dependency that had never passed.
-            let blocking_dep = stage.dependencies().iter().find(|dep| {
-                blocked.contains(*dep)
-                    || ctx
-                        .outcome_of(dep)
-                        .is_some_and(super::error::StageOutcome::is_blocking)
-            });
-            let dep_blocked = blocking_dep.is_some();
-
-            // `always_run` teardown stages (e.g. final cleanup) are exempt from
-            // the dependency skip-cascade: they must run even when an earlier
-            // stage failed, so this run's killswitch / exit-NAT residue is
-            // always removed from the guests (leaving it is a release-blocker).
-            // They still respect the explicit-skip set handled above.
-            if dep_blocked && !stage.always_run() {
-                blocked.insert(id.clone());
-                let reason = blocking_dep.map_or_else(
-                    || "a dependency did not pass".to_owned(),
-                    |dep| format!("dependency `{dep}` did not pass, so this stage never ran"),
-                );
-                let outcome = StageOutcome::Skipped(reason);
-                observer.stage_finished(&id, &outcome);
-                results.push((id.clone(), outcome.clone()));
-                ctx.record_outcome(id, outcome);
-                continue;
-            }
-
-            // Shutdown-requested: skip non-teardown stages but still run
-            // `always_run` cleanup stages so guest killswitch/NAT residue is
-            // torn down (leaving it is a release-blocker per F5-4).
-            if let Some(ref flag) = self.shutdown_flag
-                && flag.load(Ordering::Acquire)
-                && !stage.always_run()
-            {
-                let outcome = StageOutcome::Skipped(
-                    "shutdown was requested before this stage started".to_owned(),
-                );
-                observer.stage_finished(&id, &outcome);
-                results.push((id.clone(), outcome.clone()));
-                ctx.record_outcome(id, outcome);
+                observer.stage_finished(&id, &decision.outcome);
+                results.push((id.clone(), decision.outcome.clone()));
+                ctx.record_outcome(id, decision.outcome);
                 continue;
             }
 
@@ -230,6 +192,86 @@ impl StateMachineRunner {
         }
 
         Ok(results)
+    }
+
+    /// The single gate for every reason a stage might be skipped. `None` means
+    /// "execute the stage".
+    ///
+    /// The `always_run()` exemption is checked FIRST and short-circuits to
+    /// `None` for teardown stages, ahead of explicit-skip, dependency-cascade,
+    /// and shutdown. That ordering is the invariant: an `always_run` cleanup
+    /// stage must run so this run's killswitch / exit-NAT residue is torn down
+    /// (leaving it is a release-blocker), and funnelling every skip source
+    /// through one exemption means a skip source added later cannot
+    /// reintroduce the fail-open by forgetting the `!always_run()` guard the
+    /// way the old explicit-skip branch did.
+    ///
+    /// Non-teardown precedence is preserved exactly as before: explicit skip →
+    /// dependency cascade → shutdown.
+    fn skip_decision(
+        &self,
+        stage: &dyn OrchestrationStage,
+        ctx: &OrchestrationContext,
+        blocked: &HashSet<StageId>,
+    ) -> Option<SkipDecision> {
+        // Teardown stages are never skipped — checked ahead of every source.
+        if stage.always_run() {
+            return None;
+        }
+
+        let id = stage.id();
+
+        // 1) Explicit operator omission (`--skip-stage`, or the `--rerun-stage`
+        //    tail). A listed-but-reused skip carries its validated digest and
+        //    does not block; a bare `NotRun` blocks its dependents.
+        if self.explicit_skips.contains(&id) {
+            let outcome = self
+                .reused_skips
+                .get(&id)
+                .map_or(StageOutcome::NotRun, |digest| StageOutcome::Reused {
+                    evidence_sha256: digest.clone(),
+                });
+            let mark_blocked =
+                outcome.is_blocking() || matches!(outcome, StageOutcome::Skipped(..));
+            return Some(SkipDecision {
+                outcome,
+                mark_blocked,
+            });
+        }
+
+        // 2) Dependency cascade — keep the blocking dependency's NAME, not just
+        //    the fact that one exists: a cascade skip that cannot say what it is
+        //    waiting on is indistinguishable from "this role was never
+        //    elected", and those have opposite remedies. A cascade-skipped
+        //    stage is itself marked blocked so its own dependents cascade too.
+        if let Some(dep) = stage.dependencies().iter().find(|dep| {
+            blocked.contains(*dep)
+                || ctx
+                    .outcome_of(dep)
+                    .is_some_and(super::error::StageOutcome::is_blocking)
+        }) {
+            return Some(SkipDecision {
+                outcome: StageOutcome::Skipped(format!(
+                    "dependency `{dep}` did not pass, so this stage never ran"
+                )),
+                mark_blocked: true,
+            });
+        }
+
+        // 3) Shutdown requested before this stage started. Unlike a cascade,
+        //    this does NOT block dependents — the whole run is winding down.
+        if let Some(ref flag) = self.shutdown_flag
+            && flag.load(Ordering::Acquire)
+        {
+            return Some(SkipDecision {
+                outcome: StageOutcome::Skipped(
+                    "shutdown was requested before this stage started".to_owned(),
+                ),
+                mark_blocked: false,
+            });
+        }
+
+        None
     }
 }
 
@@ -481,6 +523,56 @@ mod tests {
             outcome_of(&StageId::Cleanup),
             Some(&StageOutcome::Passed),
             "always_run cleanup MUST run despite a failed dependency"
+        );
+    }
+
+    #[test]
+    fn always_run_cleanup_runs_even_when_explicitly_skipped() {
+        // The `--rerun-stage` tail marks every stage after the target as an
+        // explicit skip — INCLUDING a trailing `always_run` cleanup stage.
+        // Before the `skip_decision` unification the explicit-skip branch was
+        // evaluated ahead of the `always_run` exemption, so cleanup was skipped
+        // (`NotRun`) and this run's killswitch / exit-NAT residue was left on
+        // the guest — a release-blocker fail-open reachable from a shipped CLI
+        // flag. Cleanup must now still run.
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::Preflight, vec![]),
+            always_run_stage(StageId::Cleanup, vec![StageId::Preflight]),
+        ];
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            // Simulate `--rerun-stage Preflight`: everything after the target is
+            // explicit-skipped, which includes the `always_run` Cleanup.
+            .with_explicit_skips([StageId::Cleanup])
+            .run(&mut make_ctx())
+            .expect("run");
+        let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
+        assert_eq!(
+            outcome_of(&StageId::Cleanup),
+            Some(&StageOutcome::Passed),
+            "always_run cleanup MUST run even when it is in the explicit-skip set"
+        );
+    }
+
+    #[test]
+    fn non_cleanup_stage_still_honors_explicit_skip() {
+        // The exemption is scoped to `always_run`: an ordinary stage in the
+        // explicit-skip set is still skipped (`NotRun`), so the fix did not
+        // turn the skip set into a no-op.
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::Preflight, vec![]),
+            pass_stage(StageId::VerifySshReachability, vec![StageId::Preflight]),
+        ];
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .with_explicit_skips([StageId::VerifySshReachability])
+            .run(&mut make_ctx())
+            .expect("run");
+        let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
+        assert_eq!(
+            outcome_of(&StageId::VerifySshReachability),
+            Some(&StageOutcome::NotRun),
+            "a non-always_run stage in the explicit-skip set is still skipped"
         );
     }
 
