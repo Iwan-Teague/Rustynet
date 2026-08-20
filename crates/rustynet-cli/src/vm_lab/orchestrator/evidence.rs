@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::vm_lab::orchestrator;
+use crate::vm_lab::orchestrator::stage::scenario;
 use crate::vm_lab::{
     LiveLabFileBinding, LiveLabReportState, LiveLabRunModeFlags, LiveLabRunProvenance,
     REPORT_STATE_RELATIVE_PATH, VmGuestPlatform, VmLabOrchestrateLiveLabConfig, VmLabStageOutcome,
@@ -817,6 +818,7 @@ pub(crate) enum EvidenceWriter {
     ArtifactCompleteness,
     ContextPersist,
     ReuseSeal,
+    CandidateVerdict,
     MatrixAppend,
     DurabilityBarrier,
     CommitMarker,
@@ -856,6 +858,9 @@ pub(crate) struct RustNativeFinalizeInputs<'a> {
     /// The run's orchestration context (source of `report_dir`, `node_ids`,
     /// `network_id`, and the persisted-context payload).
     pub ctx: &'a orchestrator::context::OrchestrationContext,
+    /// This run's instance id (§3.1.1). The candidate verdict binds to it, so a
+    /// release-pass promotion cannot be authorized by a verdict from another run.
+    pub run_instance_id: &'a str,
     /// Terminal per-stage outcomes for the whole run.
     pub results: &'a [(
         orchestrator::stage::StageId,
@@ -1114,6 +1119,45 @@ where
         evidence_errors.push(format!("write reuse evidence seal failed: {err}"));
     }
 
+    // 6.5. Candidate verdict (L0.6): persist the run's durable, run+plan-bound
+    // EvidenceVerdict BEFORE the matrix append, so promotion is gated on a
+    // verdict that does not depend on the matrix row (removing the old circular
+    // ordering). For the L0 baseline — no scenario contracts exist yet — the
+    // verdict reflects the finalizer's structural pass determination; L1 layers
+    // independent per-scenario re-derivation on top. `will_pass` re-checks the
+    // errors accumulated through step 6 (a failed reuse seal must not leave a
+    // Passed verdict). The verdict is written on EVERY terminal path: a demote
+    // writes a Rejected verdict, and the run_passed=true marker is minted only
+    // from a `ReleaseAuthorization`, which exists only for a Passed verdict bound
+    // to this run instance and plan digest.
+    let plan_digest = orchestrator::resolved_plan::read_recorded_plan(report_dir)
+        .map(|plan| plan.digest)
+        .unwrap_or_else(|_| scenario::verdict::RUN_LEVEL_NO_PLAN_DIGEST.to_owned());
+    let will_pass = candidate_pass && evidence_errors.is_empty();
+    let verdict_detail = format!(
+        "{passed} passed, {failed} failed, {skipped} skipped; {} evidence error(s)",
+        evidence_errors.len()
+    );
+    let candidate_verdict = scenario::verdict::EvidenceVerdict::run_level(
+        inputs.run_instance_id,
+        plan_digest.as_str(),
+        will_pass,
+        verdict_detail.as_str(),
+    );
+    if let Err(err) = evidence_fault_gate(EvidenceWriter::CandidateVerdict)
+        .and_then(|()| scenario::verdict::write_evidence_verdict(report_dir, &candidate_verdict))
+    {
+        evidence_errors.push(format!("write candidate verdict failed: {err}"));
+    }
+    // The type-level promotion gate: `Some` only when the verdict is Passed and
+    // bound to this run instance + plan digest. `None` (a rejected verdict, or a
+    // run/plan mismatch) makes a release-pass promotion impossible below.
+    let release_auth = scenario::verdict::authorize_release(
+        &candidate_verdict,
+        inputs.run_instance_id,
+        plan_digest.as_str(),
+    );
+
     // 7. Fail-closed gate: any evidence error demotes the run BEFORE the matrix
     // append, so neither a pass row nor a run_passed=true marker is produced.
     if !evidence_errors.is_empty() {
@@ -1129,7 +1173,14 @@ where
         Ok(()) => matrix_finalize(vm_lab_outcomes),
         Err(err) => Err(err),
     };
-    let committed = candidate_pass && finalized.is_ok();
+    // The commit marker's `run_passed=true` requires the release authorization
+    // (a Passed verdict bound to this run + plan) AND a successful matrix append.
+    // `release_auth.is_some()` equals the old `candidate_pass` here — we only
+    // reach this line past the step-7 fail-closed gate, so evidence_errors is
+    // empty and `will_pass == candidate_pass` — but the promotion is now routed
+    // through the type-level token and the durable verdict rather than a bare
+    // bool.
+    let committed = release_auth.is_some() && finalized.is_ok();
 
     // 9. Durability barrier, pass path only: the marker's own fsync makes only
     // report_state.json durable, so every artifact it vouches for — stage
@@ -1142,6 +1193,17 @@ where
         && let Err(err) = evidence_fault_gate(EvidenceWriter::DurabilityBarrier)
             .and_then(|()| sync_report_dir_tree(report_dir))
     {
+        // The evidence was pass-worthy but could not be made durable, so the run
+        // demotes. Rewrite the verdict Rejected before the false marker so the
+        // durable verdict and the commit marker agree (a Passed verdict beside a
+        // run_passed=false marker would read as a contradiction to the monitor).
+        let demoted = scenario::verdict::EvidenceVerdict::run_level(
+            inputs.run_instance_id,
+            plan_digest.as_str(),
+            false,
+            "durability barrier failed",
+        );
+        let _ = scenario::verdict::write_evidence_verdict(report_dir, &demoted);
         let _ = write_report_state_marker(report_dir, false, &inputs);
         return Err(format!("evidence durability barrier failed: {err}"));
     }
@@ -1314,6 +1376,7 @@ mod finalize_tests {
         let targets = node_targets();
         let inputs = RustNativeFinalizeInputs {
             ctx: &ctx,
+            run_instance_id: "test-run-instance",
             results: &emitted,
             node_targets: &targets,
             os_versions: &os_versions,
@@ -1406,6 +1469,11 @@ mod finalize_tests {
     }
 
     #[test]
+    fn fault_at_candidate_verdict_demotes() {
+        assert_fault_demotes(EvidenceWriter::CandidateVerdict, false, "candidate verdict");
+    }
+
+    #[test]
     fn fault_at_matrix_append_demotes() {
         assert_fault_demotes(EvidenceWriter::MatrixAppend, false, "MatrixAppend");
     }
@@ -1445,6 +1513,7 @@ mod finalize_tests {
         let targets = node_targets();
         let inputs = RustNativeFinalizeInputs {
             ctx: &ctx,
+            run_instance_id: "test-run-instance",
             results: &emitted,
             node_targets: &targets,
             os_versions: &os_versions,
@@ -1482,6 +1551,123 @@ mod finalize_tests {
         );
     }
 
+    /// The green path also writes a Passed candidate verdict bound to this run
+    /// instance and (absent a resolved plan) the no-plan sentinel digest — the
+    /// durable, run+plan-bound artifact the marker's promotion is gated on (L0.6).
+    #[test]
+    fn green_run_writes_a_passed_candidate_verdict() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let emitted = vec![(StageId::Preflight, StageOutcome::Passed)];
+        prepare_report_dir(dir, &emitted);
+
+        let ctx = make_ctx(dir);
+        let os_versions = HashMap::new();
+        let targets = node_targets();
+        let inputs = RustNativeFinalizeInputs {
+            ctx: &ctx,
+            run_instance_id: "test-run-instance",
+            results: &emitted,
+            node_targets: &targets,
+            os_versions: &os_versions,
+            readiness_outcomes: Vec::new(),
+            context_binding: Some(make_binding(dir)),
+            prior_evidence_errors: Vec::new(),
+            run_started_unix: 100,
+            run_started_utc: "2026-01-01T00:00:00Z",
+            source_mode: "working-tree",
+            repo_ref: None,
+            skip_live_suite: false,
+            skip_soak: true,
+            skip_cross_network: true,
+        };
+        let res = finalize_rust_native_run(inputs, |_outcomes| Ok("stub-matrix".to_owned()));
+        assert!(res.is_ok(), "green run must finalize: {res:?}");
+
+        let verdict = scenario::verdict::read_evidence_verdict(dir).expect("verdict written");
+        assert!(verdict.is_pass(), "green run must record a Passed verdict");
+        assert_eq!(verdict.run_instance_id, "test-run-instance");
+        assert_eq!(
+            verdict.plan_digest,
+            scenario::verdict::RUN_LEVEL_NO_PLAN_DIGEST
+        );
+        // The verdict must authorize a release for THIS run+plan, and refuse a
+        // mismatched run id — proving the marker gate is bound, not a bare bool.
+        assert!(
+            scenario::verdict::authorize_release(
+                &verdict,
+                "test-run-instance",
+                scenario::verdict::RUN_LEVEL_NO_PLAN_DIGEST,
+            )
+            .is_some()
+        );
+        assert!(
+            scenario::verdict::authorize_release(
+                &verdict,
+                "some-other-run",
+                scenario::verdict::RUN_LEVEL_NO_PLAN_DIGEST,
+            )
+            .is_none()
+        );
+    }
+
+    /// A failed stage (not an evidence error) proceeds to the matrix append but
+    /// records a Rejected verdict, so no release authorization is minted and the
+    /// commit marker stays run_passed=false.
+    #[test]
+    fn failed_stage_writes_a_rejected_verdict_and_no_pass_marker() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let emitted = vec![
+            (StageId::Preflight, StageOutcome::Passed),
+            (
+                StageId::TrafficTestMatrix,
+                StageOutcome::Failed("client->client ping failed".to_owned()),
+            ),
+        ];
+        prepare_report_dir(dir, &emitted);
+
+        let ctx = make_ctx(dir);
+        let os_versions = HashMap::new();
+        let targets = node_targets();
+        let inputs = RustNativeFinalizeInputs {
+            ctx: &ctx,
+            run_instance_id: "test-run-instance",
+            results: &emitted,
+            node_targets: &targets,
+            os_versions: &os_versions,
+            readiness_outcomes: Vec::new(),
+            context_binding: Some(make_binding(dir)),
+            prior_evidence_errors: Vec::new(),
+            run_started_unix: 100,
+            run_started_utc: "2026-01-01T00:00:00Z",
+            source_mode: "working-tree",
+            repo_ref: None,
+            skip_live_suite: false,
+            skip_soak: true,
+            skip_cross_network: true,
+        };
+        let res = finalize_rust_native_run(inputs, |_outcomes| Ok("stub-matrix".to_owned()));
+        // A failed stage is not a finalization error — the fail row is appended.
+        assert!(res.is_ok(), "a failed stage still finalizes: {res:?}");
+
+        let verdict = scenario::verdict::read_evidence_verdict(dir).expect("verdict written");
+        assert!(!verdict.is_pass(), "a failed stage must record a non-pass");
+        assert!(
+            scenario::verdict::authorize_release(
+                &verdict,
+                "test-run-instance",
+                scenario::verdict::RUN_LEVEL_NO_PLAN_DIGEST,
+            )
+            .is_none(),
+            "a rejected verdict must never authorize a release"
+        );
+        assert!(
+            !read_report_state(dir).expect("state").run_passed,
+            "a failed stage must leave run_passed=false"
+        );
+    }
+
     /// A recorder error carried in as `prior_evidence_errors` (e.g. the stage
     /// recorder's `take_errors()`) demotes the run before the matrix append.
     #[test]
@@ -1496,6 +1682,7 @@ mod finalize_tests {
         let targets = node_targets();
         let inputs = RustNativeFinalizeInputs {
             ctx: &ctx,
+            run_instance_id: "test-run-instance",
             results: &emitted,
             node_targets: &targets,
             os_versions: &os_versions,

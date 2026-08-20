@@ -26,6 +26,14 @@ pub const EVIDENCE_VERDICT_SCHEMA_VERSION: u64 = 1;
 /// `<report_dir>`-relative path of the candidate verdict.
 pub const EVIDENCE_VERDICT_RELATIVE_PATH: &str = "state/evidence_verdict.v1.json";
 
+/// The `plan_digest` a run-level verdict binds to when the run has no resolved
+/// plan on disk (`--setup-only`/`--run-only`, which are never release
+/// candidates). Using a defined sentinel — rather than an empty string — keeps
+/// the write and the [`authorize_release`] check bound to the same value in the
+/// same finalize call, so there is a single gate path with no weaker branch a
+/// missing plan could downgrade to.
+pub const RUN_LEVEL_NO_PLAN_DIGEST: &str = "no-resolved-plan";
+
 /// Who writes the verdict, for provenance in the artifact.
 const WRITER: &str = concat!(
     "rustynet-cli candidate-verifier/v",
@@ -133,6 +141,41 @@ impl EvidenceVerdict {
         }
     }
 
+    /// A run-level candidate verdict for a `--node` run that declares no scenario
+    /// contracts yet — the L0 baseline, where promotion is gated on the
+    /// finalizer's structural pass determination persisted as a durable,
+    /// run+plan-bound artifact. `passed` maps to [`Verdict::Passed`] /
+    /// [`Verdict::Rejected`]; `contract_digest` is empty because no scenario
+    /// contract governs the run and `artifact_digests` is empty because there is
+    /// no scenario evidence to bind. L1 replaces this with per-scenario verdicts
+    /// carrying real contract digests and artifact maps.
+    pub fn run_level(
+        run_instance_id: &str,
+        plan_digest: &str,
+        passed: bool,
+        detail: &str,
+    ) -> EvidenceVerdict {
+        EvidenceVerdict {
+            schema_version: EVIDENCE_VERDICT_SCHEMA_VERSION,
+            run_instance_id: run_instance_id.to_owned(),
+            plan_digest: plan_digest.to_owned(),
+            contract_digest: String::new(),
+            verdict: if passed {
+                Verdict::Passed
+            } else {
+                Verdict::Rejected
+            },
+            reason_codes: if passed {
+                Vec::new()
+            } else {
+                vec!["failed".to_owned()]
+            },
+            artifact_digests: BTreeMap::new(),
+            writer: WRITER.to_owned(),
+            detail: detail.to_owned(),
+        }
+    }
+
     pub fn is_pass(&self) -> bool {
         self.verdict == Verdict::Passed
     }
@@ -180,6 +223,54 @@ pub fn read_evidence_verdict(report_root: &Path) -> Result<EvidenceVerdict, Stri
         ));
     }
     Ok(v)
+}
+
+/// A proof token that a release-pass promotion is authorized. It exists ONLY
+/// when an [`EvidenceVerdict`] is `Passed` AND bound to the expected run instance
+/// and resolved-plan digest. The finalizer requires one to write a
+/// `run_passed=true` marker or a release-pass matrix row, so promotion is
+/// impossible without a matching passed verdict in hand — closing the gap where
+/// the finalizer vouched for a pass from its own self-count with no independent,
+/// digest-bound verdict between the matrix append and the commit marker
+/// (§3.1.2, review P0-1). No public constructor: [`authorize_release`] is the
+/// only path.
+#[derive(Debug, Clone)]
+pub struct ReleaseAuthorization {
+    run_instance_id: String,
+    plan_digest: String,
+    _seal: (),
+}
+
+impl ReleaseAuthorization {
+    pub fn run_instance_id(&self) -> &str {
+        &self.run_instance_id
+    }
+    pub fn plan_digest(&self) -> &str {
+        &self.plan_digest
+    }
+}
+
+/// The ONLY way to obtain a [`ReleaseAuthorization`]. Returns `Some` only when
+/// the verdict is `Passed` and bound to the expected run instance and plan
+/// digest; a rejected/unavailable or mismatched verdict yields `None`, so a
+/// release-pass promotion cannot proceed.
+pub fn authorize_release(
+    verdict: &EvidenceVerdict,
+    expected_run_instance_id: &str,
+    expected_plan_digest: &str,
+) -> Option<ReleaseAuthorization> {
+    if verdict.verdict == Verdict::Passed
+        && verdict.run_instance_id == expected_run_instance_id
+        && verdict.plan_digest == expected_plan_digest
+    {
+        Some(ReleaseAuthorization {
+            run_instance_id: verdict.run_instance_id.clone(),
+            plan_digest: verdict.plan_digest.clone(),
+            _seal: (),
+        })
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +321,59 @@ mod tests {
         let back = read_evidence_verdict(&dir).expect("read");
         assert_eq!(v, back);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn passed_verdict(run: &str, plan: &str) -> EvidenceVerdict {
+        EvidenceVerdict {
+            schema_version: EVIDENCE_VERDICT_SCHEMA_VERSION,
+            run_instance_id: run.to_owned(),
+            plan_digest: plan.to_owned(),
+            contract_digest: "c".to_owned(),
+            verdict: Verdict::Passed,
+            reason_codes: vec![],
+            artifact_digests: BTreeMap::new(),
+            writer: "w".to_owned(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn run_level_verdict_authorizes_only_when_passed() {
+        let pass = EvidenceVerdict::run_level("run-1", "plan-1", true, "3 passed");
+        assert_eq!(pass.verdict, Verdict::Passed);
+        assert!(pass.reason_codes.is_empty());
+        assert!(authorize_release(&pass, "run-1", "plan-1").is_some());
+
+        let fail = EvidenceVerdict::run_level("run-1", "plan-1", false, "1 failed");
+        assert_eq!(fail.verdict, Verdict::Rejected);
+        assert_eq!(fail.reason_codes, vec!["failed".to_owned()]);
+        assert!(authorize_release(&fail, "run-1", "plan-1").is_none());
+    }
+
+    #[test]
+    fn authorize_release_only_succeeds_for_a_matching_passed_verdict() {
+        let v = passed_verdict("run-1", "plan-1");
+        // Matching pass → authorized.
+        let auth = authorize_release(&v, "run-1", "plan-1").expect("authorized");
+        assert_eq!(auth.run_instance_id(), "run-1");
+        assert_eq!(auth.plan_digest(), "plan-1");
+        // Wrong run id or wrong plan digest → refused.
+        assert!(authorize_release(&v, "run-2", "plan-1").is_none());
+        assert!(authorize_release(&v, "run-1", "plan-2").is_none());
+    }
+
+    #[test]
+    fn a_rejected_or_unavailable_verdict_never_authorizes_release() {
+        let rejected = EvidenceVerdict::from_assessment(
+            &Assessment::Failed("x".to_owned()),
+            "run-1",
+            "plan-1",
+            "c",
+            BTreeMap::new(),
+        );
+        assert!(authorize_release(&rejected, "run-1", "plan-1").is_none());
+        let unavailable = EvidenceVerdict::unavailable("run-1", "plan-1", "c", "no scenario");
+        assert!(authorize_release(&unavailable, "run-1", "plan-1").is_none());
     }
 
     #[test]
