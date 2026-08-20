@@ -3,7 +3,7 @@
 ## 0) Document Relationship and Scope
 - This plan extends architecture outputs from [Phase1.md](./Phase1.md).
 - Requirement ownership remains in [Requirements.md](./Requirements.md).
-- Phase 2 outputs are prerequisites for [Phase3.md](./Phase3.md).
+- Phase 2 outputs are prerequisites for [Phase3.md](./archive/Phase3.md).
 - If this plan conflicts with [Requirements.md](./Requirements.md), requirements take precedence.
 
 ## 1) Phase 2 Objective
@@ -92,4 +92,4 @@ Deliver secure identity and enrollment flows with auditable control-plane APIs, 
 ## 6) Handoff to Phase 3
 - Phase 3 implements Linux data-plane connectivity using the Phase 1 backend boundary and Phase 2 identity/control artifacts.
 - Any data-plane design that leaks WireGuard specifics into control APIs must be rejected.
-- Use [Phase3.md](./Phase3.md) as the next execution plan once Phase 2 exit criteria are met.
+- Use [Phase3.md](./archive/Phase3.md) as the next execution plan once Phase 2 exit criteria are met.

@@ -232,7 +232,7 @@ Windows exit topology iterations over SSH/PowerShell and capture remote
 proof files.
 
 Owning historical recovery ledger:
-[`WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md).
+[`WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`](../../archive/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md).
 
 ### 3.1 What works today
 
@@ -512,7 +512,7 @@ companions for stage helpers).
 
 This is `Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md`'s
 remaining open work for Windows specifically. Owning ledger:
-[`CrossNetworkRemoteExitNodePlan_2026-03-16.md`](./CrossNetworkRemoteExitNodePlan_2026-03-16.md).
+[`CrossNetworkRemoteExitNodePlan_2026-03-16.md`](../../archive/CrossNetworkRemoteExitNodePlan_2026-03-16.md).
 
 **Goal:** prove a Linux mesh peer behind a real ISP NAT can reach the
 public internet through a Windows exit node behind a different ISP NAT.

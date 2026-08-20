@@ -19,6 +19,11 @@ Archive criteria:
   — all 5 priority queue items complete (including HP3 relay constant-time auth
   done 2026-03-25 with 39 tests). "Current Open Work" section states no
   remaining items. Archived 2026-05-21.
+- [SecurityRegressionLessons_2026-03-07.md](./SecurityRegressionLessons_2026-03-07.md) —
+  dated incident-lessons doc; archived 2026-08-19.
+- [SecurityHardeningAudit_2026-04-28.md](./SecurityHardeningAudit_2026-04-28.md) —
+  satisfied security-hardening audit, overtaken by the 2026-06-10 quality audit
+  and the 2026-06-18 `SecurityAuditLedger`; archived 2026-08-19.
 
 ## Archived Phase Implementation Checklists
 

@@ -13,7 +13,7 @@ This document covers:
 - How to build it.
 - Threats and mitigations.
 - Validation and acceptance criteria.
-- Detailed execution sequencing is defined in [MembershipImplementationPlan.md](./MembershipImplementationPlan.md).
+- Detailed execution sequencing is defined in [MembershipImplementationPlan.md](./archive/MembershipImplementationPlan.md).
 
 ## 1) Precedence and Non-Negotiables
 - [Requirements.md](./Requirements.md) is source of truth.

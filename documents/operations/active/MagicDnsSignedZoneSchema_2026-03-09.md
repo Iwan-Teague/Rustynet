@@ -109,7 +109,7 @@ This document is a schema and runtime contract. It is not a relaxed UX sketch.
 
 - [Requirements.md](../../Requirements.md) is normative.
 - [SecurityMinimumBar.md](../../SecurityMinimumBar.md) is release-blocking.
-- [Phase4.md](../../Phase4.md) and [phase10.md](../../phase10.md) define functional and runtime expectations.
+- [Phase4.md](../../archive/Phase4.md) and [phase10.md](../../phase10.md) define functional and runtime expectations.
 - If this document conflicts with a higher-precedence source, the stricter security interpretation wins.
 
 Non-negotiable constraints for this design:

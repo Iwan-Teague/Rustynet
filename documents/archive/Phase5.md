@@ -2,9 +2,9 @@
 
 ## 0) Document Relationship and Scope
 - This plan extends networking feature outputs from [Phase4.md](./Phase4.md).
-- Requirement ownership remains in [Requirements.md](./Requirements.md).
+- Requirement ownership remains in [Requirements.md](../Requirements.md).
 - Phase 5 outputs are prerequisites for [Phase6.md](./Phase6.md).
-- If this plan conflicts with [Requirements.md](./Requirements.md), requirements take precedence.
+- If this plan conflicts with [Requirements.md](../Requirements.md), requirements take precedence.
 
 ## 1) Phase 5 Objective
 Harden runtime reliability and operational visibility so the platform can be operated safely at small production scale.

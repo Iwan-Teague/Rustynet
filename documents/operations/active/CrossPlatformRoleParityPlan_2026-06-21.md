@@ -5,6 +5,10 @@
 > capability must work — and be live-lab-proven — on Linux, macOS, AND Windows.**
 > It consolidates a requirement that was previously scattered across several
 > delta plans so it cannot be missed.
+>
+> **Status superseded (2026-08-19):** the live per-OS parity-status matrix on the
+> Rust `--node` engine is now `CrossPlatformRoleParityRefresh_2026-07-23.md`.
+> This document retains the mandate and the Definition of Done.
 
 ## 1. Mandate (non-negotiable completeness criterion / release blocker)
 

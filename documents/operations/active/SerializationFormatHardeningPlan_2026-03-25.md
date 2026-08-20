@@ -130,14 +130,14 @@ Normative precedence for this plan:
 4. this plan and the related migration documents below
 
 This plan is intentionally linked to the larger migration and hardening work already underway:
-- [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
+- [ShellToRustMigrationPlan_2026-03-06.md](../../archive/ShellToRustMigrationPlan_2026-03-06.md)
 - [SecurityHardeningBacklog_2026-03-09.md](../done/SecurityHardeningBacklog_2026-03-09.md) (archived 2026-05-21 — all items complete)
 - [MeasuredEvidenceGeneration.md](../MeasuredEvidenceGeneration.md)
 - [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](../CrossNetworkRemoteExitArtifactSchema_2026-03-16.md)
 - [LiveLinuxLabOrchestrator.md](../LiveLinuxLabOrchestrator.md)
 - [MagicDnsSignedZoneSchema_2026-03-09.md](./MagicDnsSignedZoneSchema_2026-03-09.md)
 - [UdpHolePunchingImplementationBlueprint_2026-03-07.md](./UdpHolePunchingImplementationBlueprint_2026-03-07.md)
-- [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./CrossNetworkRemoteExitNodePlan_2026-03-16.md)
+- [CrossNetworkRemoteExitNodePlan_2026-03-16.md](../../archive/CrossNetworkRemoteExitNodePlan_2026-03-16.md)
 
 ## 4) Security-first format selection rules
 
@@ -694,12 +694,12 @@ Execution record: 2026-03-26T00:19:57Z
 
 | Document | Why it must change |
 |---|---|
-| [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md) | Rust migration should include serialization hardening as part of the same privileged-path cleanup story |
+| [ShellToRustMigrationPlan_2026-03-06.md](../../archive/ShellToRustMigrationPlan_2026-03-06.md) | Rust migration should include serialization hardening as part of the same privileged-path cleanup story |
 | [MeasuredEvidenceGeneration.md](../MeasuredEvidenceGeneration.md) | artifact extensions and source stream formats will change |
 | [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](../CrossNetworkRemoteExitArtifactSchema_2026-03-16.md) | report schema and file naming will change |
 | [LiveLinuxLabOrchestrator.md](../LiveLinuxLabOrchestrator.md) | run summary, failure digest, and cross-network artifact paths will change |
 | [MagicDnsSignedZoneSchema_2026-03-09.md](./MagicDnsSignedZoneSchema_2026-03-09.md) | DNS signer input path will move from JSON to canonical text manifest |
-| [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./CrossNetworkRemoteExitNodePlan_2026-03-16.md) | discovery and cross-network evidence capture examples will change |
+| [CrossNetworkRemoteExitNodePlan_2026-03-16.md](../../archive/CrossNetworkRemoteExitNodePlan_2026-03-16.md) | discovery and cross-network evidence capture examples will change |
 
 ## 13) Security risks and mitigations
 

@@ -2,9 +2,9 @@
 
 ## 0) Document Relationship and Scope
 - This plan extends assurance/compliance outputs from [Phase8.md](./Phase8.md).
-- Requirement ownership remains in [Requirements.md](./Requirements.md).
+- Requirement ownership remains in [Requirements.md](../Requirements.md).
 - Phase 9 is the completion-readiness phase for broad commercial operation.
-- If this plan conflicts with [Requirements.md](./Requirements.md), requirements take precedence.
+- If this plan conflicts with [Requirements.md](../Requirements.md), requirements take precedence.
 
 ## 1) Phase 9 Objective
 Finalize GA-grade operational maturity, compatibility guarantees, and long-term protocol agility readiness.
@@ -58,4 +58,4 @@ Finalize GA-grade operational maturity, compatibility guarantees, and long-term 
 
 ## 6) Post-Phase Continuity
 - Continue incremental roadmap planning after GA using the same governance model.
-- Update [Requirements.md](./Requirements.md) for any new strategic initiatives.
+- Update [Requirements.md](../Requirements.md) for any new strategic initiatives.

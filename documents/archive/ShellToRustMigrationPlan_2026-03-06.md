@@ -112,7 +112,7 @@ Success criteria:
 - all current gates and VM validation scenarios still pass.
 
 Related format-hardening plan:
-- [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)
+- [SerializationFormatHardeningPlan_2026-03-25.md](../operations/active/SerializationFormatHardeningPlan_2026-03-25.md)
 
 ## Status Update (2026-03-25)
 - Phase E complete: `start.sh` `write_daemon_environment` logic migrated to `rustynet ops write-daemon-env`. This ensures environment variables for systemd service are generated securely in Rust, enforcing policy defaults and fail-closed behavior before service installation. `start.sh` now delegates this critical step to Rust.

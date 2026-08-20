@@ -39,7 +39,7 @@ These features are intentionally excluded from Phase 1 implementation scope and 
 1. [Requirements.md](./Requirements.md)
 2. [SecurityMinimumBar.md](./SecurityMinimumBar.md)
 3. [Phase1.md](./Phase1.md)
-4. [Phase2.md](./Phase2.md) through [Phase9.md](./Phase9.md) (forward-compatibility constraints only)
+4. [Phase2.md](./Phase2.md) through [Phase9.md](./archive/Phase9.md) (forward-compatibility constraints only)
 5. Current workspace architecture:
    - `Cargo.toml` (workspace root)
    - `crates/*` (workspace members)

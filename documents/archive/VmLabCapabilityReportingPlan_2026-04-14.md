@@ -15,10 +15,10 @@ explicitly instead of collapsing every unsupported combination into one coarse
 Linux-only rejection.
 
 Source-backed platform facts for the OS and shell layers that underpin this
-planning work are collected in [VmLabCapabilitySources_2026-04-14.md](./VmLabCapabilitySources_2026-04-14.md).
+planning work are collected in [VmLabCapabilitySources_2026-04-14.md](../operations/active/VmLabCapabilitySources_2026-04-14.md).
 
 Reusable implementation scaffolding, phased implementation notes, and code
-snippets are collected in [VmLabCapabilityCookbook_2026-04-14.md](./VmLabCapabilityCookbook_2026-04-14.md).
+snippets are collected in [VmLabCapabilityCookbook_2026-04-14.md](../operations/active/VmLabCapabilityCookbook_2026-04-14.md).
 
 The goal is not to broaden support yet. The goal is to make the wrapper tell
 the truth, early and machine-readably, while keeping the current fail-closed
@@ -334,10 +334,10 @@ The first implementation pass should add coverage for:
 
 ## Cross-References
 
-- Live-lab runbook: [../LiveLinuxLabOrchestrator.md](../LiveLinuxLabOrchestrator.md)
-- Script function map: [../../../scripts/e2e/README.md](../../../scripts/e2e/README.md)
-- Current platform truth: [../PlatformSupportMatrix.md](../PlatformSupportMatrix.md)
-- Source-backed platform notes: [VmLabCapabilitySources_2026-04-14.md](./VmLabCapabilitySources_2026-04-14.md)
+- Live-lab runbook: [../LiveLinuxLabOrchestrator.md](../operations/LiveLinuxLabOrchestrator.md)
+- Script function map: [../../../scripts/e2e/README.md](../../scripts/e2e/README.md)
+- Current platform truth: [../PlatformSupportMatrix.md](../operations/PlatformSupportMatrix.md)
+- Source-backed platform notes: [VmLabCapabilitySources_2026-04-14.md](../operations/active/VmLabCapabilitySources_2026-04-14.md)
 
 ## Notes
 

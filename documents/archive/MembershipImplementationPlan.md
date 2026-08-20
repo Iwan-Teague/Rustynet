@@ -7,12 +7,12 @@ Implement quorum-signed membership governance end-to-end so node membership chan
 - enforced fail-closed by daemons before dataplane changes,
 - fully aligned with Rust-first and WireGuard-modular architecture constraints.
 
-This plan operationalizes [MembershipConsensus.md](./MembershipConsensus.md) into concrete build steps and release gates.
+This plan operationalizes [MembershipConsensus.md](../MembershipConsensus.md) into concrete build steps and release gates.
 
 ## 1) Precedence and Guardrails
-- [Requirements.md](./Requirements.md) is normative source of truth.
-- [SecurityMinimumBar.md](./SecurityMinimumBar.md) is release-blocking.
-- [MembershipConsensus.md](./MembershipConsensus.md) defines required architecture and security behavior.
+- [Requirements.md](../Requirements.md) is normative source of truth.
+- [SecurityMinimumBar.md](../SecurityMinimumBar.md) is release-blocking.
+- [MembershipConsensus.md](../MembershipConsensus.md) defines required architecture and security behavior.
 
 Non-negotiable constraints:
 - Rust-first implementation.

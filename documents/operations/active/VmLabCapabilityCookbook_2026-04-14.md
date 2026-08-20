@@ -10,7 +10,7 @@ of generating the same scaffolding on the fly.
 
 Use this cookbook together with:
 
-- [VmLabCapabilityReportingPlan_2026-04-14.md](./VmLabCapabilityReportingPlan_2026-04-14.md)
+- [VmLabCapabilityReportingPlan_2026-04-14.md](../../archive/VmLabCapabilityReportingPlan_2026-04-14.md)
 - [VmLabCapabilitySources_2026-04-14.md](./VmLabCapabilitySources_2026-04-14.md)
 
 The rule is simple:
@@ -385,7 +385,7 @@ Those scripts already show the Windows-specific helper responsibilities:
 
 ## Cross-References
 
-- Reporting plan: [VmLabCapabilityReportingPlan_2026-04-14.md](./VmLabCapabilityReportingPlan_2026-04-14.md)
+- Reporting plan: [VmLabCapabilityReportingPlan_2026-04-14.md](../../archive/VmLabCapabilityReportingPlan_2026-04-14.md)
 - Source notes: [VmLabCapabilitySources_2026-04-14.md](./VmLabCapabilitySources_2026-04-14.md)
 - Live-lab runbook: [../LiveLinuxLabOrchestrator.md](../LiveLinuxLabOrchestrator.md)
 - Script map: [../../../scripts/e2e/README.md](../../../scripts/e2e/README.md)

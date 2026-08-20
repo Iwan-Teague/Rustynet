@@ -2,9 +2,9 @@
 
 ## 0) Document Relationship and Scope
 - This plan extends hardening outputs from [Phase5.md](./Phase5.md).
-- Requirement ownership remains in [Requirements.md](./Requirements.md).
+- Requirement ownership remains in [Requirements.md](../Requirements.md).
 - Phase 6 outputs are prerequisites for [Phase7.md](./Phase7.md).
-- If this plan conflicts with [Requirements.md](./Requirements.md), requirements take precedence.
+- If this plan conflicts with [Requirements.md](../Requirements.md), requirements take precedence.
 
 ## 1) Phase 6 Objective
 Expand product usability through a web admin experience and broaden client support beyond Linux.

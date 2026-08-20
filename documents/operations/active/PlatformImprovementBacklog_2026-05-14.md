@@ -29,11 +29,11 @@ Order within each section is rough priority (highest leverage first).
 When an item is sourced from another active plan, the citation is included
 inline. Cross-reference with:
 * [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
-* [SecurityHardeningAudit_2026-04-28.md](./SecurityHardeningAudit_2026-04-28.md)
-* [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
+* [SecurityHardeningAudit_2026-04-28.md](../done/SecurityHardeningAudit_2026-04-28.md)
+* [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](../../archive/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 * [WindowsExitAndRelayDeltaPlan_2026-05-10.md](./WindowsExitAndRelayDeltaPlan_2026-05-10.md)
 * [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)
-* [VmLabCapabilityReportingPlan_2026-04-14.md](./VmLabCapabilityReportingPlan_2026-04-14.md)
+* [VmLabCapabilityReportingPlan_2026-04-14.md](../../archive/VmLabCapabilityReportingPlan_2026-04-14.md)
 * [OpenWorkIndex_2026-04-17.md](./OpenWorkIndex_2026-04-17.md)
 
 ---
@@ -306,7 +306,7 @@ inline. Cross-reference with:
   result on **both** success and top-level failure with shape parity so
   consumers deserialize either branch through a single typed view.
 * Source: Phase 1 of
-  [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md).
+  [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](../../archive/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md).
 * Slice progress:
   * `[x]` Collect helper: success manifest now emits `status='pass'` +
     `reason=''` alongside the existing fields; failure manifest

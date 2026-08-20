@@ -309,7 +309,7 @@ The `llm` role is "done" when:
 - [`NodeRoleTaxonomy_2026-05-21.md`](./NodeRoleTaxonomy_2026-05-21.md) — base taxonomy.
 - [`AnchorNodeRoleDesign_2026-05-21.md`](./AnchorNodeRoleDesign_2026-05-21.md) — co-deployed-sibling pattern template.
 - [`MagicDnsSignedZoneSchema_2026-03-09.md`](./MagicDnsSignedZoneSchema_2026-03-09.md) — stable overlay name (`brain.llm.<mesh>`).
-- [`CrossNetworkRemoteExitNodePlan_2026-03-16.md`](./CrossNetworkRemoteExitNodePlan_2026-03-16.md) — exit-node dataplane the §6 coexistence rule extends.
+- [`CrossNetworkRemoteExitNodePlan_2026-03-16.md`](../../archive/CrossNetworkRemoteExitNodePlan_2026-03-16.md) — exit-node dataplane the §6 coexistence rule extends.
 - [`SerializationFormatHardeningPlan_2026-03-25.md`](./SerializationFormatHardeningPlan_2026-03-25.md) — wire-format hardening for the gateway protocol + uploads.
 - [`RustynetDataplaneExecutionPlan_2026-05-18.md`](./RustynetDataplaneExecutionPlan_2026-05-18.md) — D13.d.
 - [`../PlatformSupportMatrix.md`](../PlatformSupportMatrix.md) · [`../RustynetdServiceHardening.md`](../RustynetdServiceHardening.md) · [`../MacosLaunchdServiceManagement.md`](../MacosLaunchdServiceManagement.md) · [`../SecretRedactionCoverage.md`](../SecretRedactionCoverage.md)

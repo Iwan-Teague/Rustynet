@@ -23,7 +23,7 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 │  rustynet-llm-gateway (inference identity auth)  │
 ├─────────────────────────────────────────────────┤
 │  Backend Abstraction Layer                       │
-│  rustynet-backend-api (Backend trait)            │
+│  rustynet-backend-api (TunnelBackend)            │
 │  rustynet-backend-wireguard (kernel WG)          │
 │  rustynet-backend-userspace (boringtun)          │
 │  rustynet-backend-stub (test stub)               │
@@ -41,30 +41,35 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 
 | Type | Location | Purpose |
 |---|---|---|
-| `MembershipBundle` | `src/membership.rs` | Signed membership snapshot — the core state object |
-| `MembershipSnapshot` | `src/membership.rs` | Unsigned pre-image of a bundle |
+| `SignedMembershipUpdate` | `src/membership.rs` | Signed membership change — the core state object (replaced the former `MembershipBundle`) |
+| `MembershipState` | `src/membership.rs` | The verified signed membership snapshot |
+| `MembershipSignature` | `src/membership.rs` | Ed25519 signature carried by a signed update |
 | `MembershipUpdateRecord` | `src/membership.rs` | Proposed change to membership (add/remove peer, change capabilities) |
-| `NodeId` | `src/node_id.rs` | Unique node identifier |
-| `MembershipOwnerKey` | `src/membership.rs` | The signing key for bundles |
-| `EnrollmentToken` | `src/enrollment.rs` | One-time HMAC token for device onboarding |
-| `ReplayWatermark` | `src/membership.rs` | Epoch-based anti-replay protection |
+| `NodeId` | `rustynet-backend-api/src/lib.rs` | Unique node identifier (there is **no** `control/src/node_id.rs`) |
+| `MembershipOwnerKey` | `rustynet-cli/src/vm_lab/orchestrator/` (error, adapters) | Orchestrator-side membership owner-key material — **not** in `rustynet-control` |
+| `EnrollmentToken` | `rustynetd/src/enrollment_token.rs` | One-time HMAC token for device onboarding |
+| `MembershipWatermark` | `src/membership.rs` + `src/key_rotation.rs` (`PerEpochReplayWatermark`) | Epoch-based anti-replay protection (replaced the former `ReplayWatermark`) |
 
 ### Roles (`rustynet-control`)
 
 | Type | Location | Purpose |
 |---|---|---|
-| `NodeRole` | `src/role_presets.rs` | Enum: Relay, Anchor, Exit, BlindExit, Client, Admin |
-| `RolePreset` | `src/role_presets.rs` | Pre-composed capability sets for each role |
+| `RolePreset` | `src/role_presets.rs` | The 8-value role enum: Client, Admin, Exit, BlindExit, Relay, Anchor, Nas, Llm |
+| `RolePresetComposition` | `src/role_presets.rs` | The capability-set composition attached to each role preset |
+| `NodeRole` | `rustynetd/src/daemon.rs` + `rustynet-operator/src/role.rs` | Running node role in the daemon/operator (the control crate uses `RolePreset`) |
 | `validate_transition()` | `src/role_presets.rs` | **Authoritative** transition validation — gatekeeper for all role changes |
-| `is_supported_for_platform()` | `src/role_presets.rs` | Per-platform role eligibility |
+| `is_supported_for_platform()` | `rustynet-cli/src/vm_lab/orchestrator/role.rs` | Per-platform role eligibility (not in `rustynet-control`) |
 
 ### Policy (`rustynet-policy`)
 
+Note: `rustynet-policy` is a single-file crate (`src/lib.rs`) — there is **no** `types.rs` or `eval.rs`.
+
 | Type | Location | Purpose |
 |---|---|---|
-| `Policy` | `src/types.rs` | ACL policy definition (tags, rules, src/dst) |
-| `PolicyEngine` | `src/eval.rs` | Evaluates policy against membership + traffic context |
-| `Route` | `src/types.rs` | Route advertisement (exit node advertises subnets) |
+| `PolicySet` | `src/lib.rs` | Ordered set of `PolicyRule` entries forming the ACL policy |
+| `PolicyRule` | `src/lib.rs` | Single ACL rule (tags, src/dst, disposition) |
+| `AccessRequest` | `src/lib.rs` | Evaluator input: membership identity + traffic context |
+| `Route` | `rustynet-backend-api/src/lib.rs` | Route advertisement (exit node advertises subnets) |
 
 ### Advisor (`rustynet-advisor`)
 
@@ -78,10 +83,11 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 
 | Type | Location | Purpose |
 |---|---|---|
-| `Backend` trait | `src/lib.rs` | The interface every transport backend implements |
-| `BackendConfig` | `src/lib.rs` | Configuration passed to backend at init |
-| `TransportSocket` | `src/lib.rs` | The shared UDP socket for direct + relay paths |
-| `PeerEndpoint` | `src/lib.rs` | Candidate endpoint (v4/v6 host/srflx/relay) |
+| `TunnelBackend` trait | `src/lib.rs` | The interface every transport backend implements (formerly named `Backend`) |
+| `BackendCapabilities` | `src/lib.rs` | Static capabilities a backend advertises at init |
+| `RuntimeContext` | `src/lib.rs` | Runtime context passed to the backend at init |
+| `PeerConfig` | `src/lib.rs` | Per-peer configuration for the managed tunnel |
+| `SocketEndpoint` | `src/lib.rs` | Candidate endpoint (v4/v6 host/srflx/relay) |
 
 ### WireGuard Backend (`rustynet-backend-wireguard`)
 
@@ -99,7 +105,7 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | `RelayClient` | `src/relay_client.rs` | Attaches to authoritative transport, sends keepalive |
 | `PortMappingSupervisor` | `src/port_mapper.rs` | PCP → NAT-PMP → uPnP lifecycle |
 | `CandidateSet` | `src/dataplane_candidates.rs` | Gathered v4/v6 host + srflx candidates |
-| `Killswitch` | `src/killswitch.rs` | Pre-start + post-start killswitch (nftables/WFP/pf) |
+| Killswitch (no single struct — `src/killswitch.rs` was removed) | `src/killswitch_precedence.rs`, `src/linux_killswitch_boot.rs`, `src/macos_exit_killswitch_precedence.rs`, `src/windows_killswitch_smoke.rs` | Pre-start + post-start killswitch (nftables/WFP/pf) split into the shared precedence model (`killswitch_precedence.rs`) plus per-OS apply/boot/smoke modules |
 | `RuleDisposition` + `terminator_is_reachable` + `ContainedInterfaces` | `src/killswitch_precedence.rs` | S2: the shared precedence model for killswitch containment — walks a chain as an ORDERED rule list and asks whether the terminal drop/block is actually REACHABLE, not merely present. Transport-agnostic core (pf and nftables differ in syntax, not precedence semantics); each backend supplies a `classify` closure. `Escapes` is the fail-closed default, so an unrecognised rule withholds the containment verdict. `nft_chain_rules_in_evaluation_order` moves an nft chain `policy` last, since nft PRINTS it above the rules but APPLIES it below them. Used by `linux_ipv6_leak` (IPV-03), `macos_exit_killswitch_precedence` (PF-05), `macos_blind_exit` (PF-11), and `phase10::assert_firewall_ruleset` (RN-27) |
 | `wfp_filter_shape` | `rustynet-windows-native/src/lib.rs` | WIN-03: portable validation of a read-back WFP filter's SHAPE (action == PERMIT, exactly one condition, `IP_LOCAL_INTERFACE`, LUID == tunnel). Deliberately OUTSIDE the `#[cfg(windows)]` FFI shim so it is tested on every CI leg — the shim marshals, this decides. Constants are drift-pinned to `windows_sys` by `const` assertions on the Windows build |
 | `MacosPfLoadSpec` | `src/macos_pf_load_spec.rs` | Structured spec for the `macos-pf-load` privileged builtin — daemon sends params, root helper re-renders the `pf` rule text + owns the `pfctl -f` (closes the `pfctl -f` boundary) |
@@ -192,7 +198,7 @@ observation, drift detection, redacted evidence. No mutation path exists here.
 | `NetworkProfile` + `NetworkProfileId` + `parse_network_profile_toml` | `network_profile.rs` | Strict fail-closed TOML manifest model (`profiles/vm_lab/network/*.toml`) with canonical `sha256:` digest over the validated representation |
 | `AttachmentMode` / `ManagementPolicy` / `ScenarioSubstrate` / `InternetMode` / `EvidenceTier` | `network_profile.rs` | Typed vocabulary for the dual-plane lab-network architecture |
 | `NetworkEvidenceStatus` | `network_profile.rs` | External status vocabulary (`pass`/`fail`/`not_run`/`not_supported`/`expected_fail`); `skipped` is internal-only |
-| `IpCidr` + `backend_attachment_support` / `backend_multi_nic_support` | `network_profile.rs` | Exact v4/v6 overlap math and the conservative UTM QEMU/Apple capability matrix |
+| `backend_attachment_support` / `backend_multi_nic_support` | `network_profile.rs` | The conservative UTM QEMU/Apple capability matrix (`IpCidr` is not defined here) |
 | `UtmVmObservation` / `HostNetworkObservation` / `GuestNetworkObservation` | `network_audit.rs` | Redacted-by-construction observations of UTM configs (via `plutil -extract`), host routes/VPN/proxy, and guest addresses/routes/DNS/MTU |
 | `detect_*_findings` + `overall_status_from_findings` | `network_audit.rs` | Pure drift/overlap/duplicate/stale detection (mixed attachments, bridged-to-`en0`, unpinned bridges, duplicate MAC/IP, stale `network_group`, netns transit vs mesh `100.64.0.0/10` collision) |
 | `execute_ops_vm_lab_network_audit` / `..._preflight` | `network_audit.rs` | `ops vm-lab-network-audit` (report) and `ops vm-lab-network-preflight` (fail-closed gate); both write atomic owner-only `state/vm_network_evidence.json` behind a serialized-secret guard |
@@ -272,18 +278,18 @@ observation-only + bounded-execution guarantee.
 
 ```rust
 // Domain types (safe to use anywhere)
-use rustynet_control::membership::{MembershipBundle, MembershipSnapshot};
-use rustynet_control::role_presets::{NodeRole, validate_transition};
-use rustynet_policy::eval::PolicyEngine;
+use rustynet_control::membership::{MembershipState, MembershipUpdateRecord, SignedMembershipUpdate};
+use rustynet_control::role_presets::{RolePreset, validate_transition};
+use rustynet_policy::{PolicySet, AccessRequest};
 
 // Backend types (only in backend crates)
-use rustynet_backend_api::Backend;
+use rustynet_backend_api::TunnelBackend;
 
 // Daemon types (only in daemon/CLI)
 use rustynetd::daemon::DaemonRuntime;
 
 // Crypto (anywhere that needs signing/verification)
-use rustynet_crypto::{SigningKey, VerificationKey, verify_detached};
+use rustynet_crypto::{PublicKey, SecretKey, NodeKeyPair};
 
 // Never import backend-specific types in domain crates:
 // ❌ use rustynet_backend_wireguard::... in rustynet-control
@@ -294,7 +300,7 @@ use rustynet_crypto::{SigningKey, VerificationKey, verify_detached};
 | If you're adding... | Put it in... |
 |---|---|
 | A new WireGuard feature | `rustynet-backend-wireguard` or `rustynet-backend-userspace` |
-| A new policy rule | `rustynet-policy/src/eval.rs` |
+| A new policy rule | `rustynet-policy/src/lib.rs` |
 | A new node role | `rustynet-control/src/role_presets.rs` (add variant, update matrix) |
 | A new daemon subsystem | `rustynetd/src/<subsystem>.rs` + wiring in `daemon.rs` |
 | A new CLI subcommand | `rustynet-cli/src/ops_<name>.rs` or `src/vm_lab/` |
@@ -307,10 +313,10 @@ use rustynet_crypto::{SigningKey, VerificationKey, verify_detached};
 
 | Task | Files to touch |
 |---|---|
-| Add enrollment feature | `rustynet-control/src/enrollment.rs`, `rustynetd/src/daemon.rs`, `rustynet-cli/src/main.rs` |
-| Fix a killswitch bug | `rustynetd/src/killswitch.rs` (all platforms), `rustynet-windows-native/` (WFP). If it is an ASSERTION bug, check `rustynetd/src/killswitch_precedence.rs` first — presence-vs-precedence was the same defect at five sites |
+| Add enrollment feature | `rustynetd/src/enrollment_token.rs`, `rustynetd/src/daemon.rs`, `rustynet-cli/src/main.rs` |
+| Fix a killswitch bug | `rustynetd/src/killswitch_precedence.rs`, `rustynetd/src/linux_killswitch_boot.rs`, `rustynetd/src/macos_exit_killswitch_precedence.rs`, `rustynetd/src/windows_killswitch_smoke.rs`, `rustynet-windows-native/` (WFP). If it is an ASSERTION bug, check `rustynetd/src/killswitch_precedence.rs` first — presence-vs-precedence was the same defect at five sites |
 | Add a role | `rustynet-control/src/role_presets.rs`, `rustynet-cli/src/vm_lab/orchestrator/role.rs`, `rustynet-cli/src/role_cli.rs` |
-| Add a backend | New crate in `crates/`, impl `Backend` trait |
+| Add a backend | New crate in `crates/`, impl `TunnelBackend` trait |
 | Wire a new CLI flag | `rustynetd/src/daemon.rs` (flag def), `rustynet-cli/src/main.rs` (CLI wiring) |
 | Add a live-lab stage | New `stage/<name>.rs`, register in `plan.rs`, add to `stage/mod.rs` |
 

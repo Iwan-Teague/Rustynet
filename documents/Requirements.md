@@ -4,17 +4,17 @@
 - This file is the normative source of truth for product requirements across all phases.
 - [Phase1.md](./Phase1.md) defines the first execution slice (architecture and security foundations).
 - [Phase2.md](./Phase2.md) defines identity, enrollment, and control-plane core delivery.
-- [Phase3.md](./Phase3.md) defines Linux data-plane MVP and backend-conformance delivery.
-- [Phase4.md](./Phase4.md) defines exit-node, LAN toggle, and Magic DNS delivery.
-- [Phase5.md](./Phase5.md) defines observability, reliability hardening, tamper-evident auditability, and early release-integrity delivery.
-- [Phase6.md](./Phase6.md) defines admin UX, baseline RBAC/MFA controls, and cross-platform expansion delivery.
-- [Phase7.md](./Phase7.md) defines scale and commercial foundation delivery.
-- [Phase8.md](./Phase8.md) defines advanced security assurance and compliance delivery.
-- [Phase9.md](./Phase9.md) defines completion readiness, long-term operations, and protocol-agility validation.
+- [Phase3.md](./archive/Phase3.md) defines Linux data-plane MVP and backend-conformance delivery.
+- [Phase4.md](./archive/Phase4.md) defines exit-node, LAN toggle, and Magic DNS delivery.
+- [Phase5.md](./archive/Phase5.md) defines observability, reliability hardening, tamper-evident auditability, and early release-integrity delivery.
+- [Phase6.md](./archive/Phase6.md) defines admin UX, baseline RBAC/MFA controls, and cross-platform expansion delivery.
+- [Phase7.md](./archive/Phase7.md) defines scale and commercial foundation delivery.
+- [Phase8.md](./archive/Phase8.md) defines advanced security assurance and compliance delivery.
+- [Phase9.md](./archive/Phase9.md) defines completion readiness, long-term operations, and protocol-agility validation.
 - [phase10.md](./phase10.md) defines production dataplane enablement for real encrypted exit-node traffic and LAN-toggle enforcement.
 - [SecurityMinimumBar.md](./SecurityMinimumBar.md) defines mandatory release-blocking security controls and evidence expectations.
 - [MembershipConsensus.md](./MembershipConsensus.md) defines quorum-signed membership governance and tamper-evident membership state verification.
-- [MembershipImplementationPlan.md](./MembershipImplementationPlan.md) defines phased implementation work for quorum-signed membership governance.
+- [MembershipImplementationPlan.md](./archive/MembershipImplementationPlan.md) defines phased implementation work for quorum-signed membership governance.
 - If a phase document conflicts with this file, this file takes precedence until requirements are explicitly updated.
 - Any new phase capability that changes product behavior must be reflected back into this file.
 
@@ -403,7 +403,7 @@ layer exist. Actual stack, with the original candidates kept for provenance:
 5. Run recurring roadmap reviews to keep `Requirements.md` and phase docs synchronized.
 
 ## 15) Cross-Document Consistency Rules
-- Requirement changes here must trigger updates in [Phase1.md](./Phase1.md), [Phase2.md](./Phase2.md), [Phase3.md](./Phase3.md), [Phase4.md](./Phase4.md), [Phase5.md](./Phase5.md), [Phase6.md](./Phase6.md), [Phase7.md](./Phase7.md), [Phase8.md](./Phase8.md), [Phase9.md](./Phase9.md), or [phase10.md](./phase10.md) where applicable.
+- Requirement changes here must trigger updates in [Phase1.md](./Phase1.md), [Phase2.md](./Phase2.md), [Phase3.md](./archive/Phase3.md), [Phase4.md](./archive/Phase4.md), [Phase5.md](./archive/Phase5.md), [Phase6.md](./archive/Phase6.md), [Phase7.md](./archive/Phase7.md), [Phase8.md](./archive/Phase8.md), [Phase9.md](./archive/Phase9.md), or [phase10.md](./phase10.md) where applicable.
 - Phase documents may add implementation detail, but may not relax security, ACL, or modular-backend requirements defined here.
 - Transport backend abstraction and protocol-agnostic control-plane design are mandatory across all phases.
 

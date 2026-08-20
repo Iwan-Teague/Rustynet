@@ -78,7 +78,7 @@ short-lived token, then either:
 Setting up AzureSignTool is OUT OF SCOPE for the v1 runbook (the
 PFX flow above is what the workflow currently exercises). Tracked
 as a follow-up in
-[documents/operations/active/SecurityHardeningAudit_2026-04-28.md](active/SecurityHardeningAudit_2026-04-28.md)
+[documents/operations/done/SecurityHardeningAudit_2026-04-28.md](done/SecurityHardeningAudit_2026-04-28.md)
 under a future "release signing route hardening" entry.
 
 ### 3.3 Hardware Token (Yubikey, SafeNet eToken)

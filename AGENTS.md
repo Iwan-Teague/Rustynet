@@ -29,14 +29,15 @@ Read in this order before touching code:
 8. Relevant runbooks under `documents/operations/`
 
 Current primary execution ledgers:
-- `documents/operations/active/CrossPlatformRoleParityPlan_2026-06-21.md` — **RELEASE-BLOCKING COMPLETENESS MANDATE.** Rustynet cannot be called complete until **every node role + capability (client, admin, anchor, exit, blind_exit, relay, +nas/llm) works and is LIVE-LAB-PROVEN on macOS AND Windows, not just Linux.** Linux is the done reference; macOS/Windows must reach full per-role parity, each role proven live in the lab. This doc is the single source of truth for that gap (live-proven status matrix per role × OS, the per-role × per-OS live-lab acceptance matrix, known blockers, and the parity Definition of Done). No OS may be a capability limiter.
-- `documents/operations/active/CrossPlatformRoleParityRoadmap_2026-06-22.md` — the execution roadmap that operationalizes the parity mandate: remaining work + effort per mac/win role cell, the ordered implementation program (admin → blind_exit → role-transitions → relay-lifecycle → anchor-live), file-by-file plans, the FAIL-LOUD live-stage spec (live result = stage status; no dry-run-as-pass), and the optimized concurrent Windows+macOS test pipeline + all-on-`main` workflow. Builds on the ParityPlan (status) + EfficiencyPlan (primitives).
+- `documents/operations/active/CrossPlatformRoleParityPlan_2026-06-21.md` — **RELEASE-BLOCKING COMPLETENESS MANDATE.** Rustynet cannot be called complete until **every node role + capability (client, admin, anchor, exit, blind_exit, relay, +nas/llm) works and is LIVE-LAB-PROVEN on macOS AND Windows, not just Linux.** Linux is the done reference; macOS/Windows must reach full per-role parity, each role proven live in the lab. This doc is the single source of truth for that gap (live-proven status matrix per role × OS, the per-role × per-OS live-lab acceptance matrix, known blockers, and the parity Definition of Done). No OS may be a capability limiter. **Status half superseded by the Refresh doc below; the Plan keeps the mandate.**
+- `documents/operations/active/CrossPlatformRoleParityRefresh_2026-07-23.md` — **the live parity-status matrix on the engine of record (the Rust `--node` orchestrator)**, superseding the *status* half of the ParityPlan §3 and the Roadmap for the G2 era: every old ✅ in the Plan's §3 matrix is a legacy-bash proof, and under G2 (the release reads the `--node` ledger; bash is being deleted) mac/win parity is ~0% proven on the engine of record. Read this for current per-role × per-OS status; the Plan remains the decree, the Roadmap the historical bash record + per-cell design detail.
+- `documents/operations/active/CrossPlatformRoleParityRoadmap_2026-06-22.md` — the execution roadmap that operationalizes the parity mandate: remaining work + effort per mac/win role cell, the ordered implementation program (admin → blind_exit → role-transitions → relay-lifecycle → anchor-live), file-by-file plans, the FAIL-LOUD live-stage spec (live result = stage status; no dry-run-as-pass), and the optimized concurrent Windows+macOS test pipeline + all-on-`main` workflow. Builds on the ParityPlan (status) + EfficiencyPlan (primitives). **Status half superseded by `CrossPlatformRoleParityRefresh_2026-07-23.md`; retained as the historical bash record + per-cell design detail.**
 - `documents/operations/active/LiveLabExecutionEfficiencyPlan_2026-06-20.md` — the operating method for the same-LAN "drive defects to zero" live-lab loop: setup/run split, per-node `rebuild_nodes`, single-stage wrapper re-run, the mandatory periodic full-validation gate, and the never-idle parallel-work protocol. Follow this while iterating Linux→macOS→Windows→cross-OS.
 - `documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md` for the cross-network dataplane track (D2-D13): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, service-hosting roles (nas, llm). Source of truth for "what are we building and why" when working on traversal, relay, gossip, enrollment, or cellular reliability.
 - `documents/operations/active/CrossNetworkSubstrateIntegrationSpec_2026-06-21.md` — focused integration spec to make the cross-network live-lab stages actually run (substrate↔validator mapping: netns NAT-matrix gate, vxlan SSH e2e, slirp cross-OS smoke; orchestrator wiring + phased plan X1–X4).
 - `documents/operations/active/ServiceHostingRolesRoadmap_2026-06-11.md` — top-level program roadmap for the `nas` + `llm` service-hosting roles (D13): document set, milestones M0–M6, dependency graph, gate checklist, and status tracker. Start here for the service-hosting-roles program.
-- `documents/operations/active/MasterWorkPlan_2026-03-22.md` for repo-wide remaining work
-- `documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md` for traversal, relay, and live-lab readiness (the defects it documents drive D2/D3/D4 in the dataplane execution plan)
+- `documents/operations/active/MasterWorkPlan_2026-03-22.md` for repo-wide remaining work (superseded as the repository-wide roll-up by `FullTodoInventory_2026-07-28.md`; retained for section structure/history)
+- `documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md` for traversal, relay, and live-lab readiness (the defects it documents drive D2/D3/D4 in the dataplane execution plan; those defect sections are now largely closed by D2–D4 of that plan — retained as the historical defect inventory)
 
 Current lab-reference assets:
 - `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md` (includes probe-and-recover runbook for unsticking lab guests whose nft killswitch is blocking SSH after a network reconfig)
@@ -435,7 +436,7 @@ the authoritative map and should be kept in sync when types move.
 - `scripts/` — operational + CI tooling, grouped by area: `ci/` (gate scripts),
   `vm_lab/` (UTM lab helpers incl. `probe_and_recover_local_utm.sh`),
   `bootstrap/`, `dev/`, `e2e/`, `fuzz/`, `launchd/`, `systemd/`, `windows/`,
-  `perf/`, `release/`, `operations/`, `mcp/`. Many `ci/*.sh` scripts are thin
+  `perf/`, `release/`, `operations/`, `mcp/`, `loop/` (autonomous/overnight-loop tooling), `git-hooks/` (commit-staleness guard hook). Many `ci/*.sh` scripts are thin
   wrappers over a Rust binary of the same name in `rustynet-cli/src/bin/` — the
   Rust binary is the real implementation (§4 shell-to-Rust migration rule).
 - `fuzz/` — `cargo-fuzz` targets (`ipc_parse_command`, `membership_decode_state`,
@@ -497,6 +498,7 @@ Platform + UX + tooling layer:
 - `rustynet-mcp` — MCP servers: `rustynet-mcp-repo-context`,
   `rustynet-mcp-gate-runner`, `rustynet-mcp-lab-state`.
 - `rustynet-xtask` — the `xtask` dev runner (see §7 / §12).
+- `rustynet-lab-monitor` — standalone terminal TUI (ratatui + crossterm) for the parity campaign (`LabMonitorTUIDesign_2026-06-29.md`). Its own cargo workspace, excluded from the root `--workspace` gates — run `./scripts/ci/lab_monitor_gates.sh` when in scope (§7).
 - `rustynet-netns-probe` — LAB TOOLING (not shipped): the Rust-native STUN
   responder + NAT mapping/filtering probes the `--node` cross-network netns
   simulator runs on-guest, replacing the former python3 probe scripts so the

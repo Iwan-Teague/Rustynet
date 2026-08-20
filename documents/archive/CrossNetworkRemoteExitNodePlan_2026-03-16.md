@@ -116,11 +116,11 @@ This document is implementation-oriented. It starts from the repository's curren
 
 ## 2. Document Relationship and Precedence
 This plan extends, but does not replace:
-- [Requirements.md](../../../documents/Requirements.md)
-- [SecurityMinimumBar.md](../../../documents/SecurityMinimumBar.md)
-- [phase10.md](../../../documents/phase10.md)
-- [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md](../../../documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
-- [UdpHolePunchingHP2IngestionPlan_2026-03-07.md](../../../documents/operations/active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
+- [Requirements.md](../../documents/Requirements.md)
+- [SecurityMinimumBar.md](../../documents/SecurityMinimumBar.md)
+- [phase10.md](../../documents/phase10.md)
+- [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md](../../documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
+- [UdpHolePunchingHP2IngestionPlan_2026-03-07.md](../../documents/operations/active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
 
 If any conflict exists, the stricter security interpretation wins.
 
@@ -443,10 +443,10 @@ This is acceptable because:
 - Phase 10 HP2 CI artifacts showing passing traversal path-selection and traversal-security checks.
 
 Primary source references:
-- [README.md:48](../../../README.md#L48)
-- [phase10.md](../../../documents/phase10.md)
-- [traversal_path_selection_report.json](../../../artifacts/phase10/traversal_path_selection_report.json)
-- [traversal_probe_security_report.json](../../../artifacts/phase10/traversal_probe_security_report.json)
+- [README.md:48](../../README.md#L48)
+- [phase10.md](../../documents/phase10.md)
+- [traversal_path_selection_report.json](../../artifacts/phase10/traversal_path_selection_report.json)
+- [traversal_probe_security_report.json](../../artifacts/phase10/traversal_probe_security_report.json)
 
 ### 4.2 What does not exist yet
 - Full WAN simultaneous-open traversal behavior.
@@ -454,12 +454,12 @@ Primary source references:
 - End-to-end live proof that a client on one network can use a remote exit node on a different network under real NAT conditions.
 
 Primary source references:
-- [README.md:48](../../../README.md#L48)
-- [phase10.md](../../../documents/phase10.md)
-- [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md:17](../../../documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md#L17)
+- [README.md:48](../../README.md#L48)
+- [phase10.md](../../documents/phase10.md)
+- [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md:17](../../documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md#L17)
 
 ### 4.3 Important architecture truth
-- [rustynet-relay](../../../crates/rustynet-relay/src/lib.rs) currently contains relay fleet selection primitives, not a production ciphertext relay transport.
+- [rustynet-relay](../../crates/rustynet-relay/src/lib.rs) currently contains relay fleet selection primitives, not a production ciphertext relay transport.
 - The traversal controller is partially complete, but it still operates on a one-sided proof model rather than full WAN simultaneous-open behavior.
 
 ## 5. Complete Encryption Architecture
@@ -1478,9 +1478,9 @@ Tasks:
 3. Treat HP2 and HP3 as release-blocking for cross-network remote-exit claims.
 
 Primary touchpoints:
-- [README.md](../../../README.md)
-- [phase10.md](../../../documents/phase10.md)
-- [tools/skills/rustynet-security-auditor](../../../tools/skills/rustynet-security-auditor/SKILL.md)
+- [README.md](../../README.md)
+- [phase10.md](../../documents/phase10.md)
+- [tools/skills/rustynet-security-auditor](../../tools/skills/rustynet-security-auditor/SKILL.md)
 
 Acceptance:
 - No repo document claims "connect from anywhere" without measured evidence.
@@ -1509,10 +1509,10 @@ Tasks:
    - authorization scope.
 
 Primary touchpoints:
-- [crates/rustynet-control/src/lib.rs](../../../crates/rustynet-control/src/lib.rs)
-- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
-- [crates/rustynetd/src/traversal.rs](../../../crates/rustynetd/src/traversal.rs)
-- [crates/rustynet-cli/src/main.rs](../../../crates/rustynet-cli/src/main.rs)
+- [crates/rustynet-control/src/lib.rs](../../crates/rustynet-control/src/lib.rs)
+- [crates/rustynetd/src/daemon.rs](../../crates/rustynetd/src/daemon.rs)
+- [crates/rustynetd/src/traversal.rs](../../crates/rustynetd/src/traversal.rs)
+- [crates/rustynet-cli/src/main.rs](../../crates/rustynet-cli/src/main.rs)
 
 Security constraints:
 - No raw peer endpoint gossip.
@@ -1540,10 +1540,10 @@ Tasks:
 5. Preserve direct/relay decision control in one state machine only.
 
 Primary touchpoints:
-- [crates/rustynetd/src/traversal.rs](../../../crates/rustynetd/src/traversal.rs)
-- [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
-- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
-- [crates/rustynet-backend-wireguard/src/lib.rs](../../../crates/rustynet-backend-wireguard/src/lib.rs)
+- [crates/rustynetd/src/traversal.rs](../../crates/rustynetd/src/traversal.rs)
+- [crates/rustynetd/src/phase10.rs](../../crates/rustynetd/src/phase10.rs)
+- [crates/rustynetd/src/daemon.rs](../../crates/rustynetd/src/daemon.rs)
+- [crates/rustynet-backend-wireguard/src/lib.rs](../../crates/rustynet-backend-wireguard/src/lib.rs)
 
 Security constraints:
 - No manual or operator-driven endpoint override as a production path.
@@ -1562,7 +1562,7 @@ Goal:
 - Provide a secure fallback path when direct UDP is impossible.
 
 Tasks:
-1. Convert [rustynet-relay](../../../crates/rustynet-relay/src/lib.rs) from selector-only logic into a real ciphertext relay service.
+1. Convert [rustynet-relay](../../crates/rustynet-relay/src/lib.rs) from selector-only logic into a real ciphertext relay service.
 2. Add authenticated relay session setup and expiry.
 3. Add per-session replay protection.
 4. Use constant-time comparison for relay auth/token validation.
@@ -1574,11 +1574,11 @@ Tasks:
 6. Keep relay blind to payload plaintext.
 
 Primary touchpoints:
-- [crates/rustynet-relay/src/lib.rs](../../../crates/rustynet-relay/src/lib.rs)
-- [crates/rustynet-relay/src/main.rs](../../../crates/rustynet-relay/src/main.rs)
-- [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
-- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
-- [crates/rustynet-control/src/lib.rs](../../../crates/rustynet-control/src/lib.rs)
+- [crates/rustynet-relay/src/lib.rs](../../crates/rustynet-relay/src/lib.rs)
+- [crates/rustynet-relay/src/main.rs](../../crates/rustynet-relay/src/main.rs)
+- [crates/rustynetd/src/phase10.rs](../../crates/rustynetd/src/phase10.rs)
+- [crates/rustynetd/src/daemon.rs](../../crates/rustynetd/src/daemon.rs)
+- [crates/rustynet-control/src/lib.rs](../../crates/rustynet-control/src/lib.rs)
 
 Security constraints:
 - Relay sees only ciphertext and minimal routing metadata.
@@ -1610,10 +1610,10 @@ Tasks:
 4. Ensure path changes do not cause transient underlay leaks.
 
 Primary touchpoints:
-- [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
-- [crates/rustynetd/src/dataplane.rs](../../../crates/rustynetd/src/dataplane.rs)
-- [crates/rustynet-cli/src/main.rs](../../../crates/rustynet-cli/src/main.rs)
-- [start.sh](../../../start.sh)
+- [crates/rustynetd/src/phase10.rs](../../crates/rustynetd/src/phase10.rs)
+- [crates/rustynetd/src/dataplane.rs](../../crates/rustynetd/src/dataplane.rs)
+- [crates/rustynet-cli/src/main.rs](../../crates/rustynet-cli/src/main.rs)
+- [start.sh](../../start.sh)
 
 Security constraints:
 - Exit selection remains signed-state-driven.
@@ -1645,10 +1645,10 @@ Tasks:
 5. Add a dedicated cross-network exit-node gate bundle rather than relying on generic traversal success alone.
 
 Primary touchpoints:
-- [scripts/ci/phase10_hp2_gates.sh](../../../scripts/ci/phase10_hp2_gates.sh)
-- [scripts/ci/check_phase10_readiness.sh](../../../scripts/ci/check_phase10_readiness.sh)
-- [scripts/e2e/live_linux_lab_orchestrator.sh](../../../scripts/e2e/live_linux_lab_orchestrator.sh)
-- [tools/skills/rustynet-security-auditor](../../../tools/skills/rustynet-security-auditor/SKILL.md)
+- [scripts/ci/phase10_hp2_gates.sh](../../scripts/ci/phase10_hp2_gates.sh)
+- [scripts/ci/check_phase10_readiness.sh](../../scripts/ci/check_phase10_readiness.sh)
+- [scripts/e2e/live_linux_lab_orchestrator.sh](../../scripts/e2e/live_linux_lab_orchestrator.sh)
+- [tools/skills/rustynet-security-auditor](../../tools/skills/rustynet-security-auditor/SKILL.md)
 
 Security constraints:
 - No release gate may be weakened to compensate for missing WAN evidence.
@@ -2213,7 +2213,7 @@ Each artifact must be:
 - rejected if stale, incomplete, or schema-invalid
 
 Canonical schema reference:
-- [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](../../../documents/operations/CrossNetworkRemoteExitArtifactSchema_2026-03-16.md)
+- [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](../../documents/operations/CrossNetworkRemoteExitArtifactSchema_2026-03-16.md)
 - `cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-cross-network-remote-exit-reports ...`
 
 ### 9.3 Required checks inside those artifacts
@@ -2242,12 +2242,12 @@ The measured reports must prove all of the following checks as `pass`:
 ### 9.4 Required gate wiring
 The repo should add or extend gate entry points so this evidence is enforced automatically:
 1. Add a dedicated gate bundle:
-   - [phase10_cross_network_exit_gates.sh](../../../scripts/ci/phase10_cross_network_exit_gates.sh)
+   - [phase10_cross_network_exit_gates.sh](../../scripts/ci/phase10_cross_network_exit_gates.sh)
    - include `cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-cross-network-nat-matrix ...` as a hard-fail matrix coverage check
 2. Keep `scripts/ci/phase10_hp2_gates.sh` for traversal engine correctness, but do not treat it as sufficient evidence for remote exit-node readiness.
-3. Extend [check_phase10_readiness.sh](../../../scripts/ci/check_phase10_readiness.sh) to require every cross-network remote-exit artifact and its mandatory checks.
+3. Extend [check_phase10_readiness.sh](../../scripts/ci/check_phase10_readiness.sh) to require every cross-network remote-exit artifact and its mandatory checks.
    - that readiness path must invoke `cargo run --quiet -p rustynet-cli --features vm-lab -- ops validate-cross-network-remote-exit-reports ...` before interpreting pass/fail checks
-4. Extend [live_linux_lab_orchestrator.sh](../../../scripts/e2e/live_linux_lab_orchestrator.sh) so the cross-network exit suite is a distinct hard-fail stage.
+4. Extend [live_linux_lab_orchestrator.sh](../../scripts/e2e/live_linux_lab_orchestrator.sh) so the cross-network exit suite is a distinct hard-fail stage.
 5. Extend the Rustynet security auditor skill so coverage promotion only happens when those measured reports pass schema validation and required checks.
 
 ### 9.5 Failure policy
