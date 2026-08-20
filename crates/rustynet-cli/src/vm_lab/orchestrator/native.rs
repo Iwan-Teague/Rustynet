@@ -603,6 +603,25 @@ pub(crate) fn execute_rust_native_orchestration(
     )?;
     write_rust_native_node_stage_plan(report_dir.as_path(), &stages)?;
 
+    // L0.4 (§3.1.3): record the immutable ResolvedPlan for a full run — the only
+    // kind that makes a release claim. `setup_only` / `run_only` deliberately
+    // omit the final teardown (they leave the mesh up), so they carry no
+    // ResolvedPlan and rule 4's mandatory-cleanup would not apply. The built
+    // `stages` already equal the manifest's enabled set and `plan_names`; the
+    // verifier reconstructs this plan independently and compares digests to
+    // detect a shrunk plan (that reconstruction is the next L0.4 increment).
+    if !setup_only && !run_only {
+        let graph = orchestrator::resolved_plan::StageGraph::from_stages(&stages);
+        let selection = orchestrator::resolved_plan::PlanSelection::Standard {
+            stages: stages.iter().map(|stage| stage.id()).collect(),
+        };
+        // A full run runs the whole plan; `--skip-stage` is a RUNTIME skip on
+        // stages still present in the plan, so the resolved (intended) set has
+        // no removed targets and no explicit skips reach the resolver here.
+        let resolved = orchestrator::resolved_plan::resolve(&graph, &selection, &[])?;
+        orchestrator::resolved_plan::write_resolved_plan(report_dir.as_path(), &resolved)?;
+    }
+
     // --dry-run is a WIRING CHECK: the manifest above already records the
     // resolved plan (what WOULD run) and the adapters/topology were validated
     // when they were constructed. A dry run must NOT execute any stage or

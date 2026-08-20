@@ -16,8 +16,16 @@
 #![allow(dead_code)] // consumed by native.rs plan construction + the verifier in L0.4c
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageId};
+
+/// `<report_dir>`-relative path of the resolved-plan artifact.
+pub const RESOLVED_PLAN_RELATIVE_PATH: &str = "state/resolved_plan.json";
+
+/// Schema version of `resolved_plan.json`. The verifier rejects an unknown
+/// version rather than guessing (§3.1.3).
+pub const RESOLVED_PLAN_SCHEMA_VERSION: u64 = 1;
 
 /// One stage's edges, as the resolver needs them.
 #[derive(Debug, Clone)]
@@ -147,6 +155,48 @@ impl ResolvedPlan {
     pub fn is_release_candidate(&self) -> bool {
         self.kind.is_release_candidate()
     }
+
+    /// The canonical JSON form written to `resolved_plan.json` and reconstructed
+    /// by the verifier. Ids are their `as_str` tokens, already sorted.
+    fn to_json(&self) -> serde_json::Value {
+        let ids = |v: &[StageId]| v.iter().map(StageId::as_str).collect::<Vec<_>>();
+        serde_json::json!({
+            "schema_version": RESOLVED_PLAN_SCHEMA_VERSION,
+            "kind": self.kind.as_str(),
+            "selected": ids(&self.selected),
+            "truth_closure": ids(&self.truth_closure),
+            "cleanup": ids(&self.cleanup),
+            "enabled": ids(&self.enabled),
+            "digest": self.digest,
+        })
+    }
+}
+
+/// Atomically write `resolved_plan.json` under `report_dir` (tmp + rename), the
+/// immutable record of the plan resolved for this run. Consumers (the verifier,
+/// the finalizer) read it back to detect a shrunk or mismatched plan (§3.1.3).
+pub fn write_resolved_plan(report_dir: &Path, plan: &ResolvedPlan) -> Result<(), String> {
+    let path = report_dir.join(RESOLVED_PLAN_RELATIVE_PATH);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("resolved_plan path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "create state dir for resolved_plan failed ({}): {e}",
+            parent.display()
+        )
+    })?;
+    let body = serde_json::to_vec_pretty(&plan.to_json())
+        .map_err(|e| format!("serialize resolved_plan failed: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)
+        .map_err(|e| format!("write resolved_plan tmp failed ({}): {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        format!(
+            "rename resolved_plan into place failed ({}): {e}",
+            path.display()
+        )
+    })
 }
 
 fn sort_ids(ids: &mut [StageId]) {
@@ -479,5 +529,39 @@ mod tests {
         assert!(PlanKind::Standard.is_release_candidate());
         assert!(!PlanKind::Focused.is_release_candidate());
         assert!(!PlanKind::Adjudication.is_release_candidate());
+    }
+
+    #[test]
+    fn write_resolved_plan_emits_canonical_json_that_reads_back() {
+        let g = sample_graph();
+        let plan = resolve(
+            &g,
+            &PlanSelection::Focused {
+                targets: vec![StageId::ExitHandoff],
+            },
+            &[],
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-resolved-plan-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_resolved_plan(&dir, &plan).expect("write resolved_plan");
+        let body =
+            std::fs::read_to_string(dir.join(RESOLVED_PLAN_RELATIVE_PATH)).expect("read back");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["schema_version"], RESOLVED_PLAN_SCHEMA_VERSION);
+        assert_eq!(v["kind"], "focused");
+        assert_eq!(v["digest"], plan.digest);
+        let enabled: Vec<String> = v["enabled"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_owned())
+            .collect();
+        let expected: Vec<String> = plan.enabled.iter().map(|s| s.as_str().to_owned()).collect();
+        assert_eq!(enabled, expected, "enabled list must round-trip exactly");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
