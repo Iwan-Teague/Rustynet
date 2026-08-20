@@ -105,6 +105,11 @@ fn render_planned_with_statuses(
     }
 
     let focused = app.focused_panel == Panel::StageGrid;
+    // §3.4 VerifiedPass, run-level half: computed once for the whole grid. No
+    // group renders release-green unless the run itself is verified (native
+    // dialect, passed+bound candidate verdict, final promotion, current-gen
+    // cleanup). A bash/unverified/in-progress run leaves this false.
+    let run_verified = app.run_verified();
     for (idx, group) in app.planned_stage_groups().into_iter().enumerate().take(3) {
         let mut lines = Vec::new();
         if group.stages.is_empty() {
@@ -157,11 +162,24 @@ fn render_planned_with_statuses(
                     )
             })
             .count();
+        // §3.4 VerifiedPass, per-stage half: count only enabled stages that are a
+        // CURRENT-GENERATION raw pass. A reused/skipped/not-run cell, or a pass
+        // carried over from a prior generation in a reused report dir, does not
+        // count — which is what stops an all-reused group rendering green.
+        let verified_pass = group
+            .stages
+            .iter()
+            .filter(|stage| app.stage_enabled(stage) && app.stage_is_current_gen_pass(stage))
+            .count();
+        // Release-green replaces the old `all_enabled_complete` (which counted any
+        // terminal outcome, so an all-reused group went green): a group is green
+        // ONLY when the run is verified AND every enabled stage is a current-gen
+        // raw pass.
+        let group_green = group_is_release_green(run_verified, enabled, failed, verified_pass);
         let header_style = stage_group_header_style(
             col_focused,
-            enabled,
-            completed,
             failed,
+            group_green,
             !status_by_stage.is_empty(),
         );
         lines.push(Line::from(stage_group_header_spans(
@@ -327,26 +345,45 @@ fn progress_bar_string(done: usize, total: usize, width: usize) -> String {
     )
 }
 
-/// Decides the color for a group's header (bar + title): a column that has
-/// finished every one of its currently-enabled stages (and none failed)
-/// reads as done-and-green, regardless of the group's full catalog size --
-/// a failure still wins over "everything ran", so a fully-completed-but-
-/// failing column stays red rather than misreporting success as green.
+/// Decides the color for a group's header (bar + title). Green is reserved for a
+/// RELEASE-VERIFIED column: `group_green` (§3.4 VerifiedPass — the run is
+/// verified and every enabled stage is a current-generation raw pass) is the only
+/// path to green, replacing the old `all_enabled_complete` that counted any
+/// terminal outcome and so greened an all-reused column. A failure still wins
+/// over everything, so a failing column stays red; a settled-but-unverified
+/// column (e.g. all reused, or a run with no accepted verdict) stays white, not
+/// green.
+/// The §3.4 VerifiedPass aggregate for a stage group's green: the run itself is
+/// release-verified AND every enabled stage is a current-generation raw pass
+/// (`verified_pass >= enabled`) with no failure. This REPLACES the old
+/// `all_enabled_complete = enabled > 0 && failed == 0 && completed >= enabled`,
+/// whose `completed` counted any terminal outcome — so an all-reused,
+/// all-skipped, or all-not-run group (zero fresh passes) rendered green. Here a
+/// group with zero current-generation passes has `verified_pass == 0` and can
+/// never be green, and an unverified run (no accepted verdict / no promotion /
+/// bash dialect) leaves `run_verified` false regardless of the cells.
+fn group_is_release_green(
+    run_verified: bool,
+    enabled: usize,
+    failed: usize,
+    verified_pass: usize,
+) -> bool {
+    run_verified && enabled > 0 && failed == 0 && verified_pass >= enabled
+}
+
 fn stage_group_header_style(
     col_focused: bool,
-    enabled: usize,
-    completed: usize,
     failed: usize,
+    group_green: bool,
     has_any_status: bool,
 ) -> Style {
-    let all_enabled_complete = enabled > 0 && failed == 0 && completed >= enabled;
     if col_focused {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
     } else if failed > 0 {
         Style::default().fg(Color::Red)
-    } else if all_enabled_complete {
+    } else if group_green {
         Style::default().fg(Color::Green)
     } else if !has_any_status {
         Style::default().fg(Color::Cyan)
@@ -551,35 +588,59 @@ mod tests {
     }
 
     #[test]
-    fn header_turns_green_when_every_enabled_stage_is_complete() {
-        let style = stage_group_header_style(false, 2, 2, 0, true);
-        assert_eq!(style.fg, Some(Color::Green));
+    fn release_green_requires_a_verified_run_and_fresh_passes_on_every_enabled_stage() {
+        // The happy path: run verified, all 3 enabled stages current-gen passes.
+        assert!(group_is_release_green(true, 3, 0, 3));
+        // THE P0 FIX: an all-reused/all-skipped/all-not-run group has zero
+        // current-generation passes (verified_pass == 0) — never green, even
+        // though the run itself is verified and nothing "failed".
+        assert!(!group_is_release_green(true, 3, 0, 0));
+        // A partially-fresh group (some reused) is not green either.
+        assert!(!group_is_release_green(true, 3, 0, 2));
+        // An UNVERIFIED run (no accepted verdict / no promotion / bash dialect)
+        // is never green even if every cell shows a fresh pass.
+        assert!(!group_is_release_green(false, 3, 0, 3));
+        // A failure blocks green.
+        assert!(!group_is_release_green(true, 3, 1, 3));
+        // Nothing enabled is not "done".
+        assert!(!group_is_release_green(true, 0, 0, 0));
     }
 
     #[test]
-    fn header_stays_red_when_a_fully_complete_column_has_a_failure() {
-        // All enabled stages finished (completed == enabled) but one of
-        // them failed -- must stay red, never green.
-        let style = stage_group_header_style(false, 2, 2, 1, true);
+    fn header_turns_green_only_when_the_group_is_release_verified() {
+        // group_green is the §3.4 VerifiedPass result (the run is verified AND
+        // every enabled stage is a current-generation raw pass); it is the ONLY
+        // path to green now.
+        let style = stage_group_header_style(false, 0, true, true);
+        assert_eq!(style.fg, Some(Color::Green));
+        // Settled but NOT verified — e.g. an all-reused group, or a run with no
+        // accepted verdict — is white, never green (the P0 false-green fix).
+        let unverified = stage_group_header_style(false, 0, false, true);
+        assert_eq!(unverified.fg, Some(Color::White));
+    }
+
+    #[test]
+    fn header_stays_red_when_a_column_has_a_failure() {
+        // A failure wins over everything else, even a (contradictory) green.
+        let style = stage_group_header_style(false, 1, false, true);
         assert_eq!(style.fg, Some(Color::Red));
     }
 
     #[test]
-    fn header_is_not_green_when_nothing_is_enabled() {
-        // enabled == 0 (everything toggled off) must not read as "done".
-        let style = stage_group_header_style(false, 0, 0, 0, true);
+    fn header_is_not_green_when_the_group_is_not_verified() {
+        let style = stage_group_header_style(false, 0, false, true);
         assert_ne!(style.fg, Some(Color::Green));
     }
 
     #[test]
     fn header_is_not_green_before_any_stage_has_run() {
-        let style = stage_group_header_style(false, 5, 0, 0, false);
+        let style = stage_group_header_style(false, 0, false, false);
         assert_eq!(style.fg, Some(Color::Cyan));
     }
 
     #[test]
-    fn focused_column_stays_yellow_even_when_fully_complete() {
-        let style = stage_group_header_style(true, 2, 2, 0, true);
+    fn focused_column_stays_yellow_even_when_verified() {
+        let style = stage_group_header_style(true, 0, true, true);
         assert_eq!(style.fg, Some(Color::Yellow));
     }
 }

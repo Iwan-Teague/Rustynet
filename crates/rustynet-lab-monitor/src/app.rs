@@ -935,6 +935,8 @@ impl App {
                 status: "running".to_owned(),
                 summary: "active stage".to_owned(),
                 artifacts: Vec::new(),
+                // Synthetic UI placeholder, not a recorded generation row.
+                run_instance_id: None,
             });
     }
 
@@ -1187,6 +1189,75 @@ impl App {
             .iter()
             .any(|disabled| disabled == stage)
             && self.stage_selected_for_current_target(stage)
+    }
+
+    /// The current run's generation id — the native run instance from its
+    /// manifest. `None` on a bash/wrapper or setup-only run (no `native_run`
+    /// block), which is never release-verified.
+    fn current_generation(&self) -> Option<&str> {
+        self.run_manifest
+            .as_ref()?
+            .native_run
+            .as_ref()
+            .map(|nr| nr.run_instance_id.as_str())
+    }
+
+    /// Stage ids that recorded a CURRENT-GENERATION raw `pass` in this run's
+    /// `stages.tsv`. `Reused`/`Skipped`/`NotRun`/`NotProven` are excluded (only a
+    /// fresh `pass` counts), as is any row stamped with a different or absent run
+    /// instance. Empty when this is not a native run.
+    fn current_generation_pass_stages(&self) -> HashSet<String> {
+        let generation = match self.current_generation() {
+            Some(generation) => generation,
+            None => return HashSet::new(),
+        };
+        self.stage_outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome.is_current_generation(generation)
+                    && crate::data::stage_reader::StageStatus::parse(&outcome.status)
+                        == crate::data::stage_reader::StageStatus::Pass
+            })
+            .map(|outcome| outcome.stage.clone())
+            .collect()
+    }
+
+    /// True iff `stage` recorded a current-generation raw `pass` (§3.4: the
+    /// per-stage half of `VerifiedPass`). A reused/skipped/not-run cell, or a
+    /// pass from a prior generation in a reused report dir, is NOT a current
+    /// pass — this is what stops an all-reused group rendering green.
+    pub fn stage_is_current_gen_pass(&self, stage: &str) -> bool {
+        let generation = match self.current_generation() {
+            Some(generation) => generation,
+            None => return false,
+        };
+        self.stage_outcomes.iter().any(|outcome| {
+            outcome.stage == stage
+                && outcome.is_current_generation(generation)
+                && crate::data::stage_reader::StageStatus::parse(&outcome.status)
+                    == crate::data::stage_reader::StageStatus::Pass
+        })
+    }
+
+    /// The run-level half of `VerifiedPass` (§3.4): true only when the current
+    /// run is a native run whose candidate verdict passed for this exact run and
+    /// plan, was finally promoted (`report_state.run_passed`), and whose required
+    /// cleanup ran this generation. A bash/setup run, or any missing, rejected,
+    /// foreign, or unpromoted artifact, is not verified — so no group can render
+    /// release-green on it. Reads the run's own report-dir artifacts; never
+    /// panics and treats an unreadable artifact as not-verified.
+    pub fn run_verified(&self) -> bool {
+        let report_dir = match self.run_manifest_dir.as_ref() {
+            Some(report_dir) => report_dir,
+            None => return false,
+        };
+        let native_run = self
+            .run_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.native_run.as_ref());
+        let current_gen_pass = self.current_generation_pass_stages();
+        crate::data::run_verification::verify_run(report_dir, native_run, &current_gen_pass)
+            .verified
     }
 
     /// Whether `stage` is even *possible* for the current target config
@@ -4447,6 +4518,78 @@ mod tests {
         serde_json::from_str(json).expect("manifest fixture parses")
     }
 
+    fn native_manifest_json() -> &'static str {
+        r#"{"run_mode":"full","stages":[],"native_run":{
+            "execution_dialect":"native_node_v1","run_instance_id":"run-1",
+            "plan_kind":"standard","resolved_plan_digest":"d1",
+            "required_cleanup_stage_ids":[]}}"#
+    }
+
+    fn outcome_row(
+        stage: &str,
+        status: &str,
+        generation: Option<&str>,
+    ) -> crate::data::stage_reader::StageOutcome {
+        crate::data::stage_reader::StageOutcome {
+            stage: stage.to_owned(),
+            status: status.to_owned(),
+            summary: String::new(),
+            artifacts: Vec::new(),
+            run_instance_id: generation.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn stage_is_current_gen_pass_counts_only_current_generation_raw_passes() {
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.run_manifest = Some(manifest_from_json(native_manifest_json()));
+        app.stage_outcomes = vec![
+            outcome_row("fresh", "pass", Some("run-1")),
+            outcome_row("reused", "reused", Some("run-1")),
+            outcome_row("stale", "pass", Some("run-OLD")),
+            outcome_row("legacy", "pass", None),
+        ];
+        assert!(app.stage_is_current_gen_pass("fresh"));
+        // The P0 fix at the App layer: a reused cell is not a fresh pass, a
+        // prior-generation pass in a reused report dir is not this run's, and a
+        // legacy row with no generation never counts.
+        assert!(!app.stage_is_current_gen_pass("reused"));
+        assert!(!app.stage_is_current_gen_pass("stale"));
+        assert!(!app.stage_is_current_gen_pass("legacy"));
+        assert!(!app.stage_is_current_gen_pass("absent"));
+
+        // A bash run (no native_run block) has no generation, so nothing is a
+        // current-gen pass and the run is not verified.
+        app.run_manifest = Some(manifest_from_json(r#"{"run_mode":"full","stages":[]}"#));
+        assert!(!app.stage_is_current_gen_pass("fresh"));
+        assert!(!app.run_verified());
+    }
+
+    #[test]
+    fn run_verified_requires_native_dialect_passed_verdict_and_promotion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::write(
+            state.join("evidence_verdict.v1.json"),
+            r#"{"run_instance_id":"run-1","plan_digest":"d1","verdict":"passed"}"#,
+        )
+        .unwrap();
+        std::fs::write(state.join("report_state.json"), r#"{"run_passed":true}"#).unwrap();
+
+        let mut app = App::new(PathBuf::from("/tmp")).expect("app");
+        app.run_manifest_dir = Some(dir.path().to_path_buf());
+        app.run_manifest = Some(manifest_from_json(native_manifest_json()));
+        assert!(
+            app.run_verified(),
+            "native run with a passed, bound verdict and promotion is verified"
+        );
+
+        // Demote the promotion marker → not verified.
+        std::fs::write(state.join("report_state.json"), r#"{"run_passed":false}"#).unwrap();
+        assert!(!app.run_verified(), "an unpromoted run is not verified");
+    }
+
     #[test]
     fn stage_grid_derives_from_the_runs_manifest_when_present() {
         let mut app = App::new(PathBuf::from("/tmp")).expect("app");
@@ -4518,6 +4661,7 @@ mod tests {
             status: "reused".to_owned(),
             summary: String::new(),
             artifacts: Vec::new(),
+            run_instance_id: None,
         }];
 
         assert_eq!(app.current_run_check_progress(), Some((1, 1)));
@@ -5276,12 +5420,14 @@ mod tests {
                 status: "running".to_owned(),
                 summary: "active stage".to_owned(),
                 artifacts: Vec::new(),
+                run_instance_id: None,
             },
             crate::data::stage_reader::StageOutcome {
                 stage: "prepare_source_archive".to_owned(),
                 status: "pass".to_owned(),
                 summary: String::new(),
                 artifacts: Vec::new(),
+                run_instance_id: None,
             },
         ];
         app.active_stage = Some("preflight".to_owned());
@@ -5303,6 +5449,7 @@ mod tests {
             status: status.to_owned(),
             summary: String::new(),
             artifacts: Vec::new(),
+            run_instance_id: None,
         }
     }
 
@@ -5414,30 +5561,35 @@ mod tests {
                 status: "pass".to_owned(),
                 summary: String::new(),
                 artifacts: Vec::new(),
+                run_instance_id: None,
             },
             crate::data::stage_reader::StageOutcome {
                 stage: "prepare_source_archive".to_owned(),
                 status: "pass".to_owned(),
                 summary: String::new(),
                 artifacts: Vec::new(),
+                run_instance_id: None,
             },
             crate::data::stage_reader::StageOutcome {
                 stage: "verify_ssh_reachability".to_owned(),
                 status: "pass".to_owned(),
                 summary: String::new(),
                 artifacts: Vec::new(),
+                run_instance_id: None,
             },
             crate::data::stage_reader::StageOutcome {
                 stage: "prime_remote_access".to_owned(),
                 status: "pass".to_owned(),
                 summary: String::new(),
                 artifacts: Vec::new(),
+                run_instance_id: None,
             },
             crate::data::stage_reader::StageOutcome {
                 stage: "cleanup_hosts".to_owned(),
                 status: "pass".to_owned(),
                 summary: String::new(),
                 artifacts: Vec::new(),
+                run_instance_id: None,
             },
         ];
 
@@ -5533,12 +5685,14 @@ mod tests {
                 status: "pass".to_owned(),
                 summary: String::new(),
                 artifacts: Vec::new(),
+                run_instance_id: None,
             },
             crate::data::stage_reader::StageOutcome {
                 stage: "prepare_source_archive".to_owned(),
                 status: "pass".to_owned(),
                 summary: String::new(),
                 artifacts: Vec::new(),
+                run_instance_id: None,
             },
         ];
 
