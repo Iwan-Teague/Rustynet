@@ -576,6 +576,38 @@ pub(crate) fn execute_rust_native_orchestration(
             );
         }
     }
+    // L0.4/L0.7a (§3.1.3/§3.4): resolve the immutable plan for a full run BEFORE
+    // emitting the manifest, so the manifest's `native_run` block binds to the
+    // resolved plan's kind + digest + required cleanup. `setup_only`/`run_only`
+    // omit the final teardown (they leave the mesh up), carry no ResolvedPlan, and
+    // make no release claim — they emit no `native_run` block (to the monitor,
+    // indistinguishable from a bash run, which is never evaluated for VerifiedPass).
+    // Reused-early from the former post-manifest block so the digest exists here.
+    let native_run_manifest = if !setup_only && !run_only {
+        let graph = orchestrator::resolved_plan::StageGraph::from_stages(&stages);
+        let selection = orchestrator::resolved_plan::PlanSelection::Standard {
+            stages: stages.iter().map(|stage| stage.id()).collect(),
+        };
+        // A full run runs the whole plan; `--skip-stage` is a RUNTIME skip on
+        // stages still present in the plan, so the resolved (intended) set has
+        // no removed targets and no explicit skips reach the resolver here.
+        let resolved = orchestrator::resolved_plan::resolve(&graph, &selection, &[])?;
+        orchestrator::resolved_plan::write_resolved_plan(report_dir.as_path(), &resolved)?;
+        Some(crate::live_lab_stage_manifest::NativeRunManifest {
+            execution_dialect: crate::live_lab_stage_manifest::NATIVE_EXECUTION_DIALECT.to_owned(),
+            run_instance_id: run_instance_id.clone(),
+            plan_kind: resolved.kind.as_str().to_owned(),
+            resolved_plan_digest: resolved.digest.clone(),
+            required_cleanup_stage_ids: resolved
+                .cleanup
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+        })
+    } else {
+        None
+    };
+
     // Record THIS run's node→role topology in the manifest so consumers (the
     // monitor) render live roles from the current run instead of inferring them
     // from the previous finalized matrix row (emit-don't-infer).
@@ -600,27 +632,14 @@ pub(crate) fn execute_rust_native_orchestration(
         &manifest_selectors,
         &plan_names,
         &manifest_node_assignments,
+        native_run_manifest,
     )?;
     write_rust_native_node_stage_plan(report_dir.as_path(), &stages)?;
 
-    // L0.4 (§3.1.3): record the immutable ResolvedPlan for a full run — the only
-    // kind that makes a release claim. `setup_only` / `run_only` deliberately
-    // omit the final teardown (they leave the mesh up), so they carry no
-    // ResolvedPlan and rule 4's mandatory-cleanup would not apply. The built
-    // `stages` already equal the manifest's enabled set and `plan_names`; the
-    // verifier reconstructs this plan independently and compares digests to
-    // detect a shrunk plan (that reconstruction is the next L0.4 increment).
-    if !setup_only && !run_only {
-        let graph = orchestrator::resolved_plan::StageGraph::from_stages(&stages);
-        let selection = orchestrator::resolved_plan::PlanSelection::Standard {
-            stages: stages.iter().map(|stage| stage.id()).collect(),
-        };
-        // A full run runs the whole plan; `--skip-stage` is a RUNTIME skip on
-        // stages still present in the plan, so the resolved (intended) set has
-        // no removed targets and no explicit skips reach the resolver here.
-        let resolved = orchestrator::resolved_plan::resolve(&graph, &selection, &[])?;
-        orchestrator::resolved_plan::write_resolved_plan(report_dir.as_path(), &resolved)?;
-    }
+    // (The immutable ResolvedPlan for a full run — §3.1.3 — is now written above,
+    // before the manifest, so the manifest's `native_run` block can bind to its
+    // digest. The verifier reconstructs this plan independently and compares
+    // digests to detect a shrunk plan.)
 
     // --dry-run is a WIRING CHECK: the manifest above already records the
     // resolved plan (what WOULD run) and the adapters/topology were validated
