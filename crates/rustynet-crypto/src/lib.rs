@@ -1974,6 +1974,52 @@ mod unix_custody_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Round-trip of the at-rest AEAD primitive used by the NAS store.
+    #[test]
+    fn aead_seal_then_open_round_trips() {
+        let key = [7u8; 32];
+        let blob = super::aead_seal(&key, b"peer-a/snap-1", b"payload").expect("seal");
+        assert_ne!(blob.nonce, [0u8; 24]);
+        let plaintext = super::aead_open(&key, b"peer-a/snap-1", &blob).expect("open must succeed");
+        assert_eq!(plaintext, b"payload");
+    }
+
+    /// CRY/D13: the AAD binds a blob to its logical location, so a ciphertext
+    /// captured under one namespace must NOT open under another.
+    #[test]
+    fn aead_open_rejects_wrong_aad() {
+        let key = [7u8; 32];
+        let blob = super::aead_seal(&key, b"peer-a/snap-1", b"payload").expect("seal");
+        let err = super::aead_open(&key, b"peer-b/snap-1", &blob)
+            .expect_err("replay into another namespace must fail");
+        assert!(matches!(err, super::CryptoError::DecryptionFailed));
+    }
+
+    #[test]
+    fn aead_open_rejects_tampered_ciphertext_and_wrong_key() {
+        let key = [7u8; 32];
+        let mut blob = super::aead_seal(&key, b"aad", b"payload").expect("seal");
+        blob.ciphertext[0] ^= 0x01;
+        assert!(matches!(
+            super::aead_open(&key, b"aad", &blob),
+            Err(super::CryptoError::DecryptionFailed)
+        ));
+
+        let intact = super::aead_seal(&key, b"aad", b"payload").expect("seal");
+        assert!(matches!(
+            super::aead_open(&[8u8; 32], b"aad", &intact),
+            Err(super::CryptoError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn aead_seal_draws_fresh_nonces() {
+        let key = [7u8; 32];
+        let first = super::aead_seal(&key, b"aad", b"x").expect("seal");
+        let second = super::aead_seal(&key, b"aad", b"x").expect("seal");
+        assert_ne!(first.nonce, second.nonce);
+    }
+
     /// The unimplemented-platform arm must FAIL, not pass.
     ///
     /// Runs only where the arm exists. The source pin below is what protects
