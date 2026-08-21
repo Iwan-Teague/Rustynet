@@ -385,4 +385,89 @@ mod tests {
         assert_eq!(defaults.get("mode"), Some(&"default-deny".to_owned()));
         assert_eq!(defaults.get("allow_all"), Some(&"false".to_owned()));
     }
+
+    #[test]
+    fn authorized_admin_can_perform_privileged_action() {
+        let mut api = AdminApiState::default();
+        api.add_node("node-a");
+        let admin = AdminPrincipal {
+            user_id: "admin".to_owned(),
+            role: Role::Admin,
+            mfa_verified: true,
+        };
+
+        api.update_policy(
+            &admin,
+            "csrf-123",
+            &secure_session(),
+            "allow group:family -> tag:servers".to_owned(),
+        )
+        .expect("fully authenticated admin must be able to manage policy");
+        let nodes = api
+            .list_nodes(&admin, "csrf-123", &secure_session())
+            .expect("authenticated read must succeed");
+        assert_eq!(nodes, vec!["node-a".to_owned()]);
+    }
+
+    #[test]
+    fn operator_role_matrix_allows_exit_nodes_but_denies_policy() {
+        let mut api = AdminApiState::default();
+        let operator = AdminPrincipal {
+            user_id: "operator".to_owned(),
+            role: Role::Operator,
+            mfa_verified: true,
+        };
+        let session = secure_session();
+
+        api.set_exit_node(&operator, "csrf-123", &session, "node-b".to_owned())
+            .expect("operator may manage exit nodes");
+        let err = api
+            .update_policy(&operator, "csrf-123", &session, "allow a -> b".to_owned())
+            .expect_err("operator must not manage policy");
+        assert_eq!(err, AdminError::Unauthorized);
+    }
+
+    #[test]
+    fn exit_node_management_requires_mfa() {
+        let mut api = AdminApiState::default();
+        let operator_without_mfa = AdminPrincipal {
+            user_id: "operator".to_owned(),
+            role: Role::Operator,
+            mfa_verified: false,
+        };
+        let err = api
+            .set_exit_node(
+                &operator_without_mfa,
+                "csrf-123",
+                &secure_session(),
+                "node-b".to_owned(),
+            )
+            .expect_err("exit-node management is privileged and needs MFA");
+        assert_eq!(err, AdminError::MfaRequired);
+    }
+
+    #[test]
+    fn every_insecure_session_flag_is_rejected() {
+        let mut api = AdminApiState::default();
+        api.add_node("node-a");
+        let admin = AdminPrincipal {
+            user_id: "admin".to_owned(),
+            role: Role::Admin,
+            mfa_verified: true,
+        };
+
+        let mut no_http_only = secure_session();
+        no_http_only.http_only_cookie = false;
+        assert_eq!(
+            api.list_nodes(&admin, "csrf-123", &no_http_only).err(),
+            Some(AdminError::SessionInsecure)
+        );
+
+        let mut no_same_site = secure_session();
+        no_same_site.same_site_strict = false;
+        assert_eq!(
+            api.list_nodes(&admin, "csrf-123", &no_same_site).err(),
+            Some(AdminError::SessionInsecure)
+        );
+    }
 }
