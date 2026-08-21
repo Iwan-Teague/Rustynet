@@ -3696,6 +3696,33 @@ logs "runtime bootstrap complete" unconditionally after a FAILED bootstrap
 bounded, LOUD retries (`resilience.rs` policy per its adoption rule), a terminal
 operator-visible state, and an honest bootstrap-outcome log line.
 
+**FIXED 2026-08-21 (observability; fail-closed posture unchanged).** All four defects, one
+increment in `crates/rustynetd/src/daemon.rs`: (i) `restrict_recoverable`'s Permanent
+early-return is no longer silent — it eprintlns the new failure ("node already PERMANENTLY
+restricted; new failure while restricted: …") and refreshes `bootstrap_error`, so the 1-second
+FailClosed retry loop stays operator-visible while the mode itself remains Permanent
+(fail-closed preserved); (ii) the refresh success tail was extracted into
+`complete_verified_signed_refresh`, which REFUSES to reset anything when
+`restriction_mode == Permanent` (loud eprintln, counters preserved) — a successful signed-state
+FETCH alone can no longer un-promote permanence; honest recovery still only happens through the
+reconcile success arm (real dataplane apply); (iii) `traversal_next_preexpiry_refresh_target`
+now falls back to `Some(now_unix)` when `traversal_hints` are None but
+`traversal_hint_error` is recorded, so a stale bundle no longer silently disables the pre-expiry
+refresh scheduler — attempts resume, still bounded by `MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS`;
+(iv) `run_daemon` logs "runtime bootstrap complete (restricted: <error>)" when
+`bootstrap_error` is set instead of an unconditional success line. Deliberately NOT done here:
+a resilience.rs backoff loop for the reconcile retry — the existing per-second FailClosed retry
+is pre-existing behavior and now loud; changing its cadence is a behavioural change out of this
+item's observability scope. Five unit tests pin each behavior
+(`restrict_recoverable_under_permanent_keeps_mode_and_records_new_failure`,
+`complete_verified_signed_refresh_preserves_permanent_restriction`,
+`complete_verified_signed_refresh_clears_recoverable_restriction`,
+`preexpiry_refresh_target_stays_scheduled_after_hint_clear`,
+`promote_to_permanent_threshold_unchanged`). Mutation-proven: silencing restrict_recoverable,
+deleting the Permanent guard, deleting the scheduler fallback, and weakening the promotion
+threshold (`>=`→`>`) each flipped exactly its pin test red; restored → 5/5 green. Not yet
+live-proven on a lab guest.
+
 **[[QH-46]] enforcement-test closure (2026-08-14).** The §4 gap the handover flagged is closed:
 `ensure_host_firewall_admits_forwarding` and its `allow_tunnel_relay_forward` gate now carry a
 cross-platform source-pin test (`linux_firewall_apply_checks_host_firewall_when_forwarding`,
