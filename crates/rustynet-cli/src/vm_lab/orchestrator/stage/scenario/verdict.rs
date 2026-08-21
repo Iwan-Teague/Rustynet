@@ -176,6 +176,40 @@ impl EvidenceVerdict {
         }
     }
 
+    /// A candidate verdict bound to real contract + artifact evidence (the L1
+    /// form), whose pass/fail is supplied directly by the finalizer. The
+    /// finalizer combines the structural run pass with the INDEPENDENT scenario
+    /// assessments — so unlike [`from_assessment`], the verdict here follows the
+    /// whole run's determination rather than one assessment, and it aggregates
+    /// the contract digest + artifact map over EVERY wired scenario evaluated.
+    /// `reason_codes`/`detail` describe the demotion when not passed (empty on a
+    /// pass). No secret material.
+    pub fn bound(
+        run_instance_id: &str,
+        plan_digest: &str,
+        contract_digest: &str,
+        passed: bool,
+        reason_codes: Vec<String>,
+        detail: &str,
+        artifact_digests: BTreeMap<String, String>,
+    ) -> EvidenceVerdict {
+        EvidenceVerdict {
+            schema_version: EVIDENCE_VERDICT_SCHEMA_VERSION,
+            run_instance_id: run_instance_id.to_owned(),
+            plan_digest: plan_digest.to_owned(),
+            contract_digest: contract_digest.to_owned(),
+            verdict: if passed {
+                Verdict::Passed
+            } else {
+                Verdict::Rejected
+            },
+            reason_codes: if passed { Vec::new() } else { reason_codes },
+            artifact_digests,
+            writer: WRITER.to_owned(),
+            detail: detail.to_owned(),
+        }
+    }
+
     pub fn is_pass(&self) -> bool {
         self.verdict == Verdict::Passed
     }
@@ -347,6 +381,35 @@ mod tests {
         let fail = EvidenceVerdict::run_level("run-1", "plan-1", false, "1 failed");
         assert_eq!(fail.verdict, Verdict::Rejected);
         assert_eq!(fail.reason_codes, vec!["failed".to_owned()]);
+        assert!(authorize_release(&fail, "run-1", "plan-1").is_none());
+    }
+
+    #[test]
+    fn bound_verdict_carries_contract_and_artifacts_and_gates_on_passed() {
+        let mut ad = BTreeMap::new();
+        ad.insert("state/t.json".to_owned(), "abc".to_owned());
+        let pass = EvidenceVerdict::bound("run-1", "plan-1", "cd", true, vec![], "", ad.clone());
+        assert_eq!(pass.verdict, Verdict::Passed);
+        assert_eq!(pass.contract_digest, "cd");
+        assert_eq!(pass.artifact_digests, ad);
+        assert!(
+            pass.reason_codes.is_empty(),
+            "a pass carries no reason codes"
+        );
+        assert!(authorize_release(&pass, "run-1", "plan-1").is_some());
+
+        let fail = EvidenceVerdict::bound(
+            "run-1",
+            "plan-1",
+            "cd",
+            false,
+            vec!["stale_evidence".to_owned()],
+            "wrong generation",
+            BTreeMap::new(),
+        );
+        assert_eq!(fail.verdict, Verdict::Rejected);
+        assert_eq!(fail.reason_codes, vec!["stale_evidence".to_owned()]);
+        assert_eq!(fail.detail, "wrong generation");
         assert!(authorize_release(&fail, "run-1", "plan-1").is_none());
     }
 

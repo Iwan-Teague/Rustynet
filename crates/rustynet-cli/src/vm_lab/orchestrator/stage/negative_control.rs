@@ -170,7 +170,34 @@ impl OrchestrationStage for NegativeControlWrongNodeSubstitutionStage {
     }
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let dir = control_workdir(ctx, self.name());
-        signed_bundle::run_wrong_node_control(&dir)
+        let outcome = signed_bundle::run_wrong_node_control(&dir);
+        // Emit the scenario.v1 evidence so the finalizer's INDEPENDENT verifier
+        // can re-derive this control's verdict (§3.1.2), for BOTH pass and fail.
+        // The generation binding comes from the report-dir lease; any identity or
+        // emission failure fail-closes the control.
+        let run_identity =
+            match crate::vm_lab::orchestrator::run_instance::read_leased_run_instance_id(
+                &ctx.report_dir,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    return StageOutcome::Failed(format!(
+                        "wrong-node control: run identity unavailable for scenario.v1: {e}"
+                    ));
+                }
+            };
+        let control_passed = matches!(outcome, StageOutcome::Passed);
+        if let Err(e) = signed_bundle::emit_wrong_node_scenario_v1(
+            &ctx.report_dir,
+            &dir,
+            &run_identity,
+            control_passed,
+        ) {
+            return StageOutcome::Failed(format!(
+                "wrong-node control: scenario.v1 emission failed: {e}"
+            ));
+        }
+        outcome
     }
 }
 
@@ -2156,6 +2183,166 @@ pub(crate) mod signed_bundle {
         Ok(())
     }
 
+    // ── (d) wrong-node substitution: scenario.v1 evidence (L1) ───────────────
+
+    pub(crate) const WRONG_NODE_STAGE_ID: &str = "negative_control_wrong_node_substitution";
+    pub(crate) const WRONG_NODE_ASSERTION_ID: &str = "wrong_node_substitution_rejected";
+    pub(crate) const WRONG_NODE_TRANSCRIPT_FILE: &str = "wrong_node_transcript.json";
+    const WRONG_NODE_TRANSCRIPT_SCHEMA: &str = "wrong_node_substitution_transcript.v1";
+    /// The impostor id the genuine bundle is verified AGAINST — it must be
+    /// rejected for a node-id mismatch. Hoisted so the control and its recomputer
+    /// share one definition.
+    const SUBSTITUTED_NODE_ID: &str = "nc-node-substituted-imposter";
+    /// The substring the substituted-node verify error must contain for the
+    /// rejection to count as the NAMED node-id-mismatch reason.
+    const NODE_ID_MISMATCH_SUBSTR: &str = "node_id mismatch";
+
+    /// The raw verdicts of the wrong-node control: the genuine bundle verified
+    /// against a substituted (impostor) expected_node_id — which must be REJECTED
+    /// for a node-id mismatch — and against its own id — which must be ACCEPTED.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub(crate) struct WrongNodeTranscript {
+        pub(crate) schema: String,
+        pub(crate) substituted_accepted: bool,
+        #[serde(default)]
+        pub(crate) substituted_error: Option<String>,
+        pub(crate) matching_accepted: bool,
+        #[serde(default)]
+        pub(crate) matching_error: Option<String>,
+    }
+
+    fn write_wrong_node_transcript(dir: &Path, doc: &WrongNodeTranscript) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let body = serde_json::to_string_pretty(doc)
+            .map_err(|e| format!("serialize wrong-node transcript: {e}"))?;
+        let path = dir.join(WRONG_NODE_TRANSCRIPT_FILE);
+        std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    /// Emit the wrong-node control's `scenario.v1`, referencing the raw transcript
+    /// as the `wrong_node_substitution_rejected` (Identity) assertion's witness.
+    /// Mirrors [`emit_signed_bundle_scenario_v1`]; the self-reported `result` is
+    /// never trusted — the finalizer recomputes from the transcript.
+    pub(crate) fn emit_wrong_node_scenario_v1(
+        report_root: &Path,
+        control_dir: &Path,
+        run_identity: &str,
+        control_passed: bool,
+    ) -> Result<PathBuf, String> {
+        use crate::vm_lab::orchestrator::stage::scenario::AssertionClass;
+        use crate::vm_lab::orchestrator::stage::scenario::registry::ScenarioContractRegistry;
+        use crate::vm_lab::orchestrator::stage::scenario::schema::{
+            ArtifactRef, AssertionRecord, CleanupRecord, FaultRecord, ItemResult,
+            SCENARIO_SCHEMA_VERSION, ScenarioV1, SelectedTarget, write_scenario_v1,
+        };
+
+        let transcript_path = control_dir.join(WRONG_NODE_TRANSCRIPT_FILE);
+        let bytes = std::fs::read(&transcript_path).map_err(|e| {
+            format!(
+                "read wrong-node transcript {}: {e}",
+                transcript_path.display()
+            )
+        })?;
+        let sha256 = crate::vm_lab::sha256_hex_bytes(&bytes);
+        let reference = report_root_relative(report_root, &transcript_path)?;
+
+        let registry = ScenarioContractRegistry::canonical();
+        let registered = registry
+            .lookup(WRONG_NODE_STAGE_ID)
+            .ok_or_else(|| format!("no registered contract for {WRONG_NODE_STAGE_ID}"))?;
+
+        let result = if control_passed {
+            ItemResult::Pass
+        } else {
+            ItemResult::Fail
+        };
+        let artifact = ArtifactRef { reference, sha256 };
+        let scenario = ScenarioV1 {
+            schema_version: SCENARIO_SCHEMA_VERSION,
+            scenario_id: "wrong_node_substitution".to_owned(),
+            stage_id: WRONG_NODE_STAGE_ID.to_owned(),
+            contract_digest: registered.contract_digest().to_owned(),
+            run_identity: run_identity.to_owned(),
+            selected_targets: vec![SelectedTarget {
+                alias: "nc-local".to_owned(),
+                node_id: BUNDLE_NODE_ID.to_owned(),
+                role: "local_control".to_owned(),
+                platform: "in_proc".to_owned(),
+                os_version: String::new(),
+            }],
+            admission: vec![],
+            baseline: vec![],
+            fault: Some(FaultRecord {
+                kind: "wrong_node_substitution".to_owned(),
+                scope: "in_proc_assignment_verifier".to_owned(),
+                applied: true,
+                verified: true,
+                evidence: vec![artifact.clone()],
+            }),
+            assertions: vec![AssertionRecord {
+                id: WRONG_NODE_ASSERTION_ID.to_owned(),
+                class: AssertionClass::Identity,
+                required: true,
+                result,
+                evidence: vec![artifact],
+            }],
+            cleanup: vec![CleanupRecord {
+                action: "in_proc_fixtures_retained_as_evidence".to_owned(),
+                result: ItemResult::Pass,
+                residual_check: ItemResult::Pass,
+                evidence: vec![],
+            }],
+            limitations: vec!["in-process crypto control; no live guest".to_owned()],
+            terminal_outcome: if control_passed { "passed" } else { "failed" }.to_owned(),
+        };
+        write_scenario_v1(report_root, &scenario)
+    }
+
+    /// Recompute `wrong_node_substitution_rejected` from the raw transcript: the
+    /// substituted (impostor) verify MUST have been rejected for a node-id
+    /// mismatch, and the matching verify MUST have been accepted. Re-derives from
+    /// the recorded verdicts against the reason this recomputer holds
+    /// independently ([`NODE_ID_MISMATCH_SUBSTR`]) — it never re-runs the verifier
+    /// and never trusts the scenario's self-report.
+    pub(crate) fn recompute_wrong_node_substitution_rejected(
+        _record: &AssertionRecord,
+        artifacts: &[ValidatedArtifact],
+    ) -> Result<(), String> {
+        let transcript = artifacts
+            .iter()
+            .find(|a| a.reference.ends_with(WRONG_NODE_TRANSCRIPT_FILE))
+            .ok_or_else(|| {
+                format!("no `{WRONG_NODE_TRANSCRIPT_FILE}` artifact bound to the assertion")
+            })?;
+        let body = std::fs::read_to_string(&transcript.path).map_err(|e| {
+            format!(
+                "read wrong-node transcript {}: {e}",
+                transcript.path.display()
+            )
+        })?;
+        let doc: WrongNodeTranscript =
+            serde_json::from_str(&body).map_err(|e| format!("parse wrong-node transcript: {e}"))?;
+        if doc.substituted_accepted {
+            return Err(
+                "substituted (impostor) node_id was ACCEPTED (fail-open) — must be rejected"
+                    .to_owned(),
+            );
+        }
+        let err = doc.substituted_error.as_deref().unwrap_or("");
+        if !err.contains(NODE_ID_MISMATCH_SUBSTR) {
+            return Err(format!(
+                "substituted node rejected for the wrong reason (expected a node-id mismatch): {err:?}"
+            ));
+        }
+        if !doc.matching_accepted {
+            return Err(format!(
+                "positive control broken — the matching node_id was REJECTED: {:?}",
+                doc.matching_error
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod scenario_emission_tests {
         use super::*;
@@ -2294,6 +2481,48 @@ pub(crate) mod signed_bundle {
                 .expect_err("a fabricated accept must fail recompute");
             assert!(err.contains("ACCEPTED"), "{err}");
         }
+
+        #[test]
+        fn wrong_node_recompute_rejects_an_accepted_impostor() {
+            // Security-critical direction: a control that ACCEPTED the substituted
+            // (impostor) node_id must not recompute to a pass.
+            use crate::vm_lab::orchestrator::stage::scenario::AssertionClass;
+            use crate::vm_lab::orchestrator::stage::scenario::schema::{
+                AssertionRecord, ItemResult,
+            };
+
+            let tmp = tempdir().unwrap();
+            let control_dir = tmp.path().join("wn");
+            assert!(matches!(
+                run_wrong_node_control(&control_dir),
+                StageOutcome::Passed
+            ));
+            let transcript_ref = format!("wn/{WRONG_NODE_TRANSCRIPT_FILE}");
+            let record = AssertionRecord {
+                id: WRONG_NODE_ASSERTION_ID.to_owned(),
+                class: AssertionClass::Identity,
+                required: true,
+                result: ItemResult::Pass,
+                evidence: vec![],
+            };
+
+            let good = validate_artifact(tmp.path(), &transcript_ref, 1 << 20).unwrap();
+            recompute_wrong_node_substitution_rejected(&record, std::slice::from_ref(&good))
+                .expect("healthy transcript recomputes");
+
+            // Fabricate: the impostor was ACCEPTED.
+            let path = control_dir.join(WRONG_NODE_TRANSCRIPT_FILE);
+            let mut doc: WrongNodeTranscript =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            doc.substituted_accepted = true;
+            doc.substituted_error = None;
+            std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+            let bad = validate_artifact(tmp.path(), &transcript_ref, 1 << 20).unwrap();
+            let err =
+                recompute_wrong_node_substitution_rejected(&record, std::slice::from_ref(&bad))
+                    .expect_err("an accepted impostor must fail recompute");
+            assert!(err.contains("ACCEPTED"), "{err}");
+        }
     }
 
     // ── (d) wrong-node substitution ─────────────────────────────────────────
@@ -2353,28 +2582,64 @@ pub(crate) mod signed_bundle {
         let fixture = match write_genuine(dir, BUNDLE_NODE_ID) {
             Ok(fixture) => fixture,
             Err(err) => {
+                // Record a transcript documenting the staging failure so the
+                // finalizer's verifier still has a witness (a control with no
+                // witness fails closed).
+                let _ = write_wrong_node_transcript(
+                    dir,
+                    &WrongNodeTranscript {
+                        schema: WRONG_NODE_TRANSCRIPT_SCHEMA.to_owned(),
+                        substituted_accepted: false,
+                        substituted_error: Some(format!("fixture staging failed: {err}")),
+                        matching_accepted: false,
+                        matching_error: Some(format!("fixture staging failed: {err}")),
+                    },
+                );
                 return StageOutcome::Failed(format!(
                     "wrong-node negative control: fixture staging failed: {err}"
                 ));
             }
         };
-        let substituted = verify(&fixture, Some("nc-node-substituted-imposter"));
+        let substituted = verify(&fixture, Some(SUBSTITUTED_NODE_ID));
         let matching = verify(&fixture, Some(BUNDLE_NODE_ID));
+
+        // Record the raw verdicts BEFORE classifying (which consumes them) — the
+        // time-stable witness the recomputer re-classifies.
+        let transcript = WrongNodeTranscript {
+            schema: WRONG_NODE_TRANSCRIPT_SCHEMA.to_owned(),
+            substituted_accepted: substituted.is_ok(),
+            substituted_error: substituted.as_ref().err().cloned(),
+            matching_accepted: matching.is_ok(),
+            matching_error: matching.as_ref().err().cloned(),
+        };
+        let mut failures: Vec<String> = Vec::new();
+        if let Err(e) = write_wrong_node_transcript(dir, &transcript) {
+            failures.push(format!("transcript write failed: {e}"));
+        }
+
         match classify_wrong_node(substituted, matching) {
-            WrongNodeCheck::RejectedSubstitutionAcceptedMatch => StageOutcome::Passed,
-            WrongNodeCheck::AcceptedSubstitution => StageOutcome::Failed(
-                "wrong-node negative control: FAIL-OPEN — a bundle for a different node_id was \
-                 ACCEPTED under a substituted expected_node_id"
+            WrongNodeCheck::RejectedSubstitutionAcceptedMatch => {}
+            WrongNodeCheck::AcceptedSubstitution => failures.push(
+                "FAIL-OPEN — a bundle for a different node_id was ACCEPTED under a substituted \
+                 expected_node_id"
                     .to_owned(),
             ),
-            WrongNodeCheck::RejectedWrongReason { actual } => StageOutcome::Failed(format!(
-                "wrong-node negative control: substituted node rejected for the WRONG reason \
-                 (expected a node_id mismatch): {actual}"
+            WrongNodeCheck::RejectedWrongReason { actual } => failures.push(format!(
+                "substituted node rejected for the WRONG reason (expected a node_id mismatch): \
+                 {actual}"
             )),
-            WrongNodeCheck::MatchRejected { actual } => StageOutcome::Failed(format!(
-                "wrong-node negative control: positive control broken — the matching node_id was \
-                 REJECTED: {actual}"
+            WrongNodeCheck::MatchRejected { actual } => failures.push(format!(
+                "positive control broken — the matching node_id was REJECTED: {actual}"
             )),
+        }
+
+        if failures.is_empty() {
+            StageOutcome::Passed
+        } else {
+            StageOutcome::Failed(format!(
+                "wrong-node negative control: {}",
+                failures.join("; ")
+            ))
         }
     }
 

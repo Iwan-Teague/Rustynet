@@ -11,9 +11,10 @@
 //! DEMOTES the run even when it was structurally green, and the durable verdict
 //! binds to the real contract digest + artifact map.
 //!
-//! Today exactly one control is wired — the local, in-process signed-bundle
-//! forgery-rejection control. New controls join by adding their `(stage_id,
-//! recomputer)` to [`wired_scenarios`].
+//! Today the two local, in-process controls are wired — signed-bundle forgery
+//! rejection and wrong-node substitution — and both are evaluated when present.
+//! New controls join by adding their `(stage_id, assertion_id, recomputer)` to
+//! [`wired_scenarios`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -38,23 +39,46 @@ type RecomputerFn = fn(&AssertionRecord, &[ValidatedArtifact]) -> Result<(), Str
 /// The wired T5 controls: `(stage_id, assertion_id, recomputer)`. New controls
 /// register here when their `scenario.v1` emission + recomputer land.
 fn wired_scenarios() -> Vec<(&'static str, &'static str, RecomputerFn)> {
-    vec![(
-        signed_bundle::SIGNED_BUNDLE_STAGE_ID,
-        signed_bundle::SIGNED_BUNDLE_ASSERTION_ID,
-        signed_bundle::recompute_signed_bundle_forgery_rejected,
-    )]
+    vec![
+        (
+            signed_bundle::SIGNED_BUNDLE_STAGE_ID,
+            signed_bundle::SIGNED_BUNDLE_ASSERTION_ID,
+            signed_bundle::recompute_signed_bundle_forgery_rejected,
+        ),
+        (
+            signed_bundle::WRONG_NODE_STAGE_ID,
+            signed_bundle::WRONG_NODE_ASSERTION_ID,
+            signed_bundle::recompute_wrong_node_substitution_rejected,
+        ),
+    ]
 }
 
-/// The independent evaluation of one wired scenario.
+/// The aggregate independent evaluation of EVERY wired scenario present this run.
 pub struct WiredScenarioEval {
-    /// The `pass_certificate::evaluate` verdict for this scenario.
-    pub assessment: Assessment,
-    /// The digest of the contract the scenario resolved to (for the durable
-    /// verdict binding).
+    /// True iff every present wired scenario proved out. A single non-pass
+    /// demotes the run.
+    pub all_passed: bool,
+    /// Reason codes from the FIRST non-pass (a `ReasonCode` token, or `failed`),
+    /// empty when all passed.
+    pub reason_codes: Vec<String>,
+    /// Human detail of the first non-pass, prefixed with its stage id (never a
+    /// secret), empty when all passed.
+    pub detail: String,
+    /// A digest binding the SET of contracts evaluated (sha256 over the sorted
+    /// per-scenario contract digests), for the durable verdict.
     pub contract_digest: String,
-    /// `reference -> sha256` of every artifact the scenario referenced, for the
+    /// Union of every evaluated scenario's `reference -> sha256`, for the
     /// monitor's staleness cross-check.
     pub artifact_digests: BTreeMap<String, String>,
+}
+
+/// The `(reason_codes, detail)` an assessment contributes to a demotion.
+fn assessment_reason(assessment: &Assessment) -> (Vec<String>, String) {
+    match assessment {
+        Assessment::Passed(_) => (Vec::new(), String::new()),
+        Assessment::NotProven(reason, detail) => (vec![reason.as_str().to_owned()], detail.clone()),
+        Assessment::Failed(detail) => (vec!["failed".to_owned()], detail.clone()),
+    }
 }
 
 /// Evaluate the wired scenario controls' emitted `scenario.v1` under
@@ -68,17 +92,27 @@ pub struct WiredScenarioEval {
 ///     unreadable: an integrity fault the finalizer treats as an evidence error
 ///     (fail closed).
 ///
-/// Only ONE wired scenario exists today; when more are wired this evaluates the
-/// first present one. (A run exercises at most one negative control at a time.)
+/// Evaluates ALL wired scenarios present this run — the negative-control suite
+/// runs both local controls, so both emit and BOTH must be independently
+/// verified (evaluating only the first would leave the second present-but-
+/// unverified). The run passes only if every present scenario proves out.
 pub fn evaluate_wired_scenarios(
     report_dir: &Path,
     run_instance_id: &str,
 ) -> Result<Option<WiredScenarioEval>, String> {
+    let mut evaluated = 0usize;
+    let mut all_passed = true;
+    let mut reason_codes: Vec<String> = Vec::new();
+    let mut detail = String::new();
+    let mut contract_digests: Vec<String> = Vec::new();
+    let mut artifact_digests: BTreeMap<String, String> = BTreeMap::new();
+
     for (stage_id, assertion_id, recompute) in wired_scenarios() {
         let path = scenario_v1_path(report_dir, stage_id);
         if !path.exists() {
             continue;
         }
+        evaluated += 1;
         let body =
             std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let scenario =
@@ -106,20 +140,36 @@ pub fn evaluate_wired_scenarios(
             &recomputers,
         );
 
-        let mut artifact_digests = BTreeMap::new();
+        contract_digests.push(registered.contract_digest().to_owned());
         for a in &scenario.assertions {
             for aref in &a.evidence {
                 artifact_digests.insert(aref.reference.clone(), aref.sha256.clone());
             }
         }
-
-        return Ok(Some(WiredScenarioEval {
-            assessment,
-            contract_digest: registered.contract_digest().to_owned(),
-            artifact_digests,
-        }));
+        if !assessment.is_pass() && all_passed {
+            // Record the FIRST non-pass (subsequent ones do not change the
+            // demotion, only the primary reason).
+            all_passed = false;
+            let (rc, d) = assessment_reason(&assessment);
+            reason_codes = rc;
+            detail = format!("{stage_id}: {d}");
+        }
     }
-    Ok(None)
+
+    if evaluated == 0 {
+        return Ok(None);
+    }
+    // Bind the verdict to the SET of contracts evaluated (order-independent).
+    contract_digests.sort();
+    let contract_digest = crate::vm_lab::sha256_hex_bytes(contract_digests.join("\n").as_bytes());
+
+    Ok(Some(WiredScenarioEval {
+        all_passed,
+        reason_codes,
+        detail,
+        contract_digest,
+        artifact_digests,
+    }))
 }
 
 #[cfg(test)]
@@ -138,6 +188,19 @@ mod tests {
             StageOutcome::Passed
         ));
         signed_bundle::emit_signed_bundle_scenario_v1(report_root, &control_dir, run_id, true)
+            .expect("emit");
+    }
+
+    /// Emit exactly what the wrong-node control's `execute()` would.
+    fn emit_wrong_node(report_root: &Path, run_id: &str) {
+        let control_dir = report_root
+            .join("negative_control")
+            .join(signed_bundle::WRONG_NODE_STAGE_ID);
+        assert!(matches!(
+            signed_bundle::run_wrong_node_control(&control_dir),
+            StageOutcome::Passed
+        ));
+        signed_bundle::emit_wrong_node_scenario_v1(report_root, &control_dir, run_id, true)
             .expect("emit");
     }
 
@@ -161,14 +224,62 @@ mod tests {
             .unwrap()
             .expect("scenario present");
         assert!(
-            eval.assessment.is_pass(),
-            "independent evaluate must pass: {:?}",
-            eval.assessment
+            eval.all_passed,
+            "independent evaluate must pass: {}",
+            eval.detail
         );
         assert_eq!(eval.contract_digest.len(), 64, "sha-256 hex");
         assert!(
             !eval.artifact_digests.is_empty(),
             "the transcript artifact must be bound"
+        );
+    }
+
+    #[test]
+    fn both_controls_present_are_both_evaluated_and_pass() {
+        // The negative-control suite emits BOTH local controls; both must be
+        // evaluated (not just the first), and the aggregate binds both artifacts.
+        let report = tempfile::tempdir().unwrap();
+        let run_id = "0123456789abcdef0123456789abcdef";
+        emit_signed_bundle(report.path(), run_id);
+        emit_wrong_node(report.path(), run_id);
+        let eval = evaluate_wired_scenarios(report.path(), run_id)
+            .unwrap()
+            .expect("scenarios present");
+        assert!(eval.all_passed, "both must prove out: {}", eval.detail);
+        // Both transcripts bound.
+        assert!(
+            eval.artifact_digests
+                .keys()
+                .any(|k| k.ends_with(signed_bundle::SIGNED_BUNDLE_TRANSCRIPT_FILE)),
+            "signed-bundle transcript bound"
+        );
+        assert!(
+            eval.artifact_digests
+                .keys()
+                .any(|k| k.ends_with(signed_bundle::WRONG_NODE_TRANSCRIPT_FILE)),
+            "wrong-node transcript bound"
+        );
+    }
+
+    #[test]
+    fn one_failing_control_demotes_the_aggregate() {
+        // Two controls present; the wrong-node scenario is bound to the WRONG
+        // generation → its recompute is stale → the aggregate does not pass even
+        // though the signed-bundle scenario is clean.
+        let report = tempfile::tempdir().unwrap();
+        let run_id = "0123456789abcdef0123456789abcdef";
+        emit_signed_bundle(report.path(), run_id);
+        // Wrong-node emitted for a different generation.
+        emit_wrong_node(report.path(), "ffffffffffffffffffffffffffffffff");
+        let eval = evaluate_wired_scenarios(report.path(), run_id)
+            .unwrap()
+            .expect("scenarios present");
+        assert!(!eval.all_passed);
+        assert!(
+            eval.detail.contains(signed_bundle::WRONG_NODE_STAGE_ID),
+            "the demotion names the failing stage: {}",
+            eval.detail
         );
     }
 
@@ -181,7 +292,7 @@ mod tests {
         let eval = evaluate_wired_scenarios(report.path(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
             .unwrap()
             .expect("scenario present");
-        assert!(!eval.assessment.is_pass());
+        assert!(!eval.all_passed);
     }
 
     #[test]
