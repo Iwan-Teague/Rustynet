@@ -193,6 +193,38 @@ mod tests {
         );
     }
 
+    /// A daemon self-report that loaded fine and set overall_ok=true but shows
+    /// ZERO mesh peers must not earn a green through the seam — the orchestrator
+    /// recomputes the §4.1 at-least-one-peer admission from the raw snapshot.
+    /// This is the peerless-green fail-open that kept a node with no mesh peer
+    /// green across four consecutive runs.
+    #[test]
+    fn validate_rejects_a_peerless_green_self_report() {
+        let mock = MockShellHost::new();
+        let argv = probe_argv();
+        let peerless_report = serde_json::json!({
+            "schema_version": 1,
+            "state_path": "/var/lib/rustynet/rustynetd.state",
+            "overall_ok": true,
+            "snapshot": {
+                "load_status": "ok",
+                "timestamp_unix": 1_700_000_000u64,
+                "age_seconds": 5,
+                "peer_ids": [],
+                "selected_exit_node": null,
+                "lan_access_enabled": false
+            },
+            "expected_peer_ids": [],
+            "max_age_seconds": 180,
+            "drift_reasons": []
+        })
+        .to_string();
+        mock.program_run_response(&argv, exit_ok(&peerless_report));
+        let err = validate_linux_mesh_status(&mock, TEST_DAEMON, "deb-1")
+            .expect_err("a peerless self-report must not earn a green");
+        assert!(err.contains("zero mesh peers"), "got: {err}");
+    }
+
     /// The dispatch MUST carry `--max-age-seconds`, on every platform.
     ///
     /// This is the test whose absence let the defect live. Without the flag the
@@ -206,6 +238,10 @@ mod tests {
     /// dropped, so reverting the argv breaks this test.
     #[test]
     fn every_platform_dispatch_passes_the_freshness_bound() {
+        // A genuinely good report has at least one mesh peer — the Linux
+        // evaluator now rejects a peerless green (§4.1), and this fixture must
+        // stay valid so the test keeps asserting the dispatch flag, not peer
+        // presence.
         let good = serde_json::json!({
             "schema_version": 1,
             "state_path": "/var/lib/rustynet/rustynetd.state",
@@ -214,7 +250,7 @@ mod tests {
                 "load_status": "ok",
                 "timestamp_unix": 1_700_000_000u64,
                 "age_seconds": 5,
-                "peer_ids": [],
+                "peer_ids": ["peer-a"],
                 "selected_exit_node": serde_json::Value::Null,
                 "lan_access_enabled": false
             },
