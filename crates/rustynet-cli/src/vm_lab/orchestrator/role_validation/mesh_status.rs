@@ -63,42 +63,22 @@ pub fn mesh_status_runtime_implemented(platform: VmGuestPlatform) -> bool {
     )
 }
 
-/// Build the mesh-status-check argv: the freshness bound, plus one
-/// `--expected-peer-id <id>` per peer the orchestrator requires the node's
-/// daemon to report as present. With an empty peer set the argv is identical to
-/// the historical fixed form (the daemon's peer check is then a no-op).
-fn mesh_status_argv<'a>(
-    daemon_path: &'a str,
-    subcommand: &'a str,
-    expected_peer_ids: &'a [&'a str],
-) -> Vec<&'a str> {
-    let mut argv = vec![
-        daemon_path,
-        subcommand,
-        "--max-age-seconds",
-        SNAPSHOT_MAX_AGE_SECONDS,
-    ];
-    for &peer in expected_peer_ids {
-        argv.push("--expected-peer-id");
-        argv.push(peer);
-    }
-    argv
-}
-
 /// Run the Linux mesh-status daemon self-check through the shell seam,
 /// applying the typed evaluator. Returns `Err` with detail on failure
 /// (fail-closed) or `Ok(())` on pass — where "pass" means the evaluator's full
 /// contract (schema, overall_ok), not merely the daemon's exit code.
-/// `expected_peer_ids` names the mesh peers the daemon must report present;
-/// a named peer absent from the snapshot is drift → `overall_ok=false` → reject.
 pub fn validate_linux_mesh_status(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
     alias: &str,
-    expected_peer_ids: &[&str],
 ) -> Result<(), String> {
     const SUBCOMMAND: &str = "linux-mesh-status-check";
-    let argv = mesh_status_argv(daemon_path, SUBCOMMAND, expected_peer_ids);
+    let argv = [
+        daemon_path,
+        SUBCOMMAND,
+        "--max-age-seconds",
+        SNAPSHOT_MAX_AGE_SECONDS,
+    ];
     let out = shell
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
@@ -111,10 +91,14 @@ pub fn validate_macos_mesh_status(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
     alias: &str,
-    expected_peer_ids: &[&str],
 ) -> Result<(), String> {
     const SUBCOMMAND: &str = "macos-mesh-status-check";
-    let argv = mesh_status_argv(daemon_path, SUBCOMMAND, expected_peer_ids);
+    let argv = [
+        daemon_path,
+        SUBCOMMAND,
+        "--max-age-seconds",
+        SNAPSHOT_MAX_AGE_SECONDS,
+    ];
     let out = shell
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
@@ -127,10 +111,14 @@ pub fn validate_windows_mesh_status(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
     alias: &str,
-    expected_peer_ids: &[&str],
 ) -> Result<(), String> {
     const SUBCOMMAND: &str = "windows-mesh-status-check";
-    let argv = mesh_status_argv(daemon_path, SUBCOMMAND, expected_peer_ids);
+    let argv = [
+        daemon_path,
+        SUBCOMMAND,
+        "--max-age-seconds",
+        SNAPSHOT_MAX_AGE_SECONDS,
+    ];
     let out = shell
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
@@ -186,7 +174,7 @@ mod tests {
         })
         .to_string();
         mock.program_run_response(&argv, exit_ok(&bad_report));
-        let err = validate_linux_mesh_status(&mock, TEST_DAEMON, "deb-1", &[])
+        let err = validate_linux_mesh_status(&mock, TEST_DAEMON, "deb-1")
             .expect_err("an invalid report must fail the stage");
         assert!(
             err.contains("unsupported schema_version"),
@@ -197,7 +185,7 @@ mod tests {
     #[test]
     fn validate_fails_closed_on_dispatch_error() {
         let mock = MockShellHost::new();
-        let err = validate_linux_mesh_status(&mock, TEST_DAEMON, "deb-1", &[])
+        let err = validate_linux_mesh_status(&mock, TEST_DAEMON, "deb-1")
             .expect_err("a mock that hasn't been configured for this command must fail");
         assert!(
             err.contains("dispatch") && err.contains("failed"),
@@ -232,7 +220,7 @@ mod tests {
         })
         .to_string();
         mock.program_run_response(&argv, exit_ok(&peerless_report));
-        let err = validate_linux_mesh_status(&mock, TEST_DAEMON, "deb-1", &[])
+        let err = validate_linux_mesh_status(&mock, TEST_DAEMON, "deb-1")
             .expect_err("a peerless self-report must not earn a green");
         assert!(err.contains("zero mesh peers"), "got: {err}");
     }
@@ -276,7 +264,7 @@ mod tests {
             (
                 "linux-mesh-status-check",
                 validate_linux_mesh_status
-                    as fn(&dyn RemoteShellHost, &str, &str, &[&str]) -> Result<(), String>,
+                    as fn(&dyn RemoteShellHost, &str, &str) -> Result<(), String>,
             ),
             ("macos-mesh-status-check", validate_macos_mesh_status),
             ("windows-mesh-status-check", validate_windows_mesh_status),
@@ -291,51 +279,10 @@ mod tests {
                 ],
                 exit_ok(&good),
             );
-            validate(&mock, TEST_DAEMON, "deb-1", &[]).unwrap_or_else(|err| {
+            validate(&mock, TEST_DAEMON, "deb-1").unwrap_or_else(|err| {
                 panic!("{subcommand} must dispatch with --max-age-seconds; got: {err}")
             });
         }
-    }
-
-    /// The expected peers must be threaded to the daemon as `--expected-peer-id`
-    /// args — that is what makes the daemon's own peer check non-vacuous. Assert
-    /// by dispatch: the mock is programmed ONLY for the argv that carries both
-    /// peer flags, so dropping the threading (or an arg) fails to match.
-    #[test]
-    fn expected_peers_are_threaded_as_expected_peer_id_args() {
-        let good = serde_json::json!({
-            "schema_version": 1,
-            "state_path": "/var/lib/rustynet/rustynetd.state",
-            "overall_ok": true,
-            "snapshot": {
-                "load_status": "ok",
-                "timestamp_unix": 1_700_000_000u64,
-                "age_seconds": 5,
-                "peer_ids": ["node-a", "node-b"],
-                "selected_exit_node": serde_json::Value::Null,
-                "lan_access_enabled": false
-            },
-            "expected_peer_ids": [],
-            "max_age_seconds": 300,
-            "drift_reasons": []
-        })
-        .to_string();
-        let mock = MockShellHost::new();
-        mock.program_run_response(
-            &[
-                TEST_DAEMON,
-                "linux-mesh-status-check",
-                "--max-age-seconds",
-                SNAPSHOT_MAX_AGE_SECONDS,
-                "--expected-peer-id",
-                "node-a",
-                "--expected-peer-id",
-                "node-b",
-            ],
-            exit_ok(&good),
-        );
-        validate_linux_mesh_status(&mock, TEST_DAEMON, "deb-1", &["node-a", "node-b"])
-            .expect("dispatch carrying both --expected-peer-id flags must match + validate");
     }
 
     /// The bound must be a positive integer the daemon can parse, and must sit
