@@ -394,6 +394,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rsa0017_open_rejects_symlinked_db_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rn-rsa0017c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let target = dir.join("real-control.db");
+        std::fs::write(&target, b"").expect("seed target db file");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 600");
+        let link = dir.join("link-to-control.db");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let err = SqliteStore::open(&link)
+            .expect_err("symlinked DB path must be refused even when the target is 0600");
+        assert!(format!("{err}").contains("symlink"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn sqlite_store_applies_schema_and_persists_core_records() {
         let store = SqliteStore::open_in_memory().expect("open in-memory sqlite");
