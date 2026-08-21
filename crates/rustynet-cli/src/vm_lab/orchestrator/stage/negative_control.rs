@@ -1515,6 +1515,8 @@ pub(crate) mod signed_bundle {
     //! forgery that reaches the verifier's SPECIFIC rejection path, and the
     //! adjudicator asserts the actual error names that specific reason.
     use super::*;
+    use crate::vm_lab::orchestrator::stage::scenario::artifact::ValidatedArtifact;
+    use crate::vm_lab::orchestrator::stage::scenario::schema::AssertionRecord;
     use ed25519_dalek::{Signer, SigningKey};
     use rustynetd::daemon::verify_signed_assignment_state_artifact;
 
@@ -2088,6 +2090,72 @@ pub(crate) mod signed_bundle {
             .ok_or_else(|| format!("artifact path {} is not valid UTF-8", rel.display()))
     }
 
+    /// Independently re-derive the `signed_bundle_forgery_rejected` assertion
+    /// from the raw verifier transcript. This is the `pass_certificate` recomputer
+    /// for this control: it NEVER re-runs the verifier (the fixtures embed
+    /// absolute timestamps, so a finalize-time re-execution would give a
+    /// different, unsound verdict) and NEVER trusts the scenario's self-report.
+    /// Instead it re-classifies the recorded verbatim verdicts against the
+    /// expected named reasons held INDEPENDENTLY in [`SCENARIOS`] — so a control
+    /// that accepted a forgery, rejected one for the wrong reason, or rejected the
+    /// genuine bundle is caught here even though its scenario.v1 self-reported a
+    /// pass.
+    pub(crate) fn recompute_signed_bundle_forgery_rejected(
+        _record: &AssertionRecord,
+        artifacts: &[ValidatedArtifact],
+    ) -> Result<(), String> {
+        let transcript = artifacts
+            .iter()
+            .find(|a| a.reference.ends_with(SIGNED_BUNDLE_TRANSCRIPT_FILE))
+            .ok_or_else(|| {
+                format!("no `{SIGNED_BUNDLE_TRANSCRIPT_FILE}` artifact bound to the assertion")
+            })?;
+        let body = std::fs::read_to_string(&transcript.path)
+            .map_err(|e| format!("read transcript {}: {e}", transcript.path.display()))?;
+        let doc: SignedBundleTranscript = serde_json::from_str(&body)
+            .map_err(|e| format!("parse signed-bundle transcript: {e}"))?;
+        let by_id: std::collections::HashMap<&str, &SignedBundleTranscriptEntry> = doc
+            .entries
+            .iter()
+            .map(|e| (e.corpus_id.as_str(), e))
+            .collect();
+
+        // Every corpus forgery must be REJECTED for ITS named reason — the
+        // expected reason comes from our own SCENARIOS, never from the artifact.
+        for scenario in SCENARIOS {
+            let entry = by_id.get(scenario.corpus_id).ok_or_else(|| {
+                format!(
+                    "transcript has no entry for corpus `{}`",
+                    scenario.corpus_id
+                )
+            })?;
+            if entry.accepted {
+                return Err(format!(
+                    "forgery `{}` was ACCEPTED (fail-open) — must be rejected",
+                    scenario.corpus_id
+                ));
+            }
+            let err = entry.verifier_error.as_deref().unwrap_or("");
+            if !err.contains(scenario.required_error_substr) {
+                return Err(format!(
+                    "forgery `{}` rejected for the wrong reason: expected {:?}, raw error {:?}",
+                    scenario.corpus_id, scenario.required_error_substr, err
+                ));
+            }
+        }
+        // The genuine positive control must be ACCEPTED.
+        let genuine = by_id
+            .get(GENUINE_CORPUS_ID)
+            .ok_or_else(|| "transcript has no genuine entry".to_owned())?;
+        if !genuine.accepted {
+            return Err(format!(
+                "genuine bundle was REJECTED: {:?}",
+                genuine.verifier_error
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod scenario_emission_tests {
         use super::*;
@@ -2183,6 +2251,48 @@ pub(crate) mod signed_bundle {
             let validated =
                 validate_artifact(report_root.path(), &aref.reference, 1 << 20).expect("valid");
             assert_eq!(validated.sha256, aref.sha256);
+        }
+
+        #[test]
+        fn recompute_accepts_healthy_but_rejects_a_fabricated_transcript() {
+            // The recomputer is the security-critical direction: a control that
+            // FALSELY records a forgery as accepted must not recompute to a pass.
+            use crate::vm_lab::orchestrator::stage::scenario::AssertionClass;
+            use crate::vm_lab::orchestrator::stage::scenario::schema::{
+                AssertionRecord, ItemResult,
+            };
+
+            let tmp = tempdir().unwrap();
+            let control_dir = tmp.path().join("nc");
+            assert!(matches!(
+                run_signed_bundle_control(&control_dir),
+                StageOutcome::Passed
+            ));
+            let transcript_ref = format!("nc/{SIGNED_BUNDLE_TRANSCRIPT_FILE}");
+            // The recomputer ignores the record, deriving from the raw artifact.
+            let record = AssertionRecord {
+                id: SIGNED_BUNDLE_ASSERTION_ID.to_owned(),
+                class: AssertionClass::Security,
+                required: true,
+                result: ItemResult::Pass,
+                evidence: vec![],
+            };
+
+            let good = validate_artifact(tmp.path(), &transcript_ref, 1 << 20).unwrap();
+            recompute_signed_bundle_forgery_rejected(&record, std::slice::from_ref(&good))
+                .expect("healthy transcript recomputes");
+
+            // Fabricate: mark the first forgery as ACCEPTED.
+            let path = control_dir.join(SIGNED_BUNDLE_TRANSCRIPT_FILE);
+            let mut doc: SignedBundleTranscript =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            doc.entries[0].accepted = true;
+            doc.entries[0].verifier_error = None;
+            std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+            let bad = validate_artifact(tmp.path(), &transcript_ref, 1 << 20).unwrap();
+            let err = recompute_signed_bundle_forgery_rejected(&record, std::slice::from_ref(&bad))
+                .expect_err("a fabricated accept must fail recompute");
+            assert!(err.contains("ACCEPTED"), "{err}");
         }
     }
 
