@@ -385,6 +385,96 @@ mod tests {
     }
 
     #[test]
+    fn audit_chain_rejects_entry_whose_hash_does_not_cover_its_payload() {
+        let mut log = TamperEvidentAuditLog::new(30);
+        log.append("alice", "policy.update", 100);
+        log.append("alice", "exit_node.select", 101);
+
+        let unique = format!(
+            "rustynet-audit-rehash-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        log.backup_to_file(&path).expect("backup should succeed");
+
+        // Rewrite an action INSIDE the body and refresh the trailing digest so
+        // the file-level integrity check PASSES; only the per-entry hash-chain
+        // recomputation inside verify_integrity can now catch the forgery.
+        let body = std::fs::read_to_string(&path).expect("read backup");
+        let forged_body = body.replacen("policy.update", "policy.hijack", 1);
+        assert_ne!(body, forged_body, "forgery must change the body");
+        let digest = format!("digest={}\n", super::sha256_hex(forged_body.as_bytes()));
+        let forged_file = forged_body
+            .rsplit_once("digest=")
+            .map(|(prefix, _)| format!("{prefix}{digest}"))
+            .expect("backup always ends with a digest line");
+        std::fs::write(&path, &forged_file).expect("write forged backup");
+
+        // The forged action also changes the entry payload, so the stored
+        // entry_hash no longer covers it.
+        let err = TamperEvidentAuditLog::restore_from_file(&path)
+            .expect_err("digest-valid body with a broken chain must be refused");
+        assert_eq!(err, OperationsError::IntegrityMismatch);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn audit_chain_rejects_reordered_entries_with_consistent_digest() {
+        let mut log = TamperEvidentAuditLog::new(30);
+        log.append("alice", "a.first", 100);
+        log.append("bob", "b.second", 101);
+
+        let unique = format!(
+            "rustynet-audit-reorder-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        log.backup_to_file(&path).expect("backup should succeed");
+
+        // Swap the two entry lines and refresh the digest: every line is a
+        // well-formed entry whose own hash is untouched, but the sequence
+        // indexes no longer match their positions.
+        let body = std::fs::read_to_string(&path).expect("read backup");
+        let mut entry_lines: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with("entry="))
+            .collect();
+        assert_eq!(entry_lines.len(), 2);
+        entry_lines.reverse();
+        let mut forged_body = String::new();
+        for line in body.lines() {
+            if line.starts_with("entry=") {
+                continue;
+            }
+            if line.starts_with("digest=") {
+                continue;
+            }
+            forged_body.push_str(line);
+            forged_body.push('\n');
+        }
+        for line in &entry_lines {
+            forged_body.push_str(line);
+            forged_body.push('\n');
+        }
+        let digest = format!("digest={}\n", super::sha256_hex(forged_body.as_bytes()));
+        forged_body.push_str(&digest);
+        std::fs::write(&path, &forged_body).expect("write reordered backup");
+
+        let err = TamperEvidentAuditLog::restore_from_file(&path)
+            .expect_err("reordered entries must break the positional chain");
+        assert_eq!(err, OperationsError::IntegrityMismatch);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn diagnostics_summary_reports_overall_health() {
         let summary = DiagnosticsSummary {
             components: vec![
