@@ -1157,17 +1157,63 @@ where
     let plan_digest = orchestrator::resolved_plan::read_recorded_plan(report_dir)
         .map(|plan| plan.digest)
         .unwrap_or_else(|_| scenario::verdict::RUN_LEVEL_NO_PLAN_DIGEST.to_owned());
-    let will_pass = candidate_pass && evidence_errors.is_empty();
+
+    // L1: INDEPENDENT per-scenario re-derivation (the first non-test caller of
+    // pass_certificate::evaluate). If a wired T5 control emitted a scenario.v1
+    // this run, resolve it to its independent contract and recompute its required
+    // assertions from the raw witnesses. The result both binds the durable
+    // verdict to the real contract + artifact map and, when it does not prove
+    // out, DEMOTES the run even if it was structurally green — an independent
+    // NotProven/Failed always wins over the scenario's self-report. A scenario
+    // present but unbindable (unknown stage / digest mismatch / unreadable
+    // evidence) is an integrity fault surfaced as an evidence error (fail closed).
+    let scenario_eval =
+        match scenario::finalize::evaluate_wired_scenarios(report_dir, inputs.run_instance_id) {
+            Ok(eval) => eval,
+            Err(err) => {
+                evidence_errors.push(format!("scenario evidence present but unresolvable: {err}"));
+                None
+            }
+        };
+    let scenario_pass = scenario_eval
+        .as_ref()
+        .is_none_or(|e| e.assessment.is_pass());
+    let will_pass = candidate_pass && evidence_errors.is_empty() && scenario_pass;
     let verdict_detail = format!(
         "{passed} passed, {failed} failed, {not_proven} not_proven, {skipped} skipped; {} evidence error(s)",
         evidence_errors.len()
     );
-    let candidate_verdict = scenario::verdict::EvidenceVerdict::run_level(
-        inputs.run_instance_id,
-        plan_digest.as_str(),
-        will_pass,
-        verdict_detail.as_str(),
-    );
+    let candidate_verdict = match scenario_eval {
+        Some(eval) => {
+            // Bind the verdict to the scenario's real contract + artifact map. The
+            // verdict's PASS/FAIL follows the WHOLE run's `will_pass`, not the
+            // assessment alone: a scenario that passed cannot certify a run that
+            // failed structurally, so synthesize a Failed in that case; a scenario
+            // that did not pass carries its own reason.
+            let effective = if will_pass {
+                eval.assessment
+            } else if eval.assessment.is_pass() {
+                scenario::pass_certificate::Assessment::Failed(
+                    "run demoted by a non-scenario stage or evidence failure".to_owned(),
+                )
+            } else {
+                eval.assessment
+            };
+            scenario::verdict::EvidenceVerdict::from_assessment(
+                &effective,
+                inputs.run_instance_id,
+                plan_digest.as_str(),
+                &eval.contract_digest,
+                eval.artifact_digests,
+            )
+        }
+        None => scenario::verdict::EvidenceVerdict::run_level(
+            inputs.run_instance_id,
+            plan_digest.as_str(),
+            will_pass,
+            verdict_detail.as_str(),
+        ),
+    };
     if let Err(err) = evidence_fault_gate(EvidenceWriter::CandidateVerdict)
         .and_then(|()| scenario::verdict::write_evidence_verdict(report_dir, &candidate_verdict))
     {
