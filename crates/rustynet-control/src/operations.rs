@@ -474,6 +474,91 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Forge an append whose OWN hash is self-consistent but whose
+    /// previous-hash link points nowhere: only the linkage check inside
+    /// verify_integrity can reject this, the per-entry hash cannot.
+    #[test]
+    fn audit_chain_rejects_entry_linked_to_a_nonexistent_predecessor() {
+        let mut log = TamperEvidentAuditLog::new(30);
+        log.append("alice", "policy.update", 100);
+
+        let unique = format!(
+            "rustynet-audit-dangling-link-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        log.backup_to_file(&path).expect("backup should succeed");
+
+        let body = std::fs::read_to_string(&path).expect("read backup");
+        let mut forged_body = String::new();
+        for line in body.lines() {
+            if line.starts_with("digest=") {
+                continue;
+            }
+            forged_body.push_str(line);
+            forged_body.push('\n');
+        }
+        // A perfectly well-formed second entry whose previous_hash names a
+        // predecessor that does not exist anywhere in the log.
+        let dangling_previous = "dangling-link-not-a-real-hash";
+        let forged_payload = format!("1|101|bob|exit_node.select|{dangling_previous}");
+        let forged_line = format!(
+            "entry={forged_payload}|{}",
+            super::sha256_hex(forged_payload.as_bytes())
+        );
+        forged_body.push_str(&forged_line);
+        forged_body.push('\n');
+        let digest = format!("digest={}\n", super::sha256_hex(forged_body.as_bytes()));
+        forged_body.push_str(&digest);
+        std::fs::write(&path, &forged_body).expect("write dangling-link backup");
+
+        let err = TamperEvidentAuditLog::restore_from_file(&path)
+            .expect_err("an entry linked to a nonexistent predecessor must be refused");
+        assert_eq!(err, OperationsError::IntegrityMismatch);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Forge a SINGLE entry whose hash is recomputed over a WRONG sequence
+    /// index: the payload hash is internally consistent, the genesis link is
+    /// correct, so only the positional-index check can reject this.
+    #[test]
+    fn audit_chain_rejects_self_consistent_entry_at_the_wrong_position() {
+        let unique = format!(
+            "rustynet-audit-wrong-index-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+
+        let payload = format!(
+            "{}|{}|{}|{}|{}",
+            7, 100, "alice", "policy.update", "genesis"
+        );
+        let body = format!(
+            "retention_days=30\nentry={payload}|{}\ndigest={}\n",
+            super::sha256_hex(payload.as_bytes()),
+            {
+                let inner = format!("retention_days=30\nentry={payload}|{}\n", {
+                    super::sha256_hex(payload.as_bytes())
+                });
+                super::sha256_hex(inner.as_bytes())
+            }
+        );
+        std::fs::write(&path, &body).expect("write wrong-index backup");
+
+        let err = TamperEvidentAuditLog::restore_from_file(&path)
+            .expect_err("a self-consistent entry claiming index 7 at position 0 must be refused");
+        assert_eq!(err, OperationsError::IntegrityMismatch);
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn diagnostics_summary_reports_overall_health() {
         let summary = DiagnosticsSummary {
