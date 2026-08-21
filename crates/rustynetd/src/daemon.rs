@@ -5072,6 +5072,26 @@ impl DaemonRuntime {
             );
         }
 
+        self.complete_verified_signed_refresh(reason);
+        Ok(())
+    }
+
+    /// QH-55: the post-fetch completion tail of
+    /// `refresh_signed_state_with_reason`, extracted so its restriction
+    /// semantics are directly testable. A successful signed-state FETCH alone
+    /// must not clear a PERMANENT restriction: Permanent means the reconcile
+    /// failure threshold was exceeded or fail-closed enforcement failed, and
+    /// only a real dataplane re-apply (the reconcile success path) may
+    /// restore service. Recoverable/None restrictions still reset here.
+    fn complete_verified_signed_refresh(&mut self, reason: SignedStateRefreshReason) {
+        if self.restriction_mode == RestrictionMode::Permanent {
+            eprintln!(
+                "rustynetd: signed state refresh completed (reason={}) but node remains PERMANENTLY restricted: {}",
+                reason.as_str(),
+                self.bootstrap_error.as_deref().unwrap_or("unknown")
+            );
+            return;
+        }
         self.restriction_mode = RestrictionMode::None;
         self.bootstrap_error = None;
         self.reconcile_failures = 0;
@@ -5080,7 +5100,6 @@ impl DaemonRuntime {
             "rustynetd: signed state refresh completed (reason={})",
             reason.as_str()
         );
-        Ok(())
     }
 
     fn record_traversal_bootstrap_error(&mut self, err: &TraversalBootstrapError) {
@@ -5105,6 +5124,15 @@ impl DaemonRuntime {
     }
 
     fn traversal_next_preexpiry_refresh_target(&self, now_unix: u64) -> Option<u64> {
+        // QH-55: when a stale/rejected bundle cleared the traversal hints,
+        // the scheduler used to return None here and permanently disable
+        // itself — no refresh would ever be attempted again. With a recorded
+        // hint error there is still state worth refreshing, so keep the
+        // scheduler alive (cooldown in `traversal_preexpiry_refresh_due`
+        // bounds the retry rate) instead of silently self-disabling.
+        if self.traversal_hints.is_none() && self.traversal_hint_error.is_some() {
+            return Some(now_unix);
+        }
         let envelope = self.traversal_hints.as_ref()?;
         let expires_at_unix = envelope
             .bundles
@@ -9612,6 +9640,14 @@ impl DaemonRuntime {
 
     fn restrict_recoverable(&mut self, message: String) {
         if self.restriction_mode == RestrictionMode::Permanent {
+            // QH-55: a PERMANENTLY restricted node must not swallow subsequent
+            // failure reports. The restriction itself is unchanged (fail-closed
+            // posture preserved), but every new failure stays operator-visible
+            // and recorded instead of being silently dropped on each retry.
+            eprintln!(
+                "rustynetd: restrict_recoverable: node already PERMANENTLY restricted; new failure while restricted: {message}"
+            );
+            self.bootstrap_error = Some(message);
             return;
         }
         eprintln!("rustynetd: restrict_recoverable: {message}");
@@ -10378,7 +10414,14 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     };
     log::info!("rustynetd startup: daemon runtime constructed");
     runtime.bootstrap();
-    log::info!("rustynetd startup: runtime bootstrap complete");
+    // QH-55: the bootstrap outcome must be visible to the operator. A
+    // bootstrap that entered a restricted state (recoverable or permanent)
+    // used to log an unconditional "complete" line, hiding the restriction.
+    if let Some(err) = runtime.bootstrap_error.as_deref() {
+        log::info!("rustynetd startup: runtime bootstrap complete (restricted: {err})");
+    } else {
+        log::info!("rustynetd startup: runtime bootstrap complete");
+    }
     scrub_runtime_wireguard_key_after_bootstrap(&config)?;
     // Port-mapping bring-up is owned by the reconcile loop's
     // `maybe_refresh_port_mapping()` — it performs the initial bring-up on
@@ -16436,10 +16479,11 @@ mod tests {
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
         MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
-        MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole, StateFetcher,
-        TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS, TraversalCandidate, TraversalCandidateType,
-        TrustEvidenceRecord, TrustPolicy, TrustWatermark, anchor_bundle_pull_token_thumbprint,
-        bind_anchor_bundle_pull_listener, build_dns_response, build_gossip_node,
+        MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole,
+        SignedStateRefreshReason, StateFetcher, TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS,
+        TraversalCandidate, TraversalCandidateType, TrustEvidenceRecord, TrustPolicy,
+        TrustWatermark, anchor_bundle_pull_token_thumbprint, bind_anchor_bundle_pull_listener,
+        build_dns_response, build_gossip_node,
         collect_traversal_host_candidate_snapshot_with_retry,
         enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
         load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_dns_zone_bundle,
@@ -30817,6 +30861,152 @@ mod tests {
         let _ = std::fs::remove_file(membership_snapshot_path);
         let _ = std::fs::remove_file(membership_log_path);
         let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    // QH-55 test scaffolding: an in-memory runtime whose restriction bookkeeping
+    // fields can be driven directly. Bootstrap is deliberately NOT invoked so
+    // each test controls the exact restriction state under examination.
+    fn restriction_test_runtime(tag: &str) -> (DaemonRuntime, std::path::PathBuf) {
+        let test_dir = secure_test_dir(tag);
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        let config = DaemonConfig {
+            state_path: test_dir.join("daemon.state"),
+            trust_evidence_path: test_dir.join("missing.trust"),
+            trust_verifier_key_path: test_dir.join("missing.trust.pub"),
+            trust_watermark_path: test_dir.join("trust.watermark"),
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        (runtime, test_dir)
+    }
+
+    #[test]
+    fn restrict_recoverable_under_permanent_keeps_mode_and_records_new_failure() {
+        // QH-55: once PERMANENTLY restricted, later reconcile failures must not
+        // be silently dropped — the mode stays Permanent (fail closed) but the
+        // newest failure message must be recorded.
+        let (mut runtime, test_dir) =
+            restriction_test_runtime("rustynetd-qh55-recoverable-under-permanent");
+        runtime.restriction_mode = RestrictionMode::Permanent;
+        runtime.bootstrap_error = Some("original failure".to_owned());
+
+        runtime.restrict_recoverable("new reconcile failure".to_owned());
+
+        assert_eq!(runtime.restriction_mode, RestrictionMode::Permanent);
+        assert_eq!(
+            runtime.bootstrap_error.as_deref(),
+            Some("new reconcile failure")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn complete_verified_signed_refresh_preserves_permanent_restriction() {
+        // QH-55: a successful signed-state FETCH alone must not un-promote a
+        // PERMANENT restriction or zero the reconcile counters — recovery only
+        // happens through a real dataplane re-apply (reconcile success arm).
+        let (mut runtime, test_dir) =
+            restriction_test_runtime("rustynetd-qh55-refresh-preserves-permanent");
+        runtime.restriction_mode = RestrictionMode::Permanent;
+        runtime.bootstrap_error = Some("reconcile failure threshold exceeded: 5".to_owned());
+        runtime.reconcile_failures = 9;
+
+        runtime.complete_verified_signed_refresh(SignedStateRefreshReason::Command);
+
+        assert_eq!(runtime.restriction_mode, RestrictionMode::Permanent);
+        assert_eq!(
+            runtime.bootstrap_error.as_deref(),
+            Some("reconcile failure threshold exceeded: 5")
+        );
+        assert_eq!(runtime.reconcile_failures, 9);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn complete_verified_signed_refresh_clears_recoverable_restriction() {
+        // QH-55: non-permanent restriction state still clears on a verified
+        // signed-state refresh (existing behavior preserved).
+        let (mut runtime, test_dir) =
+            restriction_test_runtime("rustynetd-qh55-refresh-clears-recoverable");
+        runtime.restriction_mode = RestrictionMode::Recoverable;
+        runtime.bootstrap_error = Some("transient failure".to_owned());
+        runtime.reconcile_failures = 3;
+        runtime.last_reconcile_error = Some("transient failure".to_owned());
+
+        runtime.complete_verified_signed_refresh(SignedStateRefreshReason::PreExpiry);
+
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+        assert_eq!(runtime.bootstrap_error, None);
+        assert_eq!(runtime.reconcile_failures, 0);
+        assert_eq!(runtime.last_reconcile_error, None);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn preexpiry_refresh_target_stays_scheduled_after_hint_clear() {
+        // QH-55: when a stale bundle cleared traversal_hints but recorded the
+        // error, the pre-expiry refresh scheduler must keep returning targets
+        // instead of silently disabling itself forever.
+        let (mut runtime, test_dir) =
+            restriction_test_runtime("rustynetd-qh55-preexpiry-target-after-hint-clear");
+        assert!(runtime.traversal_hints.is_none());
+        runtime.traversal_hint_error = Some("stale bundle rejected".to_owned());
+
+        assert_eq!(
+            runtime.traversal_next_preexpiry_refresh_target(1000),
+            Some(1000)
+        );
+
+        // Negative case: no hints AND no hint error means nothing is due.
+        runtime.traversal_hint_error = None;
+        assert_eq!(runtime.traversal_next_preexpiry_refresh_target(1000), None);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn promote_to_permanent_threshold_unchanged() {
+        // QH-55 guard: promotion still requires reaching max_reconcile_failures
+        // exactly — below threshold stays recoverable, at threshold promotes.
+        let (mut runtime, test_dir) =
+            restriction_test_runtime("rustynetd-qh55-promotion-threshold");
+        runtime.max_reconcile_failures = 2;
+        runtime.reconcile_failures = 1;
+
+        runtime.promote_to_permanent_if_over_limit();
+        assert_ne!(runtime.restriction_mode, RestrictionMode::Permanent);
+
+        runtime.reconcile_failures = 2;
+        runtime.promote_to_permanent_if_over_limit();
+        assert_eq!(runtime.restriction_mode, RestrictionMode::Permanent);
+        assert!(
+            runtime
+                .bootstrap_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("threshold exceeded")
+        );
+
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
