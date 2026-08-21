@@ -57,6 +57,49 @@ fn lock_path(report_dir: &Path) -> PathBuf {
     report_dir.join("state").join(".orchestrator.lock")
 }
 
+/// Read this run's `run_instance_id` back from the report directory's lease
+/// stamp — the single canonical on-disk source, written once at lease
+/// acquisition (before any stage runs) by [`acquire_report_dir_lease`].
+///
+/// This is the seam by which a T5 control's `execute` (which only sees
+/// `&mut OrchestrationContext`, and through it `report_dir`) stamps its
+/// `scenario.v1` `run_identity`, while the finalizer binds the pass certificate
+/// to the same id it minted from the lease. Both sides therefore derive the
+/// generation binding from ONE source and cannot drift.
+///
+/// Fails CLOSED: a missing, empty, or malformed stamp is an error, never a
+/// silent empty id — an empty `run_identity` would neuter the verifier's
+/// generation-binding gate (§10.1 fail-closed).
+pub fn read_leased_run_instance_id(report_dir: &Path) -> Result<String, String> {
+    let path = lock_path(report_dir);
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read report-dir lease stamp {}: {e}", path.display()))?;
+    parse_run_instance_id_stamp(&body).ok_or_else(|| {
+        format!(
+            "report-dir lease stamp {} has no valid run_instance_id (content: {:?})",
+            path.display(),
+            body.trim()
+        )
+    })
+}
+
+/// Extract the `run_instance_id=<hex>` value from a lease stamp
+/// (`pid=<pid> run_instance_id=<hex>\n`). Returns `None` if the token is absent
+/// or its value is not the exact 32-char lowercase hex a mint produces, so a
+/// corrupt or truncated stamp is rejected rather than propagated as a bogus id.
+fn parse_run_instance_id_stamp(body: &str) -> Option<String> {
+    for token in body.split_whitespace() {
+        if let Some(id) = token.strip_prefix("run_instance_id=") {
+            let valid = id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+            return valid.then(|| id.to_owned());
+        }
+    }
+    None
+}
+
 // ── Unix: real advisory-flock lease ──────────────────────────────────────────
 
 /// Exclusive, process-lifetime lease on one report directory. Dropping it (or
@@ -227,6 +270,54 @@ mod tests {
         );
         drop(first);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leased_id_reads_back_from_the_stamp_matching_the_holder() {
+        // The reader the T5 control uses must return exactly the id the lease
+        // minted, so a control's scenario.v1 run_identity binds to the same
+        // generation the finalizer certifies.
+        let dir = tmp_report_dir("readback");
+        let lease = acquire_report_dir_lease(&dir).expect("lease");
+        let read = read_leased_run_instance_id(&dir).expect("read stamp");
+        assert_eq!(
+            read,
+            lease.run_instance_id().as_str(),
+            "reader must return the leased id verbatim"
+        );
+        assert_eq!(read.len(), 32);
+        drop(lease);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reading_the_id_fails_closed_when_no_lease_exists() {
+        // No lease acquired ⇒ no stamp file ⇒ error, never a silent empty id.
+        let dir = tmp_report_dir("no-lease");
+        let err = read_leased_run_instance_id(&dir).expect_err("must fail closed");
+        assert!(
+            err.contains("lease stamp"),
+            "error must name the missing stamp; got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_parser_rejects_malformed_values() {
+        // Absent token, wrong length, and uppercase hex are all rejected; only a
+        // well-formed 32-char lowercase hex value parses.
+        assert!(parse_run_instance_id_stamp("pid=17\n").is_none());
+        assert!(parse_run_instance_id_stamp("pid=17 run_instance_id=\n").is_none());
+        assert!(parse_run_instance_id_stamp("run_instance_id=deadbeef").is_none());
+        assert!(
+            parse_run_instance_id_stamp(&format!("run_instance_id={}", "A".repeat(32))).is_none(),
+            "uppercase hex is not a mint output"
+        );
+        let good = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_run_instance_id_stamp(&format!("pid=9 run_instance_id={good}\n")).as_deref(),
+            Some(good)
+        );
     }
 
     #[test]
