@@ -404,17 +404,26 @@ mod tests {
         // the file-level integrity check PASSES; only the per-entry hash-chain
         // recomputation inside verify_integrity can now catch the forgery.
         let body = std::fs::read_to_string(&path).expect("read backup");
-        let forged_body = body.replacen("policy.update", "policy.hijack", 1);
-        assert_ne!(body, forged_body, "forgery must change the body");
+        let mut forged_body = String::new();
+        for line in body.lines() {
+            if line.starts_with("digest=") {
+                continue;
+            }
+            if line.starts_with("entry=") {
+                forged_body.push_str(&line.replacen("policy.update", "policy.hijack", 1));
+            } else {
+                forged_body.push_str(line);
+            }
+            forged_body.push('\n');
+        }
         let digest = format!("digest={}\n", super::sha256_hex(forged_body.as_bytes()));
-        let forged_file = forged_body
-            .rsplit_once("digest=")
-            .map(|(prefix, _)| format!("{prefix}{digest}"))
-            .expect("backup always ends with a digest line");
-        std::fs::write(&path, &forged_file).expect("write forged backup");
+        forged_body.push_str(&digest);
+        std::fs::write(&path, &forged_body).expect("write forged backup");
 
-        // The forged action also changes the entry payload, so the stored
-        // entry_hash no longer covers it.
+        // The forged action changes the first entry's payload while its stored
+        // entry_hash still covers the original payload, and every later link
+        // stays intact, so the per-entry hash recomputation is the ONLY
+        // remaining defense.
         let err = TamperEvidentAuditLog::restore_from_file(&path)
             .expect_err("digest-valid body with a broken chain must be refused");
         assert_eq!(err, OperationsError::IntegrityMismatch);
