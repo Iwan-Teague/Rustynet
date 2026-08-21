@@ -52,9 +52,12 @@
 
 .PARAMETER SshAllowCidrs
     Comma-separated CIDRs to allow through the SSH fail-open rule.
-    Accepted for parity with the macOS/Linux wrappers; the Windows
-    install helper does not currently apply a fail-closed-ssh-allow
-    flag (no Windows-side firewall rule equivalent exists yet).
+    QH-62: threaded through to the installed service environment
+    (`--fail-closed-ssh-allow true --fail-closed-ssh-allow-cidrs`) so the
+    daemon's scoped WFP egress allow re-permits management SSH to these
+    CIDRs under the killswitch — parity with the Linux/macOS
+    SSH_ALLOW_CIDRS env pair. Empty (default) leaves the fail-closed SSH
+    allow off, exactly as before.
 
 .PARAMETER SourceArchive
     Absolute path to the source archive scp'd by the orchestrator.
@@ -288,7 +291,8 @@ Write-Host ('rn_bootstrap_windows.ps1: install-release rerun with -NodeId={0}' -
     -InstallRoot $installRoot `
     -StateRoot $stateRoot `
     -ServiceName $ServiceName `
-    -NodeId $NodeId
+    -NodeId $NodeId `
+    -SshAllowCidrs $SshAllowCidrs
 if ($LASTEXITCODE -ne 0) {
     throw ('rn_bootstrap_windows.ps1: Install-RustyNetWindowsService.ps1 rerun (NodeId={0}) failed with exit code {1}' -f
         $NodeId, $LASTEXITCODE)

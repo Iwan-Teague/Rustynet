@@ -9,6 +9,15 @@ param(
     # daemon runs as `admin` (which is the daemon default when the flag is
     # omitted). Threaded explicitly so it can never be dropped on this platform.
     [string]$NodeRole = 'client',
+    # QH-62: comma-separated management SSH CIDRs for the daemon's fail-closed
+    # SSH allow (`--fail-closed-ssh-allow true --fail-closed-ssh-allow-cidrs`).
+    # Threaded into the daemon args env so an operator-supplied value can never
+    # be validated then silently dropped again. The daemon applies these as
+    # scoped WFP egress allows under the killswitch (phase10
+    # apply_windows_scoped_egress_allows), mirroring the Linux/macOS
+    # SSH_ALLOW_CIDRS env pair. Empty (default) emits neither flag, preserving
+    # every existing caller's behavior exactly.
+    [string]$SshAllowCidrs = '',
     [string]$OutputPath = '',
     # Operator override: pin the daemon to the explicit fail-closed
     # `windows-unsupported` backend even when WireGuard for Windows
@@ -113,6 +122,27 @@ function Test-RustyNetNodeId {
     }
 }
 
+# QH-62: mirrors the reviewed charset enforced by the bootstrap wrapper's
+# Assert-SshAllowCidrs (rn_bootstrap_windows.ps1) so a caller that bypasses
+# the wrapper still fails closed on a malformed value instead of threading
+# it into the daemon args env. Empty is allowed (the feature stays off).
+# Per-CIDR well-formedness (address/slash/prefix-length sanity) is enforced
+# by the daemon's own --fail-closed-ssh-allow-cidrs parser, which rejects
+# the service start; this check only pins the transport charset so an
+# unparseable injection cannot reach the daemon argv.
+function Test-RustyNetSshAllowCidrs {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) {
+        return
+    }
+    if ($Value.Length -gt 1024) {
+        throw ('ssh allow cidrs exceeds 1024 chars: {0} chars' -f $Value.Length)
+    }
+    if ($Value -notmatch '^[A-Fa-f0-9:./,]+$') {
+        throw ('ssh allow cidrs must contain only hex/colon/dot/slash/comma; rejected: {0}' -f $Value)
+    }
+}
+
 function Test-RustyNetReviewedInstallRoot {
     param([Parameter(Mandatory = $true)][string]$Path)
     $expected = 'C:\Program Files\RustyNet'
@@ -134,6 +164,7 @@ function Test-RustyNetReviewedStateRoot {
 # to a generic 'install-init-exception'.
 Test-RustyNetServiceName -Name $ServiceName
 Test-RustyNetNodeId -Name $NodeId
+Test-RustyNetSshAllowCidrs -Value $SshAllowCidrs
 Test-RustyNetReviewedInstallRoot -Path $InstallRoot
 Test-RustyNetReviewedStateRoot -Path $StateRoot
 
@@ -652,7 +683,8 @@ function Build-ReviewedDaemonArgsJson {
         [Parameter(Mandatory = $true)][string]$BackendLabel,
         [Parameter(Mandatory = $true)][string]$NodeId,
         [Parameter(Mandatory = $true)][string]$NodeRole,
-        [bool]$AutoTunnelEnforce = $false
+        [bool]$AutoTunnelEnforce = $false,
+        [string]$SshAllowCidrs = ''
     )
     if ($BackendLabel -ne 'windows-unsupported' -and
         $BackendLabel -ne 'windows-wireguard-nt') {
@@ -697,12 +729,29 @@ function Build-ReviewedDaemonArgsJson {
     # is 120s which is correct for production with an active refresh
     # service but too tight for a single-run lab pipeline.
     $autoTunnelValue = if ($AutoTunnelEnforce) { 'true' } else { 'false' }
+    # QH-62: the fail-closed SSH allow is emitted only as a matched pair —
+    # `--fail-closed-ssh-allow true` alone would trip the daemon's config
+    # validation (rejects allow=true with no CIDRs), so both flags appear
+    # together and only when the operator supplied at least one CIDR.
+    if ([string]::IsNullOrEmpty($SshAllowCidrs)) {
+        return (@(
+            '--backend', $BackendLabel,
+            '--auto-tunnel-enforce', $autoTunnelValue,
+            '--auto-tunnel-max-age-secs', '86400',
+            '--trust-max-age-secs', '86400',
+            '--traversal-max-age-secs', '86400',
+            '--node-role', $NodeRole,
+            '--node-id', $NodeId
+        ) | ConvertTo-Json -Compress)
+    }
     return (@(
         '--backend', $BackendLabel,
         '--auto-tunnel-enforce', $autoTunnelValue,
         '--auto-tunnel-max-age-secs', '86400',
         '--trust-max-age-secs', '86400',
         '--traversal-max-age-secs', '86400',
+        '--fail-closed-ssh-allow', 'true',
+        '--fail-closed-ssh-allow-cidrs', $SshAllowCidrs,
         '--node-role', $NodeRole,
         '--node-id', $NodeId
     ) | ConvertTo-Json -Compress)
@@ -715,7 +764,8 @@ function Write-ReviewedEnvFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$BackendLabel,
-        [bool]$AutoTunnelEnforce = $false
+        [bool]$AutoTunnelEnforce = $false,
+        [string]$SshAllowCidrs = ''
     )
     $banner = if ($BackendLabel -eq 'windows-wireguard-nt') {
         '# Reviewed RustyNet Windows service host configuration. WireGuard for Windows detected; daemon will bring up tunnels via the wireguard.exe / wg.exe / netsh.exe toolchain.'
@@ -724,7 +774,7 @@ function Write-ReviewedEnvFile {
     }
     @(
         $banner
-        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson -BackendLabel $BackendLabel -NodeId $NodeId -NodeRole $NodeRole -AutoTunnelEnforce $AutoTunnelEnforce))
+        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson -BackendLabel $BackendLabel -NodeId $NodeId -NodeRole $NodeRole -AutoTunnelEnforce $AutoTunnelEnforce -SshAllowCidrs $SshAllowCidrs))
     ) | Out-File -Encoding ascii $Path
 }
 
@@ -1361,7 +1411,7 @@ $backendLabel = Resolve-ReviewedBackendLabel `
     -ForceUnsupported ([bool]$ForceUnsupportedBackend)
 Write-Host ("[install-helper] selected backend label: {0} (wireguard.present={1}, force-unsupported={2})" -f
     $backendLabel, [bool]$wireGuardProbe.present, [bool]$ForceUnsupportedBackend)
-Write-ReviewedEnvFile -Path $configPath -BackendLabel $backendLabel -AutoTunnelEnforce ([bool]$EnforceAutoTunnel)
+Write-ReviewedEnvFile -Path $configPath -BackendLabel $backendLabel -AutoTunnelEnforce ([bool]$EnforceAutoTunnel) -SshAllowCidrs $SshAllowCidrs
 
 Set-InstallProgressStep 'configure-dns-failclosed'
 if (-not $NoDaemonStart) {
