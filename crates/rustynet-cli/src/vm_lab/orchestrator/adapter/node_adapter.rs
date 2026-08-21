@@ -222,24 +222,7 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         kind: RoleValidatorKind,
         expected_node_id: Option<&str>,
     ) -> Result<(), AdapterError> {
-        self.run_role_validator_with_peers(kind, expected_node_id, &[])
-    }
-
-    /// Like [`NodeAdapter::run_role_validator`] but also names the mesh peers the
-    /// node's daemon must report as present. Only the `MeshStatus` validator
-    /// consumes the set (emitting one `--expected-peer-id` per id); every other
-    /// validator ignores it. This closes §4.1 clause 2: the daemon's own
-    /// expected-peer check is a no-op unless the orchestrator names the peers it
-    /// must see, so a node that reached only a SUBSET of the mesh would otherwise
-    /// still report `overall_ok=true`. Fail-closed: a named peer absent from the
-    /// snapshot is drift → `overall_ok=false` → the validator rejects.
-    fn run_role_validator_with_peers(
-        &self,
-        kind: RoleValidatorKind,
-        expected_node_id: Option<&str>,
-        expected_peer_ids: &[&str],
-    ) -> Result<(), AdapterError> {
-        run_typed_role_validator(self, kind, expected_node_id, expected_peer_ids)
+        run_typed_role_validator(self, kind, expected_node_id)
     }
 
     fn supports_role_validator(&self, kind: RoleValidatorKind) -> bool {
@@ -460,7 +443,6 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
     adapter: &T,
     kind: RoleValidatorKind,
     expected_node_id: Option<&str>,
-    expected_peer_ids: &[&str],
 ) -> Result<(), AdapterError> {
     use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
     use crate::vm_lab::orchestrator::role_validation::{
@@ -546,18 +528,13 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
             authenticode::validate_windows_authenticode(&*shell, daemon_path, alias)
         }
         (RoleValidatorKind::MeshStatus, VmGuestPlatform::Linux) => {
-            mesh_status::validate_linux_mesh_status(&*shell, daemon_path, alias, expected_peer_ids)
+            mesh_status::validate_linux_mesh_status(&*shell, daemon_path, alias)
         }
         (RoleValidatorKind::MeshStatus, VmGuestPlatform::Macos) => {
-            mesh_status::validate_macos_mesh_status(&*shell, daemon_path, alias, expected_peer_ids)
+            mesh_status::validate_macos_mesh_status(&*shell, daemon_path, alias)
         }
         (RoleValidatorKind::MeshStatus, VmGuestPlatform::Windows) => {
-            mesh_status::validate_windows_mesh_status(
-                &*shell,
-                daemon_path,
-                alias,
-                expected_peer_ids,
-            )
+            mesh_status::validate_windows_mesh_status(&*shell, daemon_path, alias)
         }
         // The CLI, not the daemon: the gossip counters ride on the daemon's IPC
         // `status` response and `rustynet` is what surfaces it.
