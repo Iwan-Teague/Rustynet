@@ -1435,6 +1435,137 @@ mod tests {
             .expect("second tun poll should drain remaining packets");
         assert_eq!(tun_state.snapshot().queued_inbound_packets, 0);
     }
+    // ---- QH-51: network-flap recovery — reconcile must not churn sessions ----
+    //
+    // After a network flap the reconcile pass re-applies every peer config.
+    // While ANY re-configure of an existing peer reported `Replaced`, each pass
+    // tore down the live session and, seeing `Replaced`, cleared that peer's
+    // recorded handshake — so liveness read permanently dead on nodes that were
+    // passing traffic (QH-51). These pin the RUNTIME half of the contract (the
+    // engine's disposition/session pins live in engine.rs): the recorded
+    // handshake SURVIVES an unchanged or roaming re-apply, and is CLEARED only
+    // when the peer's material genuinely changed, so a stale timestamp can
+    // never be carried onto a new session and make `handshake_fresh` lie.
+
+    #[test]
+    fn linux_runtime_identical_reconfigure_keeps_recorded_handshake() {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let (mut state, _tun_state, _private_key) = test_runtime_state("rn-test3");
+        let node_id = NodeId::new("peer-flap").expect("valid node id");
+        let config = PeerConfig {
+            node_id: node_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.20".parse().expect("valid ip"),
+                port: 51820,
+            },
+            public_key: [21u8; 32],
+            allowed_ips: vec!["100.64.0.20/32".to_owned()],
+            persistent_keepalive_secs: Some(25),
+        };
+
+        state
+            .configure_peer(config.clone())
+            .expect("first configure");
+        let handshake_unix = 1_700_000_000;
+        state
+            .handshake_telemetry
+            .record_authenticated_handshake(&node_id, handshake_unix);
+
+        // The flap lifts; the reconcile pass re-applies the SAME material.
+        state.configure_peer(config).expect("identical re-apply");
+
+        assert_eq!(
+            state.handshake_telemetry.latest_handshake(&node_id),
+            Some(handshake_unix),
+            "an unchanged re-apply must not wipe the recorded handshake"
+        );
+    }
+
+    #[test]
+    fn linux_runtime_endpoint_only_reconfigure_keeps_recorded_handshake_and_moves_the_peer() {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let (mut state, _tun_state, _private_key) = test_runtime_state("rn-test4");
+        let node_id = NodeId::new("peer-roam").expect("valid node id");
+        let at = |port: u16| PeerConfig {
+            node_id: node_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.21".parse().expect("valid ip"),
+                port,
+            },
+            public_key: [22u8; 32],
+            allowed_ips: vec!["100.64.0.21/32".to_owned()],
+            persistent_keepalive_secs: None,
+        };
+
+        state.configure_peer(at(51820)).expect("first configure");
+        let handshake_unix = 1_700_000_100;
+        state
+            .handshake_telemetry
+            .record_authenticated_handshake(&node_id, handshake_unix);
+
+        // Roaming is an endpoint-only change: the session is keyed by the
+        // static keys, so the peer moves in place and its record stays.
+        state.configure_peer(at(51999)).expect("roaming re-apply");
+
+        assert_eq!(
+            state.handshake_telemetry.latest_handshake(&node_id),
+            Some(handshake_unix),
+            "a roaming re-apply must not wipe the recorded handshake"
+        );
+        assert_eq!(
+            state
+                .current_peer_endpoint(&node_id)
+                .expect("peer configured"),
+            Some(SocketEndpoint {
+                addr: "203.0.113.21".parse().expect("valid ip"),
+                port: 51999,
+            }),
+            "the peer must actually move to the new endpoint"
+        );
+    }
+
+    #[test]
+    fn linux_runtime_replaced_peer_material_clears_recorded_handshake() {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let base = |pubkey: u8, cidr: &str| PeerConfig {
+            node_id: NodeId::new("peer-rekey").expect("valid node id"),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.22".parse().expect("valid ip"),
+                port: 51820,
+            },
+            public_key: [pubkey; 32],
+            allowed_ips: vec![cidr.to_owned()],
+            persistent_keepalive_secs: None,
+        };
+        let record_handshake = |state: &mut RuntimeState, node_id: &NodeId| {
+            state
+                .handshake_telemetry
+                .record_authenticated_handshake(node_id, 1_700_000_200);
+        };
+
+        for (label, changed) in [
+            ("public key", base(9, "100.64.0.22/32")),
+            ("allowed ips", base(4, "100.64.0.23/32")),
+        ] {
+            let (mut state, _tun_state, _private_key) = test_runtime_state("rn-test5");
+            let node_id = NodeId::new("peer-rekey").expect("valid node id");
+            state
+                .configure_peer(base(4, "100.64.0.22/32"))
+                .expect("first configure");
+            record_handshake(&mut state, &node_id);
+
+            // Material that ACTUALLY changed rebuilds the session; keeping the
+            // old timestamp would attach it to a session that never produced
+            // it and make `handshake_fresh` lie.
+            state.configure_peer(changed).expect("changed re-apply");
+
+            assert_eq!(
+                state.handshake_telemetry.latest_handshake(&node_id),
+                None,
+                "a changed {label} must clear the stale handshake record"
+            );
+        }
+    }
 
     fn test_runtime_state(
         interface_name: &str,
