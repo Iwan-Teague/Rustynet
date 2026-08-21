@@ -737,6 +737,29 @@ mod tests {
     }
 
     #[test]
+    fn per_epoch_watermark_advance_to_is_monotonic() {
+        let mut store = PerEpochReplayWatermark::new(RotationEpoch(3));
+        let err = store
+            .advance_to(RotationEpoch(3))
+            .expect_err("equal epoch must be rejected");
+        assert!(matches!(
+            err,
+            RotationError::EpochNotMonotonic { current, attempted }
+                if current.value() == 3 && attempted.value() == 3
+        ));
+        let err = store
+            .advance_to(RotationEpoch(1))
+            .expect_err("regression must be rejected");
+        assert!(matches!(
+            err,
+            RotationError::EpochNotMonotonic { current, attempted }
+                if current.value() == 3 && attempted.value() == 1
+        ));
+        store.advance_to(RotationEpoch(4)).expect("advance");
+        assert_eq!(store.current_epoch(), RotationEpoch(4));
+    }
+
+    #[test]
     fn audit_entry_canonical_line_is_deterministic() {
         let entry = RotationAuditEntry::success(
             RotationEpoch(1),
