@@ -25403,6 +25403,32 @@ pub(crate) fn evaluate_linux_mesh_status_report(
         };
         return Err(format!("Linux mesh status drift detected: {summary}"));
     }
+    // overall_ok=true WITH recorded drift is a self-contradiction (the collector
+    // sets overall_ok = drift_reasons.is_empty()); reject rather than trust the
+    // boolean. Parity with the macOS evaluator, which already does this.
+    if !report.drift_reasons.is_empty() {
+        return Err(format!(
+            "Linux mesh status on {linux_alias}: overall_ok=true but drift_reasons is non-empty: {}",
+            report.drift_reasons.join("; ")
+        ));
+    }
+    // Recompute the §4.1 admission from the RAW snapshot rather than trusting the
+    // daemon's overall_ok: mesh_status_validation admits at least one expected
+    // remote peer, so a loaded-but-peerless snapshot is a vacuous green. This is
+    // the fail-open that kept a node with zero mesh peers green across four
+    // consecutive runs — the daemon reports overall_ok=true because its own
+    // expected-peer set is empty, so its peer check is a no-op. A zero-peer
+    // local-only profile is a distinct scenario that cannot reuse this name.
+    if let rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Ok { peer_ids, .. } =
+        &report.snapshot
+        && peer_ids.is_empty()
+    {
+        return Err(format!(
+            "Linux mesh status on {linux_alias}: snapshot loaded but reports zero mesh peers; \
+             mesh_status_validation admits at least one expected remote peer — a peerless green is \
+             vacuous (§4.1)"
+        ));
+    }
     Ok(format!(
         "Linux mesh status verified on {linux_alias}: state at {}",
         report.state_path
@@ -52956,6 +52982,60 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             .expect("clean mesh-status must validate");
         assert!(summary.contains("debian-utm-1"));
         assert!(summary.contains("/var/lib/rustynet/rustynetd.state"));
+    }
+
+    #[test]
+    fn evaluate_linux_mesh_status_report_rejects_peerless_green() {
+        // The fail-open this closes: the daemon self-reports overall_ok=true on a
+        // node that reached zero mesh peers (its own expected-peer set is empty),
+        // and the orchestrator used to trust that boolean. The orchestrator now
+        // recomputes the §4.1 "at least one expected remote peer" admission from
+        // the raw snapshot and rejects the vacuous green.
+        let raw = r#"{
+            "schema_version": 1,
+            "state_path": "/var/lib/rustynet/rustynetd.state",
+            "overall_ok": true,
+            "snapshot": {
+                "load_status": "ok",
+                "timestamp_unix": 1700000000,
+                "age_seconds": 30,
+                "peer_ids": [],
+                "selected_exit_node": null,
+                "lan_access_enabled": false
+            },
+            "expected_peer_ids": [],
+            "max_age_seconds": null,
+            "drift_reasons": []
+        }"#;
+        let err = super::evaluate_linux_mesh_status_report("debian-utm-1", raw)
+            .expect_err("a peerless self-report must not earn a green");
+        assert!(err.contains("zero mesh peers"), "got: {err}");
+    }
+
+    #[test]
+    fn evaluate_linux_mesh_status_report_rejects_overall_ok_with_drift() {
+        // overall_ok=true beside a non-empty drift_reasons is a self-contradiction
+        // (the collector sets overall_ok = drift_reasons.is_empty()); reject it
+        // rather than trust the boolean.
+        let raw = r#"{
+            "schema_version": 1,
+            "state_path": "/var/lib/rustynet/rustynetd.state",
+            "overall_ok": true,
+            "snapshot": {
+                "load_status": "ok",
+                "timestamp_unix": 1700000000,
+                "age_seconds": 30,
+                "peer_ids": ["peer-a"],
+                "selected_exit_node": null,
+                "lan_access_enabled": false
+            },
+            "expected_peer_ids": [],
+            "max_age_seconds": null,
+            "drift_reasons": ["stale snapshot"]
+        }"#;
+        let err = super::evaluate_linux_mesh_status_report("debian-utm-1", raw)
+            .expect_err("overall_ok=true with drift must be rejected");
+        assert!(err.contains("drift_reasons is non-empty"), "got: {err}");
     }
 
     #[test]
