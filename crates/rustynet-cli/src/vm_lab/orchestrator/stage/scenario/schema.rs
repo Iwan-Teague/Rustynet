@@ -12,6 +12,8 @@
 //! verifier independently re-checks. Parsing therefore validates shape and
 //! version only — never "the scenario said it passed".
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 use super::AssertionClass;
@@ -19,6 +21,9 @@ use super::AssertionClass;
 /// The only accepted schema version. The parser rejects anything else rather
 /// than guessing (§3.3).
 pub const SCENARIO_SCHEMA_VERSION: u64 = 1;
+
+/// The fixed file name a scenario writes and the verifier reads.
+pub const SCENARIO_V1_FILE_NAME: &str = "scenario.v1.json";
 
 /// A participant the scenario exercised. Identity is asserted, not just logged:
 /// the verifier binds these to an expected-node-id challenge (§4.8/S2).
@@ -151,9 +156,58 @@ impl ScenarioV1 {
     }
 }
 
+/// Canonical on-disk location of a stage's `scenario.v1.json`, keyed by
+/// `stage_id` under the run's report root. Both the emitting control and the
+/// finalizer's verifier derive the path through this one function, so they can
+/// never disagree about where a scenario's evidence lives.
+pub fn scenario_v1_path(report_root: &Path, stage_id: &str) -> PathBuf {
+    report_root
+        .join("scenarios")
+        .join(stage_id)
+        .join(SCENARIO_V1_FILE_NAME)
+}
+
+/// Durably write a `scenario.v1` document to its canonical path under
+/// `report_root` (atomic tmp → fsync → rename → dir-fsync via the shared
+/// [`crate::vm_lab::orchestrator::context::atomic_write_fsync`], so a reader
+/// never observes a torn file). Returns the path written.
+///
+/// Fails CLOSED before writing anything if the document could not bind or be
+/// located: an unsupported `schema_version`, an empty `run_identity` (the
+/// generation binding the verifier checks — an unbound one would neuter its
+/// identity gate, §10.1), or an empty `stage_id` (no canonical path) is
+/// rejected. `scenario.v1` carries no secret material (§3.3), so the file keeps
+/// the process default mode.
+pub fn write_scenario_v1(report_root: &Path, scenario: &ScenarioV1) -> Result<PathBuf, String> {
+    if scenario.schema_version != SCENARIO_SCHEMA_VERSION {
+        return Err(format!(
+            "refusing to write scenario.v1 with unsupported schema_version {} (expected {SCENARIO_SCHEMA_VERSION})",
+            scenario.schema_version
+        ));
+    }
+    if scenario.run_identity.trim().is_empty() {
+        return Err(
+            "refusing to write scenario.v1 with an empty run_identity; an unbound generation \
+             would neuter the verifier's identity gate"
+                .to_owned(),
+        );
+    }
+    if scenario.stage_id.trim().is_empty() {
+        return Err(
+            "refusing to write scenario.v1 with an empty stage_id; no canonical path can be derived"
+                .to_owned(),
+        );
+    }
+    let body = scenario.to_json_pretty()?;
+    let path = scenario_v1_path(report_root, &scenario.stage_id);
+    crate::vm_lab::orchestrator::context::atomic_write_fsync(&path, body.as_bytes(), None)?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn sample() -> ScenarioV1 {
         ScenarioV1 {
@@ -249,6 +303,50 @@ mod tests {
         // The parser surfaces the self-report verbatim; it draws no pass/fail
         // conclusion from it.
         assert_eq!(back.assertions[0].result, ItemResult::Pass);
+    }
+
+    #[test]
+    fn write_scenario_v1_round_trips_from_its_canonical_path() {
+        let tmp = tempdir().unwrap();
+        let doc = sample();
+        let path = write_scenario_v1(tmp.path(), &doc).expect("write");
+        // The writer and the path helper agree on the location.
+        assert_eq!(path, scenario_v1_path(tmp.path(), &doc.stage_id));
+        assert!(path.ends_with("scenario.v1.json"));
+        // What was written parses back identical.
+        let body = std::fs::read_to_string(&path).expect("read back");
+        let back = ScenarioV1::parse(&body).expect("parse");
+        assert_eq!(doc, back);
+    }
+
+    #[test]
+    fn write_scenario_v1_refuses_empty_run_identity_and_writes_nothing() {
+        let tmp = tempdir().unwrap();
+        let mut doc = sample();
+        doc.run_identity = "   ".to_owned();
+        let err = write_scenario_v1(tmp.path(), &doc).expect_err("must refuse");
+        assert!(err.contains("run_identity"), "{err}");
+        // Fail-closed: nothing is written on refusal.
+        assert!(!scenario_v1_path(tmp.path(), &doc.stage_id).exists());
+    }
+
+    #[test]
+    fn write_scenario_v1_refuses_empty_stage_id_and_bad_version() {
+        let tmp = tempdir().unwrap();
+        let mut doc = sample();
+        doc.stage_id = String::new();
+        assert!(
+            write_scenario_v1(tmp.path(), &doc)
+                .unwrap_err()
+                .contains("stage_id")
+        );
+        let mut doc2 = sample();
+        doc2.schema_version = 2;
+        assert!(
+            write_scenario_v1(tmp.path(), &doc2)
+                .unwrap_err()
+                .contains("schema_version")
+        );
     }
 
     #[test]
