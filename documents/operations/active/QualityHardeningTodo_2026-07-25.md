@@ -2877,6 +2877,34 @@ and untouched under (b).
 the above must be captured mid-stage. Counters must be read in one sample; comparing a filter
 counter from one run against a nat counter from another proves nothing.
 
+**QH-51 CONFIGURE_PEER NO-OP: runtime contract pinned (2026-08-21) — unit- and mutation-proven;
+not yet live-proven.** The prescribed session-lifecycle fix itself was already on the engine of
+record at `4148cdae`: `configure_peer` returns `Unchanged` for identical material and
+`EndpointMoved` for an endpoint-only change without rebuilding the `Tunn`, and both runtimes
+(linux + macOS userspace-shared) clear handshake telemetry ONLY on `Replaced` — exactly the shape
+above, including the deliberate refusal to weaken the clear. What was MISSING was this ledger's
+prescribed verification at the RUNTIME level ("a recorded handshake survives the second call ...
+still cleared when the public key or allowed IPs actually change"): the engine tests pinned only
+disposition + session identity (`tunnel_index`), and nothing asserted what happens to the
+telemetry record. Added six runtime-level tests, linux and macOS mirrors of each half:
+`{linux,macos}_runtime_identical_reconfigure_keeps_recorded_handshake`,
+`{linux,macos}_runtime_endpoint_only_reconfigure_keeps_recorded_handshake_and_moves_the_peer`
+(also asserts the peer actually moved), and
+`{linux,macos}_runtime_replaced_peer_material_clears_recorded_handshake` (public-key and
+allowed-IP variants — the stale-timestamp-must-not-survive half). Mutation-proven in the worktree
+at base `4148cdae`: (M1) making BOTH runtimes clear on any disposition → the 4 survival tests fail
+(rc 101); (M2) removing the clear entirely → the 2 clears tests fail (rc 101); (M3) disabling the
+engine's unchanged/roam guard so every re-apply rebuilds → all 8 fail (the 6 new plus the two
+pre-existing engine QH-51 pins) (rc 101); restored between mutations from backup, final state
+green (rc 0). Gates at the same tree: fmt rc 0; clippy `-p rustynetd` and
+`-p rustynet-backend-wireguard` (`--all-targets --all-features --locked -D warnings`) rc 0;
+`cargo test -p rustynetd --all-targets --all-features --locked` rc 0 (2265 passed);
+`cargo test -p rustynet-backend-wireguard --all-targets --all-features --locked` rc 0.
+Caveat: these pins prove the reconcile no longer destroys the RECORD; whether a post-flap
+reconcile actually restores handshakes within the stage's recovery window is still governed by
+the open probe-pacing question above and remains unproven until a live run samples
+`traversal_probe_next_reprobe_unix` / `traversal_probe_attempts` per the capture protocol.
+
 
 ### QH-52 — the firewalld zone bind is never undone: role demotion leaves the binding behind
 
