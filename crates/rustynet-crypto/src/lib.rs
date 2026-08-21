@@ -1993,6 +1993,15 @@ mod tests {
         let err = super::aead_open(&key, b"peer-b/snap-1", &blob)
             .expect_err("replay into another namespace must fail");
         assert!(matches!(err, super::CryptoError::DecryptionFailed));
+
+        // The sharper half of the binding: a blob sealed with NO associated
+        // data must not be opened under a CLAIMED namespace either, otherwise
+        // an attacker strips the AAD at rest and replays across namespaces.
+        let unbound = super::aead_seal(&key, b"", b"payload").expect("seal");
+        assert!(matches!(
+            super::aead_open(&key, b"peer-b/snap-1", &unbound),
+            Err(super::CryptoError::DecryptionFailed)
+        ));
     }
 
     #[test]
