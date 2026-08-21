@@ -170,6 +170,26 @@ as `rustynet_cli::orchestrator_test_surface` (RNQ-09 integration-test hook).
 | `MacosNodeAdapter` | `adapter/macos.rs` | macOS adapter |
 | `node_adapter_for()` | `adapter/factory.rs` | Factory: (platform, connection) → NodeAdapter |
 
+### Scenario evidence framework (`rustynet-cli/src/vm_lab/orchestrator/`)
+
+The truth-preserving oracle (`LiveLabTestCoverageImplementationDesign_2026-08-19`,
+L0/L1): a `--node` run's pass is **independently re-derived from raw witnesses**,
+not taken from the finalizer's own structural self-count. A stage emits a
+`scenario.v1` referencing raw artifacts; the finalizer resolves it to an
+independent contract and recomputes each required assertion.
+
+| Type | Location | Purpose |
+|---|---|---|
+| `RunInstanceId` + `ReportDirLease` + `read_leased_run_instance_id()` | `run_instance.rs` | CSPRNG 128-bit generation binding + exclusive report-dir flock lease; the lease stamp (`state/.orchestrator.lock`) is the single canonical source a control reads its `run_identity` from (fail-closed) |
+| `AssertionClass` / `StageContract` / `ScenarioEvidenceContract` / `AdmissionContract` | `stage/scenario/mod.rs` | Framework contract types — what KIND of proof each assertion carries and the typed admission/evidence a stage declares (consulted independently of anything the scenario self-reports) |
+| `ScenarioV1` + `write_scenario_v1()` + `scenario_v1_path()` | `stage/scenario/schema.rs` | The `scenario.v1` on-disk schema and its atomic, fail-closed writer; one document per scenario at `<report_root>/scenarios/<stage_id>/scenario.v1.json`, referencing raw artifacts by relative path + sha256 |
+| `validate_artifact()` + `ValidatedArtifact` | `stage/scenario/artifact.rs` | Containment-safe artifact validation (no absolute/`..`/symlink escape, byte budget, digest-bound) — an unverifiable artifact is never evidence |
+| `PassCertificate` + `evaluate()` + `Recomputer` | `stage/scenario/pass_certificate.rs` | The SOLE gate that mints a pass: contract+generation binding, per-required-assertion artifact validation, and an independent `Recomputer` re-deriving each claim. No recomputer ⇒ `NotProven`, never a pass |
+| `ScenarioContractRegistry` + `resolve_for()` | `stage/scenario/registry.rs` | The independent source-of-truth contract per stage (never read from a run artifact); a scenario whose stage is unknown or whose contract digest mismatches cannot certify a pass |
+| `EvidenceVerdict` + `from_assessment()`/`bound()`/`run_level()` + `authorize_release()` | `stage/scenario/verdict.rs` | The durable `evidence_verdict.v1.json`; a `ReleaseAuthorization` (the `run_passed=true` gate) exists only for a Passed verdict bound to this run+plan digest |
+| `evaluate_wired_scenarios()` + `wired_scenarios()` | `stage/scenario/finalize.rs` | The finalizer bridge (first non-test caller of `evaluate`): evaluates EVERY wired control's emitted scenario, demotes the run if any fails even when structurally green, aggregates the contract + artifact map |
+| Negative-control T5 stages + `signed_bundle` emission/recomputers | `stage/negative_control.rs` | The four T5 deliberate-inversion controls; the two LOCAL ones (signed-bundle forgery, wrong-node substitution) emit `scenario.v1` + a time-stable verifier transcript their recomputers re-classify (never re-run the verifier — fixtures embed absolute timestamps) |
+
 ### VM-lab host-script renderer (`rustynet-cli/src/vm_lab/script_template.rs`)
 
 The single audited boundary between a Rust value and a shell script that runs on a
