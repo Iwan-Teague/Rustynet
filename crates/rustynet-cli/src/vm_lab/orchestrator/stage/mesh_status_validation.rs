@@ -1,7 +1,9 @@
 #![allow(dead_code)]
+use std::collections::HashMap;
+
 use crate::vm_lab::orchestrator::adapter::node_adapter::RoleValidatorKind;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
-use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::error::{StageOutcome, WireguardPublicKey};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -60,9 +62,13 @@ impl OrchestrationStage for MeshStatusValidationStage {
                 continue;
             }
             let expected_node_id = ctx.node_ids.get(alias.as_str()).map(String::as_str);
-            if let Err(e) =
-                adapter.run_role_validator(RoleValidatorKind::MeshStatus, expected_node_id)
-            {
+            let expected_peers =
+                expected_mesh_peers(alias, &aliases, &ctx.node_ids, &ctx.collected_pubkeys);
+            if let Err(e) = adapter.run_role_validator_with_peers(
+                RoleValidatorKind::MeshStatus,
+                expected_node_id,
+                &expected_peers,
+            ) {
                 failures.push(format!("{alias}: {e}"));
             }
         }
@@ -72,6 +78,31 @@ impl OrchestrationStage for MeshStatusValidationStage {
         }
         outcome_for(&failures, &reported_skips)
     }
+}
+
+/// The node ids of the mesh peers `alias` must see: every OTHER assigned node
+/// confirmed up (it has a collected WireGuard pubkey) that has a known node id.
+///
+/// Design (§4.1 clause 2): naming the expected peers makes the daemon's own
+/// peer check active — a node that reached only a SUBSET of the mesh is flagged
+/// as missing an expected peer, not passed on a bare non-empty count. The set is
+/// restricted to collected-pubkey nodes so a node that never joined is NOT
+/// expected: one node's bootstrap failure must not cascade into every other
+/// node's mesh-status. Self is excluded, and the result is node ids (the id
+/// space the daemon's snapshot `peer_ids` use, bound to `ctx.node_ids` by the
+/// §4.7 identity challenge).
+fn expected_mesh_peers<'a>(
+    alias: &str,
+    aliases: &[String],
+    node_ids: &'a HashMap<String, String>,
+    collected_pubkeys: &HashMap<String, WireguardPublicKey>,
+) -> Vec<&'a str> {
+    aliases
+        .iter()
+        .filter(|other| other.as_str() != alias)
+        .filter(|other| collected_pubkeys.contains_key(other.as_str()))
+        .filter_map(|other| node_ids.get(other.as_str()).map(String::as_str))
+        .collect()
 }
 
 fn outcome_for(failures: &[String], reported_skips: &[(String, String)]) -> StageOutcome {
@@ -147,5 +178,24 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("mac-1") && s.contains("win-1"));
         assert!(s.contains("mesh_status_validation"));
+    }
+
+    #[test]
+    fn expected_mesh_peers_names_confirmed_up_peers_by_node_id_excluding_self() {
+        let aliases = vec!["self".to_owned(), "up".to_owned(), "down".to_owned()];
+        let mut node_ids = HashMap::new();
+        node_ids.insert("self".to_owned(), "node-self".to_owned());
+        node_ids.insert("up".to_owned(), "node-up".to_owned());
+        node_ids.insert("down".to_owned(), "node-down".to_owned());
+        let mut collected = HashMap::new();
+        collected.insert("self".to_owned(), WireguardPublicKey("s".repeat(64)));
+        collected.insert("up".to_owned(), WireguardPublicKey("u".repeat(64)));
+        // "down" is assigned and has a node id but never came up (no collected
+        // pubkey) — it must NOT be expected, so its failure cannot cascade.
+
+        let peers = expected_mesh_peers("self", &aliases, &node_ids, &collected);
+        // Only "up": self excluded, "down" excluded (never joined), and the peer
+        // is named by its node id (not its alias).
+        assert_eq!(peers, vec!["node-up"]);
     }
 }
