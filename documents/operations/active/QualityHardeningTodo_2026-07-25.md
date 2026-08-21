@@ -3916,6 +3916,27 @@ but a validated-then-dropped operator input is a defect regardless: either threa
 WFP management allow (parity with the Linux env pair) or remove the parameter and document
 why. Needs the Windows installer + `rustynet-windows-native` WFP surface read before choosing.
 
+**FIXED 2026-08-21 (threaded, not removed).** The daemon side already supported the pair on
+Windows — `daemon.rs` builds `WindowsCommandSystem` with
+`.with_fail_closed_ssh_allow(config.fail_closed_ssh_allow, config.fail_closed_ssh_allow_cidrs)`
+and phase10's `apply_windows_scoped_egress_allows` emits scoped WFP netsh allows for those
+CIDRs under the killswitch (the same semantic as the Linux/macOS SSH_ALLOW_CIDRS env pair).
+The gap was purely installer plumbing. Fix: `Install-RustyNetWindowsService.ps1` gains an
+optional `-SshAllowCidrs` param with its own fail-closed charset validator
+(`Test-RustyNetSshAllowCidrs`, mirroring the wrapper's `Assert-SshAllowCidrs`) and threads it
+through `Write-ReviewedEnvFile` → `Build-ReviewedDaemonArgsJson`, which emits the MATCHED pair
+`--fail-closed-ssh-allow true --fail-closed-ssh-allow-cidrs <cidrs>` only when non-empty
+(allow=true alone trips the daemon's config validation, so the pair is atomic); empty emits
+neither flag, preserving every existing caller byte-for-byte. The e2e wrapper
+`rn_bootstrap_windows.ps1` forwards its validated value on the final authoritative install-helper
+invocation. Removal was not viable: the vm_lab source pins require the wrapper's
+`Assert-SshAllowCidrs` line, and callers outside this fix's lane pass the parameter. Two source-pin
+tests in `install/live_windows.rs` (`install_helper_threads_ssh_allow_cidrs_into_the_daemon_args_env`,
+`bootstrap_wrapper_forwards_ssh_allow_cidrs_to_the_install_helper`) pin param + validator-before-consume +
+matched-pair-after-empty-guard + both forward sites; mutation-proven (deleting the wrapper forward and
+the daemon-args pair each fails exactly its own test). Not yet live-proven on a Windows guest — the
+first bootstrap that passes a non-empty `-SshAllowCidrs` exercises it end-to-end.
+
 ### QH-61 — bare `rustynet` argv heads die under sudo on RHEL-family guests
 
 Run `qh57-lantoggle-20260816a` (the QH-57 live proof: client survived role enforcement with SSH

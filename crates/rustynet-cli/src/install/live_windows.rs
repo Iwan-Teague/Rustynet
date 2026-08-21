@@ -409,4 +409,94 @@ mod tests {
             "NodeId param missing"
         );
     }
+
+    /// QH-62: the install helper must thread `-SshAllowCidrs` into the daemon
+    /// args env as a matched `--fail-closed-ssh-allow` /
+    /// `--fail-closed-ssh-allow-cidrs` pair, guarded so an empty value emits
+    /// neither flag. A validated-then-dropped operator input is the defect
+    /// class this pin keeps closed.
+    #[test]
+    fn install_helper_threads_ssh_allow_cidrs_into_the_daemon_args_env() {
+        // The parameter exists and is validated before any use.
+        assert!(
+            INSTALL_SERVICE_SCRIPT_WIN.contains("[string]$SshAllowCidrs = '',"),
+            "SshAllowCidrs param missing"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT_WIN.contains("function Test-RustyNetSshAllowCidrs {"),
+            "SshAllowCidrs validator missing"
+        );
+        let validator_invoked = INSTALL_SERVICE_SCRIPT_WIN
+            .find("Test-RustyNetSshAllowCidrs -Value $SshAllowCidrs")
+            .expect("SshAllowCidrs validator never invoked");
+        let first_consumed = INSTALL_SERVICE_SCRIPT_WIN
+            .find("'--fail-closed-ssh-allow'")
+            .expect("value never consumed by the daemon args builder");
+        assert!(
+            validator_invoked < first_consumed,
+            "validator must run before the value reaches the daemon args env"
+        );
+
+        // The daemon args builder emits the matched pair, and ONLY under the
+        // non-empty guard (the empty path must return before it).
+        let args_fn_start = INSTALL_SERVICE_SCRIPT_WIN
+            .find("function Build-ReviewedDaemonArgsJson")
+            .expect("daemon args builder missing");
+        let empty_guard = INSTALL_SERVICE_SCRIPT_WIN[args_fn_start..]
+            .find("if ([string]::IsNullOrEmpty($SshAllowCidrs)) {")
+            .expect("empty-CIDR guard missing from daemon args builder");
+        let bare_return = INSTALL_SERVICE_SCRIPT_WIN[empty_guard..]
+            .find("--fail-closed-ssh-allow")
+            .map(|off| off + empty_guard)
+            .expect("matched pair missing");
+        assert!(
+            bare_return > empty_guard,
+            "the fail-closed SSH allow pair must come after the empty guard"
+        );
+        for needle in [
+            "'--fail-closed-ssh-allow', 'true',",
+            "'--fail-closed-ssh-allow-cidrs', $SshAllowCidrs,",
+        ] {
+            assert!(
+                INSTALL_SERVICE_SCRIPT_WIN.contains(needle),
+                "daemon args pair member missing: {needle}"
+            );
+        }
+
+        // The env-file writer and its production call site both pass the
+        // value explicitly — threading must not rely on PS dynamic scoping.
+        assert!(
+            INSTALL_SERVICE_SCRIPT_WIN
+                .contains("-AutoTunnelEnforce $AutoTunnelEnforce -SshAllowCidrs $SshAllowCidrs))"),
+            "Write-ReviewedEnvFile does not forward SshAllowCidrs to the args builder"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT_WIN.contains(
+                "-AutoTunnelEnforce ([bool]$EnforceAutoTunnel) -SshAllowCidrs $SshAllowCidrs"
+            ),
+            "production Write-ReviewedEnvFile call site drops SshAllowCidrs"
+        );
+    }
+
+    /// QH-62: the e2e bootstrap wrapper must hand its validated
+    /// `-SshAllowCidrs` to the install helper (the final, authoritative
+    /// service registration), not validate then silently drop it.
+    #[test]
+    fn bootstrap_wrapper_forwards_ssh_allow_cidrs_to_the_install_helper() {
+        const WRAPPER: &str = include_str!("../../../../scripts/e2e/rn_bootstrap_windows.ps1");
+        let helper_call = WRAPPER
+            .find("& $installHelper")
+            .expect("install helper invocation missing");
+        let forward = WRAPPER[helper_call..]
+            .find("-SshAllowCidrs $SshAllowCidrs")
+            .expect("wrapper never forwards SshAllowCidrs to the install helper");
+        assert!(forward > 0, "forward must be part of the helper invocation");
+        // The wrapper-side validation stays (it is also pinned by the vm_lab
+        // source pins) — forwarding replaces dropping, it does not remove the
+        // fail-closed charset check.
+        assert!(
+            WRAPPER.contains("Assert-SshAllowCidrs -Value $SshAllowCidrs"),
+            "wrapper validation was removed instead of being wired through"
+        );
+    }
 }
