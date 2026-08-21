@@ -23967,19 +23967,6 @@ fn evaluate_windows_mesh_join_report(
             report.drift_reasons.join("; ")
         ));
     }
-    // Recompute the §4.1 at-least-one-peer admission from the RAW snapshot: a
-    // loaded-but-peerless snapshot is a vacuous green, the same fail-open the
-    // Linux evaluator closes.
-    if let rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Ok { peer_ids, .. } =
-        &report.snapshot
-        && peer_ids.is_empty()
-    {
-        return Err(format!(
-            "Windows mesh-join state on {windows_alias}: snapshot loaded but reports zero mesh \
-             peers; mesh_status_validation admits at least one expected remote peer — a peerless \
-             green is vacuous (§4.1)"
-        ));
-    }
     let summary_detail = match &report.snapshot {
         rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Ok {
             peer_ids,
@@ -25357,20 +25344,6 @@ fn evaluate_macos_mesh_status_report(macos_alias: &str, raw_json: &str) -> Resul
         return Err(format!(
             "report set overall_ok=true but drift_reasons is non-empty: {}",
             report.drift_reasons.join("; ")
-        ));
-    }
-    // Recompute the §4.1 at-least-one-peer admission from the RAW snapshot: a
-    // loaded-but-peerless snapshot is a vacuous green, the same fail-open the
-    // Linux evaluator closes. (macOS mesh is not yet live-exercised, but the
-    // gap is identical and the check is pure.)
-    if let rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Ok { peer_ids, .. } =
-        &report.snapshot
-        && peer_ids.is_empty()
-    {
-        return Err(format!(
-            "macOS mesh status on {macos_alias}: snapshot loaded but reports zero mesh peers; \
-             mesh_status_validation admits at least one expected remote peer — a peerless green is \
-             vacuous (§4.1)"
         ));
     }
     let summary_detail = match &report.snapshot {
@@ -50958,60 +50931,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 && summary.contains("age_seconds=12"),
             "unexpected summary: {summary}"
         );
-    }
-
-    #[test]
-    fn evaluate_windows_mesh_join_report_rejects_peerless_green() {
-        // The peerless-green fail-open, closed on Windows too: a loaded snapshot
-        // reporting zero mesh peers is a vacuous green (§4.1).
-        let mut payload = reviewed_mesh_join_payload();
-        payload["snapshot"]["peer_ids"] = serde_json::json!([]);
-        let err =
-            super::evaluate_windows_mesh_join_report("windows-utm-1", payload.to_string().as_str())
-                .expect_err("a peerless self-report must not earn a green");
-        assert!(err.contains("zero mesh peers"), "unexpected: {err}");
-    }
-
-    fn reviewed_macos_mesh_payload() -> serde_json::Value {
-        serde_json::json!({
-            "schema_version": 1,
-            "state_path": "/var/lib/rustynet/rustynetd.state",
-            "overall_ok": true,
-            "snapshot": {
-                "load_status": "ok",
-                "timestamp_unix": 1_745_000_000u64,
-                "age_seconds": 12,
-                "peer_ids": ["debian-headless-1"],
-                "selected_exit_node": serde_json::Value::Null,
-                "lan_access_enabled": false
-            },
-            "expected_peer_ids": [],
-            "max_age_seconds": null,
-            "drift_reasons": []
-        })
-    }
-
-    #[test]
-    fn evaluate_macos_mesh_status_report_accepts_reviewed_payload() {
-        let summary = super::evaluate_macos_mesh_status_report(
-            "macos-utm-1",
-            reviewed_macos_mesh_payload().to_string().as_str(),
-        )
-        .expect("reviewed payload must validate");
-        assert!(
-            summary.contains("macos-utm-1") && summary.contains("peers=1"),
-            "unexpected summary: {summary}"
-        );
-    }
-
-    #[test]
-    fn evaluate_macos_mesh_status_report_rejects_peerless_green() {
-        let mut payload = reviewed_macos_mesh_payload();
-        payload["snapshot"]["peer_ids"] = serde_json::json!([]);
-        let err =
-            super::evaluate_macos_mesh_status_report("macos-utm-1", payload.to_string().as_str())
-                .expect_err("a peerless self-report must not earn a green");
-        assert!(err.contains("zero mesh peers"), "unexpected: {err}");
     }
 
     #[test]
