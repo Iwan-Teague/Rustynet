@@ -119,7 +119,36 @@ impl OrchestrationStage for NegativeControlSignedBundleRejectionStage {
     }
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let dir = control_workdir(ctx, self.name());
-        signed_bundle::run_signed_bundle_control(&dir)
+        let outcome = signed_bundle::run_signed_bundle_control(&dir);
+        // Emit the scenario.v1 evidence so the finalizer's INDEPENDENT verifier
+        // can re-derive this control's verdict (§3.1.2). Emitted for BOTH pass
+        // and fail — a failing control still produces a truthful non-pass
+        // document. The generation binding (`run_identity`) comes from the
+        // report-dir lease; any identity or emission failure fail-closes the
+        // control rather than yielding a green with no verifiable evidence.
+        let run_identity =
+            match crate::vm_lab::orchestrator::run_instance::read_leased_run_instance_id(
+                &ctx.report_dir,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    return StageOutcome::Failed(format!(
+                        "signed-bundle control: run identity unavailable for scenario.v1: {e}"
+                    ));
+                }
+            };
+        let control_passed = matches!(outcome, StageOutcome::Passed);
+        if let Err(e) = signed_bundle::emit_signed_bundle_scenario_v1(
+            &ctx.report_dir,
+            &dir,
+            &run_identity,
+            control_passed,
+        ) {
+            return StageOutcome::Failed(format!(
+                "signed-bundle control: scenario.v1 emission failed: {e}"
+            ));
+        }
+        outcome
     }
 }
 
@@ -1768,17 +1797,37 @@ pub(crate) mod signed_bundle {
 
     /// Adjudicate one forgery scenario.
     pub(crate) fn adjudicate_scenario(dir: &Path, scenario: &BundleScenario) -> RejectionCheck {
+        run_scenario_capturing(dir, scenario).2
+    }
+
+    /// Stage the fixture, run the verifier, and return BOTH the raw verdict
+    /// (accepted?, verbatim error) and the classified [`RejectionCheck`]. The raw
+    /// verdict is recorded into the time-stable transcript the finalizer's
+    /// recomputer re-classifies — re-running the verifier at finalize-time would
+    /// be unsound because the genuine freshness window and the future-dated /
+    /// replay clocks all move after the control ran.
+    fn run_scenario_capturing(
+        dir: &Path,
+        scenario: &BundleScenario,
+    ) -> (bool, Option<String>, RejectionCheck) {
         let fixture = match write_scenario(dir, scenario.kind) {
             Ok(fixture) => fixture,
             // A fixture we could not even stage is a wrong-reason rejection, not
             // a pass — never silently swallow it into a control pass.
             Err(err) => {
-                return RejectionCheck::RejectedWrongReason {
-                    actual: format!("fixture staging failed: {err}"),
-                };
+                let msg = format!("fixture staging failed: {err}");
+                return (
+                    false,
+                    Some(msg.clone()),
+                    RejectionCheck::RejectedWrongReason { actual: msg },
+                );
             }
         };
-        classify_rejection(verify(&fixture, None), scenario.required_error_substr)
+        let raw = verify(&fixture, None);
+        let accepted = raw.is_ok();
+        let verifier_error = raw.as_ref().err().cloned();
+        let check = classify_rejection(raw, scenario.required_error_substr);
+        (accepted, verifier_error, check)
     }
 
     /// Pure classifier: given the verifier's result and the required named
@@ -1801,17 +1850,29 @@ pub(crate) mod signed_bundle {
 
     /// Adjudicate the genuine positive control.
     pub(crate) fn adjudicate_genuine(dir: &Path) -> AcceptanceCheck {
+        match run_genuine_capturing(dir) {
+            (true, _) => AcceptanceCheck::AcceptedAsExpected,
+            (false, actual) => AcceptanceCheck::RejectedButMustAccept {
+                actual: actual.unwrap_or_else(|| "rejected".to_owned()),
+            },
+        }
+    }
+
+    /// Stage the genuine bundle, verify it, and return the raw verdict
+    /// (accepted?, verbatim error) for the transcript.
+    fn run_genuine_capturing(dir: &Path) -> (bool, Option<String>) {
         let fixture = match write_genuine(dir, BUNDLE_NODE_ID) {
             Ok(fixture) => fixture,
             Err(err) => {
-                return AcceptanceCheck::RejectedButMustAccept {
-                    actual: format!("genuine fixture staging failed: {err}"),
-                };
+                return (
+                    false,
+                    Some(format!("genuine fixture staging failed: {err}")),
+                );
             }
         };
         match verify(&fixture, None) {
-            Ok(()) => AcceptanceCheck::AcceptedAsExpected,
-            Err(err) => AcceptanceCheck::RejectedButMustAccept { actual: err },
+            Ok(()) => (true, None),
+            Err(err) => (false, Some(err)),
         }
     }
 
@@ -1822,10 +1883,17 @@ pub(crate) mod signed_bundle {
     /// is `AcceptedAsExpected`.
     pub(crate) fn run_signed_bundle_control(dir: &Path) -> StageOutcome {
         let mut failures: Vec<String> = Vec::new();
+        let mut entries: Vec<SignedBundleTranscriptEntry> = Vec::new();
 
         for scenario in SCENARIOS {
             let scenario_dir = dir.join(scenario.corpus_id);
-            match adjudicate_scenario(&scenario_dir, scenario) {
+            let (accepted, verifier_error, check) = run_scenario_capturing(&scenario_dir, scenario);
+            entries.push(SignedBundleTranscriptEntry {
+                corpus_id: scenario.corpus_id.to_owned(),
+                accepted,
+                verifier_error,
+            });
+            match check {
                 RejectionCheck::RejectedAsExpected => {}
                 RejectionCheck::AcceptedButMustReject => failures.push(format!(
                     "{} ({}): FAIL-OPEN — forged bundle was ACCEPTED but must be rejected",
@@ -1841,11 +1909,25 @@ pub(crate) mod signed_bundle {
             }
         }
 
-        match adjudicate_genuine(&dir.join("genuine")) {
-            AcceptanceCheck::AcceptedAsExpected => {}
-            AcceptanceCheck::RejectedButMustAccept { actual } => failures.push(format!(
-                "positive control: genuine bundle was REJECTED but must be accepted: {actual}"
-            )),
+        let (genuine_accepted, genuine_error) = run_genuine_capturing(&dir.join("genuine"));
+        entries.push(SignedBundleTranscriptEntry {
+            corpus_id: GENUINE_CORPUS_ID.to_owned(),
+            accepted: genuine_accepted,
+            verifier_error: genuine_error.clone(),
+        });
+        if !genuine_accepted {
+            failures.push(format!(
+                "positive control: genuine bundle was REJECTED but must be accepted: {}",
+                genuine_error.unwrap_or_else(|| "rejected".to_owned())
+            ));
+        }
+
+        // Persist the RAW verdicts as the time-stable transcript the finalizer's
+        // recomputer re-classifies. A write failure taints the control — without
+        // the transcript the verifier has no independent witness to recompute
+        // from, so a green here would be unverifiable (fail closed).
+        if let Err(e) = write_signed_bundle_transcript(dir, &entries) {
+            failures.push(format!("verifier transcript write failed: {e}"));
         }
 
         if failures.is_empty() {
@@ -1857,6 +1939,250 @@ pub(crate) mod signed_bundle {
                 SCENARIOS.len() + 1,
                 failures.join("; ")
             ))
+        }
+    }
+
+    // ── scenario.v1 evidence emission (L1b) ──────────────────────────────────
+
+    /// The stage id + assertion id + contract this control emits under, kept as
+    /// named constants so the emitter, the recomputer, and the finalizer wiring
+    /// all agree.
+    pub(crate) const SIGNED_BUNDLE_STAGE_ID: &str = "negative_control_signed_bundle_rejection";
+    pub(crate) const SIGNED_BUNDLE_ASSERTION_ID: &str = "signed_bundle_forgery_rejected";
+    /// The raw-witness file written under the control workdir.
+    pub(crate) const SIGNED_BUNDLE_TRANSCRIPT_FILE: &str = "verifier_transcript.json";
+    const SIGNED_BUNDLE_TRANSCRIPT_SCHEMA: &str = "signed_bundle_verifier_transcript.v1";
+    /// The transcript key for the genuine positive control.
+    pub(crate) const GENUINE_CORPUS_ID: &str = "genuine";
+
+    /// One raw verifier verdict, recorded verbatim. `accepted=false` with the
+    /// verbatim `verifier_error` is what the recomputer re-classifies against the
+    /// expected named reasons it holds independently in [`SCENARIOS`].
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub(crate) struct SignedBundleTranscriptEntry {
+        pub(crate) corpus_id: String,
+        pub(crate) accepted: bool,
+        #[serde(default)]
+        pub(crate) verifier_error: Option<String>,
+    }
+
+    /// The raw-witness transcript: the verifier's verbatim verdict for every
+    /// corpus forgery plus the genuine positive control.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub(crate) struct SignedBundleTranscript {
+        pub(crate) schema: String,
+        pub(crate) entries: Vec<SignedBundleTranscriptEntry>,
+    }
+
+    fn write_signed_bundle_transcript(
+        dir: &Path,
+        entries: &[SignedBundleTranscriptEntry],
+    ) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let doc = SignedBundleTranscript {
+            schema: SIGNED_BUNDLE_TRANSCRIPT_SCHEMA.to_owned(),
+            entries: entries.to_vec(),
+        };
+        let body = serde_json::to_string_pretty(&doc)
+            .map_err(|e| format!("serialize signed-bundle transcript: {e}"))?;
+        let path = dir.join(SIGNED_BUNDLE_TRANSCRIPT_FILE);
+        std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    /// Emit this control's `scenario.v1` under `report_root`, referencing the raw
+    /// verifier transcript (already written by [`run_signed_bundle_control`]) as
+    /// the assertion's independent witness. The finalizer later resolves the
+    /// contract and recomputes the assertion from that transcript; the
+    /// self-reported `result` here is never trusted.
+    pub(crate) fn emit_signed_bundle_scenario_v1(
+        report_root: &Path,
+        control_dir: &Path,
+        run_identity: &str,
+        control_passed: bool,
+    ) -> Result<PathBuf, String> {
+        use crate::vm_lab::orchestrator::stage::scenario::AssertionClass;
+        use crate::vm_lab::orchestrator::stage::scenario::registry::ScenarioContractRegistry;
+        use crate::vm_lab::orchestrator::stage::scenario::schema::{
+            ArtifactRef, AssertionRecord, CleanupRecord, FaultRecord, ItemResult,
+            SCENARIO_SCHEMA_VERSION, ScenarioV1, SelectedTarget, write_scenario_v1,
+        };
+
+        let transcript_path = control_dir.join(SIGNED_BUNDLE_TRANSCRIPT_FILE);
+        let bytes = std::fs::read(&transcript_path).map_err(|e| {
+            format!(
+                "read signed-bundle transcript {}: {e}",
+                transcript_path.display()
+            )
+        })?;
+        let sha256 = crate::vm_lab::sha256_hex_bytes(&bytes);
+        let reference = report_root_relative(report_root, &transcript_path)?;
+
+        // The contract digest binds the scenario to this exact contract version;
+        // it is read from the SAME independent registry the finalizer resolves
+        // against, so a faithful emission always matches.
+        let registry = ScenarioContractRegistry::canonical();
+        let registered = registry
+            .lookup(SIGNED_BUNDLE_STAGE_ID)
+            .ok_or_else(|| format!("no registered contract for {SIGNED_BUNDLE_STAGE_ID}"))?;
+
+        let result = if control_passed {
+            ItemResult::Pass
+        } else {
+            ItemResult::Fail
+        };
+        let artifact = ArtifactRef { reference, sha256 };
+        let scenario = ScenarioV1 {
+            schema_version: SCENARIO_SCHEMA_VERSION,
+            scenario_id: "signed_bundle_forgery_corpus".to_owned(),
+            stage_id: SIGNED_BUNDLE_STAGE_ID.to_owned(),
+            contract_digest: registered.contract_digest().to_owned(),
+            run_identity: run_identity.to_owned(),
+            selected_targets: vec![SelectedTarget {
+                alias: "nc-local".to_owned(),
+                node_id: BUNDLE_NODE_ID.to_owned(),
+                role: "local_control".to_owned(),
+                platform: "in_proc".to_owned(),
+                os_version: String::new(),
+            }],
+            admission: vec![],
+            baseline: vec![],
+            fault: Some(FaultRecord {
+                kind: "signed_bundle_forgery_corpus".to_owned(),
+                scope: "in_proc_assignment_verifier".to_owned(),
+                applied: true,
+                verified: true,
+                evidence: vec![artifact.clone()],
+            }),
+            assertions: vec![AssertionRecord {
+                id: SIGNED_BUNDLE_ASSERTION_ID.to_owned(),
+                class: AssertionClass::Security,
+                required: true,
+                result,
+                evidence: vec![artifact],
+            }],
+            cleanup: vec![CleanupRecord {
+                action: "in_proc_fixtures_retained_as_evidence".to_owned(),
+                result: ItemResult::Pass,
+                residual_check: ItemResult::Pass,
+                evidence: vec![],
+            }],
+            limitations: vec!["in-process crypto control; no live guest".to_owned()],
+            terminal_outcome: if control_passed { "passed" } else { "failed" }.to_owned(),
+        };
+        write_scenario_v1(report_root, &scenario)
+    }
+
+    /// Report-root-relative reference for an artifact under the report root, with
+    /// forward-slash separators. Fails closed if the artifact is not beneath the
+    /// root or the path is not UTF-8.
+    fn report_root_relative(report_root: &Path, path: &Path) -> Result<String, String> {
+        let rel = path.strip_prefix(report_root).map_err(|_| {
+            format!(
+                "artifact {} is not under report root {}",
+                path.display(),
+                report_root.display()
+            )
+        })?;
+        rel.to_str()
+            .map(|s| s.to_owned())
+            .ok_or_else(|| format!("artifact path {} is not valid UTF-8", rel.display()))
+    }
+
+    #[cfg(test)]
+    mod scenario_emission_tests {
+        use super::*;
+        use crate::vm_lab::orchestrator::stage::scenario::artifact::validate_artifact;
+        use crate::vm_lab::orchestrator::stage::scenario::registry::ScenarioContractRegistry;
+        use crate::vm_lab::orchestrator::stage::scenario::schema::{ScenarioV1, scenario_v1_path};
+        use tempfile::tempdir;
+
+        fn run_and_read_transcript(control_dir: &Path) -> SignedBundleTranscript {
+            let outcome = run_signed_bundle_control(control_dir);
+            assert!(
+                matches!(outcome, StageOutcome::Passed),
+                "the corpus must reject every forgery on a healthy verifier: {outcome:?}"
+            );
+            let body =
+                std::fs::read_to_string(control_dir.join(SIGNED_BUNDLE_TRANSCRIPT_FILE)).unwrap();
+            serde_json::from_str(&body).unwrap()
+        }
+
+        #[test]
+        fn control_writes_a_full_transcript_of_raw_verdicts() {
+            let tmp = tempdir().unwrap();
+            let doc = run_and_read_transcript(tmp.path());
+            assert_eq!(doc.schema, SIGNED_BUNDLE_TRANSCRIPT_SCHEMA);
+            // One entry per corpus forgery plus the genuine positive control.
+            assert_eq!(doc.entries.len(), SCENARIOS.len() + 1);
+            for scenario in SCENARIOS {
+                let e = doc
+                    .entries
+                    .iter()
+                    .find(|e| e.corpus_id == scenario.corpus_id)
+                    .expect("corpus entry present");
+                assert!(
+                    !e.accepted,
+                    "forgery {} must be rejected",
+                    scenario.corpus_id
+                );
+                let err = e.verifier_error.as_deref().unwrap_or("");
+                assert!(
+                    err.contains(scenario.required_error_substr),
+                    "forgery {} raw error {err:?} must name {:?}",
+                    scenario.corpus_id,
+                    scenario.required_error_substr
+                );
+            }
+            let genuine = doc
+                .entries
+                .iter()
+                .find(|e| e.corpus_id == GENUINE_CORPUS_ID)
+                .expect("genuine entry present");
+            assert!(genuine.accepted, "the genuine bundle must be accepted");
+        }
+
+        #[test]
+        fn emit_produces_a_scenario_v1_that_resolves_and_binds_a_valid_artifact() {
+            let report_root = tempdir().unwrap();
+            let control_dir = report_root
+                .path()
+                .join("negative_control")
+                .join(SIGNED_BUNDLE_STAGE_ID);
+            let _ = run_and_read_transcript(&control_dir);
+
+            let run_identity = "0123456789abcdef0123456789abcdef";
+            let scenario_path = emit_signed_bundle_scenario_v1(
+                report_root.path(),
+                &control_dir,
+                run_identity,
+                true,
+            )
+            .expect("emit");
+            assert_eq!(
+                scenario_path,
+                scenario_v1_path(report_root.path(), SIGNED_BUNDLE_STAGE_ID)
+            );
+
+            // The emitted scenario resolves against the INDEPENDENT registry: the
+            // stage is known and the contract digest binds.
+            let body = std::fs::read_to_string(&scenario_path).unwrap();
+            let scenario = ScenarioV1::parse(&body).expect("parse scenario.v1");
+            assert_eq!(scenario.run_identity, run_identity);
+            let registry = ScenarioContractRegistry::canonical();
+            let registered = registry.resolve_for(&scenario).expect("resolves");
+            assert_eq!(registered.stage_id(), SIGNED_BUNDLE_STAGE_ID);
+
+            // The one required assertion references the transcript, and that
+            // artifact validates (containment) with a matching recorded digest.
+            let assertion = scenario
+                .assertions
+                .iter()
+                .find(|a| a.id == SIGNED_BUNDLE_ASSERTION_ID)
+                .expect("assertion present");
+            let aref = &assertion.evidence[0];
+            let validated =
+                validate_artifact(report_root.path(), &aref.reference, 1 << 20).expect("valid");
+            assert_eq!(validated.sha256, aref.sha256);
         }
     }
 
