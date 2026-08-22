@@ -1014,6 +1014,62 @@ mod tests {
     }
 
     #[test]
+    fn empty_policy_set_denies_every_request_shape() {
+        // Core default-deny invariant, broader than
+        // `policy_defaults_to_deny`: an EMPTY set denies EVERY
+        // request shape — every protocol, both policy engines, and
+        // even requests from fully-active membership. No rule means
+        // no allow, ever.
+        let empty = PolicySet::default();
+        let empty_contextual = ContextualPolicySet::default();
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-a", MembershipStatus::Active);
+        membership.set_node_status("node-b", MembershipStatus::Active);
+
+        for protocol in [Protocol::Tcp, Protocol::Udp, Protocol::Any] {
+            let request = AccessRequest {
+                src: "node:a".to_owned(),
+                dst: "node:b".to_owned(),
+                protocol,
+            };
+            assert_eq!(
+                empty.evaluate(&request),
+                Decision::Deny,
+                "empty set must deny plain request ({protocol:?})"
+            );
+            assert_eq!(
+                empty.evaluate_with_membership(&request, &membership),
+                Decision::Deny,
+                "empty set must deny active-membership request ({protocol:?})"
+            );
+
+            for context in [
+                TrafficContext::Mesh,
+                TrafficContext::SharedExit,
+                TrafficContext::NasService,
+            ] {
+                let contextual = ContextualAccessRequest {
+                    src: "node:a".to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol,
+                    context,
+                };
+                assert_eq!(
+                    empty_contextual.evaluate(&contextual),
+                    Decision::Deny,
+                    "empty contextual set must deny ({protocol:?}, {context:?})"
+                );
+                assert_eq!(
+                    empty_contextual.evaluate_with_membership(&contextual, &membership),
+                    Decision::Deny,
+                    "empty contextual set must deny with active membership \
+                     ({protocol:?}, {context:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn policy_respects_first_match() {
         let set = PolicySet {
             rules: vec![
