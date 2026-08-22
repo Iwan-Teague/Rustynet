@@ -2929,6 +2929,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_message_sign_and_verify_round_trips() {
+        // Empty-input edge case: ed25519 signs the SHA-512 of the
+        // message, so b"" is a valid input — sign must succeed and
+        // verify of that signature over b"" must ACCEPT.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/empty-message",
+            [91; 32],
+        );
+        let empty: &[u8] = b"";
+        let signature = keypair
+            .sign_attestation(empty)
+            .expect("empty payload signs");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(empty, &signature)
+            .expect("signature over the empty message must verify");
+
+        // Control: it is bound to the empty string, not to everything.
+        let err = keypair.verify_attestation(b"x", &signature).err();
+        assert_eq!(err, Some(CryptoError::AttestationVerificationFailed));
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
