@@ -3770,6 +3770,38 @@ mod tests {
     }
 
     #[test]
+    fn apply_signed_update_rejects_epoch_rollback_to_older_watermark() {
+        // Anti-rollback: an update whose epoch pair sits BEHIND the
+        // live state's watermark (epoch_new == state.epoch, i.e. the
+        // previous generation) is a stale/rolled-back record and must
+        // be rejected even though its internal epoch chain and
+        // signatures are valid. (The sibling test covers skipping
+        // FORWARD; this pins the backwards direction.)
+        let (state, mut record, _signatures) = signed_add_node_fixture();
+        assert!(state.epoch >= 1);
+        record.epoch_prev = state.epoch - 1;
+        record.epoch_new = state.epoch;
+        // Re-sign so the failure is the epoch check, not a signature mismatch.
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let guardian_key = SigningKey::from_bytes(&[2; 32]);
+        let signed = SignedMembershipUpdate {
+            approver_signatures: vec![
+                sign_update_record(&record, "owner-1", &owner_key).expect("sign"),
+                sign_update_record(&record, "guardian-1", &guardian_key).expect("sign"),
+            ],
+            record,
+        };
+        let err = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect_err("epoch rollback must be rejected");
+        match err {
+            MembershipError::InvalidTransition(msg) => {
+                assert_eq!(msg, "epoch chain mismatch for membership update");
+            }
+            other => panic!("expected epoch InvalidTransition, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_signed_update_rejects_prev_state_root_mismatch() {
         // The prev-root check anchors the update to the exact state it was
         // authored against; a mismatch is a rollback/fork attempt. It fires
