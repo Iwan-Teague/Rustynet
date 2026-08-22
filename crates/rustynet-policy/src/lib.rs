@@ -1342,6 +1342,39 @@ mod tests {
     }
 
     #[test]
+    fn icmp_allow_rule_does_not_admit_tcp_to_same_destination() {
+        // Protocol isolation: an ICMP-only allow rule must not leak
+        // into TCP. The TCP request misses the protocol filter,
+        // matches nothing, and falls through to terminal Deny.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:a".to_owned(),
+                dst: "tag:web".to_owned(),
+                protocol: Protocol::Icmp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let icmp_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:web".to_owned(),
+            protocol: Protocol::Icmp,
+        };
+        assert_eq!(set.evaluate(&icmp_request), Decision::Allow);
+
+        let tcp_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:web".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate(&tcp_request),
+            Decision::Deny,
+            "an ICMP-only rule must not admit TCP traffic to the same destination"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
