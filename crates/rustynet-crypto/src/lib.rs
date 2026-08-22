@@ -2828,6 +2828,33 @@ mod tests {
     }
 
     #[test]
+    fn signing_is_deterministic_same_message_same_signature() {
+        // RFC 8032 ed25519 is deterministic: the same key over the
+        // same bytes must yield byte-identical signatures on every
+        // call. Randomized signing would break signature-derived
+        // dedup/replay bookkeeping downstream.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/determinism",
+            [51; 32],
+        );
+        let message = b"determinism-canary";
+        let first = keypair.sign_attestation(message).expect("sign once");
+        let second = keypair.sign_attestation(message).expect("sign twice");
+        assert_eq!(first.len(), 64);
+        assert_eq!(
+            first, second,
+            "the same key over the same message must produce identical signature bytes"
+        );
+
+        // Control: a different message still signs differently.
+        let other = keypair
+            .sign_attestation(b"other-canary")
+            .expect("sign other");
+        assert_ne!(first, other);
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
