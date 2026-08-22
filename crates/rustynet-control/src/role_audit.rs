@@ -665,6 +665,35 @@ mod tests {
     }
 
     #[test]
+    fn verify_role_audit_chain_rejects_replayed_duplicate_entry() {
+        // An attacker replays a genuine record verbatim to fabricate
+        // two identical events. The verifier must reject the replay:
+        // position 1 demands index 1 bound to entry 0's hash, but the
+        // duplicate still claims index 0.
+        let event = RoleTransitionEvent::PresetTransition {
+            from: RolePreset::Admin,
+            to: RolePreset::Exit,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        };
+        let payload = event.canonical_payload(100);
+        let genuine = RoleAuditEntry {
+            index: 0,
+            previous_hash: GENESIS_PREVIOUS_HASH.to_owned(),
+            entry_hash: compute_entry_hash(0, GENESIS_PREVIOUS_HASH, &payload),
+            event_hex: hex_encode(payload.as_bytes()),
+        };
+        let err = verify_role_audit_chain(&[genuine.clone(), genuine]).unwrap_err();
+        match err {
+            RoleAuditError::ChainBroken(msg) => {
+                assert!(msg.contains("position 1"), "unexpected message: {msg}");
+                assert!(msg.contains("index=0"), "unexpected message: {msg}");
+            }
+            other => panic!("expected ChainBroken, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn inserting_an_entry_breaks_chain() {
         let path = tmp_path("insert");
         append_role_audit_entry(
