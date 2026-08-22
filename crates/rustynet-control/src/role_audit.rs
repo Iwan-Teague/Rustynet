@@ -817,7 +817,7 @@ mod tests {
         // digit so it stays a plausible digest but no longer matches.
         let first_char = entries[1].entry_hash[0..1].to_owned();
         let replacement = if first_char == "0" { "1" } else { "0" };
-        entries[1].entry_hash.replace_range(0..1, &replacement);
+        entries[1].entry_hash.replace_range(0..1, replacement);
         let err = verify_role_audit_chain(&entries).unwrap_err();
         match err {
             RoleAuditError::ChainBroken(msg) => {
