@@ -1105,6 +1105,31 @@ mod tests {
     // ----- Local-only transitions (admin ↔ client) -----
 
     #[test]
+    fn client_to_admin_transition_needs_no_owner_signature() {
+        // Client → Admin changes ONLY the primary role (identical
+        // capability sets), so it is a local-only configuration
+        // change: allowed WITHOUT an owner-signed membership record.
+        let kind = validate_transition(RolePreset::Client, RolePreset::Admin);
+        assert_eq!(kind, TransitionKind::LocalOnly);
+        assert!(
+            !kind.requires_owner_signature(),
+            "client → admin must not require an owner signature"
+        );
+
+        // The full plan agrees and carries exactly the primary flip.
+        let plan = transition_plan(RolePreset::Client, RolePreset::Admin);
+        assert_eq!(plan.kind, TransitionKind::LocalOnly);
+        assert_eq!(plan.from, RolePreset::Client);
+        assert_eq!(plan.to, RolePreset::Admin);
+        assert_eq!(
+            plan.primary_change,
+            Some((PrimaryRole::Client, PrimaryRole::Admin))
+        );
+        assert!(plan.adds_capabilities.is_empty());
+        assert!(plan.removes_capabilities.is_empty());
+    }
+
+    #[test]
     fn admin_to_client_is_local_only() {
         let plan = transition_plan(RolePreset::Admin, RolePreset::Client);
         assert_eq!(plan.kind, TransitionKind::LocalOnly);
