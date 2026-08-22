@@ -7380,6 +7380,62 @@ mod tests {
         assert!(rendered.contains("REDACTED"));
     }
 
+    fn claims(issued_at_unix: u64, expires_at_unix: u64, nonce: &str) -> TokenClaims {
+        TokenClaims {
+            subject: "alice@example.local".to_owned(),
+            issued_at_unix,
+            expires_at_unix,
+            nonce: nonce.to_owned(),
+        }
+    }
+
+    #[test]
+    fn replay_guard_rejects_inverted_token_lifetime() {
+        let mut guard = AuthSurfaceGuard::default();
+        let err = guard
+            .validate_token_and_nonce(&claims(2000, 1000, "n-inverted"), 1500)
+            .expect_err("expires <= issued must be refused");
+        assert_eq!(err, AuthError::InvalidTokenLifetime);
+    }
+
+    #[test]
+    fn replay_guard_rejects_lifetime_beyond_policy_maximum() {
+        let mut guard = AuthSurfaceGuard::default();
+        // Default policy allows 300s; one second more is refused...
+        let err = guard
+            .validate_token_and_nonce(&claims(1000, 1000 + 301, "n-too-long"), 1100)
+            .expect_err("lifetime beyond the policy maximum must be refused");
+        assert_eq!(err, AuthError::InvalidTokenLifetime);
+        // ...and exactly the maximum is accepted.
+        guard
+            .validate_token_and_nonce(&claims(1000, 1000 + 300, "n-max-lifetime"), 1100)
+            .expect("lifetime at the policy maximum must be accepted");
+    }
+
+    #[test]
+    fn replay_guard_rejects_expired_token_only_after_the_skew_window() {
+        let mut guard = AuthSurfaceGuard::default();
+        let err = guard
+            .validate_token_and_nonce(&claims(1000, 1300, "n-expired"), 1391)
+            .expect_err("token past expiry plus skew must be refused");
+        assert_eq!(err, AuthError::TokenExpired);
+        guard
+            .validate_token_and_nonce(&claims(1000, 1300, "n-skew-edge"), 1390)
+            .expect("the last second inside the skew window must still be accepted");
+    }
+
+    #[test]
+    fn replay_guard_rejects_token_from_the_future() {
+        let mut guard = AuthSurfaceGuard::default();
+        let err = guard
+            .validate_token_and_nonce(&claims(2000, 2300, "n-future"), 1909)
+            .expect_err("issued-at beyond now plus skew must be refused");
+        assert_eq!(err, AuthError::TokenNotYetValid);
+        guard
+            .validate_token_and_nonce(&claims(2000, 2300, "n-future-edge"), 1910)
+            .expect("issued-at within the skew window must be accepted");
+    }
+
     #[test]
     fn signed_token_claims_are_verified_and_replay_guarded() {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
