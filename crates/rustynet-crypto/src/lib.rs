@@ -2742,6 +2742,23 @@ mod tests {
     }
 
     #[test]
+    fn fresh_keypair_sign_then_verify_accepts_valid_signature() {
+        // Happy path, raw trait level: a FRESH keypair signs a
+        // message and its own verify() accepts the signature.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/happy-path-fresh",
+            [21; 32],
+        );
+        let message = b"happy-path-canary";
+        let signature = keypair.sign_attestation(message).expect("sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(message, &signature)
+            .expect("a valid signature from the same fresh key must be accepted");
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
