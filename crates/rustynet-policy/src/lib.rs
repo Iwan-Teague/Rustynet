@@ -1275,6 +1275,40 @@ mod tests {
     }
 
     #[test]
+    fn single_tag_allow_admits_matching_tag_and_denies_others() {
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:web".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let web_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:web".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate(&web_request),
+            Decision::Allow,
+            "a request tagged 'web' must be allowed by the tag rule"
+        );
+
+        let db_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:db".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate(&db_request),
+            Decision::Deny,
+            "a request tagged 'db' matches no allow rule and must be denied"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
