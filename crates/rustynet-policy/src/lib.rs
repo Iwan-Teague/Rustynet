@@ -1213,6 +1213,68 @@ mod tests {
     }
 
     #[test]
+    fn absent_or_unknown_tag_requests_are_denied_even_against_wildcard() {
+        // POL-03, evaluator level: an EMPTY identity in either
+        // position is absent trust state and matches NOTHING — not
+        // even a wildcard ALLOW rule. An unknown tag simply matches
+        // no rule. Both must fall through to terminal Deny.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node:a", MembershipStatus::Active);
+        membership.set_node_status("tag:servers", MembershipStatus::Active);
+
+        let empty_src = AccessRequest {
+            src: String::new(),
+            dst: "tag:servers".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&empty_src), Decision::Deny);
+        assert_eq!(
+            set.evaluate_with_membership(&empty_src, &membership),
+            Decision::Deny
+        );
+
+        let empty_dst = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: String::new(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&empty_dst), Decision::Deny);
+
+        // A malformed empty-body tag ("tag:") is NOT the empty-string
+        // case: the raw engine's equality matching lets a wildcard
+        // match it, and rejecting malformed selector FORMS is the
+        // membership gate's job — so pin the denial there.
+        let empty_body_tag = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate_with_membership(&empty_body_tag, &membership),
+            Decision::Deny,
+            "the membership gate must reject the malformed 'tag:' form"
+        );
+
+        let unknown_tag = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:never-provisioned".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate_with_membership(&unknown_tag, &membership),
+            Decision::Deny
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
