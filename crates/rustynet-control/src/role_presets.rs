@@ -1007,6 +1007,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blind_exit_lockout_pins_reason_and_empty_side_effects() {
+        // The existing Blocked sweep only matches `Blocked(_)`. This
+        // pins the exact lock-out reason and that a blocked plan
+        // carries NO side-effects, so neither the message nor an
+        // accidentally-computed delta can drift.
+        for &to in [
+            RolePreset::Client,
+            RolePreset::Admin,
+            RolePreset::Exit,
+            RolePreset::Relay,
+            RolePreset::Anchor,
+            RolePreset::Nas,
+            RolePreset::Llm,
+        ]
+        .iter()
+        {
+            let plan = transition_plan(RolePreset::BlindExit, to);
+            assert_eq!(plan.from, RolePreset::BlindExit);
+            assert_eq!(plan.to, to);
+            match plan.kind {
+                TransitionKind::Blocked(reason) => assert_eq!(
+                    reason,
+                    "blind_exit is immutable; factory reset + fresh key provisioning required to change role",
+                ),
+                other => panic!("expected Blocked for blind_exit → {to:?}, got {other:?}"),
+            }
+            assert!(
+                plan.primary_change.is_none(),
+                "blocked blind_exit → {to:?} must not change primary role"
+            );
+            assert!(
+                plan.adds_capabilities.is_empty() && plan.removes_capabilities.is_empty(),
+                "blocked blind_exit → {to:?} must not compute capability deltas"
+            );
+            assert!(
+                plan.service_deploys.is_empty() && plan.service_undeploys.is_empty(),
+                "blocked blind_exit → {to:?} must not schedule service lifecycle"
+            );
+        }
+    }
+
     // ----- Irreversible transitions (into BlindExit) -----
 
     #[test]
