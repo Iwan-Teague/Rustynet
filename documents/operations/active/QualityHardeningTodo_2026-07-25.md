@@ -1407,6 +1407,17 @@ snapshot test with the traversal index a strict **superset** of the assignment p
 advance. It was deliberately **specced rather than half-built**, on the sound reasoning that a
 half-built negative test is worse than a documented gap — it looks like coverage.
 
+**CLOSED 2026-08-22 (wave1/qh30):** both live `extra_peers` fail-closed sites are now pinned by unit
+tests in `crates/rustynetd/src/daemon.rs` — `daemon_runtime_auto_tunnel_traversal_authority_fail_closes_on_unmanaged_peers`
+(bootstrap-time apply gate, `apply_traversal_authority_to_peers`; asserts the apply-specific wrapper
+"traversal authority rejected bootstrap apply: traversal authority snapshot contains unmanaged peers: node-stray")
+and `daemon_runtime_auto_tunnel_traversal_runtime_sync_fail_closes_on_unmanaged_snapshot_peer`
+(runtime-sync gate via `refresh_traversal_hint_state` after a valid bootstrap; asserts
+"traversal runtime sync failed" + `DataplaneState::FailClosed`). Each test was mutation-proven in
+isolation: neutering only the apply-site check fails only the first test; neutering only the
+sync-site check fails only the second (the stray peer is Active in membership so the earlier
+membership gate passes and cannot mask either site).
+
 **Related, from the same retraction cycle — an inference rule worth keeping:** *counter arithmetic can
 bound magnitudes but cannot localise a drop across a netfilter hook upstream of the counter.*
 `IPSTATS_MIB_OUTFORWDATAGRAMS` increments in `ip_forward_finish`, downstream of `NF_INET_FORWARD`, so

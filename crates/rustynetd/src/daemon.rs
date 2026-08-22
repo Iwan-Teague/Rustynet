@@ -28297,6 +28297,216 @@ mod tests {
     }
 
     #[test]
+    fn daemon_runtime_auto_tunnel_traversal_authority_fail_closes_on_unmanaged_peers() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-extra-peer");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files_with_additional_nodes(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+            &[
+                ("node-exit", MembershipNodeStatus::Active),
+                ("node-relay", MembershipNodeStatus::Active),
+                // node-stray must be ACTIVE in membership so the bootstrap
+                // apply-time membership gate passes and the snapshot reaches
+                // the traversal runtime sync, whose assignment-scoped
+                // extra_peers check is what this test pins.
+                ("node-stray", MembershipNodeStatus::Active),
+            ],
+        );
+        write_auto_tunnel_file_two_peers(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+        );
+        write_traversal_file_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            &[
+                ("node-exit", "10.0.0.2", 51820),
+                ("node-relay", "10.0.0.3", 51820),
+                ("node-stray", "10.0.0.9", 51820),
+            ],
+            2,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path),
+            traversal_bundle_path: traversal_path,
+            traversal_verifier_key_path: traversal_verifier_path,
+            traversal_watermark_path,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let bootstrap_error = runtime
+            .bootstrap_error
+            .as_deref()
+            .unwrap_or("none")
+            .to_owned();
+        // The "rejected bootstrap apply" wrapper is unique to the apply-time
+        // gate (sync-path failures are wrapped "traversal runtime sync
+        // failed"), so this assertion can only be satisfied by the apply-site
+        // extra_peers check.
+        assert!(
+            bootstrap_error.contains(
+                "traversal authority rejected bootstrap apply: traversal authority snapshot contains unmanaged peers: node-stray"
+            ),
+            "unexpected bootstrap error: {bootstrap_error}"
+        );
+        assert_eq!(
+            runtime.controller.state(),
+            crate::phase10::DataplaneState::FailClosed
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_auto_tunnel_traversal_runtime_sync_fail_closes_on_unmanaged_snapshot_peer() {
+        let test_dir = secure_test_dir("rustynetd-runtime-traversal-sync-extra-peer");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        // node-stray is Active in membership so the apply-time membership gate
+        // accepts it; the sync path's extra_peers check (assignment-scoped) is
+        // the branch this test pins.
+        write_membership_files_with_additional_nodes(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+            &[
+                ("node-exit", MembershipNodeStatus::Active),
+                ("node-relay", MembershipNodeStatus::Active),
+                ("node-stray", MembershipNodeStatus::Active),
+            ],
+        );
+        write_auto_tunnel_file_two_peers(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+        );
+        write_traversal_file_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            &[
+                ("node-exit", "10.0.0.2", 51820),
+                ("node-relay", "10.0.0.3", 51820),
+            ],
+            2,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+        assert!(
+            runtime.bootstrap_error.is_none(),
+            "bootstrap should succeed before the swap: {:?}",
+            runtime.bootstrap_error
+        );
+
+        // Swap in a snapshot that adds a peer the assignment does not manage.
+        write_traversal_file_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            &[
+                ("node-exit", "10.0.0.2", 51820),
+                ("node-relay", "10.0.0.3", 51820),
+                ("node-stray", "10.0.0.9", 51820),
+            ],
+            3,
+        );
+        runtime.refresh_traversal_hint_state(true);
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("restricted_safe_mode=true"));
+        assert!(
+            status
+                .message
+                .contains("bootstrap_error=traversal runtime sync failed"),
+            "unexpected status message: {}",
+            status.message
+        );
+        assert_eq!(
+            runtime.controller.state(),
+            crate::phase10::DataplaneState::FailClosed
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn daemon_runtime_auto_tunnel_traversal_runtime_sync_fail_closes_on_missing_peer_coverage() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-sync-missing-peer");
         let state_path = test_dir.join("daemon.state");
