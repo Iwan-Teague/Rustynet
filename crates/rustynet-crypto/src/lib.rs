@@ -2793,6 +2793,41 @@ mod tests {
     }
 
     #[test]
+    fn verify_attestation_rejects_all_zero_and_empty_signatures() {
+        // Bytes of zero are not a signature: an all-zero 64-byte
+        // blob has degenerate (identity/small-order) R and S points
+        // and must be refused by strict verification, not accepted
+        // because its LENGTH happens to be right. An empty slice is
+        // refused even earlier, by the length guard.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/zero-signature",
+            [41; 32],
+        );
+        let payload = b"zero-signature-canary";
+
+        let all_zero = vec![0u8; 64];
+        assert_eq!(
+            keypair.verify_attestation(payload, &all_zero).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "an all-zero 64-byte blob must not verify"
+        );
+
+        assert_eq!(
+            keypair.verify_attestation(payload, &[]).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "an empty signature must be refused by the length guard"
+        );
+
+        // Control: a real signature over the same payload verifies.
+        let genuine = keypair.sign_attestation(payload).expect("sign");
+        assert!(genuine != all_zero);
+        keypair
+            .verify_attestation(payload, &genuine)
+            .expect("control signature must verify");
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
