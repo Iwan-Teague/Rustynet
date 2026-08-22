@@ -1098,6 +1098,58 @@ mod tests {
     }
 
     #[test]
+    fn nonempty_policy_set_denies_request_matching_no_rule() {
+        // Default-deny holds WITH rules present: every rule here is
+        // an ALLOW, and none of them matches this request (wrong src,
+        // wrong dst, wrong protocol) — so evaluation falls through
+        // every rule and must still terminate in Deny.
+        let set = PolicySet {
+            rules: vec![
+                PolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Allow,
+                },
+                PolicyRule {
+                    src: "group:x".to_owned(),
+                    dst: "tag:y".to_owned(),
+                    protocol: Protocol::Udp,
+                    action: RuleAction::Allow,
+                },
+            ],
+        };
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-a", MembershipStatus::Active);
+        membership.set_node_status("node-c", MembershipStatus::Active);
+
+        let off_src = AccessRequest {
+            src: "node:c".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&off_src), Decision::Deny);
+        assert_eq!(
+            set.evaluate_with_membership(&off_src, &membership),
+            Decision::Deny
+        );
+
+        let off_dst = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:z".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&off_dst), Decision::Deny);
+
+        let off_protocol = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Udp,
+        };
+        assert_eq!(set.evaluate(&off_protocol), Decision::Deny);
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
