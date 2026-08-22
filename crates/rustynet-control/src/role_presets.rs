@@ -978,6 +978,34 @@ mod tests {
     // ----- Blocked transitions (from BlindExit) -----
 
     #[test]
+    fn every_transition_leaving_blind_exit_is_blocked() {
+        // Irreversibility: blind_exit has no exit transition. Any
+        // target role must come back TransitionKind::Blocked and be
+        // disallowed.
+        for &to in [
+            RolePreset::Client,
+            RolePreset::Admin,
+            RolePreset::Exit,
+            RolePreset::Relay,
+            RolePreset::Anchor,
+            RolePreset::Nas,
+            RolePreset::Llm,
+        ]
+        .iter()
+        {
+            let kind = validate_transition(RolePreset::BlindExit, to);
+            assert!(
+                matches!(kind, TransitionKind::Blocked(_)),
+                "blind_exit → {to:?} must be Blocked, got {kind:?}"
+            );
+            assert!(
+                !kind.is_allowed(),
+                "blind_exit → {to:?} must not be allowed"
+            );
+        }
+    }
+
+    #[test]
     fn blind_exit_to_anything_else_is_blocked() {
         for &to in [
             RolePreset::Client,
