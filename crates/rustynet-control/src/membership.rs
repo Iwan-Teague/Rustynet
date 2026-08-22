@@ -3416,6 +3416,54 @@ mod tests {
     }
 
     #[test]
+    fn update_signed_by_non_approver_key_is_rejected_as_unauthorized() {
+        // Authority check, distinct from signature validity: the
+        // outsider's ed25519 signature is CRYPTOGRAPHICALLY VALID
+        // over the record, but "guardian-9" is not in the state's
+        // approver roster, so the update must be rejected as
+        // unauthorized — not merely as a bad signature.
+        let state = base_state();
+        let new_node = active_node("node-b", 12);
+
+        let mut candidate = state.clone();
+        candidate.nodes.push(new_node.clone());
+        candidate.epoch += 1;
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-non-approver-signer".to_owned(),
+            operation: MembershipOperation::AddNode(new_node),
+            target: "node-b".to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 120,
+            expires_at_unix: 600,
+            reason_code: "join".to_owned(),
+            policy_context: None,
+        };
+
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let outsider_key = SigningKey::from_bytes(&[9; 32]);
+        let outsider_signature =
+            sign_update_record(&record, "guardian-9", &outsider_key).expect("sign");
+        let owner_signature = sign_update_record(&record, "owner-1", &owner_key).expect("sign");
+        let signed = SignedMembershipUpdate {
+            record,
+            approver_signatures: vec![outsider_signature, owner_signature],
+        };
+
+        let err = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect_err("a non-approver signer must be rejected");
+        match err {
+            MembershipError::SignerNotAuthorized(approver_id) => {
+                assert_eq!(approver_id, "guardian-9");
+            }
+            other => panic!("expected SignerNotAuthorized, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn owner_signature_required_for_rotate_approver() {
         let state = base_state();
         let replacement = MembershipApprover {
