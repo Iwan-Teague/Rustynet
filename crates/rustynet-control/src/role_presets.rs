@@ -1130,6 +1130,34 @@ mod tests {
     }
 
     #[test]
+    fn same_role_transition_is_identity_no_op() {
+        // A transition whose from equals its to is a no-op: Identity,
+        // allowed, and requiring no owner signature. BlindExit is
+        // included deliberately — its lock-out arm must sit AFTER the
+        // identity short-circuit, or a no-op would read as Blocked.
+        for &preset in [
+            RolePreset::Client,
+            RolePreset::Admin,
+            RolePreset::Exit,
+            RolePreset::Relay,
+            RolePreset::Anchor,
+            RolePreset::Nas,
+            RolePreset::Llm,
+            RolePreset::BlindExit,
+        ]
+        .iter()
+        {
+            let kind = validate_transition(preset, preset);
+            assert_eq!(kind, TransitionKind::Identity, "{preset:?} → itself");
+            assert!(kind.is_allowed(), "{preset:?} → itself must be allowed");
+            assert!(
+                !kind.requires_owner_signature(),
+                "{preset:?} → itself must not require an owner signature"
+            );
+        }
+    }
+
+    #[test]
     fn admin_to_client_is_local_only() {
         let plan = transition_plan(RolePreset::Admin, RolePreset::Client);
         assert_eq!(plan.kind, TransitionKind::LocalOnly);
