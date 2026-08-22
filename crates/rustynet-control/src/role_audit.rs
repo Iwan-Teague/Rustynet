@@ -732,6 +732,52 @@ mod tests {
     }
 
     #[test]
+    fn verify_role_audit_chain_rejects_non_monotonic_index_entry() {
+        // An attacker deletes a middle record and leaves the later
+        // indices untouched: positions 0 and 1 now carry indices 0
+        // and 2. The remaining entry is otherwise fully self-consistent
+        // (its previous_hash binds to entry 0 and its entry_hash covers
+        // its own payload) so ONLY the index monotonicity check can
+        // reject the gap.
+        let event0 = RoleTransitionEvent::PresetTransition {
+            from: RolePreset::Admin,
+            to: RolePreset::Exit,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        };
+        let event2 = RoleTransitionEvent::CapabilityMutation {
+            capability: Capability::ServesExit,
+            mutation: CapabilityMutationKind::Remove,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        };
+        let payload0 = event0.canonical_payload(100);
+        let genuine = RoleAuditEntry {
+            index: 0,
+            previous_hash: GENESIS_PREVIOUS_HASH.to_owned(),
+            entry_hash: compute_entry_hash(0, GENESIS_PREVIOUS_HASH, &payload0),
+            event_hex: hex_encode(payload0.as_bytes()),
+        };
+        let payload2 = event2.canonical_payload(300);
+        let gapped = RoleAuditEntry {
+            index: 2,
+            previous_hash: genuine.entry_hash.clone(),
+            entry_hash: compute_entry_hash(2, &genuine.entry_hash, &payload2),
+            event_hex: hex_encode(payload2.as_bytes()),
+        };
+        let err = verify_role_audit_chain(&[genuine, gapped]).unwrap_err();
+        match err {
+            RoleAuditError::ChainBroken(msg) => {
+                assert!(
+                    msg.contains("entry at position 1 has index=2 (expected 1)"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected ChainBroken, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn inserting_an_entry_breaks_chain() {
         let path = tmp_path("insert");
         append_role_audit_entry(
