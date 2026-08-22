@@ -2903,6 +2903,32 @@ mod tests {
     }
 
     #[test]
+    fn two_keypairs_signing_same_message_yield_different_signatures() {
+        // Signatures bind to the signer's key: the SAME message
+        // signed by two different keypairs must produce different
+        // signature bytes.
+        let keypair_a = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/sig-diff-a",
+            [81; 32],
+        );
+        let keypair_b = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/sig-diff-b",
+            [82; 32],
+        );
+        let message = b"same-message-two-signers";
+        let sig_a = keypair_a.sign_attestation(message).expect("sign a");
+        let sig_b = keypair_b.sign_attestation(message).expect("sign b");
+        assert_eq!(sig_a.len(), 64);
+        assert_eq!(sig_b.len(), 64);
+        assert_ne!(
+            sig_a, sig_b,
+            "two different keys must not produce identical signatures"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
