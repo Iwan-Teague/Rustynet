@@ -778,6 +778,59 @@ mod tests {
     }
 
     #[test]
+    fn verify_role_audit_chain_rejects_second_entry_with_corrupted_stored_hash() {
+        // A valid two-entry chain whose second record's stored
+        // entry_hash no longer matches what its canonical payload
+        // hashes to must be rejected at that record.
+        let event0 = RoleTransitionEvent::PresetTransition {
+            from: RolePreset::Admin,
+            to: RolePreset::Exit,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        };
+        let event1 = RoleTransitionEvent::CapabilityMutation {
+            capability: Capability::AnchorGossipSeed,
+            mutation: CapabilityMutationKind::Add,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        };
+        let payload0 = event0.canonical_payload(100);
+        let payload1 = event1.canonical_payload(200);
+        let mut entries = vec![
+            RoleAuditEntry {
+                index: 0,
+                previous_hash: GENESIS_PREVIOUS_HASH.to_owned(),
+                entry_hash: compute_entry_hash(0, GENESIS_PREVIOUS_HASH, &payload0),
+                event_hex: hex_encode(payload0.as_bytes()),
+            },
+            RoleAuditEntry {
+                index: 1,
+                previous_hash: String::new(),
+                entry_hash: String::new(),
+                event_hex: hex_encode(payload1.as_bytes()),
+            },
+        ];
+        entries[1].previous_hash = entries[0].entry_hash.clone();
+        entries[1].entry_hash = compute_entry_hash(1, &entries[0].entry_hash, &payload1);
+        verify_role_audit_chain(&entries).expect("chain valid before corruption");
+        // Corrupt the stored hash of the second entry: flip one hex
+        // digit so it stays a plausible digest but no longer matches.
+        let first_char = entries[1].entry_hash[0..1].to_owned();
+        let replacement = if first_char == "0" { "1" } else { "0" };
+        entries[1].entry_hash.replace_range(0..1, &replacement);
+        let err = verify_role_audit_chain(&entries).unwrap_err();
+        match err {
+            RoleAuditError::ChainBroken(msg) => {
+                assert!(
+                    msg.contains("entry index=1") && msg.contains("entry_hash mismatch"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected ChainBroken, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn inserting_an_entry_breaks_chain() {
         let path = tmp_path("insert");
         append_role_audit_entry(
