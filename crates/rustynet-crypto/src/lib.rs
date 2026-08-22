@@ -2953,6 +2953,42 @@ mod tests {
     }
 
     #[test]
+    fn verify_attestation_rejects_truncated_signatures_without_panicking() {
+        // Any non-64-byte signature — truncated or over-long — must
+        // come back as a typed error, never panic and never verify.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/truncation",
+            [101; 32],
+        );
+        let payload = b"truncation-canary";
+        let signature = keypair.sign_attestation(payload).expect("sign");
+
+        for len in [0usize, 1, 32, 63] {
+            let truncated = &signature[..len];
+            assert_eq!(
+                keypair.verify_attestation(payload, truncated).err(),
+                Some(CryptoError::AttestationVerificationFailed),
+                "truncated-to-{len}-byte signature must be rejected"
+            );
+        }
+        for len in [65usize, 128] {
+            let mut overlong = signature.clone();
+            overlong.resize(len, 0);
+            assert_eq!(
+                keypair.verify_attestation(payload, &overlong).err(),
+                Some(CryptoError::AttestationVerificationFailed),
+                "over-long-{len}-byte signature must be rejected"
+            );
+        }
+
+        // Control: the untouched signature still verifies.
+        keypair
+            .verify_attestation(payload, &signature)
+            .expect("control signature must verify");
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
