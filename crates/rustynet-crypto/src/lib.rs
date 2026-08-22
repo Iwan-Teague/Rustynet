@@ -2797,6 +2797,50 @@ mod tests {
     /// (`[ℓ]B` is the identity), so a non-strict verifier would accept it.
     /// `verify_strict` must reject it, eliminating signature malleability.
     #[test]
+    fn verify_attestation_rejects_tampered_message_and_foreign_key_directly() {
+        // Negative coverage of the RAW trait method (not the
+        // attestation-envelope wrappers): a genuine 64-byte signature
+        // must be rejected when (a) any payload byte changed after
+        // signing, or (b) it was produced by a different seed — even
+        // under an identical key identifier.
+        let provider = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/direct-negative",
+            [13; 32],
+        );
+        let foreign = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/direct-negative",
+            [14; 32],
+        );
+        let payload = b"direct-verify-canary";
+        let signature = provider.sign_attestation(payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        provider
+            .verify_attestation(payload, &signature)
+            .expect("untampered signature from the right key must verify");
+
+        let mut tampered_payload = *payload;
+        tampered_payload[0] ^= 0x01;
+        assert_eq!(
+            provider
+                .verify_attestation(&tampered_payload, &signature)
+                .err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "a signature over different bytes must be rejected"
+        );
+
+        let foreign_signature = foreign.sign_attestation(payload).expect("sign");
+        assert_eq!(
+            provider
+                .verify_attestation(payload, &foreign_signature)
+                .err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "a signature from another key must be rejected"
+        );
+    }
+
+    #[test]
     fn verify_attestation_rejects_non_canonical_malleable_signature() {
         let provider = Ed25519SigningProvider::from_seed(
             SigningProviderKind::Kms,
