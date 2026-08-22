@@ -2759,6 +2759,40 @@ mod tests {
     }
 
     #[test]
+    fn fresh_ed25519_keypairs_are_distinct() {
+        // No key reuse: two independently generated keypairs must
+        // have different public keys and produce different signatures
+        // over the same bytes. (The CSPRNG salt/nonce distinctness pin
+        // covers custody material; this covers the signing identity.)
+        let a = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/distinct-a",
+            [31; 32],
+        );
+        let b = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/distinct-b",
+            [32; 32],
+        );
+
+        let vk_a = a.verifying_key_hex();
+        let vk_b = b.verifying_key_hex();
+        assert!(!vk_a.is_empty());
+        assert_ne!(vk_a, vk_b, "distinct seeds must yield distinct public keys");
+        // Deterministic derivation: the same provider reports the
+        // same public key on every call.
+        assert_eq!(vk_a, a.verifying_key_hex());
+
+        let message = b"key-distinctness-canary";
+        let sig_a = a.sign_attestation(message).expect("sign a");
+        let sig_b = b.sign_attestation(message).expect("sign b");
+        assert_ne!(
+            sig_a, sig_b,
+            "distinct keys must not emit identical signatures over the same message"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
