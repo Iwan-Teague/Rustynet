@@ -2879,6 +2879,30 @@ mod tests {
     }
 
     #[test]
+    fn verify_attestation_rejects_signature_presented_for_different_message() {
+        // A signature over message A binds to A's bytes only: verify()
+        // against a DIFFERENT message B must return Err even though
+        // the signature itself is genuine.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/cross-message",
+            [71; 32],
+        );
+        let message_a = b"message-a-canary";
+        let message_b = b"an entirely different message B";
+        let signature_a = keypair.sign_attestation(message_a).expect("sign a");
+        keypair
+            .verify_attestation(message_a, &signature_a)
+            .expect("control: signature verifies for its own message");
+
+        assert_eq!(
+            keypair.verify_attestation(message_b, &signature_a).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "a signature over A must not verify against B"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
