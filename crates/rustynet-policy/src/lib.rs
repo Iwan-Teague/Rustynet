@@ -1309,6 +1309,39 @@ mod tests {
     }
 
     #[test]
+    fn tcp_only_tag_rule_denies_udp_requests_for_same_tag() {
+        // Protocol-specific enforcement: the rule grants ONLY TCP for
+        // tag:web. A UDP request for the same tag misses the protocol
+        // filter, matches no rule, and must be denied.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:web".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let tcp_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:web".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&tcp_request), Decision::Allow);
+
+        let udp_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:web".to_owned(),
+            protocol: Protocol::Udp,
+        };
+        assert_eq!(
+            set.evaluate(&udp_request),
+            Decision::Deny,
+            "the TCP-only rule must not admit UDP traffic for tag:web"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
