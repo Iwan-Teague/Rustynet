@@ -3349,7 +3349,7 @@ mod tests {
         let replacement = if first_char == "0" { "1" } else { "0" };
         guardian_signature
             .signature_hex
-            .replace_range(0..1, &replacement);
+            .replace_range(0..1, replacement);
         let owner_signature = sign_update_record(&record, "owner-1", &owner_key).expect("sign");
         let signed = SignedMembershipUpdate {
             record,
@@ -3367,7 +3367,7 @@ mod tests {
         // anything. Even a well-formed update carrying a genuine
         // owner signature must be rejected at state validation —
         // before any transition logic can run.
-        let mut state = base_state();
+        let state = base_state();
         let new_node = active_node("node-b", 12);
 
         let mut candidate = state.clone();
