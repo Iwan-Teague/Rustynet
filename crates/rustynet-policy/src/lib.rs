@@ -1150,6 +1150,69 @@ mod tests {
     }
 
     #[test]
+    fn deny_rule_wins_when_it_matches_first() {
+        // First-match semantics are fail-safe only because a DENY
+        // rule that matches the tuple terminates evaluation before
+        // any later ALLOW for the SAME tuple can be reached. Both
+        // engines must honour that ordering.
+        let set = PolicySet {
+            rules: vec![
+                PolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Deny,
+                },
+                PolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Allow,
+                },
+            ],
+        };
+        let request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&request), Decision::Deny);
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-a", MembershipStatus::Active);
+        membership.set_node_status("node-b", MembershipStatus::Active);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Deny
+        );
+
+        let contextual_set = ContextualPolicySet {
+            rules: vec![
+                ContextualPolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Deny,
+                    contexts: vec![TrafficContext::Mesh],
+                },
+                ContextualPolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Allow,
+                    contexts: vec![TrafficContext::Mesh],
+                },
+            ],
+        };
+        let contextual_request = ContextualAccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::Mesh,
+        };
+        assert_eq!(contextual_set.evaluate(&contextual_request), Decision::Deny);
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
