@@ -3362,6 +3362,60 @@ mod tests {
     }
 
     #[test]
+    fn membership_state_with_no_approvers_fails_closed() {
+        // Default-deny: an approver-less state can never authorize
+        // anything. Even a well-formed update carrying a genuine
+        // owner signature must be rejected at state validation —
+        // before any transition logic can run.
+        let mut state = base_state();
+        let new_node = active_node("node-b", 12);
+
+        let mut candidate = state.clone();
+        candidate.nodes.push(new_node.clone());
+        candidate.epoch += 1;
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-no-approvers".to_owned(),
+            operation: MembershipOperation::AddNode(new_node),
+            target: "node-b".to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 120,
+            expires_at_unix: 600,
+            reason_code: "join".to_owned(),
+            policy_context: None,
+        };
+
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let owner_signature = sign_update_record(&record, "owner-1", &owner_key).expect("sign");
+        // Strip the approver roster only after the record is built
+        // against a valid base state: the update is otherwise
+        // well-formed, so ONLY the empty-roster validation can reject.
+        let mut broken_state = state.clone();
+        broken_state.approver_set.clear();
+        let signed = SignedMembershipUpdate {
+            record,
+            approver_signatures: vec![owner_signature],
+        };
+
+        let err = apply_signed_update(
+            &broken_state,
+            &signed,
+            130,
+            &mut MembershipReplayCache::default(),
+        )
+        .expect_err("approver-less state should be rejected");
+        match err {
+            MembershipError::InvalidFormat(msg) => {
+                assert_eq!(msg, "at least one active approver is required");
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn owner_signature_required_for_rotate_approver() {
         let state = base_state();
         let replacement = MembershipApprover {
