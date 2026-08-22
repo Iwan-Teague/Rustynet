@@ -694,6 +694,44 @@ mod tests {
     }
 
     #[test]
+    fn verify_role_audit_chain_rejects_tampered_genesis_binding() {
+        // An attacker rewrites the log's root: entry 0 must bind to
+        // the fixed genesis hash, but the forged entry claims a
+        // different predecessor. The rest of the entry is kept
+        // self-consistent (its entry_hash matches its own payload
+        // under the forged predecessor) so ONLY the genesis link can
+        // trigger the rejection.
+        let attacker_previous = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let event = RoleTransitionEvent::PresetTransition {
+            from: RolePreset::Admin,
+            to: RolePreset::Exit,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        };
+        let payload = event.canonical_payload(100);
+        let forged_genesis = RoleAuditEntry {
+            index: 0,
+            previous_hash: attacker_previous.to_owned(),
+            entry_hash: compute_entry_hash(0, attacker_previous, &payload),
+            event_hex: hex_encode(payload.as_bytes()),
+        };
+        let err = verify_role_audit_chain(&[forged_genesis]).unwrap_err();
+        match err {
+            RoleAuditError::ChainBroken(msg) => {
+                assert!(
+                    msg.contains("previous_hash mismatch"),
+                    "unexpected message: {msg}"
+                );
+                assert!(
+                    msg.contains("expected genesis"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected ChainBroken, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn inserting_an_entry_breaks_chain() {
         let path = tmp_path("insert");
         append_role_audit_entry(
