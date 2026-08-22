@@ -1158,6 +1158,29 @@ mod tests {
     }
 
     #[test]
+    fn becoming_blind_exit_is_irreversible_with_destructive_reason() {
+        // Becoming blind_exit wipes node identity and re-enrolls
+        // fresh: allowed, but classified Irreversible and requiring
+        // an owner signature. The exact destructive reason is pinned
+        // so it cannot silently weaken.
+        let plan = transition_plan(RolePreset::Admin, RolePreset::BlindExit);
+        assert_eq!(plan.from, RolePreset::Admin);
+        assert_eq!(plan.to, RolePreset::BlindExit);
+        match plan.kind {
+            TransitionKind::Irreversible(reason) => assert_eq!(
+                reason,
+                "becoming blind_exit wipes node identity and re-enrolls fresh; this cannot be undone without another factory reset",
+            ),
+            other => panic!("expected Irreversible, got {other:?}"),
+        }
+        assert!(plan.kind.is_allowed());
+        assert!(plan.kind.requires_owner_signature());
+
+        let kind = validate_transition(RolePreset::Admin, RolePreset::BlindExit);
+        assert!(matches!(kind, TransitionKind::Irreversible(_)));
+    }
+
+    #[test]
     fn admin_to_client_is_local_only() {
         let plan = transition_plan(RolePreset::Admin, RolePreset::Client);
         assert_eq!(plan.kind, TransitionKind::LocalOnly);
