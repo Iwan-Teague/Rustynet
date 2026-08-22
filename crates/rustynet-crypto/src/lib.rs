@@ -2855,6 +2855,30 @@ mod tests {
     }
 
     #[test]
+    fn verify_attestation_rejects_signature_with_flipped_last_byte() {
+        // Flipping ANY byte of a valid signature — including the last
+        // byte of S — must break verification.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/flip-last-byte",
+            [61; 32],
+        );
+        let payload = b"flip-last-byte-canary";
+        let mut signature = keypair.sign_attestation(payload).expect("sign");
+        keypair
+            .verify_attestation(payload, &signature)
+            .expect("control signature must verify");
+
+        let last = signature[63];
+        signature[63] = if last == u8::MAX { 0 } else { last + 1 };
+        assert_eq!(
+            keypair.verify_attestation(payload, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "a signature with a flipped final byte must be rejected"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
