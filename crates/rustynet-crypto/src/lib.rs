@@ -2989,6 +2989,42 @@ mod tests {
     }
 
     #[test]
+    fn signature_from_keypair_a_is_rejected_by_keypair_b() {
+        // Wrong-key rejection: a signature made by keypair A must be
+        // REJECTED when verified against keypair B's public key.
+        let a = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/wrong-key-a",
+            [111; 32],
+        );
+        let b = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/wrong-key-b",
+            [112; 32],
+        );
+        assert_ne!(a.verifying_key_hex(), b.verifying_key_hex());
+
+        let message = b"wrong-key-canary";
+        let sig_a = a.sign_attestation(message).expect("sign with A");
+
+        // Control: B's own signature verifies under B.
+        let sig_b = b.sign_attestation(message).expect("sign with B");
+        b.verify_attestation(message, &sig_b)
+            .expect("control: B verifies its own signature");
+
+        assert_eq!(
+            b.verify_attestation(message, &sig_a).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "B must reject the signature produced by A"
+        );
+        assert_eq!(
+            a.verify_attestation(message, &sig_b).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "A must reject the signature produced by B"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
