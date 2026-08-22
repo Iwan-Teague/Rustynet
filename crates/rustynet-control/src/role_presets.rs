@@ -1178,6 +1178,24 @@ mod tests {
     }
 
     #[test]
+    fn admin_to_exit_adding_serves_exit_is_signed_membership() {
+        // Adding the serves_exit capability changes the capability
+        // set, so the transition MUST be classified SignedMembership
+        // and require an owner signature — never a local-only flip.
+        let plan = transition_plan(RolePreset::Admin, RolePreset::Exit);
+        assert_eq!(plan.adds_capabilities, vec![Capability::ServesExit]);
+        assert_eq!(plan.kind, TransitionKind::SignedMembership);
+        assert!(
+            plan.kind.requires_owner_signature(),
+            "adding serves_exit must require an owner signature"
+        );
+
+        let kind = validate_transition(RolePreset::Admin, RolePreset::Exit);
+        assert_eq!(kind, TransitionKind::SignedMembership);
+        assert!(kind.requires_owner_signature());
+    }
+
+    #[test]
     fn client_to_exit_is_signed_membership_with_primary_change() {
         let plan = transition_plan(RolePreset::Client, RolePreset::Exit);
         assert_eq!(plan.kind, TransitionKind::SignedMembership);
