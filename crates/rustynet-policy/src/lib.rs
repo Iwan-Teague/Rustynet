@@ -1375,6 +1375,40 @@ mod tests {
     }
 
     #[test]
+    fn allow_rule_for_source_x_denies_request_from_source_y() {
+        // Default-deny for unmatched sources: the ONLY allow rule is
+        // scoped to node:x. A request from node:y hits no rule and
+        // must be denied even though the destination matches.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:x".to_owned(),
+                dst: "tag:data".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let from_y = AccessRequest {
+            src: "node:y".to_owned(),
+            dst: "tag:data".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate(&from_y),
+            Decision::Deny,
+            "a source with no matching rule must be denied"
+        );
+
+        // Control: the granted source itself is admitted.
+        let from_x = AccessRequest {
+            src: "node:x".to_owned(),
+            dst: "tag:data".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&from_x), Decision::Allow);
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
