@@ -1648,6 +1648,36 @@ mod tests {
     }
 
     #[test]
+    fn tcp_allow_rule_for_tag_a_denies_icmp_request_for_tag_a() {
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:a".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let tcp_request = AccessRequest {
+            src: "node:n".to_owned(),
+            dst: "tag:a".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&tcp_request), Decision::Allow);
+
+        let icmp_request = AccessRequest {
+            src: "node:n".to_owned(),
+            dst: "tag:a".to_owned(),
+            protocol: Protocol::Icmp,
+        };
+        assert_eq!(
+            set.evaluate(&icmp_request),
+            Decision::Deny,
+            "the TCP-only rule must not admit ICMP traffic for tag:a"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
