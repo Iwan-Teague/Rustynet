@@ -1023,6 +1023,21 @@ mod tests {
     }
 
     #[test]
+    fn verify_role_audit_chain_rejects_non_hex_event_payload() {
+        // A payload that is not valid hex cannot hash to any stored
+        // entry_hash: the reader's decode must fail with Malformed
+        // before any chain comparison runs.
+        let forged = RoleAuditEntry {
+            index: 0,
+            previous_hash: GENESIS_PREVIOUS_HASH.to_owned(),
+            entry_hash: "0123456789abcdef".to_owned(),
+            event_hex: "not-hex!".to_owned(),
+        };
+        let err = verify_role_audit_chain(&[forged]).unwrap_err();
+        assert!(matches!(err, RoleAuditError::Malformed(_)));
+    }
+
+    #[test]
     fn malformed_line_returns_typed_error() {
         let path = tmp_path("malformed");
         fs::write(&path, "this is not a valid line\n").unwrap();
