@@ -3456,6 +3456,29 @@ mod tests {
     }
 
     #[test]
+    fn five_byte_message_signs_and_verifies() {
+        // Size matrix: 5-byte message signs and verifies.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/five-byte",
+            [10; 32],
+        );
+        let payload = [10u8, 20, 30, 40, 50];
+        let signature = keypair.sign_attestation(&payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(&payload, &signature)
+            .expect("signature over the 5-byte message must verify");
+
+        let mut other = payload;
+        other[4] ^= 0x80;
+        assert_eq!(
+            keypair.verify_attestation(&other, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
