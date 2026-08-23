@@ -210,6 +210,81 @@ mod tests {
     }
 
     #[test]
+    fn capability_drift_reported_when_snapshot_loads_but_self_lacks_cap() {
+        // Distinct arm: the snapshot LOADS fine, but SELF does not
+        // hold anchor.port_mapping_authoritative while
+        // expect_self_capability=true. The drift must name the
+        // capability expectation specifically.
+        use rustynet_control::membership::{
+            MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+            MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
+            persist_membership_snapshot,
+        };
+        use rustynet_control::roles::RoleCapability;
+
+        let hex64 = |byte: u8| format!("{byte:02x}").repeat(32);
+        let mk_node = |node_id: &str, joined_at: u64| MembershipNode {
+            node_id: node_id.to_owned(),
+            node_pubkey_hex: hex64(0xBB),
+            owner: "owner@example.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: Vec::new(),
+            capabilities: vec![RoleCapability::AnchorGossipSeed],
+            joined_at_unix: joined_at,
+            updated_at_unix: joined_at,
+        };
+
+        let mut state = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-anchor-drift".to_owned(),
+            epoch: 1,
+            nodes: vec![mk_node("genesis", 100), mk_node("junior", 200)],
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: hex64(0xAA),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 50,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        };
+        let _ = &mut state;
+
+        let unique = format!(
+            "anchor-status-drift-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let snapshot = dir.join("membership.snapshot");
+        persist_membership_snapshot(&snapshot, &state).expect("persist");
+
+        // Neither node holds the capability; junior expects it.
+        let options = AnchorPortMappingStatusOptions {
+            snapshot_path: Some(snapshot.clone()),
+            self_node_id: "junior".to_owned(),
+            expect_self_capability: true,
+        };
+        let report = collect_anchor_port_mapping_status_report(&options);
+        assert!(!report.overall_ok);
+        assert!(!report.self_holds_capability);
+        assert_eq!(report.drift_reasons.len(), 1);
+        assert!(
+            report.drift_reasons[0]
+                .contains("expected junior to hold anchor.port_mapping_authoritative"),
+            "unexpected drift reason: {:?}",
+            report.drift_reasons
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn missing_snapshot_file_reports_drift() {
         let options = AnchorPortMappingStatusOptions {
             snapshot_path: Some(PathBuf::from("/nonexistent/membership.snapshot")),
