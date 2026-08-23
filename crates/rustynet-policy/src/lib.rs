@@ -2775,4 +2775,51 @@ mod tests {
         // A wildcard still passes, so the guard has not broken the normal path.
         assert!(selector_membership_allowed("*", &membership));
     }
+
+    #[test]
+    fn selector_matching_is_case_sensitive_in_the_evaluator() {
+        // Fail-closed on case folding: a rule scoped to lowercase
+        // `node:a` must NOT admit a request whose selector differs
+        // only by case (`NODE:A`). Case-folding would widen what a
+        // rule matches; mismatch means no-match means deny.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:a".to_owned(),
+                dst: "tag:data".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node:a", MembershipStatus::Active);
+
+        let control = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:data".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&control), Decision::Allow);
+
+        let upper_src = AccessRequest {
+            src: "NODE:A".to_owned(),
+            dst: "tag:data".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate(&upper_src),
+            Decision::Deny,
+            "case-folded source must not match the lowercase rule"
+        );
+        assert_eq!(
+            set.evaluate_with_membership(&upper_src, &membership),
+            Decision::Deny
+        );
+
+        let mixed_dst = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "TAG:Data".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&mixed_dst), Decision::Deny);
+    }
 }
