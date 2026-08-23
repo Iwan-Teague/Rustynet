@@ -1757,6 +1757,41 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_string_with_port_443_does_not_match_port_8443() {
+        // This engine has NO port dimension: selectors are opaque
+        // strings matched by full equality. Pinned here via
+        // port-bearing endpoint strings: a rule naming ":443"
+        // admits exactly that string and must not match an ":8443"
+        // variant — no prefix/range/substring widening exists.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "svc:web.example:443".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let p443 = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "svc:web.example:443".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&p443), Decision::Allow);
+
+        let p8443 = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "svc:web.example:8443".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate(&p8443),
+            Decision::Deny,
+            "the ':443' rule must not admit the ':8443' endpoint"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
