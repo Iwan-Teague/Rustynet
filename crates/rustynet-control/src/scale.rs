@@ -493,6 +493,30 @@ mod tests {
     }
 
     #[test]
+    fn unknown_principal_is_denied_not_silently_defaulted() {
+        // Fail-closed on identity: a principal that was never
+        // registered has NO tenant and NO role. Every action against
+        // every tenant must be refused with UnknownPrincipal — the
+        // guard must never invent a default (least-privilege or
+        // otherwise) for an identity it has never seen.
+        let mut guard = TenantBoundaryGuard::default();
+        guard.register_principal("alice", "tenant-a", TenantRole::DelegatedAdmin);
+
+        let actions = [
+            TenantAction::ViewResources,
+            TenantAction::MutatePolicy,
+            TenantAction::ManageUsers,
+        ];
+        for action in actions {
+            assert_eq!(
+                guard.authorize("mallory", "tenant-a", action).err(),
+                Some(TenantError::UnknownPrincipal),
+                "unregistered principal {action:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
     fn enterprise_auth_validates_issuer_audience_and_mfa() {
         let config = EnterpriseAuthConfig {
             issuer: "https://id.example.local".to_owned(),
