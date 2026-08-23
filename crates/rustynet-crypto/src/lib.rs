@@ -3548,6 +3548,29 @@ mod tests {
     }
 
     #[test]
+    fn sixteen_byte_message_signs_and_verifies() {
+        // Size matrix: 16-byte (AES-block-sized) message signs and verifies.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/sixteen-byte",
+            [14; 32],
+        );
+        let payload: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(17)).collect();
+        let signature = keypair.sign_attestation(&payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(&payload, &signature)
+            .expect("signature over the 16-byte message must verify");
+
+        let mut other = payload;
+        other[15] ^= 0x01;
+        assert_eq!(
+            keypair.verify_attestation(&other, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
