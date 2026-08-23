@@ -737,6 +737,30 @@ mod tests {
     }
 
     #[test]
+    fn per_epoch_watermark_rejects_unfrozen_past_epoch() {
+        // Adversarial edge: advance_to records NO rotation points —
+        // only freeze_outgoing does. A bundle tagged with a past
+        // epoch that was never frozen therefore has NO bound on its
+        // watermark and must fail closed as UnknownEpoch rather than
+        // silently passing unbounded replay.
+        let mut store = PerEpochReplayWatermark::new(RotationEpoch(1));
+        store.advance_to(RotationEpoch(2)).expect("advance");
+        store.advance_to(RotationEpoch(3)).expect("advance again");
+
+        assert!(store.rotation_point_for(RotationEpoch(2)).is_none());
+        let err = store
+            .validate_bundle(RotationEpoch(2), 1)
+            .expect_err("an unfrozen past epoch must fail closed");
+        assert!(
+            matches!(
+                err,
+                RotationError::UnknownEpoch { epoch } if epoch.value() == 2
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
     fn per_epoch_watermark_advance_to_is_monotonic() {
         let mut store = PerEpochReplayWatermark::new(RotationEpoch(3));
         let err = store
