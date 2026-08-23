@@ -269,7 +269,16 @@ pub fn authorize_trusted_key(
     }
     let trust_state =
         load_trust_state(trust_state_path).map_err(TrustHardeningError::TrustState)?;
-    if trust_state.signing_fingerprint != presented_fingerprint {
+    // Constant-time compare (RSA-0016 standard, same as break-glass
+    // below): the fingerprint is the authorization-decision input, so
+    // a plain `!=` short-circuit would let a caller probe it
+    // byte-by-byte through timing.
+    let matches: bool = trust_state
+        .signing_fingerprint
+        .as_bytes()
+        .ct_eq(presented_fingerprint.as_bytes())
+        .into();
+    if !matches {
         return Err(TrustHardeningError::UnauthorizedKey);
     }
     Ok(())
