@@ -1711,6 +1711,52 @@ mod tests {
     }
 
     #[test]
+    fn cidr_rule_matches_only_its_literal_string_not_contained_addresses() {
+        // Pinned real semantics: PolicySet selectors are exact-string
+        // matches. A CIDR-form destination ("10.0.0.0/8") is an
+        // opaque literal here — it does NOT do address containment,
+        // so "10.1.2.3" matches nothing and denies. (CIDR recognition
+        // lives in the membership GATE, where a Cidr selector means
+        // "explicitly enumerated, no membership lookup" — see
+        // SelectorKind::Cidr.) The rule admits only requests whose
+        // dst is the literal CIDR string itself.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "10.0.0.0/8".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let contained_address = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "10.1.2.3".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate(&contained_address),
+            Decision::Deny,
+            "the engine has no CIDR containment: '10.1.2.3' must not match '10.0.0.0/8'"
+        );
+
+        let outside_address = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "192.168.0.1".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&outside_address), Decision::Deny);
+
+        // Control: the literal CIDR string itself matches.
+        let literal = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "10.0.0.0/8".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&literal), Decision::Allow);
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
