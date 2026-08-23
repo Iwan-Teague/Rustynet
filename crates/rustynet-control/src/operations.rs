@@ -113,10 +113,14 @@ impl StructuredLogger {
                 encoded.push(',');
             }
             first = false;
+            // Fail closed on structural characters: an unescaped quote
+            // or newline would let a field value break out of (or add
+            // lines to) the JSON frame — same injection class as the
+            // audit-log delimiter fix.
             encoded.push('"');
-            encoded.push_str(key);
+            encoded.push_str(&json_escape(key));
             encoded.push_str("\":\"");
-            encoded.push_str(value);
+            encoded.push_str(&json_escape(value));
             encoded.push('"');
         }
         encoded.push('}');
@@ -130,6 +134,24 @@ impl StructuredLogger {
         let guard = self.lines.lock().map_err(|_| OperationsError::Internal)?;
         Ok(guard.clone())
     }
+}
+
+/// Minimal JSON string escaping for the structured log frame: quotes,
+/// backslashes, and control characters cannot break out of the value.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +372,35 @@ mod tests {
         DiagnosticsSummary, HealthSnapshot, IngestionPath, OperationsError, StructuredLogger,
         TamperEvidentAuditLog, redact_fields,
     };
+
+    #[test]
+    fn structured_logger_escapes_quotes_and_newlines_in_fields() {
+        // Adversarial finding: values were interpolated into the JSON
+        // frame unescaped, so a quote/newline in ANY field value could
+        // break out of the frame or inject a second line.
+        let logger = StructuredLogger::default();
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "hostname".to_string(),
+            "host\"},{\"injected\":\"1".to_string(),
+        );
+        fields.insert("note".to_string(), "line1\nline2".to_string());
+
+        logger.log(IngestionPath::LogField, &fields).expect("log");
+        let lines = logger.lines().expect("lines readable");
+
+        assert_eq!(lines.len(), 1, "one log call must emit exactly one line");
+        let line = &lines[0];
+        assert!(!line.contains("\n"), "emitted frame must be a single line");
+        assert!(
+            line.contains("host\\\"},\\\\\\\"") || line.contains("\\\"injected\\\""),
+            "quotes must be escaped: {line}"
+        );
+        assert!(
+            line.contains("line1\\nline2"),
+            "newlines inside values must be escaped: {line}"
+        );
+    }
 
     #[test]
     fn redaction_covers_kebab_case_secret_key_variants() {
