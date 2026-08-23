@@ -3151,6 +3151,30 @@ mod tests {
     }
 
     #[test]
+    fn one_byte_message_sign_and_verify_round_trips() {
+        // Minimal non-empty input: a single-byte message signs and
+        // verifies like any other — no special-casing on length 1.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/one-byte",
+            [171; 32],
+        );
+        let payload = [0x42u8];
+        let signature = keypair.sign_attestation(&payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(&payload, &signature)
+            .expect("signature over the one-byte message must verify");
+
+        // Control: a different single byte is not covered.
+        let other = [0x43u8];
+        assert_eq!(
+            keypair.verify_attestation(&other, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
