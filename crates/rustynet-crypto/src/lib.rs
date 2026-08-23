@@ -3120,6 +3120,37 @@ mod tests {
     }
 
     #[test]
+    fn large_message_sign_and_verify_round_trips() {
+        // Large-input edge case: a ~100KB message must sign and
+        // verify exactly like small ones — ed25519 hashes internally,
+        // so payload size never bypasses verification.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/large-message",
+            [161; 32],
+        );
+        let mut payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(payload.len(), 100_000);
+
+        let signature = keypair.sign_attestation(&payload).expect("large sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(&payload, &signature)
+            .expect("signature over the large message must verify");
+
+        // Control: flipping ONE byte anywhere in the 100KB blob —
+        // including near the far end, past any plausible block
+        // boundary — must be rejected.
+        let last = payload.len() - 1;
+        payload[last] ^= 0x01;
+        assert_eq!(
+            keypair.verify_attestation(&payload, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "a single flipped byte in the large message must invalidate the signature"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
