@@ -138,9 +138,17 @@ impl TenantBoundaryGuard {
         principal: impl Into<String>,
         tenant: impl Into<String>,
         role: TenantRole,
-    ) {
-        self.principals
-            .insert(principal.into(), (tenant.into(), role));
+    ) -> Result<(), TenantError> {
+        // Fail closed on absent trust state (POL-03): an empty
+        // principal or tenant id is not an identity and must never
+        // enter the registry.
+        let principal_id: String = principal.into();
+        let tenant_id: String = tenant.into();
+        if principal_id.trim().is_empty() || tenant_id.trim().is_empty() {
+            return Err(TenantError::UnknownPrincipal);
+        }
+        self.principals.insert(principal_id, (tenant_id, role));
+        Ok(())
     }
 
     pub fn authorize(
@@ -434,9 +442,15 @@ mod tests {
     #[test]
     fn tenant_guard_enforces_isolation_and_delegated_admin_limits() {
         let mut guard = TenantBoundaryGuard::default();
-        guard.register_principal("alice", "tenant-a", TenantRole::DelegatedAdmin);
-        guard.register_principal("bob", "tenant-b", TenantRole::Viewer);
-        guard.register_principal("root", "global", TenantRole::GlobalAdmin);
+        guard
+            .register_principal("alice", "tenant-a", TenantRole::DelegatedAdmin)
+            .expect("valid principal registration");
+        guard
+            .register_principal("bob", "tenant-b", TenantRole::Viewer)
+            .expect("valid principal registration");
+        guard
+            .register_principal("root", "global", TenantRole::GlobalAdmin)
+            .expect("valid principal registration");
 
         assert!(
             guard
@@ -460,6 +474,30 @@ mod tests {
                 .authorize("root", "tenant-b", TenantAction::ManageUsers)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn register_principal_rejects_blank_principal_or_tenant() {
+        // Fail closed at registration: an empty principal or tenant
+        // id is absent trust state (POL-03) and must never enter the
+        // registry — a ghost identity that later authorizes actions.
+        let mut guard = TenantBoundaryGuard::default();
+        assert_eq!(
+            guard
+                .register_principal("", "tenant-a", TenantRole::DelegatedAdmin)
+                .err(),
+            Some(TenantError::UnknownPrincipal)
+        );
+        assert_eq!(
+            guard
+                .register_principal("alice", "", TenantRole::DelegatedAdmin)
+                .err(),
+            Some(TenantError::UnknownPrincipal)
+        );
+        // Control: valid ids still register.
+        guard
+            .register_principal("alice", "tenant-a", TenantRole::DelegatedAdmin)
+            .expect("valid registration");
     }
 
     #[test]
@@ -500,7 +538,9 @@ mod tests {
         // guard must never invent a default (least-privilege or
         // otherwise) for an identity it has never seen.
         let mut guard = TenantBoundaryGuard::default();
-        guard.register_principal("alice", "tenant-a", TenantRole::DelegatedAdmin);
+        guard
+            .register_principal("alice", "tenant-a", TenantRole::DelegatedAdmin)
+            .expect("valid principal registration");
 
         let actions = [
             TenantAction::ViewResources,
