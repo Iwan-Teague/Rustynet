@@ -126,11 +126,7 @@ mod tests {
         };
         use rustynet_control::roles::RoleCapability;
 
-        let hex64 = |byte: u8| {
-            std::iter::repeat(format!("{byte:02x}"))
-                .take(32)
-                .collect::<String>()
-        };
+        let hex64 = |byte: u8| format!("{byte:02x}").repeat(32);
         let anchor_caps = || {
             vec![
                 RoleCapability::AnchorGossipSeed,
@@ -154,7 +150,7 @@ mod tests {
             updated_at_unix: joined_at,
         };
 
-        let mut state = MembershipState {
+        let state = MembershipState {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
             network_id: "net-anchor-status".to_owned(),
             epoch: 1,
