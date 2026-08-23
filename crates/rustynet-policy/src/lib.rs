@@ -1825,6 +1825,58 @@ mod tests {
     }
 
     #[test]
+    fn cidr_dst_needs_no_dst_membership_but_src_still_gated() {
+        // Adversarial edge of the CIDR pin, corrected after probing:
+        // SelectorKind::Cidr exempts ONLY THE DESTINATION side from
+        // membership lookup ("explicitly enumerated network, no
+        // identity"). The SOURCE is still gated normally:
+        //   - empty directory  -> src unresolvable -> DENY (fail closed)
+        //   - src node Active  -> admitted despite no dst membership
+        //   - src node Revoked -> DENIED
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "10.0.0.0/8".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "10.0.0.0/8".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+
+        let empty_directory = MembershipDirectory::default();
+        assert_eq!(
+            set.evaluate_with_membership(&request, &empty_directory),
+            Decision::Deny,
+            "an unresolvable source must deny even toward a CIDR destination"
+        );
+
+        let mut active = MembershipDirectory::default();
+        // DOCUMENTED CONVENTION (probed empirically): a `node:X`
+        // selector is resolved against the DIRECTORY KEY X — the
+        // `node:` prefix is stripped by selector_node_id before
+        // lookup. Callers must therefore register membership under
+        // the bare node id.
+        active.set_node_status("a", MembershipStatus::Active);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &active),
+            Decision::Allow,
+            "an active source is admitted; the CIDR dst needs no dst membership"
+        );
+
+        let mut revoked = MembershipDirectory::default();
+        revoked.set_node_status("a", MembershipStatus::Revoked);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &revoked),
+            Decision::Deny,
+            "a revoked source must be denied even toward a CIDR destination"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
