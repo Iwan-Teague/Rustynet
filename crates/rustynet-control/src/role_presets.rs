@@ -1181,6 +1181,19 @@ mod tests {
     }
 
     #[test]
+    fn leaving_blind_exit_for_llm_is_blocked() {
+        // Immutable lock-out: a transition FROM blind_exit toward any
+        // role is Blocked — the node's identity cannot be changed,
+        // only wiped by factory reset.
+        let kind = validate_transition(RolePreset::BlindExit, RolePreset::Llm);
+        assert!(
+            matches!(kind, TransitionKind::Blocked(_)),
+            "blind_exit → llm must be Blocked, got {kind:?}"
+        );
+        assert!(!kind.is_allowed());
+    }
+
+    #[test]
     fn admin_to_client_is_local_only() {
         let plan = transition_plan(RolePreset::Admin, RolePreset::Client);
         assert_eq!(plan.kind, TransitionKind::LocalOnly);
