@@ -1422,6 +1422,39 @@ mod tests {
     }
 
     #[test]
+    fn icmp_only_tag_rule_denies_udp_requests_for_same_tag() {
+        // Protocol isolation (ICMP variant): the rule grants ONLY
+        // ICMP for tag:a. A UDP request for the same tag misses the
+        // protocol filter, matches nothing, and must be denied.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:a".to_owned(),
+                protocol: Protocol::Icmp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let icmp_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:a".to_owned(),
+            protocol: Protocol::Icmp,
+        };
+        assert_eq!(set.evaluate(&icmp_request), Decision::Allow);
+
+        let udp_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:a".to_owned(),
+            protocol: Protocol::Udp,
+        };
+        assert_eq!(
+            set.evaluate(&udp_request),
+            Decision::Deny,
+            "the ICMP-only rule must not admit UDP traffic for tag:a"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
