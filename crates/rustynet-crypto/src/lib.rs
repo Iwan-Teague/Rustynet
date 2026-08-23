@@ -3025,6 +3025,28 @@ mod tests {
     }
 
     #[test]
+    fn ed25519_verifying_key_is_exactly_32_bytes() {
+        // An ed25519 public key is exactly 32 bytes; the hex form is
+        // 64 characters and decodes to 32 bytes. A shorter or longer
+        // key would break every downstream fixed-size key check.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/vk-length",
+            [121; 32],
+        );
+        let vk_hex = keypair.verifying_key_hex();
+        assert_eq!(
+            vk_hex.len(),
+            64,
+            "hex encoding of a 32-byte key is 64 chars"
+        );
+        let decoded = super::hex_decode(&vk_hex).expect("hex must decode");
+        assert_eq!(decoded.len(), 32, "ed25519 public keys are 32 bytes");
+        // Deterministic: same provider, same key material.
+        assert_eq!(vk_hex, keypair.verifying_key_hex());
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
