@@ -1342,6 +1342,25 @@ mod tests {
     }
 
     #[test]
+    fn removing_serves_relay_requires_owner_signed_membership() {
+        // Removing serves_relay changes the capability set: the
+        // transition must be SignedMembership AND require an owner
+        // signature — relay service cannot be torn down by local
+        // config alone.
+        let plan = transition_plan(RolePreset::Relay, RolePreset::Admin);
+        assert_eq!(plan.removes_capabilities, vec![Capability::ServesRelay]);
+        assert!(plan.adds_capabilities.is_empty());
+        assert_eq!(plan.kind, TransitionKind::SignedMembership);
+        assert!(
+            plan.kind.requires_owner_signature(),
+            "removing serves_relay must require an owner signature"
+        );
+        let kind = validate_transition(RolePreset::Relay, RolePreset::Admin);
+        assert_eq!(kind, TransitionKind::SignedMembership);
+        assert!(kind.requires_owner_signature());
+    }
+
+    #[test]
     fn admin_to_relay_requires_deploy() {
         let plan = transition_plan(RolePreset::Admin, RolePreset::Relay);
         assert_eq!(plan.kind, TransitionKind::SignedMembership);
