@@ -3385,6 +3385,29 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_signature_buffer_returns_err_not_panic() {
+        // A zero-length signature buffer must come back as a typed
+        // error — never a panic, never an acceptance.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/zero-len-sig",
+            [241; 32],
+        );
+        let payload = b"zero-length-sig-canary";
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            keypair.verify_attestation(payload, &[])
+        }));
+        assert!(
+            result.is_ok(),
+            "verify() must not panic on a zero-length signature buffer"
+        );
+        assert_eq!(
+            result.expect("no panic").err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
