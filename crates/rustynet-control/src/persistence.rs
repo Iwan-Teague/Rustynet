@@ -378,6 +378,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rsa0017_open_rejects_group_readable_wal_sidecar() {
+        // The DB itself is locked to 0o600, but WAL mode writes
+        // `-wal`/`-shm` sidecars that carry the same credential and
+        // single-use state. A group/other-readable SIDECAR must fail
+        // closed exactly like the main DB file.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rn-rsa0017-wal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db = dir.join("control.db");
+        std::fs::write(&db, b"").expect("seed db file");
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        let wal = dir.join("control.db-wal");
+        std::fs::write(&wal, b"").expect("seed wal");
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+
+        let err = SqliteStore::open(&db).expect_err("group-readable WAL must fail closed");
+        assert!(
+            format!("{err}").contains("group/other-accessible"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rsa0017_open_creates_and_tightens_db_to_0600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("rn-rsa0017b-{}", std::process::id()));
