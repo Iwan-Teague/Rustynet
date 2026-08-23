@@ -1325,6 +1325,23 @@ mod tests {
     }
 
     #[test]
+    fn adding_serves_llm_requires_owner_signed_membership() {
+        // Adding serves_llm changes the capability set: the transition
+        // must be SignedMembership AND require an owner signature —
+        // LLM gateway service cannot be enabled by local config.
+        let plan = transition_plan(RolePreset::Admin, RolePreset::Llm);
+        assert_eq!(plan.adds_capabilities, vec![Capability::ServesLlm]);
+        assert_eq!(plan.kind, TransitionKind::SignedMembership);
+        assert!(
+            plan.kind.requires_owner_signature(),
+            "adding serves_llm must require an owner signature"
+        );
+        let kind = validate_transition(RolePreset::Admin, RolePreset::Llm);
+        assert_eq!(kind, TransitionKind::SignedMembership);
+        assert!(kind.requires_owner_signature());
+    }
+
+    #[test]
     fn admin_to_relay_requires_deploy() {
         let plan = transition_plan(RolePreset::Admin, RolePreset::Relay);
         assert_eq!(plan.kind, TransitionKind::SignedMembership);
