@@ -3822,6 +3822,32 @@ mod tests {
     }
 
     #[test]
+    fn signature_binds_to_seed_and_payload_not_key_identifier() {
+        // Two providers sharing a SEED but carrying DIFFERENT
+        // key_identifier strings must be cryptographically identical:
+        // same signature bytes and mutual verification. Pins that the
+        // label never leaks into the signed payload.
+        let make =
+            |id: &str| Ed25519SigningProvider::from_seed(SigningProviderKind::Kms, id, [241; 32]);
+        let labelled = make("kms://rustynet/prod-label");
+        let unlabelled = make("kms://rustynet/dev-label");
+
+        assert_ne!(labelled.key_identifier(), unlabelled.key_identifier());
+
+        let message = b"label-independence-canary";
+        let sig_labelled = labelled.sign_attestation(message).expect("sign");
+        let sig_unlabelled = unlabelled.sign_attestation(message).expect("sign");
+        assert_eq!(
+            sig_labelled, sig_unlabelled,
+            "the identifier must not perturb signature bytes"
+        );
+
+        labelled
+            .verify_attestation(message, &sig_unlabelled)
+            .expect("cross-label verification must succeed for the same seed");
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
