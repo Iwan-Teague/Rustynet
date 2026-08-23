@@ -1618,6 +1618,36 @@ mod tests {
     }
 
     #[test]
+    fn tcp_scoped_rule_does_not_match_udp_request_same_tag_and_dst() {
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:a".to_owned(),
+                dst: "tag:api".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let tcp_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:api".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&tcp_request), Decision::Allow);
+
+        let udp_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:api".to_owned(),
+            protocol: Protocol::Udp,
+        };
+        assert_eq!(
+            set.evaluate(&udp_request),
+            Decision::Deny,
+            "the TCP-scoped rule must not match a UDP request for the same tag+dst"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
