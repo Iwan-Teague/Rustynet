@@ -1308,6 +1308,23 @@ mod tests {
     }
 
     #[test]
+    fn adding_serves_nas_requires_owner_signed_membership() {
+        // Adding serves_nas changes the capability set: the transition
+        // must be SignedMembership AND require an owner signature —
+        // storage service cannot be enabled by local config.
+        let plan = transition_plan(RolePreset::Admin, RolePreset::Nas);
+        assert_eq!(plan.adds_capabilities, vec![Capability::ServesNas]);
+        assert_eq!(plan.kind, TransitionKind::SignedMembership);
+        assert!(
+            plan.kind.requires_owner_signature(),
+            "adding serves_nas must require an owner signature"
+        );
+        let kind = validate_transition(RolePreset::Admin, RolePreset::Nas);
+        assert_eq!(kind, TransitionKind::SignedMembership);
+        assert!(kind.requires_owner_signature());
+    }
+
+    #[test]
     fn admin_to_relay_requires_deploy() {
         let plan = transition_plan(RolePreset::Admin, RolePreset::Relay);
         assert_eq!(plan.kind, TransitionKind::SignedMembership);
