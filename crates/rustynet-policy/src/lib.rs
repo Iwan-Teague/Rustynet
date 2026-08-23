@@ -1928,6 +1928,45 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_tag_from_the_acl_revokes_previously_allowed_requests() {
+        // Revocation takes effect with no stale allow: while
+        // tag:ephemeral has an active member, the request admits.
+        // Once the ACL entry is REMOVED (empty member list), the
+        // same request must deny — removal cannot leave a stale
+        // authorization behind.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:ephemeral".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+        let request = AccessRequest {
+            src: "node:client".to_owned(),
+            dst: "tag:ephemeral".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("client", MembershipStatus::Active);
+        membership.set_node_status("node-x", MembershipStatus::Active);
+        membership.set_selector_members("tag:ephemeral", vec!["node-x".to_owned()]);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Allow
+        );
+
+        // Remove the ACL entry: overwrite with an empty member list.
+        membership.set_selector_members("tag:ephemeral", Vec::<String>::new());
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Deny,
+            "a removed ACL entry must revoke previously allowed access"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
