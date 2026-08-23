@@ -3479,6 +3479,29 @@ mod tests {
     }
 
     #[test]
+    fn six_byte_message_signs_and_verifies() {
+        // Size matrix: 6-byte message signs and verifies.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/six-byte",
+            [11; 32],
+        );
+        let payload = [11u8, 22, 33, 44, 55, 66];
+        let signature = keypair.sign_attestation(&payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(&payload, &signature)
+            .expect("signature over the 6-byte message must verify");
+
+        let mut other = payload;
+        other[0] ^= 0x80;
+        assert_eq!(
+            keypair.verify_attestation(&other, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
