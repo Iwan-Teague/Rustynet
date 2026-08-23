@@ -1792,6 +1792,39 @@ mod tests {
     }
 
     #[test]
+    fn source_tag_scoped_rule_denies_request_from_other_source_tag() {
+        // Source isolation with TAG-form selectors: a rule scoped to
+        // src "tag:team-a" admits only requests FROM that source;
+        // "tag:team-b" matches no rule and denies.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "tag:team-a".to_owned(),
+                dst: "tag:data".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let from_a = AccessRequest {
+            src: "tag:team-a".to_owned(),
+            dst: "tag:data".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&from_a), Decision::Allow);
+
+        let from_b = AccessRequest {
+            src: "tag:team-b".to_owned(),
+            dst: "tag:data".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate(&from_b),
+            Decision::Deny,
+            "a different source tag must not match the team-a rule"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
