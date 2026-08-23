@@ -130,6 +130,17 @@ mod tests {
     }
 
     #[test]
+    fn containment_mask_boundaries_are_exact() {
+        // Same-prefix-length ranges whose NETWORK half differs must be
+        // distinguished exactly: the upper half of 100/8 is NOT inside
+        // the 100.64/10 CGNAT block, while fd00::/8 IS inside fc00::/7.
+        validate_mesh_egress_source_cidr("100.64.0.0/10")
+            .unwrap_or_else(|err| panic!("lower CGNAT half must pass: {err}"));
+        assert!(validate_mesh_egress_source_cidr("100.128.0.0/10").is_err());
+        validate_mesh_egress_source_cidr("fd00::/8").expect("fd00::/8 sits inside fc00::/7");
+    }
+
+    #[test]
     fn rejects_default_route_and_global_supernets() {
         for cidr in [
             "0.0.0.0/0",    // the killswitch-bypass exploit
