@@ -428,6 +428,32 @@ mod tests {
     }
 
     #[test]
+    fn error_budget_gate_denies_exhausted_budget_even_with_green_slo() {
+        // Both arms must hold: a GREEN availability SLO does not
+        // rescue an EXHAUSTED error budget — fast-but-flaky builds
+        // must still be denied.
+        let green_slo_exhausted_budget = ErrorBudgetGate {
+            availability_slo_percent: 99.9,
+            measured_availability_percent: 99.95,
+            max_error_budget_consumed_percent: 80.0,
+            measured_error_budget_consumed_percent: 85.0,
+        };
+        assert!(
+            !green_slo_exhausted_budget.passes(),
+            "exhausted error budget must deny despite green SLO"
+        );
+
+        // Boundary: consuming EXACTLY the max budget is still a pass.
+        let at_max = ErrorBudgetGate {
+            availability_slo_percent: 99.9,
+            measured_availability_percent: 99.95,
+            max_error_budget_consumed_percent: 80.0,
+            measured_error_budget_consumed_percent: 80.0,
+        };
+        assert!(at_max.passes(), "consuming exactly the budget must pass");
+    }
+
+    #[test]
     fn insecure_compatibility_exception_requires_explicit_active_risk_acceptance() {
         let exception = InsecureCompatibilityException {
             mode: "legacy-handshake".to_owned(),
