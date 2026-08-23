@@ -3097,6 +3097,29 @@ mod tests {
     }
 
     #[test]
+    fn same_key_signing_different_messages_yields_different_signatures() {
+        // Signatures bind to the message: the SAME key over two
+        // DIFFERENT messages must produce different signature bytes.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/msg-diff",
+            [151; 32],
+        );
+        let sig_a = keypair
+            .sign_attestation(b"first-message-canary")
+            .expect("sign a");
+        let sig_b = keypair
+            .sign_attestation(b"second-message-canary")
+            .expect("sign b");
+        assert_eq!(sig_a.len(), 64);
+        assert_eq!(sig_b.len(), 64);
+        assert_ne!(
+            sig_a, sig_b,
+            "the same key must not emit identical signatures over different messages"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
