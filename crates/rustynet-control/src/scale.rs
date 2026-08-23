@@ -190,6 +190,7 @@ pub struct EnterpriseAuthConfig {
 pub enum EnterpriseAuthError {
     InvalidIssuer,
     InvalidAudience,
+    InvalidSubject,
     MfaRequired,
 }
 
@@ -198,6 +199,7 @@ impl fmt::Display for EnterpriseAuthError {
         match self {
             EnterpriseAuthError::InvalidIssuer => f.write_str("invalid issuer"),
             EnterpriseAuthError::InvalidAudience => f.write_str("invalid audience"),
+            EnterpriseAuthError::InvalidSubject => f.write_str("invalid subject"),
             EnterpriseAuthError::MfaRequired => f.write_str("mfa required"),
         }
     }
@@ -207,6 +209,12 @@ impl std::error::Error for EnterpriseAuthError {}
 
 impl EnterpriseAuthConfig {
     pub fn validate_claims(&self, claims: &OidcClaims) -> Result<(), EnterpriseAuthError> {
+        // OIDC core: `sub` MUST be a non-empty value identifying the
+        // principal. An empty (or whitespace) subject is an invalid
+        // token — never an anonymous-but-valid identity.
+        if claims.subject.trim().is_empty() {
+            return Err(EnterpriseAuthError::InvalidSubject);
+        }
         if claims.issuer != self.issuer {
             return Err(EnterpriseAuthError::InvalidIssuer);
         }
@@ -382,6 +390,36 @@ mod tests {
                 .authorize("root", "tenant-b", TenantAction::ManageUsers)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn enterprise_auth_rejects_empty_subject_claims() {
+        // OIDC core: `sub` MUST identify the principal and be
+        // non-empty. An empty or whitespace-only subject must fail
+        // closed as InvalidSubject, never authorize.
+        let config = EnterpriseAuthConfig {
+            issuer: "https://idp.example".to_owned(),
+            allowed_audiences: BTreeSet::from(["rustynet".to_owned()]),
+            require_mfa: false,
+        };
+        let mk = |subject: &str| OidcClaims {
+            issuer: "https://idp.example".to_owned(),
+            audience: "rustynet".to_owned(),
+            subject: subject.to_owned(),
+            mfa_present: false,
+        };
+
+        assert_eq!(
+            config.validate_claims(&mk("")).err(),
+            Some(EnterpriseAuthError::InvalidSubject)
+        );
+        assert_eq!(
+            config.validate_claims(&mk("   ")).err(),
+            Some(EnterpriseAuthError::InvalidSubject)
+        );
+
+        // Control: a real subject with the same config authorizes.
+        assert!(config.validate_claims(&mk("alice@example.local")).is_ok());
     }
 
     #[test]
