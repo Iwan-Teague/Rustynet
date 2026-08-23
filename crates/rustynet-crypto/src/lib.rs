@@ -3262,6 +3262,31 @@ mod tests {
     }
 
     #[test]
+    fn flipping_one_bit_in_the_message_breaks_verification() {
+        // Avalanche: flipping ONE BIT anywhere in the message must
+        // invalidate the signature. Here the flipped bit sits mid-
+        // message with a non-trivial mask.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/message-bit-flip",
+            [221; 32],
+        );
+        let mut payload = *b"bit-flip-message-canary";
+        let signature = keypair.sign_attestation(&payload).expect("sign");
+        keypair
+            .verify_attestation(&payload, &signature)
+            .expect("control signature must verify");
+
+        let middle = payload.len() / 2;
+        payload[middle] ^= 0x02; // flip a single bit
+        assert_eq!(
+            keypair.verify_attestation(&payload, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "one flipped message bit must break verification"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
