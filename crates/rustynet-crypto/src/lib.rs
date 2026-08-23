@@ -3175,6 +3175,31 @@ mod tests {
     }
 
     #[test]
+    fn independent_keypairs_have_different_secret_keys() {
+        // No secret reuse: two independently generated keypairs must
+        // hold different signing-key material, not merely present
+        // different public halves. White-box by necessity — the
+        // signing_key field is deliberately inaccessible outside.
+        let a = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/sk-distinct-a",
+            [191; 32],
+        );
+        let b = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/sk-distinct-b",
+            [192; 32],
+        );
+        let sk_a = a.signing_key.to_bytes();
+        let sk_b = b.signing_key.to_bytes();
+        assert_eq!(sk_a.len(), 32);
+        assert_ne!(
+            sk_a, sk_b,
+            "distinct seeds must derive distinct secret keys"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
