@@ -3287,6 +3287,33 @@ mod tests {
     }
 
     #[test]
+    fn all_zero_message_sign_and_verify_round_trips() {
+        // A message of all-zero BYTES is a legitimate payload (it is
+        // not the signature): sign and verify must round-trip. The
+        // zero-sig test covers degenerate SIGNATURE bytes; this pins
+        // the message side.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/zero-message",
+            [231; 32],
+        );
+        let payload = [0u8; 32];
+        let signature = keypair.sign_attestation(&payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(&payload, &signature)
+            .expect("signature over the all-zero message must verify");
+
+        // Control: any nonzero message is not covered.
+        let mut other = payload;
+        other[31] = 1;
+        assert_eq!(
+            keypair.verify_attestation(&other, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
