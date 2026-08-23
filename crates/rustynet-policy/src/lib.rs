@@ -1678,6 +1678,39 @@ mod tests {
     }
 
     #[test]
+    fn two_allow_rules_admit_a_and_b_and_deny_c() {
+        let set = PolicySet {
+            rules: vec![
+                PolicyRule {
+                    src: "*".to_owned(),
+                    dst: "tag:a".to_owned(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Allow,
+                },
+                PolicyRule {
+                    src: "*".to_owned(),
+                    dst: "tag:b".to_owned(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Allow,
+                },
+            ],
+        };
+
+        let mk = |dst: &str| AccessRequest {
+            src: "node:n".to_owned(),
+            dst: dst.to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&mk("tag:a")), Decision::Allow);
+        assert_eq!(set.evaluate(&mk("tag:b")), Decision::Allow);
+        assert_eq!(
+            set.evaluate(&mk("tag:c")),
+            Decision::Deny,
+            "tag:c is unlisted and must be denied"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
