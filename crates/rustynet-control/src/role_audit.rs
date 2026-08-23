@@ -1059,6 +1059,29 @@ mod tests {
     }
 
     #[test]
+    fn verify_role_audit_chain_rejects_non_hex_pair_in_event_hex() {
+        // Valid even length, but the PAIR "zz" is not hex: the pair
+        // decoder must reject it as Malformed naming the offending
+        // pair.
+        let forged = RoleAuditEntry {
+            index: 0,
+            previous_hash: GENESIS_PREVIOUS_HASH.to_owned(),
+            entry_hash: "0123456789abcdef".to_owned(),
+            event_hex: "zz".to_owned(),
+        };
+        let err = verify_role_audit_chain(&[forged]).unwrap_err();
+        match err {
+            RoleAuditError::Malformed(msg) => {
+                assert!(
+                    msg.contains("invalid hex pair"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn malformed_line_returns_typed_error() {
         let path = tmp_path("malformed");
         fs::write(&path, "this is not a valid line\n").unwrap();
