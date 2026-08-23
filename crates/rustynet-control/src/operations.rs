@@ -354,6 +354,51 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_entry_lines_with_wrong_field_count() {
+        // Adversarial sweep finding: the 6-field guard on entry lines
+        // (extra '|' segments would otherwise shift every field) must
+        // be pinned — a 7-segment entry is structurally invalid even
+        // before digest checks run.
+        let unique = format!(
+            "rustynet-ops-badcount-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let path = std::env::temp_dir().join(unique.clone());
+        std::fs::write(
+            &path,
+            "retention_days=30\nentry=0|1|actor|action|prev|hash|EXTRA\ndigest=00\n",
+        )
+        .unwrap();
+
+        let err = TamperEvidentAuditLog::restore_from_file(&path).unwrap_err();
+        assert!(matches!(err, OperationsError::InvalidFormat));
+        let _ = std::fs::remove_file(&path);
+
+        // Control: a well-formed 6-field entry line passes the count
+        // guard (it may fail later on digest, which is a DIFFERENT
+        // error — here the file has only this one entry and no valid
+        // digest, so assert it does not fail with InvalidFormat from
+        // the field-count arm).
+        let good = std::env::temp_dir().join(format!("rustynet-ops-goodcount-{unique}"));
+        std::fs::write(
+            &good,
+            "retention_days=30\nentry=0|1|actor|action|prev|hash\ndigest=00\n",
+        )
+        .unwrap();
+        match TamperEvidentAuditLog::restore_from_file(&good) {
+            Err(OperationsError::InvalidFormat) => {
+                panic!("6-field entry must pass the count guard")
+            }
+            _ => {}
+        }
+        let _ = std::fs::remove_file(&good);
+    }
+
+    #[test]
     fn tamper_evident_audit_log_detects_corruption() {
         let mut log = TamperEvidentAuditLog::new(90);
         log.append("alice", "policy.update", 100);
