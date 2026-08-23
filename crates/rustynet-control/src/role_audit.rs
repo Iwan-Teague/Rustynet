@@ -309,7 +309,24 @@ pub fn read_role_audit_log(path: &Path) -> Result<Vec<RoleAuditEntry>, RoleAudit
                     line_no + 1
                 ))
             })?;
-            fields.insert(key, value);
+            // Fail closed on non-canonical lines: the entry hash covers
+            // only the four canonical fields, so an UNKNOWN field would
+            // be invisible tampering (attacker appends `note=pwned` and
+            // the chain still verifies), and a DUPLICATE key would let
+            // a later value silently overwrite the signed one
+            // (`index=1 index=2`). Reject both shapes outright.
+            if !matches!(key, "index" | "previous_hash" | "entry_hash" | "event_hex") {
+                return Err(RoleAuditError::Malformed(format!(
+                    "line {}: unknown field {key:?}",
+                    line_no + 1
+                )));
+            }
+            if fields.insert(key, value).is_some() {
+                return Err(RoleAuditError::Malformed(format!(
+                    "line {}: duplicate field {key:?}",
+                    line_no + 1
+                )));
+            }
         }
         let index: u64 = fields
             .get("index")
@@ -950,6 +967,58 @@ mod tests {
         fs::write(&path, body).unwrap();
         let entries = read_role_audit_log(&path).unwrap();
         assert_eq!(entries.len(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reader_rejects_unknown_and_duplicate_fields_on_valid_lines() {
+        // Adversarial finding, hardened: the canonical hash covers only
+        // the four known fields, so a reader that IGNORED unknown tokens
+        // or let DUPLICATE keys overwrite silently would accept tampered
+        // lines the hash cannot see. Both shapes must be rejected.
+        let event = RoleTransitionEvent::PresetTransition {
+            from: RolePreset::Admin,
+            to: RolePreset::Exit,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        };
+        let payload = event.canonical_payload(100);
+        let entry_hash = compute_entry_hash(0, GENESIS_PREVIOUS_HASH, &payload);
+        let canonical_line = format!(
+            "index=0 previous_hash={GENESIS_PREVIOUS_HASH} entry_hash={entry_hash} event_hex={}\n",
+            hex_encode(payload.as_bytes())
+        );
+
+        // Control: the canonical line parses and verifies.
+        let path = tmp_path("canonical-line");
+        fs::write(&path, &canonical_line).unwrap();
+        let entries = read_role_audit_log(&path).expect("canonical line must parse");
+        verify_role_audit_chain(&entries).expect("canonical chain valid");
+        cleanup(&path);
+
+        // Unknown extra field: invisible to the hash, so must be refused.
+        let junk_line = canonical_line.replace("event_hex=", "note=pwned event_hex=");
+        assert_ne!(junk_line, canonical_line);
+        let path = tmp_path("junk-field");
+        fs::write(&path, &junk_line).unwrap();
+        match read_role_audit_log(&path) {
+            Err(RoleAuditError::Malformed(msg)) => {
+                assert!(msg.contains("unknown field"), "got: {msg}");
+            }
+            other => panic!("expected Malformed for unknown field, got {other:?}"),
+        }
+        cleanup(&path);
+
+        // Duplicate key: last-write-wins would hide the real value.
+        let dup_line = canonical_line.replace("index=0", "index=0 index=7");
+        let path = tmp_path("duplicate-field");
+        fs::write(&path, &dup_line).unwrap();
+        match read_role_audit_log(&path) {
+            Err(RoleAuditError::Malformed(msg)) => {
+                assert!(msg.contains("duplicate field"), "got: {msg}");
+            }
+            other => panic!("expected Malformed for duplicate field, got {other:?}"),
+        }
         cleanup(&path);
     }
 
