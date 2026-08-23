@@ -3525,6 +3525,29 @@ mod tests {
     }
 
     #[test]
+    fn eight_byte_message_signs_and_verifies() {
+        // Size matrix: 8-byte message signs and verifies.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/eight-byte",
+            [13; 32],
+        );
+        let payload = [13u8, 26, 39, 52, 65, 78, 91, 104];
+        let signature = keypair.sign_attestation(&payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(&payload, &signature)
+            .expect("signature over the 8-byte message must verify");
+
+        let mut other = payload;
+        other[7] ^= 0x01;
+        assert_eq!(
+            keypair.verify_attestation(&other, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
