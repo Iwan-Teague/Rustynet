@@ -3314,6 +3314,28 @@ mod tests {
     }
 
     #[test]
+    fn same_seed_across_provider_instances_signs_identically() {
+        // Second determinism vector, distinct from the
+        // single-instance pin (a9229479): key derivation AND signing
+        // are functions of the SEED alone — two independently
+        // constructed providers from the same seed produce
+        // byte-identical signatures, even with different key
+        // identifiers.
+        let make =
+            |id: &str| Ed25519SigningProvider::from_seed(SigningProviderKind::Kms, id, [241; 32]);
+        let p1 = make("kms://rustynet/det-instance-1");
+        let p2 = make("kms://rustynet/det-instance-2");
+
+        let message = b"cross-instance-canary";
+        let sig_1a = p1.sign_attestation(message).expect("sign 1a");
+        let sig_2 = p2.sign_attestation(message).expect("sign 2");
+        assert_eq!(sig_1a, sig_2, "same seed must sign identically everywhere");
+
+        let sig_1b = p1.sign_attestation(message).expect("sign 1b");
+        assert_eq!(sig_1a, sig_1b);
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
