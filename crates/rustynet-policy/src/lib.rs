@@ -1967,6 +1967,70 @@ mod tests {
     }
 
     #[test]
+    fn contextual_engine_revokes_on_acl_removal_like_the_plain_engine() {
+        // Cross-engine consistency: ACL removal must revoke in BOTH
+        // evaluators. The contextual rule names Mesh explicitly so
+        // the only variable across the two phases is the membership
+        // entry itself.
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:ephemeral".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::Mesh],
+            }],
+        };
+        let request = AccessRequest {
+            src: "node:client".to_owned(),
+            dst: "tag:ephemeral".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        let contextual_request = ContextualAccessRequest {
+            src: "node:client".to_owned(),
+            dst: "tag:ephemeral".to_owned(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::Mesh,
+        };
+
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("client", MembershipStatus::Active);
+        membership.set_node_status("node-x", MembershipStatus::Active);
+        membership.set_selector_members("tag:ephemeral", vec!["node-x".to_owned()]);
+
+        let plain_set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:ephemeral".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        // Phase 1: ACL present — both engines admit.
+        assert_eq!(
+            plain_set.evaluate_with_membership(&request, &membership),
+            Decision::Allow
+        );
+        assert_eq!(
+            set.evaluate_with_membership(&contextual_request, &membership),
+            Decision::Allow
+        );
+
+        // Phase 2: ACL entry removed — both engines must deny.
+        membership.set_selector_members("tag:ephemeral", Vec::<String>::new());
+        assert_eq!(
+            plain_set.evaluate_with_membership(&request, &membership),
+            Decision::Deny
+        );
+        assert_eq!(
+            set.evaluate_with_membership(&contextual_request, &membership),
+            Decision::Deny,
+            "the contextual engine must revoke on ACL removal like the plain engine"
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
