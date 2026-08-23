@@ -1877,6 +1877,57 @@ mod tests {
     }
 
     #[test]
+    fn partially_revoked_tag_denies_even_when_some_members_are_active() {
+        // ALL-members semantics: a tag whose member list contains ANY
+        // non-Active node is unresolvable trust state — the whole tag
+        // denies. One good node plus one revoked node must NOT admit.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:servers".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let mut membership = MembershipDirectory::default();
+        // Request source must itself be an active member (bare-id key
+        // convention — see the CIDR gate test).
+        membership.set_node_status("client", MembershipStatus::Active);
+        membership.set_node_status("node-good", MembershipStatus::Active);
+        membership.set_node_status("node-revoked", MembershipStatus::Revoked);
+        membership.set_selector_members(
+            "tag:servers",
+            vec!["node-good".to_owned(), "node-revoked".to_owned()],
+        );
+
+        let request = AccessRequest {
+            src: "node:client".to_owned(),
+            dst: "tag:servers".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Deny,
+            "a tag with any revoked member must deny"
+        );
+
+        // Control: same tag with BOTH members active admits.
+        let mut healthy = MembershipDirectory::default();
+        healthy.set_node_status("client", MembershipStatus::Active);
+        healthy.set_node_status("node-good", MembershipStatus::Active);
+        healthy.set_node_status("node-revoked", MembershipStatus::Active);
+        healthy.set_selector_members(
+            "tag:servers",
+            vec!["node-good".to_owned(), "node-revoked".to_owned()],
+        );
+        assert_eq!(
+            set.evaluate_with_membership(&request, &healthy),
+            Decision::Allow
+        );
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
