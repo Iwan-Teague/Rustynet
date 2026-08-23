@@ -1455,6 +1455,46 @@ mod tests {
     }
 
     #[test]
+    fn composite_selector_never_partially_matches_a_rule() {
+        // Real semantics pinned: a request carries EXACTLY ONE src
+        // and ONE dst selector, matched by full-string equality.
+        // There is no multi-tag/any-tag-match mode, so a composite
+        // destination string containing an allowed tag must NOT
+        // partially match the rule — it matches nothing and denies.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:a".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        // Control: exact selector match admits.
+        let exact = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:a".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&exact), Decision::Allow);
+
+        // Composite strings never partially match.
+        let mut composite = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:a,tag:b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate(&composite),
+            Decision::Deny,
+            "a composite selector must not partially match 'tag:a'"
+        );
+
+        composite.dst = "tag:ab".to_owned();
+        assert_eq!(set.evaluate(&composite), Decision::Deny);
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
