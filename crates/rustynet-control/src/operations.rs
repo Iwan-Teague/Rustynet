@@ -33,7 +33,10 @@ pub fn redact_fields(
 }
 
 fn is_sensitive_key(key: &str) -> bool {
-    let lowered = key.to_ascii_lowercase();
+    // Canonicalize separators BEFORE matching: kebab-case variants
+    // ("private-key", "auth-header", "api-key") must hit the same
+    // needles as their snake_case twins, or they log cleartext.
+    let lowered = key.to_ascii_lowercase().replace('-', "_");
     [
         "token",
         "secret",
@@ -341,6 +344,39 @@ mod tests {
         DiagnosticsSummary, HealthSnapshot, IngestionPath, OperationsError, StructuredLogger,
         TamperEvidentAuditLog, redact_fields,
     };
+
+    #[test]
+    fn redaction_covers_kebab_case_secret_key_variants() {
+        // Separator-canonicalization pin: hyphenated variants must
+        // hit the snake_case needles — "private-key" previously
+        // logged cleartext because the needle was "private_key".
+        let input: BTreeMap<String, String> = [
+            ("private-key", "raw-key-material"),
+            ("auth-header", "Bearer abc"),
+            ("api-key", "sk_live_abc"),
+            ("client-passwd", "hunter2"),
+            ("signing-secret", "topsecret"),
+            ("enrollment-token", "tok_123"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let redacted = redact_fields(IngestionPath::LogField, &input);
+        for (key, value) in &redacted {
+            assert_eq!(
+                value, "REDACTED",
+                "kebab-case secret key {key:?} must be redacted"
+            );
+        }
+
+        // Control: a benign kebab-case key is untouched.
+        let benign: BTreeMap<String, String> = [("node-count".to_string(), "7".to_string())]
+            .into_iter()
+            .collect();
+        let passed = redact_fields(IngestionPath::LogField, &benign);
+        assert_eq!(passed.get("node-count").map(String::as_str), Some("7"));
+    }
 
     #[test]
     fn redaction_covers_common_secret_key_and_value_shapes() {
