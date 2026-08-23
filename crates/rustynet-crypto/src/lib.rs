@@ -3225,6 +3225,43 @@ mod tests {
     }
 
     #[test]
+    fn sign_verifies_against_same_keypairs_derived_public_key() {
+        // Self-consistency: the public key derived FROM the secret
+        // half (published as verifying_key_hex) must verify what the
+        // secret half signs.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/self-consistency",
+            [211; 32],
+        );
+        let message = b"self-consistency-canary";
+        let signature = keypair.sign_attestation(message).expect("sign");
+
+        // Reconstruct the verifier purely from the PUBLISHED public
+        // half and check it accepts the signature.
+        let vk_bytes = super::hex_decode(&keypair.verifying_key_hex()).expect("vk hex");
+        let vk =
+            ed25519_dalek::VerifyingKey::from_bytes(vk_bytes.as_slice().try_into().expect("32"))
+                .expect("public key derives");
+        let dalek_sig = ed25519_dalek::Signature::from_slice(&signature)
+            .expect("signature bytes are well-formed");
+        vk.verify_strict(message, &dalek_sig)
+            .expect("derived public key must verify the signature");
+
+        // Provider path agrees, and tampering is still rejected
+        // (keeps this test sensitive to verification mutations).
+        keypair
+            .verify_attestation(message, &signature)
+            .expect("provider verify accepts");
+        let mut broken = signature.clone();
+        broken[0] ^= 0x01;
+        assert_eq!(
+            keypair.verify_attestation(message, &broken).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
