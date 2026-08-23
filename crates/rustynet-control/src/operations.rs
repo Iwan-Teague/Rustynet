@@ -38,10 +38,15 @@ fn is_sensitive_key(key: &str) -> bool {
         "token",
         "secret",
         "password",
+        "passwd",
         "passphrase",
         "credential",
         "private_key",
         "nonce",
+        "api_key",
+        "apikey",
+        "authorization",
+        "auth_header",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
@@ -50,7 +55,11 @@ fn is_sensitive_key(key: &str) -> bool {
 fn looks_sensitive_value(value: &str) -> bool {
     let lowered = value.to_ascii_lowercase();
     lowered.contains("bearer ")
+        || lowered.contains("basic ")
         || lowered.starts_with("sk_")
+        || lowered.starts_with("sk-ant-")
+        || lowered.starts_with("ghp_")
+        || lowered.starts_with("github_pat_")
         || lowered.starts_with("vault://")
         || lowered.contains("-----begin")
 }
@@ -332,6 +341,43 @@ mod tests {
         DiagnosticsSummary, HealthSnapshot, IngestionPath, OperationsError, StructuredLogger,
         TamperEvidentAuditLog, redact_fields,
     };
+
+    #[test]
+    fn redaction_covers_common_secret_key_and_value_shapes() {
+        // Adversarial sweep: the needle lists previously missed
+        // api_key/apikey/passwd/authorization key shapes and
+        // Basic/GitHub/Anthropic value shapes. Every one of these
+        // must redact — a miss logs cleartext secrets.
+        let input: BTreeMap<String, String> = [
+            ("api_key", "sk_live_abc123"),
+            ("apikey", "sk_live_abc123"),
+            ("API_KEY", "value-does-not-matter"),
+            ("passwd", "hunter2"),
+            ("Authorization", "Basic dXNlcjpwYXNz"),
+            ("auth_header", "Bearer abc"),
+            ("github_token_field", "ghp_16charsXXXXXXXXXXXXXX"),
+            ("anthropic_note", "sk-ant-api03-xxxx"),
+            ("ssh_key_pem", "-----BEGIN OPENSSH PRIVATE KEY-----"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let redacted = redact_fields(IngestionPath::ApiPayload, &input);
+        for (key, value) in &redacted {
+            assert_eq!(
+                value, "REDACTED",
+                "field {key:?} must be redacted, got cleartext {value:?}"
+            );
+        }
+
+        // Control: innocuous fields pass through untouched.
+        let benign: BTreeMap<String, String> = [("node_count".to_string(), "42".to_string())]
+            .into_iter()
+            .collect();
+        let passed = redact_fields(IngestionPath::ApiPayload, &benign);
+        assert_eq!(passed.get("node_count").map(String::as_str), Some("42"));
+    }
 
     #[test]
     fn redaction_covers_all_ingestion_paths() {
