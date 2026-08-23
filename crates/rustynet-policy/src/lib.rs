@@ -1495,6 +1495,36 @@ mod tests {
     }
 
     #[test]
+    fn single_explicit_deny_rule_denies_matching_request() {
+        // Explicit deny holds: a lone DENY rule for a tuple denies
+        // the matching request — and, being the only rule, also
+        // everything else (fall-through default-deny).
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:a".to_owned(),
+                dst: "tag:secret".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Deny,
+            }],
+        };
+
+        let matching = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:secret".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&matching), Decision::Deny);
+
+        // Non-matching requests still deny via default-deny.
+        let other = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:public".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&other), Decision::Deny);
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
