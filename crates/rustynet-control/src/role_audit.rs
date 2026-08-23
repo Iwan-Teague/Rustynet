@@ -1038,6 +1038,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_role_audit_chain_rejects_odd_length_event_hex() {
+        // Odd-length event_hex cannot be valid hex: the dedicated
+        // length guard must fire BEFORE any pair decoding, producing
+        // its own "length is odd" Malformed — distinct from the
+        // invalid-hex-pair rejection.
+        let forged = RoleAuditEntry {
+            index: 0,
+            previous_hash: GENESIS_PREVIOUS_HASH.to_owned(),
+            entry_hash: "0123456789abcdef".to_owned(),
+            event_hex: "abc".to_owned(),
+        };
+        let err = verify_role_audit_chain(&[forged]).unwrap_err();
+        match err {
+            RoleAuditError::Malformed(msg) => {
+                assert!(msg.contains("length is odd"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn malformed_line_returns_typed_error() {
         let path = tmp_path("malformed");
         fs::write(&path, "this is not a valid line\n").unwrap();
