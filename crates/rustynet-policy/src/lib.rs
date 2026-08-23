@@ -1536,6 +1536,41 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_rule_does_not_allow_requests_it_does_not_match() {
+        // Growing a policy never widens it beyond its rules: before
+        // the rule, everything denies. After adding an allow rule for
+        // tag:a, a request for tag:b must STILL deny — the new rule
+        // authorizes exactly its own tuple and nothing else.
+        let mut set = PolicySet { rules: vec![] };
+        let request_b = AccessRequest {
+            src: "node:n".to_owned(),
+            dst: "tag:b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&request_b), Decision::Deny);
+
+        set.rules.push(PolicyRule {
+            src: "node:n".to_owned(),
+            dst: "tag:a".to_owned(),
+            protocol: Protocol::Tcp,
+            action: RuleAction::Allow,
+        });
+        assert_eq!(
+            set.evaluate(&request_b),
+            Decision::Deny,
+            "adding a rule for tag:a must not allow tag:b"
+        );
+
+        // The added rule authorizes exactly its own tuple.
+        let request_a = AccessRequest {
+            src: "node:n".to_owned(),
+            dst: "tag:a".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(set.evaluate(&request_a), Decision::Allow);
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
