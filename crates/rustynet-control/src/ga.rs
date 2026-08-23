@@ -393,6 +393,41 @@ mod tests {
     }
 
     #[test]
+    fn crypto_calendar_boundaries_are_fail_closed() {
+        // Exact-boundary pin: deprecation begins AT deprecates_at_unix
+        // and denial begins AT removal_at_unix. An off-by-one in
+        // either comparison would leave a deprecated algorithm
+        // "Allowed" for one extra tick.
+        let calendar = CryptoDeprecationCalendar {
+            records: vec![CryptoDeprecationRecord {
+                algorithm: "sha1".to_owned(),
+                deprecates_at_unix: 100,
+                removal_at_unix: 200,
+            }],
+        };
+
+        assert_eq!(
+            calendar.lifecycle_for("sha1", 99),
+            AlgorithmLifecycle::Allowed,
+            "the tick before deprecation must still be allowed"
+        );
+        assert_eq!(
+            calendar.lifecycle_for("sha1", 100),
+            AlgorithmLifecycle::Deprecated,
+            "deprecation must begin exactly at deprecates_at_unix"
+        );
+        assert_eq!(
+            calendar.lifecycle_for("sha1", 199),
+            AlgorithmLifecycle::Deprecated
+        );
+        assert_eq!(
+            calendar.lifecycle_for("sha1", 200),
+            AlgorithmLifecycle::Denied,
+            "denial must begin exactly at removal_at_unix"
+        );
+    }
+
+    #[test]
     fn insecure_compatibility_exception_requires_explicit_active_risk_acceptance() {
         let exception = InsecureCompatibilityException {
             mode: "legacy-handshake".to_owned(),
