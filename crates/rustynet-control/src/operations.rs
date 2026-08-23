@@ -57,8 +57,14 @@ fn is_sensitive_key(key: &str) -> bool {
 
 fn looks_sensitive_value(value: &str) -> bool {
     let lowered = value.to_ascii_lowercase();
-    lowered.contains("bearer ")
-        || lowered.contains("basic ")
+    // Scheme prefixes may be followed by a space OR a tab (header
+    // folding); match both so "bearer\tTOKEN" cannot slip through.
+    let scheme_gated = ["bearer", "basic"].iter().any(|scheme| {
+        lowered.starts_with(&format!("{scheme} "))
+            || lowered.contains(&format!("\t{scheme} "))
+            || lowered.contains(&format!("{scheme}\t"))
+    });
+    scheme_gated
         || lowered.starts_with("sk_")
         || lowered.starts_with("sk-ant-")
         || lowered.starts_with("ghp_")
@@ -391,6 +397,7 @@ mod tests {
             ("passwd", "hunter2"),
             ("Authorization", "Basic dXNlcjpwYXNz"),
             ("auth_header", "Bearer abc"),
+            ("folded_header", "bearer\tTAB-separat ed-token"),
             ("github_token_field", "ghp_16charsXXXXXXXXXXXXXX"),
             ("anthropic_note", "sk-ant-api03-xxxx"),
             ("ssh_key_pem", "-----BEGIN OPENSSH PRIVATE KEY-----"),
