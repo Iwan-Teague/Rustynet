@@ -3336,6 +3336,31 @@ mod tests {
     }
 
     #[test]
+    fn two_byte_message_order_is_bound_into_the_signature() {
+        // [1,2] and [2,1] are different messages: the signature over
+        // [1,2] verifies for [1,2] and is rejected for [2,1] — byte
+        // ORDER is bound into the digest.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/two-byte-order",
+            [251; 32],
+        );
+        let message = [1u8, 2];
+        let signature = keypair.sign_attestation(&message).expect("sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(&message, &signature)
+            .expect("signature over [1,2] must verify");
+
+        let swapped = [2u8, 1];
+        assert_eq!(
+            keypair.verify_attestation(&swapped, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "the signature over [1,2] must not verify against [2,1]"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
