@@ -3721,6 +3721,30 @@ mod tests {
     }
 
     #[test]
+    fn all_ff_message_signs_and_verifies() {
+        // Edge-value matrix: an all-0xFF 32-byte message (max byte
+        // value everywhere) signs and verifies like any other payload.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/all-ff-message",
+            [21; 32],
+        );
+        let payload = [0xFFu8; 32];
+        let signature = keypair.sign_attestation(&payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        keypair
+            .verify_attestation(&payload, &signature)
+            .expect("signature over the all-0xFF message must verify");
+
+        let mut other = payload;
+        other[0] = 0xFE;
+        assert_eq!(
+            keypair.verify_attestation(&other, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
