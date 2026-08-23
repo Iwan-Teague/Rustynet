@@ -3408,6 +3408,30 @@ mod tests {
     }
 
     #[test]
+    fn three_byte_message_sign_and_verify_round_trips() {
+        // Size matrix: 3-byte message ([9,9,9]) signs and verifies Ok.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/three-byte",
+            [251; 32],
+        );
+        let payload = [9u8; 3];
+        let signature = keypair.sign_attestation(&payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        assert!(
+            keypair.verify_attestation(&payload, &signature).is_ok(),
+            "signature over the 3-byte message must verify"
+        );
+
+        let mut other = payload;
+        other[1] ^= 0x01;
+        assert_eq!(
+            keypair.verify_attestation(&other, &signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
