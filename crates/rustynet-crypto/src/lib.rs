@@ -3361,6 +3361,30 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_signing_does_not_disturb_determinism() {
+        // No hidden signing state: A, B, A again — the two A
+        // signatures must be byte-identical even though a different
+        // message was signed in between.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/interleaved-det",
+            [5; 32],
+        );
+        let msg_a = b"interleaved-message-a";
+        let msg_b = b"interleaved-message-b";
+
+        let a1 = keypair.sign_attestation(msg_a).expect("sign a1");
+        let b = keypair.sign_attestation(msg_b).expect("sign b");
+        let a2 = keypair.sign_attestation(msg_a).expect("sign a2");
+
+        assert_ne!(a1, b, "different messages must sign differently");
+        assert_eq!(
+            a1, a2,
+            "re-signing message A after an interleaved B must reproduce A's signature exactly"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
