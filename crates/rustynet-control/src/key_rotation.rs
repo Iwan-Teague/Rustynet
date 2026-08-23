@@ -790,14 +790,24 @@ mod tests {
             "insertion order must not change the canonical ledger input"
         );
 
-        // Exact-content pin: epoch-sorted lines, count header first.
-        let expected_first = "archive_count=3\narchive.0.epoch=1\n";
-        assert!(
-            payload_a.starts_with(expected_first),
-            "unexpected canonical head: {payload_a:?}"
+        // Exact-content pin: epoch-sorted lines, count header first,
+        // every field of every verifier rendered in canonical order.
+        let expected = concat!(
+            "archive_count=3\n",
+            "archive.0.epoch=1\n",
+            "archive.0.public_key_hex=aa\n",
+            "archive.0.archived_at_unix=100\n",
+            "archive.0.watermark_at_rotation=7\n",
+            "archive.1.epoch=2\n",
+            "archive.1.public_key_hex=bb\n",
+            "archive.1.archived_at_unix=200\n",
+            "archive.1.watermark_at_rotation=8\n",
+            "archive.2.epoch=3\n",
+            "archive.2.public_key_hex=cc\n",
+            "archive.2.archived_at_unix=300\n",
+            "archive.2.watermark_at_rotation=9\n",
         );
-        assert!(payload_a.contains("archive.2.public_key_hex=cc"));
-        assert!(payload_a.contains("archive.1.watermark_at_rotation=8"));
+        assert_eq!(payload_a, expected, "canonical ledger input drifted");
     }
 
     #[test]
