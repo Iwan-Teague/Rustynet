@@ -2672,6 +2672,47 @@ mod tests {
     }
 
     #[test]
+    fn signing_provider_policy_matrix_accepts_and_rejects_each_arm() {
+        // Arm coverage for validate_signing_provider_policy: the
+        // hardware-primary rejection was pinned; here the ACCEPT path
+        // and the LOCAL-FALLBACK-DISALLOWED rejection arm get pinned.
+        let kms = SigningProviderKind::Kms;
+        let local = SigningProviderKind::LocalEncryptedFile;
+
+        // 1. Hardware-backed primary, no fallback: always acceptable.
+        let no_fallback = SigningProviderPolicy {
+            require_hardware_backed_primary: true,
+            allow_local_fallback: true,
+        };
+        assert_eq!(
+            validate_signing_provider_policy(kms, None, no_fallback),
+            Ok(())
+        );
+
+        // 2. Software primary permitted when the policy does not
+        //    demand a hardware-backed primary.
+        let software_ok = SigningProviderPolicy {
+            require_hardware_backed_primary: false,
+            allow_local_fallback: false,
+        };
+        assert_eq!(
+            validate_signing_provider_policy(local, None, software_ok),
+            Ok(())
+        );
+
+        // 3. A local fallback is refused when the policy forbids it.
+        let no_local = SigningProviderPolicy {
+            require_hardware_backed_primary: false,
+            allow_local_fallback: false,
+        };
+        assert_eq!(
+            validate_signing_provider_policy(kms, Some(local), no_local),
+            Err(CryptoError::UnsupportedProviderPolicy)
+        );
+        let _ = software_ok;
+    }
+
+    #[test]
     fn key_custody_manager_rejects_invalid_key_identifier() {
         let manager = KeyCustodyManager::new(
             NoOsSecureStore,
