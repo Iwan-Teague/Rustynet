@@ -73,6 +73,13 @@ impl HaCluster {
         {
             replica.healthy = false;
         }
+        // Fail closed: if the marked replica IS the active one, the
+        // stale pointer must not survive — callers reading
+        // active_replica() would otherwise keep routing to a dead
+        // node until someone happens to call failover().
+        if self.active_replica.as_deref() == Some(replica_id) {
+            self.active_replica = None;
+        }
     }
 
     pub fn failover(&mut self) -> Result<String, HaError> {
@@ -322,6 +329,40 @@ mod tests {
         OidcClaims, TenantAction, TenantBoundaryGuard, TenantError, TenantRole,
         TrustHardeningConfig, TrustHardeningError, authorize_trusted_key, disable_trust_hardening,
     };
+
+    #[test]
+    fn marking_active_replica_unhealthy_clears_stale_active_pointer() {
+        // Adversarial finding: mark_unhealthy previously left
+        // active_replica pointing at the dead node, so callers polling
+        // active_replica() kept routing to an unhealthy replica.
+        let mut cluster = HaCluster::new(vec![
+            ControlPlaneReplica {
+                id: "cp-a".to_owned(),
+                healthy: true,
+                policy_generation: 1,
+            },
+            ControlPlaneReplica {
+                id: "cp-b".to_owned(),
+                healthy: true,
+                policy_generation: 1,
+            },
+        ]);
+        let active = cluster.elect_active().expect("elect");
+        assert_eq!(active, "cp-a");
+        assert_eq!(cluster.active_replica(), Some("cp-a"));
+
+        cluster.mark_unhealthy("cp-a");
+        assert_eq!(
+            cluster.active_replica(),
+            None,
+            "stale active pointer must be cleared when the active replica dies"
+        );
+
+        // Recovery: failover re-elects the surviving replica.
+        let next = cluster.failover().expect("failover to survivor");
+        assert_eq!(next, "cp-b");
+        assert_eq!(cluster.active_replica(), Some("cp-b"));
+    }
 
     #[test]
     fn ha_cluster_fails_over_to_next_healthy_replica() {
