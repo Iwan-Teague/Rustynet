@@ -1571,6 +1571,53 @@ mod tests {
     }
 
     #[test]
+    fn independent_sets_from_same_rules_decide_identically() {
+        // Determinism: evaluation is a pure function of (rules,
+        // request) — no hidden per-instance state. Two independently
+        // built sets from the SAME rule list must decide every
+        // request identically.
+        let build = || PolicySet {
+            rules: vec![
+                PolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "tag:open".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Allow,
+                },
+                PolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "tag:vault".to_owned(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Deny,
+                },
+            ],
+        };
+        let set_1 = build();
+        let set_2 = build();
+
+        let cases = [
+            ("node:a", "tag:open", Protocol::Tcp, Decision::Allow),
+            ("node:a", "tag:vault", Protocol::Udp, Decision::Deny),
+            ("node:b", "tag:open", Protocol::Tcp, Decision::Deny),
+            ("node:b", "tag:vault", Protocol::Tcp, Decision::Deny),
+        ];
+        for (src, dst, protocol, expected) in cases {
+            let request = AccessRequest {
+                src: src.to_owned(),
+                dst: dst.to_owned(),
+                protocol,
+            };
+            let d1 = set_1.evaluate(&request);
+            let d2 = set_2.evaluate(&request);
+            assert_eq!(d1, d2, "{src:?}→{dst:?} must decide identically");
+            assert_eq!(
+                d1, expected,
+                "{src:?}→{dst:?} must match the pinned decision"
+            );
+        }
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
