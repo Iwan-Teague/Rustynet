@@ -3070,6 +3070,33 @@ mod tests {
     }
 
     #[test]
+    fn verify_attestation_rejects_bitwise_not_of_valid_signature() {
+        // The full bitwise complement of a genuine signature inverts
+        // BOTH the R point encoding and the S scalar: neither can
+        // still satisfy the verification equation. Strict
+        // verification must reject it outright.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/bitflip-all",
+            [141; 32],
+        );
+        let payload = b"all-bits-flipped-canary";
+        let signature = keypair.sign_attestation(payload).expect("sign");
+        keypair
+            .verify_attestation(payload, &signature)
+            .expect("control signature must verify");
+
+        let inverted: Vec<u8> = signature.iter().map(|b| !b).collect();
+        assert_eq!(inverted.len(), 64);
+        assert_ne!(inverted, signature);
+        assert_eq!(
+            keypair.verify_attestation(payload, &inverted).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "the bitwise complement of a valid signature must be rejected"
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
