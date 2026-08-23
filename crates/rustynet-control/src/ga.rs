@@ -521,6 +521,31 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_for_fails_closed_when_the_calendar_is_invalid() {
+        // An INVALID calendar (deprecation window inverted here:
+        // removal before deprecation) cannot be trusted to classify
+        // anything — every lookup must resolve to Denied rather than
+        // consulting the broken records.
+        let calendar = CryptoDeprecationCalendar {
+            records: vec![CryptoDeprecationRecord {
+                algorithm: "sha1".to_owned(),
+                deprecates_at_unix: 200,
+                removal_at_unix: 100,
+            }],
+        };
+        assert!(calendar.validate().is_err(), "calendar must be invalid");
+
+        assert_eq!(
+            calendar.lifecycle_for("sha1", 50),
+            AlgorithmLifecycle::Denied
+        );
+        assert_eq!(
+            calendar.lifecycle_for("sha1", 150),
+            AlgorithmLifecycle::Denied
+        );
+    }
+
+    #[test]
     fn insecure_compatibility_exception_requires_explicit_active_risk_acceptance() {
         let exception = InsecureCompatibilityException {
             mode: "legacy-handshake".to_owned(),
