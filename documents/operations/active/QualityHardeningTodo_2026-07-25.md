@@ -4028,3 +4028,40 @@ bare head names the offending file). The lab live-proved the mechanism on run 44
 pass after the same fix); the siblings inherit it by construction and are unit-locked, not
 separately live-proven — each will be exercised the first time its role lands on a Fedora/Rocky
 guest.
+
+## ADVERSARIAL REVIEW SWEEP — sec-hardening branch (2026-08-23)
+
+Manager-agent sweep of rustynet-control / rustynet-policy / rustynet-crypto test and
+fix surfaces. Six production fixes plus companion tests; every fix mutation-proven
+(revert → test fails → restore). Branch `sec-hardening`, all scoped gates green
+(fmt / clippy -D warnings / 567+ tests across the three crates).
+
+- `00165bb8` role_audit reader accepted UNKNOWN fields (invisible to the canonical
+  hash) and DUPLICATE keys (last-write-wins) on otherwise-valid lines — both now
+  rejected fail closed. Test: `reader_rejects_unknown_and_duplicate_fields_on_valid_lines`.
+- `f83ac54a` TamperEvidentAuditLog::append now returns Result and rejects `|`,
+  `\n`, `\r` in actor/action: newlines injected forged `entry=` lines that
+  backup+restore faithfully accepted; pipes shifted fields into an unrestorable
+  log. Test: `append_rejects_delimiters_that_would_inject_or_shift_entries`.
+- `a018036c` + `b6254a66` redaction needles broadened (`passwd`, `api_key`,
+  `apikey`, `authorization`, `auth_header`) and separators canonicalized
+  (`-`→`_`) so kebab-case keys like `private-key` hit the snake_case needles.
+  Tests: `redaction_covers_common_secret_key_and_value_shapes`,
+  `redaction_covers_kebab_case_secret_key_variants`.
+- `c241ee42` scheme matching accepts tab after `bearer`/`basic` (header folding).
+  Test case folded into the common-shapes test.
+- `44f3848c` scale.rs `authorize_trusted_key` fingerprint compare switched to
+  constant-time `ct_eq` (RSA-0016 standard); behavioral regression covered by the
+  pre-existing missing/mismatch/match test.
+- `127ff20d` EnterpriseAuthConfig::validate_claims rejects empty/whitespace OIDC
+  subjects (`InvalidSubject`). Test:
+  `enterprise_auth_rejects_empty_subject_claims`.
+- `5150f169` HaCluster::mark_unhealthy clears a stale active pointer when the
+  ACTIVE replica dies, so callers polling active_replica() cannot route to a dead
+  node. Test: `marking_active_replica_unhealthy_clears_stale_active_pointer`.
+
+Companion pins landed alongside: policy empty-set/no-rules/CIDR-literal/composite-
+selector semantics, crypto seed-determinism + label-independence + zero/FF/1KB/4KB/
+100KB size matrix + provider-policy matrix, key_rotation unfrozen-past-epoch +
+canonical-payload exactness, membership spoofed-id/empty-roster/rollback, role-audit
+replay/gensis/genesis-binding/non-monotonic/corrupt-hash, role-presets lockout pins.
