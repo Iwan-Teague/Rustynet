@@ -761,6 +761,46 @@ mod tests {
     }
 
     #[test]
+    fn verifier_archive_canonical_payload_is_order_independent_and_exact() {
+        // The canonical payload is the ledger-hash input for the
+        // archive: it must be IDENTICAL regardless of insertion order
+        // (BTreeMap orders by epoch) and must render every archived
+        // verifier's fields exactly.
+        let build_a = || {
+            let mut archive = VerifierArchive::new();
+            archive.record(verifier(1, "aa", 100, 7)).expect("rec 1");
+            archive.record(verifier(2, "bb", 200, 8)).expect("rec 2");
+            archive.record(verifier(3, "cc", 300, 9)).expect("rec 3");
+            archive
+        };
+        let build_b = || {
+            let mut archive = VerifierArchive::new();
+            archive.record(verifier(3, "cc", 300, 9)).expect("rec 3");
+            archive.record(verifier(1, "aa", 100, 7)).expect("rec 1");
+            archive.record(verifier(2, "bb", 200, 8)).expect("rec 2");
+            archive
+        };
+
+        let a = build_a();
+        let b = build_b();
+        let payload_a = a.canonical_payload();
+        let payload_b = b.canonical_payload();
+        assert_eq!(
+            payload_a, payload_b,
+            "insertion order must not change the canonical ledger input"
+        );
+
+        // Exact-content pin: epoch-sorted lines, count header first.
+        let expected_first = "archive_count=3\narchive.0.epoch=1\n";
+        assert!(
+            payload_a.starts_with(expected_first),
+            "unexpected canonical head: {payload_a:?}"
+        );
+        assert!(payload_a.contains("archive.2.public_key_hex=cc"));
+        assert!(payload_a.contains("archive.1.watermark_at_rotation=8"));
+    }
+
+    #[test]
     fn per_epoch_watermark_advance_to_is_monotonic() {
         let mut store = PerEpochReplayWatermark::new(RotationEpoch(3));
         let err = store
