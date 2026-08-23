@@ -545,6 +545,108 @@ mod tests {
         );
     }
 
+    type ConditionBreaker = Box<dyn Fn(&mut GaReleaseReadiness)>;
+
+    #[test]
+    fn ga_release_gate_reports_each_unmet_condition_specifically() {
+        // Fail-closed release gate: from a fully-green readiness,
+        // breaking EACH condition independently must produce ITS OWN
+        // GaGateFailure variant — no condition's failure may be
+        // masked by, or misreported as, another.
+        let green = GaReleaseReadiness {
+            compatibility_ok: true,
+            error_budget_gate: ErrorBudgetGate {
+                availability_slo_percent: 99.9,
+                measured_availability_percent: 99.95,
+                max_error_budget_consumed_percent: 100.0,
+                measured_error_budget_consumed_percent: 70.0,
+            },
+            performance_budget: PerformanceBudgetSnapshot {
+                idle_cpu_percent: 1.2,
+                idle_memory_mb: 64.0,
+                reconnect_seconds: 3.0,
+                route_apply_p95_seconds: 1.2,
+                throughput_overhead_percent: 11.0,
+                soak_test_hours: 24.2,
+            },
+            dr_validation: DisasterRecoveryValidation {
+                region_count: 2,
+                rpo_target_minutes: 15,
+                rto_target_minutes: 60,
+                measured_rpo_minutes: 8,
+                measured_rto_minutes: 42,
+                restore_integrity_verified: true,
+            },
+            backend_agility: BackendAgilityValidation {
+                default_backend_configured: true,
+                additional_backend_paths: 1,
+                conformance_passed: true,
+                security_review_complete: true,
+                backend_adapter_boundary_preserved: true,
+                protocol_leakage_detected: false,
+            },
+            incident_drill_completed: true,
+            oncall_readiness_confirmed: true,
+        };
+        assert!(green.evaluate().is_ok());
+
+        let cases: &[(String, ConditionBreaker, GaGateFailure)] = &[
+            (
+                "compatibility".to_owned(),
+                Box::new(|r: &mut GaReleaseReadiness| r.compatibility_ok = false),
+                GaGateFailure::Compatibility,
+            ),
+            (
+                "error_budget".to_owned(),
+                Box::new(|r: &mut GaReleaseReadiness| {
+                    r.error_budget_gate.measured_error_budget_consumed_percent = 101.0;
+                }),
+                GaGateFailure::ErrorBudget,
+            ),
+            (
+                "performance_budget".to_owned(),
+                Box::new(|r: &mut GaReleaseReadiness| {
+                    r.performance_budget.reconnect_seconds = 5.5;
+                }),
+                GaGateFailure::PerformanceBudget,
+            ),
+            (
+                "disaster_recovery".to_owned(),
+                Box::new(|r: &mut GaReleaseReadiness| {
+                    r.dr_validation.restore_integrity_verified = false;
+                }),
+                GaGateFailure::DisasterRecovery,
+            ),
+            (
+                "backend_agility".to_owned(),
+                Box::new(|r: &mut GaReleaseReadiness| {
+                    r.backend_agility.conformance_passed = false;
+                }),
+                GaGateFailure::BackendAgility,
+            ),
+            (
+                "incident_drill".to_owned(),
+                Box::new(|r: &mut GaReleaseReadiness| r.incident_drill_completed = false),
+                GaGateFailure::IncidentDrill,
+            ),
+            (
+                "oncall_readiness".to_owned(),
+                Box::new(|r: &mut GaReleaseReadiness| r.oncall_readiness_confirmed = false),
+                GaGateFailure::OnCallReadiness,
+            ),
+        ];
+
+        for (name, break_condition, expected) in cases {
+            let mut readiness = green.clone();
+            break_condition(&mut readiness);
+            assert_eq!(
+                readiness.evaluate(),
+                Err(expected.clone()),
+                "breaking {name} must surface its own failure"
+            );
+        }
+    }
+
     #[test]
     fn insecure_compatibility_exception_requires_explicit_active_risk_acceptance() {
         let exception = InsecureCompatibilityException {
