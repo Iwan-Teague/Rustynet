@@ -4065,3 +4065,24 @@ selector semantics, crypto seed-determinism + label-independence + zero/FF/1KB/4
 100KB size matrix + provider-policy matrix, key_rotation unfrozen-past-epoch +
 canonical-payload exactness, membership spoofed-id/empty-roster/rollback, role-audit
 replay/gensis/genesis-binding/non-monotonic/corrupt-hash, role-presets lockout pins.
+
+### Second-wave companion pins (same sweep, post-ledger additions)
+
+- ga: deprecation calendar exact boundaries fail closed (`>=` at both
+  `deprecates_at_unix`/`removal_at_unix`; off-by-one mutation-proven).
+- ga: `lifecycle_for` returns Denied when the CALENDAR itself fails validation
+  (inverted window) rather than consulting broken records.
+- ga: release gate reports each unmet condition specifically — all seven
+  conditions flip-tested from green; misreported variants caught.
+- ga: performance budget enforces each of six thresholds independently
+  (at-limit passes, +0.01 over any single limit fails).
+- scale: `elect_active` breaks generation ties by lowest replica id regardless
+  of insertion order (deterministic leader choice across restarts).
+- key_rotation: bundles tagged with an UNFROZEN past epoch fail closed as
+  UnknownEpoch (`advance_to` records no rotation points); archive canonical
+  payload pinned byte-exact including count header and per-verifier fields.
+- persistence: group/other-readable `-wal` SIDECAR fails open() closed like the
+  main DB file (RSA-0017 sidecar arm previously unpinned).
+- crypto: signature binds to seed+payload only — key_identifier never perturbs
+  signature bytes; provider-policy acceptance matrix (hardware-primary,
+  software-primary-ok, local-fallback-forbidden) pinned.
