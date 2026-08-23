@@ -365,6 +365,35 @@ mod tests {
     }
 
     #[test]
+    fn elect_active_breaks_generation_ties_by_replica_id() {
+        // Deterministic leader choice: equal policy generations must
+        // resolve by LOWEST replica id regardless of insertion order —
+        // otherwise two daemons restarting could elect different
+        // actives from identical state (split-brain).
+        let mk = |ids: &[&str]| {
+            HaCluster::new(
+                ids.iter()
+                    .map(|id| ControlPlaneReplica {
+                        id: id.to_string(),
+                        healthy: true,
+                        policy_generation: 7,
+                    })
+                    .collect(),
+            )
+        };
+
+        let inserted_b_first = mk(&["cp-b", "cp-a"]).elect_active().expect("elect");
+        let inserted_a_first = mk(&["cp-a", "cp-b"]).elect_active().expect("elect");
+
+        assert_eq!(inserted_b_first, "cp-a");
+        assert_eq!(inserted_a_first, "cp-a");
+        assert_eq!(
+            inserted_b_first, inserted_a_first,
+            "identical state must elect an identical leader"
+        );
+    }
+
+    #[test]
     fn ha_cluster_fails_over_to_next_healthy_replica() {
         let mut cluster = HaCluster::new(vec![
             ControlPlaneReplica {
