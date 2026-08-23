@@ -3200,6 +3200,31 @@ mod tests {
     }
 
     #[test]
+    fn empty_slice_sign_then_verify_is_ok() {
+        // Signing an empty byte slice succeeds and its signature
+        // verifies with Ok — empty input is valid input.
+        let keypair = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/empty-slice",
+            [201; 32],
+        );
+        let empty: &[u8] = &[];
+        let result = keypair
+            .sign_attestation(empty)
+            .and_then(|sig| keypair.verify_attestation(empty, &sig).map(|_| sig));
+        assert!(result.is_ok(), "empty-slice round-trip must return Ok");
+        let sig = result.expect("sig").clone();
+        assert_eq!(sig.len(), 64);
+
+        // Control keeps the test mutation-sensitive: verification is
+        // not a blanket accept-all.
+        assert_eq!(
+            keypair.verify_attestation(b"x", &sig).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+    }
+
+    #[test]
     fn secret_key_ct_eq_same_local() {
         let a = super::SecretKey([1u8; 32]);
         let b = super::SecretKey([1u8; 32]);
