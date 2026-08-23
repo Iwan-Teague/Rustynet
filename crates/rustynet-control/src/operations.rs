@@ -374,6 +374,32 @@ mod tests {
     };
 
     #[test]
+    fn restore_rejects_unknown_line_prefixes() {
+        // Fail-closed framing: any line that is not `retention_days=`,
+        // `entry=`, or `digest=` must be rejected outright — never
+        // silently skipped — so a tampered backup cannot smuggle
+        // content past the reader.
+        let unique = format!(
+            "rustynet-ops-junkline-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::write(
+            &path,
+            "retention_days=30\nsmuggled_field=1\nentry=0|1|actor|action|prev|hash\ndigest=00\n",
+        )
+        .unwrap();
+
+        let err = TamperEvidentAuditLog::restore_from_file(&path).unwrap_err();
+        assert!(matches!(err, OperationsError::InvalidFormat));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn structured_logger_escapes_quotes_and_newlines_in_fields() {
         // Adversarial finding: values were interpolated into the JSON
         // frame unescaped, so a quote/newline in ANY field value could
