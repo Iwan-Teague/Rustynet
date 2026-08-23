@@ -3312,6 +3312,48 @@ mod tests {
     }
 
     #[test]
+    fn spoofed_approver_id_with_foreign_key_is_rejected() {
+        // Identity-spoofing vector, distinct from the roster-absent
+        // case: the signature CLAIMS roster member "guardian-1" but
+        // was produced by an attacker's key. Verification must look
+        // up guardian-1's REGISTERED public key and reject on
+        // mismatch (SignatureInvalid), never trust the claimed id.
+        let state = base_state();
+        let new_node = active_node("node-b", 12);
+
+        let mut candidate = state.clone();
+        candidate.nodes.push(new_node.clone());
+        candidate.epoch += 1;
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-spoofed-approver-id".to_owned(),
+            operation: MembershipOperation::AddNode(new_node),
+            target: "node-b".to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 120,
+            expires_at_unix: 600,
+            reason_code: "join".to_owned(),
+            policy_context: None,
+        };
+
+        let attacker_key = SigningKey::from_bytes(&[9; 32]);
+        let spoofed = sign_update_record(&record, "guardian-1", &attacker_key).expect("sign");
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let owner_signature = sign_update_record(&record, "owner-1", &owner_key).expect("sign");
+        let signed = SignedMembershipUpdate {
+            record,
+            approver_signatures: vec![owner_signature, spoofed],
+        };
+
+        let err = apply_signed_update(&state, &signed, 130, &mut MembershipReplayCache::default())
+            .expect_err("a spoofed approver identity must be rejected");
+        assert!(matches!(err, MembershipError::SignatureInvalid));
+    }
+
+    #[test]
     fn corrupted_signature_bytes_are_rejected_as_signature_invalid() {
         // A structurally valid quorum update whose approver signature
         // bytes were flipped must fail closed with SignatureInvalid —
