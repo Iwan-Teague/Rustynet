@@ -1409,6 +1409,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_set_denies_representative_request() {
+        // Default-deny: no rules means no allows, ever.
+        let empty = PolicySet::default();
+        assert!(empty.rules.is_empty());
+        let request = AccessRequest {
+            src: "node:laptop".to_owned(),
+            dst: "tag:nas".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(empty.evaluate(&request), Decision::Deny);
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
