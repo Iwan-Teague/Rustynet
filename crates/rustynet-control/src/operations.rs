@@ -159,7 +159,24 @@ impl TamperEvidentAuditLog {
         }
     }
 
-    pub fn append(&mut self, actor: &str, action: &str, timestamp_unix: u64) {
+    pub fn append(
+        &mut self,
+        actor: &str,
+        action: &str,
+        timestamp_unix: u64,
+    ) -> Result<(), OperationsError> {
+        // Fail closed on delimiters: '|' would shift fields on
+        // restore (unrestorable log), '\n'/'\r' would inject forged
+        // entry lines that backup+restore then faithfully accept.
+        if actor.contains('|')
+            || actor.contains('\n')
+            || actor.contains('\r')
+            || action.contains('|')
+            || action.contains('\n')
+            || action.contains('\r')
+        {
+            return Err(OperationsError::InvalidFormat);
+        }
         let index = self.entries.len() as u64;
         let previous_hash = self
             .entries
@@ -175,6 +192,7 @@ impl TamperEvidentAuditLog {
             previous_hash,
             entry_hash,
         });
+        Ok(())
     }
 
     pub fn entries(&self) -> &[AuditEntry] {
@@ -389,20 +407,62 @@ mod tests {
             "retention_days=30\nentry=0|1|actor|action|prev|hash\ndigest=00\n",
         )
         .unwrap();
-        match TamperEvidentAuditLog::restore_from_file(&good) {
-            Err(OperationsError::InvalidFormat) => {
-                panic!("6-field entry must pass the count guard")
-            }
-            _ => {}
+        if let Err(OperationsError::InvalidFormat) = TamperEvidentAuditLog::restore_from_file(&good)
+        {
+            panic!("6-field entry must pass the count guard");
         }
         let _ = std::fs::remove_file(&good);
     }
 
     #[test]
+    fn append_rejects_delimiters_that_would_inject_or_shift_entries() {
+        // Adversarial finding: append previously accepted '|' and
+        // newlines in actor/action. '|' shifts fields on restore
+        // (unrestorable log); '\n' injects a forged `entry=` line
+        // that backup+restore faithfully accept as history.
+        let mut log = TamperEvidentAuditLog::new(90);
+        assert!(matches!(
+            log.append("attacker\nentry=1|0|x|y|z|forged", "act", 100),
+            Err(OperationsError::InvalidFormat)
+        ));
+        assert!(matches!(
+            log.append("actor", "act\nentry=2|0|x|y|z|forged", 100),
+            Err(OperationsError::InvalidFormat)
+        ));
+        assert!(matches!(
+            log.append("at|tacker", "act", 100),
+            Err(OperationsError::InvalidFormat)
+        ));
+        assert!(
+            log.entries().is_empty(),
+            "rejected appends must not mutate the log"
+        );
+
+        // Control: clean values still append, and the round-trip holds.
+        log.append("alice", "policy.update", 100)
+            .expect("clean append");
+        let path = std::env::temp_dir().join(format!(
+            "rustynet-ops-injection-guard-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        log.backup_to_file(&path).expect("backup");
+        let restored =
+            TamperEvidentAuditLog::restore_from_file(&path).expect("clean log must round-trip");
+        assert_eq!(restored.entries().len(), 1);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn tamper_evident_audit_log_detects_corruption() {
         let mut log = TamperEvidentAuditLog::new(90);
-        log.append("alice", "policy.update", 100);
-        log.append("alice", "exit_node.select", 101);
+        log.append("alice", "policy.update", 100)
+            .expect("valid actor/action");
+        log.append("alice", "exit_node.select", 101)
+            .expect("valid actor/action");
         assert!(log.verify_integrity());
 
         let unique = format!(
@@ -432,8 +492,10 @@ mod tests {
     #[test]
     fn audit_chain_rejects_entry_whose_hash_does_not_cover_its_payload() {
         let mut log = TamperEvidentAuditLog::new(30);
-        log.append("alice", "policy.update", 100);
-        log.append("alice", "exit_node.select", 101);
+        log.append("alice", "policy.update", 100)
+            .expect("valid actor/action");
+        log.append("alice", "exit_node.select", 101)
+            .expect("valid actor/action");
 
         let unique = format!(
             "rustynet-audit-rehash-{}",
@@ -479,8 +541,10 @@ mod tests {
     #[test]
     fn audit_chain_rejects_reordered_entries_with_consistent_digest() {
         let mut log = TamperEvidentAuditLog::new(30);
-        log.append("alice", "a.first", 100);
-        log.append("bob", "b.second", 101);
+        log.append("alice", "a.first", 100)
+            .expect("valid actor/action");
+        log.append("bob", "b.second", 101)
+            .expect("valid actor/action");
 
         let unique = format!(
             "rustynet-audit-reorder-{}",
@@ -534,7 +598,8 @@ mod tests {
     #[test]
     fn audit_chain_rejects_entry_linked_to_a_nonexistent_predecessor() {
         let mut log = TamperEvidentAuditLog::new(30);
-        log.append("alice", "policy.update", 100);
+        log.append("alice", "policy.update", 100)
+            .expect("valid actor/action");
 
         let unique = format!(
             "rustynet-audit-dangling-link-{}",
