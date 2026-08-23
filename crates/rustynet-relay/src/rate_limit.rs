@@ -218,4 +218,45 @@ mod tests {
         // node-b should still have tokens
         assert!(limiter.check_packet("node-b", 100));
     }
+
+    #[test]
+    fn retain_active_nodes_prunes_stale_buckets_and_keeps_retained_token_state() {
+        // Bucket pruning: retain_active_nodes must remove buckets for
+        // node_ids NOT in the retained set while preserving the token
+        // state of retained nodes — pruning must not reset rate-limit
+        // accounting, which would give an active sender a fresh burst.
+        let mut limiter = RateLimiter {
+            max_pps: 3,
+            max_bps: 100_000,
+            max_sessions_per_node: 8,
+            buckets: HashMap::new(),
+        };
+
+        // Exhaust ALL tokens for node-keep.
+        assert!(limiter.check_packet("node-keep", 1));
+        assert!(limiter.check_packet("node-keep", 1));
+        assert!(limiter.check_packet("node-keep", 1));
+        assert!(
+            !limiter.check_packet("node-keep", 1),
+            "node-keep must be exhausted"
+        );
+
+        // Establish node-prune as well.
+        assert!(limiter.check_packet("node-prune", 1));
+        assert_eq!(limiter.bucket_count(), 2);
+
+        // Retain only node-keep: node-prune's bucket is dropped,
+        // node-keep's exhausted state survives (pruning does NOT
+        // reset its rate-limit budget).
+        limiter.retain_active_nodes(|id| id == "node-keep");
+        assert_eq!(limiter.bucket_count(), 1);
+        assert!(
+            !limiter.check_packet("node-keep", 1),
+            "retained bucket must remain exhausted after pruning"
+        );
+
+        // node-prune was removed: its next packet takes the cold path
+        // with a full fresh burst.
+        assert!(limiter.check_packet("node-prune", 1));
+    }
 }
