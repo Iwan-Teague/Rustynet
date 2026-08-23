@@ -1525,6 +1525,17 @@ mod tests {
     }
 
     #[test]
+    fn policy_with_no_rules_denies() {
+        let set = PolicySet { rules: vec![] };
+        let request = AccessRequest {
+            src: "node:n".to_owned(),
+            dst: "tag:t".to_owned(),
+            protocol: Protocol::Udp,
+        };
+        assert_eq!(set.evaluate(&request), Decision::Deny);
+    }
+
+    #[test]
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
