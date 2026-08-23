@@ -454,6 +454,73 @@ mod tests {
     }
 
     #[test]
+    fn performance_budget_enforces_each_threshold_independently() {
+        // Every arm must hold on its own: a snapshot sitting exactly
+        // AT every limit passes; nudging ANY single field over its
+        // limit must fail. Catches a weakened individual comparison.
+        let at_limits = PerformanceBudgetSnapshot {
+            idle_cpu_percent: 2.0,
+            idle_memory_mb: 120.0,
+            reconnect_seconds: 5.0,
+            route_apply_p95_seconds: 2.0,
+            throughput_overhead_percent: 15.0,
+            soak_test_hours: 24.0,
+        };
+        assert!(at_limits.passes(), "exact-limit snapshot must pass");
+
+        let violations: [(&str, PerformanceBudgetSnapshot); 6] = [
+            (
+                "idle_cpu",
+                PerformanceBudgetSnapshot {
+                    idle_cpu_percent: 2.01,
+                    ..at_limits.clone()
+                },
+            ),
+            (
+                "idle_memory",
+                PerformanceBudgetSnapshot {
+                    idle_memory_mb: 120.01,
+                    ..at_limits.clone()
+                },
+            ),
+            (
+                "reconnect",
+                PerformanceBudgetSnapshot {
+                    reconnect_seconds: 5.01,
+                    ..at_limits.clone()
+                },
+            ),
+            (
+                "route_apply_p95",
+                PerformanceBudgetSnapshot {
+                    route_apply_p95_seconds: 2.01,
+                    ..at_limits.clone()
+                },
+            ),
+            (
+                "throughput",
+                PerformanceBudgetSnapshot {
+                    throughput_overhead_percent: 15.01,
+                    ..at_limits.clone()
+                },
+            ),
+            (
+                "soak_hours",
+                PerformanceBudgetSnapshot {
+                    soak_test_hours: 23.99,
+                    ..at_limits.clone()
+                },
+            ),
+        ];
+        for (field, snapshot) in &violations {
+            assert!(
+                !snapshot.passes(),
+                "{field} over its limit must fail the performance budget"
+            );
+        }
+    }
+
+    #[test]
     fn insecure_compatibility_exception_requires_explicit_active_risk_acceptance() {
         let exception = InsecureCompatibilityException {
             mode: "legacy-handshake".to_owned(),
