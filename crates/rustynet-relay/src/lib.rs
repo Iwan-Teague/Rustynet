@@ -169,4 +169,63 @@ mod tests {
             .expect("policy-constrained relay should be selected");
         assert_eq!(selected.id, "relay-b");
     }
+
+    #[test]
+    fn all_relays_unhealthy_returns_none_fail_closed() {
+        // Fail-closed relay selection: when every relay in the fleet
+        // is unhealthy, select_best must return None — never a dead
+        // node. Traffic must stop rather than flow through an
+        // unavailable hop.
+        let mut fleet = RelayFleet {
+            nodes: vec![
+                RelayNode {
+                    id: "relay-a".to_owned(),
+                    region: "us-east".to_owned(),
+                    healthy: false,
+                    latency_ms: 10,
+                },
+                RelayNode {
+                    id: "relay-b".to_owned(),
+                    region: "eu-west".to_owned(),
+                    healthy: false,
+                    latency_ms: 15,
+                },
+            ],
+        };
+
+        assert_eq!(fleet.select_best(None), None);
+
+        // Region-constrained variant also returns None.
+        assert_eq!(
+            fleet.select_with_policy(&RelaySelectionPolicy {
+                preferred_region: Some("us-east".to_owned()),
+                allowed_regions: vec!["us-east".to_owned()],
+            }),
+            None
+        );
+
+        // Recovery: marking one healthy again restores selection.
+        if let Some(node) = fleet.nodes.iter_mut().find(|n| n.id == "relay-b") {
+            node.healthy = true;
+        }
+        let recovered = fleet.select_best(None).expect("recovered");
+        assert_eq!(recovered.id, "relay-b");
+    }
+
+    #[test]
+    fn mark_unhealthy_unknown_relay_is_silent_no_op() {
+        // Best-effort health marking: marking an unknown relay id must
+        // not panic and must not disturb existing healthy relays.
+        let mut fleet = RelayFleet {
+            nodes: vec![RelayNode {
+                id: "relay-a".to_owned(),
+                region: "us-east".to_owned(),
+                healthy: true,
+                latency_ms: 10,
+            }],
+        };
+        fleet.mark_unhealthy("relay-nonexistent");
+
+        assert!(fleet.select_best(None).is_some());
+    }
 }
