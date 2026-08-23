@@ -557,6 +557,41 @@ mod tests {
     }
 
     #[test]
+    fn viewer_role_is_read_only_and_tenant_scoped() {
+        // A Viewer may only ViewResources inside its own tenant. Every
+        // mutating action must be refused, and any cross-tenant access
+        // must be refused as CrossTenantDenied before role checks run.
+        let mut guard = TenantBoundaryGuard::default();
+        guard
+            .register_principal("bob", "tenant-b", TenantRole::Viewer)
+            .expect("valid principal");
+        guard
+            .register_principal("carol", "tenant-c", TenantRole::DelegatedAdmin)
+            .expect("valid principal");
+
+        // Control: the read action inside the own tenant works.
+        guard
+            .authorize("bob", "tenant-b", TenantAction::ViewResources)
+            .expect("viewer may view resources in its own tenant");
+
+        // Mutating actions are refused for a viewer.
+        assert_eq!(
+            guard
+                .authorize("bob", "tenant-b", TenantAction::MutatePolicy)
+                .err(),
+            Some(TenantError::Unauthorized)
+        );
+
+        // Cross-tenant reads are refused for a viewer.
+        assert_eq!(
+            guard
+                .authorize("carol", "tenant-b", TenantAction::ViewResources)
+                .err(),
+            Some(TenantError::CrossTenantDenied)
+        );
+    }
+
+    #[test]
     fn enterprise_auth_validates_issuer_audience_and_mfa() {
         let config = EnterpriseAuthConfig {
             issuer: "https://id.example.local".to_owned(),
