@@ -332,7 +332,12 @@ pub fn classify_nft_general_egress_rule(
     contained: &ContainedInterfaces,
     acknowledged_wide_open_interfaces: &[&str],
 ) -> RuleDisposition {
-    let lowered = rule.trim().to_ascii_lowercase();
+    // Keyword matching runs on the rule with quoted segments removed:
+    // an nft comment payload (`comment "we do not drop here"`) must not
+    // make an accept rule read as a drop terminator, and a jump/goto word
+    // inside a comment must not read as an escape. Interface extraction
+    // below still reads the original rule, where quotes delimit names.
+    let lowered = without_quoted_segments(&rule.trim().to_ascii_lowercase());
     if lowered.is_empty() || lowered.starts_with('#') {
         return RuleDisposition::Irrelevant;
     }
@@ -388,6 +393,25 @@ pub fn classify_nft_general_egress_rule(
         return RuleDisposition::NarrowAllow;
     }
     RuleDisposition::Escapes
+}
+
+/// Remove every double-quoted segment (and the quotes) from `text`.
+///
+/// Used before keyword classification so text inside `comment "..."`
+/// payloads cannot decide a rule's disposition.
+fn without_quoted_segments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_quotes = false;
+    for c in text.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if !in_quotes {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Assert that a Linux killswitch chain's terminal drop is REACHABLE.
@@ -601,6 +625,41 @@ mod tests {
         assert_eq!(
             ContainedInterfaces::nft_rule_output_interface("ip saddr 10.0.0.1 accept"),
             None
+        );
+    }
+
+    #[test]
+    fn comment_payloads_do_not_decide_a_rules_disposition() {
+        let contained = ContainedInterfaces::default();
+        // An ACCEPT whose comment payload contains "drop" must not be read
+        // as the terminator: that would let a broad accept hide every rule
+        // beneath it behind a prose word (the RN-27 masking shape).
+        assert_eq!(
+            classify_nft_general_egress_rule(
+                r#"oifname "eth0" accept comment "packets we do not drop here""#,
+                &contained,
+                &[],
+            ),
+            RuleDisposition::Escapes
+        );
+        // Same for jump/goto vocabulary inside a comment: the tunnel-scoped
+        // accept stays contained rather than reading as an escape.
+        assert_eq!(
+            classify_nft_general_egress_rule(
+                r#"oifname "wg0" accept comment "no jump beyond this chain""#,
+                &contained,
+                &[],
+            ),
+            RuleDisposition::Contained
+        );
+        // A real terminator with a comment still classifies as one.
+        assert_eq!(
+            classify_nft_general_egress_rule(
+                r#"counter drop comment "final verdict""#,
+                &contained,
+                &[],
+            ),
+            RuleDisposition::Terminator
         );
     }
 
