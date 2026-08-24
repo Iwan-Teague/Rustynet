@@ -30,7 +30,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -309,8 +309,35 @@ pub fn read_role_audit_log(path: &Path) -> Result<Vec<RoleAuditEntry>, RoleAudit
             metadata.len()
         )));
     }
-    let body = fs::read_to_string(path)
-        .map_err(|err| RoleAuditError::Io(format!("read_to_string: {err}")))?;
+    let mut file =
+        fs::File::open(path).map_err(|err| RoleAuditError::Io(format!("open: {err}")))?;
+    // Read at most cap+1 bytes so a file grown between the metadata
+    // check and this read cannot bypass the cap via TOCTOU. Reading
+    // cap+1 lets us distinguish exactly-at-cap (accepted) from
+    // over-cap (refused) without a second stat.
+    let mut capped = vec![0u8; MAX_ROLE_AUDIT_LOG_BYTES + 1];
+    let mut filled = 0usize;
+    loop {
+        let read = file
+            .read(&mut capped[filled..])
+            .map_err(|err| RoleAuditError::Io(format!("read: {err}")))?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+        if filled == capped.len() {
+            break;
+        }
+    }
+    capped.truncate(filled);
+    if capped.len() > MAX_ROLE_AUDIT_LOG_BYTES {
+        return Err(RoleAuditError::Io(format!(
+            "role audit log exceeds {} byte cap; refusing to parse",
+            MAX_ROLE_AUDIT_LOG_BYTES
+        )));
+    }
+    let body = String::from_utf8(capped)
+        .map_err(|_| RoleAuditError::Io("utf8: invalid encoding in role audit log".to_string()))?;
     let mut out = Vec::new();
     for (line_no, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
@@ -455,6 +482,42 @@ mod tests {
 
     fn cleanup(path: &Path) {
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn oversized_audit_log_fails_closed_at_cap() {
+        let path = tmp_path("oversized");
+        let oversized = vec![b'a'; MAX_ROLE_AUDIT_LOG_BYTES + 1];
+        fs::write(&path, &oversized).expect("write oversized log");
+        let err = read_role_audit_log(&path).expect_err("over-cap read must fail closed");
+        match &err {
+            RoleAuditError::Io(msg) => {
+                assert!(
+                    msg.contains("byte cap"),
+                    "expected byte-cap refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected Io error at cap, got: {other:?}"),
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn audit_log_at_exact_cap_boundary_is_accepted() {
+        // Exactly-at-cap must NOT trigger the byte-cap refusal — it
+        // should fall through to the parser (which rejects the single
+        // '#' line as Malformed). This distinguishes the cap path from
+        // the parser path so a regression that refuses everything
+        // cannot hide as "still failing closed".
+        let path = tmp_path("exact_cap");
+        let exact = vec![b'#'; MAX_ROLE_AUDIT_LOG_BYTES];
+        fs::write(&path, &exact).expect("write exact-cap log");
+        let err = read_role_audit_log(&path).expect_err("parser must reject '#' line");
+        assert!(
+            matches!(err, RoleAuditError::Malformed(_)),
+            "expected Malformed from parser (cap NOT triggered), got: {err:?}"
+        );
+        cleanup(&path);
     }
 
     #[test]
