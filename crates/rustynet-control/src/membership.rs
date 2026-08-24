@@ -1534,10 +1534,20 @@ pub fn load_membership_watermark(path: &Path) -> Result<Option<MembershipWaterma
     let mut version: Option<u8> = None;
     let mut epoch: Option<u64> = None;
     let mut state_root: Option<String> = None;
+    // Duplicate-key rejection tracks RAW key presence, not parsed values:
+    // a failed parse erases the evidence (version becomes None), so a
+    // tampered "epoch=5\nepoch=999" must be caught even if the first
+    // line had failed to parse. Mirrors the role-audit reader's
+    // duplicate rejection in this same crate (fail-closed standard).
+    let mut seen: Vec<&str> = Vec::new();
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err("membership watermark line missing key/value separator".to_owned());
         };
+        if seen.contains(&key) {
+            return Err(format!("duplicate membership watermark key {key}"));
+        }
+        seen.push(key);
         match key {
             "version" => {
                 version = value.parse::<u8>().ok();
@@ -1546,6 +1556,12 @@ pub fn load_membership_watermark(path: &Path) -> Result<Option<MembershipWaterma
                 epoch = value.parse::<u64>().ok();
             }
             "state_root" => {
+                // An empty root is not a state identity; accepting it
+                // would let a truncated/tampered file pass the replay
+                // gate with a placeholder value.
+                if value.is_empty() {
+                    return Err("empty membership watermark state_root".to_owned());
+                }
                 state_root = Some(value.to_owned());
             }
             _ => return Err(format!("unknown membership watermark key {key}")),
@@ -2780,12 +2796,12 @@ mod tests {
         MEMBERSHIP_CLOCK_SKEW_SECS, MEMBERSHIP_SCHEMA_VERSION, MembershipApprover,
         MembershipApproverRole, MembershipApproverStatus, MembershipError, MembershipNode,
         MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipSignature,
-        MembershipState, MembershipUpdateRecord, SignedMembershipUpdate,
+        MembershipState, MembershipUpdateRecord, MembershipWatermark, SignedMembershipUpdate,
         append_membership_log_entry, apply_signed_update, decode_membership_state,
         decode_update_record, encode_membership_state, hex_encode, load_membership_log,
-        load_membership_snapshot, persist_membership_snapshot, preview_next_state,
-        reduce_membership_state, replay_membership_snapshot_and_log, sign_update_record,
-        write_membership_audit_log,
+        load_membership_snapshot, load_membership_watermark, persist_membership_snapshot,
+        persist_membership_watermark, preview_next_state, reduce_membership_state,
+        replay_membership_snapshot_and_log, sign_update_record, write_membership_audit_log,
     };
     // The size-cap constants are only exercised by the `#[cfg(unix)]` oversized-file
     // tests below; gate the import to match so Windows does not see them as unused.
@@ -5945,6 +5961,63 @@ mod tests {
             "expected binding refusal, got: {err}"
         );
         assert!(!path.exists(), "no snapshot may be written on refusal");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn watermark_test_dir(label: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "membership-watermark-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        temp_dir
+    }
+
+    #[test]
+    fn watermark_loader_rejects_duplicate_keys() {
+        let temp_dir = watermark_test_dir("dup");
+        let path = temp_dir.join("watermark");
+        // A tampered file that repeats epoch= must NOT have its last line
+        // silently win — the loader must fail closed on the duplicate.
+        std::fs::write(
+            &path,
+            "version=1\nepoch=5\nepoch=999\nstate_root=abc\nstate_root=zzz\n",
+        )
+        .expect("write watermark");
+        let err = load_membership_watermark(&path).expect_err("duplicate epoch must be rejected");
+        assert!(err.contains("duplicate"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn watermark_loader_rejects_empty_state_root() {
+        let temp_dir = watermark_test_dir("empty-root");
+        let path = temp_dir.join("watermark");
+        std::fs::write(&path, "version=1\nepoch=7\nstate_root=\n").expect("write watermark");
+        let err = load_membership_watermark(&path).expect_err("empty state_root must be rejected");
+        assert!(err.contains("empty"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn watermark_persist_load_round_trip() {
+        let temp_dir = watermark_test_dir("round-trip");
+        let path = temp_dir.join("nested").join("watermark");
+        let written = MembershipWatermark {
+            epoch: 41,
+            state_root: "root-bytes-0123".to_owned(),
+        };
+        persist_membership_watermark(&path, &written).expect("persist watermark");
+        let loaded = load_membership_watermark(&path)
+            .expect("load persisted watermark")
+            .expect("watermark file must exist after persist");
+        assert_eq!(loaded.epoch, written.epoch);
+        assert_eq!(loaded.state_root, written.state_root);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
