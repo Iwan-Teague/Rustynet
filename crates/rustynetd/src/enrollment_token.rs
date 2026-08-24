@@ -46,7 +46,7 @@
 //!   the enrollee's public key to the membership snapshot. The
 //!   token is opaque to the enrollee.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -355,12 +355,20 @@ pub fn decode_token(encoded: &str) -> Result<EnrollmentToken, EnrollmentTokenErr
     })
 }
 
-/// Bookkeeping for already-consumed token IDs. Persisted via the
-/// daemon's watermark spool pattern so single-use survives restart.
+/// Bookkeeping for already-consumed token IDs, keyed to each token's
+/// expiry so expired entries can be pruned instead of growing forever.
+/// Persisted via the daemon's watermark spool pattern so single-use
+/// survives restart.
 #[derive(Debug, Default, Clone)]
 pub struct ConsumedTokenLedger {
-    inner: HashSet<[u8; TOKEN_ID_LEN]>,
+    inner: HashMap<[u8; TOKEN_ID_LEN], u64>,
 }
+
+/// Expiry recorded for entries migrated from ledger format v1, which
+/// stored bare token ids with no expiry. They are never auto-pruned —
+/// conservative, since pruning an entry that is still unexpired would
+/// let a replayed token be consumed twice.
+const NO_EXPIRY_RECORDED: u64 = u64::MAX;
 
 impl ConsumedTokenLedger {
     pub fn new() -> Self {
@@ -368,35 +376,36 @@ impl ConsumedTokenLedger {
     }
 
     pub fn was_consumed(&self, token_id: &[u8; TOKEN_ID_LEN]) -> bool {
-        self.inner.contains(token_id)
+        self.inner.contains_key(token_id)
     }
 
-    pub fn record_consumed(&mut self, token_id: [u8; TOKEN_ID_LEN]) {
-        self.inner.insert(token_id);
+    /// Record a consumption together with the token's expiry instant so
+    /// [`purge_expired_against`] can retire it once it no longer matters.
+    pub fn record_consumed(&mut self, token_id: [u8; TOKEN_ID_LEN], expires_at_unix: u64) {
+        self.inner.entry(token_id).or_insert(expires_at_unix);
     }
 
     pub fn consumed_count(&self) -> usize {
         self.inner.len()
     }
 
-    /// Optional GC: drop expired tokens from the ledger to keep its
-    /// footprint bounded. Safe because an expired token is already
-    /// rejected by the expiry check; once it's expired we don't need
-    /// to remember we saw it.
-    pub fn purge_expired_against(&mut self, _now_unix: u64) {
-        // The ledger stores only the token ID, not the expiry, so a
-        // separate expiry-indexed structure is needed to purge
-        // efficiently. The first cut keeps the ledger simple; a
-        // production system will spool token_id + expires_at to a
-        // file and prune at startup. This stub is documented as a
-        // follow-up.
+    /// Drop entries whose expiry has passed. Safe because an expired
+    /// token is rejected by the expiry check before the ledger is ever
+    /// consulted — once a token is expired we do not need to remember
+    /// having seen it. Returns how many entries were removed.
+    pub fn purge_expired_against(&mut self, now_unix: u64) -> usize {
+        let before = self.inner.len();
+        self.inner.retain(|_, expires_at| *expires_at > now_unix);
+        before - self.inner.len()
     }
 
-    /// Iterate every consumed token_id. Used by the spool writer.
-    /// Order is unspecified — callers that need a deterministic
+    /// Iterate every consumed (token_id, expiry) pair. Used by the spool
+    /// writer. Order is unspecified — callers that need a deterministic
     /// on-disk layout should sort the result.
-    pub fn iter_consumed(&self) -> impl Iterator<Item = &[u8; TOKEN_ID_LEN]> {
-        self.inner.iter()
+    pub fn iter_consumed_with_expiry(
+        &self,
+    ) -> impl Iterator<Item = ([u8; TOKEN_ID_LEN], u64)> + '_ {
+        self.inner.iter().map(|(id, exp)| (*id, *exp))
     }
 }
 
@@ -429,23 +438,31 @@ impl std::error::Error for EnrollmentSpoolError {}
 /// Wire-format version byte for the on-disk ledger spool. Bumped
 /// only on schema change; an older daemon reading a newer file
 /// rejects fail-closed.
-const LEDGER_WIRE_VERSION: u8 = 1;
+const LEDGER_WIRE_VERSION: u8 = 2;
+
+/// Ledger format written by the previous schema: bare hex token ids
+/// under `consumed=` with no expiry recorded. Still readable — such
+/// entries are loaded with [`NO_EXPIRY_RECORDED`] so they are never
+/// auto-pruned (conservative: pruning an unexpired entry would let a
+/// replayed token be consumed twice).
+const LEGACY_LEDGER_WIRE_VERSION: u8 = 1;
 
 /// Upper bound on the on-disk single-use ledger (ENR-08), enforced on **both**
 /// read and write so the daemon can never persist a ledger it will later refuse
 /// to load.
 ///
-/// Each consumed entry is a 16-byte token id rendered as 32 hex characters plus a
-/// separator, i.e. 33 bytes, so this admits ~31.7k consumed tokens.
+/// Each consumed entry is a 16-byte token id rendered as 32 hex characters plus
+/// its expiry and separators (~50 bytes), so this admits ~20k live entries.
 ///
-/// The write-side check is not optional. `purge_expired_against` is a documented
-/// no-op (RN-26), so the ledger is grow-only: a read-only cap would eventually
-/// reject a file the daemon itself wrote, aborting every subsequent redemption.
-/// That fails closed, but the only field recovery is deleting the ledger — which
-/// resets single-use enforcement and reopens replay for every consumed-but-
-/// unexpired token. Failing at write time instead keeps the failure actionable and
-/// never produces an unreadable file. Raising this bound is not the fix; landing
-/// RN-26's purge is.
+/// The write-side check stays as defense-in-depth now that expired entries are
+/// pruned on every redemption (`purge_expired_against`): it guarantees the daemon
+/// can never persist a file its own reader would refuse. A read cap alone would
+/// eventually reject a file the daemon itself wrote, aborting every subsequent
+/// redemption — failing at write time instead keeps the failure actionable and
+/// never produces an unreadable file. Legacy v1 entries carry no expiry and are
+/// never pruned, so a long-lived upgrade from v1 can still fill the spool; that
+/// failure remains actionable (delete the spool after confirming no unexpired
+/// tokens are outstanding).
 const MAX_LEDGER_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Read a consumed-token ledger from disk. Returns `Ok(default)`
@@ -489,6 +506,8 @@ pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, Enroll
     let content =
         fs::read_to_string(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
     let mut version: Option<u8> = None;
+    let mut saw_consumed_exp = false;
+    let mut legacy_consumed_nonempty = false;
     let mut ledger = ConsumedTokenLedger::new();
     for line in content.lines() {
         if line.is_empty() {
@@ -504,11 +523,14 @@ pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, Enroll
                 version = value.parse::<u8>().ok();
             }
             "consumed" => {
-                // consumed=<hex32>,<hex32>,...  (32 hex chars per id
-                // because TOKEN_ID_LEN is 16 bytes = 32 hex chars)
+                // v1: consumed=<hex32>,<hex32>,... (32 hex chars per id
+                // because TOKEN_ID_LEN is 16 bytes). Entries carry no
+                // expiry; they load with NO_EXPIRY_RECORDED so they are
+                // never auto-pruned.
                 if value.is_empty() {
                     continue;
                 }
+                legacy_consumed_nonempty = true;
                 for entry in value.split(',') {
                     if entry.len() != TOKEN_ID_LEN * 2 {
                         return Err(EnrollmentSpoolError::Corrupt(
@@ -524,7 +546,45 @@ pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, Enroll
                             EnrollmentSpoolError::Corrupt("ledger consumed entry is not valid hex")
                         })?;
                     }
-                    ledger.record_consumed(id);
+                    ledger.record_consumed(id, NO_EXPIRY_RECORDED);
+                }
+            }
+            "consumed_exp" => {
+                // v2: consumed_exp=<hex32>:<unix-secs>,<hex32>:<unix-secs>,...
+                // The expiry is what lets purge_expired_against retire the
+                // entry once it can no longer matter.
+                saw_consumed_exp = true;
+                if value.is_empty() {
+                    continue;
+                }
+                for entry in value.split(',') {
+                    let Some((id_hex, exp)) = entry.split_once(':') else {
+                        return Err(EnrollmentSpoolError::Corrupt(
+                            "ledger consumed_exp entry missing expiry",
+                        ));
+                    };
+                    if id_hex.len() != TOKEN_ID_LEN * 2 {
+                        return Err(EnrollmentSpoolError::Corrupt(
+                            "ledger consumed_exp entry has wrong hex length",
+                        ));
+                    }
+                    let mut id = [0u8; TOKEN_ID_LEN];
+                    for (i, chunk) in id_hex.as_bytes().chunks(2).enumerate() {
+                        let hex = std::str::from_utf8(chunk).map_err(|_| {
+                            EnrollmentSpoolError::Corrupt("ledger consumed_exp entry is not ASCII")
+                        })?;
+                        id[i] = u8::from_str_radix(hex, 16).map_err(|_| {
+                            EnrollmentSpoolError::Corrupt(
+                                "ledger consumed_exp entry is not valid hex",
+                            )
+                        })?;
+                    }
+                    let expires_at_unix = exp.parse::<u64>().map_err(|_| {
+                        EnrollmentSpoolError::Corrupt(
+                            "ledger consumed_exp entry has invalid expiry",
+                        )
+                    })?;
+                    ledger.record_consumed(id, expires_at_unix);
                 }
             }
             _ => {
@@ -534,10 +594,30 @@ pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, Enroll
             }
         }
     }
-    if version != Some(LEDGER_WIRE_VERSION) {
-        return Err(EnrollmentSpoolError::Corrupt(
-            "ledger file version mismatch",
-        ));
+    match version {
+        Some(LEDGER_WIRE_VERSION) => {
+            // v2 carries expiries in `consumed_exp=`; a bare `consumed=`
+            // list would silently lose the pruning contract.
+            if legacy_consumed_nonempty || !saw_consumed_exp {
+                return Err(EnrollmentSpoolError::Corrupt(
+                    "v2 ledger must carry expiries via consumed_exp",
+                ));
+            }
+        }
+        Some(LEGACY_LEDGER_WIRE_VERSION) => {
+            // v1 never had expiries; a `consumed_exp=` key there is an
+            // unknown-key-shaped mismatch.
+            if saw_consumed_exp {
+                return Err(EnrollmentSpoolError::Corrupt(
+                    "v1 ledger cannot carry consumed_exp entries",
+                ));
+            }
+        }
+        _ => {
+            return Err(EnrollmentSpoolError::Corrupt(
+                "ledger file version mismatch",
+            ));
+        }
     }
     Ok(ledger)
 }
@@ -563,11 +643,11 @@ pub fn write_ledger(
     }
     let mut payload = String::new();
     payload.push_str(&format!("version={LEDGER_WIRE_VERSION}\n"));
-    payload.push_str("consumed=");
-    let mut entries: Vec<[u8; TOKEN_ID_LEN]> = ledger.iter_consumed().copied().collect();
+    payload.push_str("consumed_exp=");
+    let mut entries: Vec<([u8; TOKEN_ID_LEN], u64)> = ledger.iter_consumed_with_expiry().collect();
     entries.sort();
     let mut first = true;
-    for id in entries {
+    for (id, expires_at_unix) in entries {
         if !first {
             payload.push(',');
         }
@@ -575,6 +655,8 @@ pub fn write_ledger(
         for byte in id {
             payload.push_str(&format!("{byte:02x}"));
         }
+        payload.push(':');
+        payload.push_str(&expires_at_unix.to_string());
     }
     payload.push('\n');
     // ENR-08: refuse to persist a ledger larger than `load_ledger` will accept.
@@ -582,8 +664,9 @@ pub fn write_ledger(
     // (see the constant's doc for why that is worse than failing here).
     if payload.len() as u64 > MAX_LEDGER_FILE_BYTES {
         return Err(EnrollmentSpoolError::Corrupt(
-            "enrollment ledger is full; the consumed-token spool needs purging \
-             (RN-26) before further redemptions can be recorded",
+            "enrollment ledger is full; expired entries should have been \
+             purged — delete the spool only after confirming no unexpired \
+             tokens are outstanding, then retry",
         ));
     }
     let temp_path = path.with_extension(format!(
@@ -918,7 +1001,8 @@ pub fn verify_and_consume_token_with_now(
     if ledger.was_consumed(&token.token_id) {
         return Err(EnrollmentTokenError::AlreadyConsumed);
     }
-    ledger.record_consumed(token.token_id);
+    ledger.record_consumed(token.token_id, token.expires_at_unix);
+    ledger.purge_expired_against(now_unix);
     Ok(token)
 }
 
@@ -1170,10 +1254,10 @@ mod tests {
         let mut ledger = ConsumedTokenLedger::new();
         let id = [99u8; TOKEN_ID_LEN];
         assert!(!ledger.was_consumed(&id));
-        ledger.record_consumed(id);
+        ledger.record_consumed(id, u64::MAX);
         assert!(ledger.was_consumed(&id));
         // Idempotent: recording twice doesn't break the count.
-        ledger.record_consumed(id);
+        ledger.record_consumed(id, u64::MAX);
         assert_eq!(ledger.consumed_count(), 1);
     }
 
@@ -1322,7 +1406,7 @@ mod tests {
         for i in 0..entries {
             let mut id = [0u8; TOKEN_ID_LEN];
             id[..8].copy_from_slice(&i.to_be_bytes());
-            ledger.record_consumed(id);
+            ledger.record_consumed(id, u64::MAX);
         }
 
         match write_ledger(&path, &ledger) {
@@ -1369,7 +1453,7 @@ mod tests {
         // Loose permissions: refused.
         let loose = dir.path().join("loose.ledger");
         let mut ledger = ConsumedTokenLedger::new();
-        ledger.record_consumed([0xa1u8; TOKEN_ID_LEN]);
+        ledger.record_consumed([0xa1u8; TOKEN_ID_LEN], u64::MAX);
         write_ledger(&loose, &ledger).expect("seed ledger");
         // 0o640 — GROUP-readable only, no world bits. Chosen deliberately: a
         // weakened predicate of `mode & 0o007` (world only) still trips on 0o666,
@@ -1421,8 +1505,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("enrollment.ledger");
         let mut ledger = ConsumedTokenLedger::new();
-        ledger.record_consumed([0xa1u8; TOKEN_ID_LEN]);
-        ledger.record_consumed([0xb2u8; TOKEN_ID_LEN]);
+        ledger.record_consumed([0xa1u8; TOKEN_ID_LEN], u64::MAX);
+        ledger.record_consumed([0xb2u8; TOKEN_ID_LEN], u64::MAX);
         write_ledger(&path, &ledger).expect("write ok");
         let loaded = load_ledger(&path).expect("load ok");
         assert_eq!(loaded.consumed_count(), 2);
@@ -1517,6 +1601,127 @@ mod tests {
         let path = dir.path().join("bad.ledger");
         fs::write(&path, b"version=99\nconsumed=\n").expect("write");
         let err = load_ledger(&path).expect_err("wrong version must reject");
+        assert!(matches!(err, EnrollmentSpoolError::Corrupt(_)));
+    }
+
+    #[test]
+    fn expired_entry_is_purged_and_expiry_still_rejects_the_replay() {
+        let secret = deterministic_secret(0x11);
+        const T0: u64 = 1_700_000_000;
+        let (_token, encoded) = mint_token_with_clock(&secret, 600, T0).expect("mint");
+
+        // Consume while valid.
+        let mut ledger = ConsumedTokenLedger::new();
+        verify_and_consume_token_with_now(&encoded, &secret, &mut ledger, T0 + 300)
+            .expect("first consume");
+        assert_eq!(ledger.consumed_count(), 1);
+
+        // After expiry the purge retires the entry...
+        assert_eq!(ledger.purge_expired_against(T0 + 601), 1);
+        assert_eq!(ledger.consumed_count(), 0);
+
+        // ...and that loses nothing: the same replay is rejected by the
+        // expiry check, not silently accepted as a fresh consumption.
+        let err = verify_and_consume_token_with_now(&encoded, &secret, &mut ledger, T0 + 601)
+            .expect_err("expired replay must fail on expiry, not pass as unconsumed");
+        assert!(
+            matches!(err, EnrollmentTokenError::Expired { .. }),
+            "purge is safe only because expiry fires before the ledger; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unexpired_entries_survive_purge_and_keep_single_use() {
+        let secret = deterministic_secret(0x12);
+        const T0: u64 = 1_700_000_000;
+        let (_t_short, short_encoded) = mint_token_with_clock(&secret, 600, T0).expect("mint");
+        let (t_long, long_encoded) = mint_token_with_clock(&secret, 3600, T0).expect("mint");
+
+        let mut ledger = ConsumedTokenLedger::new();
+        verify_and_consume_token_with_now(&short_encoded, &secret, &mut ledger, T0 + 300)
+            .expect("consume short-lived");
+        verify_and_consume_token_with_now(&long_encoded, &secret, &mut ledger, T0 + 300)
+            .expect("consume long-lived");
+        assert_eq!(ledger.consumed_count(), 2);
+
+        // Only the expired entry goes.
+        assert_eq!(ledger.purge_expired_against(T0 + 601), 1);
+        assert_eq!(ledger.consumed_count(), 1);
+        assert!(ledger.was_consumed(&t_long.token_id));
+
+        // The survivor still enforces single-use.
+        let err = verify_and_consume_token_with_now(&long_encoded, &secret, &mut ledger, T0 + 700)
+            .expect_err("surviving entry must still reject replay");
+        assert!(
+            matches!(err, EnrollmentTokenError::AlreadyConsumed),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_ledger_loads_and_never_auto_prunes() {
+        use std::fs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("legacy.ledger");
+        fs::write(
+            &path,
+            b"version=1\nconsumed=0102030405060708090a0b0c0d0e0f10\n",
+        )
+        .expect("write legacy ledger");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("chmod legacy ledger");
+        }
+
+        let mut loaded = load_ledger(&path).expect("v1 loads");
+        assert_eq!(loaded.consumed_count(), 1);
+
+        // NO_EXPIRY_RECORDED survives every purge — conservative.
+        loaded.purge_expired_against(u64::MAX - 1);
+        assert_eq!(loaded.consumed_count(), 1);
+    }
+
+    #[test]
+    fn v2_round_trip_preserves_expiry_across_disk() {
+        use tempfile::TempDir;
+        let secret = deterministic_secret(0x13);
+        const T0: u64 = 1_700_000_000;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("spool.ledger");
+
+        let (_token, encoded) = mint_token_with_clock(&secret, 600, T0).expect("mint");
+        let mut ledger = ConsumedTokenLedger::new();
+        verify_and_consume_token_with_now(&encoded, &secret, &mut ledger, T0 + 300)
+            .expect("consume");
+
+        write_ledger(&path, &ledger).expect("write v2 spool");
+        let mut reloaded = load_ledger(&path).expect("reload v2 spool");
+        assert_eq!(reloaded.consumed_count(), 1);
+
+        // The expiry survived the disk round trip: purging at the same
+        // instant that pruned the in-memory copy also empties the reloaded
+        // one. (The in-memory `ledger` already had its entry retired by the
+        // consume-path purge; reload from disk to prove persistence.)
+        let _ = &ledger;
+        assert_eq!(reloaded.purge_expired_against(T0 + 601), 1);
+        assert_eq!(reloaded.consumed_count(), 0);
+    }
+
+    #[test]
+    fn v2_ledger_rejects_legacy_consumed_list() {
+        use std::fs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("mixed.ledger");
+        fs::write(
+            &path,
+            b"version=2\nconsumed=0102030405060708090a0b0c0d0e0f10\n",
+        )
+        .expect("write");
+        let err = load_ledger(&path).expect_err("v2 with bare ids must reject");
         assert!(matches!(err, EnrollmentSpoolError::Corrupt(_)));
     }
 
