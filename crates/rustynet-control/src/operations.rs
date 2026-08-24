@@ -62,6 +62,12 @@ fn is_sensitive_key(key: &str) -> bool {
         // contains() would swallow unrelated keys like "bypass" — so
         // only the underscore-delimited form and the exact word match.
         "_pass",
+        // Any *_key field is treated as credential material:
+        // "signing_key", "encryption_key", "hmac_key", "master_key",
+        // "session_key" all authenticate or decrypt on their own. The
+        // specific needles above stay for documentation; this suffix
+        // catch-all closes the class.
+        "_key",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
@@ -722,6 +728,12 @@ mod tests {
             ("client_secret", "cs_live_abc123"),
             ("refresh_token", "rt_abc123"),
             ("session_token", "st_abc123"),
+            // *_key suffix pins: signing/encryption/hmac keys are
+            // credential material on their own; the "_key" needle
+            // closes the class without enumerating each variant.
+            ("signing_key", "hex-key-material"),
+            ("encryption_key", "aes256-key-bytes"),
+            ("hmac_key", "hmac-secret-bytes"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -736,11 +748,20 @@ mod tests {
         }
 
         // Control: innocuous fields pass through untouched.
-        let benign: BTreeMap<String, String> = [("node_count".to_string(), "42".to_string())]
-            .into_iter()
-            .collect();
+        let benign: BTreeMap<String, String> = [
+            ("node_count".to_string(), "42".to_string()),
+            // "key" appearing mid-word must NOT trigger: only the
+            // "_key" suffix is sensitive, not a bare substring.
+            ("key_rotation".to_string(), "completed".to_string()),
+        ]
+        .into_iter()
+        .collect();
         let passed = redact_fields(IngestionPath::ApiPayload, &benign);
         assert_eq!(passed.get("node_count").map(String::as_str), Some("42"));
+        assert_eq!(
+            passed.get("key_rotation").map(String::as_str),
+            Some("completed")
+        );
     }
 
     #[test]
