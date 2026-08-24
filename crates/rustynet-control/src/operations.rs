@@ -73,6 +73,10 @@ fn looks_sensitive_value(value: &str) -> bool {
         || lowered.starts_with("ghp_")
         || lowered.starts_with("github_pat_")
         || lowered.starts_with("vault://")
+        // JWT: base64 of '{"' produces "eyJ" but after to_ascii_lowercase()
+        // the capital J becomes lowercase, yielding "eyj". Match against
+        // the lowercased form and require a dot separator (header.payload).
+        || (lowered.starts_with("eyj") && lowered.contains('.'))
         || lowered.contains("-----begin")
 }
 
@@ -477,6 +481,23 @@ mod tests {
             .collect();
         let passed = redact_fields(IngestionPath::LogField, &benign);
         assert_eq!(passed.get("node-count").map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    fn redaction_catches_jwt_tokens_in_values() {
+        // JWTs (starting with base64 of `{"` = "eyJ") are active session
+        // credentials. A leaked JWT in logs allows session hijacking.
+        // The dot separator distinguishes real JWTs from random "eyJ" text.
+        assert!(looks_sensitive_value(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+        ));
+        assert!(looks_sensitive_value(
+            "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lkLmV4YW1wbGUuY29tIn0.sig"
+        ));
+
+        // Control: a value starting with "eyj" but without a dot is not
+        // a JWT — it should NOT be flagged as sensitive.
+        assert!(!looks_sensitive_value("eyjust_a_word"));
     }
 
     #[test]
