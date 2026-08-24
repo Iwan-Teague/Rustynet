@@ -76,7 +76,10 @@ fn looks_sensitive_value(value: &str) -> bool {
         // JWT: base64 of '{"' produces "eyJ" but after to_ascii_lowercase()
         // the capital J becomes lowercase, yielding "eyj". Match against
         // the lowercased form and require a dot separator (header.payload).
+        // Also match a whitespace-preceded occurrence ("token eyJ… rejected")
+        // so an embedded JWT is caught even when not the whole value.
         || (lowered.starts_with("eyj") && lowered.contains('.'))
+        || (lowered.contains(" eyj") && lowered.contains('.'))
         || lowered.contains("-----begin")
 }
 
@@ -493,6 +496,12 @@ mod tests {
         ));
         assert!(looks_sensitive_value(
             "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lkLmV4YW1wbGUuY29tIn0.sig"
+        ));
+
+        // Mid-string JWT embedded in an error message must also be caught
+        // (mirrors the bearer/basic mid-string precedent).
+        assert!(looks_sensitive_value(
+            "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig rejected"
         ));
 
         // Control: a value starting with "eyj" but without a dot is not
