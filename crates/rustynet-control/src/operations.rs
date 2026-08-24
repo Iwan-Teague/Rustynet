@@ -651,6 +651,14 @@ mod tests {
             ("github_token_field", "ghp_16charsXXXXXXXXXXXXXX"),
             ("anthropic_note", "sk-ant-api03-xxxx"),
             ("ssh_key_pem", "-----BEGIN OPENSSH PRIVATE KEY-----"),
+            // Suffix-variant pins: needle matching uses contains(), so
+            // compound names whose SENSITIVE WORD sits mid-string must
+            // still hit ("client_secret" ends in secret, "refresh_token"
+            // ends in token). A refactor to starts_with/exact-match would
+            // silently drop these.
+            ("client_secret", "cs_live_abc123"),
+            ("refresh_token", "rt_abc123"),
+            ("session_token", "st_abc123"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
