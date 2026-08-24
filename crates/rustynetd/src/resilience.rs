@@ -59,6 +59,10 @@ impl fmt::Display for ResilienceError {
 
 impl std::error::Error for ResilienceError {}
 
+/// On-disk bound for the crash-resume session snapshot. Checked BEFORE the
+/// file is read so hostile/oversized disk state cannot drive allocation.
+const MAX_SESSION_SNAPSHOT_BYTES: u64 = 128 * 1024;
+
 pub fn next_reconnect_delay_ms(policy: ReconnectPolicy, attempt: u32) -> u64 {
     let factor = policy.multiplier.saturating_pow(attempt);
     let backoff = policy.initial_backoff_ms.saturating_mul(u64::from(factor));
@@ -129,8 +133,18 @@ pub fn persist_session_snapshot(
 pub fn load_session_snapshot(
     path: impl AsRef<Path>,
 ) -> Result<SessionStateSnapshot, ResilienceError> {
+    let path = path.as_ref();
+    // Bound the file BEFORE it is read into memory. The post-read length
+    // check below stays as defense-in-depth, but checking first matches
+    // every other state loader in this crate family (enrollment ledger,
+    // sealed NAS files, role-audit log): disk state must never be able to
+    // drive an unbounded allocation before a bound is applied.
+    let on_disk_len = fs::metadata(path).map_err(|_| ResilienceError::Io)?.len();
+    if on_disk_len > MAX_SESSION_SNAPSHOT_BYTES {
+        return Err(ResilienceError::InvalidFormat);
+    }
     let content = fs::read_to_string(path).map_err(|_| ResilienceError::Io)?;
-    if content.len() > 128 * 1024 {
+    if content.len() > MAX_SESSION_SNAPSHOT_BYTES as usize {
         return Err(ResilienceError::InvalidFormat);
     }
     let mut timestamp: Option<u64> = None;
@@ -410,8 +424,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ReconnectPolicy, ResilienceError, SessionStateSnapshot, acquire_lock,
-        load_session_snapshot, lock_path_for, next_reconnect_delay_jittered_ms,
+        MAX_SESSION_SNAPSHOT_BYTES, ReconnectPolicy, ResilienceError, SessionStateSnapshot,
+        acquire_lock, load_session_snapshot, lock_path_for, next_reconnect_delay_jittered_ms,
         next_reconnect_delay_ms, persist_session_snapshot,
     };
 
@@ -512,6 +526,28 @@ mod tests {
         std::fs::write(&path, tampered).expect("tampered write should succeed");
         let err = load_session_snapshot(&path);
         assert_eq!(err.err(), Some(ResilienceError::IntegrityMismatch));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn oversize_snapshot_is_refused_before_full_read() {
+        let unique = format!(
+            "rustynet-session-oversize-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::write(&path, vec![b'x'; MAX_SESSION_SNAPSHOT_BYTES as usize + 1])
+            .expect("oversize seed should write");
+
+        // The pre-read bound must refuse the file without reading it all; the
+        // observable contract is a typed InvalidFormat rejection, never an
+        // allocation proportional to hostile disk state.
+        let err = load_session_snapshot(&path);
+        assert_eq!(err.err(), Some(ResilienceError::InvalidFormat));
 
         let _ = std::fs::remove_file(path);
     }
