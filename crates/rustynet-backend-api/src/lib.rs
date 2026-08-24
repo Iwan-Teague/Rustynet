@@ -37,6 +37,13 @@ impl NodeId {
                 "node id must not contain invisible or bidirectional override characters",
             ));
         }
+        // Bound the length: an unbounded node id would consume memory
+        // proportional to peer-supplied input and could exceed downstream
+        // argv / storage limits. 255 bytes accommodates hostnames, FQDNs,
+        // and UUIDs with room to spare.
+        if normalized.len() > 255 {
+            return Err(BackendError::invalid_input("node id exceeds 255 bytes"));
+        }
         Ok(Self(normalized.to_owned()))
     }
 
@@ -373,6 +380,19 @@ mod tests {
                 .expect_err(&format!("invisible/bidi char in {bad:?} must be rejected"));
             assert_eq!(err.kind, BackendErrorKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn node_id_rejects_overly_long_values() {
+        // A node id longer than 255 bytes would consume unbounded memory
+        // and could exceed downstream argv / storage limits. Fail closed.
+        let oversized = "x".repeat(256);
+        let err = NodeId::new(oversized.as_str()).expect_err("256-byte node id must be rejected");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+
+        // Boundary: exactly 255 bytes is accepted.
+        let at_limit = "x".repeat(255);
+        NodeId::new(at_limit.as_str()).expect("255-byte node id must be accepted");
     }
 
     #[test]
