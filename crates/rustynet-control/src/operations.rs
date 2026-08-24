@@ -745,6 +745,34 @@ mod tests {
     }
 
     #[test]
+    fn redaction_leaves_benign_non_secret_fields_unchanged() {
+        // A numeric counter under a benign key must pass through untouched:
+        // neither "node_count" trips any sensitive-key needle nor does "5"
+        // look like a secret-shaped value, and over-redacting ordinary
+        // operational fields would destroy diagnostic value.
+        let counts: BTreeMap<String, String> = [("node_count".to_owned(), "5".to_owned())]
+            .into_iter()
+            .collect();
+        let passed = redact_fields(IngestionPath::LogField, &counts);
+        assert_eq!(passed.get("node_count").map(String::as_str), Some("5"));
+
+        // Prose that merely mentions the word "authorization" under a benign
+        // key must also survive: scheme_gated requires an actual credential
+        // reference ("bearer <token>" / "basic <credentials>"), not the bare
+        // word, so policy prose stays readable instead of collapsing to
+        // REDACTED.
+        let prose: BTreeMap<String, String> =
+            [("message".to_owned(), "authorization is required".to_owned())]
+                .into_iter()
+                .collect();
+        let passed_prose = redact_fields(IngestionPath::LogField, &prose);
+        assert_eq!(
+            passed_prose.get("message").map(String::as_str),
+            Some("authorization is required")
+        );
+    }
+
+    #[test]
     fn structured_logger_never_writes_cleartext_secrets() {
         let logger = StructuredLogger::default();
         let mut payload = BTreeMap::new();
