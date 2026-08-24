@@ -83,6 +83,15 @@ fn validate_credential_token(label: &str, value: &str) -> Result<(), String> {
             "{label} must not contain leading or trailing whitespace",
         ));
     }
+    // Fail closed on dash-prefix argv confusion: a value starting with
+    // '-' or '--' would be parsed as a command-line flag by child
+    // processes (systemd-creds, security, DPAPI helper) rather than
+    // as a positional value argument.
+    if value.starts_with("-") {
+        return Err(format!(
+            "{label} {value:?} starts with '-'; would be parsed as an argv flag"
+        ));
+    }
     if !value
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
@@ -615,6 +624,8 @@ mod tests {
             "a&b",
             "../etc/passwd",
             "/usr/local/etc/rustynet",
+            "-flag",  // argv confusion: parsed as flag by child process
+            "--help", // argv confusion: long-flag form
             "a|b",
             "a`b`",
             "a\"b",
