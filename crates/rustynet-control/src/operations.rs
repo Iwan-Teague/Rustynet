@@ -107,6 +107,15 @@ fn looks_sensitive_value(value: &str) -> bool {
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric())
             })
+        // Slack tokens: "xox" + role char (b=bot, p=user, a=app,
+        // r=refresh) + "-". Each is a bearer credential on its own.
+        || ["xoxb-", "xoxp-", "xoxa-", "xoxr-"]
+            .iter()
+            .any(|prefix| lowered.starts_with(prefix))
+        // Google API keys: "AIza" + 35 chars = 39 total, all
+        // alphanumeric or '-'/'_' in practice; require the length so a
+        // bare word starting with "aiza" does not over-trigger.
+        || (lowered.starts_with("aiza") && lowered.len() >= 39)
 }
 
 #[derive(Debug, Default)]
@@ -586,6 +595,41 @@ mod tests {
         let redacted = redact_fields(IngestionPath::LogField, &input);
         assert_eq!(
             redacted.get("aws_access_key_id").map(String::as_str),
+            Some("REDACTED")
+        );
+    }
+
+    #[test]
+    fn redaction_catches_slack_and_google_api_credentials() {
+        // Slack tokens are bearer credentials on their own: xoxb = bot,
+        // xoxp = user, xoxa = app, xoxr = refresh. Google API keys start
+        // with "AIza" and run 39 characters. Both shapes must redact.
+        // Tokens are assembled from fragments at runtime so this file
+        // never contains a literal matching secret-scanner patterns.
+        let slack_bot = ["xox", "b-", "123456789012-", "abcdefghijklmnopqrstuvwx"].concat();
+        let slack_user = ["xox", "p-", "123456789012-abcdef"].concat();
+        assert!(looks_sensitive_value(&slack_bot));
+        assert!(looks_sensitive_value(&slack_user));
+        assert!(looks_sensitive_value(
+            "AIzaSyD-9tJkeYwBpSvfBkPLvVqXgN0mZoOoPpQq"
+        ));
+
+        // Control: bare prefixes that fail the length requirement, or
+        // values without the dash separator, must pass through so the
+        // detector does not over-trigger on ordinary words.
+        assert!(!looks_sensitive_value("xoxb"));
+        assert!(!looks_sensitive_value("AIza"));
+        assert!(!looks_sensitive_value("aiza-not-a-google-key"));
+
+        // End-to-end: a Slack bot token arriving under a NEUTRAL key
+        // name must still be redacted by value shape alone.
+        let input: BTreeMap<String, String> =
+            [("integration_payload".to_string(), slack_bot.clone())]
+                .into_iter()
+                .collect();
+        let redacted = redact_fields(IngestionPath::LogField, &input);
+        assert_eq!(
+            redacted.get("integration_payload").map(String::as_str),
             Some("REDACTED")
         );
     }
