@@ -120,4 +120,52 @@ mod tests {
         assert!(rendered.contains("CSPRNG"));
         assert!(rendered.contains("relay session id"));
     }
+
+    #[test]
+    fn is_paired_with_requires_bidirectional_node_id_match() {
+        // The security gate for relay forwarding: two sessions are
+        // paired ONLY when each names the other as its peer. A bug here
+        // would let unpaired sessions forward traffic to each other.
+        let mk = |node_id: &str, peer_node_id: &str| RelaySession {
+            session_id: SessionId::try_generate().expect("OsRng"),
+            node_id: node_id.to_owned(),
+            peer_node_id: peer_node_id.to_owned(),
+            allocated_port: 51_820,
+            hello_source_addr: "10.0.0.1:1000".parse().unwrap(),
+            bound_peer_addr: None,
+            expires_at_unix: u64::MAX,
+            established_at: Instant::now(),
+            last_packet_at: Instant::now(),
+            paired_session_id: None,
+        };
+
+        // Bidirectional pair: A→B and B→A.
+        let forward = mk("node-a", "node-b");
+        let reverse = mk("node-b", "node-a");
+        assert!(
+            forward.is_paired_with(&reverse),
+            "reciprocal sessions must be paired"
+        );
+        assert!(reverse.is_paired_with(&forward));
+
+        // Same direction (both A→B): NOT paired.
+        let same_dir = mk("node-a", "node-b");
+        assert!(
+            !forward.is_paired_with(&same_dir),
+            "two sessions in the same direction must not be paired"
+        );
+
+        // Mismatched peers: A→B vs C→D are NOT paired.
+        let mismatched = mk("node-c", "node-d");
+        assert!(!forward.is_paired_with(&mismatched));
+
+        // Self-pairing: a session whose node_id == its own peer_node_id
+        // trivially pairs with itself (consistent with the bidirectional
+        // check — both conditions hold).
+        let self_session = mk("node-a", "node-a");
+        assert!(
+            self_session.is_paired_with(&self_session),
+            "a self-referential session pairs with itself by design"
+        );
+    }
 }
