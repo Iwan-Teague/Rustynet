@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -715,9 +715,20 @@ impl SignedMembershipUpdate {
     }
 }
 
+/// Upper bound on remembered update ids in a `MembershipReplayCache`.
+///
+/// Without a bound the id set grows once per accepted update for the life
+/// of the daemon. The epoch watermark alone still blocks rollback replays
+/// for evicted ids (apply_signed_update enforces the strict epoch chain
+/// before observe), so eviction only relaxes same-id dedup for very old
+/// ids — an acceptable trade against unbounded memory growth.
+pub const MAX_REPLAY_CACHE_ENTRIES: usize = 4096;
+
 #[derive(Debug, Default, Clone)]
 pub struct MembershipReplayCache {
     seen_update_ids: HashSet<String>,
+    /// Insertion order for oldest-first eviction once the cap is hit.
+    seen_update_order: VecDeque<String>,
     max_epoch: u64,
 }
 
@@ -730,6 +741,14 @@ impl MembershipReplayCache {
             return Err(MembershipError::ReplayDetected);
         }
         self.seen_update_ids.insert(update_id.to_owned());
+        self.seen_update_order.push_back(update_id.to_owned());
+        while self.seen_update_ids.len() > MAX_REPLAY_CACHE_ENTRIES {
+            if let Some(oldest) = self.seen_update_order.pop_front() {
+                self.seen_update_ids.remove(&oldest);
+            } else {
+                break;
+            }
+        }
         self.max_epoch = epoch_new;
         Ok(())
     }
@@ -1743,6 +1762,7 @@ pub fn replay_membership_snapshot_and_log(
     let mut state = snapshot.clone();
     let mut replay_cache = MembershipReplayCache {
         seen_update_ids: HashSet::new(),
+        seen_update_order: VecDeque::new(),
         max_epoch: snapshot.epoch,
     };
     let mut replay_started = false;
@@ -2793,15 +2813,16 @@ fn sha256_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MEMBERSHIP_CLOCK_SKEW_SECS, MEMBERSHIP_SCHEMA_VERSION, MembershipApprover,
-        MembershipApproverRole, MembershipApproverStatus, MembershipError, MembershipNode,
-        MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipSignature,
-        MembershipState, MembershipUpdateRecord, MembershipWatermark, SignedMembershipUpdate,
-        append_membership_log_entry, apply_signed_update, decode_membership_state,
-        decode_update_record, encode_membership_state, hex_encode, load_membership_log,
-        load_membership_snapshot, load_membership_watermark, persist_membership_snapshot,
-        persist_membership_watermark, preview_next_state, reduce_membership_state,
-        replay_membership_snapshot_and_log, sign_update_record, write_membership_audit_log,
+        MAX_REPLAY_CACHE_ENTRIES, MEMBERSHIP_CLOCK_SKEW_SECS, MEMBERSHIP_SCHEMA_VERSION,
+        MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipError,
+        MembershipNode, MembershipNodeStatus, MembershipOperation, MembershipReplayCache,
+        MembershipSignature, MembershipState, MembershipUpdateRecord, MembershipWatermark,
+        SignedMembershipUpdate, append_membership_log_entry, apply_signed_update,
+        decode_membership_state, decode_update_record, encode_membership_state, hex_encode,
+        load_membership_log, load_membership_snapshot, load_membership_watermark,
+        persist_membership_snapshot, persist_membership_watermark, preview_next_state,
+        reduce_membership_state, replay_membership_snapshot_and_log, sign_update_record,
+        write_membership_audit_log,
     };
     // The size-cap constants are only exercised by the `#[cfg(unix)]` oversized-file
     // tests below; gate the import to match so Windows does not see them as unused.
@@ -6019,6 +6040,35 @@ mod tests {
         assert_eq!(loaded.epoch, written.epoch);
         assert_eq!(loaded.state_root, written.state_root);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn replay_cache_bounded_at_cap_and_still_dedups_recent_ids() {
+        let mut cache = MembershipReplayCache::default();
+        for i in 0..(MAX_REPLAY_CACHE_ENTRIES + 250) {
+            let id = format!("replay-cache-fill-{i}");
+            cache
+                .observe(&id, (i + 1) as u64)
+                .unwrap_or_else(|e| panic!("observe {id} rejected: {e:?}"));
+        }
+        assert!(
+            cache.seen_update_ids.len() <= MAX_REPLAY_CACHE_ENTRIES,
+            "cache grew past the cap: {}",
+            cache.seen_update_ids.len()
+        );
+        // The most recent id is still remembered and deduped after eviction.
+        let latest = format!("replay-cache-fill-{}", MAX_REPLAY_CACHE_ENTRIES + 249);
+        assert!(matches!(
+            cache.observe(&latest, MAX_REPLAY_CACHE_ENTRIES as u64 + 251),
+            Err(MembershipError::ReplayDetected)
+        ));
+        // And a fresh id at a fresh epoch is still accepted post-eviction.
+        cache
+            .observe(
+                "replay-cache-post-eviction",
+                MAX_REPLAY_CACHE_ENTRIES as u64 + 252,
+            )
+            .expect("fresh id must be accepted after eviction");
     }
 }
 
