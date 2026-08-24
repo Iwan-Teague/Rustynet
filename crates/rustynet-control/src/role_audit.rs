@@ -1082,6 +1082,38 @@ mod tests {
     }
 
     #[test]
+    fn reader_rejects_simultaneous_unknown_and_duplicate_fields() {
+        // Multiple simultaneous violations: the parser must fail
+        // closed reporting the FIRST violation encountered — not
+        // panic, not skip, not collapse into a wrong variant.
+        let event = RoleTransitionEvent::PresetTransition {
+            from: RolePreset::Admin,
+            to: RolePreset::Exit,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        };
+        let payload = event.canonical_payload(100);
+        let entry_hash = compute_entry_hash(0, GENESIS_PREVIOUS_HASH, &payload);
+        let hex = hex_encode(payload.as_bytes());
+        let canonical_line = format!(
+            "index=0 previous_hash={GENESIS_PREVIOUS_HASH} entry_hash={entry_hash} event_hex={hex}\n"
+        );
+
+        // Unknown + duplicate on same line: must reject as Malformed
+        // regardless of which violation the parser encounters first.
+        let combo = canonical_line.replace("event_hex=", "junk=1 event_hex=");
+        let combo = combo.replace("index=0", "index=0 index=7");
+        assert_ne!(combo, canonical_line);
+        let path = tmp_path("combo-violations");
+        fs::write(&path, &combo).unwrap();
+        match read_role_audit_log(&path) {
+            Err(RoleAuditError::Malformed(_)) => {}
+            other => panic!("expected Malformed for simultaneous violations, got {other:?}"),
+        }
+        cleanup(&path);
+    }
+
+    #[test]
     fn malformed_line_returns_typed_error() {
         let path = tmp_path("malformed");
         fs::write(&path, "this is not a valid line\n").unwrap();
