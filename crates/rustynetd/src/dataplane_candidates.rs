@@ -191,6 +191,31 @@ pub fn classify_ipv6(addr: Ipv6Addr) -> AddressScope {
     if addr.segments()[0] == 0x2001 && addr.segments()[1] == 0x0db8 {
         return AddressScope::Unspecified;
     }
+    // RFC 7526 6to4 (2002::/16) — deprecated; embeds an attacker-chosen
+    // IPv4 address in bits 16-48, so treat the whole range as
+    // unreachable rather than a connect target.
+    if seg0 == 0x2002 {
+        return AddressScope::Unspecified;
+    }
+    // RFC 4380 Teredo (2001:0000::/32) — tunneling special-use; same
+    // class as the documentation-prefix fold above (0x0db8 and 0x0000
+    // do not overlap, so this stays after that check).
+    if addr.segments()[0] == 0x2001 && addr.segments()[1] == 0x0000 {
+        return AddressScope::Unspecified;
+    }
+    // RFC 6052 NAT64 well-known prefix (64:ff9b::/96) — translation
+    // special-use; reaching it requires translator infrastructure we
+    // never intend as a peer endpoint.
+    let segs = addr.segments();
+    if segs[0] == 0x0064
+        && segs[1] == 0xff9b
+        && segs[2] == 0x0000
+        && segs[3] == 0x0000
+        && segs[4] == 0x0000
+        && segs[5] == 0x0000
+    {
+        return AddressScope::Unspecified;
+    }
     AddressScope::Global
 }
 
@@ -582,6 +607,21 @@ mod tests {
         // Documentation prefix 2001:db8::/32 — never a real endpoint
         assert_eq!(
             classify_ipv6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+            AddressScope::Unspecified
+        );
+        // 6to4 2002::/16 (RFC 7526) — embeds attacker-chosen v4
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x2002, 0x836b, 0x4179, 0, 0, 0, 0, 1)),
+            AddressScope::Unspecified
+        );
+        // Teredo 2001:0000::/32 (RFC 4380)
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x2001, 0x0000, 0x1234, 0, 0, 0, 0, 1)),
+            AddressScope::Unspecified
+        );
+        // NAT64 well-known 64:ff9b::/96 (RFC 6052), embedding 192.0.2.1
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xc000, 0x0201)),
             AddressScope::Unspecified
         );
     }
