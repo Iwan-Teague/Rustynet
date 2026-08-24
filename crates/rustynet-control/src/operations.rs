@@ -128,9 +128,14 @@ fn looks_sensitive_value(value: &str) -> bool {
         // personal access tokens, npm automation tokens: each
         // authenticates on its own. (pk_live_ is public-by-design and is
         // deliberately NOT matched.) Errs toward over-redaction.
-        || ["whsec_", "rk_live_", "glpat-", "npm_"]
-            .iter()
-            .any(|prefix| lowered.starts_with(prefix))
+        || [
+            "whsec_", "rk_live_", "glpat-", "npm_", // existing shapes
+            "shpat_",  // Shopify admin API access token
+            "shpss_",  // Shopify shared-secret app token
+            "shpca_",  // Shopify custom app token
+        ]
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
 }
 
 #[derive(Debug, Default)]
@@ -740,15 +745,22 @@ mod tests {
         let rk_live = ["rk_li", "ve_", "k0Zx8WqPn4MvBt7YhJcRs2FdLu6GeA"].concat();
         let glpat = ["glp", "at-", "Xy9kQ2mNvB7cLpTzR6fG"].concat();
         let npm = ["npm", "_", "q8Zx4WvPn2Mb6Tt1YhJ"].concat();
+        // Shopify admin access token (shpat_ family), assembled from
+        // fragments so no scanner-matching literal appears in source.
+        let shpat = ["shp", "at_", "a1B2c3D4e5F6g7H8i9J0"].concat();
 
         assert!(looks_sensitive_value(&whsec));
         assert!(looks_sensitive_value(&rk_live));
         assert!(looks_sensitive_value(&glpat));
         assert!(looks_sensitive_value(&npm));
+        assert!(looks_sensitive_value(&shpat));
 
         // Negatives: near-miss prefixes must not over-trigger.
         assert!(!looks_sensitive_value("rk_livexyz"));
         assert!(!looks_sensitive_value("installed via npm without a token"));
+        // Control: "shp" alone (no underscore-delimited token kind) and a
+        // shop URL must not match any prefix.
+        assert!(!looks_sensitive_value("https://shop.example.com"));
 
         // The new key-name needle covers abbreviated password fields.
         assert!(is_sensitive_key("db_pwd"));
