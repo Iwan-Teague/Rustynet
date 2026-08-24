@@ -82,10 +82,14 @@ fn looks_sensitive_value(value: &str) -> bool {
         // JWT: base64 of '{"' produces "eyJ" but after to_ascii_lowercase()
         // the capital J becomes lowercase, yielding "eyj". Match against
         // the lowercased form and require a dot separator (header.payload).
-        // Also match a whitespace-preceded occurrence ("token eyJ… rejected")
-        // so an embedded JWT is caught even when not the whole value.
-        || (lowered.starts_with("eyj") && lowered.contains('.'))
-        || (lowered.contains(" eyj") && lowered.contains('.'))
+        // Mirror the scheme handling above: an occurrence may be the whole
+        // value or be preceded by a space, a tab (header folding), a quote
+        // (JSON-dumped request body), or a newline (multi-line error
+        // text). Errs toward over-redaction.
+        || lowered.contains('.')
+            && ["eyj", " eyj", "\teyj", "\"eyj", "\neyj"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
         || lowered.contains("-----begin")
 }
 
@@ -518,6 +522,19 @@ mod tests {
         // (mirrors the bearer/basic mid-string precedent).
         assert!(looks_sensitive_value(
             "token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig rejected"
+        ));
+
+        // Tab-, quote-, and newline-preceded occurrences mirror the
+        // scheme handling: header folding, JSON-dumped bodies, and
+        // multi-line error text.
+        assert!(looks_sensitive_value(
+            "auth\teyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig"
+        ));
+        assert!(looks_sensitive_value(
+            "{\"authorization\":\"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig\"}"
+        ));
+        assert!(looks_sensitive_value(
+            "auth failed\neyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.sig rejected"
         ));
 
         // Control: a value starting with "eyj" but without a dot is not
