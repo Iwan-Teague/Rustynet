@@ -101,14 +101,11 @@ fn looks_sensitive_value(value: &str) -> bool {
         // JWT: base64 of '{"' produces "eyJ" but after to_ascii_lowercase()
         // the capital J becomes lowercase, yielding "eyj". Match against
         // the lowercased form and require a dot separator (header.payload).
-        // Mirror the scheme handling above: an occurrence may be the whole
-        // value or be preceded by a space, a tab (header folding), a quote
-        // (JSON-dumped request body), or a newline (multi-line error
-        // text). Errs toward over-redaction.
+        // The bare substring subsumes every embedded occurrence (space-, tab-,
+        // quote-, or newline-preceded), so no per-separator variants are
+        // needed.
         || lowered.contains('.')
-            && ["eyj", " eyj", "\teyj", "\"eyj", "\neyj"]
-                .iter()
-                .any(|needle| lowered.contains(needle))
+            && lowered.contains("eyj")
         || lowered.contains("-----begin")
         // AWS access key ids: 4-char service prefix + 16 uppercase
         // alphanumerics. "AKIA" = long-lived IAM user keys; "ASIA" =
