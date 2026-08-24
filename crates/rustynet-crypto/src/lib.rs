@@ -4398,4 +4398,42 @@ mod tests {
         let hash_b = Sha256::digest(b"collision-check-beta");
         assert_ne!(hash_a.as_slice(), hash_b.as_slice());
     }
+
+    #[test]
+    fn sha256_known_answer_test_vector_abc() {
+        // NIST FIPS 180-4 classic test vector: SHA-256("abc") is a
+        // published constant. Pins algorithm-level correctness beyond
+        // the empty-input case so a broken implementation cannot pass
+        // by special-casing zero-length input.
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(b"abc");
+        let hex = hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn sha256_incremental_update_matches_one_shot_digest() {
+        // Streaming contract: feeding the same bytes through repeated
+        // update() calls in arbitrary chunk boundaries must equal the
+        // one-shot digest. A regression splitting this equivalence
+        // would silently corrupt every incremental integrity check.
+        use sha2::{Digest, Sha256};
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let one_shot = Sha256::digest(&data);
+        let mut hasher = Sha256::new();
+        // Deliberately awkward boundaries: 0-byte first chunk, a
+        // single byte, an odd multi-byte slice, and the remainder.
+        hasher.update(&data[..0]);
+        hasher.update(&data[..1]);
+        hasher.update(&data[1..3333]);
+        hasher.update(&data[3333..]);
+        let incremental = hasher.finalize();
+        assert_eq!(one_shot.as_slice(), incremental.as_slice());
+    }
 }
