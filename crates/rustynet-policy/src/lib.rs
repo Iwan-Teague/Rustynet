@@ -1928,6 +1928,47 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_with_membership_falls_through_to_terminal_default_deny_when_no_rule_matches() {
+        // Terminal default-deny pin: the membership gate ADMITS the
+        // request (both endpoints Active) and a rule IS present whose
+        // selectors resolve cleanly against the directory — yet nothing
+        // matches the request tuple. The only correct outcome is the
+        // fall-through Decision::Deny at the end of
+        // evaluate_with_membership; flipping it to Allow must fail
+        // this test.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "tag:other-servers".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+
+        let mut membership = MembershipDirectory::default();
+        // Bare-id key convention (see the CIDR gate test above).
+        membership.set_node_status("a", MembershipStatus::Active);
+        membership.set_node_status("b", MembershipStatus::Active);
+        // The rule's dst tag resolves to an ACTIVE member, so the rule
+        // passes its OWN membership gate too — the deny below comes
+        // purely from selector non-match, not a trust-state skip.
+        membership.set_node_status("member-of-other-tag", MembershipStatus::Active);
+        membership
+            .set_selector_members("tag:other-servers", vec!["member-of-other-tag".to_owned()]);
+
+        let request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Deny,
+            "an admitted request matched by no rule must fall through to the terminal default-deny"
+        );
+    }
+
+    #[test]
     fn removing_a_tag_from_the_acl_revokes_previously_allowed_requests() {
         // Revocation takes effect with no stale allow: while
         // tag:ephemeral has an active member, the request admits.
