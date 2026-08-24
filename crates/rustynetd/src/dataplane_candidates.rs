@@ -130,6 +130,34 @@ pub fn classify_ipv4(addr: Ipv4Addr) -> AddressScope {
     if oct[0] == 100 && (64..=127).contains(&oct[1]) {
         return AddressScope::Private;
     }
+    // Remaining IPv4 special-use ranges are never legitimate mesh
+    // endpoints, so they fold into Unspecified the same way the IPv6
+    // documentation prefix does below; both candidate filters then
+    // reject them fail-closed:
+    //
+    // - 0.0.0.0/8 "This network" (RFC 791): only the exact
+    //   unspecified address was matched above; the rest of the block
+    //   is equally meaningless as a peer address.
+    if oct[0] == 0 {
+        return AddressScope::Unspecified;
+    }
+    // - RFC 5737 TEST-NET-1/2/3: documentation ranges that must never
+    //   be dialled or announced (mirrors dns-zone's
+    //   is_universally_inappropriate_mesh_ipv4 standard).
+    if addr.is_documentation() {
+        return AddressScope::Unspecified;
+    }
+    // - RFC 2544 benchmarking range 198.18.0.0/15 (manual check;
+    //   `Ipv4Addr::is_benchmarking` is not stable on our toolchain).
+    if oct[0] == 198 && (18..=19).contains(&oct[1]) {
+        return AddressScope::Unspecified;
+    }
+    // - 240.0.0.0/4 reserved (RFC 1112); exact 255.255.255.255 was
+    //   already classified Broadcast above, so everything left here
+    //   is reserved space.
+    if oct[0] >= 240 {
+        return AddressScope::Unspecified;
+    }
     AddressScope::Global
 }
 
@@ -487,6 +515,40 @@ mod tests {
         assert_eq!(
             classify_ipv4(Ipv4Addr::new(8, 8, 8, 8)),
             AddressScope::Global
+        );
+        // Remaining special-use blocks fold into Unspecified (fail-closed):
+        // they are never legitimate mesh endpoints.
+        assert_eq!(
+            classify_ipv4(Ipv4Addr::new(0, 1, 2, 3)),
+            AddressScope::Unspecified
+        );
+        assert_eq!(
+            classify_ipv4(Ipv4Addr::new(240, 1, 2, 3)),
+            AddressScope::Unspecified
+        );
+        // 255.1.2.3 is reserved space, NOT the broadcast address (which is
+        // exactly 255.255.255.255).
+        assert_eq!(
+            classify_ipv4(Ipv4Addr::new(255, 1, 2, 3)),
+            AddressScope::Unspecified
+        );
+        // RFC 5737 TEST-NETs.
+        assert_eq!(
+            classify_ipv4(Ipv4Addr::new(192, 0, 2, 1)),
+            AddressScope::Unspecified
+        );
+        assert_eq!(
+            classify_ipv4(Ipv4Addr::new(198, 51, 100, 7)),
+            AddressScope::Unspecified
+        );
+        assert_eq!(
+            classify_ipv4(Ipv4Addr::new(203, 0, 113, 9)),
+            AddressScope::Unspecified
+        );
+        // RFC 2544 benchmarking 198.18.0.0/15.
+        assert_eq!(
+            classify_ipv4(Ipv4Addr::new(198, 18, 0, 1)),
+            AddressScope::Unspecified
         );
     }
 
