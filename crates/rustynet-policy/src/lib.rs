@@ -686,6 +686,12 @@ fn selector_is_literal_cidr(selector: &str) -> bool {
     if prefix.len() > 1 && prefix.starts_with('0') {
         return false;
     }
+    // A signed spelling (`/+24`) parses as the same network but reads as
+    // different text — the same one-spelling bypass `/024` was rejected for.
+    // Digits only; signs are never part of a canonical prefix.
+    if !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
     let Ok(prefix_len) = prefix.parse::<u8>() else {
         return false;
     };
@@ -755,6 +761,10 @@ mod tests {
             "::1/129",
             // A redundantly-written prefix: one network, one spelling.
             "192.168.1.0/024",
+            // Signed prefixes parse to the same network but read as different
+            // text — same spelling-bypass shape as `/024`.
+            "192.168.1.0/+24",
+            "192.168.1.0/-24",
         ] {
             assert!(
                 !selector_membership_allowed(evasion, &membership),
