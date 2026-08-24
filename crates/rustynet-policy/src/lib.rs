@@ -2822,4 +2822,45 @@ mod tests {
         };
         assert_eq!(set.evaluate(&mixed_dst), Decision::Deny);
     }
+
+    #[test]
+    fn revoked_destination_denied_in_gated_plain_evaluation() {
+        // Revocation takes effect on the DESTINATION side: an allow
+        // rule matching both src and dst is overridden when the dst
+        // node has been revoked in the membership directory. The
+        // active-pair control proves the rule itself is valid.
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:a".to_owned(),
+                dst: "node:b".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+        let mut membership = MembershipDirectory::default();
+        // Bare-id key convention: selectors are stripped to their id
+        // before the status lookup.
+        membership.set_node_status("a", MembershipStatus::Active);
+        membership.set_node_status("b", MembershipStatus::Revoked);
+
+        let request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Deny,
+            "a revoked destination must deny even with a matching allow rule"
+        );
+
+        // Control: same rule with both nodes active admits.
+        let mut healthy = MembershipDirectory::default();
+        healthy.set_node_status("a", MembershipStatus::Active);
+        healthy.set_node_status("b", MembershipStatus::Active);
+        assert_eq!(
+            set.evaluate_with_membership(&request, &healthy),
+            Decision::Allow
+        );
+    }
 }
