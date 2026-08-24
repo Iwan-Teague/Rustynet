@@ -427,6 +427,32 @@ mod tests {
     }
 
     #[test]
+    fn elect_active_prefers_generation_over_id_ordering() {
+        // Generation precedence: a HIGHER-generation replica must win
+        // even when its id sorts AFTER a lower-generation peer's id.
+        // All daemons computing from signed state must converge on the
+        // same leader based on generation number, not alphabetical
+        // convenience.
+        let mut cluster = HaCluster::new(vec![
+            ControlPlaneReplica {
+                id: "replica-z".to_owned(),
+                healthy: true,
+                policy_generation: 5,
+            },
+            ControlPlaneReplica {
+                id: "replica-a".to_owned(),
+                healthy: true,
+                policy_generation: 3,
+            },
+        ]);
+        let elected = cluster.elect_active().expect("elect");
+        assert_eq!(
+            elected, "replica-z",
+            "generation 5 must win over generation 3 regardless of id order"
+        );
+    }
+
+    #[test]
     fn ha_cluster_rejects_when_no_healthy_replica_exists() {
         let mut cluster = HaCluster::new(vec![ControlPlaneReplica {
             id: "replica-a".to_owned(),
