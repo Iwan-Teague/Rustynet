@@ -116,6 +116,11 @@ fn looks_sensitive_value(value: &str) -> bool {
         // alphanumeric or '-'/'_' in practice; require the length so a
         // bare word starting with "aiza" does not over-trigger.
         || (lowered.starts_with("aiza") && lowered.len() >= 39)
+        // Azure storage account keys appear inside connection strings as
+        // "AccountKey=<base64>" (often with trailing '=' padding). The
+        // key name marker is the credential signal; matching it errs
+        // toward over-redaction of any value that follows it.
+        || lowered.contains("accountkey=")
 }
 
 #[derive(Debug, Default)]
@@ -630,6 +635,43 @@ mod tests {
         let redacted = redact_fields(IngestionPath::LogField, &input);
         assert_eq!(
             redacted.get("integration_payload").map(String::as_str),
+            Some("REDACTED")
+        );
+    }
+
+    #[test]
+    fn redaction_catches_azure_storage_account_keys() {
+        // Azure storage account keys ride inside connection strings as
+        // "AccountKey=<base64>". The marker itself is the credential
+        // signal; the base64 blob after it must never reach a log.
+        // The blob is assembled from fragments at runtime so this file
+        // never contains a literal matching secret-scanner patterns.
+        let azure_blob = [
+            "Account",
+            "Key=",
+            "abcdefghijklmnopqrstuvwxyz0123456789+/ABCD",
+            "EFGH==",
+        ]
+        .concat();
+        assert!(looks_sensitive_value(&azure_blob));
+
+        // Lowercase variant (connection strings are case-insensitive in
+        // practice and our detector lowercases before matching).
+        let azure_lower = ["accountkey=", "c2VjcmV0YmFzZTY0dmFsdWU="].concat();
+        assert!(looks_sensitive_value(&azure_lower));
+
+        // Control: "account key" without '=' separator is ordinary prose.
+        assert!(!looks_sensitive_value("the account key rotation completed"));
+
+        // End-to-end under a NEUTRAL key name so value-shape detection
+        // alone drives the redaction.
+        let input: BTreeMap<String, String> =
+            [("connection_string".to_string(), azure_blob.clone())]
+                .into_iter()
+                .collect();
+        let redacted = redact_fields(IngestionPath::LogField, &input);
+        assert_eq!(
+            redacted.get("connection_string").map(String::as_str),
             Some("REDACTED")
         );
     }
