@@ -23,6 +23,20 @@ impl NodeId {
                 "node id must not contain control characters",
             ));
         }
+        // Fail closed on invisible/bidi Unicode format characters (category Cf):
+        // they are invisible in display contexts and can make two visually
+        // identical node ids cryptographically distinct, enabling operator
+        // confusion during authorization decisions.
+        if normalized.chars().any(|c| {
+            matches!(
+                u32::from(c),
+                0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0xFEFF
+            )
+        }) {
+            return Err(BackendError::invalid_input(
+                "node id must not contain invisible or bidirectional override characters",
+            ));
+        }
         Ok(Self(normalized.to_owned()))
     }
 
@@ -337,6 +351,26 @@ mod tests {
         for bad in ["node\0id", "\x01\x02", "a\nb", "a\tb", "\x7f"] {
             let err = NodeId::new(bad)
                 .expect_err(&format!("control character in {bad:?} must be rejected"));
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn node_id_rejects_invisible_and_bidi_override_characters() {
+        // Unicode format characters (category Cf) are invisible in
+        // display contexts and can make two visually identical node
+        // ids cryptographically distinct. Fail closed on the
+        // known-dangerous ranges.
+        for bad in [
+            "node\u{200B}id",
+            "node\u{200D}id",
+            "\u{202E}node",
+            "node\u{2060}id",
+            "\u{FEFF}node",
+            "node\u{202A}id",
+        ] {
+            let err = NodeId::new(bad)
+                .expect_err(&format!("invisible/bidi char in {bad:?} must be rejected"));
             assert_eq!(err.kind, BackendErrorKind::InvalidInput);
         }
     }
