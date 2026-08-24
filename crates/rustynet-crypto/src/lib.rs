@@ -4387,4 +4387,15 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
+
+    #[test]
+    fn sha256_collision_sanity_distinct_inputs_distinct_digests() {
+        use sha2::{Digest, Sha256};
+        // Two different byte inputs must produce different SHA-256
+        // digests. A collision here would compromise every
+        // content-addressed integrity check in the codebase.
+        let hash_a = Sha256::digest(b"collision-check-alpha");
+        let hash_b = Sha256::digest(b"collision-check-beta");
+        assert_ne!(hash_a.as_slice(), hash_b.as_slice());
+    }
 }
