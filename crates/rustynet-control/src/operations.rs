@@ -60,12 +60,18 @@ fn looks_sensitive_value(value: &str) -> bool {
     // Scheme prefixes may be followed by a space OR a tab (header
     // folding); match both so "bearer\tTOKEN" cannot slip through.
     // Also match mid-string occurrences ("use bearer abc123") which
-    // starts_with alone misses.
+    // starts_with alone misses, plus quote-delimited (JSON-embedded
+    // `"Basic dXNlcjpwYXNz"` inside a dumped request body) and
+    // newline-delimited (multi-line error text) occurrences. Errs
+    // toward over-redaction: a missed credential in a log line is a
+    // leak; an over-redacted diagnostic is only noise.
     let scheme_gated = ["bearer", "basic"].iter().any(|scheme| {
         lowered.starts_with(&format!("{scheme} "))
             || lowered.contains(&format!(" {scheme} "))
             || lowered.contains(&format!("\t{scheme} "))
             || lowered.contains(&format!("{scheme}\t"))
+            || lowered.contains(&format!("\"{scheme} "))
+            || lowered.contains(&format!("\n{scheme} "))
     });
     scheme_gated
         || lowered.starts_with("sk_")
@@ -449,6 +455,16 @@ mod tests {
         ));
         assert!(looks_sensitive_value("credentials: basic dXNlcjpwYXNz"));
         assert!(looks_sensitive_value("send bearer TOKEN here"));
+        // JSON-embedded scheme reference: the quote before the scheme
+        // defeats every space/tab-delimited pattern, so a dumped
+        // request body carrying `"Authorization": "Basic …"` must
+        // still be flagged.
+        assert!(looks_sensitive_value(
+            "{\"error\":\"denied\",\"authorization\":\"basic dXNlcjpwYXNz\"}"
+        ));
+        assert!(looks_sensitive_value("{\"header\":\"bearer abc123\"}"));
+        // Newline-delimited scheme reference in multi-line error text.
+        assert!(looks_sensitive_value("auth failed\nbearer abc123 rejected"));
         // Control: non-scheme text is not flagged.
         assert!(!looks_sensitive_value("standard policy update completed"));
     }
