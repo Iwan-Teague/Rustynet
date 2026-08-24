@@ -15,6 +15,14 @@ impl NodeId {
         if normalized.is_empty() {
             return Err(BackendError::invalid_input("node id must not be empty"));
         }
+        // Fail closed on control characters: a NUL byte truncates
+        // arguments when passed to child processes via argv, and other
+        // C0/C1 controls have no legitimate role in a node identifier.
+        if normalized.chars().any(|c| c.is_control()) {
+            return Err(BackendError::invalid_input(
+                "node id must not contain control characters",
+            ));
+        }
         Ok(Self(normalized.to_owned()))
     }
 
@@ -321,6 +329,17 @@ pub trait TunnelBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{BackendErrorKind, NodeId};
+
+    #[test]
+    fn node_id_rejects_control_characters() {
+        // NUL truncates argv on Unix; other C0/C1 controls have no
+        // legitimate role in a node identifier. Fail closed on all.
+        for bad in ["node\0id", "\x01\x02", "a\nb", "a\tb", "\x7f"] {
+            let err = NodeId::new(bad)
+                .expect_err(&format!("control character in {bad:?} must be rejected"));
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        }
+    }
 
     #[test]
     fn node_id_trims_outer_whitespace() {
