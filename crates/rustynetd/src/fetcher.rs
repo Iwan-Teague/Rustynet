@@ -335,10 +335,16 @@ impl SignedBundle {
     }
 }
 
+#[derive(Debug)]
 pub struct WatermarkStore {
     path: std::path::PathBuf,
     watermarks: std::collections::HashMap<String, u64>,
 }
+
+/// On-disk bound for the persisted watermark store. Checked BEFORE the
+/// file is read so hostile/oversized disk state cannot drive unbounded
+/// allocation (same posture as every other on-disk loader).
+const MAX_WATERMARK_STORE_BYTES: u64 = 64 * 1024;
 
 impl WatermarkStore {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, String> {
@@ -373,6 +379,31 @@ impl WatermarkStore {
     }
 
     fn load_from_disk(path: &Path) -> Result<std::collections::HashMap<String, u64>, String> {
+        // Size cap BEFORE the read: a corrupted or oversized store must not
+        // drive allocation proportional to disk state.
+        let on_disk_len = fs::metadata(path)
+            .map_err(|e| format!("failed to stat watermark store: {e}"))?
+            .len();
+        if on_disk_len > MAX_WATERMARK_STORE_BYTES {
+            return Err(format!(
+                "watermark store exceeds {MAX_WATERMARK_STORE_BYTES}-byte cap; refusing to load"
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(path)
+                .map_err(|e| format!("failed to stat watermark store: {e}"))?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "watermark store permissions too open ({mode:o}); refusing to load"
+                ));
+            }
+        }
+
         let content =
             fs::read_to_string(path).map_err(|e| format!("failed to read watermark store: {e}"))?;
 
@@ -389,7 +420,16 @@ impl WatermarkStore {
             let value = parts[1]
                 .parse::<u64>()
                 .map_err(|e| format!("invalid watermark value: {e}"))?;
-            watermarks.insert(key, value);
+            // A duplicate key silently taking the LAST value would let
+            // tampered disk state ROLL BACK the anti-replay watermark
+            // ("assignment=9\nassignment=3" loading 3), re-opening bundles
+            // the daemon already accepted. Fail closed instead.
+            if watermarks.insert(key, value).is_some() {
+                return Err(
+                    "duplicate watermark key in store; refusing to load (anti-replay state cannot be downgraded)"
+                        .to_owned(),
+                );
+            }
         }
 
         Ok(watermarks)
@@ -533,6 +573,76 @@ mod tests {
             let permissions = metadata.permissions();
             assert_eq!(permissions.mode() & 0o777, 0o600);
         }
+    }
+
+    /// A tampered store must not be able to ROLL BACK the anti-replay
+    /// watermark by listing the same key twice (last-wins would load the
+    /// smaller value and re-open already-consumed bundles).
+    #[test]
+    fn test_watermark_store_rejects_duplicate_keys() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let watermark_path = temp_dir.path().join("watermarks.txt");
+        fs::write(&watermark_path, "assignment=9\nassignment=3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&watermark_path).unwrap().permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&watermark_path, perms).unwrap();
+        }
+
+        let err = WatermarkStore::new(&watermark_path).unwrap_err();
+        assert!(
+            err.contains("duplicate"),
+            "expected duplicate-key rejection, got: {err}"
+        );
+    }
+
+    /// Group/world-accessible disk state must be refused before its contents
+    /// are trusted (parity with every other on-disk loader).
+    #[test]
+    fn test_watermark_store_rejects_loose_permissions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let watermark_path = temp_dir.path().join("watermarks.txt");
+        fs::write(&watermark_path, "assignment=7\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&watermark_path).unwrap().permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&watermark_path, perms).unwrap();
+
+            let err = WatermarkStore::new(&watermark_path).unwrap_err();
+            assert!(
+                err.contains("permissions too open"),
+                "expected permission rejection, got: {err}"
+            );
+        }
+    }
+
+    /// An oversized store must be refused BEFORE its bytes are read into
+    /// memory — allocation must never be proportional to hostile disk state.
+    #[test]
+    fn test_watermark_store_rejects_oversize_before_read() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let watermark_path = temp_dir.path().join("watermarks.txt");
+        // Valid-shaped lines so only the size bound can reject it.
+        let line = "k0000000000000000000000000001=5\n";
+        let body = line.repeat((MAX_WATERMARK_STORE_BYTES as usize) / line.len() + 8);
+        fs::write(&watermark_path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&watermark_path).unwrap().permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&watermark_path, perms).unwrap();
+        }
+
+        let err = WatermarkStore::new(&watermark_path).unwrap_err();
+        assert!(
+            err.contains("exceeds") && err.contains("cap"),
+            "expected oversize rejection, got: {err}"
+        );
     }
 
     #[test]
