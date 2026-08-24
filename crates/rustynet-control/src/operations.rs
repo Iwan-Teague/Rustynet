@@ -74,24 +74,38 @@ fn is_sensitive_key(key: &str) -> bool {
         || lowered == "pass"
 }
 
+/// True when `scheme` occurs in `lowered` at a word boundary — preceded
+/// by start-of-string or a non-alphanumeric character — and followed by a
+/// space or tab. Scans every occurrence so an earlier false candidate
+/// (e.g. "notabearer ") cannot shadow a later real one ("(bearer x)").
+fn scheme_reference_present(lowered: &str, scheme: &str) -> bool {
+    let bytes = lowered.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = lowered[from..].find(scheme) {
+        let abs = from + pos;
+        let boundary_before = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+        let after = &lowered[abs + scheme.len()..];
+        if boundary_before && after.starts_with(' ') || after.starts_with('\t') {
+            return true;
+        }
+        from = abs + 1;
+    }
+    false
+}
+
 fn looks_sensitive_value(value: &str) -> bool {
     let lowered = value.to_ascii_lowercase();
-    // Scheme prefixes may be followed by a space OR a tab (header
-    // folding); match both so "bearer\tTOKEN" cannot slip through.
-    // Also match mid-string occurrences ("use bearer abc123") which
-    // starts_with alone misses, plus quote-delimited (JSON-embedded
-    // `"Basic dXNlcjpwYXNz"` inside a dumped request body) and
-    // newline-delimited (multi-line error text) occurrences. Errs
-    // toward over-redaction: a missed credential in a log line is a
-    // leak; an over-redacted diagnostic is only noise.
-    let scheme_gated = ["bearer", "basic"].iter().any(|scheme| {
-        lowered.starts_with(&format!("{scheme} "))
-            || lowered.contains(&format!(" {scheme} "))
-            || lowered.contains(&format!("\t{scheme} "))
-            || lowered.contains(&format!("{scheme}\t"))
-            || lowered.contains(&format!("\"{scheme} "))
-            || lowered.contains(&format!("\n{scheme} "))
-    });
+    // Scheme reference: "bearer"/"basic" at a word boundary (preceded by
+    // start-of-string or any non-alphanumeric char) and followed by a
+    // space or tab. One boundary scan subsumes every delimiter variant —
+    // start-of-value, mid-string, header-folding tab, JSON quote,
+    // multi-line newline, wrapping parens/brackets — without a growing
+    // per-separator needle list. Errs toward over-redaction: a missed
+    // credential in a log line is a leak; an over-redacted diagnostic is
+    // only noise.
+    let scheme_gated = ["bearer", "basic"]
+        .iter()
+        .any(|scheme| scheme_reference_present(&lowered, scheme));
     scheme_gated
         || lowered.starts_with("sk_")
         || lowered.starts_with("sk-ant-")
@@ -523,6 +537,13 @@ mod tests {
         assert!(looks_sensitive_value("{\"header\":\"bearer abc123\"}"));
         // Newline-delimited scheme reference in multi-line error text.
         assert!(looks_sensitive_value("auth failed\nbearer abc123 rejected"));
+        // Punctuation-delimited scheme references: wrapping parens and
+        // brackets in error text defeat every enumerated separator
+        // needle — the boundary scan catches any non-alphanumeric
+        // delimiter.
+        assert!(looks_sensitive_value("auth failed (bearer abc123)"));
+        assert!(looks_sensitive_value("[basic dXNlcjpwYXNz]"));
+        assert!(looks_sensitive_value("error: bearer\tleaked"));
         // Control: non-scheme text is not flagged.
         assert!(!looks_sensitive_value("standard policy update completed"));
     }
