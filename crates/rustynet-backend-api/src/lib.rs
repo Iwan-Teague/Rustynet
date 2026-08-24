@@ -393,6 +393,22 @@ mod tests {
         // Boundary: exactly 255 bytes is accepted.
         let at_limit = "x".repeat(255);
         NodeId::new(at_limit.as_str()).expect("255-byte node id must be accepted");
+
+        // The bound is measured in BYTES, not characters. Each 'é' is
+        // 2 bytes of UTF-8, so 128 of them is only 128 characters but a
+        // full 256 bytes — it must be rejected exactly like the ASCII case.
+        let multibyte_oversize = "é".repeat(128);
+        assert_eq!(multibyte_oversize.len(), 256);
+        assert_eq!(multibyte_oversize.chars().count(), 128);
+        let err = NodeId::new(multibyte_oversize.as_str())
+            .expect_err("256-byte (128-char) UTF-8 node id must be rejected");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+
+        // Complement: a multi-byte id that fits within the byte budget is
+        // accepted even though its character count differs from its byte count.
+        let multibyte_fits = "é".repeat(127); // 254 bytes, 127 chars
+        assert_eq!(multibyte_fits.len(), 254);
+        NodeId::new(multibyte_fits.as_str()).expect("254-byte UTF-8 node id must be accepted");
     }
 
     #[test]
