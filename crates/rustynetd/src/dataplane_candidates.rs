@@ -152,6 +152,14 @@ pub fn classify_ipv4(addr: Ipv4Addr) -> AddressScope {
     if oct[0] == 198 && (18..=19).contains(&oct[1]) {
         return AddressScope::Unspecified;
     }
+    // - IETF protocol assignments 192.0.0.0/24 (RFC 6890): includes the
+    //   PCP anycast addresses 192.0.0.9/10 and the NAT64 prefix64
+    //   discovery address — protocol control planes, never mesh peer
+    //   endpoints (same "never useful as a real endpoint" class as the
+    //   TEST-NETs above).
+    if oct[0] == 192 && oct[1] == 0 && oct[2] == 0 {
+        return AddressScope::Unspecified;
+    }
     // - 240.0.0.0/4 reserved (RFC 1112); exact 255.255.255.255 was
     //   already classified Broadcast above, so everything left here
     //   is reserved space.
@@ -597,6 +605,16 @@ mod tests {
         // RFC 2544 benchmarking 198.18.0.0/15.
         assert_eq!(
             classify_ipv4(Ipv4Addr::new(198, 18, 0, 1)),
+            AddressScope::Unspecified
+        );
+        // IETF protocol assignments 192.0.0.0/24 (PCP anycast + NAT64
+        // prefix64 discovery).
+        assert_eq!(
+            classify_ipv4(Ipv4Addr::new(192, 0, 0, 9)),
+            AddressScope::Unspecified
+        );
+        assert_eq!(
+            classify_ipv4(Ipv4Addr::new(192, 0, 0, 193)),
             AddressScope::Unspecified
         );
     }
