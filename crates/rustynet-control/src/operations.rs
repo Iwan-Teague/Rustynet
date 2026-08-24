@@ -54,6 +54,9 @@ fn is_sensitive_key(key: &str) -> bool {
         // leaked access key id alone enables targeted attacks even when
         // the paired secret is absent.
         "access_key",
+        // Common abbreviation in db/admin config keys ("db_pwd",
+        // "admin_pwd"); the longer needles above miss it.
+        "pwd",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
@@ -121,6 +124,13 @@ fn looks_sensitive_value(value: &str) -> bool {
         // key name marker is the credential signal; matching it errs
         // toward over-redaction of any value that follows it.
         || lowered.contains("accountkey=")
+        // Stripe webhook signing secrets + restricted live keys, GitLab
+        // personal access tokens, npm automation tokens: each
+        // authenticates on its own. (pk_live_ is public-by-design and is
+        // deliberately NOT matched.) Errs toward over-redaction.
+        || ["whsec_", "rk_live_", "glpat-", "npm_"]
+            .iter()
+            .any(|prefix| lowered.starts_with(prefix))
 }
 
 #[derive(Debug, Default)]
@@ -720,6 +730,57 @@ mod tests {
             .collect();
         let passed = redact_fields(IngestionPath::ApiPayload, &benign);
         assert_eq!(passed.get("node_count").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn redaction_catches_stripe_gitlab_npm_credential_shapes() {
+        // Fabricated at runtime from fragments so no scanner-matching
+        // literal appears contiguous in committed source.
+        let whsec = ["whse", "c_", "kHJ9yQ2vXw8mNb3LpTzR6fGsD1uCeA"].concat();
+        let rk_live = ["rk_li", "ve_", "k0Zx8WqPn4MvBt7YhJcRs2FdLu6GeA"].concat();
+        let glpat = ["glp", "at-", "Xy9kQ2mNvB7cLpTzR6fG"].concat();
+        let npm = ["npm", "_", "q8Zx4WvPn2Mb6Tt1YhJ"].concat();
+
+        assert!(looks_sensitive_value(&whsec));
+        assert!(looks_sensitive_value(&rk_live));
+        assert!(looks_sensitive_value(&glpat));
+        assert!(looks_sensitive_value(&npm));
+
+        // Negatives: near-miss prefixes must not over-trigger.
+        assert!(!looks_sensitive_value("rk_livexyz"));
+        assert!(!looks_sensitive_value("installed via npm without a token"));
+
+        // The new key-name needle covers abbreviated password fields.
+        assert!(is_sensitive_key("db_pwd"));
+        assert!(is_sensitive_key("admin_pwd"));
+        // Control: a word merely containing "pwd" as an unrelated
+        // substring would be over-redaction — "cwd" does not contain it.
+        assert!(!is_sensitive_key("cwd"));
+
+        // End-to-end under NEUTRAL keys so value-shape detection alone
+        // drives the redaction.
+        let input: BTreeMap<String, String> = [
+            ("webhook_config".to_string(), whsec.clone()),
+            ("registry_auth".to_string(), npm.clone()),
+            ("database".to_string(), "local".to_string()),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut with_pwd_field = input;
+        with_pwd_field.insert("db_pwd".to_string(), "hunter2".to_string());
+
+        let redacted = redact_fields(IngestionPath::LogField, &with_pwd_field);
+        assert_eq!(
+            redacted.get("webhook_config").map(String::as_str),
+            Some("REDACTED")
+        );
+        assert_eq!(
+            redacted.get("registry_auth").map(String::as_str),
+            Some("REDACTED")
+        );
+        assert_eq!(redacted.get("db_pwd").map(String::as_str), Some("REDACTED"));
+        assert_eq!(redacted.get("database").map(String::as_str), Some("local"));
     }
 
     #[test]
