@@ -948,7 +948,11 @@ mod tests {
             v4_host: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))],
             v6_host: vec![IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))],
             v4_srflx: vec![SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+                // Genuinely global (not an RFC 5737 TEST-NET): the
+                // dataplane-candidates classifier folds documentation
+                // ranges into Unspecified, so a TEST-NET here would be
+                // rejected as unreachable.
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
                 51820,
             )],
             v6_srflx: vec![SocketAddr::new(

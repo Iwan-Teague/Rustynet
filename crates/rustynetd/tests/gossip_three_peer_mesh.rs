@@ -182,7 +182,9 @@ fn bundle_propagates_a_to_b_within_3s_and_a_to_c_via_b_within_6s() {
         .v4_host
         .push(IpAddr::V4(Ipv4Addr::new(10, 99, 77, 1)));
     candidates.v4_srflx.push(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        // Genuinely global — TEST-NETs (203.0.113.0/24) are now folded
+        // into Unspecified and rejected as unreachable endpoints.
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         51820,
     ));
 
