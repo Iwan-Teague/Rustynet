@@ -216,6 +216,30 @@ pub fn classify_ipv6(addr: Ipv6Addr) -> AddressScope {
     {
         return AddressScope::Unspecified;
     }
+    // RFC 6666 Discard-Only (100::/64) — traffic sent here must be
+    // discarded; never a usable peer endpoint.
+    if segs[0] == 0x0100 && segs[1] == 0x0000 && segs[2] == 0x0000 && segs[3] == 0x0000 {
+        return AddressScope::Unspecified;
+    }
+    // RFC 8215 local-use NAT64 (64:ff9b:1::/48) — translation
+    // special-use like the well-known prefix above.
+    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 && segs[3] == 0x0000 {
+        return AddressScope::Unspecified;
+    }
+    // RFC 5180 benchmarking (2001:2::/48) — measurement only, same
+    // class as the IPv4 TEST-NET folds.
+    if segs[0] == 0x2001 && segs[1] == 0x0002 {
+        return AddressScope::Unspecified;
+    }
+    // RFC 4843 ORCHID (2001:10::/28, deprecated) — cryptographic-hash
+    // overlay identifiers, not routable endpoints.
+    if segs[0] == 0x2001 && (segs[1] & 0xfff0) == 0x0010 {
+        return AddressScope::Unspecified;
+    }
+    // RFC 7343 ORCHIDv2 (2001:20::/28) — same class as ORCHID above.
+    if segs[0] == 0x2001 && (segs[1] & 0xfff0) == 0x0020 {
+        return AddressScope::Unspecified;
+    }
     AddressScope::Global
 }
 
@@ -623,6 +647,45 @@ mod tests {
         assert_eq!(
             classify_ipv6(Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xc000, 0x0201)),
             AddressScope::Unspecified
+        );
+        // Discard-only 100::/64 (RFC 6666)
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 1)),
+            AddressScope::Unspecified
+        );
+        // Local-use NAT64 64:ff9b:1::/48 (RFC 8215)
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x0064, 0xff9b, 0x0001, 0, 0, 0, 0, 0xdead)),
+            AddressScope::Unspecified
+        );
+        // Benchmarking 2001:2::/48 (RFC 5180) — same class as v4 TEST-NETs
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0xabcd)),
+            AddressScope::Unspecified
+        );
+        // ORCHID 2001:10::/28 deprecated (RFC 4843); top-of-range 0x001f
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 1)),
+            AddressScope::Unspecified
+        );
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x2001, 0x001f, 0xffff, 0xffff, 0, 0, 0, 1)),
+            AddressScope::Unspecified
+        );
+        // ORCHIDv2 2001:20::/28 (RFC 7343); bottom and top of range
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 1)),
+            AddressScope::Unspecified
+        );
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x2001, 0x002f, 0xffff, 0xffff, 0, 0, 0, 1)),
+            AddressScope::Unspecified
+        );
+        // Control: 2001:0003:: is inside the IETF protocol block but NOT
+        // benchmarking/ORCHID — must stay Global.
+        assert_eq!(
+            classify_ipv6(Ipv6Addr::new(0x2001, 0x0003, 0, 0, 0, 0, 0, 1)),
+            AddressScope::Global
         );
     }
 
