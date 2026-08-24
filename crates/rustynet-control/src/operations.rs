@@ -57,9 +57,15 @@ fn is_sensitive_key(key: &str) -> bool {
         // Common abbreviation in db/admin config keys ("db_pwd",
         // "admin_pwd"); the longer needles above miss it.
         "pwd",
+        // The other common abbreviation: "db_pass", "user_pass",
+        // "admin_pass". A bare "pass" needle is deliberately avoided —
+        // contains() would swallow unrelated keys like "bypass" — so
+        // only the underscore-delimited form and the exact word match.
+        "_pass",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
+        || lowered == "pass"
 }
 
 fn looks_sensitive_value(value: &str) -> bool {
@@ -768,6 +774,17 @@ mod tests {
         // Control: a word merely containing "pwd" as an unrelated
         // substring would be over-redaction — "cwd" does not contain it.
         assert!(!is_sensitive_key("cwd"));
+
+        // The "_pass" needle covers the other abbreviation family; the
+        // bare word "pass" matches exactly.
+        assert!(is_sensitive_key("db_pass"));
+        assert!(is_sensitive_key("user_pass"));
+        assert!(is_sensitive_key("pass"));
+        // Controls: a bare-"pass" contains() match would over-redact
+        // these unrelated keys; only exact/underscore forms hit.
+        assert!(!is_sensitive_key("bypass"));
+        assert!(!is_sensitive_key("passenger_count"));
+        assert!(!is_sensitive_key("surpassed"));
 
         // End-to-end under NEUTRAL keys so value-shape detection alone
         // drives the redaction.
