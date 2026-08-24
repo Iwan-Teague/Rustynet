@@ -59,8 +59,11 @@ fn looks_sensitive_value(value: &str) -> bool {
     let lowered = value.to_ascii_lowercase();
     // Scheme prefixes may be followed by a space OR a tab (header
     // folding); match both so "bearer\tTOKEN" cannot slip through.
+    // Also match mid-string occurrences ("use bearer abc123") which
+    // starts_with alone misses.
     let scheme_gated = ["bearer", "basic"].iter().any(|scheme| {
         lowered.starts_with(&format!("{scheme} "))
+            || lowered.contains(&format!(" {scheme} "))
             || lowered.contains(&format!("\t{scheme} "))
             || lowered.contains(&format!("{scheme}\t"))
     });
@@ -370,7 +373,7 @@ mod tests {
 
     use super::{
         DiagnosticsSummary, HealthSnapshot, IngestionPath, OperationsError, StructuredLogger,
-        TamperEvidentAuditLog, redact_fields,
+        TamperEvidentAuditLog, looks_sensitive_value, redact_fields,
     };
 
     #[test]
@@ -426,6 +429,21 @@ mod tests {
             line.contains("line1\\nline2"),
             "newlines inside values must be escaped: {line}"
         );
+    }
+
+    #[test]
+    fn redaction_catches_mid_string_bearer_and_basic_references() {
+        // Regression: switching from contains() to starts_with() broke
+        // mid-string scheme detection. A value like "please use bearer
+        // abc123" must still be redacted even though it doesn't START
+        // with "bearer".
+        assert!(looks_sensitive_value(
+            "please use bearer abc123 to authenticate"
+        ));
+        assert!(looks_sensitive_value("credentials: basic dXNlcjpwYXNz"));
+        assert!(looks_sensitive_value("send bearer TOKEN here"));
+        // Control: non-scheme text is not flagged.
+        assert!(!looks_sensitive_value("standard policy update completed"));
     }
 
     #[test]
