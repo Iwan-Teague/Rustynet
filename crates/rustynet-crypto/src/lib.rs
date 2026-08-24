@@ -4369,4 +4369,22 @@ mod tests {
             "delete helper must target the System keychain and carry no secret in argv"
         );
     }
+
+    #[test]
+    fn sha256_empty_input_produces_stable_defined_digest() {
+        // SHA-256 of the empty string is a well-known constant:
+        // e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"");
+        let result = hasher.finalize();
+        let hex = result
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
 }
