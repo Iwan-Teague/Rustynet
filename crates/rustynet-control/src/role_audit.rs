@@ -183,6 +183,10 @@ pub struct RoleAuditEntry {
 /// first entry. The membership log uses the same convention.
 pub const GENESIS_PREVIOUS_HASH: &str = "genesis";
 
+/// Maximum allowed size for a role audit log file (8 MiB). Prevents
+/// memory exhaustion from adversarially grown audit files.
+pub const MAX_ROLE_AUDIT_LOG_BYTES: usize = 8 * 1024 * 1024;
+
 /// Lowercase hex alphabet for the nibble-lookup encoder.
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
@@ -289,10 +293,21 @@ pub fn append_role_audit_entry(
 }
 
 /// Read all entries from the log at `path`. Returns an empty vec if
-/// the file doesn't exist (genesis case).
+/// the file doesn't exist (genesis case). Fails closed if the file
+/// exceeds [`MAX_ROLE_AUDIT_LOG_BYTES`] to prevent memory exhaustion
+/// from adversarially grown audit files.
 pub fn read_role_audit_log(path: &Path) -> Result<Vec<RoleAuditEntry>, RoleAuditError> {
     if !path.exists() {
         return Ok(Vec::new());
+    }
+    let metadata =
+        fs::metadata(path).map_err(|err| RoleAuditError::Io(format!("metadata: {err}")))?;
+    if metadata.len() > MAX_ROLE_AUDIT_LOG_BYTES as u64 {
+        return Err(RoleAuditError::Io(format!(
+            "role audit log exceeds {} byte cap (got {} bytes); refusing to read",
+            MAX_ROLE_AUDIT_LOG_BYTES,
+            metadata.len()
+        )));
     }
     let body = fs::read_to_string(path)
         .map_err(|err| RoleAuditError::Io(format!("read_to_string: {err}")))?;
