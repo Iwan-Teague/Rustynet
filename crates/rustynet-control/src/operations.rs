@@ -50,6 +50,10 @@ fn is_sensitive_key(key: &str) -> bool {
         "apikey",
         "authorization",
         "auth_header",
+        // AWS-style identifiers carry long-lived cloud credentials; a
+        // leaked access key id alone enables targeted attacks even when
+        // the paired secret is absent.
+        "access_key",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
@@ -91,6 +95,18 @@ fn looks_sensitive_value(value: &str) -> bool {
                 .iter()
                 .any(|needle| lowered.contains(needle))
         || lowered.contains("-----begin")
+        // AWS access key ids: 4-char service prefix + 16 uppercase
+        // alphanumerics. "AKIA" = long-lived IAM user keys; "ASIA" =
+        // temporary STS credentials. Both are credentials on their own.
+        || ["akia", "asia"]
+            .iter()
+            .any(|prefix| {
+                lowered.starts_with(prefix)
+                    && lowered.len() >= 20
+                    && lowered[prefix.len()..]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric())
+            })
 }
 
 #[derive(Debug, Default)]
@@ -390,7 +406,7 @@ mod tests {
 
     use super::{
         DiagnosticsSummary, HealthSnapshot, IngestionPath, OperationsError, StructuredLogger,
-        TamperEvidentAuditLog, looks_sensitive_value, redact_fields,
+        TamperEvidentAuditLog, is_sensitive_key, looks_sensitive_value, redact_fields,
     };
 
     #[test]
@@ -540,6 +556,38 @@ mod tests {
         // Control: a value starting with "eyj" but without a dot is not
         // a JWT — it should NOT be flagged as sensitive.
         assert!(!looks_sensitive_value("eyjust_a_word"));
+    }
+
+    #[test]
+    fn redaction_catches_aws_access_key_credentials() {
+        // AWS access key ids are credentials on their own: AKIA marks a
+        // long-lived IAM user key and ASIA a temporary STS credential.
+        // A leaked id enables targeted attacks even without the paired
+        // secret, so both the key name and the value shape must redact.
+        assert!(is_sensitive_key("access_key_id"));
+        assert!(is_sensitive_key("aws_access_key_id"));
+        assert!(looks_sensitive_value("AKIAIOSFODNN7EXAMPLE"));
+        assert!(looks_sensitive_value("ASIAIOSFODNN7EXAMPLE"));
+
+        // Control: short akia-prefixed strings that fail the 20-char
+        // minimum, and values with non-alphanumeric characters after the
+        // prefix, are not AWS access key ids and must pass through.
+        assert!(!looks_sensitive_value("akia12345"));
+        assert!(!looks_sensitive_value("akia-with-dashes-and-more-chars"));
+
+        // End-to-end: the classic doc example must be redacted when it
+        // arrives as a log field under an AWS-style key.
+        let input: BTreeMap<String, String> = [(
+            "aws_access_key_id".to_string(),
+            "AKIAIOSFODNN7EXAMPLE".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let redacted = redact_fields(IngestionPath::LogField, &input);
+        assert_eq!(
+            redacted.get("aws_access_key_id").map(String::as_str),
+            Some("REDACTED")
+        );
     }
 
     #[test]
