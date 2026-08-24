@@ -30,7 +30,17 @@ impl NodeId {
         if normalized.chars().any(|c| {
             matches!(
                 u32::from(c),
-                0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0xFEFF
+                0x00AD
+                    | 0x061C
+                    | 0x180E
+                    | 0x200B..=0x200F
+                    | 0x202A..=0x202E
+                    | 0x2060..=0x2064
+                    // Bidi isolates (LRI/RLI/FSI/PDI) sit just past the
+                    // word-joiner block; without them the bidi defense has
+                    // a hole exactly where modern overrides live.
+                    | 0x2066..=0x2069
+                    | 0xFEFF
             )
         }) {
             return Err(BackendError::invalid_input(
@@ -375,6 +385,13 @@ mod tests {
             "node\u{2060}id",
             "\u{FEFF}node",
             "node\u{202A}id",
+            // Bidi isolates (U+2066..U+2069) and other invisible format
+            // characters outside the original ranges must also fail closed.
+            "\u{2068}node",
+            "node\u{2066}id",
+            "\u{00AD}node",
+            "node\u{061C}id",
+            "node\u{180E}id",
         ] {
             let err = NodeId::new(bad)
                 .expect_err(&format!("invisible/bidi char in {bad:?} must be rejected"));
