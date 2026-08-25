@@ -17680,6 +17680,95 @@ mod tests {
     }
 
     #[test]
+    fn authorize_remote_command_rejects_future_nonce() {
+        let test_dir = secure_test_dir("rustynetd-remote-ops-future");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+
+        let remote_seed = [56u8; 32];
+        let remote_signing_key = SigningKey::from_bytes(&remote_seed);
+        let remote_verifier_key = remote_signing_key.verifying_key();
+        let remote_ops_verifier_path = test_dir.join("remote-ops.pub");
+        std::fs::write(
+            &remote_ops_verifier_path,
+            hex_encode(remote_verifier_key.as_bytes()),
+        )
+        .expect("verifier key should be written");
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            remote_ops_token_verifier_key_path: Some(remote_ops_verifier_path),
+            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_owned(),
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        let now = unix_now();
+        // A nonce 61 seconds in the future exceeds the ±60-second freshness
+        // window and must be rejected before signature verification runs.
+        let future_nonce = now.saturating_add(61);
+        let command = IpcCommand::Status;
+        let payload = remote_ops_signature_payload(
+            DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
+            future_nonce,
+            &command,
+        );
+        let signature = remote_signing_key.sign(&payload);
+        let envelope = RemoteCommandEnvelope {
+            subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_owned(),
+            nonce: future_nonce,
+            command: command.clone(),
+            signature: signature.to_bytes().to_vec(),
+        };
+
+        let err = runtime
+            .authorize_remote_command(&envelope, now)
+            .expect_err("future-dated nonce must be rejected");
+        assert!(err.contains("nonce in future"));
+
+        // Boundary: a nonce exactly at the +60-second edge is still inside
+        // the window (inclusive comparison) so it should NOT trip the
+        // future check; it may succeed or fail on replay depending on prior
+        // calls, but never on the future-nonce guard.
+        let boundary_nonce = now.saturating_add(60);
+        let boundary_payload = remote_ops_signature_payload(
+            DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT,
+            boundary_nonce,
+            &command,
+        );
+        let boundary_signature = remote_signing_key.sign(&boundary_payload);
+        let boundary_envelope = RemoteCommandEnvelope {
+            subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_owned(),
+            nonce: boundary_nonce,
+            command,
+            signature: boundary_signature.to_bytes().to_vec(),
+        };
+        let boundary_result = runtime.authorize_remote_command(&boundary_envelope, now);
+        if let Err(msg) = &boundary_result {
+            assert!(
+                !msg.contains("nonce in future"),
+                "boundary nonce at +60 must not be flagged as future"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn authorize_remote_command_rejects_wrong_subject() {
         let test_dir = secure_test_dir("rustynetd-remote-ops-subject");
         let state_path = test_dir.join("daemon.state");
