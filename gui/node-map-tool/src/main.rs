@@ -1733,7 +1733,10 @@ fn poly_sample(path: &[Pos2], t: f32) -> Pos2 {
         }
         target -= seg;
     }
-    *path.last().unwrap()
+    // The loop above consumes every segment for t in [0,1], but f32 rounding can
+    // leave the running remainder a hair past the final segment; degrade to the
+    // path end instead of panicking (no unwrap in production paths).
+    path.last().copied().unwrap_or(Pos2::ZERO)
 }
 
 fn with_alpha(c: Color32, a: f32) -> Color32 {
@@ -2201,7 +2204,7 @@ impl App {
                         ));
                         // Straight polygon edges.
                         let stroke = Stroke::new(
-                            if hl { 2.4 } else { 1.4 },
+                            if hl { 2.4_f32 } else { 1.4_f32 },
                             with_alpha(g.color, if hl { 0.95 } else { 0.55 }),
                         );
                         for k in 0..g.poly.len() {
@@ -2383,13 +2386,16 @@ impl App {
                         painter.circle_stroke(
                             d.p.screen,
                             ring_r,
-                            Stroke::new(1.6, with_alpha(Color32::from_rgb(235, 242, 255), 0.85)),
+                            Stroke::new(
+                                1.6_f32,
+                                with_alpha(Color32::from_rgb(235, 242, 255), 0.85),
+                            ),
                         );
                     } else if hover_idx == Some(d.idx) {
                         painter.circle_stroke(
                             d.p.screen,
                             ring_r,
-                            Stroke::new(1.1, with_alpha(FIBER, 0.5)),
+                            Stroke::new(1.1_f32, with_alpha(FIBER, 0.5)),
                         );
                     }
                 }
@@ -2579,7 +2585,7 @@ fn draw_tooltip(painter: &egui::Painter, at: Pos2, node: &Node) {
     let pad = Vec2::new(8.0, 5.0);
     let bg = Rect::from_min_size(pos, galley.size() + pad * 2.0);
     painter.rect_filled(bg, 6.0, Color32::from_rgba_unmultiplied(8, 11, 18, 235));
-    painter.rect_stroke(bg, 6.0, Stroke::new(1.0, Color32::from_rgb(40, 50, 70)));
+    painter.rect_stroke(bg, 6.0, Stroke::new(1.0_f32, Color32::from_rgb(40, 50, 70)));
     // Small role dot.
     painter.circle_filled(
         pos + Vec2::new(6.0, galley.size().y * 0.5 + pad.y),
@@ -2718,7 +2724,7 @@ fn main() -> eframe::Result<()> {
             v.window_fill = Color32::from_rgb(10, 13, 22);
             v.panel_fill = Color32::from_rgb(10, 13, 22);
             v.extreme_bg_color = Color32::from_rgb(6, 8, 15);
-            v.window_stroke = Stroke::new(1.0, Color32::from_rgb(40, 50, 72));
+            v.window_stroke = Stroke::new(1.0_f32, Color32::from_rgb(40, 50, 72));
             v.selection.bg_fill = Color32::from_rgb(82, 150, 240);
             cc.egui_ctx.set_visuals(v);
             Ok(Box::new(App::new(graph)))
@@ -2851,6 +2857,32 @@ mod tests {
             "sides are capped so big galaxies stay round"
         );
         assert!(galaxy_sides(3) >= 5 && galaxy_sides(1) >= 5);
+    }
+
+    #[test]
+    fn poly_sample_always_returns_finite_point() {
+        // Contract sweep: any path of >= 2 points and any parameter must yield a
+        // finite sample without panicking — poly_sample is on the render path, so
+        // it may not carry panic primitives (AGENTS §10.2).
+        let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+        let mut rand = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..2000 {
+            let n = 2 + (rand() * 7.0) as usize;
+            let path: Vec<Pos2> = (0..n)
+                .map(|_| Pos2::new(((rand() - 0.5) * 2e6) as f32, ((rand() - 0.5) * 2e6) as f32))
+                .collect();
+            let t = rand() as f32;
+            let p = poly_sample(&path, t);
+            assert!(
+                p.x.is_finite() && p.y.is_finite(),
+                "poly_sample returned a non-finite point for n={n}, t={t}"
+            );
+        }
     }
 
     #[test]
