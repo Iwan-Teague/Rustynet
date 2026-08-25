@@ -249,4 +249,24 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::Insecure(_))));
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn directory_tmp_residue_is_refused_and_untouched() {
+        let dir = unique_dir("rustynet-op-dir-residue");
+        fs::create_dir_all(&dir).unwrap();
+        let planted = dir.join(".wizard.env.tmp");
+        fs::create_dir(&planted).unwrap();
+        fs::write(planted.join("payload"), "x").unwrap();
+
+        let result = save_config_atomic(&dir.join("wizard.env"), "NODE_ROLE=admin\n");
+        assert!(
+            matches!(result, Err(ConfigError::Insecure(_))),
+            "non-regular temp residue must be refused as Insecure, got {result:?}"
+        );
+        // The planted entry must survive untouched; saving never deletes or
+        // traverses an entry it could not classify as a plain regular file.
+        assert!(planted.is_dir());
+        assert!(planted.join("payload").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
 }
