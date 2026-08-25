@@ -336,6 +336,30 @@ mod tests {
     }
 
     #[test]
+    fn well_formed_but_unverifiable_manifest_is_also_a_hard_error() {
+        // Parseable JSON whose signature does not verify against its own
+        // embedded key must take the same fail-closed path as corrupt JSON:
+        // a downgrade to skip-with-note would silently accept attacker bytes.
+        let src = tmp("badselfv-src");
+        let bytes = write_fake_binaries(&src);
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&signed_manifest_for(&bytes)).unwrap();
+        manifest["verifier_key_hex"] =
+            serde_json::json!("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
+        std::fs::write(
+            src.join("release-manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        let staging = tmp("badselfv-stg");
+        let err = acquire(&AcquisitionMode::FromDir(src.clone()), TRIPLE, "", &staging)
+            .expect_err("unverifiable manifest must fail closed");
+        assert!(err.contains("failed self-verification"), "{err}");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+
+    #[test]
     fn verified_download_is_deferred_fail_closed() {
         let staging = tmp("vd-stg");
         let err = acquire(&AcquisitionMode::VerifiedDownload, TRIPLE, "", &staging)
