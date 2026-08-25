@@ -503,6 +503,16 @@ fn unique_suffix() -> Result<String, String> {
 }
 
 fn secure_runtime_dir(path: &Path) -> Result<(), String> {
+    create_secure_runtime_dir(path, verify_secure_runtime_dir)
+}
+
+/// Single hardened creation path. The post-create verification step is a
+/// parameter so tests can observe that it always runs; production wires the
+/// real [`verify_secure_runtime_dir`].
+fn create_secure_runtime_dir<F>(path: &Path, post_create_verify: F) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
     if fs::symlink_metadata(path).is_ok() {
         return Err(format!(
             "runtime dir already exists; refusing to reuse pre-existing path: {}",
@@ -519,7 +529,7 @@ fn secure_runtime_dir(path: &Path) -> Result<(), String> {
     builder
         .create(path)
         .map_err(|e| format!("create runtime dir {}: {e}", path.display()))?;
-    verify_secure_runtime_dir(path)
+    post_create_verify(path)
 }
 
 fn verify_secure_runtime_dir(path: &Path) -> Result<(), String> {
@@ -793,6 +803,32 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn secure_runtime_dir_always_runs_post_create_verification() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let base = scratch_dir("verify-wired");
+        let target = base.join("wired");
+        let calls = Rc::new(Cell::new(0usize));
+        let counter = Rc::clone(&calls);
+        // The spy delegates to the real verifier, so this pins the wiring
+        // (create is always followed by verification) without weakening what
+        // is checked: the created dir must still pass the real mode check.
+        let result = create_secure_runtime_dir(&target, move |p| {
+            counter.set(counter.get() + 1);
+            verify_secure_runtime_dir(p)
+        });
+        assert!(
+            result.is_ok(),
+            "wired create+verify must succeed: {result:?}"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "post-create verification must run exactly once"
+        );
     }
 
     #[cfg(unix)]
