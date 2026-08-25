@@ -1,7 +1,7 @@
 # Crypto / Policy / Release-Manifest Security Hardening — 2026-08-25
 
 Status: **ready for merge review** as of 2026-08-25 (branch `sec-hardening`,
-33 commits ahead of `origin/main`, 0 behind; final full scoped regression of
+37 commits ahead of `origin/main`, 0 behind; final full scoped regression of
 all three touched crates green the same day). Implementation is complete;
 what remains is operator review of the watchlist item below and the merge
 itself.
@@ -39,6 +39,9 @@ restores cannot destroy uncommitted work).
   `selector_matches` rejects independently. No behavioral test can kill a
   mutant here (verified: flip survives the whole suite), mirroring the
   documented redundancy inside `selector_matches`' own guard.
+- `189893c7`: per-variant pin for `TrafficContext::is_service_context`
+  (three dataplane contexts false, both D13 hosting contexts true) —
+  previously the predicate ran only indirectly through rule matching.
 - `59720c5f`: source-grep pin for `selector_matches`' both-sides-empty guard —
   its rule-side half is behaviourally redundant under equality matching
   (documented at the function), so removal was previously invisible to every
