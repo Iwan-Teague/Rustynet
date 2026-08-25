@@ -3075,6 +3075,31 @@ mod tests {
             prune_head.contains("return Err"),
             "prune must fail closed on an unavailable clock before touching the nonce map"
         );
+
+        // The `SystemTime::now()` census above does not see wall-clock reads
+        // that never spell `SystemTime::now()`: `UNIX_EPOCH.elapsed()` is the
+        // same clock under a different spelling, so
+        // `UNIX_EPOCH.elapsed().unwrap_or(..)` reintroduces the substituted-
+        // default defect while every pin above stays green. Every production
+        // line that touches the epoch must go through the checked
+        // `duration_since(UNIX_EPOCH)` shape (and `use` lines are exempt).
+        let elapsed = [".elapsed", "("].concat();
+        for (index, line) in production.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("use ") {
+                continue;
+            }
+            if !line.contains("UNIX_EPOCH") {
+                continue;
+            }
+            assert!(
+                line.contains("duration_since(UNIX_EPOCH)") && !line.contains(elapsed.as_str()),
+                "line {} reads the epoch clock outside the checked helper; route it \
+                 through now_unix_checked() — a substituted default for an \
+                 unavailable clock is the RLY-15 defect",
+                index + 1
+            );
+        }
     }
 
     #[test]
