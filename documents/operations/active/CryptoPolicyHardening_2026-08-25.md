@@ -119,6 +119,13 @@ in non-test production code of all five touched files; policy/crypto
 doctests pass (no code fences); branch footprint vs `origin/main` is
 exactly the seven intended files (+803/−20) with a clean tree.
 
+Also RUN and green: `scripts/ci/llm_default_deny_gates.sh` and
+`scripts/ci/anchor_secret_redaction_gates.sh`. The latter emits one
+tolerated informational hit on `live_linux_anchor_test.rs:3511` — a
+negative-test fixture (variable literally named `leaky`, alphabet
+placeholder token) pre-existing on origin/main and untouched by this
+branch; the gate exits 0.
+
 Scoped security gates since RUN and green on this branch:
 `scripts/ci/secrets_hygiene_gates.sh` (18 checks incl. inline-secret and
 test-output verification) and `scripts/ci/check_backend_boundary_leakage.sh`
