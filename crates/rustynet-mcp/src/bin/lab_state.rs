@@ -7127,7 +7127,18 @@ fn collect_files(dir: &Path, base: &Path, out: &mut Vec<(String, u64)>, depth: u
     };
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.is_dir() {
+        // Do NOT follow symlinks. The walked dir is confined, but an artifact
+        // inside it can be a symlink to an out-of-tree target; `file_type()`
+        // (unlike `is_dir()`/`metadata()`) reports the link itself without
+        // resolving it, so a symlinked dir or file is skipped rather than
+        // walked or read through. Mirrors ai_agent's collect_repo_files.
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
             collect_files(&p, base, out, depth + 1);
         } else if let Ok(rel) = p.strip_prefix(base) {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -10227,6 +10238,69 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert!(
             !txt.contains("b.log"),
             "non-matching file excluded; got: {txt}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_files_does_not_follow_symlinks() {
+        // Mirrors ai_agent's collect_repo_files regression pin: a symlink
+        // inside a confined report dir must NOT be followed out of the tree by
+        // the walker underpinning grep_report, list_report_artifacts, and
+        // get_stage_log's filename-matching fallback.
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempRoot::new("mcp-collect-files-symlink");
+        let outside = TempRoot::new("mcp-collect-files-outside");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.log"), b"TOPSECRET-walk").unwrap();
+        std::fs::write(tmp.join("real.log"), b"in-tree").unwrap();
+        symlink(outside.join("secret.log"), tmp.join("leak.log")).unwrap();
+        symlink(&outside, tmp.join("leakdir")).unwrap();
+
+        let mut files: Vec<(String, u64)> = Vec::new();
+        collect_files(&tmp, &tmp, &mut files, 0);
+        let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+
+        assert!(
+            names.iter().any(|n| n.contains("real.log")),
+            "real in-tree file must be listed: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("leak") || n.contains("secret")),
+            "symlinked file/dir must NOT be followed/listed: {names:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn grep_report_never_renders_symlinked_out_of_repo_content() {
+        // End-to-end companion to collect_files_does_not_follow_symlinks:
+        // before the walker skipped symlinks, a planted symlink inside the
+        // report dir turned grep_report into an arbitrary-file read.
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempRoot::new("mcp-grep-symlink");
+        let outside = TempRoot::new("mcp-grep-outside");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOPSECRET-grep\n").unwrap();
+        symlink(outside.join("secret.txt"), tmp.join("leak.txt")).unwrap();
+
+        let srv = test_server(&tmp);
+        let res = srv.grep_report(Some(
+            &json!({"report_dir": tmp.to_string_lossy(), "pattern": "TOPSECRET"}),
+        ));
+        let txt = res.content[0].text.clone();
+        // The echoed pattern in the header necessarily repeats the needle, so
+        // assert on the LEAK channels: the symlinked file's name must never
+        // appear as a scanned/matched path, and there must be zero matches.
+        assert!(
+            !txt.contains("leak") && txt.contains("matches: 0"),
+            "grep followed a planted symlink out of the report dir: {txt}"
         );
     }
 
