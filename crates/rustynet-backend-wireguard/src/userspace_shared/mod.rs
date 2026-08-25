@@ -656,6 +656,7 @@ mod tests {
     };
 
     use super::LinuxUserspaceSharedBackend;
+    use super::engine::UserspaceEngine;
     use super::tun::{
         TestExitModeBehavior, TestRouteBehavior, TestTunBehavior, TestTunLifecycle,
         TunExitModeMutation, TunRouteMutation, TunRouteMutationKind,
@@ -952,6 +953,48 @@ mod tests {
         );
 
         let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn userspace_engine_rejects_degenerate_all_zero_private_key() {
+        // CRY-06 convention: an all-zero static private key is a publicly
+        // derivable identity, so loading one must fail closed exactly like
+        // rustynet-crypto's WeakMaterial rejects — never mint an engine from
+        // it. A blank/corrupted key file would otherwise come up "healthy".
+        let private_key_path = write_private_key([0u8; 32]);
+
+        let err = UserspaceEngine::from_private_key_file(&private_key_path)
+            .expect_err("an all-zero private key must be rejected");
+
+        assert!(
+            err.message.contains("degenerate"),
+            "expected degenerate-key error, got: {err}"
+        );
+
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn userspace_engine_bounds_private_key_file_read_before_buffering() {
+        // Same class as the rustynetd secret-read bounds: a misprovisioned or
+        // special-file key path must be refused at read time by size, not
+        // fully buffered before the base64 decoder rejects it.
+        let oversized_path = unique_path("oversized");
+        fs::write(
+            &oversized_path,
+            "A".repeat(<super::engine::UserspaceEngine>::MAX_PRIVATE_KEY_FILE_BYTES as usize + 1),
+        )
+        .expect("oversized key file should be written");
+
+        let err = UserspaceEngine::from_private_key_file(&oversized_path)
+            .expect_err("an over-cap key file must be refused before buffering");
+
+        assert!(
+            err.message.contains("byte cap"),
+            "expected byte-cap error, got: {err}"
+        );
+
+        let _ = fs::remove_file(oversized_path);
     }
 
     #[test]

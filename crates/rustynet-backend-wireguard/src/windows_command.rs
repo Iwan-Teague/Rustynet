@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::prelude::*;
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
     SocketEndpoint, TunnelBackend, TunnelStats,
@@ -454,9 +455,12 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
         self.ensure_running()?;
-        let peer_for_runtime = peer.clone();
+        // Apply to the runtime FIRST and record only on success. The in-memory
+        // map is the source for sync_persistent_config, so recording before a
+        // successful `wg set` would let a failed (or validation-rejected) peer
+        // silently activate on the next service restart.
+        self.apply_peer_runtime(&peer)?;
         self.peers.insert(peer.node_id.clone(), peer);
-        self.apply_peer_runtime(&peer_for_runtime)?;
         self.sync_persistent_config()
     }
 
@@ -466,12 +470,14 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
         endpoint: SocketEndpoint,
     ) -> Result<(), BackendError> {
         self.ensure_running()?;
-        let Some(peer) = self.peers.get_mut(node_id) else {
-            return Err(BackendError::invalid_input("peer is not configured"));
-        };
-        peer.endpoint = endpoint;
-        let peer_for_runtime = peer.clone();
-        self.apply_peer_runtime(&peer_for_runtime)?;
+        let mut updated = self
+            .peers
+            .get(node_id)
+            .cloned()
+            .ok_or_else(|| BackendError::invalid_input("peer is not configured"))?;
+        updated.endpoint = endpoint;
+        self.apply_peer_runtime(&updated)?;
+        self.peers.insert(node_id.clone(), updated);
         self.sync_persistent_config()
     }
 
@@ -493,7 +499,14 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
         self.ensure_running()?;
-        let Some(peer) = self.peers.remove(node_id) else {
+        let peer_public_key = self
+            .peers
+            .get(node_id)
+            .map(|peer| encode_wg_public_key_base64(&peer.public_key));
+        // Remove from the runtime FIRST; the map entry stays until the removal
+        // actually succeeded so memory cannot claim a peer the tunnel still
+        // serves (and vice versa).
+        let Some(peer_public_key) = peer_public_key else {
             return Ok(());
         };
         self.runner.run(
@@ -502,10 +515,11 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
                 "set".to_owned(),
                 self.tunnel_name.clone(),
                 "peer".to_owned(),
-                encode_wg_public_key_base64(&peer.public_key),
+                peer_public_key,
                 "remove".to_owned(),
             ],
         )?;
+        self.peers.remove(node_id);
         self.sync_persistent_config()
     }
 
@@ -691,6 +705,10 @@ fn read_private_key_value(path: &Path) -> Result<String, BackendError> {
 
 /// Validate a WireGuard private key value (base64, non-empty) regardless of
 /// whether it came from a plaintext file or the in-memory custody decrypt.
+/// The value must decode to exactly 32 non-zero bytes: CRY-06 convention —
+/// an all-zero static private key is a publicly derivable identity that a
+/// blank or corrupted key source would mint, so it is refused here instead of
+/// being rendered into a tunnel config.
 fn validate_private_key_value(key: &str, source_label: &str) -> Result<String, BackendError> {
     let key = key.trim();
     if key.is_empty() {
@@ -704,6 +722,20 @@ fn validate_private_key_value(key: &str, source_label: &str) -> Result<String, B
     {
         return Err(BackendError::invalid_input(format!(
             "{source_label} contains invalid characters"
+        )));
+    }
+    let decoded = BASE64_STANDARD.decode(key.as_bytes()).map_err(|err| {
+        BackendError::invalid_input(format!("{source_label} is not valid base64: {err}"))
+    })?;
+    if decoded.len() != 32 {
+        return Err(BackendError::invalid_input(format!(
+            "{source_label} must decode to 32 bytes, got {}",
+            decoded.len()
+        )));
+    }
+    if decoded.iter().all(|&byte| byte == 0) {
+        return Err(BackendError::invalid_input(format!(
+            "{source_label} is degenerate (all zeros); refusing weak key material"
         )));
     }
     Ok(key.to_owned())
@@ -957,7 +989,6 @@ mod tests {
     }
 
     use super::*;
-    use base64::prelude::*;
     use rustynet_backend_api::RouteKind;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
@@ -1910,6 +1941,230 @@ mod tests {
         assert!(
             err.to_string().contains("byte cap"),
             "expected byte-cap error, got: {err}"
+        );
+    }
+
+    /// RecordingRunner whose plain `run` path can be switched to fail every
+    /// `wg set` invocation, simulating a wg.exe / tunnel-service failure while
+    /// start-time commands (installtunnelservice, readiness probes) succeed.
+    #[derive(Debug, Clone)]
+    struct SelectiveFailureRunner {
+        inner: RecordingRunner,
+        fail_wg_set: Arc<Mutex<bool>>,
+    }
+
+    impl SelectiveFailureRunner {
+        fn new() -> Self {
+            Self {
+                inner: RecordingRunner::default(),
+                fail_wg_set: Arc::new(Mutex::new(false)),
+            }
+        }
+
+        fn set_fail_wg_set(&self, fail: bool) {
+            *self.fail_wg_set.lock().expect("fail flag") = fail;
+        }
+    }
+
+    impl WireguardCommandRunner for SelectiveFailureRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+            if *self.fail_wg_set.lock().expect("fail flag") && args.iter().any(|arg| arg == "set") {
+                return Err(BackendError::internal("scripted wg set failure"));
+            }
+            self.inner.run(program, args)
+        }
+
+        fn run_capture(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<WireguardCommandOutput, BackendError> {
+            self.inner.run_capture(program, args)
+        }
+    }
+
+    fn failing_wg_backend(
+        runner: &SelectiveFailureRunner,
+        temp_dir: &TempDir,
+    ) -> WindowsWireguardBackend<SelectiveFailureRunner> {
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(temp_dir);
+        WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct")
+    }
+
+    #[test]
+    fn windows_failed_peer_configure_leaves_no_peer_state_residue() {
+        // A failed `wg set` (or a rejected config) must not leave the peer in
+        // the backend's in-memory state: the map is the source for
+        // sync_persistent_config, so residue here silently activates the
+        // never-applied peer on the next service restart.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let runner = SelectiveFailureRunner::new();
+        let mut backend = failing_wg_backend(&runner, &temp_dir);
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+
+        backend
+            .configure_peer(sample_peer("applied"))
+            .expect("first configure should succeed");
+        runner.set_fail_wg_set(true);
+        let ghost = sample_peer("ghost");
+        let ghost_id = ghost.node_id.clone();
+        backend
+            .configure_peer(ghost)
+            .expect_err("wg set failure must fail the configure");
+
+        assert_eq!(
+            backend.stats().expect("stats").peer_count,
+            1,
+            "the failed peer must not remain counted as configured"
+        );
+        assert_eq!(
+            backend.current_peer_endpoint(&ghost_id).expect("running"),
+            None,
+            "the failed peer must not be queryable as configured"
+        );
+    }
+
+    #[test]
+    fn windows_rejected_invalid_peer_config_leaves_no_poison_residue() {
+        // An empty allowed_ips list is rejected by merged_allowed_ips during
+        // apply. The rejection must happen BEFORE any state mutation;
+        // otherwise the invalid entry poisons every later render of the
+        // persistent config.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let runner = SelectiveFailureRunner::new();
+        let mut backend = failing_wg_backend(&runner, &temp_dir);
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+
+        let mut invalid = sample_peer("invalid");
+        invalid.allowed_ips.clear();
+        backend
+            .configure_peer(invalid)
+            .expect_err("empty allowed_ips must be rejected");
+        assert_eq!(
+            backend.stats().expect("stats").peer_count,
+            0,
+            "the rejected peer must not remain counted as configured"
+        );
+
+        backend
+            .configure_peer(sample_peer("valid"))
+            .expect("a valid configure must still succeed after the rejection");
+    }
+
+    #[test]
+    fn windows_failed_peer_removal_keeps_peer_configured() {
+        // If `wg set ... remove` fails, the runtime still holds the peer with
+        // its allowed_ips routing traffic; the in-memory map must agree until
+        // the removal actually succeeds.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let runner = SelectiveFailureRunner::new();
+        let mut backend = failing_wg_backend(&runner, &temp_dir);
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        let peer = sample_peer("kept");
+        let kept_id = peer.node_id.clone();
+        let endpoint = peer.endpoint;
+        backend
+            .configure_peer(peer)
+            .expect("configure should succeed");
+
+        runner.set_fail_wg_set(true);
+        backend
+            .remove_peer(&kept_id)
+            .expect_err("wg set failure must fail the removal");
+
+        assert_eq!(
+            backend.stats().expect("stats").peer_count,
+            1,
+            "the peer must stay configured while the runtime still holds it"
+        );
+        assert_eq!(
+            backend
+                .current_peer_endpoint(&kept_id)
+                .expect("peer stays configured"),
+            Some(endpoint),
+        );
+    }
+
+    #[test]
+    fn windows_failed_endpoint_update_keeps_previous_endpoint() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let runner = SelectiveFailureRunner::new();
+        let mut backend = failing_wg_backend(&runner, &temp_dir);
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        let peer = sample_peer("roaming");
+        let node_id = peer.node_id.clone();
+        let previous_endpoint = peer.endpoint;
+        backend
+            .configure_peer(peer)
+            .expect("configure should succeed");
+
+        runner.set_fail_wg_set(true);
+        backend
+            .update_peer_endpoint(
+                &node_id,
+                SocketEndpoint {
+                    addr: "203.0.113.99".parse().expect("valid ip"),
+                    port: 51821,
+                },
+            )
+            .expect_err("wg set failure must fail the update");
+
+        assert_eq!(
+            backend.current_peer_endpoint(&node_id).expect("configured"),
+            Some(previous_endpoint),
+            "the in-memory endpoint must keep matching the runtime after a failed update"
+        );
+    }
+
+    #[test]
+    fn windows_in_memory_custody_private_key_rejects_degenerate_all_zero_value() {
+        // CRY-06 convention: an all-zero static private key is a publicly
+        // derivable identity. Both key entry points on this backend — file and
+        // in-memory DPAPI custody — must refuse it instead of rendering a
+        // tunnel config around it.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, _private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let zero_key = BASE64_STANDARD.encode([0u8; 32]);
+        let mut backend = WindowsWireguardBackend::new(
+            RecordingRunner::default(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            temp_dir.path().join("unused.key").to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct")
+        .with_runtime_private_key(Zeroizing::new(zero_key));
+
+        let err = backend
+            .start(runtime_context())
+            .expect_err("an all-zero custody key must fail closed");
+
+        assert!(
+            err.to_string().contains("degenerate"),
+            "expected degenerate-key error, got: {err}"
         );
     }
 }
