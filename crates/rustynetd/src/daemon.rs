@@ -709,9 +709,13 @@ impl StateFetcher {
                         "dns zone bundle",
                     )?;
 
-                    // parse verifier key
-                    let verifier_key = std::fs::read_to_string(&self.dns_zone_verifier_key_path)
-                        .map_err(|e| format!("read dns verifier key failed: {e}"))?;
+                    // parse verifier key (bounded read: a tampered or
+                    // oversized key file must not drive unbounded allocation)
+                    let verifier_key = read_text_artifact_bounded(
+                        &self.dns_zone_verifier_key_path,
+                        "dns zone verifier key",
+                        MAX_BOOTSTRAP_ARTIFACT_BYTES,
+                    )?;
                     let _verifier = parse_dns_zone_verifying_key(&verifier_key)
                         .map_err(|e| format!("parse dns verifier key failed: {e}"))?;
 
@@ -9180,7 +9184,14 @@ impl DaemonRuntime {
         if !bundle_path.exists() {
             return Err("assignment bundle not found".to_owned());
         }
-        let _content = std::fs::read_to_string(bundle_path).map_err(|e| e.to_string())?;
+        // Readability probe with a hard bound: the bundle body is parsed by
+        // the dedicated loader below; here a tampered or oversized file must
+        // not drive unbounded allocation just to learn it is readable.
+        let _content = read_text_artifact_bounded(
+            bundle_path,
+            "auto-tunnel assignment bundle",
+            MAX_BOOTSTRAP_ARTIFACT_BYTES,
+        )?;
 
         let verifier_path = self
             .auto_tunnel_verifier_key_path
@@ -12616,12 +12627,13 @@ fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
     )
 }
 
-/// Upper bound for bootstrap watermark stores (trust / auto-tunnel /
-/// dns-zone / traversal). These files hold a handful of key=value lines, so
-/// 16 KiB is generous; the bound is enforced inside the read loop via
+/// Upper bound for small bootstrap artifacts read from local disk (trust /
+/// auto-tunnel / dns-zone / traversal watermark stores, verifier keys, staged
+/// bundle existence probes). These files hold a handful of lines, so 16 KiB is
+/// generous; the bound is enforced inside the read loop via
 /// `read_text_artifact_bounded` so tampered disk state cannot drive an
 /// unbounded allocation before the parser sees a single byte.
-const MAX_WATERMARK_FILE_BYTES: usize = 16 * 1024;
+const MAX_BOOTSTRAP_ARTIFACT_BYTES: usize = 16 * 1024;
 
 /// Read a text artifact from disk with a hard upper bound enforced inside the
 /// read loop, eliminating the TOCTOU window between a separate `fs::metadata`
@@ -13028,7 +13040,7 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
         return Ok(None);
     }
 
-    let content = read_text_artifact_bounded(path, "trust watermark", MAX_WATERMARK_FILE_BYTES)
+    let content = read_text_artifact_bounded(path, "trust watermark", MAX_BOOTSTRAP_ARTIFACT_BYTES)
         .map_err(TrustBootstrapError::Io)?;
     let mut version: Option<u8> = None;
     let mut updated_at_unix: Option<u64> = None;
@@ -13669,7 +13681,7 @@ fn load_auto_tunnel_watermark(
     }
 
     let content =
-        read_text_artifact_bounded(path, "auto-tunnel watermark", MAX_WATERMARK_FILE_BYTES)
+        read_text_artifact_bounded(path, "auto-tunnel watermark", MAX_BOOTSTRAP_ARTIFACT_BYTES)
             .map_err(AutoTunnelBootstrapError::Io)?;
     let mut version: Option<u8> = None;
     let mut generated_at_unix: Option<u64> = None;
@@ -13894,8 +13906,9 @@ fn load_dns_zone_watermark(path: &Path) -> Result<Option<DnsZoneWatermark>, DnsZ
         return Ok(None);
     }
 
-    let content = read_text_artifact_bounded(path, "dns zone watermark", MAX_WATERMARK_FILE_BYTES)
-        .map_err(DnsZoneBootstrapError::Io)?;
+    let content =
+        read_text_artifact_bounded(path, "dns zone watermark", MAX_BOOTSTRAP_ARTIFACT_BYTES)
+            .map_err(DnsZoneBootstrapError::Io)?;
     let mut version: Option<u8> = None;
     let mut generated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
@@ -15154,8 +15167,9 @@ fn load_traversal_watermark(
     if !path.exists() {
         return Ok(None);
     }
-    let content = read_text_artifact_bounded(path, "traversal watermark", MAX_WATERMARK_FILE_BYTES)
-        .map_err(TraversalBootstrapError::Io)?;
+    let content =
+        read_text_artifact_bounded(path, "traversal watermark", MAX_BOOTSTRAP_ARTIFACT_BYTES)
+            .map_err(TraversalBootstrapError::Io)?;
     let mut version: Option<u8> = None;
     let mut generated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
