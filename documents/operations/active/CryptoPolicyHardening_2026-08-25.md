@@ -32,6 +32,10 @@ restores cannot destroy uncommitted work).
   flip mutants die.
 - `0ad7f0e3`: pinned ops input guards (empty artifact list refuses before any
   signing work; trailing-colon spec leaves an inexpressible empty path).
+- `context_matches` explicit-context `contains` arm: mutation-tested
+  (disabled → six tests fail, incl.
+  `contextual_policy_does_not_widen_between_shared_router_and_exit`) —
+  covered, nothing to add.
 - Rule-filter arm of `evaluate_with_membership`: mutation-tested and found
   **provably redundant** rather than unpinned — when a rule's selector
   textually matches the request, its membership resolution is identical to the
