@@ -788,11 +788,40 @@ impl AiAgentServer {
         self.jobs_dir().join(format!("{job_id}.json"))
     }
 
+    /// Job-id charset: ASCII alphanumeric, '-', '_' ONLY, non-empty, <=128
+    /// bytes. Rejects '.' and '/' (so `../x` can never traverse out of the
+    /// jobs dir when joined into `<job_id>.json`), shell metachars, and
+    /// whitespace — validated BEFORE any path is built. Mirrors the identical
+    /// gates in lab_state's job-record helpers and this bin's lab_job_log /
+    /// lab_stage_log tools; real ids look like `labrun-<millis>-<pid>-<seq>`
+    /// or `edit-<millis>-<pid>-<seq>`, well inside this charset.
+    fn validate_job_id(job_id: &str) -> Result<(), String> {
+        if job_id.is_empty()
+            || job_id.len() > 128
+            || !job_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(format!(
+                "invalid job_id '{job_id}': only ASCII letters, digits, '-' and '_' allowed"
+            ));
+        }
+        Ok(())
+    }
+
     /// Persist a job record durably (so a reloaded server can still find it).
     /// Written atomically-ish — to a sibling `.tmp` then renamed — so a
     /// concurrent poll never reads a half-written record. Best-effort: a write
     /// failure is logged, not fatal (the in-memory map remains the fast path).
     fn write_job_record(&self, job_id: &str, rec: &Value) {
+        // Fail closed on a malformed/traversal job_id BEFORE it becomes a
+        // filename — a planted id must never place a record outside
+        // DEEPSEEK_JOBS_SUBDIR. All production callers pass server-generated
+        // or filename-derived ids, so this only ever rejects hostile input.
+        if let Err(e) = Self::validate_job_id(job_id) {
+            eprintln!("rustynet-mcp-ai-agent: refusing job-record write: {e}");
+            return;
+        }
         let dir = self.jobs_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!(
@@ -816,6 +845,11 @@ impl AiAgentServer {
 
     /// Read a persisted job record back (the reload-survival fallback path).
     fn read_job_record(&self, job_id: &str) -> Option<Value> {
+        // Fail closed on a malformed/traversal job_id BEFORE it becomes a
+        // filename — the poll/reconcile/edit tools feed the CALLER-supplied id
+        // straight in here, and an unvalidated join would read (and render
+        // fields from) an arbitrary JSON file. Mirrors lab_state's gate.
+        Self::validate_job_id(job_id).ok()?;
         let s = std::fs::read_to_string(self.job_record_path(job_id)).ok()?;
         serde_json::from_str(&s).ok()
     }
@@ -10574,6 +10608,72 @@ mod tests {
         assert_eq!(
             key_for_stage_or_cell("windows_admin_live_issue"),
             Some("windows_admin")
+        );
+    }
+
+    #[test]
+    fn live_lab_result_rejects_job_id_traversal_before_record_read() {
+        // The reload-survival fallback joins the CALLER-supplied job_id into
+        // state/deepseek-mcp-jobs/<job_id>.json. A traversal id like "../secret"
+        // resolves OUTSIDE the jobs dir; the poll must reject it instead of
+        // rendering fields from an arbitrary JSON file (lab_state fixed the
+        // identical gap at 2ae64ec6 — this is that same input on ai_agent's
+        // own record path, where only lab_job_log was charset-gated).
+        let tmp = TempRoot::new("agent-jobid-traversal");
+        let tmp = tmp.path();
+        let srv = server_rooted(tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        // One level ABOVE the jobs dir — exactly where "../secret" from inside
+        // state/deepseek-mcp-jobs/ resolves.
+        std::fs::create_dir_all(tmp.join("state")).unwrap();
+        let decoy_path = tmp.join("state/secret.json");
+        std::fs::write(
+            &decoy_path,
+            r#"{"job_id":"planted","state":"done","report_text":"TOPSECRET-LLR"}"#,
+        )
+        .unwrap();
+
+        let res = srv.call_live_lab_result(&json!({"job_id": "../secret"}));
+        assert!(res.is_error.is_some(), "traversal job_id must be rejected");
+        assert!(
+            !res.content[0].text.contains("TOPSECRET-LLR"),
+            "poll rendered fields from {}: {}",
+            decoy_path.display(),
+            res.content[0].text
+        );
+        assert!(srv.read_job_record("../secret").is_none());
+        // Charset edge cases stay closed too.
+        for bad in ["a/b", "..\\win", "jöb", "", "/abs"] {
+            assert!(
+                srv.read_job_record(bad).is_none(),
+                "{bad:?} must not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_result_rejects_job_id_traversal_before_record_read() {
+        // Same gate for the delegated-edit tier: load_edit_record feeds the
+        // caller's job_id straight into the same join.
+        let tmp = TempRoot::new("agent-edit-jobid-traversal");
+        let tmp = tmp.path();
+        let srv = server_rooted(tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        std::fs::create_dir_all(tmp.join("state")).unwrap();
+        let decoy_path = tmp.join("state/secret-edit.json");
+        std::fs::write(
+            &decoy_path,
+            r#"{"kind":"edit","state":"failed","error":"TOPSECRET-EDIT"}"#,
+        )
+        .unwrap();
+
+        let res = srv.call_edit_result(&json!({"job_id": "../secret-edit"}));
+        assert!(res.is_error.is_some(), "traversal job_id must be rejected");
+        assert!(
+            !res.content[0].text.contains("TOPSECRET-EDIT"),
+            "edit poll rendered fields from {}: {}",
+            decoy_path.display(),
+            res.content[0].text
         );
     }
 }
