@@ -1444,6 +1444,17 @@ mod tests {
             protocol: Protocol::Icmp,
         };
         assert_eq!(empty.evaluate(&request), Decision::Deny);
+
+        // Same shape through the membership-aware path: even a fully
+        // active directory must not let an empty ACL allow ICMP.
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-a", MembershipStatus::Active);
+        membership.set_node_status("node-b", MembershipStatus::Active);
+        assert_eq!(
+            empty.evaluate_with_membership(&request, &membership),
+            Decision::Deny,
+            "empty ACL denies ICMP even with fully-active membership"
+        );
     }
 
     #[test]
