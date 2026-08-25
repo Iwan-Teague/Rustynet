@@ -731,6 +731,19 @@ mod tests {
     fn secure_runtime_dir_refuses_pre_existing_path() {
         let base = scratch_dir("refuse-existing");
         let target = base.join("planted");
+        #[cfg(unix)]
+        {
+            // Attacker-realistic plant: already 0700 and not a symlink, so
+            // every post-create verification would accept it. Only the
+            // explicit pre-existing-path refusal may reject it.
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&target)
+                .expect("plant attacker-owned dir");
+        }
+        #[cfg(not(unix))]
         fs::create_dir_all(&target).expect("plant");
         assert!(secure_runtime_dir(&target).is_err());
     }
@@ -765,6 +778,21 @@ mod tests {
             .create(&target)
             .expect("create loose");
         assert!(verify_secure_runtime_dir(&target).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_runtime_dir_fresh_create_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch_dir("fresh-mode");
+        let target = base.join("fresh");
+        secure_runtime_dir(&target).expect("fresh create must succeed");
+        let mode = fs::symlink_metadata(&target)
+            .expect("dir meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[cfg(unix)]
