@@ -8497,6 +8497,18 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             !shipped_body.contains("RelaySelfSignedCodeSigning::Allow"),
             "the shipped `role set` relay path must never pass Allow"
         );
+        // The literal grep above escapes an import alias (`use
+        // RelaySelfSignedCodeSigning as Signing;` + `Signing::Allow`) — the
+        // Allow path returns under a spelling the needle cannot see while the
+        // Disallow pin stays satisfied. Strip every Disallow mention; no bare
+        // Allow spelling may remain anywhere on the shipped path.
+        let without_disallow = shipped_body.replace("Disallow", "");
+        assert!(
+            !without_disallow.contains("Allow"),
+            "the shipped `role set` relay path must never name the Allow signing \
+             policy under ANY spelling (import aliases included) — Allow mints a \
+             root CA on operator hosts"
+        );
         // `Allow` itself is `#[cfg(feature = "vm-lab")]`, so a release build
         // cannot name it and the compiler — not this test — is what stops a
         // shipped caller from minting. This asserts that gate is still there,
