@@ -2248,6 +2248,24 @@ mod tests {
         );
         let required = format!("let mut ssh_allow_cidrs = String::{}();", "new");
         assert!(source.contains(required.as_str()));
+        // The needles above pin ONE construction spelling (`String::from`) and
+        // one init shape. `push_str`, `format!`, a const, or any other
+        // assembly reintroduces the QH-57 wedge while both stay green. Ban the
+        // CIDR VALUE itself in code. Bound the scan to the implementation
+        // region (everything before the unit-test module): this test's own
+        // runtime-assembled needle legitimately names the value, and comment
+        // lines are exempt because the rationale comment names it too.
+        let cidr = ["192.168.", "18.0/24"].concat();
+        let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
+        for (index, line) in source[..impl_end].lines().enumerate() {
+            let trimmed = line.trim_start();
+            assert!(
+                trimmed.starts_with("//") || !line.contains(cidr.as_str()),
+                "line {} embeds the QH-57 wedge CIDR {cidr} in implementation code; \
+                 ssh-allow-cidrs must stay operator-supplied with no baked-in default",
+                index + 1
+            );
+        }
     }
 
     use super::{
