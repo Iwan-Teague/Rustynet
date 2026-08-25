@@ -32,6 +32,13 @@ restores cannot destroy uncommitted work).
   flip mutants die.
 - `0ad7f0e3`: pinned ops input guards (empty artifact list refuses before any
   signing work; trailing-colon spec leaves an inexpressible empty path).
+- Rule-filter arm of `evaluate_with_membership`: mutation-tested and found
+  **provably redundant** rather than unpinned — when a rule's selector
+  textually matches the request, its membership resolution is identical to the
+  request-gate check that already passed; when it does not match,
+  `selector_matches` rejects independently. No behavioral test can kill a
+  mutant here (verified: flip survives the whole suite), mirroring the
+  documented redundancy inside `selector_matches`' own guard.
 - `59720c5f`: source-grep pin for `selector_matches`' both-sides-empty guard —
   its rule-side half is behaviourally redundant under equality matching
   (documented at the function), so removal was previously invisible to every
