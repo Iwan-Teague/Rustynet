@@ -97,6 +97,25 @@ in non-test production code of all five touched files; policy/crypto
 doctests pass (no code fences); branch footprint vs `origin/main` is
 exactly the seven intended files (+803/−20) with a clean tree.
 
+## Merge readiness (Definition of Done walk-through)
+
+- In-scope requirements implemented end-to-end: yes — each defect fixed at its
+  enforcement point with a pin that fails under the reverted guard.
+- Security minimum bar: satisfied for the touched scope; no crypto invented,
+  WireGuard untouched, default-deny strengthened (empty-ACL/ICMP/membership
+  terminals now executed by tests).
+- Gates actually run: scoped `cargo test --all-targets --all-features` for
+  rustynet-crypto, rustynet-policy, rustynet-cli (green at every commit);
+  `cargo clippy -p` ×3 with `-D warnings` (exit 0); `cargo fmt -p` clean.
+- Gates deliberately deferred, named so nothing is silently claimed: the
+  full-workspace §7 test stage and `cargo audit`/`cargo deny` were not run
+  (operating constraint: scoped testing only); workspace-excluded crates
+  (`rustynet-lab-monitor`, `gui`, `fuzz`) untouched and untriggered. The
+  changed crates are pure library/CI-tooling surfaces with no daemon dataplane
+  behaviour change, so no live-lab run is required to merge this branch; if
+  the operator disagrees, the branch is ordinary to rebase and re-gate.
+- No TODO/FIXME/placeholders introduced; artifacts are the commits themselves.
+
 ## Known non-issues (checked, left alone)
 
 - `unwrap_or_default()` remnants in `rustynet-cli` are display/report paths.
