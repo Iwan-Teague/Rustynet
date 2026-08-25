@@ -1300,6 +1300,15 @@ fn equality_hit_is_allowlisted(file_path_label: &str, line_content: &str) -> boo
 ///   ticks (`'a`) fall through as ordinary characters.
 /// - Raw strings `r"…"`, `r#"…"#`, `br#"…"#` are honoured, but never
 ///   when the prefix character continues an identifier.
+/// - Inline comments are blanked too (`// …` to end-of-line; `/* … */`
+///   nesting-aware, unterminated → end-of-line), because executable
+///   code may FOLLOW an inline block comment on the same line and a
+///   stray quote inside that comment would otherwise open a phantom
+///   string that swallows — and thereby hides — a genuine comparison
+///   after it (over-stripping is fail-open). Whole-line comments are
+///   skipped by the caller before this helper runs; this arm covers
+///   the inline shapes. This also keeps comment-only mentions of
+///   `ct_eq` from suppressing detection of a real compare on the line.
 fn strip_string_literal_contents(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
@@ -1377,6 +1386,40 @@ fn strip_string_literal_contents(line: &str) -> String {
                 } else {
                     out.push(c);
                     i += 1;
+                }
+            }
+            '/' => {
+                match chars.get(i + 1) {
+                    // `// …`: line comment — everything to end-of-line is
+                    // comment; nothing executable can follow it, but
+                    // blanking keeps a stray quote inside from opening a
+                    // phantom string (and matches the caller's whole-line
+                    // comment skip for inline placements).
+                    Some('/') => break,
+                    // `/* … */`: block comment — nesting-aware skip so
+                    // executable code AFTER the closer stays visible.
+                    // Unterminated → blank to end-of-line (the real
+                    // literal/comment continues on later lines, which the
+                    // caller's per-line reset already degrades safely).
+                    Some('*') => {
+                        let mut depth = 1usize;
+                        i += 2;
+                        while i < n && depth > 0 {
+                            if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                                depth += 1;
+                                i += 2;
+                            } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                                depth -= 1;
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                    _ => {
+                        out.push('/');
+                        i += 1;
+                    }
                 }
             }
             other => {
@@ -1655,6 +1698,59 @@ fn secret_equality_scanner_survives_char_literals_and_raw_strings() {
     assert!(
         !hits_raw.iter().any(|(line_no, _)| *line_no == 1),
         "raw-string contents on line 1 must not be flagged: {hits_raw:?}"
+    );
+}
+
+// ---- TEMP ADVERSARIAL PROBES (zz_probe_*) --------------------------
+
+#[test]
+fn zz_pin_p7_compare_after_quoted_inline_block_comment_must_fire() {
+    let with_quote = "f(x); /* say \"hi */ if supplied_token == expected_token {}";
+    let hits = scan_source_for_secret_material_equality(with_quote, "crates/example/src/lib.rs");
+    assert!(
+        hits.iter().any(|(_, t)| t == "token"),
+        "a real compare after an inline block comment containing a quote \
+         must still fire (over-stripping is fail-open): {hits:?}"
+    );
+}
+
+#[test]
+fn zz_pin_p8_ct_eq_in_comment_must_not_suppress_real_compare() {
+    let block = "if supplied_mac == expected_mac { /* TODO route via ct_eq */ }";
+    let trailing = "if supplied_mac == expected_mac { process(); } // use ct_eq instead";
+    for (name, body) in [("block", block), ("trailing", trailing)] {
+        let hits = scan_source_for_secret_material_equality(body, "crates/example/src/lib.rs");
+        assert!(
+            hits.iter().any(|(_, t)| t == "mac"),
+            "ct_eq mentioned only inside a {name} comment must not silence a real compare: {hits:?}"
+        );
+    }
+}
+
+#[test]
+fn zz_pin_p6_unterminated_quote_does_not_leak_across_lines() {
+    let body = "let s = \"oops
+if supplied_mac == expected_mac {}";
+    let hits = scan_source_for_secret_material_equality(body, "crates/example/src/lib.rs");
+    assert!(
+        hits.iter().any(|(line_no, t)| *line_no == 2 && t == "mac"),
+        "fail-closed: a compare on the line AFTER an unterminated quote must still fire: {hits:?}"
+    );
+}
+
+#[test]
+fn zz_pin_escapes_escaped_quote_and_char_escape() {
+    let dq = r#"let s = "a\"b"; if supplied_token != expected_token {}"#;
+    let hits_dq = scan_source_for_secret_material_equality(dq, "crates/example/src/lib.rs");
+    assert!(
+        hits_dq.iter().any(|(_, t)| t == "token"),
+        "escaped quote inside a literal must not hide a following real compare: {hits_dq:?}"
+    );
+    let sq = r#"let c = '\''; if supplied_mac == expected_mac {}"#;
+    let hits_sq = scan_source_for_secret_material_equality(sq, "crates/example/src/lib.rs");
+    assert!(
+        hits_sq.iter().any(|(_, t)| t == "mac"),
+        "escaped-quote char literal must not hide a following real compare: {hits_sq:?}"
     );
 }
 
