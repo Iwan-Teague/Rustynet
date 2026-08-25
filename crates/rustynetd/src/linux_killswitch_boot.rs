@@ -232,6 +232,17 @@ impl BootTraversalEndpoint {
 /// - implicit `policy drop` for everything else
 ///
 /// On non-Linux hosts this is a no-op (the killswitch is Linux-only).
+///
+/// The interface name is validated BEFORE any nft exec. This installer is
+/// the one firewall-enforcement path that execs `nft` directly instead of
+/// through the privileged helper's argv allowlist (whose `is_interface_name`
+/// gate covers every runtime rule shape), and nft parses its concatenated
+/// arguments as grammar — so an unvalidated name could add match terms or
+/// verdicts to the boot chain. The value is operator-reachable from real
+/// config: the reviewed systemd unit interpolates `${RUSTYNET_WG_INTERFACE}`
+/// into `--iface` on the ExecStartPre line, which arrives here verbatim as a
+/// single argument. The character class mirrors the runtime path's
+/// `validate_net_device_name` exactly so boot and runtime cannot drift.
 pub fn install_linux_boot_killswitch(
     iface: &str,
     ssh_allow: bool,
@@ -239,6 +250,17 @@ pub fn install_linux_boot_killswitch(
     wg_listen_port: Option<u16>,
     traversal_endpoints: &[BootTraversalEndpoint],
 ) -> Result<(), String> {
+    if iface.is_empty()
+        || iface.len() > 15
+        || !iface
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(format!(
+            "invalid boot killswitch interface name {iface:?}: must be 1-15 chars of \
+             [A-Za-z0-9_-] (mirrors the runtime dataplane's device-name gate)"
+        ));
+    }
     install_linux_boot_killswitch_inner(
         iface,
         ssh_allow,
@@ -1360,5 +1382,59 @@ table inet rustynetfoo {
             "install_linux_boot_killswitch_inner must emit a `sport` match so outbound \
              WireGuard to a NAT-mapped peer endpoint is permitted"
         );
+    }
+
+    /// The boot installer is the ONE firewall-enforcement path that execs
+    /// `nft` DIRECTLY (not through the privileged helper's argv allowlist,
+    /// whose `is_interface_name` gate covers every runtime rule shape). The
+    /// interface name therefore must be validated BEFORE it becomes an nft
+    /// argv token: nft concatenates its arguments into one command line and
+    /// parses them as grammar, so an unvalidated value could add match terms
+    /// or verdicts to the boot chain's rules.
+    ///
+    /// The value is operator-reachable from real config: the reviewed unit
+    /// (`scripts/systemd/rustynetd.service`) interpolates
+    /// `${RUSTYNET_WG_INTERFACE}` into `--iface` on the ExecStartPre line, so
+    /// `/etc/default/rustynetd` reaches this argv verbatim (systemd's
+    /// `${VAR}` form passes the whole expansion as ONE argument).
+    ///
+    /// The gate mirrors the runtime path's `validate_net_device_name`
+    /// character class exactly ([A-Za-z0-9_-], 1..=15) so boot and runtime
+    /// cannot drift apart on what an interface name may contain. Validation
+    /// errors fire before ANY nft exec on every host OS, so this test is
+    /// safe to run off-Linux too; the negative cases never reach exec even
+    /// on Linux.
+    #[test]
+    fn boot_killswitch_rejects_injectable_interface_name_before_nft_exec() {
+        for hostile in [
+            "rustynet0 accept",
+            "rustynet0; drop",
+            "",
+            "rustynet 0",
+            "rustynet0\taccept",
+            "a".repeat(16).as_str(),
+            "rusty.net0",
+        ] {
+            let result = super::install_linux_boot_killswitch(hostile, false, &[], None, &[]);
+            let err = result.expect_err(
+                "an interface name outside the reviewed class must be refused \
+                 before any nft argv is built",
+            );
+            assert!(
+                err.contains("invalid boot killswitch interface name"),
+                "refusal must name the offending input: {err}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn boot_killswitch_accepts_canonical_interface_name() {
+        // Off-Linux the installer is a no-op after validation, so the
+        // positive path is observable here without touching host state. The
+        // canonical name must keep passing the gate or every Linux node
+        // fails closed at ExecStartPre.
+        super::install_linux_boot_killswitch("rustynet0", false, &[], None, &[])
+            .expect("the canonical tunnel interface name must pass the boot gate");
     }
 }
