@@ -1451,12 +1451,29 @@ fn run_macos_pfctl(binary: &Path, args: &[&str]) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
     }
-    Err(format!(
-        "pfctl {:?} failed: status={:?} stderr={}",
+    Err(pfctl_failure_message(
         args,
         output.status.code(),
-        truncate_lossy(&output.stderr, MAX_OUTPUT_BYTES)
+        &output.stderr,
     ))
+}
+
+/// The ONE construction site for the macOS pf-load builtin's failure message.
+/// The message travels back as `HelperResponse::error` over the helper IPC
+/// channel on every path that reaches the privilege-separated helper, so its
+/// embedded stderr is clamped to the deliverable field budget here — the same
+/// invariant `success_response_from_exec_output` enforces for exec-side
+/// streams. Clamping only at MAX_OUTPUT_BYTES (the old bound) let a verbosely
+/// failing `pfctl` build an error field the codec refuses to encode, and the
+/// helper then dropped the connection silently.
+#[cfg(unix)]
+fn pfctl_failure_message(args: &[&str], code: Option<i32>, stderr: &[u8]) -> String {
+    format!(
+        "pfctl {:?} failed: status={:?} stderr={}",
+        args,
+        code,
+        truncate_lossy(stderr, RESPONSE_FIELD_BUDGET_BYTES)
+    )
 }
 
 /// If `program` is an in-helper builtin, validate its arguments and run the
@@ -4353,6 +4370,36 @@ mod tests {
             "encoded response {} exceeds one frame ({MAX_MESSAGE_BYTES})",
             encoded.len()
         );
+    }
+
+    #[test]
+    fn builtin_pf_load_failure_message_is_always_deliverable() {
+        // The macOS pf-load builtin reports a failing `pfctl` as
+        // HelperResponse::error over the helper IPC channel. A verbosely
+        // failing pfctl used to be clamped only at MAX_OUTPUT_BYTES, so the
+        // error field could exceed the codec's per-field cap and the helper
+        // would drop the connection silently. The failure message must be
+        // bounded at the RESPONSE_FIELD_BUDGET_BYTES deliverability budget
+        // through its production construction site.
+        let verbose_stderr = vec![0x80u8; super::MAX_OUTPUT_BYTES];
+        let err = super::pfctl_failure_message(
+            &[
+                "-n",
+                "-a",
+                "com.rustynet/dns",
+                "-f",
+                "/var/rustynet/pf/rules.conf",
+            ],
+            Some(1),
+            &verbose_stderr,
+        );
+        // stderr contributes at most budget + marker; the fixed pfctl prefix
+        // adds well under 200 bytes.
+        assert!(err.len() <= super::RESPONSE_FIELD_BUDGET_BYTES + 14 + 200);
+        let response = HelperResponse::error(err);
+        let encoded = super::encode_helper_response(&response)
+            .expect("a pf-load failure response must always encode");
+        assert!(encoded.len() <= MAX_MESSAGE_BYTES);
     }
 
     #[test]
