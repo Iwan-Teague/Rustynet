@@ -52,6 +52,7 @@ mod daemon {
     use tokio::sync::RwLock;
     use tokio::time::interval;
 
+    use rustynet_control::RELAY_TOKEN_SCOPE;
     use rustynet_control::canonical_relay_id_from_label;
     use rustynet_relay::session::SessionId;
     use rustynet_relay::transport::{RelayForwardError, RelayHelloResponse, RelayTransport};
@@ -1282,6 +1283,23 @@ mod daemon {
         let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
+        // Bound the token-embedded identifier BEFORE it is copied. This is the
+        // same pre-auth memory bound RLY-05 applied to the outer hello fields,
+        // which `parse_relay_token` missed: this function runs on an
+        // unauthenticated datagram BEFORE signature verification, and without a
+        // bound each of `node_id` / `peer_node_id` / `scope` could be declared
+        // up to 64 KiB inside one ~64 KiB hello, forcing ~3x that in heap
+        // `String`s per datagram. No legitimate token can hit these caps: any
+        // session that would pass validation has token ids equal (constant-time
+        // compared) to hello fields already capped at
+        // `MAX_RELAY_NODE_ID_BYTES`, and scope equal to `RELAY_TOKEN_SCOPE`, so
+        // a longer value could never authenticate.
+        if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+            return Err(format!(
+                "token node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+            ));
+        }
+
         if pos + node_id_len > data.len() {
             return Err("truncated token node_id".to_owned());
         }
@@ -1295,6 +1313,13 @@ mod daemon {
         }
         let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
+
+        // Same bound as the token's node_id above.
+        if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+            return Err(format!(
+                "token peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+            ));
+        }
 
         if pos + peer_node_id_len > data.len() {
             return Err("truncated token peer_node_id".to_owned());
@@ -1318,6 +1343,16 @@ mod daemon {
         }
         let scope_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
+
+        // Scope is compared for exact equality against `RELAY_TOKEN_SCOPE`
+        // during validation, so anything longer can never authenticate — cap
+        // the copy at that length (same pre-auth memory bound as above).
+        if scope_len > RELAY_TOKEN_SCOPE.len() {
+            return Err(format!(
+                "token scope length {scope_len} exceeds maximum {}",
+                RELAY_TOKEN_SCOPE.len()
+            ));
+        }
 
         if pos + scope_len > data.len() {
             return Err("truncated scope".to_owned());
@@ -3112,6 +3147,141 @@ mod daemon {
             );
         }
 
+        // ── Token-embedded field bounds (parse_relay_token) ──────────────────────
+        //
+        // The RLY-05 bound above covers the OUTER hello identifiers.
+        // `parse_relay_token` copies a SECOND set of node_id / peer_node_id /
+        // scope strings out of the same unauthenticated datagram, before any
+        // signature check, and without its own bound each could be declared up
+        // to 64 KiB — ~195 KB of attacker-chosen heap per hello datagram.
+
+        /// Minimal wire-shaped token: [version][len+node_id][len+peer_node_id]
+        /// [relay_id][len+scope]. The `*_body` slices are the bytes actually
+        /// supplied for each length-delimited field; the `*_len` values are what
+        /// the wire DECLARES. Truncation after `scope` is deliberate — the
+        /// length bounds are checked BEFORE the truncation checks, so these
+        /// datagrams must fail on the bound, not incidentally as truncated.
+        fn token_prefix_bytes(
+            node_len: usize,
+            node_body: &[u8],
+            peer_len: usize,
+            peer_body: &[u8],
+            scope_len: usize,
+        ) -> Vec<u8> {
+            let mut token = vec![1u8];
+            token.extend_from_slice(&(node_len as u16).to_be_bytes());
+            token.extend_from_slice(node_body);
+            token.extend_from_slice(&(peer_len as u16).to_be_bytes());
+            token.extend_from_slice(peer_body);
+            token.extend_from_slice(&[0xEEu8; 16]); // relay_id placeholder
+            token.extend_from_slice(&(scope_len as u16).to_be_bytes());
+            token
+        }
+
+        /// A hello datagram carrying `token` as its token field (outer ids tiny).
+        fn hello_with_token_bytes(token: &[u8]) -> Vec<u8> {
+            let mut data = vec![RELAY_HELLO_MSG_TYPE];
+            data.extend_from_slice(&[0x00, 0x01, b'a']);
+            data.extend_from_slice(&[0x00, 0x01, b'b']);
+            data.extend_from_slice(&(token.len() as u16).to_be_bytes());
+            data.extend_from_slice(token);
+            data
+        }
+
+        #[test]
+        fn oversized_token_embedded_ids_are_rejected_by_their_own_length_bounds() {
+            // Token-embedded node_id declared oversized: refused by the BOUND,
+            // not as truncated — the distinguishing assertion, exactly as in
+            // the outer-field RLY-05 test.
+            let token = token_prefix_bytes(u16::MAX as usize, b"a", 0, b"", 0);
+            let err = parse_relay_hello(&hello_with_token_bytes(&token))
+                .expect_err("oversized token node_id must be rejected");
+            assert!(
+                err.contains("token node_id length") && err.contains("exceeds maximum"),
+                "token-embedded node_id must hit its own length bound; got: {err}"
+            );
+
+            // Token-embedded peer_node_id likewise.
+            let token = token_prefix_bytes(1, b"a", u16::MAX as usize, b"b", 0);
+            let err = parse_relay_hello(&hello_with_token_bytes(&token))
+                .expect_err("oversized token peer_node_id must be rejected");
+            assert!(
+                err.contains("token peer_node_id length") && err.contains("exceeds maximum"),
+                "token-embedded peer_node_id must hit its own length bound; got: {err}"
+            );
+
+            // Token-embedded scope: anything longer than RELAY_TOKEN_SCOPE can
+            // never pass validation (exact-match), so it must be refused by the
+            // bound rather than copied.
+            let token = token_prefix_bytes(1, b"a", 1, b"b", RELAY_TOKEN_SCOPE.len() + 1);
+            let err = parse_relay_hello(&hello_with_token_bytes(&token))
+                .expect_err("oversized token scope must be rejected");
+            assert!(
+                err.contains("token scope length") && err.contains("exceeds maximum"),
+                "token-embedded scope must hit its own length bound; got: {err}"
+            );
+        }
+
+        #[test]
+        fn token_embedded_id_bounds_are_exactly_max_relay_node_id_bytes() {
+            // Same mutation-resistance pattern as
+            // `node_id_bound_is_exactly_max_relay_node_id_bytes_rly05`: derive
+            // both sides of the boundary from the constant so widening it
+            // cannot happen silently green.
+            let at_cap = |id_len: usize| token_prefix_bytes(id_len, b"a", 0, b"", 0);
+
+            // Exactly at the cap: inside the bound; the datagram still fails,
+            // but as TRUNCATED (the declared id body was never supplied).
+            let token = at_cap(MAX_RELAY_NODE_ID_BYTES);
+            let err = parse_relay_hello(&hello_with_token_bytes(&token))
+                .expect_err("truncated token body still fails");
+            assert!(
+                !err.contains("exceeds maximum"),
+                "token node_id == cap must be inside the bound; got: {err}"
+            );
+
+            // One byte over: refused by the bound itself.
+            let token = at_cap(MAX_RELAY_NODE_ID_BYTES + 1);
+            let err = parse_relay_hello(&hello_with_token_bytes(&token))
+                .expect_err("cap + 1 must be rejected");
+            assert!(
+                err.contains("token node_id length") && err.contains("exceeds maximum"),
+                "token node_id == cap + 1 must hit the bound; got: {err}"
+            );
+        }
+
+        #[test]
+        fn legitimately_signed_token_with_max_length_ids_still_parses() {
+            // No-false-reject pin: a REAL control-plane-signed token whose ids
+            // sit AT the cap parses cleanly end-to-end. Serialisation mirrors
+            // `parse_relay_token`'s field order exactly.
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let node_id = "a".repeat(MAX_RELAY_NODE_ID_BYTES);
+            let peer_node_id = "b".repeat(MAX_RELAY_NODE_ID_BYTES);
+            let token =
+                RelaySessionToken::sign(&signing_key, &node_id, &peer_node_id, [0xAA; 16], 60);
+
+            let mut token_bytes = vec![1u8];
+            token_bytes.extend_from_slice(&(token.node_id.len() as u16).to_be_bytes());
+            token_bytes.extend_from_slice(token.node_id.as_bytes());
+            token_bytes.extend_from_slice(&(token.peer_node_id.len() as u16).to_be_bytes());
+            token_bytes.extend_from_slice(token.peer_node_id.as_bytes());
+            token_bytes.extend_from_slice(&token.relay_id);
+            token_bytes.extend_from_slice(&(RELAY_TOKEN_SCOPE.len() as u16).to_be_bytes());
+            token_bytes.extend_from_slice(RELAY_TOKEN_SCOPE.as_bytes());
+            token_bytes.extend_from_slice(&token.issued_at_unix.to_be_bytes());
+            token_bytes.extend_from_slice(&token.expires_at_unix.to_be_bytes());
+            token_bytes.extend_from_slice(&token.nonce);
+            token_bytes.extend_from_slice(&token.signature);
+
+            let hello = parse_relay_hello(&hello_with_token_bytes(&token_bytes))
+                .expect("a legitimately signed max-length token must parse");
+            assert_eq!(hello.session_token.node_id, node_id);
+            assert_eq!(hello.session_token.peer_node_id, peer_node_id);
+            assert_eq!(hello.session_token.scope, RELAY_TOKEN_SCOPE);
+            assert_eq!(hello.session_token.relay_id, [0xAA; 16]);
+        }
+
         use std::sync::atomic::Ordering;
         // Only the off-Windows fail-closed test calls this collector directly; on
         // Windows the symbol is unused here, so gate the import to match its caller.
@@ -3125,6 +3295,7 @@ mod daemon {
         #[cfg(not(windows))]
         use super::load_windows_relay_service_args;
         use ed25519_dalek::SigningKey;
+        use rustynet_control::RELAY_TOKEN_SCOPE;
         use rustynet_control::RelaySessionToken;
         use rustynet_relay::session::SessionId;
         use rustynet_relay::transport::RelayHello;
