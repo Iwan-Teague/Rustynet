@@ -507,7 +507,12 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
         // actually succeeded so memory cannot claim a peer the tunnel still
         // serves (and vice versa).
         let Some(peer_public_key) = peer_public_key else {
-            return Ok(());
+            // Peer already absent from the map — but a previous removal may
+            // have failed at sync_persistent_config after the runtime `wg set
+            // remove` succeeded, leaving the on-disk config still serving the
+            // removed peer's allowed_ips on tunnel-service restart. Converge
+            // by rewriting the persistent config before reporting success.
+            return self.sync_persistent_config();
         };
         self.runner.run(
             self.wg_exe_path.to_string_lossy().as_ref(),
@@ -2165,6 +2170,57 @@ mod tests {
         assert!(
             err.to_string().contains("degenerate"),
             "expected degenerate-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_remove_peer_retry_after_sync_failure_converges_stale_persistent_config() {
+        // A removal that fails at sync_persistent_config has already removed
+        // the peer from the runtime and the in-memory map, but the on-disk
+        // DPAPI config still lists it — a tunnel-service restart would
+        // resurrect the removed peer with its allowed_ips. The retry path
+        // (peer absent from the map) must therefore rewrite the persistent
+        // config instead of returning Ok while disk and memory disagree.
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cfg_dir = temp_dir.path().join("cfgdir");
+        fs::create_dir_all(&cfg_dir).expect("cfg dir");
+        let (_, private_key_path, wireguard_path, wg_path, netsh_path) = backend_paths(&temp_dir);
+        let config_path = cfg_dir.join("rustynet0.conf.dpapi");
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner,
+            "rustynet0",
+            config_path.to_string_lossy().as_ref(),
+            private_key_path.to_string_lossy().as_ref(),
+            wireguard_path.to_string_lossy().as_ref(),
+            wg_path.to_string_lossy().as_ref(),
+            netsh_path.to_string_lossy().as_ref(),
+            51820,
+        )
+        .expect("backend should construct");
+        backend.start(runtime_context()).expect("start");
+        let peer = sample_peer("gone");
+        let gone_id = peer.node_id.clone();
+        backend.configure_peer(peer).expect("configure");
+
+        // Break persistence: a read-only config directory fails the staging
+        // write inside write_config_atomically while the runtime `wg set`
+        // remove succeeds and the map entry is dropped.
+        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+        backend
+            .remove_peer(&gone_id)
+            .expect_err("sync failure must fail the removal");
+        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+
+        backend
+            .remove_peer(&gone_id)
+            .expect("retry removal (peer already absent from map)");
+
+        let persisted = fs::read_to_string(&config_path).expect("config readable");
+        assert!(
+            !persisted.contains("[Peer]"),
+            "stale persistent config must be rewritten by the retry; got: {persisted}"
         );
     }
 }
