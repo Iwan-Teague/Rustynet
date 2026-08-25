@@ -2999,6 +2999,46 @@ mod tests {
         );
     }
 
+    /// The envelope's provider_kind and key_identifier bindings must each
+    /// reject INDEPENDENTLY of the signature math: existing negative tests
+    /// vary the seed, so a deleted kind or id guard would have survived the
+    /// suite behind the signature check.
+    #[test]
+    fn verify_provider_attestation_rejects_kind_and_key_id_mismatches() {
+        let payload = b"release-artifact-digest";
+        let source = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/signing-key",
+            [7; 32],
+        );
+        let attestation =
+            create_provider_attestation(&source, payload).expect("attestation should be created");
+
+        // Same identifier, same key material, WRONG provider kind.
+        let other_kind = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::LocalEncryptedFile,
+            "kms://rustynet/signing-key",
+            [7; 32],
+        );
+        assert_eq!(
+            verify_provider_attestation(&other_kind, payload, &attestation).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "provider_kind mismatch must reject before any signature work"
+        );
+
+        // Same kind, same key material, WRONG key identifier.
+        let other_id = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://other/signing-key",
+            [7; 32],
+        );
+        assert_eq!(
+            verify_provider_attestation(&other_id, payload, &attestation).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "key_identifier mismatch must reject before any signature work"
+        );
+    }
+
     #[test]
     fn fresh_keypair_sign_then_verify_accepts_valid_signature() {
         // Happy path, raw trait level: a FRESH keypair signs a
