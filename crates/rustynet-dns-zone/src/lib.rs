@@ -257,6 +257,7 @@ pub fn build_signed_dns_zone_bundle(
         nonce,
         &canonical_records,
     );
+    ensure_payload_within_wire_parser_bounds(payload.as_str())?;
     let signature = signing_key.sign(payload.as_bytes());
     Ok(SignedDnsZoneBundle {
         payload,
@@ -612,6 +613,41 @@ fn canonicalize_dns_zone_records(
     }
     canonical_records.sort_by(|left, right| left.fqdn.cmp(&right.fqdn));
     Ok(canonical_records)
+}
+
+/// The wire parser (`parse_signed_dns_zone_bundle_wire`) refuses bundles
+/// whose total wire size or any field VALUE exceeds its DoS bounds
+/// (`MAX_BUNDLE_BYTES` / `MAX_VALUE_BYTES`). The builder serializes
+/// operator-controlled strings (the joined alias list, target/subject node
+/// ids) into those fields with no per-field cap of its own, so it must
+/// refuse to MINT a bundle the verifier-side parser would reject — the same
+/// build-vs-parse contract the assembled 253-byte fqdn checks enforce per
+/// name. Bundle keys here are fixed-format (bounded well below
+/// MAX_KEY_BYTES / MAX_KEY_DEPTH), so only the two reachable bounds are
+/// mirrored.
+fn ensure_payload_within_wire_parser_bounds(payload: &str) -> Result<(), DnsZoneError> {
+    // render_signed_dns_zone_bundle_wire appends "signature=<128 hex>\n".
+    const SIGNATURE_WIRE_SUFFIX_BYTES: usize = "signature=".len() + 128 + 1;
+    let rendered_len = payload.len() + SIGNATURE_WIRE_SUFFIX_BYTES;
+    if rendered_len > MAX_BUNDLE_BYTES {
+        return Err(DnsZoneError::InvalidFormat(format!(
+            "serialized dns zone bundle exceeds maximum wire size ({rendered_len} > {MAX_BUNDLE_BYTES})"
+        )));
+    }
+    for line in payload.lines() {
+        let Some((_, value)) = line.split_once('=') else {
+            return Err(DnsZoneError::InvalidFormat(
+                "serialized dns zone line is malformed".to_owned(),
+            ));
+        };
+        if value.len() > MAX_VALUE_BYTES {
+            return Err(DnsZoneError::InvalidFormat(format!(
+                "serialized dns zone field value exceeds maximum size ({} > {MAX_VALUE_BYTES})",
+                value.len()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn serialize_dns_zone_payload(
@@ -1429,6 +1465,148 @@ mod tests {
             }],
         )
         .expect("a short alias must still build");
+    }
+
+    /// Same mint-vs-refuse class, field-size half: each of the 8 aliases
+    /// below is individually legal (assembled fqdn 209 <= 253, so the
+    /// per-alias bound passes), but the SERIALIZED aliases value the parser
+    /// reads is their comma join — 8 x 200 + 7 = 1607 bytes, over the
+    /// parser's MAX_VALUE_BYTES (1536) per-line DoS bound. The builder must
+    /// refuse to sign what its own verifier would refuse at line-parse time.
+    #[test]
+    fn build_bundle_rejects_alias_list_exceeding_parser_value_bound() {
+        let alias_at = |first: char| {
+            format!(
+                "{first}{}.{}.{}.{}",
+                "a".repeat(49),
+                "b".repeat(50),
+                "c".repeat(50),
+                "d".repeat(47)
+            )
+        };
+        let long_aliases: Vec<String> = (0..8).map(|i| alias_at((b'a' + i) as char)).collect();
+        let joined_len: usize = long_aliases.iter().map(String::len).sum::<usize>()
+            + long_aliases.len().saturating_sub(1);
+        assert_eq!(joined_len, 1607);
+        assert!(joined_len > super::MAX_VALUE_BYTES);
+        for alias in &long_aliases {
+            assert!(alias.len() + 1 + "rustynet".len() <= 253);
+        }
+        let err = build_signed_dns_zone_bundle(
+            &SigningKey::from_bytes(&[13u8; 32]),
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &[DnsZoneRecordInput {
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.68.1.10".to_owned(),
+                ttl_secs: 60,
+                aliases: long_aliases,
+            }],
+        )
+        .expect_err(
+            "aliases whose serialized value exceeds the parser's per-line bound must not build",
+        );
+        match err {
+            super::DnsZoneError::InvalidFormat(reason) => {
+                assert!(
+                    reason.contains("value exceeds maximum"),
+                    "rejection must cite the serialized value bound: {reason}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+
+        // Boundary control: the same shape with shorter aliases joins to a
+        // value under MAX_VALUE_BYTES and must still build.
+        let short_aliases: Vec<String> = (0..8)
+            .map(|i| {
+                format!(
+                    "{i}{}.{}.{}.{}",
+                    "e".repeat(44),
+                    "f".repeat(45),
+                    "g".repeat(45),
+                    "h".repeat(42)
+                )
+            })
+            .collect();
+        let short_joined: usize = short_aliases.iter().map(String::len).sum::<usize>() + 7;
+        assert_eq!(short_joined, 1447);
+        assert!(short_joined <= super::MAX_VALUE_BYTES);
+        build_signed_dns_zone_bundle(
+            &SigningKey::from_bytes(&[13u8; 32]),
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &[DnsZoneRecordInput {
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.68.1.10".to_owned(),
+                ttl_secs: 60,
+                aliases: short_aliases,
+            }],
+        )
+        .expect("aliases under the serialized value bound must still build");
+    }
+
+    /// Aggregate half: the builder caps records only PER RECORD; the parser
+    /// refuses any wire over MAX_BUNDLE_BYTES (256 KiB) outright. Enough
+    /// individually-legal mid-size records therefore mint a signed bundle no
+    /// peer can parse. The builder must enforce the parser's total-size
+    /// contract before signing.
+    #[test]
+    fn build_bundle_rejects_serialized_bundle_exceeding_parser_size_bound() {
+        let record = |index: usize| DnsZoneRecordInput {
+            label: format!("n{index:04}-{}.{}", "a".repeat(48), "b".repeat(55)),
+            target_node_id: format!("node-{index:04}-{}", "x".repeat(50)),
+            rr_type: DnsRecordType::A,
+            target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+            expected_ip: "100.68.1.10".to_owned(),
+            ttl_secs: 60,
+            aliases: vec![],
+        };
+        let err = build_signed_dns_zone_bundle(
+            &SigningKey::from_bytes(&[14u8; 32]),
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &(0..800).map(record).collect::<Vec<_>>(),
+        )
+        .expect_err("a bundle whose rendered wire exceeds MAX_BUNDLE_BYTES must not build");
+        match err {
+            super::DnsZoneError::InvalidFormat(reason) => {
+                assert!(
+                    reason.contains("exceeds maximum wire size"),
+                    "rejection must cite the aggregate wire-size bound: {reason}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+
+        // Control: the same record shape at a count that stays under the
+        // aggregate bound must still build (the check narrows at size, not
+        // at record count).
+        build_signed_dns_zone_bundle(
+            &SigningKey::from_bytes(&[14u8; 32]),
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &(0..200).map(record).collect::<Vec<_>>(),
+        )
+        .expect("a bundle under the aggregate wire-size bound must still build");
     }
 
     #[test]
