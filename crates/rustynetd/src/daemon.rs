@@ -20666,6 +20666,19 @@ mod tests {
                 source_path.display(),
             );
         }
+        // The source greps above only pin callsite spellings across both
+        // modules; they cannot see the constant's value. Pin it directly so
+        // redefining `DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH` to a bare or
+        // relative name — which would reintroduce Win32 PATH resolution
+        // through every pinned callsite while keeping these greps green —
+        // fails here.
+        assert_eq!(
+            crate::phase10::DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH must stay the absolute \
+             System32 path; a bare or relative name reintroduces CreateProcess \
+             PATH resolution with the daemon's token",
+        );
     }
 
     /// Regression: the IPC mutation-authorization path must not silently
