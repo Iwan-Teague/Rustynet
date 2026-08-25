@@ -145,7 +145,8 @@ fn render_scopes(snapshot: &ServiceAccessSnapshot) -> String {
 
 /// Write the full access state (`grants.v1`, `peers.v1`,
 /// `scopes.v1`) atomically: dir created `0700`, each file written
-/// via temp + fsync + rename with mode `0600`. An empty snapshot is
+/// via temp + fsync + rename + parent-dir fsync with mode `0600`.
+/// An empty snapshot is
 /// intentionally still written — empty `grants.v1` is deny-all per
 /// the binaries' parsing, which keeps the no-grants state explicit
 /// rather than depending on a leftover file from a previous epoch.
@@ -228,6 +229,15 @@ fn ensure_private_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Write one access-state file atomically: temp + fsync + rename +
+/// parent-dir fsync with mode `0600`. The final parent-directory
+/// `sync_all` makes the rename itself durable — without it a power
+/// loss right after a refresh can revert the directory entry to the
+/// previous epoch's authorisation state, resurrecting revoked grants
+/// across reboot until the next signed apply rewrites them. This is
+/// the same daemon convention as the trust-bootstrap atomic writer
+/// (`daemon.rs` `write_trust_bundle`-style temp+fsync+rename+dir-fsync)
+/// and the operator config persister.
 fn write_file_atomic(dir: &Path, file_name: &str, body: &str) -> Result<(), String> {
     let final_path = dir.join(file_name);
     let tmp_path = dir.join(format!(".{file_name}.tmp"));
@@ -260,7 +270,19 @@ fn write_file_atomic(dir: &Path, file_name: &str, body: &str) -> Result<(), Stri
             tmp_path.display(),
             final_path.display()
         )
-    })
+    })?;
+    // Fail closed on an un-durable rename too: if the directory entry
+    // cannot be flushed, the caller's deny-all fallback must fire
+    // rather than trust a refresh that may not survive a crash.
+    #[cfg(unix)]
+    {
+        let parent_dir = std::fs::File::open(dir)
+            .map_err(|err| format!("open access dir {} failed: {err}", dir.display()))?;
+        parent_dir
+            .sync_all()
+            .map_err(|err| format!("sync access dir {} failed: {err}", dir.display()))?;
+    }
+    Ok(())
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<(), String> {
