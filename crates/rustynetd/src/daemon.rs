@@ -194,6 +194,20 @@ pub const DEFAULT_ANCHOR_BUNDLE_PULL_ADDR: &str = "127.0.0.1:51822";
 pub const DEFAULT_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
     "/var/lib/rustynet/anchor-bundle-pull.token";
 pub const MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES: usize = 256;
+
+/// Overall wall-clock budget for reading ONE request line off a bundle-pull
+/// connection. The per-read socket timeout bounds a single `read()` call;
+/// without an overall deadline a client dripping one byte per timeout period
+/// could hold a connection open for ~256× that budget — and because the serve
+/// path runs inline in the shared daemon event loop, stall it indefinitely
+/// (slowloris). Honest clients deliver the whole line in one packet, so the
+/// budget never binds in practice.
+const ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Same bound for the optional FIS-0020 have-line read. Matches the 150ms
+/// per-read timeout an old client's silence already costs, so mixed-version
+/// behaviour is unchanged; the budget only closes the multi-byte drip gap.
+const ANCHOR_BUNDLE_PULL_HAVE_LINE_BUDGET: Duration = Duration::from_millis(150);
 pub const ANCHOR_BUNDLE_PULL_ADDR_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR";
 pub const ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH";
 pub const ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN";
@@ -988,10 +1002,33 @@ pub fn validate_anchor_bundle_pull_addr(
     Ok(())
 }
 
+/// Open a daemon state file for reading only after proving, on the link
+/// itself (`symlink_metadata` — never the follow-through target), that it
+/// is a regular file and not a symlink. A symlink swap on the bundle-pull
+/// token or served-snapshot path would redirect the anchor's read at an
+/// arbitrary local file (same control as
+/// `key_material::validate_secret_file_security` and
+/// `rustynetd::enrollment_token::ensure_regular_file_no_symlink`).
+fn open_anchor_state_file(path: &Path, label: &str) -> Result<fs::File, DaemonError> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull {label} open failed: {err}")))?;
+    if meta.file_type().is_symlink() {
+        return Err(DaemonError::InvalidConfig(format!(
+            "anchor bundle-pull {label} must not be a symlink"
+        )));
+    }
+    if !meta.file_type().is_file() {
+        return Err(DaemonError::InvalidConfig(format!(
+            "anchor bundle-pull {label} must be a regular file"
+        )));
+    }
+    fs::File::open(path)
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull {label} open failed: {err}")))
+}
+
 pub fn load_anchor_bundle_pull_token(path: &Path) -> Result<String, DaemonError> {
     let mut token = String::new();
-    fs::File::open(path)
-        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull token open failed: {err}")))?
+    open_anchor_state_file(path, "token")?
         .take(MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES as u64 + 1)
         .read_to_string(&mut token)
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull token read failed: {err}")))?;
@@ -1011,8 +1048,7 @@ pub fn load_anchor_bundle_pull_token(path: &Path) -> Result<String, DaemonError>
 
 pub fn load_anchor_bundle_pull_bundle(path: &Path) -> Result<Vec<u8>, DaemonError> {
     let mut bundle = Vec::new();
-    fs::File::open(path)
-        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bundle open failed: {err}")))?
+    open_anchor_state_file(path, "bundle")?
         .take(MAX_MEMBERSHIP_SNAPSHOT_BYTES as u64 + 1)
         .read_to_end(&mut bundle)
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bundle read failed: {err}")))?;
@@ -1140,16 +1176,28 @@ impl fmt::Display for AnchorBundlePullStreamError {
     }
 }
 
-fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<String, DaemonError> {
+/// Read one `\n`-terminated request line under BOTH a per-byte size cap and
+/// an overall wall-clock deadline. The deadline is checked before every read
+/// so an expired budget fails fast even when the peer keeps the socket open.
+fn read_line_bounded<R: std::io::Read>(
+    stream: &mut R,
+    max_bytes: usize,
+    deadline: Instant,
+) -> Result<String, DaemonError> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     loop {
+        if Instant::now() >= deadline {
+            return Err(DaemonError::Io(
+                "anchor bundle-pull request line exceeded its time budget".to_owned(),
+            ));
+        }
         match stream.read(&mut byte) {
             Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
             Ok(_) => {
                 bytes.push(byte[0]);
-                if bytes.len() > MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES {
+                if bytes.len() > max_bytes {
                     return Err(DaemonError::InvalidConfig(
                         "anchor bundle-pull request token exceeds maximum size".to_owned(),
                     ));
@@ -1167,6 +1215,14 @@ fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<Strin
     })
 }
 
+fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<String, DaemonError> {
+    read_line_bounded(
+        stream,
+        MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
+        Instant::now() + ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET,
+    )
+}
+
 /// FIS-0020: best-effort read of the optional second request line. Any
 /// error (timeout against an old client, EOF, oversize, non-utf8) yields
 /// `None` — the server then sends the full bundle. The stream's read
@@ -1178,23 +1234,12 @@ fn read_optional_anchor_bundle_pull_have_line(stream: &mut TcpStream) -> Option<
     {
         return None;
     }
-    let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
-    let line = loop {
-        match stream.read(&mut byte) {
-            Ok(0) => break None,
-            Ok(_) if byte[0] == b'\n' => {
-                break String::from_utf8(bytes).ok();
-            }
-            Ok(_) => {
-                bytes.push(byte[0]);
-                if bytes.len() > MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES {
-                    break None;
-                }
-            }
-            Err(_) => break None,
-        }
-    };
+    let line = read_line_bounded(
+        stream,
+        MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
+        Instant::now() + ANCHOR_BUNDLE_PULL_HAVE_LINE_BUDGET,
+    )
+    .ok();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     line
 }
@@ -16545,24 +16590,12 @@ mod tests {
         MAX_RELAY_SESSION_TOKEN_TTL_SECS, RelayClient, RelayClientConfig, RelayClientError,
     };
 
-    use ed25519_dalek::{Signer, SigningKey};
-    use rustynet_backend_api::{BackendError, NodeId, Route, RouteKind, SocketEndpoint};
-    #[cfg(feature = "test-harness")]
-    use rustynet_backend_api::{RuntimeContext, TunnelBackend};
-    use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperationKind;
-    use rustynet_control::membership::{
-        MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
-        MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
-        persist_membership_snapshot,
-    };
-    use rustynet_control::roles::RoleCapability;
-    use rustynet_control::{RelayFleetNodeDescriptor, SignedRelayFleetBundle};
-
     use super::{
-        AutoTunnelBundle, AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
-        DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
-        DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig,
-        DaemonRuntime, DnsZoneBootstrapError, DnsZoneLoadContext, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
+        ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, AutoTunnelBundle, AutoTunnelWatermark,
+        DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE,
+        DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL,
+        DaemonBackendMode, DaemonConfig, DaemonError, DaemonRuntime, DnsZoneBootstrapError,
+        DnsZoneLoadContext, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
         MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
@@ -16573,15 +16606,16 @@ mod tests {
         build_dns_response, build_gossip_node,
         collect_traversal_host_candidate_snapshot_with_retry,
         enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
-        load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_dns_zone_bundle,
-        load_dns_zone_watermark, load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
+        load_anchor_bundle_pull_bundle, load_anchor_bundle_pull_token, load_auto_tunnel_bundle,
+        load_auto_tunnel_watermark, load_dns_zone_bundle, load_dns_zone_watermark,
+        load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
         load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
         load_trust_watermark, membership_watermark_is_replay, overlay_addresses_from_bundle_peers,
         parse_route_interface_token, parse_windows_default_egress_interface_output,
         passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
         persist_traversal_watermark, persist_trust_watermark, poll_anchor_bundle_pull_once,
         port_mapping_bring_up_skip_reason, prepare_runtime_wireguard_key_material,
-        resolve_egress_interface_value, run_daemon, run_preflight_checks,
+        read_line_bounded, resolve_egress_interface_value, run_daemon, run_preflight_checks,
         sanitize_dataplane_routes_for_node_role, scrub_runtime_wireguard_key_material,
         select_runtime_relay_candidate, select_runtime_relay_candidate_with_verified_fleet,
         sha256_digest, snapshot_has_usable_traversal_host_candidates, trust_evidence_payload,
@@ -16594,6 +16628,18 @@ mod tests {
         DataplaneState, PathMode, RuntimeSystem, TraversalProbeDecision, TraversalProbeReason,
     };
     use crate::stun_client::StunResult;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rustynet_backend_api::{BackendError, NodeId, Route, RouteKind, SocketEndpoint};
+    #[cfg(feature = "test-harness")]
+    use rustynet_backend_api::{RuntimeContext, TunnelBackend};
+    use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperationKind;
+    use rustynet_control::membership::{
+        MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+        MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
+        persist_membership_snapshot,
+    };
+    use rustynet_control::roles::RoleCapability;
+    use rustynet_control::{RelayFleetNodeDescriptor, SignedRelayFleetBundle};
 
     #[test]
     fn daemon_does_not_discard_force_fail_closed_results() {
@@ -16991,6 +17037,180 @@ mod tests {
             poll_anchor_bundle_pull_once(&listener, &config).expect("poll must not error");
         assert!(!processed, "no pending connection ⇒ no I/O (WouldBlock)");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// State files the bundle-pull serve path reads must be regular files,
+    /// not symlinks (precedent: key_material validate_secret_file_security).
+    /// A symlink swap would redirect the anchor's token/bundle read at an
+    /// arbitrary local file.
+    #[cfg(unix)]
+    #[test]
+    fn anchor_bundle_pull_loaders_reject_symlinked_state_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Token file: valid content behind a symlink must be refused.
+        let target = dir.path().join("real.token");
+        std::fs::write(&target, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let link = dir.path().join("token.link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let err =
+            load_anchor_bundle_pull_token(&link).expect_err("symlinked token file must be refused");
+        assert!(
+            matches!(err, DaemonError::InvalidConfig(_)),
+            "rejection must be InvalidConfig, got {err:?}"
+        );
+
+        // Bundle file: same gate.
+        let bundle_target = dir.path().join("real.bundle");
+        std::fs::write(&bundle_target, b"bundle-bytes").expect("write bundle");
+        let bundle_link = dir.path().join("bundle.link");
+        std::os::unix::fs::symlink(&bundle_target, &bundle_link).expect("create symlink");
+        let err = load_anchor_bundle_pull_bundle(&bundle_link)
+            .expect_err("symlinked bundle file must be refused");
+        assert!(
+            matches!(err, DaemonError::InvalidConfig(_)),
+            "rejection must be InvalidConfig, got {err:?}"
+        );
+    }
+
+    /// Slowloris bound: the request-line reader must refuse on an EXPIRED
+    /// overall budget BEFORE consuming anything, even with bytes still
+    /// available. The per-read socket timeout alone cannot express this —
+    /// it renews for every single byte.
+    #[test]
+    fn bundle_pull_line_reader_refuses_expired_deadline_before_reading() {
+        struct OneBytePerCallReader {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl std::io::Read for OneBytePerCallReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.data.len() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        let mut reader = OneBytePerCallReader {
+            data: b"token\n".to_vec(),
+            pos: 0,
+        };
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("monotonic clock sanity");
+        let err = read_line_bounded(&mut reader, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES, expired)
+            .expect_err("expired budget must refuse the line");
+        assert!(
+            err.to_string().contains("time budget"),
+            "rejection must cite the time budget, got {err:?}"
+        );
+        // Nothing was consumed: the refusal precedes any read.
+        assert_eq!(reader.pos, 0, "expired deadline must refuse before reading");
+    }
+
+    #[test]
+    fn bundle_pull_line_reader_accepts_complete_line_within_budget() {
+        struct OneBytePerCallReader {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl std::io::Read for OneBytePerCallReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.data.len() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        let mut reader = OneBytePerCallReader {
+            data: b"abcdefgh\n".to_vec(),
+            pos: 0,
+        };
+        let line = read_line_bounded(
+            &mut reader,
+            MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
+            std::time::Instant::now() + ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET,
+        )
+        .expect("line must be accepted within budget");
+        assert_eq!(line, "abcdefgh");
+    }
+
+    #[test]
+    fn bundle_pull_line_reader_size_cap_still_applies_within_budget() {
+        let oversized = vec![b'a'; MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES + 1];
+        let mut reader = &oversized[..];
+        let err = read_line_bounded(
+            &mut reader,
+            MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
+            std::time::Instant::now() + ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET,
+        )
+        .expect_err("oversize line must refuse");
+        assert!(
+            matches!(err, DaemonError::InvalidConfig(_)),
+            "size cap must stay a size error, got {err:?}"
+        );
+    }
+
+    /// Honest-path integration through the REWIRED bounded readers: a real
+    /// loopback client that sends only the token line (pre-FIS-0020 shape)
+    /// still gets the full bundle; the optional have-line read degrades to
+    /// None on its short budget and the serve outcome reports a thumbprint.
+    #[test]
+    fn anchor_bundle_pull_stream_serves_full_bundle_over_real_socket() {
+        use super::handle_anchor_bundle_pull_stream;
+        use std::io::{Read as _, Write as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, "abcdefghijklmnopqrstuvwxyz012345").expect("write token file");
+        let bundle_path = dir.path().join("snapshot.v1");
+        std::fs::write(&bundle_path, conditional_pull_snapshot_bytes()).expect("write bundle file");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let token_path_for_thread = token_path.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            handle_anchor_bundle_pull_stream(
+                stream,
+                &token_path_for_thread,
+                &bundle_path,
+                "anchor-a",
+            )
+        });
+
+        let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        conn.write_all(b"abcdefghijklmnopqrstuvwxyz012345\n")
+            .expect("send token line");
+
+        let mut response = Vec::new();
+        conn.read_to_end(&mut response).expect("read response");
+        let outcome = handle.join().expect("serve thread").expect("serve outcome");
+        let expected_bundle = conditional_pull_snapshot_bytes();
+        assert!(
+            response.starts_with(b"OK "),
+            "full-bundle response expected, got {:?}",
+            String::from_utf8_lossy(&response[..response.len().min(24)])
+        );
+        let header_end = response
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .expect("header newline");
+        assert_eq!(
+            &response[..header_end],
+            format!("OK {}", expected_bundle.len()).as_bytes()
+        );
+        assert_eq!(&response[header_end + 1..], &expected_bundle);
+        assert_eq!(
+            outcome.token_thumbprint,
+            super::anchor_bundle_pull_token_thumbprint("abcdefghijklmnopqrstuvwxyz012345")
+        );
     }
 
     #[test]
