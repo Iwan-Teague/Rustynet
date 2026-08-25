@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::collapsible_if)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
@@ -13046,12 +13046,18 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
     let mut updated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
     let mut payload_digest: Option<[u8; 32]> = None;
+    let mut seen_keys = HashSet::<&str>::new();
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(TrustBootstrapError::InvalidFormat(
                 "watermark line missing key/value separator".to_owned(),
             ));
         };
+        if !seen_keys.insert(key) {
+            return Err(TrustBootstrapError::InvalidFormat(format!(
+                "duplicate watermark key {key}"
+            )));
+        }
         match key {
             "version" => {
                 version = value.parse::<u8>().ok();
@@ -13687,12 +13693,18 @@ fn load_auto_tunnel_watermark(
     let mut generated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
     let mut payload_digest: Option<[u8; 32]> = None;
+    let mut seen_keys = HashSet::<&str>::new();
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(AutoTunnelBootstrapError::InvalidFormat(
                 "watermark line missing key/value separator".to_owned(),
             ));
         };
+        if !seen_keys.insert(key) {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "duplicate watermark key {key}"
+            )));
+        }
         match key {
             "version" => {
                 version = value.parse::<u8>().ok();
@@ -13913,12 +13925,18 @@ fn load_dns_zone_watermark(path: &Path) -> Result<Option<DnsZoneWatermark>, DnsZ
     let mut generated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
     let mut payload_digest: Option<[u8; 32]> = None;
+    let mut seen_keys = HashSet::<&str>::new();
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(DnsZoneBootstrapError::InvalidFormat(
                 "watermark line missing key/value separator".to_owned(),
             ));
         };
+        if !seen_keys.insert(key) {
+            return Err(DnsZoneBootstrapError::InvalidFormat(format!(
+                "duplicate watermark key {key}"
+            )));
+        }
         match key {
             "version" => version = value.parse::<u8>().ok(),
             "generated_at_unix" => generated_at_unix = value.parse::<u64>().ok(),
@@ -15174,12 +15192,18 @@ fn load_traversal_watermark(
     let mut generated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
     let mut payload_digest: Option<[u8; 32]> = None;
+    let mut seen_keys = HashSet::<&str>::new();
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(TraversalBootstrapError::InvalidFormat(
                 "watermark line missing key/value separator".to_owned(),
             ));
         };
+        if !seen_keys.insert(key) {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "duplicate watermark key {key}"
+            )));
+        }
         match key {
             "version" => version = value.parse::<u8>().ok(),
             "generated_at_unix" => generated_at_unix = value.parse::<u64>().ok(),
@@ -21748,6 +21772,88 @@ mod tests {
                 assert!(msg.contains("exceeds maximum size"), "got: {msg}");
             }
             other => panic!("expected Io oversize error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_trust_watermark_rejects_duplicate_keys() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-dup");
+        let watermark_path = test_dir.join("trust.watermark");
+        // A tampered file must not be able to roll anti-replay state forward
+        // (or back) by repeating a key; the last value would silently win.
+        std::fs::write(
+            &watermark_path,
+            "version=2\nupdated_at_unix=5\nupdated_at_unix=999\nnonce=7\n",
+        )
+        .expect("duplicate-key trust watermark should be written");
+        let err = load_trust_watermark(&watermark_path)
+            .expect_err("duplicate watermark keys must fail closed");
+        match err {
+            super::TrustBootstrapError::InvalidFormat(msg) => {
+                assert!(msg.contains("duplicate"), "got: {msg}");
+            }
+            other => panic!("expected InvalidFormat duplicate error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_auto_tunnel_watermark_rejects_duplicate_keys() {
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-dup");
+        let watermark_path = test_dir.join("assignment.watermark");
+        std::fs::write(
+            &watermark_path,
+            "version=2\nnonce=5\nnonce=999\ngenerated_at_unix=100\n",
+        )
+        .expect("duplicate-key auto tunnel watermark should be written");
+        let err = load_auto_tunnel_watermark(&watermark_path)
+            .expect_err("duplicate watermark keys must fail closed");
+        match err {
+            super::AutoTunnelBootstrapError::InvalidFormat(msg) => {
+                assert!(msg.contains("duplicate"), "got: {msg}");
+            }
+            other => panic!("expected InvalidFormat duplicate error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_watermark_rejects_duplicate_keys() {
+        let test_dir = secure_test_dir("rustynetd-dns-watermark-dup");
+        let watermark_path = test_dir.join("dns-zone.watermark");
+        std::fs::write(
+            &watermark_path,
+            "version=2\nnonce=5\nnonce=999\ngenerated_at_unix=100\n",
+        )
+        .expect("duplicate-key dns zone watermark should be written");
+        let err = load_dns_zone_watermark(&watermark_path)
+            .expect_err("duplicate watermark keys must fail closed");
+        match err {
+            super::DnsZoneBootstrapError::InvalidFormat(msg) => {
+                assert!(msg.contains("duplicate"), "got: {msg}");
+            }
+            other => panic!("expected InvalidFormat duplicate error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_traversal_watermark_rejects_duplicate_keys() {
+        let test_dir = secure_test_dir("rustynetd-traversal-watermark-dup");
+        let watermark_path = test_dir.join("traversal.watermark");
+        std::fs::write(
+            &watermark_path,
+            "version=2\nnonce=5\nnonce=999\ngenerated_at_unix=100\n",
+        )
+        .expect("duplicate-key traversal watermark should be written");
+        let err = load_traversal_watermark(&watermark_path)
+            .expect_err("duplicate watermark keys must fail closed");
+        match err {
+            super::TraversalBootstrapError::InvalidFormat(msg) => {
+                assert!(msg.contains("duplicate"), "got: {msg}");
+            }
+            other => panic!("expected InvalidFormat duplicate error, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(test_dir);
     }
