@@ -433,6 +433,18 @@ impl CredentialUnwrapBackend for WindowsDpapiBackend {
 /// without re-implementing the envelope-strip + newline-trim path.
 #[cfg(target_os = "windows")]
 fn unwrap_dpapi_blob(blob_path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, String> {
+    // On-disk bound for sealed passphrase blobs. Checked BEFORE the file
+    // is read so tampered or oversized disk state cannot drive allocation.
+    const MAX_DPAPI_BLOB_BYTES: u64 = 64 * 1024;
+    let raw_len = std::fs::metadata(blob_path)
+        .map_err(|err| format!("windows-dpapi: stat {} failed: {err}", blob_path.display()))?
+        .len();
+    if raw_len > MAX_DPAPI_BLOB_BYTES {
+        return Err(format!(
+            "windows-dpapi: blob {} exceeds {MAX_DPAPI_BLOB_BYTES}-byte cap",
+            blob_path.display()
+        ));
+    }
     let raw = std::fs::read(blob_path)
         .map_err(|err| format!("windows-dpapi: read {} failed: {err}", blob_path.display()))?;
     let protected_zeroizing = Zeroizing::new(raw);

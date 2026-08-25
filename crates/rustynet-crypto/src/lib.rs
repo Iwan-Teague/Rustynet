@@ -1016,6 +1016,12 @@ fn load_from_windows_dpapi(key_id: &str) -> Result<Vec<u8>, CryptoError> {
     validate_windows_dpapi_root(root.as_path())?;
     let path = windows_dpapi_file_path(root.as_path(), key_id)?;
     validate_windows_dpapi_file(path.as_path())?;
+    let protected_len = std::fs::metadata(path.as_path())
+        .map_err(|_| CryptoError::Io)?
+        .len();
+    if protected_len > MAX_ENCRYPTED_KEY_FILE_BYTES {
+        return Err(CryptoError::Io);
+    }
     let mut protected = std::fs::read(path.as_path()).map_err(|_| CryptoError::Io)?;
     let result = dpapi_unprotect(&protected).map_err(|_| CryptoError::DecryptionFailed);
     protected.zeroize();
@@ -1613,6 +1619,11 @@ fn temp_path_for(path: &Path) -> PathBuf {
     PathBuf::from(out)
 }
 
+/// On-disk bound for encrypted key material files (and DPAPI-protected
+/// blobs). Checked BEFORE the file is read so tampered or oversized disk
+/// state cannot drive allocation proportional to file size.
+const MAX_ENCRYPTED_KEY_FILE_BYTES: u64 = 64 * 1024;
+
 pub fn read_encrypted_key_file(
     directory: &Path,
     file: &Path,
@@ -1620,6 +1631,10 @@ pub fn read_encrypted_key_file(
     policy: KeyCustodyPermissionPolicy,
 ) -> Result<Vec<u8>, CryptoError> {
     validate_key_custody_permissions(directory, file, policy)?;
+    let encoded_len = std::fs::metadata(file).map_err(|_| CryptoError::Io)?.len();
+    if encoded_len > MAX_ENCRYPTED_KEY_FILE_BYTES {
+        return Err(CryptoError::Io);
+    }
     let encoded = std::fs::read(file).map_err(|_| CryptoError::Io)?;
     let blob = decode_encrypted_blob(&encoded)?;
     decrypt_private_key_envelope(&blob, passphrase)
@@ -2572,6 +2587,42 @@ mod tests {
             KeyCustodyPermissionPolicy::default(),
         );
         assert_eq!(wrong.err(), Some(CryptoError::DecryptionFailed));
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_encrypted_key_file_refuses_oversized_file_before_reading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = format!(
+            "rustynet-oversized-key-file-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).expect("directory should be created");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("directory mode should be set");
+        let file = directory.join("node-key.enc");
+        // Valid custody modes so the permission gate passes and ONLY the
+        // size bound can reject the read.
+        std::fs::write(&file, vec![b'x'; 64 * 1024 + 1]).expect("oversize file written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .expect("file mode should be set");
+
+        let result = read_encrypted_key_file(
+            &directory,
+            &file,
+            "phase2-passphrase",
+            KeyCustodyPermissionPolicy::default(),
+        );
+
+        assert_eq!(result.err(), Some(CryptoError::Io));
 
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&directory);
