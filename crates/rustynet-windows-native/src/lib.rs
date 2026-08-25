@@ -1801,7 +1801,7 @@ mod imp {
             // Bound the walk. A corrupt count must not turn into a wild read;
             // the filter this code owns has exactly one condition, and anything
             // beyond a handful is already a validation failure.
-            const MAX_CONDITIONS: usize = 16;
+            const MAX_CONDITIONS: usize = crate::wfp_filter_shape::MAX_MATERIALIZED_CONDITIONS;
             let mut conditions = Vec::new();
             for index in 0..count.min(MAX_CONDITIONS) {
                 let condition = unsafe { &*filter_ref.filterCondition.add(index) };
@@ -1829,17 +1829,7 @@ mod imp {
             // Preserve the true count so a corrupt/oversized one still fails the
             // exactly-one-condition check instead of being silently truncated
             // to a passing shape.
-            if count > MAX_CONDITIONS {
-                conditions.truncate(0);
-                for _ in 0..count {
-                    conditions.push(crate::wfp_filter_shape::WfpConditionShape {
-                        field_key: 0,
-                        match_type: 0,
-                        value_type: 0,
-                        uint64_value: 0,
-                    });
-                }
-            }
+            conditions = crate::wfp_filter_shape::reduce_readback_conditions(count, &conditions);
             Ok(crate::wfp_filter_shape::WfpFilterShape {
                 action_type: filter_ref.action.r#type,
                 conditions,
@@ -2081,6 +2071,44 @@ pub mod wfp_filter_shape {
         Ok(())
     }
 
+    /// Upper bound on how many conditions are materialised from a read-back
+    /// filter. The engine-owned `numFilterConditions` field is writable by
+    /// anything that can tamper the persistent WFP store — exactly the
+    /// WIN-03 adversary this validator exists to detect — so a declared count
+    /// must never be replayed as an allocation size.
+    pub const MAX_MATERIALIZED_CONDITIONS: usize = 16;
+
+    /// Reduce an engine read-back's declared condition count plus the
+    /// already-bounded walked slice into the condition list a
+    /// [`WfpFilterShape`] carries.
+    ///
+    /// `num_filter_conditions` is the raw `FWPM_FILTER0::numFilterConditions`;
+    /// `walked` holds the at most [`MAX_MATERIALIZED_CONDITIONS`] conditions
+    /// the caller actually dereferenced (its length is
+    /// `num_filter_conditions.min(MAX_MATERIALIZED_CONDITIONS)`). When the
+    /// declared count exceeds the bound, the walked values are discarded and
+    /// replaced by zeroed stand-ins: validation only needs the list length to
+    /// differ from the required exactly-one condition, so the stand-in count
+    /// is deliberately a lower bound rather than the declared value replayed
+    /// back as an allocation.
+    pub fn reduce_readback_conditions(
+        num_filter_conditions: usize,
+        walked: &[WfpConditionShape],
+    ) -> Vec<WfpConditionShape> {
+        if num_filter_conditions <= MAX_MATERIALIZED_CONDITIONS {
+            return walked.to_vec();
+        }
+        vec![
+            WfpConditionShape {
+                field_key: 0,
+                match_type: 0,
+                value_type: 0,
+                uint64_value: 0,
+            };
+            MAX_MATERIALIZED_CONDITIONS
+        ]
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2196,6 +2224,50 @@ pub mod wfp_filter_shape {
                 Err(WfpShapeError::LuidMismatch {
                     found: 0x1234,
                     expected: TUNNEL_LUID,
+                })
+            );
+        }
+
+        /// A tampered filter declaring an enormous condition count must not
+        /// have that count replayed back as an allocation size: the
+        /// materialised list is bounded at MAX_MATERIALIZED_CONDITIONS and
+        /// validation rejects it on length alone.
+        #[test]
+        fn oversized_declared_condition_count_is_never_replayed_as_allocation() {
+            const DECLARED: usize = 1_000_000;
+            let reduced = reduce_readback_conditions(DECLARED, &[]);
+            assert_eq!(reduced.len(), MAX_MATERIALIZED_CONDITIONS);
+        }
+
+        /// A declared count within the bound passes the walked values through
+        /// unchanged — the bound only exists for the oversize case.
+        #[test]
+        fn declared_condition_count_within_bound_is_preserved() {
+            let walked = vec![
+                WfpConditionShape {
+                    field_key: CONDITION_IP_LOCAL_INTERFACE,
+                    match_type: MATCH_EQUAL,
+                    value_type: DATA_TYPE_UINT64,
+                    uint64_value: TUNNEL_LUID,
+                };
+                3
+            ];
+            assert_eq!(reduce_readback_conditions(3, &walked), walked);
+        }
+
+        /// End-to-end: the bounded stand-in list produced for an oversized
+        /// declared count still fails the exactly-one-condition check, so the
+        /// tampered filter can never validate.
+        #[test]
+        fn oversized_declared_count_still_fails_tunnel_permit_validation() {
+            let shape = WfpFilterShape {
+                action_type: ACTION_PERMIT,
+                conditions: reduce_readback_conditions(u32::MAX as usize, &[]),
+            };
+            assert_eq!(
+                validate_tunnel_permit_shape(&shape, TUNNEL_LUID, &[]),
+                Err(WfpShapeError::WrongConditionCount {
+                    count: MAX_MATERIALIZED_CONDITIONS
                 })
             );
         }
