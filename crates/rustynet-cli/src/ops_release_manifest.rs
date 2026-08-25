@@ -269,6 +269,46 @@ mod tests {
     }
 
     #[test]
+    fn ops_pipeline_surfaces_zero_seed_as_an_operator_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "rn-relmanifest-zero-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let art = dir.join("rustynetd-x86_64-unknown-linux-gnu");
+        std::fs::write(&art, b"fake-rustynetd-binary-bytes").unwrap();
+        // A blank seed file: 64 hex zeros. The pipeline must refuse with the
+        // operator-facing message, not mint a manifest under the known key.
+        let seed_file = dir.join("seed.hex");
+        std::fs::write(&seed_file, "0".repeat(64)).unwrap();
+        let result = execute_ops_create_release_manifest(
+            vec![format!(
+                "rustynetd:x86_64-unknown-linux-gnu:{}",
+                art.display()
+            )],
+            "beta".to_owned(),
+            seed_file,
+            "ed25519:test".to_owned(),
+            dir.join("release-manifest.json"),
+            1_700_000_000,
+        );
+        let err = result.expect_err("an all-zero signing seed must abort the create command");
+        assert!(
+            err.contains("all zeros"),
+            "error should name the zero-seed cause, got: {err}"
+        );
+        assert!(
+            !dir.join("release-manifest.json").exists(),
+            "no manifest may be written when signing refuses"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn create_then_verify_round_trips_on_disk() {
         let dir = std::env::temp_dir().join(format!(
             "rn-relmanifest-{}-{}",
