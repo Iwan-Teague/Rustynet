@@ -12502,6 +12502,7 @@ fn tail_utf8_lines(path: &Path, max_lines: usize) -> Result<String, String> {
     if max_lines == 0 {
         return Ok(String::new());
     }
+    daemon_log_pre_read_gate(path)?;
     let body = fs::read_to_string(path)
         .map_err(|err| format!("read daemon log failed ({}): {err}", path.display()))?;
     let lines = body.lines().collect::<Vec<_>>();
@@ -17604,18 +17605,11 @@ fn daemon_log_path() -> PathBuf {
 /// read forever while a planted sparse file could exhaust memory.
 const DAEMON_LOG_TAIL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Render the last `lines_to_show` lines of the daemon log, optionally
-/// filtered by a case-insensitive substring.
-///
-/// Fail-closed file gate before any read: missing, symlinked,
-/// non-regular, or oversized logs are hard errors — the same discipline
-/// as [`ensure_regular_file_no_symlink`] plus a pre-read metadata size
-/// cap, matching how `load_operator_config` bounds its config read.
-fn render_log_tail(
-    log_path: &Path,
-    lines_to_show: usize,
-    level_filter: Option<&str>,
-) -> Result<String, String> {
+/// Fail-closed pre-read gate shared by every daemon-log reader: the
+/// path must exist as a regular, non-symlinked file no larger than
+/// [`DAEMON_LOG_TAIL_MAX_BYTES`], verified from metadata BEFORE any
+/// read is attempted.
+fn daemon_log_pre_read_gate(log_path: &Path) -> Result<fs::Metadata, String> {
     let metadata = match fs::symlink_metadata(log_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -17641,6 +17635,22 @@ fn render_log_tail(
             log_path.display()
         ));
     }
+    Ok(metadata)
+}
+
+/// Render the last `lines_to_show` lines of the daemon log, optionally
+/// filtered by a case-insensitive substring.
+///
+/// Fail-closed file gate before any read: missing, symlinked,
+/// non-regular, or oversized logs are hard errors — the same discipline
+/// as [`ensure_regular_file_no_symlink`] plus a pre-read metadata size
+/// cap, matching how `load_operator_config` bounds its config read.
+fn render_log_tail(
+    log_path: &Path,
+    lines_to_show: usize,
+    level_filter: Option<&str>,
+) -> Result<String, String> {
+    daemon_log_pre_read_gate(log_path)?;
 
     let content = fs::read_to_string(log_path).map_err(|e| format!("cannot read logs: {e}"))?;
 
@@ -27488,6 +27498,34 @@ mod tests {
 
         let err = super::render_log_tail(&link, 10, None)
             .expect_err("symlinked log path must fail closed");
+        assert!(err.contains("must not be a symlink"), "got: {err}");
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tail_utf8_lines_rejects_symlinked_daemon_log() {
+        use std::os::unix::fs::symlink;
+
+        let unique = format!(
+            "rustynet-cli-log-tail-link2-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let target = std::env::temp_dir().join(format!("{unique}.target"));
+        let link = std::env::temp_dir().join(format!("{unique}.link"));
+        std::fs::write(&target, "INFO through the link\n").expect("target should be written");
+        symlink(&target, &link).expect("symlink should be created");
+
+        // The macOS runtime-restart diagnostic reads the daemon log
+        // through this helper too; a planted symlink there must fail
+        // closed exactly like render_log_tail, never be followed.
+        let err = super::tail_utf8_lines(&link, 40)
+            .expect_err("symlinked daemon log must fail closed in tail_utf8_lines");
         assert!(err.contains("must not be a symlink"), "got: {err}");
 
         let _ = std::fs::remove_file(link);
