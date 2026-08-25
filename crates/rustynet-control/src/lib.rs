@@ -1048,6 +1048,15 @@ pub fn persist_trust_state(
     state: &TrustState,
 ) -> Result<(), TrustStateError> {
     let path = path.as_ref();
+    // Fail closed on a degenerate trust state BEFORE any IO: the signing
+    // fingerprint is the pinned identity `authorize_trusted_key` compares
+    // against, and a stored empty value would authorize a caller presenting
+    // an empty fingerprint (`ct_eq("", "") == 1`). The reader enforces the
+    // same shape so hand-written or legacy files cannot resurrect the
+    // fail-open form.
+    if state.signing_fingerprint.trim().is_empty() {
+        return Err(TrustStateError::InvalidFormat);
+    }
     ensure_secure_parent_directory(path)?;
     let key_path = trust_state_key_path(path);
     let key = load_or_create_trust_state_mac_key(&key_path)?;
@@ -1121,6 +1130,16 @@ pub fn load_trust_state(path: impl AsRef<Path>) -> Result<TrustState, TrustState
         signing_fingerprint: fingerprint.ok_or(TrustStateError::Corrupt)?,
         updated_at_unix: updated_at.ok_or(TrustStateError::Corrupt)?,
     };
+
+    // Fail closed on a missing identity: an empty (or whitespace-only)
+    // `signing_fingerprint` is not a pinned trust anchor, it is the ABSENCE
+    // of one. Loading it anyway would let `authorize_trusted_key` match a
+    // caller that also presents nothing. Shape-checked before the MAC so the
+    // reject does not depend on integrity-key availability; both failures
+    // are hard errors either way.
+    if state.signing_fingerprint.trim().is_empty() {
+        return Err(TrustStateError::InvalidFormat);
+    }
 
     let expected_mac = mac.ok_or(TrustStateError::Corrupt)?;
     let payload = trust_state_payload(&state);
@@ -4820,6 +4839,151 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.integrity.key", path.display()));
+        let _ = std::fs::remove_dir(&test_dir);
+    }
+
+    #[test]
+    fn trust_state_persist_rejects_degenerate_signing_fingerprint() {
+        // The fingerprint is the pinned identity authorize_trusted_key
+        // compares against; persisting an empty (or whitespace-only) one
+        // would mint a trust state that authorizes a caller presenting an
+        // empty fingerprint. The writer must refuse it outright.
+        for bad_fingerprint in ["", "   ", "\t"] {
+            let state = TrustState {
+                generation: 1,
+                signing_fingerprint: bad_fingerprint.to_owned(),
+                updated_at_unix: 100,
+            };
+            let err = persist_trust_state(std::env::temp_dir().join("unused-trust.state"), &state)
+                .expect_err("degenerate fingerprint must be refused at the writer");
+            assert!(
+                matches!(err, super::TrustStateError::InvalidFormat),
+                "unexpected error for {bad_fingerprint:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_state_loader_rejects_empty_signing_fingerprint_before_mac() {
+        // A file that parses cleanly but pins NO identity must fail closed.
+        // The shape check fires BEFORE MAC verification, so tampering only
+        // the fingerprint line of a legitimately persisted state is enough
+        // to pin the reject as InvalidFormat (not IntegrityMismatch) without
+        // needing the integrity key.
+        let unique_dir = format!("rustynet-truststate-empty-fp-{}", std::process::id());
+        let test_dir = std::env::temp_dir().join(unique_dir);
+        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("test directory permissions should be set")
+        };
+        let path = test_dir.join("trust.state");
+
+        let persist_valid = || {
+            persist_trust_state(
+                &path,
+                &TrustState {
+                    generation: 3,
+                    signing_fingerprint: "ed25519:abc123".to_owned(),
+                    updated_at_unix: 1_000,
+                },
+            )
+            .expect("persist should succeed")
+        };
+
+        // Both degenerate values must be rejected: a truly empty value and a
+        // whitespace-only value (which parses fine but pins no identity).
+        // Each case starts from a freshly persisted VALID state, then rewrites
+        // only the fingerprint line.
+        for (label, stored_value) in [("empty", ""), ("whitespace", "   ")] {
+            persist_valid();
+            let contents = std::fs::read_to_string(&path).expect("should read state file");
+            assert!(
+                contents.contains("signing_fingerprint=ed25519:abc123"),
+                "{label}: fixture state missing fingerprint line"
+            );
+            let emptied = contents.replace(
+                "signing_fingerprint=ed25519:abc123",
+                &format!("signing_fingerprint={stored_value}"),
+            );
+            std::fs::write(&path, emptied).expect("should write emptied-fingerprint state");
+
+            let err = load_trust_state(&path)
+                .expect_err("empty signing fingerprint must fail closed at load");
+            assert!(
+                matches!(err, super::TrustStateError::InvalidFormat),
+                "{label}: unexpected error {err:?}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.integrity.key", path.display()));
+        let _ = std::fs::remove_dir(&test_dir);
+    }
+
+    #[test]
+    fn trust_state_loader_rejects_empty_fingerprint_even_under_valid_mac() {
+        // The strongest fail-open shape: an integrity-authentic state that
+        // pins NO identity. Before the shape gate this loaded successfully
+        // and authorize_trusted_key matched an attacker presenting "". Build
+        // exactly that artifact — recompute the MAC over the emptied payload
+        // with the real integrity key — and require the loader to refuse it
+        // on shape alone.
+        let unique_dir = format!("rustynet-truststate-empty-fp-mac-{}", std::process::id());
+        let test_dir = std::env::temp_dir().join(unique_dir);
+        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("test directory permissions should be set")
+        };
+        let path = test_dir.join("trust.state");
+        let key_path = test_dir.join("trust.state.integrity.key");
+
+        persist_trust_state(
+            &path,
+            &TrustState {
+                generation: 5,
+                signing_fingerprint: "ed25519:abc123".to_owned(),
+                updated_at_unix: 1_000,
+            },
+        )
+        .expect("persist should succeed");
+
+        let key_hex = std::fs::read_to_string(&key_path)
+            .expect("integrity key should be readable")
+            .trim()
+            .to_owned();
+        let mut key = [0u8; 32];
+        for (index, byte) in key_hex.as_bytes().chunks_exact(2).enumerate() {
+            key[index] = u8::from_str_radix(std::str::from_utf8(byte).expect("hex is utf8"), 16)
+                .expect("key hex decodes");
+        }
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&key).expect("hmac accepts any key length");
+        mac.update(b"version=2\ngeneration=5\nsigning_fingerprint=\nupdated_at_unix=1000\n");
+        let forged_mac = hex_bytes(mac.finalize().into_bytes().as_slice());
+        std::fs::write(
+            &path,
+            format!(
+                "version=2\ngeneration=5\nsigning_fingerprint=\nupdated_at_unix=1000\nmac={forged_mac}\n"
+            ),
+        )
+        .expect("should write validly-maced empty-fingerprint state");
+
+        let err =
+            load_trust_state(&path).expect_err("authentic-but-identityless state must be refused");
+        assert!(
+            matches!(err, super::TrustStateError::InvalidFormat),
+            "unexpected error {err:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&key_path);
         let _ = std::fs::remove_dir(&test_dir);
     }
 
