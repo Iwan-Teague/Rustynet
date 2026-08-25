@@ -148,7 +148,8 @@ const DEFAULT_ROUTE_BINARY_PATH: &str = "/sbin/route";
 const DEFAULT_PFCTL_BINARY_PATH: &str = "/sbin/pfctl";
 const DEFAULT_WIREGUARD_GO_BINARY_PATH: &str = "/usr/local/bin/wireguard-go";
 const DEFAULT_KILL_BINARY_PATH: &str = "/bin/kill";
-const DEFAULT_WINDOWS_NETSH_BINARY_PATH: &str = r"C:\Windows\System32\netsh.exe";
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const DEFAULT_WINDOWS_NETSH_BINARY_PATH: &str = r"C:\Windows\System32\netsh.exe";
 pub(crate) const DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH: &str =
     r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 const DEFAULT_WINDOWS_REG_BINARY_PATH: &str = r"C:\Windows\System32\reg.exe";

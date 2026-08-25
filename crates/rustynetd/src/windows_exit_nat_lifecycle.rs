@@ -296,7 +296,13 @@ fn capture_windows_default_egress_alias(_tunnel_alias: &str) -> Result<String, S
 
 #[cfg(windows)]
 fn capture_windows_portproxy_summary() -> Result<String, String> {
-    let output = Command::new("netsh")
+    // Resolve `netsh.exe` from `\Windows\System32\` rather than relying on
+    // Win32's PATH search. A daemon running as SYSTEM with a permissive PATH
+    // would otherwise execute an attacker-controlled `netsh.exe` with the
+    // daemon's elevated token. Same discipline as the PowerShell resolution in
+    // `windows_dns_failclosed` and the bare-name regression tests in
+    // `daemon.rs` and this module's test suite.
+    let output = Command::new(crate::phase10::DEFAULT_WINDOWS_NETSH_BINARY_PATH)
         .args(["interface", "portproxy", "show", "all"])
         .output()
         .map_err(|err| format!("netsh interface portproxy show all failed to start: {err}"))?;
@@ -343,6 +349,30 @@ fn run_powershell_with_args(script: &str, values: &[&str]) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: no production callsite in this module may invoke `netsh.exe`
+    /// by bare program name. Win32 `CreateProcess` resolves bare names via the
+    /// daemon's PATH, so a permissive PATH would silently substitute an
+    /// attacker-controlled `netsh.exe` executed with the daemon's SYSTEM token.
+    /// This mirrors the PowerShell bare-name ban pinned by
+    /// `daemon.rs::powershell_invocations_never_use_bare_program_name`. All
+    /// netsh invocations must resolve through the absolute
+    /// `C:\Windows\System32\netsh.exe` path pinned by
+    /// `crate::phase10::DEFAULT_WINDOWS_NETSH_BINARY_PATH`.
+    #[test]
+    fn netsh_invocations_never_use_bare_program_name() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/windows_exit_nat_lifecycle.rs"))
+            .expect("source file readable");
+        // Build the bare-name needle as a literal token-call shape so this
+        // assert's own source body does not match the negative grep.
+        let bare_invocation = ["Command::new(\"ne", "tsh\")"].concat();
+        assert!(
+            !body.contains(&bare_invocation),
+            "bare-name `Command::new(\"netsh\")` reappeared; resolve netsh from \
+             \\Windows\\System32\\ via crate::phase10::DEFAULT_WINDOWS_NETSH_BINARY_PATH instead",
+        );
+    }
 
     fn options() -> WindowsExitNatLifecycleOptions {
         WindowsExitNatLifecycleOptions {
