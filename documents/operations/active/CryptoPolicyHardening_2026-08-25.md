@@ -1,6 +1,10 @@
 # Crypto / Policy / Release-Manifest Security Hardening — 2026-08-25
 
-Status: **active** (branch `sec-hardening`, 28 commits, not yet merged).
+Status: **ready for merge review** as of 2026-08-25 (branch `sec-hardening`,
+33 commits ahead of `origin/main`, 0 behind; final full scoped regression of
+all three touched crates green the same day). Implementation is complete;
+what remains is operator review of the watchlist item below and the merge
+itself.
 
 Scope: fail-closed hardening and mutation-tested coverage for the Ed25519
 signing path (`rustynet-crypto`), the ACL default-deny engine
