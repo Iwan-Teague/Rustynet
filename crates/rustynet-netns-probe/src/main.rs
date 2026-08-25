@@ -215,16 +215,35 @@ fn valid_binding_request(buf: &[u8]) -> Option<[u8; 12]> {
 }
 
 /// Parse the first (XOR-)MAPPED-ADDRESS attribute (IPv4) → (ip, port).
-/// Mirrors the Python attribute walk incl. 4-byte alignment padding.
+/// Byte-pinned to stun_client.rs parse_binding_response semantics: the
+/// attribute walk is bounded by the DECLARED message length (bytes past it
+/// are trailing garbage and must never fabricate a mapping), an attribute
+/// that overruns that boundary fails the parse, and only family 0x01
+/// (IPv4) is understood — anything else is rejected instead of misread.
 fn parse_mapped_address(buf: &[u8]) -> Result<(Ipv4Addr, u16), String> {
+    if buf.len() < 20 {
+        return Err("response too short".to_owned());
+    }
+    let declared_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let end = 20usize
+        .checked_add(declared_len)
+        .ok_or_else(|| "declared length overflow".to_owned())?;
+    if buf.len() < end {
+        return Err("truncated response".to_owned());
+    }
     let mut i = 20usize;
-    while i + 4 <= buf.len() {
+    while i + 4 <= end {
         let attr_type = u16::from_be_bytes([buf[i], buf[i + 1]]);
         let attr_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
         let start = i + 4;
-        let end = (start + attr_len).min(buf.len());
-        let val = &buf[start..end];
-        if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS && val.len() >= 8 {
+        let attr_end = start
+            .checked_add(attr_len)
+            .ok_or_else(|| "stun attribute exceeds message boundary".to_owned())?;
+        if attr_end > end {
+            return Err("stun attribute exceeds message boundary".to_owned());
+        }
+        let val = &buf[start..attr_end];
+        if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS && val.len() >= 8 && val[1] == 0x01 {
             let port = u16::from_be_bytes([val[2], val[3]]) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
             let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
             let ip = Ipv4Addr::new(
@@ -235,7 +254,7 @@ fn parse_mapped_address(buf: &[u8]) -> Result<(Ipv4Addr, u16), String> {
             );
             return Ok((ip, port));
         }
-        if attr_type == STUN_ATTR_MAPPED_ADDRESS && val.len() >= 8 {
+        if attr_type == STUN_ATTR_MAPPED_ADDRESS && val.len() >= 8 && val[1] == 0x01 {
             let port = u16::from_be_bytes([val[2], val[3]]);
             let ip = Ipv4Addr::new(val[4], val[5], val[6], val[7]);
             return Ok((ip, port));
@@ -295,19 +314,60 @@ fn run_stun_responder(args: &[String]) -> Result<ExitCode, String> {
 
 // ─── mode: nat-classify (was nat_probe.py) ───────────────────────────────────
 
+/// Envelope check byte-pinned to stun_client.rs parse_binding_response:
+/// only a binding response carrying our magic cookie AND echoing our
+/// transaction id counts as ours. Anything else on the socket (stray lab
+/// traffic, or a late duplicate from a previous query) must be discarded,
+/// never parsed as a mapping.
+fn is_our_binding_response(buf: &[u8], tx_id: &[u8; 12]) -> bool {
+    if buf.len() < 20 {
+        return false;
+    }
+    let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
+    if msg_type != STUN_BINDING_RESPONSE {
+        return false;
+    }
+    let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    cookie == STUN_MAGIC_COOKIE && buf[8..20] == *tx_id
+}
+
 fn stun_round_trip(
     sock: &UdpSocket,
     server: SocketAddr,
     timeout: Duration,
 ) -> Result<(Ipv4Addr, u16), String> {
     let tx = random_tx_id();
-    sock.set_read_timeout(Some(timeout))
-        .map_err(|e| format!("set timeout: {e}"))?;
+    let deadline = Instant::now() + timeout;
     sock.send_to(&build_binding_request(&tx), server)
         .map_err(|e| format!("send: {e}"))?;
-    let mut buf = [0u8; 1024];
-    let (n, _from) = sock.recv_from(&mut buf).map_err(|e| format!("recv: {e}"))?;
-    parse_mapped_address(&buf[..n])
+    let mut buf = [0u8; 1500];
+    // Demux like the stun_client.rs gather core: drop every datagram that is
+    // not OUR binding response (wrong type / cookie / tx-id echo) and keep
+    // listening until the deadline. Accepting the first datagram unvalidated
+    // let stale or stray traffic fabricate NAT mappings.
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timed_out_err = || "recv: no matching binding response before timeout".to_owned();
+        if remaining.is_zero() {
+            return Err(timed_out_err());
+        }
+        sock.set_read_timeout(Some(remaining))
+            .map_err(|e| format!("set timeout: {e}"))?;
+        let (n, _from) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(timed_out_err());
+            }
+            Err(e) => return Err(format!("recv: {e}")),
+        };
+        if !is_our_binding_response(&buf[..n], &tx) {
+            continue;
+        }
+        return parse_mapped_address(&buf[..n]);
+    }
 }
 
 fn run_nat_classify(args: &[String]) -> Result<ExitCode, String> {
@@ -562,5 +622,91 @@ mod tests {
         let ep = parse_endpoint("198.18.0.254:3478").expect("parse");
         assert_eq!(ep.port(), 3478);
         assert_eq!(ep.ip(), IpAddr::V4(Ipv4Addr::new(198, 18, 0, 254)));
+    }
+
+    /// A datagram may carry bytes past its declared STUN message length
+    /// (trailing garbage or an injected attribute). The parser must bound its
+    /// attribute walk by the declared length — byte-pinned to stun_client.rs
+    /// parse_binding_response ("stun attribute exceeds message boundary") —
+    /// so appended bytes can never fabricate a mapping.
+    #[test]
+    fn mapped_address_parser_rejects_bytes_beyond_declared_length() {
+        // Header declares length 0, yet a well-formed MAPPED-ADDRESS attr
+        // follows at offset 20.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+        buf.extend_from_slice(&0u16.to_be_bytes()); // declared msg len = 0
+        buf.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        buf.extend_from_slice(&[7u8; 12]);
+        let mut attr = vec![0u8, 1]; // MAPPED-ADDRESS
+        attr.extend_from_slice(&8u16.to_be_bytes());
+        attr.push(0); // reserved
+        attr.push(0x01); // family IPv4
+        attr.extend_from_slice(&1234u16.to_be_bytes());
+        attr.extend_from_slice(&[203, 0, 113, 9]);
+        buf.extend_from_slice(&attr);
+        assert!(
+            parse_mapped_address(&buf).is_err(),
+            "attribute beyond the declared length must not be parsed as a mapping"
+        );
+    }
+
+    /// XOR-MAPPED-ADDRESS with family 0x02 (IPv6) cannot be represented by
+    /// this v4-only classifier; misreading its first address bytes as an
+    /// IPv4 address would report a fabricated endpoint (the reference
+    /// rejects unknown families fail-closed).
+    #[test]
+    fn mapped_address_parser_rejects_non_ipv4_family() {
+        let tx = [0x33u8; 12];
+        let v6 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            51820,
+        );
+        let resp = build_binding_response(&tx, v6);
+        if let Ok((ip, _)) = parse_mapped_address(&resp) {
+            panic!("ipv6 xor-mapped attr misparsed as ipv4 {ip}");
+        }
+    }
+
+    /// nat-classify shares one socket across servers and must demux like the
+    /// reference gather core: a valid-looking binding response that does not
+    /// echo OUR transaction id (stray traffic, or a late duplicate from a
+    /// previous query) is discarded, and the matching response is awaited.
+    #[test]
+    fn nat_classify_round_trip_discards_datagrams_not_echoing_our_tx_id() {
+        let responder = UdpSocket::bind("127.0.0.1:0").expect("bind responder");
+        let stranger = UdpSocket::bind("127.0.0.1:0").expect("bind stranger");
+        let client = UdpSocket::bind("127.0.0.1:0").expect("bind client");
+        let responder_addr = responder.local_addr().expect("responder addr");
+        let client_addr = client.local_addr().expect("client addr");
+
+        // Pre-load the client path with a stray, structurally VALID binding
+        // response whose tx id belongs to some other transaction.
+        let stale_tx = [0xEEu8; 12];
+        let stale = build_binding_response(
+            &stale_tx,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 66)), 11111),
+        );
+        stranger.send_to(&stale, client_addr).expect("send stale");
+
+        // Responder answers the real request with the true mapping.
+        let responder_sock = responder.try_clone().expect("clone responder");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            if let Ok((n, from)) = responder_sock.recv_from(&mut buf)
+                && let Some(tx) = valid_binding_request(&buf[..n])
+            {
+                let resp = build_binding_response(
+                    &tx,
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 22222),
+                );
+                let _ = responder_sock.send_to(&resp, from);
+            }
+        });
+
+        let (ip, port) =
+            stun_round_trip(&client, responder_addr, Duration::from_secs(2)).expect("round trip");
+        assert_eq!(ip, Ipv4Addr::new(203, 0, 113, 7));
+        assert_eq!(port, 22222);
     }
 }
