@@ -2251,6 +2251,22 @@ mod tests {
         );
     }
 
+    /// Sign-then-verify round-trip over the degenerate zero-length payload:
+    /// the strict (RFC 8032 / ZIP-215) `verify_strict` verifier must accept a
+    /// genuine signature even on an empty message.
+    #[test]
+    fn sign_verify_round_trip_on_empty_message() {
+        let provider = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::LocalEncryptedFile,
+            "round-trip-empty-message",
+            [7u8; 32],
+        );
+        let signature = provider.sign_attestation(b"").expect("signing succeeds");
+        provider
+            .verify_attestation(b"", &signature)
+            .expect("genuine empty-message signature verifies");
+    }
+
     #[test]
     fn rejects_zero_key_material() {
         let result = NodeKeyPair::from_raw([0; 32], [0; 32]);
