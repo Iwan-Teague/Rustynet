@@ -1016,7 +1016,7 @@ fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> Hel
     // exec'd command.
     if program.is_builtin() {
         return match execute_builtin(program, &args) {
-            Ok(output) => HelperResponse::success(output.status, output.stdout, output.stderr),
+            Ok(output) => builtin_success_response(output),
             Err(err) => HelperResponse::error(err),
         };
     }
@@ -1065,6 +1065,25 @@ fn execute_builtin(
         // No other builtins exist; fail closed if one is added without a handler.
         _ => Err(format!("no in-process handler for builtin {program}")),
     }
+}
+
+/// The ONE construction site for an in-helper builtin's success response. The
+/// builtin's captured stdout/stderr travel back as `HelperResponse::success`
+/// over the helper IPC channel on every path that reaches the
+/// privilege-separated helper, so both fields are clamped to the deliverable
+/// field budget here — the same invariant `success_response_from_exec_output`
+/// enforces for exec-side streams. Builtin stdout is NOT guaranteed helper-
+/// derived: the linux-firewalld-zone builtin embeds the effective default zone
+/// it read from a `busctl --json=short` reply, which is externally derived and
+/// unbounded at extraction, so clamping only where exec output is captured let
+/// a long enough reply build a success field the codec refuses to encode, and
+/// the helper then dropped the connection silently.
+fn builtin_success_response(output: PrivilegedCommandOutput) -> HelperResponse {
+    success_response_from_exec_output(
+        output.status,
+        output.stdout.as_bytes(),
+        output.stderr.as_bytes(),
+    )
 }
 
 /// Run the macOS `pf` anchor load builtin. The `args` were already validated as
@@ -1583,14 +1602,14 @@ fn exit_status_code(status: ExitStatus) -> i32 {
 /// every response this helper emits for a command that ran encodes and fits
 /// one frame. The deliverability pins call THIS function rather than
 /// re-implementing the construction, so a reverted clamp fails them.
-#[cfg(not(windows))]
+/// Ungated: the builtin success path shares it on every platform the helper
+/// compiles on.
 fn success_response_from_exec_output(status: i32, stdout: &[u8], stderr: &[u8]) -> HelperResponse {
     let stdout = truncate_lossy(stdout, RESPONSE_FIELD_BUDGET_BYTES);
     let stderr = truncate_lossy(stderr, RESPONSE_FIELD_BUDGET_BYTES);
     HelperResponse::success(status, stdout, stderr)
 }
 
-#[cfg(not(windows))]
 fn truncate_lossy(bytes: &[u8], max_bytes: usize) -> String {
     // Bound the POST-conversion length, not the input: from_utf8_lossy
     // replaces each isolated ill-formed byte with a 3-byte U+FFFD and a
@@ -2792,10 +2811,10 @@ mod tests {
     use super::{
         HELPER_FRAME_MAGIC, HELPER_FRAME_TYPE_REQUEST, HELPER_FRAME_TYPE_RESPONSE,
         HELPER_FRAME_VERSION, HelperRequest, HelperResponse, MAX_ARG_BYTES, MAX_ARGS,
-        MAX_MESSAGE_BYTES, MAX_PROGRAM_BYTES, PrivilegedCommandProgram, decode_helper_request,
-        encode_helper_request, handle_request, is_anchor_name_token, is_nft_token, is_path_token,
-        is_safe_token, peer_uid, read_request, read_response_frame, run_privileged_subprocess,
-        validate_pfctl_args, validate_privileged_helper_socket_security,
+        MAX_MESSAGE_BYTES, MAX_PROGRAM_BYTES, PrivilegedCommandOutput, PrivilegedCommandProgram,
+        decode_helper_request, encode_helper_request, handle_request, is_anchor_name_token,
+        is_nft_token, is_path_token, is_safe_token, peer_uid, read_request, read_response_frame,
+        run_privileged_subprocess, validate_pfctl_args, validate_privileged_helper_socket_security,
         validate_privileged_program_binary, validate_request, validate_sysctl_args,
         write_request_frame, write_response,
     };
@@ -4399,6 +4418,41 @@ mod tests {
         let response = HelperResponse::error(err);
         let encoded = super::encode_helper_response(&response)
             .expect("a pf-load failure response must always encode");
+        assert!(encoded.len() <= MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn firewalld_posture_success_message_is_always_deliverable() {
+        // The linux-firewalld-zone builtin reports the effective default zone
+        // it read over D-Bus as `default_zone=<zone>` inside the posture stdout
+        // that travels back as HelperResponse::success. That zone comes from a
+        // `busctl --json=short` reply, so it is externally derived and was NOT
+        // bounded at extraction; a long enough reply produced a success field
+        // the codec refuses to encode and the helper dropped the connection
+        // silently. The response must be bounded at the
+        // RESPONSE_FIELD_BUDGET_BYTES deliverability budget through its
+        // production construction site.
+        let hostile_zone = "Z".repeat(super::MAX_OUTPUT_BYTES);
+        let mut payload = String::from("{\"type\":\"s\",\"data\":[\"");
+        payload.push_str(&hostile_zone);
+        payload.push_str("\"]}");
+        let zone = super::extract_busctl_string(&payload)
+            .expect("a hostile busctl reply still yields a zone string");
+        assert_eq!(zone.len(), super::MAX_OUTPUT_BYTES);
+        // Exactly what execute_linux_firewalld_zone emits on its success path.
+        let output = PrivilegedCommandOutput {
+            status: 0,
+            stdout: crate::linux_firewalld_zone::FirewalldPosture {
+                presence: crate::linux_firewalld_zone::FirewalldPresence::Running,
+                default_zone: Some(zone),
+                interface_bound: Some(false),
+            }
+            .encode(),
+            stderr: String::new(),
+        };
+        let response = super::builtin_success_response(output);
+        let encoded = super::encode_helper_response(&response)
+            .expect("a firewalld posture response must always encode");
         assert!(encoded.len() <= MAX_MESSAGE_BYTES);
     }
 
