@@ -107,9 +107,13 @@ exactly the seven intended files (+803/−20) with a clean tree.
 - Gates actually run: scoped `cargo test --all-targets --all-features` for
   rustynet-crypto, rustynet-policy, rustynet-cli (green at every commit);
   `cargo clippy -p` ×3 with `-D warnings` (exit 0); `cargo fmt -p` clean.
-- Gates deliberately deferred, named so nothing is silently claimed: the
-  full-workspace §7 test stage and `cargo audit`/`cargo deny` were not run
-  (operating constraint: scoped testing only); workspace-excluded crates
+- Supply-chain gates since RUN and green on this branch:
+  `cargo audit --deny warnings` exits 0 (1226 advisories, 253 locked deps)
+  and `cargo deny check bans licenses sources advisories` reports all four
+  ok — so the only remaining §7 deferral is the full-workspace test stage.
+- Other gates deliberately deferred, named so nothing is silently claimed:
+  the full-workspace §7 test stage was not run (operating constraint: scoped
+  testing only); workspace-excluded crates
   (`rustynet-lab-monitor`, `gui`, `fuzz`) untouched and untriggered. The
   changed crates are pure library/CI-tooling surfaces with no daemon dataplane
   behaviour change, so no live-lab run is required to merge this branch; if
