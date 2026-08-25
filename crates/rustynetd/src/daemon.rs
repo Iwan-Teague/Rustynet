@@ -12616,6 +12616,13 @@ fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
     )
 }
 
+/// Upper bound for bootstrap watermark stores (trust / auto-tunnel /
+/// dns-zone / traversal). These files hold a handful of key=value lines, so
+/// 16 KiB is generous; the bound is enforced inside the read loop via
+/// `read_text_artifact_bounded` so tampered disk state cannot drive an
+/// unbounded allocation before the parser sees a single byte.
+const MAX_WATERMARK_FILE_BYTES: usize = 16 * 1024;
+
 /// Read a text artifact from disk with a hard upper bound enforced inside the
 /// read loop, eliminating the TOCTOU window between a separate `fs::metadata`
 /// size check and a subsequent `fs::read_to_string`.
@@ -13021,8 +13028,8 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
         return Ok(None);
     }
 
-    let content =
-        fs::read_to_string(path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+    let content = read_text_artifact_bounded(path, "trust watermark", MAX_WATERMARK_FILE_BYTES)
+        .map_err(TrustBootstrapError::Io)?;
     let mut version: Option<u8> = None;
     let mut updated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
@@ -13662,7 +13669,8 @@ fn load_auto_tunnel_watermark(
     }
 
     let content =
-        fs::read_to_string(path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
+        read_text_artifact_bounded(path, "auto-tunnel watermark", MAX_WATERMARK_FILE_BYTES)
+            .map_err(AutoTunnelBootstrapError::Io)?;
     let mut version: Option<u8> = None;
     let mut generated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
@@ -13886,8 +13894,8 @@ fn load_dns_zone_watermark(path: &Path) -> Result<Option<DnsZoneWatermark>, DnsZ
         return Ok(None);
     }
 
-    let content =
-        fs::read_to_string(path).map_err(|err| DnsZoneBootstrapError::Io(err.to_string()))?;
+    let content = read_text_artifact_bounded(path, "dns zone watermark", MAX_WATERMARK_FILE_BYTES)
+        .map_err(DnsZoneBootstrapError::Io)?;
     let mut version: Option<u8> = None;
     let mut generated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
@@ -15146,8 +15154,8 @@ fn load_traversal_watermark(
     if !path.exists() {
         return Ok(None);
     }
-    let content =
-        fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+    let content = read_text_artifact_bounded(path, "traversal watermark", MAX_WATERMARK_FILE_BYTES)
+        .map_err(TraversalBootstrapError::Io)?;
     let mut version: Option<u8> = None;
     let mut generated_at_unix: Option<u64> = None;
     let mut nonce: Option<u64> = None;
@@ -16487,7 +16495,7 @@ mod tests {
         collect_traversal_host_candidate_snapshot_with_retry,
         enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
         load_auto_tunnel_bundle, load_auto_tunnel_watermark, load_dns_zone_bundle,
-        load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
+        load_dns_zone_watermark, load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
         load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
         load_trust_watermark, membership_watermark_is_replay, overlay_addresses_from_bundle_peers,
         parse_route_interface_token, parse_windows_default_egress_interface_output,
@@ -21653,6 +21661,80 @@ mod tests {
             .expect("traversal watermark file should exist");
         assert!(raw.contains("version=2"));
         assert!(raw.contains("payload_digest_sha256="));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    // The four bootstrap watermark loaders must bound their reads before
+    // allocating (same class as the fetcher watermark store and resilience
+    // snapshot fixes). Oversized disk state surfaces as a typed Io error
+    // carrying the "exceeds maximum size" marker; if the bound were removed
+    // the parser would instead reject these files with InvalidFormat, so the
+    // assertions below genuinely pin the read-time cap.
+    #[test]
+    fn load_trust_watermark_refuses_oversized_file_before_read() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-oversize");
+        let watermark_path = test_dir.join("trust.watermark");
+        std::fs::write(&watermark_path, vec![b'x'; 16 * 1024 + 1])
+            .expect("oversized trust watermark should be written");
+        let err = load_trust_watermark(&watermark_path)
+            .expect_err("oversized trust watermark must fail closed");
+        match err {
+            super::TrustBootstrapError::Io(msg) => {
+                assert!(msg.contains("exceeds maximum size"), "got: {msg}");
+            }
+            other => panic!("expected Io oversize error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_auto_tunnel_watermark_refuses_oversized_file_before_read() {
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-oversize");
+        let watermark_path = test_dir.join("assignment.watermark");
+        std::fs::write(&watermark_path, vec![b'x'; 16 * 1024 + 1])
+            .expect("oversized auto tunnel watermark should be written");
+        let err = load_auto_tunnel_watermark(&watermark_path)
+            .expect_err("oversized auto tunnel watermark must fail closed");
+        match err {
+            super::AutoTunnelBootstrapError::Io(msg) => {
+                assert!(msg.contains("exceeds maximum size"), "got: {msg}");
+            }
+            other => panic!("expected Io oversize error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_watermark_refuses_oversized_file_before_read() {
+        let test_dir = secure_test_dir("rustynetd-dns-watermark-oversize");
+        let watermark_path = test_dir.join("dns-zone.watermark");
+        std::fs::write(&watermark_path, vec![b'x'; 16 * 1024 + 1])
+            .expect("oversized dns zone watermark should be written");
+        let err = load_dns_zone_watermark(&watermark_path)
+            .expect_err("oversized dns zone watermark must fail closed");
+        match err {
+            super::DnsZoneBootstrapError::Io(msg) => {
+                assert!(msg.contains("exceeds maximum size"), "got: {msg}");
+            }
+            other => panic!("expected Io oversize error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_traversal_watermark_refuses_oversized_file_before_read() {
+        let test_dir = secure_test_dir("rustynetd-traversal-watermark-oversize");
+        let watermark_path = test_dir.join("traversal.watermark");
+        std::fs::write(&watermark_path, vec![b'x'; 16 * 1024 + 1])
+            .expect("oversized traversal watermark should be written");
+        let err = load_traversal_watermark(&watermark_path)
+            .expect_err("oversized traversal watermark must fail closed");
+        match err {
+            super::TraversalBootstrapError::Io(msg) => {
+                assert!(msg.contains("exceeds maximum size"), "got: {msg}");
+            }
+            other => panic!("expected Io oversize error, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
