@@ -16715,6 +16715,44 @@ mod tests {
             !source.contains(multiline_discard),
             "daemon must not discard multiline force_fail_closed results"
         );
+        // The two discard greps above only pin `let _ =` spellings. A rename
+        // of the discarding binding (`let _closed = ...`) or any other silent
+        // drop keeps both greps green while reintroducing the discarded
+        // fail-closed result. Pin the census instead: production code may call
+        // the raw `force_fail_closed(` at exactly ONE site — inside
+        // `force_fail_closed_or_restrict` — so every other spelling of a
+        // dropped result fails here.
+        // Bound to production code by anchoring on the unit-test MODULE:
+        // daemon.rs carries several earlier `#[cfg(test)]` helper attrs, so
+        // splitting on the attribute alone would truncate the census to
+        // nothing and silently audit zero callsites.
+        let tests_mod = "\nmod tests {";
+        let prod_end = source.find(tests_mod).unwrap_or(source.len());
+        let prod = &source[..prod_end];
+        let direct_call = ["force_fail_", "closed("].concat();
+        let direct = prod.matches(direct_call.as_str()).count();
+        assert_eq!(
+            direct, 1,
+            "force_fail_closed must be called directly at exactly one production \
+             site (inside force_fail_closed_or_restrict); found {direct} — an \
+             extra callsite drops its Result and silently undoes RN-03"
+        );
+        let wrapper_start = prod
+            .find("fn force_fail_closed_or_restrict")
+            .expect("force_fail_closed_or_restrict must exist");
+        let wrapper_body_end = prod[wrapper_start..]
+            .find("\n    fn ")
+            .map(|at| wrapper_start + at)
+            .unwrap_or(prod.len());
+        let call_at = prod
+            .find(direct_call.as_str())
+            .expect("count 1 implies a match exists");
+        assert!(
+            call_at > wrapper_start && call_at < wrapper_body_end,
+            "the single raw force_fail_closed call must sit inside \
+             force_fail_closed_or_restrict so its Result is surfaced via \
+             restrict_permanent (RN-03), never discarded"
+        );
     }
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -17886,6 +17924,34 @@ mod tests {
         assert!(
             source.contains("ipc_command_read_failed"),
             "IPC read failures must be logged and the connection dropped"
+        );
+        // The negative grep above pins ONE historical spelling of the fatality
+        // (`.map_err(DaemonError::Io)?`). A refactor that renames the stream
+        // binding, wraps the error in a closure, or `return`s from the Err arm
+        // reintroduces the whole-daemon kill while that grep stays green. Pin
+        // the accept-loop block's disposition directly: the window around the
+        // per-connection read must keep log-and-continue and must not gain any
+        // early-return or map_err propagation.
+        let read_at = source
+            .find("read_command_envelope(&stream)")
+            .expect("the admin-IPC accept loop must read via read_command_envelope(&stream)");
+        let window_end = source[read_at..]
+            .find("CommandEnvelope::Local(parsed)")
+            .map(|at| read_at + at)
+            .expect("the read must feed the local-command dispatch");
+        let accept_window = &source[read_at..window_end];
+        assert!(
+            accept_window.contains("continue"),
+            "the accept loop's IPC-read Err arm must drop the connection and \
+             continue, never unwind"
+        );
+        assert!(
+            !accept_window.contains("return")
+                && !accept_window.contains(".map_err(")
+                && !accept_window.contains("?;"),
+            "a per-connection IPC read failure must not propagate out of the \
+             accept loop under ANY spelling — one bad client must not kill \
+             the daemon (log-and-continue only)"
         );
     }
 

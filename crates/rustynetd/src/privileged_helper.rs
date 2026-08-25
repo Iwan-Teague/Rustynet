@@ -4519,6 +4519,23 @@ mod tests {
             "the builtin dispatch arm must route through builtin_success_response; \
              reverting it to inline construction bypasses the deliverability clamp"
         );
+        // The constructor census above only counts explicit success-call
+        // spellings. A
+        // struct-literal construction (`HelperResponse { ok, status, .. }` with
+        // the ok flag hardcoded to true) or a `Self { .. }` inside any other fn
+        // builds an unclamped success response while every count stays green —
+        // the exact H2 regression through a different spelling. The ONLY
+        // allowed success-state field assignment is inside the `success`
+        // constructor itself (the `error` constructor and the decoder use the
+        // false/shorthand forms).
+        let ok_true = ["ok: ", "true,"].concat();
+        assert_eq!(
+            source.matches(ok_true.as_str()).count(),
+            1,
+            "HelperResponse success-state construction must stay centralized in \
+             the `success` constructor; an inline success-state literal elsewhere \
+             builds responses that skipped the deliverability clamp"
+        );
     }
 
     #[test]

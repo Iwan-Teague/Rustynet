@@ -1830,6 +1830,19 @@ mod tests {
             "WG passphrase must NOT route through the legacy default-keychain store \
              (its -A CLI fallback is unreadable by the launchd daemon on macOS 26)"
         );
+        // The negative grep above pins ONE argument spelling of the forbidden
+        // callee; `&service` (deref coercion), a renamed local, or a wrapper
+        // fn reintroduce the legacy route while it stays green. Forbid the
+        // callee NAME itself: the allow-any-app and owned-identity variants
+        // spell `..._allow_any_app(`/`..._system_keychain_owned(` and never
+        // match the paren, so zero occurrences is the only passing state.
+        let legacy_callee = ["store_macos_generic_", "password("].concat();
+        assert!(
+            !window.contains(legacy_callee.as_str()),
+            "the macOS dispatcher must never call the legacy default-keychain \
+             store_macos_generic_password under ANY spelling — only the -A and \
+             SecItemAdd variants are readable by the launchd daemon cross-session"
+        );
     }
 
     #[test]
