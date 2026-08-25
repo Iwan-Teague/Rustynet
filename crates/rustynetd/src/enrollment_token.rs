@@ -465,6 +465,30 @@ const LEGACY_LEDGER_WIRE_VERSION: u8 = 1;
 /// tokens are outstanding).
 const MAX_LEDGER_FILE_BYTES: u64 = 1024 * 1024;
 
+/// Fail-closed file-type gate for every state file this module reads.
+/// The path must be a regular file and must NOT be a symlink. The check
+/// runs on `symlink_metadata` — the link itself — so the verdict can never
+/// be influenced by what the link points at. A symlinked credential or
+/// ledger path would let a local attacker who can plant a link in the
+/// state directory redirect the daemon's read at an arbitrary target file
+/// (same control as `key_material::validate_secret_file_security` and the
+/// macOS runtime ACL evaluator).
+fn ensure_regular_file_no_symlink(path: &Path) -> Result<(), EnrollmentSpoolError> {
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+    if meta.file_type().is_symlink() {
+        return Err(EnrollmentSpoolError::Corrupt(
+            "enrollment state file must not be a symlink",
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(EnrollmentSpoolError::Corrupt(
+            "enrollment state file must be a regular file",
+        ));
+    }
+    Ok(())
+}
+
 /// Read a consumed-token ledger from disk. Returns `Ok(default)`
 /// when the file is absent (fresh daemon). Returns
 /// `Err(Corrupt)` on any structural mismatch.
@@ -488,6 +512,7 @@ pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, Enroll
     // AUDIT-027 (a `cfg(not(unix))` path that validates nothing), and rustynetd
     // ships a Windows service — so on Windows only the size bound below applies.
     // Tracked with that finding rather than diverging from `load_secret` here.
+    ensure_regular_file_no_symlink(path)?;
     let metadata = fs::metadata(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
     if metadata.len() > MAX_LEDGER_FILE_BYTES {
         return Err(EnrollmentSpoolError::Corrupt(
@@ -856,11 +881,14 @@ pub fn acquire_ledger_lock(ledger_path: &Path) -> Result<LedgerLockGuard, Enroll
 /// * The size cap rejects oversized inputs in O(1) — a hostile
 ///   replacement file cannot force the daemon to allocate megabytes
 ///   of plaintext before the length check fires.
+/// * The path must be a regular file, not a symlink (see
+///   [`ensure_regular_file_no_symlink`]).
 pub fn load_secret(
     path: &std::path::Path,
 ) -> Result<Zeroizing<[u8; ENROLLMENT_SECRET_LEN]>, EnrollmentSpoolError> {
     use std::fs;
     use std::io::Read;
+    ensure_regular_file_no_symlink(path)?;
     let metadata = fs::metadata(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
     if metadata.len() as usize != ENROLLMENT_SECRET_LEN {
         return Err(EnrollmentSpoolError::Corrupt(
@@ -1497,6 +1525,46 @@ mod tests {
             }
             other => panic!("an oversized ledger must be refused, got {other:?}"),
         }
+    }
+
+    /// State files this module reads must be regular files, not symlinks
+    /// (precedent: key_material validate_secret_file_security,
+    /// macos_runtime_acls). A symlinked secret path would let an attacker
+    /// who can plant a link in the state directory redirect the daemon's
+    /// credential read at an arbitrary target file.
+    #[cfg(unix)]
+    #[test]
+    fn load_secret_rejects_symlinked_secret_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let target = dir.path().join("real-secret.bin");
+        std::fs::write(&target, [0x42u8; ENROLLMENT_SECRET_LEN]).expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod target");
+        let link = dir.path().join("secret.link.bin");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let err = load_secret(&link).expect_err("symlinked secret must be refused");
+        assert!(
+            matches!(err, EnrollmentSpoolError::Corrupt(_)),
+            "rejection must be a structural Corrupt error, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_ledger_rejects_symlinked_ledger_file() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let target = dir.path().join("real.ledger");
+        let mut ledger = ConsumedTokenLedger::new();
+        ledger.record_consumed([0xa7u8; TOKEN_ID_LEN], u64::MAX);
+        write_ledger(&target, &ledger).expect("seed ledger");
+        let link = dir.path().join("ledger.link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let err = load_ledger(&link).expect_err("symlinked ledger must be refused");
+        assert!(
+            matches!(err, EnrollmentSpoolError::Corrupt(_)),
+            "rejection must be a structural Corrupt error, got {err:?}"
+        );
     }
 
     #[test]
