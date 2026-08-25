@@ -1059,10 +1059,29 @@ pub fn persist_trust_state(
     Ok(())
 }
 
+/// On-disk bound for trust-state files (state + integrity key). Checked
+/// during read via `Read::take` so tampered or oversized disk state cannot
+/// drive allocation proportional to file size before the parser rejects it.
+const MAX_TRUST_STATE_FILE_BYTES: usize = 64 * 1024;
+
+fn read_trust_file_bounded(path: &Path, label: &str) -> Result<String, TrustStateError> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|_| TrustStateError::Missing)?;
+    let mut buf = String::new();
+    file.take(MAX_TRUST_STATE_FILE_BYTES as u64 + 1)
+        .read_to_string(&mut buf)
+        .map_err(|_| TrustStateError::Missing)?;
+    if buf.len() > MAX_TRUST_STATE_FILE_BYTES {
+        return Err(TrustStateError::Corrupt);
+    }
+    let _ = label;
+    Ok(buf)
+}
+
 pub fn load_trust_state(path: impl AsRef<Path>) -> Result<TrustState, TrustStateError> {
     let path = path.as_ref();
     validate_secure_file(path, "trust state", 0o077)?;
-    let content = fs::read_to_string(path).map_err(|_| TrustStateError::Missing)?;
+    let content = read_trust_file_bounded(path, "trust state")?;
     let mut generation: Option<u64> = None;
     let mut fingerprint: Option<String> = None;
     let mut updated_at: Option<u64> = None;
@@ -1143,7 +1162,8 @@ fn load_or_create_trust_state_mac_key(path: &Path) -> Result<[u8; 32], TrustStat
 fn load_trust_state_mac_key(path: &Path) -> Result<[u8; 32], TrustStateError> {
     validate_secure_file(path, "trust state integrity key", 0o077)
         .map_err(|_| TrustStateError::KeyUnavailable)?;
-    let mut content = fs::read_to_string(path).map_err(|_| TrustStateError::KeyUnavailable)?;
+    let mut content = read_trust_file_bounded(path, "trust state integrity key")
+        .map_err(|_| TrustStateError::KeyUnavailable)?;
     let mut key_line = content
         .lines()
         .map(str::trim)
@@ -4801,6 +4821,53 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.integrity.key", path.display()));
         let _ = std::fs::remove_dir(&test_dir);
+    }
+
+    #[test]
+    fn trust_state_loader_refuses_oversized_file_before_parse() {
+        use std::os::unix::fs::PermissionsExt;
+        let test_dir = std::env::temp_dir().join(format!(
+            "rustynet-truststate-oversize-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
+        let path = test_dir.join("trust.state");
+        // Junk bytes are fine here: the size bound fires DURING the read,
+        // before the parser runs. Under a disabled bound the same file
+        // parses to InvalidFormat instead of Corrupt, so the assertion
+        // genuinely pins the bound.
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).expect("oversized state written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("permissions should be set");
+
+        let err = load_trust_state(&path).expect_err("oversized state must be rejected");
+        assert!(
+            matches!(err, super::TrustStateError::Corrupt),
+            "unexpected error: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn trust_state_mac_key_loader_refuses_oversized_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let test_dir =
+            std::env::temp_dir().join(format!("rustynet-mackey-oversize-{}", std::process::id()));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be creatable");
+        let path = test_dir.join("trust.state.integrity.key");
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).expect("oversized key file written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("permissions should be set");
+
+        let err = super::load_trust_state_mac_key(&path)
+            .expect_err("oversized integrity key must be rejected");
+        assert!(
+            matches!(err, super::TrustStateError::KeyUnavailable),
+            "unexpected error: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 
     #[test]

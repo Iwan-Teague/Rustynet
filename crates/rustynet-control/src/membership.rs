@@ -1549,7 +1549,10 @@ pub fn load_membership_watermark(path: &Path) -> Result<Option<MembershipWaterma
     if !path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    const MAX_WATERMARK_FILE_BYTES: usize = 4 * 1024;
+    let content =
+        read_membership_artifact_bounded(path, "membership watermark", MAX_WATERMARK_FILE_BYTES)
+            .map_err(|err| err.to_string())?;
     let mut version: Option<u8> = None;
     let mut epoch: Option<u64> = None;
     let mut state_root: Option<String> = None;
@@ -6012,6 +6015,20 @@ mod tests {
         .expect("write watermark");
         let err = load_membership_watermark(&path).expect_err("duplicate epoch must be rejected");
         assert!(err.contains("duplicate"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn watermark_loader_refuses_oversized_file_before_parse() {
+        let temp_dir = watermark_test_dir("oversize");
+        let path = temp_dir.join("watermark");
+        std::fs::write(&path, vec![b'x'; 4 * 1024 + 1]).expect("write oversized watermark");
+        let err =
+            load_membership_watermark(&path).expect_err("oversized watermark must be rejected");
+        assert!(
+            err.contains("exceeds maximum size"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 

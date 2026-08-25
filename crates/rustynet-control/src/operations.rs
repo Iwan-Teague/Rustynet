@@ -383,7 +383,16 @@ impl TamperEvidentAuditLog {
     }
 
     pub fn restore_from_file(path: impl AsRef<Path>) -> Result<Self, OperationsError> {
-        let content = std::fs::read_to_string(path).map_err(|_| OperationsError::Io)?;
+        const MAX_RESTORE_FILE_BYTES: usize = 64 * 1024;
+        use std::io::Read;
+        let file = std::fs::File::open(path.as_ref()).map_err(|_| OperationsError::Io)?;
+        let mut content = String::new();
+        file.take(MAX_RESTORE_FILE_BYTES as u64 + 1)
+            .read_to_string(&mut content)
+            .map_err(|_| OperationsError::Io)?;
+        if content.len() > MAX_RESTORE_FILE_BYTES {
+            return Err(OperationsError::Io);
+        }
         let mut retention_days: Option<u32> = None;
         let mut entries = Vec::new();
         let mut digest: Option<String> = None;
@@ -484,6 +493,27 @@ mod tests {
 
         let err = TamperEvidentAuditLog::restore_from_file(&path).unwrap_err();
         assert!(matches!(err, OperationsError::InvalidFormat));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn restore_refuses_oversized_backup_before_parse() {
+        // The size bound fires DURING the read, before the parser runs.
+        // Under a disabled bound the same file parses to InvalidFormat
+        // instead of Io, so the assertion genuinely pins the bound.
+        let unique = format!(
+            "rustynet-ops-oversize-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let path = std::env::temp_dir().join(unique);
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+
+        let err = TamperEvidentAuditLog::restore_from_file(&path).unwrap_err();
+        assert!(matches!(err, OperationsError::Io));
         std::fs::remove_file(&path).unwrap();
     }
 
