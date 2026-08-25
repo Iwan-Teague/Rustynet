@@ -1275,6 +1275,119 @@ fn equality_hit_is_allowlisted(file_path_label: &str, line_content: &str) -> boo
         })
 }
 
+/// Strips the contents of double-quoted string literals from one source
+/// line, keeping the quote delimiters themselves so the line keeps its
+/// shape for later substring searches.
+///
+/// The equality scanner is a substring matcher: it flags a line when a
+/// forbidden identifier (`token`, `mac`, …) is followed by `==`/`!=`
+/// further along the SAME line. That shape also occurs inside plain
+/// string data — most commonly an assertion MESSAGE that quotes an
+/// expression ("token node_id == cap must be inside the bound") — where
+/// no comparison executes at all. Removing literal contents before the
+/// token search stops those false positives without weakening the
+/// audit: a genuine comparison site is code, not data, so its `==`/`!=`
+/// never lives inside a string literal on the scanned line.
+///
+/// Scope and limits (deliberate):
+/// - Per-line only. A literal left open at end-of-line swallows just the
+///   remainder of THAT line, so detection state can never leak across a
+///   line boundary and silence later findings — fail-closed by
+///   construction. Multi-line literals therefore keep the scanner's
+///   previous behaviour on their continuation lines.
+/// - Char literals are recognised only in their tight forms `'x'` and
+///   `'\x'`, so a `'"'` byte cannot open a phantom string; lifetime
+///   ticks (`'a`) fall through as ordinary characters.
+/// - Raw strings `r"…"`, `r#"…"#`, `br#"…"#` are honoured, but never
+///   when the prefix character continues an identifier.
+fn strip_string_literal_contents(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+    while i < n {
+        match chars[i] {
+            '"' => {
+                out.push('"');
+                i += 1;
+                while i < n {
+                    if chars[i] == '\\' {
+                        i = (i + 2).min(n);
+                        continue;
+                    }
+                    let c = chars[i];
+                    i += 1;
+                    if c == '"' {
+                        out.push('"');
+                        break;
+                    }
+                }
+            }
+            '\'' => {
+                let escape_form = i + 4 <= n && chars[i + 1] == '\\' && chars[i + 3] == '\'';
+                let plain_form = i + 3 <= n && chars[i + 1] != '\\' && chars[i + 2] == '\'';
+                if escape_form || plain_form {
+                    let end = if escape_form { i + 4 } else { i + 3 };
+                    while i < end {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                } else {
+                    // Lifetime tick or stray apostrophe: ordinary char.
+                    out.push('\'');
+                    i += 1;
+                }
+            }
+            c @ ('r' | 'b') => {
+                let prev_is_ident =
+                    i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+                let mut j = i + 1;
+                if c == 'b' && chars.get(j) != Some(&'r') {
+                    // Plain `b"…"` byte string: its quote is handled by the
+                    // normal-string arm on the next iteration.
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                if c == 'b' {
+                    j += 1;
+                }
+                let mut hashes = 0usize;
+                while chars.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if !prev_is_ident && chars.get(j) == Some(&'"') {
+                    // Raw string opener r" / r#" / br##" (hashes may be 0):
+                    // copy it verbatim, then skip to the closing sequence
+                    // (`"` followed by the same number of `#`).
+                    out.extend(&chars[i..=j]);
+                    i = j + 1;
+                    while i < n {
+                        if chars[i] == '"'
+                            && chars[i + 1..].len() >= hashes
+                            && chars[i + 1..].iter().take(hashes).all(|&h| h == '#')
+                        {
+                            out.push('"');
+                            i += 1 + hashes;
+                            break;
+                        }
+                        i += 1;
+                    }
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Pure scan helper: returns the line numbers + matched-token strings
 /// for any source line that compares a forbidden secret-bearing
 /// identifier with `==` or `!=` outside the canonical constant-time
@@ -1291,11 +1404,17 @@ pub(crate) fn scan_source_for_secret_material_equality(
         if trimmed.starts_with("//") || trimmed.starts_with("/*") {
             continue;
         }
+        // Equality that exists only INSIDE string data is not a compare
+        // site: strip literal contents first so assertion messages quoting
+        // an expression cannot be mistaken for one. The allowlist below is
+        // still matched against the ORIGINAL line because some reviewed
+        // anchors are themselves message-text snippets.
+        let code_only = strip_string_literal_contents(line);
         // `ct_eq` is the canonical constant-time helper used through-
         // out the workspace; its presence on the line means the
         // developer already routed the compare correctly even if a
         // forbidden token also appears in the same expression.
-        if line.contains("ct_eq") {
+        if code_only.contains("ct_eq") {
             continue;
         }
         for token in FORBIDDEN_SECRET_EQUALITY_TOKENS {
@@ -1303,10 +1422,10 @@ pub(crate) fn scan_source_for_secret_material_equality(
             // anywhere later on the same line. Substring matching is
             // intentional — the allowlist absorbs the known false-
             // positives (integer counter zero-checks, etc.).
-            let Some(pos) = line.find(token) else {
+            let Some(pos) = code_only.find(token) else {
                 continue;
             };
-            let rest = &line[pos + token.len()..];
+            let rest = &code_only[pos + token.len()..];
             if !(rest.contains("==") || rest.contains("!=")) {
                 continue;
             }
@@ -1454,6 +1573,88 @@ fn secret_equality_scanner_silent_on_unrelated_integer_compare() {
     assert!(
         hits.is_empty(),
         "unrelated integer compare must not be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn secret_equality_scanner_ignores_equality_inside_string_literals() {
+    // Regression pin for the relay/src/main.rs false positives at :3240 and
+    // :3249: an assert! MESSAGE quoting an expression ("token node_id == cap
+    // …") contains no comparison at all — the `==` is string data. The
+    // exact shape of those flagged lines must stay silent.
+    let body = concat!(
+        "            let err = parse_relay_hello(&hello_with_token_bytes(&token))\n",
+        "                .expect_err(\"truncated token body still fails\");\n",
+        "            assert!(\n",
+        "                !err.contains(\"exceeds maximum\"),\n",
+        "                \"token node_id == cap must be inside the bound; got: {err}\"\n",
+        "            );\n",
+        "            let err = parse_relay_hello(&hello_with_token_bytes(&token))\n",
+        "                .expect_err(\"cap + 1 must be rejected\");\n",
+        "            assert!(\n",
+        "                err.contains(\"token node_id length\") && err.contains(\"exceeds maximum\"),\n",
+        "                \"token node_id == cap + 1 must hit the bound; got: {err}\"\n",
+        "            );\n"
+    );
+    let hits = scan_source_for_secret_material_equality(body, "crates/rustynet-relay/src/main.rs");
+    assert!(
+        hits.is_empty(),
+        "equality quoted inside an assertion message must not be flagged: {hits:?}"
+    );
+
+    // Single-line form too: the whole compare living inside one string.
+    let one_line = r#"log_info("token == expected is only prose here");"#;
+    let hits_one_line =
+        scan_source_for_secret_material_equality(one_line, "crates/example/src/lib.rs");
+    assert!(
+        hits_one_line.is_empty(),
+        "an entire compare inside one string literal must not be flagged: {hits_one_line:?}"
+    );
+}
+
+#[test]
+fn secret_equality_scanner_still_flags_real_compare_beside_string_literal() {
+    // The stripping must not blind the audit: a GENUINE secret-vs-secret
+    // comparison on a line that ALSO carries string data is still caught,
+    // even when the string itself contains a forbidden identifier.
+    let body =
+        r#"reject_enrollment(&format!("bad token length {n}"), supplied_mac == expected_mac);"#;
+    let hits = scan_source_for_secret_material_equality(body, "crates/example/src/lib.rs");
+    assert!(
+        hits.iter().any(|(_, t)| t == "mac"),
+        "a real mac compare sharing its line with string data must still fire: {hits:?}"
+    );
+}
+
+#[test]
+fn secret_equality_scanner_survives_char_literals_and_raw_strings() {
+    // A `'"'` char literal must not open a phantom string that swallows the
+    // rest of the line and hides a genuine compare behind it…
+    let char_lit_line = r#"if chunk.first() == Some(&b'"') && supplied_nonce != expected_nonce {"#;
+    let hits_char =
+        scan_source_for_secret_material_equality(char_lit_line, "crates/example/src/lib.rs");
+    assert!(
+        hits_char.iter().any(|(_, t)| t == "nonce"),
+        "a real nonce compare after a '\"' char literal must still fire: {hits_char:?}"
+    );
+
+    // …and raw-string data (`r#"…"#`) must be stripped like any other
+    // literal while compares OUTSIDE it remain visible.
+    let raw_pair = concat!(
+        r##"const DOC: &str = r#"example: token == other_token is prose"#;"##,
+        "\n",
+        "if computed.signature != expected.signature { reject(); }",
+    );
+    let hits_raw = scan_source_for_secret_material_equality(raw_pair, "crates/example/src/lib.rs");
+    assert!(
+        hits_raw
+            .iter()
+            .any(|(line_no, t)| *line_no == 2 && t == "signature"),
+        "signature compare after a raw-string line must fire on line 2: {hits_raw:?}"
+    );
+    assert!(
+        !hits_raw.iter().any(|(line_no, _)| *line_no == 1),
+        "raw-string contents on line 1 must not be flagged: {hits_raw:?}"
     );
 }
 
