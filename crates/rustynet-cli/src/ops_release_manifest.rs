@@ -48,7 +48,8 @@ pub fn execute_ops_create_release_manifest(
     }
 
     let seed = read_seed_file(&signing_seed_file)?;
-    let manifest = build_signed_manifest(&release_track, generated_at_unix, &key_id, seed, entries);
+    let manifest = build_signed_manifest(&release_track, generated_at_unix, &key_id, seed, entries)
+        .map_err(|err| format!("build signed manifest: {err}"))?;
     let json = serde_json::to_string_pretty(&manifest)
         .map_err(|err| format!("serialize release manifest: {err}"))?;
 
