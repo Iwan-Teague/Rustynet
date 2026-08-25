@@ -1027,15 +1027,11 @@ fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> Hel
     };
 
     match run_privileged_subprocess(&binary, &request.args, timeout) {
-        Ok(output) => {
-            let status = exit_status_code(output.status);
-            // Clamp to the deliverable budget, not MAX_OUTPUT_BYTES: a larger
-            // truncation bound would produce a success response the codec
-            // refuses to encode (see RESPONSE_FIELD_BUDGET_BYTES).
-            let stdout = truncate_lossy(&output.stdout, RESPONSE_FIELD_BUDGET_BYTES);
-            let stderr = truncate_lossy(&output.stderr, RESPONSE_FIELD_BUDGET_BYTES);
-            HelperResponse::success(status, stdout, stderr)
-        }
+        Ok(output) => success_response_from_exec_output(
+            exit_status_code(output.status),
+            &output.stdout,
+            &output.stderr,
+        ),
         Err(err) => HelperResponse::error(format!(
             "{program} command execution failed ({}): {err}",
             binary.display(),
@@ -1565,12 +1561,34 @@ fn exit_status_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(-1)
 }
 
+/// The ONE construction site for exec-side success responses: captured raw
+/// subprocess streams are clamped to the deliverable field budget here, so
+/// every response this helper emits for a command that ran encodes and fits
+/// one frame. The deliverability pins call THIS function rather than
+/// re-implementing the construction, so a reverted clamp fails them.
+#[cfg(not(windows))]
+fn success_response_from_exec_output(status: i32, stdout: &[u8], stderr: &[u8]) -> HelperResponse {
+    let stdout = truncate_lossy(stdout, RESPONSE_FIELD_BUDGET_BYTES);
+    let stderr = truncate_lossy(stderr, RESPONSE_FIELD_BUDGET_BYTES);
+    HelperResponse::success(status, stdout, stderr)
+}
+
 #[cfg(not(windows))]
 fn truncate_lossy(bytes: &[u8], max_bytes: usize) -> String {
-    if bytes.len() <= max_bytes {
-        return String::from_utf8_lossy(bytes).to_string();
+    // Bound the POST-conversion length, not the input: from_utf8_lossy
+    // replaces each isolated ill-formed byte with a 3-byte U+FFFD and a
+    // codepoint split by the cut adds its own replacement, so lossy output
+    // can exceed `max_bytes` even when the input did not. Every caller relies
+    // on the result fitting max_bytes + marker in ONE response field.
+    let mut out = String::from_utf8_lossy(bytes).to_string();
+    if out.len() <= max_bytes {
+        return out;
     }
-    let mut out = String::from_utf8_lossy(&bytes[..max_bytes]).to_string();
+    let mut cut = max_bytes;
+    while !out.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    out.truncate(cut);
     out.push_str("...[truncated]");
     out
 }
@@ -4270,17 +4288,66 @@ mod tests {
 
     #[test]
     fn success_response_from_full_budget_exec_output_is_always_deliverable() {
-        // Mirrors handle_request_with_timeout's construction: raw subprocess
-        // streams up to MAX_OUTPUT_BYTES are clamped at
-        // RESPONSE_FIELD_BUDGET_BYTES before HelperResponse::success. Both
-        // fields populated at the cap is the wire-cost worst case.
+        // Exercises the PRODUCTION construction site
+        // success_response_from_exec_output with raw subprocess streams at the
+        // MAX_OUTPUT_BYTES capture bound; both fields populated at the cap is
+        // the wire-cost worst case.
         let huge = vec![b'x'; super::MAX_OUTPUT_BYTES];
-        let stdout = super::truncate_lossy(&huge, super::RESPONSE_FIELD_BUDGET_BYTES);
-        let stderr = super::truncate_lossy(&huge, super::RESPONSE_FIELD_BUDGET_BYTES);
+        let response = super::success_response_from_exec_output(0, &huge, &huge);
+        let stdout = response
+            .stdout
+            .as_deref()
+            .expect("success stdout populated");
         assert_eq!(stdout.len(), super::RESPONSE_FIELD_BUDGET_BYTES + 14);
-        let response = HelperResponse::success(0, stdout, stderr);
         let encoded = super::encode_helper_response(&response)
             .expect("an exec-side-truncated success response must always encode");
+        assert!(
+            encoded.len() <= MAX_MESSAGE_BYTES,
+            "encoded response {} exceeds one frame ({MAX_MESSAGE_BYTES})",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_exec_output_cannot_break_response_deliverability() {
+        // Subprocess streams are raw bytes. String::from_utf8_lossy replaces
+        // EACH isolated ill-formed byte with one 3-byte U+FFFD, so lossy
+        // conversion can EXPAND the captured bytes up to 3x -- the pre-marker
+        // byte clamp only bounds what goes IN, so the POST-conversion length
+        // must be re-bounded too or the field blows past both the encoder's
+        // per-field cap and the frame.
+        let binary_noise = vec![0x80u8; super::MAX_OUTPUT_BYTES];
+        let response = super::success_response_from_exec_output(0, &binary_noise, &binary_noise);
+        let encoded = super::encode_helper_response(&response)
+            .expect("an invalid-UTF-8-truncated success response must always encode");
+        assert!(encoded.len() <= MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn short_invalid_utf8_output_cannot_break_response_deliverability() {
+        // Output SHORTER than the budget used to take truncate_lossy's
+        // no-marker branch -- which applied NO cap at all -- so a sub-budget
+        // run of ill-formed bytes still expanded up to 3x; it must stay
+        // deliverable through the production construction site.
+        let binary_noise = vec![0x80u8; super::RESPONSE_FIELD_BUDGET_BYTES - 171];
+        let response = super::success_response_from_exec_output(0, &binary_noise, &[]);
+        let encoded = super::encode_helper_response(&response)
+            .expect("a short-invalid-UTF-8 success response must always encode");
+        assert!(encoded.len() <= MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn multibyte_boundary_split_cannot_break_response_deliverability() {
+        // Purely VALID UTF-8 cut mid-codepoint: the orphaned lead byte becomes
+        // a 3-byte U+FFFD replacing 1 byte (+2), so the naive budget+marker
+        // bound is exceeded by 2 per field and two populated fields overflow
+        // the FRAME (16387 > 16384) while each field still passes its own cap.
+        let mut multibyte = vec![b'a'; super::RESPONSE_FIELD_BUDGET_BYTES - 1];
+        multibyte.extend_from_slice("😀".as_bytes());
+        multibyte.extend_from_slice(&[b'a'; 100]);
+        let response = super::success_response_from_exec_output(0, &multibyte, &multibyte);
+        let encoded = super::encode_helper_response(&response)
+            .expect("a boundary-split success response must always encode");
         assert!(
             encoded.len() <= MAX_MESSAGE_BYTES,
             "encoded response {} exceeds one frame ({MAX_MESSAGE_BYTES})",
@@ -4329,11 +4396,9 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("client read timeout should be set");
 
-        let stdout = super::truncate_lossy(
-            &vec![b'y'; super::MAX_OUTPUT_BYTES],
-            super::RESPONSE_FIELD_BUDGET_BYTES,
-        );
-        let response = HelperResponse::success(0, stdout.clone(), String::new());
+        let huge = vec![b'y'; super::MAX_OUTPUT_BYTES];
+        let response = super::success_response_from_exec_output(0, &huge, &[]);
+        let expected_stdout = response.stdout.clone().expect("success stdout populated");
 
         let server = std::thread::spawn(move || {
             write_response(&mut server_stream, response).expect("response must be writable")
@@ -4341,7 +4406,7 @@ mod tests {
         let decoded = read_response_frame(&mut client_stream).expect("response frame must decode");
         server.join().expect("server thread should join cleanly");
         assert_eq!(decoded.status, Some(0));
-        assert_eq!(decoded.stdout.as_deref(), Some(stdout.as_str()));
+        assert_eq!(decoded.stdout.as_deref(), Some(expected_stdout.as_str()));
     }
 
     #[test]
