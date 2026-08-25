@@ -2303,6 +2303,36 @@ mod tests {
         );
     }
 
+    /// Cross-key rejection: a signature made under key A must never
+    /// verify under an unrelated key B — a verifier that accepted it
+    /// would break identity binding entirely.
+    #[test]
+    fn verification_rejects_signature_from_wrong_key() {
+        let signer = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::LocalEncryptedFile,
+            "cross-key-signer",
+            [11u8; 32],
+        );
+        let other = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::LocalEncryptedFile,
+            "cross-key-other",
+            [22u8; 32],
+        );
+        let signature = signer
+            .sign_attestation(b"payload")
+            .expect("signing succeeds");
+        assert_ne!(
+            signer.verifying_key_hex(),
+            other.verifying_key_hex(),
+            "test keys must be distinct for this pin to mean anything"
+        );
+        assert_eq!(
+            other.verify_attestation(b"payload", &signature),
+            Err(CryptoError::AttestationVerificationFailed),
+            "signature from a different key must be rejected"
+        );
+    }
+
     #[test]
     fn rejects_zero_key_material() {
         let result = NodeKeyPair::from_raw([0; 32], [0; 32]);
