@@ -476,6 +476,19 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_an_empty_pinned_key_even_when_the_manifest_claims_it() {
+        let mut m = signed();
+        // A crafted manifest with an empty verifier key must not combine
+        // with an equally-empty pin to slip past the pin-equality check:
+        // the key decode step still has to fail closed.
+        m.verifier_key_hex = String::new();
+        let err = m
+            .verify_signed_with_pinned_key("")
+            .expect_err("an empty pinned key must be rejected as malformed");
+        assert_eq!(err, ManifestError::MalformedVerifierKey);
+    }
+
+    #[test]
     fn verify_rejects_tampered_signature() {
         let mut m = signed();
         // Flip the last signature nibble.
