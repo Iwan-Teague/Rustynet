@@ -60,6 +60,11 @@ restores cannot destroy uncommitted work).
   while every consumer of control-issued ACL bundles re-checks membership at
   apply time; a future consumer that trusts the bundle alone would make the
   leniency live.
+- Post-analysis gating: `scripts/ci/membership_gates.sh` runs green on this
+  branch (clippy -D warnings on rustynet-control, targeted membership +
+  policy-coupling tests, phase10 report generated and schema-verified with
+  status=pass) — the adjacent control crate is now gated here too, not just
+  analysed.
 
 ## Defects fixed
 
