@@ -125,6 +125,15 @@ fn parse_artifact_spec(spec: &str) -> Result<(String, String, String), String> {
             "invalid --artifact '{spec}'; expected <name>:<target>:<path>"
         ));
     }
+    // canonical_payload delimits artifact records with newlines and their
+    // fields with tabs; a control character here would let one spec forge
+    // extra records or shift fields inside the signed payload.
+    let controlled = |s: &str| s.chars().any(|c| c == '\t' || c == '\n' || c == '\r');
+    if controlled(name) || controlled(target) || controlled(path) {
+        return Err(format!(
+            "invalid --artifact '{spec}'; tab/newline characters would corrupt the signed payload"
+        ));
+    }
     Ok((name.to_owned(), target.to_owned(), path.to_owned()))
 }
 
@@ -212,6 +221,21 @@ mod tests {
         // A trailing colon leaves an empty path: staging a binary from an
         // empty source string must not be expressible.
         assert!(parse_artifact_spec("rustynetd:x86_64-unknown-linux-gnu:").is_err());
+    }
+
+    #[test]
+    fn parse_artifact_spec_rejects_tab_and_newline_field_injection() {
+        // canonical_payload delimits records with \n and fields with \t;
+        // either character inside a field would let one --artifact spec
+        // forge extra signed records or shift payload fields.
+        assert!(
+            parse_artifact_spec("rustynetd\textra:x86_64:/p").is_err(),
+            "tab in name must be rejected"
+        );
+        assert!(
+            parse_artifact_spec("rustynetd:x86_64\nextra:evil:/p").is_err(),
+            "mid-field newline in target must be rejected"
+        );
     }
 
     #[test]
