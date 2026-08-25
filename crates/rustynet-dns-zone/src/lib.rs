@@ -542,6 +542,18 @@ fn canonicalize_dns_zone_records(
         }
         let label = canonicalize_dns_relative_name(record.label.as_str())?;
         let fqdn = format!("{label}.{zone_name}");
+        // The wire parser enforces the 253-byte bound on the ASSEMBLED fqdn
+        // (canonicalize_dns_zone_fqdn); enforce it here too. The label and
+        // zone-name bounds are per-part, so their assembly could otherwise
+        // exceed the parser's limit and the builder would mint a signed
+        // bundle its own verifier refuses — a failure that surfaces only
+        // after signing and distribution, far from the operator's input.
+        if fqdn.len() > 253 {
+            return Err(DnsZoneError::InvalidFormat(format!(
+                "dns record fqdn exceeds maximum length ({} > 253)",
+                fqdn.len()
+            )));
+        }
         if !seen_names.insert(fqdn.clone()) {
             return Err(DnsZoneError::InvalidFormat(
                 "duplicate dns record name".to_owned(),
@@ -572,6 +584,15 @@ fn canonicalize_dns_zone_records(
         }
         for alias in &aliases {
             let alias_fqdn = format!("{alias}.{zone_name}");
+            // Same assembled-name bound the parser enforces in `parse_aliases`;
+            // see the fqdn check above for why it belongs on the build side too.
+            if alias_fqdn.len() > 253 {
+                return Err(DnsZoneError::InvalidFormat(format!(
+                    "record {} alias exceeds maximum fqdn length ({} > 253)",
+                    canonical_records.len(),
+                    alias_fqdn.len()
+                )));
+            }
             if !seen_names.insert(alias_fqdn) {
                 return Err(DnsZoneError::InvalidFormat(
                     "dns alias collides with another record".to_owned(),
@@ -1263,6 +1284,151 @@ mod tests {
             dns_zone_payload_digest(&bundle),
             dns_zone_payload_digest(&bundle)
         );
+    }
+
+    /// Builder/verifier contract gap: the WIRE PARSER enforces the 253-byte
+    /// bound on the fully-assembled FQDN (`canonicalize_dns_zone_fqdn`), but
+    /// the BUILDER validated only the relative label (`<=253`) and the zone
+    /// name (`<=64`) separately — never their assembly. A record whose parts
+    /// are individually legal could therefore be SIGNED and DISTRIBUTED, and
+    /// only then rejected by every peer's parser: the zone never applies and
+    /// the failure surfaces far from the operator's input point. The builder
+    /// must enforce the same assembled-name contract it will later verify
+    /// against.
+    #[test]
+    fn build_bundle_rejects_record_fqdn_exceeding_parser_bound() {
+        // Four DNS-legal labels: relative name 247 bytes (< 253, accepted by
+        // the label canonicalizer), but fqdn = 247 + 1 + 8 = 256 bytes, which
+        // is exactly the shape the parser refuses.
+        let long_label = [
+            "a".repeat(61),
+            "b".repeat(61),
+            "c".repeat(61),
+            "d".repeat(61),
+        ]
+        .join(".");
+        assert_eq!(long_label.len(), 247);
+        let err = build_signed_dns_zone_bundle(
+            &SigningKey::from_bytes(&[11u8; 32]),
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &[DnsZoneRecordInput {
+                label: long_label,
+                target_node_id: "node-nas-1".to_owned(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.68.1.10".to_owned(),
+                ttl_secs: 60,
+                aliases: vec![],
+            }],
+        )
+        .expect_err("a record whose assembled fqdn exceeds 253 bytes must not build");
+        match err {
+            super::DnsZoneError::InvalidFormat(reason) => {
+                assert!(
+                    reason.contains("exceeds maximum"),
+                    "rejection must cite the fqdn length bound: {reason}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+
+        // Boundary control: the longest label assembly that still fits the
+        // assembled bound (244 + 1 + 8 = 253) must remain buildable, so the
+        // check narrows exactly at the parser's limit and not below it.
+        let boundary_label = [
+            "e".repeat(61),
+            "f".repeat(61),
+            "g".repeat(61),
+            "h".repeat(58),
+        ]
+        .join(".");
+        assert_eq!(boundary_label.len(), 244);
+        let bundle = build_signed_dns_zone_bundle(
+            &SigningKey::from_bytes(&[11u8; 32]),
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &[DnsZoneRecordInput {
+                label: boundary_label,
+                target_node_id: "node-nas-1".to_owned(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.68.1.10".to_owned(),
+                ttl_secs: 60,
+                aliases: vec![],
+            }],
+        )
+        .expect("an fqdn of exactly 253 bytes must still build");
+        assert_eq!(bundle.records[0].fqdn.len(), 253);
+    }
+
+    /// Alias half of the same gap: `parse_aliases` enforces
+    /// `alias.{zone_name}` <= 253 bytes on the wire, but the builder checked
+    /// only the relative alias name — a signed bundle carrying an over-long
+    /// alias fqdn was un-parseable by its own verifier.
+    #[test]
+    fn build_bundle_rejects_alias_fqdn_exceeding_parser_bound() {
+        let long_alias = [
+            "i".repeat(61),
+            "j".repeat(61),
+            "k".repeat(61),
+            "l".repeat(61),
+        ]
+        .join(".");
+        assert_eq!(long_alias.len(), 247);
+        let err = build_signed_dns_zone_bundle(
+            &SigningKey::from_bytes(&[12u8; 32]),
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &[DnsZoneRecordInput {
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.68.1.10".to_owned(),
+                ttl_secs: 60,
+                aliases: vec![long_alias],
+            }],
+        )
+        .expect_err("an alias whose assembled fqdn exceeds 253 bytes must not build");
+        match err {
+            super::DnsZoneError::InvalidFormat(reason) => {
+                assert!(
+                    reason.contains("alias exceeds maximum"),
+                    "rejection must cite the alias fqdn length bound: {reason}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+
+        // Control: a normal short alias still builds (positive path intact).
+        build_signed_dns_zone_bundle(
+            &SigningKey::from_bytes(&[12u8; 32]),
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &[DnsZoneRecordInput {
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.68.1.10".to_owned(),
+                ttl_secs: 60,
+                aliases: vec!["storage".to_owned()],
+            }],
+        )
+        .expect("a short alias must still build");
     }
 
     #[test]
