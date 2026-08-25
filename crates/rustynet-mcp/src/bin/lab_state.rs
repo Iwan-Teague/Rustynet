@@ -2613,15 +2613,24 @@ impl LabStateServer {
                         "| {} | {} | {} | {} |\n",
                         cols[0], cols[2], cols[3], cols[5]
                     ));
-                    // Resolve the log path (col 4): absolute, report-relative, or ./-prefixed.
+                    // Resolve the log path (col 4): absolute, report-relative, or
+                    // ./-prefixed. A planted TSV row must not turn this tool into
+                    // an arbitrary-file read, so every candidate is confined to
+                    // the repo root first (mirrors ai_agent's lab_stage_log,
+                    // which re-confines this exact surface).
                     let raw = cols[4];
                     for cand in [
                         PathBuf::from(raw),
                         report_dir.join(raw),
                         report_dir.join(raw.trim_start_matches("./")),
                     ] {
-                        if cand.is_file() && !matched_logs.iter().any(|m| m == &cand) {
-                            matched_logs.push(cand);
+                        let Ok(confined) =
+                            self.confined_repo_path(&cand.to_string_lossy(), "stage log")
+                        else {
+                            continue;
+                        };
+                        if confined.is_file() && !matched_logs.iter().any(|m| m == &confined) {
+                            matched_logs.push(confined);
                             break;
                         }
                     }
@@ -9445,6 +9454,285 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         );
         // And the underlying read primitive stays closed as well.
         assert!(srv.read_job_record("../secret").is_none());
+    }
+
+    #[test]
+    fn write_job_record_rejects_traversal_and_bad_charset() {
+        // The WRITE side must carry the same gate as the read side: an id that
+        // fails the charset check must never become a filename, or a planted id
+        // could place a record outside state/mcp-jobs/.
+        let tmp = TempRoot::new("mcp-jobid-write-gate");
+        let srv = test_server(&tmp);
+        let rec = json!({"job_id": "x"});
+        let long: String = "j".repeat(129);
+        for bad in [
+            "../evil",
+            "a/b",
+            "/abs",
+            "",
+            "a b",
+            "..\\win",
+            "jöb",
+            long.as_str(),
+        ] {
+            assert!(
+                srv.write_job_record(bad, &rec).is_err(),
+                "job_id {bad:?} must be rejected before any path is built"
+            );
+            assert!(
+                srv.read_job_record(bad).is_none(),
+                "{bad:?} must not resolve"
+            );
+        }
+        // A well-formed id still round-trips.
+        assert!(srv.write_job_record("ok-1_2", &rec).is_ok());
+        assert_eq!(
+            srv.read_job_record("ok-1_2")
+                .and_then(|r| r.get("job_id").and_then(|v| v.as_str()).map(String::from)),
+            Some("x".to_string())
+        );
+    }
+
+    #[test]
+    fn prune_jobs_never_deletes_via_planted_traversal_job_id() {
+        // A record PLANTED on disk whose job_id traverses ("../victim") must
+        // never drive a deletion: prune_jobs reads ids from records, so the
+        // charset gate has to apply to the recorded id, not just tool input.
+        let tmp = TempRoot::new("mcp-prune-planted-id");
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        // Victim ONE level above the jobs dir (tmp/state/) — exactly where a
+        // single "../victim" from inside state/mcp-jobs/ resolves.
+        std::fs::create_dir_all(tmp.join("state")).unwrap();
+        let victim = tmp.join("state/victim.json");
+        std::fs::write(&victim, "{}").unwrap();
+        let rd_p = tmp.join("rep-p");
+        std::fs::create_dir_all(rd_p.join("state")).unwrap();
+        std::fs::write(
+            rd_p.join("state/report_state.json"),
+            r#"{"run_complete":true,"run_passed":true}"#,
+        )
+        .unwrap();
+        let planted = json!({
+            "job_id": "../victim", "report_dir": rd_p.to_string_lossy(),
+            "pid": 0u64, "created_unix": 0,
+        });
+        std::fs::write(
+            srv.jobs_dir().join("p0.json"),
+            serde_json::to_string(&planted).unwrap(),
+        )
+        .unwrap();
+        // Control: a well-formed finished job that SHOULD be pruned.
+        let rd_c = tmp.join("rep-c");
+        std::fs::create_dir_all(rd_c.join("state")).unwrap();
+        std::fs::write(
+            rd_c.join("state/report_state.json"),
+            r#"{"run_complete":true,"run_passed":true}"#,
+        )
+        .unwrap();
+        let control = json!({
+            "job_id": "j0", "report_dir": rd_c.to_string_lossy(),
+            "pid": 0u64, "created_unix": 1,
+        });
+        std::fs::write(
+            srv.job_record_path("j0"),
+            serde_json::to_string(&control).unwrap(),
+        )
+        .unwrap();
+
+        srv.prune_jobs(Some(&json!({"keep": 0})));
+        assert!(
+            victim.exists(),
+            "planted traversal job_id must never drive an unlink of {}",
+            victim.display()
+        );
+        assert!(
+            !srv.job_record_path("j0").exists(),
+            "control record should have been pruned"
+        );
+    }
+
+    #[test]
+    fn prune_jobs_never_unlinks_log_path_outside_repo() {
+        // A planted/stale record may name a log OUTSIDE the repo; the prune
+        // unlink must confine log_path exactly like every other sink.
+        let tmp = TempRoot::new("mcp-prune-log-confine");
+        let outside = TempRoot::new("mcp-prune-log-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        let secret = outside.join("secret.log");
+        std::fs::write(&secret, "do not delete").unwrap();
+        let rd = tmp.join("rep0");
+        std::fs::create_dir_all(rd.join("state")).unwrap();
+        std::fs::write(
+            rd.join("state/report_state.json"),
+            r#"{"run_complete":true,"run_passed":true}"#,
+        )
+        .unwrap();
+        let rec = json!({
+            "job_id": "j0", "report_dir": rd.to_string_lossy(), "pid": 0u64,
+            "log_path": secret.to_string_lossy(), "created_unix": 0,
+        });
+        std::fs::write(
+            srv.job_record_path("j0"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+
+        srv.prune_jobs(Some(&json!({"keep": 0})));
+        assert!(
+            secret.exists(),
+            "out-of-repo log_path must never be unlinked via a job record ({})",
+            secret.display()
+        );
+        assert!(!srv.job_record_path("j0").exists());
+    }
+
+    #[test]
+    fn tail_job_log_refuses_log_path_outside_repo() {
+        // A planted record must not turn tail_job_log into an arbitrary-file
+        // read: the record's log_path is confined to the repo root first.
+        let tmp = TempRoot::new("mcp-tail-log-confine");
+        let outside = TempRoot::new("mcp-tail-log-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        let secret = outside.join("secret.log");
+        std::fs::write(&secret, "TOPSECRET-tail").unwrap();
+        let rec_bad = json!({
+            "job_id": "jb", "report_dir": tmp.join("rep").to_string_lossy(),
+            "pid": 0u64, "log_path": secret.to_string_lossy(), "created_unix": 0,
+        });
+        std::fs::write(
+            srv.job_record_path("jb"),
+            serde_json::to_string(&rec_bad).unwrap(),
+        )
+        .unwrap();
+        let res = srv.tail_job_log(Some(&json!({"job_id": "jb"})));
+        assert!(
+            res.is_error.is_some(),
+            "out-of-repo log_path must be refused"
+        );
+        assert!(
+            !res.content[0].text.contains("TOPSECRET-tail"),
+            "tail leaked an out-of-repo file: {}",
+            res.content[0].text
+        );
+
+        // Positive control: an in-repo log still tails fine.
+        std::fs::write(tmp.join("in.log"), "inside-ok").unwrap();
+        let rec_ok = json!({
+            "job_id": "jg", "report_dir": tmp.join("rep").to_string_lossy(),
+            "pid": 0u64, "log_path": tmp.join("in.log").to_string_lossy(),
+            "created_unix": 0,
+        });
+        std::fs::write(
+            srv.job_record_path("jg"),
+            serde_json::to_string(&rec_ok).unwrap(),
+        )
+        .unwrap();
+        let ok = srv.tail_job_log(Some(&json!({"job_id": "jg"})));
+        assert!(ok.is_error.is_none(), "in-repo tail must work: {ok:?}");
+        assert!(
+            ok.content[0].text.contains("inside-ok"),
+            "control log content missing: {}",
+            ok.content[0].text
+        );
+    }
+
+    #[test]
+    fn get_run_progress_does_not_render_out_of_repo_log_metadata_or_tail() {
+        // Same confinement standard as tail_job_log, at the get_run_progress
+        // sink: neither the metadata block (size/activity) nor the verbatim
+        // tail may be sourced from a path outside the repo root.
+        let tmp = TempRoot::new("mcp-prog-confine");
+        let outside = TempRoot::new("mcp-prog-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let report = tmp.join("rep");
+        std::fs::create_dir_all(report.join("logs")).unwrap();
+        std::fs::write(report.join("logs/x.log"), "stage out\n").unwrap();
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        let secret = outside.join("secret.log");
+        std::fs::write(&secret, "TOPSECRET-prog\n").unwrap();
+        let rec = json!({
+            "job_id":"p1","report_dir":report.to_string_lossy(),
+            "pid":999_999_999u64,"log_path":secret.to_string_lossy(),
+            "created_unix": now_unix().saturating_sub(7)
+        });
+        std::fs::write(
+            srv.job_record_path("p1"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+
+        let t = srv.get_run_progress(Some(&json!({"job_id":"p1"}))).content[0]
+            .text
+            .clone();
+        assert!(!t.contains("TOPSECRET-prog"), "leaked tail: {t}");
+        assert!(
+            !t.contains("log size"),
+            "out-of-repo log metadata must not render: {t}"
+        );
+
+        // Positive control: an in-repo log still feeds progress normally.
+        let good = tmp.join("p2.log");
+        std::fs::write(&good, "bootstrap ok\n").unwrap();
+        let rec2 = json!({
+            "job_id":"p2","report_dir":report.to_string_lossy(),
+            "pid":999_999_998u64,"log_path":good.to_string_lossy(),
+            "created_unix": now_unix().saturating_sub(7)
+        });
+        std::fs::write(
+            srv.job_record_path("p2"),
+            serde_json::to_string(&rec2).unwrap(),
+        )
+        .unwrap();
+        let t2 = srv.get_run_progress(Some(&json!({"job_id":"p2"}))).content[0]
+            .text
+            .clone();
+        assert!(
+            t2.contains("Latest log lines") && t2.contains("bootstrap ok"),
+            "control in-repo log missing from progress: {t2}"
+        );
+    }
+
+    #[test]
+    fn get_stage_log_confines_stages_tsv_log_paths_to_repo_root() {
+        // stages.tsv col 4 may name an absolute path; a planted TSV row must
+        // not turn get_stage_log into an arbitrary-file read (the sibling
+        // ai_agent lab_stage_log already re-confines this exact surface).
+        let tmp = TempRoot::new("mcp-stage-log-confine");
+        let outside = TempRoot::new("mcp-stage-log-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let report = tmp.join("rep");
+        std::fs::create_dir_all(report.join("state")).unwrap();
+        let secret = outside.join("secret.log");
+        std::fs::write(&secret, "TOPSECRET-stage").unwrap();
+        std::fs::write(report.join("state/anchor.log"), "inside-anchor-ok").unwrap();
+        let tsv = format!(
+            "anchor\t-\tpass\t0\t{}\tdesc\nanchor\t-\tpass\t0\tstate/anchor.log\tdesc\n",
+            secret.to_string_lossy()
+        );
+        std::fs::write(report.join("state/stages.tsv"), tsv).unwrap();
+
+        let srv = test_server(&tmp);
+        let t = srv
+            .get_stage_log(Some(
+                &json!({"report_dir": report.to_string_lossy(), "stage": "anchor"}),
+            ))
+            .content[0]
+            .text
+            .clone();
+        assert!(
+            !t.contains("TOPSECRET-stage"),
+            "leaked out-of-repo stage log: {t}"
+        );
+        assert!(
+            t.contains("inside-anchor-ok"),
+            "control in-report stage log must still render: {t}"
+        );
     }
 
     #[test]
