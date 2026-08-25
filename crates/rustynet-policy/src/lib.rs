@@ -838,6 +838,29 @@ mod tests {
         );
     }
 
+    /// Mirror of `gate_passing_empty_set_still_denies_at_the_terminal` for
+    /// the contextual engine: resolvable selectors pass the gate, so the
+    /// empty rule set itself must produce the terminal deny.
+    #[test]
+    fn contextual_gate_passing_empty_set_still_denies_at_the_terminal() {
+        let empty = ContextualPolicySet::default();
+        assert!(empty.rules.is_empty());
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("a", MembershipStatus::Active);
+        membership.set_node_status("b", MembershipStatus::Active);
+        let request = ContextualAccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::Mesh,
+        };
+        assert_eq!(
+            empty.evaluate_with_membership(&request, &membership),
+            Decision::Deny,
+            "an empty contextual ACL denies even when the membership gate passes"
+        );
+    }
+
     #[test]
     fn an_empty_membership_directory_denies_rather_than_skipping_the_check() {
         let membership = MembershipDirectory::default();
