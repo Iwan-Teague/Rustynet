@@ -1048,19 +1048,34 @@ pub fn persist_trust_state(
     state: &TrustState,
 ) -> Result<(), TrustStateError> {
     let path = path.as_ref();
-    // Fail closed on a degenerate trust state BEFORE any IO: the signing
-    // fingerprint is the pinned identity `authorize_trusted_key` compares
-    // against, and a stored empty value would authorize a caller presenting
-    // an empty fingerprint (`ct_eq("", "") == 1`). The reader enforces the
-    // same shape so hand-written or legacy files cannot resurrect the
-    // fail-open form.
-    if state.signing_fingerprint.trim().is_empty() {
+    // Fail closed on a degenerate or format-breaking trust state BEFORE any
+    // IO: the signing fingerprint is the pinned identity `authorize_trusted_key`
+    // compares against, and a stored empty value would authorize a caller
+    // presenting an empty fingerprint (`ct_eq("", "") == 1`). A fingerprint
+    // containing '\n' or '\r' is refused as well: the payload is
+    // line-oriented, so such a value would inject additional parsed fields
+    // into the SIGNED payload, and the reader's last-wins field parse would
+    // then load different generation/version semantics than the caller asked
+    // to store — under a validly computed MAC. The reader enforces the empty
+    // shape too, so hand-written or legacy files cannot resurrect these forms.
+    if state.signing_fingerprint.trim().is_empty()
+        || state.signing_fingerprint.contains('\n')
+        || state.signing_fingerprint.contains('\r')
+    {
+        return Err(TrustStateError::InvalidFormat);
+    }
+    // Keep the writer symmetric with the loader's MAX_TRUST_STATE_FILE_BYTES
+    // read bound: persisting an oversized state would write a file the loader
+    // unconditionally rejects as Corrupt, silently bricking the trust gate at
+    // the next load. The bound covers the full body including the trailing
+    // mac line.
+    let payload = trust_state_payload(state);
+    if payload.len() + TRUST_STATE_MAC_LINE_OVERHEAD_BYTES > MAX_TRUST_STATE_FILE_BYTES {
         return Err(TrustStateError::InvalidFormat);
     }
     ensure_secure_parent_directory(path)?;
     let key_path = trust_state_key_path(path);
     let key = load_or_create_trust_state_mac_key(&key_path)?;
-    let payload = trust_state_payload(state);
     let mac = compute_trust_state_mac(payload.as_bytes(), &key)?;
     let body = format!("{payload}mac={mac}\n");
     atomic_write_secure(path, body.as_bytes(), 0o600)?;
@@ -1072,6 +1087,12 @@ pub fn persist_trust_state(
 /// during read via `Read::take` so tampered or oversized disk state cannot
 /// drive allocation proportional to file size before the parser rejects it.
 const MAX_TRUST_STATE_FILE_BYTES: usize = 64 * 1024;
+
+/// Fixed size of the trailing `mac=<64-hex>\n` line appended to every
+/// trust-state body (HMAC-SHA256 renders as exactly 64 hex chars); part of
+/// the writer's symmetry bound against the loader's
+/// `MAX_TRUST_STATE_FILE_BYTES`.
+const TRUST_STATE_MAC_LINE_OVERHEAD_BYTES: usize = 4 + 64 + 1;
 
 fn read_trust_file_bounded(path: &Path, label: &str) -> Result<String, TrustStateError> {
     use std::io::Read;
@@ -4522,15 +4543,15 @@ mod tests {
         CredentialError, DnsRecordRequest, DnsRecordType, DnsTargetAddrKind,
         ENDPOINT_HINT_SIGNING_SEED_INFO_V1, EndpointHintBundleRequest, EndpointHintCandidate,
         EndpointHintCandidateType, EnrollmentRequest, LockoutConfig,
-        MAX_RELAY_SESSION_TOKEN_TTL_SECS, PolicyCheckRequest, PolicyDecision, PolicyGuard,
-        RELAY_TOKEN_SCOPE, RelayFleetBundleRequest, RelayFleetNodeDescriptor, RelaySessionToken,
-        RelaySessionTokenRequest, ReplayPolicy, ReusableCredentialPolicy,
-        ReusableCredentialRequest, RoleCapability, SignedAutoTunnelBundle,
-        SignedDnsZoneBundleRequest, SignedTokenClaims, ThrowawayCredentialState,
-        ThrowawayCredentialStore, TokenClaims, TransportPolicyError, TraversalCoordinationRecord,
-        TrustState, auto_tunnel_payload_field_matches, canonical_relay_id_from_label,
-        derive_endpoint_hint_signing_key, derive_gossip_signing_key, derive_signing_seed,
-        hex_bytes, load_trust_state, parse_relay_session_token_wire,
+        MAX_RELAY_SESSION_TOKEN_TTL_SECS, MAX_TRUST_STATE_FILE_BYTES, PolicyCheckRequest,
+        PolicyDecision, PolicyGuard, RELAY_TOKEN_SCOPE, RelayFleetBundleRequest,
+        RelayFleetNodeDescriptor, RelaySessionToken, RelaySessionTokenRequest, ReplayPolicy,
+        ReusableCredentialPolicy, ReusableCredentialRequest, RoleCapability,
+        SignedAutoTunnelBundle, SignedDnsZoneBundleRequest, SignedTokenClaims,
+        ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
+        TraversalCoordinationRecord, TrustState, auto_tunnel_payload_field_matches,
+        canonical_relay_id_from_label, derive_endpoint_hint_signing_key, derive_gossip_signing_key,
+        derive_signing_seed, hex_bytes, load_trust_state, parse_relay_session_token_wire,
         parse_signed_relay_fleet_bundle_wire, persist_trust_state, relay_session_token_to_wire,
     };
     use ed25519_dalek::SigningKey;
@@ -4861,6 +4882,51 @@ mod tests {
                 "unexpected error for {bad_fingerprint:?}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn trust_state_persist_rejects_line_breaking_signing_fingerprint() {
+        // A fingerprint containing a line break would inject additional
+        // parsed fields into the signed payload: the loader's last-wins field
+        // parse then loads DIFFERENT generation/version values than the
+        // caller asked to store, all under a validly computed MAC (verified
+        // adversarially: persisting generation=7 with fingerprint
+        // "ed25519:x\ngeneration=0" produced a file that loaded back as
+        // generation=0). The writer must refuse the shape before any IO.
+        for bad_fingerprint in [
+            "ed25519:x\ngeneration=0",
+            "ed25519:x\r\nversion=3",
+            "line1\nline2",
+        ] {
+            let state = TrustState {
+                generation: 7,
+                signing_fingerprint: bad_fingerprint.to_owned(),
+                updated_at_unix: 1000,
+            };
+            let err = persist_trust_state(std::env::temp_dir().join("unused-trust.state"), &state)
+                .expect_err("format-breaking fingerprint must be refused at the writer");
+            assert!(
+                matches!(err, super::TrustStateError::InvalidFormat),
+                "unexpected error for {bad_fingerprint:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_state_persist_rejects_state_over_loader_file_bound() {
+        // Symmetry with the loader's MAX_TRUST_STATE_FILE_BYTES read bound:
+        // an oversized fingerprint would persist a file the loader can never
+        // accept, silently bricking the trust gate at the next load. The
+        // writer must refuse it instead of writing unreadable state.
+        let oversized = "a".repeat(MAX_TRUST_STATE_FILE_BYTES);
+        let state = TrustState {
+            generation: 1,
+            signing_fingerprint: oversized,
+            updated_at_unix: 1,
+        };
+        let err = persist_trust_state(std::env::temp_dir().join("unused-trust.state"), &state)
+            .expect_err("state beyond the loader bound must not be written");
+        assert!(matches!(err, super::TrustStateError::InvalidFormat));
     }
 
     #[test]

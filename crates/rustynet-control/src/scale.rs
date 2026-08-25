@@ -318,6 +318,14 @@ pub fn disable_trust_hardening(
     config: &mut TrustHardeningConfig,
     submitted_break_glass_secret: &str,
 ) -> Result<(), TrustHardeningError> {
+    // Fail closed on a degenerate CONFIGURED secret (POL-03, same ct_eq
+    // family as the signing-fingerprint gate): `ct_eq("", "") == 1` would let
+    // any caller disable hardening by submitting an empty secret whenever the
+    // configuration itself was minted empty. An absent secret must never arm
+    // the OFF switch, regardless of what is submitted.
+    if config.break_glass_secret.trim().is_empty() {
+        return Err(TrustHardeningError::BreakGlassSecretInvalid);
+    }
     // RSA-0016: constant-time compare so the break-glass secret cannot be
     // recovered byte-by-byte via a timing oracle (a plain `!=` short-circuits on
     // the first differing byte). Mirrors admin.rs's CSRF-token compare. ct_eq on
@@ -724,6 +732,32 @@ mod tests {
         disable_trust_hardening(&mut config, "break-glass")
             .expect("valid break-glass should disable");
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn trust_hardening_disable_fails_closed_on_degenerate_configured_secret() {
+        // POL-03, sibling of the signing-fingerprint gate: a configured
+        // break-glass secret that is empty (or whitespace-only) made
+        // disable_trust_hardening succeed for ANY caller submitting ""
+        // because ct_eq("", "") == 1. An absent secret must never arm the
+        // OFF switch — hardening stays enabled whatever is submitted.
+        for secret in ["", "   ", "\t"] {
+            let mut config = TrustHardeningConfig {
+                enabled: true,
+                break_glass_secret: secret.to_owned(),
+            };
+            assert_eq!(
+                disable_trust_hardening(&mut config, "").err(),
+                Some(TrustHardeningError::BreakGlassSecretInvalid),
+                "empty submission vs degenerate configured secret {secret:?} must not disable"
+            );
+            assert_eq!(
+                disable_trust_hardening(&mut config, "guessed-or-not").err(),
+                Some(TrustHardeningError::BreakGlassSecretInvalid),
+                "non-empty submission vs degenerate configured secret {secret:?} must not disable"
+            );
+            assert!(config.enabled, "hardening must stay enabled for {secret:?}");
+        }
     }
 
     #[test]
