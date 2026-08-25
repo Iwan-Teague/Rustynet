@@ -240,6 +240,28 @@ fn load_at_rest_key(credential: Option<&str>, key_file: Option<&Path>) -> Result
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes);
+    // Content degeneracy gate (fail closed BEFORE any store init). A
+    // zero-filled or constant-byte 32-byte file passes every structural
+    // check above yet seals all NAS data under a publicly-known key —
+    // the typical result of a truncate-grown or placeholder key file.
+    // The upstream AEAD layer rejects the all-zero case too (defense in
+    // depth); this is the proper enforcement point because it names the
+    // misprovisioned FILE to the operator instead of surfacing as an
+    // opaque crypto error mid-seal.
+    if key.iter().all(|byte| *byte == 0) {
+        return Err(
+            "at-rest key content is entirely zero bytes (degenerate); refusing to encrypt \
+             under a publicly-known key — provision 32 random bytes"
+                .into(),
+        );
+    }
+    if key.iter().all(|byte| *byte == key[0]) {
+        return Err(
+            "at-rest key content is a single repeated byte (degenerate); refusing to encrypt \
+             under a guessable key — provision 32 random bytes"
+                .into(),
+        );
+    }
     Ok(key)
 }
 
@@ -472,14 +494,24 @@ mod tests {
         assert!(validate_tunnel_shaped_bind(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))).is_err());
     }
 
-    /// 32-byte 0600 key file at a unique temp path (std-only; the crate has
-    /// no tempfile dev-dependency).
-    fn write_key_file(tag: &str) -> PathBuf {
+    /// Deterministic non-degenerate 32-byte key (varied bytes; must pass
+    /// the constant-byte degeneracy gate).
+    fn valid_test_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(37).wrapping_add(0x11);
+        }
+        key
+    }
+
+    /// 32-byte 0600 key file at a unique temp path with arbitrary
+    /// contents (std-only; the crate has no tempfile dev-dependency).
+    fn write_key_file_with(tag: &str, contents: [u8; 32]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "rustynet-nas-test-key-{}-{tag}",
             std::process::id()
         ));
-        std::fs::write(&path, [0x42u8; 32]).expect("write key file");
+        std::fs::write(&path, contents).expect("write key file");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -487,6 +519,11 @@ mod tests {
                 .expect("chmod key file");
         }
         path
+    }
+
+    /// 32-byte 0600 key file holding a valid (non-degenerate) key.
+    fn write_key_file(tag: &str) -> PathBuf {
+        write_key_file_with(tag, valid_test_key())
     }
 
     #[test]
@@ -516,7 +553,7 @@ mod tests {
             config.access_dir,
             PathBuf::from("/var/lib/rustynet-nas/access")
         );
-        assert_eq!(config.key, [0x42u8; 32]);
+        assert_eq!(config.key, valid_test_key());
         let _ = std::fs::remove_file(&key);
     }
 
@@ -583,6 +620,90 @@ mod tests {
         let err = parse_and_validate_config_from(args(&["--bogus"]))
             .expect_err("unknown flag must refuse");
         assert_eq!(err, "unknown argument: --bogus");
+    }
+
+    // Adversarial content tests for `load_at_rest_key`: a structurally
+    // perfect (32 bytes, mode 0600) but degenerate key file must fail
+    // closed BEFORE any store init.
+    mod at_rest_key_content {
+        use super::super::load_at_rest_key;
+        use super::{valid_test_key, write_key_file_with};
+        use std::path::Path;
+
+        fn cleanup(path: &Path) {
+            let _ = std::fs::remove_file(path);
+        }
+
+        #[test]
+        fn rejects_zero_filled_key_file_fail_closed() {
+            let path = write_key_file_with("all-zero", [0u8; 32]);
+            let err =
+                load_at_rest_key(None, Some(&path)).expect_err("all-zero key must be refused");
+            assert!(
+                err.contains("zero bytes"),
+                "refusal must name the degenerate content, got: {err}"
+            );
+            // Error text carries no key material (static diagnostic only).
+            assert!(
+                !err.contains("0x00") && !err.contains(&format!("{:?}", [0u8; 32])),
+                "error must not echo key bytes: {err}"
+            );
+            cleanup(&path);
+        }
+
+        #[test]
+        fn rejects_constant_byte_key_file_fail_closed() {
+            let path = write_key_file_with("constant", [0x5Au8; 32]);
+            let err =
+                load_at_rest_key(None, Some(&path)).expect_err("constant-byte key must be refused");
+            assert!(
+                err.contains("repeated byte"),
+                "refusal must name the degenerate pattern, got: {err}"
+            );
+            cleanup(&path);
+        }
+
+        #[test]
+        fn accepts_near_zero_key_with_single_nonzero_byte() {
+            // One non-zero byte is not a constant-byte pattern; the
+            // gate rejects fully-degenerate keys only, mirroring the
+            // upstream AEAD WeakMaterial rule (all-zero only).
+            let mut near_zero = [0u8; 32];
+            near_zero[17] = 0x01;
+            let path = write_key_file_with("near-zero", near_zero);
+            let loaded =
+                load_at_rest_key(None, Some(&path)).expect("near-zero key must be accepted");
+            assert_eq!(loaded, near_zero);
+            cleanup(&path);
+        }
+
+        #[test]
+        fn accepts_varied_non_degenerate_key() {
+            let expected = valid_test_key();
+            let path = write_key_file_with("varied", expected);
+            let loaded = load_at_rest_key(None, Some(&path)).expect("valid key accepted");
+            assert_eq!(loaded, expected);
+            cleanup(&path);
+        }
+
+        #[test]
+        fn rejects_wrong_length_key_file_still_enforced() {
+            let path = std::env::temp_dir().join(format!(
+                "rustynet-nas-test-key-{}-short",
+                std::process::id()
+            ));
+            std::fs::write(&path, vec![0x11u8; 31]).expect("write short key file");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("chmod key file");
+            }
+            let err = load_at_rest_key(None, Some(&path))
+                .expect_err("wrong-length key file must stay refused");
+            assert!(err.contains("exactly 32 bytes"), "got: {err}");
+            cleanup(&path);
+        }
     }
 
     #[test]
