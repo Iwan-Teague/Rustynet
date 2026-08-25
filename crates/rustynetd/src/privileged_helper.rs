@@ -4464,37 +4464,58 @@ mod tests {
         // builtin output — the exact H2 regression this seam exists to close.
         // A naive revert is caught by dead_code (the fn would lose its only
         // non-test caller), but deleting the fn AND inlining the construction
-        // escapes every behavioral test silently. Audit the production source
-        // directly: outside the test module, `HelperResponse::success` must be
-        // constructed at exactly ONE site, and that site must be inside the
-        // clamping `success_response_from_exec_output`, with the builtin arm
-        // routing through `builtin_success_response`.
+        // escapes every behavioral test silently.
+        //
+        // This file interleaves production code with cfg-gated helpers before
+        // one large `mod tests`, so no textual "production section" split is
+        // reliable: an earlier revision split on a token that only matched its
+        // own source string and silently audited half of the test module,
+        // false-failing on any test-side mention. Audit the WHOLE file instead,
+        // with an explicit census of every allowed occurrence:
+        //   1 — the seam body's clamped construction (pinned positionally below)
+        //   1 — helper_frame_round_trips_request_and_response's construction
+        // Any NEW occurrence, production or test, shifts the census and fails
+        // here, forcing a conscious review. The census is text-based, so even
+        // a comment naming the constructor trips it; that over-trigger is the
+        // accepted cost of a tripwire that formatting cannot fool. Both needles
+        // are assembled from fragments so this audit's own source never
+        // contains them verbatim and cannot count itself.
         let source = include_str!("privileged_helper.rs");
-        let prod = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the file always has a pre-test section");
-        let seam = "fn success_response_from_exec_output";
-        let seam_start = prod
-            .find(seam)
-            .unwrap_or_else(|| panic!("{seam} must exist in the production section"));
-        let count = prod.matches("HelperResponse::success(").count();
+        let census_needle = ["HelperResponse", "::success("].concat();
+        let prod_site = ["HelperResponse", "::success(status, stdout, stderr)"].concat();
         assert_eq!(
-            count, 1,
-            "HelperResponse::success must be constructed at exactly one production \
-             site — an inline construction outside the clamp seam reintroduces the \
-             unbounded-builtin-output drop-the-connection bug"
+            source.matches(census_needle.as_str()).count(),
+            2,
+            "unexpected HelperResponse::success occurrence — review it and update \
+             this audit's census deliberately; an unreviewed construction outside \
+             the clamp seam reintroduces the unbounded-builtin-output \
+             drop-the-connection bug"
         );
-        let first_construction = prod
-            .find("HelperResponse::success(")
-            .expect("count 1 implies a match exists");
+        let seam = "fn success_response_from_exec_output";
+        let seam_start = source
+            .find(seam)
+            .unwrap_or_else(|| panic!("{seam} must exist"));
+        assert_eq!(
+            source.matches(prod_site.as_str()).count(),
+            1,
+            "the seam must construct HelperResponse::success exactly once, with \
+             the raw (status, stdout, stderr) arguments, so every exec-side and \
+             builtin response is clamped to the deliverability budget"
+        );
+        let prod_at = source
+            .find(prod_site.as_str())
+            .expect("count 1 implies a match");
+        let truncate_at = source
+            .find("fn truncate_lossy")
+            .unwrap_or_else(|| panic!("fn truncate_lossy must follow the seam"));
         assert!(
-            first_construction > seam_start,
+            prod_at > seam_start && prod_at < truncate_at,
             "the single HelperResponse::success construction must sit inside \
-             success_response_from_exec_output so every caller is clamped"
+             success_response_from_exec_output, between its signature and \
+             truncate_lossy, so every caller is clamped"
         );
         assert!(
-            prod.contains("Ok(output) => builtin_success_response(output),"),
+            source.contains("Ok(output) => builtin_success_response(output),"),
             "the builtin dispatch arm must route through builtin_success_response; \
              reverting it to inline construction bypasses the deliverability clamp"
         );
