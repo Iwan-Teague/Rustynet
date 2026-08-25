@@ -497,7 +497,20 @@ impl LabStateServer {
             "orchestration/failure_digest.json",
             "diagnostics/failure_digest.json",
         ] {
-            if let Ok(s) = std::fs::read_to_string(report_dir.join(cand))
+            // Do NOT follow a symlink out of the confined report dir. A
+            // planted `failure_digest.json -> /elsewhere/secret.json` would
+            // otherwise be read THROUGH and its stage/reason/message fields
+            // rendered into diagnose output — same walker-divergence class
+            // collect_files was closed for. `symlink_metadata` reports the
+            // link itself; a missing file also skips (read would fail).
+            let p = report_dir.join(cand);
+            if std::fs::symlink_metadata(&p)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            if let Ok(s) = std::fs::read_to_string(&p)
                 && let Ok(v) = serde_json::from_str(&s)
             {
                 return Some(v);
@@ -4025,7 +4038,17 @@ fn find_digest_recursive(dir: &Path, depth: usize) -> Option<Value> {
     }
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let p = entry.path();
-        if p.is_dir() {
+        // Do NOT follow symlinks — mirrors collect_files/collect_repo_files:
+        // `file_type()` reports the link itself, so a symlinked dir is not
+        // walked into and a symlink named failure_digest.json is not read
+        // through to an out-of-tree target.
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
             if let Some(v) = find_digest_recursive(&p, depth - 1) {
                 return Some(v);
             }
@@ -10301,6 +10324,80 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert!(
             !txt.contains("leak") && txt.contains("matches: 0"),
             "grep followed a planted symlink out of the report dir: {txt}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn find_failure_digest_never_reads_symlinked_out_of_repo_digests() {
+        // Companion to collect_files_does_not_follow_symlinks for the OTHER
+        // walker family on the same confined-report-dir surface:
+        // find_failure_digest reads four fixed candidate names directly and
+        // then recurses via find_digest_recursive, which used `p.is_dir()` —
+        // a resolving metadata read, so a planted symlinked dir was walked
+        // and a symlink named failure_digest.json was read THROUGH and its
+        // JSON fields (stage/reason/message) rendered into diagnose output.
+        // Same threat model as the grep_report pin: an attacker who can
+        // plant entries inside a report dir must not gain an arbitrary-file
+        // read through any consumer of it.
+        use std::os::unix::fs::symlink;
+
+        // 1. Leaf symlink at a fixed candidate name must not be read through.
+        let tmp = TempRoot::new("mcp-digest-leaf-symlink");
+        let outside = TempRoot::new("mcp-digest-outside");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("secret.json"),
+            r#"{"first_failure":{"stage":"LEAKSTAGE","message":"TOPSECRET-digest"}}"#,
+        )
+        .unwrap();
+        symlink(outside.join("secret.json"), tmp.join("failure_digest.json")).unwrap();
+
+        let srv = test_server(&tmp);
+        let digest = srv.find_failure_digest(&tmp);
+        assert!(
+            digest.is_none(),
+            "leaf-symlink candidate was followed out of the report dir: {digest:?}"
+        );
+
+        // 2. Symlinked DIRECTORY must not be walked into by the recursive
+        // fallback looking for failure_digest.json.
+        let tmp2 = TempRoot::new("mcp-digest-dir-symlink");
+        let outside2 = TempRoot::new("mcp-digest-outside2");
+        std::fs::create_dir_all(&tmp2).unwrap();
+        std::fs::create_dir_all(&outside2).unwrap();
+        std::fs::write(
+            outside2.join("failure_digest.json"),
+            r#"{"first_failure":{"stage":"LEAKSTAGE2","message":"TOPSECRET-digest2"}}"#,
+        )
+        .unwrap();
+        symlink(&outside2, tmp2.join("leakdir")).unwrap();
+
+        let srv2 = test_server(&tmp2);
+        let digest2 = srv2.find_failure_digest(&tmp2);
+        assert!(
+            digest2.is_none(),
+            "symlinked dir was walked into out of the report dir: {digest2:?}"
+        );
+
+        // Positive control: a REAL in-tree digest must still be found.
+        let tmp3 = TempRoot::new("mcp-digest-real");
+        std::fs::create_dir_all(tmp3.join("state")).unwrap();
+        std::fs::write(
+            tmp3.join("state/failure_digest.json"),
+            r#"{"first_failure":{"stage":"anchor"}}"#,
+        )
+        .unwrap();
+        let srv3 = test_server(&tmp3);
+        let real = srv3.find_failure_digest(&tmp3);
+        let found_stage = real
+            .as_ref()
+            .and_then(|d| d["first_failure"]["stage"].as_str());
+        assert_eq!(
+            found_stage,
+            Some("anchor"),
+            "legitimate in-tree digest must still be found: {real:?}"
         );
     }
 
