@@ -37,16 +37,19 @@ restores cannot destroy uncommitted work).
   (documented at the function), so removal was previously invisible to every
   behavioral test.
 
-## Watchlist (observed, deliberately not touched)
+## Watchlist (observed, analysed read-only)
 
-- `rustynet-control` `evaluate`-path (lib.rs:~3465): on an **empty** membership
-  directory the both-endpoints-Active requirement is skipped and issuance falls
-  back to plain default-deny ACL evaluation. Same *shape* as the removed RN-11
-  fail-open, but (a) it gates bundle issuance, downstream of the daemon's
-  independent provisioning gate, (b) it carries an explicit pre-membership
-  rationale, and (c) the crate adjoins the reverted mesh-status/L1c area this
-  campaign was told not to enter. Left for the owning reviewers; recorded so
-  the shape cannot be re-introduced silently elsewhere.
+- ~~`rustynet-control` `evaluate`-path (lib.rs:~3465)~~ **RESOLVED — not a
+  defect.** On an empty membership directory the both-endpoints-Active
+  requirement is skipped there, but the daemon's own provisioning gate
+  (`check_peer_membership_active`, `phase10.rs:6648`) maps every node in an
+  empty directory to `MembershipStatus::Unknown` → `MembershipNotFound`, so
+  RN-11's "empty directory denies peer provisioning" holds independently.
+  A bundle issued under the lenient path names nodes that cannot be
+  provisioned — inert end-to-end. Condition to remember: this stays safe only
+  while every consumer of control-issued ACL bundles re-checks membership at
+  apply time; a future consumer that trusts the bundle alone would make the
+  leniency live.
 
 ## Defects fixed
 
