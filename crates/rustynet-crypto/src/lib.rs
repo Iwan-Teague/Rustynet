@@ -1164,6 +1164,36 @@ impl fmt::Debug for Ed25519SigningProvider {
 }
 
 impl Ed25519SigningProvider {
+    /// Fallible constructor for PRODUCTION paths: rejects the degenerate
+    /// all-zero seed (the publicly-known Ed25519 identity a blank key file
+    /// would mint) with `WeakMaterial`, mirroring `NodeKeyPair::from_raw`.
+    /// The by-value seed copy is wiped on both success and rejection.
+    pub fn try_from_seed(
+        provider_kind: SigningProviderKind,
+        key_id: impl Into<String>,
+        mut seed: [u8; 32],
+    ) -> Result<Self, CryptoError> {
+        if is_all_zeros(&seed) {
+            seed.zeroize();
+            return Err(CryptoError::WeakMaterial);
+        }
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key();
+        // CRY-11: wipe our by-value copy of the seed. `SigningKey` zeroizes its
+        // own copy on drop (ed25519-dalek's `ZeroizeOnDrop`), but this parameter
+        // is a separate stack copy that otherwise outlives the call.
+        seed.zeroize();
+        Ok(Self {
+            provider_kind,
+            key_id: key_id.into(),
+            signing_key,
+            verifying_key,
+        })
+    }
+
+    /// Infallible TEST helper: derives the provider from any seed, including
+    /// degenerate all-zero material. Production paths must use
+    /// [`Self::try_from_seed`], which fails closed on a zero seed.
     pub fn from_seed(
         provider_kind: SigningProviderKind,
         key_id: impl Into<String>,
@@ -2300,6 +2330,33 @@ mod tests {
             provider.verify_attestation(b"x", &signature),
             Err(CryptoError::AttestationVerificationFailed),
             "empty-message signature must not verify over a different payload"
+        );
+    }
+
+    /// `try_from_seed` fails closed on the degenerate all-zero seed and
+    /// accepts any other 32-byte seed, yielding the same keys as the
+    /// infallible test helper.
+    #[test]
+    fn try_from_seed_rejects_zero_seed_and_matches_from_seed_otherwise() {
+        assert_eq!(
+            Ed25519SigningProvider::try_from_seed(
+                SigningProviderKind::LocalEncryptedFile,
+                "zero",
+                [0u8; 32],
+            )
+            .err(),
+            Some(CryptoError::WeakMaterial),
+            "all-zero seed must be rejected, not minted into a known key"
+        );
+
+        let seed = [9u8; 32];
+        let fallible = Ed25519SigningProvider::try_from_seed(SigningProviderKind::Kms, "ok", seed)
+            .expect("non-zero seed is accepted");
+        let infallible = Ed25519SigningProvider::from_seed(SigningProviderKind::Kms, "ok", seed);
+        assert_eq!(
+            fallible.verifying_key_hex(),
+            infallible.verifying_key_hex(),
+            "try_from_seed derives the same identity as from_seed"
         );
     }
 

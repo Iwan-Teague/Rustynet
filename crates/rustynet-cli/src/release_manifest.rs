@@ -136,8 +136,15 @@ pub fn build_signed_manifest(
         return Err(ManifestError::WeakSigningSeed);
     }
     sort_artifacts(&mut artifacts);
-    let provider =
-        Ed25519SigningProvider::from_seed(SigningProviderKind::LocalEncryptedFile, key_id, seed);
+    // Belt and braces: the boundary guard above catches a zero seed with a
+    // domain error; try_from_seed independently refuses to derive any
+    // degenerate key material, so signing cannot proceed on weak input.
+    let provider = Ed25519SigningProvider::try_from_seed(
+        SigningProviderKind::LocalEncryptedFile,
+        key_id,
+        seed,
+    )
+    .map_err(|_| ManifestError::WeakSigningSeed)?;
     let verifier_key_hex = provider.verifying_key_hex();
     let payload = canonical_payload(
         release_track,
