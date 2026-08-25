@@ -679,12 +679,21 @@ impl LabStateServer {
                         report_dir.join(raw),
                         report_dir.join(raw.trim_start_matches("./")),
                     ] {
-                        if cand.is_file() {
-                            match read_file_capped(&cand, 1_000_000) {
+                        // Confine every candidate before reading: a planted
+                        // stages.tsv col-4 value may be absolute or contain
+                        // `..`, and this sink must never become an arbitrary-
+                        // file read (same discipline as get_stage_log).
+                        let Ok(confined) =
+                            self.confined_repo_path(&cand.to_string_lossy(), "stage log")
+                        else {
+                            continue;
+                        };
+                        if confined.is_file() {
+                            match read_file_capped(&confined, 1_000_000) {
                                 Ok(content) => {
                                     out.push_str(&format!(
                                         "- **Log:** `{}`\n\n```\n{}\n```\n",
-                                        cand.display(),
+                                        confined.display(),
                                         truncate_tail(&content, 40, 16_000),
                                     ));
                                     found = true;
@@ -9728,6 +9737,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert!(
             !t.contains("TOPSECRET-stage"),
             "leaked out-of-repo stage log: {t}"
+        );
+        assert!(
+            t.contains("inside-anchor-ok"),
+            "control in-report stage log must still render: {t}"
+        );
+    }
+
+    #[test]
+    fn diagnose_profileless_stage_filter_confines_tsv_log_paths_to_repo_root() {
+        // Same class as get_stage_log_confines_stages_tsv_log_paths_to_repo_
+        // root, one sink later: diagnose_profileless_run's stage-filtered tail
+        // ALSO resolves stages.tsv col-4 candidates, so a planted absolute row
+        // must not turn it into an arbitrary-file read either.
+        let tmp = TempRoot::new("mcp-diag-log-confine");
+        let outside = TempRoot::new("mcp-diag-log-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.log");
+        std::fs::write(&secret, "TOPSECRET-diag").unwrap();
+        std::fs::create_dir_all(tmp.join("state")).unwrap();
+        std::fs::write(tmp.join("state/anchor.log"), "inside-anchor-ok").unwrap();
+        let tsv = format!(
+            "anchor\t-\tpass\t0\t{}\tdesc\nanchor\t-\tpass\t0\tstate/anchor.log\tdesc\n",
+            secret.to_string_lossy()
+        );
+        std::fs::write(tmp.join("state/stages.tsv"), tsv).unwrap();
+
+        let srv = test_server(&tmp);
+        let result = srv.diagnose_profileless_run(&tmp, Some("anchor"), false);
+        assert!(
+            result.is_error.is_none(),
+            "should succeed: {:?}",
+            result.content
+        );
+        let t = result.content[0].text.clone();
+        assert!(
+            !t.contains("TOPSECRET-diag"),
+            "diagnose rendered an out-of-repo stage log: {t}"
         );
         assert!(
             t.contains("inside-anchor-ok"),

@@ -922,8 +922,14 @@ impl AiAgentServer {
     /// finishes; its presence + contents let the poll path surface the OUTCOME of
     /// an orphaned run. Returns (overall_status, first_failed_stage).
     fn read_orchestrate_outcome(&self, report_dir: &str) -> Option<(String, Option<String>)> {
-        let path = self.repo_root.join(report_dir).join(ORCHESTRATE_RESULT_REL);
-        let body = std::fs::read_to_string(path).ok()?;
+        // The report_dir may come from a PLANTED job record; an absolute value
+        // would REPLACE repo_root in the join below. Confine the resolved
+        // artifact path under the repo root before any read (same standard as
+        // job_state_summary's "report dir escapes repo" and lab_state's
+        // confined_repo_path).
+        let canon =
+            self.confine_resolved(&self.repo_root.join(report_dir).join(ORCHESTRATE_RESULT_REL))?;
+        let body = std::fs::read_to_string(canon).ok()?;
         let v: Value = serde_json::from_str(&body).ok()?;
         let overall = v
             .get("overall_status")
@@ -10674,6 +10680,127 @@ mod tests {
             "edit poll rendered fields from {}: {}",
             decoy_path.display(),
             res.content[0].text
+        );
+    }
+
+    #[test]
+    fn write_job_record_never_places_a_record_outside_jobs_dir() {
+        // The WRITE-side gate is the one 229fa039 check that had no pin —
+        // reverting it left the whole suite green. A traversal job_id handed
+        // to write_job_record (e.g. reconcile writing back a planted record's
+        // id) must never become a filename outside state/deepseek-mcp-jobs/.
+        let tmp = TempRoot::new("agent-write-jobid-traversal");
+        let tmp = tmp.path();
+        let srv = server_rooted(tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        // One level ABOVE the jobs dir — exactly where "../escape" resolves.
+        std::fs::create_dir_all(tmp.join("state")).unwrap();
+
+        srv.write_job_record(
+            "../escape",
+            &json!({"job_id": "planted", "note": "WRITE-ESCAPED"}),
+        );
+        let stray: Vec<std::path::PathBuf> = std::fs::read_dir(tmp.join("state"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n != "deepseek-mcp-jobs")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "traversal job_id placed a record outside the jobs dir: {stray:?}"
+        );
+        // Charset edge cases likewise stay closed.
+        for bad in ["a/b", "", "..\\win", "/abs"] {
+            srv.write_job_record(bad, &json!({"job_id": "x"}));
+        }
+        let stray: Vec<std::path::PathBuf> = std::fs::read_dir(tmp.join("state"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n != "deepseek-mcp-jobs")
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "bad-charset ids placed files outside the jobs dir: {stray:?}"
+        );
+        // A well-formed id still round-trips into the jobs dir.
+        srv.write_job_record("ok-w1", &json!({"job_id": "ok-w1"}));
+        assert!(
+            srv.jobs_dir().join("ok-w1.json").exists(),
+            "valid id must still persist a record"
+        );
+    }
+
+    #[test]
+    fn live_lab_result_does_not_render_out_of_repo_orchestrate_artifacts() {
+        // The reload fallback feeds a PLANTED record's report_dir straight into
+        // read_orchestrate_outcome, which joined it as repo_root.join(dir) —
+        // an absolute report_dir REPLACES the base, so the poll could read (and
+        // render overall_status / first_failed from) an arbitrary
+        // orchestration/orchestrate_result.json. job_state_summary already
+        // confines this exact field ("report dir escapes repo"); the artifact
+        // read must meet the same standard.
+        let tmp = TempRoot::new("agent-reportdir-traversal");
+        let tmp = tmp.path();
+        let srv = server_rooted(tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        let outside = TempRoot::new("agent-reportdir-outside");
+        let outside = outside.path();
+        std::fs::create_dir_all(outside.join("orch/orchestration")).unwrap();
+        std::fs::write(
+            outside.join("orch/orchestration/orchestrate_result.json"),
+            r#"{"overall_status":"TOPSECRET-overall","outcomes":[{"stage":"TOPSECRET-stage","status":"fail"}]}"#,
+        )
+        .unwrap();
+
+        let rec = json!({
+            "job_id": "jr", "kind": "labrun", "state": "running",
+            "area": "probe", "report_dir": outside.join("orch").to_string_lossy(),
+        });
+        std::fs::write(
+            srv.job_record_path("jr"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+
+        let res = srv.call_live_lab_result(&json!({"job_id": "jr"}));
+        let text = res.content[0].text.clone();
+        assert!(
+            !text.contains("TOPSECRET-overall") && !text.contains("TOPSECRET-stage"),
+            "poll rendered fields from an out-of-repo orchestration artifact: {text}"
+        );
+
+        // Positive control: an in-repo completion artifact still reconciles.
+        let rep = tmp.join("rep");
+        std::fs::create_dir_all(rep.join("orchestration")).unwrap();
+        std::fs::write(
+            rep.join("orchestration/orchestrate_result.json"),
+            r#"{"overall_status":"pass","outcomes":[{"stage":"anchor","status":"pass"}]}"#,
+        )
+        .unwrap();
+        let rec_ok = json!({
+            "job_id": "jg", "kind": "labrun", "state": "running",
+            "area": "probe", "report_dir": rep.to_string_lossy(),
+        });
+        std::fs::write(
+            srv.job_record_path("jg"),
+            serde_json::to_string(&rec_ok).unwrap(),
+        )
+        .unwrap();
+        let ok = srv.call_live_lab_result(&json!({"job_id": "jg"}));
+        assert!(
+            ok.content[0].text.contains("pass"),
+            "in-repo artifact must still reconcile: {}",
+            ok.content[0].text
         );
     }
 }
