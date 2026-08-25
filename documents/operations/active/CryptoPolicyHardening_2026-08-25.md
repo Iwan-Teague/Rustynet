@@ -1,6 +1,6 @@
 # Crypto / Policy / Release-Manifest Security Hardening — 2026-08-25
 
-Status: **active** (branch `sec-hardening`, 20 commits, not yet merged).
+Status: **active** (branch `sec-hardening`, 24 commits, not yet merged).
 
 Scope: fail-closed hardening and mutation-tested coverage for the Ed25519
 signing path (`rustynet-crypto`), the ACL default-deny engine
@@ -9,6 +9,28 @@ signing path (`rustynet-crypto`), the ACL default-deny engine
 **mutation-tested**: the guard was neutralized in place, the pinning test
 was required to FAIL, then the guard restored (commit-first protocol so
 restores cannot destroy uncommitted work).
+
+## Later additions (post-ledger)
+
+- `5863e7d0`: pinned the installer-consumer arm — a parseable manifest whose
+  signature fails self-verification hard-fails staging (`failed
+  self-verification`), closing the one uncovered branch of the acquire
+  contract (corrupt JSON / tampered binary / no-manifest were already pinned).
+- Clippy `-D warnings` verified clean across all three touched crates.
+- Duplicate-rejection attempt in the rollout controller was **retracted before
+  commit**: `protocol_enumeration_no_longer_evades_the_allow_all_guard`
+  (policy lib.rs:847) is a strict superset of the proposed pin.
+
+## Watchlist (observed, deliberately not touched)
+
+- `rustynet-control` `evaluate`-path (lib.rs:~3465): on an **empty** membership
+  directory the both-endpoints-Active requirement is skipped and issuance falls
+  back to plain default-deny ACL evaluation. Same *shape* as the removed RN-11
+  fail-open, but (a) it gates bundle issuance, downstream of the daemon's
+  independent provisioning gate, (b) it carries an explicit pre-membership
+  rationale, and (c) the crate adjoins the reverted mesh-status/L1c area this
+  campaign was told not to enter. Left for the owning reviewers; recorded so
+  the shape cannot be re-introduced silently elsewhere.
 
 ## Defects fixed
 
