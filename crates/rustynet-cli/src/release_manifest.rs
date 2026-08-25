@@ -209,6 +209,13 @@ impl ReleaseManifest {
             .ok()
             .and_then(|b| b.try_into().ok())
             .ok_or(ManifestError::MalformedVerifierKey)?;
+        // Defense in depth: a pinned key of all zeros is the publicly-known
+        // degenerate Ed25519 identity (the exact key a blank signing seed
+        // would mint). Trusting it would make every zero-key-signed manifest
+        // verifiable, so refuse the pin itself, not just the signature.
+        if key_bytes.iter().all(|value| *value == 0) {
+            return Err(ManifestError::WeakSigningSeed);
+        }
         let verifying_key = VerifyingKey::from_bytes(&key_bytes)
             .map_err(|_| ManifestError::MalformedVerifierKey)?;
         let sig_bytes: [u8; 64] = from_hex(&self.signature_hex)
@@ -381,6 +388,17 @@ mod tests {
             [0u8; 32],
             sample_artifacts(),
         );
+        assert_eq!(result.err(), Some(ManifestError::WeakSigningSeed));
+    }
+
+    #[test]
+    fn verification_refuses_a_pinned_all_zero_verifier_key() {
+        let zero_key_hex = to_hex(&[0u8; 32]);
+        let mut manifest = signed();
+        // Even a signature that is otherwise well-formed must not verify
+        // when the pinned key is the degenerate all-zero identity.
+        manifest.verifier_key_hex = zero_key_hex.clone();
+        let result = manifest.verify_signed_with_pinned_key(&zero_key_hex);
         assert_eq!(result.err(), Some(ManifestError::WeakSigningSeed));
     }
 
