@@ -1142,6 +1142,14 @@ fn arg_str<'a>(args: Option<&'a Value>, key: &str) -> Option<&'a str> {
 
 /// Recursively collect `*.md` files under `dir`, pushing repo-relative paths.
 fn collect_md(dir: &Path, repo_root: &Path, out: &mut Vec<String>) {
+    // Fail closed on a symlinked ROOT argument too. fs::read_dir() RESOLVES
+    // `dir` itself, so the per-entry file_type() skip below would never see a
+    // planted `documents -> <elsewhere>` link; symlink_metadata() reports the
+    // link without following it, so a linked root walks nothing.
+    match fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        _ => return,
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -2224,6 +2232,37 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("leak") || p.contains("secret")),
             "symlinked file/dir must NOT be followed/listed: {files:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_md_does_not_follow_a_symlinked_docs_root() {
+        // The per-entry file_type() skip cannot see the ROOT argument itself:
+        // fs::read_dir() RESOLVES `dir`, so a planted `documents -> <elsewhere>`
+        // symlink made the list_documents/find_in_docs walk enumerate the
+        // outside tree even with the leaf/dir skips in place.
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("repo_ctx_collect_md_root_{}", std::process::id()));
+        let real_docs = root.join("real-docs");
+        let outside = root.join("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&real_docs).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(real_docs.join("real.md"), "# Real\nbody\n").unwrap();
+        std::fs::write(outside.join("secret.md"), "# TOPSECRET-title\n").unwrap();
+        symlink(&outside, root.join("documents")).unwrap();
+
+        let mut files: Vec<String> = Vec::new();
+        collect_md(&root.join("documents"), &root, &mut files);
+
+        assert!(
+            files.is_empty(),
+            "symlinked docs ROOT must NOT be walked into: {files:?}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
