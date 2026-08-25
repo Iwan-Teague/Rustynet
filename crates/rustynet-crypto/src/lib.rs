@@ -2327,6 +2327,16 @@ mod tests {
             "truncated signature must be rejected"
         );
 
+        // Oversized: 65 bytes must hit the same length guard, not panic or
+        // silently truncate into some other accepted encoding.
+        let mut oversized = signature.clone();
+        oversized.push(0u8);
+        assert_eq!(
+            provider.verify_attestation(b"", &oversized),
+            Err(CryptoError::AttestationVerificationFailed),
+            "oversized signature must be rejected"
+        );
+
         // Cross-payload: a signature over b"" is not valid for other data.
         assert_eq!(
             provider.verify_attestation(b"x", &signature),
