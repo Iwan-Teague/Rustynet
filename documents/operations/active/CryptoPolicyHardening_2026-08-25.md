@@ -92,6 +92,11 @@ crates with `-D warnings` exits 0; `cargo fmt -p` clean. Full-workspace §7
 suite deliberately not run (constraint), and the workspace-excluded crates
 are untouched.
 
+Final-sweep additions: §10.2 audit found zero `unwrap`/`expect`/`panic!`
+in non-test production code of all five touched files; policy/crypto
+doctests pass (no code fences); branch footprint vs `origin/main` is
+exactly the seven intended files (+803/−20) with a clean tree.
+
 ## Known non-issues (checked, left alone)
 
 - `unwrap_or_default()` remnants in `rustynet-cli` are display/report paths.
