@@ -119,6 +119,12 @@ in non-test production code of all five touched files; policy/crypto
 doctests pass (no code fences); branch footprint vs `origin/main` is
 exactly the seven intended files (+803/−20) with a clean tree.
 
+Scoped security gates since RUN and green on this branch:
+`scripts/ci/secrets_hygiene_gates.sh` (18 checks incl. inline-secret and
+test-output verification) and `scripts/ci/check_backend_boundary_leakage.sh`
+(§10.3/§10.6 of the operating contract) — directly relevant to a campaign
+that touched the crypto and policy crates.
+
 Compile-integrity additions (compile-only, not the deferred test stage):
 `cargo check --workspace --all-targets --all-features` finishes clean
 — covering every bench/example/target outside the scoped crates — and
