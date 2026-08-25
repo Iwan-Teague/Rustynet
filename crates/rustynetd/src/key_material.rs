@@ -216,10 +216,14 @@ fn read_bounded_secret_bytes<R: std::io::Read>(
 ) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut raw = Vec::new();
-    reader
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut raw)
-        .map_err(|err| format!("read {source_label} failed: {err}"))?;
+    let read_result = reader.take(max_bytes as u64 + 1).read_to_end(&mut raw);
+    if let Err(err) = read_result {
+        // A mid-read failure can leave partially-read secret bytes in the
+        // buffer; the documented contract zeroizes EVERY rejected buffer,
+        // not only the oversize one.
+        raw.zeroize();
+        return Err(format!("read {source_label} failed: {err}"));
+    }
     if raw.len() > max_bytes {
         raw.zeroize();
         return Err(format!("{source_label} exceeds maximum allowed size"));
@@ -1267,6 +1271,30 @@ pub fn migrate_existing_private_key_material(
             "target key material already exists; use --force to overwrite existing files"
                 .to_owned(),
         );
+    }
+
+    // Pre-open gate, mirroring every sibling secret-file read above: refuse
+    // symlinks and non-regular files by metadata BEFORE opening. File::open
+    // follows symlinks (a swapped link would silently migrate foreign key
+    // material) and blocks forever on a FIFO (the reader bound cannot fire —
+    // no byte is ever consumed), so the size cap alone cannot close this gap.
+    let existing_meta = fs::symlink_metadata(existing_private_key_path).map_err(|err| {
+        format!(
+            "inspect existing private key {} failed: {err}",
+            existing_private_key_path.display()
+        )
+    })?;
+    if existing_meta.file_type().is_symlink() {
+        return Err(format!(
+            "existing private key {} must not be a symlink",
+            existing_private_key_path.display()
+        ));
+    }
+    if !existing_meta.file_type().is_file() {
+        return Err(format!(
+            "existing private key {} must be a regular file",
+            existing_private_key_path.display()
+        ));
     }
 
     let mut private_key = read_bounded_secret_file(
@@ -2320,6 +2348,70 @@ mod tests {
         assert!(!public.exists(), "no public key on rejected input");
 
         let _ = remove_file_if_present(&existing);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_existing_private_key_rejects_symlinked_input_fails_closed() {
+        // Every sibling secret-file read in this module refuses symlinks
+        // BEFORE opening (passphrase file, Windows DPAPI sources, key
+        // writers). Migration is the one attacker-influenced read whose
+        // input gate was missing: File::open follows the link, so a
+        // swapped symlink silently migrates whatever the link points at,
+        // and a FIFO hangs inside open() forever (the reader bound cannot
+        // help — no byte is ever consumed). The gate must fire pre-open.
+        let dir = unique_test_dir("rn-migrate-symlink");
+        let real_key = dir.join("real.key");
+        std::fs::write(&real_key, b"pretend key material\n").expect("fixture should be writable");
+        let link = dir.join("existing.key");
+        std::os::unix::fs::symlink(&real_key, &link).expect("symlink fixture should be creatable");
+
+        let err = super::migrate_existing_private_key_material(
+            &link,
+            &dir.join("runtime.key"),
+            &dir.join("encrypted.key"),
+            &dir.join("wireguard.pub"),
+            &dir.join("passphrase"),
+            None,
+            true,
+        )
+        .expect_err("symlinked existing key must be rejected");
+        assert!(
+            err.contains("must not be a symlink"),
+            "rejection must refuse the symlink BEFORE reading through it, got: {err}"
+        );
+        assert!(
+            !dir.join("encrypted.key").exists(),
+            "no encrypted key on rejected input"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_existing_private_key_rejects_non_regular_file_input_fails_closed() {
+        // Companion to the symlink pin: a character device (/dev/null) or
+        // FIFO must be refused by metadata BEFORE open, not discovered by
+        // reading it. Pre-fix behavior reads /dev/null as empty and fails
+        // with the wrong error ("is empty") instead of refusing the path.
+        let dir = unique_test_dir("rn-migrate-devnull");
+        let err = super::migrate_existing_private_key_material(
+            std::path::Path::new("/dev/null"),
+            &dir.join("runtime.key"),
+            &dir.join("encrypted.key"),
+            &dir.join("wireguard.pub"),
+            &dir.join("passphrase"),
+            None,
+            true,
+        )
+        .expect_err("non-regular existing-key input must be rejected");
+        assert!(
+            err.contains("must be a regular file"),
+            "rejection must refuse non-regular files BEFORE reading, got: {err}"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
