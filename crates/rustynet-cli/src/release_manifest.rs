@@ -15,7 +15,7 @@
 //! accepted encoding.
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use rustynet_crypto::{Ed25519SigningProvider, SigningProvider, SigningProviderKind};
+use rustynet_crypto::{CryptoError, Ed25519SigningProvider, SigningProvider, SigningProviderKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -146,11 +146,33 @@ pub fn build_signed_manifest(
     )
     .map_err(|_| ManifestError::WeakSigningSeed)?;
     let verifier_key_hex = provider.verifying_key_hex();
-    let payload = canonical_payload(
+    sign_manifest_with_provider(
         release_track,
         generated_at_unix,
         key_id,
         &verifier_key_hex,
+        &provider,
+        artifacts,
+    )
+}
+
+/// Core signer, provider-injected so the signing-failure path is testable.
+/// `verifier_key_hex` is passed in because it is an inherent method of the
+/// concrete Ed25519 provider, not part of the abstract trait surface.
+fn sign_manifest_with_provider(
+    release_track: &str,
+    generated_at_unix: u64,
+    key_id: &str,
+    verifier_key_hex: &str,
+    provider: &dyn SigningProvider,
+    mut artifacts: Vec<ManifestArtifact>,
+) -> Result<ReleaseManifest, ManifestError> {
+    sort_artifacts(&mut artifacts);
+    let payload = canonical_payload(
+        release_track,
+        generated_at_unix,
+        key_id,
+        verifier_key_hex,
         &artifacts,
     );
     // Fail closed on signing errors: shipping a manifest with an empty
@@ -166,7 +188,7 @@ pub fn build_signed_manifest(
         release_track: release_track.to_owned(),
         generated_at_unix,
         signer_key_id: key_id.to_owned(),
-        verifier_key_hex,
+        verifier_key_hex: verifier_key_hex.to_owned(),
         artifacts,
         signature_hex,
     })
@@ -385,6 +407,38 @@ mod tests {
             sample_artifacts(),
         )
         .expect("test signing seed is valid")
+    }
+
+    #[test]
+    fn signing_failure_aborts_instead_of_emitting_an_empty_signature() {
+        struct FailingProvider;
+        impl SigningProvider for FailingProvider {
+            fn kind(&self) -> SigningProviderKind {
+                SigningProviderKind::Kms
+            }
+            fn key_identifier(&self) -> &str {
+                "kms://failing"
+            }
+            fn sign_attestation(&self, _payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
+                Err(CryptoError::RandomnessUnavailable)
+            }
+            fn verify_attestation(
+                &self,
+                _payload: &[u8],
+                _signature: &[u8],
+            ) -> Result<(), CryptoError> {
+                Err(CryptoError::AttestationVerificationFailed)
+            }
+        }
+        let result = sign_manifest_with_provider(
+            "beta",
+            1_700_000_000,
+            "kms://failing",
+            "aa55",
+            &FailingProvider,
+            sample_artifacts(),
+        );
+        assert_eq!(result.err(), Some(ManifestError::SignatureInvalid));
     }
 
     #[test]
