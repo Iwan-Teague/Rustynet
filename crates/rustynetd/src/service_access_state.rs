@@ -658,4 +658,93 @@ mod tests {
         );
         assert!(dir.join(ACCESS_PEERS_FILE).exists());
     }
+
+    fn two_peer_snapshot() -> ServiceAccessSnapshot {
+        ServiceAccessSnapshot {
+            grants: vec!["peer-a".to_owned(), "peer-b".to_owned()],
+            peers: vec![
+                (
+                    IpAddr::V4(Ipv4Addr::new(100, 64, 0, 11)),
+                    "peer-a".to_owned(),
+                ),
+                (
+                    IpAddr::V4(Ipv4Addr::new(100, 64, 0, 12)),
+                    "peer-b".to_owned(),
+                ),
+            ],
+            scopes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stale_temp_file_from_a_crash_does_not_block_the_next_refresh() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("access");
+        // A crash mid-write leaves `.peers.v1.tmp` behind; the next
+        // refresh must clear it rather than fail forever on it.
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(".peers.v1.tmp"), b"stale").expect("seed stale temp");
+
+        write_access_state_atomic(&dir, &two_peer_snapshot()).expect("write over stale temp");
+
+        let peers = std::fs::read_to_string(dir.join(ACCESS_PEERS_FILE)).expect("peers");
+        assert_eq!(peers, "100.64.0.11 peer-a\n100.64.0.12 peer-b\n");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stale temp must not survive");
+    }
+
+    #[test]
+    fn failed_mid_sequence_write_never_leaves_grants_newer_than_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("access");
+        let previous_epoch = ServiceAccessSnapshot {
+            grants: vec!["peer-a".to_owned()],
+            peers: vec![(
+                IpAddr::V4(Ipv4Addr::new(100, 64, 0, 11)),
+                "peer-a".to_owned(),
+            )],
+            scopes: Vec::new(),
+        };
+        write_access_state_atomic(&dir, &previous_epoch).expect("previous epoch written");
+
+        // Deterministic injection: a `scopes.v1` that cannot be
+        // replaced (it is a directory) fails the middle step of the
+        // peers -> scopes -> grants sequence. The authorisation file
+        // must still hold the PREVIOUS epoch — never the new grant
+        // list — because grants.v1 is only rewritten after identity
+        // and restrictions have landed.
+        std::fs::remove_file(dir.join(ACCESS_SCOPES_FILE)).expect("drop scopes file");
+        std::fs::create_dir(dir.join(ACCESS_SCOPES_FILE)).expect("scopes.v1 becomes a dir");
+
+        let err = write_access_state_atomic(&dir, &two_peer_snapshot())
+            .expect_err("mid-sequence failure must propagate");
+        assert!(
+            err.contains("rename"),
+            "failure should be the scopes rename, got: {err}"
+        );
+
+        let grants = std::fs::read_to_string(dir.join(ACCESS_GRANTS_FILE)).expect("grants");
+        assert_eq!(
+            grants, "peer-a\n",
+            "grants.v1 must stay at the previous epoch when a prior step failed"
+        );
+        // Self-validation: the failure happened AFTER the peers step,
+        // so identity did advance to the new epoch.
+        let peers = std::fs::read_to_string(dir.join(ACCESS_PEERS_FILE)).expect("peers");
+        assert!(
+            peers.contains("peer-b"),
+            "peers.v1 must already carry the new epoch at the failing step"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "failed step must clean its temp");
+    }
 }
