@@ -1,6 +1,6 @@
 # Crypto / Policy / Release-Manifest Security Hardening — 2026-08-25
 
-Status: **active** (branch `sec-hardening`, 24 commits, not yet merged).
+Status: **active** (branch `sec-hardening`, 28 commits, not yet merged).
 
 Scope: fail-closed hardening and mutation-tested coverage for the Ed25519
 signing path (`rustynet-crypto`), the ACL default-deny engine
@@ -20,6 +20,18 @@ restores cannot destroy uncommitted work).
 - Duplicate-rejection attempt in the rollout controller was **retracted before
   commit**: `protocol_enumeration_no_longer_evades_the_allow_all_guard`
   (policy lib.rs:847) is a strict superset of the proposed pin.
+- `7ea1a392` / `0082302c`: both membership-aware evaluators' **post-gate
+  empty-set terminals were dead code to the suite** — a terminal-flip mutant
+  survived everything. Root cause: tests registered directory keys like
+  `"node-a"` while `node:` selectors resolve to the BARE id (`"a"`), so the
+  gate denied first. Pins now use bare-id keys and reach the terminal; both
+  flip mutants die.
+- `0ad7f0e3`: pinned ops input guards (empty artifact list refuses before any
+  signing work; trailing-colon spec leaves an inexpressible empty path).
+- `59720c5f`: source-grep pin for `selector_matches`' both-sides-empty guard —
+  its rule-side half is behaviourally redundant under equality matching
+  (documented at the function), so removal was previously invisible to every
+  behavioral test.
 
 ## Watchlist (observed, deliberately not touched)
 
