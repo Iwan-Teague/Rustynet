@@ -1505,11 +1505,24 @@ pub struct AeadSealedBlob {
 /// Seal `plaintext` under `key` with `aad` as associated data.
 /// Nonce is drawn from the OS CSPRNG; fails closed when the CSPRNG
 /// is unavailable (nonce reuse under one key breaks the AEAD).
+///
+/// Fails closed on a degenerate all-zero key (`WeakMaterial`). The
+/// production key source for these helpers is a raw 32-byte file
+/// (`rustynet-nas --at-rest-key-file`), whose loader checks length and
+/// permissions but not content — a zero-filled or truncated-then-grown
+/// file yields the one key whose "ciphertext" anyone can decrypt. This
+/// mirrors the all-zero rejection in `NodeKeyPair::from_raw` and
+/// `Ed25519SigningProvider::try_from_seed`; an XChaCha20-Poly1305 key
+/// that is publicly known provides no confidentiality, so refusing it
+/// is strictly fail-closed.
 pub fn aead_seal(
     key: &[u8; 32],
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<AeadSealedBlob, CryptoError> {
+    if is_all_zeros(key) {
+        return Err(CryptoError::WeakMaterial);
+    }
     use rand::TryRngCore;
     let mut nonce = [0u8; 24];
     rand::rngs::OsRng
@@ -1530,11 +1543,20 @@ pub fn aead_seal(
 
 /// Open a sealed blob. Any tamper of nonce, ciphertext, or location
 /// binding (`aad`) fails the tag check and is rejected.
+///
+/// Fails closed on a degenerate all-zero key (`WeakMaterial`) for the
+/// same reason as [`aead_seal`]: the open path must refuse to "decrypt"
+/// at-rest data under the one publicly-known key, so a mis-provisioned
+/// key source surfaces as an error instead of silent zero-value
+/// plaintext.
 pub fn aead_open(
     key: &[u8; 32],
     aad: &[u8],
     blob: &AeadSealedBlob,
 ) -> Result<Vec<u8>, CryptoError> {
+    if is_all_zeros(key) {
+        return Err(CryptoError::WeakMaterial);
+    }
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
         .decrypt(
@@ -2074,6 +2096,39 @@ mod tests {
         let first = super::aead_seal(&key, b"aad", b"x").expect("seal");
         let second = super::aead_seal(&key, b"aad", b"x").expect("seal");
         assert_ne!(first.nonce, second.nonce);
+    }
+
+    /// The AEAD helpers must refuse the one key that provides no
+    /// confidentiality. The production key source is a raw 32-byte file whose
+    /// loader checks length and permissions but not content, so an all-zero
+    /// key is a realistic mis-provisioning (`truncate -s 32`, `dd if=/dev/zero`).
+    /// Sealing under it would silently publish data; the failure must surface
+    /// as `WeakMaterial`, mirroring `NodeKeyPair::from_raw`.
+    #[test]
+    fn aead_seal_rejects_all_zero_key_fail_closed() {
+        let result = super::aead_seal(&[0u8; 32], b"peer-a/snap-1", b"payload");
+        assert_eq!(result.err(), Some(super::CryptoError::WeakMaterial));
+    }
+
+    /// Symmetric control: the open path must also refuse the all-zero key so
+    /// data at rest sealed under a mis-provisioned key cannot be "decrypted"
+    /// into silent zero-value plaintext — the store fails closed instead.
+    #[test]
+    fn aead_open_rejects_all_zero_key_fail_closed() {
+        let key = [0x2b_u8; 32];
+        let blob = super::aead_seal(&key, b"aad", b"payload").expect("seal under a real key");
+        let result = super::aead_open(&[0u8; 32], b"aad", &blob);
+        assert_eq!(result.err(), Some(super::CryptoError::WeakMaterial));
+    }
+
+    /// A single zero byte does not make the key degenerate; the check targets
+    /// exactly the all-zero material and must not reject legitimate keys whose
+    /// bytes merely include zeros.
+    #[test]
+    fn aead_seal_accepts_key_containing_zero_bytes() {
+        let mut key = [0u8; 32];
+        key[31] = 1;
+        super::aead_seal(&key, b"aad", b"payload").expect("near-zero key is still a real key");
     }
 
     /// The unimplemented-platform arm must FAIL, not pass.
