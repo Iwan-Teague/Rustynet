@@ -290,6 +290,13 @@ pub fn authorize_trusted_key(
     if !config.enabled {
         return Ok(());
     }
+    // Fail closed on an empty submission (POL-03): presenting nothing is not
+    // an identity. The ct_eq below would already reject it against a real
+    // pinned fingerprint, but the explicit reject keeps the decision correct
+    // even if the stored state or comparison ever changes shape.
+    if presented_fingerprint.trim().is_empty() {
+        return Err(TrustHardeningError::UnauthorizedKey);
+    }
     let trust_state =
         load_trust_state(trust_state_path).map_err(TrustHardeningError::TrustState)?;
     // Constant-time compare (RSA-0016 standard, same as break-glass
@@ -687,6 +694,17 @@ mod tests {
             Some(TrustHardeningError::UnauthorizedKey)
         );
         assert!(authorize_trusted_key(&config, &path, "ed25519:trusted").is_ok());
+        // POL-03 fail-closed: presenting NO identity must never authorize,
+        // even though the constant-time compare would happily match an
+        // equally-empty stored fingerprint.
+        assert_eq!(
+            authorize_trusted_key(&config, &path, "").err(),
+            Some(TrustHardeningError::UnauthorizedKey)
+        );
+        assert_eq!(
+            authorize_trusted_key(&config, &path, "   ").err(),
+            Some(TrustHardeningError::UnauthorizedKey)
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.integrity.key", path.display()));
