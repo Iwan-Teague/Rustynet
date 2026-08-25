@@ -660,7 +660,26 @@ fn protect_config_bytes(
     }
 }
 
+/// On-disk bound for the Windows plaintext private-key fallback file.
+/// Checked BEFORE the file is read so tampered/oversized disk state cannot
+/// drive unbounded allocation before the base64 validator rejects it.
+const MAX_PRIVATE_KEY_FILE_BYTES: u64 = 4096;
+
 fn read_private_key_value(path: &Path) -> Result<String, BackendError> {
+    let on_disk_len = fs::metadata(path)
+        .map_err(|err| {
+            BackendError::internal(format!(
+                "read Windows private key file failed ({}): {err}",
+                path.display()
+            ))
+        })?
+        .len();
+    if on_disk_len > MAX_PRIVATE_KEY_FILE_BYTES {
+        return Err(BackendError::internal(format!(
+            "Windows private key file exceeds {}-byte cap; refusing to read",
+            MAX_PRIVATE_KEY_FILE_BYTES
+        )));
+    }
     let contents = fs::read_to_string(path).map_err(|err| {
         BackendError::internal(format!(
             "read Windows private key file failed ({}): {err}",
@@ -1878,5 +1897,19 @@ mod tests {
                 "read_private_key_value must reject {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn windows_private_key_file_read_is_bounded_before_allocation() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("huge.key");
+        fs::write(&path, vec![b'x'; MAX_PRIVATE_KEY_FILE_BYTES as usize + 1])
+            .expect("write oversized key file");
+        let err = read_private_key_value(&path)
+            .expect_err("oversized private-key file must be refused before reading");
+        assert!(
+            err.to_string().contains("byte cap"),
+            "expected byte-cap error, got: {err}"
+        );
     }
 }
