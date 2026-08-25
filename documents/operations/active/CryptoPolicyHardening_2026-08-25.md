@@ -1,7 +1,7 @@
 # Crypto / Policy / Release-Manifest Security Hardening — 2026-08-25
 
 Status: **ready for merge review** as of 2026-08-25 (branch `sec-hardening`,
-37 commits ahead of `origin/main`, 0 behind; final full scoped regression of
+49 commits ahead of `origin/main`, 0 behind; final full scoped regression of
 all three touched crates green the same day). Implementation is complete;
 what remains is operator review of the watchlist item below and the merge
 itself.
@@ -43,6 +43,13 @@ restores cannot destroy uncommitted work).
   `selector_matches` rejects independently. No behavioral test can kill a
   mutant here (verified: flip survives the whole suite), mirroring the
   documented redundancy inside `selector_matches`' own guard.
+- `87a46d26`/`a89b34f3`: canonical_payload hardening — the documented
+  "tabs/newlines never appear in artifact fields" invariant is now
+  enforced at parse_artifact_spec (mid-field control chars rejected), and
+  a pin holds two-sided payload determinism for adversarial scalar
+  values (signer_key_id/release_track with newlines/equals) so a future
+  one-sided sanitization cannot silently break verification. Both pins
+  mutation-proven.
 - `189893c7`: per-variant pin for `TrafficContext::is_service_context`
   (three dataplane contexts false, both D13 hosting contexts true) —
   previously the predicate ran only indirectly through rule matching.
