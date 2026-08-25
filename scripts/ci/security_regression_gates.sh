@@ -57,8 +57,14 @@ echo "PASS: cargo deny bans check passed"
 # (If a legitimate NON-ed25519 `.verify(` is ever introduced, prefer a typed
 # wrapper; otherwise add a narrowly-scoped allowlist to the second grep.)
 echo "Checking all ed25519 signature verification uses verify_strict (RN-22)..."
+# The middle filter neutralizes each `.verify_strict(` occurrence IN PLACE
+# instead of dropping whole lines: a line-level `grep -v verify_strict`
+# let a raw `.verify(` hide on the SAME line as a strict call (one line,
+# two calls) and silenced the gate entirely. After neutralization any
+# surviving `.verify(` is a genuine non-strict call, wherever it sits.
 if grep -rn '\.verify(' crates --include='*.rs' \
-    | grep -v 'verify_strict' \
+    | sed -E 's/\.verify_strict\(/./g' \
+    | grep '\.verify(' \
     | grep -vE ':[0-9]+:[[:space:]]*(//|///|\*)'; then
   echo "FAIL: non-strict ed25519 .verify() found above — RN-22 mandates VerifyingKey::verify_strict" >&2
   echo "FAIL: verify_strict rejects malleable/non-canonical signatures; replace .verify( with .verify_strict(" >&2
