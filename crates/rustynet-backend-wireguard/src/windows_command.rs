@@ -2223,4 +2223,63 @@ mod tests {
             "stale persistent config must be rewritten by the retry; got: {persisted}"
         );
     }
+
+    #[test]
+    fn windows_remove_peer_retry_reports_convergence_failure_instead_of_silent_success() {
+        // The retry path converges disk with memory by rewriting the
+        // persistent config — but if THAT rewrite fails (config dir still
+        // read-only), the removal must fail loudly. Returning Ok here would
+        // silently leave a [Peer] section on disk that a tunnel-service
+        // restart resurrects, which is exactly the divergence this early
+        // return exists to close.
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let cfg_dir = temp_dir.path().join("cfgdir");
+        fs::create_dir_all(&cfg_dir).expect("cfg dir");
+        let (_, private_key_path, wireguard_path, wg_path, netsh_path) = backend_paths(&temp_dir);
+        let config_path = cfg_dir.join("rustynet0.conf.dpapi");
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner,
+            "rustynet0",
+            config_path.to_string_lossy().as_ref(),
+            private_key_path.to_string_lossy().as_ref(),
+            wireguard_path.to_string_lossy().as_ref(),
+            wg_path.to_string_lossy().as_ref(),
+            netsh_path.to_string_lossy().as_ref(),
+            51820,
+        )
+        .expect("backend should construct");
+        backend.start(runtime_context()).expect("start");
+        let peer = sample_peer("gone");
+        let gone_id = peer.node_id.clone();
+        backend.configure_peer(peer).expect("configure");
+
+        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+        backend
+            .remove_peer(&gone_id)
+            .expect_err("sync failure must fail the removal");
+        assert_eq!(
+            backend.stats().expect("stats").peer_count,
+            0,
+            "the failed-sync removal must still drop the map entry"
+        );
+
+        // Retry while the convergence rewrite itself cannot succeed: the
+        // absent-peer path must propagate the sync failure, not swallow it
+        // behind an Ok that leaves stale state on disk.
+        backend
+            .remove_peer(&gone_id)
+            .expect_err("retry must not report success while convergence failed");
+
+        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+        backend
+            .remove_peer(&gone_id)
+            .expect("a later retry once the config dir is writable must converge");
+        let persisted = fs::read_to_string(&config_path).expect("config readable");
+        assert!(
+            !persisted.contains("[Peer]"),
+            "converged persistent config must not contain the removed peer; got: {persisted}"
+        );
+    }
 }
