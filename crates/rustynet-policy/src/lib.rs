@@ -1432,6 +1432,21 @@ mod tests {
     }
 
     #[test]
+    fn icmp_request_on_empty_acl_denies() {
+        // Default-deny must also hold for ICMP — the one protocol
+        // shape the broader empty-set sweep omits. An empty ACL
+        // allows nothing, for any protocol, ever.
+        let empty = PolicySet::default();
+        assert!(empty.rules.is_empty());
+        let request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "tag:nas".to_owned(),
+            protocol: Protocol::Icmp,
+        };
+        assert_eq!(empty.evaluate(&request), Decision::Deny);
+    }
+
+    #[test]
     fn icmp_only_tag_rule_denies_udp_requests_for_same_tag() {
         // Protocol isolation (ICMP variant): the rule grants ONLY
         // ICMP for tag:a. A UDP request for the same tag misses the
