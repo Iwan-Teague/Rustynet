@@ -153,13 +153,14 @@ pub fn build_signed_manifest(
         &verifier_key_hex,
         &artifacts,
     );
-    // sign_attestation is infallible for the Ed25519 provider; fall back to an
-    // empty signature only in the theoretically-impossible error case, which then
-    // fails closed at verification time.
-    let signature_hex = provider
-        .sign_attestation(&payload)
-        .map(|sig| to_hex(&sig))
-        .unwrap_or_default();
+    // Fail closed on signing errors: shipping a manifest with an empty
+    // signature would merely defer the failure to install time. A signing
+    // failure must stop the release build here.
+    let signature_hex = to_hex(
+        &provider
+            .sign_attestation(&payload)
+            .map_err(|_| ManifestError::SignatureInvalid)?,
+    );
     Ok(ReleaseManifest {
         schema_version: RELEASE_MANIFEST_SCHEMA_VERSION,
         release_track: release_track.to_owned(),
