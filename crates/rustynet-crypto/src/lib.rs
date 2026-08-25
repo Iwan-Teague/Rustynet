@@ -2267,6 +2267,42 @@ mod tests {
             .expect("genuine empty-message signature verifies");
     }
 
+    /// Negative half of the empty-message pin: a verifier that fails OPEN
+    /// (accepting tampered, truncated, or cross-payload signatures) must be
+    /// caught by this test, not only by the broader attestation suite.
+    #[test]
+    fn empty_message_verification_fails_closed_on_bad_signatures() {
+        let provider = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::LocalEncryptedFile,
+            "empty-message-fail-closed",
+            [7u8; 32],
+        );
+        let signature = provider.sign_attestation(b"").expect("signing succeeds");
+
+        // Tampered: flip one byte of the S component.
+        let mut tampered = signature.clone();
+        tampered[63] ^= 0x01;
+        assert_eq!(
+            provider.verify_attestation(b"", &tampered),
+            Err(CryptoError::AttestationVerificationFailed),
+            "tampered empty-message signature must be rejected"
+        );
+
+        // Truncated: 63-byte encoding is structurally invalid.
+        assert_eq!(
+            provider.verify_attestation(b"", &signature[..63]),
+            Err(CryptoError::AttestationVerificationFailed),
+            "truncated signature must be rejected"
+        );
+
+        // Cross-payload: a signature over b"" is not valid for other data.
+        assert_eq!(
+            provider.verify_attestation(b"x", &signature),
+            Err(CryptoError::AttestationVerificationFailed),
+            "empty-message signature must not verify over a different payload"
+        );
+    }
+
     #[test]
     fn rejects_zero_key_material() {
         let result = NodeKeyPair::from_raw([0; 32], [0; 32]);
