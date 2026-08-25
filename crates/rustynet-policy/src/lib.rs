@@ -813,6 +813,31 @@ mod tests {
     /// bypass. This is the behaviour the corrected doc comment on
     /// `MembershipDirectory::is_populated` describes, pinned so the removed
     /// fail-open cannot come back with the comment that used to advertise it.
+    /// Post-gate empty-set terminal: with selectors that RESOLVE (bare-id
+    /// directory keys matching the `node:` inner ids) the membership gate
+    /// passes, so the deny must come from rule evaluation itself. Every
+    /// earlier membership test registered `node:`-prefixed keys while its
+    /// selectors resolved to bare ids, short-circuiting at the gate — this
+    /// pin is the first to reach the terminal with an empty rule set.
+    #[test]
+    fn gate_passing_empty_set_still_denies_at_the_terminal() {
+        let empty = PolicySet::default();
+        assert!(empty.rules.is_empty());
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("a", MembershipStatus::Active);
+        membership.set_node_status("b", MembershipStatus::Active);
+        let request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            empty.evaluate_with_membership(&request, &membership),
+            Decision::Deny,
+            "an empty ACL denies even when the membership gate itself passes"
+        );
+    }
+
     #[test]
     fn an_empty_membership_directory_denies_rather_than_skipping_the_check() {
         let membership = MembershipDirectory::default();
