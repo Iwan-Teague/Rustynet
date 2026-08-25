@@ -328,7 +328,28 @@ impl LabStateServer {
         self.jobs_dir().join(format!("{job_id}.json"))
     }
 
+    /// Job-id charset: ASCII alphanumeric, '-', '_' ONLY, non-empty, <=128
+    /// bytes. Rejects '.' and '/' (so `../x` can never traverse out of the
+    /// jobs dir when joined into `<job_id>.json`), shell metachars, and
+    /// whitespace — validated BEFORE any path is built. Mirrors the identical
+    /// gate in ai_agent's lab_job_log tool; real job ids look like
+    /// `ll-<millis>-<pid>-<seq>`, well inside this charset.
+    fn validate_job_id(job_id: &str) -> Result<(), String> {
+        if job_id.is_empty()
+            || job_id.len() > 128
+            || !job_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(format!(
+                "invalid job_id '{job_id}': only ASCII letters, digits, '-' and '_' allowed"
+            ));
+        }
+        Ok(())
+    }
+
     fn write_job_record(&self, job_id: &str, rec: &Value) -> Result<(), String> {
+        Self::validate_job_id(job_id)?;
         std::fs::create_dir_all(self.jobs_dir())
             .map_err(|e| format!("cannot create jobs dir: {e}"))?;
         std::fs::write(
@@ -339,6 +360,11 @@ impl LabStateServer {
     }
 
     fn read_job_record(&self, job_id: &str) -> Option<Value> {
+        // Fail closed on a malformed/traversal job_id BEFORE it becomes a
+        // filename — otherwise get_job_status/wait_for_job/tail_job_log/
+        // cancel_job/resolve_report_dir would read (and render fields from)
+        // an arbitrary `<jobs_dir>/../…` JSON file.
+        Self::validate_job_id(job_id).ok()?;
         let s = std::fs::read_to_string(self.job_record_path(job_id)).ok()?;
         serde_json::from_str(&s).ok()
     }
@@ -3285,10 +3311,11 @@ impl LabStateServer {
                     .filter_map(|(rel, _)| mtime_age_secs(&rd.join(rel)))
                     .min()
             };
-            if let Some(log) = rec.get("log_path").and_then(|v| v.as_str()) {
-                let lp = Path::new(log);
-                if let Ok(meta) = std::fs::metadata(lp) {
-                    let age = mtime_age_secs(lp).unwrap_or(0);
+            if let Some(log) = rec.get("log_path").and_then(|v| v.as_str())
+                && let Ok(lp) = self.confined_repo_path(log, "job log_path")
+            {
+                if let Ok(meta) = std::fs::metadata(&lp) {
+                    let age = mtime_age_secs(&lp).unwrap_or(0);
                     out.push_str(&format!(
                         "- **log size:** {} bytes\n- **last activity:** {} ago\n",
                         meta.len(),
@@ -3311,7 +3338,7 @@ impl LabStateServer {
                         }
                     }
                 }
-                if let Ok(body) = tail_file(lp, 200) {
+                if let Ok(body) = tail_file(&lp, 200) {
                     // Best-effort current stage: the last known stage token seen
                     // in the tail (the verbatim lines below are authoritative).
                     let mut current: Option<&str> = None;
@@ -6651,8 +6678,17 @@ impl LabStateServer {
             .and_then(|a| a.get("lines"))
             .and_then(|v| v.as_u64())
             .unwrap_or(100) as usize;
-        let log_path = rec.get("log_path").and_then(|v| v.as_str()).unwrap_or("");
-        match tail_file(Path::new(log_path), lines) {
+        // Confine the record's log_path to the repo root before reading: the
+        // record normally names our own state/ log, but a planted record must
+        // not turn tail_job_log into an arbitrary-file read.
+        let log_confined = match rec.get("log_path").and_then(|v| v.as_str()) {
+            Some(p) => match self.confined_repo_path(p, "job log_path") {
+                Ok(c) => c,
+                Err(e) => return tool_error(&e),
+            },
+            None => return tool_error("job record missing log_path"),
+        };
+        match tail_file(&log_confined, lines) {
             Ok(body) => tool_success(&format!(
                 "# Tail of {job_id} (last {lines} lines)\n\n```\n{}\n```\n",
                 truncate_output(&body, lines, 80_000)
@@ -6931,7 +6967,10 @@ impl LabStateServer {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    if !job_id.is_empty() {
+                    // A record whose job_id fails the charset gate never
+                    // drives a deletion: job_record_path would otherwise turn
+                    // a planted "../x" id into an arbitrary-file unlink.
+                    if Self::validate_job_id(&job_id).is_ok() {
                         jobs.push((created, job_id, rec));
                     }
                 }
@@ -6956,8 +6995,13 @@ impl LabStateServer {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&job_id);
             let _ = std::fs::remove_file(self.job_record_path(&job_id));
-            if let Some(log) = rec.get("log_path").and_then(|v| v.as_str()) {
-                let _ = std::fs::remove_file(log);
+            // The record's log_path is normally ours (under state/), but a
+            // planted record could point anywhere — confine the unlink to the
+            // repo root exactly like report_dir two lines down.
+            if let Some(log) = rec.get("log_path").and_then(|v| v.as_str())
+                && let Ok(confined_log) = self.confined_repo_path(log, "job log_path")
+            {
+                let _ = std::fs::remove_file(confined_log);
             }
             if delete_reports
                 && !report_dir_rel.is_empty()
@@ -9372,6 +9416,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert!(srv.job_record_path("j2").exists());
         assert!(!srv.job_record_path("j1").exists());
         assert!(!srv.job_record_path("j0").exists());
+    }
+
+    #[test]
+    fn get_job_status_rejects_job_id_path_traversal() {
+        // A tool-supplied job_id is joined straight into
+        // state/mcp-jobs/<job_id>.json, so a traversal id like "../secret"
+        // resolves OUTSIDE the jobs dir. The tool must reject it (charset
+        // validation, mirroring ai_agent's lab_job_log) instead of reading —
+        // and rendering fields from — an arbitrary JSON file.
+        let tmp = TempRoot::new("mcp-jobid-traversal");
+        let srv = test_server(&tmp);
+        std::fs::create_dir_all(srv.jobs_dir()).unwrap();
+        // Decoy record one level ABOVE the jobs dir: reachable via "../secret".
+        let decoy = json!({
+            "job_id": "planted", "mode": "orchestrate",
+            "report_dir": tmp.join("rep").to_string_lossy(),
+            "pid": 0u64, "created_unix": 0,
+        });
+        let decoy_path = tmp.join("state/secret.json");
+        std::fs::write(&decoy_path, serde_json::to_string(&decoy).unwrap()).unwrap();
+
+        let res = srv.get_job_status(Some(&json!({"job_id": "../secret"})));
+        assert!(
+            res.is_error.is_some(),
+            "traversal job_id '../secret' must be rejected, not resolved to {}",
+            decoy_path.display()
+        );
+        // And the underlying read primitive stays closed as well.
+        assert!(srv.read_job_record("../secret").is_none());
     }
 
     #[test]
