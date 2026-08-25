@@ -37,13 +37,44 @@ pub fn save_config_atomic(path: &Path, serialized: &str) -> Result<(), ConfigErr
     let tmp = dir.join(format!(".{file_name}.tmp"));
 
     {
-        let mut file = OpenOptions::new()
+        let mut file = match OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)
-            .map_err(|err| ConfigError::Io(format!("open temp {}: {err}", tmp.display())))?;
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                // A crashed prior save may leave a plain temp file behind;
+                // reuse only that. A symlink or non-regular file planted at
+                // the predictable temp path must never be followed: fail
+                // closed instead of redirecting the privileged-mode write.
+                let metadata = fs::symlink_metadata(&tmp).map_err(|err| {
+                    ConfigError::Io(format!("stat temp {}: {err}", tmp.display()))
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(ConfigError::Insecure(format!(
+                        "Refusing to follow non-regular temp config file: {}",
+                        tmp.display()
+                    )));
+                }
+                fs::remove_file(&tmp).map_err(|err| {
+                    ConfigError::Io(format!("remove stale temp {}: {err}", tmp.display()))
+                })?;
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&tmp)
+                    .map_err(|err| ConfigError::Io(format!("open temp {}: {err}", tmp.display())))?
+            }
+            Err(err) => {
+                return Err(ConfigError::Io(format!(
+                    "open temp {}: {err}",
+                    tmp.display()
+                )));
+            }
+        };
         file.write_all(serialized.as_bytes())
             .map_err(|err| ConfigError::Io(format!("write temp: {err}")))?;
         file.set_permissions(fs::Permissions::from_mode(0o600))
@@ -152,6 +183,39 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert_eq!(fs::read_to_string(&path).unwrap(), "NODE_ROLE=admin\n");
         assert!(!dir.join(".wizard.env.tmp").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn planted_tmp_symlink_is_refused_and_target_untouched() {
+        let dir = unique_dir("rustynet-op-tmp-symlink");
+        fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.conf");
+        fs::write(&victim, "SENTINEL").unwrap();
+        let link = dir.join(".wizard.env.tmp");
+        symlink(&victim, &link).unwrap();
+
+        let result = save_config_atomic(&dir.join("wizard.env"), "NODE_ROLE=admin\n");
+        assert!(matches!(result, Err(ConfigError::Insecure(_))));
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "SENTINEL");
+
+        // The planted symlink must survive untouched; saving never follows it.
+        let metadata = fs::symlink_metadata(&link).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stale_regular_tmp_from_crashed_save_is_replaced() {
+        let dir = unique_dir("rustynet-op-stale-tmp");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wizard.env");
+        fs::write(dir.join(".wizard.env.tmp"), "stale residue").unwrap();
+
+        save_config_atomic(&path, "NODE_ROLE=admin\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "NODE_ROLE=admin\n");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         fs::remove_dir_all(&dir).ok();
     }
 
