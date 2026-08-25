@@ -96,8 +96,8 @@ fn classify_local_error(message: &str) -> ExitCode {
     } else if lower.contains("report path has no parent")
         || lower.contains("unable to resolve repository root")
         || lower.contains("create report dir")
-        || lower.contains("create runtime dir")
-        || lower.contains("create key dir")
+        || lower.contains("runtime dir")
+        || lower.contains("key dir")
         || lower.contains("path is not valid utf-8")
     {
         ExitCode::ConfigError
@@ -121,15 +121,11 @@ fn classify_local_error(message: &str) -> ExitCode {
 fn run() -> Result<(), String> {
     let report_path = env::var("RUSTYNET_NO_LEAK_REPORT_PATH")
         .unwrap_or_else(|_| "artifacts/phase10/no_leak_dataplane_report.json".to_owned());
-    let runtime_dir = env::var("RUSTYNET_NO_LEAK_RUNTIME_DIR")
-        .unwrap_or_else(|_| "/tmp/rustynet-no-leak-gate".to_owned());
     let report_path = PathBuf::from(report_path);
-    let runtime_dir = PathBuf::from(runtime_dir);
     let report_parent = report_path
         .parent()
         .ok_or_else(|| format!("report path has no parent: {}", report_path.display()))?;
     fs::create_dir_all(report_parent).map_err(|e| format!("create report dir: {e}"))?;
-    fs::create_dir_all(&runtime_dir).map_err(|e| format!("create runtime dir: {e}"))?;
 
     if current_uid()? != 0 {
         return Err("real_wireguard_no_leak_under_load.sh must run as root".to_owned());
@@ -145,6 +141,8 @@ fn run() -> Result<(), String> {
     let ns_client = format!("rnleak-client-{pid}");
     let ns_exit = format!("rnleak-exit-{pid}");
     let ns_inet = format!("rnleak-inet-{pid}");
+    let runtime_dir =
+        prepare_secure_runtime_dir("rustynet-no-leak-gate", "RUSTYNET_NO_LEAK_RUNTIME_DIR")?;
     let key_dir = runtime_dir.join(format!("keys-{pid}"));
     let load_pcap = runtime_dir.join(format!("underlay-load-{pid}.pcap"));
     let down_pcap = runtime_dir.join(format!("underlay-down-{pid}.pcap"));
@@ -470,8 +468,105 @@ fn command_output(mut command: Command) -> Result<Vec<u8>, String> {
 
 fn generate_wg_key(namespace: &str, output_path: &Path) -> Result<(), String> {
     let output = command_output(ns_command(namespace, ["wg", "genkey"]))?;
-    fs::write(output_path, output)
-        .map_err(|e| format!("write wg key {}: {e}", output_path.display()))
+    write_private_key_file(output_path, output)
+}
+
+/// Create the per-run runtime directory fail-closed.
+///
+/// The harness runs as root on a shared CI runner and stores freshly
+/// generated WireGuard private keys here, so the directory must never be
+/// taken over by another local user: an existing path (including a
+/// symlink) is refused outright, a fresh default location is derived from
+/// a randomly seeded hash instead of a fixed shared name, and the created
+/// directory is verified to be mode `0700` and not a symlink before any
+/// key material is written into it.
+fn prepare_secure_runtime_dir(default_prefix: &str, env_var: &str) -> Result<PathBuf, String> {
+    let candidate = match env::var_os(env_var) {
+        Some(value) => PathBuf::from(value),
+        None => env::temp_dir().join(format!("{default_prefix}-{}", unique_suffix()?)),
+    };
+    secure_runtime_dir(&candidate)?;
+    Ok(candidate)
+}
+
+fn unique_suffix() -> Result<String, String> {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system clock before unix epoch: {e}"))?
+        .as_nanos();
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(nanos);
+    hasher.write_u32(process::id());
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn secure_runtime_dir(path: &Path) -> Result<(), String> {
+    if fs::symlink_metadata(path).is_ok() {
+        return Err(format!(
+            "runtime dir already exists; refusing to reuse pre-existing path: {}",
+            path.display()
+        ));
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .map_err(|e| format!("create runtime dir {}: {e}", path.display()))?;
+    verify_secure_runtime_dir(path)
+}
+
+fn verify_secure_runtime_dir(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = fs::symlink_metadata(path)
+            .map_err(|e| format!("stat runtime dir {}: {e}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "runtime dir must not be a symlink: {}",
+                path.display()
+            ));
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(format!(
+                "runtime dir must be mode 0700, got {mode:04o}: {}",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Write WireGuard private key material with owner-only permissions.
+fn write_private_key_file(output_path: &Path, key_bytes: Vec<u8>) -> Result<(), String> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(output_path)
+            .and_then(|mut file| file.write_all(&key_bytes))
+            .map_err(|e| format!("write wg key {}: {e}", output_path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(output_path, key_bytes)
+            .map_err(|e| format!("write wg key {}: {e}", output_path.display()))
+    }
 }
 
 fn generate_wg_pubkey(namespace: &str, key_path: &Path, output_path: &Path) -> Result<(), String> {
@@ -619,4 +714,79 @@ fn utc_now() -> Result<(String, String), String> {
     let timestamp = command_output(cmd("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]))?;
     let text = String::from_utf8(timestamp).map_err(|e| format!("date output not utf8: {e}"))?;
     Ok((text.trim().to_owned(), unix.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("rnleak-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn secure_runtime_dir_refuses_pre_existing_path() {
+        let base = scratch_dir("refuse-existing");
+        let target = base.join("planted");
+        fs::create_dir_all(&target).expect("plant");
+        assert!(secure_runtime_dir(&target).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_runtime_dir_refuses_symlinked_path_even_dangling() {
+        use std::os::unix::fs::symlink;
+        let base = scratch_dir("refuse-symlink");
+        let link = base.join("link");
+        symlink(base.join("does-not-exist"), &link).expect("symlink");
+        // symlink_metadata succeeds for dangling links, so the refusal
+        // must fire before any create attempt follows the link.
+        assert!(secure_runtime_dir(&link).is_err());
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("link survives")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_rejects_wrong_mode_dir() {
+        use std::os::unix::fs::DirBuilderExt;
+        let base = scratch_dir("wrong-mode");
+        let target = base.join("loose");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(&target)
+            .expect("create loose");
+        assert!(verify_secure_runtime_dir(&target).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch_dir("key-mode");
+        let key_path = base.join("client.key");
+        write_private_key_file(&key_path, b"test-private-key".to_vec()).expect("write key");
+        let mode = fs::metadata(&key_path)
+            .expect("key meta")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn unique_suffix_differs_across_calls() {
+        let a = unique_suffix().expect("suffix a");
+        let b = unique_suffix().expect("suffix b");
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 16);
+    }
 }
