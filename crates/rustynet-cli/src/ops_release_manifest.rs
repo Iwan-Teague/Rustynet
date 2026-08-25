@@ -134,6 +134,19 @@ fn parse_artifact_spec(spec: &str) -> Result<(String, String, String), String> {
             "invalid --artifact '{spec}'; tab/newline characters would corrupt the signed payload"
         ));
     }
+    // name/target become the manifest `filename` (`{name}-{target}`), which
+    // the verifier joins under the artifacts dir — path separators or `..`
+    // components would let a signed manifest address files outside it.
+    for field in [name, target] {
+        if field.contains('/')
+            || field.contains('\\')
+            || field.split(['-', '_']).any(|part| part == "..")
+        {
+            return Err(format!(
+                "invalid --artifact '{spec}'; '{field}' must not contain path separators or '..'"
+            ));
+        }
+    }
     Ok((name.to_owned(), target.to_owned(), path.to_owned()))
 }
 
@@ -236,6 +249,20 @@ mod tests {
             parse_artifact_spec("rustynetd:x86_64\nextra:evil:/p").is_err(),
             "mid-field newline in target must be rejected"
         );
+    }
+
+    #[test]
+    fn parse_artifact_spec_rejects_path_traversal_in_name_and_target() {
+        // name/target become the manifest filename joined under the
+        // artifacts dir; separators or `..` must not be expressible.
+        assert!(parse_artifact_spec("../rustynetd:x86_64:/p").is_err());
+        assert!(parse_artifact_spec("a/b:x86_64:/p").is_err());
+        assert!(parse_artifact_spec("rustynetd:..\\win:/p").is_err());
+        assert!(parse_artifact_spec("rustynetd-..-x:x86_64:/p").is_err());
+        // Dots that do not form a `..` path component are legitimate.
+        assert!(parse_artifact_spec("rustynetd-x..y:x86_64:/p").is_ok());
+        // Legitimate matrix names still parse.
+        assert!(parse_artifact_spec("rustynetd:x86_64-unknown-linux-gnu:/p").is_ok());
     }
 
     #[test]
