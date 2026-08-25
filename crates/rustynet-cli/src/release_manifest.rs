@@ -15,7 +15,7 @@
 //! accepted encoding.
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use rustynet_crypto::{CryptoError, Ed25519SigningProvider, SigningProvider, SigningProviderKind};
+use rustynet_crypto::{Ed25519SigningProvider, SigningProvider, SigningProviderKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -365,6 +365,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use rustynet_crypto::CryptoError;
 
     fn test_seed() -> [u8; 32] {
         // Fixed non-zero seed for deterministic tests.
