@@ -111,6 +111,11 @@ in non-test production code of all five touched files; policy/crypto
 doctests pass (no code fences); branch footprint vs `origin/main` is
 exactly the seven intended files (+803/−20) with a clean tree.
 
+Compile-integrity additions (compile-only, not the deferred test stage):
+`cargo check --workspace --all-targets --all-features` finishes clean
+— covering every bench/example/target outside the scoped crates — and
+the CI-invisible `fuzz/` workspace still `cargo check`s on this branch.
+
 ## Merge readiness (Definition of Done walk-through)
 
 - In-scope requirements implemented end-to-end: yes — each defect fixed at its
