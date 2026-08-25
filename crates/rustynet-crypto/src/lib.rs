@@ -2167,6 +2167,23 @@ mod tests {
         let at = source
             .find(marker)
             .expect("the non-unix key-custody arm must still discard its arguments");
+        // The next-statement pin below only inspects what FOLLOWS the discard
+        // marker. An early `return Ok(())` hoisted ABOVE it fails the arm open
+        // while the marker and the Err tail both stay green. Forbid any
+        // fail-open return between the function's entry and the marker (the
+        // rationale comments say `return ` plus a backticked `Ok(())`, which never
+        // forms this contiguous needle).
+        let fn_start = source
+            .find("pub fn validate_key_custody_permissions(")
+            .expect("validate_key_custody_permissions must remain present");
+        let prelude = &source[fn_start..at];
+        let fail_open_return = ["return ", "Ok(())"].concat();
+        assert!(
+            !prelude.contains(fail_open_return.as_str()),
+            "the non-unix key-custody arm must not gain an early Ok(()) escape \
+             before the permission refusal — that is the CRY-05/AUDIT-027 \
+             fail-open, reached through a different spelling"
+        );
         let tail = &source[at + marker.len()..];
         let next_stmt: String = tail.chars().take(120).collect();
         assert!(
@@ -2325,17 +2342,42 @@ mod tests {
         // Take a window covering the function body.
         let window_end = (start + 4_000).min(body.len());
         let window = &body[start..window_end];
+        // A bare presence pin is too weak: a wrapper fn whose body mentions
+        // the allowed name (or an added cold-branch call) satisfies it while
+        // the hot path routes through any other spelling. Pin the canonical
+        // mint statement itself...
+        let canonical = [
+            "let (salt, nonce) = ",
+            "try_generate_key_custody_material()?;",
+        ]
+        .concat();
         assert!(
-            window.contains("try_generate_key_custody_material()"),
-            "write_encrypted_key_file must use the fallible nonce+salt minter"
+            window.contains(canonical.as_str()),
+            "write_encrypted_key_file must mint its salt+nonce from the canonical \
+             fallible expression; routing the hot path through any other spelling \
+             (a wrapped/panicking minter included) re-introduces the DoS-on- \
+             CSPRNG-fault shape"
         );
-        // Build the panicking name from chunks so the regression message does
-        // not itself match the negative grep.
-        let panicking = ["generate_key_", "custody_material()"].concat();
-        assert!(
-            !window.contains(&panicking) || window.contains("try_generate_key_custody_material()"),
-            "write_encrypted_key_file must not call the panicking legacy minter directly"
-        );
+        // ...and make the negative half non-vacuous. `generate_key_custody_material()`
+        // is a SUBSTRING of the allowed `try_generate_key_custody_material()`, so
+        // the old `!contains || contains` disjunction passed whenever the allowed
+        // name appeared anywhere in the window. Every occurrence must instead be
+        // spelled with the `try_` prefix.
+        let minter = ["generate_key_", "custody_material()"].concat();
+        let mut at = 0usize;
+        let mut occurrences = 0usize;
+        while let Some(rel) = window[at..].find(minter.as_str()) {
+            let idx = at + rel;
+            occurrences += 1;
+            assert!(
+                idx >= 4 && &window[idx - 4..idx] == "try_",
+                "write_encrypted_key_file must reach the minter ONLY as \
+                 try_generate_key_custody_material — an occurrence under any other \
+                 receiver/path/import alias is the removed panicking minter"
+            );
+            at = idx + minter.len();
+        }
+        assert!(occurrences > 0, "the mint call must remain present");
     }
 
     /// Sign-then-verify round-trip over the degenerate zero-length payload:
