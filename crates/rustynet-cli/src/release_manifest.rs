@@ -55,14 +55,29 @@ pub struct ReleaseManifest {
 /// trust this artifact"; callers must treat any error as install-abort.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
-    SchemaMismatch { found: u32, expected: u32 },
+    SchemaMismatch {
+        found: u32,
+        expected: u32,
+    },
     PinnedKeyMismatch,
     MalformedVerifierKey,
     MalformedSignature,
     SignatureInvalid,
-    UnknownArtifact { name: String, target: String },
-    DigestMismatch { name: String, target: String },
-    SizeMismatch { name: String, target: String },
+    UnknownArtifact {
+        name: String,
+        target: String,
+    },
+    DigestMismatch {
+        name: String,
+        target: String,
+    },
+    SizeMismatch {
+        name: String,
+        target: String,
+    },
+    /// The release-signing seed was all zeros: a deterministic key anyone
+    /// could forge with. Signing refuses rather than minting a known key.
+    WeakSigningSeed,
 }
 
 impl std::fmt::Display for ManifestError {
@@ -88,6 +103,10 @@ impl std::fmt::Display for ManifestError {
             Self::SizeMismatch { name, target } => {
                 write!(f, "size mismatch for artifact {name} ({target})")
             }
+            Self::WeakSigningSeed => write!(
+                f,
+                "release signing seed is all zeros; refusing to sign with a publicly-known key"
+            ),
         }
     }
 }
@@ -108,7 +127,14 @@ pub fn build_signed_manifest(
     key_id: &str,
     seed: [u8; 32],
     mut artifacts: Vec<ManifestArtifact>,
-) -> ReleaseManifest {
+) -> Result<ReleaseManifest, ManifestError> {
+    // Fail closed on a degenerate seed: `from_seed` would happily derive the
+    // well-known all-zeros Ed25519 key, letting anyone forge manifests. The
+    // crate's own `NodeKeyPair::from_raw` rejects zero material; manifest
+    // signing must meet the same bar.
+    if seed.iter().all(|value| *value == 0) {
+        return Err(ManifestError::WeakSigningSeed);
+    }
     sort_artifacts(&mut artifacts);
     let provider =
         Ed25519SigningProvider::from_seed(SigningProviderKind::LocalEncryptedFile, key_id, seed);
@@ -127,7 +153,7 @@ pub fn build_signed_manifest(
         .sign_attestation(&payload)
         .map(|sig| to_hex(&sig))
         .unwrap_or_default();
-    ReleaseManifest {
+    Ok(ReleaseManifest {
         schema_version: RELEASE_MANIFEST_SCHEMA_VERSION,
         release_track: release_track.to_owned(),
         generated_at_unix,
@@ -135,7 +161,7 @@ pub fn build_signed_manifest(
         verifier_key_hex,
         artifacts,
         signature_hex,
-    }
+    })
 }
 
 impl ReleaseManifest {
@@ -343,6 +369,19 @@ mod tests {
             test_seed(),
             sample_artifacts(),
         )
+        .expect("test signing seed is valid")
+    }
+
+    #[test]
+    fn zero_seed_is_rejected_rather_than_minting_a_known_key() {
+        let result = build_signed_manifest(
+            "beta",
+            1_700_000_000,
+            "ed25519:test",
+            [0u8; 32],
+            sample_artifacts(),
+        );
+        assert_eq!(result.err(), Some(ManifestError::WeakSigningSeed));
     }
 
     #[test]

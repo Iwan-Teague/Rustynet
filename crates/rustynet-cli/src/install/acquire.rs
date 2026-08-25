@@ -248,7 +248,8 @@ mod tests {
                 size_bytes: b.len() as u64,
             })
             .collect();
-        let m = build_signed_manifest("beta", 1_700_000_000, "ed25519:test", seed, artifacts);
+        let m = build_signed_manifest("beta", 1_700_000_000, "ed25519:test", seed, artifacts)
+            .expect("test signing seed is valid");
         serde_json::to_string(&m).unwrap()
     }
 
