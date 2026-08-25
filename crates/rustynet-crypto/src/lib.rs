@@ -2360,6 +2360,33 @@ mod tests {
         );
     }
 
+    /// CRY-11, `try_from_seed` variant: the rejection path must wipe the
+    /// by-value seed copy BEFORE returning `WeakMaterial`. A stack wipe is
+    /// not observable from a behavioral unit test, so — like the sibling
+    /// pins in this module — it is pinned by source-grep.
+    #[test]
+    fn try_from_seed_wipes_the_seed_before_rejecting() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+        let start = body
+            .find("pub fn try_from_seed(")
+            .expect("try_from_seed must remain present");
+        let window_end = (start + 1_500).min(body.len());
+        let window = &body[start..window_end];
+        let guard = window
+            .find("if is_all_zeros(&seed)")
+            .expect("try_from_seed must gate on the all-zero seed");
+        let err_return = window[guard..]
+            .find("return Err(CryptoError::WeakMaterial)")
+            .expect("rejection path must return WeakMaterial");
+        let prefix = &window[..guard + err_return];
+        assert!(
+            prefix.contains("seed.zeroize()"),
+            "try_from_seed must zeroize its by-value seed copy before rejecting"
+        );
+    }
+
     /// Cross-key rejection: a signature made under key A must never
     /// verify under an unrelated key B — a verifier that accepted it
     /// would break identity binding entirely.
