@@ -1191,9 +1191,11 @@ impl Ed25519SigningProvider {
         })
     }
 
-    /// Infallible TEST helper: derives the provider from any seed, including
-    /// degenerate all-zero material. Production paths must use
-    /// [`Self::try_from_seed`], which fails closed on a zero seed.
+    /// Infallible TEST-only helper: derives the provider from any seed,
+    /// including degenerate all-zero material. Compiled out of production
+    /// builds — every non-test caller MUST use [`Self::try_from_seed`],
+    /// which fails closed on a zero seed.
+    #[cfg(test)]
     pub fn from_seed(
         provider_kind: SigningProviderKind,
         key_id: impl Into<String>,
