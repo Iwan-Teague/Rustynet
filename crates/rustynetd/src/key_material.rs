@@ -183,9 +183,35 @@ pub fn store_passphrase_in_os_secure_store(
 fn read_passphrase_from_source(source_path: &Path) -> Result<Zeroizing<String>, String> {
     let allow_root_owner = is_systemd_credential_path(source_path);
     validate_secret_file_security(source_path, "passphrase file", allow_root_owner)?;
-
-    let raw = fs::read(source_path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    let file =
+        fs::File::open(source_path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    let raw = read_bounded_passphrase_bytes(file)?;
     parse_passphrase_bytes(raw, "passphrase file")
+}
+
+/// Anti-DoS bound for passphrase-file reads: stop buffering at
+/// [`MAX_PASSPHRASE_BYTES`] + 1 and reject before any larger allocation.
+/// The cap used to be enforced only inside [`parse_passphrase_bytes`],
+/// AFTER `fs::read` had buffered the entire file, so a hostile or
+/// misprovisioned file at the spool path was fully allocated into daemon
+/// memory before being rejected. Mirrors the established bounded-read
+/// pattern in `key_rotation::read_bounded` /
+/// `gossip_runtime::read_gossip_watermark_bounded`. The rejected buffer
+/// is zeroized so partially-read secret material does not linger on the
+/// error path.
+#[cfg(not(windows))]
+fn read_bounded_passphrase_bytes<R: std::io::Read>(reader: R) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    reader
+        .take(MAX_PASSPHRASE_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|err| format!("read passphrase file failed: {err}"))?;
+    if raw.len() > MAX_PASSPHRASE_BYTES {
+        raw.zeroize();
+        return Err("passphrase exceeds maximum allowed size".to_owned());
+    }
+    Ok(raw)
 }
 
 fn parse_passphrase_bytes(
@@ -2031,6 +2057,131 @@ mod tests {
             .expect("16-char trimmed passphrase must be accepted");
         assert_eq!(value.as_str(), "sixteen-charsXYZ");
         assert_eq!(value.len(), 16);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_passphrase_from_source_rejects_oversize_file_fails_closed() {
+        // Security pin: the passphrase FILE read path must enforce the
+        // MAX_PASSPHRASE_BYTES cap itself, not rely on the downstream
+        // parser check. The read used to buffer the entire file via
+        // `fs::read` before any size validation, so a hostile or
+        // misprovisioned file at the spool path was fully allocated into
+        // daemon memory before being rejected. The bounded-read contract
+        // mirrors `key_rotation::read_bounded` /
+        // `gossip_runtime::read_gossip_watermark_bounded`: stop reading
+        // at cap + 1, reject, zeroize.
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_test_dir("rn-passphrase-oversize");
+        let path = dir.join("passphrase");
+        let oversize = vec![b'A'; super::MAX_PASSPHRASE_BYTES + 1];
+        std::fs::write(&path, &oversize).expect("oversize fixture should be writable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("fixture permissions should be settable");
+
+        let err = super::read_passphrase_from_source(&path)
+            .expect_err("oversize passphrase file must be rejected");
+        assert!(
+            err.contains("maximum allowed size"),
+            "rejection must name the size cap, got: {err}"
+        );
+
+        // And the on-disk artifact must be untouched by the failed load.
+        let mut on_disk = Vec::new();
+        std::fs::File::open(&path)
+            .expect("fixture should still be readable")
+            .read_to_end(&mut on_disk)
+            .expect("fixture re-read should succeed");
+        assert_eq!(on_disk.len(), oversize.len(), "file must not be truncated");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_passphrase_from_source_accepts_owner_only_file_at_cap_boundary() {
+        // Positive control for the bounded-read path: an owner-only file
+        // whose content fits inside the cap loads exactly as before, so
+        // the bound cannot silently break provisioning. Cap boundary:
+        // MAX_PASSPHRASE_BYTES bytes are accepted; only cap + 1 fails.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_test_dir("rn-passphrase-boundary");
+        let path = dir.join("passphrase");
+        let body = vec![b'A'; super::MAX_PASSPHRASE_BYTES];
+        std::fs::write(&path, &body).expect("boundary fixture should be writable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("fixture permissions should be settable");
+
+        let value = super::read_passphrase_from_source(&path)
+            .expect("at-cap passphrase file must be accepted");
+        assert_eq!(value.as_str().len(), super::MAX_PASSPHRASE_BYTES);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bounded_passphrase_reader_stops_buffering_at_cap_not_after() {
+        // The real regression pin for the bounded read: a counting
+        // reader proves `take()` stops pulling from the stream at
+        // MAX_PASSPHRASE_BYTES + 1. The pre-fix implementation read the
+        // ENTIRE source into memory (`fs::read`) before the parser's
+        // size check rejected it, which would serve every byte here and
+        // fail this assertion.
+        use std::io::Read;
+
+        struct CountingReader {
+            remaining: usize,
+            served: usize,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Ok(0);
+                }
+                let count = buf.len().min(self.remaining);
+                for slot in &mut buf[..count] {
+                    *slot = b'A';
+                }
+                self.remaining -= count;
+                self.served += count;
+                Ok(count)
+            }
+        }
+
+        let total = super::MAX_PASSPHRASE_BYTES * 64;
+        let mut hostile = CountingReader {
+            remaining: total,
+            served: 0,
+        };
+        let err = super::read_bounded_passphrase_bytes(&mut hostile)
+            .expect_err("oversize stream must be rejected");
+        assert!(
+            err.contains("maximum allowed size"),
+            "rejection must name the size cap, got: {err}"
+        );
+        assert!(
+            hostile.served <= super::MAX_PASSPHRASE_BYTES + 1,
+            "bounded reader must stop consuming at cap + 1; consumed {} of {}",
+            hostile.served,
+            total
+        );
+
+        // Positive control: an exactly-at-cap stream is accepted intact.
+        let mut boundary = CountingReader {
+            remaining: super::MAX_PASSPHRASE_BYTES,
+            served: 0,
+        };
+        let raw = super::read_bounded_passphrase_bytes(&mut boundary)
+            .expect("at-cap stream must be accepted");
+        assert_eq!(raw.len(), super::MAX_PASSPHRASE_BYTES);
+        assert_eq!(
+            boundary.served,
+            super::MAX_PASSPHRASE_BYTES,
+            "at-cap stream must be fully consumed"
+        );
     }
 
     #[cfg(windows)]
