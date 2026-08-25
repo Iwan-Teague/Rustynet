@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -229,35 +230,79 @@ struct AllowedIpNetwork {
 }
 
 impl UserspaceEngine {
+    /// On-disk bound for the base64 private-key file. Checked at READ time so
+    /// an oversized or special-file path cannot drive unbounded allocation
+    /// before the decoder rejects the content.
+    pub(crate) const MAX_PRIVATE_KEY_FILE_BYTES: u64 = 4096;
+
     pub(crate) fn from_private_key_file(path: &Path) -> Result<Self, BackendError> {
         // Secret-material hygiene: the on-disk base64 blob and the decoded 32-byte
         // scalar are WireGuard static private key material. Wrap intermediates in
         // `Zeroizing` so any heap-resident copy is overwritten when dropped, and
         // explicitly zeroize the stack-resident `[u8; 32]` after handing a copy to
         // `StaticSecret::from` (the array is `Copy`; the cast does not consume).
-        let encoded_private_key: Zeroizing<String> =
-            Zeroizing::new(fs::read_to_string(path).map_err(|err| {
+        //
+        // The read itself is bounded at READ time (consume at most cap + 1), not
+        // derived from stat metadata: a racing writer cannot grow the file past
+        // the bound between validation and buffering.
+        let key_file = fs::File::open(path).map_err(|err| {
+            BackendError::internal(format!(
+                "userspace-shared private key open failed for {}: {err}",
+                path.display()
+            ))
+        })?;
+        let mut raw_private_key = Zeroizing::new(Vec::new());
+        key_file
+            .take(Self::MAX_PRIVATE_KEY_FILE_BYTES + 1)
+            .read_to_end(&mut raw_private_key)
+            .map_err(|err| {
                 BackendError::internal(format!(
-                    "linux userspace-shared private key read failed for {}: {err}",
+                    "userspace-shared private key read failed for {}: {err}",
                     path.display()
                 ))
-            })?);
+            })?;
+        if raw_private_key.len() as u64 > Self::MAX_PRIVATE_KEY_FILE_BYTES {
+            return Err(BackendError::internal(format!(
+                "userspace-shared private key file exceeds {} byte cap; refusing to read {}",
+                Self::MAX_PRIVATE_KEY_FILE_BYTES,
+                path.display()
+            )));
+        }
+        let encoded_vec = std::mem::take(&mut *raw_private_key);
+        drop(raw_private_key);
+        let encoded_string = String::from_utf8(encoded_vec).map_err(|err| {
+            BackendError::internal(format!(
+                "userspace-shared private key file is not valid UTF-8 for {}: {err}",
+                path.display()
+            ))
+        })?;
+        let encoded_private_key = Zeroizing::new(encoded_string);
         let trimmed_private_key = encoded_private_key.trim();
         let decoded_private_key: Zeroizing<Vec<u8>> = Zeroizing::new(
             BASE64_STANDARD
                 .decode(trimmed_private_key.as_bytes())
                 .map_err(|err| {
                     BackendError::internal(format!(
-                        "linux userspace-shared private key decode failed for {}: {err}",
+                        "userspace-shared private key decode failed for {}: {err}",
                         path.display()
                     ))
                 })?,
         );
         if decoded_private_key.len() != 32 {
             return Err(BackendError::internal(format!(
-                "linux userspace-shared private key length invalid for {}: expected 32 bytes after base64 decode, got {}",
+                "userspace-shared private key length invalid for {}: expected 32 bytes after base64 decode, got {}",
                 path.display(),
                 decoded_private_key.len()
+            )));
+        }
+        // CRY-06 convention (mirrors rustynet-crypto's WeakMaterial rejects):
+        // an all-zero static private key is a publicly derivable identity that
+        // a blank or corrupted key file would mint. Refuse it instead of
+        // bringing up a tunnel an attacker can impersonate.
+        if decoded_private_key.iter().all(|&byte| byte == 0) {
+            return Err(BackendError::internal(format!(
+                "userspace-shared private key is degenerate (all zeros) for {}; refusing to load weak key material",
+                path.display()
             )));
         }
         let mut private_key_bytes: [u8; 32] = [0u8; 32];
@@ -1894,7 +1939,7 @@ mod tests {
         let path = dir.path().join("absent.key");
         let err = UserspaceEngine::from_private_key_file(&path).expect_err("missing file");
         assert_eq!(err.kind, BackendErrorKind::Internal);
-        assert!(err.message.contains("read failed"), "got {:?}", err.message);
+        assert!(err.message.contains("open failed"), "got {:?}", err.message);
     }
 
     #[test]
