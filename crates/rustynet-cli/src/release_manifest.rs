@@ -442,6 +442,44 @@ mod tests {
     }
 
     #[test]
+    fn sign_manifest_with_provider_embeds_the_provider_signature_verbatim() {
+        const FIXED_SIG: [u8; 64] = [0xAB; 64];
+        struct FixedProvider;
+        impl SigningProvider for FixedProvider {
+            fn kind(&self) -> SigningProviderKind {
+                SigningProviderKind::Kms
+            }
+            fn key_identifier(&self) -> &str {
+                "kms://fixed"
+            }
+            fn sign_attestation(&self, _payload: &[u8]) -> Result<Vec<u8>, CryptoError> {
+                Ok(FIXED_SIG.to_vec())
+            }
+            fn verify_attestation(
+                &self,
+                _payload: &[u8],
+                _signature: &[u8],
+            ) -> Result<(), CryptoError> {
+                Ok(())
+            }
+        }
+        let manifest = sign_manifest_with_provider(
+            "beta",
+            1_700_000_000,
+            "kms://fixed",
+            "aa55",
+            &FixedProvider,
+            sample_artifacts(),
+        )
+        .expect("fixed provider signs");
+        // The emitted manifest must carry exactly what the provider signed —
+        // no re-hexing, truncation, or field swap between payload and envelope.
+        assert_eq!(manifest.signature_hex, to_hex(&FIXED_SIG));
+        assert_eq!(manifest.verifier_key_hex, "aa55");
+        assert_eq!(manifest.signer_key_id, "kms://fixed");
+    }
+
+    #[test]
     fn zero_seed_is_rejected_rather_than_minting_a_known_key() {
         let result = build_signed_manifest(
             "beta",
