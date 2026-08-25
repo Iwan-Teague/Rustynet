@@ -5241,9 +5241,103 @@ fn apparmor_profile_status_internal() -> Vec<AppArmorProfile> {
     Vec::new()
 }
 
-#[cfg(target_os = "windows")]
-fn apparmor_profile_status_internal() -> Vec<AppArmorProfile> {
-    Vec::new()
+/// Build one [`KeyPermissionCheck`] from a `stat -c "%U:%G %a" <path>`
+/// invocation's outcome. `stat_success` is the child's exit status; `stdout`
+/// is `None` when the spawn itself failed or the output was not UTF-8.
+///
+/// Fail-closed contract: a permission audit entry may only report
+/// `is_correct: true` when the invocation succeeded AND its stdout carried an
+/// owner token and a numeric octal mode token with no group/world bits.
+/// A failed spawn, a nonzero exit (the signature of a missing/unreadable key
+/// path), non-UTF-8 output, a truncated row, or a non-numeric mode all yield
+/// `is_correct: false` plus an explicit issue — never the historical silent
+/// fallbacks (`mode = "000"` → correct, garbage mode → `0o777`) that let an
+/// unverifiable private-key path pass as "correct". Universally compiled
+/// (callers are Linux-only) so it is unit-testable on any host, matching this
+/// crate's parse/IO split convention.
+#[allow(dead_code)]
+fn key_permission_check_from_stat(
+    path: &str,
+    stat_success: bool,
+    stdout: Option<&str>,
+) -> KeyPermissionCheck {
+    let mut issues = Vec::new();
+    if !stat_success {
+        issues.push(format!(
+            "{path}: stat failed (missing or unreadable); permissions NOT verified"
+        ));
+    }
+
+    let Some(stdout) = stdout else {
+        issues.push("stat output unavailable (spawn failure or non-UTF-8)".to_string());
+        return KeyPermissionCheck {
+            path: path.to_string(),
+            owner: "unknown".to_string(),
+            mode: String::new(),
+            context: None,
+            is_correct: false,
+            issues,
+        };
+    };
+
+    let parts: Vec<&str> = stdout.split_whitespace().collect();
+    if parts.len() < 2 {
+        issues.push(format!(
+            "{path}: malformed stat output (expected \"owner:group mode\"), got {stdout:?}"
+        ));
+        return KeyPermissionCheck {
+            path: path.to_string(),
+            owner: parts
+                .first()
+                .map(|s| (*s).to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            mode: String::new(),
+            context: None,
+            is_correct: false,
+            issues,
+        };
+    }
+
+    let owner_group = parts[0];
+    let mode = parts[1];
+
+    let owner_parts: Vec<&str> = owner_group.split(':').collect();
+    let owner = owner_parts
+        .first()
+        .copied()
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Non-numeric or overflowing octal is unverifiable, not "maximally open":
+    // report it as incorrect rather than substituting 0o777.
+    let mode_val = match u32::from_str_radix(mode, 8) {
+        Ok(v) => v,
+        Err(_) => {
+            issues.push(format!("{path}: non-octal mode token {mode:?}"));
+            return KeyPermissionCheck {
+                path: path.to_string(),
+                owner,
+                mode: mode.to_string(),
+                context: None,
+                is_correct: false,
+                issues,
+            };
+        }
+    };
+    let is_correct = stat_success && (mode_val & 0o077) == 0;
+
+    if (mode_val & 0o077) != 0 {
+        issues.push("world/group readable".to_string());
+    }
+
+    KeyPermissionCheck {
+        path: path.to_string(),
+        owner,
+        mode: mode.to_string(),
+        context: None,
+        is_correct,
+        issues,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -5255,40 +5349,25 @@ fn cryptographic_key_permissions_internal() -> Vec<KeyPermissionCheck> {
     ];
 
     for path in key_paths {
-        if let Ok(output) = std::process::Command::new("stat")
+        // One check entry per audited path, always — a failed spawn, a
+        // nonzero exit, or undecodable output becomes an explicit
+        // not-correct entry instead of silently vanishing from the report
+        // (the previous skip made an unreadable key path a vacuous pass).
+        let outcome = std::process::Command::new("stat")
             .args(["-c", "%U:%G %a", path])
-            .output()
-        {
-            if let Ok(s) = String::from_utf8(output.stdout) {
-                let parts: Vec<&str> = s.split_whitespace().collect();
-                let owner_group = parts.first().copied().unwrap_or("unknown:unknown");
-                let mode = parts.get(1).copied().unwrap_or("000");
-
-                let owner_parts: Vec<&str> = owner_group.split(':').collect();
-                let owner = owner_parts
-                    .first()
-                    .copied()
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let mode_val = u32::from_str_radix(mode, 8).unwrap_or(0o777);
-                let is_correct = (mode_val & 0o077) == 0;
-
-                let mut issues = Vec::new();
-                if (mode_val & 0o077) != 0 {
-                    issues.push("world/group readable".to_string());
-                }
-
-                checks.push(KeyPermissionCheck {
-                    path: path.to_string(),
-                    owner,
-                    mode: mode.to_string(),
-                    context: None,
-                    is_correct,
-                    issues,
-                });
-            }
-        }
+            .output();
+        let (stat_success, stdout) = match outcome {
+            Ok(output) => (
+                output.status.success(),
+                String::from_utf8(output.stdout).ok(),
+            ),
+            Err(_) => (false, None),
+        };
+        checks.push(key_permission_check_from_stat(
+            path,
+            stat_success,
+            stdout.as_deref(),
+        ));
     }
 
     checks
@@ -8358,6 +8437,90 @@ UnknownState                  9
             for parser in &parsers {
                 parser(&s);
             }
+        }
+    }
+
+    // --- key_permission_check_from_stat: unverifiable input must never read
+    // --- as "correct" (fail-closed contract for the private-key permission
+    // --- audit).
+
+    #[test]
+    fn key_permission_check_missing_key_empty_stat_output_reports_not_correct() {
+        use super::key_permission_check_from_stat;
+        // `stat` on a nonexistent path exits nonzero and prints nothing; even
+        // with a (wrongly) successful status, empty output must NOT yield
+        // is_correct=true via the historical mode="000" fallback.
+        let check =
+            key_permission_check_from_stat("/etc/rustynet/keys/private.key", true, Some(""));
+        assert!(
+            !check.is_correct,
+            "empty stat output must not read as correct permissions"
+        );
+        assert!(
+            check
+                .issues
+                .iter()
+                .any(|i| i.contains("NOT verified") || i.contains("malformed")),
+            "expected an explicit unverified/malformed issue, got issues={:?} correct={}",
+            check.issues,
+            check.is_correct
+        );
+    }
+
+    #[test]
+    fn key_permission_check_failed_stat_invocation_reports_not_correct() {
+        use super::key_permission_check_from_stat;
+        let check = key_permission_check_from_stat("/p", false, Some("root:root 600"));
+        assert!(!check.is_correct);
+        assert!(check.issues.iter().any(|i| i.contains("NOT verified")));
+    }
+
+    #[test]
+    fn key_permission_check_non_utf8_stdout_reports_not_correct() {
+        use super::key_permission_check_from_stat;
+        let check = key_permission_check_from_stat("/p", true, None);
+        assert!(!check.is_correct);
+    }
+
+    #[test]
+    fn key_permission_check_truncated_stat_output_reports_not_correct() {
+        use super::key_permission_check_from_stat;
+        // Owner token only, no mode token.
+        let check = key_permission_check_from_stat("/p", true, Some("root:root"));
+        assert!(
+            !check.is_correct,
+            "truncated stat output must not read as correct permissions"
+        );
+    }
+
+    #[test]
+    fn key_permission_check_nonnumeric_mode_reports_not_correct() {
+        use super::key_permission_check_from_stat;
+        let check = key_permission_check_from_stat("/p", true, Some("root:root rwx"));
+        assert!(!check.is_correct);
+    }
+
+    #[test]
+    fn key_permission_check_restricted_modes_are_correct_without_issues() {
+        use super::key_permission_check_from_stat;
+        for mode in ["600", "400", "000"] {
+            let check =
+                key_permission_check_from_stat("/p", true, Some(&format!("root:root {mode}")));
+            assert!(check.is_correct, "mode {mode} must read as correct");
+            assert!(check.issues.is_empty());
+            assert_eq!(check.owner, "root");
+            assert_eq!(check.mode, mode);
+        }
+    }
+
+    #[test]
+    fn key_permission_check_group_or_world_bits_are_flagged() {
+        use super::key_permission_check_from_stat;
+        for mode in ["644", "666", "777", "640"] {
+            let check =
+                key_permission_check_from_stat("/p", true, Some(&format!("root:root {mode}")));
+            assert!(!check.is_correct, "mode {mode} must not read as correct");
+            assert!(check.issues.iter().any(|i| i == "world/group readable"));
         }
     }
 }
