@@ -503,9 +503,18 @@ impl StateFetcher {
             .write_all(request.as_bytes())
             .map_err(|_| "write to socket failed".to_owned())?;
         let mut buf = Vec::new();
-        stream
-            .read_to_end(&mut buf)
-            .map_err(|_| "read from socket failed".to_owned())?;
+        // Bound the response read exactly like fetcher.rs: a hostile or
+        // compromised coordinator (plain http://, no TLS) must not be able to
+        // stream unbounded bytes into memory before the signature check.
+        {
+            let mut limited = stream.take(crate::fetcher::MAX_FETCHER_BODY_BYTES as u64 + 1);
+            limited
+                .read_to_end(&mut buf)
+                .map_err(|_| "read from socket failed".to_owned())?;
+        }
+        if buf.len() > crate::fetcher::MAX_FETCHER_BODY_BYTES {
+            return Err("response exceeds maximum body size".to_owned());
+        }
         // Very minimal HTTP response parsing: look for \r\n\r\n and take the rest as body.
         if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let body = buf.split_off(idx + 4);
@@ -16193,6 +16202,38 @@ fn race_outcome_classes(
 
 #[cfg(all(test, not(windows)))]
 mod tests {
+    /// dcd7cf49-class bound: the bootstrap HTTP client must refuse a response
+    /// body larger than MAX_FETCHER_BODY_BYTES instead of streaming it into
+    /// memory. A local listener serves more than the cap; the fetcher must
+    /// return a size error, not Ok with a huge body.
+    #[test]
+    fn http_get_raw_refuses_response_body_over_cap() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accept");
+            // Drain the request (best-effort).
+            let mut scratch = [0u8; 1024];
+            let _ = std::io::Read::read(&mut conn, &mut scratch);
+            let header = b"HTTP/1.1 200 OK\r\nContent-Length: 8388609\r\nConnection: close\r\n\r\n";
+            use std::io::Write;
+            let _ = conn.write_all(header);
+            let chunk = vec![b'a'; 64 * 1024];
+            for _ in 0..(8 * 1024 * 1024 / chunk.len()) {
+                if conn.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let url = format!("http://127.0.0.1:{}/bundle", addr.port());
+        let result = StateFetcher::http_get_raw(url.as_str());
+        let err = result.expect_err("oversized body must be refused");
+        assert!(
+            err.contains("exceeds maximum body size"),
+            "unexpected error: {err}"
+        );
+        handle.join().expect("server thread");
+    }
 
     use std::collections::BTreeMap;
 
