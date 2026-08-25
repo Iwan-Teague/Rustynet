@@ -517,14 +517,30 @@ impl RelayTransport {
             return Err(RejectReason::Capacity);
         }
 
-        // Check 11: Per-node session capacity
+        // Check 11: Per-node session capacity. As with the global cap above,
+        // replacing an existing pair is not growth: the old session is removed
+        // before the new one is inserted (`remove_session_for_pair` runs after
+        // validation), so the replacement must not count the session it is
+        // about to free. Without this exemption a node at exactly its cap can
+        // never re-hello any of its own pairs — the client's proactive token
+        // refresh re-hellos while the old session is still alive — and every
+        // refresh is locked out until sessions fully expire.
         let node_session_count = self
             .sessions
             .values()
             .filter(|s| s.node_id == hello.node_id)
             .count();
+        // The indexed pair's session belongs to `hello.node_id` by construction
+        // (the index is keyed on the establishing hello's own fields), so when
+        // `replacing_existing_pair` holds, exactly one of the counted sessions
+        // is the one about to be freed.
+        let effective_node_session_count = if replacing_existing_pair {
+            node_session_count.saturating_sub(1)
+        } else {
+            node_session_count
+        };
 
-        if node_session_count >= self.max_sessions_per_node {
+        if effective_node_session_count >= self.max_sessions_per_node {
             eprintln!(
                 "Relay hello rejected: capacity limit reached for node {}",
                 hello.node_id
@@ -2103,6 +2119,69 @@ mod tests {
         assert!(!transport.has_session(sid_old));
         assert!(transport.has_session(sid_new));
         assert_eq!(transport.session_count(), 1);
+    }
+
+    #[test]
+    fn rehello_replacing_existing_pair_is_exempt_from_per_node_capacity() {
+        // Mirror of the global-capacity replacement exemption (Check 10) for
+        // the per-node cap (Check 11). A node whose OWN live session occupies
+        // its last slot must still be able to re-hello that same pair: the
+        // replacement removes the old session before inserting the new one,
+        // so the per-node live count never grows. Without the exemption a
+        // node at exactly `max_sessions_per_node` can never refresh any
+        // session (the client's proactive token refresh path re-hellos while
+        // the old session is still alive), locking every refresh out until
+        // sessions fully expire.
+        let (sk, _) = make_test_keypair();
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90);
+
+        let sid_first = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([198, 51, 100, 40], 40_200),
+        );
+        assert_eq!(transport.session_count(), 1);
+
+        let sid_second = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([198, 51, 100, 40], 40_201),
+        );
+
+        assert_ne!(sid_first, sid_second);
+        assert!(!transport.has_session(sid_first));
+        assert!(transport.has_session(sid_second));
+        assert_eq!(
+            transport.session_count(),
+            1,
+            "replacement must stay count-neutral"
+        );
+    }
+
+    #[test]
+    fn distinct_new_pair_still_counts_against_per_node_capacity() {
+        // The negative control for the exemption above: when the node's slot
+        // is occupied by a DIFFERENT pair, a hello for a new pair is genuine
+        // growth and must still be refused at the per-node cap.
+        let (sk, _) = make_test_keypair();
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90);
+
+        accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-a",
+            "node-b",
+            observed_addr([198, 51, 100, 41], 40_210),
+        );
+
+        match transport.handle_hello(make_hello(&sk, "node-a", "node-c")) {
+            RelayHelloResponse::Rejected(RejectReason::Capacity) => {}
+            other => panic!("expected Capacity rejection for genuine growth, got {other:?}"),
+        }
     }
 
     #[test]
