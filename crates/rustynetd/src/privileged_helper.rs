@@ -4457,6 +4457,50 @@ mod tests {
     }
 
     #[test]
+    fn builtin_success_construction_stays_centralized_in_the_clamp_seam() {
+        // The deliverability pin above exercises `builtin_success_response` in
+        // isolation, so it stays green even if the production dispatch reverts
+        // to constructing `HelperResponse::success` inline with unclamped
+        // builtin output — the exact H2 regression this seam exists to close.
+        // A naive revert is caught by dead_code (the fn would lose its only
+        // non-test caller), but deleting the fn AND inlining the construction
+        // escapes every behavioral test silently. Audit the production source
+        // directly: outside the test module, `HelperResponse::success` must be
+        // constructed at exactly ONE site, and that site must be inside the
+        // clamping `success_response_from_exec_output`, with the builtin arm
+        // routing through `builtin_success_response`.
+        let source = include_str!("privileged_helper.rs");
+        let prod = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file always has a pre-test section");
+        let seam = "fn success_response_from_exec_output";
+        let seam_start = prod
+            .find(seam)
+            .unwrap_or_else(|| panic!("{seam} must exist in the production section"));
+        let count = prod.matches("HelperResponse::success(").count();
+        assert_eq!(
+            count, 1,
+            "HelperResponse::success must be constructed at exactly one production \
+             site — an inline construction outside the clamp seam reintroduces the \
+             unbounded-builtin-output drop-the-connection bug"
+        );
+        let first_construction = prod
+            .find("HelperResponse::success(")
+            .expect("count 1 implies a match exists");
+        assert!(
+            first_construction > seam_start,
+            "the single HelperResponse::success construction must sit inside \
+             success_response_from_exec_output so every caller is clamped"
+        );
+        assert!(
+            prod.contains("Ok(output) => builtin_success_response(output),"),
+            "the builtin dispatch arm must route through builtin_success_response; \
+             reverting it to inline construction bypasses the deliverability clamp"
+        );
+    }
+
+    #[test]
     fn nft_schema_refusal_embedding_a_max_size_argv_still_encodes() {
         // The refusal NAMES the rejected argv (`args.join(" ")`). At
         // MAX_ARGS x MAX_ARG_BYTES the joined text alone (~32KB) exceeds both
