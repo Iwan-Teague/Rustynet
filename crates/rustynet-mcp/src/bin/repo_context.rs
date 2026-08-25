@@ -1152,7 +1152,18 @@ fn collect_md(dir: &Path, repo_root: &Path, out: &mut Vec<String>) {
         if name.starts_with('.') {
             continue;
         }
-        if path.is_dir() {
+        // Do NOT follow symlinks — mirrors lab_state's collect_files and
+        // find_digest_recursive: `file_type()` reports the link itself without
+        // resolving it, so a symlinked dir is not walked into and a symlink
+        // named *.md is not read through to an out-of-tree target by the
+        // list_documents / find_in_docs consumers.
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
             collect_md(&path, repo_root, out);
         } else if path.extension().is_some_and(|e| e == "md")
             && let Ok(rel) = path.strip_prefix(repo_root)
@@ -2178,6 +2189,44 @@ mod tests {
     fn transition_admin_client_is_local_only() {
         let p = plan_transition(Preset::Admin, Preset::Client);
         assert_eq!(p.kind, TransitionKind::LocalOnly);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_md_does_not_follow_symlinks() {
+        // Companion to lab_state/ai_agent's walker pins for THIS binary's own
+        // recursive walker: collect_md underpins list_documents/find_in_docs
+        // and used `path.is_dir()` — resolving metadata — so a committed or
+        // planted symlink under documents/ was walked into / read through and
+        // its title + find_in_docs excerpts rendered into tool output.
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("repo_ctx_collect_md_{}", std::process::id()));
+        let docs = root.join("documents");
+        let outside = root.join("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(docs.join("real.md"), "# Real\nbody\n").unwrap();
+        std::fs::write(outside.join("secret.md"), "# TOPSECRET-title\n").unwrap();
+        symlink(outside.join("secret.md"), docs.join("leak.md")).unwrap();
+        symlink(&outside, docs.join("leakdir")).unwrap();
+
+        let mut files: Vec<String> = Vec::new();
+        collect_md(&docs, &root, &mut files);
+
+        assert!(
+            files.iter().any(|p| p.ends_with("real.md")),
+            "real in-tree doc must be listed: {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.contains("leak") || p.contains("secret")),
+            "symlinked file/dir must NOT be followed/listed: {files:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
