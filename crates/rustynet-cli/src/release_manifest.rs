@@ -78,6 +78,13 @@ pub enum ManifestError {
     /// The release-signing seed was all zeros: a deterministic key anyone
     /// could forge with. Signing refuses rather than minting a known key.
     WeakSigningSeed,
+    /// Two entries claimed the same (name, target): artifact lookup is
+    /// first-match, so a duplicate would make part of the manifest
+    /// unverifiable. Signing refuses ambiguous manifests.
+    DuplicateArtifact {
+        name: String,
+        target: String,
+    },
 }
 
 impl std::fmt::Display for ManifestError {
@@ -106,6 +113,10 @@ impl std::fmt::Display for ManifestError {
             Self::WeakSigningSeed => write!(
                 f,
                 "release signing seed is all zeros; refusing to sign with a publicly-known key"
+            ),
+            Self::DuplicateArtifact { name, target } => write!(
+                f,
+                "manifest lists artifact {name} ({target}) more than once"
             ),
         }
     }
@@ -168,6 +179,17 @@ fn sign_manifest_with_provider(
     mut artifacts: Vec<ManifestArtifact>,
 ) -> Result<ReleaseManifest, ManifestError> {
     sort_artifacts(&mut artifacts);
+    // Artifact lookup is first-match on (name, target), so a duplicate pair
+    // would leave the later entry unverifiable against any downloaded
+    // binary. Sorted order puts equal keys adjacent: one comparison each.
+    for pair in artifacts.windows(2) {
+        if pair[0].name == pair[1].name && pair[0].target == pair[1].target {
+            return Err(ManifestError::DuplicateArtifact {
+                name: pair[1].name.clone(),
+                target: pair[1].target.clone(),
+            });
+        }
+    }
     let payload = canonical_payload(
         release_track,
         generated_at_unix,
@@ -478,6 +500,31 @@ mod tests {
         assert_eq!(manifest.signature_hex, to_hex(&FIXED_SIG));
         assert_eq!(manifest.verifier_key_hex, "aa55");
         assert_eq!(manifest.signer_key_id, "kms://fixed");
+    }
+
+    #[test]
+    fn duplicate_artifact_tuple_is_rejected_at_signing() {
+        let mut artifacts = sample_artifacts();
+        // Same (name, target) as an existing entry, different digest: lookup
+        // is first-match, so signing must refuse the ambiguous manifest.
+        artifacts.push(ManifestArtifact {
+            name: "rustynetd".to_owned(),
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            filename: "rustynetd-x86_64-unknown-linux-gnu".to_owned(),
+            sha256: sha256_hex(b"evil-second-entry"),
+            size_bytes: b"evil-second-entry".len() as u64,
+        });
+        let result = build_signed_manifest(
+            "beta",
+            1_700_000_000,
+            "ed25519:test",
+            test_seed(),
+            artifacts,
+        );
+        assert!(matches!(
+            result.err(),
+            Some(ManifestError::DuplicateArtifact { .. })
+        ));
     }
 
     #[test]
