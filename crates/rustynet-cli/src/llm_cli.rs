@@ -24,6 +24,12 @@ pub const DEFAULT_LLM_ACCESS_DIR: &str = "/var/lib/rustynet-llm/access";
 /// policy. Missing file ⇒ default-deny.
 pub const ACCESS_GRANTS_FILE: &str = "grants.v1";
 
+/// Maximum accepted size of `grants.v1`, verified from metadata
+/// BEFORE any read is attempted. Peer-selector lines are short and
+/// daemon-written from signed policy; anything larger is not state
+/// this CLI should buffer. Mirrors the 128 KiB operator-config cap.
+pub const ACCESS_GRANTS_MAX_BYTES: u64 = 128 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmCommand {
     Allow {
@@ -144,12 +150,43 @@ pub fn execute_llm(command: &LlmCommand, access_dir: Option<PathBuf>) -> Result<
         LlmCommand::AccessList => {
             let dir = access_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_LLM_ACCESS_DIR));
             let grants_path = dir.join(ACCESS_GRANTS_FILE);
-            if !grants_path.exists() {
-                return Ok(format!(
-                    "LLM service access: DEFAULT-DENY (no signed service-access policy \
-                     materialised at {}).\nNobody is authorised to reach this node's \
-                     inference endpoint. Authorise a device from your admin box with \
-                     `rustynet llm allow node:<id>`.\n",
+            // Fail-closed pre-read gate before any buffering: the
+            // daemon-written access state must exist as a regular,
+            // non-symlinked file within [`ACCESS_GRANTS_MAX_BYTES`],
+            // verified from metadata BEFORE any read is attempted
+            // (same discipline as the operator-config and daemon-log
+            // readers). A planted symlink must never be followed, a
+            // FIFO would block the read forever, and an oversized or
+            // sparse file must never be buffered into memory.
+            // Missing state ⇒ default-deny, honestly reported.
+            let metadata = match std::fs::symlink_metadata(&grants_path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(format!(
+                        "LLM service access: DEFAULT-DENY (no signed service-access policy \
+                         materialised at {}).\nNobody is authorised to reach this node's \
+                         inference endpoint. Authorise a device from your admin box with \
+                         `rustynet llm allow node:<id>`.\n",
+                        grants_path.display()
+                    ));
+                }
+                Err(err) => return Err(format!("cannot inspect {}: {err}", grants_path.display())),
+            };
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "LLM access state must not be a symlink: {}",
+                    grants_path.display()
+                ));
+            }
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "LLM access state must be a regular file: {}",
+                    grants_path.display()
+                ));
+            }
+            if metadata.len() > ACCESS_GRANTS_MAX_BYTES {
+                return Err(format!(
+                    "LLM access state exceeds maximum size ({ACCESS_GRANTS_MAX_BYTES} bytes): {}",
                     grants_path.display()
                 ));
             }
@@ -250,4 +287,111 @@ pub fn parse_allow_flags(peer: &str, rest: &[String]) -> Result<LlmCommand, LlmC
         max_tokens_per_window,
         max_requests_per_minute,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn run_access_list(dir: &std::path::Path) -> Result<String, String> {
+        execute_llm(&LlmCommand::AccessList, Some(dir.to_path_buf()))
+    }
+
+    #[test]
+    fn access_list_default_deny_when_grants_file_missing() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let out = run_access_list(dir.path()).expect("missing grants must stay default-deny");
+        assert!(out.contains("DEFAULT-DENY"), "got: {out}");
+    }
+
+    #[test]
+    fn access_list_lists_authorized_peers() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        std::fs::write(
+            dir.path().join(ACCESS_GRANTS_FILE),
+            "# node:sneaky-comment\nnode:alpha\n\ngroup:beta\n",
+        )
+        .expect("grants should be written");
+        let out = run_access_list(dir.path()).expect("regular small grants must read");
+        assert!(out.contains("node:alpha"), "got: {out}");
+        assert!(out.contains("group:beta"), "got: {out}");
+        // The commented-out selector must never surface as authorised
+        // (the output header legitimately says "signed policy", so match
+        // against the comment's own distinctive marker).
+        assert!(!out.contains("sneaky-comment"), "comment must not list");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn access_list_refuses_symlinked_grants_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().expect("temp dir should be created");
+        let outside = TempDir::new().expect("temp dir should be created");
+        let target = outside.path().join("real-grants.v1");
+        std::fs::write(&target, "node:sneaky\n").expect("target should be written");
+        symlink(&target, dir.path().join(ACCESS_GRANTS_FILE)).expect("symlink should be created");
+
+        let err = run_access_list(dir.path())
+            .expect_err("symlinked grants.v1 must fail closed, never be followed");
+        assert!(err.contains("must not be a symlink"), "got: {err}");
+        // The linked-to content must never surface as authorised.
+        if let Ok(out) = run_access_list(dir.path()) {
+            assert!(!out.contains("node:sneaky"), "leaked through link: {out}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn access_list_refuses_non_regular_grants_file() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let dir = TempDir::new().expect("temp dir should be created");
+        let fifo = dir.path().join(ACCESS_GRANTS_FILE);
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).expect("fifo should be created");
+
+        // Must reject from metadata BEFORE any open — opening a FIFO with
+        // no writer would block this test forever.
+        let err = run_access_list(dir.path())
+            .expect_err("non-regular grants.v1 must fail closed before any read");
+        assert!(err.contains("must be a regular file"), "got: {err}");
+    }
+
+    #[test]
+    fn access_list_refuses_oversized_grants_file() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let path = dir.path().join(ACCESS_GRANTS_FILE);
+        std::fs::write(&path, "node:alpha\n").expect("grants should be written");
+        // Sparse oversized file: length above the cap without allocating it.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("grants should reopen");
+        file.set_len(ACCESS_GRANTS_MAX_BYTES + 1)
+            .expect("set_len should work");
+        drop(file);
+
+        let err = run_access_list(dir.path())
+            .expect_err("oversized grants.v1 must fail closed before any read");
+        assert!(err.contains("exceeds maximum size"), "got: {err}");
+    }
+
+    #[test]
+    fn access_list_accepts_grants_at_size_cap() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let path = dir.path().join(ACCESS_GRANTS_FILE);
+        // Fill exactly to the cap with valid peer-selector lines plus a
+        // comment-line remainder: 18724 * 7 ("node:a\n") = 131068, + 4
+        // ("#ok\n") = 131072 = ACCESS_GRANTS_MAX_BYTES exactly.
+        let cap = ACCESS_GRANTS_MAX_BYTES;
+        let body = "node:a\n".repeat((cap / 7) as usize) + "#ok\n";
+        assert_eq!(body.len() as u64, cap, "fill must land exactly on cap");
+        std::fs::write(&path, &body).expect("grants should be written");
+
+        let out =
+            run_access_list(dir.path()).expect("exactly-at-cap grants must still be accepted");
+        assert!(out.contains("node:a"), "got: {out}");
+    }
 }
