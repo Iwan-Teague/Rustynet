@@ -2873,6 +2873,20 @@ mod tests {
         );
     }
 
+    /// Per-variant classification pin for `is_service_context`: the
+    /// three dataplane contexts are NOT service contexts and both
+    /// D13 hosting contexts ARE. Pins the predicate directly so an
+    /// inversion or missed variant is caught at the classifier, not
+    /// only through downstream rule matching.
+    #[test]
+    fn is_service_context_classifies_every_variant() {
+        assert!(!TrafficContext::Mesh.is_service_context());
+        assert!(!TrafficContext::SharedSubnetRouter.is_service_context());
+        assert!(!TrafficContext::SharedExit.is_service_context());
+        assert!(TrafficContext::NasService.is_service_context());
+        assert!(TrafficContext::LlmService.is_service_context());
+    }
+
     /// POL-03: a rule whose selector is accidentally empty must be inert, not
     /// dangerously permissive — it must not match an empty request field.
     #[test]
