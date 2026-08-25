@@ -432,6 +432,27 @@ mod tests {
         .expect("test signing seed is valid")
     }
 
+    /// Scalar fields are embedded in the payload as raw `key=value` lines, so
+    /// a signer_key_id containing `\n` or `=` yields unusual payload bytes.
+    /// That is safe ONLY because sign and verify derive the bytes identically
+    /// from the manifest fields — this pin holds that two-sided determinism
+    /// fixed, so a future one-sided sanitization cannot silently break
+    /// verification of such manifests.
+    #[test]
+    fn adversarial_scalar_fields_still_round_trip_sign_and_verify() {
+        let manifest = build_signed_manifest(
+            "beta\nwith=newlines",
+            1_700_000_000,
+            "ed25519:test\nsigner=evil\nverifier_key_hex=deadbeef",
+            test_seed(),
+            sample_artifacts(),
+        )
+        .expect("adversarial scalar fields still sign");
+        manifest
+            .verify_signed_with_pinned_key(&manifest.verifier_key_hex)
+            .expect("verification derives identical payload bytes from the same fields");
+    }
+
     #[test]
     fn signing_failure_aborts_instead_of_emitting_an_empty_signature() {
         struct FailingProvider;
