@@ -210,14 +210,33 @@ fn validate_signing_key_material(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn load_access_state(
-    access_dir: &Path,
-) -> (
+/// Materialised access state: grants, the tunnel-source identity
+/// map, and per-selector scopes.
+type AccessState = (
     Vec<String>,
     BTreeMap<IpAddr, String>,
     BTreeMap<String, LlmAccessScope>,
-) {
-    let grants = std::fs::read_to_string(access_dir.join(ACCESS_GRANTS_FILE))
+);
+
+/// Load the daemon-materialised access state. Fail-closed: a file
+/// that exists but cannot be read, or a scope line carrying a
+/// malformed limit value or an unrecognized key, is an error — never
+/// silently degraded to "no restrictions". Only genuine absence
+/// (`NotFound`) means "no entries", which keeps every state in the
+/// deny direction: missing grants deny admission, and a missing
+/// scopes file leaves grants unrestricted by documented design
+/// (scopes restrict, they never grant).
+fn load_access_state(access_dir: &Path) -> Result<AccessState, String> {
+    fn read_optional(path: &Path) -> Result<Option<String>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(body) => Ok(Some(body)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("{} unreadable: {err}", path.display())),
+        }
+    }
+
+    let grants_path = access_dir.join(ACCESS_GRANTS_FILE);
+    let grants: Vec<String> = read_optional(&grants_path)?
         .map(|body| {
             body.lines()
                 .map(str::trim)
@@ -227,7 +246,7 @@ fn load_access_state(
         })
         .unwrap_or_default();
     let mut peers = BTreeMap::new();
-    if let Ok(body) = std::fs::read_to_string(access_dir.join(ACCESS_PEERS_FILE)) {
+    if let Some(body) = read_optional(&access_dir.join(ACCESS_PEERS_FILE))? {
         for line in body.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -241,7 +260,8 @@ fn load_access_state(
         }
     }
     let mut scopes = BTreeMap::new();
-    if let Ok(body) = std::fs::read_to_string(access_dir.join(ACCESS_SCOPES_FILE)) {
+    let scopes_path = access_dir.join(ACCESS_SCOPES_FILE);
+    if let Some(body) = read_optional(&scopes_path)? {
         for line in body.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -262,24 +282,49 @@ fn load_access_state(
                             .collect(),
                     );
                 } else if let Some(quota) = part.strip_prefix("quota=") {
-                    scope.max_tokens_per_window = quota.parse().ok();
+                    // A malformed or overflowing quota must refuse the
+                    // peer, not degrade to "no quota".
+                    scope.max_tokens_per_window = Some(quota.parse().map_err(|_| {
+                        format!(
+                            "{}: selector {selector:?} has invalid quota value {quota:?}",
+                            scopes_path.display()
+                        )
+                    })?);
                 } else if let Some(rate) = part.strip_prefix("rate=") {
-                    scope.max_requests_per_minute = rate.parse().ok();
+                    scope.max_requests_per_minute = Some(rate.parse().map_err(|_| {
+                        format!(
+                            "{}: selector {selector:?} has invalid rate value {rate:?}",
+                            scopes_path.display()
+                        )
+                    })?);
+                } else {
+                    // An unrecognized key is a typo'd restriction
+                    // (e.g. `qouta=`): honouring the rest of the line
+                    // while dropping the intended limit would serve
+                    // the peer unlimited.
+                    return Err(format!(
+                        "{}: selector {selector:?} has unrecognized scope key {part:?}",
+                        scopes_path.display()
+                    ));
                 }
             }
             scopes.insert(selector.to_owned(), scope);
         }
     }
-    (grants, peers, scopes)
+    Ok((grants, peers, scopes))
 }
 
 /// Per-frame admission: tunnel-source identity + current grant.
-/// Deny-all when the daemon has not materialised any signed state.
+/// Deny-all when the daemon has not materialised any signed state,
+/// or when that state exists but cannot be read/validated.
 fn admitted_peer(
     access_dir: &Path,
     source: IpAddr,
 ) -> Result<(String, Option<LlmAccessScope>), String> {
-    let (grants, peers, scopes) = load_access_state(access_dir);
+    let (grants, peers, scopes) = load_access_state(access_dir).map_err(|err| {
+        eprintln!("[rustynet-llm-gateway] {err}; refusing peer (fail-closed)");
+        "gateway access state unusable; refused (default-deny)".to_owned()
+    })?;
     let node_id = peers
         .get(&source)
         .ok_or_else(|| format!("tunnel source {source} has no signed identity; refused"))?;
@@ -544,9 +589,139 @@ fn write_frame(stream: &mut impl Write, body: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FRAME_COALESCE_MAX, read_frame, write_frame};
+    use super::{
+        ACCESS_GRANTS_FILE, ACCESS_PEERS_FILE, ACCESS_SCOPES_FILE, FRAME_COALESCE_MAX,
+        admitted_peer, read_frame, write_frame,
+    };
+    use rustynet_policy::LlmAccessScope;
     use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+    use std::path::{Path, PathBuf};
+
+    /// Fail-open regression harness: a granted peer whose scope state
+    /// cannot be parsed must be refused, never silently widened to an
+    /// unrestricted grant.
+    const PEER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 88));
+    const PEER_NODE: &str = "node:laptop-1";
+
+    fn temp_access_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("llm-gw-scope-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp access dir");
+        dir
+    }
+
+    fn write_access_file(dir: &Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).expect("write access-state file");
+    }
+
+    /// Grant the test peer so scope handling (not admission) is what
+    /// the assertions exercise.
+    fn grant_test_peer(dir: &Path) {
+        write_access_file(dir, ACCESS_GRANTS_FILE, &format!("{PEER_NODE}\n"));
+        write_access_file(dir, ACCESS_PEERS_FILE, &format!("{PEER_IP} {PEER_NODE}\n"));
+    }
+
+    #[test]
+    fn malformed_scope_limit_values_deny_peer_instead_of_unlimited() {
+        let dir = temp_access_dir("malformed-limit");
+        grant_test_peer(&dir);
+        // A garbage token-quota, a garbage rate ceiling, and an empty
+        // value must each refuse the peer: parse failure degrading to
+        // "no limit" would silently widen a restricted grant to
+        // unlimited.
+        for line in [
+            format!("{PEER_NODE} models=tiny quota=not-a-number"),
+            format!("{PEER_NODE} models=tiny rate=-1"),
+            format!("{PEER_NODE} models=tiny quota="),
+        ] {
+            write_access_file(&dir, ACCESS_SCOPES_FILE, &format!("{line}\n"));
+            assert!(
+                admitted_peer(&dir, PEER_IP).is_err(),
+                "malformed scope line {line:?} must deny"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unrecognized_scope_key_denies_peer() {
+        let dir = temp_access_dir("unknown-key");
+        grant_test_peer(&dir);
+        // A typo'd key (`qouta=` instead of `quota=`) must not be
+        // silently dropped: the operator asked for a restriction and a
+        // silent ignore would serve the peer unlimited.
+        write_access_file(
+            &dir,
+            ACCESS_SCOPES_FILE,
+            &format!("{PEER_NODE} models=tiny qouta=5\n"),
+        );
+        assert!(
+            admitted_peer(&dir, PEER_IP).is_err(),
+            "unrecognized scope key must deny rather than drop the restriction"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_scopes_state_denies_peer() {
+        let dir = temp_access_dir("unreadable-scopes");
+        grant_test_peer(&dir);
+        // Any read failure other than absence (here: scopes.v1 is a
+        // directory, so read_to_string fails regardless of user) must
+        // deny: treating it as "no scopes configured" would strip
+        // every restriction from every granted peer.
+        std::fs::create_dir(dir.join(ACCESS_SCOPES_FILE)).expect("create blocking scopes entry");
+        assert!(
+            admitted_peer(&dir, PEER_IP).is_err(),
+            "unreadable scope state must deny rather than degrade to unrestricted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn well_formed_scope_still_enforced() {
+        let dir = temp_access_dir("well-formed");
+        grant_test_peer(&dir);
+        write_access_file(
+            &dir,
+            ACCESS_SCOPES_FILE,
+            &format!("{PEER_NODE} models=tiny quota=100 rate=2\n"),
+        );
+        let (node_id, scope) = admitted_peer(&dir, PEER_IP).expect("valid scope admits");
+        assert_eq!(node_id, PEER_NODE);
+        let scope: LlmAccessScope = scope.expect("scope entry present");
+        assert_eq!(
+            scope.allowed_models.as_deref(),
+            Some(["tiny".to_owned()].as_slice())
+        );
+        assert_eq!(scope.max_tokens_per_window, Some(100));
+        assert_eq!(scope.max_requests_per_minute, Some(2));
+        assert!(!scope.permits_model("other"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absent_scopes_file_keeps_documented_unrestricted_grant() {
+        let dir = temp_access_dir("absent-scopes");
+        grant_test_peer(&dir);
+        // Absence (NotFound) is the documented "admin set no scope"
+        // state and stays admissible; only unreadable/invalid state
+        // denies.
+        let (node_id, scope) = admitted_peer(&dir, PEER_IP).expect("grant without scopes admits");
+        assert_eq!(node_id, PEER_NODE);
+        assert!(scope.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_grant_denies_even_without_scopes() {
+        let dir = temp_access_dir("no-grant");
+        // No grants.v1 at all.
+        assert!(admitted_peer(&dir, PEER_IP).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Records every `write` call so tests can assert both the exact wire
     /// bytes and how many writes produced them.
