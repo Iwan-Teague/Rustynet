@@ -52,6 +52,18 @@ const PASSPHRASE_KEYCHAIN_ACCOUNT_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHA
 #[cfg(target_os = "macos")]
 const MACOS_PASSPHRASE_KEYCHAIN_SERVICE: &str = "net.rustynet.wg-key-passphrase";
 const MAX_PASSPHRASE_BYTES: usize = 4096;
+/// Anti-DoS bound for migrated existing-key reads. A WireGuard private key is
+/// 44 bytes + newline; the margin covers trailing whitespace/comment variants,
+/// while still refusing special files (`fs::read` on `/dev/zero` would grow
+/// without end) and misprovisioned multi-gigabyte inputs before buffering.
+const MAX_EXISTING_PRIVATE_KEY_BYTES: usize = 4096;
+/// Anti-DoS bound for Windows DPAPI passphrase-blob reads. The blob wraps a
+/// passphrase already capped at [`MAX_PASSPHRASE_BYTES`] plus DPAPI encoding
+/// overhead; 16 KiB leaves wide margin for provider-specific padding while
+/// still stopping an unbounded `fs::read` (special files, hostile blobs)
+/// before allocation.
+#[cfg(windows)]
+const MAX_WINDOWS_PASSPHRASE_BLOB_BYTES: usize = 16384;
 const WG_BINARY_PATH_ENV: &str = "RUSTYNET_WG_BINARY_PATH";
 #[cfg(not(target_os = "macos"))]
 const IP_BINARY_PATH_ENV: &str = "RUSTYNET_IP_BINARY_PATH";
@@ -183,35 +195,49 @@ pub fn store_passphrase_in_os_secure_store(
 fn read_passphrase_from_source(source_path: &Path) -> Result<Zeroizing<String>, String> {
     let allow_root_owner = is_systemd_credential_path(source_path);
     validate_secret_file_security(source_path, "passphrase file", allow_root_owner)?;
-    let file =
-        fs::File::open(source_path).map_err(|err| format!("read passphrase file failed: {err}"))?;
-    let raw = read_bounded_passphrase_bytes(file)?;
+    let raw = read_bounded_secret_file(source_path, MAX_PASSPHRASE_BYTES, "passphrase file")?;
     parse_passphrase_bytes(raw, "passphrase file")
 }
 
-/// Anti-DoS bound for passphrase-file reads: stop buffering at
-/// [`MAX_PASSPHRASE_BYTES`] + 1 and reject before any larger allocation.
-/// The cap used to be enforced only inside [`parse_passphrase_bytes`],
-/// AFTER `fs::read` had buffered the entire file, so a hostile or
-/// misprovisioned file at the spool path was fully allocated into daemon
-/// memory before being rejected. Mirrors the established bounded-read
-/// pattern in `key_rotation::read_bounded` /
-/// `gossip_runtime::read_gossip_watermark_bounded`. The rejected buffer
-/// is zeroized so partially-read secret material does not linger on the
-/// error path.
-#[cfg(not(windows))]
-fn read_bounded_passphrase_bytes<R: std::io::Read>(reader: R) -> Result<Vec<u8>, String> {
+/// Reader-generic bounded secret read: consume at most `max_bytes + 1`
+/// from `reader`, reject anything longer BEFORE any larger allocation,
+/// and zeroize the rejected buffer so partially-read secret material does
+/// not linger on the error path.
+///
+/// This is the shared enforcement point for every attacker-influenced
+/// secret-file read in this module: the passphrase file (unix), both
+/// Windows DPAPI passphrase sources, and migrated existing-key material.
+/// A read that buffers first and validates later re-opens the exact
+/// unbounded-allocation defect class each call site here fixes.
+fn read_bounded_secret_bytes<R: std::io::Read>(
+    reader: R,
+    max_bytes: usize,
+    source_label: &str,
+) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut raw = Vec::new();
     reader
-        .take(MAX_PASSPHRASE_BYTES as u64 + 1)
+        .take(max_bytes as u64 + 1)
         .read_to_end(&mut raw)
-        .map_err(|err| format!("read passphrase file failed: {err}"))?;
-    if raw.len() > MAX_PASSPHRASE_BYTES {
+        .map_err(|err| format!("read {source_label} failed: {err}"))?;
+    if raw.len() > max_bytes {
         raw.zeroize();
-        return Err("passphrase exceeds maximum allowed size".to_owned());
+        return Err(format!("{source_label} exceeds maximum allowed size"));
     }
     Ok(raw)
+}
+
+/// [`read_bounded_secret_bytes`] over a file path: open then bound, so the
+/// size limit is applied by the READER (at read time) rather than derived
+/// from metadata (which a racing writer could change between stat and
+/// read). Growing files and special files are cut off at cap + 1 either way.
+fn read_bounded_secret_file(
+    path: &Path,
+    max_bytes: usize,
+    source_label: &str,
+) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path).map_err(|err| format!("read {source_label} failed: {err}"))?;
+    read_bounded_secret_bytes(file, max_bytes, source_label)
 }
 
 fn parse_passphrase_bytes(
@@ -248,7 +274,7 @@ fn read_windows_runtime_passphrase_source(path: &Path) -> Result<Zeroizing<Strin
     // BA/SY. Security is provided by DPAPI LocalMachine encryption + NTFS DACL
     // (SY/BA/service only); file-owner identity is not a meaningful invariant.
     validate_windows_local_secret_acl(path, "passphrase file")?;
-    let raw = fs::read(path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    let raw = read_bounded_secret_file(path, MAX_WINDOWS_PASSPHRASE_BLOB_BYTES, "passphrase file")?;
     decode_windows_dpapi_passphrase_blob(raw, "passphrase file")
 }
 
@@ -256,7 +282,7 @@ fn read_windows_runtime_passphrase_source(path: &Path) -> Result<Zeroizing<Strin
 fn read_windows_explicit_passphrase_source(path: &Path) -> Result<Zeroizing<String>, String> {
     validate_windows_local_secret_input_path(path, "passphrase file")?;
     validate_secret_file_security(path, "passphrase file", false)?;
-    let raw = fs::read(path).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    let raw = read_bounded_secret_file(path, MAX_WINDOWS_PASSPHRASE_BLOB_BYTES, "passphrase file")?;
     if looks_like_windows_dpapi_passphrase_blob(raw.as_slice()) {
         decode_windows_dpapi_passphrase_blob(raw, "passphrase file")
     } else {
@@ -1243,9 +1269,14 @@ pub fn migrate_existing_private_key_material(
         );
     }
 
-    let mut private_key = fs::read(existing_private_key_path).map_err(|err| {
+    let mut private_key = read_bounded_secret_file(
+        existing_private_key_path,
+        MAX_EXISTING_PRIVATE_KEY_BYTES,
+        "existing private key",
+    )
+    .map_err(|err| {
         format!(
-            "read existing private key {} failed: {err}",
+            "migrate input {}: {err}",
             existing_private_key_path.display()
         )
     })?;
@@ -2156,8 +2187,12 @@ mod tests {
             remaining: total,
             served: 0,
         };
-        let err = super::read_bounded_passphrase_bytes(&mut hostile)
-            .expect_err("oversize stream must be rejected");
+        let err = super::read_bounded_secret_bytes(
+            &mut hostile,
+            super::MAX_PASSPHRASE_BYTES,
+            "passphrase file",
+        )
+        .expect_err("oversize stream must be rejected");
         assert!(
             err.contains("maximum allowed size"),
             "rejection must name the size cap, got: {err}"
@@ -2174,14 +2209,118 @@ mod tests {
             remaining: super::MAX_PASSPHRASE_BYTES,
             served: 0,
         };
-        let raw = super::read_bounded_passphrase_bytes(&mut boundary)
-            .expect("at-cap stream must be accepted");
+        let raw = super::read_bounded_secret_bytes(
+            &mut boundary,
+            super::MAX_PASSPHRASE_BYTES,
+            "passphrase file",
+        )
+        .expect("at-cap stream must be accepted");
         assert_eq!(raw.len(), super::MAX_PASSPHRASE_BYTES);
         assert_eq!(
             boundary.served,
             super::MAX_PASSPHRASE_BYTES,
             "at-cap stream must be fully consumed"
         );
+    }
+
+    #[test]
+    fn read_bounded_secret_bytes_stops_buffering_at_any_cap_not_after() {
+        // The shared bounded-read core behind every attacker-influenced
+        // secret-file read in this module (unix passphrase file, both
+        // Windows DPAPI passphrase sources, migrated existing-key bytes).
+        // A small non-default cap proves the bound is a parameter of the
+        // helper, not an accident of MAX_PASSPHRASE_BYTES: a counting
+        // reader must stop being consumed at cap + 1, and an at-cap
+        // stream must be accepted fully intact.
+        use std::io::Read;
+
+        struct CountingReader {
+            remaining: usize,
+            served: usize,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Ok(0);
+                }
+                let count = buf.len().min(self.remaining);
+                for slot in &mut buf[..count] {
+                    *slot = b'B';
+                }
+                self.remaining -= count;
+                self.served += count;
+                Ok(count)
+            }
+        }
+
+        const CAP: usize = 8;
+        let mut hostile = CountingReader {
+            remaining: CAP * 16,
+            served: 0,
+        };
+        let err = super::read_bounded_secret_bytes(&mut hostile, CAP, "probe secret")
+            .expect_err("oversize stream must be rejected");
+        assert!(
+            err.contains("exceeds maximum allowed size"),
+            "rejection must name the size cap, got: {err}"
+        );
+        assert_eq!(
+            hostile.served,
+            CAP + 1,
+            "bounded core must consume exactly cap + 1, got {}",
+            hostile.served
+        );
+
+        // Positive control: exactly-at-cap stream accepted, fully consumed.
+        let mut boundary = CountingReader {
+            remaining: CAP,
+            served: 0,
+        };
+        let raw = super::read_bounded_secret_bytes(&mut boundary, CAP, "probe secret")
+            .expect("at-cap stream must be accepted");
+        assert_eq!(raw.len(), CAP);
+        assert_eq!(boundary.served, CAP);
+    }
+
+    #[test]
+    fn migrate_existing_private_key_rejects_oversize_input_fails_closed() {
+        // Migration previously did `fs::read` on the operator-supplied
+        // existing-key path with NO size bound and NO regular-file check:
+        // pointing it at a special file (/dev/zero) or a misprovisioned
+        // multi-gigabyte file buffered everything into daemon memory (or
+        // hung growing forever) before any validation ran. The bound must
+        // fire during the read itself, before key derivation is attempted.
+        let dir = unique_test_dir("rn-migrate-oversize");
+        let existing = dir.join("existing.key");
+        let runtime = dir.join("runtime.key");
+        let encrypted = dir.join("encrypted.key");
+        let public = dir.join("wireguard.pub");
+        let oversize = vec![b'K'; super::MAX_EXISTING_PRIVATE_KEY_BYTES + 1];
+        std::fs::write(&existing, &oversize).expect("oversize fixture should be writable");
+
+        let err = super::migrate_existing_private_key_material(
+            &existing,
+            &runtime,
+            &encrypted,
+            &public,
+            &dir.join("passphrase"),
+            None,
+            true,
+        )
+        .expect_err("oversize existing key must be rejected");
+        assert!(
+            err.contains("exceeds maximum allowed size"),
+            "rejection must name the size cap BEFORE derivation runs, got: {err}"
+        );
+
+        // The bound fires before any side effect: no target material may
+        // have been written by the failed migration.
+        assert!(!encrypted.exists(), "no encrypted key on rejected input");
+        assert!(!public.exists(), "no public key on rejected input");
+
+        let _ = remove_file_if_present(&existing);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(windows)]
