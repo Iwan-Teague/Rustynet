@@ -7939,7 +7939,7 @@ impl DaemonRuntime {
         if age > 60 {
             return Err(format!("nonce expired (age {age}s)"));
         }
-        if envelope.nonce > now_unix + 60 {
+        if envelope.nonce > now_unix.saturating_add(60) {
             return Err(format!(
                 "nonce in future ({nonce} > {now})",
                 nonce = envelope.nonce,
