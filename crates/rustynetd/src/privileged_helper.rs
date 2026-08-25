@@ -79,6 +79,43 @@ const HELPER_FRAME_HEADER_BYTES: usize = 10;
 const MAX_MESSAGE_BYTES: usize = 16_384;
 #[cfg(not(windows))]
 const MAX_OUTPUT_BYTES: usize = 65_536;
+
+// Every response the helper can CONSTRUCT must be deliverable in one
+// MAX_MESSAGE_BYTES frame: write_frame refuses oversized payloads, so an
+// undeliverable response makes the server drop the connection silently
+// (`let _ = write_response`) while the daemon misreads the EOF mid-frame as
+// "truncated frame header" -- annotated as the helper's own I/O timeout. Two
+// construction sites can exceed the encoder's per-field cap if left unclamped:
+// the exec side's lossy truncation of captured subprocess streams, and the
+// argv-naming nft schema-refusal diagnostic (`args.join(" ")`, up to
+// MAX_ARGS * MAX_ARG_BYTES ~ 32KB of request-controlled text).
+//
+// RESPONSE_FIELD_BUDGET_BYTES is the pre-marker byte cap applied at those
+// sites, derived from the worst-case success response wire cost so the
+// derivation cannot drift from the codec:
+//
+//   ok flag (1) + present i32 status (1 tag + 4 bytes)
+//     + stdout (1 present-flag + 2 length prefix + N)
+//     + stderr (1 present-flag + 2 length prefix + N)
+//     + error ABSENT (encode_optional_string_field still writes its 1-byte
+//       present-flag for None -- an empty optional is not free)
+//
+// with N = budget + truncate_lossy's appended marker. Requiring that total to
+// stay within MAX_MESSAGE_BYTES pins the budget; the tests assert the bound
+// end-to-end through encode_helper_response and a live UnixStream round trip.
+#[cfg(not(windows))]
+const RESPONSE_TRUNCATION_MARKER_BYTES: usize = "...[truncated]".len();
+// ok (1) + present status (5) + both field prefixes (3+3) + absent-error
+// present-flag (1).
+#[cfg(not(windows))]
+const HELPER_RESPONSE_SUCCESS_FIXED_WIRE_BYTES: usize = 13;
+#[cfg(not(windows))]
+const HELPER_RESPONSE_MAX_POPULATED_STRING_FIELDS: usize = 2;
+#[cfg(not(windows))]
+const RESPONSE_FIELD_BUDGET_BYTES: usize = (MAX_MESSAGE_BYTES
+    - HELPER_RESPONSE_SUCCESS_FIXED_WIRE_BYTES
+    - 2 * RESPONSE_TRUNCATION_MARKER_BYTES)
+    / HELPER_RESPONSE_MAX_POPULATED_STRING_FIELDS;
 pub(crate) const MAX_ARGS: usize = 128;
 pub(crate) const MAX_ARG_BYTES: usize = 256;
 #[cfg(not(windows))]
@@ -992,8 +1029,11 @@ fn handle_request_with_timeout(request: HelperRequest, timeout: Duration) -> Hel
     match run_privileged_subprocess(&binary, &request.args, timeout) {
         Ok(output) => {
             let status = exit_status_code(output.status);
-            let stdout = truncate_lossy(&output.stdout, MAX_OUTPUT_BYTES);
-            let stderr = truncate_lossy(&output.stderr, MAX_OUTPUT_BYTES);
+            // Clamp to the deliverable budget, not MAX_OUTPUT_BYTES: a larger
+            // truncation bound would produce a success response the codec
+            // refuses to encode (see RESPONSE_FIELD_BUDGET_BYTES).
+            let stdout = truncate_lossy(&output.stdout, RESPONSE_FIELD_BUDGET_BYTES);
+            let stderr = truncate_lossy(&output.stderr, RESPONSE_FIELD_BUDGET_BYTES);
             HelperResponse::success(status, stdout, stderr)
         }
         Err(err) => HelperResponse::error(format!(
@@ -2287,7 +2327,10 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         }
         _ => Err(format!(
             "unsupported nft add rule argument schema: {}",
-            args.join(" ")
+            // The joined argv is request-controlled text up to
+            // MAX_ARGS * MAX_ARG_BYTES; clamp it to the deliverable response
+            // budget so the refusal itself can always be encoded and sent.
+            truncate_lossy(args.join(" ").as_bytes(), RESPONSE_FIELD_BUDGET_BYTES)
         )),
     }
 }
@@ -4215,6 +4258,90 @@ mod tests {
         let err = validate_request(PrivilegedCommandProgram::Ip, args.as_slice())
             .expect_err("oversized argument must be rejected");
         assert!(err.contains("argument too long"));
+    }
+
+    // ---- response deliverability: every response the helper can construct
+    // MUST fit one frame. The exec side truncates captured streams and the
+    // argv-naming nft refusal embeds request-controlled text; if either
+    // exceeds what encode_helper_response accepts, write_response fails, the
+    // server silently drops the connection (`let _ = write_response`), and the
+    // daemon misreads the EOF as "truncated frame header" -- annotated as its
+    // own I/O timeout. A command that RAN would then be reported as failed.
+
+    #[test]
+    fn success_response_from_full_budget_exec_output_is_always_deliverable() {
+        // Mirrors handle_request_with_timeout's construction: raw subprocess
+        // streams up to MAX_OUTPUT_BYTES are clamped at
+        // RESPONSE_FIELD_BUDGET_BYTES before HelperResponse::success. Both
+        // fields populated at the cap is the wire-cost worst case.
+        let huge = vec![b'x'; super::MAX_OUTPUT_BYTES];
+        let stdout = super::truncate_lossy(&huge, super::RESPONSE_FIELD_BUDGET_BYTES);
+        let stderr = super::truncate_lossy(&huge, super::RESPONSE_FIELD_BUDGET_BYTES);
+        assert_eq!(stdout.len(), super::RESPONSE_FIELD_BUDGET_BYTES + 14);
+        let response = HelperResponse::success(0, stdout, stderr);
+        let encoded = super::encode_helper_response(&response)
+            .expect("an exec-side-truncated success response must always encode");
+        assert!(
+            encoded.len() <= MAX_MESSAGE_BYTES,
+            "encoded response {} exceeds one frame ({MAX_MESSAGE_BYTES})",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn nft_schema_refusal_embedding_a_max_size_argv_still_encodes() {
+        // The refusal NAMES the rejected argv (`args.join(" ")`). At
+        // MAX_ARGS x MAX_ARG_BYTES the joined text alone (~32KB) exceeds both
+        // the encoder's per-field cap and one frame, so the error response
+        // could never be delivered.
+        let mut args: Vec<&str> = vec!["add", "rule", "inet", "rustynet_g1", "killswitch"];
+        while args.len() < MAX_ARGS {
+            args.push("x");
+        }
+        let padded: Vec<String> = args
+            .iter()
+            .enumerate()
+            .map(|(idx, a)| {
+                if idx < 5 {
+                    (*a).to_owned()
+                } else {
+                    format!("{a:<250}")
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = padded.iter().map(String::as_str).collect();
+        let err = validate_request(PrivilegedCommandProgram::Nft, &refs)
+            .expect_err("an unreviewed nft shape must still be refused");
+        let response = HelperResponse::error(err);
+        let encoded = super::encode_helper_response(&response)
+            .expect("a validation-refusal error response must always encode");
+        assert!(encoded.len() <= MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn write_response_delivers_a_maximum_budget_success_end_to_end() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("server write timeout should be set");
+        client_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout should be set");
+
+        let stdout = super::truncate_lossy(
+            &vec![b'y'; super::MAX_OUTPUT_BYTES],
+            super::RESPONSE_FIELD_BUDGET_BYTES,
+        );
+        let response = HelperResponse::success(0, stdout.clone(), String::new());
+
+        let server = std::thread::spawn(move || {
+            write_response(&mut server_stream, response).expect("response must be writable")
+        });
+        let decoded = read_response_frame(&mut client_stream).expect("response frame must decode");
+        server.join().expect("server thread should join cleanly");
+        assert_eq!(decoded.status, Some(0));
+        assert_eq!(decoded.stdout.as_deref(), Some(stdout.as_str()));
     }
 
     #[test]
