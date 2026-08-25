@@ -209,6 +209,35 @@ mod tests {
         assert!(parse_artifact_spec("rustynetd:x86_64-unknown-linux-gnu").is_err());
         assert!(parse_artifact_spec("::/path").is_err());
         assert!(parse_artifact_spec("").is_err());
+        // A trailing colon leaves an empty path: staging a binary from an
+        // empty source string must not be expressible.
+        assert!(parse_artifact_spec("rustynetd:x86_64-unknown-linux-gnu:").is_err());
+    }
+
+    #[test]
+    fn create_ops_requires_at_least_one_artifact_before_touching_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "rn-relmanifest-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed_file = dir.join("seed.hex");
+        std::fs::write(&seed_file, "0".repeat(64)).unwrap();
+        let err = execute_ops_create_release_manifest(
+            Vec::new(),
+            "beta".to_owned(),
+            seed_file,
+            "ed25519:test".to_owned(),
+            dir.join("release-manifest.json"),
+            1_700_000_000,
+        )
+        .expect_err("an empty artifact list must refuse before any signing work");
+        assert!(err.contains("requires at least one"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
