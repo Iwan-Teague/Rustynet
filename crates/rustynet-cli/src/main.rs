@@ -17575,7 +17575,15 @@ fn check_windows_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
 }
 
 fn execute_logs(cmd: LogsCommand) -> Result<String, String> {
-    let log_path = if cfg!(target_os = "linux") {
+    render_log_tail(
+        &daemon_log_path(),
+        cmd.lines.unwrap_or(50),
+        cmd.level.as_deref(),
+    )
+}
+
+fn daemon_log_path() -> PathBuf {
+    if cfg!(target_os = "linux") {
         PathBuf::from("/var/log/rustynet/rustynetd.log")
     } else if cfg!(target_os = "macos") {
         std::env::var("HOME").map_or_else(
@@ -17584,15 +17592,57 @@ fn execute_logs(cmd: LogsCommand) -> Result<String, String> {
         )
     } else {
         PathBuf::from("/tmp/rustynetd.log")
+    }
+}
+
+/// Upper bound applied BEFORE any read when rendering the daemon log
+/// tail (`rustynet logs` / `rustynet debug`). Only the last N lines are
+/// ever shown, so there is no reason to slurp an unbounded file into
+/// memory. The gate also refuses non-regular files: the macOS fallback
+/// path is `/tmp/rustynetd.log` when HOME is unset, and in that
+/// world-writable directory a planted FIFO would otherwise block the
+/// read forever while a planted sparse file could exhaust memory.
+const DAEMON_LOG_TAIL_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Render the last `lines_to_show` lines of the daemon log, optionally
+/// filtered by a case-insensitive substring.
+///
+/// Fail-closed file gate before any read: missing, symlinked,
+/// non-regular, or oversized logs are hard errors — the same discipline
+/// as [`ensure_regular_file_no_symlink`] plus a pre-read metadata size
+/// cap, matching how `load_operator_config` bounds its config read.
+fn render_log_tail(
+    log_path: &Path,
+    lines_to_show: usize,
+    level_filter: Option<&str>,
+) -> Result<String, String> {
+    let metadata = match fs::symlink_metadata(log_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(format!("log file not found at {}", log_path.display()));
+        }
+        Err(err) => return Err(format!("cannot read logs: {err}")),
     };
-
-    let lines_to_show = cmd.lines.unwrap_or(50);
-
-    if !log_path.exists() {
-        return Err(format!("log file not found at {}", log_path.display()));
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "daemon log must not be a symlink: {}",
+            log_path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "daemon log must be a regular file: {}",
+            log_path.display()
+        ));
+    }
+    if metadata.len() > DAEMON_LOG_TAIL_MAX_BYTES {
+        return Err(format!(
+            "daemon log exceeds maximum size ({DAEMON_LOG_TAIL_MAX_BYTES} bytes): {}",
+            log_path.display()
+        ));
     }
 
-    let content = fs::read_to_string(&log_path).map_err(|e| format!("cannot read logs: {e}"))?;
+    let content = fs::read_to_string(log_path).map_err(|e| format!("cannot read logs: {e}"))?;
 
     let lines: Vec<&str> = content.lines().collect();
     let start_idx = if lines.len() > lines_to_show {
@@ -17606,7 +17656,7 @@ fn execute_logs(cmd: LogsCommand) -> Result<String, String> {
         .map(std::string::ToString::to_string)
         .collect();
 
-    if let Some(level_filter) = cmd.level {
+    if let Some(level_filter) = level_filter {
         let level_lower = level_filter.to_lowercase();
         filtered_lines.retain(|line| line.to_lowercase().contains(&level_lower));
     }
@@ -27354,6 +27404,94 @@ mod tests {
 
         let _ = std::fs::remove_file(source_log);
         let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn render_log_tail_shows_last_n_lines_with_level_filter() {
+        let unique = format!(
+            "rustynet-cli-log-tail-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let log_path = std::env::temp_dir().join(format!("{unique}.log"));
+        std::fs::write(
+            &log_path,
+            "INFO first\nERROR boom\nINFO middle\nERROR late\nINFO last\n",
+        )
+        .expect("log should be written");
+
+        let tail = super::render_log_tail(&log_path, 2, None).expect("tail should render");
+        assert_eq!(tail, "ERROR late\nINFO last");
+
+        let filtered =
+            super::render_log_tail(&log_path, 50, Some("error")).expect("filter should render");
+        assert_eq!(filtered, "ERROR boom\nERROR late");
+
+        let none = super::render_log_tail(&log_path, 50, Some("debug")).expect("render");
+        assert_eq!(none, "no matching log entries");
+
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn render_log_tail_reports_missing_log_file() {
+        let missing = std::env::temp_dir().join("rustynet-cli-log-tail-does-not-exist.log");
+        let err = super::render_log_tail(&missing, 10, None).expect_err("missing log should fail");
+        assert!(err.contains("log file not found at"));
+    }
+
+    #[test]
+    fn render_log_tail_rejects_oversized_log_file() {
+        let unique = format!(
+            "rustynet-cli-log-tail-big-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let log_path = std::env::temp_dir().join(format!("{unique}.log"));
+        std::fs::write(&log_path, "INFO tiny\n").expect("log should be written");
+        // Sparse oversized file: length above the cap without allocating it.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log_path)
+            .expect("log should reopen");
+        file.set_len(super::DAEMON_LOG_TAIL_MAX_BYTES + 1)
+            .expect("set_len should work");
+        drop(file);
+
+        let err = super::render_log_tail(&log_path, 10, None)
+            .expect_err("oversized log must fail closed before any read");
+        assert!(err.contains("exceeds maximum size"), "got: {err}");
+
+        let _ = std::fs::remove_file(log_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn render_log_tail_rejects_symlinked_log_file() {
+        use std::os::unix::fs::symlink;
+
+        let unique = format!(
+            "rustynet-cli-log-tail-link-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let target = std::env::temp_dir().join(format!("{unique}.target"));
+        let link = std::env::temp_dir().join(format!("{unique}.link"));
+        std::fs::write(&target, "INFO through the link\n").expect("target should be written");
+        symlink(&target, &link).expect("symlink should be created");
+
+        let err = super::render_log_tail(&link, 10, None)
+            .expect_err("symlinked log path must fail closed");
+        assert!(err.contains("must not be a symlink"), "got: {err}");
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
     }
 
     #[cfg(unix)]
