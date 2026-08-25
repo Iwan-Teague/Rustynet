@@ -23,7 +23,7 @@ restores cannot destroy uncommitted work).
 - Clippy `-D warnings` verified clean across all three touched crates.
 - Duplicate-rejection attempt in the rollout controller was **retracted before
   commit**: `protocol_enumeration_no_longer_evades_the_allow_all_guard`
-  (policy lib.rs:847) is a strict superset of the proposed pin.
+  (policy lib.rs:895) is a strict superset of the proposed pin.
 - `7ea1a392` / `0082302c`: both membership-aware evaluators' **post-gate
   empty-set terminals were dead code to the suite** — a terminal-flip mutant
   survived everything. Root cause: tests registered directory keys like
