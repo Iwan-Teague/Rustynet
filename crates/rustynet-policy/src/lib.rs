@@ -2843,6 +2843,36 @@ mod tests {
         }
     }
 
+    /// The rule-side half of the empty-selector guard is behaviourally
+    /// redundant under equality matching (documented at the function), so no
+    /// behavioral test can distinguish its removal. Source-grep pins it the
+    /// way CRY-11 pins the seed wipe: if matching ever gains glob/prefix
+    /// semantics, this guard becomes load-bearing and must still be present.
+    #[test]
+    fn selector_matches_keeps_its_local_empty_guard() {
+        let body = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("policy source readable");
+        let start = body
+            .find("fn selector_matches(")
+            .expect("selector_matches must exist");
+        let window = &body[start..(start + 4_000).min(body.len())];
+        assert!(
+            window.contains("if rule_value.is_empty() || candidate.is_empty() {"),
+            "selector_matches must keep its local both-sides-empty guard"
+        );
+        let guard = window
+            .find("if rule_value.is_empty() || candidate.is_empty() {")
+            .expect("guard present");
+        let closing = window[guard..]
+            .find("return false;")
+            .expect("guard must return false");
+        // The false return must be INSIDE the guard, not after it.
+        assert!(
+            guard + closing < guard + 120,
+            "the empty guard must return false directly"
+        );
+    }
+
     /// POL-03: a rule whose selector is accidentally empty must be inert, not
     /// dangerously permissive — it must not match an empty request field.
     #[test]
