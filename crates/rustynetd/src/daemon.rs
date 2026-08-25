@@ -208,6 +208,18 @@ const ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET: Duration = Duration::from_secs(2);
 /// per-read timeout an old client's silence already costs, so mixed-version
 /// behaviour is unchanged; the budget only closes the multi-byte drip gap.
 const ANCHOR_BUNDLE_PULL_HAVE_LINE_BUDGET: Duration = Duration::from_millis(150);
+
+/// Overall wall-clock budget for WRITING one bundle-pull response. The 2s
+/// write timeout bounds a single `send()` syscall, but a client that drains
+/// the response slowly (a few bytes per timeout period) keeps every partial
+/// write short while stretching the total indefinitely — up to
+/// MAX_MEMBERSHIP_SNAPSHOT_BYTES (8 MiB), far beyond kernel socket buffers,
+/// all inside the inline single-threaded serve path (slowloris, symmetric
+/// to the request-line drip this module already closes). The budget is set
+/// far above any honest transfer of a full bundle even on a slow link;
+/// exceeding it drops the connection, which the pull protocol treats as a
+/// retryable failure.
+const ANCHOR_BUNDLE_PULL_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(30);
 pub const ANCHOR_BUNDLE_PULL_ADDR_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR";
 pub const ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH";
 pub const ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN";
@@ -1179,13 +1191,17 @@ impl fmt::Display for AnchorBundlePullStreamError {
 /// Read one `\n`-terminated request line under BOTH a per-byte size cap and
 /// an overall wall-clock deadline. The deadline is checked before every read
 /// so an expired budget fails fast even when the peer keeps the socket open.
+/// Returns the line and whether it was actually `\n`-terminated (an
+/// EOF-terminated trailing fragment is reported as such so callers can apply
+/// their own completeness rule).
 fn read_line_bounded<R: std::io::Read>(
     stream: &mut R,
     max_bytes: usize,
     deadline: Instant,
-) -> Result<String, DaemonError> {
+) -> Result<(String, bool), DaemonError> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
+    let mut newline_terminated = false;
     loop {
         if Instant::now() >= deadline {
             return Err(DaemonError::Io(
@@ -1194,7 +1210,10 @@ fn read_line_bounded<R: std::io::Read>(
         }
         match stream.read(&mut byte) {
             Ok(0) => break,
-            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) if byte[0] == b'\n' => {
+                newline_terminated = true;
+                break;
+            }
             Ok(_) => {
                 bytes.push(byte[0]);
                 if bytes.len() > max_bytes {
@@ -1210,38 +1229,67 @@ fn read_line_bounded<R: std::io::Read>(
             }
         }
     }
-    String::from_utf8(bytes).map_err(|_| {
-        DaemonError::InvalidConfig("anchor bundle-pull request token is not utf8".to_owned())
-    })
+    String::from_utf8(bytes)
+        .map(|line| (line, newline_terminated))
+        .map_err(|_| {
+            DaemonError::InvalidConfig("anchor bundle-pull request token is not utf8".to_owned())
+        })
 }
 
 fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<String, DaemonError> {
-    read_line_bounded(
+    Ok(read_line_bounded(
         stream,
         MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
         Instant::now() + ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET,
-    )
+    )?
+    .0)
+}
+
+/// Write adapter that enforces an overall wall-clock budget across every
+/// `write` call the response writer makes (header + full bundle). Each
+/// individual write is still bounded by the socket write timeout; this
+/// closes the slow-drain gap where many short partial writes stretch the
+/// total past any bound while the inline serve loop stays blocked.
+struct DeadlineWriter<'a, W: std::io::Write> {
+    inner: &'a mut W,
+    deadline: Instant,
+}
+
+impl<W: std::io::Write> std::io::Write for DeadlineWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::other(
+                "anchor bundle-pull response exceeded its time budget",
+            ));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// FIS-0020: best-effort read of the optional second request line. Any
 /// error (timeout against an old client, EOF, oversize, non-utf8) yields
-/// `None` — the server then sends the full bundle. The stream's read
-/// timeout is restored afterwards.
-fn read_optional_anchor_bundle_pull_have_line(stream: &mut TcpStream) -> Option<String> {
-    if stream
-        .set_read_timeout(Some(Duration::from_millis(150)))
-        .is_err()
-    {
-        return None;
-    }
-    let line = read_line_bounded(
+/// `None` — the server then sends the full bundle.
+///
+/// Pure I/O: the caller owns the short per-read socket timeout around this
+/// call (150ms, restored to 2s afterwards).
+fn read_optional_anchor_bundle_pull_have_line<R: std::io::Read>(stream: &mut R) -> Option<String> {
+    let (line, newline_terminated) = read_line_bounded(
         stream,
         MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
         Instant::now() + ANCHOR_BUNDLE_PULL_HAVE_LINE_BUDGET,
     )
-    .ok();
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    line
+    .ok()?;
+    // FIS-0020 completeness rule: a trailing fragment ended by EOF is an
+    // incomplete request, not a have claim — degrade to the full bundle
+    // exactly as the pre-rewire reader did (`Ok(0) => break None`).
+    if !newline_terminated {
+        return None;
+    }
+    Some(line)
 }
 
 fn handle_anchor_bundle_pull_stream(
@@ -1289,9 +1337,22 @@ fn handle_anchor_bundle_pull_stream(
     // and waits, so the cost of the optional read against an old client is
     // bounded at 150ms (mixed-version only). Timeout/EOF/garbage all
     // degrade to the full bundle.
-    let client_have = read_optional_anchor_bundle_pull_have_line(&mut stream);
+    let client_have = if stream
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .is_ok()
+    {
+        let have = read_optional_anchor_bundle_pull_have_line(&mut stream);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        have
+    } else {
+        None
+    };
+    let mut response_writer = DeadlineWriter {
+        inner: &mut stream,
+        deadline: Instant::now() + ANCHOR_BUNDLE_PULL_RESPONSE_WRITE_BUDGET,
+    };
     write_anchor_bundle_pull_response_with_have(
-        stream,
+        &mut response_writer,
         &presented_token,
         &expected_token,
         &bundle,
@@ -17136,7 +17197,7 @@ mod tests {
             std::time::Instant::now() + ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET,
         )
         .expect("line must be accepted within budget");
-        assert_eq!(line, "abcdefgh");
+        assert_eq!(line, ("abcdefgh".to_owned(), true));
     }
 
     #[test]
@@ -17153,6 +17214,104 @@ mod tests {
             matches!(err, DaemonError::InvalidConfig(_)),
             "size cap must stay a size error, got {err:?}"
         );
+    }
+
+    /// FIS-0020 contract: a have-line terminated by EOF instead of `\n`
+    /// must degrade to `None` (full bundle), exactly as the pre-rewire
+    /// reader did (`Ok(0) => break None`). A partial line without its
+    /// terminator is an incomplete request, not a have claim.
+    #[test]
+    fn bundle_pull_have_line_eof_without_newline_degrades_to_none() {
+        struct OneBytePerCallReader {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl std::io::Read for OneBytePerCallReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.data.len() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        let mut reader = OneBytePerCallReader {
+            data: b"have 5 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_vec(),
+            pos: 0,
+        };
+        let line = super::read_optional_anchor_bundle_pull_have_line(&mut reader);
+        assert!(
+            line.is_none(),
+            "EOF-terminated have line must yield None, got {line:?}"
+        );
+    }
+
+    /// Slow-drain bound for the response path (symmetric to the request-line
+    /// deadline): the write adapter must refuse on an EXPIRED overall budget
+    /// BEFORE delegating a single byte, even though each individual socket
+    /// write would still succeed within its own 2s timeout.
+    #[test]
+    fn bundle_pull_response_writer_refuses_expired_deadline_before_writing() {
+        struct CountingWriter {
+            writes: usize,
+        }
+        impl std::io::Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut inner = CountingWriter { writes: 0 };
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("monotonic clock sanity");
+        let mut writer = super::DeadlineWriter {
+            inner: &mut inner,
+            deadline: expired,
+        };
+        let err = writer
+            .write_all(b"OK 5\nhello")
+            .expect_err("expired write budget must refuse");
+        assert!(
+            err.to_string().contains("time budget"),
+            "rejection must cite the time budget, got {err}"
+        );
+        assert_eq!(inner.writes, 0, "refusal must precede any delegated write");
+    }
+
+    #[test]
+    fn bundle_pull_response_writer_delegates_within_budget() {
+        struct CountingWriter {
+            writes: usize,
+            bytes: usize,
+        }
+        impl std::io::Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut inner = CountingWriter {
+            writes: 0,
+            bytes: 0,
+        };
+        let mut writer = super::DeadlineWriter {
+            inner: &mut inner,
+            deadline: std::time::Instant::now() + super::ANCHOR_BUNDLE_PULL_RESPONSE_WRITE_BUDGET,
+        };
+        writer
+            .write_all(b"UNCHANGED\n")
+            .expect("write within budget");
+        assert_eq!((inner.writes, inner.bytes), (1, 10));
     }
 
     /// Honest-path integration through the REWIRED bounded readers: a real
