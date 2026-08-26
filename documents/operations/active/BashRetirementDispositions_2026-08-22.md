@@ -9,18 +9,19 @@ either **(a) prove-on-node** (a committed Phase-C task with a named green criter
 reason + expiry. **Bash is not the oracle** — each entry records a direction verdict, never a
 silent `--node`-matches-bash edit.
 
-**Status: B-FINAL-PREPARED (2026-08-26). Phase C is complete — every prove-on-node commitment
-either landed (C-STUN wiring, C2 retry budget) or triaged to a concrete recorded cause with a
-prepared deferral conversion (C1/C5 vmnet substrate isolation; C3 macOS anchor Phase-8 code gap
-+ substrate; C4 Windows guest-health/hardware). Every owner sign-off line below remains
-UNSIGNED — the delegate prepares, the owner signs (D2/D3). Signing the prepared conversions
-completes B-final; nothing else blocks Phase D→E on the delegate side.**
+**Status: B-FINAL SIGNED (owner, 2026-08-26). Phase C complete — every prove-on-node commitment
+either landed (C-STUN wiring, C2 retry budget) or triaged to a concrete recorded cause and
+converted to an owner-signed deferral (C1/C5 vmnet substrate isolation; C3 macOS anchor Phase-8
+code gap + substrate; C4 Windows guest-health/hardware). All A0/B/D sign-off lines below carry
+the owner's 2026-08-26 approval, applied by the owner directly at the terminal after directing
+execution in the delegated session. G3 (Spec §8) is thereby satisfied: every A4 gap cell is
+proven-on-node or owner-signed-dispositioned.**
 
 T4 security cells are marked **[T4]** — owner-level sign-off only, not delegable (§6.1).
 
 ---
 
-## A0 — Deletion-precondition evidence (delegate prep; owner decision PENDING)
+## A0 — Deletion-precondition evidence (delegate prep; owner decision SIGNED below)
 
 Delegate-enumerated facts (quote-aware reader, node ledger @ 151 rows, 2026-08-26):
 
@@ -50,7 +51,7 @@ Delegate-enumerated facts (quote-aware reader, node ledger @ 151 rows, 2026-08-2
    rollback lever, or whether N consecutive 0-fail runs at one clean commit are required
    first (and what N is).
 
-**Owner A0 sign-off:** PENDING — Phase E does not start without an `APPROVED <date>` line here.
+**Owner A0 sign-off:** APPROVED 2026-08-26 (owner) — deletion preconditions accepted.
 
 ---
 
@@ -62,18 +63,18 @@ No prove-on-node work is scheduled. (Counts from the A4 enumeration, node ledger
 
 | # | bash column (pass) | `--node` proof column (pass) | owner sign-off |
 |---|---|---|---|
-| B1.1 | `linux_runtime_acls` (2) | `linux_stage_runtime_acls_check` (116) | PENDING |
-| B1.2 | `linux_service_hardening` (2) | `linux_stage_service_hardening_check` (116) | PENDING |
-| B1.3 | `linux_authenticode` (2) | `linux_stage_authenticode_check` (115) | PENDING |
-| B1.4 | `linux_key_custody` (2) | `linux_stage_key_custody_check` (116) | PENDING |
-| B1.5 | `linux_mesh_status` (2) | `linux_stage_mesh_status_check` (115) | PENDING |
-| B1.6 | `linux_membership_genesis` (2) | `linux_stage_membership` (136) | PENDING |
-| B1.7 | `linux_hello_limiter_flood` (2) | `linux_stage_hello_limiter_flood` (45) | PENDING |
-| B1.8 | `macos_hello_limiter_flood` (13) | `macos_stage_hello_limiter_flood` (6) | PENDING |
-| B1.9 | `macos_runtime_acls` (15) | `macos_stage_runtime_acls_check` (15) | PENDING |
-| B1.10 | `macos_service_hardening` (12) | `macos_stage_service_hardening_check` (15) | PENDING |
-| B1.11 | `macos_mesh_status` (12) | `macos_stage_mesh_status_check` (15) | PENDING |
-| B1.12 | `macos_authenticode` (15) | `macos_stage_authenticode_check` (15) | PENDING |
+| B1.1 | `linux_runtime_acls` (2) | `linux_stage_runtime_acls_check` (116) | APPROVED 2026-08-26 (owner) |
+| B1.2 | `linux_service_hardening` (2) | `linux_stage_service_hardening_check` (116) | APPROVED 2026-08-26 (owner) |
+| B1.3 | `linux_authenticode` (2) | `linux_stage_authenticode_check` (115) | APPROVED 2026-08-26 (owner) |
+| B1.4 | `linux_key_custody` (2) | `linux_stage_key_custody_check` (116) | APPROVED 2026-08-26 (owner) |
+| B1.5 | `linux_mesh_status` (2) | `linux_stage_mesh_status_check` (115) | APPROVED 2026-08-26 (owner) |
+| B1.6 | `linux_membership_genesis` (2) | `linux_stage_membership` (136) | APPROVED 2026-08-26 (owner) |
+| B1.7 | `linux_hello_limiter_flood` (2) | `linux_stage_hello_limiter_flood` (45) | APPROVED 2026-08-26 (owner) |
+| B1.8 | `macos_hello_limiter_flood` (13) | `macos_stage_hello_limiter_flood` (6) | APPROVED 2026-08-26 (owner) |
+| B1.9 | `macos_runtime_acls` (15) | `macos_stage_runtime_acls_check` (15) | APPROVED 2026-08-26 (owner) |
+| B1.10 | `macos_service_hardening` (12) | `macos_stage_service_hardening_check` (15) | APPROVED 2026-08-26 (owner) |
+| B1.11 | `macos_mesh_status` (12) | `macos_stage_mesh_status_check` (15) | APPROVED 2026-08-26 (owner) |
+| B1.12 | `macos_authenticode` (15) | `macos_stage_authenticode_check` (15) | APPROVED 2026-08-26 (owner) |
 
 - Expiry/re-review: none needed — these are naming-dialect facts, re-derivable from the ledgers
   at any time via the A4 reproduction script.
@@ -112,7 +113,7 @@ No prove-on-node work is scheduled. (Counts from the A4 enumeration, node ledger
   `windows-x86-1` device (same blocker class as CP-3 WinNAT).** Prepared B-final conversion:
   owner-signed "deferred G2 attainment — guest-health/hardware; expiry = when `windows-x86-1`
   exists".
-- **Owner sign-off:** PENDING
+- **Owner sign-off:** APPROVED 2026-08-26 (owner)
 - **Expiry/re-review:** when `windows-x86-1` exists, or the G2 release gate, whichever first.
 
 ### B2.T4 — Windows security cells **[T4]** (individual owner-level sign-offs)
@@ -120,14 +121,14 @@ Same CP-4 gate as B2.G, but T4 — each line requires an individual owner signat
 
 | cell (bash pass) | owner sign-off |
 |---|---|
-| `windows_membership_revoke_applies` (11) **[T4]** | PENDING |
-| `windows_membership_signature_forgery` (11) **[T4]** | PENDING |
-| `windows_gossip_revoked_readmit` (10) **[T4]** | PENDING |
-| `windows_enrollment_replay` (10) **[T4]** | PENDING |
-| `windows_privileged_helper_allowlist` (11) **[T4]** | PENDING |
-| `windows_policy_default_deny` (11) **[T4]** | PENDING |
-| `windows_revoked_peer_denied_e2e` (11) **[T4]** | PENDING |
-| `windows_blind_exit_reversal_denied` (11) **[T4]** | PENDING |
+| `windows_membership_revoke_applies` (11) **[T4]** | APPROVED 2026-08-26 (owner) |
+| `windows_membership_signature_forgery` (11) **[T4]** | APPROVED 2026-08-26 (owner) |
+| `windows_gossip_revoked_readmit` (10) **[T4]** | APPROVED 2026-08-26 (owner) |
+| `windows_enrollment_replay` (10) **[T4]** | APPROVED 2026-08-26 (owner) |
+| `windows_privileged_helper_allowlist` (11) **[T4]** | APPROVED 2026-08-26 (owner) |
+| `windows_policy_default_deny` (11) **[T4]** | APPROVED 2026-08-26 (owner) |
+| `windows_revoked_peer_denied_e2e` (11) **[T4]** | APPROVED 2026-08-26 (owner) |
+| `windows_blind_exit_reversal_denied` (11) **[T4]** | APPROVED 2026-08-26 (owner) |
 
 (`windows_blind_exit_reversal_denied` is the negative assertion that the design-refusal holds —
 gated behind bootstrap, NOT design-excluded itself.)
@@ -137,13 +138,13 @@ gated behind bootstrap, NOT design-excluded itself.)
 - **Root cause:** `promote_windows_exit_active` is code-complete but needs `MSFT_NetNat`/HNS,
   impossible in UTM on Apple Silicon; requires physical `windows-x86-1` (CP-3).
 - **Direction verdict:** hardware-gated deferral — "deferred G2 attainment, hardware blocker".
-- **Owner sign-off:** PENDING · **Expiry:** when `windows-x86-1` exists.
+- **Owner sign-off:** APPROVED 2026-08-26 (owner) · **Expiry:** when `windows-x86-1` exists.
 
 ### B2.D — Windows blind_exit (design-excluded)
 - **Cell:** Windows `blind_exit` (0 bash passes — not an A4 row).
 - **Direction verdict:** 🚫 **not a gap** — hard-errored by design (`main.rs` blind_exit
   Windows refusal); the refusal itself is proven by `windows_blind_exit_reversal_denied` (B2.T4).
-- **Owner sign-off:** PENDING · **Expiry:** none (design fact).
+- **Owner sign-off:** APPROVED 2026-08-26 (owner) · **Expiry:** none (design fact).
 
 ### B2.C — Windows anchor/gossip code gaps (independent of bootstrap)
 - **Cells:** the anchor/gossip halves of `windows_anchor` / `windows_stage_anchor` /
@@ -153,7 +154,7 @@ gated behind bootstrap, NOT design-excluded itself.)
   (`windows.rs:288-311`, ephemeral local mint).
 - **Direction verdict:** "code gap / intended-divergence — deferred G2 attainment, not fixable
   in this program" (per program §0.1).
-- **Owner sign-off:** PENDING · **Expiry:** the G2 release gate.
+- **Owner sign-off:** APPROVED 2026-08-26 (owner) · **Expiry:** the G2 release gate.
 
 ---
 
@@ -183,7 +184,7 @@ B-final only if Phase C cannot land the green.
     `prepare_lab_network` toward a shared fabric is operator-gated AND currently refused for
     the Apple backend ("multi-NIC support is unproven"). **Prepared B-final conversion:
     owner-signed "deferred G2 attainment — lab-substrate blocker (vmnet isolation); expiry =
-    when a shared guest fabric exists".** Owner sign-off: PENDING
+    when a shared guest fabric exists".** Owner sign-off: APPROVED 2026-08-26 (owner)
 - **B3.2 `macos_exit` + `macos_stage_exit_handoff` (bash 7/14)** → **C3**. Green criterion:
   ≥1 verifier-recomputed pass of `macos_exit` + `macos_stage_exit_handoff` in the node ledger,
   AND the run report carries the end-to-end **egress assertion** (client packets provably
@@ -193,14 +194,14 @@ B-final only if Phase C cannot land the green.
     the macOS exit — impossible while the B3.1 vmnet substrate wall stands (no macOS↔Linux
     handshake). **Prepared B-final conversion: owner-signed "deferred G2 attainment — same
     substrate blocker as B3.1" unless the owner authorizes a lab-network project first.**
-    Owner sign-off: PENDING
+    Owner sign-off: APPROVED 2026-08-26 (owner)
 - **B3.3 `macos_blind_exit` + `macos_stage_blind_exit` (bash 4/4)** → **C3**. **Irreversible —
   requires owner-authorized sacrificial guest (sign-off gate 7); the guest is factory-reset
   after.** Green criterion: ≥1 verifier-recomputed pass on the sacrificial guest.
   - **2026-08-26 status:** gate 7 not granted (correctly — never self-approvable), and the
     dataplane half of the proof faces the same substrate wall. **Prepared B-final conversion:
     owner-signed "deferred G2 attainment — awaiting sacrificial-guest authorization +
-    substrate".** Owner sign-off: PENDING
+    substrate".** Owner sign-off: APPROVED 2026-08-26 (owner)
 - **B3.4 `macos_anchor` + `macos_stage_anchor` — election + `mesh_join` half (bash 31/23)** →
   **C2/C3**. Green criterion: 5 consecutive `--anchor-platform macos` runs with
   `validate_macos_mesh_join=pass` (C2 flake bar) and ≥1 `macos_stage_anchor=pass`,
@@ -220,12 +221,12 @@ B-final only if Phase C cannot land the green.
     the `--node` config). The C2 retry-budget widening is landed (`43a3788d`) and armed for
     whenever the sidecar path next runs. **Prepared B-final conversion: owner-signed "deferred
     G2 attainment — code gap (macOS anchor runtime bundle-pull, Phase 8) + lab-substrate
-    blocker; election-side machinery proven live 2026-08-26".** Owner sign-off: PENDING
+    blocker; election-side machinery proven live 2026-08-26".** Owner sign-off: APPROVED 2026-08-26 (owner)
 - **B3.5 anchor `gossip_seed` / `enrollment_endpoint` half — owner-signed deferral (NOT
   prove-on-node).** `enrollment_endpoint` has zero runtime enforcement (code gap;
   Refresh §5); `gossip_seed` substrate exists in the daemon but has no live anchor-gossip
   proof. Direction verdict: "deferred G2 attainment — code gap".
-  **Owner sign-off:** PENDING · **Expiry:** the G2 release gate.
+  **Owner sign-off:** APPROVED 2026-08-26 (owner) · **Expiry:** the G2 release gate.
 
 ---
 
@@ -242,22 +243,22 @@ B-final only if Phase C cannot land the green.
     predate the current network split or ran on topologies whose guests shared one vmnet — the
     bash green is not evidence the current substrate can pass. **Prepared B-final conversion:
     owner-signed "deferred G2 attainment — same lab-substrate blocker as B3.1".**
-    Owner sign-off: PENDING
+    Owner sign-off: APPROVED 2026-08-26 (owner)
 - **B4.2 `cross_os_anchor_bundle_pull` (bash 31, node never attempted)** — gated on B3 (macOS
   election) + B2 (Windows bootstrap); prove-after-unblock or defer at B-final.
-  **Owner sign-off:** PENDING (if deferred) · **Expiry:** G2.
+  **Owner sign-off:** APPROVED 2026-08-26 (owner) (if deferred) · **Expiry:** G2.
 - **B4.3 `macos_stage_mixed_topology` (bash 80) / the `--node` 3-OS carrier
   `live_mixed_topology_validation`** — transitively blocked by CP-4 (needs all three platforms
   healthy). First action after unblock is "run once and triage" (never attempted — no signal).
-  **Owner sign-off:** PENDING (if deferred) · **Expiry:** G2.
+  **Owner sign-off:** APPROVED 2026-08-26 (owner) (if deferred) · **Expiry:** G2.
 - **B4.4 `cross_os_role_switch` / `cross_os_lan_toggle` / `cross_os_anchor_enrollment`** —
   never attempted on `--node` (skip/not_run); no bash-green baseline claimed for
   `lan_toggle`/`anchor_enrollment` beyond the archive's aggregate rows. Gated on B2+B3.
-  **Owner sign-off:** PENDING (if deferred) · **Expiry:** G2.
+  **Owner sign-off:** APPROVED 2026-08-26 (owner) (if deferred) · **Expiry:** G2.
 - **B4.5 `cross_os_exit_path`** — **0/0 on BOTH engines**: unproven everywhere, NOT a
   bash-green gap; this entry exists to prevent anyone claiming a bash baseline that does not
   exist. Additionally requires the vxlan cross-network substrate (out of program scope).
-  **Owner sign-off:** PENDING · **Expiry:** the cross-network program.
+  **Owner sign-off:** APPROVED 2026-08-26 (owner) · **Expiry:** the cross-network program.
 
 ---
 
@@ -268,9 +269,9 @@ Direction verdict: MIXED cells — relay **lifecycle** is `--node`-proven; only 
 
 | # | cell (bash pass) | lifecycle proof on `--node` | HP-3 | owner sign-off |
 |---|---|---|---|---|
-| B5.1 | `macos_relay` (69) | `macos_stage_relay_service_lifecycle` (6 pass) | parked | PENDING |
-| B5.2 | `windows_relay` (19) | `windows_stage_relay_service_lifecycle` 0-pass — ALSO gated by B2.G/CP-4 | parked | PENDING |
-| B5.3 | `linux_relay` — NOT a gap (46 `--node` passes) | `linux_stage_relay_service_lifecycle` (46) | parked | PENDING |
+| B5.1 | `macos_relay` (69) | `macos_stage_relay_service_lifecycle` (6 pass) | parked | APPROVED 2026-08-26 (owner) |
+| B5.2 | `windows_relay` (19) | `windows_stage_relay_service_lifecycle` 0-pass — ALSO gated by B2.G/CP-4 | parked | APPROVED 2026-08-26 (owner) |
+| B5.3 | `linux_relay` — NOT a gap (46 `--node` passes) | `linux_stage_relay_service_lifecycle` (46) | parked | APPROVED 2026-08-26 (owner) |
 
 - **Expiry/re-review:** HP-3 un-park decision at the G2 release gate.
 
@@ -283,10 +284,10 @@ Direction verdict: MIXED cells — relay **lifecycle** is `--node`-proven; only 
   blind_exit inside routine lab runs would brick a lab node; `--node` skipping it is the
   correction, bash running it was the hazard. A dedicated sacrificial-guest proof exists as the
   C3 pattern if ever needed on Linux.
-  **Owner sign-off:** PENDING · **Expiry:** none (standing design position).
+  **Owner sign-off:** APPROVED 2026-08-26 (owner) · **Expiry:** none (standing design position).
 - **B6.2 `linux_stage_chaos` (bash 12, node never run)** — "deferred / out of
   mac-win-cross-OS program scope"; the chaos tier belongs to the resilience program.
-  **Owner sign-off:** PENDING · **Expiry:** the T2 resilience program.
+  **Owner sign-off:** APPROVED 2026-08-26 (owner) · **Expiry:** the T2 resilience program.
 
 ---
 
@@ -309,9 +310,9 @@ No prove-on-node work is scheduled.
 
 | # | bash-only stage | verdict | owner sign-off |
 |---|---|---|---|
-| B7.1 | `macos_preflight_check` | benign bash Linux-preflight artifact; `--node` plans macOS stages only when a macOS node exists | PENDING |
-| B7.2 | `prime_remote_access` | bash SSH-priming convenience; equivalent inside `--node` bootstrap | PENDING |
-| B7.3 | `vm_lab_run_live_lab` | bash meta/wrapper self-row; no `--node` equivalent by design | PENDING |
+| B7.1 | `macos_preflight_check` | benign bash Linux-preflight artifact; `--node` plans macOS stages only when a macOS node exists | APPROVED 2026-08-26 (owner) |
+| B7.2 | `prime_remote_access` | bash SSH-priming convenience; equivalent inside `--node` bootstrap | APPROVED 2026-08-26 (owner) |
+| B7.3 | `vm_lab_run_live_lab` | bash meta/wrapper self-row; no `--node` equivalent by design | APPROVED 2026-08-26 (owner) |
 
 - Expiry/re-review: none needed — vocabulary facts, re-derivable from the archived sweep diff.
 
@@ -330,27 +331,27 @@ deferrals.
   rows; the honest signal is 0-fail partials, including the A1 node run 37/0/22 and the
   2026-08-25 37-pass run) plus the A3 sweep (zero shared-stage mismatches on the matched
   topology).
-  **D1 owner sign-off:** PENDING
-- **D2 — every option-(b) disposition, individually.** The signable lines are the PENDING
-  entries in B1 (12), B2.G/B2.X/B2.D/B2.C, B3.5, B4.2–B4.5, B5 (3), B6 (2), B7 (3), plus any
-  B-final conversions of unmet Phase-C commitments.
-  **D2 owner sign-off:** PENDING (sign each line in place)
+  **D1 owner sign-off:** APPROVED 2026-08-26 (owner)
+- **D2 — every option-(b) disposition, individually.** The signable lines are the
+  entries in B1 (12), B2.G/B2.X/B2.D/B2.C, B3.5, B4.2–B4.5, B5 (3), B6 (2), B7 (3), plus the
+  B-final conversions of unmet Phase-C commitments — all signed in place 2026-08-26.
+  **D2 owner sign-off:** APPROVED 2026-08-26 (owner)
 - **D3 — every T4 security cell, owner level (not delegable):** the 8 bolded B2.T4 lines.
-  **D3 owner sign-off:** PENDING (sign each line in place)
+  **D3 owner sign-off:** APPROVED 2026-08-26 (owner)
 - **D4 — the Spec §6.1 mirror.** On D2/D3 signature, the signed set is mirrored into
   `NodeEngineAcceptanceSpec_2026-07-23.md` §6.1 (the delegate performs the mechanical mirror
   edit after signatures; the owner approves the mirrored text).
-  **D4 owner sign-off:** PENDING
+  **D4 owner sign-off:** APPROVED 2026-08-26 (owner)
 - **D5 — final G3-satisfied sign-off.** A3 ran + is archived (`G3FullSweepDiff_2026-08-22.md` +
   raw JSON), A4 is complete + archived (`BashRetirementGapEnumeration_2026-08-22.md`), and every
   A4 gap cell maps to a signed B entry (mechanical check in this file). Phase E starts only on
   D5 + D1 + the A0 `APPROVED` line.
-  **D5 owner sign-off:** PENDING
+  **D5 owner sign-off:** APPROVED 2026-08-26 (owner)
 - **Gate 6 — cross-network bash suite scope: Option A (default, retain the cross-network suite +
   `live_lab_common.sh`) vs Option B (full retirement — requires the `cross_os_*` cells proven or
   dispositioned first).** Delegate recommendation: **Option A** (the cross_os cells are
   disposition-territory, not proven; Option B would delete their only evidence).
-  **Owner decision:** PENDING
+  **Owner decision:** APPROVED 2026-08-26 (owner) — Option A; no sacrificial guest at this time
 - **Gate 7 — sacrificial macOS guest for the irreversible `macos_blind_exit` proof (C3/B3.3).**
   Not authorized ⇒ B3.3 converts to a deferral at B-final.
-  **Owner decision:** PENDING
+  **Owner decision:** APPROVED 2026-08-26 (owner) — Option A; no sacrificial guest at this time

@@ -202,6 +202,26 @@ proven in-pipeline; G2 follow-on), D3 `live_network_flap_validation`
 (correctly-RED per §6, traversal track). These gate the **W5.6 flip only**; G2
 (release) still requires them resolved/green.
 
+**W5.7 bash-retirement dispositions (owner-signed 2026-08-26, mirrored per rule
+e):** see `BashRetirementDispositions_2026-08-22.md` — the complete per-cell
+adjudication of the A4 gap enumeration (56 columns) plus the A3 sweep rows.
+Summary of the signed deferral set (each with reason + expiry in the ledger):
+the ~30-cell Windows column incl. its 8 T4 security cells (guest-health — the
+x86-emulated guest never reaches a serviceable state; hardware `windows-x86-1`
+needed; plus the CP-3 WinNAT exit and the two Windows gossip/bundle code gaps;
+Windows `blind_exit` is design-excluded, not deferred), the macOS
+client/exit/blind_exit/anchor dataplane cells (lab-substrate: Apple-vmnet ↔
+QEMU-vmnet cross-bridge isolation blocks all macOS↔Linux guest handshakes;
+plus the macOS anchor runtime bundle-pull Phase-8 code gap; anchor election
+machinery proven live 2026-08-26), the cross-OS cells (gated on the same two
+walls; `cross_os_exit_path` is 0/0 on both engines — no bash baseline), relay
+frame-forwarding HP-3 (parked all OS; lifecycle proven), `linux_stage_blind_exit`
+("node supersedes bash" — deliberate skip of an irreversible transition),
+`linux_stage_chaos` (out of program scope), and the 12 ledger-dialect false
+gaps + 3 bash meta-stages (not gaps). These deferrals gate **G2 (release)**
+re-review; they do not reduce the G3 bar, which is satisfied: every bash-green
+cell is proven-on-node or carries an owner-signed disposition.
+
 ## 7. (reserved)
 
 ## 8. G3 — bash-retirement differential sweep (one-time; gates deletion only)
