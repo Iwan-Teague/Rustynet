@@ -149,83 +149,6 @@ fn run() -> Result<(), String> {
         ))?;
     }
 
-    // Rustynet uses userspace WireGuard — `wg show` sees no interfaces.
-    // Use `rustynet netcheck` which reports the daemon's last live handshake
-    // timestamp via path_latest_live_handshake_unix.
-    logger.line("[network-flap] waiting for baseline WG handshake (up to 300s)")?;
-    let mut baseline_age_s: Option<u64> = None;
-    for attempt in 0..60u32 {
-        let nc_result = ctx.capture_root_allow_failure(
-            &client_host,
-            &[live_lab_support::REMOTE_RUSTYNET_BIN, "netcheck"],
-        );
-        let client_err = nc_result
-            .as_ref()
-            .err()
-            .map(|e| e.chars().take(120).collect::<String>());
-        let nc_out = nc_result.unwrap_or_default();
-        baseline_age_s = parse_handshake_age_s_from_netcheck(&nc_out);
-        if baseline_age_s.is_some_and(|age| age < 180) {
-            break;
-        }
-        if attempt == 0 || attempt == 11 || attempt == 23 {
-            let client_nc: String = nc_out.chars().take(300).collect();
-            let exit_nc_result = ctx.capture_root_allow_failure(
-                &exit_host,
-                &[live_lab_support::REMOTE_RUSTYNET_BIN, "netcheck"],
-            );
-            let exit_err = exit_nc_result
-                .as_ref()
-                .err()
-                .map(|e| e.chars().take(120).collect::<String>());
-            let exit_nc: String = exit_nc_result
-                .unwrap_or_default()
-                .chars()
-                .take(300)
-                .collect();
-            logger.line(format!(
-                "[network-flap] nc-diag attempt={attempt} \
-                 client={client_nc:?} client-err={client_err:?} \
-                 exit={exit_nc:?} exit-err={exit_err:?}"
-            ))?;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(5));
-    }
-    // An UNREADABLE baseline is a failure of this stage's own instrument, not a
-    // property of the tunnel, and it must be reported as such rather than
-    // silently standing in for "very old".
-    let baseline_ok = baseline_age_s.is_some_and(|age| age < 180);
-    logger.line(format!(
-        "[network-flap] baseline_handshake_age_s={} ok={baseline_ok}",
-        describe_age(baseline_age_s)
-    ))?;
-    // Post-poll failure dump: capture full WG + gossip state to understand
-    // why handshake never established.
-    if !baseline_ok {
-        logger.line("[network-flap] baseline FAILED — capturing post-poll diagnostics")?;
-        for (label, host) in [("client", &client_host), ("exit", &exit_host)] {
-            let wg_all = ctx.capture_root_allow_failure(host, &["wg", "show", "all"]);
-            let status = ctx
-                .capture_root_allow_failure(
-                    host,
-                    &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
-                )
-                .unwrap_or_default();
-            let status_snip: String = status.chars().take(300).collect();
-            let journal = ctx
-                .capture_root_allow_failure(
-                    host,
-                    &["journalctl", "-u", "rustynetd", "-n", "30", "--no-pager"],
-                )
-                .unwrap_or_default();
-            let jsnip: String = journal.chars().take(600).collect();
-            logger.line(format!(
-                "[network-flap] post-poll {label} wg-all={wg_all:?} \
-                 status={status_snip:?} journal={jsnip:?}"
-            ))?;
-        }
-    }
-
     // Resolve the data-probe target BEFORE the block goes up: the mid-blackout
     // disruption probe and the post-blackout recovery probe both ping this
     // address, and resolving it here keeps the two probes symmetric. Read the
@@ -259,6 +182,99 @@ fn run() -> Result<(), String> {
         "[network-flap] peer mesh ipv4 for data probes (host {probe_host}): {}",
         exit_mesh_ipv4.as_deref().unwrap_or("<unresolved>")
     ))?;
+
+    // Rustynet uses userspace WireGuard — `wg show` sees no interfaces.
+    // Use `rustynet netcheck` which reports the daemon's last live handshake
+    // timestamp via path_latest_live_handshake_unix.
+    logger.line("[network-flap] waiting for baseline WG handshake (up to 300s)")?;
+    let mut baseline_age_s: Option<u64> = None;
+    let mut baseline_data_crossed = false;
+    for attempt in 0..60u32 {
+        let nc_result = ctx.capture_root_allow_failure(
+            &client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "netcheck"],
+        );
+        let client_err = nc_result
+            .as_ref()
+            .err()
+            .map(|e| e.chars().take(120).collect::<String>());
+        let nc_out = nc_result.unwrap_or_default();
+        baseline_age_s = parse_handshake_age_s_from_netcheck(&nc_out);
+        if baseline_age_s.is_some_and(|age| age < 180) {
+            break;
+        }
+        // Multi-peer topologies report
+        // `traversal_probe_latest_handshake_unix=multiple`, so the age is
+        // structurally unreadable there (run livelab-1787774681: 4 peers,
+        // unreadable for the full 300s while the tunnel was demonstrably
+        // live). Data crossing the tunnel is the stronger oracle and is
+        // already the proof used by the disruption and recovery phases —
+        // accept it for the baseline too.
+        if let Some(target) = exit_mesh_ipv4.as_deref()
+            && ctx
+                .capture_root_allow_failure(&client_host, &["ping", "-c", "2", "-W", "2", target])
+                .is_ok_and(|out| out.contains(" 0% packet loss") || out.contains("2 received"))
+        {
+            baseline_data_crossed = true;
+            break;
+        }
+        if attempt == 0 || attempt == 11 || attempt == 23 {
+            let client_nc: String = nc_out.chars().take(300).collect();
+            let exit_nc_result = ctx.capture_root_allow_failure(
+                &exit_host,
+                &[live_lab_support::REMOTE_RUSTYNET_BIN, "netcheck"],
+            );
+            let exit_err = exit_nc_result
+                .as_ref()
+                .err()
+                .map(|e| e.chars().take(120).collect::<String>());
+            let exit_nc: String = exit_nc_result
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect();
+            logger.line(format!(
+                "[network-flap] nc-diag attempt={attempt} \
+                 client={client_nc:?} client-err={client_err:?} \
+                 exit={exit_nc:?} exit-err={exit_err:?}"
+            ))?;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    // An UNREADABLE baseline is a failure of this stage's own instrument, not a
+    // property of the tunnel, and it must be reported as such rather than
+    // silently standing in for "very old".
+    let baseline_ok = baseline_data_crossed || baseline_age_s.is_some_and(|age| age < 180);
+    logger.line(format!(
+        "[network-flap] baseline_handshake_age_s={} data_crossed={baseline_data_crossed} ok={baseline_ok}",
+        describe_age(baseline_age_s)
+    ))?;
+    // Post-poll failure dump: capture full WG + gossip state to understand
+    // why handshake never established.
+    if !baseline_ok {
+        logger.line("[network-flap] baseline FAILED — capturing post-poll diagnostics")?;
+        for (label, host) in [("client", &client_host), ("exit", &exit_host)] {
+            let wg_all = ctx.capture_root_allow_failure(host, &["wg", "show", "all"]);
+            let status = ctx
+                .capture_root_allow_failure(
+                    host,
+                    &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+                )
+                .unwrap_or_default();
+            let status_snip: String = status.chars().take(300).collect();
+            let journal = ctx
+                .capture_root_allow_failure(
+                    host,
+                    &["journalctl", "-u", "rustynetd", "-n", "30", "--no-pager"],
+                )
+                .unwrap_or_default();
+            let jsnip: String = journal.chars().take(600).collect();
+            logger.line(format!(
+                "[network-flap] post-poll {label} wg-all={wg_all:?} \
+                 status={status_snip:?} journal={jsnip:?}"
+            ))?;
+        }
+    }
 
     // ── Stage 2: block WG UDP output on client ────────────────────────────────
     logger.line(format!(
