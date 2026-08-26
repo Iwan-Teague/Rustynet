@@ -4541,6 +4541,29 @@ mod tests {
              the `success` constructor; an inline success-state literal elsewhere \
              builds responses that skipped the deliverability clamp"
         );
+        // The exact-spelling census above counts only the spaced,
+        // comma-terminated spaced-literal form. Three more spellings build
+        // unclamped success responses right past it: a compact literal with
+        // the space removed, a LAST-FIELD literal with no trailing comma, and
+        // a post-construction field assignment that flips an error response's
+        // flag without ever spelling the literal (proven by mutation).
+        // Normalize whitespace away and pin both remaining shapes; both
+        // needles are assembled at runtime so this comment never matches.
+        let compact_flag = ["ok:", "true"].concat();
+        let compact_assign = ["ok=", "true"].concat();
+        let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact.matches(compact_flag.as_str()).count(),
+            1,
+            "HelperResponse success-state construction must stay centralized \
+             in the `success` constructor under ANY spacing or comma placement"
+        );
+        assert!(
+            !compact.contains(compact_assign.as_str()),
+            "a post-construction assignment flipping the response flag builds \
+             an unclamped success response without spelling the literal; \
+             success state may only be produced inside the constructor"
+        );
     }
 
     #[test]

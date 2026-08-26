@@ -16753,6 +16753,37 @@ mod tests {
              force_fail_closed_or_restrict so its Result is surfaced via \
              restrict_permanent (RN-03), never discarded"
         );
+        // The paren census above is blind to PAREN-LESS references to the
+        // method path: a fn-item binding
+        // (`let raw = Phase10Controller::<..>::force_fail_closed;`) or passing
+        // the method as a value to a discarding helper reintroduces the silent
+        // Result drop while the count stays at exactly one (proven by
+        // mutation). Every non-comment production line that names the method
+        // must therefore either CALL it (`force_fail_closed(` — the one census
+        // site), be the wrapper name itself
+        // (`force_fail_closed_or_restrict`), or mention it inside a string
+        // literal (the restriction message). Anything else is an indirection
+        // that can drop the fail-closed Result outside this pin's sight.
+        let call_needle = ["force_fail_", "closed("].concat();
+        let string_needle = ["\"", "force_fail_closed"].concat();
+        for (index, line) in prod.lines().enumerate() {
+            if !line.contains("force_fail_closed") {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                line.contains(call_needle.as_str())
+                    || line.contains("force_fail_closed_or_restrict")
+                    || line.contains(string_needle.as_str()),
+                "line {} references force_fail_closed without calling it under a \
+                 pinned spelling (fn-item binding / value-passed indirection); \
+                 such a reference can drop the fail-closed Result invisibly: {line}",
+                index + 1
+            );
+        }
     }
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -17953,6 +17984,29 @@ mod tests {
              accept loop under ANY spelling — one bad client must not kill \
              the daemon (log-and-continue only)"
         );
+        // The propagation bans above miss ESCALATION spellings that leave the
+        // window's text clean: a second Err arm can keep log-and-continue for
+        // one error class and terminate the whole daemon for every other
+        // client via std::process::exit — no `return`, no `.map_err(`, no
+        // `?;`, and the retained `continue` still satisfies the shape rule
+        // (proven by mutation). Ban the remaining kill spellings inside the
+        // same window: hard exits, aborts, panics, the unwrap/expect family,
+        // and any break that abandons the accept loop.
+        for banned in [
+            "process::exit",
+            "::abort(",
+            "panic!",
+            ".expect(",
+            ".unwrap(",
+            "break",
+        ] {
+            assert!(
+                !accept_window.contains(banned),
+                "the IPC-read failure window must stay log-and-continue; \
+                 {banned} inside it lets one local client kill or wedge the \
+                 whole daemon under a spelling the propagation greps cannot see"
+            );
+        }
     }
 
     #[test]

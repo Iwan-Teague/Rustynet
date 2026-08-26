@@ -1843,6 +1843,30 @@ mod tests {
              store_macos_generic_password under ANY spelling — only the -A and \
              SecItemAdd variants are readable by the launchd daemon cross-session"
         );
+        // The window-scoped name ban above cannot see an ALIAS: a local
+        // `use ... as legacy_store;` renames the forbidden callee for the call
+        // itself, so the dispatcher routes passphrases to the legacy store
+        // while every assertion above stays green (proven by mutation). Pin
+        // the WHOLE production region instead: any non-comment line that names
+        // the legacy callee must be naming one of the two SANCTIONED variants;
+        // the bare legacy name has no sanctioned production use.
+        let prod_end = body.find("\nmod tests {").unwrap_or(body.len());
+        let safe_variants = ["_allow_any_app", "_system_keychain_owned"];
+        for (index, line) in body[..prod_end].lines().enumerate() {
+            if !line.contains("store_macos_generic_password") {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            assert!(
+                trimmed.starts_with("//")
+                    || safe_variants.iter().any(|variant| line.contains(variant)),
+                "line {} names the legacy default-keychain callee without one of \
+                 the sanctioned variant spellings; an aliased or wrapped call \
+                 routes passphrases to the -A CLI path the launchd daemon cannot \
+                 read cross-session on macOS 26",
+                index + 1
+            );
+        }
     }
 
     #[test]
