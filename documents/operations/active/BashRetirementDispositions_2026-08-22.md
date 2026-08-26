@@ -257,3 +257,37 @@ No prove-on-node work is scheduled.
 Every option-(b) deferral above must be mirrored into `NodeEngineAcceptanceSpec_2026-07-23.md`
 §6.1's deferred-with-reason list **when signed** (D4). Unsigned entries are not yet effective
 deferrals.
+
+---
+
+## PHASE D — owner sign-off package (prepared by the delegate; NOTHING below is self-approved)
+
+- **D1 — loss of the rollback lever.** Phase E removes `--legacy-bash-orchestrator` with no
+  fallback. Evidence for the comfort decision is the A0 section above (zero strict-`pass` soak
+  rows; the honest signal is 0-fail partials, including the A1 node run 37/0/22 and the
+  2026-08-25 37-pass run) plus the A3 sweep (zero shared-stage mismatches on the matched
+  topology).
+  **D1 owner sign-off:** PENDING
+- **D2 — every option-(b) disposition, individually.** The signable lines are the PENDING
+  entries in B1 (12), B2.G/B2.X/B2.D/B2.C, B3.5, B4.2–B4.5, B5 (3), B6 (2), B7 (3), plus any
+  B-final conversions of unmet Phase-C commitments.
+  **D2 owner sign-off:** PENDING (sign each line in place)
+- **D3 — every T4 security cell, owner level (not delegable):** the 8 bolded B2.T4 lines.
+  **D3 owner sign-off:** PENDING (sign each line in place)
+- **D4 — the Spec §6.1 mirror.** On D2/D3 signature, the signed set is mirrored into
+  `NodeEngineAcceptanceSpec_2026-07-23.md` §6.1 (the delegate performs the mechanical mirror
+  edit after signatures; the owner approves the mirrored text).
+  **D4 owner sign-off:** PENDING
+- **D5 — final G3-satisfied sign-off.** A3 ran + is archived (`G3FullSweepDiff_2026-08-22.md` +
+  raw JSON), A4 is complete + archived (`BashRetirementGapEnumeration_2026-08-22.md`), and every
+  A4 gap cell maps to a signed B entry (mechanical check in this file). Phase E starts only on
+  D5 + D1 + the A0 `APPROVED` line.
+  **D5 owner sign-off:** PENDING
+- **Gate 6 — cross-network bash suite scope: Option A (default, retain the cross-network suite +
+  `live_lab_common.sh`) vs Option B (full retirement — requires the `cross_os_*` cells proven or
+  dispositioned first).** Delegate recommendation: **Option A** (the cross_os cells are
+  disposition-territory, not proven; Option B would delete their only evidence).
+  **Owner decision:** PENDING
+- **Gate 7 — sacrificial macOS guest for the irreversible `macos_blind_exit` proof (C3/B3.3).**
+  Not authorized ⇒ B3.3 converts to a deferral at B-final.
+  **Owner decision:** PENDING
