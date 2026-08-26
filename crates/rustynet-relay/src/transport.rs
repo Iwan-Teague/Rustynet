@@ -3100,6 +3100,38 @@ mod tests {
                 index + 1
             );
         }
+
+        // The epoch-shape rule above routes every read through
+        // now_unix_checked(), but it cannot see the helper's OWN internals:
+        // swapping its checked disposal for a defaulted value moves the
+        // RLY-15 substituted default INSIDE the one sanctioned call site while
+        // every line-level rule above stays green (the offending spelling sits
+        // on a chain line that names neither `now_unix` nor `UNIX_EPOCH`;
+        // proven by mutation). Pin the helper body directly: it must dispose
+        // of a failed clock via `.ok()` and may not spell any substituting or
+        // panicking fallback.
+        let helper_start = production
+            .find("fn now_unix_checked()")
+            .expect("now_unix_checked must exist");
+        let helper_body_end = production[helper_start..]
+            .find("\n}\n")
+            .map(|at| helper_start + at)
+            .expect("now_unix_checked must have a closing brace");
+        let helper = &production[helper_start..=helper_body_end];
+        let unwrap_needle = format!("unwrap_{}", "or");
+        for banned in [unwrap_needle.as_str(), ".expect(", ".unwrap("] {
+            assert!(
+                !helper.contains(banned),
+                "now_unix_checked must not substitute or panic on an unavailable \
+                 clock ({banned}); it must return None so every consumer disposes \
+                 of the failure in its own fail-closed direction (RLY-15)"
+            );
+        }
+        assert!(
+            helper.contains(".ok()"),
+            "now_unix_checked must keep the checked Option disposal; replacing \
+             it with a defaulted value is the RLY-15 defect"
+        );
     }
 
     #[test]
