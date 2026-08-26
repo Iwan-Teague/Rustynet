@@ -1,0 +1,155 @@
+{
+  "overall_functional_parity_pass": false,
+  "overall_status_match": false,
+  "overall_status_left": "failed",
+  "overall_status_right": "partial",
+  "shared_stages": [
+    {
+      "stage_id": "discover_local_utm",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "preflight",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "prepare_source_archive",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "verify_ssh_reachability",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "cleanup_hosts",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "bootstrap_hosts",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "collect_pubkeys",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "membership_init",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "distribute_membership",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "distribute_assignments",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "distribute_traversal",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "distribute_dns_zone",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "enforce_baseline_runtime",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    },
+    {
+      "stage_id": "validate_baseline_runtime",
+      "left_outcome": "passed",
+      "right_outcome": "passed",
+      "matches": true
+    }
+  ],
+  "shared_stage_count": 14,
+  "stages_only_in_left": [
+    "macos_preflight_check",
+    "prime_remote_access",
+    "vm_lab_run_live_lab"
+  ],
+  "stages_only_in_right": [
+    "active_exit",
+    "admin_issue",
+    "anchor_validation",
+    "authenticode_validation",
+    "blind_exit",
+    "blind_exit_dataplane_validation",
+    "cleanup",
+    "cross_network_controller_switch",
+    "cross_network_direct_remote_exit",
+    "cross_network_failback_roaming",
+    "cross_network_nat_classification",
+    "cross_network_nat_matrix",
+    "cross_network_node_network_switch",
+    "cross_network_preflight",
+    "cross_network_relay_remote_exit",
+    "cross_network_remote_exit_dns",
+    "cross_network_remote_exit_soak",
+    "cross_network_traversal_adversarial",
+    "deploy_relay_service",
+    "dns_failclosed_validation",
+    "exit_demotion_residue_validation",
+    "exit_dns_failclosed_validation",
+    "exit_handoff",
+    "exit_nat_lifecycle_validation",
+    "extended_soak",
+    "gossip_convergence_validation",
+    "ipv6_leak_validation",
+    "key_custody_validation",
+    "live_anchor",
+    "live_enrollment_restart_validation",
+    "live_hello_limiter_flood_validation",
+    "live_key_custody_validation",
+    "live_lan_toggle_validation",
+    "live_managed_dns_validation",
+    "live_mixed_topology_validation",
+    "live_network_flap_validation",
+    "live_reboot_recovery_validation",
+    "live_secrets_not_in_logs_validation",
+    "live_two_hop_validation",
+    "mesh_status_validation",
+    "relay_validation",
+    "role_switch_matrix",
+    "runtime_acls_validation",
+    "security_audit_validation",
+    "service_hardening_validation",
+    "traffic_test_matrix"
+  ],
+  "node_count_match": true,
+  "node_count_left": 2,
+  "node_count_right": 2,
+  "validator_pass_count_match": true,
+  "validator_pass_count_left": 0,
+  "validator_pass_count_right": 0,
+  "validator_total_count_match": true,
+  "validator_total_count_left": 0,
+  "validator_total_count_right": 0
+}
