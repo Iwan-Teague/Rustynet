@@ -160,12 +160,16 @@ impl LinuxUserspaceSharedBackend {
     }
 
     fn is_runtime_worker_unavailable(err: &BackendError) -> bool {
+        // Prefix match, not equality: the control appends the recorded worker
+        // exit cause to these messages ("...: worker exit cause: <why>") so the
+        // operator can see WHY the worker died without a journal excavation.
         err.kind == rustynet_backend_api::BackendErrorKind::Internal
-            && matches!(
-                err.message.as_str(),
-                "linux userspace-shared runtime worker is unavailable"
-                    | "linux userspace-shared runtime worker dropped a reply"
-            )
+            && (err
+                .message
+                .starts_with("linux userspace-shared runtime worker is unavailable")
+                || err
+                    .message
+                    .starts_with("linux userspace-shared runtime worker dropped a reply"))
     }
 
     /// Take the handed-over socket if there is one, otherwise bind `listen_port`.

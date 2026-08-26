@@ -173,12 +173,15 @@ impl MacosUserspaceSharedBackend {
     }
 
     fn is_runtime_worker_unavailable(err: &BackendError) -> bool {
+        // Prefix match, not equality: the control appends the recorded worker
+        // exit cause ("...: worker exit cause: <why>"). Mirrors the linux twin.
         err.kind == rustynet_backend_api::BackendErrorKind::Internal
-            && matches!(
-                err.message.as_str(),
-                "macos userspace-shared runtime worker is unavailable"
-                    | "macos userspace-shared runtime worker dropped a reply"
-            )
+            && (err
+                .message
+                .starts_with("macos userspace-shared runtime worker is unavailable")
+                || err
+                    .message
+                    .starts_with("macos userspace-shared runtime worker dropped a reply"))
     }
 
     fn bind_authoritative_socket(&self) -> Result<AuthoritativeSocket, BackendError> {

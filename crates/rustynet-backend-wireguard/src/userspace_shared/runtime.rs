@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -136,6 +136,8 @@ impl RunningUserspaceRuntime {
         let worker_test_state = test_state.clone();
         let worker_alive = Arc::new(AtomicBool::new(true));
         let worker_alive_for_thread = worker_alive.clone();
+        let worker_exit_cause = Arc::new(Mutex::new(None));
+        let worker_exit_cause_for_thread = worker_exit_cause.clone();
         let round_trip_in_flight = Arc::new(AtomicBool::new(false));
         let thread_name = format!("rustynet-wg-userspace-{interface_name}");
 
@@ -152,6 +154,7 @@ impl RunningUserspaceRuntime {
                     ready_tx,
                     test_state: worker_test_state,
                     worker_alive: worker_alive_for_thread,
+                    worker_exit_cause: worker_exit_cause_for_thread,
                 });
             })
             .map_err(|err| {
@@ -180,6 +183,7 @@ impl RunningUserspaceRuntime {
                 authoritative_identity,
                 worker_alive,
                 round_trip_in_flight,
+                worker_exit_cause,
                 test_state,
             },
             join_handle,
@@ -211,6 +215,11 @@ pub(crate) struct RuntimeControl {
     authoritative_identity: AuthoritativeTransportIdentity,
     worker_alive: Arc<AtomicBool>,
     round_trip_in_flight: Arc<AtomicBool>,
+    /// WHY the worker exited, recorded at the exit site (first writer wins).
+    /// Before this existed the cause was discarded unless a round trip was in
+    /// flight, so a live incident surfaced only as "dropped a reply" with the
+    /// actual error (a firewalled send) invisible (2026-08-26).
+    worker_exit_cause: Arc<Mutex<Option<String>>>,
     #[cfg_attr(not(test), allow(dead_code))]
     test_state: RuntimeTestState,
 }
@@ -412,11 +421,29 @@ impl RuntimeControl {
     ) -> Result<T, BackendError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx.send(make_request(reply_tx)).map_err(|_| {
-            BackendError::internal("linux userspace-shared runtime worker is unavailable")
+            self.worker_gone_error("linux userspace-shared runtime worker is unavailable")
         })?;
         reply_rx.recv().map_err(|_| {
-            BackendError::internal("linux userspace-shared runtime worker dropped a reply")
+            self.worker_gone_error("linux userspace-shared runtime worker dropped a reply")
         })?
+    }
+
+    /// Build the worker-gone error, appending the recorded exit cause when one
+    /// exists. `is_runtime_worker_unavailable` matches these messages by
+    /// PREFIX, so the appended cause keeps the recovery path intact while the
+    /// operator finally sees WHY the worker died (on 2026-08-26 the cause — a
+    /// firewalled send — was discarded, and root-causing it took a guest
+    /// journal excavation).
+    fn worker_gone_error(&self, base: &str) -> BackendError {
+        let cause = self
+            .worker_exit_cause
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        match cause {
+            Some(cause) => BackendError::internal(format!("{base}: worker exit cause: {cause}")),
+            None => BackendError::internal(base),
+        }
     }
 }
 
@@ -1092,6 +1119,7 @@ struct WorkerRuntimeParts {
     ready_tx: ReplySender<AuthoritativeTransportIdentity>,
     test_state: RuntimeTestState,
     worker_alive: Arc<AtomicBool>,
+    worker_exit_cause: Arc<Mutex<Option<String>>>,
 }
 
 fn run_worker(parts: WorkerRuntimeParts) {
@@ -1105,6 +1133,7 @@ fn run_worker(parts: WorkerRuntimeParts) {
         ready_tx,
         test_state,
         worker_alive,
+        worker_exit_cause,
     } = parts;
     let mut state = RuntimeState {
         context,
@@ -1129,11 +1158,22 @@ fn run_worker(parts: WorkerRuntimeParts) {
     match state.authoritative_identity() {
         Ok(identity) => {
             if ready_tx.send(Ok(identity)).is_err() {
+                record_worker_exit_cause(
+                    &worker_exit_cause,
+                    "runtime control dropped the readiness channel before the worker reported ready",
+                );
                 mark_worker_exit(&test_state, &worker_alive);
                 return;
             }
         }
         Err(err) => {
+            record_worker_exit_cause(
+                &worker_exit_cause,
+                format!(
+                    "startup failed resolving authoritative identity: {}",
+                    err.message
+                ),
+            );
             let _ = ready_tx.send(Err(err));
             mark_worker_exit(&test_state, &worker_alive);
             return;
@@ -1144,18 +1184,24 @@ fn run_worker(parts: WorkerRuntimeParts) {
         match command_rx.recv_timeout(state.next_wait_timeout()) {
             Ok(request) => {
                 if !handle_request(&mut state, request) {
+                    record_worker_exit_cause(&worker_exit_cause, "shutdown requested");
                     break;
                 }
                 loop {
                     match command_rx.try_recv() {
                         Ok(request) => {
                             if !handle_request(&mut state, request) {
+                                record_worker_exit_cause(&worker_exit_cause, "shutdown requested");
                                 mark_worker_exit(&test_state, &worker_alive);
                                 return;
                             }
                         }
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => {
+                            record_worker_exit_cause(
+                                &worker_exit_cause,
+                                "command channel disconnected during authoritative transport processing",
+                            );
                             state.fail_outstanding_round_trip(BackendError::internal(
                                 "linux userspace-shared runtime worker command channel disconnected during authoritative transport processing",
                             ));
@@ -1166,20 +1212,35 @@ fn run_worker(parts: WorkerRuntimeParts) {
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                record_worker_exit_cause(&worker_exit_cause, "command channel disconnected");
+                break;
+            }
         }
 
         if let Err(err) = state.poll_peer_timers() {
+            record_worker_exit_cause(
+                &worker_exit_cause,
+                format!("peer timer tick failed: {}", err.message),
+            );
             state.fail_outstanding_round_trip(err);
             mark_worker_exit(&test_state, &worker_alive);
             return;
         }
 
         if let Err(err) = state.poll_authoritative_socket() {
+            record_worker_exit_cause(
+                &worker_exit_cause,
+                format!("authoritative socket poll failed: {}", err.message),
+            );
             state.fail_outstanding_round_trip(err);
             break;
         }
         if let Err(err) = state.poll_tun_device() {
+            record_worker_exit_cause(
+                &worker_exit_cause,
+                format!("tun device poll failed: {}", err.message),
+            );
             state.fail_outstanding_round_trip(err);
             break;
         }
@@ -1190,6 +1251,15 @@ fn run_worker(parts: WorkerRuntimeParts) {
         "linux userspace-shared runtime worker exited while an authoritative transport round trip was still in flight",
     ));
     mark_worker_exit(&test_state, &worker_alive);
+}
+
+/// Record WHY the worker exited. First writer wins: the first error is the one
+/// that initiated the exit; later fallthrough sites must not overwrite it. A
+/// poisoned lock is skipped — this is diagnostics, never worth a panic.
+fn record_worker_exit_cause(slot: &Mutex<Option<String>>, cause: impl Into<String>) {
+    if let Ok(mut guard) = slot.lock() {
+        guard.get_or_insert_with(|| cause.into());
+    }
 }
 
 fn mark_worker_exit(test_state: &RuntimeTestState, worker_alive: &AtomicBool) {
@@ -1524,6 +1594,68 @@ mod tests {
                 .poll_peer_timers()
                 .expect("a refused egress send must not kill the timer tick");
         }
+    }
+
+    #[test]
+    fn linux_runtime_worker_exit_cause_surfaces_in_control_errors() {
+        // 2026-08-26: the worker died on a firewalled send and the CAUSE was
+        // discarded — `fail_outstanding_round_trip` only forwards the error
+        // when a round trip is in flight — so the daemon journal showed hours
+        // of bare "dropped a reply" and root-causing took a guest journal
+        // excavation. Pin: the recorded exit cause must surface in the
+        // control's worker-gone errors, as a SUFFIX (the recovery matcher
+        // `is_runtime_worker_unavailable` matches these messages by prefix).
+        let context = RuntimeContext {
+            local_node: NodeId::new("linux-diag-node").expect("valid node id"),
+            interface_name: "rn-test-diag".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.9/32".to_owned(),
+        };
+        let tun_state = TunTestState::default();
+        let tun_device = TunDevice::test_handle(tun_state.clone());
+        let tun_lifecycle = SharedTunLifecycle::new(Box::new(TestTunLifecycle::new()));
+        let authoritative_socket = AuthoritativeSocket::bind(0).expect("authoritative bind");
+        let private_key = write_private_key([9; 32]);
+        let engine = UserspaceEngine::from_private_key_file(private_key.path())
+            .expect("engine should load key");
+        let runtime = RunningUserspaceRuntime::start(
+            "rn-test-diag",
+            context,
+            tun_device,
+            authoritative_socket,
+            engine,
+            tun_lifecycle,
+        )
+        .expect("runtime should start");
+
+        tun_state.set_next_recv_error("injected tun failure for the diagnosability pin");
+        let control = runtime.control().clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.is_worker_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !control.is_worker_alive(),
+            "the injected tun recv error must kill the worker"
+        );
+
+        let err = control
+            .current_peer_endpoint(NodeId::new("any-peer").expect("valid node id"))
+            .expect_err("a request against a dead worker must error");
+        assert!(
+            err.message
+                .starts_with("linux userspace-shared runtime worker"),
+            "prefix must stay matchable by is_runtime_worker_unavailable: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("worker exit cause:")
+                && err
+                    .message
+                    .contains("injected tun failure for the diagnosability pin"),
+            "the recorded exit cause must surface in the control error: {}",
+            err.message
+        );
     }
 
     #[test]
