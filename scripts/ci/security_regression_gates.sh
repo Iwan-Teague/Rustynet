@@ -62,10 +62,24 @@ echo "Checking all ed25519 signature verification uses verify_strict (RN-22)..."
 # let a raw `.verify(` hide on the SAME line as a strict call (one line,
 # two calls) and silenced the gate entirely. After neutralization any
 # surviving `.verify(` is a genuine non-strict call, wherever it sits.
-if grep -rn '\.verify(' crates --include='*.rs' \
-    | sed -E 's/\.verify_strict\(/./g' \
-    | grep '\.verify(' \
-    | grep -vE ':[0-9]+:[[:space:]]*(//|///|\*)'; then
+# Whitespace-tolerant companion scans: Rust is whitespace-insensitive around
+# the dot and the paren, and a method call may be split across lines
+# (`x . verify (sig)` and `x\n.verify\n(sig)` both compile and both evaded
+# the single-line pattern above while carrying a live malleable-verifier call;
+# both were confirmed against this gate by adversarial review). The EOL arm
+# catches the line-split form; rustfmt would collapse it, but this gate must
+# stand alone when invoked directly.
+g3_hits="$(
+  {
+    grep -rn '\.verify(' crates --include='*.rs' \
+      | sed -E 's/\.verify_strict\(/./g' \
+      | grep '\.verify(' || true
+    grep -rnE '\.[[:space:]]+verify[[:space:]]*\(|\.[[:space:]]*verify[[:space:]]*$' crates --include='*.rs' \
+      | grep -v 'verify_strict' || true
+  } | grep -vE ':[0-9]+:[[:space:]]*(//|///|\*)' || true
+)"
+if [ -n "$g3_hits" ]; then
+  printf '%s\n' "$g3_hits"
   echo "FAIL: non-strict ed25519 .verify() found above — RN-22 mandates VerifyingKey::verify_strict" >&2
   echo "FAIL: verify_strict rejects malleable/non-canonical signatures; replace .verify( with .verify_strict(" >&2
   exit 1
