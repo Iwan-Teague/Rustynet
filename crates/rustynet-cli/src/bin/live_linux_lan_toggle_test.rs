@@ -2266,6 +2266,27 @@ mod tests {
                 index + 1
             );
         }
+        // The whole-value ban above is defeated by SPLITTING the constant:
+        // two string pieces assembled through format!/push_str/concat
+        // reintroduce the wedge while no single line carries the full value
+        // (proven by mutation). Ban the natural split fragments too — the
+        // distinctive `18.0` octet boundary and the bare prefix. Splits into
+        // three or more innocuous pieces remain a residual of ANY value-grep
+        // pin; the operator-supplied requirement itself is separately enforced
+        // at runtime by validate_ssh_allow_cidrs rejecting empty input.
+        let fragments = ["18.0/24", "192.168.18.0"];
+        for fragment in fragments {
+            for (index, line) in source[..impl_end].lines().enumerate() {
+                let trimmed = line.trim_start();
+                assert!(
+                    trimmed.starts_with("//") || !line.contains(fragment),
+                    "line {} embeds QH-57 wedge fragment {fragment} in \
+                     implementation code; a split-constant assembly reintroduces \
+                     the baked-in ssh default this test bans",
+                    index + 1
+                );
+            }
+        }
     }
 
     use super::{
