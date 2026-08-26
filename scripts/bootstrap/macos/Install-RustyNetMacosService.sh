@@ -53,6 +53,11 @@ AUTO_TUNNEL_ENFORCE="false"
 TRUST_MAX_AGE_SECS="86400"
 AUTO_TUNNEL_MAX_AGE_SECS=""
 TRAVERSAL_MAX_AGE_SECS=""
+# Optional ip:port CSV of STUN servers for srflx candidate gathering. Empty
+# (the default) omits the flag and the daemon disables STUN observation —
+# production installs configure this deliberately; the lab bootstrap threads
+# the guest's default gateway (C-STUN, BashOrchestratorRetirementProgram).
+TRAVERSAL_STUN_SERVERS=""
 DNS_ZONE_MAX_AGE_SECS=""
 FAIL_CLOSED_SSH_ALLOW="false"
 FAIL_CLOSED_SSH_ALLOW_CIDRS=""
@@ -90,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     --trust-max-age-secs)          TRUST_MAX_AGE_SECS="$2";          shift 2 ;;
     --auto-tunnel-max-age-secs)    AUTO_TUNNEL_MAX_AGE_SECS="$2";    shift 2 ;;
     --traversal-max-age-secs)      TRAVERSAL_MAX_AGE_SECS="$2";      shift 2 ;;
+    --traversal-stun-servers)      TRAVERSAL_STUN_SERVERS="$2";      shift 2 ;;
     --dns-zone-max-age-secs)       DNS_ZONE_MAX_AGE_SECS="$2";       shift 2 ;;
     --wg-interface)                WG_INTERFACE="$2";                shift 2 ;;
     --fail-closed-ssh-allow)       FAIL_CLOSED_SSH_ALLOW="$2";       shift 2 ;;
@@ -173,6 +179,15 @@ if [[ -n "${DNS_ZONE_MAX_AGE_SECS}" ]]; then
     *[!0-9]*|"") echo "error: --dns-zone-max-age-secs must be a positive integer" >&2; exit 2 ;;
   esac
 fi
+if [[ -n "${TRAVERSAL_STUN_SERVERS}" ]]; then
+  # The daemon parses socket addresses (ip:port CSV), not hostnames; fail
+  # closed here so a malformed value never reaches the plist and bricks the
+  # daemon at argument parsing.
+  if [[ ! "${TRAVERSAL_STUN_SERVERS}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}(,[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5})*$ ]]; then
+    echo "error: --traversal-stun-servers must be an ip:port CSV (got '${TRAVERSAL_STUN_SERVERS}')" >&2
+    exit 2
+  fi
+fi
 case "${FAIL_CLOSED_SSH_ALLOW}" in
   true|false) ;;
   *) echo "error: --fail-closed-ssh-allow must be true or false" >&2; exit 2 ;;
@@ -202,6 +217,11 @@ TRAVERSAL_MAX_AGE_PLIST_FRAGMENT=""
 if [[ -n "${TRAVERSAL_MAX_AGE_SECS}" ]]; then
   TRAVERSAL_MAX_AGE_PLIST_FRAGMENT="        <string>--traversal-max-age-secs</string>
         <string>${TRAVERSAL_MAX_AGE_SECS}</string>"
+fi
+TRAVERSAL_STUN_PLIST_FRAGMENT=""
+if [[ -n "${TRAVERSAL_STUN_SERVERS}" ]]; then
+  TRAVERSAL_STUN_PLIST_FRAGMENT="        <string>--traversal-stun-servers</string>
+        <string>${TRAVERSAL_STUN_SERVERS}</string>"
 fi
 DNS_ZONE_MAX_AGE_PLIST_FRAGMENT=""
 if [[ -n "${DNS_ZONE_MAX_AGE_SECS}" ]]; then
@@ -378,6 +398,7 @@ ${AUTO_TUNNEL_MAX_AGE_PLIST_FRAGMENT}
         <string>--traversal-watermark</string>
         <string>${STATE_ROOT}/trust/rustynetd.traversal.watermark</string>
 ${TRAVERSAL_MAX_AGE_PLIST_FRAGMENT}
+${TRAVERSAL_STUN_PLIST_FRAGMENT}
         <string>--dns-zone-bundle</string>
         <string>${STATE_ROOT}/trust/rustynetd.dns-zone</string>
         <string>--dns-zone-verifier-key</string>

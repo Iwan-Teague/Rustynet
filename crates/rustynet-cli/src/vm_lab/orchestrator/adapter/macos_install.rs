@@ -563,8 +563,18 @@ pub fn enforce_daemon(
     // timer (unlike Linux rustynetd-trust-refresh.service).  The lab issues
     // trust evidence once during bootstrap; 86400 s keeps it valid for the
     // duration of any reasonable lab run without requiring a separate refresh.
+    //
+    // The STUN detection prelude (C-STUN, BashOrchestratorRetirementProgram)
+    // mirrors Bootstrap-RustyNetMacos.sh: the enforce re-render would
+    // otherwise silently drop the bootstrap-time --traversal-stun-servers
+    // (the same trap as --wg-interface, which is threaded explicitly above).
+    // Detection failure passes no flag, preserving the pre-C-STUN plist.
     let script = format!(
         "chmod 700 /tmp/Install-RustyNetMacosService.sh && \
+         RN_LAB_GW=\"$(route -n get default 2>/dev/null | awk '/gateway:/{{print $2; exit}}')\" ; \
+         RN_STUN_FLAG='' ; RN_STUN_VAL='' ; \
+         if echo \"$RN_LAB_GW\" | grep -Eq '^[0-9]{{1,3}}(\\.[0-9]{{1,3}}){{3}}$'; then \
+           RN_STUN_FLAG='--traversal-stun-servers' ; RN_STUN_VAL=\"$RN_LAB_GW:3478\" ; fi ; \
          sudo -n /tmp/Install-RustyNetMacosService.sh \
            --rustynetd-bin {MACOS_RUSTYNETD_PATH} \
            --state-root {MACOS_STATE_ROOT} \
@@ -577,6 +587,7 @@ pub fn enforce_daemon(
            --auto-tunnel-max-age-secs 86400 \
            --traversal-max-age-secs 86400 \
            --dns-zone-max-age-secs 86400 \
+           $RN_STUN_FLAG $RN_STUN_VAL \
            --fail-closed-ssh-allow '{ssh_allow_flag}' \
            --fail-closed-ssh-allow-cidrs '{ssh_allow_cidrs_arg}'",
     );

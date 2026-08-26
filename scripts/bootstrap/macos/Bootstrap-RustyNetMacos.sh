@@ -1249,6 +1249,25 @@ install_launchd_service() {
     echo "[bootstrap] WG_INTERFACE='${wg_interface}' must match ^utun[0-9]+\$" >&2
     exit 2
   fi
+  # Lab STUN endpoint (C-STUN, BashOrchestratorRetirementProgram): an empty
+  # --traversal-stun-servers disables srflx candidate gathering, so the lab
+  # bootstrap threads the guest's default gateway on 3478 (the UTM host as
+  # seen from this guest's subnet — a valid ip:port, which is all the daemon
+  # parses). A live responder there is optional: gathering fails soft on a
+  # bounded timeout. RUSTYNET_LAB_STUN_SERVERS in the bootstrap env overrides;
+  # detection failure leaves the flag off, preserving prior behaviour.
+  local lab_stun_servers="${RUSTYNET_LAB_STUN_SERVERS:-}"
+  if [[ -z "${lab_stun_servers}" ]]; then
+    local default_gw
+    default_gw="$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')"
+    if [[ "${default_gw}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      lab_stun_servers="${default_gw}:3478"
+    fi
+  fi
+  local stun_flags=()
+  if [[ -n "${lab_stun_servers}" ]]; then
+    stun_flags=(--traversal-stun-servers "${lab_stun_servers}")
+  fi
   bash "${install_script}" \
     --rustynetd-bin "${RUSTYNETD_BIN}" \
     --state-root "${STATE_ROOT}" \
@@ -1263,6 +1282,7 @@ install_launchd_service() {
     --auto-tunnel-max-age-secs 86400 \
     --traversal-max-age-secs 86400 \
     --dns-zone-max-age-secs 86400 \
+    ${stun_flags[@]+"${stun_flags[@]}"} \
     --wg-interface "${wg_interface}" \
     --fail-closed-ssh-allow "${ssh_allow_flag}" \
     --fail-closed-ssh-allow-cidrs "${SSH_ALLOW_CIDRS:-}"
