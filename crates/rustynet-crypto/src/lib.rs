@@ -2160,34 +2160,121 @@ mod tests {
     /// would restore a silent fail-open on the encrypted-at-rest fallback path,
     /// where this is the only permission control. A reviewer on unix cannot see
     /// it compile, so pin the text.
+    /// Reduce Rust source to code-shaped text: drop line and block comments,
+    /// keep string delimiters but empty their contents. The key-custody pins
+    /// below must judge only real code — adversarial re-review of these very
+    /// tests found bypasses where a comment or string literal carried the
+    /// pinned text verbatim while the guarded arm returned `Ok(())` / minted
+    /// through a panicking wrapper.
+    ///
+    /// Known simplifications, acceptable here because they only ever make the
+    /// scan STRICTER: raw strings (`r"…"`, `r#"…"#`) and char literals are
+    /// treated as ordinary text.
+    fn strip_non_code(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+        let mut in_string = false;
+        let mut escaped = false;
+        while let Some(c) = chars.next() {
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                    out.push(c);
+                }
+                continue;
+            }
+            if in_block_comment {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                    out.push(' ');
+                }
+                continue;
+            }
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match c {
+                    '\\' => escaped = true,
+                    '"' => {
+                        in_string = false;
+                        out.push('"');
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '/' if chars.peek() == Some(&'/') => {
+                    chars.next();
+                    in_line_comment = true;
+                    out.push(' ');
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    in_block_comment = true;
+                    out.push(' ');
+                }
+                '"' => {
+                    in_string = true;
+                    out.push('"');
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
     #[test]
     fn non_unix_key_custody_arm_does_not_return_ok() {
-        let source = include_str!("lib.rs");
+        // Scan COMMENT-STRIPPED source: a comment carrying the pinned Err text
+        // verbatim satisfied the old raw-text pins while the arm returned
+        // `Ok(())` outright.
+        let source = strip_non_code(include_str!("lib.rs"));
         let marker = "let _ = (directory, file, policy);";
         let at = source
             .find(marker)
             .expect("the non-unix key-custody arm must still discard its arguments");
-        // The next-statement pin below only inspects what FOLLOWS the discard
-        // marker. An early `return Ok(())` hoisted ABOVE it fails the arm open
-        // while the marker and the Err tail both stay green. Forbid any
-        // fail-open return between the function's entry and the marker (the
-        // rationale comments say `return ` plus a backticked `Ok(())`, which never
-        // forms this contiguous needle).
         let fn_start = source
             .find("pub fn validate_key_custody_permissions(")
             .expect("validate_key_custody_permissions must remain present");
-        let prelude = &source[fn_start..at];
-        let fail_open_return = ["return ", "Ok(())"].concat();
+        // Whitespace-normalized needles: `return\n    Ok(())`, `return  Ok(())`,
+        // and any other spacing defeated the old contiguous-substring check.
+        // The rationale comments are stripped above, so prose can never form
+        // this needle either.
+        let fail_open_return = ["return", "Ok(("].concat();
+        let normalize =
+            |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        // (1) Between the function's entry and the discard marker.
+        let prelude_norm = normalize(&source[fn_start..at]);
         assert!(
-            !prelude.contains(fail_open_return.as_str()),
-            "the non-unix key-custody arm must not gain an early Ok(()) escape \
-             before the permission refusal — that is the CRY-05/AUDIT-027 \
-             fail-open, reached through a different spelling"
+            !prelude_norm.contains(fail_open_return.as_str()),
+            "the non-unix key-custody arm must not gain an early escape that \
+             returns Ok — that is the CRY-05/AUDIT-027 fail-open, reached \
+             through a different spelling"
+        );
+        // (2) Between the discard marker and the required refusal expression:
+        // a compact guard such as `if true { return Ok(()); }` once fit inside
+        // the old fixed next-statement window and passed every pin.
+        let err_needle = "Err(CryptoError::PermissionValidationUnavailable)";
+        let err_at = source[at..].find(err_needle).map(|rel| at + rel).expect(
+            "the non-unix key-custody arm must still refuse via PermissionValidationUnavailable",
+        );
+        let between_norm = normalize(&source[at + marker.len()..err_at]);
+        assert!(
+            !between_norm.contains(fail_open_return.as_str()),
+            "nothing between the discard marker and the permission refusal may \
+             return Ok — a guarded early escape there is the same CRY-05/ \
+             AUDIT-027 fail-open behind a conditional"
         );
         let tail = &source[at + marker.len()..];
         let next_stmt: String = tail.chars().take(120).collect();
         assert!(
-            next_stmt.contains("Err(CryptoError::PermissionValidationUnavailable)"),
+            next_stmt.contains(err_needle),
             "the non-unix key-custody arm must fail closed; found: {next_stmt:?}"
         );
         assert!(
@@ -2339,9 +2426,24 @@ mod tests {
         let start = body
             .find("pub fn write_encrypted_key_file(")
             .expect("write_encrypted_key_file must remain present");
-        // Take a window covering the function body.
-        let window_end = (start + 4_000).min(body.len());
-        let window = &body[start..window_end];
+        // Bound the window at the NEXT top-level item (col-0 `fn ` / `pub fn `)
+        // so a sibling function's own mint statement can never satisfy these
+        // pins for THIS function.
+        let after_start = start + 8;
+        let next_plain = body[after_start..].find("\nfn ").map(|at| after_start + at);
+        let next_pub = body[after_start..]
+            .find("\npub fn ")
+            .map(|at| after_start + at);
+        let next_fn = match (next_plain, next_pub) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+        .unwrap_or(body.len());
+        let window_end = next_fn.min(body.len());
+        // Scan the COMMENT- AND STRING-STRIPPED window: a canonical mint text
+        // embedded in a comment or string literal satisfied every textual pin
+        // below while the hot path routed through a panicking wrapper.
+        let window = strip_non_code(&body[start..window_end]);
         // A bare presence pin is too weak: a wrapper fn whose body mentions
         // the allowed name (or an added cold-branch call) satisfies it while
         // the hot path routes through any other spelling. Pin the canonical
