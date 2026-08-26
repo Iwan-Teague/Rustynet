@@ -14586,8 +14586,18 @@ fn assignment_refresh_available_ops(env_path: &Path) -> Result<bool, String> {
         return Ok(true);
     }
 
+    // `--no-pager` is load-bearing, not cosmetic: systemd 259 (Fedora 44)
+    // spawns the pager for `systemctl cat` even with stdout on /dev/null and
+    // exits 141 (SIGPIPE) every time in this non-interactive context —
+    // measured 5/5 on fedora-utm-1, while `--no-pager` exits 0 5/5 and
+    // Debian's systemd never pages here. Without the flag this probe read
+    // "unit missing" on Fedora and failed LAN-access coupling closed on a
+    // healthy node (live_lan_toggle_validation, run livelab-1787769995).
+    // The other systemctl probes in this file use non-paging verbs
+    // (is-active/is-enabled/start/stop/disable) and are unaffected.
     let status = Command::new("systemctl")
         .arg("cat")
+        .arg("--no-pager")
         .arg("rustynetd-assignment-refresh.service")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
