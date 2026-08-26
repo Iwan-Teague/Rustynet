@@ -4564,6 +4564,106 @@ mod tests {
              an unclamped success response without spelling the literal; \
              success state may only be produced inside the constructor"
         );
+        // The whitespace-normalized censuses above still judge RAW source
+        // text, so they are blind to two whole families (proven green by
+        // mutation): an ok field initialized with any NON-literal expression
+        // (a bool-from helper call, a const alias, a tautological comparison),
+        // and compound / non-literal flag assignments (OR / AND / XOR into
+        // the field, negation assignments). The needles below therefore judge
+        // COMMENT- AND LITERAL-STRIPPED, whitespace-normalized source: exactly
+        // THREE colon-suffixed ok sites may exist — the field declaration
+        // (type position), the error constructor (false), and the success
+        // constructor (true) — so ANY fourth construction site fails
+        // regardless of its value spelling; no dot-prefixed flag assignment
+        // may exist; and a local named ok may be bound only by the sanctioned
+        // wire decoder (the one site that feeds the shorthand construction).
+        // String-literal stripping also removes these needles' own spellings
+        // from what is scanned, so none of them can self-match. NOTE: this
+        // comment deliberately spells no needle verbatim — the raw-text
+        // censuses above still read comments, so an adjacent mention here
+        // would inflate their counts.
+        fn strip_comments_and_string_literals(src: &str) -> String {
+            let chars: Vec<char> = src.chars().collect();
+            let mut out = String::with_capacity(src.len());
+            let mut i = 0usize;
+            while i < chars.len() {
+                let c = chars[i];
+                if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                } else if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                    i += 2;
+                    while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(chars.len());
+                } else if c == '"' {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        if chars[i] == '\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                } else if c == '\'' && i + 2 < chars.len() && chars[i + 2] == '\'' {
+                    i += 3;
+                } else if c == '\'' && i + 3 < chars.len() && chars[i + 1] == '\\' {
+                    i += 4;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            out
+        }
+        let stripped = strip_comments_and_string_literals(source);
+        let sc: String = stripped.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            sc.matches(["ok", ":"].concat().as_str()).count(),
+            3,
+            "exactly three ok: sites may exist (field declaration, error \
+             constructor, success constructor); a fourth builds success state \
+             outside the constructors under ANY expression spelling"
+        );
+        for (needle, why) in [
+            (
+                ["ok:", "bool"].concat(),
+                "the HelperResponse struct field declaration",
+            ),
+            (["ok:", "false"].concat(), "the `error` constructor"),
+            (["ok:", "true"].concat(), "the `success` constructor"),
+        ] {
+            assert_eq!(
+                sc.matches(needle.as_str()).count(),
+                1,
+                "`{needle}` must appear exactly once — {why}; anything else \
+                 produces response state outside the pinned constructors"
+            );
+        }
+        for banned_assign in [".ok=", ".ok|=", ".ok&=", ".ok^="] {
+            assert!(
+                !sc.contains(banned_assign),
+                "a post-construction flag assignment ({banned_assign}) flips an \
+                 error response into an unclamped success without ever spelling \
+                 the constructor literal"
+            );
+        }
+        let let_ok = ["letok", "="].concat();
+        let decode_site = ["letok=decode_bool("].concat();
+        assert_eq!(
+            sc.matches(let_ok.as_str()).count(),
+            1,
+            "a second local named ok bound from arbitrary state reintroduces \
+             shorthand construction with attacker-controlled success flags"
+        );
+        assert_eq!(
+            sc.matches(let_ok.as_str()).count(),
+            sc.matches(decode_site.as_str()).count(),
+            "the single `let ok =` binding must remain the wire decoder's \
+             (`decode_bool`) binding feeding the shorthand construction"
+        );
     }
 
     #[test]
