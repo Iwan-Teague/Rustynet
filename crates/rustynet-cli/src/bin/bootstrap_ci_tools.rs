@@ -12,6 +12,13 @@ const PINNED_TOOLCHAIN: &str = "1.85.0";
 const DEFAULT_SECURITY_TOOLCHAIN: &str = "1.88.0";
 const REQUIRED_AUDIT_VERSION_PREFIX: &str = "cargo-audit 0.22.";
 const REQUIRED_DENY_VERSION_PREFIX: &str = "cargo-deny 0.19.";
+/// The exact cargo-deny version installed when the `REQUIRED_DENY_VERSION_PREFIX`
+/// probe above does not match. Mirrors the inline pin on the Windows CI leg
+/// (`cross-platform-ci.yml`). This pin is load-bearing: without a `--version`
+/// flag the remediation install pulled crates.io's LATEST cargo-deny — 0.20.x,
+/// a different major from the required 0.19.x prefix — so the prefix contract
+/// was silently violated on every runner that did not already have 0.19.x.
+const PINNED_DENY_VERSION: &str = "0.19.1";
 /// The pinned cargo-nextest version (BLD-2: nextest is the test *runner*;
 /// `cargo test` remains the authoritative gate definition). 0.9.114 is the
 /// newest nextest whose MSRV (1.88) the security toolchain (1.88.0) used for
@@ -129,6 +136,8 @@ fn run() -> Result<(), i32> {
                 "install",
                 "cargo-deny",
                 "--locked",
+                "--version",
+                PINNED_DENY_VERSION,
                 "--force",
             ],
             cargo_bin.as_deref(),
