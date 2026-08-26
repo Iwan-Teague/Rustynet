@@ -892,6 +892,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn secure_runtime_dir_wrapper_delegates_to_the_seam_with_the_real_verifier() {
+        // The counting-spy pin drives the seam directly, so it cannot see what
+        // the production wrapper passes: a wrapper reverted to inline creation
+        // or swapped to a no-op verifier stayed green under every prior test
+        // (proven by mutation). Audit the source like the rustynetd seam audits
+        // do — the census forces conscious review of any NEW internal caller,
+        // and the delegation must sit inside the wrapper window with the real
+        // verifier named. Needles are fragment-assembled so this audit never
+        // matches its own source.
+        let source = include_str!("real_wireguard_exitnode_e2e.rs");
+        let callsite_census = ["create_secure_runtime_dir", "("].concat();
+        assert_eq!(
+            source.matches(callsite_census.as_str()).count(),
+            2,
+            "unexpected create_secure_runtime_dir caller — review it and update \
+             this census deliberately; the wrapper must stay the only production \
+             caller so the post-create verifier cannot be swapped or skipped"
+        );
+        let delegation = [
+            "create_secure_runtime_dir",
+            "(path, ",
+            "verify_secure_runtime_dir)",
+        ]
+        .concat();
+        assert_eq!(
+            source.matches(delegation.as_str()).count(),
+            1,
+            "the wrapper must delegate to the seam exactly once, passing the REAL \
+             owner-only verifier; a no-op or dropped verifier silently disables \
+             post-create permission verification"
+        );
+        let wrapper_start = source
+            .find("fn secure_runtime_dir(path: &Path)")
+            .expect("the secure_runtime_dir wrapper must exist");
+        let seam_start = source
+            .find("fn create_secure_runtime_dir")
+            .expect("the creation seam must exist");
+        let delegation_at = source
+            .find(delegation.as_str())
+            .expect("count 1 implies a match");
+        assert!(
+            delegation_at > wrapper_start && delegation_at < seam_start,
+            "the delegation must sit inside the secure_runtime_dir wrapper, so \
+             production cannot reach the seam through any other wiring"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_key_file_is_owner_only() {

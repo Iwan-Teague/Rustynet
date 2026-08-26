@@ -4514,8 +4514,13 @@ mod tests {
              success_response_from_exec_output, between its signature and \
              truncate_lossy, so every caller is clamped"
         );
+        // This needle is assembled from fragments like the censuses above: a
+        // verbatim literal here would appear in its own include_str!'d source
+        // and make contains() self-satisfying — proven vacuous by mutation
+        // (rerouting the arm away from builtin_success_response stayed green).
+        let arm_routing = ["Ok(output) => ", "builtin_success_response", "(output),"].concat();
         assert!(
-            source.contains("Ok(output) => builtin_success_response(output),"),
+            source.contains(arm_routing.as_str()),
             "the builtin dispatch arm must route through builtin_success_response; \
              reverting it to inline construction bypasses the deliverability clamp"
         );
