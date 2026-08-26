@@ -14195,7 +14195,16 @@ fn run_macos_orchestration_stages(
         // Poll for mesh convergence: peers populate after the first gossip
         // round, so a single shot right after distribute can race. Fail closed
         // if the daemon never reports a real peer within the window.
-        const MESH_JOIN_ATTEMPTS: usize = 6;
+        //
+        // Anchor elections front-load extra latency before the first gossip
+        // round (deploy_macos_anchor_profile + the anchor-capability membership
+        // amendment + its distribution), and the flat 6-attempt (~48 s) window
+        // flaked intermittently on `--anchor-platform macos` runs (C2,
+        // BashOrchestratorRetirementProgram_2026-08-22.md). Anchor topologies
+        // get 15 attempts (~2 min of sleep, inside the stage's 180 s registry
+        // budget); non-anchor runs keep the tighter window so a genuinely
+        // unmeshed node still fails fast.
+        let mesh_join_attempts: usize = if is_macos_elected_anchor { 15 } else { 6 };
         const MESH_JOIN_SLEEP: Duration = Duration::from_secs(8);
         let result = (|| -> Result<String, String> {
             let inventory = load_inventory(inventory_path)?;
@@ -14210,7 +14219,7 @@ fn run_macos_orchestration_stages(
             // peer-list exit from being treated as an SSH transport failure.
             let check_script = "sudo /usr/local/bin/rustynet peer-list 2>&1 || true";
             let mut last_output = String::new();
-            for attempt in 1..=MESH_JOIN_ATTEMPTS {
+            for attempt in 1..=mesh_join_attempts {
                 let output = capture_remote_shell_command_for_target(
                     &target,
                     None,
@@ -14222,18 +14231,18 @@ fn run_macos_orchestration_stages(
                 .map_err(|e| format!("rustynet peer-list on {macos_alias} failed: {e}"))?;
                 if macos_peer_list_indicates_mesh_join(&output) {
                     return Ok(format!(
-                        "macOS node {macos_alias} joined mesh (attempt {attempt}/{MESH_JOIN_ATTEMPTS}); peer-list:\n{}",
+                        "macOS node {macos_alias} joined mesh (attempt {attempt}/{mesh_join_attempts}); peer-list:\n{}",
                         output.trim()
                     ));
                 }
                 last_output = output.trim().to_owned();
-                if attempt < MESH_JOIN_ATTEMPTS {
+                if attempt < mesh_join_attempts {
                     std::thread::sleep(MESH_JOIN_SLEEP);
                 }
             }
             Err(format!(
                 "macOS node {macos_alias} did not report a live mesh peer after \
-                 {MESH_JOIN_ATTEMPTS} attempts; daemon is down or unmeshed. \
+                 {mesh_join_attempts} attempts; daemon is down or unmeshed. \
                  Last peer-list output:\n{}",
                 if last_output.is_empty() {
                     "(empty)".to_owned()
