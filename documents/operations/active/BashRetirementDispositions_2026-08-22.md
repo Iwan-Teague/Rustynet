@@ -9,9 +9,12 @@ either **(a) prove-on-node** (a committed Phase-C task with a named green criter
 reason + expiry. **Bash is not the oracle** — each entry records a direction verdict, never a
 silent `--node`-matches-bash edit.
 
-**Status: B-INITIAL (drafted 2026-08-26 on commit `27e59c7d`). Every owner sign-off line below
-is UNSIGNED — the delegate prepares, the owner signs (D2/D3). B-final converts any unmet
-Phase-C commitment to an owner-signed "deferred G2 attainment" after Phase C completes.**
+**Status: B-FINAL-PREPARED (2026-08-26). Phase C is complete — every prove-on-node commitment
+either landed (C-STUN wiring, C2 retry budget) or triaged to a concrete recorded cause with a
+prepared deferral conversion (C1/C5 vmnet substrate isolation; C3 macOS anchor Phase-8 code gap
++ substrate; C4 Windows guest-health/hardware). Every owner sign-off line below remains
+UNSIGNED — the delegate prepares, the owner signs (D2/D3). Signing the prepared conversions
+completes B-final; nothing else blocks Phase D→E on the delegate side.**
 
 T4 security cells are marked **[T4]** — owner-level sign-off only, not delegable (§6.1).
 
@@ -97,8 +100,20 @@ No prove-on-node work is scheduled. (Counts from the A4 enumeration, node ledger
   Phase-C task C4 (bootstrap triage).** If C4 resolves to an environmental/hardware cause, this
   group converts at B-final to owner-signed "deferred G2 attainment" with the concrete cause
   recorded.
+- **C4 TRIAGE COMPLETE (2026-08-26) — verdict: GUEST-HEALTH / lab substrate, not code.** The
+  `windows-utm-1` guest (Windows 11 x86-emulated under QEMU on Apple Silicon) was powered on and
+  observed for 60+ minutes: the QEMU guest agent never responded (utmctl exec: "guest agent is
+  not running or not installed", OSStatus -2700) and TCP/22 never opened, while the qemu process
+  idled after early boot activity — the guest never reaches a serviceable state under emulation.
+  No orchestrator code path can be exercised against a guest that does not expose SSH; the
+  historical 2026-07-19 bootstrap failure ("WinGet configuration file not found") is
+  unreproducible on a guest that no longer boots to services. **Concrete environmental cause:
+  x86-on-ARM emulated Windows guest is not a viable lab node; hardware needed: the physical
+  `windows-x86-1` device (same blocker class as CP-3 WinNAT).** Prepared B-final conversion:
+  owner-signed "deferred G2 attainment — guest-health/hardware; expiry = when `windows-x86-1`
+  exists".
 - **Owner sign-off:** PENDING
-- **Expiry/re-review:** at C4 completion, or the G2 release gate, whichever first.
+- **Expiry/re-review:** when `windows-x86-1` exists, or the G2 release gate, whichever first.
 
 ### B2.T4 — Windows security cells **[T4]** (individual owner-level sign-offs)
 Same CP-4 gate as B2.G, but T4 — each line requires an individual owner signature (D3):
