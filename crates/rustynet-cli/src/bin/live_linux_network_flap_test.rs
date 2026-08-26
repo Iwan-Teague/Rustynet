@@ -226,6 +226,40 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // Resolve the data-probe target BEFORE the block goes up: the mid-blackout
+    // disruption probe and the post-blackout recovery probe both ping this
+    // address, and resolving it here keeps the two probes symmetric. Read the
+    // mesh address off the TUNNEL INTERFACE, the way the two-hop stage already
+    // does successfully (`live_linux_two_hop_test.rs`
+    // `mesh_ipv4_discovery_command`). An earlier attempt parsed an
+    // `assigned_cidr=` token out of `rustynet status` — a field name that was
+    // assumed rather than checked, and does not appear in that output. Probe
+    // the client's OWN PEER, not the final exit.
+    let probe_host = if peer_host.is_empty() {
+        &exit_host
+    } else {
+        &peer_host
+    };
+    let exit_mesh_ipv4 = ctx
+        .capture_root_allow_failure(
+            probe_host,
+            &["ip", "-4", "-o", "addr", "show", "dev", "rustynet0"],
+        )
+        .ok()
+        .and_then(|out| {
+            // `... inet 100.80.169.183/32 scope global rustynet0`
+            out.split_whitespace()
+                .skip_while(|token| *token != "inet")
+                .nth(1)
+                .and_then(|cidr| cidr.split('/').next())
+                .filter(|addr| addr.starts_with("100."))
+                .map(str::to_owned)
+        });
+    logger.line(format!(
+        "[network-flap] peer mesh ipv4 for data probes (host {probe_host}): {}",
+        exit_mesh_ipv4.as_deref().unwrap_or("<unresolved>")
+    ))?;
+
     // ── Stage 2: block WG UDP output on client ────────────────────────────────
     logger.line(format!(
         "[network-flap] blocking WG UDP output port {WG_PORT} on client"
@@ -271,7 +305,27 @@ fn run() -> Result<(), String> {
     std::thread::sleep(std::time::Duration::from_secs(35));
     let flap_duration_s = flap_start.elapsed().as_secs();
 
-    // ── Stage 4: confirm no new handshake ─────────────────────────────────────
+    // ── Stage 4: confirm the blackout actually severs the dataplane ───────────
+    // Disruption is proven by DATA FAILING TO CROSS, symmetric with the
+    // recovery probe below: with client egress on the WG port dropped, a ping
+    // to the peer's mesh address must fail.
+    //
+    // The old oracle here demanded a stale-or-vanished handshake stamp, and
+    // that was wrong twice over. A 35s block is shorter than WireGuard's ~120s
+    // rekey, so a live session legitimately needs no new handshake inside the
+    // window — the stamp staying fresh proves nothing about the dataplane.
+    // And the years of "unreadable ⇒ disruption confirmed" passes were in
+    // fact detecting the WORKER DEATH the block used to cause (fixed in
+    // 7901939a): the stamp vanished because the runtime worker was killed by
+    // the firewalled send, not because the session was rebuilt. The stamp is
+    // kept below as logged telemetry only.
+    let mid_probe_crossed = exit_mesh_ipv4.as_deref().is_some_and(|target| {
+        ctx.capture_root_allow_failure(&client_host, &["ping", "-c", "2", "-W", "2", target])
+            .is_ok_and(|out| out.contains(" 0% packet loss") || out.contains("2 received"))
+    });
+    // Fail closed: no probe target means disruption was NOT proven — an
+    // unresolved target must fail the stage, not vacuously confirm it.
+    let disruption_confirmed = baseline_ok && exit_mesh_ipv4.is_some() && !mid_probe_crossed;
     let mid_nc = ctx
         .capture_root_allow_failure(
             &client_host,
@@ -279,20 +333,8 @@ fn run() -> Result<(), String> {
         )
         .unwrap_or_default();
     let mid_age_s = parse_handshake_age_s_from_netcheck(&mid_nc);
-    // Disruption is confirmed by EITHER a readably-old handshake, or the record
-    // having disappeared entirely — but only once the baseline proved the
-    // instrument can read this metric at all on this node.
-    //
-    // The distinction matters and is the whole point of QH-51. An unreadable
-    // metric with NO working baseline is an instrument failure and proves
-    // nothing, which is how this check used to pass on missing data. An
-    // unreadable metric AFTER a readable baseline is evidence: the daemon clears
-    // a peer's handshake record when it rebuilds that peer's session, so the
-    // record's absence means no live session exists — which is exactly the
-    // disruption this stage induces.
-    let disruption_confirmed = baseline_ok && mid_age_s.is_none_or(|age| age >= 30);
     logger.line(format!(
-        "[network-flap] mid_handshake_age_s={} disruption_confirmed={disruption_confirmed}",
+        "[network-flap] mid_data_probe_crossed={mid_probe_crossed} mid_handshake_age_s={} disruption_confirmed={disruption_confirmed}",
         describe_age(mid_age_s)
     ))?;
 
@@ -327,40 +369,9 @@ fn run() -> Result<(), String> {
     // timestamp — a stale-but-present handshake stamp proves nothing about
     // whether packets move, while a reply cannot be produced without a working
     // session. If the tunnel genuinely fails to recover, this fails.
-    // Read the mesh address off the TUNNEL INTERFACE, the way the two-hop stage
-    // already does successfully (`live_linux_two_hop_test.rs`
-    // `mesh_ipv4_discovery_command`). An earlier attempt here parsed an
-    // `assigned_cidr=` token out of `rustynet status` — a field name that was
-    // assumed rather than checked, and does not appear in that output. The probe
-    // silently resolved to `<unresolved>` and never ran, so the run neither
-    // proved nor disproved anything.
-    // Probe the client's OWN PEER, not the final exit. Same command whose output
-    // format is already proven (it resolved a target on run
-    // `qh51-datapath2-20260814n`); only the host differs.
-    let probe_host = if peer_host.is_empty() {
-        &exit_host
-    } else {
-        &peer_host
-    };
-    let exit_mesh_ipv4 = ctx
-        .capture_root_allow_failure(
-            probe_host,
-            &["ip", "-4", "-o", "addr", "show", "dev", "rustynet0"],
-        )
-        .ok()
-        .and_then(|out| {
-            // `... inet 100.80.169.183/32 scope global rustynet0`
-            out.split_whitespace()
-                .skip_while(|token| *token != "inet")
-                .nth(1)
-                .and_then(|cidr| cidr.split('/').next())
-                .filter(|addr| addr.starts_with("100."))
-                .map(str::to_owned)
-        });
-    logger.line(format!(
-        "[network-flap] peer mesh ipv4 for data probe (host {probe_host}): {}",
-        exit_mesh_ipv4.as_deref().unwrap_or("<unresolved>")
-    ))?;
+    // The probe target was resolved before the block went up (shared with the
+    // mid-blackout disruption probe); same command whose output format is
+    // already proven (it resolved a target on run `qh51-datapath2-20260814n`).
 
     for _ in 0..36 {
         std::thread::sleep(std::time::Duration::from_secs(5));

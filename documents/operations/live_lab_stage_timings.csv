@@ -2615,3 +2615,9 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2026-07-13T14:24:55Z,44c23ef,dirty,live_key_custody,pair3-bash-1783951734,21,pass
 2026-07-13T14:25:20Z,44c23ef,dirty,cross_network_nat_classification,pair3-bash-1783951734,50,pass
 2026-07-13T14:26:11Z,44c23ef,dirty,cross_network_daemon_path,pair3-bash-1783951734,15,pass
+2026-08-26T17:13:21Z,,clean,preflight,g3-a1-bash-1787764349,0,pass
+2026-08-26T17:13:22Z,25d49e2,dirty,prepare_source_archive,g3-a1-bash-1787764349,2,pass
+2026-08-26T17:13:25Z,25d49e2,dirty,verify_ssh_reachability,g3-a1-bash-1787764349,0,pass
+2026-08-26T17:13:27Z,25d49e2,dirty,prime_remote_access,g3-a1-bash-1787764349,18,pass
+2026-08-26T17:13:46Z,25d49e2,dirty,macos_preflight_check,g3-a1-bash-1787764349,0,pass
+2026-08-26T17:13:47Z,25d49e2,dirty,cleanup_hosts,g3-a1-bash-1787764349,12,pass
