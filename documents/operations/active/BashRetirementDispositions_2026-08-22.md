@@ -232,9 +232,25 @@ Direction verdict: MIXED cells — relay **lifecycle** is `--node`-proven; only 
 - A4 columns mapped: 12 (B1) + 30 (B2.G 22 + B2.T4 8) + 7 (B3.1–B3.4) + 3 (B4.1–B4.3) +
   2 (B5.1–B5.2) + 2 (B6) = **56 ✓** (B5.2 `windows_relay` carries its B2 gate note here;
   B2.X/B2.D/B2.C/B4.4/B4.5/B5.3 disposition non-A4 cells for completeness).
-- Zero un-adjudicated A4 columns remain. A3 `matches:false` / `stages_only_in_left` rows will be
-  unioned in after the Phase-A sweep lands (placeholder — see
-  `G3FullSweepDiff_2026-08-22.md`).
+- Zero un-adjudicated A4 columns remain.
+- **A3 union (sweep landed 2026-08-26, `G3FullSweepDiff_2026-08-22.md`): zero `matches:false`
+  shared stages; three `stages_only_in_left` rows, adjudicated as B7 below.**
+
+---
+
+## B7 — A3 sweep-diff rows (3 entries): bash-only harness/meta stages
+
+Direction verdict for all three: **not a capability — harness bookkeeping**; the `--node`
+engine either performs the equivalent inside another stage or has no need of a self-row.
+No prove-on-node work is scheduled.
+
+| # | bash-only stage | verdict | owner sign-off |
+|---|---|---|---|
+| B7.1 | `macos_preflight_check` | benign bash Linux-preflight artifact; `--node` plans macOS stages only when a macOS node exists | PENDING |
+| B7.2 | `prime_remote_access` | bash SSH-priming convenience; equivalent inside `--node` bootstrap | PENDING |
+| B7.3 | `vm_lab_run_live_lab` | bash meta/wrapper self-row; no `--node` equivalent by design | PENDING |
+
+- Expiry/re-review: none needed — vocabulary facts, re-derivable from the archived sweep diff.
 
 ## Mirror duty (Spec §6.1 rule e)
 
