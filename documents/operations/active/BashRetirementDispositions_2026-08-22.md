@@ -174,13 +174,38 @@ B-final only if Phase C cannot land the green.
   AND the run report carries the end-to-end **egress assertion** (client packets provably
   egress the macOS exit to an external target) — `pf`-mechanism divergence does NOT waive it
   (Refresh §6/S2). Lifecycle/NAT-teardown proof alone does not satisfy G2.
+  - **2026-08-26 status:** the egress assertion requires a Linux client's packets to traverse
+    the macOS exit — impossible while the B3.1 vmnet substrate wall stands (no macOS↔Linux
+    handshake). **Prepared B-final conversion: owner-signed "deferred G2 attainment — same
+    substrate blocker as B3.1" unless the owner authorizes a lab-network project first.**
+    Owner sign-off: PENDING
 - **B3.3 `macos_blind_exit` + `macos_stage_blind_exit` (bash 4/4)** → **C3**. **Irreversible —
   requires owner-authorized sacrificial guest (sign-off gate 7); the guest is factory-reset
   after.** Green criterion: ≥1 verifier-recomputed pass on the sacrificial guest.
+  - **2026-08-26 status:** gate 7 not granted (correctly — never self-approvable), and the
+    dataplane half of the proof faces the same substrate wall. **Prepared B-final conversion:
+    owner-signed "deferred G2 attainment — awaiting sacrificial-guest authorization +
+    substrate".** Owner sign-off: PENDING
 - **B3.4 `macos_anchor` + `macos_stage_anchor` — election + `mesh_join` half (bash 31/23)** →
   **C2/C3**. Green criterion: 5 consecutive `--anchor-platform macos` runs with
   `validate_macos_mesh_join=pass` (C2 flake bar) and ≥1 `macos_stage_anchor=pass`,
   verifier-recomputed.
+  - **C3-ANCHOR EXERCISED (2026-08-26, run `livelab-1787768750-dbeffe80d0ca`): the
+    never-elected selector now has a `--node` election on record** (`--node
+    macos-utm-1:anchor`, 3-node topology, 21 stages green incl. the macOS anchor's bootstrap /
+    membership / distribute / enforce / validate / security checks). The election itself works.
+    `anchor_validation` recorded a **named runtime skip, not a fail**: the macOS anchor passed
+    capability-advertisement validation, then the runtime bundle-pull substages
+    reported-skipped on the explicit `is_supported_for_platform` posture gate
+    (`stage/anchor_validation.rs` — "pending cross-OS Phase 8 wiring" of macOS bundle-pull
+    token/listener provisioning). So `macos_stage_anchor=pass` is unreachable today for TWO
+    recorded reasons: (a) the Phase-8 code gap above; (b) the same vmnet substrate wall as
+    B3.1 for anything handshake-dependent (incl. `mesh_join`, whose sidecar additionally is
+    not reachable from the pure `--node` path — QH-18: `--anchor-platform` is not consumed by
+    the `--node` config). The C2 retry-budget widening is landed (`43a3788d`) and armed for
+    whenever the sidecar path next runs. **Prepared B-final conversion: owner-signed "deferred
+    G2 attainment — code gap (macOS anchor runtime bundle-pull, Phase 8) + lab-substrate
+    blocker; election-side machinery proven live 2026-08-26".** Owner sign-off: PENDING
 - **B3.5 anchor `gossip_seed` / `enrollment_endpoint` half — owner-signed deferral (NOT
   prove-on-node).** `enrollment_endpoint` has zero runtime enforcement (code gap;
   Refresh §5); `gossip_seed` substrate exists in the daemon but has no live anchor-gossip
