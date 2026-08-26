@@ -4457,6 +4457,216 @@ mod tests {
     }
 
     #[test]
+    fn builtin_success_construction_stays_centralized_in_the_clamp_seam() {
+        // The deliverability pin above exercises `builtin_success_response` in
+        // isolation, so it stays green even if the production dispatch reverts
+        // to constructing `HelperResponse::success` inline with unclamped
+        // builtin output — the exact H2 regression this seam exists to close.
+        // A naive revert is caught by dead_code (the fn would lose its only
+        // non-test caller), but deleting the fn AND inlining the construction
+        // escapes every behavioral test silently.
+        //
+        // This file interleaves production code with cfg-gated helpers before
+        // one large `mod tests`, so no textual "production section" split is
+        // reliable: an earlier revision split on a token that only matched its
+        // own source string and silently audited half of the test module,
+        // false-failing on any test-side mention. Audit the WHOLE file instead,
+        // with an explicit census of every allowed occurrence:
+        //   1 — the seam body's clamped construction (pinned positionally below)
+        //   1 — helper_frame_round_trips_request_and_response's construction
+        // Any NEW occurrence, production or test, shifts the census and fails
+        // here, forcing a conscious review. The census is text-based, so even
+        // a comment naming the constructor trips it; that over-trigger is the
+        // accepted cost of a tripwire that formatting cannot fool. Both needles
+        // are assembled from fragments so this audit's own source never
+        // contains them verbatim and cannot count itself.
+        let source = include_str!("privileged_helper.rs");
+        let census_needle = ["HelperResponse", "::success("].concat();
+        let prod_site = ["HelperResponse", "::success(status, stdout, stderr)"].concat();
+        assert_eq!(
+            source.matches(census_needle.as_str()).count(),
+            2,
+            "unexpected HelperResponse::success occurrence — review it and update \
+             this audit's census deliberately; an unreviewed construction outside \
+             the clamp seam reintroduces the unbounded-builtin-output \
+             drop-the-connection bug"
+        );
+        let seam = "fn success_response_from_exec_output";
+        let seam_start = source
+            .find(seam)
+            .unwrap_or_else(|| panic!("{seam} must exist"));
+        assert_eq!(
+            source.matches(prod_site.as_str()).count(),
+            1,
+            "the seam must construct HelperResponse::success exactly once, with \
+             the raw (status, stdout, stderr) arguments, so every exec-side and \
+             builtin response is clamped to the deliverability budget"
+        );
+        let prod_at = source
+            .find(prod_site.as_str())
+            .expect("count 1 implies a match");
+        let truncate_at = source
+            .find("fn truncate_lossy")
+            .unwrap_or_else(|| panic!("fn truncate_lossy must follow the seam"));
+        assert!(
+            prod_at > seam_start && prod_at < truncate_at,
+            "the single HelperResponse::success construction must sit inside \
+             success_response_from_exec_output, between its signature and \
+             truncate_lossy, so every caller is clamped"
+        );
+        // This needle is assembled from fragments like the censuses above: a
+        // verbatim literal here would appear in its own include_str!'d source
+        // and make contains() self-satisfying — proven vacuous by mutation
+        // (rerouting the arm away from builtin_success_response stayed green).
+        let arm_routing = ["Ok(output) => ", "builtin_success_response", "(output),"].concat();
+        assert!(
+            source.contains(arm_routing.as_str()),
+            "the builtin dispatch arm must route through builtin_success_response; \
+             reverting it to inline construction bypasses the deliverability clamp"
+        );
+        // The constructor census above only counts explicit success-call
+        // spellings. A
+        // struct-literal construction (`HelperResponse { ok, status, .. }` with
+        // the ok flag hardcoded to true) or a `Self { .. }` inside any other fn
+        // builds an unclamped success response while every count stays green —
+        // the exact H2 regression through a different spelling. The ONLY
+        // allowed success-state field assignment is inside the `success`
+        // constructor itself (the `error` constructor and the decoder use the
+        // false/shorthand forms).
+        let ok_true = ["ok: ", "true,"].concat();
+        assert_eq!(
+            source.matches(ok_true.as_str()).count(),
+            1,
+            "HelperResponse success-state construction must stay centralized in \
+             the `success` constructor; an inline success-state literal elsewhere \
+             builds responses that skipped the deliverability clamp"
+        );
+        // The exact-spelling census above counts only the spaced,
+        // comma-terminated spaced-literal form. Three more spellings build
+        // unclamped success responses right past it: a compact literal with
+        // the space removed, a LAST-FIELD literal with no trailing comma, and
+        // a post-construction field assignment that flips an error response's
+        // flag without ever spelling the literal (proven by mutation).
+        // Normalize whitespace away and pin both remaining shapes; both
+        // needles are assembled at runtime so this comment never matches.
+        let compact_flag = ["ok:", "true"].concat();
+        let compact_assign = ["ok=", "true"].concat();
+        let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact.matches(compact_flag.as_str()).count(),
+            1,
+            "HelperResponse success-state construction must stay centralized \
+             in the `success` constructor under ANY spacing or comma placement"
+        );
+        assert!(
+            !compact.contains(compact_assign.as_str()),
+            "a post-construction assignment flipping the response flag builds \
+             an unclamped success response without spelling the literal; \
+             success state may only be produced inside the constructor"
+        );
+        // The whitespace-normalized censuses above still judge RAW source
+        // text, so they are blind to two whole families (proven green by
+        // mutation): an ok field initialized with any NON-literal expression
+        // (a bool-from helper call, a const alias, a tautological comparison),
+        // and compound / non-literal flag assignments (OR / AND / XOR into
+        // the field, negation assignments). The needles below therefore judge
+        // COMMENT- AND LITERAL-STRIPPED, whitespace-normalized source: exactly
+        // THREE colon-suffixed ok sites may exist — the field declaration
+        // (type position), the error constructor (false), and the success
+        // constructor (true) — so ANY fourth construction site fails
+        // regardless of its value spelling; no dot-prefixed flag assignment
+        // may exist; and a local named ok may be bound only by the sanctioned
+        // wire decoder (the one site that feeds the shorthand construction).
+        // String-literal stripping also removes these needles' own spellings
+        // from what is scanned, so none of them can self-match. NOTE: this
+        // comment deliberately spells no needle verbatim — the raw-text
+        // censuses above still read comments, so an adjacent mention here
+        // would inflate their counts.
+        fn strip_comments_and_string_literals(src: &str) -> String {
+            let chars: Vec<char> = src.chars().collect();
+            let mut out = String::with_capacity(src.len());
+            let mut i = 0usize;
+            while i < chars.len() {
+                let c = chars[i];
+                if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                } else if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                    i += 2;
+                    while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(chars.len());
+                } else if c == '"' {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        if chars[i] == '\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                } else if c == '\'' && i + 2 < chars.len() && chars[i + 2] == '\'' {
+                    i += 3;
+                } else if c == '\'' && i + 3 < chars.len() && chars[i + 1] == '\\' {
+                    i += 4;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            out
+        }
+        let stripped = strip_comments_and_string_literals(source);
+        let sc: String = stripped.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            sc.matches(["ok", ":"].concat().as_str()).count(),
+            3,
+            "exactly three ok: sites may exist (field declaration, error \
+             constructor, success constructor); a fourth builds success state \
+             outside the constructors under ANY expression spelling"
+        );
+        for (needle, why) in [
+            (
+                ["ok:", "bool"].concat(),
+                "the HelperResponse struct field declaration",
+            ),
+            (["ok:", "false"].concat(), "the `error` constructor"),
+            (["ok:", "true"].concat(), "the `success` constructor"),
+        ] {
+            assert_eq!(
+                sc.matches(needle.as_str()).count(),
+                1,
+                "`{needle}` must appear exactly once — {why}; anything else \
+                 produces response state outside the pinned constructors"
+            );
+        }
+        for banned_assign in [".ok=", ".ok|=", ".ok&=", ".ok^="] {
+            assert!(
+                !sc.contains(banned_assign),
+                "a post-construction flag assignment ({banned_assign}) flips an \
+                 error response into an unclamped success without ever spelling \
+                 the constructor literal"
+            );
+        }
+        let let_ok = ["letok", "="].concat();
+        let decode_site = ["letok=decode_bool("].concat();
+        assert_eq!(
+            sc.matches(let_ok.as_str()).count(),
+            1,
+            "a second local named ok bound from arbitrary state reintroduces \
+             shorthand construction with attacker-controlled success flags"
+        );
+        assert_eq!(
+            sc.matches(let_ok.as_str()).count(),
+            sc.matches(decode_site.as_str()).count(),
+            "the single `let ok =` binding must remain the wire decoder's \
+             (`decode_bool`) binding feeding the shorthand construction"
+        );
+    }
+
+    #[test]
     fn nft_schema_refusal_embedding_a_max_size_argv_still_encodes() {
         // The refusal NAMES the rejected argv (`args.join(" ")`). At
         // MAX_ARGS x MAX_ARG_BYTES the joined text alone (~32KB) exceeds both

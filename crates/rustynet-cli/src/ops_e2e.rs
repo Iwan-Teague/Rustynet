@@ -8497,6 +8497,53 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             !shipped_body.contains("RelaySelfSignedCodeSigning::Allow"),
             "the shipped `role set` relay path must never pass Allow"
         );
+        // The literal grep above escapes an import alias (`use
+        // RelaySelfSignedCodeSigning as Signing;` + `Signing::Allow`) — the
+        // Allow path returns under a spelling the needle cannot see while the
+        // Disallow pin stays satisfied. Strip every Disallow mention; no bare
+        // Allow spelling may remain anywhere on the shipped path.
+        let without_disallow = shipped_body.replace("Disallow", "");
+        assert!(
+            !without_disallow.contains("Allow"),
+            "the shipped `role set` relay path must never name the Allow signing \
+             policy under ANY spelling (import aliases included) — Allow mints a \
+             root CA on operator hosts"
+        );
+        // The two body-scoped rules above audit only the shipped function's
+        // TEXT. An indirection defined OUTSIDE it — a module-level constant
+        // bound to the minting variant and referenced from the body by name —
+        // leaves this body spelling-free while the shipped path still reaches
+        // that policy (proven by mutation: such a tree passes both rules above
+        // AND the raw grep). Pin a crate-wide census instead: exactly TWO
+        // sanctioned mentions of the variant path may exist under
+        // rustynet-cli/src — the vm-lab-only lab verb call site in main.rs, and
+        // THIS test's own raw needle above. The needle here is assembled at
+        // runtime so this assertion does not count itself.
+        let variant_path = ["SelfSignedCode", "Signing::Allow"].concat();
+        let mut census = 0;
+        let src_root = root.join("crates/rustynet-cli/src");
+        let mut stack = vec![src_root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("cli src tree readable") {
+                let entry = entry.expect("cli src entries readable");
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|err| panic!("{} readable: {err}", path.display()));
+                    census += text.matches(variant_path.as_str()).count();
+                }
+            }
+        }
+        assert_eq!(
+            census, 2,
+            "the Allow signing-policy variant must be named at exactly two \
+             crate-local sites (the vm-lab install verb in main.rs and this \
+             test's own needle); any further mention is an out-of-body \
+             indirection that can route the SHIPPED relay path to the minting \
+             policy"
+        );
         // `Allow` itself is `#[cfg(feature = "vm-lab")]`, so a release build
         // cannot name it and the compiler — not this test — is what stops a
         // shipped caller from minting. This asserts that gate is still there,

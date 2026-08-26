@@ -2248,6 +2248,45 @@ mod tests {
         );
         let required = format!("let mut ssh_allow_cidrs = String::{}();", "new");
         assert!(source.contains(required.as_str()));
+        // The needles above pin ONE construction spelling (`String::from`) and
+        // one init shape. `push_str`, `format!`, a const, or any other
+        // assembly reintroduces the QH-57 wedge while both stay green. Ban the
+        // CIDR VALUE itself in code. Bound the scan to the implementation
+        // region (everything before the unit-test module): this test's own
+        // runtime-assembled needle legitimately names the value, and comment
+        // lines are exempt because the rationale comment names it too.
+        let cidr = ["192.168.", "18.0/24"].concat();
+        let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
+        for (index, line) in source[..impl_end].lines().enumerate() {
+            let trimmed = line.trim_start();
+            assert!(
+                trimmed.starts_with("//") || !line.contains(cidr.as_str()),
+                "line {} embeds the QH-57 wedge CIDR {cidr} in implementation code; \
+                 ssh-allow-cidrs must stay operator-supplied with no baked-in default",
+                index + 1
+            );
+        }
+        // The whole-value ban above is defeated by SPLITTING the constant:
+        // two string pieces assembled through format!/push_str/concat
+        // reintroduce the wedge while no single line carries the full value
+        // (proven by mutation). Ban the natural split fragments too — the
+        // distinctive `18.0` octet boundary and the bare prefix. Splits into
+        // three or more innocuous pieces remain a residual of ANY value-grep
+        // pin; the operator-supplied requirement itself is separately enforced
+        // at runtime by validate_ssh_allow_cidrs rejecting empty input.
+        let fragments = ["18.0/24", "192.168.18.0"];
+        for fragment in fragments {
+            for (index, line) in source[..impl_end].lines().enumerate() {
+                let trimmed = line.trim_start();
+                assert!(
+                    trimmed.starts_with("//") || !line.contains(fragment),
+                    "line {} embeds QH-57 wedge fragment {fragment} in \
+                     implementation code; a split-constant assembly reintroduces \
+                     the baked-in ssh default this test bans",
+                    index + 1
+                );
+            }
+        }
     }
 
     use super::{

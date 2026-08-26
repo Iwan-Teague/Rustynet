@@ -57,9 +57,36 @@ echo "PASS: cargo deny bans check passed"
 # (If a legitimate NON-ed25519 `.verify(` is ever introduced, prefer a typed
 # wrapper; otherwise add a narrowly-scoped allowlist to the second grep.)
 echo "Checking all ed25519 signature verification uses verify_strict (RN-22)..."
-if grep -rn '\.verify(' crates --include='*.rs' \
-    | grep -v 'verify_strict' \
-    | grep -vE ':[0-9]+:[[:space:]]*(//|///|\*)'; then
+# The middle filter neutralizes each `.verify_strict(` occurrence IN PLACE
+# instead of dropping whole lines: a line-level `grep -v verify_strict`
+# let a raw `.verify(` hide on the SAME line as a strict call (one line,
+# two calls) and silenced the gate entirely. After neutralization any
+# surviving `.verify(` is a genuine non-strict call, wherever it sits.
+# Whitespace-tolerant companion scans: Rust is whitespace-insensitive around
+# the dot and the paren, and a method call may be split across lines
+# (`x . verify (sig)` and `x\n.verify\n(sig)` both compile and both evaded
+# the single-line pattern above while carrying a live malleable-verifier call;
+# both were confirmed against this gate by adversarial review). The EOL arm
+# catches the line-split form; rustfmt would collapse it, but this gate must
+# stand alone when invoked directly. The companion patterns cannot match a
+# strict spelling (`verify_strict` puts `_` where the arms require optional
+# whitespace then `(` or end-of-line), so NO verify_strict line filter is
+# applied here: a line-level `-v verify_strict` would silence a live spaced
+# call whenever an unrelated comment on the same line merely MENTIONS
+# verify_strict — a filter divergence proven by adversarial review.
+# Known residual spellings (documented, rustfmt-normalized, deliberate
+# evasion only): turbofish `.verify::<T>(`; block-comment token splice
+# `./*c*/verify/*c*/(sig)`; EOL-comment splice `. // c\nverify\n(sig)`.
+g3_hits="$(
+  {
+    grep -rn '\.verify(' crates --include='*.rs' \
+      | sed -E 's/\.verify_strict\(/./g' \
+      | grep '\.verify(' || true
+    grep -rnE '\.[[:space:]]+verify[[:space:]]*\(|\.[[:space:]]*verify[[:space:]]*$' crates --include='*.rs' || true
+  } | grep -vE ':[0-9]+:[[:space:]]*(//|///|\*)' || true
+)"
+if [ -n "$g3_hits" ]; then
+  printf '%s\n' "$g3_hits"
   echo "FAIL: non-strict ed25519 .verify() found above — RN-22 mandates VerifyingKey::verify_strict" >&2
   echo "FAIL: verify_strict rejects malleable/non-canonical signatures; replace .verify( with .verify_strict(" >&2
   exit 1

@@ -1830,6 +1830,57 @@ mod tests {
             "WG passphrase must NOT route through the legacy default-keychain store \
              (its -A CLI fallback is unreadable by the launchd daemon on macOS 26)"
         );
+        // The negative grep above pins ONE argument spelling of the forbidden
+        // callee; `&service` (deref coercion), a renamed local, or a wrapper
+        // fn reintroduce the legacy route while it stays green. Forbid the
+        // callee NAME itself: the allow-any-app and owned-identity variants
+        // spell `..._allow_any_app(`/`..._system_keychain_owned(` and never
+        // match the paren, so zero occurrences is the only passing state.
+        let legacy_callee = ["store_macos_generic_", "password("].concat();
+        assert!(
+            !window.contains(legacy_callee.as_str()),
+            "the macOS dispatcher must never call the legacy default-keychain \
+             store_macos_generic_password under ANY spelling — only the -A and \
+             SecItemAdd variants are readable by the launchd daemon cross-session"
+        );
+        // The window-scoped name ban above cannot see an ALIAS: a local
+        // `use ... as legacy_store;` renames the forbidden callee for the call
+        // itself, so the dispatcher routes passphrases to the legacy store
+        // while every assertion above stays green (proven by mutation). Pin
+        // the WHOLE production region instead: EVERY occurrence of the legacy
+        // callee name on a non-comment line must extend into one of the two
+        // SANCTIONED variant spellings. Occurrence-wise, not line-level
+        // any-variant: a same-line co-location
+        // (`..._system_keychain_owned(a,b,c); ...::store_macos_generic_password(d,e,f);`)
+        // would otherwise whitewash the bare legacy call sharing that line
+        // (proven green-by-mutation before this pin). The bare legacy name has
+        // no sanctioned production use.
+        let prod_end = body.find("\nmod tests {").unwrap_or(body.len());
+        let base_name = ["store_macos_generic_", "password"].concat();
+        for (index, line) in body[..prod_end].lines().enumerate() {
+            if !line.contains(base_name.as_str()) {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let mut cursor = 0usize;
+            while let Some(at) = line[cursor..].find(base_name.as_str()) {
+                let abs = cursor + at;
+                let rest = &line[abs + base_name.len()..];
+                assert!(
+                    rest.starts_with("_allow_any_app")
+                        || rest.starts_with("_system_keychain_owned"),
+                    "line {} names the legacy default-keychain callee without one of \
+                     the sanctioned variant spellings; an aliased or wrapped call \
+                     routes passphrases to the -A CLI path the launchd daemon cannot \
+                     read cross-session on macOS 26: {line}",
+                    index + 1
+                );
+                cursor = abs + base_name.len();
+            }
+        }
     }
 
     #[test]
