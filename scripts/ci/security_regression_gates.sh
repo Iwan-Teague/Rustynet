@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Anchor every check below to the repository root. The shell-side G2a and
+# G3 scans use workspace-relative paths (Cargo.lock, crates/) whose failures
+# are deliberately swallowed (`2>/dev/null`, `|| true` inside the hit
+# collection), so when this gate was invoked from a workspace subdirectory
+# both scans silently matched nothing and the gate exited 0 having checked
+# nothing. cd-ing to the root derived from this script's own location makes
+# the verdict independent of the caller's cwd.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$repo_root"
+
 echo "Running security regression gates..."
 
 # Run the Rust-based gates. The historical G1 grep-based secret-
