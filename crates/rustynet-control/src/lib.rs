@@ -8608,71 +8608,137 @@ mod tests {
         );
     }
 
-    /// Reduce Rust source to code-shaped text: drop line and block comments,
-    /// keep string delimiters but empty their contents. The enrollment-window
-    /// pins below must judge only real code — an adversarial comment or string
-    /// literal carrying the canonical mint text verbatim satisfied every
-    /// textual pin while the hot path routed through a panicking wrapper
-    /// (found by adversarial re-review of this very test).
+    /// Reduce Rust source to code-shaped text: drop line comments and
+    /// nesting-aware block comments, empty the contents of normal and raw
+    /// string literals, and consume character literals wholesale. The
+    /// enrollment-window pins below must judge only real code — adversarial
+    /// re-review of these very tests found bypasses where a comment, string
+    /// literal, nested block comment (`/* /* */ x */`), or raw string
+    /// (`r#"a"b"#`) carried the canonical mint text verbatim while the hot
+    /// path routed through a panicking wrapper.
     ///
-    /// Known simplifications, acceptable here because they only ever make the
-    /// scan STRICTER on these windows: raw strings (`r"…"`, `r#"…"#`) and char
-    /// literals are treated as ordinary text.
+    /// The scanner recognizes `r"…"`, `br"…"`, `cr"…"`, and their `#`-delimited
+    /// forms so a raw-string interior cannot leak into the code stream, tracks
+    /// block-comment nesting so an inner `*/` cannot close the comment early,
+    /// and consumes `'…'` character literals (including `'"'`) so their quotes
+    /// cannot flip string state. Lifetime elisions (`'a`) are emitted
+    /// untouched. An unclosed construct consumes to EOF, which only occurs in
+    /// source that does not compile.
     fn strip_non_code(input: &str) -> String {
+        let chars: Vec<char> = input.chars().collect();
+        let n = chars.len();
         let mut out = String::with_capacity(input.len());
-        let mut chars = input.chars().peekable();
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-        let mut in_string = false;
-        let mut escaped = false;
-        while let Some(c) = chars.next() {
-            if in_line_comment {
-                if c == '\n' {
-                    in_line_comment = false;
-                    out.push(c);
+        let mut i = 0usize;
+        while i < n {
+            let c = chars[i];
+            // Line comment.
+            if c == '/' && i + 1 < n && chars[i + 1] == '/' {
+                i += 2;
+                while i < n && chars[i] != '\n' {
+                    i += 1;
                 }
+                out.push(' ');
                 continue;
             }
-            if in_block_comment {
-                if c == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    in_block_comment = false;
+            // Nesting-aware block comment.
+            if c == '/' && i + 1 < n && chars[i + 1] == '*' {
+                let mut depth = 1usize;
+                i += 2;
+                while i < n && depth > 0 {
+                    if chars[i] == '/' && i + 1 < n && chars[i + 1] == '*' {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && i + 1 < n && chars[i + 1] == '/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push(' ');
+                continue;
+            }
+            // Raw string literals: r"…", r#"…"#, br"…", br#"…"#, cr"…",
+            // cr#"…"#. A prefix only counts when it does not continue an
+            // identifier.
+            let prefix_raw =
+                (c == 'r') || ((c == 'b' || c == 'c') && i + 1 < n && chars[i + 1] == 'r');
+            let prefix_clean = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+            if prefix_raw && prefix_clean {
+                let mut k = if c == 'r' { i + 1 } else { i + 2 };
+                let mut hashes = 0usize;
+                while k < n && chars[k] == '#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < n && chars[k] == '"' {
+                    k += 1;
+                    loop {
+                        if k >= n {
+                            break;
+                        }
+                        if chars[k] == '"' {
+                            let mut end = k + 1;
+                            let mut seen = 0usize;
+                            while seen < hashes && end < n && chars[end] == '#' {
+                                seen += 1;
+                                end += 1;
+                            }
+                            if seen == hashes {
+                                k = end;
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
                     out.push(' ');
-                }
-                continue;
-            }
-            if in_string {
-                if escaped {
-                    escaped = false;
+                    i = k;
                     continue;
                 }
-                match c {
-                    '\\' => escaped = true,
-                    '"' => {
-                        in_string = false;
-                        out.push('"');
+            }
+            // Character literals: consume wholesale so their quotes cannot
+            // toggle string state. A `'` that is not a char literal (lifetime
+            // elision, loop labels) is emitted untouched.
+            if c == '\'' {
+                if i + 1 < n && chars[i + 1] == '\\' {
+                    let mut k = i + 2;
+                    while k < n && chars[k] != '\'' {
+                        k += 1;
                     }
-                    _ => {}
+                    i = (k + 1).min(n);
+                    out.push(' ');
+                    continue;
+                }
+                if i + 2 < n && chars[i + 2] == '\'' {
+                    i += 3;
+                    out.push(' ');
+                    continue;
+                }
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            // Normal string literal: delimiters kept, contents emptied,
+            // escapes honored.
+            if c == '"' {
+                out.push('"');
+                i += 1;
+                let mut escaped = false;
+                while i < n {
+                    let ch = chars[i];
+                    i += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        break;
+                    }
                 }
                 continue;
             }
-            match c {
-                '/' if chars.peek() == Some(&'/') => {
-                    chars.next();
-                    in_line_comment = true;
-                    out.push(' ');
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    chars.next();
-                    in_block_comment = true;
-                    out.push(' ');
-                }
-                '"' => {
-                    in_string = true;
-                    out.push('"');
-                }
-                _ => out.push(c),
-            }
+            out.push(c);
+            i += 1;
         }
         out
     }

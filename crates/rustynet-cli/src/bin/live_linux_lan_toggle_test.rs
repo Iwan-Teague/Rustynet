@@ -2287,6 +2287,40 @@ mod tests {
                 );
             }
         }
+        // A value-grep cannot follow DATAFLOW: pieces cut BETWEEN the pinned
+        // fragments ("192.168.18" + ".0/24" assembles the wedge with no banned
+        // fragment on any line; proven green by mutation) defeat every value
+        // pin above. Pin the variable's SOURCES instead: ssh_allow_cidrs may
+        // only ever be written by the empty init or the operator-supplied
+        // --ssh-allow-cidrs value, so no assembly anywhere can bake a default
+        // in regardless of how it is spelled or split.
+        for (index, line) in source[..impl_end].lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !(line.contains("ssh_allow_cidrs")
+                    && (line.contains("push_str")
+                        || line.contains("&mut ssh_allow_cidrs")
+                        || line.contains("insert(")
+                        || line.contains("extend(")
+                        || line.contains("write!("))),
+                "line {} mutates ssh_allow_cidrs through an assembly spelling; \
+                 the variable may only ever hold the operator-supplied \
+                 --ssh-allow-cidrs value (QH-57)",
+                index + 1
+            );
+            if line.contains("ssh_allow_cidrs =") {
+                assert!(
+                    line.contains("String::new()") || line.contains("required_value(&args"),
+                    "line {} assigns ssh_allow_cidrs from an unsanctioned source; \
+                     only the String::new() init and the required_value(...) \
+                     operator argument may write it (QH-57)",
+                    index + 1
+                );
+            }
+        }
     }
 
     use super::{
