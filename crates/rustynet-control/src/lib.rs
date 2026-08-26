@@ -8608,6 +8608,75 @@ mod tests {
         );
     }
 
+    /// Reduce Rust source to code-shaped text: drop line and block comments,
+    /// keep string delimiters but empty their contents. The enrollment-window
+    /// pins below must judge only real code — an adversarial comment or string
+    /// literal carrying the canonical mint text verbatim satisfied every
+    /// textual pin while the hot path routed through a panicking wrapper
+    /// (found by adversarial re-review of this very test).
+    ///
+    /// Known simplifications, acceptable here because they only ever make the
+    /// scan STRICTER on these windows: raw strings (`r"…"`, `r#"…"#`) and char
+    /// literals are treated as ordinary text.
+    fn strip_non_code(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+        let mut in_string = false;
+        let mut escaped = false;
+        while let Some(c) = chars.next() {
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                    out.push(c);
+                }
+                continue;
+            }
+            if in_block_comment {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                    out.push(' ');
+                }
+                continue;
+            }
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match c {
+                    '\\' => escaped = true,
+                    '"' => {
+                        in_string = false;
+                        out.push('"');
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '/' if chars.peek() == Some(&'/') => {
+                    chars.next();
+                    in_line_comment = true;
+                    out.push(' ');
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    in_block_comment = true;
+                    out.push(' ');
+                }
+                '"' => {
+                    in_string = true;
+                    out.push('"');
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
     /// Regression: `try_random_nonce_hex` must remain the only path that
     /// enrollment flows reach. The panicking legacy `random_nonce_hex` was
     /// removed; this test fires if a future change reintroduces it.
@@ -8640,7 +8709,10 @@ mod tests {
             }
             .unwrap_or(body.len());
             let window_end = (next_fn + 1).min(body.len());
-            let window = &body[start..window_end];
+            // Scan the COMMENT- AND STRING-STRIPPED window: a canonical mint
+            // text embedded in a comment, doc comment, string literal, or
+            // nested const must never satisfy these pins.
+            let window = strip_non_code(&body[start..window_end]);
             assert!(
                 window.contains("try_random_nonce_hex("),
                 "enrollment `{fn_name}` must mint nonces via `try_random_nonce_hex`"
