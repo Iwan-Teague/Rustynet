@@ -391,3 +391,5 @@ timestamp_utc,git_commit,git_dirty,stage,scope,duration_secs,outcome
 2026-08-10T12:46:32Z,571b3036,clean,fmt,workspace,3,pass
 2026-08-10T12:47:00Z,571b3036,clean,clippy,workspace,28,pass
 2026-08-10T12:50:45Z,571b3036,clean,test,workspace,224,pass
+2026-08-26T18:00:50Z,4a05355a,dirty,fmt,-p rustynet-backend-wireguard,2,pass
+2026-08-26T18:00:51Z,4a05355a,dirty,clippy,-p rustynet-backend-wireguard,1,pass
