@@ -875,6 +875,16 @@ fn enforce_host_macos(role: &str, node_id: &str, ssh_allow_cidrs: &str) -> Resul
     }
     let network_id = plist_env_value(&plist, "RUSTYNET_NETWORK_ID").unwrap_or_default();
 
+    // C-STUN (BashOrchestratorRetirementProgram): preserve the bootstrap-time
+    // STUN endpoint across the enforce re-render — the re-render otherwise
+    // silently drops it, the same trap this function already avoids for
+    // --wg-interface and RUSTYNET_NETWORK_ID. An explicit env var wins; with
+    // neither present the flag is omitted and STUN gathering stays disabled.
+    let traversal_stun_servers = env::var("RUSTYNET_TRAVERSAL_STUN_SERVERS")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| plist_program_arg_value(&plist, "--traversal-stun-servers"));
+
     // Extended freshness windows (lab passes 86400 via env; default to the
     // same so an omitted env var does not fall back to the 300 s default).
     let auto_tunnel_max_age =
@@ -888,39 +898,44 @@ fn enforce_host_macos(role: &str, node_id: &str, ssh_allow_cidrs: &str) -> Resul
     };
 
     let script_path = write_secure_macos_install_script()?;
+    let mut args: Vec<&str> = vec![
+        script_path
+            .to_str()
+            .ok_or("e2e-enforce-host on macOS: temp script path is not UTF-8")?,
+        "--rustynetd-bin",
+        RUSTYNETD_BIN,
+        "--state-root",
+        STATE_ROOT,
+        "--node-id",
+        node_id,
+        "--node-role",
+        role,
+        "--network-id",
+        network_id.as_str(),
+        "--wg-interface",
+        wg_interface.as_str(),
+        "--auto-tunnel-enforce",
+        "true",
+        "--trust-max-age-secs",
+        "86400",
+        "--auto-tunnel-max-age-secs",
+        auto_tunnel_max_age.as_str(),
+        "--traversal-max-age-secs",
+        traversal_max_age.as_str(),
+        "--dns-zone-max-age-secs",
+        "86400",
+        "--fail-closed-ssh-allow",
+        ssh_allow_flag,
+        "--fail-closed-ssh-allow-cidrs",
+        ssh_allow_cidrs,
+    ];
+    if let Some(stun) = traversal_stun_servers.as_deref() {
+        args.push("--traversal-stun-servers");
+        args.push(stun);
+    }
     let run = run_status(
         "/bin/bash",
-        &[
-            script_path
-                .to_str()
-                .ok_or("e2e-enforce-host on macOS: temp script path is not UTF-8")?,
-            "--rustynetd-bin",
-            RUSTYNETD_BIN,
-            "--state-root",
-            STATE_ROOT,
-            "--node-id",
-            node_id,
-            "--node-role",
-            role,
-            "--network-id",
-            network_id.as_str(),
-            "--wg-interface",
-            wg_interface.as_str(),
-            "--auto-tunnel-enforce",
-            "true",
-            "--trust-max-age-secs",
-            "86400",
-            "--auto-tunnel-max-age-secs",
-            auto_tunnel_max_age.as_str(),
-            "--traversal-max-age-secs",
-            traversal_max_age.as_str(),
-            "--dns-zone-max-age-secs",
-            "86400",
-            "--fail-closed-ssh-allow",
-            ssh_allow_flag,
-            "--fail-closed-ssh-allow-cidrs",
-            ssh_allow_cidrs,
-        ],
+        &args,
         &[],
         "install-launchd enforce pass failed",
     );
@@ -8994,6 +9009,31 @@ mod macos_enforce_tests {
             Some("rustynet-lab-net")
         );
         assert_eq!(plist_env_value(SAMPLE_PLIST, "RUSTYNET_MISSING"), None);
+    }
+
+    /// C-STUN (BashOrchestratorRetirementProgram): the embedded macOS install
+    /// script must accept and render the STUN endpoint, and the enforce pass
+    /// must be able to read it back from an installed plist so the re-render
+    /// does not silently drop it.
+    #[test]
+    fn macos_install_script_supports_traversal_stun_servers() {
+        assert!(
+            super::MACOS_INSTALL_SERVICE_SCRIPT.contains("--traversal-stun-servers"),
+            "the embedded installer must accept --traversal-stun-servers"
+        );
+        assert!(
+            super::MACOS_INSTALL_SERVICE_SCRIPT.contains("TRAVERSAL_STUN_PLIST_FRAGMENT"),
+            "the installer must render the STUN endpoint into the plist"
+        );
+    }
+
+    #[test]
+    fn plist_program_arg_value_reads_stun_servers() {
+        let plist = "<array>\n<string>--traversal-stun-servers</string>\n<string>192.168.64.1:3478</string>\n</array>";
+        assert_eq!(
+            plist_program_arg_value(plist, "--traversal-stun-servers").as_deref(),
+            Some("192.168.64.1:3478")
+        );
     }
 
     #[test]

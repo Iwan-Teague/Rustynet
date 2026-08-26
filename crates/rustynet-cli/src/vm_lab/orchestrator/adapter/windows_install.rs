@@ -307,6 +307,12 @@ pub fn enforce_daemon(
     //   RUSTYNETD_DAEMON_ARGS_JSON=["--backend","...",
     //       "--auto-tunnel-enforce","false","--node-id","..."]
     // We parse the JSON array, flip the value, and write it back.
+    //
+    // The same patch threads --traversal-stun-servers with the guest's default
+    // gateway on 3478 (C-STUN, BashOrchestratorRetirementProgram) — an empty
+    // value disables srflx candidate gathering, and no Windows deploy path set
+    // it anywhere. Gateway detection failure adds no flag (prior behaviour);
+    // a live responder is optional (gathering fails soft on a bounded timeout).
     let env_path_q = ps_quote(&env_path)?;
     let patch_script = format!(
         "Set-StrictMode -Version Latest; \
@@ -335,6 +341,16 @@ pub fn enforce_daemon(
                      $null = $arr.Add('86400') \
                  }} elseif (($dnsAgeIdx + 1) -lt $arr.Count) {{ \
                      $arr[$dnsAgeIdx + 1] = '86400' \
+                 }}; \
+                 $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop; \
+                 if ($gw -match '^[0-9]{{1,3}}(\\.[0-9]{{1,3}}){{3}}$') {{ \
+                     $stunIdx = [array]::IndexOf([string[]]$arr, '--traversal-stun-servers'); \
+                     if ($stunIdx -lt 0) {{ \
+                         $null = $arr.Add('--traversal-stun-servers'); \
+                         $null = $arr.Add(($gw + ':3478')) \
+                     }} elseif (($stunIdx + 1) -lt $arr.Count) {{ \
+                         $arr[$stunIdx + 1] = ($gw + ':3478') \
+                     }} \
                  }}; \
                  'RUSTYNETD_DAEMON_ARGS_JSON=' + ($arr.ToArray() | ConvertTo-Json -Compress) \
              }} else {{ $_ }} \
