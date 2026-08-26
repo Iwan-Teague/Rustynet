@@ -198,21 +198,48 @@ pub fn enforce_daemon(
     // once by DistributeDnsZone and is not refreshed.  The default 300-s window
     // causes dns_alarm_state=error once the bundle ages past 5 minutes, which
     // can block traffic validation in longer pipeline runs.
-    let script = format!(
-        "sudo -n env \
+    //
+    let script = build_enforce_script(role_str, &node_id, &src_dir, &ssh_allow_cidrs);
+    ssh::run_remote(conn, &script, Duration::from_secs(120))?;
+    Ok(())
+}
+
+/// Render the remote `e2e-enforce-host` invocation for [`enforce_daemon`].
+///
+/// RUSTYNET_TRAVERSAL_STUN_SERVERS (C-STUN, BashOrchestratorRetirementProgram):
+/// an empty value disables srflx candidate gathering entirely, so the lab
+/// enforce pass threads the guest's default gateway on 3478 (the UTM host as
+/// seen from the guest's subnet — a valid ip:port, which is all the daemon's
+/// socket-address parser accepts). A live responder there is optional:
+/// gathering fails soft on a bounded timeout and same-LAN validation rides
+/// host candidates either way. Detected on the guest because each guest's
+/// subnet (and therefore gateway) differs; empty detection leaves the env
+/// var unset, preserving the pre-C-STUN behaviour. This mirrors the identical
+/// threading in rn_bootstrap.sh — the enforce pass rewrites the systemd unit,
+/// so without it the bootstrap-time value would be silently dropped here.
+fn build_enforce_script(
+    role_str: &str,
+    node_id: &str,
+    src_dir: &str,
+    ssh_allow_cidrs: &str,
+) -> String {
+    format!(
+        "RN_LAB_GW=\"$(ip -4 route show default 2>/dev/null | awk '{{print $3; exit}}')\"; \
+         RN_STUN_ENV=''; \
+         if [ -n \"$RN_LAB_GW\" ]; then RN_STUN_ENV=\"RUSTYNET_TRAVERSAL_STUN_SERVERS=$RN_LAB_GW:3478\"; fi; \
+         sudo -n env \
          PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin \
          RUSTYNET_INSTALL_SOURCE_ROOT={src_dir} \
          RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400 \
          RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400 \
          RUSTYNET_DNS_ZONE_MAX_AGE_SECS=86400 \
+         $RN_STUN_ENV \
          {LINUX_RUSTYNET_PATH} ops e2e-enforce-host \
          --role {role_str} \
          --node-id '{node_id}' \
          --src-dir '{src_dir}' \
          --ssh-allow-cidrs '{ssh_allow_cidrs}'"
-    );
-    ssh::run_remote(conn, &script, Duration::from_secs(120))?;
-    Ok(())
+    )
 }
 
 /// Deploy the `rustynet-relay` sibling service onto this Relay node so the
@@ -554,6 +581,45 @@ mod tests {
         assert!(
             BOOTSTRAP_SCRIPT.contains("rustynet ops e2e-bootstrap-host"),
             "bootstrap must install the daemon via e2e-bootstrap-host"
+        );
+    }
+
+    /// C-STUN (BashOrchestratorRetirementProgram): both Linux install passes
+    /// must thread a non-empty RUSTYNET_TRAVERSAL_STUN_SERVERS into the daemon
+    /// install, because an empty value disables srflx candidate gathering and
+    /// the enforce pass rewrites the unit (dropping any bootstrap-time value).
+    #[test]
+    fn bootstrap_script_threads_lab_stun_servers() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("RUSTYNET_TRAVERSAL_STUN_SERVERS="),
+            "linux bootstrap must forward a lab STUN endpoint so srflx candidate \
+             gathering is exercised in lab deployments"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("\"${stun_env[@]}\""),
+            "the stun env must be forwarded on the e2e-bootstrap-host invocation"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("RUSTYNET_LAB_STUN_SERVERS"),
+            "the bootstrap env override hook must exist"
+        );
+    }
+
+    #[test]
+    fn enforce_script_threads_lab_stun_servers() {
+        let script =
+            build_enforce_script("client", "node-1", "/home/lab/Rustynet", "192.168.64.0/24");
+        assert!(
+            script.contains("RUSTYNET_TRAVERSAL_STUN_SERVERS=$RN_LAB_GW:3478"),
+            "enforce must thread the guest-gateway STUN endpoint: {script}"
+        );
+        assert!(
+            script.contains("$RN_STUN_ENV"),
+            "the stun env word must be on the sudo env invocation: {script}"
+        );
+        assert!(
+            script.contains("ops e2e-enforce-host"),
+            "must still invoke e2e-enforce-host: {script}"
         );
     }
 

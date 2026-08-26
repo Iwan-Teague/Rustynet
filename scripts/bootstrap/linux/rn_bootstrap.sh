@@ -568,6 +568,25 @@ backend_env=()
 if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
   backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
 fi
+# Lab STUN endpoint: an empty RUSTYNET_TRAVERSAL_STUN_SERVERS disables srflx
+# candidate gathering entirely, so the lab threads a non-empty default — the
+# guest's default gateway on 3478 (the UTM host as seen from this subnet). A
+# live responder there is optional: gathering fails soft on a bounded timeout
+# and same-LAN validation rides host candidates either way. The value must be
+# ip:port CSV (the daemon parses socket addresses, not hostnames), which the
+# gateway address satisfies; RUSTYNET_LAB_STUN_SERVERS in the bootstrap env
+# overrides. Production deployments never run this script.
+lab_stun_servers="${RUSTYNET_LAB_STUN_SERVERS:-}"
+if [[ -z "${lab_stun_servers}" ]]; then
+  default_gw="$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')"
+  if [[ -n "${default_gw}" ]]; then
+    lab_stun_servers="${default_gw}:3478"
+  fi
+fi
+stun_env=()
+if [[ -n "${lab_stun_servers}" ]]; then
+  stun_env+=(RUSTYNET_TRAVERSAL_STUN_SERVERS="${lab_stun_servers}")
+fi
 # Lab bootstrap uses the relaxed 86400s freshness window (parity with macOS
 # Bootstrap-RustyNetMacos.sh and the Windows installer) so a Linux node is not
 # left enforcing the strict 300s/120s window if the later enforce pass is
@@ -579,6 +598,7 @@ run_root env RUSTYNET_INSTALL_SOURCE_ROOT="${HOME}/Rustynet" \
   RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400 \
   RUSTYNET_DNS_ZONE_MAX_AGE_SECS=86400 \
   "${backend_env[@]}" \
+  "${stun_env[@]}" \
   /usr/local/bin/rustynet ops e2e-bootstrap-host \
   --role "${ROLE}" \
   --node-id "${NODE_ID}" \
