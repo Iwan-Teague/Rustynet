@@ -8533,6 +8533,34 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
                     let text = std::fs::read_to_string(&path)
                         .unwrap_or_else(|err| panic!("{} readable: {err}", path.display()));
                     census += text.matches(variant_path.as_str()).count();
+                    // The census needle names the variant by FULL PATH only. An
+                    // import alias (`use RelaySelfSignedCodeSigning as X;` +
+                    // `X::Allow`) reaches the same variant under a spelling the
+                    // census cannot see and the shipped-body rules never scan.
+                    // Ban the alias import itself; comment lines are exempt
+                    // because the rationale comment quotes the shape.
+                    // ` as ` is assembled from fragments: a verbatim literal
+                    // here sits on the SAME scanned line as the enum name once
+                    // rustfmt joins the assert, and the rule would fire on its
+                    // own source (proven when the first draft went red on this
+                    // file at line 8548 right after cargo fmt).
+                    let alias_needle = format!(" {} ", "as");
+                    for (line_no, line) in text.lines().enumerate() {
+                        let trimmed = line.trim_start();
+                        if trimmed.starts_with("//") {
+                            continue;
+                        }
+                        assert!(
+                            !(line.contains("RelaySelfSignedCodeSigning")
+                                && line.contains(alias_needle.as_str())),
+                            "{}:{} imports RelaySelfSignedCodeSigning under an \
+                             alias; aliased spellings evade the variant-path \
+                             census and could route the shipped path to the \
+                             minting policy unreviewed",
+                            path.display(),
+                            line_no + 1
+                        );
+                    }
                 }
             }
         }

@@ -893,6 +893,25 @@ mod tests {
     }
 
     #[test]
+    fn secure_runtime_dir_propagates_the_verifiers_verdict() {
+        // The wired spy drives a PASSING verifier, so a seam that ran
+        // verification and then swallowed its Err stayed green across the
+        // whole suite (proven by mutation: both bins 8+8 with the seam doing
+        // `if let Err(e) = post_create_verify(path) { eprintln!(..); }`). The
+        // seam's result must be exactly what the injected verifier returned —
+        // swallowing, rewriting, or defaulting it would silently accept an
+        // unverified runtime dir.
+        let base = scratch_dir("verify-verdict");
+        let target = base.join("verdict");
+        let result = create_secure_runtime_dir(&target, |_p| Err("verifier refused".to_string()));
+        assert!(
+            matches!(&result, Err(message) if message.contains("verifier refused")),
+            "the seam must propagate the verifier's failure verbatim, not \
+             swallow or rewrite it: {result:?}"
+        );
+    }
+
+    #[test]
     fn secure_runtime_dir_wrapper_delegates_to_the_seam_with_the_real_verifier() {
         // The counting-spy pin drives the seam directly, so it cannot see what
         // the production wrapper passes: a wrapper reverted to inline creation
@@ -903,10 +922,24 @@ mod tests {
         // verifier named. Needles are fragment-assembled so this audit never
         // matches its own source.
         let source = include_str!("real_wireguard_exitnode_e2e.rs");
+        // The census counts PRODUCTION callers only: the counting-spy and this
+        // audit's own verdict probe are test-module call sites that never ship,
+        // and counting them would force an update on every legitimate test-side
+        // use (proven when adding the verdict probe tripped the whole-file
+        // census at 3). The security-relevant invariant is that exactly ONE
+        // production call site — the wrapper delegation pinned below — can
+        // reach the seam; anything else in production code fails here.
+        let production = &source[..source
+            .find(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .expect("the test module must exist")];
         let callsite_census = ["create_secure_runtime_dir", "("].concat();
         assert_eq!(
-            source.matches(callsite_census.as_str()).count(),
-            2,
+            production.matches(callsite_census.as_str()).count(),
+            1,
             "unexpected create_secure_runtime_dir caller — review it and update \
              this census deliberately; the wrapper must stay the only production \
              caller so the post-create verifier cannot be swapped or skipped"
