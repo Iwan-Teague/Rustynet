@@ -125,6 +125,41 @@ impl AuthoritativeSocket {
         Ok(())
     }
 
+    /// Best-effort dataplane egress: send one ciphertext datagram, DROPPING it
+    /// (`Ok(false)`) when the OS refuses in a transient way instead of erroring.
+    ///
+    /// WireGuard's wire protocol is loss-tolerant — a dropped keepalive,
+    /// handshake initiation, or data frame is retried by boringtun's own
+    /// timers — but a `BackendError` escaping the worker loop kills the worker
+    /// thread outright. A host firewall rejecting egress (netfilter REJECT on
+    /// the WG port ⇒ `EPERM`), a link flap (`ENETDOWN`/`ENETUNREACH`), or an
+    /// ICMP-reflected refusal are exactly the conditions a VPN daemon must ride
+    /// out, not die from: on 2026-08-26 a 35-second nft egress block killed this
+    /// worker on its first keepalive tick, the replacement worker died the same
+    /// way during recovery replay, and five failed reconciles latched the node
+    /// PERMANENTLY restricted — turning a transient block into an unrecoverable
+    /// dataplane. Structural failures (bad fd, truncation) still fail loudly.
+    ///
+    /// This tolerance is dataplane-only. Control-plane round trips keep using
+    /// the strict [`Self::send_to`] so their callers see the failure.
+    pub(crate) fn send_to_dataplane(
+        &self,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<bool, BackendError> {
+        match self.socket.send_to(payload, remote_addr) {
+            Ok(written) if written == payload.len() => Ok(true),
+            Ok(written) => Err(BackendError::internal(format!(
+                "linux userspace-shared authoritative UDP socket send_to truncated datagram for {remote_addr}: wrote {written} of {} bytes",
+                payload.len()
+            ))),
+            Err(err) if is_transient_dataplane_send_error(&err) => Ok(false),
+            Err(err) => Err(BackendError::internal(format!(
+                "linux userspace-shared authoritative UDP socket send_to failed for {remote_addr}: {err}"
+            ))),
+        }
+    }
+
     /// Receive one datagram into the caller's long-lived scratch buffer
     /// (no per-packet allocation). Returns the filled length and the
     /// sender; `None` when the socket has no pending datagram.
@@ -134,7 +169,21 @@ impl AuthoritativeSocket {
     ) -> Result<Option<(usize, SocketAddr)>, BackendError> {
         match self.socket.recv_from(scratch) {
             Ok((len, remote_addr)) => Ok(Some((len, remote_addr))),
-            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            // ConnectionRefused/ConnectionReset are a peer's ICMP
+            // port-unreachable reflected back onto the socket, not a broken
+            // socket: there is no datagram, and the peer being briefly
+            // unreachable is a routine dataplane condition. Treating them as
+            // fatal would kill the worker thread over a condition boringtun's
+            // timers already handle by retrying.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::ConnectionRefused
+                        | ErrorKind::ConnectionReset
+                ) =>
+            {
                 Ok(None)
             }
             Err(err) => Err(BackendError::internal(format!(
@@ -161,5 +210,117 @@ impl AuthoritativeSocket {
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Classify an OS send error as a transient egress condition (drop the
+/// datagram, keep the worker alive) versus a structural socket failure
+/// (fail loudly).
+///
+/// Transient means "this datagram could not leave the host right now":
+/// - `PermissionDenied` — `EPERM`/`EACCES`: a netfilter/nft REJECT or DROP on
+///   the egress path refuses locally-generated packets with `EPERM`. This is
+///   the exact condition the live-lab `live_network_flap_validation` stage
+///   creates on purpose, and the one that killed the worker on 2026-08-26.
+/// - `NetworkDown` / `NetworkUnreachable` / `HostUnreachable` /
+///   `AddrNotAvailable` — link flaps, route churn, DHCP renumbering.
+/// - `ConnectionRefused` / `ConnectionReset` — a peer's ICMP unreachable
+///   reflected onto the socket.
+/// - `WouldBlock` / `Interrupted` — kernel buffer pressure / signal delivery.
+///
+/// Everything else (bad fd, `InvalidInput`, message-too-large, …) stays fatal:
+/// those indicate the socket or the caller is broken, and continuing would
+/// silently blackhole all egress.
+fn is_transient_dataplane_send_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::PermissionDenied
+            | ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NetworkDown
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::HostUnreachable
+            | ErrorKind::AddrNotAvailable
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error, ErrorKind};
+
+    use super::*;
+
+    #[test]
+    fn transient_send_error_classifier_covers_firewall_and_link_conditions() {
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(
+                is_transient_dataplane_send_error(&Error::from(kind)),
+                "{kind:?} must be tolerated on the dataplane egress path"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_send_errors_stay_fatal() {
+        for kind in [
+            ErrorKind::InvalidInput,
+            ErrorKind::NotFound,
+            ErrorKind::BrokenPipe,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_transient_dataplane_send_error(&Error::from(kind)),
+                "{kind:?} must remain a loud failure"
+            );
+        }
+    }
+
+    #[test]
+    fn dataplane_send_drops_firewalled_egress_instead_of_erroring() {
+        // Sending to the broadcast address without SO_BROADCAST is refused by
+        // the kernel with EACCES -> PermissionDenied: a deterministic stand-in
+        // for the nft REJECT (EPERM) that a host firewall produces. The
+        // dataplane path must report "dropped", not an error. Bind loopback:
+        // this module's tests also compile-and-run on the macOS CI leg, where
+        // a wildcard-bound broadcast send is not refused.
+        let socket = AuthoritativeSocket::from_bound_socket(
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("loopback bind"),
+        )
+        .expect("bind should succeed");
+        let target: SocketAddr = "255.255.255.255:9".parse().expect("valid addr");
+        let delivered = socket
+            .send_to_dataplane(target, &[0u8; 8])
+            .expect("transient egress refusal must be dropped, not fatal");
+        assert!(!delivered, "a refused send must report dropped, not sent");
+
+        // The strict control-plane path must keep failing loudly on the same
+        // condition — the tolerance is dataplane-only.
+        assert!(
+            socket.send_to(target, &[0u8; 8]).is_err(),
+            "control-plane send_to must stay strict"
+        );
+    }
+
+    #[test]
+    fn dataplane_send_still_delivers_when_egress_is_open() {
+        let socket = AuthoritativeSocket::bind(0).expect("bind should succeed");
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("receiver bind");
+        let target = receiver.local_addr().expect("receiver addr");
+        let delivered = socket
+            .send_to_dataplane(target, &[7u8; 8])
+            .expect("open egress must send");
+        assert!(delivered, "an accepted send must report delivered");
     }
 }

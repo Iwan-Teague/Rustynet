@@ -102,6 +102,33 @@ impl AuthoritativeSocket {
         Ok(())
     }
 
+    /// Best-effort dataplane egress: send one ciphertext datagram, DROPPING it
+    /// (`Ok(false)`) when the OS refuses in a transient way instead of erroring.
+    ///
+    /// Mirrors `userspace_shared::socket::send_to_dataplane` (see its rustdoc
+    /// for the incident rationale): WireGuard's wire protocol is loss-tolerant,
+    /// and an error escaping the worker loop kills the worker thread — a host
+    /// firewall block (PF on macOS, `EPERM`/`EACCES`) or link flap must be
+    /// ridden out, not die from. Structural failures still fail loudly, and
+    /// control-plane round trips keep using the strict [`Self::send_to`].
+    pub(crate) fn send_to_dataplane(
+        &self,
+        remote_addr: SocketAddr,
+        payload: &[u8],
+    ) -> Result<bool, BackendError> {
+        match self.socket.send_to(payload, remote_addr) {
+            Ok(written) if written == payload.len() => Ok(true),
+            Ok(written) => Err(BackendError::internal(format!(
+                "macos userspace-shared authoritative UDP socket send_to truncated datagram for {remote_addr}: wrote {written} of {} bytes",
+                payload.len()
+            ))),
+            Err(err) if is_transient_dataplane_send_error(&err) => Ok(false),
+            Err(err) => Err(BackendError::internal(format!(
+                "macos userspace-shared authoritative UDP socket send_to failed for {remote_addr}: {err}"
+            ))),
+        }
+    }
+
     /// Receive one datagram into the caller's long-lived scratch buffer
     /// (no per-packet allocation). Returns the filled length and the
     /// sender; `None` when the socket has no pending datagram.
@@ -111,7 +138,18 @@ impl AuthoritativeSocket {
     ) -> Result<Option<(usize, SocketAddr)>, BackendError> {
         match self.socket.recv_from(scratch) {
             Ok((len, remote_addr)) => Ok(Some((len, remote_addr))),
-            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            // ConnectionRefused/ConnectionReset are a peer's ICMP
+            // port-unreachable reflected back onto the socket, not a broken
+            // socket — a routine dataplane condition boringtun's timers retry.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::ConnectionRefused
+                        | ErrorKind::ConnectionReset
+                ) =>
+            {
                 Ok(None)
             }
             Err(err) => Err(BackendError::internal(format!(
@@ -140,6 +178,25 @@ impl AuthoritativeSocket {
     }
 }
 
+/// Classify an OS send error as a transient egress condition (drop the
+/// datagram, keep the worker alive) versus a structural socket failure.
+/// Mirrors `userspace_shared::socket::is_transient_dataplane_send_error`;
+/// see that rustdoc for the per-kind rationale and the 2026-08-26 incident.
+fn is_transient_dataplane_send_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::PermissionDenied
+            | ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NetworkDown
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::HostUnreachable
+            | ErrorKind::AddrNotAvailable
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{SocketAddr, UdpSocket};
@@ -147,6 +204,53 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn transient_send_error_classifier_covers_firewall_and_link_conditions() {
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::NetworkDown,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(
+                is_transient_dataplane_send_error(&std::io::Error::from(kind)),
+                "{kind:?} must be tolerated on the dataplane egress path"
+            );
+        }
+        for kind in [
+            ErrorKind::InvalidInput,
+            ErrorKind::NotFound,
+            ErrorKind::BrokenPipe,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_transient_dataplane_send_error(&std::io::Error::from(kind)),
+                "{kind:?} must remain a loud failure"
+            );
+        }
+    }
+
+    #[test]
+    fn dataplane_send_drops_firewalled_egress_instead_of_erroring() {
+        // Broadcast without SO_BROADCAST is refused with EACCES ->
+        // PermissionDenied: a deterministic stand-in for a PF egress block.
+        let socket = AuthoritativeSocket::bind_loopback_for_test().expect("bind should succeed");
+        let target: SocketAddr = "255.255.255.255:9".parse().expect("valid addr");
+        let delivered = socket
+            .send_to_dataplane(target, &[0u8; 8])
+            .expect("transient egress refusal must be dropped, not fatal");
+        assert!(!delivered, "a refused send must report dropped, not sent");
+        assert!(
+            socket.send_to(target, &[0u8; 8]).is_err(),
+            "control-plane send_to must stay strict"
+        );
+    }
 
     #[test]
     fn bind_reports_macos_authoritative_identity() {

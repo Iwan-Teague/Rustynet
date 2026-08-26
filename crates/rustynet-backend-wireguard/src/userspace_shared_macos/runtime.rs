@@ -102,7 +102,14 @@ impl EngineIoSink for RuntimeIoSink<'_> {
         {
             let _ = (self.local_addr, self.transport_generation);
         }
-        self.authoritative_socket.send_to(remote_addr, payload)
+        // Dataplane egress is loss-tolerant by protocol design: a datagram the
+        // OS transiently refuses (PF egress block, link flap, ICMP reflection)
+        // is DROPPED rather than surfaced — an error on this path exits the
+        // worker loop and escalates a transient block into a
+        // permanently-restricted node (observed live on Linux 2026-08-26).
+        self.authoritative_socket
+            .send_to_dataplane(remote_addr, payload)
+            .map(|_delivered| ())
     }
 
     fn write_plaintext(&mut self, payload: &[u8]) -> Result<(), BackendError> {

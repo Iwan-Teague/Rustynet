@@ -99,7 +99,15 @@ impl EngineIoSink for RuntimeIoSink<'_> {
         {
             let _ = (self.local_addr, self.transport_generation);
         }
-        self.authoritative_socket.send_to(remote_addr, payload)
+        // Dataplane egress is loss-tolerant by protocol design: a datagram the
+        // OS transiently refuses (host firewall EPERM, link flap, ICMP
+        // reflection) is DROPPED here rather than surfaced, because an error on
+        // this path exits the worker loop and a 35s firewall block then
+        // escalates to a permanently-restricted node (observed live
+        // 2026-08-26). Structural socket failures still propagate.
+        self.authoritative_socket
+            .send_to_dataplane(remote_addr, payload)
+            .map(|_delivered| ())
     }
 
     fn write_plaintext(&mut self, payload: &[u8]) -> Result<(), BackendError> {
@@ -1446,6 +1454,47 @@ mod tests {
     // handshake SURVIVES an unchanged or roaming re-apply, and is CLEARED only
     // when the peer's material genuinely changed, so a stale timestamp can
     // never be carried onto a new session and make `handshake_fresh` lie.
+
+    #[test]
+    fn linux_runtime_peer_timer_tick_survives_firewalled_egress() {
+        // Live incident 2026-08-26 (live_network_flap_validation): an nft
+        // REJECT on the WG port made the keepalive send fail with EPERM, the
+        // error escaped poll_peer_timers, the worker loop exited (silently),
+        // the replacement worker died the same way during recovery replay, and
+        // five failed reconciles latched the node PERMANENTLY restricted — a
+        // 35-second firewall block became an unrecoverable dataplane.
+        //
+        // A broadcast endpoint without SO_BROADCAST is refused with EACCES ->
+        // PermissionDenied, the same classifier bucket as EPERM: every send
+        // the timer tick emits toward this peer is refused, exactly like a
+        // firewalled egress. The tick must ride it out.
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let (mut state, _tun_state, _private_key) = test_runtime_state("rn-test-flap");
+        let node_id = NodeId::new("peer-firewalled").expect("valid node id");
+        state
+            .configure_peer(PeerConfig {
+                node_id: node_id.clone(),
+                endpoint: SocketEndpoint {
+                    addr: "255.255.255.255".parse().expect("valid ip"),
+                    port: 51820,
+                },
+                public_key: [22u8; 32],
+                allowed_ips: vec!["100.64.0.22/32".to_owned()],
+                persistent_keepalive_secs: Some(1),
+            })
+            .expect("configure should succeed even when egress is refused");
+
+        // Drive several timer ticks past the pacing interval so handshake
+        // initiations / keepalives are actually attempted (and refused).
+        for _ in 0..3 {
+            state.last_peer_timer_tick = Instant::now()
+                .checked_sub(PEER_TIMER_TICK_INTERVAL * 2)
+                .expect("clock arithmetic");
+            state
+                .poll_peer_timers()
+                .expect("a refused egress send must not kill the timer tick");
+        }
+    }
 
     #[test]
     fn linux_runtime_identical_reconfigure_keeps_recorded_handshake() {
