@@ -154,6 +154,21 @@ B-final only if Phase C cannot land the green.
   `per_hop_ttl_decrement=1` — the report, never the aliased ledger column (QH-07; the
   flip-dispositions D1 proved the column is a false-green vehicle on both engines).
   Verifier-recomputed.
+  - **C1 TRIAGE COMPLETE (2026-08-26) — root cause is ENVIRONMENTAL, prove-on-node is
+    substrate-blocked.** Fresh evidence (runs `livelab-1787664882` @ clean `e9cc8ad99` and the
+    2026-08-26 3-node anchor run): 100% bidirectional packet loss macOS↔Linux at the MESH layer
+    because the UNDERLAY is dead — the macOS guest's Apple-Virtualization vmnet
+    (`bridge101`, 192.168.65.0/24) is filter-isolated from the Linux guests' QEMU vmnet
+    (`bridge100`, 192.168.64.0/24); direct probe from the macOS guest to 192.168.64.4 fails at
+    ICMP and TCP (host `net.inet.ip.forwarding=1`, so it is vmnet isolation, not routing —
+    matching `InventoryNetworkGroupPlan_2026-08-13.md` §1's 2026-08-13 measurement).
+    WireGuard handshakes (UDP 51820) cannot cross, so every handshake-dependent macOS
+    validation fails regardless of daemon code. The stale "userspace shared-socket handshake"
+    hypothesis is REFUTED as the cause. Fix requires a lab-network reconfiguration:
+    `prepare_lab_network` toward a shared fabric is operator-gated AND currently refused for
+    the Apple backend ("multi-NIC support is unproven"). **Prepared B-final conversion:
+    owner-signed "deferred G2 attainment — lab-substrate blocker (vmnet isolation); expiry =
+    when a shared guest fabric exists".** Owner sign-off: PENDING
 - **B3.2 `macos_exit` + `macos_stage_exit_handoff` (bash 7/14)** → **C3**. Green criterion:
   ≥1 verifier-recomputed pass of `macos_exit` + `macos_stage_exit_handoff` in the node ledger,
   AND the run report carries the end-to-end **egress assertion** (client packets provably
@@ -180,6 +195,14 @@ B-final only if Phase C cannot land the green.
   **prove-on-node, C5**. Green criterion: a genuine **multi-OS** `--node` run (single-OS runs
   write no column) with `cross_os_peer_visibility=pass`, verifier-recomputed. Direction-diagnosis
   escape: if triage shows the bash green was invalid, this converts to "node supersedes bash".
+  - **C5 TRIAGE COMPLETE (2026-08-26) — same root cause as C1/B3.1: vmnet cross-bridge
+    isolation kills all macOS↔Linux guest dataplane.** The `--node` engine adjudicates it
+    correctly (loud fail-closed: "the node reached no mesh peer, so the block cannot be
+    attributed to policy"). A relevant direction-diagnosis note for the bash 98 "passes": they
+    predate the current network split or ran on topologies whose guests shared one vmnet — the
+    bash green is not evidence the current substrate can pass. **Prepared B-final conversion:
+    owner-signed "deferred G2 attainment — same lab-substrate blocker as B3.1".**
+    Owner sign-off: PENDING
 - **B4.2 `cross_os_anchor_bundle_pull` (bash 31, node never attempted)** — gated on B3 (macOS
   election) + B2 (Windows bootstrap); prove-after-unblock or defer at B-final.
   **Owner sign-off:** PENDING (if deferred) · **Expiry:** G2.
