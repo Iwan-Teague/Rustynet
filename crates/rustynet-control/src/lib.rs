@@ -8608,6 +8608,75 @@ mod tests {
         );
     }
 
+    /// Reduce Rust source to code-shaped text: drop line and block comments,
+    /// keep string delimiters but empty their contents. The enrollment-window
+    /// pins below must judge only real code — an adversarial comment or string
+    /// literal carrying the canonical mint text verbatim satisfied every
+    /// textual pin while the hot path routed through a panicking wrapper
+    /// (found by adversarial re-review of this very test).
+    ///
+    /// Known simplifications, acceptable here because they only ever make the
+    /// scan STRICTER on these windows: raw strings (`r"…"`, `r#"…"#`) and char
+    /// literals are treated as ordinary text.
+    fn strip_non_code(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        let mut in_line_comment = false;
+        let mut in_block_comment = false;
+        let mut in_string = false;
+        let mut escaped = false;
+        while let Some(c) = chars.next() {
+            if in_line_comment {
+                if c == '\n' {
+                    in_line_comment = false;
+                    out.push(c);
+                }
+                continue;
+            }
+            if in_block_comment {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                    out.push(' ');
+                }
+                continue;
+            }
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match c {
+                    '\\' => escaped = true,
+                    '"' => {
+                        in_string = false;
+                        out.push('"');
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '/' if chars.peek() == Some(&'/') => {
+                    chars.next();
+                    in_line_comment = true;
+                    out.push(' ');
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    in_block_comment = true;
+                    out.push(' ');
+                }
+                '"' => {
+                    in_string = true;
+                    out.push('"');
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
     /// Regression: `try_random_nonce_hex` must remain the only path that
     /// enrollment flows reach. The panicking legacy `random_nonce_hex` was
     /// removed; this test fires if a future change reintroduces it.
@@ -8624,19 +8693,69 @@ mod tests {
             let start = body
                 .find(fn_name)
                 .unwrap_or_else(|| panic!("enrollment fn `{fn_name}` missing"));
-            // Take the next ~4000 chars as the window covering the body.
-            let window_end = (start + 4_000).min(body.len());
-            let window = &body[start..window_end];
+            // Bound the window at the NEXT method so a fixed 4000 chars cannot
+            // reach into the sibling enrollment fn and satisfy these pins with
+            // ITS canonical mint line.
+            let after_start = start + 8;
+            let next_plain = body[after_start..]
+                .find("\n    fn ")
+                .map(|at| after_start + at);
+            let next_pub = body[after_start..]
+                .find("\n    pub fn ")
+                .map(|at| after_start + at);
+            let next_fn = match (next_plain, next_pub) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+            .unwrap_or(body.len());
+            let window_end = (next_fn + 1).min(body.len());
+            // Scan the COMMENT- AND STRING-STRIPPED window: a canonical mint
+            // text embedded in a comment, doc comment, string literal, or
+            // nested const must never satisfy these pins.
+            let window = strip_non_code(&body[start..window_end]);
             assert!(
                 window.contains("try_random_nonce_hex("),
                 "enrollment `{fn_name}` must mint nonces via `try_random_nonce_hex`"
             );
-            // Build the panicking-fn name from chunks so this test's own source
-            // does not match the negative grep.
-            let panicking_name = ["random_nonce_", "hex("].concat();
+            // A bare `try_random_nonce_hex(` presence pin is too weak on its
+            // own: a wrapper fn whose body mentions the allowed name (or a
+            // second call on a cold branch) satisfies it while the HOT path
+            // routes elsewhere. Pin the canonical mint expression itself.
+            let canonical = [
+                "nonce: ",
+                "try_random_nonce_hex(16)",
+                ".map_err(|_| ControlPlaneError::Internal)?,",
+            ]
+            .concat();
             assert!(
-                !window.contains(&panicking_name) || window.contains("try_random_nonce_hex("),
-                "enrollment `{fn_name}` must not call the legacy panicking nonce minter"
+                window.contains(canonical.as_str()),
+                "enrollment `{fn_name}` must assign its nonce from the canonical \
+                 fallible mint expression; routing the hot path through any \
+                 other spelling (a wrapped/panicking minter included) is the \
+                 CSPRNG-crash regression"
+            );
+            // The naive negative grep is ALSO vacuous: `random_nonce_hex(` is
+            // a SUBSTRING of the allowed `try_random_nonce_hex(`, so the old
+            // `!contains || contains` disjunction passed whenever the allowed
+            // name appeared anywhere in the window. Check every occurrence's
+            // spelling instead: each must be directly preceded by `try_`.
+            let minter = ["random_nonce_", "hex("].concat();
+            let mut at = 0usize;
+            let mut occurrences = 0usize;
+            while let Some(rel) = window[at..].find(minter.as_str()) {
+                let idx = at + rel;
+                occurrences += 1;
+                assert!(
+                    idx >= 4 && &window[idx - 4..idx] == "try_",
+                    "enrollment `{fn_name}` must reach the nonce minter ONLY as \
+                     try_random_nonce_hex — an occurrence under any other \
+                     receiver/path/import alias is the removed panicking minter"
+                );
+                at = idx + minter.len();
+            }
+            assert!(
+                occurrences > 0,
+                "enrollment `{fn_name}` window must still contain the mint call"
             );
         }
     }

@@ -16715,6 +16715,83 @@ mod tests {
             !source.contains(multiline_discard),
             "daemon must not discard multiline force_fail_closed results"
         );
+        // The two discard greps above only pin `let _ =` spellings. A rename
+        // of the discarding binding (`let _closed = ...`) or any other silent
+        // drop keeps both greps green while reintroducing the discarded
+        // fail-closed result. Pin the census instead: production code may call
+        // the raw `force_fail_closed(` at exactly ONE site — inside
+        // `force_fail_closed_or_restrict` — so every other spelling of a
+        // dropped result fails here.
+        // Bound to production code by anchoring on the unit-test MODULE:
+        // daemon.rs carries several earlier `#[cfg(test)]` helper attrs, so
+        // splitting on the attribute alone would truncate the census to
+        // nothing and silently audit zero callsites.
+        let tests_mod = "\nmod tests {";
+        let prod_end = source.find(tests_mod).unwrap_or(source.len());
+        let prod = &source[..prod_end];
+        let direct_call = ["force_fail_", "closed("].concat();
+        let direct = prod.matches(direct_call.as_str()).count();
+        assert_eq!(
+            direct, 1,
+            "force_fail_closed must be called directly at exactly one production \
+             site (inside force_fail_closed_or_restrict); found {direct} — an \
+             extra callsite drops its Result and silently undoes RN-03"
+        );
+        let wrapper_start = prod
+            .find("fn force_fail_closed_or_restrict")
+            .expect("force_fail_closed_or_restrict must exist");
+        let wrapper_body_end = prod[wrapper_start..]
+            .find("\n    fn ")
+            .map(|at| wrapper_start + at)
+            .unwrap_or(prod.len());
+        let call_at = prod
+            .find(direct_call.as_str())
+            .expect("count 1 implies a match exists");
+        assert!(
+            call_at > wrapper_start && call_at < wrapper_body_end,
+            "the single raw force_fail_closed call must sit inside \
+             force_fail_closed_or_restrict so its Result is surfaced via \
+             restrict_permanent (RN-03), never discarded"
+        );
+        // The paren census above is blind to PAREN-LESS references to the
+        // method path: a fn-item binding
+        // (`let raw = Phase10Controller::<..>::force_fail_closed;`) or passing
+        // the method as a value to a discarding helper reintroduces the silent
+        // Result drop while the count stays at exactly one (proven by
+        // mutation). Every non-comment production line that names the method
+        // must therefore either CALL it (`force_fail_closed(` — the one census
+        // site), be the wrapper name itself
+        // (`force_fail_closed_or_restrict`), or sit INSIDE the wrapper body
+        // (its restriction message quotes the name in a string literal).
+        // Positional exemption, not a string-literal exemption: a same-line
+        // string mention would otherwise whitewash a bare path reference
+        // sharing that line (`let raw = P::<..>::force_fail_closed;
+        // eprintln!("force_fail_closed");` — proven green-by-mutation before
+        // this pin). Anything else is an indirection that can drop the
+        // fail-closed Result outside this pin's sight.
+        let call_needle = ["force_fail_", "closed("].concat();
+        let mut offset = 0usize;
+        for (index, line) in prod.lines().enumerate() {
+            let line_start = offset;
+            offset += line.len() + 1;
+            if !line.contains("force_fail_closed") {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            assert!(
+                (line_start >= wrapper_start && line_start < wrapper_body_end)
+                    || line.contains(call_needle.as_str())
+                    || line.contains("force_fail_closed_or_restrict"),
+                "line {} references force_fail_closed without calling it under a \
+                 pinned spelling (fn-item binding / value-passed indirection / \
+                 same-line string-literal dodge); such a reference can drop the \
+                 fail-closed Result invisibly: {line}",
+                index + 1
+            );
+        }
     }
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -17887,6 +17964,73 @@ mod tests {
             source.contains("ipc_command_read_failed"),
             "IPC read failures must be logged and the connection dropped"
         );
+        // The negative grep above pins ONE historical spelling of the fatality
+        // (`.map_err(DaemonError::Io)?`). A refactor that renames the stream
+        // binding, wraps the error in a closure, or `return`s from the Err arm
+        // reintroduces the whole-daemon kill while that grep stays green. Pin
+        // the accept-loop block's disposition directly: the window around the
+        // per-connection read must keep log-and-continue and must not gain any
+        // early-return or map_err propagation.
+        let read_at = source
+            .find("read_command_envelope(&stream)")
+            .expect("the admin-IPC accept loop must read via read_command_envelope(&stream)");
+        let window_end = source[read_at..]
+            .find("CommandEnvelope::Local(parsed)")
+            .map(|at| read_at + at)
+            .expect("the read must feed the local-command dispatch");
+        let accept_window = &source[read_at..window_end];
+        assert!(
+            accept_window.contains("continue"),
+            "the accept loop's IPC-read Err arm must drop the connection and \
+             continue, never unwind"
+        );
+        assert!(
+            !accept_window.contains("return")
+                && !accept_window.contains(".map_err(")
+                && !accept_window.contains("?;"),
+            "a per-connection IPC read failure must not propagate out of the \
+             accept loop under ANY spelling — one bad client must not kill \
+             the daemon (log-and-continue only)"
+        );
+        // The propagation bans above miss ESCALATION spellings that leave the
+        // window's text clean: a second Err arm can keep log-and-continue for
+        // one error class and terminate the whole daemon for every other
+        // client via std::process::exit — no `return`, no `.map_err(`, no
+        // `?;`, and the retained `continue` still satisfies the shape rule
+        // (proven by mutation). Ban the remaining kill spellings inside the
+        // same window, matching against a WHITESPACE-STRIPPED copy so spaced
+        // token spellings (`std :: process :: exit (70)`) cannot slide past a
+        // contiguous needle (stripping only ADDS matches; every whitespace-free
+        // needle survives verbatim), and covering the alias/FFI/macro-family
+        // escapes proven green-by-mutation against the raw-needle set:
+        // `use std::process::exit; exit(70)`, `libc::exit(70)`,
+        // `use std::process::abort; abort()`, `unreachable!` / `todo!` /
+        // `unimplemented!`. Hard exits, aborts, panics, the unwrap/expect
+        // family, and any break that abandons the accept loop are all banned.
+        let compact_window: String = accept_window
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for banned in [
+            "process::exit",
+            "::abort(",
+            "exit(",
+            "abort(",
+            "panic!",
+            "unreachable!",
+            "todo!",
+            "unimplemented!",
+            ".expect(",
+            ".unwrap(",
+            "break",
+        ] {
+            assert!(
+                !compact_window.contains(banned),
+                "the IPC-read failure window must stay log-and-continue; \
+                 {banned} inside it lets one local client kill or wedge the \
+                 whole daemon under a spelling the propagation greps cannot see"
+            );
+        }
     }
 
     #[test]
@@ -20666,6 +20810,19 @@ mod tests {
                 source_path.display(),
             );
         }
+        // The source greps above only pin callsite spellings across both
+        // modules; they cannot see the constant's value. Pin it directly so
+        // redefining `DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH` to a bare or
+        // relative name — which would reintroduce Win32 PATH resolution
+        // through every pinned callsite while keeping these greps green —
+        // fails here.
+        assert_eq!(
+            crate::phase10::DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH must stay the absolute \
+             System32 path; a bare or relative name reintroduces CreateProcess \
+             PATH resolution with the daemon's token",
+        );
     }
 
     /// Regression: the IPC mutation-authorization path must not silently
