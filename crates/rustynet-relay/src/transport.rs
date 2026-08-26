@@ -3039,9 +3039,14 @@ mod tests {
             }
             let mentions_clock = line.contains("now_unix") || line.contains("now_unix_checked");
             assert!(
-                !(mentions_clock && line.contains(unwrap_needle.as_str())),
+                !(mentions_clock
+                    && (line.contains(unwrap_needle.as_str())
+                        || line.contains(".or(")
+                        || line.contains("map_or(")
+                        || line.contains("= match"))),
                 "line {} substitutes a default for an unavailable clock; every consumer must \
-                 dispose of `None` in its own fail-closed direction: {line}",
+                 dispose of `None` in its own fail-closed direction (unwrap_or/map_or/.or/match \
+                 spellings included): {line}",
                 index + 1
             );
         }
@@ -3119,7 +3124,18 @@ mod tests {
             .expect("now_unix_checked must have a closing brace");
         let helper = &production[helper_start..=helper_body_end];
         let unwrap_needle = format!("unwrap_{}", "or");
-        for banned in [unwrap_needle.as_str(), ".expect(", ".unwrap("] {
+        // `.map_err(|_| 0)` and `.ok().or(Some(0))` keep the sanctioned `.ok()`
+        // spelling while substituting a value on the Err/None arm (both proven
+        // green by mutation before these tokens were added), so the ban covers
+        // the whole substitute-on-failure family, not just the unwrap spellings.
+        for banned in [
+            unwrap_needle.as_str(),
+            ".expect(",
+            ".unwrap(",
+            ".map_err(",
+            ".or(",
+            "map_or(",
+        ] {
             assert!(
                 !helper.contains(banned),
                 "now_unix_checked must not substitute or panic on an unavailable \
