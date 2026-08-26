@@ -68,14 +68,21 @@ echo "Checking all ed25519 signature verification uses verify_strict (RN-22)..."
 # the single-line pattern above while carrying a live malleable-verifier call;
 # both were confirmed against this gate by adversarial review). The EOL arm
 # catches the line-split form; rustfmt would collapse it, but this gate must
-# stand alone when invoked directly.
+# stand alone when invoked directly. The companion patterns cannot match a
+# strict spelling (`verify_strict` puts `_` where the arms require optional
+# whitespace then `(` or end-of-line), so NO verify_strict line filter is
+# applied here: a line-level `-v verify_strict` would silence a live spaced
+# call whenever an unrelated comment on the same line merely MENTIONS
+# verify_strict — a filter divergence proven by adversarial review.
+# Known residual spellings (documented, rustfmt-normalized, deliberate
+# evasion only): turbofish `.verify::<T>(`; block-comment token splice
+# `./*c*/verify/*c*/(sig)`; EOL-comment splice `. // c\nverify\n(sig)`.
 g3_hits="$(
   {
     grep -rn '\.verify(' crates --include='*.rs' \
       | sed -E 's/\.verify_strict\(/./g' \
       | grep '\.verify(' || true
-    grep -rnE '\.[[:space:]]+verify[[:space:]]*\(|\.[[:space:]]*verify[[:space:]]*$' crates --include='*.rs' \
-      | grep -v 'verify_strict' || true
+    grep -rnE '\.[[:space:]]+verify[[:space:]]*\(|\.[[:space:]]*verify[[:space:]]*$' crates --include='*.rs' || true
   } | grep -vE ':[0-9]+:[[:space:]]*(//|///|\*)' || true
 )"
 if [ -n "$g3_hits" ]; then

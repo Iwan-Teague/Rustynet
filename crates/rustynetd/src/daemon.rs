@@ -16761,12 +16761,19 @@ mod tests {
         // mutation). Every non-comment production line that names the method
         // must therefore either CALL it (`force_fail_closed(` — the one census
         // site), be the wrapper name itself
-        // (`force_fail_closed_or_restrict`), or mention it inside a string
-        // literal (the restriction message). Anything else is an indirection
-        // that can drop the fail-closed Result outside this pin's sight.
+        // (`force_fail_closed_or_restrict`), or sit INSIDE the wrapper body
+        // (its restriction message quotes the name in a string literal).
+        // Positional exemption, not a string-literal exemption: a same-line
+        // string mention would otherwise whitewash a bare path reference
+        // sharing that line (`let raw = P::<..>::force_fail_closed;
+        // eprintln!("force_fail_closed");` — proven green-by-mutation before
+        // this pin). Anything else is an indirection that can drop the
+        // fail-closed Result outside this pin's sight.
         let call_needle = ["force_fail_", "closed("].concat();
-        let string_needle = ["\"", "force_fail_closed"].concat();
+        let mut offset = 0usize;
         for (index, line) in prod.lines().enumerate() {
+            let line_start = offset;
+            offset += line.len() + 1;
             if !line.contains("force_fail_closed") {
                 continue;
             }
@@ -16775,12 +16782,13 @@ mod tests {
                 continue;
             }
             assert!(
-                line.contains(call_needle.as_str())
-                    || line.contains("force_fail_closed_or_restrict")
-                    || line.contains(string_needle.as_str()),
+                (line_start >= wrapper_start && line_start < wrapper_body_end)
+                    || line.contains(call_needle.as_str())
+                    || line.contains("force_fail_closed_or_restrict"),
                 "line {} references force_fail_closed without calling it under a \
-                 pinned spelling (fn-item binding / value-passed indirection); \
-                 such a reference can drop the fail-closed Result invisibly: {line}",
+                 pinned spelling (fn-item binding / value-passed indirection / \
+                 same-line string-literal dodge); such a reference can drop the \
+                 fail-closed Result invisibly: {line}",
                 index + 1
             );
         }
@@ -17990,18 +17998,34 @@ mod tests {
         // client via std::process::exit — no `return`, no `.map_err(`, no
         // `?;`, and the retained `continue` still satisfies the shape rule
         // (proven by mutation). Ban the remaining kill spellings inside the
-        // same window: hard exits, aborts, panics, the unwrap/expect family,
-        // and any break that abandons the accept loop.
+        // same window, matching against a WHITESPACE-STRIPPED copy so spaced
+        // token spellings (`std :: process :: exit (70)`) cannot slide past a
+        // contiguous needle (stripping only ADDS matches; every whitespace-free
+        // needle survives verbatim), and covering the alias/FFI/macro-family
+        // escapes proven green-by-mutation against the raw-needle set:
+        // `use std::process::exit; exit(70)`, `libc::exit(70)`,
+        // `use std::process::abort; abort()`, `unreachable!` / `todo!` /
+        // `unimplemented!`. Hard exits, aborts, panics, the unwrap/expect
+        // family, and any break that abandons the accept loop are all banned.
+        let compact_window: String = accept_window
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         for banned in [
             "process::exit",
             "::abort(",
+            "exit(",
+            "abort(",
             "panic!",
+            "unreachable!",
+            "todo!",
+            "unimplemented!",
             ".expect(",
             ".unwrap(",
             "break",
         ] {
             assert!(
-                !accept_window.contains(banned),
+                !compact_window.contains(banned),
                 "the IPC-read failure window must stay log-and-continue; \
                  {banned} inside it lets one local client kill or wedge the \
                  whole daemon under a spelling the propagation greps cannot see"
