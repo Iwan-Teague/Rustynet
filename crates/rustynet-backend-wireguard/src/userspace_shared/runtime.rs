@@ -1470,6 +1470,14 @@ mod tests {
         // firewalled egress. The tick must ride it out.
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
         let (mut state, _tun_state, _private_key) = test_runtime_state("rn-test-flap");
+        // Loopback-bound: a broadcast send from a wildcard-bound socket is not
+        // refused on macOS, and this module's tests also run on the macOS CI
+        // leg. From loopback, 255.255.255.255 without SO_BROADCAST is refused
+        // with EACCES on both OSes, so the refusal is deterministic.
+        state.authoritative_socket = AuthoritativeSocket::from_bound_socket(
+            UdpSocket::bind("127.0.0.1:0").expect("loopback bind"),
+        )
+        .expect("adopt loopback socket");
         let node_id = NodeId::new("peer-firewalled").expect("valid node id");
         state
             .configure_peer(PeerConfig {
@@ -1483,6 +1491,28 @@ mod tests {
                 persistent_keepalive_secs: Some(1),
             })
             .expect("configure should succeed even when egress is refused");
+
+        // Queue plaintext routed to that peer: encapsulation has no session,
+        // so the engine emits a handshake initiation through the sink — a real
+        // refused send on the exact seam that killed the worker.
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45; // IPv4, IHL 5
+        packet[3] = 20; // total length
+        packet[8] = 64; // TTL
+        packet[9] = 17; // UDP
+        packet[12..16].copy_from_slice(&[100, 64, 0, 2]); // src: local
+        packet[16..20].copy_from_slice(&[100, 64, 0, 22]); // dst: the peer
+        state
+            .queue_tun_plaintext_packet_for_test(packet)
+            .expect("test packet should queue");
+        state
+            .poll_tun_device()
+            .expect("a refused handshake-initiation send must not kill the tun poll");
+        assert!(
+            !state.recorded_peer_ciphertext_egress.is_empty(),
+            "the queued plaintext must have provoked an egress send attempt — \
+             without one this test proves nothing"
+        );
 
         // Drive several timer ticks past the pacing interval so handshake
         // initiations / keepalives are actually attempted (and refused).
