@@ -1011,6 +1011,75 @@ echo "STOP-RESULT: stopped"
 "#,
 );
 
+/// Answer "is a live-lab run in flight on this host?" without a process-table scan.
+///
+/// **Why this is not `pgrep -f 'vm-lab-orchestrate-live-lab'` (QH-18 class).** The
+/// status path drives its probe over SSH, and sshd hands the command to the login
+/// shell — so whatever we send arrives as the argument of a remote `bash -c`, and
+/// its whole text sits in that shell's argv. A `pgrep -f` for the orchestrator
+/// subcommand therefore matched the parent shell that was carrying the pattern,
+/// and an idle host reported a run in flight. It is the same defect, and the same
+/// unfixable shape, as the launch-side gate and the stop-side fallback: no pattern
+/// can be made correct while the probe must contain the string it searches for.
+///
+/// What replaces it is a better handle, not a better pattern. The launch script
+/// keeps `state/host-lab-runs/*.pid` under an argv liveness check, so a genuinely
+/// running orchestrator always leaves a trustworthy recorded pid. Reading only
+/// those removes pattern matching from the status path entirely: the marker string
+/// is still used, but only via `ps -p <pid>` against one specific recorded pid,
+/// never as a scan over every command line on the box.
+///
+/// Each recorded pid clears two guards before it is reported live:
+///
+/// 1. **Ancestor exclusion.** The pid must not be this shell or any of its
+///    ancestors. Structural, and it holds even against a corrupted or forged
+///    pidfile — the ssh/bash process carrying this probe's text can never be
+///    reported as a run.
+/// 2. **Pid-recycling guard.** Pidfiles are retired at the next launch, not on
+///    natural completion, so a stale handle can name a pid the OS has since
+///    recycled to an unrelated process. A pid counts only if its own argv still
+///    contains the orchestrator marker. `-ww` disables ps's COLUMNS truncation,
+///    which would otherwise sever the marker and report a live run as absent.
+///
+/// Read-only: it inspects pidfiles and `ps`, and mutates nothing. A stale handle is
+/// left alone here — retiring it belongs to the launch and stop paths, and a status
+/// command that silently deleted the stop path's handle would be worse than a
+/// slightly untidy directory.
+///
+/// Output is one `RUN-IN-FLIGHT: <pid> <argv>` line per live recorded pid, and
+/// nothing at all when the host is idle.
+const HOST_RUN_STATUS_SCRIPT: ScriptTemplate = ScriptTemplate(
+    r#"#!/bin/bash
+set -uo pipefail
+REPO_DIR=__REPO_DIR__
+cd "$REPO_DIR" 2>/dev/null || true
+
+# Ancestor chain of this shell (self first). Nothing in it may ever be reported as
+# a run: this probe is driven inline over ssh, so an ancestor's argv contains this
+# text — including the orchestrator marker below. Bounded so a bogus ppid cannot
+# loop forever.
+ancestors=" "
+anc="$$"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+  case "$anc" in ''|0|1) break ;; esac
+  ancestors="$ancestors$anc "
+  anc="$(ps -o ppid= -p "$anc" 2>/dev/null | tr -d '[:space:]')"
+done
+
+# The recorded handles are the ONLY source of candidate pids. There is deliberately
+# no whole-process-table argv pattern scan anywhere in this script.
+for f in state/host-lab-runs/*.pid; do
+  [ -f "$f" ] || continue
+  p="$(cat "$f" 2>/dev/null | tr -d '[:space:]' || true)"
+  [ -n "$p" ] || continue
+  case "$p" in *[!0-9]*) continue ;; esac
+  case "$ancestors" in *" $p "*) continue ;; esac
+  args="$(ps -ww -o args= -p "$p" 2>/dev/null || true)"
+  case "$args" in *vm-lab-orchestrate-live-lab*) echo "RUN-IN-FLIGHT: $p $args" ;; esac
+done
+"#,
+);
+
 /// Create a libvirt guest on a host: qemu-img overlay + cloud-init seed +
 /// virt-install --import. Runs entirely unprivileged — the pool is group-writable
 /// to `kvm` and the host user is in `libvirt` (see the pool remediation in the
@@ -1503,6 +1572,14 @@ pub(crate) fn render_host_fetch_artifact_script(
 pub(crate) fn render_host_stop_script(repo_dir: &str) -> Result<String, String> {
     render_script_template(
         HOST_STOP_SCRIPT,
+        &[("__REPO_DIR__", Binding::Literal(repo_dir))],
+    )
+}
+
+/// Render the read-only "is a run in flight?" probe. See [`HOST_RUN_STATUS_SCRIPT`].
+pub(crate) fn render_host_run_status_script(repo_dir: &str) -> Result<String, String> {
+    render_script_template(
+        HOST_RUN_STATUS_SCRIPT,
         &[("__REPO_DIR__", Binding::Literal(repo_dir))],
     )
 }

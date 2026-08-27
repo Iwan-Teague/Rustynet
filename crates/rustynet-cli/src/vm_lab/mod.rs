@@ -3736,16 +3736,37 @@ pub fn execute_ops_vm_lab_host_run_status(
     };
 
     // --- is a run in flight? -------------------------------------------------
-    // `pgrep -f` exits 1 when nothing matches, which is a legitimate answer, not
-    // an error — so a non-zero exit here must not be mistaken for "cannot tell".
+    // NOT `pgrep -f 'vm-lab-orchestrate-live-lab'`, which is what this used to be.
+    // sshd hands the command to the login shell, so the probe arrives as the
+    // argument of a remote `bash -c` and its text sits in that shell's argv — and
+    // the text necessarily contains the subcommand string the pattern searched
+    // for. The scan matched its own parent shell and an IDLE host reported a run
+    // in flight, which is the same unfixable shape as the launch-side gate
+    // (QH-18) and the stop-side fallback.
+    //
+    // The probe reads the recorded pidfiles instead and verifies each one by argv
+    // with `ps -p <pid>` — one named pid, never a scan — after excluding this
+    // shell and its ancestors. See `HOST_RUN_STATUS_SCRIPT`.
+    //
+    // A failed probe yields None: an idle host produces no output and a missing
+    // handle directory is not an error, so "cannot tell" and "nothing running"
+    // are reported the same way here, exactly as before.
+    let probe = script_template::render_host_run_status_script(repo_dir.as_str())?;
     let running = match run_host_cmd(
         endpoint.as_str(),
-        &["pgrep", "-af", "vm-lab-orchestrate-live-lab"],
+        &["bash", "-c", probe.as_str()],
         &ssh,
         timeout,
     ) {
-        Ok(out) if !out.trim().is_empty() => Some(out.trim().to_owned()),
-        _ => None,
+        Ok(out) => {
+            let live = out
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("RUN-IN-FLIGHT: "))
+                .collect::<Vec<_>>()
+                .join("; ");
+            (!live.is_empty()).then_some(live)
+        }
+        Err(_) => None,
     };
 
     // --- read the host's own stage ledger ------------------------------------
@@ -51092,6 +51113,181 @@ mod launch_on_host_tests {
             !script.contains("; touch /tmp/pwned; '\n"),
             "the payload must not reach the shell as syntax"
         );
+    }
+}
+
+#[cfg(test)]
+mod host_run_status_probe_tests {
+    use super::script_template;
+
+    const MARKER: &str = "vm-lab-orchestrate-live-lab";
+
+    fn render(repo_dir: &str) -> String {
+        // Through the production renderer, never a local substitution, or a
+        // regression in the render chain would leave these green (QH-02).
+        script_template::render_host_run_status_script(repo_dir)
+            .expect("a benign repo_dir must render")
+    }
+
+    /// The status path used to ask `pgrep -af 'vm-lab-orchestrate-live-lab'`. Its
+    /// probe is driven over SSH, sshd hands the command to the login shell, and the
+    /// probe text necessarily contains the subcommand string the pattern searched
+    /// for — so the scan matched its own parent shell and an idle host reported a
+    /// run in flight. Same shape as the launch-side gate (QH-18) and the stop-side
+    /// fallback, and equally unfixable by rewriting the pattern. The rendered probe
+    /// must therefore contain no whole-process-table match at all.
+    #[test]
+    fn the_run_status_probe_contains_no_self_matching_process_scan() {
+        let script = render("/srv/rustynet");
+        assert!(
+            !script.contains("pgrep"),
+            "no pgrep in the status path — its pattern would match this probe's own \
+             launcher argv; script was:\n{script}"
+        );
+        // Every use of the marker must be a test of ONE named pid's argv, captured
+        // by `ps ... -p "$p"`, never a scan across processes.
+        assert!(
+            script.contains(r#"args="$(ps -ww -o args= -p "$p" 2>/dev/null || true)""#),
+            "the probe must read argv for one named recorded pid"
+        );
+        for line in script.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            if line.contains(MARKER) {
+                assert!(
+                    line.contains(r#"case "$args" in"#),
+                    "the marker may only be matched against one named pid's captured \
+                     argv; offending line: {line}"
+                );
+            }
+        }
+    }
+
+    /// The structural half, which holds even against a corrupted or forged pidfile:
+    /// this shell and every ancestor of it can never be reported as a live run.
+    #[test]
+    fn the_run_status_probe_never_reports_itself_or_an_ancestor() {
+        let script = render("/srv/rustynet");
+        assert!(
+            script.contains(r#"anc="$(ps -o ppid= -p "$anc""#),
+            "the probe must walk its own ancestor chain"
+        );
+        assert!(
+            script.contains(r#"case "$ancestors" in *" $p "*) continue ;; esac"#),
+            "a recorded pid that is this shell or an ancestor must be skipped"
+        );
+    }
+
+    /// Read-only. A status command that retired handle files would strip the stop
+    /// path of the pid it needs to signal.
+    #[test]
+    fn the_run_status_probe_mutates_nothing() {
+        let script = render("/srv/rustynet");
+        for forbidden in ["rm ", "kill ", "> ", "mkdir", "touch"] {
+            assert!(
+                !script.contains(forbidden),
+                "the status probe must not mutate host state ({forbidden:?}): {script}"
+            );
+        }
+    }
+
+    /// Behavioural proof, run the way the production path runs it.
+    ///
+    /// `execute_ops_vm_lab_host_run_status` sends this probe over SSH, where sshd
+    /// hands it to the login shell — so the launcher's argv carries the whole probe
+    /// text, marker included. `bash -c <script>` reproduces that exactly, and it is
+    /// what made the old `pgrep -af` report a run on an idle host.
+    ///
+    /// Three cases in one run, because they share the fixture: an idle host with no
+    /// handles at all; a handle naming a LIVE but unrelated process (a recycled pid);
+    /// and a handle naming a live process whose argv really does carry the marker.
+    #[cfg(unix)]
+    #[test]
+    fn the_run_status_probe_reports_only_a_genuinely_recorded_live_run() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-run-status-probe-{}",
+            super::unique_suffix()
+        ));
+        let handles = dir.join("state/host-lab-runs");
+        std::fs::create_dir_all(handles.as_path()).expect("temp run-handle dir");
+        let script = render(dir.to_str().expect("temp dir path must be utf-8"));
+
+        let run = |script: &str| -> String {
+            let out = Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("run the rendered probe");
+            assert!(
+                out.status.success(),
+                "probe exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // (a) Idle host. The launcher's argv contains the marker; a scan would
+        // match it. Nothing may be reported.
+        assert_eq!(
+            run(script.as_str()).trim(),
+            "",
+            "an idle host must report no run, even though this probe's own launcher \
+             argv contains the marker"
+        );
+
+        // (b) A recorded pid recycled onto an unrelated live process, plus a
+        // malformed handle. Neither may be reported.
+        let mut bystander = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn the bystander");
+        std::fs::write(
+            handles.join("recycled.pid"),
+            format!("{}\n", bystander.id()).as_bytes(),
+        )
+        .expect("write the recycled pidfile");
+        std::fs::write(handles.join("garbage.pid"), b"not-a-pid\n").expect("write garbage pidfile");
+        assert_eq!(
+            run(script.as_str()).trim(),
+            "",
+            "a recycled or malformed recorded pid must not be reported as a run"
+        );
+
+        // (c) A live process whose OWN argv carries the marker, recorded in a
+        // pidfile — the only thing that counts as a run in flight.
+        let mut orchestrator = Command::new("bash")
+            .arg("-c")
+            .arg(format!(": {MARKER}; sleep 30; :"))
+            .spawn()
+            .expect("spawn the stand-in orchestrator");
+        let orchestrator_pid = orchestrator.id();
+        std::fs::write(
+            handles.join("live.pid"),
+            format!("{orchestrator_pid}\n").as_bytes(),
+        )
+        .expect("write the live pidfile");
+        let reported = run(script.as_str());
+        assert!(
+            reported
+                .lines()
+                .any(|line| line.starts_with(&format!("RUN-IN-FLIGHT: {orchestrator_pid} "))),
+            "a recorded pid still running the orchestrator must be reported: {reported}"
+        );
+        assert_eq!(
+            reported.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "only the live recorded pid may be reported: {reported}"
+        );
+
+        let _ = orchestrator.kill();
+        let _ = orchestrator.wait();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
