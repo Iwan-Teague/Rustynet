@@ -47,6 +47,7 @@ use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
 use rustynetd::port_mapper::PortMappingMode;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
+use rustynetd::shutdown_residue::SHUTDOWN_RESIDUE_FAIL_CLOSED_TOKEN;
 use rustynetd::windows_authenticode::inspect_authenticode_signature;
 use rustynetd::windows_backend_gate::{
     WINDOWS_UNSUPPORTED_BACKEND_LABEL, WINDOWS_WIREGUARD_NT_BACKEND_LABEL,
@@ -88,10 +89,19 @@ fn main() {
         // this to a direct enum match.
         let code = classify_top_level_error(&err);
         let hint = code.operator_hint();
-        if hint.is_empty() {
-            eprintln!("rustynetd startup failed: {err}");
+        // QH-40 — a failed shutdown rollback is the one error that is NOT a
+        // startup failure. Printing "startup failed" for it sent operators to
+        // the wrong half of the lifecycle, so pick the banner off the pinned
+        // fail-closed token the daemon embeds in the message.
+        let banner = if err.contains(SHUTDOWN_RESIDUE_FAIL_CLOSED_TOKEN) {
+            "rustynetd shutdown left dataplane residue"
         } else {
-            eprintln!("rustynetd startup failed [{code}]: {err}\n  hint: {hint}");
+            "rustynetd startup failed"
+        };
+        if hint.is_empty() {
+            eprintln!("{banner}: {err}");
+        } else {
+            eprintln!("{banner} [{code}]: {err}\n  hint: {hint}");
         }
         std::process::exit(code.as_i32());
     }
@@ -127,6 +137,74 @@ fn classify_top_level_error(message: &str) -> rustynetd::exit_codes::ExitCode {
         ExitCode::TransientFailure
     } else {
         ExitCode::GenericFailure
+    }
+}
+
+/// QH-40 — `rustynetd shutdown-residue-check --state <path> [--acknowledge]`.
+///
+/// Read-only by default and unprivileged: it inspects the durable marker the
+/// daemon writes when a shutdown rollback fails, so the live-lab evidence
+/// pipeline can observe residue over the SSH probe surface it already has,
+/// instead of depending on a launchd exit code nothing reads.
+///
+/// Exit contract:
+/// * clean  -> 0
+/// * residue-> `ExitCode::PolicyReject` (78), because the message carries
+///   `SHUTDOWN_RESIDUE_FAIL_CLOSED_TOKEN`
+///
+/// `--acknowledge` is the ONLY way a marker is ever removed. It is a deliberate
+/// operator act performed after the residue has actually been cleaned up; the
+/// daemon never clears the marker on its own start.
+fn run_shutdown_residue_check_command(args: &[String]) -> Result<(), String> {
+    let mut state: Option<PathBuf> = None;
+    let mut acknowledge = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--state") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing required value for --state".to_owned())?;
+                state = Some(PathBuf::from(value));
+                index += 2;
+            }
+            Some("--acknowledge") => {
+                acknowledge = true;
+                index += 1;
+            }
+            Some(other) => {
+                return Err(format!(
+                    "rustynetd usage: shutdown-residue-check --state <path> [--acknowledge] (unknown argument {other})"
+                ));
+            }
+            None => break,
+        }
+    }
+    let state = state.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_PATH));
+
+    if acknowledge {
+        let scan = rustynetd::shutdown_residue::scan(&state);
+        let summary = scan
+            .fail_closed_message()
+            .unwrap_or_else(|| "no residue marker present".to_owned());
+        let removed = rustynetd::shutdown_residue::acknowledge_marker(&state)?;
+        println!(
+            "shutdown-residue-check: acknowledged={removed} marker={} previous={summary}",
+            rustynetd::shutdown_residue::marker_path(&state).display()
+        );
+        return Ok(());
+    }
+
+    match rustynetd::shutdown_residue::scan(&state).fail_closed_message() {
+        // Returned as an Err so `main` exits PolicyReject (78) rather than 0.
+        Some(message) => Err(message),
+        None => {
+            println!(
+                "shutdown-residue-check: clean (no marker at {})",
+                rustynetd::shutdown_residue::marker_path(&state).display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -234,6 +312,9 @@ fn run() -> Result<(), String> {
                 run_anchor_bundle_pull_bind_check_command(rest)
             }
             [cmd, rest @ ..] if cmd == "privileged-helper" => run_privileged_helper_command(rest),
+            [cmd, rest @ ..] if cmd == "shutdown-residue-check" => {
+                run_shutdown_residue_check_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "privileged-helper-allowlist-audit" => {
                 run_privileged_helper_allowlist_audit_command(rest)
             }
@@ -4612,6 +4693,7 @@ fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::run_shutdown_residue_check_command;
     use super::{
         classify_top_level_error, help_text, parse_daemon_config,
         run_blind_exit_reversal_audit_command, run_enrollment_replay_audit_command,
@@ -4628,6 +4710,103 @@ mod tests {
         run_windows_named_pipe_acls_check_command, run_windows_registry_acls_check_command,
         run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
     };
+
+    // ── QH-40: `shutdown-residue-check` exit contract ────────────────────────
+
+    fn residue_state_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    /// A clean host exits 0.
+    ///
+    /// Mutation: returning Err unconditionally makes this fail.
+    #[test]
+    fn shutdown_residue_check_reports_clean_when_no_marker_exists() {
+        let dir = residue_state_dir();
+        let state = dir.path().join("rustynetd.state");
+        let args = vec!["--state".to_owned(), state.to_string_lossy().into_owned()];
+        assert!(run_shutdown_residue_check_command(&args).is_ok());
+    }
+
+    /// NEGATIVE TEST — residue present must surface as an Err whose message
+    /// classifies as PolicyReject (78), never as a silent success.
+    ///
+    /// Mutation: printing the marker and returning Ok makes this fail.
+    #[test]
+    fn shutdown_residue_check_fails_closed_when_a_marker_exists() {
+        use rustynetd::shutdown_residue::{
+            SHUTDOWN_RESIDUE_FAIL_CLOSED_TOKEN, ShutdownResidueMarker,
+            TRIGGER_UNIX_SHUTDOWN_SIGNAL, record_marker,
+        };
+        let dir = residue_state_dir();
+        let state = dir.path().join("rustynetd.state");
+        record_marker(
+            &state,
+            &ShutdownResidueMarker::new(
+                1_756_000_000,
+                "node-a",
+                TRIGGER_UNIX_SHUTDOWN_SIGNAL,
+                "rollback failed: exit-mode rollback failed",
+            ),
+        )
+        .expect("record");
+
+        let args = vec!["--state".to_owned(), state.to_string_lossy().into_owned()];
+        let err =
+            run_shutdown_residue_check_command(&args).expect_err("residue must not report success");
+        assert!(err.contains(SHUTDOWN_RESIDUE_FAIL_CLOSED_TOKEN), "{err}");
+        assert_eq!(
+            super::classify_top_level_error(&err),
+            rustynetd::exit_codes::ExitCode::PolicyReject,
+            "residue must map to the no-retry exit bucket, got {err}"
+        );
+    }
+
+    /// The marker is removed only by the explicit acknowledgement, and the
+    /// check reports clean afterwards.
+    #[test]
+    fn shutdown_residue_check_acknowledge_clears_the_marker() {
+        use rustynetd::shutdown_residue::{
+            ShutdownResidueMarker, TRIGGER_UNIX_SHUTDOWN_SIGNAL, record_marker,
+        };
+        let dir = residue_state_dir();
+        let state = dir.path().join("rustynetd.state");
+        record_marker(
+            &state,
+            &ShutdownResidueMarker::new(
+                1_756_000_000,
+                "node-a",
+                TRIGGER_UNIX_SHUTDOWN_SIGNAL,
+                "rollback failed",
+            ),
+        )
+        .expect("record");
+        let state_arg = state.to_string_lossy().into_owned();
+        let ack = vec![
+            "--state".to_owned(),
+            state_arg.clone(),
+            "--acknowledge".to_owned(),
+        ];
+        run_shutdown_residue_check_command(&ack).expect("acknowledge");
+        let check = vec!["--state".to_owned(), state_arg];
+        assert!(
+            run_shutdown_residue_check_command(&check).is_ok(),
+            "an acknowledged host must read clean"
+        );
+    }
+
+    /// An unknown flag is a usage error, not a silent clean verdict.
+    #[test]
+    fn shutdown_residue_check_rejects_unknown_arguments_as_bad_args() {
+        let err = run_shutdown_residue_check_command(&["--bogus".to_owned()])
+            .expect_err("unknown argument must be rejected");
+        assert_eq!(
+            super::classify_top_level_error(&err),
+            rustynetd::exit_codes::ExitCode::BadArgs,
+            "{err}"
+        );
+    }
+
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
         DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_DNS_ZONE_NAME, DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH,
