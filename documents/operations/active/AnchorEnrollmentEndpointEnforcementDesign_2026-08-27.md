@@ -2,6 +2,7 @@
 
 - Date: 2026-08-27
 - Status: active — design + first enforcement point landed on `work/d3-anchor-enrollment`; the LAN listener half is an owner decision (§7) and is NOT implemented here.
+  - **Correction 2026-08-27 (`work/enrollment-listener`):** the owner sanctioned the listener build as a phase-1 change; §7 item 1 has landed there (pending the independent adversarial review pass the bundle-pull precedent requires before LAN exposure is used in anger). See the dated notes in §7.
 - Owner: Rustynet
 - Parent doc: [`AnchorNodeRoleDesign_2026-05-21.md`](./AnchorNodeRoleDesign_2026-05-21.md) §4 (`anchor.enrollment_endpoint`), §5.2, §8.
 - Precedent followed: [`AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./AnchorBundlePullAttestationSecurityReview_2026-07-20.md) and the bundle-pull enforcement code it produced.
@@ -231,20 +232,51 @@ Verification methods (`AGENTS.md` §4 requirement 2) — negative tests first:
 
 ## 7) What is NOT done, and what unblocks it
 
-1. **The LAN-exposed listener does not exist.** Enrollment-consume is still reachable only
-   over the daemon's local IPC socket. The gate above makes the capability meaningful for that
-   surface; it does not make an anchor reachable from a new device on the LAN. Building the
-   listener is a mechanical copy of the bundle-pull listener seam
-   (`bind_anchor_bundle_pull_listener` / `poll_anchor_bundle_pull_once`, shared by the Unix and
-   Windows loops, loopback-only unless `--allow-lan`, token file gate, per-request capability
-   re-read) carrying an `EnrollmentConsume` payload whose encoding `ipc.rs` already defines.
-   It needs no new wire format and no new crypto — but it does add a network-exposed
-   pre-authentication parser, and per §7 of the bundle-pull review that class of change is a
-   **repo-owner decision plus an independent adversarial review pass**, not something to land
-   from a defect ticket. This document does not invent it.
+1. **The LAN-exposed listener does not exist.**
+   **Landed 2026-08-27 (`work/enrollment-listener`).** What shipped, in
+   `crates/rustynetd/src/daemon.rs`, modeled on the bundle-pull seam exactly as sketched here:
+   - `bind_anchor_enrollment_listener` / `poll_anchor_enrollment_once` /
+     `handle_anchor_enrollment_stream`, portable (`std::net`) and polled by BOTH the Unix and
+     Windows daemon main loops. Opt-in: the listener binds only when
+     `--anchor-enrollment-addr` / `RUSTYNET_ANCHOR_ENROLLMENT_ADDR` is set (no default
+     address), loopback-only unless the explicit `--anchor-enrollment-allow-lan` /
+     `RUSTYNET_ANCHOR_ENROLLMENT_ALLOW_LAN` opt-in.
+   - It serves EXACTLY one verb: the existing `enrollment consume <token> <pubkey-b64>
+     <addr:port>` wire encoding from `ipc.rs`, dispatched into the existing
+     `handle_enrollment_consume` → `enrollment_consume::consume_and_register_peer` path under
+     `PushAddressPolicy::Strict`. Every other line — including `status`, `gossip push`,
+     `membership apply`, and remote-op envelopes — is refused default-deny with one fixed
+     string. No new wire format, no new crypto, no attestation (§5 held).
+   - Pre-authentication hardening mirrors bundle-pull: accept-time capability re-read before
+     any client byte is parsed, one request line under a 256-byte byte-at-a-time cap
+     (`MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES`) and a 2s wall-clock read budget, 2s socket
+     timeouts, deadline-bounded response writes, fixed-vocabulary `OK …`/`ERR …` responses.
+     Two deliberate tightenings beyond the precedent: an EOF-truncated request line is refused
+     outright (bundle-pull tolerates one for compatibility), and inside
+     `handle_enrollment_consume` every payload parse now precedes the enrollment ledger lock,
+     so invalid-consume floods never contend on the single-use ledger.
+   - Per the bundle-pull review's rule for network-exposed pre-authentication parsers, the
+     independent adversarial review pass remains REQUIRED before any deployment sets
+     `--anchor-enrollment-allow-lan`; loopback-only operation does not wait on it.
+     **Update 2026-08-27, same branch:** that review pass is complete — see
+     [`AnchorEnrollmentListenerSecurityReview_2026-08-27.md`](./AnchorEnrollmentListenerSecurityReview_2026-08-27.md),
+     verdict PASS with no MEDIUM-or-above finding (five accepted INFO/LOW residuals recorded
+     there, including the F2 fixed-string hardening follow-up for the `{err}`-bearing
+     secret/ledger arms).
 2. **Startup coherence gate (§4c)** — promote to a hard `DaemonError` once (1) ships and the
    Linux/macOS/Windows install templates provision the endpoint on anchors. Until then it
    would brick anchors.
+   **Update 2026-08-27 (`work/enrollment-listener`):** the listener-open half is implemented
+   as designed: `bind_anchor_enrollment_listener` refuses to open (no optimistic bind) unless
+   the local quorum-signed snapshot shows `anchor.enrollment_endpoint` on an **Active** row —
+   missing/symlinked/oversized/malformed snapshot and unprovisioned enrollment subsystem all
+   refuse at startup. The per-request re-read inside `handle_enrollment_consume` is kept
+   unchanged as the revocation mechanism (listener-open = startup coherence; per-request =
+   revocation; both exist, verified by
+   `anchor_enrollment_revoked_capability_refused_per_request_while_listener_stays_bound`).
+   The remaining §4(c) promotion — "capability advertised but no endpoint provisioned ⇒
+   refuse to start" — still waits on the install templates provisioning the endpoint on
+   anchors, exactly as stated above.
 3. **`anchor_validation`'s reported skip.** `anchor_validation.rs` `:43`/`:256` hard-coded
    `reported_skipped_runtime_dependent=[enrollment_endpoint]` with the reason "pending a
    trust-model decision — enrollment admit signs a membership update with the owner signing
@@ -252,6 +284,20 @@ Verification methods (`AGENTS.md` §4 requirement 2) — negative tests first:
    endpoint does not serve (§2). `enrollment consume` needs no owner key. The accurate blocker
    for the *positive* substage is (1) — there is no listener to probe. The note is updated to
    say so, and the *negative* substage is unblocked today (§8).
+   **Update 2026-08-27 (`work/enrollment-listener`):** with (1) landed, the positive substage
+   is no longer design-blocked — DESIGN sketch only, no stage code written here. What it
+   needs from the listener: the admin/exit lab roles already advertise the capability (§6);
+   the stage additionally provisions `--anchor-enrollment-addr 127.0.0.1:51823` (51823 is the
+   suggested convention, one above bundle-pull's 51822 — any free port works, discovered from
+   the daemon argv, there is no default) plus the existing `--enrollment-secret` /
+   `--enrollment-ledger` flags on the serving node, mints a token against the co-located
+   secret, then drives one TCP line `enrollment consume <token> <pubkey-b64> <addr:port>\n`
+   and asserts the `OK enrollment accepted node=…` response, the durable ledger burn, and a
+   replay refusal. LAN-crossing cells additionally require `--anchor-enrollment-allow-lan
+   true`, which stays gated on the adversarial review pass noted in (1). The
+   `anchor_validation.rs` reported-skip reason text is NOT edited on this branch (live-lab
+   stage files are out of scope here); it should change to "positive substage pending
+   live-lab stage implementation against the landed listener" when that stage lands.
 
 ## 8) Live-lab stage shape (sketch only — not run, no lab access in this task)
 
@@ -280,3 +326,7 @@ A negative substage is exercisable now and needs neither a listener nor an owner
 - `SecurityMinimumBar.md` — add the enrollment-endpoint authorisation control alongside
   control 2 (bundle-pull head attestation).
 - `AnchorLiveLabAndCrossPlatformRoleDeltaPlan_2026-05-23.md` Track A, enrollment sub-stage.
+
+**Note 2026-08-27 (`work/enrollment-listener`):** §7(1) has landed on that branch; the three
+documents above still carry their pre-listener text and are deliberately NOT edited there
+(they are shared with in-flight branches). Update them when this branch merges.
