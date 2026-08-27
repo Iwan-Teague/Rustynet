@@ -281,7 +281,7 @@ Acceptance: a failed step in any host script produces a non-zero exit and a
 diagnosable message; a test asserts this for at least the provisioning and
 launch paths.
 
-### QH-04 — Assign an owner to the assignment/traversal atomicity exposure
+### QH-04 — Assignment/traversal atomicity — FIXED 2026-08-27
 
 > **[REVIEW 2026-07-25] Mechanism VERIFIED and genuinely PRODUCT + release-blocking — but
 > "unrecoverable" is FALSE, and the citation trail is broken.**
@@ -343,12 +343,95 @@ the short window are recorded in `NodeEngineFlipDispositions_2026-07-24.md` (D1)
 and cross-referenced from `TraversalSelfSustenancePlan_2026-07-23.md`. The lab
 orchestrator itself distributes the two halves as separate stages.
 
-This is the highest-severity *product* finding of the session and currently has
-no owner. Candidate shapes recorded in D1: co-distribute atomically, a single
-combined artifact, or evaluate set-equality against a staged pair.
+> **[CORRECTION 2026-08-27] Two claims above are wrong; the defect is real but is
+> a different mechanism than the prose describes.**
+>
+> 1. **"Permanently restricts itself" is FALSE** (as the 2026-07-25 review
+>    already flagged, and confirmed again against `main` @ `8abea28b`). A node
+>    that fail-closes on a half-installed generation recovers on the next
+>    successful reconcile: the success arm clears `restriction_mode`,
+>    `bootstrap_error` and `reconcile_failures`
+>    (`crates/rustynetd/src/daemon.rs:9848-9851`), and the retry keeps firing
+>    because `last_applied_assignment` only advances on success. Tolerance
+>    before promotion to a permanent restriction is ~5 s —
+>    `DEFAULT_MAX_RECONCILE_FAILURES = 5` (`daemon.rs:364`) ×
+>    `DEFAULT_RECONCILE_INTERVAL_MS = 1_000` (`daemon.rs:363`). Correct wording:
+>    ***"stays restricted until the matching half arrives, then recovers on the
+>    next reconcile tick."*** Regression-proven by
+>    `reconcile_fails_closed_when_only_the_assignment_half_advances_then_recovers`.
+>
+> 2. **The "second equality site" note in the 2026-07-25 review was misread
+>    downstream.** `daemon.rs:6208-6218` ("unmanaged") and `:6224-6230`
+>    ("missing") are *both* inside `sync_traversal_runtime_state` — they are the
+>    two directions of one set-equality check, not one managed site and one
+>    missing site. (Those line numbers are stale; the checks are now at
+>    `daemon.rs:6785-6791` and `:6798-6804`.) `apply_dataplane_generation` holds
+>    no equality check at all; the assignment-side check lives in
+>    `apply_traversal_authority_to_peers` (`daemon.rs:7344-7360`).
+>
+> **What was actually wrong.** `reconcile` calls
+> `refresh_traversal_hint_state` — and therefore
+> `sync_traversal_runtime_state` — *before* `apply_dataplane_generation`
+> (`daemon.rs:9627`, apply at `:9741`). The sync compares the **freshly loaded
+> traversal snapshot** against `controller.managed_peer_ids()`, which still
+> holds the **previous** generation's peer set. So a correctly co-distributed
+> peer-set change failed its own equality check across two generations: the
+> node set `traversal_hint_error`, called `restrict_recoverable` +
+> `force_fail_closed_or_restrict` (tearing the tunnel down mid-pass), and then
+> either poisoned `apply_traversal_authority_to_peers` or — worse — recovered
+> the restriction while leaving `traversal_probe_statuses` **empty**, i.e.
+> reporting a *successful* reconcile whose traversal runtime state described no
+> generation at all. That is the §3 fail-closed violation: success reported
+> with assignment and traversal disagreeing about which generation is live.
+>
+> **Invariant now enforced.** *Traversal runtime state must be evaluated for
+> set-equality only against the dataplane generation that is actually live, and
+> at the end of a reconcile pass it must describe exactly the peer set of the
+> generation that pass applied. If it cannot be brought to that generation, the
+> reconcile counts as failed.*
+>
+> **Fix shape** (chosen from D1's list: *evaluate set-equality against a staged
+> pair*): the two set-equality failures are now classified
+> `TraversalSyncFailure::GenerationDivergence` and everything else
+> `::Invalid`. `reconcile` decides up front whether the pass will apply a new
+> generation (`pending_generation_apply`); while that is armed, a divergence in
+> the pre-apply window is deferred rather than restricting, because it is a
+> cross-generation comparison. Immediately after a successful
+> `apply_dataplane_generation`, the equality check is re-run against the applied
+> generation — the only point at which both halves are guaranteed to describe
+> the same generation — and a divergence there increments `reconcile_failures`,
+> restricts, and fails closed instead of reporting success. Fail-closed is
+> strictly preserved: the deferral changes *when* the check fires, never *what*
+> it enforces.
+>
+> **Fix:** `crates/rustynetd/src/daemon.rs` — `TraversalSyncFailure`,
+> `sync_traversal_runtime_state_detailed`, `refresh_traversal_hint_state`
+> tail, and the `reconcile` pre-apply/post-apply sites. Branch
+> `work/qh04-atomicity`.
+>
+> **Tests:**
+> `reconcile_applies_codistributed_peer_set_growth_without_generation_divergence`
+> (positive: co-distributed growth applies and leaves probe state == managed
+> set), `reconcile_fails_closed_when_only_the_assignment_half_advances_then_recovers`
+> (negative + recovery: half-installed generation fails the reconcile and feeds
+> the failure tolerance, then recovers on the next pass),
+> `traversal_divergence_against_the_live_generation_still_fails_closed`
+> (negative: the deferral does not weaken the check when no generation is being
+> applied).
+>
+> **Still open, deliberately out of scope** (each is its own item, not QH-04):
+> the `ops assignment-refresh` timer path that installs traversal
+> unconditionally but re-mints the assignment only near expiry; the remote-pull
+> path's independent `traversal_url`/`assignment_url` watermarks with no
+> cross-binding; and membership revocation landing before the matching re-mint.
+> Those are *distribution* gaps upstream of the daemon. This fix makes the
+> daemon's own reconcile atomic with respect to the two halves — it does not
+> make the halves arrive together.
 
-Acceptance: an owner, a chosen shape, and a live-proven test that a peer-set
-change cannot open the window.
+**Status: FIXED (daemon-side atomicity), 2026-08-27.** The gate suite is green
+on `work/qh04-atomicity`. Remaining acceptance for the *distribution* half is
+tracked by the three out-of-scope items listed above; per QH-07 that acceptance
+must name the artifact and field rather than "a peer-set change".
 
 ---
 
