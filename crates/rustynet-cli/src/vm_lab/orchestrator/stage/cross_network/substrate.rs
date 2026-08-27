@@ -292,6 +292,22 @@ pub fn plan_overlay(topology: &SubstrateTopology) -> Result<Option<OverlayPlan>,
     }))
 }
 
+/// Deterministic locally-administered MAC for a node's vxlan device, derived
+/// from its (unique) overlay IPv4: `02:52:<ip0>:<ip1>:<ip2>:<ip3>`.
+///
+/// An explicit MAC is load-bearing, not cosmetic. Lab guests are cloned from
+/// one image and share `/etc/machine-id`; systemd's default
+/// `MACAddressPolicy=persistent` then derives the SAME "persistent" MAC for a
+/// same-named virtual device on every guest. The kernel's vxlan decap drops
+/// any inner frame whose source MAC equals the receiving device's own address
+/// (loop prevention), so with colliding MACs the overlay encaps and delivers
+/// on the wire but every decap is silently discarded — RX stays 0 and no ARP
+/// ever resolves. Verified live on two Debian 13 UTM guests (2026-08-27).
+pub fn overlay_mac(overlay: Ipv4Addr) -> String {
+    let o = overlay.octets();
+    format!("02:52:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3])
+}
+
 /// Digest binding a substrate id to the exact alias/underlay/overlay tuples.
 pub fn topology_digest(
     substrate_id: &str,
@@ -411,6 +427,7 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
             };
             let local = handle.underlay_ips[alias].clone();
             let overlay = handle.overlay_ips[alias].clone();
+            let mac = overlay_mac(plan.overlay_ips[alias]);
             // Idempotent pre-delete: a leftover device from an aborted run is
             // expected, so a non-zero exit here is fine — but a transport
             // failure is not.
@@ -427,6 +444,8 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
                     "link",
                     "add",
                     VXLAN_LINK_NAME,
+                    "address",
+                    &mac,
                     "type",
                     "vxlan",
                     "id",
@@ -1138,6 +1157,15 @@ mod tests {
     }
 
     #[test]
+    fn overlay_mac_is_locally_administered_and_unique_per_overlay_ip() {
+        let a = overlay_mac(Ipv4Addr::new(172, 20, 10, 2));
+        let b = overlay_mac(Ipv4Addr::new(172, 20, 20, 2));
+        assert_eq!(a, "02:52:ac:14:0a:02");
+        assert_eq!(b, "02:52:ac:14:14:02");
+        assert_ne!(a, b, "distinct overlay IPs must yield distinct MACs");
+    }
+
+    #[test]
     fn topology_digest_changes_when_a_node_moves_network() {
         let before = topology(&[("a", "192.168.64.10"), ("b", "192.168.0.30")]);
         let after = topology(&[("a", "192.168.64.10"), ("b", "192.168.2.30")]);
@@ -1211,6 +1239,12 @@ mod tests {
                 "link",
                 "add",
                 VXLAN_LINK_NAME,
+                "address",
+                // Unique per-node MAC derived from the overlay IP
+                // (172.20.10.2): cloned guests share machine-id, so the
+                // systemd-persistent default MAC collides and vxlan decap
+                // self-drops every inner frame.
+                "02:52:ac:14:0a:02",
                 "type",
                 "vxlan",
                 "id",
