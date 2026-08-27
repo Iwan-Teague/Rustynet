@@ -969,6 +969,32 @@ excludes the six evidence ledgers the orchestrator itself appends to, with a com
 explaining that otherwise a clean run would flip itself to dirty on its own evidence write
 and fail the provenance check on a non-code change.
 
+★★ **UPDATE 2026-08-27 (STATUS-PGREP) — the third and last self-matching site, on the read-only
+status path, is now closed.** `execute_ops_vm_lab_host_run_status`
+(`crates/rustynet-cli/src/vm_lab/mod.rs:3743`) asked
+`["pgrep","-af","vm-lab-orchestrate-live-lab"]` over SSH. `run_host_cmd` pre-quotes the argv into
+one command string and sshd hands it to the login shell, so the probe arrived as the argument of
+a remote `bash -c` whose argv contained the pattern: the parent shell self-matched and an **idle
+host reported a run in flight**. Harmless compared with the stop path's signal, but it made the
+status command's headline answer wrong on exactly the hosts an operator uses it to check.
+
+Fixed the same way as the launch and stop sides — a better handle, not a better pattern. The
+probe is now a rendered script (`HOST_RUN_STATUS_SCRIPT`,
+`script_template::render_host_run_status_script`) whose only source of candidate pids is
+`state/host-lab-runs/*.pid`, made trustworthy by the launcher's argv-liveness-checked prune. Each
+recorded pid must clear the same two guards as on the stop path before it is reported: it is not
+this shell or any of its ancestors, and its own argv still contains the orchestrator marker,
+checked with `ps -ww -o args= -p <pid>` against one named pid rather than a scan. Non-numeric
+handles are skipped. The probe is read-only — it never retires a handle file, which would strip
+the stop path of the pid it needs to signal.
+
+Pinned by `vm_lab::host_run_status_probe_tests`: no `pgrep` and no whole-process-table match in
+the rendered probe, the ancestor walk and exclusion are present, the probe mutates nothing, and a
+behavioural test runs the rendered probe under `bash -c <script>` (reproducing the
+inline-over-SSH argv exactly) across three cases — an idle host with no handles reports nothing,
+a handle naming a live-but-unrelated process or a malformed handle reports nothing, and only a
+handle naming a process whose own argv carries the marker is reported.
+
 ### QH-19 — "Escape at interpolation" is not one rule; every sink context has its own
 **Severity: high (it is the conceptual gap behind QH-01/QH-13). Confidence: VERIFIED — each row below was found the hard way this session.**
 
