@@ -61,6 +61,66 @@ pub trait NetLeafRunner {
     /// executed at all (transport/spawn failure); `Ok(LeafOutput)` reports
     /// the command's own exit status in `success`.
     fn run(&self, argv: &[&str]) -> Result<LeafOutput, String>;
+
+    /// Run one argv inside a Linux network namespace, i.e.
+    /// `ip netns exec <ns> <argv...>`.
+    ///
+    /// Provided (not required) so every backend gets namespace execution for
+    /// free and no implementor can hand-roll a *different*, weaker prefix.
+    /// The namespace name is validated against a strict allowlist BEFORE it
+    /// is placed in argv position, so it can never smuggle an option (`-…`),
+    /// a path component (`.`/`..`/`/`) or a shell metacharacter across the
+    /// `RemoteShellRunner` quoting boundary.
+    ///
+    /// CN-2's `NetnsSubstrate` is the first consumer; it exists here because
+    /// the spec (§0.1) puts it on the runner trait, and because putting it
+    /// anywhere else would re-open the shell-construction hole.
+    fn in_netns(&self, ns: &str, argv: &[&str]) -> Result<LeafOutput, String> {
+        validate_netns_name(ns)?;
+        validate_argv(argv)?;
+        let mut full: Vec<&str> = vec!["ip", "netns", "exec", ns];
+        full.extend_from_slice(argv);
+        self.run(&full)
+    }
+}
+
+/// Longest permitted network-namespace name. `ip netns` materialises each
+/// namespace as a bind mount at `/var/run/netns/<name>`, so the name is a
+/// filename and inherits the filesystem's component limit.
+const MAX_NETNS_NAME_LEN: usize = 255;
+
+/// Validate a network-namespace name: non-empty, length-bounded, ASCII
+/// `[A-Za-z0-9_.-]` only, never a relative-path component, and never
+/// option-looking. Deliberately an allowlist — a denylist here would be a
+/// shell-injection hole one unusual character wide.
+fn validate_netns_name(ns: &str) -> Result<(), String> {
+    if ns.is_empty() {
+        return Err("network namespace name must not be empty".to_owned());
+    }
+    if ns.len() > MAX_NETNS_NAME_LEN {
+        return Err(format!(
+            "network namespace name exceeds {MAX_NETNS_NAME_LEN} bytes: {ns:?}"
+        ));
+    }
+    if ns == "." || ns == ".." {
+        return Err(format!(
+            "network namespace name must not be a path component: {ns:?}"
+        ));
+    }
+    if ns.starts_with('-') {
+        return Err(format!(
+            "network namespace name must not look like an option: {ns:?}"
+        ));
+    }
+    if !ns
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err(format!(
+            "network namespace name must contain only ASCII letters, digits, '.', '_' or '-': {ns:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Reject argv elements that could break the quoting boundary. Every element
@@ -202,6 +262,52 @@ pub struct SubstrateHandle {
     pub created_links: Vec<CreatedLink>,
 }
 
+/// Which addressing plane an endpoint came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointPlane {
+    /// The substrate-provisioned overlay address — what cross-LAN peers must
+    /// be given as the dataplane endpoint.
+    Overlay,
+    /// The node's management/underlay address. Correct only when no overlay
+    /// was needed (single network group); on a multi-LAN fleet an underlay
+    /// endpoint is exactly the unroutable value the substrate exists to
+    /// replace.
+    Underlay,
+}
+
+/// Where a scenario node lives (spec §0.1 `SubstrateHandle::endpoint`). The
+/// plane is carried alongside the address so a caller cannot mistake a
+/// fallback underlay address for a provisioned overlay one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEndpoint {
+    pub alias: String,
+    pub address: String,
+    pub plane: EndpointPlane,
+}
+
+impl SubstrateHandle {
+    /// Resolve one node's dataplane endpoint: the overlay address when the
+    /// substrate provisioned one, otherwise the management/underlay address.
+    /// `None` for an alias this substrate does not know — never a silently
+    /// invented address.
+    pub fn endpoint(&self, alias: &str) -> Option<ResolvedEndpoint> {
+        if let Some(address) = self.overlay_ips.get(alias) {
+            return Some(ResolvedEndpoint {
+                alias: alias.to_owned(),
+                address: address.clone(),
+                plane: EndpointPlane::Overlay,
+            });
+        }
+        self.underlay_ips
+            .get(alias)
+            .map(|address| ResolvedEndpoint {
+                alias: alias.to_owned(),
+                address: address.clone(),
+                plane: EndpointPlane::Underlay,
+            })
+    }
+}
+
 /// Setup failure that keeps the partial state: the stage stores
 /// `partial` on the context so the always-run teardown stage can remove
 /// whatever was created before the failure (fail closed, never fail-and-leak).
@@ -211,11 +317,91 @@ pub struct SubstrateSetupFailure {
     pub partial: SubstrateHandle,
 }
 
+/// The §D5.1 NAT-profile vocabulary as a closed set. Anything outside it is
+/// rejected rather than passed through: a substrate asked about a profile it
+/// has never heard of must not be able to answer "supported".
+pub const KNOWN_NAT_PROFILES: &[&str] = &[
+    "baseline_lan",
+    "full_cone",
+    "port_restricted_cone",
+    "symmetric",
+    "double_nat_cgnat",
+];
+
+/// A validated NAT-profile identifier (spec §0.1). Construction is the only
+/// way in, so a `NatProfileId` in hand is always one of
+/// [`KNOWN_NAT_PROFILES`].
+///
+/// Note this is NOT (yet) what `--cross-network-nat-profiles` parses into —
+/// that flag keeps its existing shape-only validation so CN-1 changes no
+/// behaviour. Tightening the CLI onto this type is a deliberate, separate
+/// behavioural change.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct NatProfileId(String);
+
+impl NatProfileId {
+    /// Parse a profile name, fail-closed on anything unknown.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let trimmed = value.trim();
+        match KNOWN_NAT_PROFILES.iter().find(|known| **known == trimmed) {
+            Some(known) => Ok(Self((*known).to_owned())),
+            None => Err(format!(
+                "unknown NAT profile {trimmed:?}; expected one of {}",
+                KNOWN_NAT_PROFILES.join("|")
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for NatProfileId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Whether a substrate can realise a NAT profile (spec §0.1).
+///
+/// The point of the `UnsupportedByDesign` arm is that it carries a REASON, so
+/// the caller records a typed, honest `Skipped` with that reason instead of
+/// the shell era's bare `exit 2` (`netns_internet_sim.sh:189` for
+/// `double_nat_cgnat`). It is not an error and must never be silently
+/// swallowed into a pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Support {
+    Supported,
+    UnsupportedByDesign(String),
+}
+
+impl Support {
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    /// The documented reason a profile is out of reach, or `None` when it is
+    /// supported.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported => None,
+            Self::UnsupportedByDesign(reason) => Some(reason),
+        }
+    }
+}
+
 /// WHERE the overlay topology lives. Provisioned once by the
 /// `cross_network_substrate_setup` stage (before `collect_pubkeys`), torn down
 /// by the always-run `cross_network_substrate_teardown` stage.
 pub trait CrossNetworkSubstrateProvider {
     fn id(&self) -> &'static str;
+
+    /// Can this substrate realise `profile`? See [`Support`]: the
+    /// `UnsupportedByDesign` arm is a typed, reasoned skip, not a failure.
+    /// Required (no default) so a new substrate cannot inherit an
+    /// over-permissive answer by omission.
+    fn supports(&self, profile: &NatProfileId) -> Support;
 
     /// Stand up the overlay. On failure the partial handle inside the error
     /// still lists every link that was created. Boxed so the `Err` arm stays
@@ -350,6 +536,29 @@ impl VxlanSubstrateProvider {
 impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
     fn id(&self) -> &'static str {
         "vxlan"
+    }
+
+    /// Today this provider builds a FLAT, routable vxlan overlay and applies
+    /// no NAT at all: it exists to make cross-LAN peer endpoints routable,
+    /// not to shape them. So the only profile it honestly realises is
+    /// `baseline_lan`. Every NAT-shaping profile needs the
+    /// `apply_nat_profile.sh` semantics ported into
+    /// `apply_nat_profile` + `NatModifiers` (CN-4), and `double_nat_cgnat`
+    /// additionally needs the two-router chain. Claiming support here would
+    /// turn "the profile silently did nothing" into a false pass.
+    fn supports(&self, profile: &NatProfileId) -> Support {
+        match profile.as_str() {
+            "baseline_lan" => Support::Supported,
+            "double_nat_cgnat" => Support::UnsupportedByDesign(
+                "double_nat_cgnat needs a two-router chain; the vxlan overlay has one router hop \
+                 per site"
+                    .to_owned(),
+            ),
+            other => Support::UnsupportedByDesign(format!(
+                "{other} needs per-site NAT shaping; the vxlan topology substrate provisions a \
+                 flat routable overlay and applies no NAT profile yet (CN-4)"
+            )),
+        }
     }
 
     fn setup(
@@ -1386,6 +1595,211 @@ mod tests {
             .teardown(&handle, &runners)
             .expect("no-op teardown");
         assert!(a.recorded().is_empty());
+    }
+
+    // ── CN-1 §0.1 additions: in_netns, supports(), endpoint() ──────────
+
+    /// `in_netns` must produce exactly `ip netns exec <ns> <argv…>` — the
+    /// argv-only form. Verified through the runner's own recording, so a
+    /// backend that rebuilt the prefix differently would be caught.
+    #[test]
+    fn in_netns_prefixes_ip_netns_exec_and_preserves_argv() {
+        let runner = mock::MockLeafRunner::default();
+        let output = runner
+            .in_netns("site-a-router", &["nft", "list", "ruleset"])
+            .expect("in_netns runs");
+        assert!(output.success);
+        assert_eq!(
+            runner.recorded(),
+            vec![vec![
+                "ip".to_owned(),
+                "netns".to_owned(),
+                "exec".to_owned(),
+                "site-a-router".to_owned(),
+                "nft".to_owned(),
+                "list".to_owned(),
+                "ruleset".to_owned(),
+            ]]
+        );
+    }
+
+    /// Negative path: a namespace name that could smuggle an option, a path
+    /// component, or a shell metacharacter is rejected BEFORE any command
+    /// runs. The runner must record zero calls — rejection, not execution.
+    #[test]
+    fn in_netns_rejects_hostile_namespace_names_without_running_anything() {
+        let hostile = [
+            "",
+            ".",
+            "..",
+            "-rf",
+            "site a",
+            "site;reboot",
+            "site$(id)",
+            "../../etc/passwd",
+            "site\nnext",
+        ];
+        for name in hostile {
+            let runner = mock::MockLeafRunner::default();
+            let err = runner
+                .in_netns(name, &["ip", "addr"])
+                .expect_err("hostile namespace name must be rejected");
+            assert!(
+                err.contains("network namespace name"),
+                "unexpected error for {name:?}: {err}"
+            );
+            assert!(
+                runner.recorded().is_empty(),
+                "{name:?} must not reach the runner"
+            );
+        }
+        // A 256-byte name exceeds the /var/run/netns filename bound.
+        let runner = mock::MockLeafRunner::default();
+        assert!(
+            runner
+                .in_netns(&"a".repeat(256), &["ip", "addr"])
+                .expect_err("over-long namespace name must be rejected")
+                .contains("exceeds")
+        );
+        assert!(runner.recorded().is_empty());
+    }
+
+    /// Negative path: argv validation still applies inside a namespace.
+    #[test]
+    fn in_netns_rejects_empty_and_control_char_argv() {
+        let runner = mock::MockLeafRunner::default();
+        assert!(
+            runner
+                .in_netns("ns0", &[])
+                .expect_err("empty argv must be rejected")
+                .contains("must not be empty")
+        );
+        assert!(
+            runner
+                .in_netns("ns0", &["ip", "addr\n; reboot"])
+                .expect_err("control chars must be rejected")
+                .contains("control characters")
+        );
+        assert!(runner.recorded().is_empty());
+    }
+
+    /// A namespace-scoped failure propagates the leaf command's own exit
+    /// status, not a transport error — the two arms stay distinguishable.
+    #[test]
+    fn in_netns_reports_leaf_exit_status_and_transport_failure_separately() {
+        let failing = mock::MockLeafRunner {
+            fail_on: vec![0],
+            failure_stderr: "Cannot open network namespace \"ns0\"".to_owned(),
+            ..mock::MockLeafRunner::default()
+        };
+        let output = failing.in_netns("ns0", &["ip", "addr"]).expect("Ok arm");
+        assert!(!output.success);
+        assert!(output.stderr.contains("Cannot open network namespace"));
+
+        let unreachable = mock::MockLeafRunner {
+            transport_error_on: vec![0],
+            ..mock::MockLeafRunner::default()
+        };
+        assert!(
+            unreachable
+                .in_netns("ns0", &["ip", "addr"])
+                .expect_err("transport failure is the Err arm")
+                .contains("mock transport failure")
+        );
+    }
+
+    #[test]
+    fn nat_profile_id_accepts_only_the_known_vocabulary() {
+        for known in KNOWN_NAT_PROFILES {
+            let parsed = NatProfileId::parse(known).expect("known profile parses");
+            assert_eq!(parsed.as_str(), *known);
+            assert_eq!(parsed.to_string(), *known);
+        }
+        // Surrounding whitespace is trimmed, not treated as a new profile.
+        assert_eq!(
+            NatProfileId::parse("  full_cone ").expect("trims").as_str(),
+            "full_cone"
+        );
+    }
+
+    /// Negative path: an unknown profile must fail closed rather than becoming
+    /// an opaque string a substrate could later claim to support.
+    #[test]
+    fn nat_profile_id_rejects_unknown_profiles() {
+        for bad in [
+            "",
+            "FULL_CONE",
+            "full-cone",
+            "baseline_lan_v2",
+            "symmetric;",
+        ] {
+            let err = NatProfileId::parse(bad).expect_err("unknown profile must be rejected");
+            assert!(err.contains("unknown NAT profile"), "{bad:?}: {err}");
+        }
+    }
+
+    /// The vxlan topology substrate provisions a flat routable overlay and
+    /// applies no NAT, so it must claim only `baseline_lan` — every shaping
+    /// profile is a reasoned `UnsupportedByDesign`, never a silent pass.
+    #[test]
+    fn vxlan_supports_only_baseline_lan_and_explains_every_refusal() {
+        let provider = VxlanSubstrateProvider;
+        assert_eq!(
+            provider.supports(&NatProfileId::parse("baseline_lan").expect("known")),
+            Support::Supported
+        );
+        assert!(
+            provider
+                .supports(&NatProfileId::parse("baseline_lan").expect("known"))
+                .reason()
+                .is_none()
+        );
+        for shaping in ["full_cone", "port_restricted_cone", "symmetric"] {
+            let support = provider.supports(&NatProfileId::parse(shaping).expect("known"));
+            assert!(!support.is_supported(), "{shaping} must not be claimed");
+            assert!(
+                support.reason().expect("reason").contains("no NAT profile"),
+                "{shaping} refusal must name the missing NAT shaping"
+            );
+        }
+        let cgnat = provider.supports(&NatProfileId::parse("double_nat_cgnat").expect("known"));
+        assert!(!cgnat.is_supported());
+        assert!(
+            cgnat.reason().expect("reason").contains("two-router chain"),
+            "double_nat_cgnat refusal must state the topological reason"
+        );
+    }
+
+    /// `endpoint()` prefers the provisioned overlay address, falls back to the
+    /// underlay only when there is no overlay, and never invents one.
+    #[test]
+    fn endpoint_prefers_overlay_falls_back_to_underlay_and_refuses_unknown_aliases() {
+        let handle = SubstrateHandle {
+            record: vxlan_record(true),
+            overlay_ips: BTreeMap::from([("a".to_owned(), "172.20.10.2".to_owned())]),
+            underlay_ips: BTreeMap::from([
+                ("a".to_owned(), "192.168.64.10".to_owned()),
+                ("b".to_owned(), "192.168.0.20".to_owned()),
+            ]),
+            created_links: Vec::new(),
+        };
+        assert_eq!(
+            handle.endpoint("a").expect("a resolves"),
+            ResolvedEndpoint {
+                alias: "a".to_owned(),
+                address: "172.20.10.2".to_owned(),
+                plane: EndpointPlane::Overlay,
+            }
+        );
+        assert_eq!(
+            handle.endpoint("b").expect("b resolves"),
+            ResolvedEndpoint {
+                alias: "b".to_owned(),
+                address: "192.168.0.20".to_owned(),
+                plane: EndpointPlane::Underlay,
+            }
+        );
+        assert!(handle.endpoint("missing").is_none());
     }
 
     #[test]
