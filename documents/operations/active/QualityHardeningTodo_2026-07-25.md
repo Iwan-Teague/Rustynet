@@ -3017,6 +3017,58 @@ next full apply. Pre-existing (the old pre-start bind had the same hole); made e
 as the next apply failing closed. Needs either a re-bind hook in the recovery path or a periodic
 posture assert.
 
+**FIXED 2026-08-27 — periodic posture assert (the second of the two options above).**
+
+Two corrections to the paragraph above first. The path is stale: the function is
+`crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs:218` (and its macOS twin at
+`userspace_shared_macos/mod.rs:224`), not `rustynetd`. And the loss is not "may not survive" —
+`SharedTunLifecycle::cleanup` runs `ip link del` unconditionally
+(`userspace_shared/tun.rs:480-495`, via `remove_interface_if_present`), so the device firewalld was bound to is destroyed and a new
+one takes its place. Nothing re-binds it: recovery runs behind the `TunnelBackend` trait and
+returns the retried operation as an ordinary success, and the daemon's one-second reconcile
+re-applies only on a fail-closed/restricted state or an assignment/membership/route change
+(`daemon.rs:9533-9538`), so a healthy serving node never revisits the bind.
+
+The re-bind hook was rejected. firewalld coexistence is owned by `rustynetd`
+(`phase10.rs:999` `ensure_host_firewall_admits_forwarding`); a hook inside
+`recover_runtime_after_worker_exit` would push a Linux host-firewall concern into the WireGuard
+adapter crate, which is the backend leakage AGENTS.md §3 forbids. Hooking a protocol-agnostic
+recovery signal instead is the typed `WorkerUnavailable` + daemon recovery-coordinator work in
+the P1/P2 blueprints below, which are not implemented.
+
+Implemented instead: `Phase10Controller::reassert_host_firewall_admission` (`phase10.rs:5957`),
+driven from the reconcile tail by `DaemonRuntime::maybe_reassert_host_firewall_admission`
+(`daemon.rs:9769`) every `HOST_FIREWALL_ADMISSION_ASSERT_INTERVAL_SECS` = 30s while
+`serving_exit_node_active()`. It calls the apply path's own
+`DataplaneSystem::admit_host_firewall_forwarding` — the same delegate, the same `serve_exit_node`
+gate, no second re-bind — so firewalld presence is decided in exactly one place and a host
+without firewalld is a no-op here for the same reason it is at creation. Failure mirrors the
+apply path verbatim: `rollback_generation_best_effort(..., FailClosed)`, then
+`force_fail_closed("host_firewall_admit_failed")`, same error precedence, and the daemon records
+a recoverable restriction. No softer recovery path was invented; the availability fix does not
+trade into fail-open.
+
+Tests (`cargo test -p rustynetd --lib --all-features`): serving node re-asserts through the apply
+stage and nothing else; a client node never re-asserts; a failed re-assert unwinds the
+generation, blocks egress and lands `FailClosed` exactly like a failed apply admit; a source pin
+that the re-assert contains no firewalld vocabulary of its own (no presence/zone/posture branch)
+and keeps the apply path's fail-closed reason; a source pin that the reconcile loop drives it on
+its own cadence under the serving gate. `DryRunSystem::fail_on_from_now` was added so the same
+stage can succeed at apply and fail on a later call.
+
+**Ledger staleness found while doing this (2026-08-27).**
+[RepoStateAssessmentAndNextSteps_2026-08-19.md](RepoStateAssessmentAndNextSteps_2026-08-19.md)
+lines 88 and 246 record QH-54 as "3 blueprints done, not implemented". Those three blueprints
+(P1/P2/P3 below) are the transport-incarnation and relay-session work. **None of them is a
+blueprint for the firewalld re-bind** — the re-bind had exactly the two unelaborated one-line
+options in the paragraph above. The transport/relay blueprints remain open and unimplemented.
+
+Still open, deliberately: the assert bounds the exposure window, it does not eliminate it. A
+recreated interface stays unbound for up to 30s, during which firewalld discards forwarded
+traffic. Closing that window needs the recovery event to be observable, i.e. P1/P2. Also
+unchanged: `chaos_daemon_fault` is still not proof of this path (see below), and there is still
+no live-lab stage for it.
+
 **`--node` test-surface clarification (2026-08-17).** Do not count
 `chaos_daemon_fault` as QH-54 proof. Its Rust `--node` stage invokes
 `live_chaos_daemon_fault_test`, which kills or SIGSTOP/SIGCONTs the *whole* systemd daemon, then
