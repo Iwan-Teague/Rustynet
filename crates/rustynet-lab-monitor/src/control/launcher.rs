@@ -89,13 +89,14 @@ pub fn build_orchestrator_args(
     a.push("--skip-cross-network".to_string());
     a.extend(["--source-mode".to_string(), "working-tree".to_string()]);
 
-    if config.engine.trim().eq_ignore_ascii_case("rust-node") {
-        for assignment in synthesize_rust_node_args(config) {
-            a.extend(["--node".to_string(), assignment]);
-        }
-        if !config.rebuild_nodes.is_empty() {
-            a.extend(["--rebuild-nodes".to_string(), config.rebuild_nodes.clone()]);
-        }
+    // W5.7: the Rust --node engine is the only engine, so --node assignments
+    // are synthesized regardless of the (now vestigial) engine config value —
+    // a stale `legacy-bash` setting must not produce a role-less invocation.
+    for assignment in synthesize_rust_node_args(config) {
+        a.extend(["--node".to_string(), assignment]);
+    }
+    if !config.rebuild_nodes.is_empty() {
+        a.extend(["--rebuild-nodes".to_string(), config.rebuild_nodes.clone()]);
     }
 
     let mut normalized = config.clone();
