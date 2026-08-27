@@ -258,6 +258,11 @@ Verification methods (`AGENTS.md` §4 requirement 2) — negative tests first:
    - Per the bundle-pull review's rule for network-exposed pre-authentication parsers, the
      independent adversarial review pass remains REQUIRED before any deployment sets
      `--anchor-enrollment-allow-lan`; loopback-only operation does not wait on it.
+     **Update 2026-08-27, same branch:** that review pass is complete — see
+     [`AnchorEnrollmentListenerSecurityReview_2026-08-27.md`](./AnchorEnrollmentListenerSecurityReview_2026-08-27.md),
+     verdict PASS with no MEDIUM-or-above finding (five accepted INFO/LOW residuals recorded
+     there, including the F2 fixed-string hardening follow-up for the `{err}`-bearing
+     secret/ledger arms).
 2. **Startup coherence gate (§4c)** — promote to a hard `DaemonError` once (1) ships and the
    Linux/macOS/Windows install templates provision the endpoint on anchors. Until then it
    would brick anchors.
