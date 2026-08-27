@@ -353,6 +353,14 @@ pub fn run_remote_check(
 }
 
 /// SCP a local file to the remote host.
+///
+/// Retries transport-layer failures (our timeout wrapper, or scp/ssh's own
+/// exit 255) up to two more times with a short backoff. A file copy is
+/// idempotent, and on a real cross-LAN path transient connection failures
+/// are routine — run livelab-1787836555 lost both lenovo guests to exit-255
+/// scp failures while the link sat at 80-100ms RTT, then reached them fine
+/// seconds later. Non-transport failures (permission, missing path — any
+/// exit code other than 255) still fail on the first attempt.
 pub fn scp_to(
     conn: &NodeConnection,
     local: &Path,
@@ -360,21 +368,37 @@ pub fn scp_to(
     timeout: Duration,
 ) -> Result<(), AdapterError> {
     let (host, port, user, identity_file, known_hosts) = ssh_params(conn)?;
-    let mut cmd = base_scp_command(port, identity_file, known_hosts, user);
-    cmd.arg("--")
-        .arg(local.as_os_str())
-        .arg(format!("{host}:{remote_dst}"));
-    let status =
-        run_status_with_timeout(&mut cmd, timeout).map_err(|message| AdapterError::Ssh {
-            message: format!("SCP to {host}:{remote_dst} failed: {message}"),
-        })?;
-    if !status.success() {
-        return Err(AdapterError::Command {
-            exit_code: status.code(),
-            stderr: format!("scp to {host}:{remote_dst} exited with status {status}"),
-        });
+    let mut last_err: Option<AdapterError> = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(3 * u64::from(attempt)));
+        }
+        let mut cmd = base_scp_command(port, identity_file.clone(), known_hosts.clone(), user);
+        cmd.arg("--")
+            .arg(local.as_os_str())
+            .arg(format!("{host}:{remote_dst}"));
+        match run_status_with_timeout(&mut cmd, timeout) {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                let err = AdapterError::Command {
+                    exit_code: status.code(),
+                    stderr: format!("scp to {host}:{remote_dst} exited with status {status}"),
+                };
+                if status.code() != Some(255) {
+                    return Err(err);
+                }
+                last_err = Some(err);
+            }
+            Err(message) => {
+                last_err = Some(AdapterError::Ssh {
+                    message: format!("SCP to {host}:{remote_dst} failed: {message}"),
+                });
+            }
+        }
     }
-    Ok(())
+    Err(last_err.unwrap_or(AdapterError::Ssh {
+        message: format!("SCP to {host}:{remote_dst} failed with no recorded error"),
+    }))
 }
 
 /// SCP a file from the remote host to a local path.
