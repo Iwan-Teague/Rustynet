@@ -43,7 +43,7 @@ Current lab-reference assets:
 - `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md` (includes probe-and-recover runbook for unsticking lab guests whose nft killswitch is blocking SSH after a network reconfig)
 - `documents/operations/active/vm_lab_inventory.json`
 - `scripts/vm_lab/probe_and_recover_local_utm.sh` — call before retrying a failed orchestrator run when one or more lab VMs show TCP/22 timeout but are visible in `arp -a`
-- `documents/operations/LiveLabRunMatrix.md`, `documents/operations/live_lab_node_run_matrix.csv` (the Rust `--node` engine's evidence ledger — **the live one: current work appends here and tooling reads here**), and `documents/operations/live_lab_run_matrix.csv` (the **legacy bash-orchestrator archive** — frozen; `--node` no longer appends to it) — standard live-lab wrappers append a row automatically; verify the row exists after every run or focused live-lab stage used as evidence, including commit, dirty state, report directory, OS/role/stage statuses, node identity per role, and regression reference when applicable. **Never read a stage result from one ledger as evidence for the other engine.** They diverge: the bash archive records 52 `two_hop` passes that the `--node` engine has never achieved.
+- `documents/operations/LiveLabRunMatrix.md`, `documents/operations/live_lab_node_run_matrix.csv` (the Rust `--node` engine's evidence ledger — **the live one: current work appends here and tooling reads here**), and `documents/operations/live_lab_run_matrix.csv` (the **legacy bash-orchestrator archive** — frozen, read-only history; the bash engine itself was DELETED in W5.7 per `BashOrchestratorRetirementProgram_2026-08-22.md`, so nothing can append to it) — the `--node` orchestrate wrapper appends a row automatically; verify the row exists after every run or focused live-lab stage used as evidence, including commit, dirty state, report directory, OS/role/stage statuses, node identity per role, and regression reference when applicable. **Never read a stage result from one ledger as evidence for the other engine.** They diverge: the bash archive records 52 `two_hop` passes that the `--node` engine has never achieved.
 
 Rules:
 - If ambiguity exists, choose the strictest secure practical default and document that choice.
@@ -707,13 +707,8 @@ The lower-level **loop driver** is:
   the mac/win stages need the mesh; they gate on setup's `distribute_*` outcomes,
   not on the Linux suite, so the cell stays fully exercised. (Distinct from
   `windows_only`, which skips ALL Linux incl. membership and only works on an
-  already-mesh-joined Windows guest.) (`legacy_bash: true` routes the Linux live suite
-  through the legacy bash orchestrator instead of the default Rust one; BOTH paths
-  run the mac/win role stages — `activate_macos_exit_role` + capture, the
-  relay/anchor lifecycle — when `--macos-vm` + the role selector are set, so
-  `legacy_bash` is OPTIONAL. The early `macos_preflight_check` logging "no macOS
-  nodes in topology — skipping" is a benign Linux-preflight artifact, NOT the
-  macOS role stages.) The run is RELOAD-PROOF: the orchestrator
+  already-mesh-joined Windows guest.) (`legacy_bash` was RETIRED with the bash orchestrator in W5.7 — passing it is now a
+  hard error; the Rust `--node` engine is the only path.) The run is RELOAD-PROOF: the orchestrator
   is spawned detached (own process group, stdout→a log file, no pipe to the MCP
   server) so an MCP-server recycle mid-run no longer SIGPIPE-kills it, and async
   jobs persist to `state/deepseek-mcp-jobs/{job_id}.json` (ids

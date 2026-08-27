@@ -37,13 +37,10 @@ to commits and so OS, role, and stage gaps stay visible.
 
 The following paths append one row automatically at completion:
 
-- `ops vm-lab-setup-live-lab`
-- `ops vm-lab-run-live-lab`
-- `ops vm-lab-orchestrate-live-lab`
-- `ops vm-lab-iterate-live-lab`
-- `scripts/e2e/live_linux_lab_orchestrator.sh` (appends on exit via the EXIT
-  trap whenever `run_summary.json` was written; covers both pass and hard-fail
-  exits)
+- `ops vm-lab-orchestrate-live-lab` (the Rust `--node` engine — the only
+  writer since the W5.7 bash-orchestrator deletion; the bash EXIT-trap writer
+  and the retired `vm-lab-run-live-lab`/`vm-lab-iterate-live-lab` wrappers are
+  gone)
 
 The writer also emits the exact row for the current run at
 `<report_dir>/state/live_lab_run_matrix_row.csv`. Focused macOS, Windows, or

@@ -1216,20 +1216,8 @@ enum OpsCommand {
         config: vm_lab::VmLabDiffLiveLabRunsConfig,
     },
     #[cfg(feature = "vm-lab")]
-    VmLabDiffOrchestratorParity {
-        config: vm_lab::VmLabDiffOrchestratorParityConfig,
-    },
-    #[cfg(feature = "vm-lab")]
     VmLabEmitParityInput {
         config: vm_lab::VmLabEmitParityInputConfig,
-    },
-    #[cfg(feature = "vm-lab")]
-    VmLabIterateLiveLab {
-        config: vm_lab::VmLabIterateLiveLabConfig,
-    },
-    #[cfg(feature = "vm-lab")]
-    VmLabRunLiveLab {
-        config: vm_lab::VmLabRunLiveLabConfig,
     },
     #[cfg(feature = "vm-lab")]
     VmLabCheckKnownHosts {
@@ -1546,10 +1534,6 @@ enum OpsCommand {
         config: ops_live_lab_orchestrator::DiffRunSummariesConfig,
     },
     #[cfg(feature = "vm-lab")]
-    EmitStageManifest {
-        config: live_lab_stage_manifest::EmitStageManifestConfig,
-    },
-    #[cfg(feature = "vm-lab")]
     RecordStageStart {
         config: live_lab_stage_recorder::RecordStageStartConfig,
     },
@@ -1560,10 +1544,6 @@ enum OpsCommand {
     #[cfg(feature = "vm-lab")]
     LiveLabCoverageReport {
         config: live_lab_coverage::LiveLabCoverageReportConfig,
-    },
-    #[cfg(feature = "vm-lab")]
-    AppendOrchestratorRunToMatrix {
-        config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig,
     },
 }
 
@@ -4401,8 +4381,6 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 ssh_identity_file: parser.required_path("--ssh-identity-file")?,
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 require_same_network: parser.has_flag("--require-same-network"),
-                script_path: parser
-                    .path_or_default("--script", vm_lab::default_live_lab_orchestrator_path()),
                 report_dir: parser.required_path("--report-dir")?,
                 source_mode: parser.value("--source-mode"),
                 repo_ref: parser.value("--repo-ref"),
@@ -4441,8 +4419,6 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 ssh_identity_file: parser.required_path("--ssh-identity-file")?,
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 require_same_network: parser.has_flag("--require-same-network"),
-                script_path: parser
-                    .path_or_default("--script", vm_lab::default_live_lab_orchestrator_path()),
                 report_dir: parser.required_path("--report-dir")?,
                 source_mode: parser.value("--source-mode"),
                 repo_ref: parser.value("--repo-ref"),
@@ -4493,7 +4469,6 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     }
                     out
                 },
-                legacy_bash_orchestrator: parser.has_flag("--legacy-bash-orchestrator"),
                 orchestrate_ssh_allow_cidrs: parser.value("--ssh-allow-cidrs"),
                 no_fail_on_authenticode: parser.has_flag("--no-fail-on-authenticode"),
                 topology_profile: parser.optional_path("--topology-profile"),
@@ -4675,106 +4650,10 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             },
         }),
         #[cfg(feature = "vm-lab")]
-        "vm-lab-diff-orchestrator-parity" => Ok(OpsCommand::VmLabDiffOrchestratorParity {
-            config: vm_lab::VmLabDiffOrchestratorParityConfig {
-                left_path: parser.required_path("--left")?,
-                right_path: parser.required_path("--right")?,
-                output_path: parser.required_path("--output")?,
-                // Default `strict` preserves the pre-`--mode` exit-code +
-                // output-byte contract. `functional` selects the satisfiable
-                // cross-dialect (bash↔Rust) gate. Unknown values fail closed.
-                mode: match parser.value("--mode").as_deref() {
-                    None | Some("strict") => vm_lab::ParityMode::Strict,
-                    Some("functional") => vm_lab::ParityMode::Functional,
-                    Some(other) => {
-                        return Err(format!(
-                            "ops vm-lab-diff-orchestrator-parity: invalid --mode '{other}' \
-                             (expected 'strict' or 'functional')"
-                        ));
-                    }
-                },
-            },
-        }),
-        #[cfg(feature = "vm-lab")]
         "vm-lab-emit-parity-input" => Ok(OpsCommand::VmLabEmitParityInput {
             config: vm_lab::VmLabEmitParityInputConfig {
                 report_dir: parser.required_path("--report-dir")?,
                 output_path: parser.required_path("--output")?,
-            },
-        }),
-        #[cfg(feature = "vm-lab")]
-        "vm-lab-iterate-live-lab" => {
-            let validation_steps = collect_repeated_option_values(&args[1..], "--validation-step")
-                .into_iter()
-                .map(|value| vm_lab::parse_vm_lab_iteration_validation_step_spec(value.as_str()))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(OpsCommand::VmLabIterateLiveLab {
-                config: vm_lab::VmLabIterateLiveLabConfig {
-                    inventory_path: parser
-                        .path_or_default("--inventory", vm_lab::default_inventory_path()),
-                    profile_output_path: parser.optional_path("--profile-output"),
-                    exit_vm: parser.value("--exit-vm"),
-                    exit_target: parser.value("--exit-target"),
-                    client_vm: parser.value("--client-vm"),
-                    client_target: parser.value("--client-target"),
-                    entry_vm: parser.value("--entry-vm"),
-                    entry_target: parser.value("--entry-target"),
-                    aux_vm: parser.value("--aux-vm"),
-                    aux_target: parser.value("--aux-target"),
-                    extra_vm: parser.value("--extra-vm"),
-                    extra_target: parser.value("--extra-target"),
-                    fifth_client_vm: parser.value("--fifth-client-vm"),
-                    fifth_client_target: parser.value("--fifth-client-target"),
-                    require_same_network: parser.has_flag("--require-same-network"),
-                    ssh_identity_file: parser.required_path("--ssh-identity-file")?,
-                    ssh_known_hosts_file: parser.optional_path("--ssh-known-hosts-file"),
-                    ssh_allow_cidrs: parser.value("--ssh-allow-cidrs"),
-                    network_id: parser.value("--network-id"),
-                    traversal_ttl_secs: match parser.value("--traversal-ttl-secs") {
-                        Some(value) => Some(value.parse::<u64>().map_err(|err| {
-                            format!("invalid value for --traversal-ttl-secs: {err}")
-                        })?),
-                        None => None,
-                    },
-                    backend: parser.value("--backend"),
-                    source_mode: parser.value("--source-mode"),
-                    repo_ref: parser.value("--repo-ref"),
-                    report_dir: parser.optional_path("--report-dir"),
-                    script_path: parser
-                        .path_or_default("--script", vm_lab::default_live_lab_orchestrator_path()),
-                    dry_run: parser.has_flag("--dry-run"),
-                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
-                    skip_gates: parser.has_flag("--skip-gates"),
-                    skip_soak: parser.has_flag("--skip-soak"),
-                    skip_cross_network: parser.has_flag("--skip-cross-network"),
-                    require_clean_tree: parser.has_flag("--require-clean-tree"),
-                    require_local_head: parser.has_flag("--require-local-head"),
-                    validation_steps,
-                    collect_failure_diagnostics: parser.has_flag("--collect-failure-diagnostics"),
-                    failed_log_tail_lines: parser
-                        .parse_u64_or_default("--failed-log-tail-lines", 40)?
-                        as usize,
-                },
-            })
-        }
-        #[cfg(feature = "vm-lab")]
-        "vm-lab-run-live-lab" => Ok(OpsCommand::VmLabRunLiveLab {
-            config: vm_lab::VmLabRunLiveLabConfig {
-                profile_path: parser.required_path("--profile")?,
-                script_path: parser
-                    .path_or_default("--script", vm_lab::default_live_lab_orchestrator_path()),
-                dry_run: parser.has_flag("--dry-run"),
-                skip_setup: parser.has_flag("--skip-setup"),
-                skip_gates: parser.has_flag("--skip-gates"),
-                skip_soak: parser.has_flag("--skip-soak"),
-                skip_cross_network: parser.has_flag("--skip-cross-network"),
-                enable_chaos_suite: parser.has_flag("--enable-chaos-suite"),
-                source_mode: parser.value("--source-mode"),
-                repo_ref: parser.value("--repo-ref"),
-                report_dir: parser.optional_path("--report-dir"),
-                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
-                stage_timeout_secs: parser.parse_u64_or_default("--stage-timeout-secs", 0)?,
-                orchestrated: false,
             },
         }),
         #[cfg(feature = "vm-lab")]
@@ -5858,37 +5737,6 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             },
         }),
         #[cfg(feature = "vm-lab")]
-        "emit-stage-manifest" => Ok(OpsCommand::EmitStageManifest {
-            config: live_lab_stage_manifest::EmitStageManifestConfig {
-                report_dir: parser.required_path("--report-dir")?,
-                run_command: parser
-                    .value("--run-command")
-                    .unwrap_or_else(|| "live-linux-lab-orchestrator".to_owned()),
-                run_mode: parser
-                    .value("--run-mode")
-                    .unwrap_or_else(|| "full".to_owned()),
-                selectors: live_lab_stage_registry::TargetSelectors {
-                    wants_macos: parser.has_flag("--macos"),
-                    wants_windows: parser.has_flag("--windows"),
-                    macos_promote_exit: parser.has_flag("--macos-promote-exit"),
-                    exit_platform: parser.value("--exit-platform").unwrap_or_default(),
-                    relay_platform: parser.value("--relay-platform").unwrap_or_default(),
-                    anchor_platform: parser.value("--anchor-platform").unwrap_or_default(),
-                    admin_platform: parser.value("--admin-platform").unwrap_or_default(),
-                    blind_exit_platform: parser.value("--blind-exit-platform").unwrap_or_default(),
-                    role_switch_platform: parser
-                        .value("--role-switch-platform")
-                        .unwrap_or_default(),
-                    skip_linux_live_suite: parser.has_flag("--skip-linux-live-suite"),
-                    chaos_suite: parser.has_flag("--chaos-suite"),
-                    cross_network_suite: parser.has_flag("--cross-network-suite"),
-                    soak_suite: parser.has_flag("--soak-suite"),
-                    local_gate_suite: parser.has_flag("--local-gate-suite"),
-                    negative_control_suite: parser.has_flag("--negative-control-suite"),
-                },
-            },
-        }),
-        #[cfg(feature = "vm-lab")]
         "record-stage-start" => Ok(OpsCommand::RecordStageStart {
             config: live_lab_stage_recorder::RecordStageStartConfig {
                 report_dir: parser.required_path("--report-dir")?,
@@ -5921,14 +5769,6 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 summary: parser.value("--summary").unwrap_or_default(),
                 started_at: parser.value("--started-at").unwrap_or_default(),
                 finished_at: parser.value("--finished-at").unwrap_or_default(),
-            },
-        }),
-        #[cfg(feature = "vm-lab")]
-        "append-orchestrator-run-to-matrix" => Ok(OpsCommand::AppendOrchestratorRunToMatrix {
-            config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig {
-                report_dir: parser.required_path("--report-dir")?,
-                profile_path: parser.value("--profile").as_deref().map(PathBuf::from),
-                inventory_path: parser.value("--inventory").as_deref().map(PathBuf::from),
             },
         }),
         _ => Err(format!("unknown ops subcommand: {subcommand}")),
@@ -8706,21 +8546,6 @@ fn guest_claim_for(command: &OpsCommand) -> Option<GuestClaim> {
             inventory_path: Some(config.inventory_path.clone()),
             claim: excl::guest_refs_for_orchestrate(config),
         }),
-        OpsCommand::VmLabIterateLiveLab { config } => Some(GuestClaim {
-            command: "vm-lab-iterate-live-lab",
-            inventory_path: Some(config.inventory_path.clone()),
-            claim: excl::guest_refs_for_iterate(config),
-        }),
-        OpsCommand::VmLabRunLiveLab { config } => Some(GuestClaim {
-            command: "vm-lab-run-live-lab",
-            // This form has no `--inventory` flag; resolve against the default
-            // one anyway. Without it a profile's `EXIT_TARGET=debian@<ip>`
-            // would key as the raw host while an orchestrate run keys the same
-            // machine as its alias, and the two forms would not exclude each
-            // other at all.
-            inventory_path: Some(vm_lab::default_inventory_path()),
-            claim: excl::guest_refs_for_run_live_lab(config),
-        }),
         // `vm-lab-run-suite` resolves `--vm` aliases into a topology and drives
         // those guests for a full live-lab-length timeout. It was omitted from
         // the first version of this dispatcher, so a suite run and a live-lab
@@ -9215,19 +9040,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             vm_lab::execute_ops_vm_lab_diff_live_lab_runs(config)
         }
         #[cfg(feature = "vm-lab")]
-        OpsCommand::VmLabDiffOrchestratorParity { config } => {
-            vm_lab::execute_ops_vm_lab_diff_orchestrator_parity(config)
-        }
-        #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabEmitParityInput { config } => {
             vm_lab::execute_ops_vm_lab_emit_parity_input(config)
         }
-        #[cfg(feature = "vm-lab")]
-        OpsCommand::VmLabIterateLiveLab { config } => {
-            vm_lab::execute_ops_vm_lab_iterate_live_lab(config)
-        }
-        #[cfg(feature = "vm-lab")]
-        OpsCommand::VmLabRunLiveLab { config } => vm_lab::execute_ops_vm_lab_run_live_lab(config),
         #[cfg(feature = "vm-lab")]
         OpsCommand::VmLabCheckKnownHosts { config } => {
             vm_lab::execute_ops_vm_lab_check_known_hosts(config)
@@ -9594,10 +9409,6 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             })
         }
         #[cfg(feature = "vm-lab")]
-        OpsCommand::EmitStageManifest { config } => {
-            live_lab_stage_manifest::execute_ops_emit_stage_manifest(config)
-        }
-        #[cfg(feature = "vm-lab")]
         OpsCommand::RecordStageStart { config } => {
             live_lab_stage_recorder::execute_ops_record_stage_start(config)
         }
@@ -9608,11 +9419,6 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::LiveLabCoverageReport { config } => {
             live_lab_coverage::execute_ops_live_lab_coverage_report(config)
-        }
-        #[cfg(feature = "vm-lab")]
-        OpsCommand::AppendOrchestratorRunToMatrix { config } => {
-            live_lab_run_matrix::execute_ops_append_orchestrator_run_to_matrix(config)
-                .map(|r| format!("appended orchestrator run row run_id={}", r.run_id))
         }
     }
 }
@@ -20644,8 +20450,8 @@ fn help_text() -> String {
         "  ops vm-lab-run [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
-        "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--dry-run]",
-        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--legacy-bash-orchestrator] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--script <path>] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>]",
+        "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--dry-run]",
+        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>]",
         "  ops vm-lab-overnight --ssh-identity-file <path> [--inventory <path>] [--known-hosts-file <path>] [--branch-prefix <name>] [--backlog <path>] [--max-duration-secs <secs>] [--max-attempts-per-cell <n>] [--rotation <breadth-first|deep-first>] [--auto-merge-safe-cells] [--agent-cmd <path>] [--agent-timeout-secs <secs>] [--seed-status <os:role=status,...>] [--dry-run]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--no-fail-on-authenticode] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
         "  ops vm-lab-validate-linux-security [--inventory <path>] --linux-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--mesh-status-state-path <path>] [--mesh-status-expected-peer-ids <id[,id...]>] [--mesh-status-max-age-seconds <secs>]",
@@ -20657,8 +20463,8 @@ fn help_text() -> String {
         "  ops vm-lab-diff-live-lab-runs --old-report-dir <path> --new-report-dir <path>",
         "  ops vm-lab-diff-orchestrator-parity --left <parity_input.json> --right <parity_input.json> --output <parity_diff.json> [--mode strict|functional]",
         "  ops vm-lab-emit-parity-input --report-dir <run_report_dir> --output <parity_input.json>",
-        "  ops vm-lab-iterate-live-lab [--inventory <path>] [--profile-output <path>] --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--script <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--require-clean-tree] [--require-local-head] --validation-step <fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter]>... [--collect-failure-diagnostics] [--failed-log-tail-lines <n>] [--timeout-secs <secs>]",
-        "  ops vm-lab-run-live-lab --profile <path> [--script <path>] [--dry-run] [--skip-setup] [--skip-gates] [--skip-soak] [--skip-cross-network] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>]",
+        "  ops vm-lab-iterate-live-lab [--inventory <path>] [--profile-output <path>] --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--dry-run] [--skip-gates] [--skip-soak] [--skip-cross-network] [--require-clean-tree] [--require-local-head] --validation-step <fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter]>... [--collect-failure-diagnostics] [--failed-log-tail-lines <n>] [--timeout-secs <secs>]",
+        "  ops vm-lab-run-live-lab --profile <path> [--dry-run] [--skip-setup] [--skip-gates] [--skip-soak] [--skip-cross-network] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>]",
         "  ops vm-lab-check-known-hosts [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--known-hosts-file <path>]",
         "  ops vm-lab-preflight [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--require-same-network] [--require-command <name>]... [--require-commands <name[,name...]>] [--min-free-kib <kib>] [--require-rustynet-installed] [--timeout-secs <secs>]",
         "  ops vm-lab-readiness-check [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--ssh-port <port>] [--connect-timeout-secs <secs>] [--report-dir <path>]",
@@ -22665,65 +22471,58 @@ mod guest_claim_wiring_tests {
     use super::{OpsCommand, execute_ops, guest_claim_for, vm_lab};
     use std::path::PathBuf;
 
-    fn run_live_lab_command(profile_path: PathBuf) -> OpsCommand {
-        run_live_lab_command_with_dry_run(profile_path, false)
-    }
-
-    fn run_live_lab_command_with_dry_run(profile_path: PathBuf, dry_run: bool) -> OpsCommand {
-        OpsCommand::VmLabRunLiveLab {
-            config: vm_lab::VmLabRunLiveLabConfig {
-                profile_path,
-                script_path: PathBuf::from("/dev/null"),
-                dry_run,
-                skip_setup: false,
-                skip_gates: false,
-                skip_soak: false,
-                skip_cross_network: false,
-                enable_chaos_suite: false,
+    /// W5.7: the profile-driven `vm-lab-run-live-lab` fixture died with the
+    /// bash engine; the setup command (a surviving guest-bearing op) carries
+    /// the same claim wiring, so it is the vehicle now.
+    fn setup_live_lab_command(exit_alias: &str, report_dir: PathBuf) -> OpsCommand {
+        OpsCommand::VmLabSetupLiveLab {
+            config: vm_lab::VmLabSetupLiveLabConfig {
+                inventory_path: vm_lab::default_inventory_path(),
+                profile_path: None,
+                profile_output_path: None,
+                exit_vm: Some(exit_alias.to_owned()),
+                client_vm: None,
+                entry_vm: None,
+                aux_vm: None,
+                extra_vm: None,
+                fifth_client_vm: None,
+                relay_vm: None,
+                linux_blind_exit_vm: None,
+                ssh_identity_file: PathBuf::from("/dev/null"),
+                known_hosts_path: None,
+                require_same_network: false,
+                report_dir,
                 source_mode: None,
                 repo_ref: None,
-                report_dir: None,
+                resume_from: None,
+                rerun_stage: None,
+                max_parallel_node_workers: None,
                 timeout_secs: 1,
                 stage_timeout_secs: 0,
+                dry_run: false,
                 orchestrated: false,
             },
         }
     }
 
     #[test]
-    fn a_live_lab_run_claims_the_guests_named_by_its_profile() {
+    fn a_setup_run_claims_the_guest_named_by_its_role_flag() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let profile = tmp.path().join("p.env");
-        std::fs::write(
-            &profile,
-            "EXIT_TARGET=debian@192.168.18.65\nCLIENT_TARGET=ubuntu@192.168.18.52\n",
-        )
-        .expect("write profile");
-
-        let claim = guest_claim_for(&run_live_lab_command(profile))
-            .expect("vm-lab-run-live-lab must claim its guests");
-        assert_eq!(claim.command, "vm-lab-run-live-lab");
-        assert_eq!(
-            claim.claim.refs,
-            vec!["debian@192.168.18.65", "ubuntu@192.168.18.52"]
+        let claim = guest_claim_for(&setup_live_lab_command(
+            "zz-qh18-guest",
+            tmp.path().join("report"),
+        ))
+        .expect("vm-lab-setup-live-lab must claim its guests");
+        assert_eq!(claim.command, "vm-lab-setup-live-lab");
+        assert!(
+            claim.claim.refs.iter().any(|r| r == "zz-qh18-guest"),
+            "the exit alias must be claimed; got {:?}",
+            claim.claim.refs
         );
         assert!(
             claim.inventory_path.is_some(),
-            "must resolve against an inventory, or profile targets and --node \
-             aliases key differently and never collide"
-        );
-    }
-
-    #[test]
-    fn an_unreadable_profile_claims_nothing_rather_than_inventing_guests() {
-        let claim = guest_claim_for(&run_live_lab_command(PathBuf::from(
-            "/nonexistent/profile.env",
-        )))
-        .expect("the command still claims");
-        assert!(
-            claim.claim.refs.is_empty(),
-            "no guesses from an unreadable profile; claim_guests warns that the \
-             run is unprotected rather than pretending otherwise"
+            "must resolve against an inventory, or aliases and raw targets \
+             key differently and never collide"
         );
     }
 
@@ -22738,21 +22537,6 @@ mod guest_claim_wiring_tests {
     /// for one. Locking it turned `ai_lab_run`'s documented "fast wiring check"
     /// into something that fails whenever a real run is in flight — a new false
     /// refusal introduced by the fix for the old false permit.
-    #[test]
-    fn a_dry_run_claims_no_guests_because_it_touches_none() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let profile = tmp.path().join("p.env");
-        std::fs::write(&profile, "EXIT_TARGET=debian@192.0.2.11\n").expect("write profile");
-
-        let claim = guest_claim_for(&run_live_lab_command_with_dry_run(profile, true))
-            .expect("the command still maps");
-        assert!(
-            claim.claim.touches_no_guest,
-            "a dry run must be marked as touching no guest"
-        );
-        assert!(claim.claim.refs.is_empty(), "and must claim nothing");
-    }
-
     /// QH-18. This pins the WIRING. Everything above pins the MAPPING, and the
     /// two are not the same thing: the mapping being right says nothing about
     /// whether the claim is taken and HELD.
@@ -22781,11 +22565,11 @@ mod guest_claim_wiring_tests {
         // write into the operator's real `~/.rustynet`.
         excl::set_lock_dir_override(Some(tmp.path().to_path_buf()));
 
-        let profile = tmp.path().join("p.env");
-        std::fs::write(&profile, "EXIT_TARGET=debian@192.0.2.11\n").expect("write profile");
-
-        let claim = guest_claim_for(&run_live_lab_command(profile.clone()))
-            .expect("vm-lab-run-live-lab must claim its guests");
+        let claim = guest_claim_for(&setup_live_lab_command(
+            "zz-qh18-guest",
+            tmp.path().join("report"),
+        ))
+        .expect("vm-lab-setup-live-lab must claim its guests");
         let keys = excl::canonical_guest_keys(claim.inventory_path.as_deref(), claim.claim.refs);
         assert!(
             !keys.is_empty(),
@@ -22795,8 +22579,11 @@ mod guest_claim_wiring_tests {
         let held = excl::acquire_guest_run_locks(&keys).expect("first claim must succeed");
         assert!(!held.keys().is_empty(), "the first claim must hold a lock");
 
-        let err = execute_ops(run_live_lab_command(profile))
-            .expect_err("a second run on a held guest must be REFUSED, not merely warned about");
+        let err = execute_ops(setup_live_lab_command(
+            "zz-qh18-guest",
+            tmp.path().join("report2"),
+        ))
+        .expect_err("a second run on a held guest must be REFUSED, not merely warned about");
         assert!(
             keys.iter().any(|key| err.contains(key.as_str())),
             "the refusal must name the contended guest so the operator can find \
@@ -26466,44 +26253,6 @@ mod tests {
             "artifacts/live_lab/new".to_owned(),
         ]);
         assert!(format!("{vm_lab_diff:?}").contains("VmLabDiffLiveLabRuns"));
-
-        let vm_lab_iteration = parse_command(&[
-            "ops".to_owned(),
-            "vm-lab-iterate-live-lab".to_owned(),
-            "--ssh-identity-file".to_owned(),
-            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_owned(),
-            "--exit-vm".to_owned(),
-            "debian-headless-1".to_owned(),
-            "--client-target".to_owned(),
-            "debian@192.168.18.52".to_owned(),
-            "--validation-step".to_owned(),
-            "fmt".to_owned(),
-            "--validation-step".to_owned(),
-            "check:rustynetd".to_owned(),
-            "--validation-step".to_owned(),
-            "test-bin:rustynet-cli:live_linux_lan_toggle_test".to_owned(),
-            "--skip-cross-network".to_owned(),
-            "--require-clean-tree".to_owned(),
-            "--require-local-head".to_owned(),
-            "--collect-failure-diagnostics".to_owned(),
-        ]);
-        assert!(format!("{vm_lab_iteration:?}").contains("VmLabIterateLiveLab"));
-        assert!(format!("{vm_lab_iteration:?}").contains("CargoCheckPackage"));
-        assert!(format!("{vm_lab_iteration:?}").contains("CargoTestBin"));
-        assert!(format!("{vm_lab_iteration:?}").contains("skip_cross_network: true"));
-
-        let vm_lab_live_lab = parse_command(&[
-            "ops".to_owned(),
-            "vm-lab-run-live-lab".to_owned(),
-            "--profile".to_owned(),
-            "/tmp/live_lab.env".to_owned(),
-            "--dry-run".to_owned(),
-            "--skip-setup".to_owned(),
-            "--skip-gates".to_owned(),
-        ]);
-        assert!(format!("{vm_lab_live_lab:?}").contains("VmLabRunLiveLab"));
-        assert!(format!("{vm_lab_live_lab:?}").contains("dry_run: true"));
-        assert!(format!("{vm_lab_live_lab:?}").contains("skip_setup: true"));
 
         let vm_lab_known_hosts = parse_command(&[
             "ops".to_owned(),

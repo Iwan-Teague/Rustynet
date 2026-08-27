@@ -1317,13 +1317,11 @@ as inline dispatch_stage calls inside the bash orchestrator's linux_live_suite b
 R4) ORCHESTRATOR ARCHITECTURE
 ────────────────────────────────────────────
 
-Two orchestrator paths:
-- **Bash** (`scripts/e2e/live_linux_lab_orchestrator.sh`, 8829 lines): still PRIMARY for the
-  full Linux suite. Runs 15 setup stages + Linux live suite sub-stages.
-- **Rust-native** (`crates/rustynet-cli/src/vm_lab/orchestrator/`, 21 StageIds): only fires
-  with `--node` flags. Has cleaner skip-cascade semantics.
-- **RustOrchestrator wrapper** (mod.rs:~6452): hybrid — delegates to bash for any topology
-  containing Linux.
+ONE orchestrator path (W5.7 deleted the legacy bash orchestrator):
+- **Rust-native** (`crates/rustynet-cli/src/vm_lab/orchestrator/`): the engine of
+  record, driven via `--node <alias>:<role>` assignments (the legacy `--*-vm`
+  role flags still translate). Unsupported legacy shapes (platform selectors,
+  --macos-vm/--windows-vm, --topology-profile) fail closed with the reason.
 
 Three sidecar paths for mac/win stages (ALL go through finalize_vm_lab_orchestration_result):
 1. **Normal or skip_linux_live_suite path** — run_windows_orchestration_with_pulled_bundles

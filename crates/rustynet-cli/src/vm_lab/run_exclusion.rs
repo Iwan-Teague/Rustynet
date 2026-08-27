@@ -333,7 +333,6 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         ssh_identity_file: _,
         known_hosts_path: _,
         require_same_network: _,
-        script_path: _,
         report_dir: _,
         source_mode: _,
         repo_ref: _,
@@ -362,7 +361,6 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         windows_only: _,
         no_fail_on_authenticode: _,
         validate_linux_daemon_state: _,
-        legacy_bash_orchestrator: _,
         orchestrate_ssh_allow_cidrs: _,
         macos_promote_exit: _,
         enable_chaos_suite: _,
@@ -455,7 +453,6 @@ pub fn guest_refs_for_setup(config: &super::VmLabSetupLiveLabConfig) -> GuestCla
         ssh_identity_file: _,
         known_hosts_path: _,
         require_same_network: _,
-        script_path: _,
         report_dir: _,
         source_mode: _,
         repo_ref: _,
@@ -496,77 +493,6 @@ pub fn guest_refs_for_setup(config: &super::VmLabSetupLiveLabConfig) -> GuestCla
     }
 }
 
-/// Every guest `ops vm-lab-iterate-live-lab` will touch. This form accepts a
-/// guest by alias OR by raw SSH target, which is exactly why canonicalization
-/// has to collapse both spellings onto one key.
-pub fn guest_refs_for_iterate(config: &super::VmLabIterateLiveLabConfig) -> GuestClaimRefs {
-    // Exhaustive: see `guest_refs_for_orchestrate`.
-    let super::VmLabIterateLiveLabConfig {
-        exit_vm,
-        exit_target,
-        client_vm,
-        client_target,
-        entry_vm,
-        entry_target,
-        aux_vm,
-        aux_target,
-        extra_vm,
-        extra_target,
-        fifth_client_vm,
-        fifth_client_target,
-        dry_run,
-        inventory_path: _,
-        profile_output_path: _,
-        require_same_network: _,
-        ssh_identity_file: _,
-        ssh_known_hosts_file: _,
-        ssh_allow_cidrs: _,
-        network_id: _,
-        traversal_ttl_secs: _,
-        backend: _,
-        source_mode: _,
-        repo_ref: _,
-        report_dir: _,
-        script_path: _,
-        timeout_secs: _,
-        skip_gates: _,
-        skip_soak: _,
-        skip_cross_network: _,
-        require_clean_tree: _,
-        require_local_head: _,
-        validation_steps: _,
-        collect_failure_diagnostics: _,
-        failed_log_tail_lines: _,
-    } = config;
-
-    if *dry_run {
-        return GuestClaimRefs::no_guests();
-    }
-
-    GuestClaimRefs {
-        refs: [
-            exit_vm,
-            exit_target,
-            client_vm,
-            client_target,
-            entry_vm,
-            entry_target,
-            aux_vm,
-            aux_target,
-            extra_vm,
-            extra_target,
-            fifth_client_vm,
-            fifth_client_target,
-        ]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect(),
-        unresolved: Vec::new(),
-        touches_no_guest: false,
-    }
-}
-
 /// Every guest named by a live-lab profile (`ops vm-lab-run-live-lab` takes
 /// only `--profile`, so its topology lives in the file).
 ///
@@ -596,38 +522,6 @@ pub fn guest_refs_from_profile(path: &Path) -> Vec<String> {
             Some(value.to_owned())
         })
         .collect()
-}
-
-/// Every guest `ops vm-lab-run-live-lab` will touch. This form is driven
-/// entirely by its profile.
-pub fn guest_refs_for_run_live_lab(config: &super::VmLabRunLiveLabConfig) -> GuestClaimRefs {
-    // Exhaustive: see `guest_refs_for_orchestrate`.
-    let super::VmLabRunLiveLabConfig {
-        profile_path,
-        dry_run,
-        script_path: _,
-        skip_setup: _,
-        skip_gates: _,
-        skip_soak: _,
-        skip_cross_network: _,
-        enable_chaos_suite: _,
-        source_mode: _,
-        repo_ref: _,
-        report_dir: _,
-        timeout_secs: _,
-        stage_timeout_secs: _,
-        orchestrated: _,
-    } = config;
-
-    if *dry_run {
-        return GuestClaimRefs::no_guests();
-    }
-
-    GuestClaimRefs {
-        refs: guest_refs_from_profile(profile_path.as_path()),
-        unresolved: Vec::new(),
-        touches_no_guest: false,
-    }
 }
 
 /// Every guest `ops vm-lab-run-suite` will touch.

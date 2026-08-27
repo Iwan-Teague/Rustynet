@@ -1,5 +1,12 @@
 # DeepSeek Live-Lab Orchestration Pipeline — Design
 
+> **W5.7 (2026-08-27): the legacy bash orchestrator was DELETED**
+> (`BashOrchestratorRetirementProgram_2026-08-22.md` — owner-signed G3). Any
+> instruction below that invokes `live_linux_lab_orchestrator.sh`,
+> `--legacy-bash-orchestrator`, `vm-lab-run-live-lab`, `vm-lab-iterate-live-lab`
+> or `legacy_bash: true` is historical; the engine of record is
+> `ops vm-lab-orchestrate-live-lab --node <alias>:<role> ...`.
+
 - Status: **ACTIVE — rigid triage + deterministic lab launch + standardized loop/recovery entrypoints landed; stage-by-stage v4-pro orchestration remains future work** (2026-06-28)
 - Owner surface: `crates/rustynet-mcp` (the `rustynet-mcp-deepseek` server, binary `bin/rustynet-mcp-deepseek`)
 - Related: [§12.5 DeepSeek MCP](../../../CLAUDE.md) · [LiveLabExecutionEfficiencyPlan](LiveLabExecutionEfficiencyPlan_2026-06-20.md) · [CrossPlatformRoleParityPlan](CrossPlatformRoleParityPlan_2026-06-21.md) · [CrossPlatformRoleParityRoadmap](CrossPlatformRoleParityRoadmap_2026-06-22.md)

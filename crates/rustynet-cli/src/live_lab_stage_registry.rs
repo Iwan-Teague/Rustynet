@@ -2785,52 +2785,6 @@ mod tests {
         assert!(!find_stage("preflight").expect("registered").synthetic);
     }
 
-    /// Finding 1D (drift gate, orchestrator half): every stage-name
-    /// literal the bash orchestrator records must resolve in the registry.
-    /// A new bash stage that lands without a registry entry fails this
-    /// test instead of becoming invisible to every consumer.
-    #[test]
-    fn every_bash_orchestrator_stage_literal_is_registered() {
-        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../scripts/e2e/live_linux_lab_orchestrator.sh");
-        let source = std::fs::read_to_string(&script_path)
-            .unwrap_or_else(|err| panic!("read {}: {err}", script_path.display()));
-        let mut names = std::collections::BTreeSet::new();
-        for line in source.lines() {
-            let line = line.trim_start();
-            for prefix in [
-                "run_stage hard ",
-                "run_stage soft ",
-                "run_setup_stage hard ",
-                "run_setup_stage soft ",
-                "record_stage_skip \"",
-            ] {
-                if let Some(rest) = line.find(prefix).map(|idx| &line[idx + prefix.len()..]) {
-                    let name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
-                        .collect();
-                    if !name.is_empty() {
-                        names.insert(name);
-                    }
-                }
-            }
-        }
-        assert!(
-            names.len() >= 30,
-            "extraction regressed — only {} stage literals found",
-            names.len()
-        );
-        let missing: Vec<String> = names
-            .into_iter()
-            .filter(|name| find_stage(name).is_none())
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "bash orchestrator records stages the registry does not know: {missing:?}"
-        );
-    }
-
     /// Finding 1D (drift gate, monitor half): every stage-name literal in
     /// the lab monitor's fallback catalogs must resolve in the registry.
     /// The monitor is workspace-excluded (no build-time sharing), so this

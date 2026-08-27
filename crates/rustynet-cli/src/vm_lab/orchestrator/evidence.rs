@@ -1382,7 +1382,7 @@ mod finalize_tests {
             "vm-lab-orchestrate-live-lab",
             "full",
             &crate::live_lab_stage_registry::TargetSelectors::default(),
-            Some(&active),
+            &active,
         );
         crate::live_lab_stage_manifest::write_stage_manifest(report_dir, &manifest)
             .expect("stage manifest");

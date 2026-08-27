@@ -59,7 +59,6 @@ run_orch "role_validation" vm_lab::orchestrator::role_validation::
 
 # Stage registry drift gates.
 run_orch "stage_registry"  live_lab_stage_registry::tests::every_rust_state_machine_stage_id_is_registered
-run_orch "bash_registry"   live_lab_stage_registry::tests::every_bash_orchestrator_stage_literal_is_registered
 run_orch "monitor_registry" live_lab_stage_registry::tests::every_monitor_fallback_catalog_stage_is_registered
 
 # Run-matrix oracle parity (registry ≡ historical hand-maintained tables).

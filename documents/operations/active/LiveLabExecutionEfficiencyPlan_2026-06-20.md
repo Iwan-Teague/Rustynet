@@ -1,5 +1,12 @@
 # Live-Lab Execution Efficiency Plan — 2026-06-20
 
+> **W5.7 (2026-08-27): the legacy bash orchestrator was DELETED**
+> (`BashOrchestratorRetirementProgram_2026-08-22.md` — owner-signed G3). Any
+> instruction below that invokes `live_linux_lab_orchestrator.sh`,
+> `--legacy-bash-orchestrator`, `vm-lab-run-live-lab`, `vm-lab-iterate-live-lab`
+> or `legacy_bash: true` is historical; the engine of record is
+> `ops vm-lab-orchestrate-live-lab --node <alias>:<role> ...`.
+
 Permanent execution-strategy doc for the same-LAN "drive defects to zero" loop.
 Goal: iron out **all same-LAN kinks** (Linux, macOS, Windows, cross-OS) as fast as
 possible **without weakening security or reliability**. Security is the priority;

@@ -1,5 +1,12 @@
 # Cross-Platform Role Parity — Completion Roadmap & Test-Pipeline Plan — 2026-06-22
 
+> **W5.7 (2026-08-27): the legacy bash orchestrator was DELETED**
+> (`BashOrchestratorRetirementProgram_2026-08-22.md` — owner-signed G3). Any
+> instruction below that invokes `live_linux_lab_orchestrator.sh`,
+> `--legacy-bash-orchestrator`, `vm-lab-run-live-lab`, `vm-lab-iterate-live-lab`
+> or `legacy_bash: true` is historical; the engine of record is
+> `ops vm-lab-orchestrate-live-lab --node <alias>:<role> ...`.
+
 **Purpose.** A single, concrete roadmap to drive macOS and Windows to full per-role
 parity with Linux (the release-blocking mandate in
 `CrossPlatformRoleParityPlan_2026-06-21.md`), **plus** an optimized live-lab test

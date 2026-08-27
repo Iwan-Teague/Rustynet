@@ -65,6 +65,7 @@ pub enum TopologyPlatform {
 }
 
 impl TopologyPlatform {
+    #[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
     pub fn as_str(self) -> &'static str {
         match self {
             TopologyPlatform::Linux => "linux",
@@ -73,6 +74,7 @@ impl TopologyPlatform {
         }
     }
 
+    #[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
     pub fn parse(raw: &str) -> Result<Self, String> {
         let normalised = raw.trim().to_ascii_lowercase();
         match normalised.as_str() {
@@ -221,6 +223,7 @@ fn ensure_topology_alias_value(role: TopologyRole, alias: &str) -> Result<(), St
 /// "Debian/Linux" today). Mobile guests are reported as
 /// [`TopologyPlatform::Linux`] only when the inference defaults to
 /// Linux; otherwise [`platform_for_entry`] returns `None`.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 pub(crate) fn platform_for_entry(entry: &VmInventoryEntry) -> Option<TopologyPlatform> {
     let utm_name = entry.controller.as_ref().map(controller_utm_name);
     let inferred = VmGuestPlatform::infer(
@@ -232,6 +235,7 @@ pub(crate) fn platform_for_entry(entry: &VmInventoryEntry) -> Option<TopologyPla
     TopologyPlatform::try_from(inferred).ok()
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn controller_utm_name(controller: &super::VmController) -> String {
     match controller {
         super::VmController::LocalUtm { utm_name, .. } => utm_name.clone(),
@@ -247,6 +251,7 @@ fn controller_utm_name(controller: &super::VmController) -> String {
 /// array, so operators can reorder entries to influence the pick.
 /// Returns `None` when no entry matches; callers translate that into a
 /// hard error with role + platform context.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 pub(crate) fn select_alias_by_platform(
     inventory: &[VmInventoryEntry],
     platform: TopologyPlatform,
@@ -355,6 +360,7 @@ impl TopologyResolution {
 /// - A topology profile alias must exist in the inventory; the
 ///   resolver verifies presence so a typo in the profile file fails
 ///   loudly.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 pub(crate) fn resolve_topology(
     inputs: &TopologyResolveInputs<'_>,
     inventory: &[VmInventoryEntry],
@@ -403,6 +409,7 @@ pub(crate) fn resolve_topology(
     })
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn resolve_one_role(
     role: TopologyRole,
     explicit: Option<&str>,
@@ -461,6 +468,7 @@ fn resolve_one_role(
     Ok(None)
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn ensure_alias_in_inventory(
     role: TopologyRole,
     alias: &str,
@@ -490,6 +498,7 @@ fn ensure_alias_in_inventory(
 /// caller can log + audit the choice and emit `*_PLATFORM` env vars
 /// for the bash orchestrator when the resolution differs from the
 /// default.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 pub(crate) fn apply_topology_overrides_to_orchestrate_config(
     mut config: VmLabOrchestrateLiveLabConfig,
     inventory: &[VmInventoryEntry],
@@ -528,6 +537,7 @@ pub(crate) fn apply_topology_overrides_to_orchestrate_config(
     Ok((config, resolution))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn parse_optional_platform(
     label: &str,
     raw: Option<&str>,
@@ -873,7 +883,6 @@ mod tests {
             ssh_identity_file: PathBuf::from("/dev/null"),
             known_hosts_path: None,
             require_same_network: false,
-            script_path: PathBuf::from("/dev/null"),
             report_dir: PathBuf::from("/dev/null"),
             source_mode: None,
             repo_ref: None,
@@ -906,7 +915,6 @@ mod tests {
             windows_only: false,
             validate_linux_daemon_state: false,
             node_assignments: Vec::new(),
-            legacy_bash_orchestrator: false,
             orchestrate_ssh_allow_cidrs: None,
             no_fail_on_authenticode: false,
             topology_profile: None,
