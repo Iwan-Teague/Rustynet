@@ -14,7 +14,12 @@ impl OrchestrationStage for CollectPubkeysStage {
         "collect_pubkeys"
     }
     fn dependencies(&self) -> &[StageId] {
-        &[StageId::BootstrapHosts]
+        // The substrate-setup dependency is the topology-level seam: when an
+        // overlay substrate is requested and fails, collecting (and later
+        // distributing) unroutable underlay endpoints must cascade-skip
+        // rather than run. On the default no-substrate path the setup stage
+        // passes as a no-op and this edge changes nothing.
+        &[StageId::BootstrapHosts, StageId::CrossNetworkSubstrateSetup]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
         &[]

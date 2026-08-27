@@ -558,6 +558,308 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
     }
 }
 
+// ───────────────────────────── lifecycle stages ─────────────────────────────
+
+use crate::vm_lab::orchestrator::context::OrchestrationContext;
+use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+
+use super::{CrossNetworkOptions, CrossNetworkSubstrate};
+
+/// Resolve every assigned node's alias → management IPv4 from its adapter's
+/// SSH parameters. Fail closed on a node with no SSH params or a
+/// non-IPv4-literal host: an overlay planned over an incomplete topology
+/// would hand out endpoints some peers cannot use.
+fn substrate_topology_from_ctx(ctx: &OrchestrationContext) -> Result<SubstrateTopology, String> {
+    let mut nodes = BTreeMap::new();
+    for assignment in &ctx.assignments {
+        let alias = assignment.alias.as_str();
+        let adapter = ctx
+            .adapters
+            .get(alias)
+            .ok_or_else(|| format!("substrate topology: no adapter for '{alias}'"))?;
+        let params = adapter
+            .ssh_connection_params()
+            .ok_or_else(|| format!("substrate topology: '{alias}' has no SSH connection params"))?;
+        let host = super::strip_ssh_host(params.host.as_str());
+        let ip: Ipv4Addr = host.parse().map_err(|_| {
+            format!("substrate topology: '{alias}' management host {host:?} is not an IPv4 literal")
+        })?;
+        nodes.insert(alias.to_owned(), ip);
+    }
+    Ok(SubstrateTopology { nodes })
+}
+
+/// Build one hardened remote leaf runner per assigned node.
+fn build_remote_runners(
+    ctx: &OrchestrationContext,
+    stage_name: &str,
+) -> Result<Vec<(String, RemoteShellRunner)>, String> {
+    let log_path = ctx
+        .report_dir
+        .join(stage_name)
+        .join("substrate_leaf_commands.log");
+    let mut runners = Vec::new();
+    for assignment in &ctx.assignments {
+        let alias = assignment.alias.clone();
+        let host = super::remote_host_for_alias(ctx, &alias)?;
+        runners.push((
+            alias.clone(),
+            RemoteShellRunner::new(host, log_path.clone(), alias),
+        ));
+    }
+    Ok(runners)
+}
+
+fn runner_refs(runners: &[(String, RemoteShellRunner)]) -> BTreeMap<String, &dyn NetLeafRunner> {
+    runners
+        .iter()
+        .map(|(alias, runner)| (alias.clone(), runner as &dyn NetLeafRunner))
+        .collect()
+}
+
+/// The requested-vs-persisted provenance check shared by setup and teardown.
+/// Any disagreement between what this run requests and what the persisted
+/// record says a previous (resumed) run provisioned is a hard failure.
+fn check_record_against_request(
+    record: Option<&SubstrateRecord>,
+    requested_id: Option<&str>,
+    current_digest: Option<&str>,
+) -> Result<(), String> {
+    let Some(record) = record else {
+        return Ok(());
+    };
+    match requested_id {
+        None => Err(format!(
+            "substrate provenance mismatch: the persisted context records substrate '{}' \
+             but this run requests none; refusing to continue over unknown overlay state \
+             (re-run setup or tear the lab down)",
+            record.substrate_id
+        )),
+        Some(requested_id) if requested_id != record.substrate_id => Err(format!(
+            "substrate provenance mismatch: persisted substrate '{}' but this run requests \
+             '{requested_id}'",
+            record.substrate_id
+        )),
+        Some(_) => match current_digest {
+            Some(digest) if digest != record.topology_digest => Err(format!(
+                "substrate topology mismatch on resume: persisted digest {} but this run's \
+                 topology digests to {digest}; the inventory changed under the overlay — \
+                 refusing to reuse stale overlay addressing",
+                record.topology_digest
+            )),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Provision the topology-level substrate BEFORE `collect_pubkeys` so overlay
+/// addresses (not raw cross-LAN-unroutable underlay IPs) become the recorded
+/// peer endpoints. A complete no-op pass unless `--cross-network-substrate
+/// vxlan` is selected — the default netns substrate provisions nothing here
+/// and existing single-LAN runs are unaffected.
+pub struct CrossNetworkSubstrateSetupStage {
+    options: CrossNetworkOptions,
+}
+
+impl CrossNetworkSubstrateSetupStage {
+    pub fn new(options: CrossNetworkOptions) -> Self {
+        Self { options }
+    }
+
+    /// The provider-driving half, parameterized over runners so it is
+    /// unit-testable with `MockLeafRunner`. `execute` supplies real
+    /// SSH-backed runners.
+    fn provision(
+        ctx: &mut OrchestrationContext,
+        topology: &SubstrateTopology,
+        runners: &BTreeMap<String, &dyn NetLeafRunner>,
+    ) -> StageOutcome {
+        let provider = VxlanSubstrateProvider;
+        let plan = match plan_overlay(topology) {
+            Ok(plan) => plan,
+            Err(err) => return StageOutcome::Failed(err),
+        };
+        let digest = topology_digest(provider.id(), topology, plan.as_ref());
+        if let Err(err) = check_record_against_request(
+            ctx.substrate_record.as_ref(),
+            Some(provider.id()),
+            Some(&digest),
+        ) {
+            return StageOutcome::Failed(err);
+        }
+        match provider.setup(topology, runners) {
+            Ok(handle) => {
+                ctx.substrate_record = Some(handle.record.clone());
+                ctx.substrate = Some(handle);
+                StageOutcome::Passed
+            }
+            Err(failure) => {
+                // Keep the partial state so the always-run teardown removes
+                // exactly what was created before the failure.
+                ctx.substrate_record = Some(failure.partial.record.clone());
+                ctx.substrate = Some(failure.partial);
+                StageOutcome::Failed(format!(
+                    "vxlan substrate setup failed (partial state recorded for teardown): {}",
+                    failure.message
+                ))
+            }
+        }
+    }
+}
+
+impl OrchestrationStage for CrossNetworkSubstrateSetupStage {
+    fn id(&self) -> StageId {
+        StageId::CrossNetworkSubstrateSetup
+    }
+    fn name(&self) -> &str {
+        "cross_network_substrate_setup"
+    }
+    fn dependencies(&self) -> &[StageId] {
+        &[StageId::BootstrapHosts]
+    }
+    fn applies_to_roles(&self) -> &[NodeRole] {
+        &[]
+    }
+    fn fanout(&self) -> StageFanout {
+        StageFanout::Once
+    }
+
+    fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        if self.options.substrate != CrossNetworkSubstrate::Vxlan {
+            // No overlay-provisioning substrate requested: pass through
+            // untouched — UNLESS a resumed context says one was provisioned,
+            // which is a provenance mismatch and fails closed.
+            return match check_record_against_request(ctx.substrate_record.as_ref(), None, None) {
+                Ok(()) => StageOutcome::Passed,
+                Err(err) => StageOutcome::Failed(err),
+            };
+        }
+        let topology = match substrate_topology_from_ctx(ctx) {
+            Ok(topology) => topology,
+            Err(err) => return StageOutcome::Failed(err),
+        };
+        // The vxlan leaf ops are Linux `ip`/`bridge`; a non-Linux guest in an
+        // overlay-needing topology cannot be silently excluded (its endpoints
+        // would stay unroutable), so fail closed until per-OS leaf ops exist.
+        match plan_overlay(&topology) {
+            Err(err) => return StageOutcome::Failed(err),
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                for assignment in &ctx.assignments {
+                    let platform = ctx
+                        .adapters
+                        .get(assignment.alias.as_str())
+                        .map(|adapter| adapter.platform());
+                    if platform != Some(crate::vm_lab::VmGuestPlatform::Linux) {
+                        return StageOutcome::Failed(format!(
+                            "vxlan topology substrate supports only Linux guests today; \
+                             '{}' is {:?}",
+                            assignment.alias, platform
+                        ));
+                    }
+                }
+            }
+        }
+        let runners = match build_remote_runners(ctx, "cross_network_substrate_setup") {
+            Ok(runners) => runners,
+            Err(err) => return StageOutcome::Failed(err),
+        };
+        let refs = runner_refs(&runners);
+        Self::provision(ctx, &topology, &refs)
+    }
+}
+
+/// Remove every vxlan link the substrate created — even after a partial
+/// setup or an earlier stage failure (`always_run`), and even after a resume
+/// where only the persisted record survives. Failure to remove is a stage
+/// FAILURE (possible residue), never silent.
+pub struct CrossNetworkSubstrateTeardownStage {
+    options: CrossNetworkOptions,
+}
+
+impl CrossNetworkSubstrateTeardownStage {
+    pub fn new(options: CrossNetworkOptions) -> Self {
+        Self { options }
+    }
+
+    fn teardown_with(
+        ctx: &mut OrchestrationContext,
+        runners: &BTreeMap<String, &dyn NetLeafRunner>,
+        requested_id: Option<&str>,
+    ) -> StageOutcome {
+        let Some(record) = ctx.substrate_record.clone() else {
+            return StageOutcome::Passed;
+        };
+        if let Err(err) = check_record_against_request(Some(&record), requested_id, None) {
+            return StageOutcome::Failed(err);
+        }
+        if !record.provisioned {
+            return StageOutcome::Passed;
+        }
+        let provider = VxlanSubstrateProvider;
+        // The live handle when we have it (exact created-link list, covers
+        // partial setup); otherwise a record-derived handle (resume case).
+        let handle = ctx.substrate.clone().unwrap_or_else(|| SubstrateHandle {
+            record: record.clone(),
+            overlay_ips: BTreeMap::new(),
+            underlay_ips: BTreeMap::new(),
+            created_links: Vec::new(),
+        });
+        match provider.teardown(&handle, runners) {
+            Ok(()) => {
+                ctx.substrate = None;
+                StageOutcome::Passed
+            }
+            Err(err) => StageOutcome::Failed(err),
+        }
+    }
+}
+
+impl OrchestrationStage for CrossNetworkSubstrateTeardownStage {
+    fn id(&self) -> StageId {
+        StageId::CrossNetworkSubstrateTeardown
+    }
+    fn name(&self) -> &str {
+        "cross_network_substrate_teardown"
+    }
+    fn dependencies(&self) -> &[StageId] {
+        // Teardown is a `finally` block like FinalCleanupStage: ordered by
+        // catalog position (just before `cleanup`), gated on nothing.
+        &[]
+    }
+    fn applies_to_roles(&self) -> &[NodeRole] {
+        &[]
+    }
+    fn fanout(&self) -> StageFanout {
+        StageFanout::Once
+    }
+
+    /// Overlay residue on the guests is release-blocking exactly like exit-NAT
+    /// residue: teardown must run even when an earlier stage failed.
+    fn always_run(&self) -> bool {
+        true
+    }
+
+    fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        let requested_id = if self.options.substrate == CrossNetworkSubstrate::Vxlan {
+            Some("vxlan")
+        } else {
+            None
+        };
+        if ctx.substrate_record.is_none() {
+            return StageOutcome::Passed;
+        }
+        let runners = match build_remote_runners(ctx, "cross_network_substrate_teardown") {
+            Ok(runners) => runners,
+            Err(err) => return StageOutcome::Failed(err),
+        };
+        let refs = runner_refs(&runners);
+        Self::teardown_with(ctx, &refs, requested_id)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod mock {
     use super::{LeafOutput, NetLeafRunner};
@@ -606,6 +908,186 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn options_with(substrate: CrossNetworkSubstrate) -> CrossNetworkOptions {
+        CrossNetworkOptions {
+            substrate,
+            ..CrossNetworkOptions::default()
+        }
+    }
+
+    fn empty_ctx() -> OrchestrationContext {
+        OrchestrationContext::new(Vec::new(), std::env::temp_dir(), "net".to_owned())
+    }
+
+    fn vxlan_record(provisioned: bool) -> SubstrateRecord {
+        SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned,
+            participants: vec!["a".to_owned()],
+        }
+    }
+
+    /// Invariant (a): the default (netns) substrate makes both lifecycle
+    /// stages complete no-ops that PASS — existing single-LAN runs are
+    /// untouched (no record written, no endpoint change, no leaf command).
+    #[test]
+    fn setup_and_teardown_are_no_op_passes_without_an_overlay_substrate() {
+        let mut ctx = empty_ctx();
+        let setup =
+            CrossNetworkSubstrateSetupStage::new(options_with(CrossNetworkSubstrate::Netns));
+        assert_eq!(setup.execute(&mut ctx), StageOutcome::Passed);
+        assert!(ctx.substrate.is_none());
+        assert!(ctx.substrate_record.is_none());
+        assert!(ctx.endpoints.is_empty());
+
+        let teardown =
+            CrossNetworkSubstrateTeardownStage::new(options_with(CrossNetworkSubstrate::Netns));
+        assert_eq!(teardown.execute(&mut ctx), StageOutcome::Passed);
+    }
+
+    /// Invariant (c): a resumed context recording a provisioned substrate
+    /// while this run requests none is a provenance mismatch — hard failure,
+    /// in BOTH lifecycle stages.
+    #[test]
+    fn resume_with_a_substrate_mismatch_fails_closed() {
+        let mut ctx = empty_ctx();
+        ctx.substrate_record = Some(vxlan_record(true));
+        let setup =
+            CrossNetworkSubstrateSetupStage::new(options_with(CrossNetworkSubstrate::Netns));
+        let outcome = setup.execute(&mut ctx);
+        assert!(
+            matches!(outcome, StageOutcome::Failed(ref msg) if msg.contains("provenance mismatch")),
+            "{outcome:?}"
+        );
+
+        let teardown =
+            CrossNetworkSubstrateTeardownStage::new(options_with(CrossNetworkSubstrate::Netns));
+        let outcome = teardown.execute(&mut ctx);
+        assert!(
+            matches!(outcome, StageOutcome::Failed(ref msg) if msg.contains("provenance mismatch")),
+            "{outcome:?}"
+        );
+    }
+
+    /// Invariant (c), digest half: same substrate id but a changed topology
+    /// (inventory moved under the resume) must fail closed, before any leaf
+    /// command runs.
+    #[test]
+    fn resume_with_a_changed_topology_digest_fails_closed() {
+        use mock::MockLeafRunner;
+        let mut ctx = empty_ctx();
+        let mut stale = vxlan_record(true);
+        stale.topology_digest = "not-the-current-digest".to_owned();
+        ctx.substrate_record = Some(stale);
+        let a = MockLeafRunner::default();
+        let b = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &a), ("b", &b)]);
+        let topo = topology(&[("a", "192.168.64.10"), ("b", "192.168.0.30")]);
+        let outcome = CrossNetworkSubstrateSetupStage::provision(&mut ctx, &topo, &runners);
+        assert!(
+            matches!(outcome, StageOutcome::Failed(ref msg) if msg.contains("topology mismatch")),
+            "{outcome:?}"
+        );
+        assert!(a.recorded().is_empty(), "no leaf command may run");
+        assert!(b.recorded().is_empty());
+    }
+
+    /// Happy path through the stage seam: provision records the handle +
+    /// record on the context; teardown then removes the created links and
+    /// drains the handle.
+    #[test]
+    fn provision_then_teardown_round_trips_through_the_context() {
+        use mock::MockLeafRunner;
+        let mut ctx = empty_ctx();
+        let a = MockLeafRunner::default();
+        let b = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &a), ("b", &b)]);
+        let topo = topology(&[("a", "192.168.64.10"), ("b", "192.168.0.30")]);
+        assert_eq!(
+            CrossNetworkSubstrateSetupStage::provision(&mut ctx, &topo, &runners),
+            StageOutcome::Passed
+        );
+        let handle = ctx.substrate.as_ref().expect("handle stored");
+        assert!(handle.record.provisioned);
+        assert_eq!(handle.created_links.len(), 2);
+        assert_eq!(
+            ctx.substrate_record.as_ref().map(|r| r.provisioned),
+            Some(true)
+        );
+
+        let td_a = MockLeafRunner::default();
+        let td_b = MockLeafRunner::default();
+        let td_runners = runner_map(&[("a", &td_a), ("b", &td_b)]);
+        assert_eq!(
+            CrossNetworkSubstrateTeardownStage::teardown_with(&mut ctx, &td_runners, Some("vxlan")),
+            StageOutcome::Passed
+        );
+        assert!(ctx.substrate.is_none(), "teardown drains the live handle");
+        assert_eq!(td_a.recorded().len(), 1);
+        assert_eq!(td_b.recorded().len(), 1);
+    }
+
+    /// Invariant (d) at the stage seam: after a PARTIAL setup the context
+    /// still carries the created links, and teardown issues a removal per
+    /// created interface.
+    #[test]
+    fn teardown_after_partial_setup_removes_every_created_interface() {
+        use mock::MockLeafRunner;
+        let mut ctx = empty_ctx();
+        // Node "a" provisions; node "b"'s `ip link add` (call 1) fails.
+        let a = MockLeafRunner::default();
+        let b = MockLeafRunner {
+            fail_on: vec![1],
+            failure_stderr: "RTNETLINK answers: Operation not permitted".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let runners = runner_map(&[("a", &a), ("b", &b)]);
+        let topo = topology(&[("a", "192.168.0.30"), ("b", "192.168.64.10")]);
+        let outcome = CrossNetworkSubstrateSetupStage::provision(&mut ctx, &topo, &runners);
+        assert!(matches!(outcome, StageOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(
+            ctx.substrate
+                .as_ref()
+                .map(|handle| handle.created_links.clone()),
+            Some(vec![CreatedLink {
+                alias: "a".to_owned(),
+                link: VXLAN_LINK_NAME.to_owned(),
+            }]),
+            "the partial handle must survive the failure for teardown"
+        );
+
+        let td_a = MockLeafRunner::default();
+        let td_runners = runner_map(&[("a", &td_a)]);
+        assert_eq!(
+            CrossNetworkSubstrateTeardownStage::teardown_with(&mut ctx, &td_runners, Some("vxlan")),
+            StageOutcome::Passed
+        );
+        assert_eq!(
+            td_a.recorded(),
+            [vec![
+                "sudo".to_owned(),
+                "-n".to_owned(),
+                "ip".to_owned(),
+                "link".to_owned(),
+                "del".to_owned(),
+                VXLAN_LINK_NAME.to_owned()
+            ]],
+            "one removal per created interface"
+        );
+    }
+
+    #[test]
+    fn check_record_against_request_covers_the_three_mismatch_axes() {
+        let record = vxlan_record(true);
+        assert!(check_record_against_request(None, None, None).is_ok());
+        assert!(check_record_against_request(Some(&record), None, None).is_err());
+        assert!(check_record_against_request(Some(&record), Some("netns"), None).is_err());
+        assert!(check_record_against_request(Some(&record), Some("vxlan"), None).is_ok());
+        assert!(check_record_against_request(Some(&record), Some("vxlan"), Some("digest")).is_ok());
+        assert!(check_record_against_request(Some(&record), Some("vxlan"), Some("other")).is_err());
+    }
 
     fn topology(pairs: &[(&str, &str)]) -> SubstrateTopology {
         SubstrateTopology {

@@ -159,6 +159,12 @@ define_stage_catalog! {
     VerifySshReachability => "verify_ssh_reachability" @ Setup / T0Core,
     CleanupHosts => "cleanup_hosts" @ Setup / T0Core,
     BootstrapHosts => "bootstrap_hosts" @ Setup / T0Core,
+    // TOPOLOGY-LEVEL substrate seam (spec §0.5, 2026-08-27): must run BEFORE
+    // collect_pubkeys so overlay addresses — not raw cross-LAN-unroutable
+    // underlay IPs — are what land in ctx.endpoints. A no-op pass unless an
+    // overlay-provisioning substrate (vxlan) is selected. Substrate
+    // correctness is T0 like the nat_classification/matrix rows below.
+    CrossNetworkSubstrateSetup => "cross_network_substrate_setup" @ Setup / T0Core,
     CollectPubkeys => "collect_pubkeys" @ Setup / T0Core,
     MembershipInit => "membership_init" @ Setup / T0Core,
     DistributeMembership => "distribute_membership" @ Setup / T0Core,
@@ -273,6 +279,10 @@ define_stage_catalog! {
     NegativeControlPlantedResidue => "negative_control_planted_residue" @ NegativeControl / T5NegativeControl,
     NegativeControlWrongNodeSubstitution => "negative_control_wrong_node_substitution" @ NegativeControl / T5NegativeControl,
     NegativeControlDaemonKillMidStage => "negative_control_daemon_kill_mid_stage" @ NegativeControl / T5NegativeControl,
+    // Always-run overlay teardown (FinalCleanupStage pattern): vxlan link
+    // residue on a guest is release-blocking exactly like exit-NAT residue,
+    // so this must survive skip-cascade and run just before cleanup.
+    CrossNetworkSubstrateTeardown => "cross_network_substrate_teardown" @ Cleanup / T0Core,
     // Clean teardown, residue-asserted — named in spec §3's T0 list.
     Cleanup => "cleanup" @ Cleanup / T0Core,
 }

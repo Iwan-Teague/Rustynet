@@ -642,6 +642,29 @@ fn ssh_params_for_any_role(
     ))
 }
 
+/// As [`remote_host_for_role`], but keyed by node alias — the substrate
+/// lifecycle stages operate on every assigned node, not a single role slot.
+fn remote_host_for_alias(ctx: &OrchestrationContext, alias: &str) -> Result<RemoteHost, String> {
+    let adapter = ctx
+        .adapters
+        .get(alias)
+        .ok_or_else(|| format!("no adapter for {alias}"))?;
+    let params = adapter
+        .ssh_connection_params()
+        .ok_or_else(|| format!("{alias}: no SSH params available"))?;
+    Ok(RemoteHost {
+        host: strip_ssh_host(params.host.as_str()),
+        port: params.port,
+        user: Some(
+            params
+                .user
+                .unwrap_or_else(|| default_ssh_user(adapter.platform()).to_owned()),
+        ),
+        identity_file: params.identity_file,
+        known_hosts: params.known_hosts,
+    })
+}
+
 fn remote_host_for_role(ctx: &OrchestrationContext, label: &str) -> Result<RemoteHost, String> {
     let assignment = ctx
         .assignments
