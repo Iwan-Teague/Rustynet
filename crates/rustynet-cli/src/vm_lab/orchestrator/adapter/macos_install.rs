@@ -112,7 +112,10 @@ pub fn install_daemon(
         "/tmp/rn_macos_bootstrap.env",
         SHORT_TIMEOUT,
     )?;
-    ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", SHORT_TIMEOUT)?;
+    // The source archive is bulk data; SHORT_TIMEOUT (sized for tiny script
+    // files) timed the equivalent Linux transfer out cross-LAN. Use the build
+    // budget for the bulk copy, mirroring the second install site below.
+    ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", BUILD_TIMEOUT)?;
 
     let _ = std::fs::remove_file(&script_tmp);
     let _ = std::fs::remove_file(&install_tmp);

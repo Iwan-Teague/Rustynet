@@ -201,6 +201,17 @@ pub struct GossipNode {
     pub local_node_id: [u8; 32],
     signing_key: SigningKey,
     pub peers: HashMap<[u8; 32], GossipPeer>,
+    /// QH-36: which gossip key id each MEMBERSHIP node currently owns.
+    /// Registration through [`Self::register_member_peer`] REPLACES a
+    /// node's previous key entry instead of accumulating alongside it —
+    /// before this index existed, `MembershipOperation::RotateNodeKey`
+    /// left the rotated-away key registered (routable AND verifying) for
+    /// the daemon's whole process lifetime, a revocation gap. Plain
+    /// [`Self::register_peer`] (no membership identity in hand) stays
+    /// additive on purpose: enrollment can register a peer before its
+    /// membership entry commits, and pruning on absence would break that
+    /// onboarding window.
+    peer_id_by_member_node: HashMap<String, [u8; 32]>,
     /// Signed membership says these peers carry
     /// `anchor.gossip_seed`. Re-broadcast schedules send to them
     /// first, sorted by peer id, then to all other peers sorted by
@@ -278,6 +289,7 @@ impl GossipNode {
             local_node_id,
             signing_key,
             peers: HashMap::new(),
+            peer_id_by_member_node: HashMap::new(),
             anchor_gossip_seed_peer_ids: HashSet::new(),
             revoked_peer_ids: HashSet::new(),
             applied_endpoints: HashMap::new(),
@@ -305,6 +317,9 @@ impl GossipNode {
     }
 
     /// Register or update a peer's routing/verification entry.
+    ///
+    /// Additive by design — see [`Self::register_member_peer`] for the
+    /// membership-identity-aware variant that replaces a rotated key.
     pub fn register_peer(
         &mut self,
         peer_node_id: [u8; 32],
@@ -320,6 +335,32 @@ impl GossipNode {
         );
     }
 
+    /// QH-36: register a peer ATTRIBUTED to a membership node, replacing
+    /// that node's previous key entry when the key rotated. Without the
+    /// replacement, `RotateNodeKey` left the old key registered — still
+    /// routable and still verifying inbound bundles — until the daemon
+    /// restarted, while revocation later removed only the new key.
+    pub fn register_member_peer(
+        &mut self,
+        member_node_id: &str,
+        peer_node_id: [u8; 32],
+        verifying_key: VerifyingKey,
+        push_addr: SocketAddr,
+    ) {
+        if let Some(previous) = self
+            .peer_id_by_member_node
+            .insert(member_node_id.to_owned(), peer_node_id)
+            && previous != peer_node_id
+        {
+            // The rotated-away key must lose BOTH its routing entry and
+            // its inbound-verification standing in the same tick the new
+            // key registers. The seen-sequence ledger is retained, exactly
+            // as in unregister_peer: it is the anti-replay watermark.
+            self.peers.remove(&previous);
+        }
+        self.register_peer(peer_node_id, verifying_key, push_addr);
+    }
+
     /// FIS-0003 phase 1: remove a peer's routing/verification state (the
     /// re-push destination and verifying key). The seen-sequence ledger is
     /// DELIBERATELY retained — it is the anti-replay watermark, and pruning
@@ -327,6 +368,14 @@ impl GossipNode {
     /// bundles. (Deviation from the FIS-0003 sketch's "prune seen
     /// sequences", chosen per the strictest-secure-default rule.)
     pub fn unregister_peer(&mut self, peer_node_id: &[u8; 32]) -> bool {
+        // Keep the member-attribution index consistent: a revoked peer's
+        // membership slot must not keep claiming the removed key, or a
+        // later register_member_peer for that node would "replace" an
+        // entry that no longer exists while a re-registration of the OLD
+        // key (e.g. a replayed additive registration) would slip back in
+        // unindexed.
+        self.peer_id_by_member_node
+            .retain(|_, id| id != peer_node_id);
         self.peers.remove(peer_node_id).is_some()
     }
 
@@ -802,6 +851,9 @@ pub fn revoked_peer_ids_from_membership(state: &MembershipState) -> Vec<[u8; 32]
 /// [`GossipNode::register_peer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GossipPeerRegistration {
+    /// The MEMBERSHIP node this key belongs to (QH-36: drives the
+    /// replace-on-rotation semantics in `register_member_peer`).
+    pub member_node_id: String,
     pub peer_node_id: [u8; 32],
     pub verifying_key: VerifyingKey,
     pub push_addr: SocketAddr,
@@ -862,6 +914,7 @@ pub fn gossip_peer_registrations_from_membership(
             continue;
         };
         out.push(GossipPeerRegistration {
+            member_node_id: member.node_id.clone(),
             peer_node_id,
             verifying_key,
             push_addr: SocketAddr::new(*overlay_addr, RUSTYNET_GOSSIP_PORT),
@@ -1278,6 +1331,107 @@ mod tests {
         let mut node = GossipNode::new(signing_key, Some(path)).expect("node ctor");
         node.set_local_membership_epoch(TEST_EPOCH);
         node
+    }
+
+    fn peer_key(byte: u8) -> (SigningKey, [u8; 32], VerifyingKey) {
+        let key = SigningKey::from_bytes(&[byte; 32]);
+        let verifying = key.verifying_key();
+        (key.clone(), verifying.to_bytes(), verifying)
+    }
+
+    fn any_addr(port: u16) -> SocketAddr {
+        SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            port,
+        )
+    }
+
+    // ── QH-36: member-attributed registration replaces a rotated key ────────
+
+    #[test]
+    fn member_key_rotation_evicts_the_old_key_entry() {
+        // Before register_member_peer existed, RotateNodeKey left the
+        // rotated-away key registered (routable AND verifying inbound)
+        // for the daemon's process lifetime — revocation later removed
+        // only the NEW key. Pin: registering node-x's new key removes
+        // node-x's old key in the same call.
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(1, dir.path());
+        let (_w_key, w_id, w_verifying) = peer_key(0x22);
+        let (_g_key, g_id, g_verifying) = peer_key(0x33);
+
+        node.register_member_peer("node-x", w_id, w_verifying, any_addr(1001));
+        assert!(node.peers.contains_key(&w_id));
+
+        node.register_member_peer("node-x", g_id, g_verifying, any_addr(1002));
+        assert!(
+            !node.peers.contains_key(&w_id),
+            "the rotated-away key must lose its registration in the same tick"
+        );
+        assert!(node.peers.contains_key(&g_id));
+    }
+
+    #[test]
+    fn member_registration_does_not_touch_other_members_keys() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(1, dir.path());
+        let (_ka, a_id, a_verifying) = peer_key(0x44);
+        let (_kb, b_id, b_verifying) = peer_key(0x55);
+
+        node.register_member_peer("node-a", a_id, a_verifying, any_addr(1001));
+        node.register_member_peer("node-b", b_id, b_verifying, any_addr(1002));
+        assert!(node.peers.contains_key(&a_id));
+        assert!(node.peers.contains_key(&b_id));
+
+        // Re-registering node-a with the SAME key is idempotent and must
+        // not disturb anyone.
+        node.register_member_peer("node-a", a_id, a_verifying, any_addr(1003));
+        assert!(node.peers.contains_key(&a_id));
+        assert!(node.peers.contains_key(&b_id));
+    }
+
+    #[test]
+    fn plain_register_peer_stays_additive_for_pre_membership_enrollment() {
+        // Enrollment can register a peer BEFORE its membership entry
+        // commits; the identity-less path must stay additive so that
+        // onboarding window keeps working (the deliberate behaviour the
+        // QH-36 ledger warned a naive prune would regress).
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(1, dir.path());
+        let (_ka, a_id, a_verifying) = peer_key(0x66);
+        let (_kb, b_id, b_verifying) = peer_key(0x77);
+
+        node.register_peer(a_id, a_verifying, any_addr(1001));
+        node.register_peer(b_id, b_verifying, any_addr(1002));
+        assert!(node.peers.contains_key(&a_id) && node.peers.contains_key(&b_id));
+    }
+
+    #[test]
+    fn unregister_clears_the_member_attribution_index() {
+        // After revocation removes a key, the membership slot must not
+        // keep claiming it: a later register_member_peer for the same
+        // node must land cleanly, and re-registering the OLD key through
+        // the member path must evict it again rather than slip back in
+        // unindexed.
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(1, dir.path());
+        let (_kw, w_id, w_verifying) = peer_key(0x88);
+        let (_kg, g_id, g_verifying) = peer_key(0x99);
+
+        node.register_member_peer("node-x", w_id, w_verifying, any_addr(1001));
+        assert!(node.unregister_peer(&w_id));
+
+        node.register_member_peer("node-x", g_id, g_verifying, any_addr(1002));
+        assert!(node.peers.contains_key(&g_id));
+
+        // The stale key tries to come back attributed to the same node:
+        // it replaces g (last verified writer wins), never coexists.
+        node.register_member_peer("node-x", w_id, w_verifying, any_addr(1003));
+        assert!(node.peers.contains_key(&w_id));
+        assert!(
+            !node.peers.contains_key(&g_id),
+            "one membership node must never hold two live key entries"
+        );
     }
 
     fn hex32(byte: u8) -> String {
