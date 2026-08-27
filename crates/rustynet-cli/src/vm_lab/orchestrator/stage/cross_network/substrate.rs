@@ -93,7 +93,7 @@ const MAX_NETNS_NAME_LEN: usize = 255;
 /// `[A-Za-z0-9_.-]` only, never a relative-path component, and never
 /// option-looking. Deliberately an allowlist — a denylist here would be a
 /// shell-injection hole one unusual character wide.
-fn validate_netns_name(ns: &str) -> Result<(), String> {
+pub(crate) fn validate_netns_name(ns: &str) -> Result<(), String> {
     if ns.is_empty() {
         return Err("network namespace name must not be empty".to_owned());
     }
@@ -127,7 +127,7 @@ fn validate_netns_name(ns: &str) -> Result<(), String> {
 /// is later single-quoted, so the only characters that must never appear are
 /// control characters (which would corrupt logs and can smuggle terminal
 /// escapes) and empty elements (which vanish visually).
-fn validate_argv(argv: &[&str]) -> Result<(), String> {
+pub(crate) fn validate_argv(argv: &[&str]) -> Result<(), String> {
     if argv.is_empty() {
         return Err("leaf command argv must not be empty".to_owned());
     }
@@ -240,11 +240,43 @@ pub struct SubstrateRecord {
     pub participants: Vec<String>,
 }
 
-/// One vxlan link this run created on a guest (exact teardown targets).
+/// What kind of kernel object a substrate created, so teardown removes it
+/// with the right verb. A stringly-typed name alone could not distinguish
+/// `ip link del` from `ip netns del`, and guessing wrong leaves residue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// A network interface (`ip link del <name>`).
+    Link,
+    /// A network namespace (`ip netns del <name>`).
+    Netns,
+}
+
+/// One kernel object this run created on a guest (exact teardown targets).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatedLink {
+pub struct CreatedResource {
     pub alias: String,
-    pub link: String,
+    pub kind: ResourceKind,
+    pub name: String,
+}
+
+impl CreatedResource {
+    /// A created network interface on `alias`.
+    pub fn link(alias: &str, name: &str) -> Self {
+        Self {
+            alias: alias.to_owned(),
+            kind: ResourceKind::Link,
+            name: name.to_owned(),
+        }
+    }
+
+    /// A created network namespace on `alias`.
+    pub fn netns(alias: &str, name: &str) -> Self {
+        Self {
+            alias: alias.to_owned(),
+            kind: ResourceKind::Netns,
+            name: name.to_owned(),
+        }
+    }
 }
 
 /// A live (or partially live) substrate. Holds per-node overlay + underlay
@@ -257,9 +289,10 @@ pub struct SubstrateHandle {
     pub overlay_ips: BTreeMap<String, String>,
     /// alias → management/underlay IPv4 (SSH keeps using these).
     pub underlay_ips: BTreeMap<String, String>,
-    /// Links actually created so far — appended as each `ip link add`
-    /// succeeds, so a partial setup still knows exactly what to remove.
-    pub created_links: Vec<CreatedLink>,
+    /// Kernel objects actually created so far — appended as each creating
+    /// command succeeds, so a partial setup still knows exactly what to
+    /// remove. Ordered creation-first; teardown walks it in reverse.
+    pub created_resources: Vec<CreatedResource>,
 }
 
 /// Which addressing plane an endpoint came from.
@@ -583,7 +616,7 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
             },
             overlay_ips: BTreeMap::new(),
             underlay_ips: underlay_ips.clone(),
-            created_links: Vec::new(),
+            created_resources: Vec::new(),
         };
         let plan = match plan_overlay(topology) {
             Ok(plan) => plan,
@@ -611,7 +644,7 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
                 .map(|(alias, ip)| (alias.clone(), ip.to_string()))
                 .collect(),
             underlay_ips,
-            created_links: Vec::new(),
+            created_resources: Vec::new(),
         };
         for alias in &participants {
             let runner = match Self::runner_for(runners, alias) {
@@ -649,10 +682,9 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
             ) {
                 return Err(fail(err, handle));
             }
-            handle.created_links.push(CreatedLink {
-                alias: alias.clone(),
-                link: VXLAN_LINK_NAME.to_owned(),
-            });
+            handle
+                .created_resources
+                .push(CreatedResource::link(alias, VXLAN_LINK_NAME));
             for peer in &participants {
                 if peer == alias {
                     continue;
@@ -717,18 +749,15 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
         // otherwise every recorded participant with the well-known link name
         // (covers teardown after a resume where the live handle was rebuilt
         // from the persisted record).
-        let targets: Vec<CreatedLink> = if handle.created_links.is_empty() {
+        let targets: Vec<CreatedResource> = if handle.created_resources.is_empty() {
             handle
                 .record
                 .participants
                 .iter()
-                .map(|alias| CreatedLink {
-                    alias: alias.clone(),
-                    link: VXLAN_LINK_NAME.to_owned(),
-                })
+                .map(|alias| CreatedResource::link(alias, VXLAN_LINK_NAME))
                 .collect()
         } else {
-            handle.created_links.clone()
+            handle.created_resources.clone()
         };
         let mut errors = Vec::new();
         for target in &targets {
@@ -739,7 +768,7 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
                     continue;
                 }
             };
-            match runner.run(&["sudo", "-n", "ip", "link", "del", &target.link]) {
+            match runner.run(&["sudo", "-n", "ip", "link", "del", &target.name]) {
                 Err(err) => errors.push(format!("{}: {err}", target.alias)),
                 Ok(output) if !output.success => {
                     // Already-gone is the idempotent success case; anything
@@ -748,7 +777,7 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
                         errors.push(format!(
                             "{}: delete {} failed: {}",
                             target.alias,
-                            target.link,
+                            target.name,
                             output.stderr.trim()
                         ));
                     }
@@ -1014,7 +1043,7 @@ impl CrossNetworkSubstrateTeardownStage {
             record: record.clone(),
             overlay_ips: BTreeMap::new(),
             underlay_ips: BTreeMap::new(),
-            created_links: Vec::new(),
+            created_resources: Vec::new(),
         });
         match provider.teardown(&handle, runners) {
             Ok(()) => {
@@ -1074,8 +1103,9 @@ pub(crate) mod mock {
     use super::{LeafOutput, NetLeafRunner};
     use std::sync::Mutex;
 
-    /// Scriptable in-memory runner: records every argv, and fails (exit
-    /// status or transport) at the scripted call indexes.
+    /// Scriptable in-memory runner: records every argv, fails (exit status or
+    /// transport) at the scripted call indexes, and can script stdout either
+    /// by call index or by an argv substring.
     #[derive(Default)]
     pub struct MockLeafRunner {
         pub calls: Mutex<Vec<Vec<String>>>,
@@ -1085,6 +1115,26 @@ pub(crate) mod mock {
         pub transport_error_on: Vec<usize>,
         /// stderr text attached to failing calls.
         pub failure_stderr: String,
+        /// stdout keyed by 0-based call index (checked first).
+        pub stdout_for: Vec<(usize, String)>,
+        /// stdout keyed by a substring of the space-joined argv — how a test
+        /// scripts "whatever call runs `nat-classify` answers this", without
+        /// having to count the calls before it.
+        pub stdout_by_match: Vec<(String, String)>,
+    }
+
+    impl MockLeafRunner {
+        fn scripted_stdout(&self, index: usize, argv: &[&str]) -> String {
+            if let Some((_, text)) = self.stdout_for.iter().find(|(at, _)| *at == index) {
+                return text.clone();
+            }
+            let joined = argv.join(" ");
+            self.stdout_by_match
+                .iter()
+                .find(|(needle, _)| joined.contains(needle.as_str()))
+                .map(|(_, text)| text.clone())
+                .unwrap_or_default()
+        }
     }
 
     impl NetLeafRunner for MockLeafRunner {
@@ -1092,12 +1142,13 @@ pub(crate) mod mock {
             let mut calls = self.calls.lock().expect("mock runner lock");
             let index = calls.len();
             calls.push(argv.iter().map(|s| (*s).to_owned()).collect());
+            drop(calls);
             if self.transport_error_on.contains(&index) {
                 return Err(format!("mock transport failure at call {index}"));
             }
             Ok(LeafOutput {
                 success: !self.fail_on.contains(&index),
-                stdout: String::new(),
+                stdout: self.scripted_stdout(index, argv),
                 stderr: if self.fail_on.contains(&index) {
                     self.failure_stderr.clone()
                 } else {
@@ -1220,7 +1271,7 @@ mod tests {
         );
         let handle = ctx.substrate.as_ref().expect("handle stored");
         assert!(handle.record.provisioned);
-        assert_eq!(handle.created_links.len(), 2);
+        assert_eq!(handle.created_resources.len(), 2);
         assert_eq!(
             ctx.substrate_record.as_ref().map(|r| r.provisioned),
             Some(true)
@@ -1259,11 +1310,8 @@ mod tests {
         assert_eq!(
             ctx.substrate
                 .as_ref()
-                .map(|handle| handle.created_links.clone()),
-            Some(vec![CreatedLink {
-                alias: "a".to_owned(),
-                link: VXLAN_LINK_NAME.to_owned(),
-            }]),
+                .map(|handle| handle.created_resources.clone()),
+            Some(vec![CreatedResource::link("a", VXLAN_LINK_NAME)]),
             "the partial handle must survive the failure for teardown"
         );
 
@@ -1407,7 +1455,7 @@ mod tests {
             ["lenovo-1", "utm-1", "utm-2"],
             "every node participates"
         );
-        assert_eq!(handle.created_links.len(), 3);
+        assert_eq!(handle.created_resources.len(), 3);
         // Per node: del + add + 2 fdb + addr + up = 6 calls.
         let calls = lenovo.recorded();
         assert_eq!(calls.len(), 6);
@@ -1466,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn vxlan_setup_failure_keeps_partial_created_links_for_teardown() {
+    fn vxlan_setup_failure_keeps_partial_created_resources_for_teardown() {
         use mock::MockLeafRunner;
         let lenovo = MockLeafRunner::default();
         // Second node's `ip link add` (its call index 1, after the pre-delete)
@@ -1485,11 +1533,8 @@ mod tests {
         // The partial handle still lists the link the FIRST node created, so
         // the always-run teardown can remove it.
         assert_eq!(
-            failure.partial.created_links,
-            [CreatedLink {
-                alias: "lenovo-1".to_owned(),
-                link: VXLAN_LINK_NAME.to_owned(),
-            }]
+            failure.partial.created_resources,
+            [CreatedResource::link("lenovo-1", VXLAN_LINK_NAME)]
         );
 
         // Teardown after the partial setup issues one removal per created link.
@@ -1524,7 +1569,7 @@ mod tests {
             },
             overlay_ips: BTreeMap::new(),
             underlay_ips: BTreeMap::new(),
-            created_links: Vec::new(),
+            created_resources: Vec::new(),
         };
         let a = MockLeafRunner::default();
         let b = MockLeafRunner::default();
@@ -1548,7 +1593,7 @@ mod tests {
             },
             overlay_ips: BTreeMap::new(),
             underlay_ips: BTreeMap::new(),
-            created_links: Vec::new(),
+            created_resources: Vec::new(),
         };
         let gone = MockLeafRunner {
             fail_on: vec![0],
@@ -1781,7 +1826,7 @@ mod tests {
                 ("a".to_owned(), "192.168.64.10".to_owned()),
                 ("b".to_owned(), "192.168.0.20".to_owned()),
             ]),
-            created_links: Vec::new(),
+            created_resources: Vec::new(),
         };
         assert_eq!(
             handle.endpoint("a").expect("a resolves"),
