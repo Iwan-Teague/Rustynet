@@ -3,6 +3,14 @@
 # Rustynet testing, built entirely from Linux network namespaces on ONE Debian
 # guest (dataplane plan D5.1, Tier A).
 #
+# SUPERSEDED FOR THE ORCHESTRATOR (CN-2, 2026-08-27): the `--node` engine no
+# longer scp's or runs this script. Its topology is ported to
+# `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/netns.rs`
+# (`NetnsSubstrateProvider`), which drives the same `ip`/`nft`/`tc` leaf ops as
+# argv-only commands. This file survives ONLY as the dependency of
+# `netns_daemon_path.sh` and as the target of `vm-lab-network-audit`'s
+# transit/mesh collision check; it is on no active orchestrator path.
+#
 # WHY
 #   The UTM lab puts every VM on one L2 bridge, so VM-to-VM is same-LAN — there
 #   is no NAT boundary to traverse. This harness builds a real cross-NAT
