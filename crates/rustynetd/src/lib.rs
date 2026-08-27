@@ -73,6 +73,7 @@ pub mod revoked_peer_denied_audit;
 pub mod secret_log_audit;
 pub mod service_access_state;
 pub mod service_exposure;
+pub mod shutdown_residue;
 pub mod stun_client;
 pub mod traversal;
 #[cfg(unix)]

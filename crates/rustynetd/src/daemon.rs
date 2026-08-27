@@ -2005,6 +2005,15 @@ pub enum DaemonError {
     Io(String),
     InvalidConfig(String),
     State(String),
+    /// QH-40 — the daemon stopped but its dataplane rollback did not
+    /// complete, so firewall / DNS / exit-NAT / interface state may still be
+    /// installed on this host.
+    ///
+    /// This is the *only* `DaemonError` that is not a startup failure. It is
+    /// raised after the shutdown key scrub has run, so returning it never
+    /// costs key custody, and `main.rs` renders it with a shutdown-specific
+    /// banner instead of "rustynetd startup failed".
+    ShutdownRollbackResidue(String),
 }
 
 impl fmt::Display for DaemonError {
@@ -2013,6 +2022,10 @@ impl fmt::Display for DaemonError {
             DaemonError::Io(message) => write!(f, "i/o error: {message}"),
             DaemonError::InvalidConfig(message) => write!(f, "invalid config: {message}"),
             DaemonError::State(message) => write!(f, "state error: {message}"),
+            // The rendered text must keep `SHUTDOWN_RESIDUE_FAIL_CLOSED_TOKEN`
+            // intact: `main.rs` matches on it for both the banner and the
+            // PolicyReject (78) exit-code bucket.
+            DaemonError::ShutdownRollbackResidue(message) => write!(f, "{message}"),
         }
     }
 }
@@ -10494,6 +10507,40 @@ fn port_mapping_bring_up_skip_reason(
     }
 }
 
+/// QH-40 — record the durable "last shutdown left residue" marker and return
+/// the operator-facing message.
+///
+/// Called from both shutdown gates the instant `controller.shutdown()` fails,
+/// *before* anything else can go wrong, so the evidence is on disk even if the
+/// process is SIGKILLed a moment later (launchd's default `ExitTimeOut` gives
+/// the daemon 5 s after SIGTERM, and neither Rustynet plist overrides it).
+///
+/// A failure to write the marker is itself logged and folded into the returned
+/// message: losing the durable channel must not also lose the report.
+fn record_shutdown_rollback_residue(
+    config: &DaemonConfig,
+    trigger: &str,
+    rollback_error: &str,
+) -> String {
+    let marker = crate::shutdown_residue::ShutdownResidueMarker::new(
+        unix_now(),
+        config.node_id.clone(),
+        trigger,
+        rollback_error,
+    );
+    let message = marker.fail_closed_message();
+    match crate::shutdown_residue::record_marker(&config.state_path, &marker) {
+        Ok(path) => {
+            log::error!("{message} residue_marker={}", path.display());
+            message
+        }
+        Err(err) => {
+            log::error!("{message} residue_marker_write_failed={err}");
+            format!("{message} residue_marker_write_failed={err}")
+        }
+    }
+}
+
 pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     let mut config = config;
     if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
@@ -10524,6 +10571,31 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             .map_err(DaemonError::InvalidConfig)?;
     }
     log::info!("rustynetd startup: configuration and runtime ACLs validated");
+    // QH-40 — surface a previous shutdown that left dataplane residue.
+    //
+    // The marker is deliberately NOT cleared here: an automatic clear on
+    // start would let the very restart that launchd performs erase the only
+    // durable evidence that this host is carrying firewall / DNS / exit-NAT
+    // state from a failed teardown. It is cleared only by the explicit
+    // operator acknowledgement (`rustynetd shutdown-residue-check
+    // --acknowledge`).
+    //
+    // Disposition is REPORT, not REFUSE. Refusing to start would not remove
+    // the residue (a start applies state, it does not roll back), so it would
+    // trade a silent-residue host for a crash-looping host that is still
+    // carrying the same residue. Escalating this to a hard startup refusal is
+    // the sign-off-gated half of the design; see
+    // `documents/operations/active/MacOsHelperShutdownOrderingDesign_2026-08-27.md`.
+    {
+        let scan = crate::shutdown_residue::scan(&config.state_path);
+        if let Some(message) = scan.fail_closed_message() {
+            log::error!(
+                "{} {message} residue_marker={}",
+                crate::shutdown_residue::SHUTDOWN_RESIDUE_DETECTED_LOG_TOKEN,
+                crate::shutdown_residue::marker_path(&config.state_path).display()
+            );
+        }
+    }
     prepare_runtime_wireguard_key(&config)?;
     log::info!("rustynetd startup: runtime key material prepared");
     if let Err(err) = run_preflight_checks(&config) {
@@ -10727,6 +10799,15 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                     log::error!(
                         "windows service stop-triggered shutdown encountered errors (best-effort): {err}"
                     );
+                    // QH-40 — the exit code stays 0 here on purpose (a
+                    // non-zero service exit makes the SCM refuse the next
+                    // start), so the durable marker is the ONLY loud channel
+                    // on this path. Record it unconditionally.
+                    let _ = record_shutdown_rollback_residue(
+                        &config,
+                        crate::shutdown_residue::TRIGGER_WINDOWS_SERVICE_STOP,
+                        &err.to_string(),
+                    );
                 }
                 break;
             }
@@ -10923,6 +11004,12 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
         let socket_owner_uid = socket_owner_uid(&config.socket_path)?;
 
+        // QH-40 — set when the shutdown-signal gate observes a failed
+        // dataplane rollback. Carried past the loop so the non-zero exit
+        // happens only after `scrub_runtime_wireguard_key_after_bootstrap`;
+        // returning at the shutdown site itself would skip the scrub and
+        // leave plaintext WireGuard key material at rest (§4 key custody).
+        let mut shutdown_rollback_residue: Option<String> = None;
         let mut processed = 0usize;
         let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.get().max(100));
         let mut next_reconcile = Instant::now() + reconcile_interval;
@@ -10942,8 +11029,17 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             if shutdown_signals.requested() {
                 if let Err(err) = runtime.controller.shutdown() {
                     log::error!(
-                        "unix shutdown-signal-triggered controller shutdown encountered errors (best-effort): {err}"
+                        "unix shutdown-signal-triggered controller shutdown encountered errors: {err}"
                     );
+                    // QH-40 — a failed rollback must not read as a clean stop.
+                    // Record the durable marker NOW (launchd SIGKILLs 5 s after
+                    // SIGTERM), and remember the failure so the post-loop path
+                    // can exit non-zero *after* the key scrub has run.
+                    shutdown_rollback_residue = Some(record_shutdown_rollback_residue(
+                        &config,
+                        crate::shutdown_residue::TRIGGER_UNIX_SHUTDOWN_SIGNAL,
+                        &err.to_string(),
+                    ));
                 }
                 break;
             }
@@ -11106,6 +11202,12 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         }
 
         scrub_runtime_wireguard_key_after_bootstrap(&config)?;
+        // QH-40 — fail closed on the way out. The key scrub above has already
+        // run, so this return costs nothing in key custody; it converts the
+        // previous silent `exit(0)` into ExitCode::PolicyReject (78).
+        if let Some(message) = shutdown_rollback_residue {
+            return Err(DaemonError::ShutdownRollbackResidue(message));
+        }
         Ok(())
     }
 }
@@ -16309,6 +16411,119 @@ fn race_outcome_classes(
 
 #[cfg(all(test, not(windows)))]
 mod tests {
+    // ── QH-40: shutdown-rollback residue reporting ───────────────────────────
+
+    /// A failed shutdown rollback must produce the durable marker AND a
+    /// message carrying the pinned fail-closed token.
+    ///
+    /// Mutation that proves it discriminates: making
+    /// `record_shutdown_rollback_residue` log-and-return without writing
+    /// leaves `scan` reporting `Clean` and this fails.
+    #[test]
+    fn failed_shutdown_rollback_records_a_durable_residue_marker() {
+        use crate::shutdown_residue::{ResidueScan, TRIGGER_UNIX_SHUTDOWN_SIGNAL, scan};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig {
+            node_id: "node-qh40".to_owned(),
+            state_path: dir.path().join("rustynetd.state"),
+            ..DaemonConfig::default()
+        };
+
+        let message = super::record_shutdown_rollback_residue(
+            &config,
+            TRIGGER_UNIX_SHUTDOWN_SIGNAL,
+            "rollback failed: exit-mode rollback failed; interface cleanup failed",
+        );
+
+        assert!(
+            message.contains(crate::shutdown_residue::SHUTDOWN_RESIDUE_FAIL_CLOSED_TOKEN),
+            "operator message must carry the fail-closed token: {message}"
+        );
+        match scan(&config.state_path) {
+            ResidueScan::Present(marker) => {
+                assert_eq!(marker.node_id, "node-qh40");
+                assert_eq!(marker.trigger, TRIGGER_UNIX_SHUTDOWN_SIGNAL);
+                assert!(
+                    marker.rollback_error.contains("interface cleanup failed"),
+                    "the verbatim rollback error must be persisted: {}",
+                    marker.rollback_error
+                );
+            }
+            other => panic!("expected a recorded marker, got {other:?}"),
+        }
+    }
+
+    /// NEGATIVE TEST — the clean-shutdown half. A shutdown that never failed
+    /// writes no marker, so the next start stays silent and the process exits
+    /// 0 exactly as before this change.
+    ///
+    /// Mutation: recording a marker unconditionally makes this fail.
+    #[test]
+    fn successful_shutdown_leaves_no_residue_marker() {
+        use crate::shutdown_residue::{ResidueScan, marker_path, scan};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("rustynetd.state");
+        assert_eq!(scan(&state_path), ResidueScan::Clean);
+        assert!(
+            !marker_path(&state_path).exists(),
+            "a clean shutdown must not create a marker file"
+        );
+    }
+
+    /// The residue error must NOT be rendered as a startup failure, and must
+    /// keep the token `main.rs` matches on for the banner and the exit code.
+    ///
+    /// Mutation: rendering it as `startup failed: …` or dropping the token
+    /// makes this fail.
+    #[test]
+    fn shutdown_residue_daemon_error_renders_the_fail_closed_token() {
+        let rendered = DaemonError::ShutdownRollbackResidue(
+            "shutdown rollback failed (fail-closed): node_id=n trigger=t".to_owned(),
+        )
+        .to_string();
+        assert!(
+            rendered.contains(crate::shutdown_residue::SHUTDOWN_RESIDUE_FAIL_CLOSED_TOKEN),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("startup"),
+            "a shutdown residue error must not read as a startup failure: {rendered}"
+        );
+    }
+
+    /// A marker-write failure must still yield a loud message rather than a
+    /// silent success. The state path points at a location that cannot be
+    /// created, so the write fails.
+    ///
+    /// Mutation: swallowing the write error and returning the plain message
+    /// makes this fail.
+    #[test]
+    fn residue_marker_write_failure_is_reported_not_swallowed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A regular file used as a directory component: create_dir_all and the
+        // write both fail beneath it.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker");
+        let config = DaemonConfig {
+            node_id: "node-qh40".to_owned(),
+            state_path: blocker.join("nested").join("rustynetd.state"),
+            ..DaemonConfig::default()
+        };
+        let message = super::record_shutdown_rollback_residue(
+            &config,
+            crate::shutdown_residue::TRIGGER_UNIX_SHUTDOWN_SIGNAL,
+            "rollback failed: firewall apply failed",
+        );
+        assert!(
+            message.contains(crate::shutdown_residue::SHUTDOWN_RESIDUE_FAIL_CLOSED_TOKEN),
+            "{message}"
+        );
+        assert!(
+            message.contains("residue_marker_write_failed"),
+            "a lost durable channel must be disclosed in the message: {message}"
+        );
+    }
+
     /// dcd7cf49-class bound: the bootstrap HTTP client must refuse a response
     /// body larger than MAX_FETCHER_BODY_BYTES instead of streaming it into
     /// memory. A local listener serves more than the cap; the fetcher must
