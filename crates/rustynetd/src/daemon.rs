@@ -21858,6 +21858,85 @@ mod tests {
         );
     }
 
+    // ── Reviewer-added adversarial probes (AnchorEnrollmentListener security
+    //    review 2026-08-27). These lock two properties the task called out
+    //    that the author's suite left implicit: the EXACT byte-cap boundary,
+    //    and the impossibility of smuggling a second verb past the arity-fixed
+    //    whitelist. Both pass unmodified — they confirm the listener holds,
+    //    and guard against a future `>=`/`>` slip or a variadic parse arm.
+
+    /// The size cap is an EXACT 256/257 boundary, not an approximate one. A
+    /// request line of exactly `MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES`
+    /// payload bytes plus its newline is read in full (then refused by the
+    /// verb whitelist, since 256 `a`s is not a valid consume); one byte more
+    /// is refused by the bounded reader BEFORE the newline is ever seen, so
+    /// the connection drops without a response. An off-by-one that flipped
+    /// the reader's `>` to `>=`, or vice-versa, would move exactly one of
+    /// these two assertions.
+    #[test]
+    fn anchor_enrollment_stream_size_cap_is_exact_256_257_boundary() {
+        let dir = secure_test_dir("rustynetd-enroll-cap-boundary");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("listener");
+        // Exactly at the cap, newline-terminated: accepted by the reader
+        // (length never exceeds the cap), then refused by the whitelist.
+        let mut at_cap = vec![b'a'; MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES];
+        at_cap.push(b'\n');
+        let response = drive_enrollment_request(&listener, &mut runtime, at_cap);
+        assert_eq!(
+            response, "ERR unsupported operation\n",
+            "a line at exactly the cap must be read, then refused by the whitelist"
+        );
+        // One byte over the cap: the reader refuses before the newline, so
+        // the connection is dropped with no response.
+        let mut over_cap = vec![b'a'; MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES + 1];
+        over_cap.push(b'\n');
+        let response = drive_enrollment_request(&listener, &mut runtime, over_cap);
+        assert_eq!(
+            response, "",
+            "one byte over the cap must be dropped, not answered"
+        );
+    }
+
+    /// A well-formed consume line carrying a VALID token cannot smuggle a
+    /// second verb past the whitelist: `parse_command`'s arity is fixed at
+    /// five tokens, so a trailing sixth field forces an `Unknown` dispatch
+    /// and the fixed refusal. Neither the token nor the trailing verb reaches
+    /// the ledger, so nothing is burned.
+    #[test]
+    fn anchor_enrollment_stream_refuses_smuggled_second_verb() {
+        let dir = secure_test_dir("rustynetd-enroll-smuggle");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("listener");
+        let (_, encoded) =
+            crate::enrollment_token::mint_token(&ENROLLMENT_LISTENER_TEST_SECRET, 600)
+                .expect("mint");
+        // A valid five-field consume with a trailing sixth token (`status`).
+        let mut line = enrollment_consume_request_line(&encoded);
+        line.pop(); // drop the newline the helper appended
+        line.extend_from_slice(b" status\n");
+        assert!(line.len() <= MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES);
+        let response = drive_enrollment_request(&listener, &mut runtime, line);
+        assert_eq!(
+            response, "ERR unsupported operation\n",
+            "a sixth field must force Unknown, never a smuggled second verb"
+        );
+        let ledger_path = config
+            .enrollment_ledger_path
+            .as_deref()
+            .expect("fixture sets a ledger path");
+        assert!(
+            !ledger_path.exists(),
+            "a refused smuggle attempt must not burn the valid token it carried"
+        );
+    }
+
     fn secure_test_dir(prefix: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
