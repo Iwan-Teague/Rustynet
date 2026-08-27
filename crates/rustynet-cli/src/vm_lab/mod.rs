@@ -51117,10 +51117,56 @@ mod stop_host_run_tests {
     }
 
     #[test]
-    fn stop_reads_recorded_pids_then_falls_back_to_pgrep() {
+    fn stop_takes_its_candidate_pids_only_from_the_recorded_handles() {
         let script = render();
         assert!(script.contains("state/host-lab-runs/*.pid"));
-        assert!(script.contains("pgrep -f 'vm-lab-orchestrate-live-lab'"));
+    }
+
+    /// STOP-PGREP. The stop script is driven INLINE over ssh, so its whole text
+    /// lands in the remote `bash -c` argv — and the text has to contain the
+    /// orchestrator subcommand string. Any argv *scan* for that string therefore
+    /// matches the script's own launcher, and the next thing this script does is
+    /// `kill -TERM -- -<pid>` on the match's PROCESS GROUP: its own. So the
+    /// rendered script must contain no whole-process-table pattern match at all.
+    /// Mirrors the launch-side pin from QH-18.
+    #[test]
+    fn the_stop_script_contains_no_self_matching_process_scan() {
+        let script = render();
+        assert!(
+            !script.contains("pgrep"),
+            "no pgrep in the stop path — its pattern would match this script's own \
+             launcher argv; script was:\n{script}"
+        );
+        // Every use of the marker string must be a lookup of ONE named pid
+        // (`ps ... -p "$p"`), never a scan over all processes.
+        for line in script.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            if line.contains("vm-lab-orchestrate-live-lab") {
+                assert!(
+                    line.contains(r#"-p "$p""#),
+                    "the marker may only be matched against one named pid; offending \
+                     line: {line}"
+                );
+            }
+        }
+    }
+
+    /// The other half of the self-match fix, and the one that holds even if a
+    /// pidfile is corrupted or forged: this shell and every ancestor of it are
+    /// excluded from the candidate set before anything is signaled.
+    #[test]
+    fn stop_never_signals_itself_or_an_ancestor() {
+        let script = render();
+        assert!(
+            script.contains(r#"anc="$(ps -o ppid= -p "$anc""#),
+            "the script must walk its own ancestor chain"
+        );
+        assert!(
+            script.contains(r#"case "$ancestors" in *" $p "*)"#),
+            "a recorded pid that is this shell or an ancestor must be skipped"
+        );
     }
 
     #[test]
@@ -51147,6 +51193,99 @@ mod stop_host_run_tests {
         assert!(script.contains(r#"pids="$pids $p""#));
         assert!(script.contains(r#"skipped="$skipped $p""#));
         assert!(script.contains("ignoring stale/recycled recorded pid(s)"));
+    }
+
+    /// Behavioural proof of STOP-PGREP, run the way the production path runs it.
+    ///
+    /// `execute_ops_vm_lab_stop_host_run` drives this script INLINE — the whole
+    /// text becomes the argument of a remote `bash -c`, so the launcher's argv
+    /// contains the orchestrator marker string. That is reproduced exactly here by
+    /// `bash -c <script>`, and it is what made the old `pgrep -f` fallback match
+    /// its own launcher and then signal that launcher's process group.
+    ///
+    /// The child is put in its OWN process group first. A regression here signals
+    /// a process group, and without that isolation the blast radius would be the
+    /// test runner itself rather than one contained child.
+    ///
+    /// The scenario also pins the pid-recycling guard: a pidfile naming a LIVE but
+    /// unrelated process (a `sleep`, standing in for a recycled pid) must be
+    /// reported as stale and left completely alone.
+    #[cfg(unix)]
+    #[test]
+    fn the_stop_script_signals_nothing_when_its_own_text_is_in_its_launchers_argv() {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Command;
+
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-stop-pgrep-{}", super::unique_suffix()));
+        let handles = dir.join("state/host-lab-runs");
+        std::fs::create_dir_all(handles.as_path()).expect("temp run-handle dir");
+
+        // A live bystander whose argv does NOT contain the orchestrator marker —
+        // exactly the shape of a recycled pid. It must survive the stop.
+        let mut bystander = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn the bystander");
+        let bystander_pid = bystander.id();
+        std::fs::write(
+            handles.join("recycled.pid"),
+            format!("{bystander_pid}\n").as_bytes(),
+        )
+        .expect("write the recycled pidfile");
+        // A dead/garbage handle, to prove a malformed pidfile is skipped, not run
+        // through `kill`.
+        std::fs::write(handles.join("garbage.pid"), b"not-a-pid\n").expect("write garbage pidfile");
+
+        let script = script_template::render_host_stop_script(
+            dir.to_str().expect("temp dir path must be utf-8"),
+        )
+        .expect("a benign repo_dir must render");
+
+        let out = {
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c").arg(script.as_str());
+            // Contain a regression: its own group, never the test runner's.
+            cmd.process_group(0);
+            cmd.output().expect("run the rendered stop script")
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+        assert!(
+            out.status.success(),
+            "stop script must exit 0 on an idle host; stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("STOP-RESULT: no run in flight"),
+            "an idle host must report no run in flight; stdout:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("STOP-RESULT: signaling:"),
+            "nothing may be signaled — the marker in the launcher argv is not a run; \
+             stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("ignoring stale/recycled recorded pid(s)"),
+            "the live-but-unrelated recorded pid must be reported as stale; \
+             stdout:\n{stdout}"
+        );
+
+        // The bystander must be untouched: still running, killable by US.
+        assert!(
+            matches!(bystander.try_wait(), Ok(None)),
+            "the recycled-pid bystander must not have been signaled"
+        );
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+
+        // Stale handles are retired so a later status cannot report a dead pid.
+        assert!(
+            !handles.join("recycled.pid").exists(),
+            "stale handles must be pruned"
+        );
+
+        let _ = std::fs::remove_dir_all(dir.as_path());
     }
 }
 

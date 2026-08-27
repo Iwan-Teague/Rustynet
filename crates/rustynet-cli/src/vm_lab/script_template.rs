@@ -928,51 +928,92 @@ cat "$P"
 /// (`cargo` → `rustynet-cli` → the guest-SSH children) goes down together — a plain
 /// `kill <pid>` would orphan the children to keep running against the guests. The
 /// recorded pid IS the session-leader/pgid (the runner wrote it before `exec`), so
-/// `kill -- -<pid>` reaches the group. `pgrep` is a fallback for a run whose handle
-/// file was lost. TERM first, then KILL after a grace period.
+/// `kill -- -<pid>` reaches the group. TERM first, then KILL after a grace period.
 ///
-/// Pid-recycling guard: pidfiles are retired at the next launch, not on natural
-/// completion (the runner `exec`s cargo, leaving no shell to clean up), so a stale
-/// pidfile can linger between a run finishing and the next launch — and the OS may
-/// recycle its dead pid to an unrelated live process. So a recorded pid is signaled
-/// ONLY if its argv still contains `vm-lab-orchestrate-live-lab`; a dead or recycled
-/// pid is skipped, never killed. `pgrep -f` matches on argv and only returns live
-/// procs, so those pids are self-verified.
+/// **The recorded pidfiles are the ONLY source of candidate pids (STOP-PGREP).** A
+/// `pgrep -f 'vm-lab-orchestrate-live-lab'` fallback used to be unioned in for a run
+/// whose handle file was lost. It could not be repaired in place, for the same reason
+/// the launch-side gate could not (QH-18): this script is driven **inline** over SSH,
+/// so its whole text lands in the remote `bash -c` argv — and the text necessarily
+/// contains the subcommand string it searches for. `pgrep -f` therefore matched the
+/// script's own launcher, and this script's very next act is
+/// `kill -TERM -- -<pid>` on the matched pid's **process group** — its own. A stop on
+/// an idle host could signal itself, and on a busy host could take down an unrelated
+/// shell that merely had the string in its argv.
+///
+/// What replaces it is not a better pattern but a better handle. The launch script
+/// prunes `state/host-lab-runs/*.pid` under an argv liveness check (QH-18), keeping
+/// any pidfile whose pid is still the orchestrator, so a live run always has a
+/// trustworthy recorded handle. Reading only those pidfiles removes pattern matching
+/// from the stop path entirely: the marker string is still used, but only via
+/// `ps -p <pid>` against one specific recorded pid, never as a scan over every
+/// command line on the box.
+///
+/// Two guards on each recorded pid, both of which must pass before it is signaled:
+///
+/// 1. **Ancestor exclusion.** The pid must not be this script's own shell or any of
+///    its ancestors. That is the structural half of the self-match fix: even if a
+///    pidfile were somehow to name the ssh/bash process carrying this script's text,
+///    it could not be signaled.
+/// 2. **Pid-recycling guard.** Pidfiles are retired at the next launch, not on
+///    natural completion (the runner `exec`s cargo, leaving no shell to clean up), so
+///    a stale pidfile can linger between a run finishing and the next launch — and
+///    the OS may recycle its dead pid to an unrelated live process. So a pid is
+///    signaled ONLY if its argv still contains `vm-lab-orchestrate-live-lab`; a dead
+///    or recycled pid is skipped, never killed.
+///
+/// With no live recorded pid the script signals nothing, prunes the stale handles and
+/// says so — the honest answer, and the one that cannot kill a bystander.
 const HOST_STOP_SCRIPT: ScriptTemplate = ScriptTemplate(
     r#"#!/bin/bash
 set -uo pipefail
 REPO_DIR=__REPO_DIR__
 cd "$REPO_DIR" 2>/dev/null || true
 
-# Recorded handles first (reload-proof), then anything pgrep still sees.
-#
+# The recorded handles are the ONLY source of candidate pids. There is deliberately
+# NO whole-process-table argv pattern scan anywhere in this script:
+# this script is driven inline over ssh, so its own text sits in an ancestor's argv
+# and contains the very subcommand string such a scan would search for. The scan
+# matched its own launcher, and the next thing this script does is signal the matched
+# pid's PROCESS GROUP — its own. The launcher keeps live pidfiles under an argv
+# liveness check, so a running orchestrator always has a recorded handle.
+
+# Ancestor chain of this shell (self first). Nothing in it may ever be signaled —
+# the structural half of the self-match fix. Bounded so a bogus ppid cannot loop.
+ancestors=" "
+anc="$$"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+  case "$anc" in ''|0|1) break ;; esac
+  ancestors="$ancestors$anc "
+  anc="$(ps -o ppid= -p "$anc" 2>/dev/null | tr -d '[:space:]')"
+done
+
 # CRITICAL — pid recycling: a recorded pidfile can be stale (its run completed or
 # was killed without a stop, so the pid is dead) and the OS may have recycled that
 # pid to an UNRELATED live process. Signaling it would kill an innocent process. So
 # a recorded pid is signaled ONLY if it is still the orchestrator, verified by its
-# argv. `pgrep -f` already returns only live procs whose argv matches, so those are
-# self-verified and taken as-is.
+# argv.
 pids=""
 skipped=""
 for f in state/host-lab-runs/*.pid; do
   [ -f "$f" ] || continue
-  p="$(cat "$f" 2>/dev/null || true)"
+  p="$(cat "$f" 2>/dev/null | tr -d '[:space:]' || true)"
   [ -n "$p" ] || continue
+  case "$p" in *[!0-9]*) skipped="$skipped $p"; continue ;; esac
+  # Never signal ourselves or an ancestor, whatever a pidfile claims.
+  case "$ancestors" in *" $p "*) skipped="$skipped $p"; continue ;; esac
   # The recorded pid IS the runner's pid, which exec'd cargo, so a live one's argv
   # still contains 'vm-lab-orchestrate-live-lab'. A dead or recycled pid does not.
   # `-ww` disables ps's COLUMNS width truncation (procps-ng truncates to COLUMNS
   # even down a pipe): the marker sits ~60 cols into the argv, so a leaked COLUMNS
-  # would otherwise sever it and divert a LIVE run's pid to `skipped`. `pgrep -f`
-  # below reads the untruncated /proc cmdline and is the authoritative matcher;
-  # this pidfile check is the reload-proof advisory that also feeds `skipped`.
+  # would otherwise sever it and divert a LIVE run's pid to `skipped`. This is a
+  # lookup of ONE named pid, not a scan — it cannot match anything but that pid.
   if ps -ww -o args= -p "$p" 2>/dev/null | grep -q 'vm-lab-orchestrate-live-lab'; then
     pids="$pids $p"
   else
     skipped="$skipped $p"
   fi
 done
-pgrep_pids="$(pgrep -f 'vm-lab-orchestrate-live-lab' 2>/dev/null || true)"
-pids="$pids $pgrep_pids"
 
 # de-dup + drop blanks
 pids="$(printf '%s\n' $pids | sort -u | tr '\n' ' ')"
@@ -984,7 +1025,7 @@ skipped="$(echo $skipped)"
 if [ -z "$pids" ]; then
   # Nothing live to signal; clear any stale handle files so status stays honest.
   rm -f state/host-lab-runs/*.pid 2>/dev/null || true
-  echo "STOP-RESULT: no run in flight (no live recorded pid, nothing matched pgrep)"
+  echo "STOP-RESULT: no run in flight (no live recorded pid in state/host-lab-runs)"
   exit 0
 fi
 

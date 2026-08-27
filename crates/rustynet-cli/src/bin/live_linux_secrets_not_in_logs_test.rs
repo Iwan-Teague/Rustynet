@@ -18,7 +18,10 @@ mod live_lab_support;
 
 use std::path::PathBuf;
 
-use live_lab_support::{LiveLabContext, Logger, repo_root, run_cargo_ops};
+use live_lab_support::{
+    LINUX_ENROLLMENT_SECRET_PATH, LiveLabContext, Logger, REMOTE_RUSTYNET_BIN, repo_root,
+    run_cargo_ops,
+};
 
 fn main() {
     if let Err(err) = run() {
@@ -108,19 +111,51 @@ fn run() -> Result<(), String> {
     let _ = ctx.run_root_allow_failure(&target_host, &["journalctl", "--flush"]);
 
     // ── Stage 2: trigger enrollment activity to exercise key paths ────────────
+    // The real verb is `rustynet enrollment mint --secret <path> --ttl <secs>`.
+    // This stage used to call `rustynet ops generate-enrollment-token
+    // --ttl-seconds 60`, which the parser has never had — and it went through an
+    // allow-failure helper that keeps stdout only, so the CLI's own error text
+    // came back looking like output and the enrollment code path was never
+    // exercised at all (HARNESS-VERBS). It also spelled the binary as a bare
+    // `rustynet`, which dies as `command not found` under sudo on the RHEL
+    // family (QH-61).
+    //
+    // The one legitimate reason the mint cannot run is that this node has no
+    // enrollment secret: it is seeded on admin nodes only, deliberately, so the
+    // daemon's enrollment IPC stays fail-closed elsewhere. That is detectable,
+    // so it is probed for explicitly and logged. Anything else — an argv the CLI
+    // cannot parse, or a mint that fails with the secret present — aborts.
     logger.line("[secrets-log] triggering enrollment token activity")?;
-    // Invoke `rustynet ops generate-enrollment-token` — if it errors (no anchor state on
-    // this node), that's fine; we just want to exercise the codepath in the daemon logs.
-    let _ = ctx.capture_root_allow_failure(
-        &target_host,
-        &[
-            "rustynet",
-            "ops",
-            "generate-enrollment-token",
-            "--ttl-seconds",
-            "60",
-        ],
-    );
+    let secret_present = ctx
+        .run_root_allow_failure(&target_host, &["test", "-s", LINUX_ENROLLMENT_SECRET_PATH])
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if secret_present {
+        let minted = ctx.rustynet_root_must_succeed(
+            &target_host,
+            "enrollment mint",
+            &[
+                REMOTE_RUSTYNET_BIN,
+                "enrollment",
+                "mint",
+                "--secret",
+                LINUX_ENROLLMENT_SECRET_PATH,
+                "--ttl",
+                "60",
+            ],
+        )?;
+        // Never log the token itself — this is the secrets-hygiene stage.
+        logger.line(format!(
+            "[secrets-log] enrollment mint exercised (token len={})",
+            minted.trim().len()
+        ))?;
+    } else {
+        logger.line(format!(
+            "[secrets-log] no enrollment secret at {LINUX_ENROLLMENT_SECRET_PATH} on \
+             {target_host} (non-admin node); the enrollment code path is NOT exercised by \
+             this run"
+        ))?;
+    }
     std::thread::sleep(std::time::Duration::from_secs(3));
 
     // ── Stage 3: collect journal lines ───────────────────────────────────────
