@@ -71,6 +71,11 @@ pub fn install_daemon(
     let env_tmp = write_temp_file("rn_bootstrap_env_", ".env", env_content.as_bytes())?;
 
     let short_timeout = Duration::from_secs(30);
+    // The source archive is tens of MB and, on a cross-LAN topology, crosses
+    // two physical networks — 30s (sized for the tiny script/env files) timed
+    // it out on the lenovo guests (run livelab-1787835570). Give the bulk
+    // transfer its own budget.
+    let archive_timeout = Duration::from_secs(300);
     let build_timeout = Duration::from_secs(900); // cargo build can take a while
     let socket_timeout = Duration::from_secs(300);
 
@@ -87,7 +92,12 @@ pub fn install_daemon(
         "/tmp/rn_bootstrap.env",
         short_timeout,
     )?;
-    ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", short_timeout)?;
+    ssh::scp_to(
+        conn,
+        source.path(),
+        "/tmp/rn_source.tar.gz",
+        archive_timeout,
+    )?;
 
     // Cleanup temp files (best-effort; ignore errors).
     let _ = std::fs::remove_file(&script_tmp);

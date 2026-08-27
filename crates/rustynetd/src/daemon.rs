@@ -5739,7 +5739,8 @@ impl DaemonRuntime {
                 &self.local_node_id,
                 &local_gossip_node_id,
             ) {
-                node.register_peer(
+                node.register_member_peer(
+                    registration.member_node_id.as_str(),
                     registration.peer_node_id,
                     registration.verifying_key,
                     registration.push_addr,
