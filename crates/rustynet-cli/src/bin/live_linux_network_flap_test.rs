@@ -20,7 +20,10 @@ mod live_lab_support;
 
 use std::path::PathBuf;
 
-use live_lab_support::{LiveLabContext, Logger, repo_root, run_cargo_ops};
+use live_lab_support::{
+    LINUX_MEMBERSHIP_LOG_PATH, LINUX_MEMBERSHIP_SNAPSHOT_PATH, LiveLabContext, Logger,
+    MEMBERSHIP_VERIFY_PASS_PREFIX, REMOTE_MEMBERSHIP_AUDIT_PATH, repo_root, run_cargo_ops,
+};
 
 fn main() {
     if let Err(err) = run() {
@@ -434,17 +437,43 @@ fn run() -> Result<(), String> {
     logger.line(format!("[network-flap] tunnel_active={tunnel_active}"))?;
 
     // ── Stage 8: membership integrity ────────────────────────────────────────
-    let integrity_out = ctx
-        .capture_root_allow_failure(
-            &exit_host,
-            &[
-                live_lab_support::REMOTE_RUSTYNET_BIN,
-                "ops",
-                "verify-membership",
-            ],
-        )
-        .unwrap_or_default();
-    let membership_intact = integrity_out.contains("ok") || integrity_out.contains("valid");
+    // `rustynet membership verify` (alias of `verify-log`), NOT the
+    // `ops verify-membership` this stage used to call — that verb has never
+    // existed in the parser, so the call returned the CLI's own error text as
+    // stdout and the substring heuristic below silently reported `fail`
+    // (HARNESS-VERBS). `rustynet_root` aborts the stage if the CLI does not
+    // parse the argv, so the same class of defect cannot recur silently.
+    //
+    // `--audit-output` is pinned to /tmp: its default is CWD-relative
+    // (`artifacts/membership/...`), and the CWD of an SSH command is the login
+    // user's home, so the default would scatter audit logs through guest homes.
+    let integrity = ctx.rustynet_root(
+        &exit_host,
+        "membership verify",
+        &[
+            live_lab_support::REMOTE_RUSTYNET_BIN,
+            "membership",
+            "verify",
+            "--snapshot",
+            LINUX_MEMBERSHIP_SNAPSHOT_PATH,
+            "--log",
+            LINUX_MEMBERSHIP_LOG_PATH,
+            "--audit-output",
+            REMOTE_MEMBERSHIP_AUDIT_PATH,
+        ],
+    )?;
+    // Match the verb's real success line. The previous
+    // `contains("ok") || contains("valid")` heuristic matched neither
+    // `"membership log verification passed: ..."` nor any of its failure
+    // strings, so it could only ever say `fail`.
+    let membership_intact = integrity.succeeded()
+        && integrity
+            .trimmed_stdout()
+            .starts_with(MEMBERSHIP_VERIFY_PASS_PREFIX);
+    logger.line(format!(
+        "[network-flap] membership verify: {}",
+        integrity.detail()
+    ))?;
     logger.line(format!(
         "[network-flap] membership_intact={membership_intact}"
     ))?;
