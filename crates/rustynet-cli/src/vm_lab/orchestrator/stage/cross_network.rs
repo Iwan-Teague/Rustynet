@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 pub mod netns;
+pub mod scenario;
 pub mod substrate;
 
 use crate::vm_lab::VmGuestPlatform;
