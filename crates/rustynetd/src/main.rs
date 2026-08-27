@@ -3,9 +3,9 @@
 use rustynet_crypto::{KeyCustodyPermissionPolicy, write_encrypted_key_file};
 use rustynetd::daemon::{
     ANCHOR_BUNDLE_PULL_ADDR_ENV, ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV,
-    ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV, DEFAULT_AUTO_PORT_FORWARD_EXIT,
-    DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS, DEFAULT_EGRESS_INTERFACE, DEFAULT_FAIL_CLOSED_SSH_ALLOW,
-    DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
+    ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV, ANCHOR_ENROLLMENT_ADDR_ENV, ANCHOR_ENROLLMENT_ALLOW_LAN_ENV,
+    DEFAULT_AUTO_PORT_FORWARD_EXIT, DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS, DEFAULT_EGRESS_INTERFACE,
+    DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
     DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
     DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
     DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_RELAY_FLEET_BUNDLE_PATH,
@@ -3007,6 +3007,28 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             }
         };
     }
+    if let Ok(value) = std::env::var(ANCHOR_ENROLLMENT_ADDR_ENV) {
+        config.anchor_enrollment_addr = if value.trim().is_empty() {
+            None
+        } else {
+            Some(
+                value
+                    .parse::<SocketAddr>()
+                    .map_err(|err| format!("invalid {ANCHOR_ENROLLMENT_ADDR_ENV}: {err}"))?,
+            )
+        };
+    }
+    if let Ok(value) = std::env::var(ANCHOR_ENROLLMENT_ALLOW_LAN_ENV) {
+        config.anchor_enrollment_allow_lan = match value.trim() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" | "" => false,
+            _ => {
+                return Err(format!(
+                    "invalid {ANCHOR_ENROLLMENT_ALLOW_LAN_ENV} value: expected true or false"
+                ));
+            }
+        };
+    }
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -3129,6 +3151,42 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     _ => {
                         return Err(format!(
                             "invalid --anchor-bundle-pull-allow-lan value '{value}': expected true or false"
+                        ));
+                    }
+                };
+                index += 2;
+            }
+            Some("--anchor-enrollment-addr") => {
+                // D-3 §7(1): opt-in bind address for the anchor
+                // enrollment-consume listener. Empty value disables it.
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--anchor-enrollment-addr requires a value".to_owned())?;
+                config.anchor_enrollment_addr = if value.is_empty() {
+                    None
+                } else {
+                    Some(
+                        value
+                            .parse::<SocketAddr>()
+                            .map_err(|err| format!("invalid anchor enrollment addr: {err}"))?,
+                    )
+                };
+                index += 2;
+            }
+            Some("--anchor-enrollment-allow-lan") => {
+                // D-3 §7(1): explicit operator ack required to bind the
+                // enrollment listener on a non-loopback address. No
+                // auto-detect or silent fallback — same rule as
+                // --anchor-bundle-pull-allow-lan.
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--anchor-enrollment-allow-lan requires a value".to_owned())?;
+                config.anchor_enrollment_allow_lan = match value.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => {
+                        return Err(format!(
+                            "invalid --anchor-enrollment-allow-lan value '{value}': expected true or false"
                         ));
                     }
                 };
@@ -5913,6 +5971,53 @@ mod tests {
         let err = parse_daemon_config(&args)
             .expect_err("invalid anchor allow-lan value should fail parsing");
         assert!(err.contains("invalid --anchor-bundle-pull-allow-lan value"));
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_anchor_enrollment_settings() {
+        let args = vec![
+            "--anchor-enrollment-addr".to_owned(),
+            "127.0.0.1:51823".to_owned(),
+            "--anchor-enrollment-allow-lan".to_owned(),
+            "true".to_owned(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(
+            config
+                .anchor_enrollment_addr
+                .expect("enrollment addr should be set")
+                .to_string(),
+            "127.0.0.1:51823"
+        );
+        assert!(config.anchor_enrollment_allow_lan);
+    }
+
+    #[test]
+    fn parse_daemon_config_defaults_anchor_enrollment_listener_off() {
+        let config = parse_daemon_config(&[]).expect("empty args should parse");
+        assert!(
+            config.anchor_enrollment_addr.is_none(),
+            "enrollment listener must be opt-in"
+        );
+        assert!(!config.anchor_enrollment_allow_lan);
+    }
+
+    #[test]
+    fn parse_daemon_config_disables_anchor_enrollment_on_empty_addr() {
+        let args = vec!["--anchor-enrollment-addr".to_owned(), "".to_owned()];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert!(config.anchor_enrollment_addr.is_none());
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_anchor_enrollment_allow_lan() {
+        let args = vec![
+            "--anchor-enrollment-allow-lan".to_owned(),
+            "maybe".to_owned(),
+        ];
+        let err = parse_daemon_config(&args)
+            .expect_err("invalid enrollment allow-lan value should fail parsing");
+        assert!(err.contains("invalid --anchor-enrollment-allow-lan value"));
     }
 
     #[test]
