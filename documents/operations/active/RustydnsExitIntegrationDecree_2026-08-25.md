@@ -51,6 +51,11 @@ this decree makes in-scope product work:
 
 ## Status
 
+- 2026-08-27: detailed design recorded in
+  [`RustydnsTandemIntegrationDesign_2026-08-27.md`](./RustydnsTandemIntegrationDesign_2026-08-27.md).
+  It freezes signed per-exit activation, authenticated local readiness,
+  managed and transparent data paths, default-deny lifecycle, OS ownership and
+  residue proof, platform limiters, and Rust `--node` evidence requirements.
 - 2026-08-25: decree recorded. rustydns side: engine + privacy e2e-proven
   (UDP/TCP/DoH/DoT/DoQ, blocklists, no-client-identity-in-logs capstone);
   user-journey (plug-and-play) test lane in progress. Rustynet side:

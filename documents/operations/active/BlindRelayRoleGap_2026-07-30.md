@@ -1,14 +1,18 @@
 # UNBUILT ROLE — `blind_relay` — raised 2026-07-30
 
-**Status: NOT STARTED. Not designed, not specced, not written.** Raised by the
-operator so it is not lost; this file exists to be found later, not to design
-the thing.
+**Status: DESIGN PROPOSED; NOT ACCEPTED OR IMPLEMENTED.** The detailed design is
+[BlindRelayRoleDesign_2026-08-27.md](./BlindRelayRoleDesign_2026-08-27.md).
+This gap record remains the origin/history of the request; the design document
+is authoritative for proposed semantics and explicitly marks unresolved choices.
 
 ## What is here today
 
-Nothing. Verified 2026-07-30: a case-insensitive search for `blind_relay` /
-`blind-relay` / "blind relay" across `crates/` and `documents/` returns **zero
-hits**. This is a genuinely new role, not a partially-built one.
+No implementation. The original 2026-07-30 search found zero hits. Re-verified
+before the design was written on 2026-08-27: a case-insensitive search for
+`blind_relay` / `blind-relay` / "blind relay" found seven hits, all prose in
+this gap record and its active index entry, and no implementation hit in
+`crates/`, `scripts/`, or `third_party/`. This is a genuinely new role, not a
+partially-built one.
 
 The nearest existing thing — and the obvious model — is `blind_exit`:
 
@@ -23,54 +27,51 @@ The nearest existing thing — and the obvious model — is `blind_exit`:
 - Dataplane + verifier: `rustynetd/src/linux_blind_exit.rs`,
   `macos_blind_exit.rs`, and the `linux_blind_exit_dataplane` live-lab stage.
 
-## Why it is being recorded rather than started
+## Why implementation remains unstarted
 
-The role's *meaning* has not been defined. "Blind" for the exit role means the
-exit cannot associate traffic with the originating node. What the equivalent
-property is for a **relay** — and whether it is the same property, a weaker one,
-or a different one entirely — is an open design question, not an implementation
-detail. Guessing it here would be worse than leaving it blank.
+The proposed design now defines "blind" narrowly as concealment of stable
+Rustynet endpoint identities from the relay, while explicitly admitting that a
+single relay sees both socket legs and traffic metadata. Implementation remains
+gated on acceptance, protocol/encoding and proof-of-possession choices,
+security review, per-OS enforcement paths, and named verification. The role
+must not be inferred from this historical gap summary; use the linked design.
 
 ## What must be decided before any code
 
-1. **The privacy property, stated precisely.** What must a `blind_relay` be
-   unable to learn or correlate? Frame it as a property an adversary cannot
-   violate, not as a list of fields to omit.
-2. **Relationship to `RelayHost` / `EntryRelay`.** Is `blind_relay` a
-   *modifier* on an existing relay capability (as `BlindExit` modifies
-   `ExitServer`, requiring it), or a distinct capability? The `BlindExit`
-   precedent argues for a modifier with a required base.
-3. **Reducer invariants.** Which combinations must be refused? `BlindExit`'s
-   anchor-exclusion exists because an anchor sees control-plane state that
-   defeats blindness; the same question applies here and probably has the same
-   answer.
-4. **Reversibility.** `blind_exit` is irreversible and needs a factory reset.
-   Is `blind_relay` the same? If yes, it inherits ENR-06's typo hazard and needs
-   the same confirmation gate.
-5. **Session-token interaction — the sharpest one.** Relay forwarding is
-   authorized by `RelaySessionToken`, which names an explicit
-   `node_id`/`peer_node_id` **pair** (`rustynet-control/src/lib.rs:1691-1701`),
-   and the relay verifies only the signature
-   (`rustynet-relay/src/transport.rs:395`). **A relay therefore already learns
-   exactly which two nodes a session is between.** Any blindness property has to
-   confront that directly — it may require changing the token shape, which is a
-   signed wire format and therefore expensive to change later. **This is the
-   reason to decide the design before more relay work lands, not after.**
+1. **Privacy property:** proposed as relay-host concealment of stable Rustynet
+   endpoint identities, not concealment of IP/timing/volume or the unavoidable
+   same-circuit leg association.
+2. **Capability relationship:** proposed `BlindRelay` modifier requiring
+   `RelayHost`, plus a dedicated local primary/preset to avoid admin co-location.
+3. **Reducer invariants:** proposed exact set `{RelayHost, BlindRelay}`; every
+   other present or future capability is denied unless a reviewed amendment
+   changes the allowlist.
+4. **Reversibility:** proposed reversible through mandatory drain, stop, purge,
+   residue verification, and signed transition ordering; not factory reset,
+   avoiding an unsupported ENR-06-style irreversible typo hazard.
+5. **Session-token interaction — the sharpest one:** token/hello v1 names and
+   repeats the explicit `node_id`/`peer_node_id` pair. The proposed role therefore
+   requires identity-free, opaque per-circuit/per-leg, proof-of-possession v2
+   authorization and rejects v1 without fallback. The old statement that the
+   relay "verifies only the signature" is stale: current transport also checks
+   TTL/freshness/future date, self-pair, replay, hello/token/relay/scope bindings,
+   and capacity. It still delegates membership/pair policy to the signed issuer.
 
 ## Scope estimate
 
-Unknown, deliberately. By analogy with `blind_exit` it touches: the role enum
-and parser, membership reducer invariants, role-transition side-effects
-(CLAUDE.md §10.7), a platform dataplane path per OS, a verifier, a live-lab
-stage, and the cross-platform parity matrix. That analogy is a floor, not an
-estimate — item 5 above could make it materially larger.
+Large and intentionally unestimated until the OPEN protocol choices are closed.
+The surface includes role/capability enums and parsers, exact membership reducer,
+preset/local-role and transition side effects, signed fleet v2, token/hello v2,
+issuer and client changes, relay runtime/state/telemetry, one hardened platform
+path plus verifier per OS, adversarial live-lab stages, migration/anti-rollback,
+and eventually cross-platform parity rows. See the design's §14 dependency order.
 
 ## Where this must not get lost
 
 - Indexed in `documents/operations/active/README.md`.
 - Belongs in the release-blocking completeness mandate
-  (`CrossPlatformRoleParityPlan_2026-07-21.md`) once the role is defined: that
+  (`CrossPlatformRoleParityPlan_2026-06-21.md`) once the design is accepted: that
   document requires **every node role + capability** to be live-proven on macOS
   and Windows as well as Linux, so a new role widens that matrix by a row per OS.
-  It is deliberately **not** added there yet — adding an undefined role to a
+  It is deliberately **not** added there yet — adding an unaccepted role to a
   completeness matrix would make the matrix lie about what is outstanding.
