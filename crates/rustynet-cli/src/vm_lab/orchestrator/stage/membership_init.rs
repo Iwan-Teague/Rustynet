@@ -164,6 +164,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         assert!(matches!(
             MembershipInitStage.execute(&mut ctx),
@@ -197,6 +199,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         let exit_key = "a".repeat(64);
         let client_key = "b".repeat(64);
@@ -291,6 +295,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         ctx.collected_pubkeys
             .insert("client-1".to_owned(), WireguardPublicKey("b".repeat(64)));
@@ -323,6 +329,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         ctx.node_ids
             .insert("client-1".to_owned(), "client-node-id".to_owned());

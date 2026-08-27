@@ -13,7 +13,11 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 use crate::vm_lab::orchestrator::stage::StageId;
 use serde::{Deserialize, Serialize};
 
-pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 4;
+// v5: added `substrate_record` (topology-level cross-network substrate seam).
+// A v4 snapshot predates the substrate seam; rejecting it as stale is the
+// fail-closed choice (re-run setup rather than resume with unknown overlay
+// provenance).
+pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 5;
 
 pub const ENV_ORCHESTRATOR_DIALECT: &str = "RUSTYNET_ORCHESTRATOR_DIALECT";
 
@@ -46,6 +50,13 @@ struct PersistedOrchestrationContext {
     ssh_allow_cidrs: String,
     #[serde(default)]
     orchestrator_dialect: Option<OrchestratorDialect>,
+    /// Topology-level cross-network substrate provenance (id + topology
+    /// digest). The live handle is NEVER serialized; this record is what a
+    /// resumed run checks the requested substrate against, failing closed on
+    /// mismatch.
+    #[serde(default)]
+    substrate_record:
+        Option<crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +205,15 @@ pub struct OrchestrationContext {
     pub endpoints: HashMap<String, String>,
     /// Orchestrator engine that produced this run (set before stage execution).
     pub orchestrator_dialect: Option<OrchestratorDialect>,
+    /// Live topology-level substrate handle (overlay/underlay IPs + created
+    /// links). Run-local only — rebuilt by the setup stage, drained by the
+    /// always-run teardown stage, never serialized.
+    pub substrate:
+        Option<crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateHandle>,
+    /// Persisted substrate provenance (mirrors the handle's record; survives
+    /// `--resume-from` so a mismatched resume fails closed).
+    pub substrate_record:
+        Option<crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord>,
 }
 
 impl OrchestrationContext {
@@ -217,6 +237,8 @@ impl OrchestrationContext {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         }
     }
 
@@ -252,6 +274,7 @@ impl OrchestrationContext {
             network_id: self.network_id.clone(),
             ssh_allow_cidrs: self.ssh_allow_cidrs.clone(),
             orchestrator_dialect: self.orchestrator_dialect,
+            substrate_record: self.substrate_record.clone(),
         };
         let envelope = PersistedOrchestrationContextEnvelope {
             schema_version: ORCHESTRATION_CONTEXT_SCHEMA_VERSION,
@@ -335,6 +358,8 @@ impl OrchestrationContext {
             mesh_ips: snapshot.mesh_ips.into_iter().collect(),
             endpoints: snapshot.endpoints.into_iter().collect(),
             orchestrator_dialect: snapshot.orchestrator_dialect,
+            substrate: None,
+            substrate_record: snapshot.substrate_record,
         })
     }
 }
@@ -367,6 +392,14 @@ mod tests {
             .insert("exit".to_owned(), "192.0.2.10:51820".to_owned());
         ctx.ssh_allow_cidrs = "192.0.2.0/24".to_owned();
         ctx.set_dialect(OrchestratorDialect::RustNative);
+        ctx.substrate_record = Some(
+            crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord {
+                substrate_id: "vxlan".to_owned(),
+                topology_digest: "digest".to_owned(),
+                provisioned: true,
+                participants: vec!["exit".to_owned()],
+            },
+        );
 
         let path = tmp.path().join("state/orchestration_context.json");
         let binding = OrchestrationContextBinding {
@@ -394,6 +427,11 @@ mod tests {
         );
         assert!(loaded.adapters.is_empty());
         assert!(loaded.stage_outcomes.is_empty());
+        assert_eq!(loaded.substrate_record, ctx.substrate_record);
+        assert!(
+            loaded.substrate.is_none(),
+            "the live substrate handle must never survive persistence"
+        );
     }
 
     #[test]

@@ -373,6 +373,8 @@ mod tests {
             mesh_ips: std::collections::HashMap::new(),
             endpoints: std::collections::HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         write_per_control_evidence(&ctx, &[]).expect("evidence write must succeed");
 

@@ -195,6 +195,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         let outcome = ExitDemotionResidueValidationStage.execute(&mut ctx);
         assert!(matches!(outcome, StageOutcome::Failed(message) if message.contains("no Exit")));
