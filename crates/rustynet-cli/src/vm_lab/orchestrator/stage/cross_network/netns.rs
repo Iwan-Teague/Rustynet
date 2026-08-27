@@ -1046,7 +1046,10 @@ const STUN_SECONDARY_UNIT: &str = "rustynet-rnsim-stun-secondary";
 const FILTER_INIT_UNIT: &str = "rustynet-rnsim-filter-init";
 const FILTER_INIT_LOG: &str = "/tmp/rnsim-filter-init.log";
 const FILTER_MAPPED_FILE: &str = "/tmp/rnsim-filter-mapped";
-const STUN_LOG: &str = "/tmp/rnsim-stun.log";
+/// Distinct log paths per responder: `StandardOutput=file:` truncates on
+/// open, so two units sharing one path would clobber each other's diagnostics.
+const STUN_LOG_PRIMARY: &str = "/tmp/rnsim-stun-primary.log";
+const STUN_LOG_SECONDARY: &str = "/tmp/rnsim-stun-secondary.log";
 const FILTER_LISTEN_SECS: &str = "2";
 const DIFF_PORT: u16 = 49378;
 const COLD_PORT: u16 = 49379;
@@ -1212,7 +1215,7 @@ fn classify_one_profile(
     let primary = BackgroundUnit::start(
         runner,
         STUN_PRIMARY_UNIT,
-        STUN_LOG,
+        STUN_LOG_PRIMARY,
         &[
             "ip",
             "netns",
@@ -1229,7 +1232,7 @@ fn classify_one_profile(
     let secondary = BackgroundUnit::start(
         runner,
         STUN_SECONDARY_UNIT,
-        STUN_LOG,
+        STUN_LOG_SECONDARY,
         &[
             "ip",
             "netns",
@@ -1332,7 +1335,7 @@ fn filter_one_scenario(
             let stun = BackgroundUnit::start(
                 runner,
                 STUN_PRIMARY_UNIT,
-                STUN_LOG,
+                STUN_LOG_PRIMARY,
                 &[
                     "ip",
                     "netns",
@@ -1378,7 +1381,7 @@ fn filter_one_scenario(
             let stun = BackgroundUnit::start(
                 runner,
                 STUN_PRIMARY_UNIT,
-                STUN_LOG,
+                STUN_LOG_PRIMARY,
                 &[
                     "ip",
                     "netns",
@@ -1526,7 +1529,7 @@ mod tests {
         simulator_topology("exit-1", "192.168.64.10".parse().expect("ip"))
     }
 
-    fn runners<'a>(runner: &'a MockLeafRunner) -> BTreeMap<String, &'a dyn NetLeafRunner> {
+    fn runners(runner: &MockLeafRunner) -> BTreeMap<String, &dyn NetLeafRunner> {
         BTreeMap::from([("exit-1".to_owned(), runner as &dyn NetLeafRunner)])
     }
 
@@ -2146,7 +2149,7 @@ mod tests {
         let unit = BackgroundUnit::start(
             &runner,
             STUN_PRIMARY_UNIT,
-            STUN_LOG,
+            STUN_LOG_PRIMARY,
             &["ip", "netns", "exec", SVC_NS, PROBE_BIN, "stun-responder"],
         )
         .expect("start");
@@ -2160,7 +2163,7 @@ mod tests {
             calls[1],
             format!(
                 "sudo -n systemd-run --quiet --collect --unit {STUN_PRIMARY_UNIT} -p \
-                 StandardOutput=file:{STUN_LOG} -p StandardError=inherit -- ip netns exec \
+                 StandardOutput=file:{STUN_LOG_PRIMARY} -p StandardError=inherit -- ip netns exec \
                  rnsim-svc {PROBE_BIN} stun-responder"
             )
         );

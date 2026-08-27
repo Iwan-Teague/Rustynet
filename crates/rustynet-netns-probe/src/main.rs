@@ -19,7 +19,9 @@
 //! responder's replies unchanged. `#[cfg(test)]` pins the wire format against
 //! fixed vectors so it cannot silently diverge (the Python versions had no such
 //! pin). STDOUT lines are byte-identical to the Python scripts so the shell
-//! wrappers (`netns_nat_classify.sh`, `netns_nat_filter.sh`) parse them unchanged.
+//! Rust NAT gate (`stage/cross_network/netns.rs::run_nat_gates`, which replaced
+//! the former `netns_nat_classify.sh` / `netns_nat_filter.sh` wrappers in CN-2)
+//! parses them unchanged.
 
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
