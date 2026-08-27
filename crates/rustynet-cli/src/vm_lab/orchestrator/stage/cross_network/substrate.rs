@@ -311,6 +311,253 @@ pub fn topology_digest(
     format!("{:x}", hasher.finalize())
 }
 
+/// The Tier-B VXLAN provider: the essential logic of
+/// `scripts/vm_lab/vxlan_tier_b.sh`, ported onto [`NetLeafRunner`] with
+/// argv-only leaf commands. Each participating guest gets one vxlan device
+/// ([`VXLAN_LINK_NAME`], shared VNI, head-end-replication full mesh over the
+/// routable management underlay) carrying its per-group overlay address, so
+/// cross-LAN peers become mutually routable on 172.20.0.0/16.
+pub struct VxlanSubstrateProvider;
+
+impl VxlanSubstrateProvider {
+    fn runner_for<'a>(
+        runners: &'a BTreeMap<String, &'a dyn NetLeafRunner>,
+        alias: &str,
+    ) -> Result<&'a dyn NetLeafRunner, String> {
+        runners
+            .get(alias)
+            .copied()
+            .ok_or_else(|| format!("no leaf runner for participating node '{alias}'"))
+    }
+
+    /// Run one required command: transport errors and non-zero exits both
+    /// fail (closed), with the guest's stderr in the message.
+    fn run_required(runner: &dyn NetLeafRunner, alias: &str, argv: &[&str]) -> Result<(), String> {
+        let output = runner
+            .run(argv)
+            .map_err(|err| format!("{alias}: {argv:?}: {err}"))?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(format!(
+                "{alias}: {argv:?} failed: {}",
+                output.stderr.trim()
+            ))
+        }
+    }
+}
+
+impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
+    fn id(&self) -> &'static str {
+        "vxlan"
+    }
+
+    fn setup(
+        &self,
+        topology: &SubstrateTopology,
+        runners: &BTreeMap<String, &dyn NetLeafRunner>,
+    ) -> Result<SubstrateHandle, Box<SubstrateSetupFailure>> {
+        let underlay_ips: BTreeMap<String, String> = topology
+            .nodes
+            .iter()
+            .map(|(alias, ip)| (alias.clone(), ip.to_string()))
+            .collect();
+        let fail = |message: String, partial: SubstrateHandle| {
+            Box::new(SubstrateSetupFailure { message, partial })
+        };
+        let empty_handle = |digest: String| SubstrateHandle {
+            record: SubstrateRecord {
+                substrate_id: self.id().to_owned(),
+                topology_digest: digest,
+                provisioned: false,
+                participants: Vec::new(),
+            },
+            overlay_ips: BTreeMap::new(),
+            underlay_ips: underlay_ips.clone(),
+            created_links: Vec::new(),
+        };
+        let plan = match plan_overlay(topology) {
+            Ok(plan) => plan,
+            Err(err) => {
+                let digest = topology_digest(self.id(), topology, None);
+                return Err(fail(err, empty_handle(digest)));
+            }
+        };
+        let digest = topology_digest(self.id(), topology, plan.as_ref());
+        let Some(plan) = plan else {
+            // Single network group: nothing to provision, recorded honestly.
+            return Ok(empty_handle(digest));
+        };
+        let participants: Vec<String> = plan.overlay_ips.keys().cloned().collect();
+        let mut handle = SubstrateHandle {
+            record: SubstrateRecord {
+                substrate_id: self.id().to_owned(),
+                topology_digest: digest,
+                provisioned: true,
+                participants: participants.clone(),
+            },
+            overlay_ips: plan
+                .overlay_ips
+                .iter()
+                .map(|(alias, ip)| (alias.clone(), ip.to_string()))
+                .collect(),
+            underlay_ips,
+            created_links: Vec::new(),
+        };
+        for alias in &participants {
+            let runner = match Self::runner_for(runners, alias) {
+                Ok(runner) => runner,
+                Err(err) => return Err(fail(err, handle)),
+            };
+            let local = handle.underlay_ips[alias].clone();
+            let overlay = handle.overlay_ips[alias].clone();
+            // Idempotent pre-delete: a leftover device from an aborted run is
+            // expected, so a non-zero exit here is fine — but a transport
+            // failure is not.
+            if let Err(err) = runner.run(&["sudo", "-n", "ip", "link", "del", VXLAN_LINK_NAME]) {
+                return Err(fail(format!("{alias}: pre-delete: {err}"), handle));
+            }
+            if let Err(err) = Self::run_required(
+                runner,
+                alias,
+                &[
+                    "sudo",
+                    "-n",
+                    "ip",
+                    "link",
+                    "add",
+                    VXLAN_LINK_NAME,
+                    "type",
+                    "vxlan",
+                    "id",
+                    VXLAN_VNI,
+                    "local",
+                    &local,
+                    "dstport",
+                    VXLAN_DSTPORT,
+                    "nolearning",
+                ],
+            ) {
+                return Err(fail(err, handle));
+            }
+            handle.created_links.push(CreatedLink {
+                alias: alias.clone(),
+                link: VXLAN_LINK_NAME.to_owned(),
+            });
+            for peer in &participants {
+                if peer == alias {
+                    continue;
+                }
+                let peer_underlay = handle.underlay_ips[peer].clone();
+                if let Err(err) = Self::run_required(
+                    runner,
+                    alias,
+                    &[
+                        "sudo",
+                        "-n",
+                        "bridge",
+                        "fdb",
+                        "append",
+                        "00:00:00:00:00:00",
+                        "dev",
+                        VXLAN_LINK_NAME,
+                        "dst",
+                        &peer_underlay,
+                    ],
+                ) {
+                    return Err(fail(err, handle));
+                }
+            }
+            let overlay_cidr = format!("{overlay}/{OVERLAY_PREFIX_LEN}");
+            if let Err(err) = Self::run_required(
+                runner,
+                alias,
+                &[
+                    "sudo",
+                    "-n",
+                    "ip",
+                    "addr",
+                    "replace",
+                    &overlay_cidr,
+                    "dev",
+                    VXLAN_LINK_NAME,
+                ],
+            ) {
+                return Err(fail(err, handle));
+            }
+            if let Err(err) = Self::run_required(
+                runner,
+                alias,
+                &["sudo", "-n", "ip", "link", "set", VXLAN_LINK_NAME, "up"],
+            ) {
+                return Err(fail(err, handle));
+            }
+        }
+        Ok(handle)
+    }
+
+    fn teardown(
+        &self,
+        handle: &SubstrateHandle,
+        runners: &BTreeMap<String, &dyn NetLeafRunner>,
+    ) -> Result<(), String> {
+        if !handle.record.provisioned {
+            return Ok(());
+        }
+        // Exact created links when we have them (covers partial setup);
+        // otherwise every recorded participant with the well-known link name
+        // (covers teardown after a resume where the live handle was rebuilt
+        // from the persisted record).
+        let targets: Vec<CreatedLink> = if handle.created_links.is_empty() {
+            handle
+                .record
+                .participants
+                .iter()
+                .map(|alias| CreatedLink {
+                    alias: alias.clone(),
+                    link: VXLAN_LINK_NAME.to_owned(),
+                })
+                .collect()
+        } else {
+            handle.created_links.clone()
+        };
+        let mut errors = Vec::new();
+        for target in &targets {
+            let runner = match Self::runner_for(runners, &target.alias) {
+                Ok(runner) => runner,
+                Err(err) => {
+                    errors.push(err);
+                    continue;
+                }
+            };
+            match runner.run(&["sudo", "-n", "ip", "link", "del", &target.link]) {
+                Err(err) => errors.push(format!("{}: {err}", target.alias)),
+                Ok(output) if !output.success => {
+                    // Already-gone is the idempotent success case; anything
+                    // else is potential residue and must fail the stage.
+                    if !output.stderr.contains("Cannot find device") {
+                        errors.push(format!(
+                            "{}: delete {} failed: {}",
+                            target.alias,
+                            target.link,
+                            output.stderr.trim()
+                        ));
+                    }
+                }
+                Ok(_) => {}
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "vxlan substrate teardown left possible residue: {}",
+                errors.join("; ")
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod mock {
     use super::{LeafOutput, NetLeafRunner};
@@ -433,6 +680,230 @@ mod tests {
     fn shell_quote_neutralises_single_quotes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    fn two_lan_topology() -> SubstrateTopology {
+        topology(&[
+            ("lenovo-1", "192.168.0.30"),
+            ("utm-1", "192.168.64.10"),
+            ("utm-2", "192.168.64.11"),
+        ])
+    }
+
+    fn runner_map<'a>(
+        runners: &[(&str, &'a mock::MockLeafRunner)],
+    ) -> BTreeMap<String, &'a dyn NetLeafRunner> {
+        runners
+            .iter()
+            .map(|(alias, runner)| ((*alias).to_owned(), *runner as &dyn NetLeafRunner))
+            .collect()
+    }
+
+    #[test]
+    fn vxlan_setup_provisions_link_fdb_mesh_addr_and_up_per_node() {
+        use mock::MockLeafRunner;
+        let lenovo = MockLeafRunner::default();
+        let utm1 = MockLeafRunner::default();
+        let utm2 = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm1), ("utm-2", &utm2)]);
+        let handle = VxlanSubstrateProvider
+            .setup(&two_lan_topology(), &runners)
+            .expect("setup");
+
+        assert!(handle.record.provisioned);
+        assert_eq!(
+            handle.record.participants,
+            ["lenovo-1", "utm-1", "utm-2"],
+            "every node participates"
+        );
+        assert_eq!(handle.created_links.len(), 3);
+        // Per node: del + add + 2 fdb + addr + up = 6 calls.
+        let calls = lenovo.recorded();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(
+            calls[1],
+            [
+                "sudo",
+                "-n",
+                "ip",
+                "link",
+                "add",
+                VXLAN_LINK_NAME,
+                "type",
+                "vxlan",
+                "id",
+                VXLAN_VNI,
+                "local",
+                "192.168.0.30",
+                "dstport",
+                VXLAN_DSTPORT,
+                "nolearning"
+            ]
+        );
+        // fdb mesh entries point at BOTH peers' underlay addresses.
+        let fdb_dsts: Vec<&str> = calls[2..4]
+            .iter()
+            .map(|argv| argv.last().expect("dst").as_str())
+            .collect();
+        assert_eq!(fdb_dsts, ["192.168.64.10", "192.168.64.11"]);
+        assert_eq!(
+            calls[4],
+            [
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                "172.20.10.2/16",
+                "dev",
+                VXLAN_LINK_NAME
+            ]
+        );
+        assert_eq!(
+            calls[5],
+            ["sudo", "-n", "ip", "link", "set", VXLAN_LINK_NAME, "up"]
+        );
+        // The handle carries BOTH address planes, keyed by alias.
+        assert_eq!(
+            handle.overlay_ips.get("utm-1").map(String::as_str),
+            Some("172.20.20.2")
+        );
+        assert_eq!(
+            handle.underlay_ips.get("utm-1").map(String::as_str),
+            Some("192.168.64.10")
+        );
+    }
+
+    #[test]
+    fn vxlan_setup_failure_keeps_partial_created_links_for_teardown() {
+        use mock::MockLeafRunner;
+        let lenovo = MockLeafRunner::default();
+        // Second node's `ip link add` (its call index 1, after the pre-delete)
+        // fails.
+        let utm1 = MockLeafRunner {
+            fail_on: vec![1],
+            failure_stderr: "RTNETLINK answers: Operation not permitted".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let utm2 = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm1), ("utm-2", &utm2)]);
+        let failure = VxlanSubstrateProvider
+            .setup(&two_lan_topology(), &runners)
+            .expect_err("half-provisioned setup must fail closed");
+        assert!(failure.message.contains("utm-1"), "{}", failure.message);
+        // The partial handle still lists the link the FIRST node created, so
+        // the always-run teardown can remove it.
+        assert_eq!(
+            failure.partial.created_links,
+            [CreatedLink {
+                alias: "lenovo-1".to_owned(),
+                link: VXLAN_LINK_NAME.to_owned(),
+            }]
+        );
+
+        // Teardown after the partial setup issues one removal per created link.
+        let lenovo_td = MockLeafRunner::default();
+        let td_runners = runner_map(&[("lenovo-1", &lenovo_td)]);
+        VxlanSubstrateProvider
+            .teardown(&failure.partial, &td_runners)
+            .expect("teardown of the partial state");
+        assert_eq!(
+            lenovo_td.recorded(),
+            [vec![
+                "sudo".to_owned(),
+                "-n".to_owned(),
+                "ip".to_owned(),
+                "link".to_owned(),
+                "del".to_owned(),
+                VXLAN_LINK_NAME.to_owned()
+            ]]
+        );
+    }
+
+    #[test]
+    fn vxlan_teardown_falls_back_to_participants_when_links_unknown() {
+        use mock::MockLeafRunner;
+        // Resume case: handle rebuilt from the persisted record only.
+        let handle = SubstrateHandle {
+            record: SubstrateRecord {
+                substrate_id: "vxlan".to_owned(),
+                topology_digest: "digest".to_owned(),
+                provisioned: true,
+                participants: vec!["a".to_owned(), "b".to_owned()],
+            },
+            overlay_ips: BTreeMap::new(),
+            underlay_ips: BTreeMap::new(),
+            created_links: Vec::new(),
+        };
+        let a = MockLeafRunner::default();
+        let b = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &a), ("b", &b)]);
+        VxlanSubstrateProvider
+            .teardown(&handle, &runners)
+            .expect("teardown");
+        assert_eq!(a.recorded().len(), 1);
+        assert_eq!(b.recorded().len(), 1);
+    }
+
+    #[test]
+    fn vxlan_teardown_tolerates_already_deleted_but_fails_on_real_errors() {
+        use mock::MockLeafRunner;
+        let handle = SubstrateHandle {
+            record: SubstrateRecord {
+                substrate_id: "vxlan".to_owned(),
+                topology_digest: "digest".to_owned(),
+                provisioned: true,
+                participants: vec!["a".to_owned(), "b".to_owned()],
+            },
+            overlay_ips: BTreeMap::new(),
+            underlay_ips: BTreeMap::new(),
+            created_links: Vec::new(),
+        };
+        let gone = MockLeafRunner {
+            fail_on: vec![0],
+            failure_stderr: "Cannot find device \"rustynet-vx0\"".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let ok = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &gone), ("b", &ok)]);
+        VxlanSubstrateProvider
+            .teardown(&handle, &runners)
+            .expect("already-deleted must be idempotent success");
+
+        let broken = MockLeafRunner {
+            fail_on: vec![0],
+            failure_stderr: "RTNETLINK answers: Operation not permitted".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let ok2 = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &broken), ("b", &ok2)]);
+        let err = VxlanSubstrateProvider
+            .teardown(&handle, &runners)
+            .expect_err("real deletion failure must fail the teardown");
+        assert!(err.contains("possible residue"), "{err}");
+        // The OTHER node's removal was still attempted (never stop early).
+        assert_eq!(ok2.recorded().len(), 1);
+    }
+
+    #[test]
+    fn vxlan_setup_on_single_group_is_a_recorded_no_op() {
+        use mock::MockLeafRunner;
+        let a = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &a)]);
+        let handle = VxlanSubstrateProvider
+            .setup(
+                &topology(&[("a", "192.168.64.10"), ("b", "192.168.64.11")]),
+                &runners,
+            )
+            .expect("single group is a no-op, not an error");
+        assert!(!handle.record.provisioned);
+        assert!(handle.overlay_ips.is_empty());
+        assert!(a.recorded().is_empty(), "no leaf command may run");
+        // And teardown of that handle issues nothing.
+        VxlanSubstrateProvider
+            .teardown(&handle, &runners)
+            .expect("no-op teardown");
+        assert!(a.recorded().is_empty());
     }
 
     #[test]
