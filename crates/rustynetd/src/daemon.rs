@@ -223,6 +223,28 @@ const ANCHOR_BUNDLE_PULL_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(3
 pub const ANCHOR_BUNDLE_PULL_ADDR_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR";
 pub const ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH";
 pub const ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN";
+
+/// D-3 §7(1): hard cap on ONE anchor-enrollment request line, applied
+/// byte-by-byte BEFORE any allocation proportional to attacker input
+/// (`read_line_bounded` pushes one byte at a time and refuses at the cap).
+/// A maximal honest request is `enrollment consume <token> <pubkey> <addr>`
+/// = 19 + 86 (base64 token, `TOKEN_BINARY_LEN`=64 → 86 chars) + 1 + 43
+/// (base64 of a 32-byte Ed25519 key) + 1 + 47 (bracketed IPv6 `[..]:port`)
+/// ≈ 197 bytes, so 256 leaves headroom without admitting bulk payloads.
+pub const MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES: usize = 256;
+
+/// Overall wall-clock budget for reading the single enrollment request
+/// line. Same slowloris rationale as `ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET`
+/// (the serve path runs inline in the shared daemon event loop).
+const ANCHOR_ENROLLMENT_REQUEST_LINE_BUDGET: Duration = Duration::from_secs(2);
+
+/// Overall wall-clock budget for writing the one-line enrollment response.
+/// Tighter than the bundle-pull response budget (30s) because the response
+/// is a single short line, never an 8 MiB bundle — a peer that cannot drain
+/// one line in 5s is stalling the inline serve loop, not downloading.
+const ANCHOR_ENROLLMENT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(5);
+pub const ANCHOR_ENROLLMENT_ADDR_ENV: &str = "RUSTYNET_ANCHOR_ENROLLMENT_ADDR";
+pub const ANCHOR_ENROLLMENT_ALLOW_LAN_ENV: &str = "RUSTYNET_ANCHOR_ENROLLMENT_ALLOW_LAN";
 #[cfg(not(windows))]
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
 #[cfg(windows)]
@@ -1014,6 +1036,25 @@ pub fn validate_anchor_bundle_pull_addr(
     Ok(())
 }
 
+/// Validate the anchor enrollment listener bind address.
+///
+/// Same shape and rationale as [`validate_anchor_bundle_pull_addr`]:
+/// non-loopback addresses are rejected unless `allow_lan` is `true`, and
+/// callers must obtain `allow_lan` from an explicit operator flag
+/// (`--anchor-enrollment-allow-lan` / `RUSTYNET_ANCHOR_ENROLLMENT_ALLOW_LAN`);
+/// there is no auto-detect or silent fallback.
+pub fn validate_anchor_enrollment_addr(
+    addr: SocketAddr,
+    allow_lan: bool,
+) -> Result<(), DaemonError> {
+    if !addr.ip().is_loopback() && !allow_lan {
+        return Err(DaemonError::InvalidConfig(
+            "anchor enrollment listener must bind loopback only; set --anchor-enrollment-allow-lan to permit LAN bind".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Open a daemon state file for reading only after proving, on the link
 /// itself (`symlink_metadata` — never the follow-through target), that it
 /// is a regular file and not a symlink. A symlink swap on the bundle-pull
@@ -1239,20 +1280,23 @@ impl fmt::Display for AnchorBundlePullStreamError {
 /// so an expired budget fails fast even when the peer keeps the socket open.
 /// Returns the line and whether it was actually `\n`-terminated (an
 /// EOF-terminated trailing fragment is reported as such so callers can apply
-/// their own completeness rule).
+/// their own completeness rule). `label` names the artifact being read
+/// (e.g. `"bundle-pull request token"`) so both the bundle-pull and
+/// enrollment listeners log accurate diagnostics through one bounded reader.
 fn read_line_bounded<R: std::io::Read>(
     stream: &mut R,
     max_bytes: usize,
     deadline: Instant,
+    label: &str,
 ) -> Result<(String, bool), DaemonError> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     let mut newline_terminated = false;
     loop {
         if Instant::now() >= deadline {
-            return Err(DaemonError::Io(
-                "anchor bundle-pull request line exceeded its time budget".to_owned(),
-            ));
+            return Err(DaemonError::Io(format!(
+                "anchor {label} exceeded its time budget"
+            )));
         }
         match stream.read(&mut byte) {
             Ok(0) => break,
@@ -1263,23 +1307,21 @@ fn read_line_bounded<R: std::io::Read>(
             Ok(_) => {
                 bytes.push(byte[0]);
                 if bytes.len() > max_bytes {
-                    return Err(DaemonError::InvalidConfig(
-                        "anchor bundle-pull request token exceeds maximum size".to_owned(),
-                    ));
+                    return Err(DaemonError::InvalidConfig(format!(
+                        "anchor {label} exceeds maximum size"
+                    )));
                 }
             }
             Err(err) => {
                 return Err(DaemonError::Io(format!(
-                    "anchor bundle-pull token read failed: {err}"
+                    "anchor {label} read failed: {err}"
                 )));
             }
         }
     }
     String::from_utf8(bytes)
         .map(|line| (line, newline_terminated))
-        .map_err(|_| {
-            DaemonError::InvalidConfig("anchor bundle-pull request token is not utf8".to_owned())
-        })
+        .map_err(|_| DaemonError::InvalidConfig(format!("anchor {label} is not utf8")))
 }
 
 fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<String, DaemonError> {
@@ -1287,6 +1329,7 @@ fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<Strin
         stream,
         MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
         Instant::now() + ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET,
+        "bundle-pull request token",
     )?
     .0)
 }
@@ -1327,6 +1370,7 @@ fn read_optional_anchor_bundle_pull_have_line<R: std::io::Read>(stream: &mut R) 
         stream,
         MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
         Instant::now() + ANCHOR_BUNDLE_PULL_HAVE_LINE_BUDGET,
+        "bundle-pull have line",
     )
     .ok()?;
     // FIS-0020 completeness rule: a trailing fragment ended by EOF is an
@@ -1492,6 +1536,207 @@ fn poll_anchor_bundle_pull_once(
         Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
         Err(err) => Err(DaemonError::Io(format!(
             "anchor bundle-pull accept failed: {err}"
+        ))),
+    }
+}
+
+/// Bind the anchor enrollment-consume listener (D-3 §7(1)) if this node is
+/// configured to serve it. Opt-in: `Ok(None)` when no
+/// `--anchor-enrollment-addr` is configured. Modeled on
+/// [`bind_anchor_bundle_pull_listener`] — same bind/validate/fail-fast
+/// order, portable (`std::net`), outside any `cfg` so the Unix AND Windows
+/// daemon main loops share ONE verified bind path.
+///
+/// Fail-closed pre-bind checks, in order (no optimistic bind — the socket
+/// is not created until every check passes):
+/// 1. bind addr is loopback unless `--anchor-enrollment-allow-lan`;
+/// 2. the enrollment subsystem is provisioned (secret + ledger paths set)
+///    and the secret actually loads through its symlink-refusing,
+///    size- and permission-checked reader — a listener whose every request
+///    would fail on the secret is a misconfiguration to surface at startup,
+///    exactly as bundle-pull fail-fasts on an unreadable token file;
+/// 3. startup coherence (design §4(c), first half): the local quorum-signed
+///    membership snapshot must show `anchor.enrollment_endpoint` on an
+///    **Active** row for this node. Missing / symlinked / oversized /
+///    malformed snapshot, unknown or non-Active node, and absent capability
+///    all refuse through [`require_local_signed_capability`]. This check is
+///    startup coherence only — the per-request re-read inside
+///    [`DaemonRuntime::handle_enrollment_consume`] remains the revocation
+///    mechanism and is NOT replaced by it.
+fn bind_anchor_enrollment_listener(
+    config: &DaemonConfig,
+) -> Result<Option<TcpListener>, DaemonError> {
+    let Some(addr) = config.anchor_enrollment_addr else {
+        return Ok(None);
+    };
+    validate_anchor_enrollment_addr(addr, config.anchor_enrollment_allow_lan)?;
+    let Some(secret_path) = config.enrollment_secret_path.as_deref() else {
+        return Err(DaemonError::InvalidConfig(
+            "anchor enrollment listener requires an enrollment secret path".to_owned(),
+        ));
+    };
+    if config.enrollment_ledger_path.is_none() {
+        return Err(DaemonError::InvalidConfig(
+            "anchor enrollment listener requires an enrollment ledger path".to_owned(),
+        ));
+    }
+    // Fail fast on an unloadable secret (missing, symlinked, wrong size,
+    // group/world-readable). The Zeroizing buffer is dropped immediately;
+    // nothing secret is retained here.
+    crate::enrollment_token::load_secret(secret_path).map_err(|err| {
+        DaemonError::InvalidConfig(format!("anchor enrollment secret unavailable: {err}"))
+    })?;
+    require_local_signed_capability(
+        config.membership_snapshot_path.as_path(),
+        config.node_id.as_str(),
+        rustynet_control::roles::RoleCapability::AnchorEnrollmentEndpoint,
+    )?;
+    let listener = TcpListener::bind(addr)
+        .map_err(|err| DaemonError::Io(format!("anchor enrollment bind failed: {err}")))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| DaemonError::Io(format!("anchor enrollment nonblocking failed: {err}")))?;
+    log::info!("anchor_enrollment: listening addr={addr}");
+    Ok(Some(listener))
+}
+
+/// Serve exactly ONE anchor enrollment-consume request on an accepted
+/// connection. The listener serves this single verb and nothing else:
+/// membership admission (`enrollment admit`) and the signed bundle
+/// (`anchor.bundle_pull`) are explicitly out of scope (design §2), and any
+/// non-`enrollment consume` line is refused default-deny.
+///
+/// Pre-authentication surface discipline (this parser is reachable before
+/// any authentication once `--anchor-enrollment-allow-lan` is set):
+/// * capability re-checked at accept time, BEFORE any client byte is read
+///   (mirrors `handle_anchor_bundle_pull_stream`'s accept-time bundle
+///   capability check) — an unauthorized node never parses attacker bytes;
+/// * one request line, read byte-by-byte under a hard size cap
+///   (`MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES`, enforced before any
+///   proportional allocation) and an overall wall-clock budget;
+/// * hardening beyond the bundle-pull precedent: the line MUST be
+///   `\n`-terminated — an EOF-truncated fragment is refused outright
+///   (bundle-pull tolerates an EOF-terminated token line for
+///   backwards-compatibility this new endpoint does not owe anyone);
+/// * responses are structured fixed-vocabulary lines (`OK …` / `ERR …`)
+///   built from the handler's existing fixed strings, which leak neither
+///   secret material nor ledger state; read-layer failures (oversize,
+///   timeout, non-utf8, truncation) drop the connection without a response,
+///   matching bundle-pull's disposition for unreadable requests;
+/// * the write side is budgeted by [`DeadlineWriter`] so a slow-draining
+///   peer cannot stall the inline serve loop.
+///
+/// Token-burn abuse bound: the capability gate, the wire parse, and the
+/// verb whitelist above all run before [`DaemonRuntime::handle_enrollment_consume`]
+/// is entered, and inside it the capability + subsystem + gossip + payload
+/// parse checks all precede the enrollment ledger lock — a flood of
+/// invalid consumes is rejected without ever contending on the ledger.
+fn handle_anchor_enrollment_stream(
+    mut stream: TcpStream,
+    runtime: &mut DaemonRuntime,
+) -> Result<String, DaemonError> {
+    use std::io::Write as _;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| DaemonError::Io(format!("anchor enrollment read timeout failed: {err}")))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| DaemonError::Io(format!("anchor enrollment write timeout failed: {err}")))?;
+    // Accept-time capability re-read, before reading anything from the
+    // client. Revocation updates the snapshot on disk; checking here means a
+    // revoked node refuses without parsing a single attacker-controlled
+    // byte. The merged gate inside `handle_enrollment_consume` re-runs the
+    // same check as the backstop for every other path to the handler.
+    if let Err(err) = require_local_signed_capability(
+        runtime.membership_snapshot_path.as_path(),
+        runtime.local_node_id.as_str(),
+        rustynet_control::roles::RoleCapability::AnchorEnrollmentEndpoint,
+    ) {
+        let _ = stream.write_all(b"ERR forbidden after revocation\n");
+        return Err(err);
+    }
+    let (line, newline_terminated) = read_line_bounded(
+        &mut stream,
+        MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES,
+        Instant::now() + ANCHOR_ENROLLMENT_REQUEST_LINE_BUDGET,
+        "enrollment request line",
+    )?;
+    if !newline_terminated {
+        return Err(DaemonError::InvalidConfig(
+            "anchor enrollment request line is truncated (missing newline terminator)".to_owned(),
+        ));
+    }
+    // Default-deny verb whitelist: the ONLY request this listener serves is
+    // the existing `enrollment consume <token> <pubkey-b64> <addr:port>`
+    // wire encoding from `ipc.rs`. Every other parse result — including
+    // valid IPC verbs like `status`, `gossip push`, or `membership apply` —
+    // is refused with one fixed string that echoes nothing back.
+    let crate::ipc::IpcCommand::EnrollmentConsume {
+        token,
+        pubkey_b64,
+        push_addr,
+    } = crate::ipc::parse_command(&line)
+    else {
+        let _ = stream.write_all(b"ERR unsupported operation\n");
+        return Err(DaemonError::State(
+            "anchor enrollment listener refused a non-enrollment-consume request".to_owned(),
+        ));
+    };
+    let mut response_writer = DeadlineWriter {
+        inner: &mut stream,
+        deadline: Instant::now() + ANCHOR_ENROLLMENT_RESPONSE_WRITE_BUDGET,
+    };
+    match runtime.handle_enrollment_consume(&token, &pubkey_b64, &push_addr) {
+        Ok(summary) => {
+            response_writer
+                .write_all(format!("OK {summary}\n").as_bytes())
+                .map_err(|err| {
+                    DaemonError::Io(format!("anchor enrollment response failed: {err}"))
+                })?;
+            Ok(summary)
+        }
+        Err(reason) => {
+            // `reason` is one of the handler's fixed-vocabulary refusal
+            // strings (capability / subsystem / parse / token verdicts) —
+            // already vetted to disclose neither secret material nor
+            // per-step ledger state. Best-effort write: the refusal stands
+            // whether or not the peer drains it.
+            let _ = response_writer.write_all(format!("ERR {reason}\n").as_bytes());
+            Err(DaemonError::State(reason))
+        }
+    }
+}
+
+/// Accept and serve AT MOST ONE pending anchor enrollment connection on a
+/// non-blocking listener. Same disposition as
+/// [`poll_anchor_bundle_pull_once`]: `Ok(true)` when a connection was
+/// accepted (counted as processed I/O), `Ok(false)` on `WouldBlock`, `Err`
+/// only on a genuine accept error. Per-request failures are logged (one
+/// fixed-vocabulary line per connection — bounded log volume) and swallowed:
+/// one malformed or hostile request must not kill the daemon. Portable so
+/// the Unix + Windows loops share one verified serve path.
+fn poll_anchor_enrollment_once(
+    listener: &TcpListener,
+    runtime: &mut DaemonRuntime,
+) -> Result<bool, DaemonError> {
+    match listener.accept() {
+        Ok((stream, peer_addr)) => {
+            match handle_anchor_enrollment_stream(stream, runtime) {
+                Ok(summary) => {
+                    // `summary` is the handler's fixed-vocabulary success
+                    // line (enrollee node-id prefix + expiry) — no token
+                    // material is ever derived into the log.
+                    log::info!("anchor_enrollment: served peer={peer_addr} outcome={summary}");
+                }
+                Err(err) => {
+                    log::warn!("anchor_enrollment: request refused peer={peer_addr} reason={err}");
+                }
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(false),
+        Err(err) => Err(DaemonError::Io(format!(
+            "anchor enrollment accept failed: {err}"
         ))),
     }
 }
@@ -1793,6 +2038,21 @@ pub struct DaemonConfig {
     /// address. Default is `false` (loopback-only). Must be set explicitly
     /// by the operator; there is no fallback or auto-detect.
     pub anchor_bundle_pull_allow_lan: bool,
+    /// D-3 §7(1): bind address for the anchor enrollment-consume listener.
+    /// `None` (the default) disables the listener entirely — it is opt-in
+    /// via `--anchor-enrollment-addr` / `RUSTYNET_ANCHOR_ENROLLMENT_ADDR`,
+    /// the strictest practical default while install templates do not yet
+    /// provision it. Binding additionally requires the enrollment subsystem
+    /// to be configured and the local signed roster to grant
+    /// `anchor.enrollment_endpoint` on an Active row (see
+    /// `bind_anchor_enrollment_listener`).
+    pub anchor_enrollment_addr: Option<SocketAddr>,
+    /// D-3 §7(1): when `true` the enrollment listener may bind a
+    /// non-loopback address. Default is `false` (loopback-only). Must be
+    /// set explicitly by the operator (`--anchor-enrollment-allow-lan`);
+    /// there is no fallback or auto-detect — same rule as
+    /// `anchor_bundle_pull_allow_lan`.
+    pub anchor_enrollment_allow_lan: bool,
     /// D2.5: per-host spool for the gossip sequence + seen-source
     /// ledger. `None` disables gossip persistence (test default);
     /// production daemons set this via `--gossip-watermark` or
@@ -1909,6 +2169,14 @@ impl Default for DaemonConfig {
             anchor_bundle_pull_token_path: std::env::var_os(ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV)
                 .map(PathBuf::from),
             anchor_bundle_pull_allow_lan: std::env::var(ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV)
+                .ok()
+                .and_then(|v| parse_bool(v.as_str()))
+                .unwrap_or(false),
+            // Opt-in only: no default address. The env/flag wiring (with
+            // strict parse errors) lives in `parse_daemon_config`, mirroring
+            // how `anchor_bundle_pull_addr`'s env override is handled there.
+            anchor_enrollment_addr: None,
+            anchor_enrollment_allow_lan: std::env::var(ANCHOR_ENROLLMENT_ALLOW_LAN_ENV)
                 .ok()
                 .and_then(|v| parse_bool(v.as_str()))
                 .unwrap_or(false),
@@ -8799,8 +9067,11 @@ impl DaemonRuntime {
         }
     }
 
-    /// D2.7 — IPC entry point for the operator-driven enrollment
-    /// consume flow. Decodes the three-token wire payload, runs the
+    /// D2.7 — entry point for the enrollment consume flow, reached from
+    /// the local IPC socket AND (since D-3 §7(1)) from
+    /// `handle_anchor_enrollment_stream`, so every string it returns is
+    /// treated as visible to a pre-authentication network caller.
+    /// Decodes the three-token wire payload, runs the
     /// [`crate::enrollment_consume::consume_and_register_peer`]
     /// orchestrator under `PushAddressPolicy::Strict`, and reports a
     /// fixed-vocabulary summary on success. Every reject maps to a
@@ -8842,17 +9113,12 @@ impl DaemonRuntime {
             .gossip_node
             .as_mut()
             .ok_or_else(|| "gossip subsystem not attached".to_owned())?;
-        let secret = crate::enrollment_token::load_secret(secret_path)
-            .map_err(|err| format!("enrollment secret load failed: {err}"))?;
-        // RSA-0023: hold an exclusive advisory lock over the ENTIRE
-        // load → check-consumed → register → write sequence so two concurrent
-        // redemptions of the same single-use token cannot both observe "not
-        // consumed". The guard is released when this scope ends (after the
-        // consume's ledger write). Mirrors resilience.rs::acquire_lock.
-        let _ledger_lock = crate::enrollment_token::acquire_ledger_lock(ledger_path)
-            .map_err(|err| format!("enrollment ledger lock failed: {err}"))?;
-        let mut ledger = crate::enrollment_token::load_ledger(ledger_path)
-            .map_err(|err| format!("enrollment ledger load failed: {err}"))?;
+        // D-3 §7(1) abuse bound: parse EVERY attacker-controlled field
+        // BEFORE loading the secret or touching the ledger lock, so a flood
+        // of syntactically invalid consumes (now reachable through the LAN
+        // enrollment listener) is rejected without contending on the
+        // single-use ledger's exclusive advisory lock or reading the secret.
+        //
         // Decode the enrollee's 32-byte verifying key. Reject any
         // input that isn't exactly 32 bytes after base64 decode.
         let pubkey_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -8871,6 +9137,17 @@ impl DaemonRuntime {
         let push_addr: SocketAddr = push_addr_str
             .parse()
             .map_err(|err| format!("enrollee push address parse failed: {err}"))?;
+        let secret = crate::enrollment_token::load_secret(secret_path)
+            .map_err(|err| format!("enrollment secret load failed: {err}"))?;
+        // RSA-0023: hold an exclusive advisory lock over the ENTIRE
+        // load → check-consumed → register → write sequence so two concurrent
+        // redemptions of the same single-use token cannot both observe "not
+        // consumed". The guard is released when this scope ends (after the
+        // consume's ledger write). Mirrors resilience.rs::acquire_lock.
+        let _ledger_lock = crate::enrollment_token::acquire_ledger_lock(ledger_path)
+            .map_err(|err| format!("enrollment ledger lock failed: {err}"))?;
+        let mut ledger = crate::enrollment_token::load_ledger(ledger_path)
+            .map_err(|err| format!("enrollment ledger load failed: {err}"))?;
         let outcome = crate::enrollment_consume::consume_and_register_peer(
             encoded_token,
             &secret,
@@ -10577,6 +10854,9 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     if let Some(addr) = config.anchor_bundle_pull_addr {
         validate_anchor_bundle_pull_addr(addr, config.anchor_bundle_pull_allow_lan)?;
     }
+    if let Some(addr) = config.anchor_enrollment_addr {
+        validate_anchor_enrollment_addr(addr, config.anchor_enrollment_allow_lan)?;
+    }
     resolve_configured_egress_interface(&mut config)?;
     normalize_windows_dns_resolver_bind_addr(&mut config);
     normalize_windows_key_custody_paths(&mut config);
@@ -10773,6 +11053,10 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // WSAEADDRINUSE race; if a live restart ever races the 51822 bind, wrap
         // this in the same backoff — left single-attempt for parity with Unix.)
         let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
+        // Anchor enrollment-consume listener (D-3 §7(1)): same shared,
+        // portable bind seam as bundle-pull, so a Windows anchor opens the
+        // same verified enrollment surface a Linux anchor does.
+        let anchor_enrollment_listener = bind_anchor_enrollment_listener(&config)?;
 
         let mut processed = 0usize;
         let reconcile_interval = Duration::from_millis(config.reconcile_interval_ms.get().max(100));
@@ -10873,6 +11157,16 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             // Linux-verified serve path — same as the Unix loop).
             if let Some(anchor_listener) = anchor_bundle_pull_listener.as_ref()
                 && poll_anchor_bundle_pull_once(anchor_listener, &config)?
+            {
+                processed = processed.saturating_add(1);
+                processed_io = true;
+            }
+
+            // Serve one pending anchor enrollment-consume connection (same
+            // shared serve path as the Unix loop; the per-request capability
+            // re-read inside the handler is the revocation mechanism).
+            if let Some(enrollment_listener) = anchor_enrollment_listener.as_ref()
+                && poll_anchor_enrollment_once(enrollment_listener, &mut runtime)?
             {
                 processed = processed.saturating_add(1);
                 processed_io = true;
@@ -10983,6 +11277,9 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             .set_nonblocking(true)
             .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
         let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
+        // Anchor enrollment-consume listener (D-3 §7(1)): opt-in, fail-closed
+        // bind — see `bind_anchor_enrollment_listener` for the pre-bind gates.
+        let anchor_enrollment_listener = bind_anchor_enrollment_listener(&config)?;
 
         let socket_owner_uid = socket_owner_uid(&config.socket_path)?;
 
@@ -11122,6 +11419,15 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             }
             if let Some(anchor_listener) = anchor_bundle_pull_listener.as_ref()
                 && poll_anchor_bundle_pull_once(anchor_listener, &config)?
+            {
+                processed = processed.saturating_add(1);
+                processed_io = true;
+            }
+            // Serve one pending anchor enrollment-consume connection (D-3
+            // §7(1)); the per-request capability re-read inside the handler
+            // is the revocation mechanism.
+            if let Some(enrollment_listener) = anchor_enrollment_listener.as_ref()
+                && poll_anchor_enrollment_once(enrollment_listener, &mut runtime)?
             {
                 processed = processed.saturating_add(1);
                 processed_io = true;
@@ -16720,7 +17026,8 @@ mod tests {
         DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE,
         DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL,
         DaemonBackendMode, DaemonConfig, DaemonError, DaemonRuntime, DnsZoneBootstrapError,
-        DnsZoneLoadContext, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
+        DnsZoneLoadContext, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
+        MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
         MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
@@ -16728,7 +17035,7 @@ mod tests {
         SignedStateRefreshReason, StateFetcher, TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS,
         TraversalCandidate, TraversalCandidateType, TrustEvidenceRecord, TrustPolicy,
         TrustWatermark, anchor_bundle_pull_token_thumbprint, bind_anchor_bundle_pull_listener,
-        build_dns_response, build_gossip_node,
+        bind_anchor_enrollment_listener, build_dns_response, build_gossip_node,
         collect_traversal_host_candidate_snapshot_with_retry,
         enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
         load_anchor_bundle_pull_bundle, load_anchor_bundle_pull_token, load_auto_tunnel_bundle,
@@ -16739,14 +17046,15 @@ mod tests {
         parse_route_interface_token, parse_windows_default_egress_interface_output,
         passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
         persist_traversal_watermark, persist_trust_watermark, poll_anchor_bundle_pull_once,
-        port_mapping_bring_up_skip_reason, prepare_runtime_wireguard_key_material,
-        read_line_bounded, require_local_signed_capability, resolve_egress_interface_value,
-        run_daemon, run_preflight_checks, sanitize_dataplane_routes_for_node_role,
-        scrub_runtime_wireguard_key_material, select_runtime_relay_candidate,
-        select_runtime_relay_candidate_with_verified_fleet, sha256_digest,
-        snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
-        validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
-        validate_daemon_config, validate_file_security, validate_node_role_membership_alignment,
+        poll_anchor_enrollment_once, port_mapping_bring_up_skip_reason,
+        prepare_runtime_wireguard_key_material, read_line_bounded, require_local_signed_capability,
+        resolve_egress_interface_value, run_daemon, run_preflight_checks,
+        sanitize_dataplane_routes_for_node_role, scrub_runtime_wireguard_key_material,
+        select_runtime_relay_candidate, select_runtime_relay_candidate_with_verified_fleet,
+        sha256_digest, snapshot_has_usable_traversal_host_candidates, trust_evidence_payload,
+        unix_now, validate_anchor_bundle_pull_addr, validate_anchor_enrollment_addr,
+        validate_auto_tunnel_role_membership_alignment, validate_daemon_config,
+        validate_file_security, validate_node_role_membership_alignment,
         write_anchor_bundle_pull_response, write_anchor_bundle_pull_response_with_have,
         write_response, zeroize_optional_bytes,
     };
@@ -17303,8 +17611,13 @@ mod tests {
         let expired = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(1))
             .expect("monotonic clock sanity");
-        let err = read_line_bounded(&mut reader, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES, expired)
-            .expect_err("expired budget must refuse the line");
+        let err = read_line_bounded(
+            &mut reader,
+            MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
+            expired,
+            "bundle-pull request token",
+        )
+        .expect_err("expired budget must refuse the line");
         assert!(
             err.to_string().contains("time budget"),
             "rejection must cite the time budget, got {err:?}"
@@ -17337,6 +17650,7 @@ mod tests {
             &mut reader,
             MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
             std::time::Instant::now() + ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET,
+            "bundle-pull request token",
         )
         .expect("line must be accepted within budget");
         assert_eq!(line, ("abcdefgh".to_owned(), true));
@@ -17350,6 +17664,7 @@ mod tests {
             &mut reader,
             MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
             std::time::Instant::now() + ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET,
+            "bundle-pull request token",
         )
         .expect_err("oversize line must refuse");
         assert!(
@@ -21000,6 +21315,546 @@ mod tests {
         assert!(
             err.contains("enrollment subsystem not configured"),
             "expected the post-gate subsystem refusal, got: {err}"
+        );
+    }
+
+    // ── D-3 §7(1): anchor enrollment-consume listener ──────────────────
+    //
+    // The listener is a pre-authentication network surface once
+    // `--anchor-enrollment-allow-lan` is set, so the tests below are
+    // negatives-first per AGENTS.md §4: every fail-closed rule gets its own
+    // named test, and the single positive control differs from its negative
+    // in exactly one variable (the capability, or the token's validity).
+
+    /// Enrollment secret shared by every listener test.
+    const ENROLLMENT_LISTENER_TEST_SECRET: [u8; 32] = [0xa5; 32];
+
+    fn anchor_caps_with_enrollment_endpoint() -> Vec<RoleCapability> {
+        let mut caps = anchor_caps_without_enrollment_endpoint();
+        caps.push(RoleCapability::AnchorEnrollmentEndpoint);
+        caps
+    }
+
+    /// Build the config + runtime pair for the enrollment-listener tests.
+    /// Differs from `runtime_with_local_caps` in exactly the ways the
+    /// listener needs: the enrollment subsystem is provisioned (secret with
+    /// 0o600 perms + ledger path), a listener addr is configured on an
+    /// ephemeral loopback port, and a gossip node is attached so a valid
+    /// consume can complete. `capabilities` stays the only trust-state
+    /// variable between tests.
+    fn enrollment_listener_fixture(
+        dir: &Path,
+        capabilities: Vec<RoleCapability>,
+    ) -> (DaemonConfig, DaemonRuntime) {
+        let snapshot = dir.join("membership.snapshot");
+        let log = dir.join("membership.log");
+        let trust_path = dir.join("trust.evidence");
+        let trust_verifier_path = dir.join("trust.verifier.pub");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files_with_local_caps(
+            &snapshot,
+            &log,
+            "daemon-local",
+            MembershipNodeStatus::Active,
+            capabilities,
+        );
+        let secret_path = dir.join("enrollment.secret");
+        crate::enrollment_token::write_secret(&secret_path, &ENROLLMENT_LISTENER_TEST_SECRET)
+            .expect("enrollment secret should be written");
+        let config = DaemonConfig {
+            node_id: "daemon-local".to_owned(),
+            state_path: dir.join("daemon.state"),
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path: dir.join("trust.watermark"),
+            membership_snapshot_path: snapshot,
+            membership_log_path: log,
+            membership_watermark_path: dir.join("membership.watermark"),
+            enrollment_secret_path: Some(secret_path),
+            enrollment_ledger_path: Some(dir.join("enrollment.ledger")),
+            anchor_enrollment_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
+            anchor_enrollment_allow_lan: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[0x42u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        (config, runtime)
+    }
+
+    /// A syntactically valid `enrollment consume` request line carrying
+    /// `encoded_token`, a well-formed enrollee key, and a Strict-policy
+    /// push address.
+    fn enrollment_consume_request_line(encoded_token: &str) -> Vec<u8> {
+        use base64::Engine;
+        let pubkey_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            SigningKey::from_bytes(&[0xc2u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        format!("enrollment consume {encoded_token} {pubkey_b64} 10.9.8.7:51821\n").into_bytes()
+    }
+
+    /// Drive ONE request through the real accept path: spawn a client that
+    /// writes `request` and half-closes, poll the non-blocking listener
+    /// until the connection is served, and return the raw response text the
+    /// client observed (empty when the server dropped the connection
+    /// without responding). Client-side write errors are deliberately
+    /// ignored — the abuse-path tests send more bytes than the server will
+    /// read, and the server closing early surfaces to the client as a
+    /// broken pipe, which is the expected disposition, not a test failure.
+    fn drive_enrollment_request(
+        listener: &std::net::TcpListener,
+        runtime: &mut DaemonRuntime,
+        request: Vec<u8>,
+    ) -> String {
+        use std::io::Read as _;
+        use std::io::Write as _;
+        let addr = listener.local_addr().expect("listener addr");
+        let client = std::thread::spawn(move || {
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            conn.set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("client read timeout");
+            let _ = conn.write_all(&request);
+            let _ = conn.shutdown(std::net::Shutdown::Write);
+            let mut response = Vec::new();
+            let _ = conn.read_to_end(&mut response);
+            String::from_utf8_lossy(&response).into_owned()
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if poll_anchor_enrollment_once(listener, runtime).expect("poll must not error") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener never accepted the test connection"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        client.join().expect("client thread")
+    }
+
+    /// Negative (a): a node whose signed roster is unambiguously an anchor
+    /// but lacks `anchor.enrollment_endpoint` must refuse to OPEN the
+    /// listener at all — no optimistic bind.
+    #[test]
+    fn bind_anchor_enrollment_listener_refuses_when_capability_absent() {
+        let dir = secure_test_dir("rustynetd-enroll-bind-cap-absent");
+        let (config, _runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_without_enrollment_endpoint());
+        let err = bind_anchor_enrollment_listener(&config)
+            .expect_err("listener must refuse to open without the signed capability");
+        assert!(
+            format!("{err}").contains("anchor.enrollment_endpoint"),
+            "refusal must name the missing capability: {err}"
+        );
+    }
+
+    /// Positive control (h): identical fixture, and the ONLY difference is
+    /// the capability — with it, the same bind call opens the listener. The
+    /// pair proves the bind gate is a discriminator, not a blanket refusal.
+    #[test]
+    fn bind_anchor_enrollment_listener_opens_for_active_capability_holder() {
+        let dir = secure_test_dir("rustynetd-enroll-bind-cap-present");
+        let (config, _runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("an active capability holder must bind")
+            .expect("a configured addr + capability ⇒ a listener");
+        assert!(
+            listener
+                .local_addr()
+                .expect("bound addr")
+                .ip()
+                .is_loopback(),
+            "default bind must stay loopback"
+        );
+    }
+
+    /// Opt-in: no configured addr ⇒ no listener, no error — the daemon
+    /// simply does not expose the surface (strictest practical default
+    /// while install templates do not provision the endpoint).
+    #[test]
+    fn bind_anchor_enrollment_listener_returns_none_without_addr() {
+        let config = DaemonConfig {
+            anchor_enrollment_addr: None,
+            ..DaemonConfig::default()
+        };
+        let listener = bind_anchor_enrollment_listener(&config).expect("None addr must not error");
+        assert!(listener.is_none(), "no addr ⇒ no listener");
+    }
+
+    /// §3 fail-closed: trust state unavailable at startup ⇒ the listener
+    /// does not open (refusal, not a permissive bind-now-check-later).
+    #[test]
+    fn bind_anchor_enrollment_listener_refuses_when_snapshot_missing() {
+        let dir = secure_test_dir("rustynetd-enroll-bind-no-snapshot");
+        let (config, _runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        std::fs::remove_file(&config.membership_snapshot_path)
+            .expect("snapshot should be removable");
+        bind_anchor_enrollment_listener(&config)
+            .expect_err("a missing membership snapshot must refuse the bind");
+    }
+
+    /// §3 fail-closed: a symlinked snapshot is refused through the shared
+    /// `open_anchor_state_file` seam — same control as the bundle-pull
+    /// artifacts and the key-custody loaders.
+    #[cfg(unix)]
+    #[test]
+    fn bind_anchor_enrollment_listener_refuses_symlinked_snapshot() {
+        let dir = secure_test_dir("rustynetd-enroll-bind-symlink");
+        let (config, _runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let real = dir.join("membership.snapshot.real");
+        std::fs::rename(&config.membership_snapshot_path, &real)
+            .expect("snapshot should be movable");
+        std::os::unix::fs::symlink(&real, &config.membership_snapshot_path)
+            .expect("symlink should be creatable");
+        bind_anchor_enrollment_listener(&config)
+            .expect_err("a symlinked membership snapshot must refuse the bind");
+    }
+
+    /// A configured listener addr without a provisioned enrollment
+    /// subsystem is a misconfiguration surfaced at startup, not a listener
+    /// whose every request would fail.
+    #[test]
+    fn bind_anchor_enrollment_listener_refuses_unprovisioned_enrollment_subsystem() {
+        let dir = secure_test_dir("rustynetd-enroll-bind-no-subsystem");
+        let (mut config, _runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        config.enrollment_secret_path = None;
+        let err = bind_anchor_enrollment_listener(&config)
+            .expect_err("a listener addr without an enrollment secret must refuse");
+        assert!(
+            format!("{err}").contains("secret path"),
+            "refusal must name the missing provisioning: {err}"
+        );
+    }
+
+    /// D-3 §7(1) transport shape: LAN exposure is an explicit opt-in with
+    /// no auto-detect, and the config default keeps the listener disabled
+    /// and loopback-only — exactly the bundle-pull rule.
+    #[test]
+    fn anchor_enrollment_listener_defaults_disabled_and_loopback_only() {
+        let config = DaemonConfig::default();
+        assert!(
+            config.anchor_enrollment_addr.is_none(),
+            "listener must default to disabled (opt-in addr)"
+        );
+        assert!(
+            !config.anchor_enrollment_allow_lan,
+            "allow-lan must default to false"
+        );
+        let lan_addr: SocketAddr = "192.168.1.10:51823".parse().expect("addr must parse");
+        let err = validate_anchor_enrollment_addr(lan_addr, false)
+            .expect_err("LAN bind without allow-lan must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("loopback") || msg.contains("allow"),
+            "error must mention the restriction: {msg}"
+        );
+        validate_anchor_enrollment_addr(lan_addr, true)
+            .expect("LAN bind with explicit allow-lan must pass validation");
+        let lo_addr: SocketAddr = "127.0.0.1:51823".parse().expect("loopback must parse");
+        validate_anchor_enrollment_addr(lo_addr, false)
+            .expect("loopback must succeed without allow-lan");
+    }
+
+    /// The bind path enforces the loopback gate before creating any socket.
+    #[test]
+    fn bind_anchor_enrollment_listener_rejects_non_loopback_without_allow_lan() {
+        let dir = secure_test_dir("rustynetd-enroll-bind-lan");
+        let (mut config, _runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        config.anchor_enrollment_addr = Some("192.168.1.10:51823".parse().expect("addr"));
+        config.anchor_enrollment_allow_lan = false;
+        bind_anchor_enrollment_listener(&config)
+            .expect_err("a LAN bind addr without allow-lan must fail closed");
+    }
+
+    /// The shared serve path must report no I/O on an idle listener
+    /// (WouldBlock → false), never block — this is the exact poll the Unix
+    /// and Windows daemon loops both run.
+    #[test]
+    fn bind_then_poll_anchor_enrollment_is_nonblocking_wouldblock() {
+        let dir = secure_test_dir("rustynetd-enroll-poll-idle");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("configured addr + capability ⇒ a listener");
+        let processed =
+            poll_anchor_enrollment_once(&listener, &mut runtime).expect("poll must not error");
+        assert!(!processed, "no pending connection ⇒ no I/O (WouldBlock)");
+    }
+
+    /// Negative (b): capability revoked MID-RUN. The listener stays bound
+    /// (no rebind, no crash) while the per-request gate refuses before any
+    /// token handling — and burns nothing. Restoring the capability makes
+    /// the SAME bound listener serve the SAME token successfully, proving
+    /// revocation takes effect per request rather than at bind time.
+    #[test]
+    fn anchor_enrollment_revoked_capability_refused_per_request_while_listener_stays_bound() {
+        let dir = secure_test_dir("rustynetd-enroll-revoked-midrun");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("configured addr + capability ⇒ a listener");
+        let (_, encoded) =
+            crate::enrollment_token::mint_token(&ENROLLMENT_LISTENER_TEST_SECRET, 600)
+                .expect("mint");
+        // Quorum-signed revocation lands on disk while the daemon runs.
+        write_membership_files_with_local_caps(
+            &config.membership_snapshot_path,
+            &config.membership_log_path,
+            "daemon-local",
+            MembershipNodeStatus::Revoked,
+            anchor_caps_with_enrollment_endpoint(),
+        );
+        let response = drive_enrollment_request(
+            &listener,
+            &mut runtime,
+            enrollment_consume_request_line(&encoded),
+        );
+        assert_eq!(
+            response, "ERR forbidden after revocation\n",
+            "the per-request gate must refuse a revoked node before any token handling"
+        );
+        let ledger_path = config
+            .enrollment_ledger_path
+            .as_deref()
+            .expect("fixture sets a ledger path");
+        assert!(
+            !ledger_path.exists(),
+            "a refused request must not burn the token"
+        );
+        // Listener is still bound and healthy: an idle poll reports
+        // WouldBlock rather than a dead-socket error.
+        assert!(
+            !poll_anchor_enrollment_once(&listener, &mut runtime).expect("still bound"),
+            "listener must remain bound after the refusal"
+        );
+        // Restore the capability: the same listener + same token now serve.
+        write_membership_files_with_local_caps(
+            &config.membership_snapshot_path,
+            &config.membership_log_path,
+            "daemon-local",
+            MembershipNodeStatus::Active,
+            anchor_caps_with_enrollment_endpoint(),
+        );
+        let response = drive_enrollment_request(
+            &listener,
+            &mut runtime,
+            enrollment_consume_request_line(&encoded),
+        );
+        assert!(
+            response.starts_with("OK enrollment accepted node="),
+            "restoring the capability must let the SAME bound listener serve: {response}"
+        );
+    }
+
+    /// Negative (c): malformed payloads refuse cleanly, never panic. A
+    /// well-formed line that is not the whitelisted verb gets the fixed
+    /// refusal; unreadable bytes (non-utf8) drop without a response.
+    #[test]
+    fn anchor_enrollment_stream_refuses_malformed_payload_without_panic() {
+        let dir = secure_test_dir("rustynetd-enroll-malformed");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("listener");
+        // Wrong arity: parses as Unknown, refused by the verb whitelist.
+        let response = drive_enrollment_request(
+            &listener,
+            &mut runtime,
+            b"enrollment consume only-two-fields\n".to_vec(),
+        );
+        assert_eq!(response, "ERR unsupported operation\n");
+        // Non-utf8 garbage: the bounded reader refuses; connection dropped
+        // with no response written.
+        let response =
+            drive_enrollment_request(&listener, &mut runtime, vec![0xff, 0xfe, 0x00, b'x', b'\n']);
+        assert_eq!(
+            response, "",
+            "unreadable bytes must be dropped, not answered"
+        );
+    }
+
+    /// Default-deny verb whitelist: the listener serves EXACTLY
+    /// `enrollment consume` — admit does not exist on this surface, the
+    /// bundle stays on the bundle-pull listener, and every other valid IPC
+    /// verb is refused with one fixed string (design §2).
+    #[test]
+    fn anchor_enrollment_stream_refuses_non_enrollment_verbs() {
+        let dir = secure_test_dir("rustynetd-enroll-verb-whitelist");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("listener");
+        for request in [
+            "status\n",
+            "gossip push AAAA\n",
+            "membership apply AAAA\n",
+            "key revoke\n",
+            "remote-op-v1 subject=x nonce=1 command=status signature=ab\n",
+        ] {
+            let response =
+                drive_enrollment_request(&listener, &mut runtime, request.as_bytes().to_vec());
+            assert_eq!(
+                response, "ERR unsupported operation\n",
+                "verb must be refused: {request:?}"
+            );
+        }
+    }
+
+    /// Negative (d): an oversized request is refused BEFORE any allocation
+    /// proportional to it — the bounded reader collects one byte at a time
+    /// and refuses at `MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES`, so the
+    /// 8 KiB sent here can never materialise server-side. The connection
+    /// is dropped without a response.
+    #[test]
+    fn anchor_enrollment_stream_refuses_oversized_payload_before_allocation() {
+        let dir = secure_test_dir("rustynetd-enroll-oversized");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("listener");
+        let oversized = vec![b'a'; 8 * 1024];
+        assert!(oversized.len() > MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES);
+        let response = drive_enrollment_request(&listener, &mut runtime, oversized);
+        assert_eq!(
+            response, "",
+            "oversized request must be dropped, not answered"
+        );
+        // The listener survives the abuse and keeps serving.
+        assert!(
+            !poll_anchor_enrollment_once(&listener, &mut runtime).expect("still bound"),
+            "listener must remain bound after refusing an oversized request"
+        );
+    }
+
+    /// Negative (e): a truncated request (EOF before the newline
+    /// terminator) is an incomplete request and refuses cleanly — a
+    /// deliberate tightening over the bundle-pull reader, which tolerates
+    /// an EOF-terminated token line for backwards compatibility this new
+    /// endpoint does not owe anyone.
+    #[test]
+    fn anchor_enrollment_stream_refuses_truncated_payload() {
+        let dir = secure_test_dir("rustynetd-enroll-truncated");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("listener");
+        let (_, encoded) =
+            crate::enrollment_token::mint_token(&ENROLLMENT_LISTENER_TEST_SECRET, 600)
+                .expect("mint");
+        let mut truncated = enrollment_consume_request_line(&encoded);
+        truncated.pop(); // strip the newline terminator; client half-closes
+        let response = drive_enrollment_request(&listener, &mut runtime, truncated);
+        assert_eq!(
+            response, "",
+            "truncated request must be dropped, not answered"
+        );
+        let ledger_path = config
+            .enrollment_ledger_path
+            .as_deref()
+            .expect("fixture sets a ledger path");
+        assert!(
+            !ledger_path.exists(),
+            "a truncated request must not burn the token"
+        );
+    }
+
+    /// Negative (f): an expired token refuses with the fixed token verdict
+    /// (the handler collapses every token-layer failure to one string so a
+    /// network caller cannot extract which check failed) and burns nothing.
+    #[test]
+    fn anchor_enrollment_stream_refuses_expired_token() {
+        let dir = secure_test_dir("rustynetd-enroll-expired");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("listener");
+        // Minted far in the past: valid tag, long-expired window.
+        let (_, encoded) = crate::enrollment_token::mint_token_with_clock(
+            &ENROLLMENT_LISTENER_TEST_SECRET,
+            60,
+            1_700_000_000,
+        )
+        .expect("mint");
+        let response = drive_enrollment_request(
+            &listener,
+            &mut runtime,
+            enrollment_consume_request_line(&encoded),
+        );
+        assert_eq!(response, "ERR enrollment token rejected\n");
+        let ledger_path = config
+            .enrollment_ledger_path
+            .as_deref()
+            .expect("fixture sets a ledger path");
+        assert!(
+            !ledger_path.exists(),
+            "an expired token must not be recorded as consumed"
+        );
+    }
+
+    /// Negative (g) plus the end-to-end positive path: the first consume of
+    /// a valid token succeeds over the real socket (durable ledger burn +
+    /// gossip peer registration), and replaying the identical request is
+    /// refused with the same fixed token verdict — the single-use ledger is
+    /// the enforcement point.
+    #[test]
+    fn anchor_enrollment_stream_refuses_replayed_token_after_successful_consume() {
+        let dir = secure_test_dir("rustynetd-enroll-replay");
+        let (config, mut runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("bind must succeed")
+            .expect("listener");
+        let (token, encoded) =
+            crate::enrollment_token::mint_token(&ENROLLMENT_LISTENER_TEST_SECRET, 600)
+                .expect("mint");
+        let request = enrollment_consume_request_line(&encoded);
+        let response = drive_enrollment_request(&listener, &mut runtime, request.clone());
+        assert!(
+            response.starts_with("OK enrollment accepted node="),
+            "first consume must succeed: {response}"
+        );
+        let ledger_path = config
+            .enrollment_ledger_path
+            .as_deref()
+            .expect("fixture sets a ledger path");
+        let ledger =
+            crate::enrollment_token::load_ledger(ledger_path).expect("ledger should reload");
+        assert!(
+            ledger.was_consumed(&token.token_id),
+            "the burn must be durable on disk before the response is sent"
+        );
+        assert_eq!(
+            runtime
+                .gossip_node
+                .as_ref()
+                .expect("fixture attaches gossip")
+                .peers
+                .len(),
+            1,
+            "the enrollee must be registered as a gossip push peer"
+        );
+        let response = drive_enrollment_request(&listener, &mut runtime, request);
+        assert_eq!(
+            response, "ERR enrollment token rejected\n",
+            "replaying a burned token must refuse with the fixed token verdict"
         );
     }
 
