@@ -939,6 +939,29 @@ be satisfiable or defeatable by the shape of the caller's command line.
 Acceptance: launching inline over SSH does not self-trip the gate, **and** a second launch
 is refused while a real run is in flight regardless of how either was invoked.
 
+★★ **UPDATE 2026-08-27 (STOP-PGREP) — the same self-match existed on the STOP path, where the
+consequence is a signal, not a refusal, and it is now closed.** The "residual accepted
+deliberately" note above scoped the surviving false positive to the *launch* gate. It was not
+the only site: `HOST_STOP_SCRIPT` unioned a
+`pgrep -f 'vm-lab-orchestrate-live-lab'` result into its candidate pids, and that script is
+driven inline over SSH by `execute_ops_vm_lab_stop_host_run`, so its whole text — including the
+subcommand string the pattern searches for — sat in the remote `bash -c` argv. The launch-side
+false positive costs a wrong refusal; here the very next statement is
+`kill -TERM -- -<pid>` on the matched pid's **process group**, so a stop on an idle host could
+signal its own launcher, and on a busy host could take down an unrelated shell that merely had
+the string in its argv.
+The pattern scan is removed rather than rewritten, for the same reason it was removed from the
+launcher: the script must contain the string it searches for. The recorded pidfiles are now the
+only source of candidate pids, which the argv-liveness-checked prune in `HOST_LAUNCH_SCRIPT`
+makes trustworthy — a live run always has a recorded handle. Each recorded pid must clear two
+guards before it is signaled: it is not this shell or any of its ancestors, and its argv still
+contains the orchestrator marker (a `ps -p <pid>` lookup of one named pid, never a scan). With
+no live recorded pid the script signals nothing, prunes the stale handles, and says so.
+Pinned by `vm_lab::stop_host_run_tests` — `the_stop_script_contains_no_self_matching_process_scan`,
+`stop_never_signals_itself_or_an_ancestor`, and a behavioural test that runs the rendered script
+under `bash -c <script>` (reproducing the inline-over-SSH argv) in its own process group and
+asserts nothing is signaled.
+
 Related, same area: the run's report directory must be created **outside** the repo, because
 the dirty check counts untracked paths under the tree. Note the dirty check is otherwise more
 carefully built than QH-08 implies — `git_worktree_is_dirty` (`mod.rs:29591`) deliberately
