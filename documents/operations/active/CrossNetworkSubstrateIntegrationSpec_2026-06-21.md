@@ -232,9 +232,30 @@ buried inside `run_nat_classification`:
   `cargo run` fan. Vxlan scenarios run in-process (still gated `Blocked` until the 2nd network).
 - **CN-4** `VxlanSubstrate` + `SlirpSubstrate` provision over `RemoteShellHost`; wire `NatModifiers`
   (uPnP/v6) through. Live-proof deferred to when the hardware exists.
-- **CN-5** Retire the legacy-bash orchestrator's duplicate `stage_run_cross_network_*` set
-  (`live_linux_lab_orchestrator.sh`) once CN-1..4 are the single path — coordinated with the §5.3
-  bash-retirement window, not before.
+- **CN-5** ✅ **DONE by W5.7** (2026-08-27, closed retroactively 2026-08-27 — the row's own work was
+  completed by the bash-orchestrator retirement rather than by a CN-numbered change).
+  The row's scope was exactly "retire the legacy-bash orchestrator's duplicate
+  `stage_run_cross_network_*` set (`live_linux_lab_orchestrator.sh`)". **Verified before closing:**
+  the pre-deletion tree carried 12 such functions (`stage_run_cross_network_` ×24 references,
+  12 distinct definitions: `preflight`, `nat_classification`, `nat_matrix`, `direct_remote_exit`,
+  `node_network_switch`, `relay_remote_exit`, `failback_roaming`, `controller_switch`,
+  `traversal_adversarial`, `remote_exit_dns`, `remote_exit_soak`, `daemon_path`), and
+  `scripts/e2e/live_linux_lab_orchestrator.sh` is absent from the current tree. One nuance for the
+  record: the file deletion itself landed in `c9ccf1a4`, not `e93a0e4f` — a concurrent session's
+  `commit -a` swept the staged deletion out of the shared index, and `e93a0e4f` (W5.7,
+  `../done/BashOrchestratorRetirementProgram_2026-08-22.md`) is the commit that restored a building
+  tree and carried the rest of the deletion surface. Cite the pair, not `e93a0e4f` alone.
+  The row's "once CN-1..4 are the single path" precondition was **not** met on that schedule — the
+  duplicate set died with its host script under the owner-signed G3 dispositions, ahead of CN-3/CN-4.
+  **Remaining tail, explicitly OUT of CN-5's original scope** (it is not the orchestrator's duplicate
+  stage set, and no part of it lives in `live_linux_lab_orchestrator.sh`): `scripts/vm_lab/netns_daemon_path.sh`
+  (536 ln, still bash + inline `python3`) and the dead `cross_network_daemon_path` bash-dialect entry in
+  `live_lab_stage_registry.rs` (with its paired negative-vocabulary reference in `live_lab_run_matrix.rs`).
+  Retiring both is what would finally let `scripts/vm_lab/netns_internet_sim.sh` go — but note the sim
+  has a *second* live consumer, `vm_lab/network_audit.rs` (`NETNS_SIM_SCRIPT_RELATIVE_PATH`), so its
+  deletion is gated on that too. Tracked as TRACKC-FIX-1 and in
+  `NeverDispatchedLinuxStagesTriage_2026-08-27.md` §0 (currently on the unmerged branch
+  `work/linux-stage-triage`); carry it there, not by reopening this row.
 
 **Risk read:** ~13k LOC surface, but the trait seam makes it *additive-then-subtractive* (land the
 abstraction, migrate one substrate at a time, delete the old path last) rather than a big-bang rewrite.
