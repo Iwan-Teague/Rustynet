@@ -2414,6 +2414,60 @@ fn traversal_probe_due_decision(
     }
 }
 
+/// QH-04: why `sync_traversal_runtime_state` refused to bring traversal
+/// runtime state up.
+///
+/// The distinction exists because the traversal snapshot and the controller's
+/// managed peer set are two halves of one dataplane generation, and they are
+/// loaded at different points of a reconcile pass. A set mismatch observed
+/// *before* the pass applies its new generation is a comparison across two
+/// generations and proves nothing about the incoming state; the same mismatch
+/// observed against the generation that is actually live is a real divergence
+/// and must fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraversalSyncFailure {
+    /// The signed traversal snapshot and the managed peer set describe
+    /// different peer sets — the "unmanaged peer" and "missing bundle"
+    /// halves of the assignment/traversal set-equality check.
+    GenerationDivergence(String),
+    /// The traversal state is unusable no matter which generation it is
+    /// compared against (invalid signature, unusable candidates, backend
+    /// programming failure, ...).
+    Invalid(String),
+}
+
+impl TraversalSyncFailure {
+    fn divergence(message: String) -> Self {
+        Self::GenerationDivergence(message)
+    }
+
+    fn invalid(message: String) -> Self {
+        Self::Invalid(message)
+    }
+
+    fn is_generation_divergence(&self) -> bool {
+        matches!(self, Self::GenerationDivergence(_))
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::GenerationDivergence(message) | Self::Invalid(message) => message.as_str(),
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::GenerationDivergence(message) | Self::Invalid(message) => message,
+        }
+    }
+}
+
+impl From<String> for TraversalSyncFailure {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TraversalProbeCurrentState {
     path: Option<PathMode>,
@@ -3934,6 +3988,16 @@ struct DaemonRuntime {
     last_reconcile_error: Option<String>,
     last_applied_assignment: Option<AutoTunnelWatermark>,
     local_route_reconcile_pending: bool,
+    /// QH-04: true from the moment a reconcile pass decides it will apply a
+    /// new dataplane generation until that apply has been attempted.
+    ///
+    /// While set, an assignment/traversal set mismatch seen by
+    /// `sync_traversal_runtime_state` is a comparison between the freshly
+    /// loaded traversal snapshot and the *previous* generation's managed peer
+    /// set, so it must not poison `traversal_hint_error` or restrict the node.
+    /// The same check is re-run against the generation that was actually
+    /// applied, and a divergence there fails the reconcile.
+    pending_generation_apply: bool,
     max_reconcile_failures: u32,
     remote_ops_expected_subject: String,
     remote_ops_seen_nonces: BTreeMap<String, BTreeSet<u64>>,
@@ -4440,6 +4504,7 @@ impl DaemonRuntime {
             last_reconcile_error: None,
             last_applied_assignment: None,
             local_route_reconcile_pending: false,
+            pending_generation_apply: false,
             max_reconcile_failures: config.max_reconcile_failures.get(),
             remote_ops_expected_subject: config.remote_ops_expected_subject.clone(),
             remote_ops_seen_nonces: BTreeMap::new(),
@@ -5153,7 +5218,25 @@ impl DaemonRuntime {
                 self.traversal_probe_statuses.clear();
             }
         }
-        if let Err(err) = self.sync_traversal_runtime_state(force_reprobe) {
+        if let Err(failure) = self.sync_traversal_runtime_state_detailed(force_reprobe, true) {
+            // QH-04: while a reconcile pass is on its way to applying a new
+            // dataplane generation, the managed peer set still belongs to the
+            // previous generation. A set mismatch against it compares two
+            // different generations and is not evidence that the incoming
+            // traversal state is bad, so it must not poison
+            // `traversal_hint_error` (which `apply_traversal_authority_to_peers`
+            // reads as a hard stop) nor restrict the node. Probe statuses have
+            // already been cleared, and the same equality check is re-run
+            // against the applied generation immediately after the apply —
+            // where a real divergence does fail the reconcile.
+            if self.pending_generation_apply && failure.is_generation_divergence() {
+                log::debug!(
+                    "traversal runtime sync deferred to post-apply re-check: {}",
+                    failure.message()
+                );
+                return;
+            }
+            let err = failure.into_message();
             self.traversal_hint_error = Some(err.clone());
             if self.traversal_authority_mode().is_enforced() {
                 self.restrict_recoverable(format!("traversal runtime sync failed: {err}"));
@@ -6548,11 +6631,32 @@ impl DaemonRuntime {
         }
     }
 
+    /// Test-only flattening of `sync_traversal_runtime_state_detailed`.
+    /// Production callers must choose a failure classification explicitly, so
+    /// they go through the detailed form; the tests only assert on the
+    /// message.
+    #[cfg(test)]
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
+        self.sync_traversal_runtime_state_detailed(force_reprobe, true)
+            .map_err(TraversalSyncFailure::into_message)
+    }
+
+    /// QH-04: `maintain_relay_sessions` gates the once-per-pass side effects
+    /// (path-quality sampling and relay keepalive/session upkeep) so the
+    /// post-apply re-sync can re-evaluate the assignment/traversal invariant
+    /// against the generation it just applied without double-counting
+    /// keepalive evidence or ingesting a second quality sample.
+    fn sync_traversal_runtime_state_detailed(
+        &mut self,
+        force_reprobe: bool,
+        maintain_relay_sessions: bool,
+    ) -> Result<(), TraversalSyncFailure> {
         let now_unix = unix_now();
-        self.poll_path_quality(now_unix);
+        if maintain_relay_sessions {
+            self.poll_path_quality(now_unix);
+        }
         let mut relay_keepalive_failed_peers = BTreeSet::new();
-        if let Some(mut relay_client) = self.relay_client.take() {
+        if maintain_relay_sessions && let Some(mut relay_client) = self.relay_client.take() {
             let freshness_secs = self.traversal_probe_handshake_freshness_secs;
             let active_relay_peers = self
                 .traversal_probe_statuses
@@ -6657,9 +6761,9 @@ impl DaemonRuntime {
             && self.traversal_authority_mode().is_enforced()
         {
             self.traversal_probe_statuses.clear();
-            return Err(format!(
+            return Err(TraversalSyncFailure::invalid(format!(
                 "traversal authority rejected invalid traversal state: {err}"
-            ));
+            )));
         }
 
         let Some(envelope) = self.traversal_hints.clone() else {
@@ -6667,10 +6771,10 @@ impl DaemonRuntime {
             if self.traversal_authority_mode().is_enforced()
                 && !self.controller.managed_peer_ids().is_empty()
             {
-                return Err(
+                return Err(TraversalSyncFailure::invalid(
                     "traversal authority requires signed traversal state for all managed peers"
                         .to_owned(),
-                );
+                ));
             }
             return Ok(());
         };
@@ -6695,10 +6799,11 @@ impl DaemonRuntime {
             .collect::<Vec<_>>();
         if !extra_peers.is_empty() {
             self.traversal_probe_statuses.clear();
-            return Err(format!(
+            // QH-04: one half of the assignment/traversal set-equality check.
+            return Err(TraversalSyncFailure::divergence(format!(
                 "traversal authority snapshot contains unmanaged peers: {}",
                 extra_peers.join(",")
-            ));
+            )));
         }
         self.refresh_local_host_candidates_for_traversal();
         let local_candidates = self.all_local_candidates();
@@ -6707,10 +6812,11 @@ impl DaemonRuntime {
         for remote_node_id in managed_peer_ids {
             let Some(bundle) = traversal_index.get(&remote_node_id) else {
                 self.traversal_probe_statuses.clear();
-                return Err(format!(
+                // QH-04: the other half of the set-equality check.
+                return Err(TraversalSyncFailure::divergence(format!(
                     "traversal authority is missing signed traversal state for managed peer {}",
                     remote_node_id.as_str()
-                ));
+                )));
             };
             let endpoints = select_runtime_traversal_endpoints(&bundle.bundle.candidates);
             let relay_endpoint = endpoints.1;
@@ -6720,10 +6826,10 @@ impl DaemonRuntime {
             );
             if direct_candidates.is_empty() && relay_endpoint.is_none() {
                 self.traversal_probe_statuses.clear();
-                return Err(format!(
+                return Err(TraversalSyncFailure::invalid(format!(
                     "traversal bundle for peer {} contains no usable runtime endpoints",
                     remote_node_id.as_str()
-                ));
+                )));
             }
 
             let existing_status = previous_statuses.get(&remote_node_id);
@@ -6746,10 +6852,10 @@ impl DaemonRuntime {
             {
                 self.close_relay_session(&remote_node_id);
                 self.traversal_probe_statuses.clear();
-                return Err(format!(
+                return Err(TraversalSyncFailure::invalid(format!(
                     "traversal authority removed the relay candidate required for active relay peer {}",
                     remote_node_id.as_str()
-                ));
+                )));
             }
 
             let relay_refresh_due =
@@ -6796,7 +6902,7 @@ impl DaemonRuntime {
                                     "relay_keepalive_recovery_failed",
                                 );
                             }
-                            return Err(err);
+                            return Err(TraversalSyncFailure::invalid(err));
                         }
                     }
                 } else {
@@ -9518,6 +9624,18 @@ impl DaemonRuntime {
 
         self.last_reconcile_error = None;
         let now_unix = unix_now();
+        // QH-04: decide whether this pass will apply a new dataplane
+        // generation BEFORE any traversal state is (re)loaded, so every
+        // traversal sync in the pre-apply window — including the ones nested
+        // inside the pre-expiry and endpoint-change refreshes below — knows
+        // that the managed peer set it is comparing against is about to be
+        // replaced.
+        let will_apply_generation = self.controller.state() == DataplaneState::FailClosed
+            || self.restriction_mode == RestrictionMode::Recoverable
+            || assignment_changed
+            || membership_changed
+            || self.local_route_reconcile_pending;
+        self.pending_generation_apply = will_apply_generation;
         self.maybe_preexpiry_refresh_traversal(now_unix);
         // Load fresh traversal hints here, after any pre-expiry download, so
         // apply_traversal_authority_to_peers has valid state on the very first
@@ -9526,11 +9644,14 @@ impl DaemonRuntime {
         self.maybe_preexpiry_refresh_dns_zone(now_unix, auto_bundle.as_ref());
         self.maybe_trigger_endpoint_change_refresh();
 
-        if self.controller.state() == DataplaneState::FailClosed
+        // The two state-derived disjuncts are re-read here rather than reused
+        // from `will_apply_generation`: the traversal refreshes above can
+        // themselves fail closed, and this pass must still apply in that case
+        // (pre-QH-04 behavior, where the whole predicate was evaluated here).
+        // The other three disjuncts cannot change across those refreshes.
+        if will_apply_generation
+            || self.controller.state() == DataplaneState::FailClosed
             || self.restriction_mode == RestrictionMode::Recoverable
-            || assignment_changed
-            || membership_changed
-            || self.local_route_reconcile_pending
         {
             let (mesh_cidr, local_cidr, peers, routes, auto_exit, auto_lan_access, auto_watermark) =
                 if let Some(ref envelope) = auto_bundle {
@@ -9567,6 +9688,7 @@ impl DaemonRuntime {
                 self.restrict_recoverable(err);
                 self.force_fail_closed_or_restrict("blind_exit_assignment_rejected");
                 self.promote_to_permanent_if_over_limit();
+                self.pending_generation_apply = false;
                 return;
             }
             let local_node = match NodeId::new(self.local_node_id.clone()) {
@@ -9577,6 +9699,7 @@ impl DaemonRuntime {
                     self.last_reconcile_error = Some(message.clone());
                     self.restrict_permanent(message);
                     self.force_fail_closed_or_restrict("invalid_local_node_id");
+                    self.pending_generation_apply = false;
                     return;
                 }
             };
@@ -9588,6 +9711,7 @@ impl DaemonRuntime {
                 self.restrict_recoverable(message);
                 self.force_fail_closed_or_restrict("runtime_key_prepare_failed");
                 self.promote_to_permanent_if_over_limit();
+                self.pending_generation_apply = false;
                 return;
             }
 
@@ -9609,6 +9733,7 @@ impl DaemonRuntime {
                     self.restrict_recoverable(message);
                     self.force_fail_closed_or_restrict("reconcile_traversal_authority_rejected");
                     self.promote_to_permanent_if_over_limit();
+                    self.pending_generation_apply = false;
                     return;
                 }
             };
@@ -9621,6 +9746,7 @@ impl DaemonRuntime {
                 self.restrict_recoverable(message);
                 self.force_fail_closed_or_restrict("reconcile_exit_overlay_exception_violated");
                 self.promote_to_permanent_if_over_limit();
+                self.pending_generation_apply = false;
                 return;
             }
             let previously_managed_peer_ids = self
@@ -9656,6 +9782,9 @@ impl DaemonRuntime {
                     },
                 },
             );
+            // QH-04: the apply has been attempted; from here the controller's
+            // managed peer set is authoritative again.
+            self.pending_generation_apply = false;
             let cleanup_result = self.scrub_runtime_private_key_material();
 
             match (apply_result, cleanup_result) {
@@ -9673,6 +9802,45 @@ impl DaemonRuntime {
                     self.membership_state = Some(membership_state);
                     self.controller.set_membership(membership_directory.clone());
                     self.membership_directory = membership_directory;
+                    // QH-04: the generation this pass applied is now the live
+                    // one. Re-evaluate the assignment/traversal set-equality
+                    // invariant against it — this is the only place the two
+                    // halves are guaranteed to describe the same generation.
+                    // Relay/quality upkeep already ran in the pre-apply sync,
+                    // so only the probe/index half is recomputed here.
+                    match self.sync_traversal_runtime_state_detailed(false, false) {
+                        Ok(()) => {
+                            self.traversal_hint_error = None;
+                        }
+                        Err(failure) => {
+                            let enforced = self.traversal_authority_mode().is_enforced();
+                            let detail = failure.into_message();
+                            self.traversal_hint_error = Some(detail.clone());
+                            if enforced {
+                                // §3 fail closed: never report a successful
+                                // reconcile while the applied dataplane
+                                // generation and the traversal runtime state
+                                // disagree about which peer set is live.
+                                self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                                let message = format!(
+                                    "traversal runtime sync failed for applied dataplane generation: {detail}"
+                                );
+                                if self.last_reconcile_error.as_deref() != Some(message.as_str()) {
+                                    log::warn!("rustynetd reconcile fail-closed: {message}");
+                                }
+                                self.last_reconcile_error = Some(message.clone());
+                                self.restrict_recoverable(message);
+                                self.force_fail_closed_or_restrict(
+                                    "reconcile_traversal_generation_divergence",
+                                );
+                                self.promote_to_permanent_if_over_limit();
+                                return;
+                            }
+                            log::warn!(
+                                "traversal runtime sync failed after dataplane apply (traversal authority not enforced): {detail}"
+                            );
+                        }
+                    }
                     self.refresh_dns_zone_state(auto_bundle.as_ref());
                     self.materialize_service_access_state(auto_bundle.as_ref());
                     self.sync_gossip_data_plane(
@@ -29678,6 +29846,409 @@ mod tests {
         assert!(netcheck.message.contains("candidate_count=4"));
         assert!(netcheck.message.contains("traversal_probe_result=relay"));
         assert!(netcheck.message.contains("traversal_probe_peer_count=2"));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// QH-04: a reconcile pass that applies a NEW dataplane generation must
+    /// evaluate assignment/traversal set equality against the generation it is
+    /// applying, not against the generation that happens to still be live when
+    /// the signed traversal snapshot is loaded.
+    ///
+    /// Both halves are co-distributed correctly here (assignment grows to two
+    /// peers, traversal grows to the same two peers), so the pass must succeed
+    /// and leave assignment and traversal agreeing on one generation.
+    #[test]
+    fn reconcile_applies_codistributed_peer_set_growth_without_generation_divergence() {
+        let test_dir = secure_test_dir("rustynetd-qh04-peer-set-growth");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files_with_additional_nodes(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+            &[
+                ("node-exit", MembershipNodeStatus::Active),
+                ("node-relay", MembershipNodeStatus::Active),
+            ],
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            &[("node-exit", "10.0.0.2", 51820)],
+            2,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+        assert!(
+            matches!(
+                runtime.controller.state(),
+                crate::phase10::DataplaneState::DataplaneApplied
+                    | crate::phase10::DataplaneState::ExitActive
+            ),
+            "bootstrap must apply the single-peer generation: {:?} / {:?}",
+            runtime.controller.state(),
+            runtime.bootstrap_error
+        );
+
+        // Both halves of the next generation land before the reconcile tick.
+        write_auto_tunnel_file_two_peers(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            3,
+        );
+        write_traversal_file_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            &[
+                ("node-exit", "10.0.0.2", 51820),
+                ("node-relay", "10.0.0.3", 51820),
+            ],
+            4,
+        );
+
+        runtime.reconcile();
+
+        assert_eq!(
+            runtime.last_reconcile_error, None,
+            "co-distributed peer-set growth must not fail the reconcile"
+        );
+        assert_eq!(runtime.reconcile_failures, 0);
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+        assert!(matches!(
+            runtime.controller.state(),
+            crate::phase10::DataplaneState::DataplaneApplied
+                | crate::phase10::DataplaneState::ExitActive
+        ));
+        let managed = runtime
+            .controller
+            .managed_peer_ids()
+            .into_iter()
+            .map(|node_id| node_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            managed,
+            vec!["node-exit".to_owned(), "node-relay".to_owned()]
+        );
+        // The invariant: traversal runtime state describes exactly the peer set
+        // of the generation that was just applied.
+        let probed = runtime
+            .traversal_probe_statuses
+            .keys()
+            .map(|node_id| node_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            probed, managed,
+            "traversal runtime state must be synced against the applied generation"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// QH-04 negative: deferring the pre-apply set-equality check must not
+    /// swallow a real divergence. Here only the assignment half advances —
+    /// the traversal snapshot still covers one peer — so the reconcile must
+    /// fail and the node must fail closed. The following pass, once the
+    /// matching traversal half lands, must recover.
+    #[test]
+    fn reconcile_fails_closed_when_only_the_assignment_half_advances_then_recovers() {
+        let test_dir = secure_test_dir("rustynetd-qh04-half-generation");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files_with_additional_nodes(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+            &[
+                ("node-exit", MembershipNodeStatus::Active),
+                ("node-relay", MembershipNodeStatus::Active),
+            ],
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            &[("node-exit", "10.0.0.2", 51820)],
+            2,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+        assert!(matches!(
+            runtime.controller.state(),
+            crate::phase10::DataplaneState::DataplaneApplied
+                | crate::phase10::DataplaneState::ExitActive
+        ));
+
+        // Only the assignment half advances.
+        write_auto_tunnel_file_two_peers(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            3,
+        );
+        runtime.reconcile();
+
+        assert_eq!(
+            runtime.reconcile_failures, 1,
+            "a half-installed generation must feed the reconcile failure tolerance"
+        );
+        assert!(
+            runtime
+                .last_reconcile_error
+                .as_deref()
+                .unwrap_or("none")
+                .contains("missing signed traversal state for managed peers: node-relay"),
+            "unexpected reconcile error: {:?}",
+            runtime.last_reconcile_error
+        );
+        assert_eq!(runtime.restriction_mode, RestrictionMode::Recoverable);
+        assert_eq!(
+            runtime.controller.state(),
+            crate::phase10::DataplaneState::FailClosed
+        );
+
+        // The matching traversal half lands; the next pass must recover.
+        write_traversal_file_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            &[
+                ("node-exit", "10.0.0.2", 51820),
+                ("node-relay", "10.0.0.3", 51820),
+            ],
+            4,
+        );
+        runtime.reconcile();
+
+        assert_eq!(runtime.last_reconcile_error, None);
+        assert_eq!(
+            runtime.reconcile_failures, 0,
+            "a successful reconcile must clear the failure counter"
+        );
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+        assert!(matches!(
+            runtime.controller.state(),
+            crate::phase10::DataplaneState::DataplaneApplied
+                | crate::phase10::DataplaneState::ExitActive
+        ));
+        let managed = runtime
+            .controller
+            .managed_peer_ids()
+            .into_iter()
+            .map(|node_id| node_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let probed = runtime
+            .traversal_probe_statuses
+            .keys()
+            .map(|node_id| node_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            managed,
+            vec!["node-exit".to_owned(), "node-relay".to_owned()]
+        );
+        assert_eq!(
+            probed, managed,
+            "recovery must leave traversal state synced to the applied generation"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// QH-04 negative: the deferral is scoped strictly to passes that are
+    /// applying a new dataplane generation. With the applied generation
+    /// unchanged, a traversal snapshot that disagrees with the live managed
+    /// peer set is a genuine divergence and must still fail closed.
+    #[test]
+    fn traversal_divergence_against_the_live_generation_still_fails_closed() {
+        let test_dir = secure_test_dir("rustynetd-qh04-live-generation-divergence");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files_with_additional_nodes(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+            &[
+                ("node-exit", MembershipNodeStatus::Active),
+                ("node-relay", MembershipNodeStatus::Active),
+            ],
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            &[("node-exit", "10.0.0.2", 51820)],
+            2,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+        assert!(matches!(
+            runtime.controller.state(),
+            crate::phase10::DataplaneState::DataplaneApplied
+                | crate::phase10::DataplaneState::ExitActive
+        ));
+
+        // Traversal alone gains a peer the live generation does not manage.
+        write_traversal_file_set(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            &[
+                ("node-exit", "10.0.0.2", 51820),
+                ("node-relay", "10.0.0.3", 51820),
+            ],
+            4,
+        );
+        runtime.refresh_traversal_hint_state(false);
+
+        assert!(
+            runtime
+                .traversal_hint_error
+                .as_deref()
+                .unwrap_or("none")
+                .contains("traversal authority snapshot contains unmanaged peers: node-relay"),
+            "unexpected traversal hint error: {:?}",
+            runtime.traversal_hint_error
+        );
+        assert_eq!(runtime.restriction_mode, RestrictionMode::Recoverable);
+        assert_eq!(
+            runtime.controller.state(),
+            crate::phase10::DataplaneState::FailClosed
+        );
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
