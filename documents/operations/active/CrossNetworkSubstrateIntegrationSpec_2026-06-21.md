@@ -166,8 +166,25 @@ buried inside `run_nat_classification`:
 
 ### 0.4 Migration path (each step independently shippable, gate-green, on `main`)
 
-- **CN-1** Introduce the three traits + `NetLeafRunner{LocalCommand,RemoteShell}` + a `MockLeafRunner`;
+- **CN-1** ✅ **DONE** (2026-08-27, `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/substrate.rs`).
+  Introduce the three traits + `NetLeafRunner{LocalCommand,RemoteShell}` + a `MockLeafRunner`;
   no behavior change (existing enum path still runs). Pure additive, unit-tested against the mock.
+  **Three deliberate deviations from the §0.1 verbatim signatures:**
+  (a) the provider trait is named `CrossNetworkSubstrateProvider`, because the `CrossNetworkSubstrate`
+  *enum* survives as the `--cross-network-substrate` CLI selector, and its lifecycle methods are
+  `setup`/`teardown` rather than `provision`.
+  (b) `SubstrateHandle` is a **struct, not a trait**: with the seam at topology level a handle is plain
+  provisioned state (overlay/underlay address maps + the created-link list), and the per-node
+  `NetLeafRunner`s are passed in by the caller as an alias→runner map rather than owned by the handle,
+  so `leaf()` has no single sensible answer. `endpoint()` (→ `ResolvedEndpoint`, which also names the
+  overlay-vs-underlay *plane* so a fallback cannot be mistaken for a provisioned overlay address) and
+  `supports()` (→ `NatProfileId`/`Support`) exist as specified; `apply_nat_profile()` + `NatModifiers`
+  are deferred to CN-4.
+  (c) `NetLeafRunner::in_netns` is a **provided** method, not a required one, so no backend can
+  hand-roll a weaker `ip netns exec` prefix; the namespace name is allowlist-validated before it enters
+  argv, closing the shell-construction hole §4 forbids.
+  The §0.4 lifetime risk is handled as prescribed: the handle is owned by `OrchestrationContext` and
+  drained by the `always_run` `CrossNetworkSubstrateTeardownStage` — there is no `Drop` impl.
 - **CN-2** `NetnsSubstrate::provision`/`teardown` + the two lifecycle stages; port classify/filter onto
   the runner. Netns path now in-process; delete the scp of `netns_*.sh`. Live-provable on one host.
 - **CN-3** Port the 8 scenario validators to `scenario::*` fns; delete the 8 bins + `run_script_stage`'s
@@ -194,9 +211,10 @@ Verified findings from a grounded code audit after the bash orchestrator's remov
 
 - **Landed beyond what §5's X1 note claims:** `--cross-network-substrate` is a real Rust CLI flag (`main.rs`, both `vm-lab-write-live-lab-profile` and `vm-lab-orchestrate-live-lab`, parse-tested); the netns NAT-classification gate runs IN-PROCESS via `run_nat_classification` (`stage/cross_network.rs`) with the `rustynet-netns-probe` on-guest binary. The X1 "no CLI flag yet" note at §5 is stale — do not rebuild it.
 - **Dead sections:** §4.2/§4.3/§7 target `scripts/e2e/live_linux_lab_orchestrator.sh`, which no longer exists. The integration seam is now `orchestrator/plan.rs` + `stage/mod.rs` + `live_lab_stage_registry.rs`. The registry's `cross_network_daemon_path` bash-dialect entry is dead weight.
-- **Unstarted:** §0.1 traits (CN-1..CN-5), §0.3/§4.2 substrate lifecycle stages, any `VxlanSubstrate` provisioner (nothing invokes `vxlan_tier_b.sh` from Rust), NatModifiers plumbing, `double_nat_cgnat`.
+- **Unstarted (as of this 11:18 audit):** §0.1 traits (CN-1..CN-5), §0.3/§4.2 substrate lifecycle stages, any `VxlanSubstrate` provisioner (nothing invokes `vxlan_tier_b.sh` from Rust), NatModifiers plumbing, `double_nat_cgnat`.
+  - **Superseded later the same day.** CN-1 landed in `56ec906c` / `9419cfb3` / `4b1d9467` (the three trait abstractions, `LocalCommandRunner` / `RemoteShellRunner` / `MockLeafRunner`, a `VxlanSubstrateProvider`, and the two topology-level lifecycle stages), and was completed by `NetLeafRunner::in_netns`, the `NatProfileId` + `Support` honest-skip gate, and `SubstrateHandle::endpoint` / `ResolvedEndpoint`. Deviations from the verbatim §0.1 signatures are itemised in the CN-1 row of §0.4. **Still unstarted:** `NetnsSubstrate` provision/teardown + the classify/filter port (CN-2), the 8 scenario validators (CN-3), `SlirpSubstrate` + `apply_nat_profile` / `NatModifiers` + `double_nat_cgnat` (CN-4).
 - **NEW, upstream gap the spec does not cover (live-proven, run `livelab-1787790884-c9ccf1a4d1cc`, first real 2-LAN --node cell: UTM 192.168.64/24 + lenovo 192.168.0/24):** `collect_pubkeys` records each node's raw discovered underlay endpoint and `distribute_assignments` feeds it into `NODES_SPEC` verbatim, so cross-LAN pairs receive peer endpoints on the other LAN's private prefix — unroutable, no traversal engaged, `traffic_test_matrix` fails every cross-LAN pair both directions. This sits tens of stages BEFORE the `cross_network_*` block where §4.2 hooks substrate setup.
-- **DESIGN DECISION FORCED:** the substrate seam must either move to topology level (provision the overlay before `collect_pubkeys` and populate `ctx.endpoints` with overlay addresses — what a real 2-LAN fleet needs) or stay a cross-network-suite concern (spec's framing — leaves the 2-LAN fleet's base mesh broken). Resolve before writing CN-2 code; the lifecycle stages' dependency-graph position follows from this choice.
+- **DESIGN DECISION FORCED — RESOLVED 2026-08-27 in favour of TOPOLOGY LEVEL** (implemented in `56ec906c`/`4b1d9467`: `CrossNetworkSubstrateSetupStage` depends on `BootstrapHosts` and is ordered before `collect_pubkeys`, so overlay addresses are what land in `ctx.endpoints`, while SSH/management traffic keeps the management IPs). The original framing of the choice, retained for the record: the substrate seam must either move to topology level (provision the overlay before `collect_pubkeys` and populate `ctx.endpoints` with overlay addresses — what a real 2-LAN fleet needs) or stay a cross-network-suite concern (spec's framing — leaves the 2-LAN fleet's base mesh broken). Resolve before writing CN-2 code; the lifecycle stages' dependency-graph position follows from this choice.
 
 ## 1. Problem statement
 
