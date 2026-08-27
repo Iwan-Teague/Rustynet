@@ -1920,4 +1920,75 @@ mod tests {
         assert!(daemon_restart_instruction_for_os("windows").contains("Restart-Service"));
         assert!(daemon_restart_instruction_for_os("linux").contains("systemctl restart"));
     }
+
+    // ----- D-4a signing sub-flow contract -----
+
+    /// The pure signing-subflow sequencer
+    /// (`rustynet_control::role_signing_subflow`) and this planner's
+    /// executable `ConcreteAction` order must agree on the
+    /// local-side-effect phase for every non-staged SignedMembership
+    /// cell. This is the anti-divergence contract promised in the
+    /// sequencer's module docs: if either side reorders §10.7
+    /// side-effects, this test fails.
+    #[test]
+    fn signing_subflow_local_phase_matches_concrete_action_order() {
+        use rustynet_control::role_signing_subflow::{SubflowStep, signing_subflow_for};
+
+        fn as_subflow_step(action: &ConcreteAction) -> Option<SubflowStep> {
+            match action {
+                ConcreteAction::NoOp => None,
+                ConcreteAction::WriteNodeRoleEnv { .. } => {
+                    Some(SubflowStep::UpdatePrimaryRoleConfig)
+                }
+                ConcreteAction::AdvertiseDefaultRoute => Some(SubflowStep::AdvertiseExitRoute),
+                ConcreteAction::RetractDefaultRoute => Some(SubflowStep::RetractExitRoute),
+                ConcreteAction::DeployExitService => Some(SubflowStep::DeployExitPreflight),
+                ConcreteAction::UndeployExitService => Some(SubflowStep::UndeployExitPreflight),
+                ConcreteAction::DeployRelayService => {
+                    Some(SubflowStep::DeployService(ServiceKind::Relay))
+                }
+                ConcreteAction::UndeployRelayService => {
+                    Some(SubflowStep::UndeployService(ServiceKind::Relay))
+                }
+                ConcreteAction::DeployNasService => {
+                    Some(SubflowStep::DeployService(ServiceKind::Nas))
+                }
+                ConcreteAction::UndeployNasService => {
+                    Some(SubflowStep::UndeployService(ServiceKind::Nas))
+                }
+                ConcreteAction::DeployLlmService => {
+                    Some(SubflowStep::DeployService(ServiceKind::Llm))
+                }
+                ConcreteAction::UndeployLlmService => {
+                    Some(SubflowStep::UndeployService(ServiceKind::Llm))
+                }
+            }
+        }
+
+        for &from in RolePreset::all().iter() {
+            for &to in RolePreset::all().iter() {
+                let plan = plan_concrete_actions(from, to, false, env_path());
+                let RoleSetPlan::Allowed {
+                    kind: TransitionKind::SignedMembership,
+                    actions,
+                    ..
+                } = plan
+                else {
+                    continue;
+                };
+                let planner_local_phase: Vec<SubflowStep> =
+                    actions.iter().filter_map(as_subflow_step).collect();
+                let steps = signing_subflow_for(from, to)
+                    .expect("sequencer must accept every SignedMembership cell");
+                let sequencer_local_phase: Vec<SubflowStep> = steps
+                    .into_iter()
+                    .take_while(|s| !matches!(s, SubflowStep::EmitUnsignedCapabilityRecord))
+                    .collect();
+                assert_eq!(
+                    planner_local_phase, sequencer_local_phase,
+                    "local-phase divergence for {from} -> {to}"
+                );
+            }
+        }
+    }
 }

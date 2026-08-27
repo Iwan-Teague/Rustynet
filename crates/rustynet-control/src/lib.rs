@@ -10,6 +10,7 @@ pub mod operations;
 pub mod persistence;
 pub mod role_audit;
 pub mod role_presets;
+pub mod role_signing_subflow;
 pub mod roles;
 pub mod scale;
 
