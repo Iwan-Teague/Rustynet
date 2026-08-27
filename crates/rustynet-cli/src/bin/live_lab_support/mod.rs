@@ -90,6 +90,39 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Mirrors `live_lab_bin_support::REMOTE_RUSTYNET_BIN`.
 pub const REMOTE_RUSTYNET_BIN: &str = "/usr/local/bin/rustynet";
 
+/// Deployed Linux state paths. These are the defaults the systemd unit template
+/// passes to the daemon (`scripts/systemd/rustynetd.service`) and the ones
+/// `ops_install_systemd` creates, so a stage that names them explicitly is
+/// pointing at the same files the daemon uses.
+pub const LINUX_MEMBERSHIP_SNAPSHOT_PATH: &str = "/var/lib/rustynet/membership.snapshot";
+pub const LINUX_MEMBERSHIP_LOG_PATH: &str = "/var/lib/rustynet/membership.log";
+/// Seeded at install time on **admin** nodes only — non-admin nodes leave it
+/// absent so the daemon's enrollment IPC stays fail-closed
+/// (`ops_install_systemd.rs`). Its absence is therefore a legitimate,
+/// *detectable* "this node has no anchor state" condition, and the only one a
+/// stage may treat as a skip rather than a failure.
+pub const LINUX_ENROLLMENT_SECRET_PATH: &str = "/var/lib/rustynet/keys/enrollment.secret";
+/// Daemon-managed; created on first consume, so its absence means "nothing has
+/// been consumed here yet", not "misconfigured".
+pub const LINUX_ENROLLMENT_LEDGER_PATH: &str = "/var/lib/rustynet/rustynetd.enrollment.ledger";
+/// Where a stage points `membership verify --audit-output`. The verb's own
+/// default is CWD-relative, and an SSH command's CWD is the login user's home,
+/// so stages pin it. Inside the root-owned state dir rather than `/tmp` so the
+/// root-written file cannot be pre-empted by a symlink planted at a
+/// world-writable path.
+pub const REMOTE_MEMBERSHIP_AUDIT_PATH: &str =
+    "/var/lib/rustynet/membership_audit_integrity.live_lab.log";
+/// Exact success line of `rustynet membership verify`, from
+/// `execute_membership`'s `VerifyLog` arm. Stages must match this rather than
+/// guess at substrings: the previous `contains("ok") || contains("valid")`
+/// heuristic matches neither this line nor any of the verb's failure strings.
+pub const MEMBERSHIP_VERIFY_PASS_PREFIX: &str = "membership log verification passed:";
+/// The fixed gossip port (`rustynetd::gossip_transport::RUSTYNET_GOSSIP_PORT`).
+/// `enrollment consume` wants the enrollee's `<ip>:<port>` push address, and
+/// under the production `PushAddressPolicy::Strict` that address must be
+/// globally- or privately-scoped — a lab guest's LAN address qualifies.
+pub const RUSTYNET_GOSSIP_PORT: u16 = 51821;
+
 const PROCESS_POLL_INTERVAL_MILLIS: u64 = 100;
 const UTM_EXEC_TIMEOUT_SECS: u64 = 120;
 const UTM_FILE_TIMEOUT_SECS: u64 = 120;
@@ -368,6 +401,124 @@ pub fn status_code(status: ExitStatus) -> i32 {
             }
         }
     }
+}
+
+/// Result of one remote `rustynet` invocation that was allowed to fail.
+///
+/// `capture_root_allow_failure` returns only stdout and throws away both the
+/// exit status and stderr, which is how a broken invocation could look like a
+/// lab observation: the CLI prints its errors to **stdout** (`main.rs`'s error
+/// arm uses `println!`, not `eprintln!`), so a caller that keeps only stdout
+/// receives the error text as if it were data. Keeping all three fields is what
+/// lets a stage tell "the lab said no" apart from "the harness asked wrong".
+#[derive(Debug, Clone)]
+pub struct RemoteCliOutcome {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl RemoteCliOutcome {
+    pub fn succeeded(&self) -> bool {
+        self.exit_code == 0
+    }
+
+    pub fn trimmed_stdout(&self) -> &str {
+        self.stdout.trim()
+    }
+
+    /// One-line rendering for a log or an error, with both streams so a failure
+    /// is diagnosable from the stage log alone.
+    pub fn detail(&self) -> String {
+        format!(
+            "exit={} stdout={:?} stderr={:?}",
+            self.exit_code,
+            self.stdout.trim(),
+            self.stderr.trim()
+        )
+    }
+}
+
+/// Decide whether a failed `rustynet` invocation failed because the CLI could
+/// not PARSE it, rather than because the lab was in some state.
+///
+/// This distinction is load-bearing for the FAIL-LOUD live-stage spec
+/// (`CrossPlatformRoleParityRoadmap_2026-06-22.md`): a stage's status must be
+/// its live result, and a command the CLI never understood produced no live
+/// result at all. Such a failure is a harness wiring defect and must abort the
+/// stage, never fall through to a graceful-skip or a degraded "rolled back"
+/// branch that reports a plausible outcome without having exercised anything.
+///
+/// Returns `Some(reason)` when the invocation did not parse.
+///
+/// The signals, in the order they are checked:
+/// - exit 127 / `command not found` — the binary is not on the guest at all
+///   (`sudo`'s `secure_path` omits `/usr/local/bin` on the RHEL family, so a
+///   bare-name argv head lands here; see `REMOTE_RUSTYNET_BIN`).
+/// - `unknown command:` — no such top-level command.
+/// - `unknown … subcommand:` — no such subcommand. Note this is also what a
+///   `vm-lab`-gated verb looks like when the guest's binary was built without
+///   `--features vm-lab`, which is equally a wiring defect.
+/// - exit 64 / `bad_args (64)` — `classify_cli_error` routes only
+///   argument-shaped messages here (unknown verb, missing required option,
+///   invalid value), so this code means the argv was wrong, never that the
+///   operation was attempted and refused.
+pub fn cli_invocation_parse_failure(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> Option<&'static str> {
+    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    if exit_code == 127 || combined.contains("command not found") {
+        return Some("the rustynet binary is not on the guest's PATH (command not found)");
+    }
+    if combined.contains("unknown command:") {
+        return Some("the CLI has no such top-level command");
+    }
+    if combined.contains("unknown") && combined.contains("subcommand") {
+        return Some(
+            "the CLI has no such subcommand (or the guest's binary was built without \
+             --features vm-lab)",
+        );
+    }
+    if exit_code == 64 || combined.contains("bad_args (64)") {
+        return Some("the CLI rejected the arguments (bad_args): a flag name or value is wrong");
+    }
+    if combined.contains("invalid option token") {
+        return Some("the CLI could not parse an option token");
+    }
+    None
+}
+
+/// A freshly generated, VALID Ed25519 verifying key, URL-safe-base64 without
+/// padding — the shape `rustynet enrollment consume --pubkey` requires.
+///
+/// Generated through `SigningKey` rather than by base64-ing 32 random bytes:
+/// the daemon runs the input through `VerifyingKey::from_bytes`, which rejects
+/// a non-canonical point, so raw random bytes would fail intermittently and the
+/// stage would flake on its own test data instead of on the lab.
+pub fn random_enrollee_pubkey_b64() -> Result<String, String> {
+    use base64::Engine as _;
+    use rand::TryRngCore as _;
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut seed)
+        .map_err(|err| format!("os randomness unavailable for enrollee pubkey: {err}"))?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes()))
+}
+
+/// Read one `key=value` field out of a space-separated CLI status line, e.g.
+/// `already_consumed=true` from `rustynet enrollment verify`, or `node_id=…`
+/// from `rustynet status`.
+///
+/// Returns `None` when the key is absent, which callers must treat as "the
+/// output was not the shape we expected" rather than as a `false`/empty value —
+/// silently defaulting is the failure mode HARNESS-VERBS exists to remove.
+pub fn key_value_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(needle.as_str()))
 }
 
 pub fn read_text(path: &Path) -> Result<String, String> {
@@ -963,6 +1114,66 @@ impl LiveLabContext {
         self.capture_allow_failure(target, &full_args)
     }
 
+    /// Run a `rustynet` argv on a guest as root, FAILING LOUDLY if the CLI did
+    /// not parse it, and otherwise handing the caller the full outcome.
+    ///
+    /// Prefer this over `capture_root_allow_failure` for every `rustynet`
+    /// invocation. `capture_root_allow_failure` keeps stdout only, and the CLI
+    /// prints its errors to stdout, so an argv the CLI never understood comes
+    /// back as an ordinary-looking string that flows into the stage's data —
+    /// which is exactly how three stages came to drive `ops` subcommands that do
+    /// not exist while still reporting a plausible result (HARNESS-VERBS).
+    ///
+    /// A parse failure is a harness defect, so it is returned as `Err` and must
+    /// abort the stage. A non-zero exit that is NOT a parse failure is returned
+    /// as `Ok`, because that is a real live result the caller has to interpret
+    /// (for enrollment, "token rejected" is a legitimate answer).
+    ///
+    /// `label` names the operation for the error text, e.g. `"enrollment mint"`.
+    pub fn rustynet_root(
+        &self,
+        target: &str,
+        label: &str,
+        args: &[&str],
+    ) -> Result<RemoteCliOutcome, String> {
+        let output = self.run_root_allow_failure(target, args)?;
+        let outcome = RemoteCliOutcome {
+            exit_code: status_code(output.status),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        };
+        if let Some(reason) =
+            cli_invocation_parse_failure(outcome.exit_code, &outcome.stdout, &outcome.stderr)
+        {
+            return Err(format!(
+                "harness wiring defect: `{label}` was not understood by the CLI on {target} \
+                 ({reason}); argv: {}; {}",
+                args.join(" "),
+                outcome.detail()
+            ));
+        }
+        Ok(outcome)
+    }
+
+    /// [`Self::rustynet_root`] for an invocation whose success is required:
+    /// any non-zero exit is an error, not data.
+    pub fn rustynet_root_must_succeed(
+        &self,
+        target: &str,
+        label: &str,
+        args: &[&str],
+    ) -> Result<String, String> {
+        let outcome = self.rustynet_root(target, label, args)?;
+        if !outcome.succeeded() {
+            return Err(format!(
+                "`{label}` failed on {target}; argv: {}; {}",
+                args.join(" "),
+                outcome.detail()
+            ));
+        }
+        Ok(outcome.stdout)
+    }
+
     pub fn capture_root_allow_failure_with_retry(
         &self,
         target: &str,
@@ -1459,10 +1670,116 @@ pub fn run_remote_shell(
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabContext, LiveLabPlatform, enforce_linux_only_until_validator_lands, env_flag_truthy,
-        known_hosts_lookup_host, resolved_known_hosts_candidates,
-        resolved_target_address_from_ssh_g, scp_failure_is_transient, strip_host_port, target_port,
+        LiveLabContext, LiveLabPlatform, cli_invocation_parse_failure,
+        enforce_linux_only_until_validator_lands, env_flag_truthy, known_hosts_lookup_host,
+        resolved_known_hosts_candidates, resolved_target_address_from_ssh_g,
+        scp_failure_is_transient, strip_host_port, target_port,
     };
+
+    /// HARNESS-VERBS. Three stages drove `rustynet ops` subcommands that the
+    /// parser does not have. Every call site used an allow-failure helper that
+    /// keeps stdout only — and the CLI prints its errors to stdout — so the
+    /// error text flowed on as data and the stages reported plausible results
+    /// without exercising anything. The classifier is what makes that shape
+    /// impossible: a command the CLI never parsed must abort the stage.
+    #[test]
+    fn a_verb_the_cli_does_not_have_is_classified_as_a_parse_failure() {
+        // The exact stdout of the four dead calls, from the CLI's error arm.
+        for verb in [
+            "generate-enrollment-token",
+            "consume-enrollment-token",
+            "show-node-id",
+            "verify-membership",
+        ] {
+            let stdout = format!(
+                "error [bad_args (64)]: unknown ops subcommand: {verb}\n  \
+                 hint: invalid CLI arguments; re-run with --help\n"
+            );
+            assert!(
+                cli_invocation_parse_failure(64, stdout.as_str(), "").is_some(),
+                "`ops {verb}` must be classified as a parse failure"
+            );
+        }
+        // Other shapes of the same defect.
+        assert!(
+            cli_invocation_parse_failure(
+                64,
+                "error [bad_args (64)]: unknown command: peer list\n",
+                ""
+            )
+            .is_some()
+        );
+        assert!(
+            cli_invocation_parse_failure(
+                64,
+                "error [bad_args (64)]: unknown enrollment subcommand: consume-token\n",
+                ""
+            )
+            .is_some()
+        );
+        // A wrong FLAG on a real verb is equally a wiring defect: `--ttl-seconds`
+        // does not exist, the real flag is `--ttl`.
+        assert!(
+            cli_invocation_parse_failure(
+                64,
+                "error [bad_args (64)]: --ttl <secs> is required\n",
+                ""
+            )
+            .is_some()
+        );
+        // A missing binary — what a bare-name argv head does on the RHEL family.
+        assert!(
+            cli_invocation_parse_failure(127, "", "sudo: rustynet: command not found\n").is_some()
+        );
+    }
+
+    /// The other half: a REAL live result must not be mistaken for a wiring
+    /// defect, or the stage would abort on a legitimate lab observation.
+    #[test]
+    fn a_genuine_live_failure_is_not_classified_as_a_parse_failure() {
+        assert!(
+            cli_invocation_parse_failure(
+                0,
+                "membership log verification passed: entries=3 epoch=2 audit=/tmp/a.log\n",
+                ""
+            )
+            .is_none()
+        );
+        assert!(
+            cli_invocation_parse_failure(
+                0,
+                "enrollment accepted node=0a1b2c3d4e5f6071 expires_at_unix=1790000000\n",
+                ""
+            )
+            .is_none()
+        );
+        // The daemon refusing the token is a live answer, not a wiring defect.
+        assert!(
+            cli_invocation_parse_failure(
+                1,
+                "error [generic_failure (1)]: enrollment token rejected\n",
+                ""
+            )
+            .is_none()
+        );
+        assert!(
+            cli_invocation_parse_failure(
+                1,
+                "error [generic_failure (1)]: daemon unreachable: connection refused\n",
+                ""
+            )
+            .is_none()
+        );
+        // A config-error exit (65) is a real state, not a bad argv.
+        assert!(
+            cli_invocation_parse_failure(
+                65,
+                "error [config_error (65)]: membership snapshot missing\n",
+                ""
+            )
+            .is_none()
+        );
+    }
 
     /// QH-61 regression lock: no live-lab stage binary may spawn `rustynet` by
     /// bare name. Rocky's sudo `secure_path` omits `/usr/local/bin`, so a bare
@@ -1473,10 +1790,17 @@ mod tests {
     /// runtime so this file cannot satisfy its own negative assertion.
     #[test]
     fn stage_binaries_never_spawn_rustynet_by_bare_name() {
-        let sources: [(&str, &str); 9] = [
+        let sources: [(&str, &str); 10] = [
             (
                 "live_linux_lan_toggle_test.rs",
                 include_str!("../live_linux_lan_toggle_test.rs"),
+            ),
+            // Added with HARNESS-VERBS: this stage drove a bare `"rustynet"`
+            // argv head and was simply missing from the list, so QH-61 never
+            // saw it.
+            (
+                "live_linux_secrets_not_in_logs_test.rs",
+                include_str!("../live_linux_secrets_not_in_logs_test.rs"),
             ),
             (
                 "live_linux_enrollment_restart_test.rs",
@@ -1529,6 +1853,61 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "use REMOTE_RUSTYNET_BIN, never a bare `rustynet` argv head (QH-61): {offenders:?}"
+        );
+    }
+
+    /// HARNESS-VERBS regression lock. Four `ops` subcommands were driven by
+    /// three stage binaries and none of them exists in the parser
+    /// (`crates/rustynet-cli/src/main.rs`, `parse_ops_command`): the real verbs
+    /// are `enrollment mint`, `enrollment consume`, `status` (for the node id)
+    /// and `membership verify`. `--ttl-seconds` is pinned with them because the
+    /// real flag is `--ttl`, and a wrong flag fails exactly the same way a wrong
+    /// verb does.
+    ///
+    /// As with the QH-61 lock above, the needles are assembled at runtime so
+    /// this file cannot satisfy its own negative assertion, and the shape
+    /// matched is a QUOTED argv token — prose in a comment explaining what was
+    /// removed must not trip it.
+    #[test]
+    fn stage_binaries_never_drive_ops_verbs_the_parser_does_not_have() {
+        let sources: [(&str, &str); 3] = [
+            (
+                "live_linux_enrollment_restart_test.rs",
+                include_str!("../live_linux_enrollment_restart_test.rs"),
+            ),
+            (
+                "live_linux_secrets_not_in_logs_test.rs",
+                include_str!("../live_linux_secrets_not_in_logs_test.rs"),
+            ),
+            (
+                "live_linux_network_flap_test.rs",
+                include_str!("../live_linux_network_flap_test.rs"),
+            ),
+        ];
+        let dead_tokens = [
+            format!("{}-enrollment-token", "generate"),
+            format!("{}-enrollment-token", "consume"),
+            format!("{}-node-id", "show"),
+            format!("{}-membership", "verify"),
+            format!("--{}-seconds", "ttl"),
+        ];
+        let mut offenders = Vec::new();
+        for (name, source) in sources {
+            let production = source
+                .find("#[cfg(test)]")
+                .map(|at| &source[..at])
+                .unwrap_or(source);
+            for token in &dead_tokens {
+                let needle = format!("\"{token}\"");
+                if production.contains(needle.as_str()) {
+                    offenders.push(format!("{name}: argv token {needle}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these argv tokens do not exist in the CLI parser; a stage driving one \
+             proves nothing (HARNESS-VERBS): {offenders:?}"
         );
     }
 
