@@ -174,7 +174,8 @@ Previously-unindexed active files, now listed for discoverability:
 - [TestInventory_2026-07-30.md](./TestInventory_2026-07-30.md) — test inventory
 - [TestQualityReview_2026-07-30.md](./TestQualityReview_2026-07-30.md) — test-quality review
 - [QH22LedgerChronologyPlan_2026-08-10.md](./QH22LedgerChronologyPlan_2026-08-10.md) — QH-22 ledger-chronology plan
-- [QH40ShutdownRollbackPlan_2026-08-11.md](./QH40ShutdownRollbackPlan_2026-08-11.md) — QH-40 shutdown/rollback plan
+- [QH40ShutdownRollbackPlan_2026-08-11.md](./QH40ShutdownRollbackPlan_2026-08-11.md) — QH-40 shutdown/rollback plan (REFUTED; superseded by the design below)
+- [MacOsHelperShutdownOrderingDesign_2026-08-27.md](./MacOsHelperShutdownOrderingDesign_2026-08-27.md) — QH-40/D-7 macOS privileged-helper shutdown ordering + fail-closed rollback reporting design
 - [QH41NetworkEvidenceBlindPlan_2026-08-11.md](./QH41NetworkEvidenceBlindPlan_2026-08-11.md) — QH-41 network-evidence blind-spot plan
 - [CrossOsColumnSemanticsPlan_2026-08-12.md](./CrossOsColumnSemanticsPlan_2026-08-12.md) — cross-OS column-semantics plan
 - [ManagedDnsMultiClientPlan_2026-08-13.md](./ManagedDnsMultiClientPlan_2026-08-13.md) — managed-DNS multi-client plan

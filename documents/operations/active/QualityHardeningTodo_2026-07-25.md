@@ -1939,6 +1939,46 @@ the helper should outlive the daemon by design (it plainly must, if the daemon n
 roll back); and whether the daemon should refuse to report exit(0) when rollback failed.
 That last one is the fail-closed question and should be answered first.
 
+> **STATUS 2026-08-27 (D-7) — three questions ANSWERED; reporting half IMPLEMENTED, helper-lifetime
+> half BLOCKED ON OWNER SIGN-OFF.** Design:
+> [`MacOsHelperShutdownOrderingDesign_2026-08-27.md`](./MacOsHelperShutdownOrderingDesign_2026-08-27.md).
+> Branch `work/d7-qh40-helper-order`.
+>
+> 1. **The ordering claim in the heading and first paragraph above is WRONG and is retracted**
+>    (original left visible per this register's norm). Every teardown site in this repository
+>    boots the **daemon** out first, two of them with explicit comments saying why:
+>    `Install-RustyNetMacosService.sh:545-552`, `Bootstrap-RustyNetMacos.sh:753-760`,
+>    `crates/rustynet-cli/src/install/uninstall.rs:70-75`, and
+>    `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_traffic.rs:46-51`. The
+>    `QH40ShutdownRollbackPlan_2026-08-11.md` refutation note re-derived the same log window
+>    with a bounded `log show` and reports the daemon signalled **1.019 s earlier** — this
+>    entry compared the helper's SIGTERM against the daemon's *exit*. Real answer to "fixed or
+>    racy": the **signal** order is deterministic and correct; the **completion** order is racy
+>    on the two shell paths (`sleep 1` against a rollback of unbounded duration) and
+>    **deterministically wrong** on the two Rust paths, which wait not at all — neither prior
+>    QH-40 document mentions those two.
+> 2. **Should the helper outlive the daemon: yes, and launchd cannot express it.** There is no
+>    `After=`/`Requires=` equivalent for LaunchDaemons, so there is no plist key to add and the
+>    fix must be a bounded exit-wait in the callers plus a bounded rollback lease inside the
+>    helper. Privileged-boundary change — **sign-off required**, not implemented.
+> 3. **Should the daemon refuse exit(0): yes — IMPLEMENTED, and the exit code is the weaker
+>    half.** `KeepAlive` is unconditionally `true` on both plists, so launchd restarts on any
+>    exit and reads no code; a non-zero exit is honest but nearly inert (and, for the same
+>    reason, cannot create a restart loop `exit(0)` was not already creating). The primary
+>    channel is a durable, schema-versioned, never-auto-cleared residue marker written beside
+>    the state file (`crates/rustynetd/src/shutdown_residue.rs`), plus `ExitCode::PolicyReject`
+>    (78) on the Unix path *after* the WireGuard key scrub, plus the read-only
+>    `rustynetd shutdown-residue-check` probe for the evidence pipeline. An undecodable marker
+>    counts as residue, never as clean.
+>
+> **Still open, all four gated on the same review:** the helper-lifetime change; whether a
+> residue marker should make the next start re-run the teardown and refuse normal service
+> (report-only today — refusing alone would crash-loop a host while leaving the same residue in
+> place); re-measuring launchd's real post-SIGTERM kill ceiling, which bounds every wait; and
+> the competing hypothesis in the 08-11 refutation that the failures are the helper's own I/O
+> timeout rather than ordering at all (`privileged_helper.rs:660-685` documents the 2000 ms →
+> 10000 ms observation; the rendered helper plist already runs `--timeout-ms 30000`).
+
 ### QH-41 — `macos-utm-1` is on an isolated vmnet bridge, so every mixed-OS run fails its traffic matrix deterministically
 
 **Severity: medium (lab configuration, not product). Confidence: VERIFIED — measured
