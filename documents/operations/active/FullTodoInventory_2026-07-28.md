@@ -186,9 +186,11 @@ entries pointed at, which is the argument for verifying rather than scheduling.
 - Track A sub-stages A1–A3 live-pass criterion open pending a clean run against current HEAD.
 - Enrollment (A1.4) and downgrade-revocation (A1.5) destructive sub-stages remain follow-up work before `live_anchor` can be release-gate-required.
 - Track C chaos: OOM, SIGSTOP/SIGCONT, helper-socket daemon-fault sub-stages (C1.1) skipped pending live-safe implementations.
+  - **2026-08-27 pointer** — [NeverDispatchedLinuxStagesTriage_2026-08-27.md](./NeverDispatchedLinuxStagesTriage_2026-08-27.md) §2: the nine `chaos_*` stages now EXIST on the `--node` engine but have never dispatched. Two gates: `--enable-chaos-suite` passed in 0 of 178 runs, and all nine depend on `live_mixed_topology_validation` (tri-OS-only, 0-for-178), so enabling the flag yields nine cascade-skips. Also: do NOT count `chaos_daemon_fault` as QH-54 proof.
 - Track C: live daemon ingestion/rejection proof for signed-state adversarial inputs (C1.3) hermetic-only.
 - Track C categories C1.2 (clock attack), C1.4 (crash recovery), C1.5 (resource exhaustion), C1.6 (network impairment), C1.7 (membership adversarial), C1.8 (privileged-boundary stress) scaffolded/dry-run only.
 - Linux parity (DNS fail-closed, killswitch precedence, relay, anchor, genesis, IPv6 schema-v2) flagged repeatedly as "follow-up Linux slices."
+  - **2026-08-27 pointer** — [NeverDispatchedLinuxStagesTriage_2026-08-27.md](./NeverDispatchedLinuxStagesTriage_2026-08-27.md) §3: `validate_linux_membership_genesis` (the "genesis" slice) is a bash-dialect registry row with no `--node` stage; `linux_membership_genesis` is `not_run` in all 178 rows. Minting/distribution ARE proven on `--node`; the `0600 rustynetd:rustynetd` file-custody assertion is proven nowhere. §4.1 corrects the `BashRetirementDispositions` B1.6 claim that this is a false gap.
 - Windows live anchor execution fails closed until a reviewed PowerShell/SCM-safe runner is added.
 - macOS/Windows anchor live SSH traffic validation deferred to Track A/C.
 
@@ -423,6 +425,7 @@ entries pointed at, which is the argument for verifying rather than scheduling.
 - Tier 0 (2 items, code fixed but stage missing): `validate_linux_membership_revoke_applies`, `validate_linux_revoked_peer_denied_e2e` — neither stage exists.
 - Tier 1 (16 items, mostly unbuilt): GM-1 gossip-revoked-readmit, ENR-1 enrollment replay, TOCTOU-1 concurrent-consume, DOS-1 relay hello flood, RT-2 blind_exit reversal denied, RR-01/02/03 replay persistence, FCF-1/2/3 crash/corrupt/keystore fail-closed, RPT-01 relay ciphertext-only (currently the *only* relay-forwarding proof of any kind, and even that is now doubted), S3-10 codesign, RSA-0063 macOS privesc residue, KC-04 Windows key-custody negative path, PH-7 macOS helper allowlist, KL-2/3/4 killswitch-leak parity, KC-07 secrets-not-in-logs parity, CNT-1 uPnP SSRF, PH-2/3 helper socket fuzz.
 - Tier 2 (4 larger): HP-3 relay packet-forwarding proof ("single biggest looks-done-but-isn't gap"); nas/llm M5 live evidence chain; cross-network NAT-profile substrate; real cross-OS role-switch.
+  - **2026-08-27 pointer** — [NeverDispatchedLinuxStagesTriage_2026-08-27.md](./NeverDispatchedLinuxStagesTriage_2026-08-27.md) §1: HP-3 still unproven. The validator body EXISTS (`vm_lab/mod.rs:13841`) but has no `--node` `StageId`, so it can only be hand-run via `ops vm-lab-validate-linux-security`; `linux_relay_forwards_frame` is `not_run` in all 178 rows. `relay_validation` is lifecycle-only and says so at `role_validation/relay.rs:142-145`.
 - CPA-1 marked DONE elsewhere but zero code hits found — UNVERIFIED.
 - §2.4: 111 confirmed-implementable gaps across 19 surface categories; only 6 stages committed.
 - §9: no per-stage isolation mechanism for live-validation/adversarial stages — flagged highest-leverage infra gap.
@@ -549,6 +552,7 @@ entries pointed at, which is the argument for verifying rather than scheduling.
 
 ### ParallelAgentWorkPlan_2026-07-01.md
 - Job 1: HP-3 real relay packet-forwarding proof — no stage has ever proven it.
+  - **2026-08-27 pointer** — [NeverDispatchedLinuxStagesTriage_2026-08-27.md](./NeverDispatchedLinuxStagesTriage_2026-08-27.md) §1d: still true. Job 1's validator landed; the `--node` stage wrapper never did. Wiring it in is owner decision D-1 (adds a stage to the default `Live` plan).
 - Job 2a/2b: cross-OS role transitions; Windows anchor bundle-pull upgrade to live stage.
 - Job 3 (security hardening, all zero-coverage at doc time): FCF-1/2/3, RR-01/FCF-4, CNT-1/RSA-0035, PH-2/3, optionally PH-4/5.
 - Optional Job 4: RSA-0063, S3-10, KC-04, PH-7, KL-2/3/4.
