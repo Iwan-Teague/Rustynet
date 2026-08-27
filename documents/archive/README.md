@@ -8,6 +8,7 @@ Archive criteria:
 - preserved for traceability and retrospective security analysis.
 
 Archived items:
+- [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md) — runbook of the legacy bash live-lab orchestrator, deleted in W5.7 (BashOrchestratorRetirementProgram_2026-08-22.md); the frozen evidence ledger remains at `documents/operations/live_lab_run_matrix.csv`
 - [SecurityReview-2026-03-24.md](./SecurityReview-2026-03-24.md)
 - [SimulationSecurityGapAssessment.md](./SimulationSecurityGapAssessment.md)
 - [DownloadsResearchImportLedger_2026-04-17.md](./DownloadsResearchImportLedger_2026-04-17.md)

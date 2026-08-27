@@ -174,7 +174,7 @@ fn run() -> Result<(), String> {
     // them from field 3 (parse_generic_traversal_node_specs). To satisfy both
     // parsers the canonical lab form repeats the capability CSV in field 3 and
     // field 7 with the intervening owner/hostname/os/tags fields left empty
-    // (mirrors build_onehop_specs in live_linux_lab_orchestrator.sh). Using a
+    // (mirrors the retired bash orchestrator's build_onehop_specs). Using a
     // bare node_id|endpoint|key|caps form puts the caps in the owner slot and
     // leaves field 7 empty, so the assignment bundle defaults every peer to
     // client and the daemon rejects it ("route peer <id> lacks signed

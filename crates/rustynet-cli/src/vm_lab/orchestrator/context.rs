@@ -21,14 +21,12 @@ pub const ENV_ORCHESTRATOR_DIALECT: &str = "RUSTYNET_ORCHESTRATOR_DIALECT";
 #[serde(rename_all = "kebab-case")]
 pub enum OrchestratorDialect {
     RustNative,
-    LegacyBash,
 }
 
 impl OrchestratorDialect {
     pub fn as_str(&self) -> &'static str {
         match self {
             OrchestratorDialect::RustNative => "rust-native",
-            OrchestratorDialect::LegacyBash => "legacy-bash",
         }
     }
 }

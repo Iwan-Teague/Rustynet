@@ -10,7 +10,6 @@ test -x scripts/e2e/live_macos_anchor_test.sh
 test -x scripts/e2e/live_macos_anchor_bundle_pull_test.sh
 test -x scripts/e2e/live_windows_anchor_test.sh
 test -f scripts/launchd/com.rustynet.anchor.plist
-rg -q 'stage_run_live_anchor' scripts/e2e/live_linux_lab_orchestrator.sh
 rg -q 'live_anchor' documents/operations/active/AnchorLiveLabAndCrossPlatformRoleDeltaPlan_2026-05-23.md
 
 cargo test -p rustynet-cli --bin live_linux_anchor_test -- --nocapture

@@ -1,5 +1,12 @@
 # Cross-Network Substrate Integration Spec (2026-06-21)
 
+> **W5.7 (2026-08-27): the legacy bash orchestrator was DELETED**
+> (`BashOrchestratorRetirementProgram_2026-08-22.md` — owner-signed G3). Any
+> instruction below that invokes `live_linux_lab_orchestrator.sh`,
+> `--legacy-bash-orchestrator`, `vm-lab-run-live-lab`, `vm-lab-iterate-live-lab`
+> or `legacy_bash: true` is historical; the engine of record is
+> `ops vm-lab-orchestrate-live-lab --node <alias>:<role> ...`.
+
 **Status:** Active implementation spec. Resolves the one open design decision (substrate ↔ validator
 mapping) and specifies the exact orchestrator wiring needed to make the cross-network live-lab stages
 actually run. Companion to `RustynetDataplaneExecutionPlan_2026-05-18.md` §D5.1 — that plan is the *why*

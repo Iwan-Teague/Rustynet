@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// Translate the legacy per-role `--<role>-vm <alias>` CLI flags into the
 /// `Vec<NodeRoleAssignment>` shape used by `--node <alias>:<role>`.
 ///
-/// Mapping mirrors `scripts/e2e/live_linux_lab_orchestrator.sh`:
+/// Mapping (inherited from the retired bash orchestrator's flag semantics):
 ///   --exit-vm          → `<alias>:exit`
 ///   --client-vm        → `<alias>:client`
 ///   --entry-vm         → `<alias>:entry`

@@ -35,7 +35,7 @@ static BOOTSTRAP_SCRIPT: &str =
 static INSTALL_SERVICE_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/macos/Install-RustyNetMacosService.sh");
 // Phase 23 orchestrator-side wrappers (per-OS dispatch from
-// `live_linux_lab_orchestrator.sh::bootstrap_host_worker`). Compiled
+// the retired bash orchestrator's bootstrap_host_worker). Compiled
 // in for tests only so the FNV-1a parity guard and the input-validation
 // pins below stay enforced; the wrappers themselves run on the target
 // host (orchestrator scp's them from `scripts/e2e/`).
@@ -45,9 +45,6 @@ static MACOS_BOOTSTRAP_WRAPPER: &str =
 #[cfg(test)]
 static WINDOWS_BOOTSTRAP_WRAPPER: &str =
     include_str!("../../../../../../scripts/e2e/rn_bootstrap_windows.ps1");
-#[cfg(test)]
-static LIVE_LINUX_LAB_ORCHESTRATOR: &str =
-    include_str!("../../../../../../scripts/e2e/live_linux_lab_orchestrator.sh");
 #[cfg(test)]
 static LIVE_LAB_COMMON: &str = include_str!("../../../../../../scripts/e2e/live_lab_common.sh");
 
@@ -1129,29 +1126,6 @@ mod tests {
     }
 
     #[test]
-    fn live_lab_membership_distribution_uses_macos_writable_staging() {
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains("staging_dir=\"/private/var/tmp\""),
-            "macOS membership distribution must not stage files under locked-down /tmp"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR
-                .contains("remote_snapshot=\"${staging_dir}/rn-membership.snapshot\""),
-            "membership snapshot staging path must be platform-derived"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR
-                .contains("root install -m 0600 '${remote_snapshot}' '${snapshot_path}'"),
-            "macOS membership install must consume the platform-specific staging path"
-        );
-        assert!(
-            !LIVE_LINUX_LAB_ORCHESTRATOR
-                .contains("root install -m 0600 /tmp/rn-membership.snapshot '${snapshot_path}'"),
-            "macOS membership distribution must not hard-code /tmp"
-        );
-    }
-
-    #[test]
     fn live_lab_macos_signed_artifact_distribution_uses_writable_staging() {
         for needle in [
             // Assignment staging paths are node_id-scoped (commit 29ef235) to
@@ -1169,15 +1143,6 @@ mod tests {
             );
         }
         assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains("remote_pub=\"${staging_dir}/rn-traversal.pub\""),
-            "traversal pub staging path must be platform-derived"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR
-                .contains("remote_bundle=\"${staging_dir}/rn-traversal.bundle\""),
-            "traversal bundle staging path must be platform-derived"
-        );
-        assert!(
             !LIVE_LAB_COMMON.contains(
                 "scp_to \"$assignment_pub_local\" \"$target\" \"/tmp/rn-assignment.pub\""
             ),
@@ -1187,50 +1152,6 @@ mod tests {
             !LIVE_LAB_COMMON
                 .contains("scp_to \"$env_local\" \"$target\" \"/tmp/rn-assignment-refresh.env\""),
             "assignment refresh install must not hard-code /tmp for macOS"
-        );
-        assert!(
-            !LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "scp_to \"$STATE_DIR/traversal.pub\" \"$target\" \"/tmp/rn-traversal.pub\""
-            ),
-            "traversal install must not hard-code /tmp for macOS"
-        );
-    }
-
-    #[test]
-    fn live_lab_macos_enforce_uses_writable_staging() {
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "local remote_install_script=\"/private/var/tmp/Install-RustyNetMacosService.sh\""
-            ),
-            "macOS enforce must stage Install-RustyNetMacosService.sh under /private/var/tmp"
-        );
-        assert!(
-            !LIVE_LINUX_LAB_ORCHESTRATOR
-                .contains("local remote_install_script=\"/tmp/Install-RustyNetMacosService.sh\""),
-            "macOS enforce must not regress to locked-down /tmp"
-        );
-    }
-
-    /// Every live-lab stage must automatically append a duration row to
-    /// documents/operations/live_lab_stage_timings.csv, mirroring how cargo
-    /// gate timings land in documents/operations/gate_timings.csv (identical
-    /// schema). run_stage is the single choke point (run_setup_stage delegates
-    /// to it), so the timing helper must be defined and invoked there, and it
-    /// must target the dedicated sibling CSV — not the gate-timings file.
-    #[test]
-    fn live_lab_run_stage_logs_per_stage_timing_to_csv() {
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains("record_stage_timing() {"),
-            "orchestrator must define the record_stage_timing helper"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR
-                .contains("record_stage_timing \"$stage_name\" \"$_stage_elapsed_secs\" \"$status\" \"$started_at\""),
-            "run_stage must invoke record_stage_timing with the raw elapsed seconds and finalized status"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains("documents/operations/live_lab_stage_timings.csv"),
-            "stage timings must be appended to the dedicated live_lab_stage_timings.csv sibling file"
         );
     }
 
@@ -1255,250 +1176,11 @@ mod tests {
             "--dns-zone-max-age-secs 86400",
         ] {
             assert!(
-                LIVE_LINUX_LAB_ORCHESTRATOR.contains(flag),
-                "macOS enforce path (enforce_runtime_worker_macos) must forward {flag} so the \
-                 enforced daemon does not fall back to the strict 300 s production default"
-            );
-            assert!(
                 BOOTSTRAP_SCRIPT.contains(flag),
                 "macOS bootstrap install invocation must forward {flag} so the bootstrap-time \
                  daemon uses the same lab freshness window"
             );
         }
-    }
-
-    #[test]
-    fn live_lab_prime_remote_access_skips_sudo_for_windows_role_node() {
-        // A Windows role node has no sudo. live_lab_push_sudo_password runs a
-        // POSIX `sudo -n` probe over plain ssh (not the cmd.exe/EncodedCommand
-        // wrapper a Windows guest needs), so against a Windows node it blocks
-        // for the full live_lab_ssh timeout (3h) instead of completing. The
-        // prime worker must resolve the node platform and skip the sudo-prime
-        // for windows, returning success without ever invoking the probe.
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR
-                .contains("[prime-remote] %s skipping sudo-prime (windows/non-posix role node)"),
-            "prime_remote_access_worker must skip (not hang on) the sudo-prime for a windows role node"
-        );
-        // The skip must be platform-gated: the worker resolves the node's
-        // platform and the windows branch must precede the sudo push so the
-        // POSIX probe is never reached for a Windows node.
-        let prime_fn = LIVE_LINUX_LAB_ORCHESTRATOR
-            .split("prime_remote_access_worker() {")
-            .nth(1)
-            .and_then(|rest| rest.split("\nstage_preflight() {").next())
-            .expect("prime_remote_access_worker body must be present");
-        let skip_idx = prime_fn
-            .find("skipping sudo-prime (windows/non-posix role node)")
-            .expect("prime worker must log the windows skip");
-        // Match the actual call form (`live_lab_push_sudo_password "$target"`),
-        // not the bare symbol — the guard comment above also names the helper,
-        // and matching the symbol alone would find the comment, not the call.
-        let push_idx = prime_fn
-            .find("live_lab_push_sudo_password \"$target\"")
-            .expect("prime worker must still push sudo for posix nodes");
-        assert!(
-            skip_idx < push_idx,
-            "windows skip must be evaluated before the POSIX sudo-prime so a windows node never reaches it"
-        );
-        assert!(
-            prime_fn.contains("if [[ \"$platform\" == \"windows\" ]]; then"),
-            "prime worker windows guard must branch on the resolved node platform"
-        );
-    }
-
-    #[test]
-    fn live_lab_cleanup_host_worker_reachability_probe_is_platform_aware() {
-        // cleanup_host_worker runs an SSH reachability gate before dispatching
-        // per-platform cleanup. A Windows role node must NOT be probed with the
-        // bare `true`-over-default-shell `ssh_wait_for_host`, which wedges a
-        // memory-pressured Windows guest (the cleanup_hosts hang we are fixing).
-        // The gate must route through ssh_wait_for_host_for_platform, which
-        // sends Windows through the cmd.exe-wrapped probe.
-        let cleanup_fn = LIVE_LINUX_LAB_ORCHESTRATOR
-            .split("cleanup_host_worker() {")
-            .nth(1)
-            .and_then(|rest| rest.split("\ncleanup_host_worker_macos() {").next())
-            .expect("cleanup_host_worker body must be present");
-        assert!(
-            cleanup_fn.contains("ssh_wait_for_host_for_platform \"$target\" \"$platform\" 120 5"),
-            "cleanup_host_worker must gate reachability via the platform-aware probe"
-        );
-        assert!(
-            !cleanup_fn.contains("ssh_wait_for_host \"$target\" 120 5"),
-            "cleanup_host_worker must not call the POSIX-only ssh_wait_for_host directly"
-        );
-    }
-
-    #[test]
-    fn live_lab_windows_reachability_probe_uses_cmd_exe_wrapper() {
-        // The Windows-safe reachability helper must route through
-        // live_lab_ssh_windows (cmd.exe /c powershell.exe -EncodedCommand),
-        // never the POSIX live_lab_ssh_via_ssh default-shell path that hangs.
-        let probe_fn = LIVE_LINUX_LAB_ORCHESTRATOR
-            .split("ssh_wait_for_host_windows() {")
-            .nth(1)
-            .and_then(|rest| rest.split("\nssh_wait_for_host_for_platform() {").next())
-            .expect("ssh_wait_for_host_windows body must be present");
-        assert!(
-            probe_fn.contains("live_lab_ssh_windows \"$target\" 'exit 0'"),
-            "windows reachability probe must use the cmd.exe-wrapped live_lab_ssh_windows"
-        );
-        assert!(
-            !probe_fn.contains("live_lab_ssh_via_ssh"),
-            "windows reachability probe must not use the POSIX default-shell ssh path"
-        );
-        // The dispatcher must send windows to the windows probe and POSIX
-        // platforms to the POSIX probe, and fail closed on an unknown platform.
-        let dispatch_fn = LIVE_LINUX_LAB_ORCHESTRATOR
-            .split("ssh_wait_for_host_for_platform() {")
-            .nth(1)
-            .and_then(|rest| rest.split("\ncapture_boot_id() {").next())
-            .expect("ssh_wait_for_host_for_platform body must be present");
-        assert!(
-            dispatch_fn.contains("windows)")
-                && dispatch_fn.contains(
-                    "ssh_wait_for_host_windows \"$target\" \"$attempts\" \"$sleep_secs\""
-                ),
-            "dispatcher must route windows to the windows-safe probe"
-        );
-        assert!(
-            dispatch_fn.contains("linux|macos)"),
-            "dispatcher must keep the POSIX probe for linux/macos"
-        );
-        assert!(
-            dispatch_fn.contains("unsupported platform"),
-            "dispatcher must fail closed on an unknown platform"
-        );
-    }
-
-    #[test]
-    fn live_lab_windows_bootstrap_worker_reachability_probe_is_windows_safe() {
-        // bootstrap_host_worker_windows used the POSIX ssh_wait_for_host before
-        // its per-step live_lab_ssh_windows calls — the same default-shell hang
-        // class. It must use the Windows-safe probe so the bootstrap_hosts stage
-        // cannot wedge on a Windows guest.
-        let win_bootstrap = LIVE_LINUX_LAB_ORCHESTRATOR
-            .split("bootstrap_host_worker_windows() {")
-            .nth(1)
-            .and_then(|rest| rest.split("\nstage_collect_pubkeys() {").next())
-            .expect("bootstrap_host_worker_windows body must be present");
-        assert!(
-            win_bootstrap.contains("ssh_wait_for_host_windows \"$target\""),
-            "windows bootstrap worker must use the windows-safe reachability probe"
-        );
-        assert!(
-            !win_bootstrap.contains("ssh_wait_for_host \"$target\" ||"),
-            "windows bootstrap worker must not call the POSIX-only ssh_wait_for_host"
-        );
-    }
-
-    #[test]
-    fn live_lab_stage_watchdog_kills_process_tree() {
-        // The per-stage watchdog must terminate the whole descendant tree, not
-        // just the subshell pid: a stuck remote ssh/scp child would otherwise
-        // survive and keep the run wedged past --stage-timeout-secs. This is the
-        // companion to the CLI wiring that forwards the flag.
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains("kill_stage_process_tree() {"),
-            "orchestrator must define a descendant-tree kill helper for the watchdog"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains("kill_stage_process_tree TERM \"$_bg_pid\"")
-                && LIVE_LINUX_LAB_ORCHESTRATOR
-                    .contains("kill_stage_process_tree KILL \"$_bg_pid\""),
-            "stage watchdog must escalate TERM then KILL across the stage process tree"
-        );
-    }
-
-    #[test]
-    fn live_lab_refresh_runtime_state_dispatches_per_platform() {
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "root launchctl kickstart -k system/com.rustynet.privileged-helper 2>/dev/null || true; root launchctl kickstart -k system/com.rustynet.daemon"
-            ),
-            "macOS runtime refresh must bounce daemon via launchctl kickstart"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "live_lab_ssh_windows \"$target\" \"Restart-Service -Name RustyNet -Force\""
-            ),
-            "Windows runtime refresh must restart RustyNet service via PowerShell"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains("rustynet ops force-local-assignment-refresh-now"),
-            "Linux runtime refresh must keep the existing systemd-aware path"
-        );
-    }
-
-    #[test]
-    fn live_lab_refresh_trust_resolves_macos_paths_via_env() {
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR
-                .contains("RUSTYNET_TRUST_SIGNER_KEY='/usr/local/etc/rustynet/trust-evidence.key'"),
-            "macOS trust refresh must pin signer key path to the macOS canonical location"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "RUSTYNET_TRUST_EVIDENCE='/usr/local/var/rustynet/trust/rustynetd.trust'"
-            ),
-            "macOS trust refresh must pin trust evidence path to the macOS canonical location"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "[trust-refresh] %s skipped on windows (DPAPI signer-key unwrap pending)"
-            ),
-            "Windows trust refresh stays an explicit no-op until DPAPI unwrap lands"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains("rustynet ops refresh-signed-trust"),
-            "Linux trust refresh must keep the existing signed-trust verb"
-        );
-    }
-
-    #[test]
-    fn live_lab_role_coupling_validation_passes_platform() {
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "live_lab_apply_role_coupling \"$target\" \"client\" \"$exit_node_id\" \"false\" \"$env_path\" \"true\" \"$platform\""
-            ),
-            "validation role coupling must pass platform so non-Linux uses canonical assignment-refresh.env path"
-        );
-        assert!(
-            !LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "live_lab_apply_role_coupling \"$target\" \"client\" \"$exit_node_id\" \"false\" \"/etc/rustynet/assignment-refresh.env\" \"true\""
-            ),
-            "validation role coupling must not hard-code Linux assignment-refresh.env path"
-        );
-    }
-
-    #[test]
-    fn live_lab_assert_runtime_spec_dispatches_macos_route_assertions() {
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "expected_route_device=\"$(macos_wg_interface_for_node_id \"$node_id\")\""
-            ),
-            "macOS client route device assertion must derive from FNV-1a(node_id), not hard-code rustynet0"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "expected_next_hop=\"direct:$(macos_wg_interface_for_node_id \"$node_id\")\""
-            ),
-            "validate_runtime_worker must derive macOS expected_next_hop from FNV-1a(node_id)"
-        );
-        // Linux assertion must remain unchanged for backwards compatibility.
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "assert_text_contains \"$route_check\" \"$route_label\" \"actual_route_device=rustynet0\""
-            ),
-            "Linux client route device assertion must keep the existing rustynet0 pin"
-        );
-        assert!(
-            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
-                "assert_text_contains \"$route_check\" \"$route_label\" \"actual_route_table=51820\""
-            ),
-            "Linux client route table assertion must keep the existing 51820 pin"
-        );
     }
 
     #[test]

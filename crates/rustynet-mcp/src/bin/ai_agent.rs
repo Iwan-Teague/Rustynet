@@ -3749,20 +3749,24 @@ impl AiAgentServer {
             .get("macos_promote_exit")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let legacy_bash = args
+        // W5.7: the legacy bash orchestrator is deleted; the selector is a
+        // hard error so a stale caller learns why instead of silently routing.
+        if args
             .get("legacy_bash")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(false)
+        {
+            return tool_error(
+                "legacy_bash was retired with the bash orchestrator (W5.7); \
+                 the Rust --node engine is the only path",
+            );
+        }
         // Route this run through the Rust --node engine (synthesizes --node from
-        // the guest + role-platform selectors) instead of the default bash path.
-        // Mutually exclusive with legacy_bash.
+        // the guest + role-platform selectors).
         let rust_engine = args
             .get("rust_engine")
             .and_then(|v| v.as_bool())
             .unwrap_or(true); // default to Rust engine per F9-7
-        if rust_engine && legacy_bash {
-            return tool_error("rust_engine and legacy_bash are mutually exclusive");
-        }
         let entry_vm = get_str(args, "entry_vm")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -3930,7 +3934,6 @@ impl AiAgentServer {
                 blind_exit_platform.as_deref(),
                 entry_vm.as_deref(),
                 macos_promote_exit,
-                legacy_bash,
                 rust_engine,
                 dry_run,
                 windows_only,
@@ -6337,7 +6340,6 @@ fn build_orchestrator_args(
     blind_exit_platform: Option<&str>,
     entry_vm: Option<&str>,
     macos_promote_exit: bool,
-    legacy_bash: bool,
     rust_engine: bool,
     dry_run: bool,
     windows_only: bool,
@@ -6440,14 +6442,6 @@ fn build_orchestrator_args(
         }
         if macos_promote_exit {
             a.push("--macos-promote-exit".to_string());
-        }
-        // The proven orchestrator path for the mac/win ROLE stages
-        // (activate_macos_exit_role + capture, the relay/anchor lifecycle). The
-        // default Rust path may not drive every role stage; the legacy bash
-        // orchestrator does (it flipped relay + reached every prior macOS role
-        // stage). Mutually exclusive with --node (ai_lab_run never uses --node).
-        if legacy_bash {
-            a.push("--legacy-bash-orchestrator".to_string());
         }
         if windows_only {
             a.push("--windows-only".to_string());
@@ -7550,15 +7544,14 @@ impl McpServer for AiAgentServer {
                         "rebuild_nodes": json_schema_string("Comma-separated node aliases to redeploy ONLY (fast re-verify after a per-node patch)."),
                         "exit_vm": json_schema_string("Linux exit-node alias for this run's backbone (use a DISJOINT exit_vm/client_vm per run when running concurrently)."),
                         "client_vm": json_schema_string("Linux client-node alias for this run's backbone."),
-                        "exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
-                        "relay_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the RELAY role so the focused mac/win relay cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
-                        "anchor_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ANCHOR role so the focused mac/win anchor cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
-                        "admin_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ADMIN role so the focused mac/win admin issue cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
-                        "blind_exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the BLIND_EXIT role so the focused mac/win blind-exit cell runs live instead of skipping. Routes through the Rust --node engine by DEFAULT (rust_engine defaults to true); pass legacy_bash: true to force the old bash path instead."),
-                        "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm. Routes through the Rust --node engine by DEFAULT; pass legacy_bash: true to force the old bash path instead."}),
+                        "exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the EXIT role so the focused mac/win exit cell runs live instead of skipping. Routes through the Rust --node engine (the only engine since W5.7)."),
+                        "relay_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the RELAY role so the focused mac/win relay cell runs live instead of skipping. Routes through the Rust --node engine (the only engine since W5.7)."),
+                        "anchor_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ANCHOR role so the focused mac/win anchor cell runs live instead of skipping. Routes through the Rust --node engine (the only engine since W5.7)."),
+                        "admin_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the ADMIN role so the focused mac/win admin issue cell runs live instead of skipping. Routes through the Rust --node engine (the only engine since W5.7)."),
+                        "blind_exit_platform": json_schema_string("ELECT this OS (linux|macos|windows) into the BLIND_EXIT role so the focused mac/win blind-exit cell runs live instead of skipping. Routes through the Rust --node engine (the only engine since W5.7)."),
+                        "macos_promote_exit": json!({"type": "boolean", "description": "Option-B selector: elect macOS as a SECONDARY exit so the macOS exit cell runs live (drives is_macos_active_exit). Use alongside exit_vm/client_vm/entry_vm. Routes through the Rust --node engine (the only engine since W5.7)."}),
                         "entry_vm": json_schema_string("Linux entry-node alias for the Option-B exit topology (used alongside exit_vm/client_vm + macos_promote_exit)."),
-                        "legacy_bash": json!({"type": "boolean", "description": "Force this run through the legacy bash orchestrator instead of the DEFAULT Rust --node engine. Bash is slated for removal once Rust parity evidence is complete — only set this for an explicit bash-vs-rust comparison, or if a stage genuinely isn't ported to Rust yet. Mutually exclusive with rust_engine: true (which is already the default)."}),
-                        "rust_engine": json!({"type": "boolean", "description": "Route the run through the Rust-native --node orchestrator engine. DEFAULTS TO TRUE — you do not need to set this explicitly; it exists so callers can see/assert the routing, and so legacy_bash can be validated as mutually exclusive. Synthesizes --node <alias>:<role> from the guest (exit_vm/client_vm/entry_vm/macos_vm/windows_vm) + role-platform selectors, so the mesh is driven by the pure-Rust state machine."}),
+                        "rust_engine": json!({"type": "boolean", "description": "Route the run through the Rust-native --node orchestrator engine. DEFAULTS TO TRUE — you do not need to set this explicitly; it exists so callers can see/assert the routing (the legacy bash engine was deleted in W5.7). Synthesizes --node <alias>:<role> from the guest (exit_vm/client_vm/entry_vm/macos_vm/windows_vm) + role-platform selectors, so the mesh is driven by the pure-Rust state machine."}),
                         "skip_linux_live_suite": json!({"type": "boolean", "description": "FAST mac/win cell iteration: skip the ~30-45 min Linux live-validation suite (anchor/role-switch/exit-handoff/relay/two-hop/managed-dns/chaos) and jump straight to the mac/win role stages AFTER setup (bootstrap + membership + signed-bundle distribution still run, because the mac/win stages need the mesh). Pair with a role-platform selector (exit_platform/relay_platform/anchor_platform/blind_exit_platform or macos_promote_exit) to drive ONE mac/win cell live without paying for the whole Linux lab. The mac/win stages gate on setup's distribute_* outcomes, not the Linux suite, so they stay fully exercised. Use this whenever you are failing on a mac/win stage and the Linux suite would just be wasted time."}),
                         "windows_only": json!({"type": "boolean", "description": "Skip ALL Linux stages (incl. membership setup) and run ONLY the Windows bootstrap + validation stages; requires windows_vm. NOTE: this also skips membership distribution, so it only works when the Windows guest is already mesh-joined from a prior run — for a fresh Windows cell use skip_linux_live_suite instead (keeps setup)."}),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
@@ -9015,7 +9008,6 @@ mod tests {
             None,             // blind_exit_platform
             Some("debian-3"), // entry_vm
             true,             // macos_promote_exit
-            true,             // legacy_bash
             false,            // rust_engine
             false,            // dry_run
             false,            // windows_only
@@ -9041,7 +9033,7 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--admin-platform", "macos"]));
         assert!(a.windows(2).any(|w| w == ["--entry-vm", "debian-3"]));
         assert!(a.iter().any(|x| x == "--macos-promote-exit"));
-        assert!(a.iter().any(|x| x == "--legacy-bash-orchestrator"));
+        assert!(!a.iter().any(|x| x == "--legacy-bash-orchestrator"));
         assert!(a.iter().any(|x| x == "--skip-linux-live-suite"));
         // Selectors NOT provided do not appear.
         assert!(!a.iter().any(|x| x == "--windows-vm"));
@@ -9070,7 +9062,6 @@ mod tests {
             None,
             false,
             false,
-            false,
             true,
             false,
             false,
@@ -9096,7 +9087,7 @@ mod tests {
         };
         let a = build_orchestrator_args(
             "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None, None,
-            false, false, true, false, false, false, &opted_out,
+            false, true, false, false, false, &opted_out,
         );
         assert!(a.iter().any(|x| x == "--skip-cross-network"));
 
@@ -9109,7 +9100,7 @@ mod tests {
         };
         let b = build_orchestrator_args(
             "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None, None,
-            false, false, true, false, false, false, &selected,
+            false, true, false, false, false, &selected,
         );
         assert!(!b.iter().any(|x| x == "--skip-cross-network"));
         assert!(
@@ -9244,7 +9235,6 @@ mod tests {
             None,
             None,  // entry_vm
             false, // macos_promote_exit
-            false, // legacy_bash
             true,  // rust_engine
             false, // dry_run
             false, // windows_only
@@ -9284,7 +9274,6 @@ mod tests {
             None,
             None,
             false,
-            false,
             true, // rust_engine
             false,
             false,
@@ -9321,7 +9310,6 @@ mod tests {
             None,
             Some("debian-3"),
             true,
-            false,
             true,
             false,
             false,

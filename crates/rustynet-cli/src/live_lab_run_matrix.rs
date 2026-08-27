@@ -350,13 +350,6 @@ pub struct LiveLabRunMatrixAppendConfig<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendOrchestratorRunToMatrixConfig {
-    pub report_dir: PathBuf,
-    pub profile_path: Option<PathBuf>,
-    pub inventory_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveLabRunMatrixAppendResult {
     pub matrix_path: PathBuf,
     pub report_row_path: PathBuf,
@@ -415,9 +408,11 @@ struct NodeStagePlanEntry {
     roles: Vec<String>,
 }
 
-/// The **legacy (bash orchestrator)** run matrix. Frozen historical archive:
-/// the Rust `--node` engine no longer appends here and no tooling reads it for
-/// current coverage. See [`default_live_lab_node_run_matrix_path`].
+/// The **legacy (bash orchestrator)** run matrix. Frozen historical archive,
+/// read-only via the MCP `bash_archive` engine and the lab-monitor archive
+/// view; NOTHING writes here anymore (the bash engine and its EXIT-trap writer
+/// were deleted in W5.7). See [`default_live_lab_node_run_matrix_path`].
+#[allow(dead_code)] // MUST-KEEP (BashRetirementPlan §3): read-only accessor for the frozen bash archive.
 pub fn default_live_lab_run_matrix_path() -> PathBuf {
     workspace_root_path().join("documents/operations/live_lab_run_matrix.csv")
 }
@@ -454,97 +449,17 @@ pub fn default_live_lab_node_run_matrix_path() -> PathBuf {
     workspace_root_path().join("documents/operations/live_lab_node_run_matrix.csv")
 }
 
-pub fn execute_ops_append_orchestrator_run_to_matrix(
-    config: AppendOrchestratorRunToMatrixConfig,
-) -> Result<LiveLabRunMatrixAppendResult, String> {
-    let report_dir = config.report_dir.as_path();
-
-    // Read run_note from run_summary.json if present
-    let run_summary_path = report_dir.join("run_summary.json");
-    let run_note = if run_summary_path.is_file() {
-        let body = std::fs::read_to_string(&run_summary_path)
-            .map_err(|e| format!("read run_summary.json: {e}"))?;
-        let val: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| format!("parse run_summary.json: {e}"))?;
-        val.get("run_note")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    } else {
-        None
-    };
-
-    // Read first failure context from failure_digest.json if present
-    let first_failure_note = {
-        let digest_path = report_dir.join("failure_digest.json");
-        if digest_path.is_file() {
-            let body = std::fs::read_to_string(&digest_path)
-                .map_err(|e| format!("read failure_digest.json: {e}"))?;
-            let val: serde_json::Value = serde_json::from_str(&body)
-                .map_err(|e| format!("parse failure_digest.json: {e}"))?;
-            if let Some(first) = val.get("first_failure").filter(|v| !v.is_null()) {
-                let stage = first
-                    .get("stage")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let reason = first
-                    .get("primary_failure_reason")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| first.get("message").and_then(|v| v.as_str()))
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("see log");
-                Some(format!("first_failed: {stage}; {reason}"))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-
-    // Combine notes: run_note, then failure detail if any
-    let notes = match (run_note, first_failure_note) {
-        (Some(n), Some(f)) => Some(format!("{n}; {f}")),
-        (Some(n), None) => Some(n),
-        (None, Some(f)) => Some(f),
-        (None, None) => None,
-    };
-
-    append_live_lab_run_matrix_row(LiveLabRunMatrixAppendConfig {
-        command_name: "live-linux-lab-orchestrator",
-        report_dir,
-        profile_path: config.profile_path.as_deref(),
-        inventory_path: config.inventory_path.as_deref(),
-        extra_stage_outcomes: &[],
-        notes,
-        // The bash EXIT trap fires before the wrapper's sidecar stages and
-        // overall verdict exist; its row is systematically optimistic
-        // (46 of 49 historical disagreements). Interim: kept only until —
-        // and unless — the supervisor's Final row lands for the same run.
-        row_role: LiveLabRunMatrixRowRole::Interim,
-    })
-}
-
 pub fn append_live_lab_run_matrix_row(
     config: LiveLabRunMatrixAppendConfig<'_>,
 ) -> Result<LiveLabRunMatrixAppendResult, String> {
-    // Only the Rust `--node` engine writes a node stage plan into its report
-    // dir, so its presence is the engine signal — the same one the node stage
-    // ledger write below already relies on. Route each engine's rows to its own
-    // matrix: a blended file lets a bash-era `pass` be read as a `--node` pass.
-    let is_node_run = config
-        .report_dir
-        .join(NODE_STAGE_PLAN_RELATIVE_PATH)
-        .is_file();
-    let matrix_path = if is_node_run {
-        default_live_lab_node_run_matrix_path()
-    } else {
-        default_live_lab_run_matrix_path()
-    };
+    // W5.7: the Rust `--node` engine is the only writer — every row routes to
+    // the node matrix unconditionally. The bash archive
+    // (`default_live_lab_run_matrix_path`) is read-only history (MCP
+    // `engine=bash_archive`); its EXIT-trap writer died with the bash engine.
+    let matrix_path = default_live_lab_node_run_matrix_path();
     let schema = ensure_matrix_schema(matrix_path.as_path())?;
     let values = build_live_lab_run_matrix_values(&schema, &config)?;
-    if config.row_role == LiveLabRunMatrixRowRole::Final && is_node_run {
+    if config.row_role == LiveLabRunMatrixRowRole::Final {
         write_node_stage_result_ledgers(config.report_dir, &values)?;
     }
     let written = upsert_csv_row(matrix_path.as_path(), &schema, &values, config.row_role)?;
@@ -4727,6 +4642,19 @@ mod conclusion_barrier_tests {
         dir
     }
 
+    fn test_plan() -> std::collections::HashSet<String> {
+        [
+            "preflight",
+            "bootstrap_hosts",
+            "membership_init",
+            "distribute_membership",
+            "live_managed_dns",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+    }
+
     fn evidence(stage: &str, status: &str) -> StageEvidence {
         StageEvidence {
             started_at: String::new(),
@@ -4740,7 +4668,8 @@ mod conclusion_barrier_tests {
     /// (Linux-only selectors keep the eligible set small enough to
     /// enumerate exactly: the shared pipeline + the non-audit live suite.)
     fn fully_recorded_evidence() -> Vec<StageEvidence> {
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
+        let manifest =
+            build_stage_manifest("test", "full", &TargetSelectors::default(), &test_plan());
         manifest
             .stages
             .iter()
@@ -4752,7 +4681,8 @@ mod conclusion_barrier_tests {
     #[test]
     fn barrier_synthesizes_aborted_for_planned_unrecorded_stages() {
         let dir = temp_report_dir("synthesizes");
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
+        let manifest =
+            build_stage_manifest("test", "full", &TargetSelectors::default(), &test_plan());
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
 
         // The run recorded everything except live_managed_dns.
@@ -4773,7 +4703,8 @@ mod conclusion_barrier_tests {
     #[test]
     fn barrier_is_silent_when_every_planned_stage_recorded() {
         let dir = temp_report_dir("complete");
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
+        let manifest =
+            build_stage_manifest("test", "full", &TargetSelectors::default(), &test_plan());
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = fully_recorded_evidence();
         let before = stages.len();
@@ -4786,8 +4717,12 @@ mod conclusion_barrier_tests {
     fn barrier_respects_run_mode_exemptions_and_node_composites() {
         let dir = temp_report_dir("modes");
         // setup_only: recording nothing for the live suite is legitimate.
-        let manifest =
-            build_stage_manifest("test", "setup_only", &TargetSelectors::default(), None);
+        let manifest = build_stage_manifest(
+            "test",
+            "setup_only",
+            &TargetSelectors::default(),
+            &test_plan(),
+        );
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = vec![evidence("preflight", "pass")];
         apply_conclusion_barrier(&mut stages, dir.as_path()).expect("barrier");
@@ -4803,7 +4738,8 @@ mod conclusion_barrier_tests {
 
         // Node-scoped composites count as recordings of the bare stage.
         let dir = temp_report_dir("composites");
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
+        let manifest =
+            build_stage_manifest("test", "full", &TargetSelectors::default(), &test_plan());
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = fully_recorded_evidence();
         // Replace the flat record with a node-scoped one.
@@ -4825,7 +4761,8 @@ mod conclusion_barrier_tests {
         // Chaos + audit families stay quiet even though a full manifest
         // exists: chaos is disabled by default selectors, audits are
         // barrier-exempt (conditional dispatch).
-        let manifest = build_stage_manifest("test", "full", &TargetSelectors::default(), None);
+        let manifest =
+            build_stage_manifest("test", "full", &TargetSelectors::default(), &test_plan());
         write_stage_manifest(dir.as_path(), &manifest).expect("write manifest");
         let mut stages = fully_recorded_evidence();
         apply_conclusion_barrier(&mut stages, dir.as_path()).expect("barrier");

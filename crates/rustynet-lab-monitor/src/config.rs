@@ -35,9 +35,10 @@ pub struct MonitorConfig {
     pub triage_on_failure: bool,
     #[serde(default)]
     pub dry_run: bool,
-    /// Launch engine for live-lab runs started from the monitor.
-    /// Default is the Rust-native `--node` path; use `legacy-bash` only as an
-    /// explicit escape hatch while comparing old evidence.
+    /// Launch engine for live-lab runs started from the monitor. The Rust
+    /// `--node` path is the only engine (W5.7 deleted the bash orchestrator);
+    /// the field survives so stale configs still parse, but every value
+    /// launches the Rust engine.
     #[serde(default = "default_engine")]
     pub engine: String,
     #[serde(default)]

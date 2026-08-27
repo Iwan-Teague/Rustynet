@@ -61,11 +61,10 @@ pub fn build_loop_args(config: &MonitorConfig) -> Vec<String> {
     if config.dry_run {
         args.push("dry_run=true".to_string());
     }
-    if rust_engine {
-        args.push("rust_engine=true".to_string());
-    } else {
-        args.push("legacy_bash=true".to_string());
-    }
+    // W5.7: the legacy bash engine is deleted; every launch is the Rust
+    // --node engine.
+    let _ = rust_engine;
+    args.push("rust_engine=true".to_string());
     args
 }
 
@@ -97,54 +96,6 @@ pub fn build_orchestrator_args(
         if !config.rebuild_nodes.is_empty() {
             a.extend(["--rebuild-nodes".to_string(), config.rebuild_nodes.clone()]);
         }
-    } else {
-        if !config.macos_vm.is_empty() {
-            a.extend(["--macos-vm".to_string(), config.macos_vm.clone()]);
-        }
-        if !config.windows_vm.is_empty() {
-            a.extend(["--windows-vm".to_string(), config.windows_vm.clone()]);
-        }
-        if !config.exit_vm.is_empty() {
-            a.extend(["--exit-vm".to_string(), config.exit_vm.clone()]);
-        }
-        if !config.client_vm.is_empty() {
-            a.extend(["--client-vm".to_string(), config.client_vm.clone()]);
-        }
-        if !config.rebuild_nodes.is_empty() {
-            a.extend(["--rebuild-nodes".to_string(), config.rebuild_nodes.clone()]);
-        }
-
-        if !config.exit_platform.is_empty() {
-            a.extend(["--exit-platform".to_string(), config.exit_platform.clone()]);
-        }
-        if !config.relay_platform.is_empty() {
-            a.extend([
-                "--relay-platform".to_string(),
-                config.relay_platform.clone(),
-            ]);
-        }
-        if !config.anchor_platform.is_empty() {
-            a.extend([
-                "--anchor-platform".to_string(),
-                config.anchor_platform.clone(),
-            ]);
-        }
-        if !config.admin_platform.is_empty() {
-            a.extend([
-                "--admin-platform".to_string(),
-                config.admin_platform.clone(),
-            ]);
-        }
-        if !config.blind_exit_platform.is_empty() {
-            a.extend([
-                "--blind-exit-platform".to_string(),
-                config.blind_exit_platform.clone(),
-            ]);
-        }
-        if config.macos_promote_exit {
-            a.push("--macos-promote-exit".to_string());
-        }
-        a.push("--legacy-bash-orchestrator".to_string());
     }
 
     let mut normalized = config.clone();
@@ -336,8 +287,10 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--legacy-bash-orchestrator"));
     }
 
+    /// W5.7: a stale `engine = "legacy-bash"` config no longer selects a bash
+    /// path (deleted); every launch synthesizes `--node` assignments.
     #[test]
-    fn direct_orchestrator_args_legacy_engine_uses_legacy_flags() {
+    fn direct_orchestrator_args_route_node_even_for_stale_legacy_engine_value() {
         let config = MonitorConfig {
             engine: "legacy-bash".to_owned(),
             ..MonitorConfig::default()
@@ -349,13 +302,8 @@ mod tests {
             "known_hosts",
             "report",
         );
-
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["--exit-vm", "debian-headless-1"])
-        );
-        assert!(args.iter().any(|arg| arg == "--legacy-bash-orchestrator"));
-        assert!(!args.iter().any(|arg| arg == "--node"));
+        assert!(!args.iter().any(|arg| arg == "--legacy-bash-orchestrator"));
+        assert!(args.iter().any(|arg| arg == "--node"));
     }
 
     #[test]

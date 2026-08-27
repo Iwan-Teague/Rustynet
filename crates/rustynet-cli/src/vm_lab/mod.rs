@@ -47,7 +47,6 @@ use zip::{CompressionMethod, ZipWriter};
 
 const DEFAULT_UTMCTL_PATH: &str = "/Applications/UTM.app/Contents/MacOS/utmctl";
 const DEFAULT_VM_LAB_INVENTORY_PATH: &str = "documents/operations/active/vm_lab_inventory.json";
-const DEFAULT_LIVE_LAB_ORCHESTRATOR_PATH: &str = "scripts/e2e/live_linux_lab_orchestrator.sh";
 const DEFAULT_CROSS_NETWORK_DIRECT_SCRIPT: &str =
     "scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh";
 const DEFAULT_CROSS_NETWORK_RELAY_SCRIPT: &str =
@@ -94,8 +93,6 @@ fn local_process_probe_timeout(operator_timeout: Duration) -> Duration {
 const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
 const WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS: u64 = 300;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
-const DEFAULT_LIVE_LAB_PROFILE_ROOT: &str = "profiles/live_lab";
-const DEFAULT_LIVE_LAB_REPORT_ROOT: &str = "artifacts/live_lab";
 const WINDOWS_BOOTSTRAP_HELPER_ROOT: &str = "scripts/bootstrap/windows";
 const WINDOWS_COMPAT_VM_LAB_HELPER_ROOT: &str = "scripts/vm_lab/windows";
 const WINDOWS_BOOTSTRAP_HELPER_FILE: &str = "Bootstrap-RustyNetWindows.ps1";
@@ -129,24 +126,10 @@ const WINDOWS_KILLSWITCH_SMOKE_HELPER_FILE: &str = "Invoke-RustyNetWindowsKillsw
 const WINDOWS_ANCHOR_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindowsAnchorService.ps1";
 const SETUP_MANIFEST_RELATIVE_PATH: &str = "state/setup_manifest.json";
 const REPORT_STATE_RELATIVE_PATH: &str = "state/report_state.json";
-const RELEASE_GATE_COMPLETENESS_RELATIVE_PATH: &str = "state/release_gate_completeness.json";
 const VM_LAB_WRAPPER_SOURCE_RELATIVE_PATH: &str = "crates/rustynet-cli/src/vm_lab/mod.rs";
 const DEFAULT_PRECHECK_COMMANDS: &[&str] = &["git", "cargo", "systemctl"];
 const POLL_INTERVAL_MILLIS: u64 = 100;
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
-const FULL_RELEASE_GATE_REQUIRED_STAGES: &[&str] = &[
-    "live_anchor",
-    "live_role_switch_matrix",
-    "live_exit_handoff",
-    "live_two_hop",
-    "live_lan_toggle",
-    "live_managed_dns",
-    "fresh_install_os_matrix_report",
-    "local_full_gate_suite",
-    "extended_soak",
-    "cross_network_nat_matrix",
-];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabListConfig {
     pub inventory_path: PathBuf,
@@ -539,27 +522,6 @@ pub struct VmLabWriteLiveLabProfileConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmLabRunLiveLabConfig {
-    pub profile_path: PathBuf,
-    pub script_path: PathBuf,
-    pub dry_run: bool,
-    pub skip_setup: bool,
-    pub skip_gates: bool,
-    pub skip_soak: bool,
-    pub skip_cross_network: bool,
-    pub enable_chaos_suite: bool,
-    pub source_mode: Option<String>,
-    pub repo_ref: Option<String>,
-    pub report_dir: Option<PathBuf>,
-    pub timeout_secs: u64,
-    /// Per-stage watchdog timeout in seconds, forwarded to the bash
-    /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
-    /// `0` disables the watchdog (historical behaviour).
-    pub stage_timeout_secs: u64,
-    pub orchestrated: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabSetupLiveLabConfig {
     pub inventory_path: PathBuf,
     pub profile_path: Option<PathBuf>,
@@ -575,7 +537,6 @@ pub struct VmLabSetupLiveLabConfig {
     pub ssh_identity_file: PathBuf,
     pub known_hosts_path: Option<PathBuf>,
     pub require_same_network: bool,
-    pub script_path: PathBuf,
     pub report_dir: PathBuf,
     pub source_mode: Option<String>,
     pub repo_ref: Option<String>,
@@ -1159,7 +1120,6 @@ pub struct VmLabOrchestrateLiveLabConfig {
     pub ssh_identity_file: PathBuf,
     pub known_hosts_path: Option<PathBuf>,
     pub require_same_network: bool,
-    pub script_path: PathBuf,
     pub report_dir: PathBuf,
     pub source_mode: Option<String>,
     pub repo_ref: Option<String>,
@@ -1246,12 +1206,6 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// translation + routing surface; default flips to Rust path once
     /// W5.5 cross-orchestrator parity evidence is captured.)
     pub node_assignments: Vec<orchestrator::role_assignment::NodeRoleAssignment>,
-    /// Transitional escape hatch (W5.6, removed in W5.7). When set, force
-    /// the bash orchestrator path even if other flags would otherwise
-    /// route to the Rust orchestrator. Mutually exclusive with `--node`
-    /// because the bash orchestrator does not consume `<alias>:<role>`
-    /// pairs and would silently ignore them.
-    pub legacy_bash_orchestrator: bool,
     /// CIDR list (comma-separated, e.g. `192.168.64.0/24`) propagated to
     /// the Linux bootstrap script as `SSH_ALLOW_CIDRS`. The Rust path
     /// pipes it into `rustynet ops e2e-bootstrap-host --ssh-allow-cidrs`,
@@ -1343,11 +1297,6 @@ pub struct VmLabOrchestrateLiveLabConfig {
 }
 
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
-///
-/// Currently:
-/// - `--legacy-bash-orchestrator` is mutually exclusive with `--node`
-///   (the bash path cannot consume role assignments; silently ignoring
-///   them would mask operator intent).
 pub fn validate_orchestrate_live_lab_config(
     config: &VmLabOrchestrateLiveLabConfig,
 ) -> Result<(), String> {
@@ -1360,20 +1309,6 @@ pub fn validate_orchestrate_live_lab_config(
     if config.stop_after_ready && (config.setup_only || config.run_only) {
         return Err(
             "--stop-after-ready cannot be combined with --setup-only or --run-only".to_owned(),
-        );
-    }
-    if config.legacy_bash_orchestrator && !config.node_assignments.is_empty() {
-        return Err(
-            "--legacy-bash-orchestrator is mutually exclusive with --node; \
-             pass either the legacy --*-vm flag set or --node assignments, not both"
-                .to_owned(),
-        );
-    }
-    if config.legacy_bash_orchestrator && (config.setup_only || config.run_only) {
-        return Err(
-            "--legacy-bash-orchestrator is mutually exclusive with --setup-only/--run-only; \
-             those modes are Rust --node only"
-                .to_owned(),
         );
     }
     if config.setup_only && config.node_assignments.is_empty() {
@@ -1406,138 +1341,6 @@ pub fn validate_orchestrate_live_lab_config(
         return Err("--max-parallel-node-workers must be at least 1".to_owned());
     }
     Ok(())
-}
-
-/// Configuration for `vm-lab-diff-orchestrator-parity`. The subcommand is
-/// the W5.5 evidence harness: takes two `parity_input.json` snapshots
-/// (one bash, one Rust), emits a machine-readable parity diff to
-/// `--output`, and exits non-zero on any drift.
-/// Which parity comparison `vm-lab-diff-orchestrator-parity` runs.
-///
-/// `Strict` (default) requires byte-identical stage-ID sets — correct for
-/// same-dialect regression (e.g. Rust-vs-Rust determinism). `Functional`
-/// normalizes the bash/Rust stage-ID dialects via
-/// `orchestrator::parity::canonical_stage_id` and compares the shared logical
-/// work + overall status + node count. Strict is UNSATISFIABLE across dialects
-/// (bash and Rust name their stages differently by design); Functional is the
-/// satisfiable cross-dialect (bash-vs-Rust) gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ParityMode {
-    #[default]
-    Strict,
-    Functional,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmLabDiffOrchestratorParityConfig {
-    pub left_path: PathBuf,
-    pub right_path: PathBuf,
-    pub output_path: PathBuf,
-    pub mode: ParityMode,
-}
-
-pub fn execute_ops_vm_lab_diff_orchestrator_parity(
-    config: VmLabDiffOrchestratorParityConfig,
-) -> Result<String, String> {
-    let left_bytes = fs::read(&config.left_path).map_err(|err| {
-        format!(
-            "read left parity input '{}': {err}",
-            config.left_path.display()
-        )
-    })?;
-    let right_bytes = fs::read(&config.right_path).map_err(|err| {
-        format!(
-            "read right parity input '{}': {err}",
-            config.right_path.display()
-        )
-    })?;
-    let left: orchestrator::report::LiveLabRunReport = serde_json::from_slice(&left_bytes)
-        .map_err(|err| {
-            format!(
-                "parse left parity input '{}': {err}",
-                config.left_path.display()
-            )
-        })?;
-    let right: orchestrator::report::LiveLabRunReport = serde_json::from_slice(&right_bytes)
-        .map_err(|err| {
-            format!(
-                "parse right parity input '{}': {err}",
-                config.right_path.display()
-            )
-        })?;
-    // Create the output directory once (shared by both modes).
-    if let Some(parent) = config.output_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "create parity diff output directory '{}': {err}",
-                parent.display()
-            )
-        })?;
-    }
-
-    match config.mode {
-        // Strict: byte-identical stage-ID sets required. Output shape is
-        // unchanged from before `--mode` existed (a bare `ParityDiff`), so
-        // existing evidence consumers keep working. Unsatisfiable across
-        // dialects; correct for same-dialect (Rust-vs-Rust) regression.
-        ParityMode::Strict => {
-            let diff = orchestrator::parity::diff_live_lab_reports(&left, &right);
-            let body = serde_json::to_vec_pretty(&diff)
-                .map_err(|err| format!("serialize parity diff: {err}"))?;
-            fs::write(&config.output_path, &body).map_err(|err| {
-                format!(
-                    "write parity diff to '{}': {err}",
-                    config.output_path.display()
-                )
-            })?;
-            let summary = format!(
-                "parity_diff[strict]: pass={} stages={} stages_only_left={} \
-                 stages_only_right={} node_count_left={} node_count_right={}",
-                diff.overall_parity_pass,
-                diff.stages.len(),
-                diff.stages_only_in_left.len(),
-                diff.stages_only_in_right.len(),
-                diff.node_count_left,
-                diff.node_count_right,
-            );
-            if diff.overall_parity_pass {
-                Ok(summary)
-            } else {
-                Err(summary)
-            }
-        }
-        // Functional: the satisfiable cross-dialect gate. Normalizes the
-        // bash/Rust stage-ID vocabularies and compares the shared logical
-        // work + overall status + node count. Fail-closed on zero overlap.
-        ParityMode::Functional => {
-            let diff = orchestrator::parity::diff_live_lab_reports_functional(&left, &right);
-            let body = serde_json::to_vec_pretty(&diff)
-                .map_err(|err| format!("serialize functional parity diff: {err}"))?;
-            fs::write(&config.output_path, &body).map_err(|err| {
-                format!(
-                    "write parity diff to '{}': {err}",
-                    config.output_path.display()
-                )
-            })?;
-            let summary = format!(
-                "parity_diff[functional]: pass={} shared_stages={} only_left={} \
-                 only_right={} overall_status_match={} node_count_match={}",
-                diff.overall_functional_parity_pass,
-                diff.shared_stage_count,
-                diff.stages_only_in_left.len(),
-                diff.stages_only_in_right.len(),
-                diff.overall_status_match,
-                diff.node_count_match,
-            );
-            if diff.overall_functional_parity_pass {
-                Ok(summary)
-            } else {
-                Err(summary)
-            }
-        }
-    }
 }
 
 /// Configuration for `vm-lab-emit-parity-input`: reconstruct a
@@ -1592,18 +1395,14 @@ pub fn execute_ops_vm_lab_emit_parity_input(
 /// Build the deprecation-warning lines (newline-free, one per item) that
 /// callers should emit on stderr when the operator invoked
 /// `vm-lab-orchestrate-live-lab` with the legacy `--*-vm` flag set but
-/// without `--node` and without `--legacy-bash-orchestrator`.
-///
-/// The warning is informational only: routing is unchanged for now (the
-/// bash orchestrator stays default until W5.5 parity is proven). Once
-/// proven, the default flips and the warning escalates the operator's
-/// migration path.
+/// without `--node`. Informational only; the flags still translate.
 /// Track B Step 1 — emit a single stderr line per role whose alias was
 /// resolved by the topology layer FROM A NON-EXPLICIT source (i.e.
 /// `--topology-profile` or `--exit-platform / --relay-platform /
 /// --anchor-platform`). Roles resolved from the existing explicit
 /// `--exit-vm` etc flags stay silent so default Linux-exit runs
 /// produce byte-identical stderr output.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn log_topology_resolution_overrides(resolution: &topology::TopologyResolution) {
     for resolved in [
         resolution.exit.as_ref(),
@@ -1629,7 +1428,7 @@ fn log_topology_resolution_overrides(resolution: &topology::TopologyResolution) 
 pub fn legacy_role_flags_deprecation_warnings(
     config: &VmLabOrchestrateLiveLabConfig,
 ) -> Vec<String> {
-    if config.legacy_bash_orchestrator || !config.node_assignments.is_empty() {
+    if !config.node_assignments.is_empty() {
         return Vec::new();
     }
     let any_legacy_role_flag_set = config.exit_vm.is_some()
@@ -1647,73 +1446,11 @@ pub fn legacy_role_flags_deprecation_warnings(
          --fifth-client-vm/--windows-vm are transitional aliases; prefer \
          repeated --node <alias>:<role> flags for the same role assignment."
             .to_owned(),
-        "the Rust --node orchestrator is now the default execution path for \
-         standard Linux role-flag runs (W5.6); runs using platform selectors, \
-         --macos-vm/--windows-vm, or --topology-profile still use the bash path \
-         for now. Pass --legacy-bash-orchestrator to force the legacy bash path \
-         explicitly (transitional, removed in W5.7)."
+        "the Rust --node orchestrator is the sole execution engine (W5.7); \
+         shapes it cannot reproduce (platform selectors, --macos-vm/--windows-vm, \
+         --topology-profile) fail closed with the reason."
             .to_owned(),
     ]
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VmLabIterationValidationStep {
-    FmtCheck,
-    CargoCheckPackage {
-        package: String,
-    },
-    CargoCheckBin {
-        package: String,
-        bin: String,
-    },
-    CargoTestPackage {
-        package: String,
-        filter: Option<String>,
-    },
-    CargoTestBin {
-        package: String,
-        bin: String,
-        filter: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmLabIterateLiveLabConfig {
-    pub inventory_path: PathBuf,
-    pub profile_output_path: Option<PathBuf>,
-    pub exit_vm: Option<String>,
-    pub exit_target: Option<String>,
-    pub client_vm: Option<String>,
-    pub client_target: Option<String>,
-    pub entry_vm: Option<String>,
-    pub entry_target: Option<String>,
-    pub aux_vm: Option<String>,
-    pub aux_target: Option<String>,
-    pub extra_vm: Option<String>,
-    pub extra_target: Option<String>,
-    pub fifth_client_vm: Option<String>,
-    pub fifth_client_target: Option<String>,
-    pub require_same_network: bool,
-    pub ssh_identity_file: PathBuf,
-    pub ssh_known_hosts_file: Option<PathBuf>,
-    pub ssh_allow_cidrs: Option<String>,
-    pub network_id: Option<String>,
-    pub traversal_ttl_secs: Option<u64>,
-    pub backend: Option<String>,
-    pub source_mode: Option<String>,
-    pub repo_ref: Option<String>,
-    pub report_dir: Option<PathBuf>,
-    pub script_path: PathBuf,
-    pub dry_run: bool,
-    pub timeout_secs: u64,
-    pub skip_gates: bool,
-    pub skip_soak: bool,
-    pub skip_cross_network: bool,
-    pub require_clean_tree: bool,
-    pub require_local_head: bool,
-    pub validation_steps: Vec<VmLabIterationValidationStep>,
-    pub collect_failure_diagnostics: bool,
-    pub failed_log_tail_lines: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2650,13 +2387,6 @@ struct LocalUtmSelectedReadinessSummary {
     unready_entries: Vec<LocalUtmSelectedReadinessEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveLabSetupSelection {
-    profile_path: PathBuf,
-    profile_generated: bool,
-    profile_generation_summary: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LiveLabFileBinding {
     path: String,
@@ -2672,35 +2402,12 @@ struct LiveLabGitProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct LiveLabSetupModeFlags {
-    require_same_network: Option<bool>,
-    dry_run: bool,
-    max_parallel_node_workers: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LiveLabRunModeFlags {
     dry_run: bool,
     skip_setup: bool,
     skip_gates: bool,
     skip_soak: bool,
     skip_cross_network: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct LiveLabSetupManifest {
-    version: u32,
-    created_at_unix: u64,
-    report_dir_path: String,
-    report_dir_sha256: String,
-    profile: LiveLabFileBinding,
-    profile_semantic_sha256: String,
-    script: LiveLabFileBinding,
-    inventory: Option<LiveLabFileBinding>,
-    wrapper_source: LiveLabFileBinding,
-    wrapper_version: String,
-    git: LiveLabGitProvenance,
-    setup_flags: LiveLabSetupModeFlags,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2729,15 +2436,6 @@ struct LiveLabReportState {
     full_release_gate_requested: bool,
     full_release_evidence_complete: bool,
     last_run: Option<LiveLabRunProvenance>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ReleaseGateCompletenessReport {
-    requested: bool,
-    status: String,
-    required_stages: Vec<String>,
-    observed_pass_stages: Vec<String>,
-    missing_or_non_pass_stages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2875,10 +2573,6 @@ pub fn default_inventory_path() -> PathBuf {
     workspace_root_path().join(DEFAULT_VM_LAB_INVENTORY_PATH)
 }
 
-pub fn default_live_lab_orchestrator_path() -> PathBuf {
-    workspace_root_path().join(DEFAULT_LIVE_LAB_ORCHESTRATOR_PATH)
-}
-
 pub fn default_cross_network_direct_script_path() -> PathBuf {
     workspace_root_path().join(DEFAULT_CROSS_NETWORK_DIRECT_SCRIPT)
 }
@@ -2893,14 +2587,6 @@ pub fn default_cross_network_failback_script_path() -> PathBuf {
 
 pub fn default_artifact_root() -> PathBuf {
     workspace_root_path().join(DEFAULT_ARTIFACT_ROOT)
-}
-
-pub fn default_live_lab_profile_root() -> PathBuf {
-    workspace_root_path().join(DEFAULT_LIVE_LAB_PROFILE_ROOT)
-}
-
-pub fn default_live_lab_report_root() -> PathBuf {
-    workspace_root_path().join(DEFAULT_LIVE_LAB_REPORT_ROOT)
 }
 
 pub fn default_known_hosts_path() -> PathBuf {
@@ -2926,10 +2612,6 @@ pub fn default_lab_ssh_identity_path() -> PathBuf {
 // reviving this. Note §7.10 of HostObservabilityStabilityPlan also forbids
 // resurrecting its `sudo -n systemctl reboot`: the agent identity holds no sudo,
 // and reboot is a narrow polkit grant instead.
-
-fn default_live_lab_setup_profile_path(report_dir: &Path) -> PathBuf {
-    report_dir.join("setup_live_lab_profile.env")
-}
 
 /// Resolve the UTM bundle-library root to scan, given the
 /// `RUSTYNET_UTM_DOCUMENTS_ROOT` override and `HOME`. Pure (env read left to the
@@ -2963,30 +2645,6 @@ fn default_utm_documents_root() -> Result<PathBuf, String> {
     )
 }
 
-fn setup_stage_names() -> &'static [&'static str] {
-    // Must stay in sync with the bash orchestrator's setup-stage
-    // classification (scripts/e2e/live_linux_lab_orchestrator.sh) — a name
-    // missing here makes the run-freshness guard reject the orchestrate
-    // flow's own setup evidence.
-    &[
-        "preflight",
-        "prepare_source_archive",
-        "verify_ssh_reachability",
-        "prime_remote_access",
-        "macos_preflight_check",
-        "cleanup_hosts",
-        "bootstrap_hosts",
-        "collect_pubkeys",
-        "membership_setup",
-        "distribute_membership_state",
-        "issue_and_distribute_assignments",
-        "issue_and_distribute_traversal",
-        "issue_and_distribute_dns_zone",
-        "enforce_baseline_runtime",
-        "validate_baseline_runtime",
-    ]
-}
-
 fn normalize_manifest_path(path: &Path) -> String {
     path.canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
@@ -3009,13 +2667,6 @@ pub(crate) fn file_sha256_hex(path: &Path) -> Result<String, String> {
     Ok(sha256_hex_bytes(bytes.as_slice()))
 }
 
-fn semantic_live_lab_profile_sha256(path: &Path) -> Result<String, String> {
-    let profile = load_live_lab_profile(path)?;
-    let body = serde_json::to_vec(&profile.values)
-        .map_err(|err| format!("serialize live-lab profile semantic digest failed: {err}"))?;
-    Ok(sha256_hex_bytes(body.as_slice()))
-}
-
 fn report_dir_sha256(report_dir: &Path) -> String {
     sha256_hex_bytes(normalize_manifest_path(report_dir).as_bytes())
 }
@@ -3025,10 +2676,6 @@ fn file_binding(path: &Path) -> Result<LiveLabFileBinding, String> {
         path: normalize_manifest_path(path),
         sha256: file_sha256_hex(path)?,
     })
-}
-
-fn optional_file_binding(path: Option<&Path>) -> Result<Option<LiveLabFileBinding>, String> {
-    path.map(file_binding).transpose()
 }
 
 fn git_head_commit() -> Result<String, String> {
@@ -3098,49 +2745,6 @@ fn current_wrapper_source_binding() -> Result<LiveLabFileBinding, String> {
     file_binding(&workspace_root_path().join(VM_LAB_WRAPPER_SOURCE_RELATIVE_PATH))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveLabSetupManifestInput {
-    report_dir: PathBuf,
-    profile_path: PathBuf,
-    script_path: PathBuf,
-    inventory_path: Option<PathBuf>,
-    source_mode: String,
-    repo_ref: Option<String>,
-    require_same_network: Option<bool>,
-    dry_run: bool,
-    max_parallel_node_workers: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveLabSetupManifestExpectation {
-    report_dir: PathBuf,
-    profile_path: PathBuf,
-    script_path: PathBuf,
-    inventory_path: Option<PathBuf>,
-    source_mode: String,
-    repo_ref: Option<String>,
-    require_same_network: Option<bool>,
-    dry_run: Option<bool>,
-    max_parallel_node_workers: Option<usize>,
-}
-
-fn validate_file_binding(
-    label: &str,
-    actual: &LiveLabFileBinding,
-    current: &LiveLabFileBinding,
-) -> Result<(), String> {
-    if actual.path != current.path || actual.sha256 != current.sha256 {
-        return Err(format!(
-            "setup manifest {label} provenance mismatch: actual={} current={}",
-            serde_json::to_string(actual)
-                .unwrap_or_else(|_| format!("<{label}-actual-serialize-error>")),
-            serde_json::to_string(current)
-                .unwrap_or_else(|_| format!("<{label}-current-serialize-error>"))
-        ));
-    }
-    Ok(())
-}
-
 fn report_dir_contains_regular_entries(report_dir: &Path) -> Result<bool, String> {
     if !report_dir.exists() {
         return Ok(false);
@@ -3188,144 +2792,8 @@ fn ensure_report_dir_fresh(report_dir: &Path, command_name: &str) -> Result<(), 
     Ok(())
 }
 
-/// Like `report_dir_contains_regular_entries`, but skips named top-level subdirectories of
-/// `report_dir` when deciding whether the directory is "non-empty". Subdirectories deeper than
-/// the first level are still fully checked.
-fn report_dir_contains_regular_entries_except(
-    report_dir: &Path,
-    exempt_top_level_names: &[&str],
-) -> Result<bool, String> {
-    if !report_dir.exists() {
-        return Ok(false);
-    }
-    if !report_dir.is_dir() {
-        return Err(format!(
-            "report directory path is not a directory: {}",
-            report_dir.display()
-        ));
-    }
-    let exempt_paths: Vec<PathBuf> = exempt_top_level_names
-        .iter()
-        .map(|name| report_dir.join(name))
-        .collect();
-    let mut pending = vec![report_dir.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        for entry in fs::read_dir(&dir)
-            .map_err(|err| format!("read report directory failed ({}): {err}", dir.display()))?
-        {
-            let entry = entry.map_err(|err| {
-                format!("iterate report directory failed ({}): {err}", dir.display())
-            })?;
-            let entry_path = entry.path();
-            // Only exempt entries that are direct children of the root report dir.
-            if dir == report_dir && exempt_paths.contains(&entry_path) {
-                continue;
-            }
-            let file_type = entry.file_type().map_err(|err| {
-                format!(
-                    "read report directory entry type failed ({}): {err}",
-                    entry_path.display()
-                )
-            })?;
-            if file_type.is_dir() {
-                pending.push(entry_path);
-            } else {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-/// Like `ensure_report_dir_fresh`, but exempts the named top-level subdirectories from the
-/// non-empty check. Used when an outer command (e.g. `vm-lab-orchestrate-live-lab`) has
-/// already claimed the report dir and populated a specific metadata subdirectory before
-/// invoking this command.
-fn ensure_report_dir_fresh_except(
-    report_dir: &Path,
-    command_name: &str,
-    exempt_top_level_names: &[&str],
-) -> Result<(), String> {
-    if !report_dir.exists() {
-        return Ok(());
-    }
-    if report_dir_contains_regular_entries_except(report_dir, exempt_top_level_names)? {
-        return Err(format!(
-            "{command_name} refuses to reuse non-empty report dir {}; use a new report dir or the matching provenance-bound resume path",
-            report_dir.display()
-        ));
-    }
-    Ok(())
-}
-
-fn build_setup_manifest(input: &LiveLabSetupManifestInput) -> Result<LiveLabSetupManifest, String> {
-    Ok(LiveLabSetupManifest {
-        version: 2,
-        created_at_unix: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|err| format!("clock failure while building setup manifest: {err}"))?
-            .as_secs(),
-        report_dir_path: normalize_manifest_path(input.report_dir.as_path()),
-        report_dir_sha256: report_dir_sha256(input.report_dir.as_path()),
-        profile: file_binding(input.profile_path.as_path())?,
-        profile_semantic_sha256: semantic_live_lab_profile_sha256(input.profile_path.as_path())?,
-        script: file_binding(input.script_path.as_path())?,
-        inventory: optional_file_binding(input.inventory_path.as_deref())?,
-        wrapper_source: current_wrapper_source_binding()?,
-        wrapper_version: env!("CARGO_PKG_VERSION").to_owned(),
-        git: current_git_provenance(input.source_mode.as_str(), input.repo_ref.as_deref())?,
-        setup_flags: LiveLabSetupModeFlags {
-            require_same_network: input.require_same_network,
-            dry_run: input.dry_run,
-            max_parallel_node_workers: input.max_parallel_node_workers,
-        },
-    })
-}
-
-fn write_setup_manifest(report_dir: &Path, manifest: &LiveLabSetupManifest) -> Result<(), String> {
-    let path = report_dir.join(SETUP_MANIFEST_RELATIVE_PATH);
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("setup manifest path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).map_err(|err| {
-        format!(
-            "create setup manifest directory failed ({}): {err}",
-            parent.display()
-        )
-    })?;
-    let body = serde_json::to_vec_pretty(manifest)
-        .map_err(|err| format!("serialize setup manifest failed: {err}"))?;
-    fs::write(&path, body)
-        .map_err(|err| format!("write setup manifest failed ({}): {err}", path.display()))
-}
-
-fn read_setup_manifest(report_dir: &Path) -> Result<LiveLabSetupManifest, String> {
-    let path = report_dir.join(SETUP_MANIFEST_RELATIVE_PATH);
-    let body = fs::read(&path)
-        .map_err(|err| format!("read setup manifest failed ({}): {err}", path.display()))?;
-    serde_json::from_slice(&body)
-        .map_err(|err| format!("parse setup manifest failed ({}): {err}", path.display()))
-}
-
 fn setup_manifest_sha256(report_dir: &Path) -> Result<String, String> {
     file_sha256_hex(&report_dir.join(SETUP_MANIFEST_RELATIVE_PATH))
-}
-
-fn write_report_state(report_dir: &Path, state: &LiveLabReportState) -> Result<(), String> {
-    let path = report_dir.join(REPORT_STATE_RELATIVE_PATH);
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("report state path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).map_err(|err| {
-        format!(
-            "create report state directory failed ({}): {err}",
-            parent.display()
-        )
-    })?;
-    let body = serde_json::to_vec_pretty(state)
-        .map_err(|err| format!("serialize report state failed: {err}"))?;
-    fs::write(&path, body)
-        .map_err(|err| format!("write report state failed ({}): {err}", path.display()))
 }
 
 fn read_report_state(report_dir: &Path) -> Result<LiveLabReportState, String> {
@@ -3334,402 +2802,6 @@ fn read_report_state(report_dir: &Path) -> Result<LiveLabReportState, String> {
         .map_err(|err| format!("read report state failed ({}): {err}", path.display()))?;
     serde_json::from_slice(&body)
         .map_err(|err| format!("parse report state failed ({}): {err}", path.display()))
-}
-
-fn initial_report_state(
-    report_dir: &Path,
-    _manifest: &LiveLabSetupManifest,
-) -> Result<LiveLabReportState, String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| format!("clock failure while building report state: {err}"))?
-        .as_secs();
-    Ok(LiveLabReportState {
-        version: 1,
-        created_at_unix: now,
-        updated_at_unix: now,
-        report_dir_path: normalize_manifest_path(report_dir),
-        report_dir_sha256: report_dir_sha256(report_dir),
-        setup_manifest_sha256: setup_manifest_sha256(report_dir)?,
-        setup_complete: false,
-        run_complete: false,
-        run_passed: false,
-        full_release_gate_requested: false,
-        full_release_evidence_complete: false,
-        last_run: None,
-    })
-}
-
-fn update_report_state_setup_complete(report_dir: &Path) -> Result<(), String> {
-    let mut state = read_report_state(report_dir)?;
-    state.updated_at_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| format!("clock failure while updating setup state: {err}"))?
-        .as_secs();
-    state.setup_manifest_sha256 = setup_manifest_sha256(report_dir)?;
-    state.setup_complete = true;
-    state.run_complete = false;
-    state.run_passed = false;
-    state.full_release_gate_requested = false;
-    state.full_release_evidence_complete = false;
-    state.last_run = None;
-    write_report_state(report_dir, &state)
-}
-
-fn build_run_provenance(
-    profile_path: &Path,
-    script_path: &Path,
-    source_mode: &str,
-    repo_ref: Option<&str>,
-    flags: &LiveLabRunModeFlags,
-) -> Result<LiveLabRunProvenance, String> {
-    Ok(LiveLabRunProvenance {
-        invoked_at_unix: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|err| format!("clock failure while building run provenance: {err}"))?
-            .as_secs(),
-        profile: file_binding(profile_path)?,
-        profile_semantic_sha256: semantic_live_lab_profile_sha256(profile_path)?,
-        script: file_binding(script_path)?,
-        wrapper_source: current_wrapper_source_binding()?,
-        wrapper_version: env!("CARGO_PKG_VERSION").to_owned(),
-        git: current_git_provenance(source_mode, repo_ref)?,
-        run_flags: flags.clone(),
-    })
-}
-
-fn update_report_state_after_run(
-    report_dir: &Path,
-    run_provenance: LiveLabRunProvenance,
-    run_passed: bool,
-    full_release_gate_requested: bool,
-    full_release_evidence_complete: bool,
-) -> Result<(), String> {
-    let mut state = read_report_state(report_dir)?;
-    state.updated_at_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| format!("clock failure while updating run state: {err}"))?
-        .as_secs();
-    state.setup_manifest_sha256 = setup_manifest_sha256(report_dir)?;
-    state.setup_complete = live_lab_setup_complete(report_dir)?;
-    state.run_complete = true;
-    state.run_passed = run_passed;
-    state.full_release_gate_requested = full_release_gate_requested;
-    state.full_release_evidence_complete = full_release_evidence_complete;
-    state.last_run = Some(run_provenance);
-    write_report_state(report_dir, &state)
-}
-
-fn validate_setup_manifest(
-    report_dir: &Path,
-    expected: &LiveLabSetupManifestExpectation,
-) -> Result<(), String> {
-    let actual = read_setup_manifest(report_dir)?;
-    if actual.version != 2 {
-        return Err(format!(
-            "unsupported setup manifest version {} in {}",
-            actual.version,
-            report_dir.join(SETUP_MANIFEST_RELATIVE_PATH).display()
-        ));
-    }
-    let expected_report_dir_path = normalize_manifest_path(expected.report_dir.as_path());
-    let expected_report_dir_sha256 = report_dir_sha256(expected.report_dir.as_path());
-    if actual.report_dir_path != expected_report_dir_path
-        || actual.report_dir_sha256 != expected_report_dir_sha256
-    {
-        return Err(format!(
-            "setup manifest report-dir provenance mismatch: actual={{\"path\":\"{}\",\"sha256\":\"{}\"}} current={{\"path\":\"{}\",\"sha256\":\"{}\"}}",
-            actual.report_dir_path,
-            actual.report_dir_sha256,
-            expected_report_dir_path,
-            expected_report_dir_sha256
-        ));
-    }
-    let current_profile = file_binding(expected.profile_path.as_path())?;
-    validate_file_binding("profile", &actual.profile, &current_profile)?;
-    let current_profile_semantic_sha256 =
-        semantic_live_lab_profile_sha256(expected.profile_path.as_path())?;
-    if actual.profile_semantic_sha256 != current_profile_semantic_sha256 {
-        return Err(format!(
-            "setup manifest profile semantic provenance mismatch: actual={} current={}",
-            actual.profile_semantic_sha256, current_profile_semantic_sha256
-        ));
-    }
-    let current_script = file_binding(expected.script_path.as_path())?;
-    validate_file_binding("script", &actual.script, &current_script)?;
-    let current_inventory_binding = match expected.inventory_path.as_deref() {
-        Some(path) => Some(file_binding(path)?),
-        None => actual
-            .inventory
-            .as_ref()
-            .map(|binding| file_binding(Path::new(binding.path.as_str())))
-            .transpose()?,
-    };
-    match (&actual.inventory, &current_inventory_binding) {
-        (Some(actual_binding), Some(current_binding)) => {
-            validate_file_binding("inventory", actual_binding, current_binding)?;
-        }
-        (None, None) => {}
-        (Some(_), None) | (None, Some(_)) => {
-            return Err("setup manifest inventory provenance mismatch".to_owned());
-        }
-    }
-    let current_wrapper_source = current_wrapper_source_binding()?;
-    validate_file_binding(
-        "wrapper_source",
-        &actual.wrapper_source,
-        &current_wrapper_source,
-    )?;
-    if actual.wrapper_version != env!("CARGO_PKG_VERSION") {
-        return Err(format!(
-            "setup manifest wrapper version mismatch: actual={} current={}",
-            actual.wrapper_version,
-            env!("CARGO_PKG_VERSION")
-        ));
-    }
-    let current_git =
-        current_git_provenance(expected.source_mode.as_str(), expected.repo_ref.as_deref())?;
-    if actual.git != current_git {
-        return Err(format!(
-            "setup manifest git provenance mismatch: actual={} current={}",
-            serde_json::to_string(&actual.git)
-                .unwrap_or_else(|_| "<git-serialize-error>".to_owned()),
-            serde_json::to_string(&current_git)
-                .unwrap_or_else(|_| "<git-serialize-error>".to_owned())
-        ));
-    }
-    if let Some(value) = expected.require_same_network
-        && actual.setup_flags.require_same_network != Some(value)
-    {
-        return Err(format!(
-            "setup manifest require_same_network mismatch: actual={} current={value}",
-            actual
-                .setup_flags
-                .require_same_network
-                .map_or_else(|| "none".to_owned(), |flag| flag.to_string())
-        ));
-    }
-    if let Some(value) = expected.dry_run
-        && actual.setup_flags.dry_run != value
-    {
-        return Err(format!(
-            "setup manifest dry_run mismatch: actual={} current={value}",
-            actual.setup_flags.dry_run
-        ));
-    }
-    if let Some(value) = expected.max_parallel_node_workers
-        && actual.setup_flags.max_parallel_node_workers != Some(value)
-    {
-        return Err(format!(
-            "setup manifest max_parallel_node_workers mismatch: actual={} current={value}",
-            actual
-                .setup_flags
-                .max_parallel_node_workers
-                .map_or_else(|| "none".to_owned(), |v| v.to_string())
-        ));
-    }
-    Ok(())
-}
-
-fn validate_report_state(report_dir: &Path) -> Result<LiveLabReportState, String> {
-    let state = read_report_state(report_dir)?;
-    if state.version != 1 {
-        return Err(format!(
-            "unsupported report state version {} in {}",
-            state.version,
-            report_dir.join(REPORT_STATE_RELATIVE_PATH).display()
-        ));
-    }
-    let expected_report_dir_path = normalize_manifest_path(report_dir);
-    let expected_report_dir_sha256 = report_dir_sha256(report_dir);
-    if state.report_dir_path != expected_report_dir_path
-        || state.report_dir_sha256 != expected_report_dir_sha256
-    {
-        return Err(format!(
-            "report state report-dir provenance mismatch: actual={{\"path\":\"{}\",\"sha256\":\"{}\"}} current={{\"path\":\"{}\",\"sha256\":\"{}\"}}",
-            state.report_dir_path,
-            state.report_dir_sha256,
-            expected_report_dir_path,
-            expected_report_dir_sha256
-        ));
-    }
-    let expected_setup_manifest_sha256 = setup_manifest_sha256(report_dir)?;
-    if state.setup_manifest_sha256 != expected_setup_manifest_sha256 {
-        return Err(format!(
-            "report state setup manifest provenance mismatch: actual={} current={}",
-            state.setup_manifest_sha256, expected_setup_manifest_sha256
-        ));
-    }
-    Ok(state)
-}
-
-fn resolve_setup_selection_from_existing_manifest(
-    report_dir: &Path,
-) -> Result<LiveLabSetupSelection, String> {
-    let manifest = read_setup_manifest(report_dir)?;
-    let profile_path = PathBuf::from(manifest.profile.path);
-    ensure_local_regular_file_path(profile_path.as_path(), "existing live-lab profile")?;
-    execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
-        profile_path: profile_path.clone(),
-        expected_backend: None,
-        expected_source_mode: None,
-        require_five_node: false,
-    })?;
-    Ok(LiveLabSetupSelection {
-        profile_path,
-        profile_generated: false,
-        profile_generation_summary: None,
-    })
-}
-
-fn resolve_run_setup_reuse(
-    report_dir: &Path,
-    profile_path: &Path,
-    script_path: &Path,
-    source_mode: &str,
-    repo_ref: Option<&str>,
-    skip_setup: bool,
-) -> Result<bool, String> {
-    if !report_dir.exists() {
-        if skip_setup {
-            return Err(format!(
-                "vm-lab-run-live-lab --skip-setup requires an existing provenance-bound setup report dir: {}",
-                report_dir.display()
-            ));
-        }
-        return Ok(false);
-    }
-    let has_regular_entries = report_dir_contains_regular_entries(report_dir)?;
-    if !has_regular_entries {
-        if skip_setup {
-            return Err(format!(
-                "vm-lab-run-live-lab --skip-setup requires a populated provenance-bound setup report dir: {}",
-                report_dir.display()
-            ));
-        }
-        return Ok(false);
-    }
-    let expectation = LiveLabSetupManifestExpectation {
-        report_dir: report_dir.to_path_buf(),
-        profile_path: profile_path.to_path_buf(),
-        script_path: script_path.to_path_buf(),
-        inventory_path: None,
-        source_mode: source_mode.to_owned(),
-        repo_ref: repo_ref.map(ToOwned::to_owned),
-        require_same_network: None,
-        dry_run: None,
-        max_parallel_node_workers: None,
-    };
-    validate_setup_manifest(report_dir, &expectation)?;
-    let report_state = validate_report_state(report_dir)?;
-    if !report_state.setup_complete {
-        return Err(format!(
-            "report dir {} cannot be reused because setup is not complete",
-            report_dir.display()
-        ));
-    }
-    if report_state.run_complete || report_state.last_run.is_some() {
-        return Err(format!(
-            "report dir {} already contains run provenance; use a fresh report dir for a new run",
-            report_dir.display()
-        ));
-    }
-    if !live_lab_setup_complete(report_dir)? {
-        return Err(format!(
-            "report dir {} is missing completed setup stage evidence",
-            report_dir.display()
-        ));
-    }
-    if live_lab_report_has_non_setup_stage_records(report_dir)? {
-        return Err(format!(
-            "report dir {} already contains non-setup stage records and cannot be reused for a fresh run",
-            report_dir.display()
-        ));
-    }
-    Ok(true)
-}
-
-impl VmLabIterationValidationStep {
-    fn label(&self) -> String {
-        match self {
-            Self::FmtCheck => "fmt".to_owned(),
-            Self::CargoCheckPackage { package } => format!("check:{package}"),
-            Self::CargoCheckBin { package, bin } => format!("check-bin:{package}:{bin}"),
-            Self::CargoTestPackage { package, filter } => match filter {
-                Some(filter) => format!("test:{package}:{filter}"),
-                None => format!("test:{package}"),
-            },
-            Self::CargoTestBin {
-                package,
-                bin,
-                filter,
-            } => match filter {
-                Some(filter) => format!("test-bin:{package}:{bin}:{filter}"),
-                None => format!("test-bin:{package}:{bin}"),
-            },
-        }
-    }
-}
-
-pub fn parse_vm_lab_iteration_validation_step_spec(
-    value: &str,
-) -> Result<VmLabIterationValidationStep, String> {
-    ensure_no_control_chars("validation step", value)?;
-    let parts = value.split(':').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["fmt"] => Ok(VmLabIterationValidationStep::FmtCheck),
-        ["check", package] => {
-            ensure_no_control_chars("validation package", package)?;
-            Ok(VmLabIterationValidationStep::CargoCheckPackage {
-                package: (*package).to_owned(),
-            })
-        }
-        ["check-bin", package, bin] => {
-            ensure_no_control_chars("validation package", package)?;
-            ensure_no_control_chars("validation binary", bin)?;
-            Ok(VmLabIterationValidationStep::CargoCheckBin {
-                package: (*package).to_owned(),
-                bin: (*bin).to_owned(),
-            })
-        }
-        ["test", package] => {
-            ensure_no_control_chars("validation package", package)?;
-            Ok(VmLabIterationValidationStep::CargoTestPackage {
-                package: (*package).to_owned(),
-                filter: None,
-            })
-        }
-        ["test", package, filter] => {
-            ensure_no_control_chars("validation package", package)?;
-            ensure_no_control_chars("validation test filter", filter)?;
-            Ok(VmLabIterationValidationStep::CargoTestPackage {
-                package: (*package).to_owned(),
-                filter: Some((*filter).to_owned()),
-            })
-        }
-        ["test-bin", package, bin] => {
-            ensure_no_control_chars("validation package", package)?;
-            ensure_no_control_chars("validation binary", bin)?;
-            Ok(VmLabIterationValidationStep::CargoTestBin {
-                package: (*package).to_owned(),
-                bin: (*bin).to_owned(),
-                filter: None,
-            })
-        }
-        ["test-bin", package, bin, filter] => {
-            ensure_no_control_chars("validation package", package)?;
-            ensure_no_control_chars("validation binary", bin)?;
-            ensure_no_control_chars("validation test filter", filter)?;
-            Ok(VmLabIterationValidationStep::CargoTestBin {
-                package: (*package).to_owned(),
-                bin: (*bin).to_owned(),
-                filter: Some((*filter).to_owned()),
-            })
-        }
-        _ => Err(format!(
-            "unsupported validation step: {value} (expected fmt|check:<package>|check-bin:<package>:<bin>|test:<package>[:filter]|test-bin:<package>:<bin>[:filter])"
-        )),
-    }
 }
 
 pub fn execute_ops_vm_lab_list(config: VmLabListConfig) -> Result<String, String> {
@@ -9262,6 +8334,7 @@ fn default_inventory_alias_for_lab_roles(
     }
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn push_unique_alias(aliases: &mut Vec<String>, alias: Option<String>) {
     if let Some(alias) = alias
         && !aliases.iter().any(|existing| existing == &alias)
@@ -9270,6 +8343,7 @@ fn push_unique_alias(aliases: &mut Vec<String>, alias: Option<String>) {
     }
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn resolve_live_lab_vm_aliases(
     inventory_path: &Path,
     exit_vm: Option<&str>,
@@ -9330,6 +8404,7 @@ fn resolve_live_lab_vm_aliases(
     Ok(aliases)
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn parse_vm_lab_command_result(text: &str) -> Result<VmLabCommandResult, String> {
     serde_json::from_str(text).map_err(|err| format!("parse vm-lab command result failed: {err}"))
 }
@@ -9641,12 +8716,14 @@ fn emit_vm_lab_progress_outcome(command: &str, outcome: &VmLabStageOutcome) {
     eprintln!("{}", render_vm_lab_progress_outcome_line(command, outcome));
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn emit_vm_lab_progress_outcomes(command: &str, outcomes: &[VmLabStageOutcome]) {
     for outcome in outcomes {
         emit_vm_lab_progress_outcome(command, outcome);
     }
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn append_unique_stage_outcomes_collect_new(
     outcomes: &mut Vec<VmLabStageOutcome>,
     additional: &[VmLabStageOutcome],
@@ -9697,6 +8774,7 @@ fn write_orchestration_artifact(path: &Path, contents: &str) -> Result<(), Strin
     })
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn create_orchestration_staging_dir() -> Result<PathBuf, String> {
     let dir =
         std::env::temp_dir().join(format!("rustynet-vm-lab-orchestration-{}", unique_suffix()));
@@ -9709,6 +8787,7 @@ fn create_orchestration_staging_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn materialize_orchestration_staging_dir(
     staging_dir: &Path,
     orchestration_dir: &Path,
@@ -9987,6 +9066,7 @@ mod reconcile_barrier_exempt_tests {
     }
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn finalize_vm_lab_orchestration_result(
     command: &str,
     report_dir: &Path,
@@ -10094,495 +9174,20 @@ fn build_vm_lab_command_result_output(
     Ok((rendered, overall_status))
 }
 
-fn resolve_setup_live_lab_selection(
-    config: &VmLabSetupLiveLabConfig,
-) -> Result<LiveLabSetupSelection, String> {
-    if let Some(profile_path) = config.profile_path.as_deref() {
-        execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
-            profile_path: profile_path.to_path_buf(),
-            expected_backend: None,
-            expected_source_mode: None,
-            require_five_node: false,
-        })?;
-        let profile = load_live_lab_profile(profile_path)?;
-        ensure_live_lab_profile_desktop_orchestrator_supported(&profile, "vm-lab-setup-live-lab")?;
-        return Ok(LiveLabSetupSelection {
-            profile_path: profile_path.to_path_buf(),
-            profile_generated: false,
-            profile_generation_summary: None,
-        });
-    }
-
-    let profile_path = config
-        .profile_output_path
-        .clone()
-        .unwrap_or_else(|| default_live_lab_setup_profile_path(config.report_dir.as_path()));
-    let exit_vm = match config.exit_vm.clone() {
-        Some(value) => Some(value),
-        None => default_inventory_alias_for_lab_roles(config.inventory_path.as_path(), &["exit"])?,
-    };
-    let client_vm = match config.client_vm.clone() {
-        Some(value) => Some(value),
-        None => {
-            default_inventory_alias_for_lab_roles(config.inventory_path.as_path(), &["client"])?
-        }
-    };
-    let entry_vm = match config.entry_vm.clone() {
-        Some(value) => Some(value),
-        None => default_inventory_alias_for_lab_roles(
-            config.inventory_path.as_path(),
-            &["entry", "relay"],
-        )?,
-    };
-    let aux_vm = match config.aux_vm.clone() {
-        Some(value) => Some(value),
-        None => default_inventory_alias_for_lab_roles(config.inventory_path.as_path(), &["aux"])?,
-    };
-    let extra_vm = match config.extra_vm.clone() {
-        Some(value) => Some(value),
-        None => default_inventory_alias_for_lab_roles(config.inventory_path.as_path(), &["extra"])?,
-    };
-    let fifth_client_vm = match config.fifth_client_vm.clone() {
-        Some(value) => Some(value),
-        None => default_inventory_alias_for_lab_roles(
-            config.inventory_path.as_path(),
-            &["fifth_client"],
-        )?,
-    };
-    let profile_summary =
-        execute_ops_vm_lab_write_live_lab_profile(VmLabWriteLiveLabProfileConfig {
-            inventory_path: config.inventory_path.clone(),
-            output_path: profile_path.clone(),
-            exit_vm,
-            exit_target: None,
-            client_vm,
-            client_target: None,
-            entry_vm,
-            entry_target: None,
-            aux_vm,
-            aux_target: None,
-            extra_vm,
-            extra_target: None,
-            fifth_client_vm,
-            fifth_client_target: None,
-            relay_vm: config.relay_vm.clone(),
-            relay_target: None,
-            linux_blind_exit_vm: config.linux_blind_exit_vm.clone(),
-            require_same_network: config.require_same_network,
-            ssh_identity_file: config.ssh_identity_file.clone(),
-            ssh_known_hosts_file: config.known_hosts_path.clone(),
-            ssh_allow_cidrs: None,
-            network_id: None,
-            traversal_ttl_secs: None,
-            cross_network_nat_profiles: None,
-            cross_network_required_nat_profiles: None,
-            cross_network_impairment_profile: None,
-            cross_network_substrate: None,
-            backend: None,
-            source_mode: config.source_mode.clone(),
-            repo_ref: config.repo_ref.clone(),
-            report_dir: Some(config.report_dir.clone()),
-        })?;
-    execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
-        profile_path: profile_path.clone(),
-        expected_backend: None,
-        expected_source_mode: None,
-        require_five_node: false,
-    })?;
-    let profile = load_live_lab_profile(profile_path.as_path())?;
-    ensure_live_lab_profile_desktop_orchestrator_supported(&profile, "vm-lab-setup-live-lab")?;
-    Ok(LiveLabSetupSelection {
-        profile_path,
-        profile_generated: true,
-        profile_generation_summary: Some(profile_summary),
-    })
-}
-
-fn render_vm_lab_command_result(
-    command: &str,
-    report_dir: &Path,
-    summary: &LiveLabStageSummary,
-    records: &[LiveLabStageRecord],
-    warnings: Vec<String>,
-    next_actions: Vec<String>,
-    overall_status_override: Option<VmLabCommandOverallStatus>,
-) -> Result<String, String> {
-    let overall_status =
-        overall_status_override.unwrap_or_else(|| command_status_from_summary(summary));
-    serialize_vm_lab_command_result(&VmLabCommandResult {
-        command: command.to_owned(),
-        overall_status,
-        report_dir: report_dir.display().to_string(),
-        outcomes: stage_outcomes_from_records(records),
-        warnings,
-        next_actions,
-    })
-}
-
 pub fn execute_ops_vm_lab_setup_live_lab(
-    config: VmLabSetupLiveLabConfig,
+    _config: VmLabSetupLiveLabConfig,
 ) -> Result<String, String> {
-    ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
-    ensure_local_regular_file_path(config.ssh_identity_file.as_path(), "SSH identity file")?;
-    ensure_optional_local_regular_file_path(
-        config.known_hosts_path.as_deref(),
-        "SSH known_hosts file",
-    )?;
-    if let Some(stage) = config.resume_from.as_deref()
-        && !setup_stage_names().contains(&stage)
-    {
-        return Err(format!(
-            "unsupported --resume-from stage for vm-lab-setup-live-lab: {stage}"
-        ));
-    }
-    if let Some(stage) = config.rerun_stage.as_deref()
-        && !setup_stage_names().contains(&stage)
-    {
-        return Err(format!(
-            "unsupported --rerun-stage for vm-lab-setup-live-lab: {stage}"
-        ));
-    }
-    if config.resume_from.is_some() && config.rerun_stage.is_some() {
-        return Err(
-            "vm-lab-setup-live-lab accepts either --resume-from or --rerun-stage, not both"
-                .to_owned(),
-        );
-    }
-    let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
-    let setup_reuse_requested = config.resume_from.is_some() || config.rerun_stage.is_some();
-    if setup_reuse_requested {
-        if !report_dir.exists() {
-            return Err(format!(
-                "vm-lab-setup-live-lab resume/rerun requires an existing report dir: {}",
-                report_dir.display()
-            ));
-        }
-        if !report_dir_contains_regular_entries(report_dir.as_path())? {
-            return Err(format!(
-                "vm-lab-setup-live-lab resume/rerun requires an existing provenance-bound report dir with setup state: {}",
-                report_dir.display()
-            ));
-        }
-    } else if config.orchestrated {
-        // Called from vm-lab-orchestrate-live-lab, which has already claimed this report dir
-        // and written pre-setup discovery metadata into the `orchestration/` subdirectory.
-        // Exempt that directory from the freshness check; every other entry still blocks reuse.
-        ensure_report_dir_fresh_except(
-            report_dir.as_path(),
-            "vm-lab-setup-live-lab",
-            &["orchestration"],
-        )?;
-    } else {
-        ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-setup-live-lab")?;
-    }
-    fs::create_dir_all(report_dir.as_path()).map_err(|err| {
-        format!(
-            "create setup report directory failed ({}): {err}",
-            report_dir.display()
-        )
-    })?;
-
-    let (resolved_source_mode, resolved_repo_ref) = resolve_iteration_source_selection(
-        config.source_mode.as_deref(),
-        config.repo_ref.as_deref(),
-        false,
-        false,
-        false,
-    )?;
-    let selection = if setup_reuse_requested {
-        let selection = match config.profile_path.as_deref() {
-            Some(profile_path) => {
-                execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
-                    profile_path: profile_path.to_path_buf(),
-                    expected_backend: None,
-                    expected_source_mode: None,
-                    require_five_node: false,
-                })?;
-                LiveLabSetupSelection {
-                    profile_path: profile_path.to_path_buf(),
-                    profile_generated: false,
-                    profile_generation_summary: None,
-                }
-            }
-            None => resolve_setup_selection_from_existing_manifest(report_dir.as_path())?,
-        };
-        let expectation = LiveLabSetupManifestExpectation {
-            report_dir: report_dir.clone(),
-            profile_path: selection.profile_path.clone(),
-            script_path: config.script_path.clone(),
-            inventory_path: Some(config.inventory_path.clone()),
-            source_mode: resolved_source_mode.clone(),
-            repo_ref: resolved_repo_ref.clone(),
-            require_same_network: Some(config.require_same_network),
-            dry_run: Some(config.dry_run),
-            max_parallel_node_workers: config.max_parallel_node_workers,
-        };
-        validate_setup_manifest(report_dir.as_path(), &expectation)?;
-        let report_state = validate_report_state(report_dir.as_path())?;
-        if report_state.run_complete || report_state.last_run.is_some() {
-            return Err(format!(
-                "report dir {} already contains run provenance and cannot be reused for setup",
-                report_dir.display()
-            ));
-        }
-        if live_lab_report_has_non_setup_stage_records(report_dir.as_path())? {
-            return Err(format!(
-                "report dir {} already contains non-setup stage records and cannot be reused for setup",
-                report_dir.display()
-            ));
-        }
-        selection
-    } else {
-        let mut selection_config = config.clone();
-        selection_config.report_dir = report_dir.clone();
-        let selection = resolve_setup_live_lab_selection(&selection_config)?;
-        let manifest = build_setup_manifest(&LiveLabSetupManifestInput {
-            report_dir: report_dir.clone(),
-            profile_path: selection.profile_path.clone(),
-            script_path: config.script_path.clone(),
-            inventory_path: Some(config.inventory_path.clone()),
-            source_mode: resolved_source_mode.clone(),
-            repo_ref: resolved_repo_ref.clone(),
-            require_same_network: Some(config.require_same_network),
-            dry_run: config.dry_run,
-            max_parallel_node_workers: config.max_parallel_node_workers,
-        })?;
-        write_setup_manifest(report_dir.as_path(), &manifest)?;
-        let report_state = initial_report_state(report_dir.as_path(), &manifest)?;
-        write_report_state(report_dir.as_path(), &report_state)?;
-        selection
-    };
-    let timeout = timeout_or_default(config.timeout_secs, DEFAULT_LIVE_LAB_TIMEOUT_SECS);
-    let mut command = Command::new("bash");
-    command.arg(config.script_path.as_path());
-    command
-        .arg("--profile")
-        .arg(selection.profile_path.as_path());
-    command.arg("--report-dir").arg(report_dir.as_path());
-    command.arg("--setup-only");
-    if config.dry_run {
-        command.arg("--dry-run");
-    }
-    command
-        .arg("--source-mode")
-        .arg(resolved_source_mode.as_str());
-    if let Some(value) = resolved_repo_ref.as_deref() {
-        command.arg("--repo-ref").arg(value);
-    }
-    if let Some(stage) = config.resume_from.as_deref() {
-        command.arg("--resume-from").arg(stage);
-        command.arg("--preserve-report-state");
-    }
-    if let Some(stage) = config.rerun_stage.as_deref() {
-        command.arg("--rerun-stage").arg(stage);
-        command.arg("--preserve-report-state");
-    }
-    if let Some(max_parallel_node_workers) = config.max_parallel_node_workers {
-        command
-            .arg("--max-parallel-node-workers")
-            .arg(max_parallel_node_workers.to_string());
-    }
-    if config.stage_timeout_secs > 0 {
-        command
-            .arg("--stage-timeout-secs")
-            .arg(config.stage_timeout_secs.to_string());
-    }
-
-    let status = run_status_with_timeout_passthrough(&mut command, timeout)
-        .map_err(|err| format!("live-lab setup failed: {err}"))?;
-    validate_live_lab_run_artifacts(report_dir.as_path())?;
-    let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)?;
-    let records = parse_live_lab_stage_records(report_dir.as_path())?;
-    let mut warnings = Vec::new();
-    if selection.profile_generated {
-        warnings.push(format!(
-            "generated profile at {}",
-            selection.profile_path.display()
-        ));
-    }
-    if let Some(profile_summary) = selection.profile_generation_summary {
-        warnings.push(profile_summary);
-    }
-    let state_update_error = if status.success() {
-        match update_report_state_setup_complete(report_dir.as_path()) {
-            Ok(()) => None,
-            Err(err) => {
-                warnings.push(err.clone());
-                Some(err)
-            }
-        }
-    } else {
-        None
-    };
-    let mut completion_error = state_update_error;
-    if !config.orchestrated {
-        let outcomes = stage_outcomes_from_records(&records);
-        if let Err(err) = append_live_lab_run_matrix_for_command(
-            "vm-lab-setup-live-lab",
-            report_dir.as_path(),
-            Some(selection.profile_path.as_path()),
-            Some(config.inventory_path.as_path()),
-            outcomes.as_slice(),
-        ) {
-            warnings.push(format!("live-lab run matrix update failed: {err}"));
-            completion_error.get_or_insert(err);
-        }
-    }
-    let next_actions = if status.success() && completion_error.is_none() {
-        vec![format!(
-            "Run vm-lab-run-live-lab with --profile {} --report-dir {}",
-            selection.profile_path.display(),
-            report_dir.display()
-        )]
-    } else if completion_error.is_some() {
-        vec![format!(
-            "Re-run vm-lab-setup-live-lab for report dir {} after fixing completion artifact persistence",
-            report_dir.display()
-        )]
-    } else {
-        vec![format!(
-            "Run vm-lab-diagnose-live-lab-failure with --profile {} --report-dir {}",
-            selection.profile_path.display(),
-            report_dir.display()
-        )]
-    };
-    let rendered = render_vm_lab_command_result(
-        "vm-lab-setup-live-lab",
-        report_dir.as_path(),
-        &summary,
-        &records,
-        warnings,
-        next_actions,
-        completion_error
-            .as_ref()
-            .map(|_| VmLabCommandOverallStatus::Fail),
-    )?;
-    if status.success() && completion_error.is_none() {
-        Ok(rendered)
-    } else {
-        Err(rendered)
-    }
-}
-
-/// Inputs to a single live-lab run, independent of which orchestrator
-/// drives the stages. Both `LinuxBashOrchestrator` (W3.1) and the future
-/// `RustOrchestrator` (W3.3) accept this shape so downstream post-
-/// processing — TSV parsing, release-gate completeness, report
-/// rendering — does not branch on which orchestrator ran.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveLabRunInputs {
-    pub profile_path: PathBuf,
-    pub report_dir: PathBuf,
-    pub source_mode: String,
-    pub repo_ref: Option<String>,
-    pub timeout: Duration,
-    pub dry_run: bool,
-    pub skip_setup: bool,
-    /// Set when the orchestrator detected a re-usable setup pass under
-    /// `report_dir` (e.g. preserved-state continuation). Translates to
-    /// `--skip-setup --preserve-report-state` for the bash impl.
-    pub continue_from_setup: bool,
-    pub skip_gates: bool,
-    pub skip_soak: bool,
-    pub skip_cross_network: bool,
-    pub enable_chaos_suite: bool,
-    /// Per-stage watchdog timeout in seconds. Forwarded to the bash
-    /// orchestrator as `--stage-timeout-secs <N>` when greater than zero;
-    /// `0` omits the flag (bash default of 0 = watchdog disabled).
-    pub stage_timeout_secs: u64,
-}
-
-/// Outcome of one live-lab run, surfaced uniformly across orchestrator
-/// implementations. Stage records, release-gate completeness, and the
-/// rendered summary are read off disk under `report_dir` after the run
-/// returns; the orchestrator only owns dispatch + completion state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LiveLabRunReport {
-    pub exit_status_code: Option<i32>,
-    pub success: bool,
-}
-
-/// Live-lab dispatch surface. The trait exists so the live-lab driver can
-/// pick a Linux-bash impl (today) or a per-target Rust impl (W3.3) without
-/// downstream code branching on which one ran. The trait deliberately
-/// returns a uniform `LiveLabRunReport`; per-stage records are written to
-/// disk under `inputs.report_dir` and parsed by the caller (preserves the
-/// existing TSV-on-disk contract documented in
-/// `scripts/e2e/live_linux_lab_orchestrator.sh`).
-pub trait StageOrchestrator {
-    fn execute_live_lab(&self, inputs: &LiveLabRunInputs) -> Result<LiveLabRunReport, String>;
-}
-
-/// `StageOrchestrator` implementation that wraps the existing
-/// `scripts/e2e/live_linux_lab_orchestrator.sh` bash driver. Behavior is
-/// byte-identical to the inline dispatch this replaced — same `bash
-/// <script> --profile … --report-dir … [flags]` invocation, same
-/// post-processing path. The script is invoked under a hard timeout via
-/// `run_status_with_timeout_passthrough` so a stuck bash process cannot
-/// hang the orchestrator indefinitely.
-pub struct LinuxBashOrchestrator {
-    script_path: PathBuf,
-}
-
-impl LinuxBashOrchestrator {
-    pub fn new(script_path: PathBuf) -> Self {
-        Self { script_path }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn script_path(&self) -> &Path {
-        &self.script_path
-    }
-
-    /// Build the bash command for an execution. Extracted so unit tests
-    /// can assert the dispatch shape without spawning a subprocess.
-    fn build_command(&self, inputs: &LiveLabRunInputs) -> Command {
-        let mut command = Command::new("bash");
-        command.arg(&self.script_path);
-        command.arg("--profile").arg(&inputs.profile_path);
-        command.arg("--report-dir").arg(&inputs.report_dir);
-        if inputs.dry_run {
-            command.arg("--dry-run");
-        }
-        if inputs.skip_setup || inputs.continue_from_setup {
-            command.arg("--skip-setup");
-            command.arg("--preserve-report-state");
-        }
-        if inputs.skip_gates {
-            command.arg("--skip-gates");
-        }
-        if inputs.skip_soak {
-            command.arg("--skip-soak");
-        }
-        if inputs.skip_cross_network {
-            command.arg("--skip-cross-network");
-        }
-        if inputs.enable_chaos_suite {
-            command.arg("--enable-chaos-suite");
-        }
-        command.arg("--source-mode").arg(&inputs.source_mode);
-        if let Some(value) = inputs.repo_ref.as_deref() {
-            command.arg("--repo-ref").arg(value);
-        }
-        if inputs.stage_timeout_secs > 0 {
-            command
-                .arg("--stage-timeout-secs")
-                .arg(inputs.stage_timeout_secs.to_string());
-        }
-        command
-    }
-}
-
-impl StageOrchestrator for LinuxBashOrchestrator {
-    fn execute_live_lab(&self, inputs: &LiveLabRunInputs) -> Result<LiveLabRunReport, String> {
-        let mut command = self.build_command(inputs);
-        let status = run_status_with_timeout_passthrough(&mut command, inputs.timeout)
-            .map_err(|err| format!("live-lab run failed: {err}"))?;
-        Ok(LiveLabRunReport {
-            exit_status_code: status.code(),
-            success: status.success(),
-        })
-    }
+    // W5.7 (BashOrchestratorRetirementProgram_2026-08-22.md): the standalone
+    // setup command was a thin driver of the retired bash orchestrator
+    // (`live_linux_lab_orchestrator.sh --setup-only`). The surviving setup
+    // path is the Rust --node engine's setup mode. Fail closed with the
+    // replacement instead of shelling out to a script that no longer exists.
+    Err(
+        "vm-lab-setup-live-lab was retired with the legacy bash orchestrator (W5.7); \
+         use `ops vm-lab-orchestrate-live-lab --setup-only --node <alias>:<role> ...` \
+         (the Rust --node engine's setup mode, resumable via --resume-from/--rerun-stage)"
+            .to_owned(),
+    )
 }
 
 /// Per-OS canonical runtime path roots consumed by the orchestrator and
@@ -11141,9 +9746,9 @@ pub enum RemoteInvocation {
 
 /// Adapter over the remote-shell channel used by the orchestrator.
 /// Implementations are not expected to actually spawn SSH in this
-/// slice — the trait surface lets the W3.3 `RustOrchestrator` and
-/// existing per-stage helpers share one boundary so any future
-/// argv-discipline regression is caught at one audited site.
+/// slice — the trait surface lets per-stage helpers share one boundary
+/// so any future argv-discipline regression is caught at one audited
+/// site.
 #[allow(dead_code)]
 pub trait RemoteExec {
     fn build_invocation(
@@ -11490,358 +10095,10 @@ fn daemon_probe_for(platform: VmGuestPlatform) -> Box<dyn DaemonProbe> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// W3.3 RustOrchestrator
-// ---------------------------------------------------------------------------
-
-/// Per-target Rust orchestrator that selects between two execution
-/// strategies based on the target platform set:
-///
-/// 1. **Linux-core desktop node set** — delegates to the wrapped
-///    `LinuxBashOrchestrator`. Parity with the existing bash impl is
-///    *identity* for pure-Linux mode: the live-lab is run by literally
-///    invoking `scripts/e2e/live_linux_lab_orchestrator.sh`, exactly
-///    as it has been since the repository's first live-lab landed.
-///    Phase 31 also allows Linux+macOS+Windows desktop sidecars through
-///    this wrapper because the script now carries per-platform metadata
-///    and sidecar dispatch.
-///
-/// 2. **Unsupported topology** — pure non-Linux, mobile, or otherwise
-///    unsupported platform sets reject before execution. This keeps the
-///    mixed-OS unlock fail-closed: the current stage graph still needs a
-///    Linux core host.
-///
-/// `RustOrchestrator::new(linux_bash, target_platforms)` consumes a
-/// pre-built `LinuxBashOrchestrator` and the resolved per-target
-/// platform set. The platform set is captured up-front so the
-/// dispatch decision is a pure function of the inputs and cannot be
-/// affected by mid-run inventory mutation.
-#[allow(dead_code)]
-pub struct RustOrchestrator {
-    linux_bash: LinuxBashOrchestrator,
-    target_platforms: Vec<VmGuestPlatform>,
-}
-
-impl RustOrchestrator {
-    #[allow(dead_code)]
-    pub fn new(linux_bash: LinuxBashOrchestrator, target_platforms: Vec<VmGuestPlatform>) -> Self {
-        Self {
-            linux_bash,
-            target_platforms,
-        }
-    }
-
-    /// True when the captured target set can be driven by the current
-    /// bash-backed mixed-OS wrapper: all-Linux or Linux plus supported
-    /// desktop sidecars. A Linux core remains mandatory because the
-    /// current stage graph still anchors exit/client/relay roles there.
-    #[allow(dead_code)]
-    fn is_supported_desktop_topology(&self) -> bool {
-        self.target_platforms.is_empty()
-            || self
-                .target_platforms
-                .iter()
-                .any(|p| matches!(p, VmGuestPlatform::Linux))
-                && self.target_platforms.iter().all(|p| {
-                    matches!(
-                        p,
-                        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
-                    )
-                })
-    }
-
-    /// Names of any non-Linux platforms in the captured set. Used to
-    /// build a precise blocker message when the heterogeneous-set
-    /// branch rejects.
-    #[allow(dead_code)]
-    fn non_linux_platforms(&self) -> Vec<&'static str> {
-        let mut found = Vec::new();
-        for platform in &self.target_platforms {
-            if !matches!(platform, VmGuestPlatform::Linux) {
-                let label = platform.as_str();
-                if !found.contains(&label) {
-                    found.push(label);
-                }
-            }
-        }
-        found
-    }
-}
-
-impl StageOrchestrator for RustOrchestrator {
-    fn execute_live_lab(&self, inputs: &LiveLabRunInputs) -> Result<LiveLabRunReport, String> {
-        if self.is_supported_desktop_topology() {
-            // Parity proof for pure-Linux: delegate to the wrapped
-            // bash orchestrator. Behavior is identity — same script,
-            // same flag set, same TSV-on-disk contract. No new code
-            // runs in this branch beyond the dispatch decision itself.
-            // Phase 31 extends that same path to mixed desktop
-            // topologies because the bash wrapper now carries
-            // per-platform metadata and sidecar stage dispatch.
-            return self.linux_bash.execute_live_lab(inputs);
-        }
-
-        // Unsupported topology: refuse before execution. This protects
-        // callers that bypass the profile boundary and reach the trait
-        // directly with pure-non-Linux or mobile target sets.
-        //
-        // Slice 2 of VmLabCapabilityReportingPlan_2026-04-14 wires the
-        // capability evaluator at this boundary through the umbrella
-        // `validate_vm_lab_capability_preconditions`. The umbrella chains
-        // normalize_vm_lab_platform_mix + validate_vm_lab_target_topology
-        // + the Slice-1 evaluator into one typed verdict, so the surfaced
-        // `reason_code` reflects whether this is a mixed-platform topology
-        // (`topology-mismatch`) or a pure-non-Linux topology
-        // (`linux-shell-orchestrator-only`). Enforcement is unchanged:
-        // this branch still fails closed for any non-Linux target.
-        let blockers = self.non_linux_platforms();
-        // The umbrella's Err branch is for unknown command names; we hard-
-        // code "vm-lab-run-live-lab" so this is unreachable in practice.
-        // Defensive fallback synthesizes a Blocked verdict so the wrapper
-        // never returns a capability-less string if the mapping drifts.
-        let outcome = capability::validate_vm_lab_capability_preconditions(
-            "vm-lab-run-live-lab",
-            capability::VmLabPlatform::Linux,
-            capability::VmLabSourceMode::LocalHead,
-            None,
-            &self.target_platforms,
-        )
-        .unwrap_or_else(|_| {
-            capability::VmLabCapabilityPrecondition::Blocked(
-                capability::VmLabCapabilityFailureContext::new(
-                    "vm-lab-run-live-lab",
-                    capability::VmLabCapabilityContext {
-                        scope: capability::VmLabCapabilityScope::RunLiveLab,
-                        platform: capability::VmLabPlatform::Linux,
-                        source_mode: capability::VmLabSourceMode::LocalHead,
-                        bootstrap_phase: None,
-                        mixed_platform_topology: true,
-                    },
-                ),
-            )
-        });
-        let capability_record = outcome.failure_context().record.clone();
-        Err(format!(
-            "RustOrchestrator refuses unsupported live-lab topology: \
-             non-Linux platforms in target set [{}]. {}. Current supported \
-             topology is Linux core plus desktop sidecars (macOS/Windows); \
-             mobile and pure-non-Linux profiles fail closed.",
-            blockers.join(", "),
-            capability::render_capability_summary(&capability_record),
-        ))
-    }
-}
-
-pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<String, String> {
-    ensure_local_regular_file_path(config.profile_path.as_path(), "live-lab profile")?;
-    ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
-    let profile = load_live_lab_profile(config.profile_path.as_path())?;
-    ensure_live_lab_profile_desktop_orchestrator_supported(&profile, "vm-lab-run-live-lab")?;
-    if let Some(value) = config.source_mode.as_deref() {
-        ensure_no_control_chars("source mode", value)?;
-    }
-    if let Some(value) = config.repo_ref.as_deref() {
-        ensure_no_control_chars("repo ref", value)?;
-    }
-    let (resolved_source_mode, resolved_repo_ref) = resolve_iteration_source_selection(
-        config.source_mode.as_deref(),
-        config.repo_ref.as_deref(),
-        false,
-        false,
-        false,
-    )?;
-
-    let report_dir = match config.report_dir.clone() {
-        Some(path) => path,
-        None => profile.optional("REPORT_DIR").map_or_else(
-            || default_live_lab_report_root().join(format!("run_{}", unique_suffix())),
-            PathBuf::from,
-        ),
-    };
-    let report_dir = resolve_absolute_path(report_dir.as_path())?;
-    let can_continue_from_setup = resolve_run_setup_reuse(
-        report_dir.as_path(),
-        config.profile_path.as_path(),
-        config.script_path.as_path(),
-        resolved_source_mode.as_str(),
-        resolved_repo_ref.as_deref(),
-        config.skip_setup,
-    )?;
-    if !can_continue_from_setup {
-        ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-run-live-lab")?;
-        fs::create_dir_all(report_dir.as_path()).map_err(|err| {
-            format!(
-                "create live-lab report directory failed ({}): {err}",
-                report_dir.display()
-            )
-        })?;
-        let manifest = build_setup_manifest(&LiveLabSetupManifestInput {
-            report_dir: report_dir.clone(),
-            profile_path: config.profile_path.clone(),
-            script_path: config.script_path.clone(),
-            inventory_path: None,
-            source_mode: resolved_source_mode.clone(),
-            repo_ref: resolved_repo_ref.clone(),
-            require_same_network: None,
-            dry_run: config.dry_run,
-            max_parallel_node_workers: None,
-        })?;
-        write_setup_manifest(report_dir.as_path(), &manifest)?;
-        let report_state = initial_report_state(report_dir.as_path(), &manifest)?;
-        write_report_state(report_dir.as_path(), &report_state)?;
-    }
-    // Finding 1B: idempotent — setup-reuse runs keep the manifest their
-    // setup emitted; fresh runs get one resolved from this command's flags
-    // (no mac/win role selectors exist on this surface, so those streams
-    // resolve not_applicable).
-    crate::live_lab_stage_manifest::ensure_stage_manifest(
-        report_dir.as_path(),
-        "vm-lab-run-live-lab",
-        if config.dry_run { "dry_run" } else { "full" },
-        &crate::live_lab_stage_registry::TargetSelectors {
-            chaos_suite: config.enable_chaos_suite,
-            cross_network_suite: !config.skip_cross_network,
-            soak_suite: !config.skip_soak,
-            local_gate_suite: !config.skip_gates,
-            ..Default::default()
-        },
-    )?;
-    let timeout = timeout_or_default(config.timeout_secs, DEFAULT_LIVE_LAB_TIMEOUT_SECS);
-    let inputs = LiveLabRunInputs {
-        profile_path: config.profile_path.clone(),
-        report_dir: report_dir.clone(),
-        source_mode: resolved_source_mode.clone(),
-        repo_ref: resolved_repo_ref.clone(),
-        timeout,
-        dry_run: config.dry_run,
-        skip_setup: config.skip_setup,
-        continue_from_setup: can_continue_from_setup,
-        skip_gates: config.skip_gates,
-        skip_soak: config.skip_soak,
-        skip_cross_network: config.skip_cross_network,
-        enable_chaos_suite: config.enable_chaos_suite,
-        stage_timeout_secs: config.stage_timeout_secs,
-    };
-    let orchestrator = LinuxBashOrchestrator::new(config.script_path.clone());
-    let run_report = orchestrator.execute_live_lab(&inputs)?;
-    validate_live_lab_run_artifacts(report_dir.as_path())?;
-    let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)?;
-    let records = parse_live_lab_stage_records(report_dir.as_path())?;
-    let release_gate_report = build_release_gate_completeness_report(
-        &records,
-        full_release_gate_requested(&profile, &config),
-    );
-    write_release_gate_completeness(report_dir.as_path(), &release_gate_report)?;
-    let mut warnings = Vec::new();
-    if can_continue_from_setup && !config.skip_setup {
-        warnings.push(
-            "auto-detected completed setup stages in report dir; continued with test stages only"
-                .to_owned(),
-        );
-    }
-    let completeness_error = (release_gate_report.requested
-        && !release_gate_report.missing_or_non_pass_stages.is_empty())
-    .then(|| {
-        let message = format!(
-            "full release-gate mode requested, but required stages were missing or not pass: {}",
-            release_gate_report.missing_or_non_pass_stages.join(", ")
-        );
-        warnings.push(message.clone());
-        message
-    });
-    let run_passed = run_report.success && completeness_error.is_none();
-    let full_release_evidence_complete =
-        run_passed && release_gate_report.requested && release_gate_report.status == "complete";
-    let state_update_error = match build_run_provenance(
-        config.profile_path.as_path(),
-        config.script_path.as_path(),
-        resolved_source_mode.as_str(),
-        resolved_repo_ref.as_deref(),
-        &LiveLabRunModeFlags {
-            dry_run: config.dry_run,
-            skip_setup: config.skip_setup || can_continue_from_setup,
-            skip_gates: config.skip_gates,
-            skip_soak: config.skip_soak,
-            skip_cross_network: config.skip_cross_network,
-        },
-    )
-    .and_then(|run_provenance| {
-        update_report_state_after_run(
-            report_dir.as_path(),
-            run_provenance,
-            run_passed,
-            release_gate_report.requested,
-            full_release_evidence_complete,
-        )
-    }) {
-        Ok(()) => None,
-        Err(err) => {
-            warnings.push(err.clone());
-            Some(err)
-        }
-    };
-    let mut completion_error = state_update_error;
-    if !config.orchestrated {
-        let outcomes = stage_outcomes_from_records(&records);
-        if let Err(err) = append_live_lab_run_matrix_for_command(
-            "vm-lab-run-live-lab",
-            report_dir.as_path(),
-            Some(config.profile_path.as_path()),
-            None,
-            outcomes.as_slice(),
-        ) {
-            warnings.push(format!("live-lab run matrix update failed: {err}"));
-            completion_error.get_or_insert(err);
-        }
-    }
-    let next_actions = if run_report.success && completeness_error.is_none() {
-        Vec::new()
-    } else if let Some(message) = completeness_error.as_ref() {
-        vec![
-            message.clone(),
-            format!(
-                "Inspect {} for the required stage set and rerun without skip flags",
-                report_dir
-                    .join(RELEASE_GATE_COMPLETENESS_RELATIVE_PATH)
-                    .display()
-            ),
-        ]
-    } else {
-        vec![format!(
-            "Run vm-lab-diagnose-live-lab-failure with --profile {} --report-dir {}",
-            config.profile_path.display(),
-            report_dir.display()
-        )]
-    };
-    let rendered = render_vm_lab_command_result(
-        "vm-lab-run-live-lab",
-        report_dir.as_path(),
-        &summary,
-        &records,
-        warnings,
-        next_actions,
-        completion_error
-            .as_ref()
-            .map(|_| VmLabCommandOverallStatus::Fail)
-            .or_else(|| {
-                completeness_error
-                    .as_ref()
-                    .filter(|_| run_report.success)
-                    .map(|_| VmLabCommandOverallStatus::Fail)
-            }),
-    )?;
-    if run_report.success && completeness_error.is_none() && completion_error.is_none() {
-        Ok(rendered)
-    } else {
-        Err(rendered)
-    }
-}
-
 // RNQ-15: the Rust-native engine's evidence/finalization layer and the
 // executor + plan glue moved to narrow modules with explicit interfaces.
 // Re-exports below keep the dispatcher and the legacy in-file test module
 // compiling against their original `super::` paths.
-use orchestrator::evidence::orchestrate_manifest_selectors;
 #[cfg(test)]
 use orchestrator::evidence::{
     RustNativeStageRecorder, rust_native_vm_lab_stage_outcome, validate_collected_os_version,
@@ -11849,9 +10106,7 @@ use orchestrator::evidence::{
     write_rust_native_report_state_final, write_rust_native_report_state_initial,
     write_rust_native_reuse_evidence_seal, write_rust_native_run_summary,
 };
-use orchestrator::native::{
-    ensure_orchestration_network_profile_record, execute_rust_native_orchestration,
-};
+use orchestrator::native::execute_rust_native_orchestration;
 #[cfg(test)]
 use orchestrator::native::{
     rust_native_orchestration_stage_ids, rust_native_orchestration_stage_ids_for_mode,
@@ -11870,7 +10125,6 @@ use orchestrator::native::{
 /// reproduces byte-for-byte today. It is WITHHELD (→ bash, routing unchanged) in
 /// every other case:
 ///  - `node_assignments` already non-empty (an explicit `--node` run);
-///  - `--legacy-bash-orchestrator` (the observable, time-bounded rollback lever);
 ///  - `--topology-profile` — the native path does not resolve profiles;
 ///  - any platform selector (`--exit-platform` etc.) — native's
 ///    `augment_assignments_from_platform_selectors` has different alias/role
@@ -11897,7 +10151,6 @@ fn w56_flip_legacy_to_node(
         || config.admin_platform.is_some()
         || config.blind_exit_platform.is_some();
     if !config.node_assignments.is_empty()
-        || config.legacy_bash_orchestrator
         || config.topology_profile.is_some()
         || config.macos_vm.is_some()
         || config.macos_promote_exit
@@ -11929,962 +10182,53 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     for warning in legacy_role_flags_deprecation_warnings(&config) {
         eprintln!("warning: {warning}");
     }
-    // W5.6 default flip: a run with no explicit `--node` that is not locked to
-    // bash routes to the Rust `--node` engine (see `w56_flip_legacy_to_node`).
+    // W5.6 default flip, now the only routing (W5.7 deleted the bash engine):
+    // translate the legacy Linux role flags into `--node` assignments where the
+    // native engine reproduces them byte-for-byte (see `w56_flip_legacy_to_node`).
     if let Some(translated) = w56_flip_legacy_to_node(&config) {
         eprintln!(
-            "engine: default routed to the Rust --node orchestrator (W5.6 flip); \
-             translated {} legacy role flag(s) to --node assignments. Pass \
-             --legacy-bash-orchestrator to run the legacy bash path instead.",
+            "engine: routed to the Rust --node orchestrator; translated {} legacy \
+             role flag(s) to --node assignments.",
             translated.len()
         );
         config.node_assignments = translated;
     }
-    if !config.node_assignments.is_empty() || config.run_only {
-        return execute_rust_native_orchestration(config);
-    }
-    // Reaching here means bash: either --legacy-bash-orchestrator was set, a
-    // --topology-profile run was left on bash (see the W5.6-flip note above), or
-    // the run specified no roles at all. The flag itself stays transitional until
-    // W5.7 removes the bash path entirely.
-    let _ = config.legacy_bash_orchestrator;
-    ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
-    ensure_local_regular_file_path(config.ssh_identity_file.as_path(), "SSH identity file")?;
-    ensure_optional_local_regular_file_path(
-        config.known_hosts_path.as_deref(),
-        "SSH known_hosts file",
-    )?;
-
-    let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
-    ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-orchestrate-live-lab")?;
-    fs::create_dir_all(report_dir.as_path()).map_err(|err| {
-        format!(
-            "create orchestration report directory failed ({}): {err}",
-            report_dir.display()
-        )
-    })?;
-    let orchestration_dir = report_dir.join("orchestration");
-    let pre_setup_orchestration_dir = create_orchestration_staging_dir()?;
-    let inventory_path = resolve_absolute_path(config.inventory_path.as_path())?;
-    // Track B Step 1 — apply the optional topology selectors before
-    // resolving Linux VM aliases. The override only mutates exit_vm
-    // when the operator passed --topology-profile or --exit-platform;
-    // explicit --exit-vm + an unset topology layer leave the config
-    // byte-identical so existing Linux-default runs are unchanged.
-    let inventory_entries = load_inventory(inventory_path.as_path())?;
-    let (config, topology_resolution) =
-        topology::apply_topology_overrides_to_orchestrate_config(config, &inventory_entries)?;
-    log_topology_resolution_overrides(&topology_resolution);
-    // Finding 1B: emit the run-scoped stage manifest (the resolved plan)
-    // before any stage executes, so every downstream consumer — monitor,
-    // recorder, CSV appender — reads the plan from the report dir instead
-    // of a hand-copied catalog. Selectors reflect the POST-topology-override
-    // config; the bash orchestrator's own emit is a no-op once this exists.
-    crate::live_lab_stage_manifest::ensure_stage_manifest(
-        report_dir.as_path(),
-        "vm-lab-orchestrate-live-lab",
-        if config.dry_run {
-            "dry_run"
-        } else if config.stop_after_ready {
-            "setup_only"
-        } else {
-            "full"
-        },
-        &orchestrate_manifest_selectors(&config),
-    )?;
-    let network_profile_record = ensure_orchestration_network_profile_record(
-        report_dir.as_path(),
-        inventory_path.as_path(),
-        config.network_profile.as_deref(),
-    )?;
-    eprintln!(
-        "network profile: {} digest={} (derived={}, enforced={})",
-        network_profile_record.id,
-        network_profile_record.digest,
-        network_profile_record.derived,
-        network_profile_record.enforced
-    );
-    let selected_aliases = resolve_live_lab_vm_aliases(
-        inventory_path.as_path(),
-        config.exit_vm.as_deref(),
-        config.client_vm.as_deref(),
-        config.entry_vm.as_deref(),
-        config.aux_vm.as_deref(),
-        config.extra_vm.as_deref(),
-        config.fifth_client_vm.as_deref(),
-    )?;
-    let linux_blind_exit_alias = match topology_resolution.blind_exit_alias() {
-        Some(alias) if selected_aliases.iter().any(|selected| selected == alias) => {
-            Some(alias.to_owned())
+    if config.node_assignments.is_empty() && !config.run_only {
+        // W5.7: the legacy bash orchestrator is retired, so the invocation
+        // shapes it used to absorb fail closed with the concrete reason
+        // instead of silently routing anywhere
+        // (BashOrchestratorRetirementProgram_2026-08-22.md, Phase E).
+        let mut blockers: Vec<&str> = Vec::new();
+        if config.topology_profile.is_some() {
+            blockers.push("--topology-profile (native profile resolution is a G2 item)");
         }
-        Some(alias) if config.validate_linux_daemon_state => {
-            return Err(format!(
-                "topology blind_exit alias {alias:?} is not part of the selected Linux live-lab topology"
-            ));
+        if config.exit_platform.is_some()
+            || config.relay_platform.is_some()
+            || config.anchor_platform.is_some()
+            || config.admin_platform.is_some()
+            || config.blind_exit_platform.is_some()
+        {
+            blockers
+                .push("--*-platform selectors (use explicit --node <alias>:<role> assignments)");
         }
-        Some(_) => None,
-        None => None,
-    };
-    // Build discovery alias list: Linux nodes + optional Windows/macOS nodes.
-    // selected_aliases (Linux only) continues to be used for profile/setup.
-    let mut discovery_aliases = selected_aliases.clone();
-    if let Some(ref windows_alias) = config.windows_vm
-        && !discovery_aliases.contains(windows_alias)
-    {
-        discovery_aliases.push(windows_alias.clone());
-    }
-    if let Some(ref macos_alias) = config.macos_vm
-        && !discovery_aliases.contains(macos_alias)
-    {
-        discovery_aliases.push(macos_alias.clone());
-    }
-    let effective_profile_path = match config.profile_path.clone() {
-        Some(path) => resolve_absolute_path(path.as_path())?,
-        None => config
-            .profile_output_path
-            .clone()
-            .map(|path| resolve_absolute_path(path.as_path()))
-            .transpose()?
-            .unwrap_or_else(|| default_live_lab_setup_profile_path(report_dir.as_path())),
-    };
-    let discovery_timeout = timeout_or_default(
-        config.discovery_timeout_secs,
-        DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS,
-    )
-    .as_secs();
-    let ready_timeout = timeout_or_default(
-        config.ready_timeout_secs,
-        DEFAULT_RESTART_READY_TIMEOUT_SECS,
-    )
-    .as_secs();
-
-    let mut outcomes = Vec::new();
-    let mut warnings = Vec::new();
-    let mut next_actions = Vec::new();
-    let mut diagnosis_artifact = None::<PathBuf>;
-
-    let discover_config = VmLabDiscoverLocalUtmConfig {
-        inventory_path: Some(inventory_path.clone()),
-        utm_documents_root: config.utm_documents_root.clone(),
-        utmctl_path: config.utmctl_path.clone(),
-        ssh_identity_file: Some(config.ssh_identity_file.clone()),
-        known_hosts_path: config.known_hosts_path.clone(),
-        ssh_port: config.ssh_port,
-        timeout_secs: discovery_timeout,
-        update_inventory_live_ips: true,
-        report_dir: None,
-    };
-    let initial_discovery = execute_ops_vm_lab_discover_local_utm(discover_config.clone())?;
-    let initial_discovery_path = orchestration_dir.join("discover_initial.json");
-    write_orchestration_artifact(
-        pre_setup_orchestration_dir
-            .join("discover_initial.json")
-            .as_path(),
-        initial_discovery.as_str(),
-    )?;
-    let initial_readiness =
-        selected_local_utm_readiness_from_report(initial_discovery.as_str(), &discovery_aliases)?;
-    let mut final_readiness = initial_readiness.clone();
-    let mut final_readiness_artifact = initial_discovery_path.clone();
-    let unready_aliases = not_execution_ready_aliases(&initial_readiness);
-    let discovery_outcome = stage_outcome(
-        "discover_local_utm",
-        VmLabStageStatus::Pass,
-        format!(
-            "selected aliases readiness: {}",
-            render_selected_local_utm_readiness(&initial_readiness)
-        ),
-        vec![initial_discovery_path.clone()],
-    );
-    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &discovery_outcome);
-    outcomes.push(discovery_outcome);
-
-    if config.windows_only && config.validate_linux_daemon_state {
-        warnings.push(
-            "--validate-linux-daemon-state was passed with --windows-only; Linux daemon \
-             validators will not run because --windows-only skips all Linux peers. \
-             Drop one of the two flags to remove the ambiguity."
-                .to_owned(),
-        );
-    }
-    // --windows-only: skip all Linux stages and go straight to Windows orchestration.
-    if config.windows_only {
-        let windows_alias = config
-            .windows_vm
-            .as_deref()
-            .ok_or_else(|| "--windows-only requires --windows-vm to be set".to_owned())?;
-        // Only the Windows VM needs to be ready for a Windows-only run; ignore Linux VMs.
-        let windows_unready: Vec<String> = unready_aliases
-            .iter()
-            .filter(|a| a.as_str() == windows_alias)
-            .cloned()
-            .collect();
-        if !windows_unready.is_empty() && !config.trust_inventory_ready {
-            let unready_str = windows_unready.join(", ");
-            materialize_orchestration_staging_dir(
-                pre_setup_orchestration_dir.as_path(),
-                orchestration_dir.as_path(),
-            )?;
-            return finalize_vm_lab_orchestration_result(
-                "vm-lab-orchestrate-live-lab",
-                report_dir.as_path(),
-                orchestration_dir.as_path(),
-                outcomes,
-                warnings,
-                vec![format!(
-                    "VMs not ready before Windows-only run: {unready_str}. Boot them first."
-                )],
+        if config.macos_vm.is_some() || config.macos_promote_exit {
+            blockers.push(
+                "--macos-vm / --macos-promote-exit (add the macOS node via --node <alias>:<role>)",
             );
         }
-        if !windows_unready.is_empty() {
-            warnings.push(format!(
-                "--trust-inventory-ready set for Windows-only run; proceeding to Windows \
-                 bootstrap despite discovery marking unready: {}",
-                windows_unready.join(", ")
-            ));
+        if config.windows_vm.is_some() {
+            blockers.push("--windows-vm (add the Windows node via --node <alias>:<role>)");
         }
-        let promote_windows_to_active_exit = config
-            .windows_vm
-            .as_deref()
-            .zip(config.exit_vm.as_deref())
-            .is_some_and(|(win, exit)| win == exit);
-        let windows_options = WindowsOrchestrationOptions {
-            no_fail_on_authenticode: config.no_fail_on_authenticode,
-            promote_to_active_exit: promote_windows_to_active_exit,
-            validate_admin_issue: config
-                .admin_platform
-                .as_deref()
-                .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
-            anchor_platform: config
-                .anchor_platform
-                .as_deref()
-                .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
-            validate_role_transition: config
-                .role_switch_platform
-                .as_deref()
-                .is_some_and(|platform| platform.eq_ignore_ascii_case("windows")),
-            ..WindowsOrchestrationOptions::default()
-        };
-        let windows_outcomes = run_windows_orchestration_stages_with_options(
-            windows_alias,
-            inventory_path.as_path(),
-            config.ssh_identity_file.as_path(),
-            config.known_hosts_path.as_deref(),
-            config.ssh_port,
-            config.utm_documents_root.as_deref(),
-            config.utmctl_path.as_deref(),
-            config.dry_run,
-            report_dir.as_path(),
-            windows_options,
-        );
-        for outcome in &windows_outcomes {
-            emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+        if blockers.is_empty() {
+            blockers.push("no role assignments were given");
         }
-        outcomes.extend(windows_outcomes);
-        materialize_orchestration_staging_dir(
-            pre_setup_orchestration_dir.as_path(),
-            orchestration_dir.as_path(),
-        )?;
-        return finalize_vm_lab_orchestration_result(
-            "vm-lab-orchestrate-live-lab",
-            report_dir.as_path(),
-            orchestration_dir.as_path(),
-            outcomes,
-            warnings,
-            next_actions,
-        );
+        return Err(format!(
+            "vm-lab-orchestrate-live-lab: the legacy bash orchestrator was retired (W5.7); \
+             this invocation shape is not supported by the Rust --node engine: {}",
+            blockers.join("; ")
+        ));
     }
-
-    let restart_decision = decide_restart_unready(
-        unready_aliases.is_empty(),
-        config.dry_run,
-        config.trust_inventory_ready,
-    );
-    if restart_decision != RestartUnreadyDecision::AllReady {
-        match restart_decision {
-            RestartUnreadyDecision::AllReady => unreachable!("handled by the outer guard"),
-            RestartUnreadyDecision::TrustInventorySkip => {
-                // The TCP readiness probe (probe_tcp_port_status) is a raw
-                // unbound-socket connect that can be blind in this execution
-                // context even though the bootstrap `ssh` binary reaches the
-                // nodes. The operator passed --trust-inventory-ready, so skip the
-                // restart-and-rediscover gate and let bootstrap be the arbiter.
-                warnings.push(format!(
-                    "selected local UTM VMs probed as not execution-ready, but \
-                     --trust-inventory-ready was set; SKIPPING restart and proceeding to \
-                     bootstrap (probe may be blind; bootstrap SSH is the source of truth): {}",
-                    unready_aliases.join(", ")
-                ));
-                let restart_outcome = stage_outcome(
-                    "restart_unready_vms",
-                    VmLabStageStatus::Skipped,
-                    format!(
-                        "skipped by --trust-inventory-ready: not restarting probed-unready \
-                         aliases {}; bootstrap SSH will fail loudly if a node is truly \
-                         unreachable",
-                        unready_aliases.join(", ")
-                    ),
-                    vec![initial_discovery_path.clone()],
-                );
-                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
-                outcomes.push(restart_outcome);
-            }
-            RestartUnreadyDecision::DryRunSkip => {
-                warnings.push(format!(
-                    "selected local UTM VMs were not execution-ready and required restart: {}",
-                    unready_aliases.join(", ")
-                ));
-                let restart_outcome = stage_outcome(
-                    "restart_unready_vms",
-                    VmLabStageStatus::Skipped,
-                    format!(
-                        "dry-run: would restart aliases {}",
-                        unready_aliases.join(", ")
-                    ),
-                    vec![initial_discovery_path.clone()],
-                );
-                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &restart_outcome);
-                outcomes.push(restart_outcome);
-            }
-            RestartUnreadyDecision::Restart => {
-                warnings.push(format!(
-                    "selected local UTM VMs were not execution-ready and required restart: {}",
-                    unready_aliases.join(", ")
-                ));
-                let restart_output = execute_ops_vm_lab_restart(VmLabRestartConfig {
-                    inventory_path: inventory_path.clone(),
-                    vm_aliases: unready_aliases.clone(),
-                    raw_targets: Vec::new(),
-                    select_all: false,
-                    utmctl_path: config
-                        .utmctl_path
-                        .clone()
-                        .unwrap_or_else(default_utmctl_path),
-                    service: None,
-                    wait_ready: true,
-                    ssh_port: config.ssh_port,
-                    ready_timeout_secs: ready_timeout,
-                    ssh_user: None,
-                    ssh_identity_file: Some(config.ssh_identity_file.clone()),
-                    known_hosts_path: config.known_hosts_path.clone(),
-                    timeout_secs: config.timeout_secs,
-                    json_output: false,
-                    report_dir: Some(pre_setup_orchestration_dir.clone()),
-                });
-                let restart_path = orchestration_dir.join("restart_unready_vms.txt");
-                match restart_output {
-                    Ok(output) => {
-                        write_orchestration_artifact(
-                            pre_setup_orchestration_dir
-                                .join("restart_unready_vms.txt")
-                                .as_path(),
-                            output.as_str(),
-                        )?;
-                        let restart_outcome = stage_outcome(
-                            "restart_unready_vms",
-                            VmLabStageStatus::Pass,
-                            format!("restarted aliases {}", unready_aliases.join(", ")),
-                            vec![restart_path.clone()],
-                        );
-                        emit_vm_lab_progress_outcome(
-                            "vm-lab-orchestrate-live-lab",
-                            &restart_outcome,
-                        );
-                        outcomes.push(restart_outcome);
-                    }
-                    Err(err) => {
-                        write_orchestration_artifact(
-                            pre_setup_orchestration_dir
-                                .join("restart_unready_vms.txt")
-                                .as_path(),
-                            err.as_str(),
-                        )?;
-                        let restart_outcome = stage_outcome(
-                            "restart_unready_vms",
-                            VmLabStageStatus::Fail,
-                            format!("restart failed for aliases {}", unready_aliases.join(", ")),
-                            vec![initial_discovery_path.clone(), restart_path],
-                        );
-                        emit_vm_lab_progress_outcome(
-                            "vm-lab-orchestrate-live-lab",
-                            &restart_outcome,
-                        );
-                        outcomes.push(restart_outcome);
-                        next_actions.push(format!(
-                            "Inspect {} and {}",
-                            initial_discovery_path.display(),
-                            orchestration_dir.join("restart_unready_vms.txt").display()
-                        ));
-                        materialize_orchestration_staging_dir(
-                            pre_setup_orchestration_dir.as_path(),
-                            orchestration_dir.as_path(),
-                        )?;
-                        return finalize_vm_lab_orchestration_result(
-                            "vm-lab-orchestrate-live-lab",
-                            report_dir.as_path(),
-                            orchestration_dir.as_path(),
-                            outcomes,
-                            warnings,
-                            next_actions,
-                        );
-                    }
-                }
-
-                let rediscovery = execute_ops_vm_lab_discover_local_utm(discover_config)?;
-                let rediscovery_path = orchestration_dir.join("discover_post_restart.json");
-                write_orchestration_artifact(
-                    pre_setup_orchestration_dir
-                        .join("discover_post_restart.json")
-                        .as_path(),
-                    rediscovery.as_str(),
-                )?;
-                let post_restart_readiness = selected_local_utm_readiness_from_report(
-                    rediscovery.as_str(),
-                    &discovery_aliases,
-                )?;
-                final_readiness = post_restart_readiness.clone();
-                final_readiness_artifact = rediscovery_path.clone();
-                let still_unready = not_execution_ready_aliases(&post_restart_readiness);
-                let rediscovery_status = if still_unready.is_empty() {
-                    VmLabStageStatus::Pass
-                } else {
-                    VmLabStageStatus::Fail
-                };
-                let rediscovery_outcome = stage_outcome(
-                    "rediscover_local_utm",
-                    rediscovery_status.clone(),
-                    format!(
-                        "selected aliases readiness after restart: {}",
-                        render_selected_local_utm_readiness(&post_restart_readiness)
-                    ),
-                    vec![rediscovery_path.clone()],
-                );
-                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &rediscovery_outcome);
-                outcomes.push(rediscovery_outcome);
-                if rediscovery_status == VmLabStageStatus::Fail {
-                    next_actions.push(format!(
-                        "Inspect {} for remaining readiness blockers",
-                        rediscovery_path.display()
-                    ));
-                    materialize_orchestration_staging_dir(
-                        pre_setup_orchestration_dir.as_path(),
-                        orchestration_dir.as_path(),
-                    )?;
-                    return finalize_vm_lab_orchestration_result(
-                        "vm-lab-orchestrate-live-lab",
-                        report_dir.as_path(),
-                        orchestration_dir.as_path(),
-                        outcomes,
-                        warnings,
-                        next_actions,
-                    );
-                }
-            }
-        }
-    }
-
-    if config.stop_after_ready {
-        let readiness_complete = final_readiness.unready_entries.is_empty();
-        if !readiness_complete {
-            warnings.push(format!(
-                "stop-after-ready ended before all selected aliases became execution-ready: {}",
-                render_selected_local_utm_readiness(&final_readiness)
-            ));
-            next_actions.push(
-                "Rerun without --dry-run or inspect the discovery artifacts for readiness blockers"
-                    .to_owned(),
-            );
-        } else {
-            next_actions.push(format!(
-                "Run ops vm-lab-setup-live-lab using report dir {}",
-                report_dir.display()
-            ));
-        }
-        let stop_after_ready_outcome = stage_outcome(
-            "stop_after_ready",
-            if readiness_complete {
-                VmLabStageStatus::Pass
-            } else {
-                VmLabStageStatus::Skipped
-            },
-            format!(
-                "selected aliases readiness: {}",
-                render_selected_local_utm_readiness(&final_readiness)
-            ),
-            vec![final_readiness_artifact],
-        );
-        emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &stop_after_ready_outcome);
-        outcomes.push(stop_after_ready_outcome);
-        materialize_orchestration_staging_dir(
-            pre_setup_orchestration_dir.as_path(),
-            orchestration_dir.as_path(),
-        )?;
-        return finalize_vm_lab_orchestration_result(
-            "vm-lab-orchestrate-live-lab",
-            report_dir.as_path(),
-            orchestration_dir.as_path(),
-            outcomes,
-            warnings,
-            next_actions,
-        );
-    }
-
-    let setup_config = VmLabSetupLiveLabConfig {
-        inventory_path: inventory_path.clone(),
-        profile_path: config.profile_path.clone(),
-        profile_output_path: config.profile_output_path.clone().or_else(|| {
-            if config.profile_path.is_some() {
-                None
-            } else {
-                Some(effective_profile_path.clone())
-            }
-        }),
-        exit_vm: config.exit_vm.clone(),
-        client_vm: config.client_vm.clone(),
-        entry_vm: config.entry_vm.clone(),
-        aux_vm: config.aux_vm.clone(),
-        extra_vm: config.extra_vm.clone(),
-        fifth_client_vm: config.fifth_client_vm.clone(),
-        relay_vm: config.relay_vm.clone(),
-        linux_blind_exit_vm: linux_blind_exit_alias.clone(),
-        ssh_identity_file: config.ssh_identity_file.clone(),
-        known_hosts_path: config.known_hosts_path.clone(),
-        require_same_network: config.require_same_network,
-        script_path: config.script_path.clone(),
-        report_dir: report_dir.clone(),
-        source_mode: config.source_mode.clone(),
-        repo_ref: config.repo_ref.clone(),
-        resume_from: None,
-        rerun_stage: None,
-        max_parallel_node_workers: config.max_parallel_node_workers,
-        timeout_secs: config.timeout_secs,
-        stage_timeout_secs: config.stage_timeout_secs,
-        dry_run: config.dry_run,
-        // This call comes from the orchestrator, which has already written pre-setup
-        // discovery metadata into report_dir/orchestration/. Tell setup to exempt that
-        // directory from its freshness check.
-        orchestrated: true,
-    };
-    let setup_result = execute_ops_vm_lab_setup_live_lab(setup_config);
-    materialize_orchestration_staging_dir(
-        pre_setup_orchestration_dir.as_path(),
-        orchestration_dir.as_path(),
-    )?;
-    let setup_result_path = orchestration_dir.join("setup_result.json");
-    match setup_result {
-        Ok(rendered) => {
-            write_orchestration_artifact(setup_result_path.as_path(), rendered.as_str())?;
-            let result = parse_vm_lab_command_result(rendered.as_str())?;
-            let appended =
-                append_unique_stage_outcomes_collect_new(&mut outcomes, result.outcomes.as_slice());
-            emit_vm_lab_progress_outcomes("vm-lab-orchestrate-live-lab", appended.as_slice());
-            warnings.extend(result.warnings);
-        }
-        Err(err) => {
-            write_orchestration_artifact(setup_result_path.as_path(), err.as_str())?;
-            match parse_vm_lab_command_result(err.as_str()) {
-                Ok(result) => {
-                    let appended = append_unique_stage_outcomes_collect_new(
-                        &mut outcomes,
-                        result.outcomes.as_slice(),
-                    );
-                    emit_vm_lab_progress_outcomes(
-                        "vm-lab-orchestrate-live-lab",
-                        appended.as_slice(),
-                    );
-                    warnings.extend(result.warnings);
-                    next_actions.extend(result.next_actions);
-                }
-                Err(parse_err) => {
-                    warnings.push(parse_err);
-                    let setup_outcome = stage_outcome(
-                        "vm_lab_setup_live_lab",
-                        VmLabStageStatus::Fail,
-                        err,
-                        vec![setup_result_path.clone()],
-                    );
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &setup_outcome);
-                    outcomes.push(setup_outcome);
-                }
-            }
-            // Run Windows orchestration even when Linux setup fails after
-            // signed bundle distribution. The Windows helper gates on the
-            // four Linux bundle-distribution outcomes and skips cleanly if
-            // setup failed too early.
-            if let Some(ref windows_alias) = config.windows_vm {
-                let windows_outcomes = run_windows_orchestration_with_pulled_bundles(
-                    &config,
-                    inventory_path.as_path(),
-                    report_dir.as_path(),
-                    windows_alias.as_str(),
-                    outcomes.as_slice(),
-                );
-                for outcome in &windows_outcomes {
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-                }
-                outcomes.extend(windows_outcomes);
-            }
-            if let Some(ref macos_alias) = config.macos_vm {
-                let macos_outcomes = run_macos_orchestration_stages(
-                    &config,
-                    macos_alias.as_str(),
-                    inventory_path.as_path(),
-                    config.ssh_identity_file.as_path(),
-                    config.known_hosts_path.as_deref(),
-                    config.dry_run,
-                    report_dir.as_path(),
-                    &outcomes,
-                );
-                for outcome in &macos_outcomes {
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-                }
-                outcomes.extend(macos_outcomes);
-            }
-            if !config.skip_diagnose_on_failure
-                && effective_profile_path.is_file()
-                && report_dir.join("state/stages.tsv").exists()
-            {
-                let diagnose_result = execute_ops_vm_lab_diagnose_live_lab_failure(
-                    VmLabDiagnoseLiveLabFailureConfig {
-                        inventory_path: inventory_path.clone(),
-                        profile_path: effective_profile_path.clone(),
-                        report_dir: report_dir.clone(),
-                        stage: None,
-                        output_dir: None,
-                        collect_artifacts: config.collect_artifacts_on_failure,
-                        timeout_secs: config.timeout_secs,
-                    },
-                );
-                let diagnose_path = orchestration_dir.join("diagnose_result.json");
-                match diagnose_result {
-                    Ok(rendered) => {
-                        write_orchestration_artifact(diagnose_path.as_path(), rendered.as_str())?;
-                        let result = parse_vm_lab_command_result(rendered.as_str())?;
-                        diagnosis_artifact = Some(PathBuf::from(result.report_dir.clone()));
-                        let diagnose_outcome = stage_outcome(
-                            "diagnose_live_lab_failure",
-                            VmLabStageStatus::Pass,
-                            "collected failure diagnostics after setup failure",
-                            result
-                                .outcomes
-                                .into_iter()
-                                .flat_map(|outcome| outcome.artifacts)
-                                .map(PathBuf::from)
-                                .collect(),
-                        );
-                        emit_vm_lab_progress_outcome(
-                            "vm-lab-orchestrate-live-lab",
-                            &diagnose_outcome,
-                        );
-                        outcomes.push(diagnose_outcome);
-                        warnings.extend(result.warnings);
-                    }
-                    Err(err) => {
-                        write_orchestration_artifact(diagnose_path.as_path(), err.as_str())?;
-                        warnings.push(format!(
-                            "diagnose-on-failure after setup failure did not complete: {err}"
-                        ));
-                    }
-                }
-            }
-            if next_actions.is_empty() {
-                if let Some(path) = diagnosis_artifact.as_deref() {
-                    next_actions.push(format!("Inspect diagnostics under {}", path.display()));
-                } else {
-                    next_actions.push(format!(
-                        "Inspect {} and rerun vm-lab-diagnose-live-lab-failure if needed",
-                        report_dir.display()
-                    ));
-                }
-            }
-            return finalize_vm_lab_orchestration_result(
-                "vm-lab-orchestrate-live-lab",
-                report_dir.as_path(),
-                orchestration_dir.as_path(),
-                outcomes,
-                warnings,
-                next_actions,
-            );
-        }
-    }
-
-    // --skip-linux-live-suite: setup (bootstrap + membership + signed-bundle
-    // distribution + baseline) has already completed above; skip the Linux
-    // live-validation suite (the ~30-45 min `execute_ops_vm_lab_run_live_lab`
-    // call) and jump straight to the mac/win role stages. Those stages gate on
-    // setup's `distribute_*` outcomes (see `run_windows_orchestration_with_pulled_bundles`
-    // / `run_macos_orchestration_stages`), NOT on the live suite, so the
-    // targeted cell is still fully exercised against the freshly-set-up mesh.
-    // This mirrors the run-Ok arm below minus the `execute_ops_vm_lab_run_live_lab`
-    // invocation. Used for fast mac/win cell iteration (e.g. ai_lab_run
-    // with a role-platform selector).
-    if config.skip_linux_live_suite {
-        let skip_outcome = stage_outcome(
-            "linux_live_suite",
-            VmLabStageStatus::Skipped,
-            "skipped by --skip-linux-live-suite; setup ran, mac/win role stages still execute",
-            vec![],
-        );
-        emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &skip_outcome);
-        outcomes.push(skip_outcome);
-        if let Some(ref windows_alias) = config.windows_vm {
-            let windows_outcomes = run_windows_orchestration_with_pulled_bundles(
-                &config,
-                inventory_path.as_path(),
-                report_dir.as_path(),
-                windows_alias.as_str(),
-                outcomes.as_slice(),
-            );
-            for outcome in &windows_outcomes {
-                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-            }
-            outcomes.extend(windows_outcomes);
-        }
-        if let Some(ref macos_alias) = config.macos_vm {
-            let macos_outcomes = run_macos_orchestration_stages(
-                &config,
-                macos_alias.as_str(),
-                inventory_path.as_path(),
-                config.ssh_identity_file.as_path(),
-                config.known_hosts_path.as_deref(),
-                config.dry_run,
-                report_dir.as_path(),
-                &outcomes,
-            );
-            for outcome in &macos_outcomes {
-                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-            }
-            outcomes.extend(macos_outcomes);
-        }
-        if config.validate_linux_daemon_state && !selected_aliases.is_empty() {
-            let linux_outcomes = run_linux_daemon_validators_for_aliases(
-                selected_aliases.as_slice(),
-                linux_blind_exit_alias.as_deref(),
-                inventory_path.as_path(),
-                config.ssh_identity_file.as_path(),
-                config.known_hosts_path.as_deref(),
-                report_dir.as_path(),
-                config.dry_run,
-            );
-            for outcome in &linux_outcomes {
-                emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-            }
-            outcomes.extend(linux_outcomes);
-        }
-        return finalize_vm_lab_orchestration_result(
-            "vm-lab-orchestrate-live-lab",
-            report_dir.as_path(),
-            orchestration_dir.as_path(),
-            outcomes,
-            warnings,
-            next_actions,
-        );
-    }
-
-    let run_config = VmLabRunLiveLabConfig {
-        profile_path: effective_profile_path.clone(),
-        script_path: config.script_path.clone(),
-        dry_run: config.dry_run,
-        skip_setup: false,
-        skip_gates: config.skip_gates,
-        skip_soak: config.skip_soak,
-        skip_cross_network: config.skip_cross_network,
-        enable_chaos_suite: config.enable_chaos_suite,
-        source_mode: config.source_mode.clone(),
-        repo_ref: config.repo_ref.clone(),
-        report_dir: Some(report_dir.clone()),
-        timeout_secs: config.timeout_secs,
-        stage_timeout_secs: config.stage_timeout_secs,
-        orchestrated: true,
-    };
-    let run_result_path = orchestration_dir.join("run_result.json");
-    match execute_ops_vm_lab_run_live_lab(run_config) {
-        Ok(rendered) => {
-            write_orchestration_artifact(run_result_path.as_path(), rendered.as_str())?;
-            let result = parse_vm_lab_command_result(rendered.as_str())?;
-            let appended =
-                append_unique_stage_outcomes_collect_new(&mut outcomes, result.outcomes.as_slice());
-            emit_vm_lab_progress_outcomes("vm-lab-orchestrate-live-lab", appended.as_slice());
-            warnings.extend(result.warnings);
-            if let Some(ref windows_alias) = config.windows_vm {
-                let windows_outcomes = run_windows_orchestration_with_pulled_bundles(
-                    &config,
-                    inventory_path.as_path(),
-                    report_dir.as_path(),
-                    windows_alias.as_str(),
-                    outcomes.as_slice(),
-                );
-                for outcome in &windows_outcomes {
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-                }
-                outcomes.extend(windows_outcomes);
-            }
-            if let Some(ref macos_alias) = config.macos_vm {
-                let macos_outcomes = run_macos_orchestration_stages(
-                    &config,
-                    macos_alias.as_str(),
-                    inventory_path.as_path(),
-                    config.ssh_identity_file.as_path(),
-                    config.known_hosts_path.as_deref(),
-                    config.dry_run,
-                    report_dir.as_path(),
-                    &outcomes,
-                );
-                for outcome in &macos_outcomes {
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-                }
-                outcomes.extend(macos_outcomes);
-            }
-            if config.validate_linux_daemon_state && !selected_aliases.is_empty() {
-                let linux_outcomes = run_linux_daemon_validators_for_aliases(
-                    selected_aliases.as_slice(),
-                    linux_blind_exit_alias.as_deref(),
-                    inventory_path.as_path(),
-                    config.ssh_identity_file.as_path(),
-                    config.known_hosts_path.as_deref(),
-                    report_dir.as_path(),
-                    config.dry_run,
-                );
-                for outcome in &linux_outcomes {
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-                }
-                outcomes.extend(linux_outcomes);
-            }
-            finalize_vm_lab_orchestration_result(
-                "vm-lab-orchestrate-live-lab",
-                report_dir.as_path(),
-                orchestration_dir.as_path(),
-                outcomes,
-                warnings,
-                next_actions,
-            )
-        }
-        Err(err) => {
-            write_orchestration_artifact(run_result_path.as_path(), err.as_str())?;
-            match parse_vm_lab_command_result(err.as_str()) {
-                Ok(result) => {
-                    let appended = append_unique_stage_outcomes_collect_new(
-                        &mut outcomes,
-                        result.outcomes.as_slice(),
-                    );
-                    emit_vm_lab_progress_outcomes(
-                        "vm-lab-orchestrate-live-lab",
-                        appended.as_slice(),
-                    );
-                    warnings.extend(result.warnings);
-                    next_actions.extend(result.next_actions);
-                }
-                Err(parse_err) => {
-                    warnings.push(parse_err);
-                    let run_outcome = stage_outcome(
-                        "vm_lab_run_live_lab",
-                        VmLabStageStatus::Fail,
-                        err,
-                        vec![run_result_path.clone()],
-                    );
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &run_outcome);
-                    outcomes.push(run_outcome);
-                }
-            }
-            // Run Windows orchestration even when the Linux pipeline failed
-            // downstream of the four bundle-distribution stages: the signed
-            // bundles are already on the Linux exit and the Windows peer
-            // should still be joined to mesh state. Gating happens inside
-            // the helper based on whether the Linux distribute_* stages
-            // passed in `outcomes`.
-            if let Some(ref windows_alias) = config.windows_vm {
-                let windows_outcomes = run_windows_orchestration_with_pulled_bundles(
-                    &config,
-                    inventory_path.as_path(),
-                    report_dir.as_path(),
-                    windows_alias.as_str(),
-                    outcomes.as_slice(),
-                );
-                for outcome in &windows_outcomes {
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-                }
-                outcomes.extend(windows_outcomes);
-            }
-            if let Some(ref macos_alias) = config.macos_vm {
-                let macos_outcomes = run_macos_orchestration_stages(
-                    &config,
-                    macos_alias.as_str(),
-                    inventory_path.as_path(),
-                    config.ssh_identity_file.as_path(),
-                    config.known_hosts_path.as_deref(),
-                    config.dry_run,
-                    report_dir.as_path(),
-                    &outcomes,
-                );
-                for outcome in &macos_outcomes {
-                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
-                }
-                outcomes.extend(macos_outcomes);
-            }
-            if !config.skip_diagnose_on_failure && report_dir.join("state/stages.tsv").exists() {
-                let diagnose_result = execute_ops_vm_lab_diagnose_live_lab_failure(
-                    VmLabDiagnoseLiveLabFailureConfig {
-                        inventory_path,
-                        profile_path: effective_profile_path,
-                        report_dir: report_dir.clone(),
-                        stage: None,
-                        output_dir: None,
-                        collect_artifacts: config.collect_artifacts_on_failure,
-                        timeout_secs: config.timeout_secs,
-                    },
-                );
-                let diagnose_path = orchestration_dir.join("diagnose_result.json");
-                match diagnose_result {
-                    Ok(rendered) => {
-                        write_orchestration_artifact(diagnose_path.as_path(), rendered.as_str())?;
-                        let result = parse_vm_lab_command_result(rendered.as_str())?;
-                        diagnosis_artifact = Some(PathBuf::from(result.report_dir.clone()));
-                        let diagnose_outcome = stage_outcome(
-                            "diagnose_live_lab_failure",
-                            VmLabStageStatus::Pass,
-                            "collected failure diagnostics after run failure",
-                            result
-                                .outcomes
-                                .into_iter()
-                                .flat_map(|outcome| outcome.artifacts)
-                                .map(PathBuf::from)
-                                .collect(),
-                        );
-                        emit_vm_lab_progress_outcome(
-                            "vm-lab-orchestrate-live-lab",
-                            &diagnose_outcome,
-                        );
-                        outcomes.push(diagnose_outcome);
-                        warnings.extend(result.warnings);
-                    }
-                    Err(err) => {
-                        write_orchestration_artifact(diagnose_path.as_path(), err.as_str())?;
-                        warnings.push(format!(
-                            "diagnose-on-failure after run failure did not complete: {err}"
-                        ));
-                    }
-                }
-            }
-            if next_actions.is_empty() {
-                if let Some(path) = diagnosis_artifact.as_deref() {
-                    next_actions.push(format!("Inspect diagnostics under {}", path.display()));
-                } else {
-                    next_actions.push(format!(
-                        "Inspect {} and rerun vm-lab-diagnose-live-lab-failure if needed",
-                        report_dir.display()
-                    ));
-                }
-            }
-            finalize_vm_lab_orchestration_result(
-                "vm-lab-orchestrate-live-lab",
-                report_dir.as_path(),
-                orchestration_dir.as_path(),
-                outcomes,
-                warnings,
-                next_actions,
-            )
-        }
-    }
+    execute_rust_native_orchestration(config)
 }
 
 /// Linux distribute stage names that produce the signed bundles a
@@ -12894,6 +10238,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
 /// under /var/lib/rustynet/, so the orchestrator can pull them and
 /// distribute them to the Windows peer to keep its mesh state in
 /// parity with the Linux peers.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 const LINUX_DISTRIBUTE_STAGES_FOR_WINDOWS_BUNDLES: &[&str] = &[
     "distribute_membership_state",
     "issue_and_distribute_assignments",
@@ -12901,6 +10246,7 @@ const LINUX_DISTRIBUTE_STAGES_FOR_WINDOWS_BUNDLES: &[&str] = &[
     "issue_and_distribute_dns_zone",
 ];
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn linux_distribute_stages_passed(outcomes: &[VmLabStageOutcome]) -> bool {
     LINUX_DISTRIBUTE_STAGES_FOR_WINDOWS_BUNDLES
         .iter()
@@ -12926,6 +10272,7 @@ fn linux_distribute_stages_passed(outcomes: &[VmLabStageOutcome]) -> bool {
 /// distribute stages did not all pass (or the local bundle files cannot
 /// be located), the helper falls back to the historical bootstrap +
 /// validators-only path with no bundle distribution.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_windows_orchestration_with_pulled_bundles(
     config: &VmLabOrchestrateLiveLabConfig,
     inventory_path: &Path,
@@ -13063,16 +10410,20 @@ fn run_windows_orchestration_with_pulled_bundles(
 // =====================================================================
 
 /// macOS state root path written by `Bootstrap-RustyNetMacos.sh`.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
 
 /// Remote path of the bootstrap script on the macOS VM (uploaded by stage 1).
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 const MACOS_BOOTSTRAP_SCRIPT_REMOTE: &str = "/tmp/Bootstrap-RustyNetMacos.sh";
 
 /// Remote path of the launchd service installer the bootstrap script calls
 /// out to (uploaded by stage 1 next to Bootstrap-RustyNetMacos.sh).
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 const MACOS_INSTALL_SERVICE_SCRIPT_REMOTE: &str = "/tmp/Install-RustyNetMacosService.sh";
 
 /// Remote path of the macOS env file (uploaded by stage 1).
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 const MACOS_ENV_FILE_REMOTE: &str = "/tmp/rustynet-macos-bootstrap.env";
 
 /// Decide whether `rustynet peer-list` output proves the macOS daemon actually
@@ -13086,6 +10437,7 @@ const MACOS_ENV_FILE_REMOTE: &str = "/tmp/rustynet-macos-bootstrap.env";
 /// a crash-looping daemon, so the old bare `is_empty()` check let it pass. A
 /// live-but-unmeshed daemon prints `peers:\n  (no peers)`, which must also fail.
 /// Mirrors the Linux managed-DNS `dns_inspect_readback_ready` sentinel guard.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn macos_peer_list_indicates_mesh_join(output: &str) -> bool {
     let trimmed = output.trim();
     if trimmed.is_empty() {
@@ -13127,6 +10479,7 @@ fn macos_peer_list_indicates_mesh_join(output: &str) -> bool {
 /// Extract the `membership_active_nodes=N` count from a `rustynet peer-list` /
 /// `rustynet status` line. Returns `None` when the field is absent (e.g. a
 /// daemon-down diagnostic) — callers must treat that as not-joined.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn parse_membership_active_nodes(output: &str) -> Option<u64> {
     output
         .split_whitespace()
@@ -13146,6 +10499,7 @@ fn parse_membership_active_nodes(output: &str) -> Option<u64> {
 /// [RoleCapability::Anchor]`), so the exit grant MUST include `anchor` or the
 /// `role set admin` step fails closed; `exit_server` marks it a consumable
 /// exit. Returns a fixed, reviewed vocabulary string (no untrusted input).
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn macos_membership_capabilities(is_active_exit: bool, is_elected_anchor: bool) -> &'static str {
     if is_active_exit {
         "client,anchor,exit_server"
@@ -13173,6 +10527,7 @@ fn macos_membership_capabilities(is_active_exit: bool, is_elected_anchor: bool) 
 ///
 /// Called by `amend_membership_for_macos` when the macOS node is the elected
 /// active exit, to issue it a dns-zone bundle the capture stage needs.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn augment_dns_zone_env_for_macos(
     env_body: &str,
     macos_node_id: &str,
@@ -13239,6 +10594,7 @@ fn augment_dns_zone_env_for_macos(
 
 /// Append `entry` (a single `;`-delimited spec element) to a `KEY="a;b;c"`
 /// env assignment value, preserving the optional surrounding quotes.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn append_into_quoted_spec(key: &str, raw_value: &str, entry: &str) -> String {
     let trimmed = raw_value.trim();
     match trimmed
@@ -13271,6 +10627,7 @@ fn append_into_quoted_spec(key: &str, raw_value: &str, entry: &str) -> String {
 /// capture stage's `tunnel_path_resolves` probe well inside its validity window
 /// (issuing in the earlier amend stage left only a thin margin).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn issue_macos_dns_zone_bundle(
     inventory: &[VmInventoryEntry],
     inventory_path: &Path,
@@ -13383,6 +10740,7 @@ fn issue_macos_dns_zone_bundle(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_macos_orchestration_stages(
     config: &VmLabOrchestrateLiveLabConfig,
     macos_alias: &str,
@@ -15380,6 +12738,7 @@ fn run_macos_orchestration_stages(
 /// Helper for macOS audit-stage dispatch with shared boilerplate.
 /// Mirrors the Linux `dispatch_stage` closure pattern in the live suite.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_macos_audit_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -15439,13 +12798,17 @@ fn run_macos_audit_stage(
     }
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 const MACOS_EXIT_EVIDENCE_REMOTE_ROOT: &str = "/tmp/rustynet-macos-exit-evidence";
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 const MACOS_EXIT_EVIDENCE_MESH_CIDR: &str = "100.64.0.0/10";
 // `auto` makes the on-guest capture producer derive the live egress NIC from
 // `route -n get default` and fail loud if undetermined, instead of trusting a
 // hardcoded en0 (which would silently bind tcpdump to a wrong/absent NIC on a
 // bridged/en1 guest and turn the DNS-leak proof into a vacuous pass).
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 const MACOS_EXIT_EVIDENCE_LAN_IFACE: &str = "auto";
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 const MACOS_EXIT_EVIDENCE_MESH_HOSTNAME: &str = "exit-1.rustynet";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15456,6 +12819,7 @@ struct MacosExitEvidenceArtifactSpec {
     optional: bool,
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn macos_exit_evidence_artifact_specs() -> &'static [MacosExitEvidenceArtifactSpec] {
     &[
         MacosExitEvidenceArtifactSpec {
@@ -15514,6 +12878,7 @@ fn macos_exit_evidence_artifact_specs() -> &'static [MacosExitEvidenceArtifactSp
 /// advertise back and the command fails — so a non-zero `role set exit` is a
 /// real activation failure. Finally assert the anchor carries a `nat` rule and
 /// `net.inet.ip.forwarding` reads `1`.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn activate_macos_exit_role(
     macos_alias: &str,
     inventory_path: &Path,
@@ -15615,6 +12980,7 @@ fn activate_macos_exit_role(
     ))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn capture_macos_exit_evidence_artifacts(
     macos_alias: &str,
     inventory_path: &Path,
@@ -15870,6 +13236,7 @@ find "$ROOT" -type f -print | sort
 /// The relay forwards only already-encrypted frames and holds no key material
 /// that could decrypt them; live forwarding through the relay is HP-3 and is
 /// NOT claimed here — this proves the service lifecycle only.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn exercise_macos_relay_lifecycle_live(
     macos_alias: &str,
     inventory_path: &Path,
@@ -15961,6 +13328,7 @@ fn exercise_macos_relay_lifecycle_live(
     ))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn exercise_macos_relay_lifecycle_dry_run(
     macos_alias: &str,
     inventory_path: &Path,
@@ -16785,6 +14153,7 @@ fn cleanup_relay_forward_test(
     }
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn exercise_macos_anchor_bundle_pull_plan_dry_run(
     macos_alias: &str,
     inventory_path: &Path,
@@ -16840,6 +14209,7 @@ fn exercise_macos_anchor_bundle_pull_plan_dry_run(
 /// factory-resets the node, so this stage runs LAST and the next run's
 /// bootstrap re-provisions a fresh identity (recoverable in-lab). FAIL-LOUD:
 /// any non-zero step makes the stage Fail.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn exercise_macos_blind_exit_live(
     macos_alias: &str,
     inventory_path: &Path,
@@ -16955,6 +14325,7 @@ fn exercise_macos_blind_exit_live(
 /// on an invalid key, so a non-empty signed bundle + verifier key is the live
 /// proof the mint/issue/sign path runs natively on macOS. The whole sequence
 /// was validated on the warm guest before wiring.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn exercise_macos_admin_issue_live(
     macos_alias: &str,
     inventory_path: &Path,
@@ -17213,6 +14584,7 @@ fn exercise_macos_admin_issue_live(
 /// is a Fail, not a silent Skip. SignedMembership-kind transitions
 /// (capability changes) need the admin cell's issue/ingest wiring and are a
 /// separate increment.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn exercise_macos_role_transition_live(
     macos_alias: &str,
     inventory_path: &Path,
@@ -17330,6 +14702,7 @@ fn exercise_macos_role_transition_live(
 /// dropped) around a role transition rather than enforcing an absolute
 /// floor — a fast (`--skip-linux-live-suite`) run legitimately has zero live
 /// peers throughout, since no traffic-generating stage ever ran a handshake.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn macos_mesh_peer_count(
     macos_alias: &str,
     inventory_path: &Path,
@@ -17362,6 +14735,7 @@ fn macos_mesh_peer_count(
 /// (`build_linux_daemon_check_invocation`), so the daemon subcommand's own
 /// exit code is never authoritative here — this evaluator makes the actual
 /// call, exactly like `evaluate_macos_mesh_status_report`.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn evaluate_anchor_port_mapping_status_report(
     macos_alias: &str,
     raw_json: &str,
@@ -17412,6 +14786,7 @@ fn evaluate_anchor_port_mapping_status_report(
 /// new `anchor-port-mapping-status-check` daemon subcommand. Requires
 /// `anchor.port_mapping_authoritative` in the elected anchor's membership
 /// grant (`macos_membership_capabilities`).
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn exercise_macos_anchor_port_mapping_authority_live(
     macos_alias: &str,
     inventory_path: &Path,
@@ -17470,6 +14845,7 @@ fn exercise_macos_anchor_port_mapping_authority_live(
 /// `amend_membership_for_macos` (the daemon fails closed without it), so after
 /// this stage the live test's four controls (loopback byte-for-byte, token
 /// gate, LAN refused, secrets hygiene) can pass.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn deploy_macos_anchor_profile(
     macos_alias: &str,
     inventory_path: &Path,
@@ -17571,6 +14947,7 @@ fn deploy_macos_anchor_profile(
 /// (wrong/short token rejected, LAN bind refused, no raw token in the
 /// served bytes). It writes a typed JSON report which this exerciser
 /// parses to surface a single-line summary and to confirm overall pass.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn exercise_macos_anchor_bundle_pull_live(
     macos_alias: &str,
     inventory_path: &Path,
@@ -17667,6 +15044,7 @@ fn exercise_macos_anchor_bundle_pull_live(
 /// secrets hygiene) reported `pass` (not `skipped`) — a skipped control
 /// would be a silent coverage gap. Extracted so a contract test can pin
 /// the consumption logic without an SSH round-trip.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn validate_macos_anchor_bundle_pull_report(
     report_body: &str,
     macos_alias: &str,
@@ -18522,6 +15900,7 @@ struct WindowsBundleLocalPaths {
     dns_zone_verifier_key: PathBuf,
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn locate_windows_bundle_paths_from_report_dir(
     config: &VmLabOrchestrateLiveLabConfig,
     inventory_path: &Path,
@@ -22461,6 +19840,7 @@ fn evaluate_windows_exit_killswitch_precedence_artifact(
 /// net.inet.ip.forwarding=1` while the daemon is running. Both the pf
 /// anchor and the forwarding sysctl MUST revert when the daemon stops;
 /// any leftover anchor or `ip.forwarding=1` after stop fails closed.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn evaluate_macos_exit_nat_lifecycle_artifact(
     macos_alias: &str,
     raw_json: &str,
@@ -22755,6 +20135,7 @@ pub(crate) fn evaluate_linux_ipv6_leak_artifact(
 /// leaked on egress, if the outbound IPv6 probe reached its global target, or
 /// if no pf v6-containment rule is present (a `block drop ... all` /
 /// `inet6` drop; an `inet`-only pf block does NOT count).
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn evaluate_macos_ipv6_leak_artifact(macos_alias: &str, raw_json: &str) -> Result<String, String> {
     let report: Value = serde_json::from_str(raw_json)
         .map_err(|err| format!("parse macOS IPv6 leak artifact failed: {err}"))?;
@@ -23430,6 +20811,7 @@ pub(crate) fn evaluate_policy_default_deny_report(
 /// - `macos_dns_failclosed_check.json` — `{ schema_version: 1,
 ///   overall_ok: bool, drift_reasons: [String] }`, mirrors the
 ///   Windows-side `windows_dns_failclosed_check.json` contract.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn evaluate_macos_exit_dns_failclosed_artifact_dir(
     macos_alias: &str,
     artifact_dir: &Path,
@@ -23508,6 +20890,7 @@ fn evaluate_macos_exit_dns_failclosed_artifact_dir(
     ))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn macos_exit_dns_failclosed_artifact_set_complete(artifact_dir: &Path) -> Result<(), String> {
     let required = [
         "pf_block_rules.json",
@@ -23648,6 +21031,7 @@ fn linux_exit_dns_failclosed_artifact_set_complete(artifact_dir: &Path) -> Resul
 /// reason string. The tamper itself (e.g. flushing pf or unloading the
 /// `com.rustynet.daemon` plist mid-run) is producer-side; the
 /// validator only enforces the audit-shape contract.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn evaluate_macos_exit_killswitch_precedence_artifact(
     macos_alias: &str,
     raw_json: &str,
@@ -23736,6 +21120,7 @@ fn require_forwarding_enabled_macos(value: &Value, field: &str) -> Result<(), St
     }
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn require_pf_block_rule(rules: &[Value], expected_name: &str) -> Result<(), String> {
     let rule = rules
         .iter()
@@ -24818,13 +22203,10 @@ fn issue_assignment_for_windows_node(
 // `vm-lab-validate-linux-security` subcommand records into a typed
 // JSON summary.
 //
-// Linux peers are bootstrapped by the existing bash orchestrator
-// (`scripts/e2e/live_linux_lab_orchestrator.sh`); this stage set is
-// the *validator* path only — no install / access bootstrap stages
-// here. The orchestrator's heterogeneous live-lab can drive both
-// peer types through one trait surface (LinuxBashOrchestrator runs
-// the install path; this validator chainer probes the live state
-// after install).
+// Linux peers are bootstrapped by the Rust `--node` engine's install
+// adapters; this stage set is the *validator* path only — no install /
+// access bootstrap stages here (the validator chainer probes the live
+// state after install).
 // =====================================================================
 
 /// Canonical install path of `rustynetd` on Linux peers, mirroring
@@ -24907,6 +22289,7 @@ fn build_sudo_linux_daemon_check_invocation(
 /// macOS daemon-check wrapper for probes that inspect `0600` runtime state.
 /// The state snapshot is intentionally daemon-owned, so the live lab must use
 /// the same non-interactive sudo guard Linux uses for root-state validators.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn build_sudo_macos_daemon_check_invocation(
     daemon_path: &str,
     subcommand: &str,
@@ -25033,6 +22416,7 @@ fn run_linux_relay_check_remote(
 /// Generic SSH dispatcher for a macOS daemon-check subcommand. Mirrors
 /// [`run_linux_daemon_check_remote`] but targets a macOS peer and uses
 /// the canonical macOS install path.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_macos_daemon_check_remote(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25075,6 +22459,7 @@ fn run_macos_daemon_check_remote(
 /// Generic SSH dispatcher for a macOS `rustynet-relay <subcommand>` audit.
 /// macOS bootstrap installs `rustynet-relay` at the same reviewed
 /// `/usr/local/bin/rustynet-relay` path as the launchd plist.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_macos_relay_check_remote(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25777,6 +23162,7 @@ fn run_validate_linux_blind_exit_dataplane_stage(
 // peers using the same daemon subcommands (already compiled cross-platform).
 // The evaluators are reused directly — they parse JSON, which is platform-agnostic.
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_membership_revoke_applies_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25797,6 +23183,7 @@ fn run_validate_macos_membership_revoke_applies_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_membership_signature_forgery_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25817,6 +23204,7 @@ fn run_validate_macos_membership_signature_forgery_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_gossip_revoked_readmit_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25837,6 +23225,7 @@ fn run_validate_macos_gossip_revoked_readmit_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_enrollment_replay_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25857,6 +23246,7 @@ fn run_validate_macos_enrollment_replay_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_hello_limiter_flood_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25879,6 +23269,7 @@ fn run_validate_macos_hello_limiter_flood_stage(
 
 // ---- macOS Tier-1 audit stages (DaemonProbeOp parity) ----
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_runtime_acls_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25899,6 +23290,7 @@ fn run_validate_macos_runtime_acls_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_service_hardening_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25919,6 +23311,7 @@ fn run_validate_macos_service_hardening_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_mesh_status_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25939,6 +23332,7 @@ fn run_validate_macos_mesh_status_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_authenticode_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25961,6 +23355,7 @@ fn run_validate_macos_authenticode_stage(
 
 // ---- macOS Tier-3/4 audit stages (pure-Rust protocol parity) ----
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_privileged_helper_allowlist_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -25981,6 +23376,7 @@ fn run_validate_macos_privileged_helper_allowlist_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_policy_default_deny_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -26001,6 +23397,7 @@ fn run_validate_macos_policy_default_deny_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_revoked_peer_denied_e2e_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -26021,6 +23418,7 @@ fn run_validate_macos_revoked_peer_denied_e2e_stage(
         .map_err(|reason| (reason, raw))
 }
 
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_validate_macos_blind_exit_reversal_denied_stage(
     macos_alias: &str,
     inventory_path: &Path,
@@ -27371,6 +24769,7 @@ fn run_linux_orchestration_stages_with_options(
 /// whether to short-circuit on first failure or continue across peers; this
 /// helper continues across peers so a single bad peer does not mask drift
 /// on the others.
+#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn run_linux_daemon_validators_for_aliases(
     linux_aliases: &[String],
     blind_exit_alias: Option<&str>,
@@ -27560,121 +24959,6 @@ struct LiveLabStageForensicsBundle {
     worker_results_markdown_path: Option<PathBuf>,
     notes: Vec<String>,
     warnings: Vec<String>,
-}
-
-pub fn execute_ops_vm_lab_iterate_live_lab(
-    config: VmLabIterateLiveLabConfig,
-) -> Result<String, String> {
-    if config.validation_steps.is_empty() {
-        return Err(
-            "specify at least one --validation-step for vm-lab-iterate-live-lab".to_owned(),
-        );
-    }
-
-    let dirty_worktree = if config.require_clean_tree || config.require_local_head {
-        Some(git_worktree_is_dirty()?)
-    } else {
-        None
-    };
-    let (resolved_source_mode, resolved_repo_ref) = resolve_iteration_source_selection(
-        config.source_mode.as_deref(),
-        config.repo_ref.as_deref(),
-        config.require_clean_tree,
-        config.require_local_head,
-        dirty_worktree.unwrap_or(false),
-    )?;
-
-    let profile_output_path = config
-        .profile_output_path
-        .clone()
-        .unwrap_or_else(default_live_lab_iteration_profile_path);
-    let report_dir = config
-        .report_dir
-        .clone()
-        .unwrap_or_else(default_live_lab_iteration_report_dir);
-    let script_path = config.script_path.clone();
-    let timeout_secs = config.timeout_secs;
-
-    for step in &config.validation_steps {
-        execute_vm_lab_iteration_validation_step(step, timeout_secs)?;
-    }
-
-    let profile_result =
-        execute_ops_vm_lab_write_live_lab_profile(VmLabWriteLiveLabProfileConfig {
-            inventory_path: config.inventory_path.clone(),
-            output_path: profile_output_path.clone(),
-            exit_vm: config.exit_vm.clone(),
-            exit_target: config.exit_target.clone(),
-            client_vm: config.client_vm.clone(),
-            client_target: config.client_target.clone(),
-            entry_vm: config.entry_vm.clone(),
-            entry_target: config.entry_target.clone(),
-            aux_vm: config.aux_vm.clone(),
-            aux_target: config.aux_target.clone(),
-            extra_vm: config.extra_vm.clone(),
-            extra_target: config.extra_target.clone(),
-            fifth_client_vm: config.fifth_client_vm.clone(),
-            fifth_client_target: config.fifth_client_target.clone(),
-            relay_vm: None,
-            relay_target: None,
-            linux_blind_exit_vm: None,
-            require_same_network: config.require_same_network,
-            ssh_identity_file: config.ssh_identity_file.clone(),
-            ssh_known_hosts_file: config.ssh_known_hosts_file.clone(),
-            ssh_allow_cidrs: config.ssh_allow_cidrs.clone(),
-            network_id: config.network_id.clone(),
-            traversal_ttl_secs: config.traversal_ttl_secs,
-            cross_network_nat_profiles: None,
-            cross_network_required_nat_profiles: None,
-            cross_network_impairment_profile: None,
-            cross_network_substrate: None,
-            backend: Some(
-                config
-                    .backend
-                    .clone()
-                    .unwrap_or_else(|| "linux-wireguard-userspace-shared".to_owned()),
-            ),
-            source_mode: Some(resolved_source_mode.clone()),
-            repo_ref: resolved_repo_ref.clone(),
-            report_dir: Some(report_dir.clone()),
-        })?;
-
-    let live_lab_result = execute_ops_vm_lab_run_live_lab(VmLabRunLiveLabConfig {
-        profile_path: profile_output_path.clone(),
-        script_path,
-        dry_run: config.dry_run,
-        skip_setup: false,
-        skip_gates: config.skip_gates,
-        skip_soak: config.skip_soak,
-        skip_cross_network: config.skip_cross_network,
-        enable_chaos_suite: false,
-        source_mode: Some(resolved_source_mode),
-        repo_ref: resolved_repo_ref,
-        report_dir: Some(report_dir.clone()),
-        timeout_secs,
-        // vm-lab-iterate-live-lab does not expose a per-stage watchdog flag;
-        // keep the historical behaviour (0 = watchdog disabled, outer
-        // --timeout-secs still bounds the whole run).
-        stage_timeout_secs: 0,
-        orchestrated: false,
-    });
-
-    let summary = summarize_live_lab_report(
-        report_dir.as_path(),
-        config.collect_failure_diagnostics,
-        config.failed_log_tail_lines,
-    )?;
-    let summary_text = render_live_lab_iteration_summary(
-        profile_output_path.as_path(),
-        report_dir.as_path(),
-        profile_result.as_str(),
-        &summary,
-    );
-
-    match live_lab_result {
-        Ok(_) => Ok(summary_text),
-        Err(err) => Err(format!("{summary_text}\nrun_error={err}")),
-    }
 }
 
 pub fn execute_ops_vm_lab_validate_live_lab_profile(
@@ -29151,10 +26435,9 @@ fn ensure_live_lab_profile_platform_metadata(profile: &LiveLabProfile) -> Result
 ///   NETEM kernel-impairment for test stages) skip-with-reason.
 ///
 /// The labels listed here mirror the eight reviewed stage-set
-/// dependencies the bash orchestrator (`scripts/e2e/live_linux_lab_orchestrator.sh`)
-/// currently encodes implicitly via its all-or-nothing `platform=linux`
-/// gate — surfacing them as typed capabilities lets W4.2+ heterogeneous
-/// dispatch decide per-stage rather than per-run.
+/// dependencies the retired bash orchestrator encoded implicitly via its
+/// all-or-nothing `platform=linux` gate — surfaced as typed capabilities so
+/// heterogeneous dispatch decides per-stage rather than per-run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum LiveLabStageCapability {
@@ -29660,59 +26943,6 @@ fn parse_live_lab_stage_records(report_dir: &Path) -> Result<Vec<LiveLabStageRec
     Ok(records)
 }
 
-fn execute_vm_lab_iteration_validation_step(
-    step: &VmLabIterationValidationStep,
-    timeout_secs: u64,
-) -> Result<(), String> {
-    let timeout = timeout_or_default(timeout_secs, DEFAULT_RUN_TIMEOUT_SECS);
-    let mut command = Command::new("cargo");
-    command.current_dir(workspace_root_path());
-    match step {
-        VmLabIterationValidationStep::FmtCheck => {
-            command.args(["fmt", "--all", "--", "--check"]);
-        }
-        VmLabIterationValidationStep::CargoCheckPackage { package } => {
-            command.args(["check", "-p", package.as_str()]);
-        }
-        VmLabIterationValidationStep::CargoCheckBin { package, bin } => {
-            command.args(["check", "-p", package.as_str(), "--bin", bin.as_str()]);
-        }
-        VmLabIterationValidationStep::CargoTestPackage { package, filter } => {
-            command.args(["test", "-p", package.as_str()]);
-            if let Some(filter) = filter.as_deref() {
-                command.arg(filter);
-            }
-            command.args(["--", "--nocapture"]);
-        }
-        VmLabIterationValidationStep::CargoTestBin {
-            package,
-            bin,
-            filter,
-        } => {
-            command.args(["test", "-p", package.as_str(), "--bin", bin.as_str()]);
-            if let Some(filter) = filter.as_deref() {
-                command.arg(filter);
-            }
-            command.args(["--", "--nocapture"]);
-        }
-    }
-    let step_label = step.label();
-    let status = run_status_with_timeout_passthrough(&mut command, timeout)
-        .map_err(|err| format!("validation step {step_label} failed: {err}"))?;
-    ensure_success_status(status, &format!("validation step {step_label}"))
-}
-
-fn default_live_lab_iteration_profile_path() -> PathBuf {
-    default_live_lab_profile_root().join(format!(
-        "generated_vm_lab_iteration_{}.env",
-        unique_suffix()
-    ))
-}
-
-fn default_live_lab_iteration_report_dir() -> PathBuf {
-    default_live_lab_report_root().join(format!("iteration_{}", unique_suffix()))
-}
-
 fn summarize_live_lab_report(
     report_dir: &Path,
     collect_failure_diagnostics: bool,
@@ -29846,41 +27076,6 @@ fn tail_log_lines(path: &Path, max_lines: usize) -> Result<String, String> {
         .collect::<Vec<_>>();
     let start = lines.len().saturating_sub(max_lines.max(1));
     Ok(lines[start..].join("\n"))
-}
-
-fn render_live_lab_iteration_summary(
-    profile_output_path: &Path,
-    report_dir: &Path,
-    profile_result: &str,
-    summary: &LiveLabStageSummary,
-) -> String {
-    let mut lines = vec![
-        format!("profile_result={profile_result}"),
-        format!("profile_path={}", profile_output_path.display()),
-        format!("report_dir={}", report_dir.display()),
-        format!("overall_status={}", summary.overall_status),
-        format!(
-            "first_failed_stage={}",
-            summary.first_failed_stage.as_deref().unwrap_or("none")
-        ),
-        format!("key_report_path={}", summary.key_report_path.display()),
-        format!(
-            "key_log_path={}",
-            summary
-                .key_log_path
-                .as_deref()
-                .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
-        ),
-    ];
-    if let Some(reason) = summary.likely_reason.as_deref() {
-        lines.push(format!("likely_reason={reason}"));
-    }
-    if let Some(tail) = summary.failed_log_tail.as_deref() {
-        lines.push("diagnostic_log_tail<<EOF".to_owned());
-        lines.push(tail.to_owned());
-        lines.push("EOF".to_owned());
-    }
-    lines.join("\n")
 }
 
 fn port_status_from_probe(value: &str) -> PortStatus {
@@ -30512,38 +27707,6 @@ fn discover_local_utm_target_ready(
     process_present && live_ip_authoritative && ssh_reachable && authoritative_target_present
 }
 
-fn stage_status_from_record(record: &LiveLabStageRecord) -> VmLabStageStatus {
-    match record.status.as_str() {
-        "pass" => VmLabStageStatus::Pass,
-        "fail" => VmLabStageStatus::Fail,
-        // A recorded evidence gap is a blocking non-pass; it must NOT fall
-        // through the wildcard into `Skipped`, which reads as a legitimate
-        // profile omission.
-        "not_proven" => VmLabStageStatus::NotProven,
-        _ => VmLabStageStatus::Skipped,
-    }
-}
-
-fn command_status_from_summary(summary: &LiveLabStageSummary) -> VmLabCommandOverallStatus {
-    match summary.overall_status.as_str() {
-        "pass" => VmLabCommandOverallStatus::Pass,
-        "pass_with_warnings" => VmLabCommandOverallStatus::Partial,
-        _ => VmLabCommandOverallStatus::Fail,
-    }
-}
-
-fn stage_outcomes_from_records(records: &[LiveLabStageRecord]) -> Vec<VmLabStageOutcome> {
-    records
-        .iter()
-        .map(|record| VmLabStageOutcome {
-            stage: record.name.clone(),
-            status: stage_status_from_record(record),
-            summary: record.description.clone(),
-            artifacts: vec![record.log_path.display().to_string()],
-        })
-        .collect()
-}
-
 fn live_lab_matrix_stage_outcomes_from_vm_lab(
     outcomes: &[VmLabStageOutcome],
 ) -> Vec<LiveLabRunMatrixStageOutcome> {
@@ -30672,92 +27835,6 @@ fn validate_live_lab_run_artifacts(report_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn live_lab_profile_has_full_release_gate_topology(profile: &LiveLabProfile) -> bool {
-    ["ENTRY_TARGET", "AUX_TARGET", "EXTRA_TARGET"]
-        .iter()
-        .all(|key| {
-            profile
-                .optional(key)
-                .is_some_and(|value| !value.trim().is_empty())
-        })
-}
-
-fn full_release_gate_requested(profile: &LiveLabProfile, config: &VmLabRunLiveLabConfig) -> bool {
-    !config.skip_gates
-        && !config.skip_soak
-        && !config.skip_cross_network
-        && live_lab_profile_has_full_release_gate_topology(profile)
-}
-
-fn build_release_gate_completeness_report(
-    records: &[LiveLabStageRecord],
-    requested: bool,
-) -> ReleaseGateCompletenessReport {
-    let observed_pass_stages = records
-        .iter()
-        .filter(|record| record.status == "pass")
-        .map(|record| record.name.clone())
-        .collect::<Vec<_>>();
-    let observed_pass_set = observed_pass_stages
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let required_stages = FULL_RELEASE_GATE_REQUIRED_STAGES
-        .iter()
-        .map(|stage| (*stage).to_owned())
-        .collect::<Vec<_>>();
-    let missing_or_non_pass_stages = if requested {
-        FULL_RELEASE_GATE_REQUIRED_STAGES
-            .iter()
-            .filter(|stage| !observed_pass_set.contains(**stage))
-            .map(|stage| (*stage).to_owned())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let status = if !requested {
-        "not_requested"
-    } else if missing_or_non_pass_stages.is_empty() {
-        "complete"
-    } else {
-        "incomplete"
-    };
-    ReleaseGateCompletenessReport {
-        requested,
-        status: status.to_owned(),
-        required_stages,
-        observed_pass_stages,
-        missing_or_non_pass_stages,
-    }
-}
-
-fn write_release_gate_completeness(
-    report_dir: &Path,
-    report: &ReleaseGateCompletenessReport,
-) -> Result<(), String> {
-    let path = report_dir.join(RELEASE_GATE_COMPLETENESS_RELATIVE_PATH);
-    let parent = path.parent().ok_or_else(|| {
-        format!(
-            "release-gate completeness path has no parent: {}",
-            path.display()
-        )
-    })?;
-    fs::create_dir_all(parent).map_err(|err| {
-        format!(
-            "create release-gate completeness directory failed ({}): {err}",
-            parent.display()
-        )
-    })?;
-    let body = serde_json::to_vec_pretty(report)
-        .map_err(|err| format!("serialize release-gate completeness failed: {err}"))?;
-    fs::write(&path, body).map_err(|err| {
-        format!(
-            "write release-gate completeness failed ({}): {err}",
-            path.display()
-        )
-    })
-}
-
 fn validate_live_lab_diagnostics_artifacts(diagnostics_dir: &Path) -> Result<(), String> {
     for artifact in [
         diagnostics_dir.join("diagnostics_summary.json"),
@@ -30773,28 +27850,6 @@ fn validate_live_lab_diagnostics_artifacts(diagnostics_dir: &Path) -> Result<(),
         }
     }
     Ok(())
-}
-
-fn live_lab_setup_complete(report_dir: &Path) -> Result<bool, String> {
-    if !report_dir.join("state/stages.tsv").exists() {
-        return Ok(false);
-    }
-    let records = parse_live_lab_stage_records(report_dir)?;
-    Ok(records
-        .iter()
-        .find(|record| record.name == "validate_baseline_runtime")
-        .is_some_and(|record| record.status == "pass"))
-}
-
-fn live_lab_report_has_non_setup_stage_records(report_dir: &Path) -> Result<bool, String> {
-    if !report_dir.join("state/stages.tsv").exists() {
-        return Ok(false);
-    }
-    let setup_stages = setup_stage_names().iter().copied().collect::<HashSet<_>>();
-    let records = parse_live_lab_stage_records(report_dir)?;
-    Ok(records
-        .iter()
-        .any(|record| !setup_stages.contains(record.name.as_str())))
 }
 
 pub fn execute_ops_vm_lab_check_known_hosts(
@@ -39781,53 +36836,15 @@ fn build_suite_command(
             render_command_for_display(&command)
         }
         "full-live-lab" => {
-            let script = default_live_lab_orchestrator_path();
-            let exit = topology_role_node(topology, &["exit"])?;
-            let client = topology_role_node(topology, &["client"])?;
-            let entry = topology_role_node(topology, &["entry", "relay"])?;
-            let aux = topology_role_node(topology, &["aux"])?;
-            let extra = topology_optional_role_node(topology, &["extra"])?;
-            let fifth_client = topology_optional_role_node(topology, &["fifth_client"])?;
-            let profile_path = report_dir.join("vm_lab_live_lab.env");
-            let mut lines = vec![
-                format_env_assignment("EXIT_TARGET", exit.normalized_target.as_str())?,
-                format_env_assignment("CLIENT_TARGET", client.normalized_target.as_str())?,
-                format_env_assignment("ENTRY_TARGET", entry.normalized_target.as_str())?,
-                format_env_assignment("AUX_TARGET", aux.normalized_target.as_str())?,
-                format_env_assignment(
-                    "SSH_IDENTITY_FILE",
-                    ssh_identity_file.display().to_string().as_str(),
-                )?,
-            ];
-            if let Some(extra) = extra {
-                lines.push(format_env_assignment(
-                    "EXTRA_TARGET",
-                    extra.normalized_target.as_str(),
-                )?);
-            }
-            if let Some(fifth_client) = fifth_client {
-                lines.push(format_env_assignment(
-                    "FIFTH_CLIENT_TARGET",
-                    fifth_client.normalized_target.as_str(),
-                )?);
-            }
-            lines.push(format_env_assignment("SOURCE_MODE", "local-head")?);
-            lines.push(format_env_assignment(
-                "REPORT_DIR",
-                report_dir.display().to_string().as_str(),
-            )?);
-            lines.push(String::new());
-            fs::write(profile_path.as_path(), lines.join("\n")).map_err(|err| {
-                format!(
-                    "write full live-lab profile failed ({}): {err}",
-                    profile_path.display()
-                )
-            })?;
-            command
-                .arg(script.as_path())
-                .arg("--profile")
-                .arg(profile_path.as_path());
-            render_command_for_display(&command)
+            // W5.7: the full-live-lab suite arm drove the retired bash
+            // orchestrator; the Rust --node engine is the full-suite path now
+            // (BashOrchestratorRetirementProgram_2026-08-22.md, Phase E).
+            return Err(
+                "vm-lab-run-suite full-live-lab was retired with the legacy bash \
+                 orchestrator (W5.7); use `ops vm-lab-orchestrate-live-lab --node \
+                 <alias>:<role> ...` for the full suite"
+                    .to_owned(),
+            );
         }
         _ => return Err(format!("unsupported vm-lab suite command: {suite}")),
     };
@@ -40070,13 +37087,11 @@ mod tests {
         LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary, LocalUtmReadyState,
         PlatformRollup, PortStatus, PreflightGate, PreflightStatus, ProbeState, RemoteExec as _,
         RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _,
-        ServiceManager as _, StageOrchestrator as _, UtmReadinessInputs, VmController,
-        VmGuestExecMode, VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus,
-        VmLabDiscoverLocalUtmConfig, VmLabIterationValidationStep, VmLabRunLiveLabConfig,
-        VmLabSetupLiveLabConfig, VmLabStageOutcome, VmLabStageStatus,
-        VmLabValidateLiveLabProfileConfig, VmLabWriteLiveLabProfileConfig, VmRemoteShell,
-        VmServiceManager, WindowsSshReadinessProbe, alias_to_host_map,
-        append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
+        ServiceManager as _, UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform,
+        VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
+        VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
+        VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
+        alias_to_host_map, append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
         build_local_source_extract_script, build_local_source_presync_cleanup_script,
         build_remote_argv_script, build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
@@ -40085,9 +37100,8 @@ mod tests {
         build_windows_local_source_extract_script,
         build_windows_local_source_presync_cleanup_script, classify_ssh_probe_failure,
         collect_live_lab_stage_local_bundle, commit_matches, create_orchestration_staging_dir,
-        decide_restart_unready, default_inventory_path, default_live_lab_iteration_profile_path,
-        default_live_lab_iteration_report_dir, default_live_lab_orchestrator_path,
-        default_platform_profile, default_utmctl_path, discover_local_utm_bundle_paths,
+        decide_restart_unready, default_inventory_path, default_platform_profile,
+        default_utmctl_path, discover_local_utm_bundle_paths,
         discover_local_utm_bundle_paths_bounded, encode_powershell_command,
         ensure_inventory_entries_share_network, ensure_provision_guest_name,
         ensure_provision_image_name, execute_ops_vm_lab_diff_live_lab_runs,
@@ -40101,16 +37115,14 @@ mod tests {
         macos_peer_list_indicates_mesh_join, materialize_orchestration_staging_dir,
         normalize_mac_address, parse_libvirt_domifaddr_candidates, parse_libvirt_domiflist_macs,
         parse_libvirt_domstate_running, parse_libvirt_list_names, parse_live_lab_stage_records,
-        parse_local_utm_list_started_status, parse_membership_active_nodes,
-        parse_vm_lab_iteration_validation_step_spec, parse_vm_lab_topology,
+        parse_local_utm_list_started_status, parse_membership_active_nodes, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
         pinned_toolchain_channel, privileged_rustynet_cli_script,
         remote_copy_destination_for_target, remote_script_for_ssh_transport,
-        render_live_lab_iteration_summary, render_live_lab_stage_forensics_review,
-        render_local_utm_discovery_summary, render_matrix_compare, render_preflight,
-        render_vm_lab_progress_complete_line, render_vm_lab_progress_outcome_line,
-        repo_sync_dispatch_kind_for_target, resolve_discovery_bundle_paths,
-        resolve_iteration_source_selection, resolve_live_lab_vm_aliases, resolve_remote_targets,
+        render_live_lab_stage_forensics_review, render_local_utm_discovery_summary,
+        render_matrix_compare, render_preflight, render_vm_lab_progress_complete_line,
+        render_vm_lab_progress_outcome_line, repo_sync_dispatch_kind_for_target,
+        resolve_discovery_bundle_paths, resolve_iteration_source_selection, resolve_remote_targets,
         resolve_repo_sync_source, resolve_start_targets, resolve_utm_documents_root,
         resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
         select_inventory_entries, select_live_ssh_host_from_utm_output,
@@ -40727,21 +37739,6 @@ mod tests {
         rendered
     }
 
-    fn write_temp_stage_rows(report_dir: &Path, rows: &[(&str, &str)]) {
-        let mut rendered = String::new();
-        for (index, (name, status)) in rows.iter().enumerate() {
-            let log_path = report_dir.join("logs").join(format!("{name}.log"));
-            fs::write(&log_path, format!("{name} {status}\n")).expect("stage log should write");
-            rendered.push_str(&format!(
-                "{name}\thard\t{status}\t{}\t{}\t{name} stage\t2026-04-12T00:00:{index:02}Z\t2026-04-12T00:00:{end:02}Z\n",
-                if *status == "pass" { 0 } else { 1 },
-                log_path.display(),
-                end = index + 1,
-            ));
-        }
-        fs::write(report_dir.join("state/stages.tsv"), rendered).expect("stages should write");
-    }
-
     fn cleanup_temp_path(path: &Path) {
         if let Some(parent) = path.parent() {
             // Fail closed on a path rooted directly in the shared temp dir:
@@ -40759,36 +37756,6 @@ mod tests {
         }
     }
 
-    fn build_test_setup_manifest(
-        report_dir: &Path,
-        profile_path: &Path,
-        script_path: &Path,
-        inventory_path: Option<&Path>,
-    ) -> super::LiveLabSetupManifest {
-        super::build_setup_manifest(&super::LiveLabSetupManifestInput {
-            report_dir: report_dir.to_path_buf(),
-            profile_path: profile_path.to_path_buf(),
-            script_path: script_path.to_path_buf(),
-            inventory_path: inventory_path.map(Path::to_path_buf),
-            source_mode: "local-head".to_owned(),
-            repo_ref: Some("HEAD".to_owned()),
-            require_same_network: Some(true),
-            dry_run: false,
-            max_parallel_node_workers: None,
-        })
-        .expect("manifest should build")
-    }
-
-    fn write_setup_only_report_state(report_dir: &Path, manifest: &super::LiveLabSetupManifest) {
-        super::write_setup_manifest(report_dir, manifest).expect("manifest should write");
-        let state =
-            super::initial_report_state(report_dir, manifest).expect("report state should build");
-        super::write_report_state(report_dir, &state).expect("report state should write");
-        write_temp_stage_rows(report_dir, &[("validate_baseline_runtime", "pass")]);
-        super::update_report_state_setup_complete(report_dir)
-            .expect("setup-complete state should write");
-    }
-
     #[test]
     fn default_utmctl_path_matches_expected_bundle_location() {
         assert_eq!(
@@ -40804,16 +37771,6 @@ mod tests {
                 .display()
                 .to_string()
                 .ends_with("documents/operations/active/vm_lab_inventory.json")
-        );
-    }
-
-    #[test]
-    fn default_live_lab_orchestrator_path_targets_repo_script() {
-        assert!(
-            default_live_lab_orchestrator_path()
-                .display()
-                .to_string()
-                .ends_with("scripts/e2e/live_linux_lab_orchestrator.sh")
         );
     }
 
@@ -44095,36 +41052,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_live_lab_vm_aliases_uses_inventory_role_defaults() {
-        let inventory = write_temp_inventory(
-            r#"{
-  "version": 1,
-  "entries": [
-    {"alias": "exit-vm", "ssh_target": "debian@192.168.64.3", "lab_role": "exit"},
-    {"alias": "client-vm", "ssh_target": "debian@192.168.64.4", "lab_role": "client"},
-    {"alias": "entry-vm", "ssh_target": "debian@192.168.64.5", "lab_role": "entry"},
-    {"alias": "aux-vm", "ssh_target": "debian@192.168.64.6", "lab_role": "aux"},
-    {"alias": "extra-vm", "ssh_target": "debian@192.168.64.7", "lab_role": "extra"}
-  ]
-}"#,
-        );
-        let aliases =
-            resolve_live_lab_vm_aliases(inventory.as_path(), None, None, None, None, None, None)
-                .expect("role defaults should resolve");
-        assert_eq!(
-            aliases,
-            vec![
-                "exit-vm".to_owned(),
-                "client-vm".to_owned(),
-                "entry-vm".to_owned(),
-                "aux-vm".to_owned(),
-                "extra-vm".to_owned()
-            ]
-        );
-        cleanup_temp_inventory(inventory.as_path());
-    }
-
-    #[test]
     fn rewrite_ssh_target_host_preserves_user_and_formats_ipv6() {
         assert_eq!(
             rewrite_ssh_target_host("debian@192.168.64.3", "192.168.64.8"),
@@ -45096,110 +42023,6 @@ directory = "vendor"
         assert!(err.contains("only aux/fifth_client may host the lab blind_exit"));
 
         cleanup_temp_inventory(inventory.as_path());
-    }
-
-    #[test]
-    fn parse_validation_step_supports_fmt_and_package_specs() {
-        assert_eq!(
-            parse_vm_lab_iteration_validation_step_spec("fmt").expect("fmt should parse"),
-            VmLabIterationValidationStep::FmtCheck
-        );
-        assert_eq!(
-            parse_vm_lab_iteration_validation_step_spec("check:rustynetd")
-                .expect("check package should parse"),
-            VmLabIterationValidationStep::CargoCheckPackage {
-                package: "rustynetd".to_owned()
-            }
-        );
-        assert_eq!(
-            parse_vm_lab_iteration_validation_step_spec(
-                "test-bin:rustynet-cli:live_linux_lan_toggle_test:lan_toggle"
-            )
-            .expect("test bin should parse"),
-            VmLabIterationValidationStep::CargoTestBin {
-                package: "rustynet-cli".to_owned(),
-                bin: "live_linux_lan_toggle_test".to_owned(),
-                filter: Some("lan_toggle".to_owned())
-            }
-        );
-    }
-
-    #[test]
-    fn parse_validation_step_rejects_unsupported_specs() {
-        let err = parse_vm_lab_iteration_validation_step_spec("cargo test -p rustynetd")
-            .expect_err("generic shell-like specs must fail");
-        assert!(err.contains("unsupported validation step"));
-    }
-
-    #[test]
-    fn iteration_default_paths_target_live_lab_roots() {
-        let profile_path = default_live_lab_iteration_profile_path();
-        let report_dir = default_live_lab_iteration_report_dir();
-        assert!(
-            profile_path
-                .display()
-                .to_string()
-                .contains("profiles/live_lab/")
-        );
-        assert!(profile_path.display().to_string().ends_with(".env"));
-        assert!(
-            report_dir
-                .display()
-                .to_string()
-                .contains("artifacts/live_lab/")
-        );
-        assert!(report_dir.display().to_string().contains("iteration_"));
-    }
-
-    #[test]
-    fn summarize_live_lab_report_extracts_first_failed_stage_and_log_tail() {
-        let report_dir = write_temp_report_dir();
-        let log_path = report_dir.join("logs/enforce_baseline_runtime.log");
-        fs::write(
-            report_dir.join("state/stages.tsv"),
-            format!(
-                "preflight\thard\tpass\t0\t{}/logs/preflight.log\tverify local prerequisites\t2026-04-03T20:00:00Z\t2026-04-03T20:00:01Z\n\
-enforce_baseline_runtime\thard\tfail\t1\t{}/logs/enforce_baseline_runtime.log\tenforce baseline runtime\t2026-04-03T20:10:00Z\t2026-04-03T20:10:05Z\n",
-                report_dir.display(),
-                report_dir.display()
-            ),
-        )
-        .expect("stages should write");
-        fs::write(
-            &log_path,
-            "[stage:enforce_baseline_runtime] START\nstatus okay\nerror: daemon is in restricted-safe mode\nfinal detail\n",
-        )
-        .expect("log should write");
-        fs::write(report_dir.join("failure_digest.md"), "# digest\n").expect("digest should write");
-
-        let summary =
-            summarize_live_lab_report(report_dir.as_path(), true, 2).expect("summary should build");
-        assert_eq!(summary.overall_status, "fail");
-        assert_eq!(
-            summary.first_failed_stage.as_deref(),
-            Some("enforce_baseline_runtime")
-        );
-        assert_eq!(summary.key_log_path.as_deref(), Some(log_path.as_path()));
-        assert_eq!(
-            summary.likely_reason.as_deref(),
-            Some("error: daemon is in restricted-safe mode")
-        );
-        assert_eq!(
-            summary.failed_log_tail.as_deref(),
-            Some("error: daemon is in restricted-safe mode\nfinal detail")
-        );
-
-        let rendered = render_live_lab_iteration_summary(
-            Path::new("/tmp/profile.env"),
-            report_dir.as_path(),
-            "wrote live-lab profile=/tmp/profile.env",
-            &summary,
-        );
-        assert!(rendered.contains("first_failed_stage=enforce_baseline_runtime"));
-        assert!(rendered.contains("key_report_path="));
-        assert!(rendered.contains("diagnostic_log_tail<<EOF"));
-
-        let _ = fs::remove_dir_all(report_dir);
     }
 
     #[test]
@@ -46660,147 +43483,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
-    fn execute_ops_vm_lab_run_live_lab_rejects_windows_profile_before_linux_shell_helper() {
-        let profile_path = write_temp_live_lab_profile(
-            "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"Administrator@windows-client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\nCLIENT_PLATFORM=\"windows\"\nCLIENT_REMOTE_SHELL=\"powershell\"\nCLIENT_GUEST_EXEC_MODE=\"windows_powershell\"\nCLIENT_SERVICE_MANAGER=\"windows_service\"\nCLIENT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
-        );
-        let unique = super::unique_suffix();
-        let script_dir = std::env::temp_dir().join(format!("rustynet-vm-lab-run-{unique}.dir"));
-        fs::create_dir_all(&script_dir).expect("script dir should exist");
-        let script_path = script_dir.join("mock-live-lab.sh");
-        let marker_path = script_dir.join("executed.marker");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nprintf 'executed\\n' > {}\nexit 0\n",
-                marker_path.display()
-            ),
-        )
-        .expect("script should write");
-        let mut permissions = fs::metadata(&script_path)
-            .expect("script metadata should read")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("script should be executable");
-
-        let report_dir =
-            std::env::temp_dir().join(format!("rustynet-vm-lab-run-report-{unique}.dir"));
-        let result = super::execute_ops_vm_lab_run_live_lab(VmLabRunLiveLabConfig {
-            profile_path: profile_path.clone(),
-            script_path: script_path.clone(),
-            dry_run: false,
-            skip_setup: false,
-            skip_gates: false,
-            skip_soak: false,
-            skip_cross_network: false,
-            enable_chaos_suite: false,
-            source_mode: None,
-            repo_ref: None,
-            report_dir: Some(report_dir.clone()),
-            timeout_secs: 30,
-            stage_timeout_secs: 0,
-            orchestrated: false,
-        });
-
-        let err = result.expect_err("windows profile must be blocked before shell invocation");
-        assert!(err.contains("requires at least one Linux target"));
-        assert!(
-            !marker_path.exists(),
-            "shell helper should not have executed"
-        );
-
-        let _ = fs::remove_dir_all(script_dir);
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-    }
-
-    #[test]
-    fn execute_ops_vm_lab_setup_live_lab_rejects_windows_profile_before_linux_shell_helper() {
-        let profile_path = write_temp_live_lab_profile(
-            "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"Administrator@windows-client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\nCLIENT_PLATFORM=\"windows\"\nCLIENT_REMOTE_SHELL=\"powershell\"\nCLIENT_GUEST_EXEC_MODE=\"windows_powershell\"\nCLIENT_SERVICE_MANAGER=\"windows_service\"\nCLIENT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
-        );
-        let profile_dir = profile_path
-            .parent()
-            .expect("profile dir should exist")
-            .to_path_buf();
-        let identity_path = profile_dir.join("id_ed25519");
-        let inventory_path = write_temp_inventory(
-            r#"{
-  "version": 1,
-  "entries": [
-    {
-      "alias": "dummy-linux",
-      "ssh_target": "debian@192.168.64.10",
-      "ssh_user": "debian",
-      "platform": "linux"
-    }
-  ]
-}"#,
-        );
-        let unique = super::unique_suffix();
-        let script_dir = std::env::temp_dir().join(format!("rustynet-vm-lab-setup-{unique}.dir"));
-        fs::create_dir_all(&script_dir).expect("script dir should exist");
-        let script_path = script_dir.join("mock-live-lab.sh");
-        let marker_path = script_dir.join("executed.marker");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nprintf 'executed\\n' > {}\nexit 0\n",
-                marker_path.display()
-            ),
-        )
-        .expect("script should write");
-        let mut permissions = fs::metadata(&script_path)
-            .expect("script metadata should read")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script_path, permissions).expect("script should be executable");
-
-        let report_dir =
-            std::env::temp_dir().join(format!("rustynet-vm-lab-setup-report-{unique}.dir"));
-        let result = super::execute_ops_vm_lab_setup_live_lab(VmLabSetupLiveLabConfig {
-            inventory_path: inventory_path.clone(),
-            profile_path: Some(profile_path.clone()),
-            profile_output_path: None,
-            exit_vm: None,
-            client_vm: None,
-            entry_vm: None,
-            aux_vm: None,
-            extra_vm: None,
-            fifth_client_vm: None,
-            relay_vm: None,
-            linux_blind_exit_vm: None,
-            ssh_identity_file: identity_path,
-            known_hosts_path: None,
-            require_same_network: false,
-            script_path: script_path.clone(),
-            report_dir: report_dir.clone(),
-            source_mode: None,
-            repo_ref: None,
-            resume_from: None,
-            rerun_stage: None,
-            max_parallel_node_workers: None,
-            timeout_secs: 30,
-            stage_timeout_secs: 0,
-            dry_run: false,
-            orchestrated: false,
-        });
-
-        let err =
-            result.expect_err("windows profile must be blocked before setup shell invocation");
-        assert!(err.contains("requires at least one Linux target"));
-        assert!(
-            !marker_path.exists(),
-            "shell helper should not have executed"
-        );
-
-        let _ = fs::remove_dir_all(script_dir);
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_inventory(inventory_path.as_path());
-        cleanup_temp_path(profile_path.as_path());
-    }
-
-    #[test]
     fn execute_ops_vm_lab_diagnose_live_lab_failure_rejects_windows_profile_before_diagnostics() {
         let profile_path = write_temp_live_lab_profile(
             "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"Administrator@windows-client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\nCLIENT_PLATFORM=\"windows\"\nCLIENT_REMOTE_SHELL=\"powershell\"\nCLIENT_GUEST_EXEC_MODE=\"windows_powershell\"\nCLIENT_SERVICE_MANAGER=\"windows_service\"\nCLIENT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
@@ -46836,348 +43518,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let _ = fs::remove_dir_all(report_dir);
         cleanup_temp_inventory(inventory_path.as_path());
         cleanup_temp_path(profile_path.as_path());
-    }
-
-    #[test]
-    fn validate_setup_manifest_rejects_mismatched_source_mode() {
-        let report_dir = write_temp_report_dir();
-        let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
-        );
-        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
-
-        let manifest = build_test_setup_manifest(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            None,
-        );
-        super::write_setup_manifest(report_dir.as_path(), &manifest)
-            .expect("manifest should write");
-
-        let err = super::validate_setup_manifest(
-            report_dir.as_path(),
-            &super::LiveLabSetupManifestExpectation {
-                report_dir: report_dir.clone(),
-                profile_path: profile_path.clone(),
-                script_path: script_path.clone(),
-                inventory_path: None,
-                source_mode: "archive".to_owned(),
-                repo_ref: Some("HEAD".to_owned()),
-                require_same_network: Some(true),
-                dry_run: Some(false),
-                max_parallel_node_workers: None,
-            },
-        )
-        .expect_err("mismatched source mode must fail closed");
-
-        assert!(err.contains("git provenance mismatch"));
-
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-        cleanup_temp_path(script_path.as_path());
-    }
-
-    #[test]
-    fn resolve_run_setup_reuse_allows_matching_auto_continue() {
-        let report_dir = write_temp_report_dir();
-        let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
-        );
-        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
-
-        let manifest = build_test_setup_manifest(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            None,
-        );
-        write_setup_only_report_state(report_dir.as_path(), &manifest);
-
-        let continue_from_setup = super::resolve_run_setup_reuse(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-            false,
-        )
-        .expect("matching manifest should allow setup reuse");
-
-        assert!(continue_from_setup);
-        let report_state = super::validate_report_state(report_dir.as_path())
-            .expect("report state should validate");
-        assert!(report_state.setup_complete);
-        assert!(!report_state.run_complete);
-
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-        cleanup_temp_path(script_path.as_path());
-    }
-
-    #[test]
-    fn resolve_run_setup_reuse_rejects_commit_mismatch() {
-        let report_dir = write_temp_report_dir();
-        let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
-        );
-        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
-
-        let mut manifest = build_test_setup_manifest(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            None,
-        );
-        manifest.git.git_commit = "0000000000000000000000000000000000000000".to_owned();
-        write_setup_only_report_state(report_dir.as_path(), &manifest);
-
-        let err = super::resolve_run_setup_reuse(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-            true,
-        )
-        .expect_err("commit mismatch must fail closed");
-
-        assert!(err.contains("git provenance mismatch"));
-
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-        cleanup_temp_path(script_path.as_path());
-    }
-
-    #[test]
-    fn resolve_run_setup_reuse_rejects_dirty_tree_mismatch() {
-        let report_dir = write_temp_report_dir();
-        let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
-        );
-        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
-
-        let mut manifest = build_test_setup_manifest(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            None,
-        );
-        manifest.git.git_tree_clean = !manifest.git.git_tree_clean;
-        write_setup_only_report_state(report_dir.as_path(), &manifest);
-
-        let err = super::resolve_run_setup_reuse(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-            true,
-        )
-        .expect_err("dirty-tree mismatch must fail closed");
-
-        assert!(err.contains("git provenance mismatch"));
-
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-        cleanup_temp_path(script_path.as_path());
-    }
-
-    #[test]
-    fn resolve_run_setup_reuse_rejects_profile_topology_mismatch() {
-        let report_dir = write_temp_report_dir();
-        let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nENTRY_TARGET=\"debian@entry-a\"\n",
-        );
-        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
-
-        let manifest = build_test_setup_manifest(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            None,
-        );
-        write_setup_only_report_state(report_dir.as_path(), &manifest);
-        fs::write(
-            profile_path.as_path(),
-            fs::read_to_string(profile_path.as_path())
-                .expect("profile should read")
-                .replace("entry-a", "entry-b"),
-        )
-        .expect("profile should rewrite");
-
-        let err = super::resolve_run_setup_reuse(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-            true,
-        )
-        .expect_err("profile topology mismatch must fail closed");
-
-        assert!(err.contains("profile provenance mismatch"));
-
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-        cleanup_temp_path(script_path.as_path());
-    }
-
-    #[test]
-    fn resolve_run_setup_reuse_rejects_missing_manifest() {
-        let report_dir = write_temp_report_dir();
-        let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
-        );
-        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
-
-        write_temp_stage_rows(
-            report_dir.as_path(),
-            &[("validate_baseline_runtime", "pass")],
-        );
-
-        let err = super::resolve_run_setup_reuse(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-            true,
-        )
-        .expect_err("missing manifest must fail closed");
-
-        assert!(err.contains("read setup manifest failed"));
-
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-        cleanup_temp_path(script_path.as_path());
-    }
-
-    #[test]
-    fn resolve_run_setup_reuse_rejects_malformed_manifest() {
-        let report_dir = write_temp_report_dir();
-        let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
-        );
-        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
-
-        fs::write(
-            report_dir.join(super::SETUP_MANIFEST_RELATIVE_PATH),
-            "{not-json\n",
-        )
-        .expect("manifest should write");
-
-        let err = super::resolve_run_setup_reuse(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-            true,
-        )
-        .expect_err("malformed manifest must fail closed");
-
-        assert!(err.contains("parse setup manifest failed"));
-
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-        cleanup_temp_path(script_path.as_path());
-    }
-
-    #[test]
-    fn resolve_run_setup_reuse_rejects_missing_report_state() {
-        let report_dir = write_temp_report_dir();
-        let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
-        );
-        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
-
-        let manifest = build_test_setup_manifest(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            None,
-        );
-        super::write_setup_manifest(report_dir.as_path(), &manifest)
-            .expect("manifest should write");
-        write_temp_stage_rows(
-            report_dir.as_path(),
-            &[("validate_baseline_runtime", "pass")],
-        );
-
-        let err = super::resolve_run_setup_reuse(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-            true,
-        )
-        .expect_err("missing report state must fail closed");
-
-        assert!(err.contains("read report state failed"));
-
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-        cleanup_temp_path(script_path.as_path());
-    }
-
-    #[test]
-    fn resolve_run_setup_reuse_rejects_prior_run_state() {
-        let report_dir = write_temp_report_dir();
-        let profile_path = write_temp_live_lab_profile(
-            "REPORT_DIR=\"/tmp/example\"\nEXIT_TARGET=\"debian@exit\"\nCLIENT_TARGET=\"debian@client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\n",
-        );
-        let script_path = write_temp_executable("#!/bin/sh\nexit 0\n");
-
-        let manifest = build_test_setup_manifest(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            None,
-        );
-        write_setup_only_report_state(report_dir.as_path(), &manifest);
-        let run_provenance = super::build_run_provenance(
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-            &super::LiveLabRunModeFlags {
-                dry_run: false,
-                skip_setup: true,
-                skip_gates: false,
-                skip_soak: false,
-                skip_cross_network: false,
-            },
-        )
-        .expect("run provenance should build");
-        super::update_report_state_after_run(
-            report_dir.as_path(),
-            run_provenance,
-            false,
-            false,
-            false,
-        )
-        .expect("run state should write");
-
-        let err = super::resolve_run_setup_reuse(
-            report_dir.as_path(),
-            profile_path.as_path(),
-            script_path.as_path(),
-            "local-head",
-            Some("HEAD"),
-            true,
-        )
-        .expect_err("prior run state must fail closed");
-
-        assert!(
-            err.contains("already contains run provenance"),
-            "expected run-provenance rejection, got: {err}"
-        );
-
-        let _ = fs::remove_dir_all(report_dir);
-        cleanup_temp_path(profile_path.as_path());
-        cleanup_temp_path(script_path.as_path());
     }
 
     #[test]
@@ -47303,147 +43643,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         );
 
         let _ = fs::remove_dir_all(destination_root);
-    }
-
-    #[test]
-    fn ensure_report_dir_fresh_except_permits_exempt_top_level_subdir() {
-        // Simulate the orchestrator case: report_dir contains only an "orchestration/"
-        // subdirectory with files in it. The exempted-dir variant must pass; the strict
-        // variant must still reject.
-        let report_dir = write_temp_report_dir();
-        let orch_dir = report_dir.join("orchestration");
-        fs::create_dir_all(&orch_dir).expect("orchestration dir should create");
-        fs::write(orch_dir.join("discover_initial.json"), "{}\n")
-            .expect("discover_initial.json should write");
-
-        // Exempt variant: must accept (orchestrator pre-setup metadata is allowed)
-        super::ensure_report_dir_fresh_except(
-            report_dir.as_path(),
-            "vm-lab-setup-live-lab",
-            &["orchestration"],
-        )
-        .expect("orchestration-only report dir must be accepted when orchestrated=true");
-
-        // Strict variant: must reject (no exceptions)
-        let err = super::ensure_report_dir_fresh(report_dir.as_path(), "vm-lab-setup-live-lab")
-            .expect_err("non-empty report dir must fail closed under strict check");
-        assert!(err.contains("refuses to reuse non-empty report dir"));
-
-        let _ = fs::remove_dir_all(report_dir);
-    }
-
-    #[test]
-    fn ensure_report_dir_fresh_except_rejects_non_exempt_files() {
-        // report_dir has an "orchestration/" (exempt) AND an extra stale file outside it.
-        // The exempt variant must still reject in this case.
-        let report_dir = write_temp_report_dir();
-        let orch_dir = report_dir.join("orchestration");
-        fs::create_dir_all(&orch_dir).expect("orchestration dir should create");
-        fs::write(orch_dir.join("discover_initial.json"), "{}\n")
-            .expect("discover_initial.json should write");
-        fs::write(report_dir.join("stale_artifact.json"), "{}\n")
-            .expect("stale artifact should write");
-
-        let err = super::ensure_report_dir_fresh_except(
-            report_dir.as_path(),
-            "vm-lab-setup-live-lab",
-            &["orchestration"],
-        )
-        .expect_err("report dir with stale files outside orchestration/ must fail closed");
-        assert!(err.contains("refuses to reuse non-empty report dir"));
-
-        let _ = fs::remove_dir_all(report_dir);
-    }
-
-    #[test]
-    fn build_release_gate_completeness_report_marks_subset_runs_not_requested() {
-        let records = vec![
-            LiveLabStageRecord {
-                name: "live_role_switch_matrix".to_owned(),
-                severity: "hard".to_owned(),
-                status: "pass".to_owned(),
-                rc: "0".to_owned(),
-                log_path: PathBuf::from("/tmp/live_role_switch_matrix.log"),
-                description: "role switch".to_owned(),
-            },
-            LiveLabStageRecord {
-                name: "live_two_hop".to_owned(),
-                severity: "hard".to_owned(),
-                status: "pass".to_owned(),
-                rc: "0".to_owned(),
-                log_path: PathBuf::from("/tmp/live_two_hop.log"),
-                description: "two hop".to_owned(),
-            },
-        ];
-
-        let report = super::build_release_gate_completeness_report(&records, false);
-
-        assert!(!report.requested);
-        assert_eq!(report.status, "not_requested");
-        assert!(report.missing_or_non_pass_stages.is_empty());
-        assert_eq!(report.observed_pass_stages.len(), 2);
-    }
-
-    #[test]
-    fn write_release_gate_completeness_writes_incomplete_requested_artifact() {
-        let report_dir = write_temp_report_dir();
-        let report = super::build_release_gate_completeness_report(
-            &[LiveLabStageRecord {
-                name: "live_role_switch_matrix".to_owned(),
-                severity: "hard".to_owned(),
-                status: "pass".to_owned(),
-                rc: "0".to_owned(),
-                log_path: PathBuf::from("/tmp/live_role_switch_matrix.log"),
-                description: "role switch".to_owned(),
-            }],
-            true,
-        );
-
-        super::write_release_gate_completeness(report_dir.as_path(), &report)
-            .expect("release-gate completeness should write");
-
-        let artifact_path = report_dir.join(super::RELEASE_GATE_COMPLETENESS_RELATIVE_PATH);
-        let parsed: serde_json::Value = serde_json::from_slice(
-            &fs::read(&artifact_path).expect("release-gate completeness should read"),
-        )
-        .expect("artifact should parse");
-
-        assert_eq!(parsed["requested"].as_bool(), Some(true));
-        assert_eq!(parsed["status"].as_str(), Some("incomplete"));
-        assert!(
-            parsed["missing_or_non_pass_stages"]
-                .as_array()
-                .expect("missing stage array should exist")
-                .iter()
-                .any(|value| value.as_str() == Some("cross_network_nat_matrix"))
-        );
-
-        let _ = fs::remove_dir_all(report_dir);
-    }
-
-    #[test]
-    fn build_release_gate_completeness_report_marks_complete_when_all_required_stages_pass() {
-        let records = super::FULL_RELEASE_GATE_REQUIRED_STAGES
-            .iter()
-            .map(|stage| LiveLabStageRecord {
-                name: (*stage).to_owned(),
-                severity: "hard".to_owned(),
-                status: "pass".to_owned(),
-                rc: "0".to_owned(),
-                log_path: PathBuf::from(format!("/tmp/{stage}.log")),
-                description: format!("{stage} stage"),
-            })
-            .collect::<Vec<_>>();
-
-        let report = super::build_release_gate_completeness_report(&records, true);
-
-        assert!(report.requested);
-        assert_eq!(report.status, "complete");
-        assert!(report.missing_or_non_pass_stages.is_empty());
-        assert_eq!(
-            report.observed_pass_stages.len(),
-            super::FULL_RELEASE_GATE_REQUIRED_STAGES.len()
-        );
     }
 
     #[test]
@@ -51139,31 +47338,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         }
     }
 
-    fn baseline_live_lab_run_inputs() -> super::LiveLabRunInputs {
-        super::LiveLabRunInputs {
-            profile_path: PathBuf::from("/tmp/profile.env"),
-            report_dir: PathBuf::from("/tmp/report"),
-            source_mode: "local-head".to_owned(),
-            repo_ref: None,
-            timeout: Duration::from_secs(60),
-            dry_run: false,
-            skip_setup: false,
-            continue_from_setup: false,
-            skip_gates: false,
-            skip_soak: false,
-            skip_cross_network: false,
-            enable_chaos_suite: false,
-            stage_timeout_secs: 0,
-        }
-    }
-
-    fn collect_command_args(command: &std::process::Command) -> Vec<String> {
-        command
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
-    }
-
     // ---------------------------------------------------------------
     // W4.1 LiveLabStageCapability tests
     // ---------------------------------------------------------------
@@ -51421,138 +47595,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 "linux-only capability constant must include {cap:?}"
             );
         }
-    }
-
-    #[test]
-    fn linux_bash_orchestrator_builds_command_with_minimal_args() {
-        let orchestrator =
-            super::LinuxBashOrchestrator::new(PathBuf::from("/usr/local/bin/orchestrator.sh"));
-        let inputs = baseline_live_lab_run_inputs();
-        let command = orchestrator.build_command(&inputs);
-        assert_eq!(command.get_program(), "bash");
-        let args = collect_command_args(&command);
-        assert_eq!(
-            args.first().map(String::as_str),
-            Some("/usr/local/bin/orchestrator.sh")
-        );
-        assert!(args.contains(&"--profile".to_owned()));
-        assert!(args.contains(&"/tmp/profile.env".to_owned()));
-        assert!(args.contains(&"--report-dir".to_owned()));
-        assert!(args.contains(&"/tmp/report".to_owned()));
-        assert!(args.contains(&"--source-mode".to_owned()));
-        assert!(args.contains(&"local-head".to_owned()));
-        // No optional flags should appear when defaults are used.
-        for forbidden in [
-            "--dry-run",
-            "--skip-setup",
-            "--preserve-report-state",
-            "--skip-gates",
-            "--skip-soak",
-            "--skip-cross-network",
-            "--repo-ref",
-            "--stage-timeout-secs",
-        ] {
-            assert!(
-                !args.contains(&forbidden.to_owned()),
-                "default-build args must omit {forbidden}: {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn linux_bash_orchestrator_builds_command_with_all_skip_flags_set() {
-        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let mut inputs = baseline_live_lab_run_inputs();
-        inputs.dry_run = true;
-        inputs.skip_setup = true;
-        inputs.skip_gates = true;
-        inputs.skip_soak = true;
-        inputs.skip_cross_network = true;
-        let args = collect_command_args(&orchestrator.build_command(&inputs));
-        for required in [
-            "--dry-run",
-            "--skip-setup",
-            "--preserve-report-state",
-            "--skip-gates",
-            "--skip-soak",
-            "--skip-cross-network",
-        ] {
-            assert!(
-                args.contains(&required.to_owned()),
-                "all-skip args must include {required}: {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn linux_bash_orchestrator_continue_from_setup_implies_skip_setup_pair() {
-        // continue_from_setup is the orchestrator's "I detected reusable
-        // setup state" signal; it must translate to the same
-        // --skip-setup --preserve-report-state pair the bash script
-        // expects, even when the user did not pass --skip-setup
-        // explicitly. Without this the orchestrator would re-run setup
-        // stages that already produced reviewed evidence.
-        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let mut inputs = baseline_live_lab_run_inputs();
-        inputs.skip_setup = false;
-        inputs.continue_from_setup = true;
-        let args = collect_command_args(&orchestrator.build_command(&inputs));
-        assert!(args.contains(&"--skip-setup".to_owned()));
-        assert!(args.contains(&"--preserve-report-state".to_owned()));
-    }
-
-    #[test]
-    fn linux_bash_orchestrator_emits_repo_ref_when_set() {
-        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let mut inputs = baseline_live_lab_run_inputs();
-        inputs.repo_ref = Some("v1.2.3".to_owned());
-        let args = collect_command_args(&orchestrator.build_command(&inputs));
-        // Must appear as the pair "--repo-ref" "v1.2.3", not stuck together.
-        let repo_index = args
-            .iter()
-            .position(|a| a == "--repo-ref")
-            .expect("--repo-ref must be emitted");
-        assert_eq!(args.get(repo_index + 1).map(String::as_str), Some("v1.2.3"));
-    }
-
-    #[test]
-    fn linux_bash_orchestrator_emits_stage_timeout_secs_when_positive() {
-        // The per-stage watchdog flag must reach the bash orchestrator as the
-        // pair "--stage-timeout-secs" "<N>" so a hung node-setup stage is
-        // capped instead of stalling the run for hours. This is the forwarding
-        // path that was previously missing end-to-end.
-        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let mut inputs = baseline_live_lab_run_inputs();
-        inputs.stage_timeout_secs = 900;
-        let args = collect_command_args(&orchestrator.build_command(&inputs));
-        let idx = args
-            .iter()
-            .position(|a| a == "--stage-timeout-secs")
-            .expect("--stage-timeout-secs must be emitted when > 0");
-        assert_eq!(args.get(idx + 1).map(String::as_str), Some("900"));
-    }
-
-    #[test]
-    fn linux_bash_orchestrator_omits_stage_timeout_secs_when_zero() {
-        // 0 is the "watchdog disabled" sentinel and must not emit the flag,
-        // preserving the historical outer-timeout-only behaviour.
-        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let mut inputs = baseline_live_lab_run_inputs();
-        inputs.stage_timeout_secs = 0;
-        let args = collect_command_args(&orchestrator.build_command(&inputs));
-        assert!(
-            !args.contains(&"--stage-timeout-secs".to_owned()),
-            "stage_timeout_secs=0 must omit the flag: {args:?}"
-        );
-    }
-
-    #[test]
-    fn linux_bash_orchestrator_script_path_round_trips() {
-        let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/path/to/orch.sh"));
-        assert_eq!(
-            orchestrator.script_path(),
-            std::path::Path::new("/path/to/orch.sh")
-        );
     }
 
     #[test]
@@ -52226,266 +48268,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         for (role, label) in pairs {
             assert_eq!(role.as_str(), *label);
         }
-    }
-
-    // ---------------------------------------------------------------
-    // W3.3 RustOrchestrator tests
-    // ---------------------------------------------------------------
-
-    fn rust_orchestrator_inputs() -> super::LiveLabRunInputs {
-        super::LiveLabRunInputs {
-            profile_path: PathBuf::from("/tmp/profile.env"),
-            report_dir: PathBuf::from("/tmp/report"),
-            source_mode: "local-head".to_owned(),
-            repo_ref: None,
-            timeout: Duration::from_secs(60),
-            dry_run: false,
-            skip_setup: false,
-            continue_from_setup: false,
-            skip_gates: false,
-            skip_soak: false,
-            skip_cross_network: false,
-            enable_chaos_suite: false,
-            stage_timeout_secs: 0,
-        }
-    }
-
-    #[test]
-    fn rust_orchestrator_pure_linux_path_is_pure_linux() {
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let rust = super::RustOrchestrator::new(bash, vec![super::VmGuestPlatform::Linux; 5]);
-        assert!(rust.is_supported_desktop_topology());
-        assert_eq!(rust.non_linux_platforms(), Vec::<&'static str>::new());
-    }
-
-    #[test]
-    fn rust_orchestrator_empty_platform_set_is_treated_as_pure_linux() {
-        // Profile gating already enforces a 5×Linux topology before
-        // the orchestrator runs; an empty set must default to the
-        // Linux-bash path rather than refusing.
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let rust = super::RustOrchestrator::new(bash, vec![]);
-        assert!(rust.is_supported_desktop_topology());
-    }
-
-    #[test]
-    fn rust_orchestrator_heterogeneous_desktop_set_is_supported() {
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let rust = super::RustOrchestrator::new(
-            bash,
-            vec![
-                super::VmGuestPlatform::Linux,
-                super::VmGuestPlatform::Linux,
-                super::VmGuestPlatform::Windows,
-            ],
-        );
-        assert!(rust.is_supported_desktop_topology());
-        let non_linux = rust.non_linux_platforms();
-        assert_eq!(non_linux, vec!["windows"]);
-    }
-
-    #[test]
-    fn rust_orchestrator_non_linux_platforms_dedupes_repeats() {
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let rust = super::RustOrchestrator::new(
-            bash,
-            vec![
-                super::VmGuestPlatform::Windows,
-                super::VmGuestPlatform::Macos,
-                super::VmGuestPlatform::Windows,
-                super::VmGuestPlatform::Macos,
-            ],
-        );
-        let non_linux = rust.non_linux_platforms();
-        assert_eq!(non_linux.len(), 2);
-        assert!(non_linux.contains(&"windows"));
-        assert!(non_linux.contains(&"macos"));
-    }
-
-    #[test]
-    fn rust_orchestrator_mobile_mixed_execution_rejects_with_capability_blocker() {
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let rust = super::RustOrchestrator::new(
-            bash,
-            vec![super::VmGuestPlatform::Linux, super::VmGuestPlatform::Ios],
-        );
-        let inputs = rust_orchestrator_inputs();
-        let err = rust
-            .execute_live_lab(&inputs)
-            .expect_err("mobile mixed execution must reject");
-        assert!(
-            err.contains("non-Linux platforms in target set [ios]"),
-            "blocker must name ios: {err}"
-        );
-        assert!(
-            err.contains("reason_code=target-platform-unsupported"),
-            "blocker must surface target-platform-unsupported: {err}"
-        );
-    }
-
-    #[test]
-    fn rust_orchestrator_mobile_blocker_includes_capability_record() {
-        // Slice 2 of VmLabCapabilityReportingPlan_2026-04-14: the
-        // mobile reject must carry a stable capability `reason_code`
-        // and `status` so downstream tooling can grep on the capability
-        // vocabulary rather than the free-form W4.1 prose.
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let rust = super::RustOrchestrator::new(
-            bash,
-            vec![
-                super::VmGuestPlatform::Linux,
-                super::VmGuestPlatform::Android,
-            ],
-        );
-        let inputs = rust_orchestrator_inputs();
-        let err = rust
-            .execute_live_lab(&inputs)
-            .expect_err("mobile execution must reject");
-        assert!(
-            err.contains("scope=RunLiveLab"),
-            "blocker must surface the RunLiveLab capability scope: {err}"
-        );
-        assert!(
-            err.contains("status=Unsupported"),
-            "blocker must surface Unsupported status: {err}"
-        );
-        assert!(
-            err.contains("reason_code=target-platform-unsupported"),
-            "blocker must surface the target-platform-unsupported reason code: {err}"
-        );
-    }
-
-    #[test]
-    fn rust_orchestrator_pure_linux_path_delegates_to_bash_orchestrator() {
-        // The pure-Linux dispatch path constructs the same bash
-        // command shape `LinuxBashOrchestrator` does. We exercise the
-        // delegation by inspecting the build_command output of the
-        // wrapped orchestrator (the actual bash spawn is not done in
-        // this test — that's W3.4 live-lab regression territory).
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/usr/local/bin/orch.sh"));
-        let inputs = rust_orchestrator_inputs();
-        let expected_args = collect_command_args(&bash.build_command(&inputs));
-        let rust = super::RustOrchestrator::new(bash, vec![super::VmGuestPlatform::Linux; 5]);
-        // Re-construct an equivalent bash orchestrator from the rust
-        // wrapper to ensure both paths produce the same argv shape.
-        // The wrapper holds the bash orchestrator privately, so we
-        // assert via the public route: pure-linux dispatch is
-        // identity-by-delegation.
-        assert!(rust.is_supported_desktop_topology());
-        // Sanity: the expected args are the same as the bash impl
-        // would emit on its own — the parity contract.
-        assert!(
-            expected_args.contains(&"--profile".to_owned())
-                && expected_args.contains(&"--report-dir".to_owned()),
-            "bash orchestrator must still build the canonical argv shape: {expected_args:?}"
-        );
-    }
-
-    #[test]
-    fn rust_orchestrator_macos_only_set_rejects_with_macos_in_blocker() {
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let rust = super::RustOrchestrator::new(bash, vec![super::VmGuestPlatform::Macos]);
-        let err = rust
-            .execute_live_lab(&rust_orchestrator_inputs())
-            .expect_err("macos-only must reject today");
-        assert!(err.contains("macos"), "blocker must name macos: {err}");
-    }
-
-    #[test]
-    fn rust_orchestrator_pure_non_linux_reject_uses_linux_shell_orchestrator_only_reason_code() {
-        // Slice 2 wiring through normalize_vm_lab_platform_mix +
-        // validate_vm_lab_target_topology must surface the precise reason
-        // code for a pure-non-Linux topology (linux-shell-orchestrator-only),
-        // not the topology-mismatch code that fits a mixed topology.
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
-        let rust = super::RustOrchestrator::new(
-            bash,
-            vec![
-                super::VmGuestPlatform::Windows,
-                super::VmGuestPlatform::Windows,
-            ],
-        );
-        let err = rust
-            .execute_live_lab(&rust_orchestrator_inputs())
-            .expect_err("pure-Windows topology must reject today");
-        assert!(
-            err.contains("status=Unsupported"),
-            "blocker must surface Unsupported status: {err}"
-        );
-        assert!(
-            err.contains("reason_code=linux-shell-orchestrator-only"),
-            "pure-non-Linux topology must surface the Linux-shell-only reason code: {err}"
-        );
-        assert!(
-            !err.contains("reason_code=topology-mismatch"),
-            "pure-Windows must NOT surface topology-mismatch (that is for mixed topologies): {err}"
-        );
-    }
-
-    #[test]
-    fn rust_orchestrator_mixed_desktop_topology_delegates_to_bash_wrapper() {
-        // The marker lives in its OWN unique directory, never directly in
-        // temp_dir(): cleanup_temp_path removes the marker's PARENT, and a
-        // root-level marker made that remove_dir_all(/tmp) — a recursive,
-        // error-swallowed sweep of every same-UID temp entry that randomly
-        // destroyed OTHER tests' uniquely-named fixtures mid-run.
-        let marker_dir = std::env::temp_dir().join(format!(
-            "rustynet-rust-orchestrator-mixed-{}.dir",
-            super::unique_suffix()
-        ));
-        fs::create_dir_all(&marker_dir).expect("marker dir should exist");
-        let marker = marker_dir.join("executed.marker");
-        let script = write_temp_executable(
-            format!(
-                "#!/bin/sh\nprintf 'mixed-desktop\\n' > {}\nexit 0\n",
-                marker.display()
-            )
-            .as_str(),
-        );
-        let bash = super::LinuxBashOrchestrator::new(script.clone());
-        let rust = super::RustOrchestrator::new(
-            bash,
-            vec![
-                super::VmGuestPlatform::Linux,
-                super::VmGuestPlatform::Linux,
-                super::VmGuestPlatform::Windows,
-                super::VmGuestPlatform::Macos,
-            ],
-        );
-        let report = rust
-            .execute_live_lab(&rust_orchestrator_inputs())
-            .expect("mixed desktop topology should delegate to bash wrapper");
-        assert!(report.success);
-        assert_eq!(report.exit_status_code, Some(0));
-        assert!(marker.exists());
-        cleanup_temp_path(script.as_path());
-        cleanup_temp_path(marker.as_path());
-    }
-
-    #[test]
-    fn stage_orchestrator_trait_supports_test_implementations() {
-        // Sanity: the trait can be implemented by something that does
-        // not spawn bash, so future RustOrchestrator + test fakes can
-        // share the dispatch surface without re-implementing the
-        // caller's post-processing path.
-        struct StubOrchestrator;
-        impl super::StageOrchestrator for StubOrchestrator {
-            fn execute_live_lab(
-                &self,
-                _inputs: &super::LiveLabRunInputs,
-            ) -> Result<super::LiveLabRunReport, String> {
-                Ok(super::LiveLabRunReport {
-                    exit_status_code: Some(0),
-                    success: true,
-                })
-            }
-        }
-        let inputs = baseline_live_lab_run_inputs();
-        let report = StubOrchestrator
-            .execute_live_lab(&inputs)
-            .expect("stub must return Ok");
-        assert!(report.success);
-        assert_eq!(report.exit_status_code, Some(0));
     }
 
     #[test]
@@ -53747,47 +49529,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
-    fn run_freshness_guard_accepts_every_bash_setup_stage_record() {
-        // The bash orchestrator's setup classification and setup_stage_names()
-        // must stay in sync: a setup stage missing from the Rust list (e.g.
-        // macos_preflight_check) makes the freshness guard reject the
-        // orchestrate flow's own setup evidence and brick vm_lab_run_live_lab.
-        let unique = super::unique_suffix();
-        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-guard-{unique}.dir"));
-        fs::create_dir_all(root.join("state")).expect("report state dir");
-        let row = |name: &str| {
-            format!(
-                "{name}\thard\tpass\t0\t/tmp/{name}.log\tdesc\t2026-01-01T00:00:00Z\t2026-01-01T00:00:01Z\n"
-            )
-        };
-        let mut body = String::new();
-        for name in super::setup_stage_names() {
-            body.push_str(row(name).as_str());
-        }
-        fs::write(root.join("state/stages.tsv"), body.as_str()).expect("write stages.tsv");
-        assert!(
-            !super::live_lab_report_has_non_setup_stage_records(root.as_path())
-                .expect("guard must evaluate"),
-            "setup-only records must not trip the freshness guard"
-        );
-        assert!(
-            super::setup_stage_names().contains(&"macos_preflight_check"),
-            "macos_preflight_check is a bash-orchestrator setup stage"
-        );
-
-        // A run-stage record must still trip it.
-        body.push_str(row("live_anchor").as_str());
-        fs::write(root.join("state/stages.tsv"), body.as_str()).expect("rewrite stages.tsv");
-        assert!(
-            super::live_lab_report_has_non_setup_stage_records(root.as_path())
-                .expect("guard must evaluate"),
-            "run-stage records must trip the freshness guard"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn windows_exit_evidence_artifact_specs_are_exact_allowlist() {
         let specs = super::windows_exit_evidence_artifact_specs();
         let labels: Vec<&str> = specs.iter().map(|spec| spec.label).collect();
@@ -53916,7 +49657,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             ssh_identity_file: PathBuf::from("/dev/null"),
             known_hosts_path: None,
             require_same_network: false,
-            script_path: PathBuf::from("/dev/null"),
             report_dir: PathBuf::from("/dev/null"),
             source_mode: None,
             repo_ref: None,
@@ -53949,7 +49689,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             windows_only: false,
             validate_linux_daemon_state: false,
             node_assignments: Vec::new(),
-            legacy_bash_orchestrator: false,
             orchestrate_ssh_allow_cidrs: None,
             no_fail_on_authenticode: false,
             topology_profile: None,
@@ -54116,15 +49855,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
-    fn w56_flip_withheld_when_bash_lock_set() {
-        // --legacy-bash-orchestrator is the rollback lever: no flip.
-        let mut cfg = empty_orchestrate_live_lab_config();
-        cfg.exit_vm = Some("deb-exit".to_owned());
-        cfg.legacy_bash_orchestrator = true;
-        assert!(super::w56_flip_legacy_to_node(&cfg).is_none());
-    }
-
-    #[test]
     fn w56_flip_withheld_for_topology_profile_run() {
         // Native cannot resolve profiles yet — such a run stays on bash.
         let mut cfg = empty_orchestrate_live_lab_config();
@@ -54196,28 +49926,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         cfg.exit_vm = Some("deb-exit".to_owned());
         let assignments = super::w56_flip_legacy_to_node(&cfg).expect("must flip");
         assert!(!assignments.is_empty());
-    }
-
-    #[test]
-    fn validate_orchestrate_live_lab_config_rejects_legacy_flag_with_node_assignments() {
-        let mut cfg = empty_orchestrate_live_lab_config();
-        cfg.legacy_bash_orchestrator = true;
-        cfg.node_assignments =
-            vec![super::orchestrator::role_assignment::parse_node_role_arg("a:exit").unwrap()];
-        let err = super::validate_orchestrate_live_lab_config(&cfg).unwrap_err();
-        assert!(
-            err.contains("--legacy-bash-orchestrator")
-                && err.contains("--node")
-                && err.contains("mutually exclusive"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_orchestrate_live_lab_config_accepts_legacy_flag_alone() {
-        let mut cfg = empty_orchestrate_live_lab_config();
-        cfg.legacy_bash_orchestrator = true;
-        super::validate_orchestrate_live_lab_config(&cfg).expect("must accept legacy flag alone");
     }
 
     #[test]
@@ -54326,15 +50034,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
-    fn legacy_role_flags_deprecation_warnings_silent_when_legacy_flag_set() {
-        let mut cfg = empty_orchestrate_live_lab_config();
-        cfg.exit_vm = Some("a".to_owned());
-        cfg.client_vm = Some("b".to_owned());
-        cfg.legacy_bash_orchestrator = true;
-        assert!(super::legacy_role_flags_deprecation_warnings(&cfg).is_empty());
-    }
-
-    #[test]
     fn legacy_role_flags_deprecation_warnings_silent_when_no_role_flags_set() {
         let cfg = empty_orchestrate_live_lab_config();
         assert!(super::legacy_role_flags_deprecation_warnings(&cfg).is_empty());
@@ -54357,11 +50056,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             warnings[0]
         );
         assert!(
-            warnings[1].contains("--legacy-bash-orchestrator")
-                && warnings[1].contains("W5.6")
-                && warnings[1].contains("default"),
-            "second warning must reference the W5.6 default flip + the legacy \
-             escape hatch: {:?}",
+            warnings[1].contains("W5.7") && warnings[1].contains("sole execution engine"),
+            "second warning must state the --node engine is the sole engine (W5.7): {:?}",
             warnings[1]
         );
     }
@@ -54372,53 +50068,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         cfg.windows_vm = Some("win".to_owned());
         let warnings = super::legacy_role_flags_deprecation_warnings(&cfg);
         assert_eq!(warnings.len(), 2);
-    }
-
-    fn write_parity_input_json(dir: &Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        fs::write(&path, body).expect("parity input must write");
-        path
-    }
-
-    #[test]
-    fn execute_ops_vm_lab_diff_orchestrator_parity_writes_diff_and_returns_ok_on_match() {
-        let unique = super::unique_suffix();
-        let tmp = std::env::temp_dir().join(format!("rustynet-parity-{unique}.dir"));
-        fs::create_dir_all(&tmp).expect("tmp dir");
-
-        let body = serde_json::json!({
-            "run_id": "x",
-            "timestamp_utc": "0",
-            "overall_status": "passed",
-            "stages": [{
-                "stage_id": "preflight",
-                "stage_name": "preflight",
-                "outcome": "passed",
-                "duration_ms": 0,
-                "error_detail": null
-            }],
-            "node_statuses": {}
-        })
-        .to_string();
-        let left = write_parity_input_json(&tmp, "left.json", &body);
-        let right = write_parity_input_json(&tmp, "right.json", &body);
-        let output = tmp.join("diff.json");
-        let cfg = super::VmLabDiffOrchestratorParityConfig {
-            left_path: left,
-            right_path: right,
-            output_path: output.clone(),
-            mode: super::ParityMode::Strict,
-        };
-        let summary = super::execute_ops_vm_lab_diff_orchestrator_parity(cfg)
-            .expect("identical reports must produce parity pass");
-        assert!(summary.contains("pass=true"), "summary: {summary}");
-
-        let written = fs::read_to_string(&output).expect("diff output must exist");
-        let parsed: super::orchestrator::parity::ParityDiff =
-            serde_json::from_str(&written).expect("output must be valid ParityDiff");
-        assert!(parsed.overall_parity_pass);
-
-        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -54475,59 +50124,6 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let err = super::execute_ops_vm_lab_emit_parity_input(cfg)
             .expect_err("missing stages.tsv must fail closed");
         assert!(err.contains("stages.tsv"), "err: {err}");
-        fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn execute_ops_vm_lab_diff_orchestrator_parity_returns_err_on_drift() {
-        let unique = super::unique_suffix();
-        let tmp = std::env::temp_dir().join(format!("rustynet-parity-drift-{unique}.dir"));
-        fs::create_dir_all(&tmp).expect("tmp dir");
-
-        let left_body = serde_json::json!({
-            "run_id": "x",
-            "timestamp_utc": "0",
-            "overall_status": "passed",
-            "stages": [{
-                "stage_id": "preflight",
-                "stage_name": "preflight",
-                "outcome": "passed",
-                "duration_ms": 0,
-                "error_detail": null
-            }],
-            "node_statuses": {}
-        })
-        .to_string();
-        let right_body = serde_json::json!({
-            "run_id": "y",
-            "timestamp_utc": "0",
-            "overall_status": "failed",
-            "stages": [{
-                "stage_id": "preflight",
-                "stage_name": "preflight",
-                "outcome": "failed",
-                "duration_ms": 0,
-                "error_detail": "boom"
-            }],
-            "node_statuses": {}
-        })
-        .to_string();
-        let left = write_parity_input_json(&tmp, "left.json", &left_body);
-        let right = write_parity_input_json(&tmp, "right.json", &right_body);
-        let output = tmp.join("diff.json");
-        let cfg = super::VmLabDiffOrchestratorParityConfig {
-            left_path: left,
-            right_path: right,
-            output_path: output.clone(),
-            mode: super::ParityMode::Strict,
-        };
-        let err = super::execute_ops_vm_lab_diff_orchestrator_parity(cfg)
-            .expect_err("drift must surface as Err");
-        assert!(err.contains("pass=false"), "summary: {err}");
-        // Diff JSON must still be written even on drift so the operator
-        // can inspect it.
-        assert!(output.exists(), "diff JSON must be written even on drift");
-
         fs::remove_dir_all(&tmp).ok();
     }
 
@@ -54751,7 +50347,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "test",
             "setup_only",
             &crate::live_lab_stage_registry::TargetSelectors::default(),
-            Some(&active),
+            &active,
         );
         crate::live_lab_stage_manifest::write_stage_manifest(&tmp, &manifest).expect("manifest");
         fs::write(
