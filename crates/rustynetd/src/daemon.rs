@@ -361,6 +361,19 @@ pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.p
 pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH;
 pub const DEFAULT_EGRESS_INTERFACE: &str = "auto";
 pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
+
+/// QH-54: how often a serving node re-asserts that the host firewall still
+/// admits its forwarded tunnel traffic.
+///
+/// The check is a privileged D-Bus round trip, so it must not ride the
+/// one-second reconcile tick. It is bounding the exposure window of a
+/// *availability* defect — a tunnel interface recreated by in-process worker
+/// recovery loses its firewalld zone binding, and forwarded traffic is then
+/// discarded by firewalld until something re-binds it — so seconds of extra
+/// latency cost far less than a per-second privileged call on every serving
+/// node. Nothing fails open while the timer runs: an unbound interface drops
+/// traffic, it does not admit any.
+pub const HOST_FIREWALL_ADMISSION_ASSERT_INTERVAL_SECS: u64 = 30;
 pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
 pub const DEFAULT_AUTO_PORT_FORWARD_EXIT: bool = false;
 pub const DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS: u32 = 1_200;
@@ -3918,6 +3931,10 @@ struct DaemonRuntime {
     reconcile_attempts: u64,
     reconcile_failures: u64,
     last_reconcile_unix: Option<u64>,
+    /// QH-54: unix time of the last host-firewall admission re-assert, so the
+    /// periodic posture check runs on its own slow cadence rather than on every
+    /// one-second reconcile tick.
+    last_host_firewall_admission_assert_unix: Option<u64>,
     last_reconcile_error: Option<String>,
     last_applied_assignment: Option<AutoTunnelWatermark>,
     local_route_reconcile_pending: bool,
@@ -4424,6 +4441,7 @@ impl DaemonRuntime {
             reconcile_attempts: 0,
             reconcile_failures: 0,
             last_reconcile_unix: None,
+            last_host_firewall_admission_assert_unix: None,
             last_reconcile_error: None,
             last_applied_assignment: None,
             local_route_reconcile_pending: false,
@@ -9721,10 +9739,57 @@ impl DaemonRuntime {
             }
         }
 
+        self.maybe_reassert_host_firewall_admission();
         self.poll_endpoint_monitor_and_maybe_refresh();
         self.maintain_exit_port_forward(
             self.is_serving_exit_node(self.selected_exit_node.as_deref()),
         );
+    }
+
+    /// QH-54: periodically re-assert that the host firewall still admits the
+    /// forwarded tunnel traffic this node advertises a role for.
+    ///
+    /// The apply path binds the tunnel interface to firewalld's default zone
+    /// after backend start, but the binding belongs to the INTERFACE, and the
+    /// WireGuard userspace backend can delete and recreate that interface
+    /// underneath a committed generation when its worker dies
+    /// (`recover_runtime_after_worker_exit`). That recovery is transparent to the
+    /// daemon, and the block above only re-applies on a fail-closed/restricted
+    /// state or an assignment/membership/route change, so nothing would otherwise
+    /// re-bind a recreated interface on a steady-state forwarding node.
+    ///
+    /// The assert itself is `Phase10Controller::reassert_host_firewall_admission`,
+    /// which calls the same delegate the apply path calls and fails closed the
+    /// same way. Here we only choose WHEN: on a slow cadence, because the check
+    /// is a privileged D-Bus round trip and the one-second reconcile tick would
+    /// make it a hot loop.
+    ///
+    /// A failure has already fail-closed the controller by the time it returns,
+    /// so this records a recoverable restriction exactly as a failed apply does.
+    fn maybe_reassert_host_firewall_admission(&mut self) {
+        if !self.controller.serving_exit_node_active() {
+            // Not serving: nothing to admit, and no reason to hold a timestamp
+            // that would suppress the first assert after a later promotion.
+            self.last_host_firewall_admission_assert_unix = None;
+            return;
+        }
+        let now_unix = unix_now();
+        if let Some(last) = self.last_host_firewall_admission_assert_unix
+            && now_unix.saturating_sub(last) < HOST_FIREWALL_ADMISSION_ASSERT_INTERVAL_SECS
+        {
+            return;
+        }
+        self.last_host_firewall_admission_assert_unix = Some(now_unix);
+        if let Err(err) = self.controller.reassert_host_firewall_admission() {
+            self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+            let message = format!("host firewall admission re-assert failed: {err}");
+            if self.last_reconcile_error.as_deref() != Some(message.as_str()) {
+                log::warn!("rustynetd reconcile fail-closed: {message}");
+            }
+            self.last_reconcile_error = Some(message.clone());
+            self.restrict_recoverable(message);
+            self.promote_to_permanent_if_over_limit();
+        }
     }
 
     fn enforce_blind_exit_invariants(&mut self) -> Result<(), String> {
@@ -16766,6 +16831,60 @@ mod tests {
     };
     use rustynet_control::roles::RoleCapability;
     use rustynet_control::{RelayFleetNodeDescriptor, SignedRelayFleetBundle};
+
+    /// QH-54. The controller can re-assert the firewalld admission on a live
+    /// generation, but only the daemon decides WHEN — so the periodic reconcile
+    /// must actually drive it, on its own slow cadence, gated on the node
+    /// actually serving.
+    ///
+    /// Source-pinned: the alternative is a full serving-exit daemon fixture, and
+    /// what needs protecting is the wiring (a dropped call, a moved call, a
+    /// cadence collapsed onto the one-second tick), not arithmetic. The
+    /// behavioural proof of what the re-assert DOES lives in the phase10 tests.
+    #[test]
+    fn the_reconcile_loop_drives_the_host_firewall_admission_reassert() {
+        let source = include_str!("daemon.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        let call_at = code
+            .find("self.maybe_reassert_host_firewall_admission();")
+            .expect("reconcile must drive the QH-54 re-assert");
+        let reconcile_at = code
+            .find("    fn reconcile(&mut self) {")
+            .expect("the daemon must have a reconcile");
+        assert!(
+            reconcile_at < call_at,
+            "the re-assert must be driven from the reconcile loop, which is the \
+             only thing that runs on a healthy, unchanging serving node"
+        );
+
+        let fn_at = code
+            .find("fn maybe_reassert_host_firewall_admission(&mut self) {")
+            .expect("the daemon must own the re-assert cadence");
+        let body = &code[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+        assert!(
+            body.contains("self.controller.serving_exit_node_active()"),
+            "the re-assert must be gated on the node actually serving"
+        );
+        assert!(
+            body.contains("HOST_FIREWALL_ADMISSION_ASSERT_INTERVAL_SECS"),
+            "the re-assert must run on its own cadence — the reconcile tick is \
+             one second and this is a privileged D-Bus round trip"
+        );
+        assert!(
+            body.contains("self.controller.reassert_host_firewall_admission()"),
+            "the daemon must delegate to the controller's single audited re-assert"
+        );
+        assert!(
+            body.contains("self.restrict_recoverable(message)"),
+            "a failed re-assert has already fail-closed the controller; the \
+             daemon must record it as a restriction rather than swallow it"
+        );
+    }
 
     #[test]
     fn daemon_does_not_discard_force_fail_closed_results() {

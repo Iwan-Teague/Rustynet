@@ -641,6 +641,16 @@ impl DryRunSystem {
         self
     }
 
+    /// Arm the failure AFTER construction.
+    ///
+    /// `fail_on` is a builder and can only fail a stage from the very first
+    /// call onwards. QH-54's re-assert has to be exercised on a node whose
+    /// apply already SUCCEEDED, so the same stage must be able to start
+    /// healthy and then fail on a later call.
+    pub fn fail_on_from_now(&mut self, operation: &str) {
+        self.fail_operation = Some(operation.to_owned());
+    }
+
     fn step(&mut self, operation: &str) -> Result<(), SystemError> {
         self.operations.push(operation.to_owned());
         if self
@@ -5907,6 +5917,68 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         Ok(())
     }
 
+    /// Re-assert the host firewall's admission of forwarded tunnel traffic on a
+    /// node that is ALREADY serving (QH-54).
+    ///
+    /// The firewalld zone binding is a property of the tunnel INTERFACE, and the
+    /// interface can be destroyed and rebuilt underneath a committed generation.
+    /// `recover_runtime_after_worker_exit`
+    /// (`rustynet-backend-wireguard/src/userspace_shared/mod.rs:218`) does exactly
+    /// that when the userspace worker dies: `SharedTunLifecycle::cleanup` runs
+    /// `ip link del`, then `start_runtime` recreates the device. That recovery is
+    /// invisible from here — it happens behind the `TunnelBackend` trait, inside
+    /// the WireGuard adapter, and returns the retried operation as an ordinary
+    /// success — so no apply follows it and nothing re-binds the recreated
+    /// interface. The daemon's periodic reconcile only re-applies on a
+    /// fail-closed/restricted state or an assignment/membership/route change, so
+    /// a healthy forwarding node can keep advertising a role whose forwarded
+    /// traffic firewalld silently discards until the next such change.
+    ///
+    /// Availability-only, and it must stay that way: a lost bind never opens
+    /// anything, it only makes firewalld drop traffic this daemon authorised.
+    ///
+    /// **Why the assert lives here and not in the recovery path.** firewalld
+    /// coexistence is a Linux host-firewall concern owned by this crate; putting
+    /// a re-bind hook inside `recover_runtime_after_worker_exit` would push it
+    /// into the WireGuard adapter, which is precisely the backend leakage
+    /// AGENTS.md §3 forbids, and no protocol-agnostic recovery signal exists to
+    /// hook instead — making one is the typed `WorkerUnavailable` + daemon
+    /// recovery-coordinator work that QH-54's transport blueprints specify and
+    /// that is not implemented.
+    ///
+    /// **One hardened path.** This calls the SAME
+    /// `DataplaneSystem::admit_host_firewall_forwarding` the creation path calls
+    /// at apply, under the same `serve_exit_node` gate, and handles failure the
+    /// same way: unwind the generation, then `force_fail_closed`, under the same
+    /// `host_firewall_admit_failed` reason. There is deliberately no second,
+    /// softer re-bind. firewalld presence is decided inside that one delegate, so
+    /// a host without firewalld is a no-op here for exactly the reason it is a
+    /// no-op at creation, and an `Unknown` presence is treated as present in both.
+    pub fn reassert_host_firewall_admission(&mut self) -> Result<(), Phase10Error> {
+        // The apply-path gate, unchanged: a node that is not serving forwards
+        // nothing to admit, and a fail-closed node has no live generation to
+        // protect — its next apply binds from scratch.
+        if !self.current_serve_exit_node || self.state == DataplaneState::FailClosed {
+            return Ok(());
+        }
+        let Err(err) = self.system.admit_host_firewall_forwarding() else {
+            return Ok(());
+        };
+        // Mirrors the apply-path failure handling verbatim, including the error
+        // precedence: a rollback failure outranks the fail-close result, which
+        // outranks the original admit error.
+        let active_stages = std::mem::take(&mut self.active_stages);
+        let rollback_result =
+            self.rollback_generation_best_effort(active_stages, RollbackIntent::FailClosed);
+        let fail_closed_result = self.force_fail_closed("host_firewall_admit_failed");
+        if let Err(rollback_err) = rollback_result {
+            let _ = fail_closed_result;
+            return Err(rollback_err);
+        }
+        fail_closed_result?;
+        Err(err.into())
+    }
+
     pub fn set_exit_node(
         &mut self,
         node_id: NodeId,
@@ -9932,6 +10004,207 @@ mod tests {
         assert!(
             !controller.backend.started,
             "the started backend must be rolled back when the admit fails"
+        );
+    }
+
+    /// Build a committed, serving generation and hand back the controller with
+    /// its recorded ops cleared, so a following assertion sees only what the
+    /// QH-54 re-assert itself does.
+    fn serving_controller_after_apply() -> Phase10Controller<RecordingBackend, DryRunSystem> {
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            allow_shared_exit_policy(),
+            TrustPolicy::default(),
+        );
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("serving apply should succeed");
+        assert!(
+            controller.serving_exit_node_active(),
+            "the fixture must leave a serving generation committed"
+        );
+        controller.system.operations.clear();
+        controller
+    }
+
+    /// QH-54, presence direction. The userspace WireGuard backend can delete and
+    /// recreate the tunnel interface underneath a committed generation when its
+    /// worker dies (`recover_runtime_after_worker_exit` -> `ip link del` ->
+    /// `start_runtime`), which drops the interface's firewalld zone binding. No
+    /// apply follows that recovery, so the controller must be able to re-assert
+    /// the admission on a live generation — and it must do so through the SAME
+    /// stage the apply path uses, not a second re-bind of its own.
+    #[test]
+    fn a_serving_node_reasserts_host_firewall_admission_through_the_apply_stage() {
+        let mut controller = serving_controller_after_apply();
+
+        controller
+            .reassert_host_firewall_admission()
+            .expect("re-asserting an admitted posture must succeed");
+
+        assert_eq!(
+            controller.system.operations,
+            vec!["admit_host_firewall_forwarding".to_owned()],
+            "the re-assert must run the apply path's admit stage and nothing \
+             else — a second re-bind path would be a fork of a security-sensitive \
+             workflow (AGENTS.md §3)"
+        );
+        assert!(
+            controller.serving_exit_node_active(),
+            "a healthy re-assert must leave the serving generation untouched"
+        );
+    }
+
+    /// QH-54, absence direction, role half. The re-assert carries the apply
+    /// path's `serve_exit_node` gate and no other: a node that forwards nothing
+    /// has no forwarded traffic to admit, and binding a plain client's tunnel
+    /// into a zone would change the only inbound filter it has.
+    ///
+    /// The firewalld-presence half of "skips exactly like creation" is not
+    /// modelled here on purpose — presence is decided INSIDE
+    /// `admit_host_firewall_forwarding` (Absent posture ->
+    /// `forwarding_unobstructed`, `Unknown` treated as present), and the whole
+    /// point is that the re-assert has no presence branch of its own to test.
+    /// `the_reassert_has_no_firewalld_logic_of_its_own` pins that structurally.
+    #[test]
+    fn a_client_node_never_reasserts_host_firewall_admission() {
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            allow_shared_exit_policy(),
+            TrustPolicy::default(),
+        );
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("plain client apply should succeed");
+        controller.system.operations.clear();
+
+        controller
+            .reassert_host_firewall_admission()
+            .expect("a non-serving re-assert is a no-op, not a failure");
+
+        assert!(
+            controller.system.operations.is_empty(),
+            "a non-serving node must not run the admit stage: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// QH-54 negative. A re-assert that finds the posture broken must fail
+    /// EXACTLY the way the apply path's admit failure does — unwind the
+    /// generation, block egress, land in `FailClosed`, and surface the error.
+    /// This is the availability fix's fail-open guard: the cheap alternative
+    /// (log and carry on, because "it is only availability") would leave the
+    /// node advertising a forwarding role whose traffic firewalld discards,
+    /// which is the QH-46 guarantee inverted.
+    #[test]
+    fn a_failed_reassert_fails_closed_exactly_like_a_failed_apply_admit() {
+        let mut controller = serving_controller_after_apply();
+        assert!(
+            controller.backend.started,
+            "the fixture must leave the backend running"
+        );
+        controller
+            .system
+            .fail_on_from_now("admit_host_firewall_forwarding");
+
+        let err = controller
+            .reassert_host_firewall_admission()
+            .expect_err("a broken posture must not be swallowed");
+
+        assert!(matches!(err, Phase10Error::System(_)));
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert!(
+            !controller.serving_exit_node_active(),
+            "a fail-closed node must stop claiming it serves an exit"
+        );
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "block_all_egress"),
+            "fail-closed must block egress: {:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller.backend.started,
+            "the committed generation must be unwound, matching the apply path"
+        );
+    }
+
+    /// QH-54 structural pin: one hardened path.
+    ///
+    /// The re-assert must delegate to `self.system.admit_host_firewall_forwarding()`
+    /// and must contain no firewalld vocabulary of its own — no presence test, no
+    /// zone name, no posture parse. A future edit that "optimises" the re-assert by
+    /// inlining a cheaper query, or that softens it into a log-only path because the
+    /// defect is availability-only, breaks here. Source-pinned because a behavioural
+    /// test cannot see the absence of a branch.
+    #[test]
+    fn the_reassert_has_no_firewalld_logic_of_its_own() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        let fn_at = code
+            .find("pub fn reassert_host_firewall_admission")
+            .expect("the controller must expose the QH-54 re-assert");
+        let rest = &code[fn_at..];
+        let body_end = rest[1..]
+            .find("\n    pub fn ")
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|offset| offset + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..body_end];
+
+        assert!(
+            body.contains("self.system.admit_host_firewall_forwarding()"),
+            "the re-assert must call the apply path's own stage"
+        );
+        for forked in [
+            "FirewalldZoneOp",
+            "FirewalldPresence",
+            "FirewalldPosture",
+            "FirewalldZoneSpec",
+            "LinuxFirewalldZone",
+        ] {
+            assert!(
+                !body.contains(forked),
+                "the re-assert must not re-implement firewalld handling ({forked}); \
+                 presence, zone and posture all belong to the single audited stage"
+            );
+        }
+        assert!(
+            body.contains("force_fail_closed(\"host_firewall_admit_failed\")"),
+            "a failed re-assert must fail closed under the apply path's own reason"
+        );
+        assert!(
+            body.contains("rollback_generation_best_effort"),
+            "a failed re-assert must unwind the generation like the apply path"
         );
     }
 
