@@ -28,11 +28,19 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 ///     `is_supported_for_platform` posture gate (per-node, recorded in
 ///     `runtime_skipped_nodes`), pending cross-OS Phase 8 wiring of their
 ///     bundle-pull token/listener provisioning.
-///   * runtime-dependent (DEFERRED): `enrollment_endpoint` — enrollment
-///     admit signs a membership update with the owner signing key +
-///     passphrase, which the orchestrator provisions only on the
-///     Exit/membership-owner, not on standalone anchors (a trust-model
-///     decision, not just wiring).
+///   * runtime-dependent (DEFERRED): `enrollment_endpoint` — the
+///     authorisation half now HAS a runtime enforcement point (D-3: the
+///     daemon refuses `EnrollmentConsume` unless the local node holds
+///     `anchor.enrollment_endpoint` in signed membership —
+///     `require_local_signed_capability` in `rustynetd::daemon`), but the
+///     LAN-exposed enrollment listener the capability names does not exist
+///     yet, so there is no endpoint on the anchor for a positive substage to
+///     probe. See
+///     `documents/operations/active/AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md`
+///     §7. (The former reason given here — "enrollment admit signs a
+///     membership update with the owner signing key" — described
+///     `enrollment admit`, which this capability does not serve;
+///     `enrollment consume` needs no owner key.)
 ///   * mutation (DEFERRED): `gossip_priority`, `downgrade_revocation` —
 ///     need the Windows membership-mutation backend.
 pub const ANCHOR_REPORTED_SKIPS_NOTE: &str = concat!(
@@ -41,8 +49,10 @@ pub const ANCHOR_REPORTED_SKIPS_NOTE: &str = concat!(
     "(run live on Linux anchors; macOS/Windows reported-skipped on the is_supported_for_platform gate, ",
     "pending cross-OS Phase 8 wiring of bundle-pull token/listener provisioning); ",
     "reported_skipped_runtime_dependent=[enrollment_endpoint] ",
-    "(pending a trust-model decision — enrollment admit signs a membership update with the owner signing key ",
-    "+ passphrase, which the orchestrator provisions only on the Exit/membership-owner, not on standalone anchors); ",
+    "(the authorisation gate IS enforced at runtime as of D-3 — the daemon refuses EnrollmentConsume unless the ",
+    "local node holds anchor.enrollment_endpoint in signed membership — but the LAN-exposed enrollment listener ",
+    "the capability names is not built, so there is no endpoint to probe; see ",
+    "AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md §7); ",
     "reported_skipped_mutation=[gossip_priority,downgrade_revocation] ",
     "(pending the Windows membership-mutation backend); ",
     "these substages are NOT silently dropped"
@@ -79,8 +89,9 @@ const REPORTED_SKIPS_FILENAME: &str = "anchor_validation.reported_skips.json";
 /// are reported-skipped for these on the `is_supported_for_platform`
 /// posture gate (recorded per-node), pending cross-OS Phase 8 wiring.
 ///
-/// The remaining substages — `enrollment_endpoint` (needs the owner
-/// signing key + passphrase, provisioned only on the Exit) and the
+/// The remaining substages — `enrollment_endpoint` (its authorisation gate
+/// is enforced in the daemon as of D-3, but the LAN listener the capability
+/// names is not built, so there is no endpoint to probe) and the
 /// mutation substages (gossip-priority, downgrade-revocation, needing the
 /// Windows membership-mutation backend) — are reported as explicit skips
 /// via [`ANCHOR_REPORTED_SKIPS_NOTE`] (written to
@@ -252,7 +263,10 @@ fn reported_skips_json_bytes(runtime_skips: &[(String, String)]) -> Vec<u8> {
             "invalid_token",
             "log_redaction",
         ],
-        // Still deferred (named, never silently dropped).
+        // Still deferred (named, never silently dropped). The
+        // enrollment_endpoint AUTHORISATION gate is enforced in the daemon
+        // (D-3); what is missing is the LAN listener a positive substage
+        // would probe.
         "reported_skipped_runtime_dependent": ["enrollment_endpoint"],
         "reported_skipped_mutation": ["gossip_priority", "downgrade_revocation"],
         // Per-run: anchors whose runtime bundle-pull substages were skipped

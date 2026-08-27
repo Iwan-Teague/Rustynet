@@ -1199,10 +1199,25 @@ fn parse_snapshot_content(content: &str) -> Result<MembershipState, MembershipEr
     Ok(state)
 }
 
-/// Return `true` iff `node_id` holds `anchor.bundle_pull` in the given
-/// snapshot bytes.  Fails closed (returns `false`) on any parse error.
-/// Does not perform file-security checks — caller owns the source trust.
-pub fn snapshot_bytes_have_bundle_pull_capability(bytes: &[u8], node_id: &str) -> bool {
+/// Return `true` iff `node_id` is an **Active** node holding `capability`
+/// in the given snapshot bytes.
+///
+/// This is the single read-side authorisation primitive for
+/// capability-gated runtime surfaces (bundle-pull's serve path, the
+/// enrollment-endpoint consume gate). It fails closed — `false` — on every
+/// failure mode: non-utf8 bytes, an oversized snapshot, a digest mismatch,
+/// a malformed or invalid state, an unknown `node_id`, a node that is not
+/// `Active`, or an absent capability. Does not perform file-security checks
+/// (symlink/permission); the caller owns the source trust.
+///
+/// The `Active` requirement is load-bearing: a node that has been revoked
+/// keeps its `capabilities=` list in its roster row, so a
+/// capability-membership test alone would let a revoked anchor keep serving.
+pub fn snapshot_bytes_have_capability(
+    bytes: &[u8],
+    node_id: &str,
+    capability: RoleCapability,
+) -> bool {
     let Ok(content) = std::str::from_utf8(bytes) else {
         return false;
     };
@@ -1216,9 +1231,18 @@ pub fn snapshot_bytes_have_bundle_pull_capability(bytes: &[u8], node_id: &str) -
                 .nodes
                 .into_iter()
                 .find(|n| n.node_id == node_id)
-                .map(|n| n.capabilities.contains(&RoleCapability::AnchorBundlePull))
+                .map(|n| {
+                    n.status == MembershipNodeStatus::Active && n.capabilities.contains(&capability)
+                })
         })
         .unwrap_or(false)
+}
+
+/// Return `true` iff `node_id` holds `anchor.bundle_pull` in the given
+/// snapshot bytes.  Fails closed (returns `false`) on any parse error.
+/// Does not perform file-security checks — caller owns the source trust.
+pub fn snapshot_bytes_have_bundle_pull_capability(bytes: &[u8], node_id: &str) -> bool {
+    snapshot_bytes_have_capability(bytes, node_id, RoleCapability::AnchorBundlePull)
 }
 
 /// FIS-0020: (epoch, state_root_hex) identity of a membership snapshot's
@@ -2824,8 +2848,9 @@ mod tests {
         decode_membership_state, decode_update_record, encode_membership_state, hex_encode,
         load_membership_log, load_membership_snapshot, load_membership_watermark,
         persist_membership_snapshot, persist_membership_watermark, preview_next_state,
-        reduce_membership_state, replay_membership_snapshot_and_log, sign_update_record,
-        write_membership_audit_log,
+        reduce_membership_state, replay_membership_snapshot_and_log, sha256_hex,
+        sign_update_record, snapshot_bytes_have_bundle_pull_capability,
+        snapshot_bytes_have_capability, write_membership_audit_log,
     };
     // The size-cap constants are only exercised by the `#[cfg(unix)]` oversized-file
     // tests below; gate the import to match so Windows does not see them as unused.
@@ -2872,6 +2897,178 @@ mod tests {
             quorum_threshold: 2,
             metadata_hash: None,
         }
+    }
+
+    // ── D-3: `snapshot_bytes_have_capability`, the read-side authorisation
+    // primitive behind the anchor.enrollment_endpoint consume gate and the
+    // bundle-pull serve gate. Every case below is a fail-closed case except
+    // the two that prove the check is not vacuous.
+
+    /// Encode a state the way `persist_membership_snapshot` does, without
+    /// touching the filesystem, so these tests exercise the exact bytes the
+    /// runtime gates parse.
+    fn snapshot_bytes_for(state: &MembershipState) -> Vec<u8> {
+        let state_hex = hex_encode(
+            state
+                .canonical_payload()
+                .expect("test state should encode")
+                .as_bytes(),
+        );
+        let body_without_digest =
+            format!("version={MEMBERSHIP_SCHEMA_VERSION}\nstate_hex={state_hex}\n");
+        let digest = sha256_hex(body_without_digest.as_bytes());
+        format!("{body_without_digest}digest={digest}\n").into_bytes()
+    }
+
+    fn snapshot_with_node_caps(
+        node_id: &str,
+        status: MembershipNodeStatus,
+        capabilities: Vec<RoleCapability>,
+    ) -> Vec<u8> {
+        let mut state = base_state();
+        state.nodes = vec![MembershipNode {
+            node_id: node_id.to_owned(),
+            node_pubkey_hex: hex_encode(&[9; 32]),
+            owner: "owner@example.local".to_owned(),
+            status,
+            roles: vec!["tag:servers".to_owned()],
+            capabilities,
+            joined_at_unix: 100,
+            updated_at_unix: 100,
+        }];
+        snapshot_bytes_for(&state)
+    }
+
+    #[test]
+    fn snapshot_bytes_have_capability_accepts_active_holder() {
+        let bytes = snapshot_with_node_caps(
+            "anchor-a",
+            MembershipNodeStatus::Active,
+            vec![
+                RoleCapability::Anchor,
+                RoleCapability::AnchorEnrollmentEndpoint,
+            ],
+        );
+        assert!(snapshot_bytes_have_capability(
+            &bytes,
+            "anchor-a",
+            RoleCapability::AnchorEnrollmentEndpoint
+        ));
+    }
+
+    #[test]
+    fn snapshot_bytes_have_capability_discriminates_between_capabilities() {
+        // Holding one anchor sub-capability must not grant another: the gate
+        // is per-capability, not "is an anchor".
+        let bytes = snapshot_with_node_caps(
+            "anchor-a",
+            MembershipNodeStatus::Active,
+            vec![RoleCapability::Anchor, RoleCapability::AnchorGossipSeed],
+        );
+        assert!(snapshot_bytes_have_capability(
+            &bytes,
+            "anchor-a",
+            RoleCapability::AnchorGossipSeed
+        ));
+        assert!(!snapshot_bytes_have_capability(
+            &bytes,
+            "anchor-a",
+            RoleCapability::AnchorEnrollmentEndpoint
+        ));
+        assert!(!snapshot_bytes_have_capability(
+            &bytes,
+            "anchor-a",
+            RoleCapability::AnchorBundlePull
+        ));
+    }
+
+    #[test]
+    fn snapshot_bytes_have_capability_refuses_revoked_node_that_still_lists_it() {
+        // A revoked node keeps its `capabilities=` row. Testing membership in
+        // that list alone would let a revoked anchor keep serving, so the
+        // Active-status requirement is the load-bearing half of this check.
+        let bytes = snapshot_with_node_caps(
+            "anchor-a",
+            MembershipNodeStatus::Revoked,
+            vec![
+                RoleCapability::Anchor,
+                RoleCapability::AnchorEnrollmentEndpoint,
+                RoleCapability::AnchorBundlePull,
+            ],
+        );
+        assert!(!snapshot_bytes_have_capability(
+            &bytes,
+            "anchor-a",
+            RoleCapability::AnchorEnrollmentEndpoint
+        ));
+        // Same tightening reaches the pre-existing bundle-pull serve gate,
+        // which routes through this function.
+        assert!(!snapshot_bytes_have_bundle_pull_capability(
+            &bytes, "anchor-a"
+        ));
+    }
+
+    #[test]
+    fn snapshot_bytes_have_capability_refuses_unknown_node_and_malformed_input() {
+        let bytes = snapshot_with_node_caps(
+            "anchor-a",
+            MembershipNodeStatus::Active,
+            vec![
+                RoleCapability::Anchor,
+                RoleCapability::AnchorEnrollmentEndpoint,
+            ],
+        );
+        // A node id that is not in the roster at all.
+        assert!(!snapshot_bytes_have_capability(
+            &bytes,
+            "some-other-node",
+            RoleCapability::AnchorEnrollmentEndpoint
+        ));
+        // Empty, non-utf8, and structurally broken bytes all fail closed.
+        for corrupt in [
+            b"".to_vec(),
+            vec![0xff, 0xfe, 0xfd],
+            b"version=1\nstate_hex=zz\ndigest=nope\n".to_vec(),
+        ] {
+            assert!(
+                !snapshot_bytes_have_capability(
+                    &corrupt,
+                    "anchor-a",
+                    RoleCapability::AnchorEnrollmentEndpoint
+                ),
+                "malformed snapshot must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_bytes_have_capability_refuses_digest_tampered_snapshot() {
+        // Flip the recorded digest: the roster still claims the capability,
+        // but the snapshot no longer self-verifies, so the gate refuses.
+        let bytes = snapshot_with_node_caps(
+            "anchor-a",
+            MembershipNodeStatus::Active,
+            vec![
+                RoleCapability::Anchor,
+                RoleCapability::AnchorEnrollmentEndpoint,
+            ],
+        );
+        let content = String::from_utf8(bytes).expect("snapshot is utf8");
+        let tampered: String = content
+            .lines()
+            .map(|line| {
+                if line.starts_with("digest=") {
+                    format!("digest={}\n", "0".repeat(64))
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        assert!(!snapshot_bytes_have_capability(
+            tampered.as_bytes(),
+            "anchor-a",
+            RoleCapability::AnchorEnrollmentEndpoint
+        ));
     }
 
     #[test]

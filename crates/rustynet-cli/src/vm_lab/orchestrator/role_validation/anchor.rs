@@ -314,10 +314,11 @@ const ANCHOR_BUNDLE_PULL_ADDR: &str = "127.0.0.1:51822";
 /// from the bin's `Config` but carrying only the orchestrator's per-OS
 /// install-path defaults (the SSH transport is the `RemoteShellHost` the
 /// stage already builds). The enrollment-endpoint substage is NOT driven
-/// from here yet: it needs the membership owner signing key + passphrase
-/// credential, which the orchestrator provisions only on the Exit
-/// (membership owner), so it stays a reported-skip pending a trust-model
-/// decision.
+/// from here yet: the capability's authorisation gate is enforced in the
+/// daemon (D-3), but the LAN-exposed enrollment listener it names is not
+/// built, so there is no endpoint for a positive substage to probe. See
+/// `documents/operations/active/AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md`
+/// §7-§8.
 pub struct AnchorRuntimeParams {
     pub platform: VmGuestPlatform,
     pub anchor_bundle_pull_addr: String,
