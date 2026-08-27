@@ -4052,6 +4052,55 @@ pass after the same fix); the siblings inherit it by construction and are unit-l
 separately live-proven — each will be exercised the first time its role lands on a Fedora/Rocky
 guest.
 
+★★ **QH-61 ADDENDUM 2026-08-27 (HARNESS-VERBS) — the sweep's source pin was missing a file, and a
+worse variant of the same defect class was live in three stage binaries.**
+`live_linux_secrets_not_in_logs_test.rs` was never in the
+`stage_binaries_never_spawn_rustynet_by_bare_name` list, so its bare `"rustynet"` argv head
+survived the sweep unnoticed. It is now in the list and uses `REMOTE_RUSTYNET_BIN`.
+
+The larger finding is adjacent but more serious. QH-61 is about an argv head the guest cannot
+resolve; this is about an argv the CLI cannot **parse** — and it was silently absorbed rather
+than surfaced. Three stage binaries drove four `rustynet ops` subcommands that
+`parse_ops_command` has never had: `generate-enrollment-token`, `consume-enrollment-token`,
+`show-node-id`, `verify-membership`. None was ever renamed; none has ever existed. The real
+verbs are `enrollment mint`, `enrollment consume` (IPC `EnrollmentConsume` to the local
+daemon), the `node_id=` field of `rustynet status`, and `membership verify`.
+`ops verify-membership-phase10-report` — the only similarly-named verb in the parser — is a CI
+artifact gate that reads `artifacts/phase10/membership_report.json` relative to the CWD, not a
+live-host membership check.
+
+The failures were invisible because **every** call site used `capture_root_allow_failure`, which
+keeps stdout and discards both the exit status and stderr, while the CLI prints its errors to
+**stdout**. So the CLI's own `error [bad_args (64)]: unknown ops subcommand: …` came back looking
+like data: in `live_linux_enrollment_restart_test` the mint result flowed on as a "token" and the
+consume / node-id / membership results degraded into `enrollment_outcome=rolled_back` with an
+empty peer list. The stage reported a plausible outcome without exercising enrollment at all, so
+it could not have proven that enrollment survives a daemon restart. Two further defects in the
+same file: `peer list` is two tokens and does not parse either (the CLI has single-token `peers` /
+`peer-list`), and the graceful-skip path passed the string `"skipped"` into a `u64` report field,
+so the skip itself would have errored.
+
+Fixed per the FAIL-LOUD live-stage spec in `CrossPlatformRoleParityRoadmap_2026-06-22.md`. New
+`LiveLabContext::rustynet_root` / `rustynet_root_must_succeed` keep exit status, stdout and
+stderr, and abort the stage when `cli_invocation_parse_failure` classifies the failure as a parse
+failure (exit 127 / `command not found`, `unknown command:`, `unknown … subcommand:`, exit 64 /
+`bad_args (64)`, `invalid option token`) — which also catches a `vm-lab`-gated verb run against a
+guest binary built without the feature. A genuine live refusal ("enrollment token rejected",
+"daemon unreachable", a config-error exit) is still returned as data, so real lab conditions are
+not turned into aborts. The one remaining skip branch is the genuinely detectable one, probed
+directly rather than inferred from a failure: the enrollment secret is seeded on admin nodes
+only, so its absence is checked with `test -s` before the mint runs.
+
+The enrollment-restart stage now proves something real: mint on the admin, consume on the admin
+(the node holding the secret) with the enrollee's generated Ed25519 pubkey and its
+`<lan-ip>:51821` gossip push address, SIGKILL, restart, then read the on-disk consumed-token
+ledger back with `enrollment verify` and require it to agree with what the consume reported, and
+require an unconsumed token to still be valid. Pinned by three unit tests in `live_lab_support`:
+the classifier's positive and negative halves, and
+`stage_binaries_never_drive_ops_verbs_the_parser_does_not_have`, a source scan in the QH-61 style.
+**Not live-executed** — these are live-lab harness binaries; verification here is compilation,
+unit tests, and a call-by-call trace against the parser.
+
 ## ADVERSARIAL REVIEW SWEEP — sec-hardening branch (2026-08-23)
 
 Manager-agent sweep of rustynet-control / rustynet-policy / rustynet-crypto test and
