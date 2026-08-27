@@ -197,6 +197,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         }
     }
 

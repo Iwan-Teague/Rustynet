@@ -333,6 +333,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         ctx.node_ids
             .insert("exit-1".to_owned(), "exit-node-id-abc".to_owned());
@@ -396,6 +398,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         assert!(matches!(
             DistributeAssignmentsStage::new(

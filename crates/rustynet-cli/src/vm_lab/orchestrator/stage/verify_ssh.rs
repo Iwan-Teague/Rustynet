@@ -71,6 +71,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         assert_eq!(
             VerifySshReachabilityStage.execute(&mut ctx),
@@ -98,6 +100,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         assert!(matches!(
             VerifySshReachabilityStage.execute(&mut ctx),

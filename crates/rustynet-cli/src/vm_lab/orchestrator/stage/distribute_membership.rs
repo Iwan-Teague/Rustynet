@@ -95,6 +95,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         assert!(matches!(
             DistributeMembershipStage.execute(&mut ctx),
@@ -122,6 +124,8 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
             orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
         };
         // Only exit node — nothing to distribute to
         assert_eq!(
