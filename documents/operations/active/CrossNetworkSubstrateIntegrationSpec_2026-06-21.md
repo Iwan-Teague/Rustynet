@@ -188,6 +188,16 @@ netlink FFI. The one genuinely new design risk is `SubstrateHandle` lifetime acr
 
 ---
 
+## 0.5 STATUS REFRESH (2026-08-27, verified against code post-bash-retirement)
+
+Verified findings from a grounded code audit after the bash orchestrator's removal (e93a0e4f):
+
+- **Landed beyond what §5's X1 note claims:** `--cross-network-substrate` is a real Rust CLI flag (`main.rs`, both `vm-lab-write-live-lab-profile` and `vm-lab-orchestrate-live-lab`, parse-tested); the netns NAT-classification gate runs IN-PROCESS via `run_nat_classification` (`stage/cross_network.rs`) with the `rustynet-netns-probe` on-guest binary. The X1 "no CLI flag yet" note at §5 is stale — do not rebuild it.
+- **Dead sections:** §4.2/§4.3/§7 target `scripts/e2e/live_linux_lab_orchestrator.sh`, which no longer exists. The integration seam is now `orchestrator/plan.rs` + `stage/mod.rs` + `live_lab_stage_registry.rs`. The registry's `cross_network_daemon_path` bash-dialect entry is dead weight.
+- **Unstarted:** §0.1 traits (CN-1..CN-5), §0.3/§4.2 substrate lifecycle stages, any `VxlanSubstrate` provisioner (nothing invokes `vxlan_tier_b.sh` from Rust), NatModifiers plumbing, `double_nat_cgnat`.
+- **NEW, upstream gap the spec does not cover (live-proven, run `livelab-1787790884-c9ccf1a4d1cc`, first real 2-LAN --node cell: UTM 192.168.64/24 + lenovo 192.168.0/24):** `collect_pubkeys` records each node's raw discovered underlay endpoint and `distribute_assignments` feeds it into `NODES_SPEC` verbatim, so cross-LAN pairs receive peer endpoints on the other LAN's private prefix — unroutable, no traversal engaged, `traffic_test_matrix` fails every cross-LAN pair both directions. This sits tens of stages BEFORE the `cross_network_*` block where §4.2 hooks substrate setup.
+- **DESIGN DECISION FORCED:** the substrate seam must either move to topology level (provision the overlay before `collect_pubkeys` and populate `ctx.endpoints` with overlay addresses — what a real 2-LAN fleet needs) or stay a cross-network-suite concern (spec's framing — leaves the 2-LAN fleet's base mesh broken). Resolve before writing CN-2 code; the lifecycle stages' dependency-graph position follows from this choice.
+
 ## 1. Problem statement
 
 Everything cross-network is built **except the one thing that makes it run**: the orchestrator never
