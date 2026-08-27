@@ -2149,6 +2149,34 @@ pub const STAGES: &[StageSpec] = &[
         ..DEFAULT_SPEC
     },
     // ── cross-network + job-level ───────────────────────────────────────
+    // Topology-level substrate lifecycle (spec §0.5, 2026-08-27). Setup runs
+    // in the Setup suite BEFORE collect_pubkeys (endpoint seam) and is a
+    // no-op pass unless an overlay-provisioning substrate (vxlan) is
+    // selected; teardown is the always-run residue remover just before
+    // cleanup. Both dispatch on every run (EnableRule::Always) but their
+    // real work is runtime-gated on the substrate selector, which the
+    // selectors cannot see — hence conditional_dispatch.
+    StageSpec {
+        name: "cross_network_substrate_setup",
+        group: StageGroup::Pre,
+        logical: Some("cross_network"),
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::Always,
+        conditional_dispatch: true,
+        state_machine_only: true,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "cross_network_substrate_teardown",
+        group: StageGroup::Live,
+        logical: Some("cross_network"),
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::Always,
+        severity: StageSeverity::Soft,
+        conditional_dispatch: true,
+        state_machine_only: true,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "cross_network_nat_classification",
         logical: Some("cross_network"),
@@ -3022,7 +3050,10 @@ mod tests {
             *counts.entry(stage.tier().as_str()).or_default() += 1;
         }
         let expected: BTreeMap<&'static str, usize> = [
-            ("t0_core", 20),
+            // +2 on 2026-08-27: the topology-level substrate lifecycle pair
+            // (cross_network_substrate_setup/teardown) — substrate
+            // correctness, like the nat_classification/matrix rows.
+            ("t0_core", 22),
             ("t1_role", 18),
             ("t2_resilience", 13),
             ("t3_cross_os", 1),

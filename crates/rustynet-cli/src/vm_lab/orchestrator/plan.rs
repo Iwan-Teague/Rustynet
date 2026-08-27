@@ -45,6 +45,9 @@ use crate::vm_lab::orchestrator::stage::chaos::{
 };
 use crate::vm_lab::orchestrator::stage::cleanup::CleanupHostsStage;
 use crate::vm_lab::orchestrator::stage::collect_pubkeys::CollectPubkeysStage;
+use crate::vm_lab::orchestrator::stage::cross_network::substrate::{
+    CrossNetworkSubstrateSetupStage, CrossNetworkSubstrateTeardownStage,
+};
 use crate::vm_lab::orchestrator::stage::cross_network::{
     CrossNetworkControllerSwitchStage, CrossNetworkDirectRemoteExitStage,
     CrossNetworkFailbackRoamingStage, CrossNetworkNatClassificationStage,
@@ -275,6 +278,11 @@ impl PlanBuilder {
                         max_parallel_node_workers,
                         std::sync::Arc::clone(&shutdown_flag),
                     )),
+                    // Topology-level substrate seam: provision the overlay
+                    // BEFORE collect_pubkeys records endpoints.
+                    StageId::CrossNetworkSubstrateSetup => {
+                        Box::new(CrossNetworkSubstrateSetupStage::new(cross_network.clone()))
+                    }
                     StageId::CollectPubkeys => Box::new(CollectPubkeysStage),
                     StageId::MembershipInit => Box::new(MembershipInitStage),
                     StageId::DistributeMembership => Box::new(DistributeMembershipStage),
@@ -423,6 +431,10 @@ impl PlanBuilder {
                     StageId::NegativeControlDaemonKillMidStage => {
                         Box::new(NegativeControlDaemonKillMidStageStage)
                     }
+                    // Always-run overlay teardown, ordered just before cleanup.
+                    StageId::CrossNetworkSubstrateTeardown => Box::new(
+                        CrossNetworkSubstrateTeardownStage::new(cross_network.clone()),
+                    ),
                     StageId::Cleanup => Box::new(FinalCleanupStage::new(rebuild_only.clone())),
                 }
             })
@@ -435,9 +447,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_59_stages() {
+    fn build_returns_61_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 59, "plan must contain exactly 59 stages");
+        assert_eq!(stages.len(), 61, "plan must contain exactly 61 stages");
     }
 
     #[test]
@@ -445,7 +457,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        assert_eq!(ids.len(), 68, "chaos-enabled plan must contain 67 stages");
+        assert_eq!(ids.len(), 70, "chaos-enabled plan must contain 70 stages");
         for chaos_id in PlanBuilder::chaos_suite_stages() {
             assert!(
                 ids.contains(&chaos_id),
@@ -468,11 +480,11 @@ mod tests {
             .with_enable_negative_control(true)
             .build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        // Opt-in and out of the default plan (like chaos): default 58 + 4.
+        // Opt-in and out of the default plan (like chaos): default 61 + 4.
         assert_eq!(
             ids.len(),
-            63,
-            "negative-control-enabled plan must contain 62 stages"
+            65,
+            "negative-control-enabled plan must contain 65 stages"
         );
         for control_id in PlanBuilder::negative_control_suite_stages() {
             assert!(
@@ -507,8 +519,8 @@ mod tests {
             .build();
         assert_eq!(
             stages.len(),
-            72,
-            "58 default + 9 chaos + 4 negative-control"
+            74,
+            "61 default + 9 chaos + 4 negative-control"
         );
     }
 
@@ -534,10 +546,10 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 59 total - 30 live-suite stages - 11 cross-network stages - 1 soak stage = 17.
+        // 61 total - 30 live-suite stages - 11 cross-network stages - 1 soak stage = 19.
         assert_eq!(
             ids.len(),
-            59 - PlanBuilder::live_suite_stages().len()
+            61 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -579,7 +591,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            59 - PlanBuilder::live_suite_stages().len()
+            61 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -606,6 +618,7 @@ mod tests {
                 StageId::VerifySshReachability,
                 StageId::CleanupHosts,
                 StageId::BootstrapHosts,
+                StageId::CrossNetworkSubstrateSetup,
                 StageId::CollectPubkeys,
                 StageId::MembershipInit,
                 StageId::DistributeMembership,
@@ -659,6 +672,7 @@ mod tests {
                 StageId::CrossNetworkRemoteExitSoak,
                 StageId::CrossNetworkNatClassification,
                 StageId::CrossNetworkNatMatrix,
+                StageId::CrossNetworkSubstrateTeardown,
                 StageId::Cleanup,
             ],
             "orchestrator stage order is security-sensitive"
@@ -670,7 +684,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_soak(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        assert_eq!(ids.len(), 58);
+        assert_eq!(ids.len(), 60);
         assert!(!ids.contains(&StageId::LiveExtendedSoakValidation));
         assert!(ids.contains(&StageId::LiveMixedTopologyValidation));
         assert!(ids.contains(&StageId::CrossNetworkPreflight));
@@ -690,7 +704,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            59 - PlanBuilder::cross_network_suite_stages().len()
+            61 - PlanBuilder::cross_network_suite_stages().len()
         );
         for dropped in PlanBuilder::cross_network_suite_stages() {
             assert!(

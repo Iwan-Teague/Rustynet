@@ -2088,72 +2088,75 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 3 | `verify_ssh_reachability` | Confirm SSH reachability to each node | `stage/verify_ssh.rs` |
 | 4 | `cleanup_hosts` | Wipe prior daemon state before rebuild | `stage/cleanup.rs` |
 | 5 | `bootstrap_hosts` | scp source → cargo build → install daemon + service | `stage/install.rs` |
-| 6 | `collect_pubkeys` | SSH each peer + read WireGuard public key | `stage/collect_pubkeys.rs` |
-| 7 | `membership_init` | Exit node signs initial membership snapshot | `stage/membership_init.rs` |
-| 8 | `distribute_membership` | scp membership snapshot to non-exit peers | `stage/distribute_membership.rs` |
-| 9 | `anchor_validation` | Anchor role validation (bundle-pull, gossip, enrollment) | `stage/anchor_validation.rs` |
-| 10 | `admin_issue` | Admin role validation (bundle signing, assignment issuance) | `stage/admin_issue.rs` |
-| 11 | `distribute_assignments` | Exit signs + distributes assignments | `stage/distribute_assignments.rs` |
-| 12 | `distribute_traversal` | Exit signs + distributes traversal hints | `stage/distribute_traversal.rs` |
-| 13 | `distribute_dns_zone` | Exit signs + distributes DNS zone | `stage/distribute_dns_zone.rs` |
-| 14 | `enforce_baseline_runtime` | Start daemon on each peer | `stage/enforce_runtime.rs` |
-| 15 | `blind_exit` | Blind-exit role validation (PF posture, ExitServer-only) | `stage/blind_exit.rs` |
-| 16 | `validate_baseline_runtime` | Each peer's daemon ingests state + validates | `stage/validate_runtime.rs` |
-| 17 | `security_audit_validation` | Eight Tier-0 daemon self-audits (membership-revoke, revoked-peer-denied, signature-forgery, privileged-helper-allowlist, policy-default-deny, gossip-revoked-readmit, enrollment-replay, hello-limiter-flood) | `stage/security_audit_validation.rs` |
-| 18 | `dns_failclosed_validation` | Per-node DNS-failclosed daemon self-check (resolv.conf loopback-only, killswitch DNS posture) | `stage/dns_failclosed_validation.rs` |
-| 19 | `runtime_acls_validation` | Per-node runtime-ACLs daemon self-check (canonical root set, per-path consistency) | `stage/runtime_acls_validation.rs` |
-| 20 | `service_hardening_validation` | Per-node service-hardening daemon self-check (systemd unit hardening directives match shipped baseline) | `stage/service_hardening_validation.rs` |
-| 21 | `key_custody_validation` | Per-node key-custody daemon self-check (on-disk key material matches reviewed custody contract) | `stage/key_custody_validation.rs` |
-| 22 | `mesh_status_validation` | Per-node mesh-status daemon self-check (daemon's mesh-status view reports no drift) | `stage/mesh_status_validation.rs` |
-| 23 | `authenticode_validation` | Per-node authenticode daemon self-check (honest not-applicable verdict on Linux — runtime binary-signature attestation is Windows-specific) | `stage/authenticode_validation.rs` |
-| 24 | `ipv6_leak_validation` | Per-node IPv6 tunnel-leak adversarial capture (real outbound IPv6 probe, 0 leaked datagrams + containment control present) | `stage/ipv6_leak_validation.rs` |
-| 25 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
-| 26 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
-| 27 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
-| 28 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
-| 29 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
-| 30 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
-| 31 | `exit_dns_failclosed_validation` | Per-node exit DNS fail-closed leak proof (six-artifact directory: firewall rules, block pcaps, active off-tunnel probe, tunnel positive control) | `stage/exit_dns_failclosed_validation.rs` |
-| 32 | `exit_nat_lifecycle_validation` | Two-phase exit NAT lifecycle check (snapshot during active exit → stop daemon → snapshot again → prove NAT gone) | `stage/exit_nat_lifecycle_validation.rs` |
-| 33 | `exit_demotion_residue_validation` | Two-phase exit→client demotion capture (NAT torn down, forwarding restored, daemon still running) | `stage/exit_demotion_residue_validation.rs` |
-| 34 | `blind_exit_dataplane_validation` | Per-node blind-exit dataplane proof (live nft ruleset capture, five hardened subchecks: ruleset captured, mesh-scoped forward, no NAT, no unrestricted forward, no own-egress) | `stage/blind_exit_dataplane_validation.rs` |
-| 35 | `live_anchor` | Live anchor role validation delegated to the proven `live_linux_anchor_test` binary | `stage/live_anchor.rs` |
-| 36 | `live_two_hop_validation` | Live two-hop dataplane proof (client→entry→exit chain: end-to-end reachability + per-hop TTL decrement) delegates to the proven cross-OS `live_linux_two_hop_test` binary | `stage/live_two_hop_validation.rs` |
-| 37 | `live_managed_dns_validation` | Live managed-DNS issuance/refresh/fail-closed proof (signer=exit, client=client, managed peers=others) delegates to the proven cross-OS `live_linux_managed_dns_test` binary | `stage/live_managed_dns_validation.rs` |
-| 38 | `live_network_flap_validation` | Live WG tunnel recovery after network flap (exit + client: baseline handshake, induce disruption, prove recovery with membership + gossip intact) delegates to the proven cross-OS `live_linux_network_flap_test` binary | `stage/live_network_flap_validation.rs` |
-| 39 | `live_reboot_recovery_validation` | Live reboot recovery on 2-node mesh (exit + client: reboot individually, verify boot-id changed, rustynetd recovered, WireGuard re-established, gossip epoch advanced) delegates to the proven `live_linux_reboot_recovery_test` binary | `stage/live_reboot_recovery_validation.rs` |
-| 40 | `live_secrets_not_in_logs_validation` | Live secrets-not-in-logs audit (client-only: scan daemon journal + state dir for plaintext keys/key material) delegates to the proven `live_linux_secrets_not_in_logs_test` binary | `stage/live_secrets_not_in_logs_validation.rs` |
-| 41 | `live_key_custody_validation` | Live key-custody enforcement proof (client-only: manipulate key file permissions on running daemon, validate rejection + recovery) delegates to the proven `live_linux_key_custody_test` binary | `stage/live_key_custody_validation.rs` |
-| 42 | `live_enrollment_restart_validation` | Live enrollment-restart proof (admin killed mid-enrollment, must recover + membership integrity intact) delegates to the proven `live_linux_enrollment_restart_test` binary | `stage/live_enrollment_restart_validation.rs` |
-| 43 | `live_lan_toggle_validation` | Live LAN-toggle three-cycle proof (off→on→off with enforcement evidence on each side + blind-exit rejection) delegates to the proven cross-OS `live_linux_lan_toggle_test` binary | `stage/live_lan_toggle_validation.rs` |
-| 44 | `live_mixed_topology_validation` | Live cross-OS mutual-visibility proof (one Linux + one macOS + one Windows node: all mutually visible in membership + datapath freshness) delegates to the proven `live_linux_mixed_topology_test` binary | `stage/live_mixed_topology_validation.rs` |
-| 45 | `live_hello_limiter_flood_validation` | Live hello-limiter flood proof (relay hello-limiter audit: validates flood detection and rate-limit enforcement on relay-hosting nodes) delegates to the `hello-limiter-audit` subcommand of `rustynet-relay` | `stage/live_hello_limiter_flood_validation.rs` |
-| 46 | `extended_soak` | Extended soak composite over two-hop, exit-handoff, LAN-toggle, and reboot-recovery live validators | `stage/live_extended_soak_validation.rs` |
-| 47 | `cross_network_preflight` | Cross-network preflight report from the Rust run context | `stage/cross_network.rs` |
-| 48 | `cross_network_direct_remote_exit` | Cross-network direct remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 49 | `cross_network_node_network_switch` | Cross-network node-network switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 50 | `cross_network_relay_remote_exit` | Cross-network relay remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 51 | `cross_network_failback_roaming` | Cross-network failback/roaming validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 52 | `cross_network_controller_switch` | Cross-network controller-switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 53 | `cross_network_traversal_adversarial` | Cross-network traversal adversarial validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 54 | `cross_network_remote_exit_dns` | Cross-network remote-exit DNS validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 55 | `cross_network_remote_exit_soak` | Cross-network remote-exit soak validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 56 | `cross_network_nat_classification` | Rust-native registered netns classification stage; skips until substrate staging is ported | `stage/cross_network.rs` |
-| 57 | `cross_network_nat_matrix` | Cross-network NAT matrix validation via `ops validate-cross-network-nat-matrix` | `stage/cross_network.rs` |
-| 58 | `chaos_clock_attack` | Opt-in chaos clock-attack stage, delegated to `live_chaos_clock_attack_test` | `stage/chaos.rs` |
-| 59 | `chaos_crash_recovery` | Opt-in chaos crash-recovery stage, delegated to `live_chaos_crash_recovery_test` | `stage/chaos.rs` |
-| 60 | `chaos_daemon_fault` | Opt-in daemon-fault chaos stage, delegated to `live_chaos_daemon_fault_test` | `stage/chaos.rs` |
-| 61 | `chaos_daemon_sigstop_sigcont` | Opt-in daemon SIGSTOP/SIGCONT chaos stage, delegated to `live_chaos_daemon_fault_test --fault-mode sigstop-cont` | `stage/chaos.rs` |
-| 62 | `chaos_membership_adversarial` | Opt-in membership-adversarial chaos stage, delegated to `live_chaos_membership_adversarial_test` | `stage/chaos.rs` |
-| 63 | `chaos_network_impairment` | Opt-in network-impairment chaos stage, delegated to `live_chaos_network_impairment_test` | `stage/chaos.rs` |
-| 64 | `chaos_privileged_boundary` | Opt-in privileged-boundary chaos stage, delegated to `live_chaos_privileged_boundary_test` | `stage/chaos.rs` |
-| 65 | `chaos_resource_exhaustion` | Opt-in resource-exhaustion chaos stage, delegated to `live_chaos_resource_exhaustion_test` | `stage/chaos.rs` |
-| 66 | `chaos_signed_state_adversarial` | Opt-in signed-state adversarial chaos stage, delegated to `live_chaos_signed_state_adversarial_test` | `stage/chaos.rs` |
-| 67 | `negative_control_signed_bundle_rejection` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` against a forged assignment-bundle corpus; PASSES iff every forgery is rejected fail-closed for its named reason AND a genuine bundle is accepted (runs locally) | `stage/negative_control.rs` |
-| 68 | `negative_control_planted_residue` | Opt-in T5 negative control: adjudicates that planted `rustynet*` residue drives the pure `parse_node_clean_probe` clean-assert to `Err` (live guest planting deferred to live-verify) | `stage/negative_control.rs` |
-| 69 | `negative_control_wrong_node_substitution` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` with a mismatched `expected_node_id`; PASSES iff the substitution is rejected AND the matching id accepted (verify-path level) | `stage/negative_control.rs` |
-| 70 | `negative_control_daemon_kill_mid_stage` | Opt-in T5 negative control: adjudicates that a targeted stage's recorded outcome is NOT a pass under a mid-stage daemon kill (live kill reuses `live_chaos_daemon_fault_test`, deferred to live-verify) | `stage/negative_control.rs` |
-| 71 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 6 | `cross_network_substrate_setup` | Topology-level substrate seam: provision the overlay (vxlan) BEFORE endpoints are collected; no-op pass without an overlay substrate | `stage/cross_network/substrate.rs` |
+| 7 | `collect_pubkeys` | SSH each peer + read WireGuard public key | `stage/collect_pubkeys.rs` |
+| 8 | `membership_init` | Exit node signs initial membership snapshot | `stage/membership_init.rs` |
+| 9 | `distribute_membership` | scp membership snapshot to non-exit peers | `stage/distribute_membership.rs` |
+| 10 | `anchor_validation` | Anchor role validation (bundle-pull, gossip, enrollment) | `stage/anchor_validation.rs` |
+| 11 | `admin_issue` | Admin role validation (bundle signing, assignment issuance) | `stage/admin_issue.rs` |
+| 12 | `distribute_assignments` | Exit signs + distributes assignments | `stage/distribute_assignments.rs` |
+| 13 | `distribute_traversal` | Exit signs + distributes traversal hints | `stage/distribute_traversal.rs` |
+| 14 | `distribute_dns_zone` | Exit signs + distributes DNS zone | `stage/distribute_dns_zone.rs` |
+| 15 | `enforce_baseline_runtime` | Start daemon on each peer | `stage/enforce_runtime.rs` |
+| 16 | `blind_exit` | Blind-exit role validation (PF posture, ExitServer-only) | `stage/blind_exit.rs` |
+| 17 | `validate_baseline_runtime` | Each peer's daemon ingests state + validates | `stage/validate_runtime.rs` |
+| 18 | `security_audit_validation` | Eight Tier-0 daemon self-audits (membership-revoke, revoked-peer-denied, signature-forgery, privileged-helper-allowlist, policy-default-deny, gossip-revoked-readmit, enrollment-replay, hello-limiter-flood) | `stage/security_audit_validation.rs` |
+| 19 | `dns_failclosed_validation` | Per-node DNS-failclosed daemon self-check (resolv.conf loopback-only, killswitch DNS posture) | `stage/dns_failclosed_validation.rs` |
+| 20 | `runtime_acls_validation` | Per-node runtime-ACLs daemon self-check (canonical root set, per-path consistency) | `stage/runtime_acls_validation.rs` |
+| 21 | `service_hardening_validation` | Per-node service-hardening daemon self-check (systemd unit hardening directives match shipped baseline) | `stage/service_hardening_validation.rs` |
+| 22 | `key_custody_validation` | Per-node key-custody daemon self-check (on-disk key material matches reviewed custody contract) | `stage/key_custody_validation.rs` |
+| 23 | `mesh_status_validation` | Per-node mesh-status daemon self-check (daemon's mesh-status view reports no drift) | `stage/mesh_status_validation.rs` |
+| 24 | `gossip_convergence_validation` | Per-node gossip-convergence daemon self-check (registered with peers, accepting signed bundles, no unknown-source rejections) | `stage/gossip_convergence_validation.rs` |
+| 25 | `authenticode_validation` | Per-node authenticode daemon self-check (honest not-applicable verdict on Linux — runtime binary-signature attestation is Windows-specific) | `stage/authenticode_validation.rs` |
+| 26 | `ipv6_leak_validation` | Per-node IPv6 tunnel-leak adversarial capture (real outbound IPv6 probe, 0 leaked datagrams + containment control present) | `stage/ipv6_leak_validation.rs` |
+| 27 | `deploy_relay_service` | Deploy relay service on relay-capable nodes | `stage/deploy_relay.rs` |
+| 28 | `relay_validation` | Relay role validation (relay colocation, frame forwarding) | `stage/relay_validation.rs` |
+| 29 | `traffic_test_matrix` | Positive connectivity + default-deny negative tests | `stage/traffic_test_matrix.rs` |
+| 30 | `role_switch_matrix` | Validate runtime role transitions | `stage/role_switch_matrix.rs` |
+| 31 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
+| 32 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
+| 33 | `exit_dns_failclosed_validation` | Per-node exit DNS fail-closed leak proof (six-artifact directory: firewall rules, block pcaps, active off-tunnel probe, tunnel positive control) | `stage/exit_dns_failclosed_validation.rs` |
+| 34 | `exit_nat_lifecycle_validation` | Two-phase exit NAT lifecycle check (snapshot during active exit → stop daemon → snapshot again → prove NAT gone) | `stage/exit_nat_lifecycle_validation.rs` |
+| 35 | `exit_demotion_residue_validation` | Two-phase exit→client demotion capture (NAT torn down, forwarding restored, daemon still running) | `stage/exit_demotion_residue_validation.rs` |
+| 36 | `blind_exit_dataplane_validation` | Per-node blind-exit dataplane proof (live nft ruleset capture, five hardened subchecks: ruleset captured, mesh-scoped forward, no NAT, no unrestricted forward, no own-egress) | `stage/blind_exit_dataplane_validation.rs` |
+| 37 | `live_anchor` | Live anchor role validation delegated to the proven `live_linux_anchor_test` binary | `stage/live_anchor.rs` |
+| 38 | `live_two_hop_validation` | Live two-hop dataplane proof (client→entry→exit chain: end-to-end reachability + per-hop TTL decrement) delegates to the proven cross-OS `live_linux_two_hop_test` binary | `stage/live_two_hop_validation.rs` |
+| 39 | `live_managed_dns_validation` | Live managed-DNS issuance/refresh/fail-closed proof (signer=exit, client=client, managed peers=others) delegates to the proven cross-OS `live_linux_managed_dns_test` binary | `stage/live_managed_dns_validation.rs` |
+| 40 | `live_network_flap_validation` | Live WG tunnel recovery after network flap (exit + client: baseline handshake, induce disruption, prove recovery with membership + gossip intact) delegates to the proven cross-OS `live_linux_network_flap_test` binary | `stage/live_network_flap_validation.rs` |
+| 41 | `live_reboot_recovery_validation` | Live reboot recovery on 2-node mesh (exit + client: reboot individually, verify boot-id changed, rustynetd recovered, WireGuard re-established, gossip epoch advanced) delegates to the proven `live_linux_reboot_recovery_test` binary | `stage/live_reboot_recovery_validation.rs` |
+| 42 | `live_secrets_not_in_logs_validation` | Live secrets-not-in-logs audit (client-only: scan daemon journal + state dir for plaintext keys/key material) delegates to the proven `live_linux_secrets_not_in_logs_test` binary | `stage/live_secrets_not_in_logs_validation.rs` |
+| 43 | `live_key_custody_validation` | Live key-custody enforcement proof (client-only: manipulate key file permissions on running daemon, validate rejection + recovery) delegates to the proven `live_linux_key_custody_test` binary | `stage/live_key_custody_validation.rs` |
+| 44 | `live_enrollment_restart_validation` | Live enrollment-restart proof (admin killed mid-enrollment, must recover + membership integrity intact) delegates to the proven `live_linux_enrollment_restart_test` binary | `stage/live_enrollment_restart_validation.rs` |
+| 45 | `live_lan_toggle_validation` | Live LAN-toggle three-cycle proof (off→on→off with enforcement evidence on each side + blind-exit rejection) delegates to the proven cross-OS `live_linux_lan_toggle_test` binary | `stage/live_lan_toggle_validation.rs` |
+| 46 | `live_mixed_topology_validation` | Live cross-OS mutual-visibility proof (one Linux + one macOS + one Windows node: all mutually visible in membership + datapath freshness) delegates to the proven `live_linux_mixed_topology_test` binary | `stage/live_mixed_topology_validation.rs` |
+| 47 | `live_hello_limiter_flood_validation` | Live hello-limiter flood proof (relay hello-limiter audit: validates flood detection and rate-limit enforcement on relay-hosting nodes) delegates to the `hello-limiter-audit` subcommand of `rustynet-relay` | `stage/live_hello_limiter_flood_validation.rs` |
+| 48 | `extended_soak` | Extended soak composite over two-hop, exit-handoff, LAN-toggle, and reboot-recovery live validators | `stage/live_extended_soak_validation.rs` |
+| 49 | `cross_network_preflight` | Cross-network preflight report from the Rust run context | `stage/cross_network.rs` |
+| 50 | `cross_network_direct_remote_exit` | Cross-network direct remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 51 | `cross_network_node_network_switch` | Cross-network node-network switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 52 | `cross_network_relay_remote_exit` | Cross-network relay remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 53 | `cross_network_failback_roaming` | Cross-network failback/roaming validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 54 | `cross_network_controller_switch` | Cross-network controller-switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 55 | `cross_network_traversal_adversarial` | Cross-network traversal adversarial validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 56 | `cross_network_remote_exit_dns` | Cross-network remote-exit DNS validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 57 | `cross_network_remote_exit_soak` | Cross-network remote-exit soak validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 58 | `cross_network_nat_classification` | Rust-native registered netns classification stage; skips until substrate staging is ported | `stage/cross_network.rs` |
+| 59 | `cross_network_nat_matrix` | Cross-network NAT matrix validation via `ops validate-cross-network-nat-matrix` | `stage/cross_network.rs` |
+| 60 | `chaos_clock_attack` | Opt-in chaos clock-attack stage, delegated to `live_chaos_clock_attack_test` | `stage/chaos.rs` |
+| 61 | `chaos_crash_recovery` | Opt-in chaos crash-recovery stage, delegated to `live_chaos_crash_recovery_test` | `stage/chaos.rs` |
+| 62 | `chaos_daemon_fault` | Opt-in daemon-fault chaos stage, delegated to `live_chaos_daemon_fault_test` | `stage/chaos.rs` |
+| 63 | `chaos_daemon_sigstop_sigcont` | Opt-in daemon SIGSTOP/SIGCONT chaos stage, delegated to `live_chaos_daemon_fault_test --fault-mode sigstop-cont` | `stage/chaos.rs` |
+| 64 | `chaos_membership_adversarial` | Opt-in membership-adversarial chaos stage, delegated to `live_chaos_membership_adversarial_test` | `stage/chaos.rs` |
+| 65 | `chaos_network_impairment` | Opt-in network-impairment chaos stage, delegated to `live_chaos_network_impairment_test` | `stage/chaos.rs` |
+| 66 | `chaos_privileged_boundary` | Opt-in privileged-boundary chaos stage, delegated to `live_chaos_privileged_boundary_test` | `stage/chaos.rs` |
+| 67 | `chaos_resource_exhaustion` | Opt-in resource-exhaustion chaos stage, delegated to `live_chaos_resource_exhaustion_test` | `stage/chaos.rs` |
+| 68 | `chaos_signed_state_adversarial` | Opt-in signed-state adversarial chaos stage, delegated to `live_chaos_signed_state_adversarial_test` | `stage/chaos.rs` |
+| 69 | `negative_control_signed_bundle_rejection` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` against a forged assignment-bundle corpus; PASSES iff every forgery is rejected fail-closed for its named reason AND a genuine bundle is accepted (runs locally) | `stage/negative_control.rs` |
+| 70 | `negative_control_planted_residue` | Opt-in T5 negative control: adjudicates that planted `rustynet*` residue drives the pure `parse_node_clean_probe` clean-assert to `Err` (live guest planting deferred to live-verify) | `stage/negative_control.rs` |
+| 71 | `negative_control_wrong_node_substitution` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` with a mismatched `expected_node_id`; PASSES iff the substitution is rejected AND the matching id accepted (verify-path level) | `stage/negative_control.rs` |
+| 72 | `negative_control_daemon_kill_mid_stage` | Opt-in T5 negative control: adjudicates that a targeted stage's recorded outcome is NOT a pass under a mid-stage daemon kill (live kill reuses `live_chaos_daemon_fault_test`, deferred to live-verify) | `stage/negative_control.rs` |
+| 73 | `cross_network_substrate_teardown` | Always-run overlay teardown: remove every vxlan link the substrate created, even after a partial setup or an earlier failure | `stage/cross_network/substrate.rs` |
+| 74 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2284,6 +2287,7 @@ mod tests {
             "verify_ssh_reachability",
             "cleanup_hosts",
             "bootstrap_hosts",
+            "cross_network_substrate_setup",
             "collect_pubkeys",
             "membership_init",
             "distribute_membership",
@@ -2301,6 +2305,7 @@ mod tests {
             "service_hardening_validation",
             "key_custody_validation",
             "mesh_status_validation",
+            "gossip_convergence_validation",
             "authenticode_validation",
             "ipv6_leak_validation",
             "deploy_relay_service",
@@ -2349,6 +2354,7 @@ mod tests {
             "negative_control_planted_residue",
             "negative_control_wrong_node_substitution",
             "negative_control_daemon_kill_mid_stage",
+            "cross_network_substrate_teardown",
             "cleanup",
         ];
         // Parse the numbered "| N | `stage` | ... |" rows out of the doc table.
