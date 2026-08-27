@@ -865,6 +865,29 @@ unoverridable 3600 s budget.
 **Severity: HIGH — both directions now VERIFIED. There is no per-host run exclusion at all for the documented invocation form.**
 **Verified against `main` @ `b7667cce`, on `ubuntu-kvm-1`.**
 
+**STATUS 2026-08-27 — CLOSED, both directions.** The 07-26 corrected design is
+implemented as specified, not redesigned:
+- **False negative:** `crates/rustynet-cli/src/vm_lab/run_exclusion.rs` takes a
+  per-GUEST `flock` (non-blocking, fail-closed, no stale-break) and
+  `execute_ops` in `main.rs` claims it at the dispatch chokepoint for
+  `vm-lab-orchestrate-live-lab`, `vm-lab-setup-live-lab`, and
+  `vm-lab-run-suite`. `vm-lab-overnight` is deliberately excluded — it spawns
+  individual runs that each reach the chokepoint themselves. Disjoint-guest
+  concurrency is preserved. A run that resolves NO guests is REFUSED rather
+  than run unprotected (`RUSTYNET_LAB_ALLOW_UNPROTECTED_RUN=1` overrides).
+  Verified by the module's own negative test plus a wiring test that drives the
+  real `execute_ops` with the guest pre-locked and requires the refusal.
+- **False positive:** the `pgrep` gate in `HOST_LAUNCH_SCRIPT` was REMOVED, not
+  patched. The residual accepted below turned out not to be repairable in
+  place: the launcher script necessarily contains the subcommand string it
+  runs, so an inline-over-ssh launch puts it in the remote `bash -c` argv and
+  the pattern matches itself no matter how it is written. It was also per-HOST,
+  the wrong unit. The pidfile prune it justified is now liveness-checked by
+  argv, so a concurrent disjoint-guest run's stop handle is not deleted.
+- Operator-facing refusal text and the `RUSTYNET_LAB_LOCK_DIR` knob are
+  documented in `active/WindowsExitNodeRunbook_2026-06-04.md` and
+  `HeterogeneousLiveLabRunbook.md`.
+
 The per-host "is a run already in flight?" gate matches on the orchestrator's command
 string. Driving a launch **inline** over SSH — `ssh box '<script text>'` — places the literal
 string `vm-lab-orchestrate-live-lab` into the remote `bash -c` argv, so the gate matches its

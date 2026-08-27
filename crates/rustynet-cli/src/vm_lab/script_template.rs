@@ -702,23 +702,39 @@ set -uo pipefail
 REPO_DIR=__REPO_DIR__
 cd "$REPO_DIR" || { echo "LAUNCH-ERROR: repo_dir not found: $REPO_DIR" >&2; exit 1; }
 
-# Refuse a second concurrent run: two orchestrators would fight over the same
-# guests and the same stage ledger. host_run_status reports the one already going.
-if pgrep -f 'vm-lab-orchestrate-live-lab' >/dev/null 2>&1; then
-  echo "LAUNCH-ERROR: a vm-lab-orchestrate-live-lab run is already in flight on this host" >&2
-  exit 2
-fi
+# NO concurrency gate here. Mutual exclusion is taken by the orchestrator itself
+# (QH-18): a per-GUEST flock at the ops dispatch chokepoint, which every invocation
+# form reaches — including the one this script launches and the bare
+# `ops vm-lab-orchestrate-live-lab` the runbooks document.
+#
+# The argv-pattern gate that used to sit here could not be repaired in place.
+# Driven inline over ssh the whole script text lands in the remote `bash -c` argv,
+# so the pattern matched its own launcher and refused on an idle host; and no
+# rewriting of the pattern removes that, because the script must contain the
+# subcommand string it is about to run. It was also the wrong unit — per-HOST, so
+# it refused the disjoint-guest concurrency the project deliberately supports
+# (MAX_CONCURRENT_LAB_RUNS = 3).
 
 # Only the run-handle dir is created here. The report dir is left for the
 # orchestrator, which refuses to start into a NON-EMPTY one — so the launcher must
 # not seed it (an earlier version put the log inside it and the run refused itself).
 mkdir -p 'state/host-lab-runs' || { echo "LAUNCH-ERROR: cannot create state/host-lab-runs" >&2; exit 1; }
 
-# The pgrep gate above proved no run is in flight, so every pidfile still sitting
-# here is a leftover from an earlier launch that completed naturally (a stop is the
-# only thing that retires them, and this run had none). Retire them now so they do
-# not accumulate across a session and a later stop never has a dead pid to consider.
-rm -f state/host-lab-runs/*.pid 2>/dev/null || true
+# Retire leftover pidfiles so they do not accumulate across a session and a later
+# stop never has a dead pid to consider. Each one is checked for liveness first:
+# with the old per-host gate gone, a run on DISJOINT guests may legitimately be in
+# flight, and deleting its pidfile would strip the stop path of its handle. A pid is
+# kept only while it is still the orchestrator, verified by argv (`-ww` so a leaked
+# COLUMNS cannot truncate the marker away and divert a live run to deletion); dead
+# and recycled pids are removed.
+for stale_pidfile in state/host-lab-runs/*.pid; do
+  [ -f "$stale_pidfile" ] || continue
+  stale_pid="$(cat "$stale_pidfile" 2>/dev/null || true)"
+  if [ -n "$stale_pid" ] && ps -ww -o args= -p "$stale_pid" 2>/dev/null | grep -q 'vm-lab-orchestrate-live-lab'; then
+    continue
+  fi
+  rm -f "$stale_pidfile" 2>/dev/null || true
+done
 
 RUNNER='state/host-lab-runs/__LAUNCH_ID__.run.sh'
 PIDFILE='state/host-lab-runs/__LAUNCH_ID__.pid'
@@ -2161,23 +2177,39 @@ set -uo pipefail
 REPO_DIR='/home/u/Rustynet'
 cd "$REPO_DIR" || { echo "LAUNCH-ERROR: repo_dir not found: $REPO_DIR" >&2; exit 1; }
 
-# Refuse a second concurrent run: two orchestrators would fight over the same
-# guests and the same stage ledger. host_run_status reports the one already going.
-if pgrep -f 'vm-lab-orchestrate-live-lab' >/dev/null 2>&1; then
-  echo "LAUNCH-ERROR: a vm-lab-orchestrate-live-lab run is already in flight on this host" >&2
-  exit 2
-fi
+# NO concurrency gate here. Mutual exclusion is taken by the orchestrator itself
+# (QH-18): a per-GUEST flock at the ops dispatch chokepoint, which every invocation
+# form reaches — including the one this script launches and the bare
+# `ops vm-lab-orchestrate-live-lab` the runbooks document.
+#
+# The argv-pattern gate that used to sit here could not be repaired in place.
+# Driven inline over ssh the whole script text lands in the remote `bash -c` argv,
+# so the pattern matched its own launcher and refused on an idle host; and no
+# rewriting of the pattern removes that, because the script must contain the
+# subcommand string it is about to run. It was also the wrong unit — per-HOST, so
+# it refused the disjoint-guest concurrency the project deliberately supports
+# (MAX_CONCURRENT_LAB_RUNS = 3).
 
 # Only the run-handle dir is created here. The report dir is left for the
 # orchestrator, which refuses to start into a NON-EMPTY one — so the launcher must
 # not seed it (an earlier version put the log inside it and the run refused itself).
 mkdir -p 'state/host-lab-runs' || { echo "LAUNCH-ERROR: cannot create state/host-lab-runs" >&2; exit 1; }
 
-# The pgrep gate above proved no run is in flight, so every pidfile still sitting
-# here is a leftover from an earlier launch that completed naturally (a stop is the
-# only thing that retires them, and this run had none). Retire them now so they do
-# not accumulate across a session and a later stop never has a dead pid to consider.
-rm -f state/host-lab-runs/*.pid 2>/dev/null || true
+# Retire leftover pidfiles so they do not accumulate across a session and a later
+# stop never has a dead pid to consider. Each one is checked for liveness first:
+# with the old per-host gate gone, a run on DISJOINT guests may legitimately be in
+# flight, and deleting its pidfile would strip the stop path of its handle. A pid is
+# kept only while it is still the orchestrator, verified by argv (`-ww` so a leaked
+# COLUMNS cannot truncate the marker away and divert a live run to deletion); dead
+# and recycled pids are removed.
+for stale_pidfile in state/host-lab-runs/*.pid; do
+  [ -f "$stale_pidfile" ] || continue
+  stale_pid="$(cat "$stale_pidfile" 2>/dev/null || true)"
+  if [ -n "$stale_pid" ] && ps -ww -o args= -p "$stale_pid" 2>/dev/null | grep -q 'vm-lab-orchestrate-live-lab'; then
+    continue
+  fi
+  rm -f "$stale_pidfile" 2>/dev/null || true
+done
 
 RUNNER='state/host-lab-runs/launch-1-2.run.sh'
 PIDFILE='state/host-lab-runs/launch-1-2.pid'

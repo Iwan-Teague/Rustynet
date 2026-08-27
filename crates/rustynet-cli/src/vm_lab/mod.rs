@@ -50971,23 +50971,44 @@ mod launch_on_host_tests {
         assert!(script.contains("> \"$LOG\" 2>&1"));
     }
 
+    /// QH-18. The launcher must NOT carry a `pgrep` concurrency gate.
+    ///
+    /// It used to, and the gate was wrong in both directions. Driven inline over
+    /// ssh the entire script text lands in the remote `bash -c` argv, so the
+    /// pattern matched its own launcher and refused on an idle host — and that
+    /// cannot be patched by rewriting the pattern, because the script necessarily
+    /// contains the subcommand string it is about to run. It was also per-HOST,
+    /// the wrong exclusion unit, so it refused the disjoint-guest concurrency the
+    /// project deliberately supports.
+    ///
+    /// Real exclusion now lives in the orchestrator (`run_exclusion`, a per-guest
+    /// flock taken at the ops dispatch chokepoint), which the process this script
+    /// launches reaches like every other invocation form.
     #[test]
-    fn a_second_concurrent_run_is_refused() {
+    fn the_launcher_carries_no_pgrep_gate_because_the_orchestrator_locks_guests() {
         let script = render(&[]);
-        assert!(script.contains("pgrep -f 'vm-lab-orchestrate-live-lab'"));
-        assert!(script.contains("already in flight"));
+        assert!(
+            !script.contains("pgrep"),
+            "the self-matching pgrep gate must not come back; exclusion belongs to \
+             the orchestrator's per-guest flock. Script:\n{script}"
+        );
+        assert!(
+            !script.contains("already in flight"),
+            "the launcher must not claim to detect an in-flight run it cannot see"
+        );
     }
 
     #[test]
     fn stale_pidfiles_are_retired_at_launch_so_they_do_not_accumulate() {
-        // The pgrep gate proved no run is in flight, so any leftover pidfile is
-        // stale (a run retires its handle only via a stop). Pruning here keeps
-        // pidfiles from accumulating across a session and stops a later stop from
-        // ever seeing a dead recorded pid. The prune must sit AFTER mkdir and
+        // Leftover pidfiles must not accumulate across a session, and a later stop
+        // must never see a dead recorded pid. But with the per-host gate gone a run
+        // on disjoint guests may legitimately be in flight, so the prune is
+        // liveness-checked: a pid whose argv is still the orchestrator is KEPT, so
+        // the stop path retains its handle. The prune must sit AFTER mkdir and
         // BEFORE the new runner writes this launch's pidfile.
         let script = render(&[]);
         let prune = script
-            .find("rm -f state/host-lab-runs/*.pid")
+            .find("rm -f \"$stale_pidfile\"")
             .expect("launcher must prune stale pidfiles");
         let mkdir = script
             .find("mkdir -p 'state/host-lab-runs'")
@@ -50999,6 +51020,13 @@ mod launch_on_host_tests {
         assert!(
             prune < write_pid,
             "prune must run before the new pidfile is written"
+        );
+        assert!(
+            script.contains(
+                r#"ps -ww -o args= -p "$stale_pid" 2>/dev/null | grep -q 'vm-lab-orchestrate-live-lab'"#
+            ),
+            "the prune must verify liveness by argv before deleting, or it would \
+             delete a concurrent disjoint-guest run's stop handle"
         );
     }
 

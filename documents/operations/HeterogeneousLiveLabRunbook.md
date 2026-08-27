@@ -107,6 +107,17 @@ cargo run -p rustynet-cli --release -- \
   --validate-linux-daemon-state
 ```
 
+**Before anything else runs, the command claims its guests (QH-18).** Every
+invocation form takes a per-guest advisory lock, so a second run whose guests
+overlap an in-flight run's is refused immediately with a message naming the
+contended guest and the lock path. Runs on disjoint guests are allowed through
+deliberately. The lock is an `flock` released by the kernel on process death
+(SIGKILL and power loss included), so a refusal always means live contention —
+never delete a lock file to clear one; find the other run with `host_run_status`
+and wait for it or stop it. See the QH-18 section of
+`active/WindowsExitNodeRunbook_2026-06-04.md` for the full refusal text and the
+`RUSTYNET_LAB_LOCK_DIR` / `RUSTYNET_LAB_ALLOW_UNPROTECTED_RUN` knobs.
+
 What runs, in order:
 1. `discover_local_utm` — confirms every alias is up (utmctl + SSH
    readiness probe).
