@@ -796,6 +796,53 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
     }
 }
 
+/// Whether a selected substrate owns the TOPOLOGY-LEVEL seam — i.e. whether
+/// it provisions cross-LAN overlay addresses before `collect_pubkeys` records
+/// endpoints.
+///
+/// Not every substrate does, and saying so out loud is the point. The netns
+/// simulator's endpoints are namespaces inside ONE guest, not lab node
+/// aliases (spec §3: "Tier A = the deterministic NAT-matrix gate ... it does
+/// NOT run the SSH e2e validators"), and it is built and torn down per NAT
+/// profile by the classification gate, so provisioning it here would hold a
+/// topology across thirty unrelated stages that the gate then rebuilds anyway.
+pub enum TopologySeam {
+    /// Provisions an overlay; the setup stage drives it.
+    Provisions(Box<dyn CrossNetworkSubstrateProvider>),
+    /// Provisions no overlay at topology level, with the reason.
+    NoOverlay(&'static str),
+}
+
+/// Dispatch the selected substrate to its topology-level behaviour.
+pub fn topology_level_seam(substrate: CrossNetworkSubstrate) -> TopologySeam {
+    match substrate {
+        CrossNetworkSubstrate::Vxlan => TopologySeam::Provisions(Box::new(VxlanSubstrateProvider)),
+        CrossNetworkSubstrate::Netns => TopologySeam::NoOverlay(
+            "the netns simulator's endpoints are namespaces inside one guest, not lab node \
+             aliases; it provisions no cross-LAN overlay and is built per NAT profile by the \
+             cross_network_nat_classification gate",
+        ),
+        CrossNetworkSubstrate::Slirp => TopologySeam::NoOverlay(
+            "the slirp substrate is not implemented yet (CN-4); it provisions no overlay",
+        ),
+    }
+}
+
+/// The provider that owns a PERSISTED record, keyed by the id in the record
+/// itself rather than by what this run selected.
+///
+/// Teardown must remove what was actually created: dispatching on the current
+/// `--cross-network-substrate` would, after a flag change across a resume,
+/// hand a vxlan overlay to a netns teardown and silently leave the residue.
+/// (`check_record_against_request` rejects that mismatch first; this is the
+/// second lock on the same door.)
+pub fn provider_for_record(substrate_id: &str) -> Option<Box<dyn CrossNetworkSubstrateProvider>> {
+    match substrate_id {
+        "vxlan" => Some(Box::new(VxlanSubstrateProvider)),
+        _ => None,
+    }
+}
+
 // ───────────────────────────── lifecycle stages ─────────────────────────────
 
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
@@ -911,10 +958,10 @@ impl CrossNetworkSubstrateSetupStage {
     /// SSH-backed runners.
     fn provision(
         ctx: &mut OrchestrationContext,
+        provider: &dyn CrossNetworkSubstrateProvider,
         topology: &SubstrateTopology,
         runners: &BTreeMap<String, &dyn NetLeafRunner>,
     ) -> StageOutcome {
-        let provider = VxlanSubstrateProvider;
         let plan = match plan_overlay(topology) {
             Ok(plan) => plan,
             Err(err) => return StageOutcome::Failed(err),
@@ -939,7 +986,8 @@ impl CrossNetworkSubstrateSetupStage {
                 ctx.substrate_record = Some(failure.partial.record.clone());
                 ctx.substrate = Some(failure.partial);
                 StageOutcome::Failed(format!(
-                    "vxlan substrate setup failed (partial state recorded for teardown): {}",
+                    "{} substrate setup failed (partial state recorded for teardown): {}",
+                    provider.id(),
                     failure.message
                 ))
             }
@@ -965,15 +1013,20 @@ impl OrchestrationStage for CrossNetworkSubstrateSetupStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        if self.options.substrate != CrossNetworkSubstrate::Vxlan {
-            // No overlay-provisioning substrate requested: pass through
-            // untouched — UNLESS a resumed context says one was provisioned,
-            // which is a provenance mismatch and fails closed.
-            return match check_record_against_request(ctx.substrate_record.as_ref(), None, None) {
-                Ok(()) => StageOutcome::Passed,
-                Err(err) => StageOutcome::Failed(err),
-            };
-        }
+        let provider = match topology_level_seam(self.options.substrate) {
+            TopologySeam::Provisions(provider) => provider,
+            TopologySeam::NoOverlay(_reason) => {
+                // No overlay-provisioning substrate requested: pass through
+                // untouched — UNLESS a resumed context says one was
+                // provisioned, which is a provenance mismatch and fails
+                // closed.
+                return match check_record_against_request(ctx.substrate_record.as_ref(), None, None)
+                {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(err) => StageOutcome::Failed(err),
+                };
+            }
+        };
         let topology = match substrate_topology_from_ctx(ctx) {
             Ok(topology) => topology,
             Err(err) => return StageOutcome::Failed(err),
@@ -992,9 +1045,11 @@ impl OrchestrationStage for CrossNetworkSubstrateSetupStage {
                         .map(|adapter| adapter.platform());
                     if platform != Some(crate::vm_lab::VmGuestPlatform::Linux) {
                         return StageOutcome::Failed(format!(
-                            "vxlan topology substrate supports only Linux guests today; \
+                            "the {} topology substrate supports only Linux guests today; \
                              '{}' is {:?}",
-                            assignment.alias, platform
+                            provider.id(),
+                            assignment.alias,
+                            platform
                         ));
                     }
                 }
@@ -1005,7 +1060,7 @@ impl OrchestrationStage for CrossNetworkSubstrateSetupStage {
             Err(err) => return StageOutcome::Failed(err),
         };
         let refs = runner_refs(&runners);
-        Self::provision(ctx, &topology, &refs)
+        Self::provision(ctx, provider.as_ref(), &topology, &refs)
     }
 }
 
@@ -1036,7 +1091,16 @@ impl CrossNetworkSubstrateTeardownStage {
         if !record.provisioned {
             return StageOutcome::Passed;
         }
-        let provider = VxlanSubstrateProvider;
+        // Dispatch on what the RECORD says was provisioned, not on what this
+        // run selected: an unknown id means we cannot remove it correctly, and
+        // guessing would report a pass over real residue.
+        let Some(provider) = provider_for_record(&record.substrate_id) else {
+            return StageOutcome::Failed(format!(
+                "no teardown provider for persisted substrate '{}'; refusing to report a pass \
+                 over possible residue",
+                record.substrate_id
+            ));
+        };
         // The live handle when we have it (exact created-link list, covers
         // partial setup); otherwise a record-derived handle (resume case).
         let handle = ctx.substrate.clone().unwrap_or_else(|| SubstrateHandle {
@@ -1081,11 +1145,11 @@ impl OrchestrationStage for CrossNetworkSubstrateTeardownStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        let requested_id = if self.options.substrate == CrossNetworkSubstrate::Vxlan {
-            Some("vxlan")
-        } else {
-            None
+        let requested = match topology_level_seam(self.options.substrate) {
+            TopologySeam::Provisions(provider) => Some(provider),
+            TopologySeam::NoOverlay(_) => None,
         };
+        let requested_id = requested.as_ref().map(|provider| provider.id());
         if ctx.substrate_record.is_none() {
             return StageOutcome::Passed;
         }
@@ -1245,7 +1309,12 @@ mod tests {
         let b = MockLeafRunner::default();
         let runners = runner_map(&[("a", &a), ("b", &b)]);
         let topo = topology(&[("a", "192.168.64.10"), ("b", "192.168.0.30")]);
-        let outcome = CrossNetworkSubstrateSetupStage::provision(&mut ctx, &topo, &runners);
+        let outcome = CrossNetworkSubstrateSetupStage::provision(
+            &mut ctx,
+            &VxlanSubstrateProvider,
+            &topo,
+            &runners,
+        );
         assert!(
             matches!(outcome, StageOutcome::Failed(ref msg) if msg.contains("topology mismatch")),
             "{outcome:?}"
@@ -1266,7 +1335,12 @@ mod tests {
         let runners = runner_map(&[("a", &a), ("b", &b)]);
         let topo = topology(&[("a", "192.168.64.10"), ("b", "192.168.0.30")]);
         assert_eq!(
-            CrossNetworkSubstrateSetupStage::provision(&mut ctx, &topo, &runners),
+            CrossNetworkSubstrateSetupStage::provision(
+                &mut ctx,
+                &VxlanSubstrateProvider,
+                &topo,
+                &runners
+            ),
             StageOutcome::Passed
         );
         let handle = ctx.substrate.as_ref().expect("handle stored");
@@ -1305,7 +1379,12 @@ mod tests {
         };
         let runners = runner_map(&[("a", &a), ("b", &b)]);
         let topo = topology(&[("a", "192.168.0.30"), ("b", "192.168.64.10")]);
-        let outcome = CrossNetworkSubstrateSetupStage::provision(&mut ctx, &topo, &runners);
+        let outcome = CrossNetworkSubstrateSetupStage::provision(
+            &mut ctx,
+            &VxlanSubstrateProvider,
+            &topo,
+            &runners,
+        );
         assert!(matches!(outcome, StageOutcome::Failed(_)), "{outcome:?}");
         assert_eq!(
             ctx.substrate

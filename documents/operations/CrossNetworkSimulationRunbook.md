@@ -128,14 +128,14 @@ On `debian-headless-1`, 2026-06-11:
   `<rtr-B wan>:<mapped>`; validated on the legacy transit range pre-migration). The responder speaks the exact wire format `crates/rustynetd/src/stun_client.rs`
   parses (RFC 5389 binding request/response, XOR-MAPPED-ADDRESS), so the real client consumes it unchanged.
   It is lab tooling standing in for the public STUN servers — not a Rustynet component.
-- **NAT mapping-behaviour classification** (`netns_nat_classify.sh` + `nat_probe.py`): each
+- **NAT mapping-behaviour classification** (Rust: `netns::run_nat_gates`, was `netns_nat_classify.sh` + `nat_probe.py`): each
   `apply_nat_profile` profile produces its intended NAT type, verified by probing a single socket against two
   distinct STUN server addresses and comparing the reflexive ports (RFC 5780-style). Result on
   debian-headless-5: `port_restricted_cone` and `full_cone` are endpoint-INDEPENDENT (hole-punchable),
   `symmetric` is endpoint-DEPENDENT (relay-forced) — all as intended. This is the foundation the §4.1 matrix
   rests on: if a "cone" profile had behaved symmetrically, the traversal tests would be exercising the wrong
   NAT semantics. Pure netns + UDP, no rustynetd, so it runs safely alongside a VM's live mesh daemon.
-- **NAT filtering-behaviour verification** (`netns_nat_filter.sh` + `nat_filter_probe.py`): each profile is
+- **NAT filtering-behaviour verification** (Rust: `netns::run_nat_gates`, was `netns_nat_filter.sh` + `nat_filter_probe.py`): each profile is
   checked against the three §4.1.1 cold-contact cases the mapping classifier cannot prove by itself:
   `RETURN_EXACT` (the exact STUN responder return path reaches every profile),
   `UNSOLICITED_DIFF_PORT` (full cone admits packets from a different svc IP:port, while
@@ -148,11 +148,20 @@ On `debian-headless-1`, 2026-06-11:
   `port_restricted_cone` and `symmetric` receive only `RETURN_EXACT` and block `UNSOLICITED_DIFF_PORT`
   and `COLD_INBOUND`.
 
-Run the filtering verifier on the Debian sim guest:
+Both gates now run in-process from the orchestrator's
+`cross_network_nat_classification` stage (CN-2, 2026-08-27): the two bash
+wrappers were deleted and their logic lives in
+`crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/netns.rs`,
+driving `ip`/`nft`/`tc` as argv-only leaf commands over the SSH runner. Run
+them with:
 
 ```
-sudo bash netns_nat_filter.sh
+rustynet ops vm-lab-orchestrate-live-lab --node <exit-alias>:exit \
+    --cross-network-substrate netns
 ```
+
+Every check, pass or fail, is written to
+`<report-dir>/cross_network_nat_classification/cross_network_nat_gates.txt`.
 
 Expected matrix:
 
@@ -250,6 +259,8 @@ drive Tier A directly with the commands above and capture artifacts manually und
   — orchestrator and evidence ledger.
 - `scripts/vm_lab/netns_internet_sim.sh`, `scripts/vm_lab/apply_nat_profile.sh`,
   `scripts/vm_lab/stun_responder.py`, `scripts/vm_lab/nat_probe.py`,
-  `scripts/vm_lab/netns_nat_classify.sh`, `scripts/vm_lab/nat_filter_probe.py`,
-  `scripts/vm_lab/netns_nat_filter.sh`, `scripts/vm_lab/vxlan_tier_b.sh` — the substrate +
-  NAT-behaviour tooling and Tier B driver.
+  `scripts/vm_lab/vxlan_tier_b.sh` — the substrate + Tier B driver.
+  The NAT-behaviour gates are Rust now:
+  `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/netns.rs`
+  (`netns_nat_classify.sh` and `netns_nat_filter.sh` were deleted in CN-2, and
+  the python probes were replaced by `crates/rustynet-netns-probe` earlier).

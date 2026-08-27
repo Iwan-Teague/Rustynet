@@ -17,16 +17,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PROFILE: &str = "baseline_lan";
 const DEFAULT_IMPAIRMENT_PROFILE: &str = "none";
-// Shell wrappers scp'd to the guest for the netns internet simulator. The STUN
-// responder + NAT probes they invoke are the Rust `rustynet-netns-probe` binary
-// (built on-guest below), NOT the former python3 stun_responder.py /
-// nat_probe.py / nat_filter_probe.py — the `--node` cross-network path is now
-// Python-free (no python3 dependency on lab guests).
-const NETNS_CLASSIFICATION_TOOLS: &[&str] = &[
-    "netns_internet_sim.sh",
-    "netns_nat_classify.sh",
-    "netns_nat_filter.sh",
-];
+// The netns NAT gates used to be three bash scripts scp'd to the exit guest
+// and run under `sudo -n bash`. They are now the typed in-process
+// `netns::run_nat_gates` (CN-2), so nothing is copied to the guest but the
+// `rustynet-netns-probe` binary the gate builds there. The evidence file this
+// stage writes.
+const NAT_GATE_REPORT_FILE: &str = "cross_network_nat_gates.txt";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossNetworkOptions {
@@ -329,8 +325,8 @@ fn run_nat_classification(
             "this stage requires the netns cross-network substrate".to_owned(),
         );
     }
-    let host = match remote_host_for_role(ctx, "exit") {
-        Ok(host) => host,
+    let (alias, host) = match alias_and_remote_host_for_role(ctx, "exit") {
+        Ok(pair) => pair,
         Err(err) => return StageOutcome::Failed(err),
     };
     let stage_dir = ctx.report_dir.join("cross_network_nat_classification");
@@ -342,9 +338,10 @@ fn run_nat_classification(
     let log_path = stage_dir.join("cross_network_nat_classification.log");
 
     // No python3 requirement any more — the netns probes are the Rust
-    // `rustynet-netns-probe` binary. Only nft + ip are needed by the wrappers.
-    let dependency_check =
-        "sudo -n bash -lc 'nft --version >/dev/null 2>&1 && ip -V >/dev/null 2>&1'";
+    // `rustynet-netns-probe` binary. `nft` and `ip` do the topology work and
+    // `systemd-run` runs the STUN responders as transient units, so all three
+    // are hard prerequisites.
+    let dependency_check = "sudo -n bash -lc 'nft --version >/dev/null 2>&1 && ip -V >/dev/null 2>&1 && systemd-run --version >/dev/null 2>&1'";
     if let Some(outcome) =
         run_ssh_checked(&host, dependency_check, &log_path, "netns dependency check")
     {
@@ -352,10 +349,10 @@ fn run_nat_classification(
     }
 
     // Build the Rust netns probe on-guest (std-only → offline, no new cargo-cache
-    // entries) from the deployed source, then stage it at the path the netns
-    // wrappers fall back to (`/tmp/rustynet-netns-probe`). Runs as the SSH user
-    // (cargo is on the user PATH from bootstrap); `chmod +x` keeps it executable
-    // by the root-run wrappers. This replaces scp-ing the former .py probes.
+    // entries) from the deployed source, then stage it at the path the gate
+    // invokes (`/tmp/rustynet-netns-probe`). Runs as the SSH user (cargo is on
+    // the user PATH from bootstrap); `chmod +x` keeps it executable by the
+    // root-run probes.
     let build_probe = "bash -lc 'cd \"$HOME/Rustynet\" && cargo build --release -p rustynet-netns-probe && install -m 0755 target/release/rustynet-netns-probe /tmp/rustynet-netns-probe'";
     if let Some(outcome) = run_ssh_checked(
         &host,
@@ -366,39 +363,74 @@ fn run_nat_classification(
         return outcome;
     }
 
-    for tool in NETNS_CLASSIFICATION_TOOLS {
-        let local_path = repo_root().join("scripts/vm_lab").join(tool);
-        if !local_path.is_file() {
+    // The simulator is built entirely inside the guest, so the guest's own
+    // address is evidence only — but it must be a literal, because a handle
+    // that cannot name the host it provisioned cannot report where residue is.
+    let host_ip: Ipv4Addr = match host.host.parse() {
+        Ok(ip) => ip,
+        Err(_) => {
             return StageOutcome::Failed(format!(
-                "cross_network_nat_classification missing tool {}",
-                local_path.display()
+                "cross_network_nat_classification: exit node '{alias}' management host {:?} is \
+                 not an IPv4 literal",
+                host.host
             ));
         }
-        if let Some(outcome) = scp_to_remote(
-            &host,
-            local_path.as_path(),
-            &format!("/tmp/{tool}"),
-            &log_path,
-        ) {
-            return outcome;
+    };
+    let runner = substrate::RemoteShellRunner::new(host, log_path.clone(), alias.clone());
+    let sleep = |duration: std::time::Duration| std::thread::sleep(duration);
+    let gate_ctx = netns::NatGateContext {
+        host_alias: alias.as_str(),
+        host_ip,
+        sleep: &sleep,
+    };
+    match netns::run_nat_gates(&runner, &gate_ctx) {
+        // Err = the gate could not RUN (topology would not build, guest
+        // unreachable). That is a stage failure, and it is deliberately NOT
+        // the same thing as a NAT that misbehaved.
+        Err(err) => {
+            write_nat_gate_report(&stage_dir, &[], Some(err.as_str()));
+            StageOutcome::Failed(format!("netns NAT gate could not run: {err}"))
+        }
+        Ok(checks) => {
+            write_nat_gate_report(&stage_dir, &checks, None);
+            let failed: Vec<String> = checks
+                .iter()
+                .filter(|check| !check.passed)
+                .map(|check| {
+                    format!(
+                        "{}/{}/{} expected={} observed={}",
+                        check.gate, check.profile, check.scenario, check.expected, check.observed
+                    )
+                })
+                .collect();
+            if failed.is_empty() {
+                StageOutcome::Passed
+            } else {
+                StageOutcome::Failed(format!(
+                    "{} of {} netns NAT checks misbehaved: {}",
+                    failed.len(),
+                    checks.len(),
+                    failed.join("; ")
+                ))
+            }
         }
     }
+}
 
-    for (label, remote_script) in [
-        (
-            "netns NAT mapping classification",
-            "sudo -n bash /tmp/netns_nat_classify.sh",
-        ),
-        (
-            "netns NAT filtering classification",
-            "sudo -n bash /tmp/netns_nat_filter.sh",
-        ),
-    ] {
-        if let Some(outcome) = run_ssh_checked(&host, remote_script, &log_path, label) {
-            return outcome;
-        }
+/// Write every gate row, pass or fail, so the evidence says WHICH profile
+/// misbehaved rather than only that one did. Best-effort: a report we could
+/// not write must not turn a green gate red, and the stage outcome already
+/// carries the verdict.
+fn write_nat_gate_report(stage_dir: &Path, checks: &[netns::GateCheck], error: Option<&str>) {
+    let mut body = String::from("== netns NAT mapping + filtering gates ==\n");
+    for check in checks {
+        body.push_str(&check.render());
+        body.push('\n');
     }
-    StageOutcome::Passed
+    if let Some(error) = error {
+        body.push_str(&format!("GATE COULD NOT RUN: {error}\n"));
+    }
+    let _ = fs::write(stage_dir.join(NAT_GATE_REPORT_FILE), body);
 }
 
 fn run_nat_matrix(ctx: &OrchestrationContext, options: &CrossNetworkOptions) -> StageOutcome {
@@ -666,6 +698,23 @@ fn remote_host_for_alias(ctx: &OrchestrationContext, alias: &str) -> Result<Remo
     })
 }
 
+/// As [`remote_host_for_role`], but also returns the node's alias — the netns
+/// gate needs it to key its leaf runner and to name the guest any residue
+/// would be on.
+fn alias_and_remote_host_for_role(
+    ctx: &OrchestrationContext,
+    label: &str,
+) -> Result<(String, RemoteHost), String> {
+    let assignment = ctx
+        .assignments
+        .iter()
+        .find(|assignment| assignment.role.as_str() == label)
+        .ok_or_else(|| format!("no node assigned to role {label}"))?;
+    let alias = assignment.alias.clone();
+    let host = remote_host_for_alias(ctx, &alias)?;
+    Ok((alias, host))
+}
+
 fn remote_host_for_role(ctx: &OrchestrationContext, label: &str) -> Result<RemoteHost, String> {
     let assignment = ctx
         .assignments
@@ -856,48 +905,6 @@ fn build_ssh_command(host: &RemoteHost, remote_script: &str) -> Command {
     }
     cmd.arg("--").arg(&host.host).arg(remote_script);
     cmd
-}
-
-fn build_scp_to_command(host: &RemoteHost, local_path: &Path, remote_path: &str) -> Command {
-    let mut cmd = Command::new("scp");
-    cmd.args([
-        "-q",
-        "-F",
-        "/dev/null",
-        "-o",
-        "LogLevel=ERROR",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        "ConnectTimeout=15",
-        "-o",
-        "IdentitiesOnly=yes",
-        "-P",
-        &host.port.to_string(),
-    ])
-    .arg("-i")
-    .arg(&host.identity_file)
-    .arg("-o")
-    .arg(format!("UserKnownHostsFile={}", host.known_hosts.display()));
-    if let Some(user) = &host.user {
-        cmd.arg("-o").arg(format!("User={user}"));
-    }
-    cmd.arg("--")
-        .arg(local_path)
-        .arg(format!("{}:{remote_path}", host.host));
-    cmd
-}
-
-fn scp_to_remote(
-    host: &RemoteHost,
-    local_path: &Path,
-    remote_path: &str,
-    log_path: &Path,
-) -> Option<StageOutcome> {
-    let mut cmd = build_scp_to_command(host, local_path, remote_path);
-    command_failure_outcome(&mut cmd, log_path, "scp cross-network netns tool")
 }
 
 fn run_ssh_checked(

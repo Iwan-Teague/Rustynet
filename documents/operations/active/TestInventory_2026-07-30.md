@@ -312,8 +312,12 @@ That is the entire live surface reachable from CI.
   live lab run.
 - **`live_linux_*` stage validators**: 17 binaries, none with a `--dry-run`.
 - **`live_{macos,windows}_*` wrappers**: 13 scripts.
-- **netns substrate**: `netns_internet_sim.sh`, `netns_nat_classify.sh`,
-  `netns_nat_filter.sh`, `netns_daemon_path.sh`, `vxlan_tier_b.sh`.
+- **netns substrate**: `netns_internet_sim.sh` (superseded for the
+  orchestrator by the Rust `NetnsSubstrateProvider`; retained only as the
+  `netns_daemon_path.sh` dependency and the `vm-lab-network-audit` target),
+  `netns_daemon_path.sh`, `vxlan_tier_b.sh`. `netns_nat_classify.sh` and
+  `netns_nat_filter.sh` were DELETED in CN-2 (2026-08-27); their gates are
+  `stage/cross_network/netns.rs::run_nat_gates`.
 - **Perf**: `scripts/perf/run_phase1_baseline.sh`, `perf_regression_gate.sh`.
 
 ### Evidence ledgers
