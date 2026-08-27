@@ -226,6 +226,15 @@ cell is proven-on-node or carries an owner-signed disposition.
 
 ## 8. G3 — bash-retirement differential sweep (one-time; gates deletion only)
 
+**STATUS: SATISFIED + EXECUTED 2026-08-27.** The full sweep ran and is archived
+(`G3FullSweepDiff_2026-08-22.md` + raw JSON; enumeration half
+`G3EnumerationDiff_2026-07-23.md`; ledger-wide A4
+`BashRetirementGapEnumeration_2026-08-22.md`), every bash-green/`--node`-not
+cell is proven-on-node or owner-signed-dispositioned
+(`BashRetirementDispositions_2026-08-22.md`, mirrored in §6.1), and the bash
+orchestrator was deleted (W5.7, commit `e93a0e4f`). Retained below as the
+historical definition of the gate.
+
 Before **deleting** bash: run `vm-lab-diff-orchestrator-parity`; for every stage
 bash proved GREEN that `--node` has not, either (a) prove it on `--node`, or
 (b) record an **owner-signed** disposition. *(Revised per S1:)* the **enumeration

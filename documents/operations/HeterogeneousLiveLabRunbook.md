@@ -112,8 +112,8 @@ What runs, in order:
    readiness probe).
 2. `wait_until_ready` — waits up to `--wait-ready-timeout-secs` (300s
    default) for every selected VM to reach SSH-ready.
-3. The 5-node Linux live-lab via the bash orchestrator
-   (`scripts/e2e/live_linux_lab_orchestrator.sh`) — install +
+3. The 5-node Linux live-lab via the Rust `--node` engine (the sole
+   engine since W5.7 deleted the bash orchestrator) — install +
    bootstrap + 5-node enforce + traffic test + soak.
 4. **Windows post-validate (if `--windows-vm` is set)** — eight
    stages: bootstrap → client_install → runtime_acls →
