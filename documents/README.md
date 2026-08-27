@@ -78,6 +78,7 @@ The authoritative primary-ledger list is [`AGENTS.md` §2](../AGENTS.md). The da
 - [NodeRoleTaxonomy_2026-05-21.md](./operations/active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the eight user-selectable node roles: `relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin`, `nas`, `llm`. Preset compositions, transition matrix, per-platform eligibility.
 - [AnchorNodeRoleDesign_2026-05-21.md](./operations/active/AnchorNodeRoleDesign_2026-05-21.md) — canonical design for the anchor node role (D11): role definition, per-platform host capability, refactor inventory, security controls.
 - [AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md](./operations/active/AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md) — D-3: runtime enforcement for `anchor.enrollment_endpoint` (previously a purely declarative capability). Design answers + the landed per-request capability gate on `EnrollmentConsume`; the LAN listener remains an owner decision.
+- [SignedMembershipTransitionSigningSubflowDesign_2026-08-27.md](./operations/active/SignedMembershipTransitionSigningSubflowDesign_2026-08-27.md) — D-4a: design for the capability-signing sub-flow of `SignedMembership` role transitions (who signs and where the approver key lives — split-station, no key movement; the generalized §10.7 add/remove ordering per capability; per-step-boundary partial-failure states; idempotent re-run resumability). Landed skeleton: the pure `role_signing_subflow` step sequencer + ordering tests. The automated driver and live proof (D-4b) are not in scope.
 - [MasterWorkPlan_2026-03-22.md](./operations/active/MasterWorkPlan_2026-03-22.md) — superseded as the repo-wide roll-up by [FullTodoInventory_2026-07-28.md](./operations/active/FullTodoInventory_2026-07-28.md); retained for section structure/history.
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md) — historical defect inventory; the defects it documents are largely closed by Dataplane D2–D4.
 
@@ -134,6 +135,7 @@ Traversal, relay, and transport-owning backend plans:
 - [AnchorNodeRoleDesign_2026-05-21.md](./operations/active/AnchorNodeRoleDesign_2026-05-21.md)
 - [NodeRoleTaxonomy_2026-05-21.md](./operations/active/NodeRoleTaxonomy_2026-05-21.md)
 - [AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md](./operations/active/AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md)
+- [SignedMembershipTransitionSigningSubflowDesign_2026-08-27.md](./operations/active/SignedMembershipTransitionSigningSubflowDesign_2026-08-27.md)
 
 Cross-platform orchestrator, Windows, and macOS plans:
 - [OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md](./operations/active/OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md)
