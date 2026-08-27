@@ -10,8 +10,9 @@ through W3.2-followup-9 in
 
 ## 1) When to run these
 
-Run after the bash orchestrator (`scripts/e2e/live_linux_lab_orchestrator.sh`)
-has finished installing + starting the daemon on a Linux peer. The
+Run after the live-lab orchestrator (the Rust `--node` engine —
+`ops vm-lab-orchestrate-live-lab`) has finished installing + starting the
+daemon on a Linux peer. The
 validators are read-only and never mutate runtime state; they exist
 to surface drift between the live host and the reviewed posture.
 
