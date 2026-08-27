@@ -35,8 +35,24 @@
 > `debian-headless-2/3/4/5` had been independently blocking
 > `--require-same-network`; fixed in `7227627`) confirmed the fix live.
 >
+> **CORRECTION 2026-08-27 (verified against code, D-4a):** the next
+> paragraph's "design-only" claim was stale in one direction. The
+> `SignedMembership` *planning + local side-effect execution* are
+> implemented and platform-neutral — `plan_concrete_actions`
+> (`crates/rustynet-cli/src/role_cli.rs:553`, SignedMembership arms
+> `:620-800`) produces real ordered actions and `execute_role_plan` /
+> `execute_role_action` (`crates/rustynet-cli/src/main.rs:19482`/`:19629`)
+> executes them (admin-gated route IPC + platform service installers, with
+> fail-closed audit per RSA-0014). What remains missing is the
+> capability-*signing* sub-flow (emit → sign → apply → refresh is still a
+> manual operator chain) and any live proof on either OS. Design for that
+> sub-flow: `SignedMembershipTransitionSigningSubflowDesign_2026-08-27.md`
+> (D-4a); live proof is D-4b.
+>
 > The `SignedMembership` transition kind (capability changes, needs the
-> admin issue/ingest wiring) remains design-only for both OS — see §3/§4
+> admin issue/ingest wiring) remains design-only for both OS *(stale — see
+> the 2026-08-27 correction above; the signing sub-flow and live proof are
+> the remaining gaps)* — see §3/§4
 > below, unchanged. This is the banked design the
 > `CrossPlatformRoleParityPlan_2026-06-21.md` §3 *live role transitions
 > (cross-OS)* cell depends on (Roadmap `CrossPlatformRoleParityRoadmap_2026-06-22.md`
