@@ -1021,26 +1021,30 @@ pub fn validate_anchor_bundle_pull_addr(
 /// arbitrary local file (same control as
 /// `key_material::validate_secret_file_security` and
 /// `rustynetd::enrollment_token::ensure_regular_file_no_symlink`).
+/// `label` is the full human-readable name of the artifact (e.g.
+/// `"bundle-pull token"`), rendered as `anchor <label> …` in every error, so
+/// one seam serves both the bundle-pull artifacts and the capability-gate
+/// snapshot read.
 fn open_anchor_state_file(path: &Path, label: &str) -> Result<fs::File, DaemonError> {
     let meta = fs::symlink_metadata(path)
-        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull {label} open failed: {err}")))?;
+        .map_err(|err| DaemonError::Io(format!("anchor {label} open failed: {err}")))?;
     if meta.file_type().is_symlink() {
         return Err(DaemonError::InvalidConfig(format!(
-            "anchor bundle-pull {label} must not be a symlink"
+            "anchor {label} must not be a symlink"
         )));
     }
     if !meta.file_type().is_file() {
         return Err(DaemonError::InvalidConfig(format!(
-            "anchor bundle-pull {label} must be a regular file"
+            "anchor {label} must be a regular file"
         )));
     }
     fs::File::open(path)
-        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull {label} open failed: {err}")))
+        .map_err(|err| DaemonError::Io(format!("anchor {label} open failed: {err}")))
 }
 
 pub fn load_anchor_bundle_pull_token(path: &Path) -> Result<String, DaemonError> {
     let mut token = String::new();
-    open_anchor_state_file(path, "token")?
+    open_anchor_state_file(path, "bundle-pull token")?
         .take(MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES as u64 + 1)
         .read_to_string(&mut token)
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull token read failed: {err}")))?;
@@ -1060,7 +1064,7 @@ pub fn load_anchor_bundle_pull_token(path: &Path) -> Result<String, DaemonError>
 
 pub fn load_anchor_bundle_pull_bundle(path: &Path) -> Result<Vec<u8>, DaemonError> {
     let mut bundle = Vec::new();
-    open_anchor_state_file(path, "bundle")?
+    open_anchor_state_file(path, "bundle-pull bundle")?
         .take(MAX_MEMBERSHIP_SNAPSHOT_BYTES as u64 + 1)
         .read_to_end(&mut bundle)
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bundle read failed: {err}")))?;
@@ -1075,6 +1079,48 @@ pub fn load_anchor_bundle_pull_bundle(path: &Path) -> Result<Vec<u8>, DaemonErro
         ));
     }
     Ok(bundle)
+}
+
+/// Read the local signed membership snapshot and prove the local node still
+/// holds `capability`.
+///
+/// D-3 enforcement seam for `anchor.enrollment_endpoint`, and the shape every
+/// future capability-gated runtime surface should reuse. Fail-closed by
+/// construction: the snapshot is opened through the same symlink-refusing,
+/// size-bounded [`open_anchor_state_file`] path the bundle-pull artifacts use,
+/// and `snapshot_bytes_have_capability` returns `false` for a malformed
+/// snapshot, an unknown node, a non-`Active` node, or an absent capability.
+///
+/// Called per request rather than cached at startup, exactly as
+/// `handle_anchor_bundle_pull_stream` re-reads its bundle: a capability
+/// revoked by a quorum-signed update must take effect at the next request,
+/// not at the next daemon restart.
+fn require_local_signed_capability(
+    snapshot_path: &Path,
+    local_node_id: &str,
+    capability: rustynet_control::roles::RoleCapability,
+) -> Result<(), DaemonError> {
+    let mut bytes = Vec::new();
+    open_anchor_state_file(snapshot_path, "membership snapshot")?
+        .take(MAX_MEMBERSHIP_SNAPSHOT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| DaemonError::Io(format!("anchor membership snapshot read failed: {err}")))?;
+    if bytes.len() > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+        return Err(DaemonError::InvalidConfig(
+            "anchor membership snapshot exceeds maximum size".to_owned(),
+        ));
+    }
+    if !rustynet_control::membership::snapshot_bytes_have_capability(
+        &bytes,
+        local_node_id,
+        capability,
+    ) {
+        return Err(DaemonError::State(format!(
+            "local node does not hold signed capability {}",
+            capability.as_str()
+        )));
+    }
+    Ok(())
 }
 
 pub fn write_anchor_bundle_pull_response<W: Write>(
@@ -8767,6 +8813,23 @@ impl DaemonRuntime {
         push_addr_str: &str,
     ) -> Result<String, String> {
         use base64::Engine;
+        // D-3: `anchor.enrollment_endpoint` authorisation gate. Runs FIRST —
+        // before the secret is read, before the ledger lock is taken, and
+        // before any attacker-supplied byte is parsed — so a node that was
+        // never authorised to accept enrolments consumes nothing and learns
+        // nothing about the token. Re-read per request (not cached at
+        // startup) so a quorum-signed revocation takes effect immediately,
+        // matching `handle_anchor_bundle_pull_stream`'s bundle re-read.
+        //
+        // The message is a single fixed string, preserving this handler's
+        // fixed-vocabulary rule. It discloses nothing secret: capability
+        // assignment is public, quorum-signed roster state.
+        require_local_signed_capability(
+            self.membership_snapshot_path.as_path(),
+            self.local_node_id.as_str(),
+            rustynet_control::roles::RoleCapability::AnchorEnrollmentEndpoint,
+        )
+        .map_err(|_| "enrollment endpoint capability not held".to_owned())?;
         let secret_path = self
             .enrollment_secret_path
             .as_deref()
@@ -16677,11 +16740,12 @@ mod tests {
         passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
         persist_traversal_watermark, persist_trust_watermark, poll_anchor_bundle_pull_once,
         port_mapping_bring_up_skip_reason, prepare_runtime_wireguard_key_material,
-        read_line_bounded, resolve_egress_interface_value, run_daemon, run_preflight_checks,
-        sanitize_dataplane_routes_for_node_role, scrub_runtime_wireguard_key_material,
-        select_runtime_relay_candidate, select_runtime_relay_candidate_with_verified_fleet,
-        sha256_digest, snapshot_has_usable_traversal_host_candidates, trust_evidence_payload,
-        unix_now, validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
+        read_line_bounded, require_local_signed_capability, resolve_egress_interface_value,
+        run_daemon, run_preflight_checks, sanitize_dataplane_routes_for_node_role,
+        scrub_runtime_wireguard_key_material, select_runtime_relay_candidate,
+        select_runtime_relay_candidate_with_verified_fleet, sha256_digest,
+        snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
+        validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
         validate_daemon_config, validate_file_security, validate_node_role_membership_alignment,
         write_anchor_bundle_pull_response, write_anchor_bundle_pull_response_with_have,
         write_response, zeroize_optional_bytes,
@@ -20699,6 +20763,244 @@ mod tests {
             .expect("membership log should be opened");
         file.write_all(b"version=1\n")
             .expect("membership log should be written");
+    }
+
+    // ── D-3: anchor.enrollment_endpoint runtime enforcement ────────────
+    //
+    // Before this gate existed, ANY installed daemon (client included, since
+    // every install template provisions the enrollment secret + ledger)
+    // would redeem an enrollment token and register the enrollee as a gossip
+    // push peer. `handle_enrollment_consume` now refuses unless the local
+    // node holds `anchor.enrollment_endpoint` in its own signed membership.
+
+    /// Write a membership snapshot + log whose LOCAL node carries exactly
+    /// `capabilities` at `status`. Deliberately separate from
+    /// `write_membership_files_for_role` (which pins capabilities to a daemon
+    /// role) so a test can express "advertises the capability" and "does not"
+    /// as the only difference between two otherwise identical runtimes.
+    fn write_membership_files_with_local_caps(
+        snapshot_path: &Path,
+        log_path: &Path,
+        local_node_id: &str,
+        status: MembershipNodeStatus,
+        capabilities: Vec<RoleCapability>,
+    ) {
+        let owner_signing = SigningKey::from_bytes(&[7; 32]);
+        let state = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-test".to_owned(),
+            epoch: 1,
+            nodes: vec![MembershipNode {
+                node_id: local_node_id.to_owned(),
+                node_pubkey_hex: hex_encode(&[9; 32]),
+                owner: "owner@example.local".to_owned(),
+                status,
+                roles: vec!["tag:servers".to_owned()],
+                capabilities,
+                joined_at_unix: 100,
+                updated_at_unix: 100,
+            }],
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: hex_encode(owner_signing.verifying_key().as_bytes()),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        };
+        persist_membership_snapshot(snapshot_path, &state)
+            .expect("membership snapshot should be written");
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).expect("membership log parent should exist");
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600)
+        };
+        let mut file = options
+            .open(log_path)
+            .expect("membership log should be opened");
+        file.write_all(b"version=1\n")
+            .expect("membership log should be written");
+    }
+
+    /// The anchor capability set MINUS the enrollment endpoint — a node that
+    /// is unambiguously an anchor, so a failure here cannot be explained away
+    /// as "it just is not an anchor".
+    fn anchor_caps_without_enrollment_endpoint() -> Vec<RoleCapability> {
+        vec![
+            RoleCapability::Anchor,
+            RoleCapability::RelayHost,
+            RoleCapability::AnchorGossipSeed,
+            RoleCapability::AnchorBundlePull,
+            RoleCapability::AnchorRelayColocation,
+            RoleCapability::AnchorPortMappingAuthoritative,
+        ]
+    }
+
+    #[test]
+    fn require_local_signed_capability_refuses_when_capability_absent() {
+        let dir = secure_test_dir("rustynetd-d3-cap-absent");
+        let snapshot = dir.join("membership.snapshot");
+        let log = dir.join("membership.log");
+        write_membership_files_with_local_caps(
+            &snapshot,
+            &log,
+            "anchor-local",
+            MembershipNodeStatus::Active,
+            anchor_caps_without_enrollment_endpoint(),
+        );
+        let err = require_local_signed_capability(
+            &snapshot,
+            "anchor-local",
+            RoleCapability::AnchorEnrollmentEndpoint,
+        )
+        .expect_err("an anchor without the endpoint capability must be refused");
+        assert!(
+            format!("{err}").contains("anchor.enrollment_endpoint"),
+            "refusal must name the missing capability: {err}"
+        );
+        // Not vacuous: a capability this node DOES hold still passes.
+        require_local_signed_capability(
+            &snapshot,
+            "anchor-local",
+            RoleCapability::AnchorBundlePull,
+        )
+        .expect("a held capability must pass the same gate");
+    }
+
+    #[test]
+    fn require_local_signed_capability_refuses_when_snapshot_missing() {
+        // §3 fail-closed: trust state unavailable is a refusal, never a
+        // permissive default.
+        let dir = secure_test_dir("rustynetd-d3-cap-missing-snapshot");
+        let err = require_local_signed_capability(
+            &dir.join("does-not-exist.snapshot"),
+            "anchor-local",
+            RoleCapability::AnchorEnrollmentEndpoint,
+        )
+        .expect_err("an absent membership snapshot must be refused");
+        drop(err);
+    }
+
+    #[test]
+    fn require_local_signed_capability_refuses_revoked_local_node() {
+        // A revoked node keeps its capability row; only the Active check
+        // stops it from continuing to serve.
+        let dir = secure_test_dir("rustynetd-d3-cap-revoked");
+        let snapshot = dir.join("membership.snapshot");
+        let log = dir.join("membership.log");
+        let mut caps = anchor_caps_without_enrollment_endpoint();
+        caps.push(RoleCapability::AnchorEnrollmentEndpoint);
+        write_membership_files_with_local_caps(
+            &snapshot,
+            &log,
+            "anchor-local",
+            MembershipNodeStatus::Revoked,
+            caps,
+        );
+        require_local_signed_capability(
+            &snapshot,
+            "anchor-local",
+            RoleCapability::AnchorEnrollmentEndpoint,
+        )
+        .expect_err("a revoked node must be refused even while its row lists the capability");
+    }
+
+    #[test]
+    fn require_local_signed_capability_accepts_capability_holder() {
+        let dir = secure_test_dir("rustynetd-d3-cap-present");
+        let snapshot = dir.join("membership.snapshot");
+        let log = dir.join("membership.log");
+        let mut caps = anchor_caps_without_enrollment_endpoint();
+        caps.push(RoleCapability::AnchorEnrollmentEndpoint);
+        write_membership_files_with_local_caps(
+            &snapshot,
+            &log,
+            "anchor-local",
+            MembershipNodeStatus::Active,
+            caps,
+        );
+        require_local_signed_capability(
+            &snapshot,
+            "anchor-local",
+            RoleCapability::AnchorEnrollmentEndpoint,
+        )
+        .expect("an active holder must pass");
+    }
+
+    /// Build a runtime whose local node advertises exactly `capabilities`.
+    /// The enrollment subsystem is deliberately left unconfigured so the two
+    /// tests below can distinguish "refused by the capability gate" from
+    /// "refused later, by the subsystem check" purely from the message.
+    fn runtime_with_local_caps(dir: &Path, capabilities: Vec<RoleCapability>) -> DaemonRuntime {
+        let snapshot = dir.join("membership.snapshot");
+        let log = dir.join("membership.log");
+        let trust_path = dir.join("trust.evidence");
+        let trust_verifier_path = dir.join("trust.verifier.pub");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files_with_local_caps(
+            &snapshot,
+            &log,
+            "daemon-local",
+            MembershipNodeStatus::Active,
+            capabilities,
+        );
+        let config = DaemonConfig {
+            node_id: "daemon-local".to_owned(),
+            state_path: dir.join("daemon.state"),
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path: dir.join("trust.watermark"),
+            membership_snapshot_path: snapshot,
+            membership_log_path: log,
+            membership_watermark_path: dir.join("membership.watermark"),
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        DaemonRuntime::new(&config).expect("runtime should be created")
+    }
+
+    #[test]
+    fn enrollment_consume_refused_when_capability_absent() {
+        // THE fail-closed proof for D-3: a daemon whose signed membership
+        // does not grant `anchor.enrollment_endpoint` refuses the consume
+        // outright. The message identifies the CAPABILITY gate, not the
+        // subsystem check that follows it and not a token verdict — which is
+        // what proves the refusal happened before any token handling.
+        let dir = secure_test_dir("rustynetd-d3-consume-refused");
+        let mut runtime = runtime_with_local_caps(&dir, anchor_caps_without_enrollment_endpoint());
+        let err = runtime
+            .handle_enrollment_consume("some-token", "AAAA", "203.0.113.10:51820")
+            .expect_err("consume must be refused without the endpoint capability");
+        assert_eq!(err, "enrollment endpoint capability not held");
+    }
+
+    #[test]
+    fn enrollment_consume_capability_gate_precedes_subsystem_and_token_checks() {
+        // Positive control for the test above: the ONLY difference is the
+        // presence of the capability. With it, the same call gets past the
+        // gate and is refused by the next check instead — so the gate is a
+        // real discriminator, not a blanket refusal.
+        let dir = secure_test_dir("rustynetd-d3-consume-gate-order");
+        let mut caps = anchor_caps_without_enrollment_endpoint();
+        caps.push(RoleCapability::AnchorEnrollmentEndpoint);
+        let mut runtime = runtime_with_local_caps(&dir, caps);
+        let err = runtime
+            .handle_enrollment_consume("some-token", "AAAA", "203.0.113.10:51820")
+            .expect_err("the unconfigured enrollment subsystem still refuses");
+        assert_ne!(err, "enrollment endpoint capability not held");
+        assert!(
+            err.contains("enrollment subsystem not configured"),
+            "expected the post-gate subsystem refusal, got: {err}"
+        );
     }
 
     fn secure_test_dir(prefix: &str) -> std::path::PathBuf {

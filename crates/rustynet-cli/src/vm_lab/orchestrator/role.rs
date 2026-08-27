@@ -189,6 +189,15 @@ impl NodeRole {
                         RoleCapability::Anchor,
                         RoleCapability::ExitServer,
                         RoleCapability::RelayHost,
+                        // D-3: the exit is the membership owner AND the node
+                        // the live enrollment stages redeem tokens on, so it
+                        // must ADVERTISE the capability the daemon now
+                        // requires before it will accept an
+                        // `EnrollmentConsume` (`require_local_signed_capability`
+                        // in `handle_enrollment_consume`). Anchor + RelayHost
+                        // are already present, so the combination is legal
+                        // under `validate_membership_node_capabilities`.
+                        RoleCapability::AnchorEnrollmentEndpoint,
                     ])
                 } else {
                     // BlindExit on Linux: ExitServer only (no Anchor — the
@@ -206,6 +215,9 @@ impl NodeRole {
                 RoleCapability::Anchor,
                 RoleCapability::ExitServer,
                 RoleCapability::RelayHost,
+                // D-3: same reason as the Linux arm above — advertise the
+                // capability the enrollment-consume gate requires.
+                RoleCapability::AnchorEnrollmentEndpoint,
             ]),
             _ => match self {
                 NodeRole::Client | NodeRole::Aux | NodeRole::Extra => {
@@ -245,6 +257,12 @@ impl NodeRole {
                     RoleCapability::ExitServer,
                     RoleCapability::RelayHost,
                     RoleCapability::EntryRelay,
+                    // D-3: the entry must cover the Linux exit grant
+                    // (`entry_grant_covers_serving_as_the_clients_exit`), and
+                    // it runs the same admin-owner daemon role, so it
+                    // advertises the enrollment endpoint for the same reason
+                    // the exit does.
+                    RoleCapability::AnchorEnrollmentEndpoint,
                 ]),
                 // Admin and Anchor advertise the canonical anchor capability
                 // set: the Anchor marker + relay_host + the five composable
@@ -533,6 +551,7 @@ mod tests {
                 RoleCapability::Anchor,
                 RoleCapability::ExitServer,
                 RoleCapability::RelayHost,
+                RoleCapability::AnchorEnrollmentEndpoint,
             ]
         );
         assert_eq!(
@@ -555,6 +574,7 @@ mod tests {
                 RoleCapability::ExitServer,
                 RoleCapability::RelayHost,
                 RoleCapability::EntryRelay,
+                RoleCapability::AnchorEnrollmentEndpoint,
             ]
         );
     }
