@@ -169,6 +169,8 @@ as `rustynet_cli::orchestrator_test_surface` (RNQ-09 integration-test hook).
 | `WindowsNodeAdapter` | `adapter/windows.rs` | Windows adapter (PowerShell-based) |
 | `MacosNodeAdapter` | `adapter/macos.rs` | macOS adapter |
 | `node_adapter_for()` | `adapter/factory.rs` | Factory: (platform, connection) → NodeAdapter |
+| `NetLeafRunner` / `SubstrateHandle` / `CrossNetworkSubstrateProvider` | `stage/cross_network/substrate.rs` | Cross-network substrate seam (CN-1/CN-2): argv-only `ip`/`nft` leaf-op runners (local, remote-shell, mock), the provisioned-topology handle with its overlay/underlay `endpoint()` planes, the `NatProfileId`/`Support` honest-skip gate, `VxlanSubstrateProvider`, the two topology-level lifecycle stages, and the `topology_level_seam()`/`provider_for_record()` dispatch |
+| `NetnsSubstrateProvider` + `run_nat_gates` | `stage/cross_network/netns.rs` | Tier-A netns "internet in a box" (CN-2): namespace/bridge/NAT topology and the NAT mapping + filtering gates, ported from the deleted `netns_nat_classify.sh`/`netns_nat_filter.sh` and from `netns_internet_sim.sh` onto `NetLeafRunner` |
 
 ### Scenario evidence framework (`rustynet-cli/src/vm_lab/orchestrator/`)
 

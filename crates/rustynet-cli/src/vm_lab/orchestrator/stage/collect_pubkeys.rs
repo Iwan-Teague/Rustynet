@@ -2,6 +2,7 @@
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{GossipIdentity, StageOutcome};
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::stage::cross_network::substrate::EndpointPlane;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 pub struct CollectPubkeysStage;
@@ -116,10 +117,19 @@ impl OrchestrationStage for CollectPubkeysStage {
             // continues on the management IP; only the recorded WireGuard
             // endpoint changes. A malformed endpoint is an error, never a
             // silent fall-through to the unroutable address.
-            let overlay = ctx
-                .substrate
-                .as_ref()
-                .and_then(|handle| handle.overlay_ips.get(d.alias.as_str()).cloned());
+            //
+            // The substrate is asked through `SubstrateHandle::endpoint()`
+            // rather than by reaching into `overlay_ips`, so the
+            // overlay-vs-underlay decision has exactly ONE implementation.
+            // Only the `Overlay` plane may override: an `Underlay` answer is
+            // the handle telling us it provisioned nothing for this alias,
+            // which is precisely the address already discovered.
+            let overlay = ctx.substrate.as_ref().and_then(|handle| {
+                handle
+                    .endpoint(d.alias.as_str())
+                    .filter(|resolved| resolved.plane == EndpointPlane::Overlay)
+                    .map(|resolved| resolved.address)
+            });
             let endpoint = match overlay {
                 Some(overlay_ip) => match override_endpoint_host(&d.endpoint, &overlay_ip) {
                     Ok(endpoint) => endpoint,
@@ -342,7 +352,7 @@ mod tests {
                 .map(|(alias, ip)| ((*alias).to_owned(), (*ip).to_owned()))
                 .collect(),
             underlay_ips: std::collections::BTreeMap::new(),
-            created_links: Vec::new(),
+            created_resources: Vec::new(),
         }
     }
 
@@ -392,6 +402,33 @@ mod tests {
             ctx.endpoints.get("outsider").map(String::as_str),
             Some("192.168.64.11:51822"),
             "a non-participating alias keeps its discovered endpoint"
+        );
+    }
+
+    /// Negative path for the accessor seam: a handle that KNOWS the alias but
+    /// only on the underlay plane must not override anything. This is the
+    /// exact shape a non-overlay substrate (netns) produces — it provisions a
+    /// simulator inside one guest, no cross-LAN overlay address for any lab
+    /// alias — and a plane-blind implementation would silently rewrite every
+    /// endpoint to the address it already had, or worse, to another node's.
+    #[test]
+    fn an_underlay_plane_answer_never_overrides_the_discovered_endpoint() {
+        let mut ctx = ctx_with_nodes(&[("utm-1", "192.168.64.10:51820")]);
+        let mut handle = overlay_handle(&[]);
+        handle
+            .underlay_ips
+            .insert("utm-1".to_owned(), "192.168.64.10".to_owned());
+        // The handle resolves the alias, but on the underlay plane.
+        assert_eq!(
+            handle.endpoint("utm-1").map(|resolved| resolved.plane),
+            Some(EndpointPlane::Underlay)
+        );
+        ctx.substrate = Some(handle);
+        assert_eq!(CollectPubkeysStage.execute(&mut ctx), StageOutcome::Passed);
+        assert_eq!(
+            ctx.endpoints.get("utm-1").map(String::as_str),
+            Some("192.168.64.10:51820"),
+            "an underlay-plane answer is not an overlay override"
         );
     }
 
