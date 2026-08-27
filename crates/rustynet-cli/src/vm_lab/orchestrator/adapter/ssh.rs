@@ -373,7 +373,7 @@ pub fn scp_to(
         if attempt > 0 {
             std::thread::sleep(Duration::from_secs(3 * u64::from(attempt)));
         }
-        let mut cmd = base_scp_command(port, identity_file.clone(), known_hosts.clone(), user);
+        let mut cmd = base_scp_command(port, identity_file, known_hosts, user);
         cmd.arg("--")
             .arg(local.as_os_str())
             .arg(format!("{host}:{remote_dst}"));
