@@ -69,6 +69,54 @@ Pre-clean both nodes first (firewall reset on Windows, stop units + delete nft
 tables on debian) — see the live-lab re-verify recipe in
 `memory/lab_debian_node_state.md` / the standard pre-clean used in the run matrix.
 
+### If the run refuses to start: guest already claimed (QH-18)
+
+Every invocation form of the orchestrator — including the bare command above —
+takes a per-GUEST advisory lock before anything else happens. Concurrent runs on
+one host are still supported; concurrent runs on the SAME GUEST are not, because
+they corrupt each other's evidence. A collision fails the command immediately
+with a message naming the guest:
+
+```
+guest 'windows-utm-1' is already claimed by a live-lab run in flight on this host
+(lock /home/<user>/.rustynet/lab-locks/guest-windows-utm-1-<digest>.lock).
+Concurrent runs are supported ONLY on disjoint guests: give this run different
+guests, or wait for the in-flight run to finish. A dead run's lock is released by
+the kernel, so this is live contention, not a stale file.
+```
+
+What to do:
+
+- **This is never a stale lock on Linux/macOS.** The lock is an `flock`, released
+  by the kernel when the holder dies — including on SIGKILL, OOM kill, and power
+  loss. The lock file staying on disk after a crash is normal and harmless; do
+  NOT delete it to "clear" a refusal. Deleting it does not release anything and
+  can produce two runs that both believe they hold exclusion.
+- Find the other run with `host_run_status` (or `ps -ww -o args= -C rustynet-cli`)
+  and either wait for it or stop it with `stop_host_run`.
+- To run alongside it deliberately, give this run **disjoint guests** — a
+  different `--node` set. Disjoint runs are allowed through by design.
+
+Two related refusals from the same gate:
+
+- `... resolved NO guests for run exclusion ...` — the command named its guests
+  in a form the claim could not resolve (typically only a `--*-platform`
+  selector), so it would run entirely unprotected. Name the guests explicitly
+  with `--node`, or set `RUSTYNET_LAB_ALLOW_UNPROTECTED_RUN=1` if you genuinely
+  mean to run without exclusion.
+- `warning: ... could not resolve <selector> ...` — a partial claim. The run
+  proceeds and is protected on the guests it did resolve; anything named only by
+  the unresolved selector is not.
+
+Point two operators' runs at one exclusion domain with `RUSTYNET_LAB_LOCK_DIR`
+when a single host is driven by more than one user account; the default lock
+directory is per-user under `$HOME/.rustynet/lab-locks`.
+
+Note the launcher script used by `launch_live_lab_on_host` no longer refuses on
+host occupancy at all — that check was a `pgrep` pattern that matched its own
+launcher. The guest lock above is now the only run exclusion, and it covers every
+invocation path.
+
 **Expected on a WinNAT-capable guest:** all 18 stages green, including
 `active_exit` (forwarding + NAT applied, and a `Get-NetNatSession` shows debian's
 `100.64.x` mesh address NAT-translated outbound → client egress via Windows proven).

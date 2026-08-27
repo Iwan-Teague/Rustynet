@@ -63,11 +63,60 @@
 //!    a run that resolves nothing at all is REFUSED rather than run unprotected
 //!    (`RUSTYNET_LAB_ALLOW_UNPROTECTED_RUN=1` overrides). A partial claim still
 //!    excludes on everything it did resolve.
-//!  - The **false-positive** half of QH-18 — `pgrep` self-tripping on an
-//!    inline-over-SSH launch — is untouched here. Closing it means editing the
-//!    host launch template and the two assertions pinning that string, in a
-//!    file that just landed; an annoyance is not worth disturbing a settled
-//!    security boundary. This module closes the dangerous direction.
+//!  - **Different driver hosts do not exclude each other** (restated because it
+//!    is the gap most likely to be mistaken for coverage): this is a host-local
+//!    lock, not a fleet-wide lease.
+//!
+//! ## When the lock is released — every exit path, including the ugly one
+//!
+//! The guard is a value ([`GuestRunLocks`]) held for the duration of the run by
+//! a NAMED binding in `execute_ops`, so release is tied to scope exit, not to
+//! any cleanup code that could be skipped:
+//!
+//!  - **Normal exit.** The guard drops when `execute_ops` returns; the `Flock`
+//!    values close their descriptors and the kernel drops the advisory locks.
+//!  - **Error exit.** Identical: an early `return Err(..)` or a `?` unwinds
+//!    through the same scope, and the guard drops on the way out. Nothing has
+//!    to remember to unlock.
+//!  - **Panic.** Unwinding runs `Drop`; and even under `panic = "abort"` the
+//!    process dies, which is the SIGKILL case below.
+//!  - **SIGTERM / SIGINT / ^C.** No handler is installed, so the default action
+//!    terminates the process. `Drop` does NOT run — and it does not need to:
+//!    the kernel closes every descriptor of a dying process and releases the
+//!    advisory locks with them.
+//!  - **SIGKILL / power loss / OOM kill.** Nothing user-space runs at all. The
+//!    kernel still closes the descriptors, so the locks are still released. The
+//!    lock FILE remains on disk, which is correct and deliberate: the file's
+//!    existence never meant anything, only the lock on it did. The next run
+//!    opens the same file and acquires it normally.
+//!
+//! That is why there is **no stale-lock detection, no timeout, and no
+//! auto-break** on unix — there is no stale state to break. A refusal here is
+//! always live contention, which is what the refusal message asserts. If you
+//! ever find yourself wanting a `--force` that unlinks a lock file, note that
+//! unlinking does not release anything: the holder keeps its lock on the now
+//! unlinked inode while the next run creates a NEW file and locks that, and
+//! both then believe they hold exclusion.
+//!
+//! The **non-unix** fallback is the exception and says so loudly in its own
+//! refusal text: with no advisory locks the file's existence IS the lock, so a
+//! crash CAN strand it and an operator must delete it by hand after confirming
+//! no run is live. That is an explicit, loud, human-performed break — never an
+//! automatic one.
+//!
+//! ## The `pgrep` gate is gone
+//!
+//! The **false-positive** half of QH-18 is closed by deletion rather than by
+//! repair. `HOST_LAUNCH_SCRIPT` no longer carries a concurrency gate at all: a
+//! `pgrep -f` pattern cannot be made correct there, because driving the launcher
+//! inline over ssh puts the whole script text into the remote `bash -c` argv and
+//! the script must contain the subcommand string it runs — so it always matches
+//! itself. It was also per-HOST, refusing the disjoint-guest concurrency this
+//! module exists to preserve. The process that launcher starts reaches this
+//! module like every other invocation form, so removing it loses no coverage.
+//! Its pidfile prune became liveness-checked in the same change, since a
+//! concurrent disjoint-guest run's pidfile is now legitimately present and must
+//! not be deleted out from under the stop path.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
