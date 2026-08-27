@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+pub mod substrate;
+
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
@@ -617,7 +619,7 @@ impl ResolvedParams {
     }
 }
 
-struct RemoteHost {
+pub(crate) struct RemoteHost {
     host: String,
     port: u16,
     user: Option<String>,
