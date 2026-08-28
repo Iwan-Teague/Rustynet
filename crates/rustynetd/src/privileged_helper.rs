@@ -57,7 +57,13 @@ use rustynet_local_security::{
     validate_owner_only_socket, validate_root_managed_shared_runtime_socket,
 };
 
-#[cfg(not(windows))]
+// macOS: the launchd plists pass `PRIVILEGED_HELPER_SOCKET="/private/var/run/rustynet/rustynetd-privileged.sock"`
+// (`Install-RustyNetMacosService.sh:35`), so the default must resolve to the
+// macOS runtime dir rather than inherit Linux's `/run/rustynet`.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str =
+    "/private/var/run/rustynet/rustynetd-privileged.sock";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd-privileged.sock";
 #[cfg(windows)]
 pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH;
@@ -6149,5 +6155,32 @@ mod tests {
             super::MACOS_LAUNCHD_EXIT_TIMEOUT_MS,
         )
         .expect("a client timeout exactly at the ceiling is allowed");
+    }
+
+    // MacosPathConstantAudit_2026-08-28 follow-up #1: the helper socket default
+    // must resolve to the launchd plist's `PRIVILEGED_HELPER_SOCKET` value on
+    // macOS (`Install-RustyNetMacosService.sh:35`) and keep the historical
+    // Linux value on Linux.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_helper_socket_matches_installer_value() {
+        assert_eq!(
+            super::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH,
+            "/private/var/run/rustynet/rustynetd-privileged.sock"
+        );
+        assert_ne!(
+            super::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH,
+            "/run/rustynet/rustynetd-privileged.sock",
+            "macOS must not inherit the Linux helper socket path"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_helper_socket_is_unchanged() {
+        assert_eq!(
+            super::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH,
+            "/run/rustynet/rustynetd-privileged.sock"
+        );
     }
 }
