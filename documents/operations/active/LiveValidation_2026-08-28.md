@@ -675,3 +675,168 @@ the end of §9. No new stub was created — there were no failures to stub.
    suspect).
 3. Relaunch the §7 topology unchanged into a fresh report dir. The launch gate is
    currently clear — no undispositioned stub blocks it.
+
+---
+
+## 11) Attempt 4 — the full suite completes. `livelab-1787906534-877a0226693c`, `passed=44 failed=0 skipped=17`
+
+**Status: the suite ran end to end on current `main` with ZERO failures. 44 of 61
+stages passed, 17 skipped for declared topology reasons, none failed. This is the
+first live evidence for the merges that had none — membership, assignments,
+baseline runtime, the full security-check block, relay, the exit chain, managed
+DNS, network flap, and reboot recovery are all green on hardware.**
+
+### 11.1 The run
+
+| field | value |
+|---|---|
+| run id | `livelab-1787906534-877a0226693c` |
+| window | 2026-08-28T08:21:01Z → 08:42:14Z (21 min 13 s) |
+| commit | `877a0226693c` (`main` HEAD), branch `work/live-validate2`, `git_dirty_state=clean` |
+| topology | the §7 five-guest UTM set, unchanged |
+| network profile | `mgmt_shared_smoke_v1`, digest `sha256:ab06a230…f4f67e4` — unchanged across every attempt |
+| result | **`passed=44 failed=0 skipped=17`**, `overall_result=partial`, **`first_failed_stage` empty** |
+| ledger row | **confirmed** — row 186 |
+| report dir | `state/live-lab-validate4-20260828/` |
+
+Preconditions were re-verified before launch, per the §10.5 procedure: all five
+guests probed for env-pin residue and all five came back clean (`enp0s1` pinned,
+link present — `debian-headless-2` had been correctly rewritten by attempt 3's own
+successful bootstrap). Host disk 206 GiB free and stable at 205 GiB throughout;
+the 5 GB threshold was never approached.
+
+### 11.2 Comparison against the baseline — strictly better, zero regressions
+
+Against `livelab-1787825655-3afd39b18164`, the best-covered comparable run
+(same five guests, same profile digest):
+
+| | baseline `1787825655` | attempt 4 `1787906534` |
+|---|---|---|
+| planned stages | 59 | **61** |
+| passed | 42 | **44** |
+| failed | 0 | **0** |
+| skipped | 17 | 17 |
+| `linux_stage_*` column profile | 27 pass / 9 skip / 1 not_run | **identical** |
+
+A per-stage diff of the two runs across `live_lab_node_stage_results.csv` returns
+**zero flips** — every stage present in both has the same status — and the delta is
+purely additive:
+
+```
+ONLY IN NEW:      cross_network_substrate_setup, cross_network_substrate_teardown
+ONLY IN BASELINE: (none)
+FLIPS:            (none)
+```
+
+Both new stages pass, on all five nodes. **There is no regression anywhere in this
+run against the best prior evidence.**
+
+Ledger-wide context, stated honestly: across 186 rows the pass count of 44 **ties**
+the all-time high rather than setting a new one — `livelab-1786908269-5510b726035e`
+(2026-08-16) also reached `passed=44 failed=0`, though from 59 planned stages with
+15 skips rather than 61 with 17. Attempt 4 matches that ceiling while covering two
+more stages. Overall `pass` remains 0-for-186; see §11.5 for why that is structural
+and not a defect.
+
+### 11.3 Historical failures that are now green
+
+Several stages carrying repeated undispositioned failure stubs passed here:
+
+| stage | prior evidence | attempt 4 |
+|---|---|---|
+| `traffic_test_matrix` | 6 null-patch stubs (`1784495489`, `1784497253`, `1784499545`, `1784501586`, `1784502404`, `1784503194`) | **pass** |
+| `live_managed_dns_validation` | 4 null-patch stubs (`1784546555`, `1784551333`, `1784553874`, `1784555471`) | **pass** |
+| `live_network_flap_validation` | 6 null-patch stubs, and QH-51's whole subject | **pass** |
+| `gossip_convergence_validation` | failed in `1787843764` (`gossip_accepted_total=0` on four nodes) | **pass** |
+| `exit_dns_failclosed_validation` | failed in `1787885499` (missing `dig` on lenovo) | **pass** |
+| `bootstrap_hosts` | failed in `1787849060`, `1787870225`, `1787884299`, `1787903378` | **pass** |
+
+These are dispositioned-and-verified outcomes, not luck: each had a recorded remedy
+in the triage ledger, and this run is the verification pass those remedies were
+waiting for. **No new triage stub was created — there were no failures to stub.**
+
+### 11.4 What the 20 merges gained, and what they did not
+
+**Now proven on hardware** (`877a0226`, clean tree), all green: `collect_pubkeys`,
+`membership_init`, `distribute_membership`, `anchor_validation`, `admin_issue`,
+`distribute_assignments`, `distribute_traversal`, `distribute_dns_zone`,
+`enforce_baseline_runtime`, `validate_baseline_runtime`, `security_audit_validation`,
+`dns_failclosed_validation`, `runtime_acls_validation`, `service_hardening_validation`,
+`key_custody_validation`, `mesh_status_validation`, `gossip_convergence_validation`,
+`authenticode_validation`, `ipv6_leak_validation`, `deploy_relay_service`,
+`relay_validation`, `traffic_test_matrix`, `role_switch_matrix`, `exit_handoff`,
+`active_exit`, `exit_dns_failclosed_validation`, `exit_nat_lifecycle_validation`,
+`exit_demotion_residue_validation`, `live_managed_dns_validation`,
+`live_network_flap_validation`, `live_reboot_recovery_validation`,
+`live_secrets_not_in_logs_validation`, `live_key_custody_validation`,
+`live_hello_limiter_flood_validation`.
+
+That covers the QH-52 firewalld unbind path (`exit_nat_lifecycle_validation`,
+`exit_demotion_residue_validation`, `exit_handoff` all green) and the
+helper IPC timeout pair (`enforce_baseline_runtime`, `runtime_acls_validation`,
+`service_hardening_validation` all green).
+
+**NOT proven, and this is the important caveat: the CN-3 scenario port gained no
+live evidence for its validators.** All eight ported scenarios skipped:
+
+```
+cross_network_direct_remote_exit      <- this stage requires the vxlan cross-network substrate
+cross_network_relay_remote_exit       <- (same)
+cross_network_traversal_adversarial   <- (same)
+cross_network_remote_exit_dns         <- (same)
+cross_network_remote_exit_soak        <- (same)
+cross_network_node_network_switch     <- (same)
+cross_network_failback_roaming        <- (same)
+cross_network_controller_switch       <- (same)
+cross_network_nat_matrix              <- requires a substrate that supports the NAT matrix
+```
+
+What CN-3 *did* gain is the scaffolding either side of them —
+`cross_network_substrate_setup` and `cross_network_substrate_teardown`, the two new
+stages, both green. The validators themselves need a vxlan substrate this
+single-network UTM topology does not provide. **CN-3's completion remains unproven
+on hardware.**
+
+### 11.5 The 17 skips are honest, and overall `pass` is structurally out of reach here
+
+Every skip carries an explicit declared reason, and all of them reduce to the
+topology lacking a role, not to anything failing:
+
+- **blind_exit role absent** (3): `blind_exit`, `blind_exit_dataplane_validation`, `live_lan_toggle_validation`
+- **no second client / `entry` / `aux` node** (4): `live_two_hop_validation`, `live_enrollment_restart_validation`, `live_anchor`, `extended_soak`
+- **not every platform assigned** (1): `live_mixed_topology_validation` (tri-OS only)
+- **vxlan substrate required** (9): the CN-3 block above
+- plus `chaos`, `not_run` (opt-in `--enable-chaos-suite`, never passed)
+
+**This is why the ledger has never recorded an overall `pass` in 186 rows.** A
+five-guest, single-network, Linux-only topology cannot assign a blind_exit, a second
+client, an `entry` hop, or a non-Linux platform, so those stages can only ever skip,
+and any run containing a skip grades `partial`. Overall `pass` is not a bar this
+topology can clear — it would need the tri-OS fleet plus a cross-network substrate.
+Judged on what it can actually run, this suite is **44 for 44**.
+
+### 11.6 Environment notes
+
+- **Disk is fixed.** 206 GiB free at launch, 205 GiB at completion — the run's own
+  footprint remains negligible. The §10.3 constraint (272 GB of per-worktree build
+  caches) was resolved by removing 18 finished worktrees' caches. This validation
+  worktree shares `target-livelab` and contributed nothing.
+- **The §12.3.1 MCP LAN false-negative and the stale `bin/rustynet-mcp-lab-state`
+  (§10, §9.6) are both still open.** Neither was re-tested; this run was launched
+  from the shell as before, and the guest probes were done over direct SSH.
+- No guest recovery was needed at any point. `discover_local_utm` reported
+  `unready=none` immediately.
+
+### 11.7 Next
+
+The Linux-only single-network ceiling has now been reached: 44/44 of what this
+topology can run, zero failures. Further coverage requires a different shape, not a
+re-run:
+
+1. **A vxlan cross-network substrate** to dispatch the nine skipped CN-3 stages —
+   the single largest block of unproven code on `main`.
+2. **A blind_exit node and a second client** to unlock the seven role-gated skips.
+3. **The tri-OS fleet** for `live_mixed_topology_validation`, which in turn gates the
+   nine chaos stages (see `NeverDispatchedLinuxStagesTriage_2026-08-27.md`).
+
+The launch gate is clear — no undispositioned stub blocks the next run.
