@@ -327,6 +327,61 @@ pub fn build_networksetup_dns_backup(
     })
 }
 
+/// Resolve one service's backup-baseline entry from its freshly captured
+/// current DNS (`captured`: `None` = `-getdnsservers` reported no servers).
+///
+/// This is the M1 capture guard against loopback residue poisoning the
+/// restore backup (MacosDnsFailclosedEnforcementGap_2026-08-28 §7): if the
+/// captured value is ALREADY the loopback posture M1 itself enforces, it is
+/// residue from a prior apply whose teardown never ran (possible when the
+/// startup-recovery guard was bypassed because scutil was unreadable).
+/// Recording loopback as the baseline would make any later rollback
+/// "restore" the strand instead of the operator's real DNS.
+///
+/// - Normal (non-loopback) captured state, including "no servers", is
+///   recorded unchanged — the pre-existing behavior.
+/// - Loopback residue WITH a readable prior backup: the prior document's
+///   entry for this service is the real pre-enforcement original, so it is
+///   preserved instead of overwritten with loopback.
+/// - Loopback residue WITHOUT a prior entry for this service: refuse
+///   loudly. There is no trustworthy original to fall back to, so the apply
+///   aborts and names the manual fix (`networksetup -setdnsservers <service>
+///   Empty`, or the operator's real DNS servers) — a silent loopback
+///   baseline would be a deferred strand, not a fix.
+///
+/// A prior backup document that is PRESENT but unreadable never reaches
+/// this function: the caller must fail closed on the read error before any
+/// baseline is built (an unverifiable document cannot vouch for an
+/// original).
+pub fn resolve_backup_baseline_entry(
+    service: &str,
+    captured: Option<Vec<String>>,
+    prior_backup: Option<&NetworksetupDnsBackup>,
+) -> Result<NetworksetupDnsBackupEntry, String> {
+    let captured_is_loopback_residue = captured
+        .as_ref()
+        .is_some_and(|servers| is_loopback_dns_server_list(servers));
+    if !captured_is_loopback_residue {
+        return Ok(NetworksetupDnsBackupEntry {
+            service: service.to_owned(),
+            servers: captured,
+        });
+    }
+    if let Some(prior_entry) = prior_backup.and_then(|backup| {
+        backup
+            .services
+            .iter()
+            .find(|entry| entry.service == service)
+    }) {
+        // The prior document is the only record of this service's real
+        // pre-enforcement DNS; keep it rather than overwrite with residue.
+        return Ok(prior_entry.clone());
+    }
+    Err(format!(
+        "networksetup DNS backup baseline refused for service {service:?}: its current DNS is the loopback resolver M1 enforces itself, which is residue from a prior apply whose teardown did not run, and no prior backup entry holds the real original. Fix manually before applying DNS protection: sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers {service:?} {NETWORKSETUP_EMPTY_DNS_KEYWORD} (or set the operator's real DNS servers), then retry"
+    ))
+}
+
 /// Serialize and persist the backup document. Writes are restricted to the
 /// owner (0600): the document reveals which resolvers the host used.
 pub fn write_networksetup_dns_backup(
@@ -765,6 +820,92 @@ Thunderbolt Bridge
     #[test]
     fn empty_backup_document_is_refused() {
         assert!(build_networksetup_dns_backup(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn backup_baseline_refuses_loopback_residue_without_prior_original() {
+        // Loopback residue and NO prior backup at all: refuse loudly, naming
+        // the service and the manual fix — a silent loopback baseline would
+        // defer the strand to rollback time.
+        let err = resolve_backup_baseline_entry("Wi-Fi", Some(vec!["127.0.0.1".to_owned()]), None)
+            .expect_err("loopback residue with no prior backup must refuse");
+        assert!(err.contains("Wi-Fi"));
+        assert!(err.contains("-setdnsservers"));
+        assert!(err.contains("Empty"));
+        // Residue with a prior backup that does not cover THIS service is the
+        // same no-trustworthy-original case.
+        let prior = build_networksetup_dns_backup(vec![NetworksetupDnsBackupEntry {
+            service: "Ethernet".to_owned(),
+            servers: Some(vec!["8.8.8.8".to_owned()]),
+        }])
+        .expect("valid prior backup");
+        assert!(
+            resolve_backup_baseline_entry("Wi-Fi", Some(vec!["::1".to_owned()]), Some(&prior))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn backup_baseline_preserves_prior_original_over_loopback_residue() {
+        // Loopback residue with a readable prior backup: the prior document's
+        // entry is the real pre-enforcement original and must be preserved,
+        // never overwritten with loopback.
+        let prior = build_networksetup_dns_backup(vec![
+            NetworksetupDnsBackupEntry {
+                service: "Wi-Fi".to_owned(),
+                servers: Some(vec!["8.8.8.8".to_owned(), "1.1.1.1".to_owned()]),
+            },
+            NetworksetupDnsBackupEntry {
+                service: "Ethernet".to_owned(),
+                servers: None,
+            },
+        ])
+        .expect("valid prior backup");
+        let resolved = resolve_backup_baseline_entry(
+            "Wi-Fi",
+            Some(vec!["127.0.0.1".to_owned()]),
+            Some(&prior),
+        )
+        .expect("prior original must be preserved");
+        assert_eq!(resolved.service, "Wi-Fi");
+        assert_eq!(
+            resolved.servers,
+            Some(vec!["8.8.8.8".to_owned(), "1.1.1.1".to_owned()])
+        );
+        // The None (no servers configured) original is preserved as None too.
+        let resolved_none = resolve_backup_baseline_entry(
+            "Ethernet",
+            Some(vec!["127.0.0.1".to_owned()]),
+            Some(&prior),
+        )
+        .expect("prior None original must be preserved");
+        assert_eq!(resolved_none.servers, None);
+    }
+
+    #[test]
+    fn backup_baseline_records_normal_captured_dns_unchanged() {
+        // Normal non-loopback current values (and the no-servers case) are
+        // recorded exactly as captured — the pre-existing behavior.
+        let resolved =
+            resolve_backup_baseline_entry("Wi-Fi", Some(vec!["8.8.8.8".to_owned()]), None)
+                .expect("normal capture must record");
+        assert_eq!(resolved.servers, Some(vec!["8.8.8.8".to_owned()]));
+        let resolved_none = resolve_backup_baseline_entry("Ethernet", None, None)
+            .expect("no-servers capture must record");
+        assert_eq!(resolved_none.servers, None);
+        // A mixed list containing one non-loopback entry is NOT pure loopback
+        // posture, so it is captured as-is (the apply is about to overwrite
+        // it wholesale with loopback anyway).
+        let resolved_mixed = resolve_backup_baseline_entry(
+            "Thunderbolt Bridge",
+            Some(vec!["127.0.0.1".to_owned(), "8.8.8.8".to_owned()]),
+            None,
+        )
+        .expect("mixed capture must record");
+        assert_eq!(
+            resolved_mixed.servers,
+            Some(vec!["127.0.0.1".to_owned(), "8.8.8.8".to_owned()])
+        );
     }
 
     #[test]
