@@ -165,9 +165,14 @@ failure was root-caused with its first three fixes landed (see the Windows secti
 * **macOS anchor is not green**: the posture gate is circular as written (`role.rs:68-70`), and the
   macOS-specific anchor validator set needs the `--anchor-platform macos` selector plus a full-suite
   run; the exit/blind_exit cells additionally need the membership adapter's owner-key path fixed.
-* **`userspace_shared_macos` may need the QH-51c/d fixes mirrored.** The session-rebuild and roaming
-  fixes landed in `userspace_shared`; macOS has its own variant. NOT checked — do this before
-  assuming macOS benefits from the QH-51 work. (Still unexamined as of 2026-08-28.)
+* ~~**`userspace_shared_macos` may need the QH-51c/d fixes mirrored.**~~ **CLOSED 2026-08-28 —
+  examined, no mirror needed.** The macOS variant is not a divergent copy of the fixed paths:
+  its `configure_peer`/`update_peer_endpoint`/worker loop delegate to the shared
+  `userspace_shared` engine (disposition + roam + keepalive/timers logic live there), the
+  transient-egress and worker-exit-cause fixes are already mirrored in
+  `userspace_shared_macos`' own socket/runtime, and the QH-51 no-churn tests exist in the
+  macOS runtime. Full verdicts + file:line evidence in the QH-51 ledger entry,
+  `QualityHardeningTodo_2026-07-25.md` (2026-08-28 subsection).
 * **QH-46's Windows analogue is unexamined.** firewalld is RHEL-specific, but the defect CLASS —
   a foreign filter at the same hook silently discarding traffic we authorised — has an obvious
   Windows counterpart in WFP filter weights. Nobody has looked. (The CP-4 triage did not examine
