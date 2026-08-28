@@ -197,6 +197,37 @@ const REPORT_SPECS: &[CrossNetworkReportSpec] = &[
     },
 ];
 
+/// The two cross-network suites that have no [`REPORT_SPECS`] entry, paired
+/// with the `environment` value their bash originals wrote.
+///
+/// Those two scripts emitted their reports from their own inline python rather
+/// than through this generator, so the schema validator has never covered them
+/// and [`collect_report_paths`] has never looked for their filenames. Porting
+/// them to Rust must not change that: adding specs would make every
+/// artifact-dir validation start demanding two reports it has never required,
+/// which is a scope change disguised as a tidy-up.
+///
+/// They are enumerated rather than the unknown-suite check simply being dropped,
+/// so a typo'd suite name is still a hard error. This is an allowlist, not a
+/// hole.
+const UNSPECCED_SUITES: &[(&str, &str)] = &[
+    (
+        "cross_network_node_network_switch",
+        "live_linux_cross_network_node_network_switch",
+    ),
+    (
+        "cross_network_controller_switch",
+        "live_linux_cross_network_controller_switch",
+    ),
+];
+
+fn unspecced_suite_environment(suite: &str) -> Option<&'static str> {
+    UNSPECCED_SUITES
+        .iter()
+        .find(|(name, _)| *name == suite)
+        .map(|(_, environment)| *environment)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateCrossNetworkRemoteExitReportConfig {
     pub suite: String,
@@ -2506,17 +2537,28 @@ fn write_markdown(path: &Path, body: &str) -> Result<(), String> {
 pub fn execute_ops_generate_cross_network_remote_exit_report(
     config: GenerateCrossNetworkRemoteExitReportConfig,
 ) -> Result<String, String> {
-    let spec = report_spec_by_suite(config.suite.as_str()).ok_or_else(|| {
+    let spec = report_spec_by_suite(config.suite.as_str());
+    let unspecced_environment = unspecced_suite_environment(config.suite.as_str());
+    if spec.is_none() && unspecced_environment.is_none() {
         let known = REPORT_SPECS
             .iter()
             .map(|entry| entry.suite)
+            .chain(UNSPECCED_SUITES.iter().map(|(name, _)| *name))
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
+        return Err(format!(
             "unknown suite {:?}; expected one of {known}",
             config.suite.as_str()
-        )
-    })?;
+        ));
+    }
+    // Held as owned strings so the two arms agree on type; the suite name is
+    // the config's own for an unspecced suite and the spec's canonical spelling
+    // otherwise, which is the same value with the whitespace already trimmed.
+    let suite = spec.map_or_else(
+        || config.suite.trim().to_owned(),
+        |spec| spec.suite.to_owned(),
+    );
+    let title = spec.map_or_else(|| suite.clone(), |spec| spec.title.to_owned());
 
     let status = config.status.trim().to_owned();
     if status != CHECK_PASS && status != CHECK_FAIL {
@@ -2552,7 +2594,11 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
 
     let check_overrides = parse_check_overrides(&config.check_overrides)?;
     let mut checks = Map::new();
-    for check in spec.required_checks {
+    // Seed the spec's required checks fail-closed first, so a caller that
+    // forgot one emits `fail` rather than omitting the field. An unspecced
+    // suite has no required set, so its report carries exactly the checks the
+    // scenario recorded — which is what its bash original wrote too.
+    for check in spec.map_or(&[][..], |spec| spec.required_checks) {
         checks.insert((*check).to_owned(), Value::String(CHECK_FAIL.to_owned()));
     }
     for (key, value) in check_overrides {
@@ -2608,8 +2654,14 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
     let mut payload = json!({
         "schema_version": SCHEMA_VERSION,
         "phase": PHASE_NAME,
-        "suite": spec.suite,
-        "environment": if config.environment.trim().is_empty() { "live_linux_skeleton".to_owned() } else { config.environment.trim().to_owned() },
+        "suite": suite,
+        "environment": if config.environment.trim().is_empty() {
+            // An unspecced suite falls back to the `environment` its bash
+            // original wrote rather than the generic skeleton value, because
+            // that string is the only place its report says which validator
+            // produced it.
+            unspecced_environment.unwrap_or("live_linux_skeleton").to_owned()
+        } else { config.environment.trim().to_owned() },
         "evidence_mode": EVIDENCE_MODE,
         "captured_at_unix": unix_now(),
         "git_commit": current_git_commit()?,
@@ -2637,7 +2689,7 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
     }
     if status == CHECK_FAIL {
         let failure_summary = if config.failure_summary.trim().is_empty() {
-            format!("{} is not implemented yet", spec.title)
+            format!("{title} is not implemented yet")
         } else {
             config.failure_summary.trim().to_owned()
         };
@@ -2646,9 +2698,14 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
         }
     }
 
-    let problems = validate_report_payload(&report_path, &payload, None, None);
-    if !problems.is_empty() {
-        return Err(problems.join("\n"));
+    // Only a specced suite can be validated: `validate_report_payload` resolves
+    // its rules from `REPORT_SPECS` by suite, and an unspecced one has none. Its
+    // bash original was likewise never schema-checked.
+    if spec.is_some() {
+        let problems = validate_report_payload(&report_path, &payload, None, None);
+        if !problems.is_empty() {
+            return Err(problems.join("\n"));
+        }
     }
 
     let rendered = serde_json::to_string_pretty(&payload)
@@ -2658,7 +2715,7 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
 
     Ok(format!(
         "cross-network report generated: suite={} status={} output={}",
-        spec.suite,
+        suite,
         status,
         report_path.display()
     ))

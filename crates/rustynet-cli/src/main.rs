@@ -24891,7 +24891,8 @@ mod tests {
             "--path-evidence-report".to_owned(),
             "artifacts/phase10/child_report.json".to_owned(),
             "--source-artifact".to_owned(),
-            "scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh".to_owned(),
+            "crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/scenario/mod.rs"
+                .to_owned(),
             "--source-artifact".to_owned(),
             "artifacts/phase10/some-extra-source.txt".to_owned(),
             "--check".to_owned(),

@@ -47,8 +47,6 @@ use zip::{CompressionMethod, ZipWriter};
 
 const DEFAULT_UTMCTL_PATH: &str = "/Applications/UTM.app/Contents/MacOS/utmctl";
 const DEFAULT_VM_LAB_INVENTORY_PATH: &str = "documents/operations/active/vm_lab_inventory.json";
-const DEFAULT_CROSS_NETWORK_FAILBACK_SCRIPT: &str =
-    "scripts/e2e/live_linux_cross_network_failback_roaming_test.sh";
 const DEFAULT_START_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SYNC_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 1800;
@@ -2581,10 +2579,6 @@ fn workspace_root_path() -> PathBuf {
 
 pub fn default_inventory_path() -> PathBuf {
     workspace_root_path().join(DEFAULT_VM_LAB_INVENTORY_PATH)
-}
-
-pub fn default_cross_network_failback_script_path() -> PathBuf {
-    workspace_root_path().join(DEFAULT_CROSS_NETWORK_FAILBACK_SCRIPT)
 }
 
 pub fn default_artifact_root() -> PathBuf {
@@ -29375,15 +29369,8 @@ pub fn execute_ops_vm_lab_run_suite(config: VmLabRunSuiteConfig) -> Result<Strin
         )
     })?;
 
-    let mut suite_command = build_suite_command(
-        suite_name.as_str(),
-        &topology,
-        inventory.as_slice(),
-        config.ssh_identity_file.as_path(),
-        config.nat_profile.as_deref(),
-        config.impairment_profile.as_deref(),
-        report_dir.as_path(),
-    )?;
+    let mut suite_command =
+        build_suite_command(suite_name.as_str(), &topology, inventory.as_slice())?;
     if config.dry_run {
         return Ok(suite_command.rendered);
     }
@@ -36971,20 +36958,25 @@ fn ensure_suite_topology_linux_only(
     }
 }
 
+/// Resolve a `vm-lab-run-suite` name to a command to run.
+///
+/// **Every suite name now errors.** CN-3 retired the last cross-network arm and
+/// W5.7 retired `full-live-lab`, so this function's only remaining job is to
+/// tell an operator where the suite went. The topology guard still runs first,
+/// because a Windows target is a different mistake from a retired suite and the
+/// operator should hear about it as such.
+///
+/// The signature keeps its `Result<SuiteCommand, …>` shape rather than
+/// collapsing to a bare error: `execute_ops_vm_lab_run_suite` is a stable CLI
+/// verb whose contract is unchanged, and folding the retirement into the caller
+/// would scatter the same message across it.
 fn build_suite_command(
     suite: &str,
     topology: &VmLabTopology,
     inventory: &[VmInventoryEntry],
-    ssh_identity_file: &Path,
-    nat_profile: Option<&str>,
-    impairment_profile: Option<&str>,
-    report_dir: &Path,
 ) -> Result<SuiteCommand, String> {
-    let nat_profile = nat_profile.unwrap_or("baseline_lan");
-    let impairment_profile = impairment_profile.unwrap_or("none");
     ensure_suite_topology_linux_only(suite, topology, inventory)?;
-    let mut command = Command::new("bash");
-    let rendered = match suite {
+    Err(match suite {
         "direct-remote-exit" => {
             // CN-3: this suite arm shelled straight to the bash validator,
             // independently of the orchestrator's own dispatch, so the same
@@ -37015,43 +37007,17 @@ fn build_suite_command(
             );
         }
         "failback-roaming" => {
-            let script = default_cross_network_failback_script_path();
-            let client = topology_role_node(topology, &["client"])?;
-            let exit = topology_role_node(topology, &["exit"])?;
-            let relay = topology_role_node(topology, &["relay", "entry"])?;
-            let report_path = report_dir.join("cross_network_failback_roaming_report.json");
-            let log_path = report_dir.join("cross_network_failback_roaming.log");
-            command
-                .arg(script.as_path())
-                .arg("--ssh-identity-file")
-                .arg(ssh_identity_file)
-                .arg("--client-host")
-                .arg(client.normalized_target.as_str())
-                .arg("--exit-host")
-                .arg(exit.normalized_target.as_str())
-                .arg("--relay-host")
-                .arg(relay.normalized_target.as_str())
-                .arg("--client-node-id")
-                .arg(client.node_id.as_str())
-                .arg("--exit-node-id")
-                .arg(exit.node_id.as_str())
-                .arg("--relay-node-id")
-                .arg(relay.node_id.as_str())
-                .arg("--client-network-id")
-                .arg(client.network_id.as_str())
-                .arg("--exit-network-id")
-                .arg(exit.network_id.as_str())
-                .arg("--relay-network-id")
-                .arg(relay.network_id.as_str())
-                .arg("--nat-profile")
-                .arg(nat_profile)
-                .arg("--impairment-profile")
-                .arg(impairment_profile)
-                .arg("--report-path")
-                .arg(report_path.as_path())
-                .arg("--log-path")
-                .arg(log_path.as_path());
-            render_command_for_display(&command)
+            // CN-3: retired alongside direct- and relay-remote-exit, and for
+            // the same reason — this arm shelled straight to the bash validator
+            // independently of the orchestrator's own dispatch, so one scenario
+            // had two entry points that could drift.
+            return Err(
+                "vm-lab-run-suite failback-roaming was retired with the bash \
+                 cross-network validator (CN-3); use `ops vm-lab-orchestrate-live-lab \
+                 --node <alias>:<role> ...`, which runs the ported \
+                 cross_network_failback_roaming stage in process"
+                    .to_owned(),
+            );
         }
         "full-live-lab" => {
             // W5.7: the full-live-lab suite arm drove the retired bash
@@ -37064,19 +37030,8 @@ fn build_suite_command(
                     .to_owned(),
             );
         }
-        _ => return Err(format!("unsupported vm-lab suite command: {suite}")),
-    };
-    Ok(SuiteCommand { command, rendered })
-}
-
-fn render_command_for_display(command: &Command) -> String {
-    let mut rendered = String::new();
-    rendered.push_str(command.get_program().to_string_lossy().as_ref());
-    for arg in command.get_args() {
-        rendered.push(' ');
-        rendered.push_str(shell_quote(arg.to_string_lossy().as_ref()).as_str());
-    }
-    rendered
+        _ => format!("unsupported vm-lab suite command: {suite}"),
+    })
 }
 
 fn execute_legacy_posix_bootstrap_phase_for_target(
@@ -43697,16 +43652,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             ]
         }))
         .expect("topology should parse");
-        let err = build_suite_command(
-            "direct-remote-exit",
-            &topology,
-            inventory.as_slice(),
-            Path::new("/Users/iwanteague/.ssh/rustynet_lab_ed25519"),
-            Some("baseline_lan"),
-            Some("none"),
-            Path::new("/tmp/vm-lab-report"),
-        )
-        .expect_err("the direct-remote-exit suite arm was retired by CN-3");
+        let err = build_suite_command("direct-remote-exit", &topology, inventory.as_slice())
+            .expect_err("the direct-remote-exit suite arm was retired by CN-3");
         // The retirement must be explicit and must say where the scenario went.
         // A bare "unsupported suite" would read as a typo to an operator who
         // has been running this command for months.
@@ -43777,16 +43724,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         }))
         .expect("topology should parse");
 
-        let err = build_suite_command(
-            "direct-remote-exit",
-            &topology,
-            inventory.as_slice(),
-            Path::new("/Users/iwanteague/.ssh/rustynet_lab_ed25519"),
-            Some("baseline_lan"),
-            Some("none"),
-            Path::new("/tmp/vm-lab-report"),
-        )
-        .expect_err("windows targets must be blocked from linux live-lab shell helpers");
+        let err = build_suite_command("direct-remote-exit", &topology, inventory.as_slice())
+            .expect_err("windows targets must be blocked from linux live-lab shell helpers");
 
         assert!(err.contains("blocked targets"));
         assert!(err.contains("platform=windows"));
