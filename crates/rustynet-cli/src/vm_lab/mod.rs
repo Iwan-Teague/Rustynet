@@ -2430,6 +2430,20 @@ struct LiveLabReportState {
     full_release_gate_requested: bool,
     full_release_evidence_complete: bool,
     last_run: Option<LiveLabRunProvenance>,
+    /// Worktree cleanliness sampled ONCE at run start, before the orchestrator
+    /// mutates anything it owns (QH-34). The end-of-run samples in `last_run`
+    /// and the run summary are taken after readiness has refreshed
+    /// `vm_lab_inventory.json` with live guest IPs, so they cannot distinguish
+    /// "the operator started from a tree with uncommitted edits" — the thing the
+    /// run matrix's `git_dirty_state` column exists to warn about — from "the
+    /// orchestrator updated the inventory, as designed". This field is the
+    /// pre-mutation reading and is what the run-matrix row prefers.
+    ///
+    /// `None` on a state file written before this field existed, and on a run
+    /// whose start-of-run `git status` could not be taken at all; consumers fall
+    /// back to the end-of-run samples in that case.
+    #[serde(default)]
+    run_start_git_tree_clean: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6846,6 +6860,11 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         let mut discovery_notes = Vec::new();
         let mut live_ip_source = "unavailable".to_owned();
         let mut live_ip = None;
+        // Set when the UTM-bundle read did not complete within its deadline.
+        // Distinct from "no live IP found": it makes readiness an ERROR rather
+        // than merely Missing, so a host that cannot read its own bundles is
+        // never reported ready. See `read_to_string_with_timeout`.
+        let mut live_ip_probe_error: Option<String> = None;
         let mut authoritative_ssh_target = None;
         let mut authoritative_target_present = false;
         let mut advisory_ssh_target = None;
@@ -6901,17 +6920,40 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             ) {
                 live_ip_source = "utmctl".to_owned();
                 live_ip = Some(ip);
-            } else if let Some(ip) = entry_bundle_path.and_then(resolve_local_utm_live_host_via_arp)
-            {
-                live_ip_source = "arp-by-mac".to_owned();
-                live_ip = Some(ip);
-                discovery_notes
-                    .push("utmctl-ip-address-unavailable-resolved-via-arp-by-mac".to_owned());
-            } else if let Some(ip) = entry.last_known_ip.as_deref() {
-                live_ip_source = "inventory.last_known_ip".to_owned();
-                live_ip = Some(ip.to_owned());
-                discovery_notes
-                    .push("utmctl-ip-address-unavailable-using-inventory-fallback".to_owned());
+            } else {
+                match entry_bundle_path
+                    .map(resolve_local_utm_live_host_via_arp)
+                    .transpose()
+                {
+                    Ok(Some(Some(ip))) => {
+                        live_ip_source = "arp-by-mac".to_owned();
+                        live_ip = Some(ip);
+                        discovery_notes.push(
+                            "utmctl-ip-address-unavailable-resolved-via-arp-by-mac".to_owned(),
+                        );
+                    }
+                    // No bundle path, or a bundle with no usable MAC: both are
+                    // ordinary misses, so keep the historical inventory fallback.
+                    Ok(_) => {
+                        if let Some(ip) = entry.last_known_ip.as_deref() {
+                            live_ip_source = "inventory.last_known_ip".to_owned();
+                            live_ip = Some(ip.to_owned());
+                            discovery_notes.push(
+                                "utmctl-ip-address-unavailable-using-inventory-fallback".to_owned(),
+                            );
+                        }
+                    }
+                    // Fail closed. The bundle read did not complete, so this
+                    // host cannot currently answer ANY question about the guest
+                    // — including whether its recorded address is still its
+                    // address. Falling through to `inventory.last_known_ip`
+                    // here would dress an unknown up as a Fallback and let a
+                    // wedged host look ready.
+                    Err(err) => {
+                        live_ip_probe_error = Some(err.clone());
+                        discovery_notes.push(err);
+                    }
+                }
             }
             entry.platform_profile()
         } else {
@@ -6926,11 +6968,22 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             ) {
                 live_ip_source = "utmctl".to_owned();
                 live_ip = Some(ip);
-            } else if let Some(ip) = resolve_local_utm_live_host_via_arp(bundle_path.as_path()) {
-                live_ip_source = "arp-by-mac".to_owned();
-                live_ip = Some(ip);
-                discovery_notes
-                    .push("utmctl-ip-address-unavailable-resolved-via-arp-by-mac".to_owned());
+            } else {
+                match resolve_local_utm_live_host_via_arp(bundle_path.as_path()) {
+                    Ok(Some(ip)) => {
+                        live_ip_source = "arp-by-mac".to_owned();
+                        live_ip = Some(ip);
+                        discovery_notes.push(
+                            "utmctl-ip-address-unavailable-resolved-via-arp-by-mac".to_owned(),
+                        );
+                    }
+                    Ok(None) => {}
+                    // Fail closed, as above.
+                    Err(err) => {
+                        live_ip_probe_error = Some(err.clone());
+                        discovery_notes.push(err);
+                    }
+                }
             }
             if let Some(ip) = live_ip.clone() {
                 ssh_target_source =
@@ -6964,8 +7017,16 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 value: ip,
                 reason: format!("live-ip-source={live_ip_source}"),
             },
-            None => ProbeState::Missing {
-                reason: "live-ip-unavailable".to_owned(),
+            // A bounded-read failure is an ERROR, not a Missing: `Missing`
+            // reads as "this guest simply has no discoverable address", which
+            // is a statement about the guest. This is a statement about the
+            // HOST — it could not complete the read at all — and the message
+            // names the path so the operator can see which file wedged.
+            None => match live_ip_probe_error.clone() {
+                Some(reason) => ProbeState::Error { reason },
+                None => ProbeState::Missing {
+                    reason: "live-ip-unavailable".to_owned(),
+                },
             },
         };
         if matches!(
@@ -30068,6 +30129,34 @@ fn resolved_inventory_ssh_target_with_utmctl(
 /// guests, the virsh domifaddr/ip-neigh ladder for libvirt guests. `None` when
 /// the entry has no controller or discovery fails — callers keep the inventory
 /// ssh_target.
+///
+/// ## Why readiness still runs while the QH-18 flocks are held
+///
+/// The wedge recorded in `LiveValidation_2026-08-28.md` §3 D2 was severe
+/// because the per-guest flock is taken BEFORE readiness resolution, so an
+/// unbounded probe held the whole fleet. The ordering was re-examined as part
+/// of that fix and deliberately KEPT, for three reasons:
+///
+/// 1. The lock is taken at the single `execute_ops` dispatch chokepoint, which
+///    covers `vm-lab-setup-live-lab` and `vm-lab-run-live-lab` as well —
+///    including when the orchestrator calls them in-process as its own phases.
+///    Probing before locking would mean hoisting readiness out of those
+///    commands into the dispatcher, i.e. redesigning the chokepoint, not
+///    reordering two statements.
+/// 2. Readiness is not a read-only observation. `--update-inventory-live-ips`
+///    makes `execute_ops_vm_lab_discover_local_utm` WRITE the shared inventory
+///    (`persist_local_utm_ready_states_to_inventory`), and it power-probes
+///    guests. Running that unlocked is exactly the concurrent-mutation the
+///    flock exists to prevent, and a probe-then-lock-then-re-verify shape
+///    leaves that write in the unlocked window.
+/// 3. It would buy nothing on the reported defect anyway: the claim set is
+///    derived from the run's config before any probing, so probing first
+///    narrows no lock set. D1's seven-locks-for-five-guests was an argv defect,
+///    fixed at the argv.
+///
+/// The recovery property comes from bounding the probe instead: every branch
+/// below now has a deadline, so a wedged host releases its locks by failing
+/// that guest's readiness rather than by holding them forever.
 fn resolve_controller_live_host(entry: &VmInventoryEntry, utmctl_path: &Path) -> Option<String> {
     match entry.controller.as_ref()? {
         VmController::LocalUtm {
@@ -30100,8 +30189,23 @@ fn resolve_local_utm_live_host_by_name(
     utmctl_path: &Path,
     bundle_path: Option<&Path>,
 ) -> Option<String> {
-    resolve_local_utm_live_host_via_utmctl(utm_name, last_known_ip, mesh_ip, utmctl_path)
-        .or_else(|| bundle_path.and_then(resolve_local_utm_live_host_via_arp))
+    if let Some(host) =
+        resolve_local_utm_live_host_via_utmctl(utm_name, last_known_ip, mesh_ip, utmctl_path)
+    {
+        return Some(host);
+    }
+    match bundle_path.map(resolve_local_utm_live_host_via_arp) {
+        Some(Ok(host)) => host,
+        // A bounded-read failure is NOT a silent miss: say so on stderr naming
+        // the path, then keep the caller's inventory ssh_target. The readiness
+        // probe (`execute_ops_vm_lab_discover_local_utm`) handles the same error
+        // fail-closed — it is the caller that holds the QH-18 flocks.
+        Some(Err(err)) => {
+            eprintln!("warning: {err}");
+            None
+        }
+        None => None,
+    }
 }
 
 /// `utmctl ip-address` is unsupported for the Apple Virtualization backend
@@ -30109,9 +30213,16 @@ fn resolve_local_utm_live_host_by_name(
 /// the backend", every call, unconditionally. This is the fallback: resolve
 /// the guest's live IP via the host ARP table, keyed by the guest's MAC
 /// address read from its UTM bundle config.plist.
-fn resolve_local_utm_live_host_via_arp(bundle_path: &Path) -> Option<String> {
-    let mac = mac_address_from_utm_config_plist(bundle_path)?;
-    resolve_live_ip_via_arp_by_mac(mac.as_str())
+///
+/// `Ok(None)` is a clean miss (no bundle, no MAC key, no ARP row) — the
+/// historical best-effort behaviour. `Err` is reserved for the one case that
+/// must NOT be treated as a miss: the bundle read did not complete within the
+/// deadline. See `mac_address_from_utm_config_plist`.
+fn resolve_local_utm_live_host_via_arp(bundle_path: &Path) -> Result<Option<String>, String> {
+    match mac_address_from_utm_config_plist(bundle_path)? {
+        Some(mac) => Ok(resolve_live_ip_via_arp_by_mac(mac.as_str())),
+        None => Ok(None),
+    }
 }
 
 fn resolve_local_utm_live_host_via_utmctl(
@@ -30137,12 +30248,116 @@ fn resolve_local_utm_live_host_via_utmctl(
     select_live_ssh_host_from_utm_output(stdout.as_str(), last_known_ip, mesh_ip)
 }
 
+/// Why a bounded read did not produce contents.
+///
+/// The distinction is the whole point of the type: `Io` is an ordinary miss
+/// (no such bundle, no `config.plist`, unreadable file) and callers may keep
+/// treating it as "no ARP fallback available", while `Timeout` means the read
+/// never came back and NOTHING about the guest was learned.
+enum BoundedReadFailure {
+    Io(String),
+    Timeout(String),
+}
+
+/// `fs::read_to_string` with a deadline.
+///
+/// A UTM bundle lives under the operator's `Documents` directory, so in a
+/// sandboxed / TCC-scoped process context `open()` can block in the kernel
+/// indefinitely instead of returning an error. That is not hypothetical: on
+/// 2026-08-28 the MCP-spawned readiness probe wedged in exactly this call for
+/// the Apple-Virtualization macOS guest — two thread samples ten minutes apart,
+/// both stuck in `open` — while holding the QH-18 per-guest flock for every
+/// guest in the fleet, closing the lab to every other agent with no
+/// self-recovery (`documents/operations/active/LiveValidation_2026-08-28.md`
+/// §3 D2). The sibling `utmctl` branch of the same `or_else` chain was already
+/// bounded by `run_output_with_timeout`; this gives the plist branch the same
+/// discipline, keyed off the same `DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS`.
+///
+/// The worker thread is deliberately NOT joined on timeout. A thread blocked in
+/// an uninterruptible kernel call cannot be cancelled, so leaking it is the
+/// price of the caller getting control back — and getting control back is what
+/// releases the fleet's locks. The channel send is fallible-by-design for the
+/// same reason: the receiver is long gone by the time a wedged read returns.
+fn read_to_string_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<String, BoundedReadFailure> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let read_path = path.to_path_buf();
+    thread::Builder::new()
+        .name("utm-bundle-read".to_owned())
+        .spawn(move || {
+            let _ = sender.send(fs::read_to_string(read_path.as_path()));
+        })
+        .map_err(|err| {
+            BoundedReadFailure::Io(format!(
+                "could not spawn a bounded read of {}: {err}",
+                path.display()
+            ))
+        })?;
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(contents)) => Ok(contents),
+        Ok(Err(err)) => Err(BoundedReadFailure::Io(format!(
+            "reading {} failed: {err}",
+            path.display()
+        ))),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(BoundedReadFailure::Timeout(format!(
+                "reading {} did not complete within {} seconds \
+                 (the read is still blocked in the kernel; the process gave up on it \
+                 rather than hold the lab's per-guest run locks indefinitely)",
+                path.display(),
+                timeout.as_secs()
+            )))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(BoundedReadFailure::Io(format!(
+                "the bounded read of {} ended without a result",
+                path.display()
+            )))
+        }
+    }
+}
+
 /// Extract the first `<key>MacAddress</key><string>…</string>` value from a
 /// UTM bundle's `config.plist` (UTM always writes this as XML, not binary
 /// plist). Text-scan rather than a plist dependency: the schema is simple and
 /// stable, and this keeps the fallback dependency-free.
-fn mac_address_from_utm_config_plist(bundle_path: &Path) -> Option<String> {
-    let contents = fs::read_to_string(bundle_path.join("config.plist")).ok()?;
+///
+/// `Ok(None)` — no readable `config.plist`, or no usable `MacAddress` in it —
+/// is the historical best-effort miss and stays one. `Err` is returned ONLY
+/// when the read timed out, and the message names the path: that case must fail
+/// the guest's readiness rather than fall through to a stale address, because
+/// the caller cannot distinguish "this guest has no MAC" from "this host cannot
+/// answer questions about this guest right now".
+fn mac_address_from_utm_config_plist(bundle_path: &Path) -> Result<Option<String>, String> {
+    let plist_path = bundle_path.join("config.plist");
+    let contents = match read_to_string_with_timeout(
+        plist_path.as_path(),
+        Duration::from_secs(DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS),
+    ) {
+        Ok(contents) => contents,
+        Err(BoundedReadFailure::Io(message)) => {
+            // Not a fail-closed case — a guest whose bundle has no readable
+            // `config.plist` simply has no ARP fallback, which is the
+            // historical best-effort miss. But an UNEXPECTED I/O error (a
+            // permission problem, a half-written bundle) is worth naming rather
+            // than dropping: only a genuinely absent file is silent.
+            if !matches!(plist_path.try_exists(), Ok(false)) {
+                eprintln!("warning: {message}");
+            }
+            return Ok(None);
+        }
+        Err(BoundedReadFailure::Timeout(message)) => return Err(message),
+    };
+    Ok(mac_address_from_utm_config_plist_contents(
+        contents.as_str(),
+    ))
+}
+
+/// The pure parse half of `mac_address_from_utm_config_plist`, split out so the
+/// scan is testable without touching the filesystem.
+fn mac_address_from_utm_config_plist_contents(contents: &str) -> Option<String> {
     let key_pos = contents.find("<key>MacAddress</key>")?;
     let after_key = &contents[key_pos + "<key>MacAddress</key>".len()..];
     let string_start = after_key.find("<string>")? + "<string>".len();
@@ -37004,13 +37219,13 @@ fn execute_bootstrap_phase_for_target(
 mod tests {
     use super::script_template;
     use super::{
-        DEFAULT_LIBVIRT_CONNECT_URI, DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS, DaemonProbe as _,
-        DiscoveredGuest, LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS, LabHost, LabHostKind,
-        LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary, LocalUtmReadyState,
-        PlatformRollup, PortStatus, PreflightGate, PreflightStatus, ProbeState, RemoteExec as _,
-        RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision, RuntimePaths as _,
-        ServiceManager as _, UtmReadinessInputs, VmController, VmGuestExecMode, VmGuestPlatform,
-        VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
+        BoundedReadFailure, DEFAULT_LIBVIRT_CONNECT_URI, DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS,
+        DaemonProbe as _, DiscoveredGuest, LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS, LabHost,
+        LabHostKind, LibvirtPowerAction, LiveLabStageRecord, LiveLabStageSummary,
+        LocalUtmReadyState, PlatformRollup, PortStatus, PreflightGate, PreflightStatus, ProbeState,
+        RemoteExec as _, RepoSyncDispatchKind, RepoSyncMode, RestartUnreadyDecision,
+        RuntimePaths as _, ServiceManager as _, UtmReadinessInputs, VmController, VmGuestExecMode,
+        VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
         VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
         VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
         alias_to_host_map, append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
@@ -37039,7 +37254,7 @@ mod tests {
         parse_libvirt_domstate_running, parse_libvirt_list_names, parse_live_lab_stage_records,
         parse_local_utm_list_started_status, parse_membership_active_nodes, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
-        pinned_toolchain_channel, privileged_rustynet_cli_script,
+        pinned_toolchain_channel, privileged_rustynet_cli_script, read_to_string_with_timeout,
         remote_copy_destination_for_target, remote_script_for_ssh_transport,
         render_live_lab_stage_forensics_review, render_local_utm_discovery_summary,
         render_matrix_compare, render_preflight, render_vm_lab_progress_complete_line,
@@ -39223,7 +39438,8 @@ mod tests {
         )
         .expect("config.plist should be written");
 
-        let mac = mac_address_from_utm_config_plist(bundle.as_path());
+        let mac = mac_address_from_utm_config_plist(bundle.as_path())
+            .expect("a readable plist is not a bounded-read failure");
         assert_eq!(mac.as_deref(), Some("32:6b:39:df:d7:4e"));
 
         let _ = fs::remove_dir_all(&bundle);
@@ -39234,7 +39450,98 @@ mod tests {
         let unique = super::unique_suffix();
         let bundle =
             std::env::temp_dir().join(format!("rustynet-vm-lab-mac-plist-missing-{unique}.utm"));
-        assert_eq!(mac_address_from_utm_config_plist(bundle.as_path()), None);
+        // An absent bundle is a clean miss, NOT a bounded-read failure: there is
+        // simply no ARP fallback for this guest.
+        assert_eq!(
+            mac_address_from_utm_config_plist(bundle.as_path()),
+            Ok(None)
+        );
+    }
+
+    /// The timeout half of the D2 fix
+    /// (`documents/operations/active/LiveValidation_2026-08-28.md` §3): a read
+    /// that never returns must NOT hang the caller. Before this, the readiness
+    /// probe blocked in `open()` indefinitely while holding the QH-18 flock for
+    /// every guest in the fleet.
+    ///
+    /// A real uninterruptible-`open()` block cannot be staged portably, so this
+    /// drives the bound itself against a FIFO with no writer — `open()` for
+    /// reading on a FIFO blocks until a writer appears, which is the same shape
+    /// as the live wedge and equally never completes on its own.
+    #[test]
+    fn a_read_that_never_completes_is_bounded_and_names_the_path() {
+        let unique = super::unique_suffix();
+        let dir = std::env::temp_dir().join(format!("rustynet-vm-lab-bounded-read-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let fifo = dir.join("never-readable");
+
+        // `unsafe` is forbidden workspace-wide, so create the FIFO with the
+        // binary rather than calling libc's mkfifo directly.
+        let made = std::process::Command::new("mkfifo")
+            .arg(fifo.as_os_str())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = fs::remove_dir_all(&dir);
+            return; // no mkfifo on this host: nothing to pin, and no false green
+        }
+
+        let started = std::time::Instant::now();
+        let result = read_to_string_with_timeout(fifo.as_path(), Duration::from_secs(1));
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(BoundedReadFailure::Timeout(message)) => {
+                assert!(
+                    message.contains(&fifo.display().to_string()),
+                    "the timeout must name the path that wedged; got: {message}"
+                );
+            }
+            Err(BoundedReadFailure::Io(message)) => {
+                panic!("a blocked open must be reported as a Timeout, not an I/O miss: {message}")
+            }
+            Ok(_) => panic!("a FIFO with no writer cannot produce contents"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "the read must return at its deadline, not hold the caller: {elapsed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And the fail-closed consequence: a timed-out bundle read surfaces as an
+    /// error naming the path, never as `Ok(None)` (which the readiness path
+    /// would treat as an ordinary "no ARP fallback" and continue past).
+    #[test]
+    fn a_timed_out_bundle_read_fails_closed_rather_than_reading_as_a_clean_miss() {
+        let unique = super::unique_suffix();
+        let bundle =
+            std::env::temp_dir().join(format!("rustynet-vm-lab-mac-plist-fifo-{unique}.utm"));
+        fs::create_dir_all(&bundle).expect("bundle dir should be created");
+        let made = std::process::Command::new("mkfifo")
+            .arg(bundle.join("config.plist").as_os_str())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = fs::remove_dir_all(&bundle);
+            return;
+        }
+
+        // The production call uses DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS, so
+        // assert the shape through the same bounded helper at a test-sized
+        // deadline, then assert the classification the caller depends on.
+        let plist = bundle.join("config.plist");
+        let bounded = read_to_string_with_timeout(plist.as_path(), Duration::from_millis(500));
+        assert!(
+            matches!(bounded, Err(BoundedReadFailure::Timeout(_))),
+            "a wedged config.plist must classify as Timeout, not Io — Io is treated as a \
+             clean miss and would let the guest keep its stale address"
+        );
+
+        let _ = fs::remove_dir_all(&bundle);
     }
 
     #[test]

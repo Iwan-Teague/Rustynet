@@ -4208,6 +4208,43 @@ fn has_role_platform_selector(args: Option<&Value>) -> bool {
         .any(|k| arg_str(args, k).is_some())
 }
 
+/// Which `--windows-vm` / `--macos-vm` aliases an orchestrate run actually needs.
+///
+/// Auto-topology exists so a caller that names NO topology still gets 3-OS
+/// coverage: the Windows and macOS aliases are filled from the inventory. It
+/// used to be applied unconditionally, which is the defect recorded as D1 in
+/// `documents/operations/active/LiveValidation_2026-08-28.md`: a request naming
+/// five Linux guests in `nodes` still rendered `--windows-vm windows-utm-1
+/// --macos-vm macos-utm-1`, so the launch claimed **seven** QH-18 guest flocks
+/// for a five-node Linux run and readiness then probed the Apple-Virtualization
+/// macOS guest nobody had asked for. The identical run launched from a shell —
+/// which passes only `--node` flags — claimed five and advanced past discovery.
+///
+/// So an explicit `nodes` topology is the complete guest list, exactly as it is
+/// on the shell path: auto-topology does not extend it. An explicitly passed
+/// `windows_vm` / `macos_vm` alongside `nodes` is rejected before this point (a
+/// silent drop would hide a topology the caller asked for), so the `(None, None)`
+/// arm below is also the fail-safe for that case rather than a silent drop.
+fn auto_topology_vm_aliases(
+    explicit_nodes: &[String],
+    windows_vm: Option<&str>,
+    macos_vm: Option<&str>,
+    auto_topology: bool,
+    inventory_windows: impl FnOnce() -> Option<String>,
+    inventory_macos: impl FnOnce() -> Option<String>,
+) -> (Option<String>, Option<String>) {
+    if !explicit_nodes.is_empty() {
+        return (None, None);
+    }
+    let win = windows_vm
+        .map(String::from)
+        .or_else(|| auto_topology.then(inventory_windows).flatten());
+    let mac = macos_vm
+        .map(String::from)
+        .or_else(|| auto_topology.then(inventory_macos).flatten());
+    (win, mac)
+}
+
 const OVERNIGHT_PLAYBOOK: &str = r#"# Overnight live-lab autonomous loop
 
 Drive: run live lab (Windows + macOS + Linux) → catch bugs → patch → re-verify,
@@ -4813,9 +4850,9 @@ impl McpServer for LabStateServer {
                     json!({
                         "mode": json_schema_string("orchestrate | run | setup (default: orchestrate)"),
                         "report_dir": json_schema_string("Optional report dir (default: a fresh state/live-lab-<job_id>)"),
-                        "auto_topology": json_schema_boolean("orchestrate: if true (default) and windows_vm/macos_vm are not given, auto-fill them from the inventory so the run covers all 3 OSes. Set false for Linux-only."),
-                        "windows_vm": json_schema_string("orchestrate: Windows VM alias (overrides auto_topology)"),
-                        "macos_vm": json_schema_string("orchestrate: macOS VM alias (overrides auto_topology)"),
+                        "auto_topology": json_schema_boolean("orchestrate: if true (default), 'nodes' is NOT set, and windows_vm/macos_vm are not given, auto-fill them from the inventory so the run covers all 3 OSes. Set false for Linux-only. Ignored when 'nodes' is set — an explicit --node topology is the complete guest list, and extending it would claim run locks and plan stages for guests the run does not use."),
+                        "windows_vm": json_schema_string("orchestrate: Windows VM alias (overrides auto_topology). Cannot be combined with 'nodes' — put the guest in nodes as \"alias:role\" instead."),
+                        "macos_vm": json_schema_string("orchestrate: macOS VM alias (overrides auto_topology). Cannot be combined with 'nodes' — put the guest in nodes as \"alias:role\" instead."),
                         "nodes": json_schema_array_string("orchestrate: role assignments 'alias:role'"),
                         "rebuild_nodes": json_schema_array_string("orchestrate: redeploy code to ONLY these node aliases (others keep their daemon+state); the fast re-verify after a per-node code patch. Requires nodes to be set. Pair with skip_soak."),
                         "profile": json_schema_string("run: profile env file (required for mode=run)"),
@@ -6282,6 +6319,27 @@ impl LabStateServer {
                      Pass the macOS node's role directly in nodes (e.g. \"macos-utm-1:exit\").",
                 );
             }
+            // Same fail-closed rule for the raw guest aliases. Under the --node
+            // engine `--windows-vm` / `--macos-vm` assign no role, but they are
+            // NOT inert: `run_exclusion::guest_refs_for_orchestrate` claims a
+            // QH-18 flock for each, and `orchestrator::evidence` reads them as
+            // `wants_windows` / `wants_macos` and plans stages for an OS the
+            // topology does not contain. Dropping them silently would hide a
+            // topology the caller asked for; emitting them corrupts the run.
+            for (key, example) in [
+                ("windows_vm", "windows-utm-1:client"),
+                ("macos_vm", "macos-utm-1:exit"),
+            ] {
+                if arg_str(args, key).is_some() {
+                    return tool_error(&format!(
+                        "'{key}' cannot be combined with 'nodes': nodes routes to the Rust \
+                         --node engine, which takes every guest and its role from the \
+                         alias:role list. A bare '{key}' would claim that guest's run lock \
+                         and plan stages for its OS without ever assigning it a role. Add it \
+                         to nodes instead (e.g. \"{example}\"), or omit nodes."
+                    ));
+                }
+            }
         }
 
         let job_id = self.new_job_id();
@@ -6356,22 +6414,25 @@ impl LabStateServer {
                 {
                     cli.extend(["--network-profile".into(), network_profile.to_string()]);
                 }
+                let explicit_nodes = string_array(args, "nodes");
+
                 // Windows/macOS: explicit arg wins; otherwise auto-topology
-                // (default on) fills them from the inventory.
+                // (default on) fills them from the inventory — but ONLY when the
+                // caller did not name an explicit `--node` topology. See
+                // `auto_topology_vm_aliases` for why that qualifier is
+                // load-bearing.
                 let auto = args
                     .and_then(|a| a.get("auto_topology"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let win = arg_str(args, "windows_vm").map(String::from).or_else(|| {
-                    auto.then(|| self.inventory_alias_for_platform("windows"))
-                        .flatten()
-                });
-                let mac = arg_str(args, "macos_vm").map(String::from).or_else(|| {
-                    auto.then(|| self.inventory_alias_for_platform("macos"))
-                        .flatten()
-                });
-
-                let explicit_nodes = string_array(args, "nodes");
+                let (win, mac) = auto_topology_vm_aliases(
+                    &explicit_nodes,
+                    arg_str(args, "windows_vm"),
+                    arg_str(args, "macos_vm"),
+                    auto,
+                    || self.inventory_alias_for_platform("windows"),
+                    || self.inventory_alias_for_platform("macos"),
+                );
                 // Role-platform selectors (Bucket 5) ELECT an OS into a role so the
                 // focused mac/win cell runs live instead of skipping. Bash is slated
                 // for removal once Rust parity evidence is complete, so — unlike the
@@ -10184,6 +10245,132 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             Some("mac-1")
         );
         assert_eq!(srv.inventory_alias_for_platform("linux"), None);
+    }
+
+    /// The negative test for D1 (`LiveValidation_2026-08-28.md` §3): a
+    /// Linux-only `nodes` topology must render an argv with NO `--windows-vm`
+    /// and NO `--macos-vm`, even though the inventory can resolve both aliases
+    /// and auto-topology is on by default. Seven QH-18 flocks were taken for a
+    /// five-node Linux run because this held the other way.
+    #[test]
+    fn a_linux_only_node_topology_renders_no_windows_or_macos_vm_flags() {
+        let nodes: Vec<String> = [
+            "ubuntu-utm-1:client",
+            "rocky-utm-1:admin",
+            "debian-headless-4:exit",
+            "fedora-utm-1:relay",
+            "debian-headless-2:anchor",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        let (win, mac) = auto_topology_vm_aliases(
+            &nodes,
+            None,
+            None,
+            true,
+            || Some("windows-utm-1".to_owned()),
+            || Some("macos-utm-1".to_owned()),
+        );
+        assert_eq!(
+            win, None,
+            "auto-topology must not extend an explicit --node topology"
+        );
+        assert_eq!(
+            mac, None,
+            "auto-topology must not extend an explicit --node topology"
+        );
+
+        // Render the flags exactly as the orchestrate arm does, and assert the
+        // argv itself — the lock set and the planned-stage set are both derived
+        // from the argv, not from the option pair above.
+        let mut argv: Vec<String> = Vec::new();
+        if let Some(w) = &win {
+            argv.extend(["--windows-vm".to_owned(), w.clone()]);
+        }
+        if let Some(m) = &mac {
+            argv.extend(["--macos-vm".to_owned(), m.clone()]);
+        }
+        for n in &nodes {
+            argv.extend(["--node".to_owned(), n.clone()]);
+        }
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a == "--windows-vm" || a == "--macos-vm"),
+            "a Linux-only request must not render mac/windows VM flags; got {argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--node").count(),
+            5,
+            "exactly the five requested guests: {argv:?}"
+        );
+    }
+
+    /// The positive half: with no `nodes`, auto-topology still fills both from
+    /// the inventory, so the fix narrows nothing for a 3-OS coverage run.
+    #[test]
+    fn auto_topology_still_fills_both_when_no_nodes_are_given() {
+        let (win, mac) = auto_topology_vm_aliases(
+            &[],
+            None,
+            None,
+            true,
+            || Some("windows-utm-1".to_owned()),
+            || Some("macos-utm-1".to_owned()),
+        );
+        assert_eq!(win.as_deref(), Some("windows-utm-1"));
+        assert_eq!(mac.as_deref(), Some("macos-utm-1"));
+
+        let (off_win, off_mac) = auto_topology_vm_aliases(
+            &[],
+            None,
+            None,
+            false,
+            || Some("windows-utm-1".to_owned()),
+            || Some("macos-utm-1".to_owned()),
+        );
+        assert_eq!(off_win, None, "auto_topology=false must stay Linux-only");
+        assert_eq!(off_mac, None, "auto_topology=false must stay Linux-only");
+
+        let (explicit_win, explicit_mac) = auto_topology_vm_aliases(
+            &[],
+            Some("win-override"),
+            Some("mac-override"),
+            true,
+            || Some("windows-utm-1".to_owned()),
+            || Some("macos-utm-1".to_owned()),
+        );
+        assert_eq!(explicit_win.as_deref(), Some("win-override"));
+        assert_eq!(explicit_mac.as_deref(), Some("mac-override"));
+    }
+
+    /// An explicit `windows_vm`/`macos_vm` next to `nodes` is REFUSED, not
+    /// silently dropped: under the --node engine it assigns no role but still
+    /// claims that guest's QH-18 flock and flips `wants_windows`/`wants_macos`.
+    #[test]
+    fn explicit_windows_or_macos_vm_next_to_nodes_is_refused() {
+        let tmp = TempRoot::new("mcp-vmflags");
+        let srv = test_server(&tmp);
+
+        for (key, alias) in [("windows_vm", "windows-utm-1"), ("macos_vm", "macos-utm-1")] {
+            let args = json!({
+                "mode": "orchestrate",
+                "nodes": ["ubuntu-utm-1:client", "debian-headless-4:exit"],
+                key: alias,
+            });
+            let res = srv.start_live_lab_run(Some(&args));
+            let text = &res.content[0].text;
+            assert!(
+                res.is_error.unwrap_or(false),
+                "'{key}' with 'nodes' must be refused; got: {text}"
+            );
+            assert!(
+                text.contains(key) && text.contains("nodes"),
+                "the refusal must name both the offending key and 'nodes'; got: {text}"
+            );
+        }
     }
 
     #[test]

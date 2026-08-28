@@ -1385,8 +1385,21 @@ fn git_stdout<const N: usize>(args: [&str; N]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Resolve the row's `git_dirty_state`, preferring the EARLIEST sample available.
+///
+/// QH-34: the orchestrator refreshes `documents/operations/active/vm_lab_inventory.json`
+/// with live guest IPs during readiness, so every sample taken after that point —
+/// `last_run.git.git_tree_clean` (written at finalization), the setup manifest's, and
+/// this module's own render-time `current_git_dirty_state` fallback — sees the
+/// orchestrator's own write and reports dirt on a run that started from a clean,
+/// committed tree. `report_state.run_start_git_tree_clean` is sampled before readiness
+/// runs and is therefore the only reading that answers the question the column is for:
+/// did the OPERATOR start this run with uncommitted edits? Prefer it; fall back to the
+/// later samples only when it is absent (a state file written before the field existed,
+/// or a run whose start-of-run `git status` failed).
 fn git_dirty_state(report_state: &Option<Value>, setup_manifest: &Option<Value>) -> Option<String> {
-    json_bool_path(report_state, &["last_run", "git", "git_tree_clean"])
+    json_bool_path(report_state, &["run_start_git_tree_clean"])
+        .or_else(|| json_bool_path(report_state, &["last_run", "git", "git_tree_clean"]))
         .or_else(|| json_bool_path(setup_manifest, &["git", "git_tree_clean"]))
         .map(|clean| {
             if clean {
@@ -2800,10 +2813,10 @@ pub(crate) fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::{
         DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
-        NodeRow, StageEvidence, TargetEvidence, build_live_lab_run_matrix_values, csv_escape,
-        normalize_os_family, parse_csv_record, populate_cross_os_values,
-        populate_role_result_values, populate_stage_values, render_csv_row,
-        set_special_stage_values, validate_target_evidence,
+        NodeRow, StageEvidence, TargetEvidence, Value, build_live_lab_run_matrix_values,
+        csv_escape, git_dirty_state, normalize_os_family, parse_csv_record,
+        populate_cross_os_values, populate_role_result_values, populate_stage_values,
+        render_csv_row, set_special_stage_values, validate_target_evidence,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
@@ -3792,6 +3805,52 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// QH-34: the run-start sample is authoritative for `git_dirty_state`.
+    ///
+    /// The later samples see the orchestrator's own mid-run refresh of
+    /// `vm_lab_inventory.json`, so they answer a different question than the
+    /// column asks. Pin both directions of disagreement so a future change
+    /// cannot quietly demote the run-start reading back to a tiebreaker.
+    #[test]
+    fn git_dirty_state_prefers_the_run_start_sample_over_later_ones() {
+        let dirty_at_start: Option<Value> = Some(serde_json::json!({
+            "run_start_git_tree_clean": false,
+            "last_run": {"git": {"git_tree_clean": true}},
+        }));
+        let clean_setup: Option<Value> = Some(serde_json::json!({
+            "git": {"git_tree_clean": true},
+        }));
+        assert_eq!(
+            git_dirty_state(&dirty_at_start, &clean_setup).as_deref(),
+            Some("dirty:recorded"),
+            "a tree already dirty at run start must stay flagged even though \
+             the end-of-run samples read clean"
+        );
+
+        let clean_at_start: Option<Value> = Some(serde_json::json!({
+            "run_start_git_tree_clean": true,
+            "last_run": {"git": {"git_tree_clean": false}},
+        }));
+        assert_eq!(
+            git_dirty_state(&clean_at_start, &None).as_deref(),
+            Some("clean"),
+            "a run that started clean must not be flagged for the orchestrator's \
+             own mid-run inventory refresh"
+        );
+
+        // No run-start field (a state file written before QH-34, or a run whose
+        // start-of-run `git status` failed): the later samples still apply.
+        let legacy: Option<Value> = Some(serde_json::json!({
+            "last_run": {"git": {"git_tree_clean": false}},
+        }));
+        assert_eq!(
+            git_dirty_state(&legacy, &None).as_deref(),
+            Some("dirty:recorded"),
+            "the end-of-run sample must remain the fallback when no run-start \
+             reading was recorded"
+        );
+    }
+
     #[test]
     fn rust_native_stage_outcomes_populate_matrix_coverage_cells() {
         let root = temp_dir("rust-native");
@@ -4340,11 +4399,17 @@ mod registry_equivalence_tests {
                 "bash-only stage must not be rust-native: {bash_only}"
             );
         }
-        // Prefix fallback preserved: unknown chaos_/cross_network_ names stay
-        // in the Rust suite families (incl. the bash-exclusive
-        // cross_network_daemon_path — historical behavior).
+        // Prefix fallback preserved: unknown chaos_/cross_network_ names stay in
+        // the Rust suite families by construction. Pinned with names that are
+        // deliberately absent from both the registry and `StageId` — this used
+        // to be pinned with `cross_network_daemon_path`, which was deleted with
+        // the rest of the CN-5 bash tail and would now pass for the wrong
+        // reason once someone re-registered it.
         assert!(live_lab_stage_registry::is_rust_native_stage_name(
-            "cross_network_daemon_path"
+            "cross_network_unregistered_probe"
+        ));
+        assert!(live_lab_stage_registry::is_rust_native_stage_name(
+            "chaos_unregistered_probe"
         ));
     }
 
