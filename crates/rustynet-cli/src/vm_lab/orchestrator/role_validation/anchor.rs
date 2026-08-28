@@ -289,9 +289,39 @@ fn row_has_capability(line: &str, capability: &str) -> bool {
 // explicit RemoteShellHost call (read_file / tcp_send_recv / run_argv)
 // with Rust-side parsing — no shell string is built from a non-constant
 // value. The owning stage runs these only where
-// `NodeRole::Anchor::is_supported_for_platform` holds (Linux today) and
-// reported-skips macOS/Windows, since their bundle-pull token/listener
-// provisioning is not yet wired (cross-OS Phase 8).
+// [`anchor_lab_runtime_implemented`] holds (Linux inline; macOS through
+// the dedicated macOS anchor validator set, MAC-D1) and reported-skips
+// the rest, never consulting `NodeRole::Anchor::is_supported_for_platform`
+// — gating a stage on the same predicate whose promotion requires the
+// stage's own green run is circular (MAC-D1,
+// `MacCellsHarvest_2026-08-28.md` §2.2), the same decoupling
+// `relay_lab_runtime_implemented` / `active_exit_runtime_implemented`
+// already apply to their stages.
+
+/// Is the anchor bundle-pull RUNTIME (loopback / invalid-token /
+/// log-redaction) implemented and live-provable for this platform —
+/// independent of the posture-promotion gate
+/// (`NodeRole::Anchor::is_supported_for_platform`)?
+///
+/// * Linux: yes — the inline substages run against the token
+///   `ops install-systemd` seeds for admin-role nodes.
+/// * macOS: yes — the runtime is implemented (`AnchorRuntimeParams::
+///   for_platform` carries the macOS token path) and its provisioning +
+///   evidence path is the dedicated macOS anchor validator set
+///   (`deploy_macos_anchor_profile` /
+///   `validate_macos_anchor_bundle_pull` /
+///   `validate_macos_anchor_port_mapping_authority`, dispatched by
+///   `--anchor-platform macos`). The owning stage delegates macOS runtime
+///   coverage to that set instead of running the inline substages, whose
+///   token provisioning lives behind the validator set's deploy stage.
+/// * Windows: no — bundle-pull token/listener provisioning is not wired
+///   (cross-OS Phase 8); reported-skip, never a silent pass.
+///
+/// Mirrors `relay_lab_runtime_implemented` /
+/// `active_exit_runtime_implemented` (MAC-D1 de-circularisation).
+pub fn anchor_lab_runtime_implemented(platform: VmGuestPlatform) -> bool {
+    matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
+}
 
 /// Linux anchor bundle-pull token path — seeded by `ops install-systemd`
 /// for admin-role nodes (mirrors `ops_install_systemd`'s
@@ -676,6 +706,19 @@ mod tests {
     }
 
     // ── validate_anchor_capabilities (copied) ──
+
+    #[test]
+    fn anchor_lab_runtime_implemented_covers_linux_and_macos_only() {
+        // MAC-D1: the runtime-capability predicate is decoupled from the
+        // posture gate. macOS runtime is implemented (evidence path: the
+        // macOS anchor validator set); Windows stays pending Phase 8;
+        // iOS/Android have no adapter at all.
+        assert!(anchor_lab_runtime_implemented(VmGuestPlatform::Linux));
+        assert!(anchor_lab_runtime_implemented(VmGuestPlatform::Macos));
+        assert!(!anchor_lab_runtime_implemented(VmGuestPlatform::Windows));
+        assert!(!anchor_lab_runtime_implemented(VmGuestPlatform::Ios));
+        assert!(!anchor_lab_runtime_implemented(VmGuestPlatform::Android));
+    }
 
     #[test]
     fn validate_anchor_capabilities_requires_all_anchor_caps() {

@@ -105,6 +105,71 @@ so none of those three dispatched. Electing the role and enabling the macOS
 anchor validators are two independent switches, and the parity cell needs both.
 That run is **still open** (see §5).
 
+> **Disposition 2026-08-28 (MAC-D1 fix) — the circularity is broken in code;
+> option (b) applied as a mechanical decoupling following the repo's own
+> stage-gate precedent.** The defect was that `anchor_validation` gated its
+> inline bundle-pull runtime substages on
+> `NodeRole::Anchor.is_supported_for_platform` (`anchor_validation.rs:185`) —
+> the one predicate whose promotion contract ("promoted only once a green run
+> is archived") can never be satisfied by this stage for macOS, because the
+> gate forces a reported runtime skip and `outcome_for` grades any skip as
+> `Skipped` → `RunStatus::Partial`. The gate itself is NOT stale policy: it
+> guards *posture promotion*, and the macOS anchor capability underneath it is
+> genuinely implemented (daemon mapping `Admin|Anchor → "admin"` on macOS,
+> platform-independent capability set — live-proven in §2.1 — and
+> `AnchorRuntimeParams::for_platform` carries the macOS token path). What was
+> wrong was the *evidence wiring*: `anchor_validation` is the only stage still
+> consulting the posture predicate for its runtime gate, while its siblings
+> (`deploy_relay` / `relay_validation`, `active_exit`) already key on
+> per-capability predicates (`relay_lab_runtime_implemented`,
+> `active_exit_runtime_implemented`). The fix applies the same pattern:
+>
+> * New `anchor_lab_runtime_implemented(platform)`
+>   (`role_validation/anchor.rs`): true for Linux + macOS, false for Windows
+>   (Phase 8 pending) and iOS/Android. The stage's runtime gate now keys on
+>   this, never on `is_supported_for_platform`.
+> * New pure `runtime_coverage(platform, macos_anchor_validators_elected)`
+>   (`stage/anchor_validation.rs`): Linux ⇒ inline substages (unchanged);
+>   macOS **with** the validator set elected in the same run
+>   (`--anchor-platform macos`, threaded run-local as
+>   `OrchestrationContext::macos_anchor_validators_elected` in
+>   `orchestrator/native.rs`) ⇒ `DelegatedToMacosValidators` — recorded in
+>   the side-car JSON under `runtime_delegated_nodes`, NOT counted as a skip,
+>   so the combined run (validators green in the same invocation) can go
+>   green; macOS **without** the set, and Windows ⇒ `ReportedSkip` —
+>   fail-closed unchanged, the stage grades `Skipped` and the run stays
+>   Partial. A resumed context reloads the election flag as `false`, which is
+>   the fail-closed direction.
+> * `role.rs`'s `is_supported_for_platform` arm itself is intentionally LEFT
+>   Linux-only (Anchor/Admin/Relay) with the MAC-D1 evidence path documented
+>   in its doc comment: the strictest-secure-default reading. The gate's own
+>   contract ("promoted only once a green run is archived") is now reachable —
+>   the §5 run (role election + `--anchor-platform macos` + full Linux live
+>   suite, no `--skip-linux-live-suite`, per §2.3) produces exactly the
+>   evidence it names — and the arm should be lifted in the follow-up commit
+>   that archives that green, mirroring how Exit/macOS was promoted after its
+>   blind_exit PF evidence. Lifting it preemptively, with zero archived
+>   evidence, would violate the same fail-closed contract MAC-D1 preserves.
+>
+> Verification: fail-closed negatives pinned by unit tests —
+> `runtime_coverage_macos_without_validators_is_reported_skip`,
+> `runtime_coverage_windows_is_reported_skip`,
+> `outcome_for_runtime_skip_with_no_failures_is_skipped` (existing),
+> `anchor_lab_runtime_implemented_covers_linux_and_macos_only`; positive path
+> pinned by `runtime_coverage_macos_delegates_only_when_validators_elected`,
+> `outcome_for_delegated_macos_runtime_with_no_failures_is_passed`, and the
+> `runtime_delegated_nodes` JSON assertion in
+> `reported_skips_json_bytes_is_valid_json_naming_every_substage`.
+> Gates: `cargo fmt --all -- --check`, `cargo clippy -p rustynet-cli -p
+> rustynet-control --all-targets --all-features --locked -- -D warnings`, and
+> `cargo test -p rustynet-cli -p rustynet-control --all-targets
+> --all-features --locked` (one unrelated pre-existing failure on clean HEAD:
+> `macos_doctor_custody_paths_are_installer_roots_not_linux_defaults`).
+> **Cell status: UNBLOCKED for re-run** — the §5 run shape
+> (`--node macos-utm-1:anchor` + `--anchor-platform macos` + full Linux live
+> suite) now has a producible green; the posture arm lifts on its archived
+> evidence.
+
 ### 2.3 `live_anchor` was excluded by `--skip-linux-live-suite`, not by dialect
 
 **Correction to my own first reading, recorded rather than silently fixed.** My
@@ -145,6 +210,16 @@ requires paying for the full Linux live suite.
 That correction does not change Cell 1's verdict — `anchor_validation` did
 dispatch and its skip is genuine — but it does mean the `live_anchor` half of
 the cell is **untested today**, not unavailable.
+
+> **MAC-D1 note (2026-08-28):** this §2.3 arithmetic is unchanged by the
+> §2.2 disposition — the re-run that harvests the anchor cell must still pay
+> for the full Linux live suite (`live_anchor`,
+> `exit_nat_lifecycle_validation`, `exit_demotion_residue_validation`,
+> `exit_dns_failclosed_validation` are all dropped by
+> `--skip-linux-live-suite`). What the §2.2 fix changes is that the run is
+> now *worth* paying for: `anchor_validation` can go green with the macOS
+> runtime delegated to the elected validator set instead of structurally
+> topping out at Partial.
 
 > Disposition 2026-08-28 (updated same day): **every §2.4 arm is now fixed.**
 > The `macos_anchor` arm was fixed first — it now calls `add_default_backbone`
