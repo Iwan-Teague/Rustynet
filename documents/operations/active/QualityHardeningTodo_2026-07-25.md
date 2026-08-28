@@ -3137,6 +3137,32 @@ the Windows arm of `admit_host_firewall_forwarding` is a self-documented no-op
 (`phase10.rs:4870-4876`), so the QH-54 posture loop cannot fire there. The audit states the
 exact fix shape; it implements nothing.
 
+**QH-46 ADDENDUM 2026-08-28 (WINDOWS ENFORCEMENT POINT IMPLEMENTED — guest-verification
+pending).** The audit's §3 fix shape is now implemented: the Windows arm of
+`admit_host_firewall_forwarding` (`crates/rustynetd/src/phase10.rs`) is no longer a no-op. It
+calls the new `rustynet_windows_native::assert_forwarded_traffic_admitted()`, which enumerates
+every filter at the forwarded-traffic layers (`FwpmFilterEnum0` scoped to
+`FWPM_LAYER_IPFORWARD_V4/V6` via `FWPM_FILTER_ENUM_TEMPLATE0.layerKey` — read-only, no mutation)
+and hands plain-value observations to the portable arbiter
+`wfp_filter_shape::assess_forwarded_traffic_arbitration` in
+`crates/rustynet-windows-native/src/lib.rs`. Verdict rules (all tested off-Windows, same
+pattern as the tunnel-permit shape module): a foreign non-permit filter at a forward layer is
+an obstruction (at those layers RustyNet's arbitration position is the ABSENCE of a block, so
+any foreign block sits at-or-above it by construction; the default-deny rule treats any action
+that is not positively a PERMIT as an obstruction); filters under RustyNet's own sublayer key
+are skipped; and an `Err` from the enumeration — unreadable WFP state — fails closed as
+`ForeignForwardObstruction::Unreadable`, mirroring the Linux `FirewalldPosture`
+unknown-presence-is-treated-present rule. An `Err` admit feeds the existing
+`reassert_host_firewall_admission` machinery unchanged (fail-closed rollback +
+`force_fail_closed("host_firewall_admit_failed")`), so the QH-54 30-second posture loop is no
+longer vacuous on Windows. `withdraw_host_firewall_forwarding` stays a paired no-op (the admit
+is detection-only; a surviving foreign filter is not ours to delete and is re-detected by the
+next admit). Verification: `cargo test -p rustynetd -p rustynet-windows-native
+--all-targets --all-features --locked` green (7 new portable arbiter tests), clippy + fmt
+green. REMAINING: the Windows-guest half — a live run proving a foreign block at
+`IPFORWARD_V4/V6` on a Windows exit node trips the fail-closed rollback — same split as the
+original QH-46 (code done, live proof pending a Windows guest).
+
 Rustynet installs its forward chain at `type filter hook forward priority 0` and appends the relay
 hairpin allow `iifname rustynet0 oifname rustynet0 counter accept` (`phase10.rs:2265-2294`). In
 netfilter a base chain's `accept` is `NF_ACCEPT` — "continue to the next base chain at this hook" —
