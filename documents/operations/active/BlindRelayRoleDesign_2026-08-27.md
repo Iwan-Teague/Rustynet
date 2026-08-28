@@ -4,6 +4,29 @@
 or live-proven. No code, schema, platform claim, evidence date, or release claim is
 created by this document.
 
+> **2026-08-28 — phase 1 (control-plane scaffolding) landed.** The §0 items 1
+> and 3 scaffolding is implemented in `rustynet-control`, ahead of (and without
+> preempting) §16 sign-off, exactly as scoped: the append-only
+> `RoleCapability::BlindRelay` modifier (stable text `blind_relay`, kebab alias
+> `blind-relay` accepted by the parser, canonical render emits `blind_relay`)
+> parses and reduces, and the signed-state reducer
+> (`validate_membership_node_capabilities`) enforces the §5.1 invariant — a
+> node carrying `BlindRelay` must have the canonical set exactly
+> `{RelayHost, BlindRelay}`, so every other co-capability (and any future
+> capability) is refused fail-closed. Per the §16 line-1129 mandate,
+> `blind_relay` is NOT advertisable by production signed state: the two
+> construction chokepoints (`MembershipOperation::AddNode` and
+> `SetNodeCapabilities` application in `reduce_membership_state`, plus
+> enrollment admission via `enrollee_capabilities_from_roles`) refuse it with
+> "design-only; pending §16 wire-format sign-off". **Still phase-gated, NOT in
+> this landing:** the wire format (v2 token/hello/fleet — §7-§8, phase 3), the
+> `RolePreset::BlindRelay` / `PrimaryRole::BlindRelay` / `NodeRole::BlindRelay`
+> dedicated role (§4.2, phase 2 — the `role_presets.rs` transition/lockout
+> match tables are non-additive and need real transition behavior), validation
+> sites (3)-(6) (§5.2: daemon alignment, assignment, fleet publication,
+> startup reconciliation), and §6 transitions (phase 4). No
+> `RelaySessionToken` or relay-fleet wire change was touched.
+
 **Decision owner:** Rustynet security/architecture maintainers.
 
 **Implementation gate:** Do not implement the role until the open protocol
