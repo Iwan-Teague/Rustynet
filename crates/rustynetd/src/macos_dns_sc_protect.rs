@@ -804,8 +804,7 @@ Thunderbolt Bridge
         std::fs::write(&path, foreign).expect("write");
         assert!(read_networksetup_dns_backup(&path).is_err());
 
-        let hostile =
-            "{\"schema_version\": 1, \"services\": [{\"service\": \"bad\\nname\", \"servers\": null}]}";
+        let hostile = "{\"schema_version\": 1, \"services\": [{\"service\": \"bad\\nname\", \"servers\": null}]}";
         std::fs::write(&path, hostile).expect("write");
         assert!(read_networksetup_dns_backup(&path).is_err());
 
