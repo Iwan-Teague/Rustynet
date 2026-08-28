@@ -243,6 +243,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         }
     }
 
@@ -280,6 +281,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         let outcome = PreflightStage.execute(&mut ctx);
         assert!(

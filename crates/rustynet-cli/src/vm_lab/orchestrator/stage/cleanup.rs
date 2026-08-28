@@ -113,6 +113,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         }
     }
 
@@ -154,6 +155,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         assert_eq!(
             CleanupHostsStage::new(None).execute(&mut ctx),

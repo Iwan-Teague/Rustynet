@@ -197,6 +197,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         let outcome = ExitDemotionResidueValidationStage.execute(&mut ctx);
         assert!(matches!(outcome, StageOutcome::Failed(message) if message.contains("no Exit")));
