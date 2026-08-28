@@ -35,16 +35,28 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::ops_cross_network_reports::{
-    ReadCrossNetworkReportFieldsConfig, execute_ops_read_cross_network_report_fields,
+    GenerateCrossNetworkRemoteExitReportConfig, ReadCrossNetworkReportFieldsConfig,
+    execute_ops_generate_cross_network_remote_exit_report,
+    execute_ops_read_cross_network_report_fields,
 };
 
 /// The orchestrator-host command surface a scenario needs.
 pub trait ScenarioHost {
-    /// Run one required-test gate. `Ok(true)` means the gate passed;
-    /// `Ok(false)` means it ran and failed. `Err` is reserved for not being
-    /// able to run it at all — a distinction the shell collapsed into a single
-    /// non-zero status.
-    fn run_required_test(&self, crate_name: &str, test_name: &str) -> Result<bool, String>;
+    /// Run one required-test gate, appending its combined output to `log_path`.
+    /// `Ok(true)` means the gate passed; `Ok(false)` means it ran and failed.
+    /// `Err` is reserved for not being able to run it at all — a distinction the
+    /// shell collapsed into a single non-zero status.
+    ///
+    /// The log is not optional: the cross-network report validator lists the
+    /// gate log in `required_pass_log_artifacts`, so a scenario that ran its
+    /// gates without recording their output cannot emit a passing report. The
+    /// shell got this from `… | tee -a "$log_path"`.
+    fn run_required_test(
+        &self,
+        crate_name: &str,
+        test_name: &str,
+        log_path: &Path,
+    ) -> Result<bool, String>;
 
     /// Invoke a sibling validator binary with `args`. As above, `Ok(false)` is
     /// "it ran and reported failure", `Err` is "it could not be run".
@@ -70,6 +82,25 @@ pub trait ScenarioHost {
     /// so a scenario that cannot write one has not produced its evidence and
     /// the failure is propagated rather than swallowed.
     fn write_artifact(&self, path: &Path, contents: &str) -> Result<(), String>;
+
+    /// Write a cross-network report for a scenario this one *composed*.
+    ///
+    /// Five of the eight validators establish their baseline by running another
+    /// scenario. The shell did that by executing the baseline's script, which
+    /// wrote its own report as a side effect; the composing script then named
+    /// that file in its own `source_artifacts`. Composition is now a Rust
+    /// function call, so no report appears by itself — and the report validator
+    /// lists those baseline reports in `required_pass_source_artifacts`, so a
+    /// composing scenario that skipped writing one could not emit a passing
+    /// report at all.
+    ///
+    /// It is on the trait rather than called directly so a scenario unit test
+    /// can assert on the report that *would* be written without touching the
+    /// filesystem, exactly as it does for every other local effect here.
+    fn write_report(
+        &self,
+        config: GenerateCrossNetworkRemoteExitReportConfig,
+    ) -> Result<(), String>;
 }
 
 /// The production [`ScenarioHost`]: real subprocesses, real filesystem, and the
@@ -116,14 +147,35 @@ impl LocalScenarioHost {
 }
 
 impl ScenarioHost for LocalScenarioHost {
-    fn run_required_test(&self, crate_name: &str, test_name: &str) -> Result<bool, String> {
+    fn run_required_test(
+        &self,
+        crate_name: &str,
+        test_name: &str,
+        log_path: &Path,
+    ) -> Result<bool, String> {
+        // Append rather than truncate: the caller runs several gates in a row
+        // into one log, which is what made the shell's `tee -a` the right
+        // primitive and a per-gate truncation the wrong one.
+        let log = append_log(log_path)?;
+        let errors = log
+            .try_clone()
+            .map_err(|err| format!("failed to open gate log {}: {err}", log_path.display()))?;
         let mut command = Command::new("bash");
         command
             .arg("scripts/ci/run_required_test.sh")
             .arg(crate_name)
             .arg(test_name)
-            .arg("--all-features");
+            .arg("--all-features")
+            .stdout(log)
+            .stderr(errors);
         self.status_of(command, &format!("required test {crate_name}::{test_name}"))
+    }
+
+    fn write_report(
+        &self,
+        config: GenerateCrossNetworkRemoteExitReportConfig,
+    ) -> Result<(), String> {
+        execute_ops_generate_cross_network_remote_exit_report(config).map(|_| ())
     }
 
     fn run_validator_bin(&self, bin: &str, args: &[&str]) -> Result<bool, String> {
@@ -187,6 +239,22 @@ impl ScenarioHost for LocalScenarioHost {
     }
 }
 
+/// Open `path` for appending, creating its parent directory and the file
+/// itself. Failing here is a hard error rather than a silent fallback to
+/// discarding the output: the gate log is declared evidence, and a gate whose
+/// output went nowhere has not produced it.
+fn append_log(path: &Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create log directory {}: {err}", parent.display()))?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| format!("failed to open gate log {}: {err}", path.display()))
+}
+
 /// Split the reader's newline-delimited output into exactly `expected` values,
 /// padding any short answer with `"fail"`.
 ///
@@ -220,7 +288,7 @@ pub fn all_pass(values: &[String]) -> bool {
 
 #[cfg(test)]
 pub(crate) mod recording {
-    use super::{CHECK_FAIL, ScenarioHost};
+    use super::{CHECK_FAIL, GenerateCrossNetworkRemoteExitReportConfig, ScenarioHost};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -231,7 +299,12 @@ pub(crate) mod recording {
         RequiredTest {
             crate_name: String,
             test_name: String,
+            log_path: PathBuf,
         },
+        /// A report a composed baseline scenario asked to have written. Kept as
+        /// the whole config so a test can assert on the suite, the status and
+        /// the artifact lists the composing scenario declared.
+        WriteReport(Box<GenerateCrossNetworkRemoteExitReportConfig>),
         ValidatorBin {
             bin: String,
             args: Vec<String>,
@@ -266,6 +339,8 @@ pub(crate) mod recording {
         pub report_read_errors: Vec<PathBuf>,
         /// Artifact paths whose write fails outright.
         pub artifact_write_errors: Vec<PathBuf>,
+        /// Report paths whose generation fails outright.
+        pub report_write_errors: Vec<PathBuf>,
     }
 
     impl RecordingHost {
@@ -279,10 +354,16 @@ pub(crate) mod recording {
     }
 
     impl ScenarioHost for RecordingHost {
-        fn run_required_test(&self, crate_name: &str, test_name: &str) -> Result<bool, String> {
+        fn run_required_test(
+            &self,
+            crate_name: &str,
+            test_name: &str,
+            log_path: &Path,
+        ) -> Result<bool, String> {
             self.record(HostCall::RequiredTest {
                 crate_name: crate_name.to_owned(),
                 test_name: test_name.to_owned(),
+                log_path: log_path.to_path_buf(),
             });
             if self
                 .required_test_errors
@@ -337,6 +418,21 @@ pub(crate) mod recording {
             });
             if self.artifact_write_errors.iter().any(|p| p == path) {
                 return Err(format!("mock: cannot write {}", path.display()));
+            }
+            Ok(())
+        }
+
+        fn write_report(
+            &self,
+            config: GenerateCrossNetworkRemoteExitReportConfig,
+        ) -> Result<(), String> {
+            let report_path = config.report_path.clone();
+            self.record(HostCall::WriteReport(Box::new(config)));
+            if self.report_write_errors.contains(&report_path) {
+                return Err(format!(
+                    "mock: cannot write report {}",
+                    report_path.display()
+                ));
             }
             Ok(())
         }
