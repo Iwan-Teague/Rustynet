@@ -4,6 +4,35 @@
 or live-proven. No code, schema, platform claim, evidence date, or release claim is
 created by this document.
 
+> **2026-08-29 — phase 2 (dedicated role scaffolding) landed.** The §0 item 2
+> role scaffolding is implemented, again ahead of (and without preempting) §16
+> sign-off and with the phase-1 gates untouched: `RolePreset::BlindRelay` and
+> `PrimaryRole::BlindRelay` in `rustynet-control` (`role_presets.rs`, preset
+> composition primary `BlindRelay` with capabilities exactly
+> `{ServesRelay, BlindRelay}`; `ROLE_PRESET_TABLE` now nine entries), the
+> matching `NodeRole::BlindRelay` in `rustynetd` (`daemon.rs`:
+> `required_membership_capabilities` = `{RelayHost, BlindRelay}`, minimal
+> BlindExit-style IPC allowlist, membership-alignment validation refuses any
+> co-location capability fail-closed with NO warn-and-continue exception per
+> §5.2), and the operator mirror (`rustynet-operator`: `NodeRole`/`RolePreset`
+> variants, `primary_role()` mapping to the dedicated primary, fail-closed
+> policy posture, read-only status menu). The transition table gained the
+> §5.1 exclusivity arms: entering `blind_relay` from client/exit/anchor/nas/llm
+> is `Blocked` (pinned reason, no side effects computed); entry from admin or
+> plain relay is `SignedMembership`; leaving is reversible-but-marked;
+> `blind_relay → blind_exit` stays `Irreversible`. `TransitionPlan` gained
+> `requires_privacy_boundary_reinit`: any allowed plan touching `blind_relay`
+> records the §6.1 ordered reinit requirement — the ceremony itself (owner
+> ack, privacy epoch, ordered teardown/deploy, residue verification, audit
+> event) is deliberately NOT performed here (phase 4). **Still phase-gated,
+> NOT in this landing:** the wire format (v2 token/hello/fleet — §7-§8, phase
+> 3), production advertisement of `blind_relay` (the phase-1 construction/
+> enrollment refusals stay closed pending §16), §5.2 validation sites (4)-(6)
+> (assignment/application, fleet publication, startup reconciliation), §6
+> transition EXECUTION incl. the reinit ceremony (phase 4), and platform
+> eligibility entries for the new role. No `RelaySessionToken` or relay-fleet
+> wire change was touched.
+
 > **2026-08-28 — phase 1 (control-plane scaffolding) landed.** The §0 items 1
 > and 3 scaffolding is implemented in `rustynet-control`, ahead of (and without
 > preempting) §16 sign-off, exactly as scoped: the append-only

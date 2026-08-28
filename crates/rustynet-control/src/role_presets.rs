@@ -1,16 +1,18 @@
-//! Node role taxonomy: eight user-selectable per-device presets.
+//! Node role taxonomy: nine user-selectable per-device presets.
 //!
 //! Canonical design:
 //! `documents/operations/active/NodeRoleTaxonomy_2026-05-21.md` (base six),
 //! extended by
 //! `documents/operations/active/NodeRoleTaxonomyExtension_2026-06-11.md`
-//! (the two service-hosting presets `nas` and `llm`).
+//! (the two service-hosting presets `nas` and `llm`) and by
+//! `documents/operations/active/BlindRelayRoleDesign_2026-08-27.md`
+//! (the privacy-preserving `blind_relay` preset, §4.2).
 //!
 //! Two-axis internal model (kept separate by design):
 //!
 //! - **Axis 1** — primary local role
-//!   ([`PrimaryRole`]: `Admin | Client | BlindExit`). Mirrors
-//!   `crates/rustynetd/src/daemon.rs::NodeRole`. Controls local
+//!   ([`PrimaryRole`]: `Admin | Client | BlindExit | BlindRelay`).
+//!   Mirrors `crates/rustynetd/src/daemon.rs::NodeRole`. Controls local
 //!   IPC permissions and dataplane posture.
 //! - **Axis 2** — composable mesh capabilities ([`Capability`]).
 //!   Signed in the membership bundle.
@@ -23,7 +25,12 @@
 //! reversibility matrix in [`validate_transition`] /
 //! [`transition_plan`]. Some transitions are local-only
 //! (admin↔client); some require a signed membership update record;
-//! some are irreversible (anything involving `blind_exit`).
+//! some are irreversible (anything involving `blind_exit`); and
+//! transitions that cross the blind-relay privacy boundary carry
+//! [`TransitionPlan::requires_privacy_boundary_reinit`] — the
+//! ordered teardown/purge/re-verify ceremony is a phase-4
+//! deliverable (BlindRelayRoleDesign §6.1) and is NOT performed by
+//! this layer.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -40,6 +47,7 @@ pub enum RolePreset {
     Anchor,
     Nas,
     Llm,
+    BlindRelay,
 }
 
 impl RolePreset {
@@ -54,6 +62,7 @@ impl RolePreset {
             RolePreset::Anchor => "anchor",
             RolePreset::Nas => "nas",
             RolePreset::Llm => "llm",
+            RolePreset::BlindRelay => "blind_relay",
         }
     }
 
@@ -78,13 +87,20 @@ impl RolePreset {
             RolePreset::Llm => {
                 "always-on AI box: tunnel-only inference API endpoint, default-deny per signed policy"
             }
+            RolePreset::BlindRelay => {
+                "privacy-preserving unlogged relay hop: identity-blind forwarding, no local \
+                 relay identity state (§16 advertisement sign-off pending)"
+            }
         }
     }
 
     /// All presets in canonical order. Wizard surfaces should
     /// present in this order: hosting roles first (anchor, admin,
-    /// exit, relay, nas, llm), passive presets last.
-    pub fn all() -> &'static [RolePreset; 8] {
+    /// exit, relay, nas, llm), passive presets last. `blind_relay`
+    /// sits with the passive/hardened presets: entering or leaving
+    /// it is a privacy-boundary crossing (§6.1), not a routine
+    /// capability edit.
+    pub fn all() -> &'static [RolePreset; 9] {
         &[
             RolePreset::Anchor,
             RolePreset::Admin,
@@ -94,6 +110,7 @@ impl RolePreset {
             RolePreset::Llm,
             RolePreset::Client,
             RolePreset::BlindExit,
+            RolePreset::BlindRelay,
         ]
     }
 }
@@ -117,8 +134,9 @@ impl FromStr for RolePreset {
             "anchor" => Ok(RolePreset::Anchor),
             "nas" => Ok(RolePreset::Nas),
             "llm" => Ok(RolePreset::Llm),
+            "blind_relay" | "blind-relay" => Ok(RolePreset::BlindRelay),
             other => Err(format!(
-                "invalid role preset: {other:?} (expected one of: anchor, admin, exit, relay, nas, llm, client, blind_exit)"
+                "invalid role preset: {other:?} (expected one of: anchor, admin, exit, relay, nas, llm, client, blind_exit, blind_relay)"
             )),
         }
     }
@@ -135,6 +153,7 @@ pub enum PrimaryRole {
     Client,
     Admin,
     BlindExit,
+    BlindRelay,
 }
 
 impl PrimaryRole {
@@ -143,6 +162,7 @@ impl PrimaryRole {
             PrimaryRole::Client => "client",
             PrimaryRole::Admin => "admin",
             PrimaryRole::BlindExit => "blind_exit",
+            PrimaryRole::BlindRelay => "blind_relay",
         }
     }
 }
@@ -161,8 +181,9 @@ impl FromStr for PrimaryRole {
             "client" => Ok(PrimaryRole::Client),
             "admin" => Ok(PrimaryRole::Admin),
             "blind_exit" | "blind-exit" => Ok(PrimaryRole::BlindExit),
+            "blind_relay" | "blind-relay" => Ok(PrimaryRole::BlindRelay),
             other => Err(format!(
-                "invalid primary role: {other:?} (expected client, admin, or blind_exit)"
+                "invalid primary role: {other:?} (expected client, admin, blind_exit, or blind_relay)"
             )),
         }
     }
@@ -207,6 +228,15 @@ pub enum Capability {
     /// only; peer access is governed by signed service-access policy
     /// (default-deny).
     ServesLlm,
+    /// Marks the carrying node as a blind relay: the relay hop must
+    /// hold exactly {RelayHost, BlindRelay} in the membership bundle
+    /// and nothing else (BlindRelayRoleDesign §5.1). DESIGN-ONLY
+    /// pending §16 wire-format sign-off: production advertisement of
+    /// this capability remains refused downstream (enrollment
+    /// admission + membership reduce gates). New variants append
+    /// after this one — the derived ordering feeds canonical
+    /// serialisation and must stay append-only.
+    BlindRelay,
 }
 
 impl Capability {
@@ -223,6 +253,7 @@ impl Capability {
             Capability::AnchorPortMappingAuthoritative => "anchor.port_mapping_authoritative",
             Capability::ServesNas => "serves_nas",
             Capability::ServesLlm => "serves_llm",
+            Capability::BlindRelay => "blind_relay",
         }
     }
 }
@@ -247,6 +278,7 @@ impl FromStr for Capability {
             "anchor.port_mapping_authoritative" => Ok(Capability::AnchorPortMappingAuthoritative),
             "serves_nas" => Ok(Capability::ServesNas),
             "serves_llm" => Ok(Capability::ServesLlm),
+            "blind_relay" | "blind-relay" => Ok(Capability::BlindRelay),
             other => Err(format!("invalid capability: {other:?}")),
         }
     }
@@ -266,7 +298,7 @@ pub struct RolePresetComposition {
 /// (2) a new entry in this table; (3) new transition rows/columns
 /// in [`validate_transition`]; (4) wizard + CLI surface updates;
 /// (5) per-platform eligibility entries in `PlatformSupportMatrix`.
-pub const ROLE_PRESET_TABLE: [RolePresetComposition; 8] = [
+pub const ROLE_PRESET_TABLE: [RolePresetComposition; 9] = [
     RolePresetComposition {
         preset: RolePreset::Client,
         primary: PrimaryRole::Client,
@@ -312,6 +344,16 @@ pub const ROLE_PRESET_TABLE: [RolePresetComposition; 8] = [
         preset: RolePreset::Llm,
         primary: PrimaryRole::Admin,
         capabilities: &[Capability::ServesLlm],
+    },
+    RolePresetComposition {
+        preset: RolePreset::BlindRelay,
+        primary: PrimaryRole::BlindRelay,
+        // BlindRelayRoleDesign §4.2: the blind relay carries exactly
+        // {ServesRelay, BlindRelay} — the relay binary it forwards
+        // for, plus the privacy marker. Membership projection is the
+        // exact set {RelayHost, BlindRelay} (§5.1) and the reducer
+        // rejects any other co-location.
+        capabilities: &[Capability::ServesRelay, Capability::BlindRelay],
     },
 ];
 
@@ -491,6 +533,15 @@ pub struct TransitionPlan {
     /// revocation drops the capability from local state
     /// (teardown/undeploy-before-revoke). Canonical order.
     pub service_undeploys: Vec<ServiceKind>,
+    /// True when the transition crosses the blind-relay privacy
+    /// boundary (source or destination is `blind_relay`). Phase 2
+    /// records the requirement only; the ordered
+    /// teardown → purge → residue-verify ceremony itself is the
+    /// phase-4 deliverable (BlindRelayRoleDesign §6.1) and MUST be
+    /// performed before this plan is executed by the transition
+    /// orchestrator. Blocked plans never set this flag — they
+    /// compute no side effects at all.
+    pub requires_privacy_boundary_reinit: bool,
 }
 
 impl TransitionPlan {
@@ -502,6 +553,14 @@ impl TransitionPlan {
     /// Whether this transition undeploys the given sibling service.
     pub fn requires_service_undeploy(&self, kind: ServiceKind) -> bool {
         self.service_undeploys.contains(&kind)
+    }
+
+    /// Whether the transition enters `blind_relay` from a compatible
+    /// source. Per BlindRelayRoleDesign §5.1 the blind relay cannot
+    /// co-exist with client/entry/exit/anchor identity-bearing state;
+    /// only privacy-clean sources (admin, plain relay) may enter.
+    pub fn is_blind_relay_entry_compatible(from: RolePreset) -> bool {
+        matches!(from, RolePreset::Admin | RolePreset::Relay)
     }
 }
 
@@ -531,6 +590,7 @@ pub fn transition_plan(from: RolePreset, to: RolePreset) -> TransitionPlan {
             removes_capabilities: Vec::new(),
             service_deploys: Vec::new(),
             service_undeploys: Vec::new(),
+            requires_privacy_boundary_reinit: false,
         };
     }
 
@@ -548,6 +608,30 @@ pub fn transition_plan(from: RolePreset, to: RolePreset) -> TransitionPlan {
             removes_capabilities: Vec::new(),
             service_deploys: Vec::new(),
             service_undeploys: Vec::new(),
+            requires_privacy_boundary_reinit: false,
+        };
+    }
+
+    // Blind-relay exclusivity (BlindRelayRoleDesign §5.1): entering
+    // blind_relay is only possible from a privacy-clean source. A
+    // node carrying client/entry/exit/anchor/application-service
+    // state cannot become a blind relay by a role edit — it must
+    // first step down to admin (or plain relay), which is its own
+    // signed transition. Fail closed: refuse rather than compute a
+    // plan that would violate the co-location invariant.
+    if to == RolePreset::BlindRelay && !TransitionPlan::is_blind_relay_entry_compatible(from) {
+        return TransitionPlan {
+            from,
+            to,
+            kind: TransitionKind::Blocked(
+                "blind_relay must be the node's only mesh duty: step down to admin or relay before entering blind_relay (no client/exit/anchor/service co-location, §5.1)",
+            ),
+            primary_change: None,
+            adds_capabilities: Vec::new(),
+            removes_capabilities: Vec::new(),
+            service_deploys: Vec::new(),
+            service_undeploys: Vec::new(),
+            requires_privacy_boundary_reinit: false,
         };
     }
 
@@ -579,9 +663,21 @@ pub fn transition_plan(from: RolePreset, to: RolePreset) -> TransitionPlan {
         None
     };
 
+    // Privacy-boundary marker (BlindRelayRoleDesign §6.1): any
+    // allowed transition touching blind_relay — entering OR leaving
+    // — requires the ordered privacy-boundary reinit ceremony
+    // (owner-signed change, typed disclosure acknowledgement, fresh
+    // privacy epoch, ordered teardown/deploy + residue verification,
+    // audit event). Phase 2 records the requirement; the ceremony is
+    // phase 4 and is deliberately NOT performed here.
+    let crosses_privacy_boundary = from == RolePreset::BlindRelay || to == RolePreset::BlindRelay;
+
     // Becoming BlindExit is destructive: wipes existing identity
     // and re-enrolls fresh. Allowed but irreversible — the wizard
-    // must confirm with typed acknowledgement.
+    // must confirm with typed acknowledgement. (blind_relay →
+    // blind_exit keeps this classification: the target role change
+    // is irreversible even though leaving blind_relay itself is
+    // reversible via the §6.1 ceremony.)
     let kind = if to == RolePreset::BlindExit {
         TransitionKind::Irreversible(
             "becoming blind_exit wipes node identity and re-enrolls fresh; this cannot be undone without another factory reset",
@@ -609,6 +705,7 @@ pub fn transition_plan(from: RolePreset, to: RolePreset) -> TransitionPlan {
         removes_capabilities: removes,
         service_deploys,
         service_undeploys,
+        requires_privacy_boundary_reinit: crosses_privacy_boundary,
     }
 }
 
@@ -619,8 +716,8 @@ mod tests {
     // ----- Preset table integrity -----
 
     #[test]
-    fn preset_table_has_exactly_eight_entries() {
-        assert_eq!(ROLE_PRESET_TABLE.len(), 8);
+    fn preset_table_has_exactly_nine_entries() {
+        assert_eq!(ROLE_PRESET_TABLE.len(), 9);
     }
 
     #[test]
@@ -635,6 +732,7 @@ mod tests {
             RolePreset::Anchor,
             RolePreset::Nas,
             RolePreset::Llm,
+            RolePreset::BlindRelay,
         ]
         .iter()
         .copied()
@@ -728,6 +826,18 @@ mod tests {
         assert_eq!(comp.capabilities, &[Capability::ServesLlm]);
     }
 
+    #[test]
+    fn blind_relay_composition() {
+        // BlindRelayRoleDesign §4.2: dedicated primary role, exactly
+        // {ServesRelay, BlindRelay} — never Admin-with-a-checkbox.
+        let comp = composition_for(RolePreset::BlindRelay);
+        assert_eq!(comp.primary, PrimaryRole::BlindRelay);
+        assert_eq!(
+            comp.capabilities,
+            &[Capability::ServesRelay, Capability::BlindRelay]
+        );
+    }
+
     // ----- Str round-trips -----
 
     #[test]
@@ -741,6 +851,7 @@ mod tests {
             RolePreset::Anchor,
             RolePreset::Nas,
             RolePreset::Llm,
+            RolePreset::BlindRelay,
         ]
         .iter()
         {
@@ -763,6 +874,22 @@ mod tests {
     }
 
     #[test]
+    fn role_preset_accepts_hyphen_variant_for_blind_relay() {
+        // Same alias convention as blind_exit: both spellings parse,
+        // and the canonical render is the underscore form.
+        assert_eq!(
+            "blind-relay".parse::<RolePreset>().unwrap(),
+            RolePreset::BlindRelay
+        );
+        assert_eq!(
+            "blind_relay".parse::<RolePreset>().unwrap(),
+            RolePreset::BlindRelay
+        );
+        assert_eq!(RolePreset::BlindRelay.as_str(), "blind_relay");
+        assert_eq!(RolePreset::BlindRelay.to_string(), "blind_relay");
+    }
+
+    #[test]
     fn role_preset_rejects_unknown() {
         assert!("supernode".parse::<RolePreset>().is_err());
         assert!("".parse::<RolePreset>().is_err());
@@ -775,6 +902,7 @@ mod tests {
             PrimaryRole::Client,
             PrimaryRole::Admin,
             PrimaryRole::BlindExit,
+            PrimaryRole::BlindRelay,
         ]
         .iter()
         {
@@ -782,6 +910,15 @@ mod tests {
             let parsed: PrimaryRole = s.parse().expect("round trip");
             assert_eq!(parsed, primary);
         }
+    }
+
+    #[test]
+    fn primary_role_blind_relay_accepts_hyphen_alias() {
+        assert_eq!(
+            "blind-relay".parse::<PrimaryRole>().unwrap(),
+            PrimaryRole::BlindRelay
+        );
+        assert_eq!(PrimaryRole::BlindRelay.as_str(), "blind_relay");
     }
 
     #[test]
@@ -796,6 +933,7 @@ mod tests {
             Capability::AnchorPortMappingAuthoritative,
             Capability::ServesNas,
             Capability::ServesLlm,
+            Capability::BlindRelay,
         ]
         .iter()
         {
@@ -803,6 +941,15 @@ mod tests {
             let parsed: Capability = s.parse().expect("round trip");
             assert_eq!(parsed, cap);
         }
+    }
+
+    #[test]
+    fn capability_blind_relay_accepts_hyphen_alias() {
+        assert_eq!(
+            "blind-relay".parse::<Capability>().unwrap(),
+            Capability::BlindRelay
+        );
+        assert_eq!(Capability::BlindRelay.as_str(), "blind_relay");
     }
 
     #[test]
@@ -820,6 +967,9 @@ mod tests {
         // reorders the enum.
         assert!(Capability::AnchorPortMappingAuthoritative < Capability::ServesNas);
         assert!(Capability::ServesNas < Capability::ServesLlm);
+        // BlindRelay appended last (phase 2) — ordering must stay
+        // append-only for canonical serialisation.
+        assert!(Capability::ServesLlm < Capability::BlindRelay);
     }
 
     // ----- Relay-binary requirement -----
@@ -958,6 +1108,12 @@ mod tests {
             required_service_binaries(composition_for(RolePreset::Llm).capabilities),
             vec![ServiceKind::Llm]
         );
+        // blind_relay keeps the relay binary running (it forwards via
+        // rustynet-relay) — nothing else to deploy.
+        assert_eq!(
+            required_service_binaries(composition_for(RolePreset::BlindRelay).capabilities),
+            vec![ServiceKind::Relay]
+        );
     }
 
     // ----- Identity transitions -----
@@ -990,6 +1146,7 @@ mod tests {
             RolePreset::Anchor,
             RolePreset::Nas,
             RolePreset::Llm,
+            RolePreset::BlindRelay,
         ]
         .iter()
         {
@@ -1015,6 +1172,7 @@ mod tests {
             RolePreset::Anchor,
             RolePreset::Nas,
             RolePreset::Llm,
+            RolePreset::BlindRelay,
         ]
         .iter()
         {
@@ -1049,6 +1207,7 @@ mod tests {
             RolePreset::Anchor,
             RolePreset::Nas,
             RolePreset::Llm,
+            RolePreset::BlindRelay,
         ]
         .iter()
         {
@@ -1089,6 +1248,7 @@ mod tests {
             RolePreset::Anchor,
             RolePreset::Nas,
             RolePreset::Llm,
+            RolePreset::BlindRelay,
         ]
         .iter()
         {
@@ -1144,6 +1304,7 @@ mod tests {
             RolePreset::Nas,
             RolePreset::Llm,
             RolePreset::BlindExit,
+            RolePreset::BlindRelay,
         ]
         .iter()
         {
@@ -1587,15 +1748,20 @@ mod tests {
     /// extended to eight presets by
     /// `documents/operations/active/NodeRoleTaxonomyExtension_2026-06-11.md` §4
     /// (`nas`/`llm` behave exactly like `relay`: capability change ⇒
-    /// signed; no new blocked/irreversible cells). Drift between this
-    /// table and `validate_transition` is a test failure and a
-    /// docs-vs-code synchronisation defect.
+    /// signed; no new blocked/irreversible cells) and to nine by
+    /// `documents/operations/active/BlindRelayRoleDesign_2026-08-27.md`
+    /// §5.1/§6 (entering `blind_relay` from an incompatible role is
+    /// Blocked; leaving it is signed; `→ blind_exit` stays
+    /// Irreversible). Drift between this table and
+    /// `validate_transition` is a test failure and a docs-vs-code
+    /// synchronisation defect.
     fn expected_kind(from: RolePreset, to: RolePreset) -> TransitionKind {
         use RolePreset::*;
         match (from, to) {
             (a, b) if a == b => TransitionKind::Identity,
             (BlindExit, _) => TransitionKind::Blocked(""),
             (_, BlindExit) => TransitionKind::Irreversible(""),
+            (Client | Exit | Anchor | Nas | Llm, BlindRelay) => TransitionKind::Blocked(""),
             (Admin, Client) | (Client, Admin) => TransitionKind::LocalOnly,
             _ => TransitionKind::SignedMembership,
         }
@@ -1612,11 +1778,18 @@ mod tests {
         if from == to || from == RolePreset::BlindExit {
             return (Vec::new(), Vec::new());
         }
+        // Blocked blind-relay entries compute no service lifecycle
+        // at all — mirror the expected_kind Blocked arm.
+        if to == RolePreset::BlindRelay && !matches!(from, RolePreset::Admin | RolePreset::Relay) {
+            return (Vec::new(), Vec::new());
+        }
         let needs = |preset: RolePreset, kind: ServiceKind| {
             matches!(
                 (preset, kind),
-                (RolePreset::Relay | RolePreset::Anchor, ServiceKind::Relay)
-                    | (RolePreset::Nas, ServiceKind::Nas)
+                (
+                    RolePreset::Relay | RolePreset::Anchor | RolePreset::BlindRelay,
+                    ServiceKind::Relay
+                ) | (RolePreset::Nas, ServiceKind::Nas)
                     | (RolePreset::Llm, ServiceKind::Llm)
             )
         };
@@ -1661,6 +1834,7 @@ mod tests {
             RolePreset::Anchor,
             RolePreset::Nas,
             RolePreset::Llm,
+            RolePreset::BlindRelay,
         ];
         let mut mismatches = Vec::new();
         for &from in all.iter() {
@@ -1714,6 +1888,165 @@ mod tests {
         );
     }
 
+    // ----- Blind-relay role (BlindRelayRoleDesign §5.1/§6, phase 2) -----
+
+    #[test]
+    fn entering_blind_relay_from_incompatible_roles_is_blocked() {
+        // §5.1 exclusivity: a node carrying client, exit, anchor, or
+        // application-service state cannot become a blind relay by a
+        // role edit. (blind_exit → blind_relay is covered by the
+        // blind-exit lock-out sweep above.)
+        for &from in [
+            RolePreset::Client,
+            RolePreset::Exit,
+            RolePreset::Anchor,
+            RolePreset::Nas,
+            RolePreset::Llm,
+        ]
+        .iter()
+        {
+            let plan = transition_plan(from, RolePreset::BlindRelay);
+            assert_eq!(plan.from, from);
+            assert_eq!(plan.to, RolePreset::BlindRelay);
+            match plan.kind {
+                TransitionKind::Blocked(reason) => assert_eq!(
+                    reason,
+                    "blind_relay must be the node's only mesh duty: step down to admin or relay before entering blind_relay (no client/exit/anchor/service co-location, §5.1)",
+                ),
+                other => panic!("expected Blocked for {from:?} → blind_relay, got {other:?}"),
+            }
+            assert!(
+                !plan.kind.is_allowed(),
+                "{from:?} → blind_relay must not be allowed"
+            );
+            // Blocked plans compute no side effects and never claim
+            // the reinit ceremony.
+            assert!(plan.primary_change.is_none());
+            assert!(plan.adds_capabilities.is_empty());
+            assert!(plan.removes_capabilities.is_empty());
+            assert!(plan.service_deploys.is_empty());
+            assert!(plan.service_undeploys.is_empty());
+            assert!(!plan.requires_privacy_boundary_reinit);
+        }
+    }
+
+    #[test]
+    fn entering_blind_relay_from_compatible_roles_is_signed_membership() {
+        // Admin and plain relay are the only privacy-clean entry
+        // points (§6.2 enters from a normal, unadvertised relay).
+        for &from in [RolePreset::Admin, RolePreset::Relay].iter() {
+            let plan = transition_plan(from, RolePreset::BlindRelay);
+            assert_eq!(plan.kind, TransitionKind::SignedMembership);
+            assert!(plan.kind.is_allowed());
+            assert!(plan.kind.requires_owner_signature());
+            // The privacy boundary is crossed: phase 2 records the
+            // ordered-reinit requirement without performing it.
+            assert!(plan.requires_privacy_boundary_reinit);
+            assert_eq!(
+                plan.primary_change,
+                Some((composition_for(from).primary, PrimaryRole::BlindRelay))
+            );
+        }
+        // Service lifecycle: admin must deploy the relay binary
+        // (it runs nothing today); plain relay already runs it, so
+        // nothing deploys.
+        let from_admin = transition_plan(RolePreset::Admin, RolePreset::BlindRelay);
+        assert_eq!(from_admin.service_deploys, vec![ServiceKind::Relay]);
+        // Capability deltas: admin gains both blind-relay
+        // capabilities; plain relay only gains the blind marker.
+        assert_eq!(
+            from_admin.adds_capabilities,
+            vec![Capability::ServesRelay, Capability::BlindRelay]
+        );
+        let from_relay = transition_plan(RolePreset::Relay, RolePreset::BlindRelay);
+        assert_eq!(from_relay.adds_capabilities, vec![Capability::BlindRelay]);
+        assert!(from_relay.removes_capabilities.is_empty());
+        assert_eq!(from_relay.service_deploys, Vec::<ServiceKind>::new());
+    }
+
+    #[test]
+    fn leaving_blind_relay_is_reversible_but_marked() {
+        // §6.1: blind_relay is NOT factory-reset-irreversible.
+        // Leaving it is a signed transition in every direction, and
+        // every leaving plan records the privacy-boundary reinit
+        // requirement (ceremony itself is phase 4).
+        for &to in [
+            RolePreset::Client,
+            RolePreset::Admin,
+            RolePreset::Exit,
+            RolePreset::Relay,
+            RolePreset::Anchor,
+            RolePreset::Nas,
+            RolePreset::Llm,
+        ]
+        .iter()
+        {
+            let plan = transition_plan(RolePreset::BlindRelay, to);
+            assert!(
+                plan.kind.is_allowed(),
+                "blind_relay → {to:?} must be allowed"
+            );
+            assert_eq!(
+                plan.kind,
+                TransitionKind::SignedMembership,
+                "blind_relay → {to:?} must require a signed membership record"
+            );
+            assert!(plan.requires_privacy_boundary_reinit);
+            // Leaving always drops the blind marker capability.
+            assert!(plan.removes_capabilities.contains(&Capability::BlindRelay));
+        }
+    }
+
+    #[test]
+    fn blind_relay_to_blind_exit_stays_irreversible() {
+        // The (_, blind_exit) irreversibility rule keeps precedence
+        // over the reversible-leaving rule: the destination change is
+        // a factory reset, and the plan still records the privacy
+        // boundary crossing.
+        let plan = transition_plan(RolePreset::BlindRelay, RolePreset::BlindExit);
+        assert!(matches!(plan.kind, TransitionKind::Irreversible(_)));
+        assert!(plan.kind.requires_owner_signature());
+        assert!(plan.requires_privacy_boundary_reinit);
+    }
+
+    #[test]
+    fn privacy_boundary_marker_absent_without_blind_relay() {
+        // The marker is exclusively a blind-relay signal: no
+        // blind-relay-free transition may claim the reinit ceremony.
+        for &from in [RolePreset::Client, RolePreset::Admin, RolePreset::Relay].iter() {
+            for &to in [RolePreset::Client, RolePreset::Admin, RolePreset::Exit].iter() {
+                let plan = transition_plan(from, to);
+                assert!(
+                    !plan.requires_privacy_boundary_reinit,
+                    "{from:?} → {to:?} must not claim the privacy reinit"
+                );
+            }
+        }
+        for entry in ROLE_PRESET_TABLE.iter() {
+            let plan = transition_plan(entry.preset, entry.preset);
+            assert!(!plan.requires_privacy_boundary_reinit);
+        }
+    }
+
+    #[test]
+    fn blind_relay_entry_exclusivity_holds_across_matrix() {
+        // Exhaustive guard: no allowed transition may produce a plan
+        // whose destination is blind_relay unless the source is one
+        // of the two compatible sources (or identity). This is the
+        // transition-table mirror of the §5.1 co-location invariant.
+        for &from in RolePreset::all().iter() {
+            for &to in RolePreset::all().iter() {
+                let plan = transition_plan(from, to);
+                if plan.kind.is_allowed() && to == RolePreset::BlindRelay && from != to {
+                    assert!(
+                        matches!(from, RolePreset::Admin | RolePreset::Relay),
+                        "allowed entry into blind_relay from incompatible source {from:?}"
+                    );
+                }
+            }
+        }
+    }
+
     // ----- Helper predicates -----
 
     #[test]
@@ -1739,11 +2072,11 @@ mod tests {
     }
 
     #[test]
-    fn all_presets_returns_eight_unique_entries() {
+    fn all_presets_returns_nine_unique_entries() {
         let all = RolePreset::all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
         let unique: BTreeSet<RolePreset> = all.iter().copied().collect();
-        assert_eq!(unique.len(), 8);
+        assert_eq!(unique.len(), 9);
     }
 
     #[test]

@@ -1942,6 +1942,7 @@ pub enum NodeRole {
     Admin,
     Client,
     BlindExit,
+    BlindRelay,
 }
 
 impl NodeRole {
@@ -1950,6 +1951,7 @@ impl NodeRole {
             NodeRole::Admin => "admin",
             NodeRole::Client => "client",
             NodeRole::BlindExit => "blind_exit",
+            NodeRole::BlindRelay => "blind_relay",
         }
     }
 
@@ -1966,6 +1968,10 @@ impl NodeRole {
             NodeRole::Admin => &[RoleCapability::Anchor],
             NodeRole::Client => &[RoleCapability::Client],
             NodeRole::BlindExit => &[RoleCapability::BlindExit, RoleCapability::ExitServer],
+            // BlindRelayRoleDesign §4.2: the blind relay projects
+            // exactly {RelayHost, BlindRelay}. Co-location refusals
+            // live in validate_node_role_membership_alignment.
+            NodeRole::BlindRelay => &[RoleCapability::RelayHost, RoleCapability::BlindRelay],
         }
     }
 
@@ -1983,7 +1989,9 @@ impl NodeRole {
                     | IpcCommand::LanAccessOff
                     | IpcCommand::DnsInspect
             ),
-            NodeRole::BlindExit => matches!(
+            // Blind roles expose read-only status visibility only:
+            // no operator-initiated network mutations over IPC.
+            NodeRole::BlindExit | NodeRole::BlindRelay => matches!(
                 command,
                 IpcCommand::Status
                     | IpcCommand::Netcheck
@@ -2002,7 +2010,10 @@ impl std::str::FromStr for NodeRole {
             "admin" => Ok(NodeRole::Admin),
             "client" => Ok(NodeRole::Client),
             "blind_exit" | "blind-exit" => Ok(NodeRole::BlindExit),
-            _ => Err("invalid node role: expected admin, client, or blind_exit".to_owned()),
+            "blind_relay" | "blind-relay" => Ok(NodeRole::BlindRelay),
+            _ => Err(
+                "invalid node role: expected admin, client, blind_exit, or blind_relay".to_owned(),
+            ),
         }
     }
 }
@@ -2097,6 +2108,44 @@ fn validate_node_role_membership_alignment(
         }
         NodeRole::BlindExit if node.capabilities.contains(&RoleCapability::Anchor) => {
             Err("blind_exit role cannot use membership carrying anchor capability".to_owned())
+        }
+        // Blind-relay exclusivity (BlindRelayRoleDesign §5.1): the
+        // signed membership for a blind_relay node must carry the
+        // exact set {RelayHost, BlindRelay} and nothing else — no
+        // client/entry/exit/anchor/application-service co-location.
+        // Unlike blind_exit there is NO warn-and-continue exception
+        // here (§5.2: that exception is not precedent); a violating
+        // bundle fails the alignment check closed.
+        NodeRole::BlindRelay => {
+            const FORBIDDEN: [RoleCapability; 7] = [
+                RoleCapability::Client,
+                RoleCapability::EntryRelay,
+                RoleCapability::ExitServer,
+                RoleCapability::BlindExit,
+                RoleCapability::Anchor,
+                RoleCapability::ServesNas,
+                RoleCapability::ServesLlm,
+            ];
+            if let Some(offending) = FORBIDDEN
+                .iter()
+                .find(|capability| node.capabilities.contains(capability))
+            {
+                return Err(format!(
+                    "blind_relay role cannot use membership carrying {} capability (exact blind-relay set required, §5.1)",
+                    offending.as_str()
+                ));
+            }
+            if let Some(offending) = node
+                .capabilities
+                .iter()
+                .find(|capability| capability.is_anchor_capability())
+            {
+                return Err(format!(
+                    "blind_relay role cannot use membership carrying anchor sub-capability {} (§5.1)",
+                    offending.as_str()
+                ));
+            }
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -12787,6 +12836,12 @@ fn validate_node_role_backend_capabilities(
         NodeRole::BlindExit => {
             !(capabilities.supports_exit_nodes && capabilities.supports_exit_serving)
         }
+        // blind_relay forwards mesh frames via the relay sibling
+        // service; it serves no exit and selects no exit client,
+        // so none of the backend capability flags gate it today.
+        // Platform eligibility and the dataplane posture are the
+        // phase-3/§16 deliverables (BlindRelayRoleDesign §16).
+        NodeRole::BlindRelay => false,
     };
     if rejected {
         return Err(DaemonError::InvalidConfig(format!(
@@ -21613,6 +21668,9 @@ mod tests {
             NodeRole::Client => vec![RoleCapability::Client],
             // blind_exit must not carry Anchor (validator rejects that combo).
             NodeRole::BlindExit => vec![RoleCapability::BlindExit, RoleCapability::ExitServer],
+            // Exact blind-relay set (§5.1) — the validator rejects
+            // any co-location.
+            NodeRole::BlindRelay => vec![RoleCapability::RelayHost, RoleCapability::BlindRelay],
         };
         let owner_signing = SigningKey::from_bytes(&[7; 32]);
         let state_nodes = vec![
