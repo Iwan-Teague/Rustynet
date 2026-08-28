@@ -370,7 +370,27 @@ harvest stages).
   produce (e.g. grade a runtime-skip as promotable once the macOS validators pass). Code work in
   `role.rs`/`anchor_validation.rs`; the fail-closed default itself stays.
 
-Source: `MacCellsHarvest_2026-08-28.md` §2.2–§2.3. **Status: `pending`.**
+Source: `MacCellsHarvest_2026-08-28.md` §2.2–§2.3. **Status: `resolved (code)
+2026-08-28` — option (b) applied as a mechanical decoupling, no owner decision
+needed.** The gate itself is correct posture policy (not stale, not forced
+open); the defect was `anchor_validation` consulting it for its runtime gate —
+the only stage still doing so, its siblings already keying on per-capability
+predicates (`relay_lab_runtime_implemented`, `active_exit_runtime_implemented`).
+The fix applies the same pattern: new `anchor_lab_runtime_implemented`
+(Linux + macOS; Windows pending Phase 8) plus a pure `runtime_coverage`
+decision that grades a macOS anchor's bundle-pull runtime as
+`DelegatedToMacosValidators` (recorded under `runtime_delegated_nodes`, not a
+skip) **only** when `--anchor-platform macos` is elected in the same run
+(`OrchestrationContext::macos_anchor_validators_elected`, run-local, reloads
+`false` on resume = fail-closed), and as a reported skip otherwise.
+Fail-closed negatives are pinned by unit tests
+(`runtime_coverage_macos_without_validators_is_reported_skip`,
+`runtime_coverage_windows_is_reported_skip`); the combined
+role-election + validator-set + full-Live-suite run (§5) now has a producible
+green, and `role.rs`'s Anchor/macOS arm lifts on THAT archived evidence (kept
+Linux-only until then, strictest-secure-default; evidence path documented in
+its doc comment). Disposition details:
+`MacCellsHarvest_2026-08-28.md` §2.2.
 
 ### 20. MAC-D2 — macOS exit cell blocked: membership-owner adapter reads the wrong path, without privilege
 

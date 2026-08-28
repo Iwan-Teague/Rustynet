@@ -166,6 +166,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         assert!(matches!(
             MembershipInitStage.execute(&mut ctx),
@@ -201,6 +202,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         let exit_key = "a".repeat(64);
         let client_key = "b".repeat(64);
@@ -297,6 +299,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         ctx.collected_pubkeys
             .insert("client-1".to_owned(), WireguardPublicKey("b".repeat(64)));
@@ -331,6 +334,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         ctx.node_ids
             .insert("client-1".to_owned(), "client-node-id".to_owned());

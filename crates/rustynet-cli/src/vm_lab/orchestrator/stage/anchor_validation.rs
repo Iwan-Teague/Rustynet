@@ -1,9 +1,10 @@
 #![allow(dead_code)]
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::anchor::{
-    AnchorRuntimeParams, validate_anchor_capability_advertisement,
+    AnchorRuntimeParams, anchor_lab_runtime_implemented, validate_anchor_capability_advertisement,
     validate_bundle_pull_log_redaction, validate_bundle_pull_loopback,
     validate_invalid_token_rejected,
 };
@@ -24,10 +25,20 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 ///
 ///   * bundle-pull runtime (PORTED): `bundle_pull_loopback`,
 ///     `invalid_token`, `log_redaction` run live on Linux anchors;
-///     macOS/Windows anchors are reported-skipped on the
-///     `is_supported_for_platform` posture gate (per-node, recorded in
-///     `runtime_skipped_nodes`), pending cross-OS Phase 8 wiring of their
-///     bundle-pull token/listener provisioning.
+///     macOS anchors delegate runtime coverage to the dedicated macOS
+///     anchor validator set (`deploy_macos_anchor_profile` /
+///     `validate_macos_anchor_bundle_pull` /
+///     `validate_macos_anchor_port_mapping_authority`) when that set is
+///     elected in the same run (`--anchor-platform macos`, MAC-D1); a
+///     macOS anchor in a run WITHOUT the validator set — and any Windows
+///     anchor — is reported-skipped (per-node, recorded in
+///     `runtime_skipped_nodes`), pending Windows cross-OS Phase 8 wiring
+///     of bundle-pull token/listener provisioning. The gate is
+///     [`anchor_lab_runtime_implemented`] + the validator-set election,
+///     NEVER `NodeRole::Anchor::is_supported_for_platform`: gating this
+///     stage on the same predicate whose promotion requires this stage's
+///     own green run is circular (MAC-D1, `MacCellsHarvest_2026-08-28.md`
+///     §2.2).
 ///   * runtime-dependent (DEFERRED): `enrollment_endpoint` — the
 ///     authorisation half now HAS a runtime enforcement point (D-3: the
 ///     daemon refuses `EnrollmentConsume` unless the local node holds
@@ -46,8 +57,10 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 pub const ANCHOR_REPORTED_SKIPS_NOTE: &str = concat!(
     "anchor_validation scope=capability_advertisement+bundle_pull; ",
     "ported_runtime_dependent=[bundle_pull_loopback,invalid_token,log_redaction] ",
-    "(run live on Linux anchors; macOS/Windows reported-skipped on the is_supported_for_platform gate, ",
-    "pending cross-OS Phase 8 wiring of bundle-pull token/listener provisioning); ",
+    "(run live on Linux anchors; macOS anchors delegate runtime coverage to the macOS anchor validator set ",
+    "when --anchor-platform macos is elected in the same run; macOS without that set and Windows are ",
+    "reported-skipped, gated on anchor_lab_runtime_implemented + the validator election, never on ",
+    "is_supported_for_platform — MAC-D1 de-circularisation); ",
     "reported_skipped_runtime_dependent=[enrollment_endpoint] ",
     "(the authorisation gate IS enforced at runtime as of D-3 — the daemon refuses EnrollmentConsume unless the ",
     "local node holds anchor.enrollment_endpoint in signed membership — but the LAN-exposed enrollment listener ",
@@ -85,9 +98,14 @@ const REPORTED_SKIPS_FILENAME: &str = "anchor_validation.reported_skips.json";
 /// bundle-pull runtime substages (loopback / invalid-token / log-redaction)
 /// over the same seam — proving the daemon's bundle-pull listener serves
 /// the signed snapshot to an authorised token, rejects an unauthorised
-/// one, and redacts the raw token from its journal. macOS/Windows anchors
-/// are reported-skipped for these on the `is_supported_for_platform`
-/// posture gate (recorded per-node), pending cross-OS Phase 8 wiring.
+/// one, and redacts the raw token from its journal. A macOS anchor whose
+/// runtime is covered by the macOS anchor validator set elected in the
+/// same run (`--anchor-platform macos`) is recorded as delegated (never a
+/// skip) so the combined run can go green; a macOS anchor without that
+/// set — and any Windows anchor — is reported-skipped (recorded per-node),
+/// pending Windows cross-OS Phase 8 wiring. The gate is
+/// [`anchor_lab_runtime_implemented`] + the validator-set election, never
+/// the `is_supported_for_platform` posture gate (circular — MAC-D1).
 ///
 /// The remaining substages — `enrollment_endpoint` (its authorisation gate
 /// is enforced in the daemon as of D-3, but the LAN listener the capability
@@ -138,8 +156,14 @@ impl OrchestrationStage for AnchorValidationStage {
         let mut failures: Vec<String> = Vec::new();
         // (alias, platform) anchors whose runtime bundle-pull substages were
         // reported-skipped because they are not yet live-supported there
-        // (macOS/Windows). Named, never a silent pass.
+        // (Windows; macOS without the validator set). Named, never a silent
+        // pass.
         let mut runtime_skips: Vec<(String, String)> = Vec::new();
+        // (alias, platform) anchors whose runtime bundle-pull coverage is
+        // DELEGATED to the macOS anchor validator set elected in this same
+        // run (`--anchor-platform macos`) — recorded as evidence, never
+        // counted as a skip (MAC-D1).
+        let mut runtime_delegations: Vec<(String, String)> = Vec::new();
         for alias in &anchor_aliases {
             let adapter = match ctx.adapters.get(alias.as_str()) {
                 Some(adapter) => adapter,
@@ -176,42 +200,109 @@ impl OrchestrationStage for AnchorValidationStage {
                 continue;
             }
 
-            // Runtime bundle-pull substages: live on Linux anchors today
-            // (the daemon binds the loopback listener + `ops install-systemd`
-            // seeds the token for admin-role nodes). macOS/Windows anchors are
-            // reported-skipped — named, never a silent pass — on the same
-            // is_supported_for_platform posture gate, pending cross-OS Phase 8
-            // wiring of their bundle-pull token/listener provisioning.
-            if NodeRole::Anchor.is_supported_for_platform(&platform) {
-                let params = match AnchorRuntimeParams::for_platform(platform) {
-                    Ok(params) => params,
-                    Err(e) => {
-                        failures.push(format!("{alias}: anchor runtime params: {e}"));
-                        continue;
+            // Runtime bundle-pull substages. The coverage decision is
+            // [`runtime_coverage`] — a pure function of platform + this
+            // run's macOS-anchor-validator election, NEVER the
+            // `is_supported_for_platform` posture gate: gating this stage
+            // on the predicate whose promotion requires this stage's own
+            // green run was circular (MAC-D1,
+            // `MacCellsHarvest_2026-08-28.md` §2.2).
+            //
+            // Linux runs them inline (token seeded by `ops install-systemd`
+            // for admin-role nodes). macOS with the validator set elected
+            // delegates coverage to `deploy_macos_anchor_profile` +
+            // `validate_macos_anchor_bundle_pull` +
+            // `validate_macos_anchor_port_mapping_authority`, which run in
+            // this same invocation (recorded as a delegation, not a skip).
+            // macOS without the set, and Windows, are reported-skipped —
+            // fail-closed: the stage cannot go green without real runtime
+            // evidence.
+            match runtime_coverage(platform, ctx.macos_anchor_validators_elected) {
+                AnchorRuntimeCoverage::Inline => {
+                    let params = match AnchorRuntimeParams::for_platform(platform) {
+                        Ok(params) => params,
+                        Err(e) => {
+                            failures.push(format!("{alias}: anchor runtime params: {e}"));
+                            continue;
+                        }
+                    };
+                    if let Err(e) = validate_bundle_pull_loopback(&*shell, &params) {
+                        failures.push(format!("{alias}: {e}"));
                     }
-                };
-                if let Err(e) = validate_bundle_pull_loopback(&*shell, &params) {
-                    failures.push(format!("{alias}: {e}"));
+                    if let Err(e) = validate_invalid_token_rejected(&*shell, &params) {
+                        failures.push(format!("{alias}: {e}"));
+                    }
+                    if let Err(e) = validate_bundle_pull_log_redaction(&*shell, &params) {
+                        failures.push(format!("{alias}: {e}"));
+                    }
                 }
-                if let Err(e) = validate_invalid_token_rejected(&*shell, &params) {
-                    failures.push(format!("{alias}: {e}"));
+                AnchorRuntimeCoverage::DelegatedToMacosValidators => {
+                    runtime_delegations.push((alias.clone(), format!("{platform:?}")));
                 }
-                if let Err(e) = validate_bundle_pull_log_redaction(&*shell, &params) {
-                    failures.push(format!("{alias}: {e}"));
+                AnchorRuntimeCoverage::ReportedSkip => {
+                    runtime_skips.push((alias.clone(), format!("{platform:?}")));
                 }
-            } else {
-                runtime_skips.push((alias.clone(), format!("{platform:?}")));
             }
         }
 
         if failures.is_empty() {
-            // Record the deferred-substage note + any per-node runtime skips as
-            // evidence on a non-failing run. Best-effort: a write failure does not
-            // change the outcome (the proofs that ran already passed), but the
-            // common path leaves a machine-readable artifact behind.
-            write_reported_skips_note(ctx, &runtime_skips);
+            // Record the deferred-substage note + any per-node runtime skips
+            // and validator-set delegations as evidence on a non-failing run.
+            // Best-effort: a write failure does not change the outcome (the
+            // proofs that ran already passed), but the common path leaves a
+            // machine-readable artifact behind.
+            write_reported_skips_note(ctx, &runtime_skips, &runtime_delegations);
         }
         outcome_for(&failures, &runtime_skips)
+    }
+}
+
+/// How an anchor node's bundle-pull RUNTIME substages are covered — the
+/// pure decision behind the per-node runtime gate (MAC-D1). Never derived
+/// from `NodeRole::Anchor::is_supported_for_platform`: that predicate's
+/// promotion contract requires a green run, and this stage is the stage
+/// that could not produce one — the circularity the harvest documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorRuntimeCoverage {
+    /// Run the inline bundle-pull substages over the shell seam (Linux:
+    /// token seeded by `ops install-systemd` for admin-role nodes).
+    Inline,
+    /// macOS with the macOS anchor validator set elected in this same run
+    /// (`--anchor-platform macos`): runtime coverage is delegated to
+    /// `deploy_macos_anchor_profile`, `validate_macos_anchor_bundle_pull`
+    /// and `validate_macos_anchor_port_mapping_authority`, which provision
+    /// the token and prove loopback / token-gate / LAN-refused /
+    /// secrets-hygiene on the macOS anchor. Recorded as a delegation, not
+    /// a skip — the combined run can go green.
+    DelegatedToMacosValidators,
+    /// No runtime evidence path in this run: macOS without the validator
+    /// set, or Windows (pending Phase 8 provisioning). Reported-skip —
+    /// named, never a silent pass; the stage grades Skipped so the run
+    /// goes Partial (fail-closed: no green without real runtime evidence).
+    ReportedSkip,
+}
+
+/// Pure per-node runtime-coverage decision (unit-testable without an
+/// adapter). `macos_anchor_validators_elected` mirrors
+/// `--anchor-platform macos` for this run (threaded run-local on
+/// [`OrchestrationContext`]; a resumed context reloads `false`, which is
+/// the fail-closed direction).
+fn runtime_coverage(
+    platform: VmGuestPlatform,
+    macos_anchor_validators_elected: bool,
+) -> AnchorRuntimeCoverage {
+    if !anchor_lab_runtime_implemented(platform) {
+        return AnchorRuntimeCoverage::ReportedSkip;
+    }
+    match platform {
+        VmGuestPlatform::Linux => AnchorRuntimeCoverage::Inline,
+        VmGuestPlatform::Macos if macos_anchor_validators_elected => {
+            AnchorRuntimeCoverage::DelegatedToMacosValidators
+        }
+        // macOS runtime IS implemented, but this run carries no validator
+        // set — no evidence path, so the runtime substages cannot be
+        // claimed. Fail closed: reported skip, never a silent pass.
+        _ => AnchorRuntimeCoverage::ReportedSkip,
     }
 }
 
@@ -220,17 +311,19 @@ impl OrchestrationStage for AnchorValidationStage {
 /// per-OS adapter (whose `platform()` would otherwise have to be macOS/Windows
 /// for the reported-skip case). Mirrors `deploy_relay::outcome_for`.
 ///
-/// Honest cross-OS posture (Wave 1): capability-advertisement runs real on every
-/// OS, but the bundle-pull RUNTIME substages are reported-skipped on
-/// macOS/Windows anchors. So:
+/// Honest cross-OS posture (Wave 1, MAC-D1 revision): capability-advertisement
+/// runs real on every OS; bundle-pull RUNTIME substages run inline on Linux,
+/// are delegated on macOS when the validator set is elected, and are
+/// reported-skipped otherwise. So:
 ///   * any hard failure (broken cap-advert / runtime probe / construction) ⇒
 ///     `Failed`;
-///   * else any reported runtime-skip (a macOS/Windows anchor whose bundle-pull
-///     runtime substages did not run) ⇒ `Skipped`, so the run goes
-///     `RunStatus::Partial` instead of falsely green — the stage did NOT fully
-///     prove every anchor; the skipped nodes are named in the side-car note;
-///   * else (every anchor fully validated incl. runtime; the empty-anchor-lab
-///     no-op is handled before this) ⇒ `Passed`.
+///   * else any reported runtime-skip (an anchor whose bundle-pull runtime
+///     has no evidence path in this run) ⇒ `Skipped`, so the run goes
+///     `RunStatus::Partial` instead of falsely green — the stage did NOT
+///     fully prove every anchor; the skipped nodes are named in the side-car
+///     note (delegated nodes are NOT skips — they are recorded separately);
+///   * else (every anchor fully validated or validly delegated; the
+///     empty-anchor-lab no-op is handled before this) ⇒ `Passed`.
 fn outcome_for(failures: &[String], runtime_skips: &[(String, String)]) -> StageOutcome {
     if !failures.is_empty() {
         StageOutcome::Failed(failures.join("; "))
@@ -248,16 +341,24 @@ fn outcome_for(failures: &[String], runtime_skips: &[(String, String)]) -> Stage
 /// (no I/O) so a unit test can assert the content without depending on
 /// the filesystem. `to_vec_pretty` on this fixed `serde_json::Value`
 /// cannot fail, so the `unwrap_or_default` is unreachable in practice.
-fn reported_skips_json_bytes(runtime_skips: &[(String, String)]) -> Vec<u8> {
+fn reported_skips_json_bytes(
+    runtime_skips: &[(String, String)],
+    runtime_delegations: &[(String, String)],
+) -> Vec<u8> {
     let runtime_skipped_nodes: Vec<serde_json::Value> = runtime_skips
+        .iter()
+        .map(|(alias, platform)| serde_json::json!({ "alias": alias, "platform": platform }))
+        .collect();
+    let runtime_delegated_nodes: Vec<serde_json::Value> = runtime_delegations
         .iter()
         .map(|(alias, platform)| serde_json::json!({ "alias": alias, "platform": platform }))
         .collect();
     let body = serde_json::json!({
         "stage": "anchor_validation",
         "scope": "capability_advertisement+bundle_pull",
-        // Now ported + run live on Linux anchors (reported-skipped per-node on
-        // macOS/Windows — see `runtime_skipped_nodes`).
+        // Ported + run live on Linux anchors (macOS delegates to the macOS
+        // anchor validator set when elected in this run; see
+        // `runtime_delegated_nodes` / `runtime_skipped_nodes`).
         "ported_runtime_dependent": [
             "bundle_pull_loopback",
             "invalid_token",
@@ -270,20 +371,32 @@ fn reported_skips_json_bytes(runtime_skips: &[(String, String)]) -> Vec<u8> {
         "reported_skipped_runtime_dependent": ["enrollment_endpoint"],
         "reported_skipped_mutation": ["gossip_priority", "downgrade_revocation"],
         // Per-run: anchors whose runtime bundle-pull substages were skipped
-        // because their platform is not yet live-supported (macOS/Windows).
+        // because their platform is not yet live-supported, or macOS runs
+        // without the macOS anchor validator set (MAC-D1 fail-closed).
         "runtime_skipped_nodes": runtime_skipped_nodes,
+        // Per-run: macOS anchors whose runtime coverage is delegated to the
+        // macOS anchor validator set elected in this same run
+        // (`--anchor-platform macos`) — recorded here, NOT as skips (MAC-D1).
+        "runtime_delegated_nodes": runtime_delegated_nodes,
         "note": ANCHOR_REPORTED_SKIPS_NOTE,
     });
     serde_json::to_vec_pretty(&body).unwrap_or_default()
 }
 
 /// Write the reported-skip note to `<report_dir>/anchor_validation.reported_skips.json`
-/// so the deferred substages (and any per-node runtime skips) are recorded as
-/// evidence. Best-effort: a write failure is ignored (the stage's own proofs
-/// already passed).
-fn write_reported_skips_note(ctx: &OrchestrationContext, runtime_skips: &[(String, String)]) {
+/// so the deferred substages (and any per-node runtime skips / validator-set
+/// delegations) are recorded as evidence. Best-effort: a write failure is
+/// ignored (the stage's own proofs already passed).
+fn write_reported_skips_note(
+    ctx: &OrchestrationContext,
+    runtime_skips: &[(String, String)],
+    runtime_delegations: &[(String, String)],
+) {
     let path = ctx.report_dir.join(REPORTED_SKIPS_FILENAME);
-    let _ = std::fs::write(&path, reported_skips_json_bytes(runtime_skips));
+    let _ = std::fs::write(
+        &path,
+        reported_skips_json_bytes(runtime_skips, runtime_delegations),
+    );
 }
 
 #[cfg(test)]
@@ -309,6 +422,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         }
     }
 
@@ -443,12 +557,11 @@ mod tests {
     fn reported_skips_json_bytes_is_valid_json_naming_every_substage() {
         // Pure (no FS): the serialized note must parse back and name
         // every deferred substage in its structured fields.
-        // Two macOS/Windows anchors whose runtime substages were skipped.
-        let runtime_skips = vec![
-            ("anchor-mac".to_owned(), "Macos".to_owned()),
-            ("anchor-win".to_owned(), "Windows".to_owned()),
-        ];
-        let bytes = reported_skips_json_bytes(&runtime_skips);
+        // One Windows skip (no runtime path) + one macOS delegation
+        // (validator set elected in-run; MAC-D1).
+        let runtime_skips = vec![("anchor-win".to_owned(), "Windows".to_owned())];
+        let runtime_delegations = vec![("anchor-mac".to_owned(), "Macos".to_owned())];
+        let bytes = reported_skips_json_bytes(&runtime_skips, &runtime_delegations);
         let parsed: serde_json::Value =
             serde_json::from_slice(&bytes).expect("reported-skip note must be valid JSON");
         assert_eq!(parsed["stage"], "anchor_validation");
@@ -484,12 +597,80 @@ mod tests {
         let skipped_nodes = parsed["runtime_skipped_nodes"]
             .as_array()
             .expect("runtime_skipped_nodes list");
-        assert_eq!(skipped_nodes.len(), 2);
+        assert_eq!(skipped_nodes.len(), 1);
         assert!(
             skipped_nodes
                 .iter()
+                .any(|v| v["alias"] == "anchor-win" && v["platform"] == "Windows")
+        );
+        // Delegations are recorded separately from skips (MAC-D1).
+        let delegated_nodes = parsed["runtime_delegated_nodes"]
+            .as_array()
+            .expect("runtime_delegated_nodes list");
+        assert_eq!(delegated_nodes.len(), 1);
+        assert!(
+            delegated_nodes
+                .iter()
                 .any(|v| v["alias"] == "anchor-mac" && v["platform"] == "Macos")
         );
+    }
+
+    #[test]
+    fn runtime_coverage_linux_is_inline_regardless_of_election() {
+        // Linux runs the inline substages; the macOS election is irrelevant.
+        assert_eq!(
+            runtime_coverage(VmGuestPlatform::Linux, false),
+            AnchorRuntimeCoverage::Inline
+        );
+        assert_eq!(
+            runtime_coverage(VmGuestPlatform::Linux, true),
+            AnchorRuntimeCoverage::Inline
+        );
+    }
+
+    #[test]
+    fn runtime_coverage_macos_delegates_only_when_validators_elected() {
+        // MAC-D1: with `--anchor-platform macos` elected, the macOS anchor's
+        // bundle-pull runtime is delegated to the validator set of this run.
+        assert_eq!(
+            runtime_coverage(VmGuestPlatform::Macos, true),
+            AnchorRuntimeCoverage::DelegatedToMacosValidators
+        );
+    }
+
+    #[test]
+    fn runtime_coverage_macos_without_validators_is_reported_skip() {
+        // Fail-closed negative (MAC-D1): a macOS anchor in a run that does
+        // NOT elect the macOS anchor validator set has NO runtime evidence
+        // path — reported skip, never a silent delegation or pass, so the
+        // stage grades Skipped and the run goes Partial.
+        assert_eq!(
+            runtime_coverage(VmGuestPlatform::Macos, false),
+            AnchorRuntimeCoverage::ReportedSkip
+        );
+    }
+
+    #[test]
+    fn runtime_coverage_windows_is_reported_skip() {
+        // Windows bundle-pull provisioning is still pending Phase 8.
+        assert_eq!(
+            runtime_coverage(VmGuestPlatform::Windows, false),
+            AnchorRuntimeCoverage::ReportedSkip
+        );
+        assert_eq!(
+            runtime_coverage(VmGuestPlatform::Windows, true),
+            AnchorRuntimeCoverage::ReportedSkip
+        );
+    }
+
+    #[test]
+    fn outcome_for_delegated_macos_runtime_with_no_failures_is_passed() {
+        // MAC-D1: a macOS anchor whose runtime is delegated to the elected
+        // validator set is NOT a runtime skip — with capability
+        // advertisement green and no skips, the stage can go Passed so the
+        // combined run (validators green in the same invocation) can be
+        // the archived evidence the posture promotion names.
+        assert!(matches!(outcome_for(&[], &[]), StageOutcome::Passed));
     }
 
     #[test]

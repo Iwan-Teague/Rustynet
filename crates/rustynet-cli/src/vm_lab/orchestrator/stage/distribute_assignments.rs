@@ -335,6 +335,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         ctx.node_ids
             .insert("exit-1".to_owned(), "exit-node-id-abc".to_owned());
@@ -400,6 +401,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         assert!(matches!(
             DistributeAssignmentsStage::new(

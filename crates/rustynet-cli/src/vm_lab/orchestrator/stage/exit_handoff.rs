@@ -78,6 +78,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         assert!(matches!(
             ExitHandoffStage.execute(&mut ctx),
