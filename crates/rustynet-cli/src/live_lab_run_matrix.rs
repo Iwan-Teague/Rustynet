@@ -4399,11 +4399,17 @@ mod registry_equivalence_tests {
                 "bash-only stage must not be rust-native: {bash_only}"
             );
         }
-        // Prefix fallback preserved: unknown chaos_/cross_network_ names stay
-        // in the Rust suite families (incl. the bash-exclusive
-        // cross_network_daemon_path — historical behavior).
+        // Prefix fallback preserved: unknown chaos_/cross_network_ names stay in
+        // the Rust suite families by construction. Pinned with names that are
+        // deliberately absent from both the registry and `StageId` — this used
+        // to be pinned with `cross_network_daemon_path`, which was deleted with
+        // the rest of the CN-5 bash tail and would now pass for the wrong
+        // reason once someone re-registered it.
         assert!(live_lab_stage_registry::is_rust_native_stage_name(
-            "cross_network_daemon_path"
+            "cross_network_unregistered_probe"
+        ));
+        assert!(live_lab_stage_registry::is_rust_native_stage_name(
+            "chaos_unregistered_probe"
         ));
     }
 
