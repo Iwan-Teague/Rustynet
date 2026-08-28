@@ -213,8 +213,6 @@ pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = "/var/lib/rustynet/membership.log"
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH;
 pub const DEFAULT_ANCHOR_BUNDLE_PULL_ADDR: &str = "127.0.0.1:51822";
-pub const DEFAULT_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
-    "/var/lib/rustynet/anchor-bundle-pull.token";
 pub const MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES: usize = 256;
 
 /// Overall wall-clock budget for reading ONE request line off a bundle-pull
