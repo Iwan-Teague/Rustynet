@@ -10011,6 +10011,42 @@ impl DaemonProbeOp {
 pub trait DaemonProbe {
     fn build_argv(&self, op: DaemonProbeOp, daemon_path: &Path) -> Result<Vec<String>, String>;
     fn platform_label(&self) -> &'static str;
+
+    /// `build_argv` plus caller-supplied expectation flags.
+    ///
+    /// The base argv is the same fixed set of known-safe strings on every
+    /// platform; the extras carry the per-run expectations a check needs in
+    /// order to assert anything (QH-39: `mesh-status` dispatched with no
+    /// expectations performs ZERO assertions in its `Ok` branch, so
+    /// `overall_ok: true` means only "a state file exists and parses").
+    /// Rejection still comes from `build_argv`, so an unsupported op cannot
+    /// be smuggled through by passing extras.
+    ///
+    /// Two adapters join this argv into a `sudo -n …` shell string, so each
+    /// extra is validated to be a single non-empty shell-safe token before it
+    /// is appended — the base argv's "no user-controlled input reaches argv"
+    /// property must survive the widening.
+    fn build_argv_with_extra_args(
+        &self,
+        op: DaemonProbeOp,
+        daemon_path: &Path,
+        extra_args: &[String],
+    ) -> Result<Vec<String>, String> {
+        let mut argv = self.build_argv(op, daemon_path)?;
+        for arg in extra_args {
+            if arg.is_empty()
+                || !arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
+            {
+                return Err(format!(
+                    "daemon probe extra argument {arg:?} is not a shell-safe token"
+                ));
+            }
+            argv.push(arg.clone());
+        }
+        Ok(argv)
+    }
 }
 
 /// Linux probe surface. Daemon emits the same JSON schemas; only the

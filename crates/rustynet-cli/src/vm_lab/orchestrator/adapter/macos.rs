@@ -196,11 +196,15 @@ impl NodeAdapter for MacosNodeAdapter {
 
     // ── Validators ────────────────────────────────────────────────────────────
 
-    fn run_validator(&self, op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
+    fn run_validator(
+        &self,
+        op: DaemonProbeOp,
+        extra_args: &[String],
+    ) -> Result<ValidatorReport, AdapterError> {
         use crate::vm_lab::{DaemonProbe, MacosDaemonProbe};
         let probe = MacosDaemonProbe;
         let argv = probe
-            .build_argv(op, MACOS_RUSTYNETD_PATH.as_ref())
+            .build_argv_with_extra_args(op, MACOS_RUSTYNETD_PATH.as_ref(), extra_args)
             .map_err(|message| AdapterError::Protocol { message })?;
         let op_label = argv.get(1).cloned().unwrap_or_default();
         // All argv elements come from `MacosDaemonProbe::build_argv`, which produces

@@ -2065,6 +2065,72 @@ used, justify it against the reuse loops, not only against continuous runs.
    drift-consistency check, unlike the typed evaluators the dedicated stages use. Every one
    of its six probes inherits that weakness, not just these two.
 
+> **STATUS 2026-08-28 (ATTEMPT 2) — BOTH HALVES IMPLEMENTED on branch
+> `work/qh39-macos-greens`. Gates green; the macOS-guest live confirmation is FOLLOW-UP and
+> neither half is evidence-grade until it runs.** Three commits, each with its negative case
+> written first.
+>
+> **DNS half — the dead assertion is now a real, independent observation.**
+> `collect_macos_dns_failclosed_snapshot` no longer hardcodes
+> `loopback_resolver_advertised = true`; it is derived from `scutil --dns`, macOS's own
+> resolver configuration, parsed from the PRIMARY unscoped `resolver #1` block. That is the
+> independent source REVISION 2 required — deriving it from the parsed `resolv.conf`
+> nameservers was rejected as the tautology it is. A `resolv.conf` reading `127.0.0.1` while
+> `scutil` resolves against a public server now FAILS the check, and unreadable `scutil`
+> output fails closed. Snapshot construction is split into a pure
+> `build_macos_dns_failclosed_snapshot(resolv_conf, scutil_dns)` so production and tests
+> share one path and the drift branch is reachable from the same function the daemon calls.
+> Six new unit tests, including the negative case where `resolv.conf` is CLEAN and only the
+> resolver has drifted (asserting the failure comes from that branch and not from the
+> nameserver rule). This does NOT close unrecorded finding 1 above — the check still reads
+> `/etc/resolv.conf` for its nameserver list; what changed is that the second field is now
+> sourced from the configuration macOS actually uses.
+>
+> **mesh-status half — the freshness bound is armed, and ATTEMPT 1's blocker is fixed at its
+> root first.** Blocker 1 was RE-VERIFIED against current code before any edit: the apply
+> block (and the `persist_state` inside it) is still gated on `will_apply_generation ||
+> FailClosed || Recoverable`, where `will_apply_generation` is the five-way disjunct
+> (`daemon.rs:9938-9942`, `:9957-9960`), so a converged healthy node's snapshot still aged
+> without bound. Arming a bound on top of that would have repeated the reverted commit. So
+> the daemon now HEARTBEATS the snapshot on a slow cadence
+> (`STATE_SNAPSHOT_HEARTBEAT_INTERVAL_SECS = 30`, following the existing
+> `maybe_reassert_host_firewall_admission` pattern), deliberately NOT while the node is
+> restricted, fail-closed, or the pass errored — so the timestamp measures daemon liveness
+> and a wedged daemon still goes stale. With that prerequisite, `--max-age-seconds 180` is
+> sound in the reuse loops too (6x the heartbeat), which is the justification ATTEMPT 1
+> could not give. The bound and its measurement are SHARED with
+> `role_validation/mesh_status.rs` rather than re-derived.
+>
+> **The probe is NOT removed** — ATTEMPT 1's second blocker stands, and the `Missing` /
+> `IntegrityMismatch` / `InvalidFormat` arms it would have discarded are kept.
+>
+> **`--no-fail-on-drift` is KEPT, and this is a decision, not an oversight.** It suppresses
+> only the daemon's non-zero exit; the report still carries `overall_ok=false` +
+> `drift_reasons`, and the orchestrator's verdict comes from that JSON
+> (`adapter/ssh.rs::validator_report_ok`). Dropping it would make `run_remote` turn a drifted
+> node into an `AdapterError::Ssh` and THROW THE REPORT AWAY, so the stage would fail with a
+> bare exit code instead of the reasons. Drift tolerance is not what made the check vacuous;
+> the missing expectations were.
+>
+> **`--expected-peer-id` is still NOT emitted, and the reason is now pinned to code.** The
+> daemon builds `SessionStateSnapshot.peer_ids` from `self.advertised_routes`
+> (`daemon.rs`, `persist_state`) — advertised route CIDRs, validated by `validate_cidr`, not
+> peer node ids. No node id can ever match one, so passing the run's identities would red
+> every node. REVISION 2's "the plumbing already exists at both ends" is correct about the
+> flags and wrong about what the field holds. **Asserting peer visibility at this probe is
+> blocked on a daemon-side fix** (persist the real mesh peer set, or rename the field to what
+> it is); that is a separate entry's worth of work and is not attempted here.
+>
+> **Tests answer ATTEMPT 1's "the tests did not discriminate" note.** Beyond the argv-shape
+> pin (all three platforms, plus a pin that `--no-fail-on-drift` survives), the bound is
+> checked SEMANTICALLY against `rustynetd::daemon::STATE_SNAPSHOT_HEARTBEAT_INTERVAL_SECS` —
+> the orchestrator's string and the daemon's cadence are now bound together across the crate
+> boundary, so a meaningless `86400` fails. Two daemon tests pin the heartbeat itself: a
+> quiescent reconcile refreshes a stale snapshot, and does NOT rewrite a fresh one.
+>
+> **Unrecorded finding 2 (raw substring match, all six probes) is NOT addressed** and remains
+> open.
+
 ### QH-40 — launchd SIGTERMs the privileged helper BEFORE the daemon, so every macOS rollback path fails while the process still exits 0
 
 **Severity: HIGH (fail-closed). Confidence: VERIFIED from the guest's unified log,
@@ -2497,8 +2563,9 @@ simply wrote nothing before dying, so the whole diagnosis came from the failure 
 
 ### QH-47 — NAT rules are applied without ever flushing conntrack
 
-**Severity: medium.** Not lab-only; it affects any node that gains or changes an exit/relay role
-while traffic is already flowing.
+**Severity: medium. FIXED 2026-08-28 (Linux), unit- and mutation-tested; LIVE PROOF OUTSTANDING.**
+Not lab-only; it affects any node that gains or changes an exit/relay role while traffic is
+already flowing.
 
 `nftables` nat chains are traversed only for the first packet of a flow. Once conntrack confirms a
 flow, its NAT binding (or absence of one) is fixed, and later packets never re-enter the nat hook.
@@ -2517,11 +2584,77 @@ observe only NEW-state packets. A non-zero forward counter alongside a zero nat 
 consistent with the nat table having been created after those packets flowed, and is not by itself
 evidence that the nat rule is malformed.
 
-**Fix direction (not yet implemented):** flush the affected conntrack entries after a NAT change, at
-minimum those for the tunnel subnet. Any such flush must go through the privileged-helper allowlist
-as an argv-only invocation with validated arguments (§4); it must not be built by string
-construction, and it is not a weakening of the allowlist to add a narrowly shaped entry for it.
-Whether this is QH-46's cause is a separate question, tracked there.
+**Fix as implemented (2026-08-28).** A new in-helper builtin, `linux-conntrack-flush`
+(`crates/rustynetd/src/linux_conntrack_flush.rs`), plus a call site on every NAT generation
+transition in `crates/rustynetd/src/phase10.rs`. Whether this is QH-46's cause is a separate
+question, tracked there.
+
+*Selector — the narrowest one the tooling supports.* `conntrack -D --family ipv4 --orig-src
+<mesh_cidr>`. The only flows a masquerade generation change invalidates are the ones whose
+ORIGINAL SOURCE is a mesh address: those are precisely the flows the mesh masquerade would rewrite,
+or has stopped rewriting. Alternatives considered and rejected: a table-wide `conntrack -F`
+destroys every unrelated long-lived flow on the host — the operator's own SSH session into the
+node, the daemon's control-plane connection, the WireGuard UDP association, and every service the
+box happens to run, turning an invisible role change into a full outage; an interface selector
+does not exist, because conntrack tuples carry no interface; and `--status`/`--nat-src` selects
+entries that are ALREADY translated, the complement of the set the install direction needs.
+
+*The blanket flush is unrepresentable, not merely rejected.* The source network is validated on
+both sides of the privileged boundary by the SAME bounded private/CGNAT containment check the pf
+egress source uses (`macos_pf_mesh_cidr::validate_mesh_egress_source_cidr`), plus a canonical
+network-address check, so `0.0.0.0/0` — the value that would turn the selective delete into `-F`
+by another name — cannot cross. The family is a single-variant enum, so an IPv6 flush is likewise
+unrepresentable until a v6 exit NAT deliberately adds it.
+
+*argv shape.* Two `key=value` tokens, `family=ipv4 orig-src=<cidr>`, decoded by
+`ConntrackFlushSpec::decode` — decode success IS the validation, the same shape as the
+`macos-pf-load` and `linux-firewalld-zone` builtins. There is no operation token, so `-D` filtered
+by original source is the only thing the grammar can express. The daemon never constructs a
+`conntrack` argument: the helper builds the whole argv from the decoded spec, resolves the binary
+from a pinned candidate list under the standard root-owned/non-group-writable checks, and returns
+a structured outcome line. Near-miss negatives per the QH-45 pattern
+(`linux_conntrack_flush_builtin_rejects_near_miss_argv`, plus the pure-module set): one character
+off in a key or value, a token missing, duplicated, or unseparated, a `-F` appended, a globally
+routable source, and a non-canonical prefix are each refused.
+
+*Absent-binary behaviour: surface loudly, do NOT refuse the apply.* `conntrack-tools` is absent on
+most minimal installs. The helper returns a distinct `outcome=tool-absent` — never collapsed into
+`entries=0`, because "nothing matched" and "the flush never ran" are different facts — and the
+daemon logs it at warn with an operator-actionable message. It does not fail the generation.
+Refusing the apply would make every minimal-install host unable to serve as an exit at all,
+converting "flows established before this generation keep their old binding until they close" into
+"the node cannot serve the role", which is disproportionate: new flows are bound correctly either
+way, and the pre-existing un-NATed flows were already egressing that way before the change. The
+flush is a repair of inherited state, not a precondition for the new generation's correctness.
+
+*Call sites.* One site at generation commit in `apply_dataplane_generation` (after both mutation
+points — a withdrawal performed by `rollback_obsolete_controls` and an install performed by
+`apply_generation_stages`), and one in the `NatApplied` arm of `rollback_generation_best_effort`
+so a fail-closed unwind or shutdown cannot leave mesh flows still translated out of a host that
+has withdrawn the capability (§10.7). Ordering is asserted by test: the flush must FOLLOW the rule
+change, because a flush issued first is undone by the next packet of a steady stream re-creating
+the entry against the old ruleset.
+
+*No-op re-applies do not flush.* The controller carries a `NatPosture` (masquerade present,
+hairpin present, mesh CIDR) for the committed generation. The reconcile loop re-applies constantly;
+an identical posture invalidates nothing, and flushing on it would repeatedly destroy healthy mesh
+flows. Tested in both directions, including the `blind_exit` cases (a blind exit installs no
+masquerade, so promoting into it WITHDRAWS one and re-applying it flushes nothing) and a mesh
+renumber (a changed CIDR is a real transition).
+
+*Scope.* Linux/nftables only. The macOS and Windows arms return `PlatformUnsupported` explicitly
+rather than silently succeeding — macOS translates through `pf` and has the same class of defect,
+whose fix (`pfctl -F states` scoped to the mesh source) is a different privileged surface and is
+NOT covered here. Track it as follow-up when the macOS exit cell is next worked.
+
+**LIVE-PROOF FOLLOW-UP (required).** Everything above is unit- and mutation-tested only; no lab run
+has exercised it. Two things need live confirmation on a real guest: (1) that the installed
+`conntrack` accepts a CIDR mask on `--orig-src` (the filter parser is expected to, but the version
+on the target guests has not been checked — if it does not, the flush degrades to a logged warning
+rather than failing, which is safe but useless); and (2) the end-to-end behaviour the defect
+describes — establish a mesh-sourced flow with a steady packet stream, promote the node to a
+NATing exit, and confirm the flow becomes NATed rather than persisting un-NATed indefinitely.
+Until that run exists, treat QH-47 as fixed-in-code and unproven-in-lab.
 
 ### QH-50 — blind_exit NAT scan could not pass on a firewalld host, and missed a real NAT rule
 
