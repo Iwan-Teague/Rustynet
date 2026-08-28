@@ -453,6 +453,68 @@ function ConvertTo-PowerShellSingleQuotedLiteral {
     return ([string]::Concat("'", $Value.Replace("'", "''"), "'"))
 }
 
+# Probe whether WinGet's Configuration feature (`winget configure`) is
+# available on this machine.
+#
+# `winget.exe` being present does NOT imply `winget configure` works:
+# Configuration ships DISABLED and has to be turned on explicitly, per
+# machine, by an elevated `winget configure --enable`. The bootstrap has a
+# hard dependency on it (Ensure-WingetConfigurationDependencies installs
+# Git, PowerShell 7, rustup and WireGuard through it), so its state belongs
+# in the tooling report next to the other WinGet facts — otherwise a guest
+# that is otherwise healthy fails bootstrap with no precondition recorded.
+#
+# The probe is side-effect free: `winget settings export` writes nothing and
+# dumps the effective settings as JSON. Parsing is best-effort — this value
+# is DIAGNOSTIC only. Enforcement lives in Enable-WingetConfigurationFeature,
+# which enables the feature rather than trusting this probe.
+function Get-WingetConfigurationFeatureState {
+    $state = [ordered]@{
+        probe_attempted = $false
+        probe_exit_code = $null
+        enabled = $false
+        admin_settings = ''
+        detail = ''
+    }
+    if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+        $state.detail = 'winget-command-missing'
+        return $state
+    }
+    $state.probe_attempted = $true
+    # PS5.1: $ErrorActionPreference='Stop' turns native-command stderr into a
+    # terminating NativeCommandError. Lower it to Continue (function-scoped)
+    # so a chatty winget cannot abort a diagnostic probe, and gate on
+    # $LASTEXITCODE instead.
+    $ErrorActionPreference = 'Continue'
+    $exported = (& winget.exe settings export 2>$null | Out-String)
+    $state.probe_exit_code = $LASTEXITCODE
+    $state.admin_settings = $exported.Trim()
+    if ($state.probe_exit_code -ne 0) {
+        $state.detail = 'winget-settings-export-failed'
+        return $state
+    }
+    try {
+        $parsed = $exported | ConvertFrom-Json -ErrorAction Stop
+        $adminSettings = $parsed.adminSettings
+        if ($null -ne $adminSettings) {
+            $state.admin_settings = ($adminSettings | ConvertTo-Json -Depth 4 -Compress)
+            foreach ($name in @('Configuration', 'EnableConfiguration')) {
+                $value = $adminSettings.PSObject.Properties[$name]
+                if ($null -ne $value) {
+                    $state.enabled = [bool]$value.Value
+                    $state.detail = "adminSettings.$name"
+                    return $state
+                }
+            }
+        }
+        $state.detail = 'configuration-flag-absent-from-admin-settings'
+    }
+    catch {
+        $state.detail = 'winget-settings-export-not-json'
+    }
+    return $state
+}
+
 function Get-WindowsBootstrapToolingState {
     $wingetCommand = Get-Command winget.exe -ErrorAction SilentlyContinue
     $cargoCommand = Get-Command cargo.exe -ErrorAction SilentlyContinue
@@ -464,6 +526,7 @@ function Get-WindowsBootstrapToolingState {
     $appInstallerPackages = @(
         Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue
     )
+    $wingetConfigurationState = Get-WingetConfigurationFeatureState
     $windowsAppsMatches = @()
     if (Test-Path -LiteralPath 'C:\Program Files\WindowsApps') {
         $windowsAppsMatches = @(
@@ -498,6 +561,8 @@ function Get-WindowsBootstrapToolingState {
                 }
             }
         )
+        winget_configuration_enabled = [bool]$wingetConfigurationState.enabled
+        winget_configuration_probe = $wingetConfigurationState
         windowsapps_matches = @($windowsAppsMatches)
         cargo_present = [bool]$cargoCommand
         cargo_source = if ($cargoCommand) { $cargoCommand.Source } else { '' }
@@ -1120,13 +1185,71 @@ function Resolve-DiagnosticsHelperPath {
     return $candidate
 }
 
+# Turn on WinGet's Configuration feature before the bootstrap depends on it.
+#
+# `winget configure` is an OPT-IN feature: it ships disabled and every
+# `winget configure ...` invocation on a machine where it was never enabled
+# fails with "Configuration is not enabled. Run `winget configure --enable`
+# to enable it." That message goes to STDOUT, so the only thing the
+# orchestrator's error path ever recorded was a PowerShell error record
+# pointing at the outer script invocation — a deterministic failure on every
+# fresh Windows image, diagnosed as an environment problem for five weeks.
+#
+# The bootstrap already runs elevated, so it enables the feature itself
+# rather than merely asserting the precondition: a guest built from the
+# documented runbook has no reason to have it on. `--enable` is idempotent
+# and returns 0 when the feature is already enabled.
+#
+# Fail closed: if the feature cannot be enabled we throw a named, actionable
+# error here instead of letting the caller's `winget configure --file` run
+# and fail with a message that names neither the feature nor the remedy.
+function Enable-WingetConfigurationFeature {
+    param([Parameter(Mandatory = $true)]$State)
+
+    # PS5.1: merging native stderr into the pipeline under
+    # $ErrorActionPreference='Stop' raises a terminating error from winget's
+    # own stderr text BEFORE the $LASTEXITCODE gate below runs, masking the
+    # named error this function exists to produce. Lower the preference
+    # (function-scoped) and gate on the exit code, as the cargo and icacls
+    # call sites in this script already do.
+    $ErrorActionPreference = 'Continue'
+    $enableOutput = (& winget.exe configure --enable 2>&1 | Out-String).Trim()
+    $enableExitCode = $LASTEXITCODE
+    if ($enableExitCode -eq 0) {
+        return
+    }
+
+    $reasons = @()
+    if (-not (Test-RunningAsAdministrator)) {
+        $reasons += 'the current session is not elevated and `winget configure --enable` requires administrator rights'
+    }
+    else {
+        $reasons += 'the elevated `winget configure --enable` call was rejected by WinGet'
+    }
+    $reasons += ('exit_code=' + [string]$enableExitCode)
+    if ($enableOutput) {
+        $reasons += ('winget_output=' + $enableOutput)
+    }
+    $probeDetail = $State.winget_configuration_probe.detail
+    if ($probeDetail) {
+        $reasons += ('configuration_probe=' + $probeDetail)
+    }
+    throw (
+        'WinGet Configuration feature is not enabled and could not be enabled; ' +
+        ($reasons -join '; ') +
+        '; run `winget configure --enable` from an elevated session on this guest ' +
+        'or use a pre-baked Windows lab template that has it enabled'
+    )
+}
+
 function Ensure-WingetConfigurationDependencies {
     param([string]$ConfigPath = '')
     $candidate = Resolve-WingetConfigurationPath -ConfigPath $ConfigPath
     if (-not (Test-Path -LiteralPath $candidate)) {
         throw "WinGet configuration file not found: $candidate"
     }
-    Require-Winget | Out-Null
+    $state = Require-Winget
+    Enable-WingetConfigurationFeature -State $state
     & winget configure --file $candidate --accept-configuration-agreements --disable-interactivity
     if ($LASTEXITCODE -ne 0) {
         throw 'winget configure failed for RustyNet bootstrap configuration'
