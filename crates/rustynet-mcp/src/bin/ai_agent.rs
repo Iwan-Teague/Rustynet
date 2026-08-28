@@ -1851,12 +1851,14 @@ impl AiAgentServer {
                 m.insert("admin_platform".into(), json!("macos"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
                 m.insert("rust_engine".into(), json!(true));
+                self.add_default_backbone(&mut m, true);
             }
             "windows_admin" => {
                 area = "Windows admin live issue".into();
                 m.insert("windows".into(), json!(true));
                 m.insert("admin_platform".into(), json!("windows"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
+                self.add_default_backbone(&mut m, false);
             }
             "macos_exit" => {
                 area = "macOS exit live verification".into();
@@ -1879,6 +1881,7 @@ impl AiAgentServer {
                 m.insert("blind_exit_platform".into(), json!("macos"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
                 m.insert("rust_engine".into(), json!(true));
+                self.add_default_backbone(&mut m, true);
             }
             "macos_anchor" => {
                 area = "macOS anchor live bundle-pull".into();
@@ -1893,6 +1896,7 @@ impl AiAgentServer {
                 m.insert("windows".into(), json!(true));
                 m.insert("anchor_platform".into(), json!("windows"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
+                self.add_default_backbone(&mut m, false);
             }
             "macos_relay" => {
                 area = "macOS relay lifecycle".into();
@@ -1900,12 +1904,14 @@ impl AiAgentServer {
                 m.insert("relay_platform".into(), json!("macos"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
                 m.insert("rust_engine".into(), json!(true));
+                self.add_default_backbone(&mut m, true);
             }
             "windows_relay" => {
                 area = "Windows relay lifecycle".into();
                 m.insert("windows".into(), json!(true));
                 m.insert("relay_platform".into(), json!("windows"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
+                self.add_default_backbone(&mut m, false);
             }
             "full" => {
                 area = "full cross-platform live lab".into();
@@ -8981,6 +8987,109 @@ mod tests {
             anchor.args.get("anchor_platform"),
             Some(&json!("macos")),
             "anchor election must be preserved"
+        );
+    }
+
+    #[test]
+    fn macos_role_cell_targets_carry_the_default_backbone_like_macos_exit() {
+        // Every macOS role-election arm (admin, blind_exit, relay, anchor) runs
+        // on the macOS guest but preflight still requires exactly one Exit node
+        // (preflight.rs:139-149 counts only NodeRole::Exit — admin/blind_exit/
+        // anchor/relay do not count), so each arm must carry the same Linux
+        // backbone (exit + client + entry) macos_exit does via
+        // add_default_backbone. Without it the arm renders a zero-exit topology
+        // and the run dies in preflight ("lab requires exactly 1 Exit node,
+        // found 0"). Pin the backbone keys whatever the local inventory
+        // resolves; with no inventory the backbone inserts nothing and the
+        // equivalence assertion stays green.
+        let s = server();
+        let exit = s.next_live_lab_target(Some("macos_exit")).unwrap();
+        for key in [
+            "macos_admin",
+            "macos_blind_exit",
+            "macos_relay",
+            "macos_anchor",
+        ] {
+            let target = s.next_live_lab_target(Some(key)).unwrap();
+            for backbone in ["exit_vm", "client_vm", "entry_vm"] {
+                assert_eq!(
+                    target.args.get(backbone),
+                    exit.args.get(backbone),
+                    "{key} must populate {backbone} exactly as macos_exit does"
+                );
+            }
+            assert_eq!(
+                target.args.get("rust_engine"),
+                Some(&json!(true)),
+                "{key} must route through the Rust --node engine"
+            );
+        }
+        // The role-election selector must survive alongside the backbone.
+        assert_eq!(
+            s.next_live_lab_target(Some("macos_admin"))
+                .unwrap()
+                .args
+                .get("admin_platform"),
+            Some(&json!("macos"))
+        );
+        assert_eq!(
+            s.next_live_lab_target(Some("macos_blind_exit"))
+                .unwrap()
+                .args
+                .get("blind_exit_platform"),
+            Some(&json!("macos"))
+        );
+        assert_eq!(
+            s.next_live_lab_target(Some("macos_relay"))
+                .unwrap()
+                .args
+                .get("relay_platform"),
+            Some(&json!("macos"))
+        );
+    }
+
+    #[test]
+    fn windows_role_cell_targets_carry_the_default_backbone_like_windows_exit() {
+        // Windows mirror of the macOS backbone equivalence: windows_exit
+        // carries exit_vm + client_vm (no entry) via add_default_backbone, and
+        // every other Windows role-election arm (admin, anchor, relay) renders
+        // the same zero-exit preflight rejection without it. Note preflight
+        // counts only NodeRole::Exit, so the elected windows:admin /
+        // windows:anchor / windows:relay node never satisfies the exit
+        // requirement by itself.
+        let s = server();
+        let exit = s.next_live_lab_target(Some("windows_exit")).unwrap();
+        for key in ["windows_admin", "windows_anchor", "windows_relay"] {
+            let target = s.next_live_lab_target(Some(key)).unwrap();
+            for backbone in ["exit_vm", "client_vm", "entry_vm"] {
+                assert_eq!(
+                    target.args.get(backbone),
+                    exit.args.get(backbone),
+                    "{key} must populate {backbone} exactly as windows_exit does"
+                );
+            }
+        }
+        // The role-election selector must survive alongside the backbone.
+        assert_eq!(
+            s.next_live_lab_target(Some("windows_admin"))
+                .unwrap()
+                .args
+                .get("admin_platform"),
+            Some(&json!("windows"))
+        );
+        assert_eq!(
+            s.next_live_lab_target(Some("windows_anchor"))
+                .unwrap()
+                .args
+                .get("anchor_platform"),
+            Some(&json!("windows"))
+        );
+        assert_eq!(
+            s.next_live_lab_target(Some("windows_relay"))
+                .unwrap()
+                .args
+                .get("relay_platform"),
+            Some(&json!("windows"))
         );
     }
 
