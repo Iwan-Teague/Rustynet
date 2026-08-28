@@ -4851,3 +4851,47 @@ cleanup path removes it, and `install-systemd` reads its selected exit endpoint
 when deriving egress. Endpoint-based derivation queries live route state, so a
 stale endpoint fails loud rather than silent today; promote to a numbered item
 only if a live run shows it steering derivation wrong.
+
+**Audit verdict (2026-08-28, static code audit — CLOSED, do not promote):**
+writer/reader enumeration and stale-file tracing across
+`ops_install_systemd.rs`, `main.rs` (refresh path), the vm_lab orchestrator
+(provisioning + three cross-network scenarios + `build_assignment_refresh_env`),
+`ops_e2e.rs`, the `live_linux_*` binaries, `collect_linux_reconnect_bundle.rs`,
+and `scripts/e2e/live_lab_common.sh` confirm the file has no provenance marker
+and no teardown/cleanup path (grep over
+`orchestrator/stage/` finds only writers; `distribute_assignments.rs:117,124`
+documents that production nodes refresh via the timer instead), but a stale
+file cannot steer egress derivation wrong in any reachable static path:
+
+- Install-time endpoint detection (`ops_install_systemd.rs:511-514`) runs
+  BEFORE the env rewrite (:1236-1253) and consumes the live assignment bundle;
+  a preferred `RUSTYNET_ASSIGNMENT_EXIT_NODE_ID` absent from the bundle fails
+  the install loudly (`assignment_peer_endpoint`, :2174-2176; bundle-missing
+  case :1902-1908), and an explicit `RUSTYNET_EGRESS_INTERFACE` that disagrees
+  with the endpoint-derived interface also fails loudly (:1808-1812).
+- The refresh path is independently guarded:
+  `validate_assignment_issue_config` (`main.rs:16708-16717`) rejects an exit
+  node id that is absent from `--nodes` or lacks `exit_server`, so a
+  decommissioned exit id makes the timer's refresh fail loudly (the old bundle
+  then expires and traffic fails closed) rather than re-issuing against a
+  stale endpoint.
+- The only theoretically silent case requires the stale id to STILL be listed
+  as a bundle peer while the bundle's own `exit_default` route has moved to a
+  different exit (`resolve_selected_exit_node_id` override,
+  `ops_install_systemd.rs:2067-2071`), AND the two exits to egress via
+  different interfaces on a multi-homed host; on the single-WAN hosts this
+  repo's lab and docs assume, `ip route get` for either endpoint resolves the
+  same default interface, so the pin is identical. The candidate note's own
+  promote bar ("a live run shows it steering derivation wrong") is therefore
+  unmet.
+- Residue is operator-manageable by design: `ops
+  set-assignment-refresh-exit-node` (`main.rs:5466`, rewrite at :15203)
+  updates or clears the stale id explicitly, and install never silently
+  overrides preserved operator configuration (same fail-closed posture as the
+  QH-63 egress pin's operator provenance).
+
+Remaining residue is cosmetic (an uncleaned 0600 file on a decommissioned
+guest produces loud timer failures, never silent misconfiguration), so this
+stays documentation-only; if a future multi-homed live run ever shows the
+override steering the pin wrong, re-open with that evidence and the QH-63
+provenance-marker pattern applies unchanged.
