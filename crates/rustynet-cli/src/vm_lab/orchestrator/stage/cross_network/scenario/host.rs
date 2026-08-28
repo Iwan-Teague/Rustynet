@@ -67,6 +67,15 @@ pub trait ScenarioHost {
     /// before emitting evidence" (fail closed, nothing to assert on).
     fn report_exists(&self, report_path: &Path) -> bool;
 
+    /// Read the `status` field of the report at `report_path`.
+    ///
+    /// The shell got this from the same reader call as the checks, by passing
+    /// `--include-status`, which prepended it to the results and left every
+    /// subsequent index shifted by one. Splitting it out means a scenario
+    /// indexes its checks from zero and cannot silently read the status as a
+    /// check — the off-by-one that shift invites.
+    fn read_report_status(&self, report_path: &Path) -> Result<String, String>;
+
     /// Read `checks` out of the report at `report_path`, in order. A missing
     /// check reads as `"fail"`, never as absent — the shell's
     /// `"${results[0]:-fail}"` default, made structural.
@@ -219,6 +228,21 @@ impl ScenarioHost for LocalScenarioHost {
             .map_err(|err| format!("failed to write artifact {}: {err}", path.display()))
     }
 
+    fn read_report_status(&self, report_path: &Path) -> Result<String, String> {
+        let rendered =
+            execute_ops_read_cross_network_report_fields(ReadCrossNetworkReportFieldsConfig {
+                report_path: report_path.to_path_buf(),
+                include_status: true,
+                checks: Vec::new(),
+                network_fields: Vec::new(),
+                default_value: CHECK_FAIL.to_owned(),
+            })?;
+        Ok(split_report_lines(&rendered, 1)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| CHECK_FAIL.to_owned()))
+    }
+
     fn read_report_checks(
         &self,
         report_path: &Path,
@@ -313,6 +337,9 @@ pub(crate) mod recording {
             report_path: PathBuf,
             checks: Vec<String>,
         },
+        ReadReportStatus {
+            report_path: PathBuf,
+        },
         WriteArtifact {
             path: PathBuf,
             contents: String,
@@ -335,6 +362,8 @@ pub(crate) mod recording {
         pub existing_reports: Vec<PathBuf>,
         /// Check values by report path, in the order the scenario asks.
         pub report_checks: BTreeMap<PathBuf, Vec<String>>,
+        /// Report `status` by path; absent = `"pass"`.
+        pub report_status: BTreeMap<PathBuf, String>,
         /// Report paths whose read fails outright.
         pub report_read_errors: Vec<PathBuf>,
         /// Artifact paths whose write fails outright.
@@ -388,6 +417,20 @@ pub(crate) mod recording {
 
         fn report_exists(&self, report_path: &Path) -> bool {
             self.existing_reports.iter().any(|path| path == report_path)
+        }
+
+        fn read_report_status(&self, report_path: &Path) -> Result<String, String> {
+            self.record(HostCall::ReadReportStatus {
+                report_path: report_path.to_path_buf(),
+            });
+            if self.report_read_errors.iter().any(|p| p == report_path) {
+                return Err(format!("mock: cannot read {}", report_path.display()));
+            }
+            Ok(self
+                .report_status
+                .get(report_path)
+                .cloned()
+                .unwrap_or_else(|| super::CHECK_PASS.to_owned()))
         }
 
         fn read_report_checks(

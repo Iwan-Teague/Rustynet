@@ -734,6 +734,17 @@ fn run_ported_scenario_profile(
                 scenario::controller_switch::ControllerSwitchOptions::default(),
             ),
         ),
+        // The zone name, DNS interface and bind address stay at the shell's
+        // defaults: they were flags no orchestrator call site ever passed.
+        CrossNetworkStageKind::RemoteExitDns => (
+            scenario::remote_exit_dns::SUITE,
+            scenario::remote_exit_dns::run(
+                &host,
+                &inputs,
+                &lab,
+                &scenario::remote_exit_dns::RemoteExitDnsOptions::default(),
+            ),
+        ),
         // The adversarial scenario runs no remote commands of its own — it
         // composes two sibling validator binaries that drive their own ssh
         // transport — so it takes ssh targets rather than the runner triple the
@@ -954,7 +965,6 @@ fn add_common_hosts(cmd: &mut Command, topology: &CrossNetworkTopology) {
 
 fn bin_name(kind: CrossNetworkStageKind) -> &'static str {
     match kind {
-        CrossNetworkStageKind::RemoteExitDns => "live_linux_cross_network_remote_exit_dns_test",
         CrossNetworkStageKind::RemoteExitSoak => "live_linux_cross_network_remote_exit_soak_test",
         // The ported scenarios join these: CN-3 dispatches them in process via
         // `run_ported_scenario_stage`, so they never reach the `cargo run --bin`
@@ -966,6 +976,7 @@ fn bin_name(kind: CrossNetworkStageKind) -> &'static str {
         | CrossNetworkStageKind::NodeNetworkSwitch
         | CrossNetworkStageKind::FailbackRoaming
         | CrossNetworkStageKind::ControllerSwitch
+        | CrossNetworkStageKind::RemoteExitDns
         | CrossNetworkStageKind::Preflight
         | CrossNetworkStageKind::NatClassification
         | CrossNetworkStageKind::NatMatrix => unreachable!("no script for this stage kind"),
