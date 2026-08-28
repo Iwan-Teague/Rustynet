@@ -45,7 +45,9 @@ use super::substrate::{LeafOutput, NetLeafRunner};
 
 pub mod baseline;
 pub mod direct_remote_exit;
+pub mod endpoint_switch;
 pub mod host;
+pub mod node_network_switch;
 pub mod provisioning;
 pub mod relay_remote_exit;
 pub mod remote_exit_common;
