@@ -43,6 +43,7 @@ use std::fmt;
 
 use super::substrate::{LeafOutput, NetLeafRunner};
 
+pub mod baseline;
 pub mod direct_remote_exit;
 pub mod host;
 pub mod provisioning;

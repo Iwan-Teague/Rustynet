@@ -906,6 +906,14 @@ pub struct LabContext {
     pub relay_ssh_target: Option<String>,
     /// `user@host` for the probe, when the scenario has one.
     pub probe_ssh_target: Option<String>,
+    /// `--client-network-id`. Carried because a composing scenario writes its
+    /// baseline's report itself, and the report schema requires the network
+    /// context; the shell passed these straight through to the baseline script.
+    pub client_network_id: String,
+    /// `--exit-network-id`.
+    pub exit_network_id: String,
+    /// `--relay-network-id`, when the scenario has a relay.
+    pub relay_network_id: Option<String>,
     /// `live_lab_remote_src_dir` for the client.
     pub client_src_dir: String,
     /// `live_lab_remote_src_dir` for the exit.
@@ -943,6 +951,13 @@ impl LabContext {
         self.probe_ssh_target
             .as_deref()
             .ok_or_else(|| format!("{scenario} requires a probe ssh target but none was resolved"))
+    }
+
+    /// The relay network id, or a fail-closed error.
+    pub fn require_relay_network_id(&self, scenario: &str) -> Result<&str, String> {
+        self.relay_network_id
+            .as_deref()
+            .ok_or_else(|| format!("{scenario} requires a relay network id but none was resolved"))
     }
 }
 
