@@ -626,3 +626,132 @@ requires a peer to initiate toward the mac.
 
 Per the §12.3.1 note, every reachability verdict here is from `nc`/`ping`/`ssh`
 in the shell, not from an MCP probe.
+
+---
+
+## 7. Re-run after MAC-D1 + DNS M1 — 2026-08-28 (later session)
+
+**Scope.** Re-run Cell 1 (macOS `anchor`) now that MAC-D1 (`8ec851a9`,
+de-circularised the posture gate via validator-set election) and the macOS DNS
+M1 enforcement (`f048918c`, `macos_dns_sc_protect.rs`) are on the deployed
+source. Triage only — no code changed in this session.
+
+### 7.1 Run
+
+`livelab-1787959261-51746fdac765` (internal run id `rust-1787957920`), commit
+`51746fda…` (this worktree's HEAD, carries MAC-D1 + DNS M1),
+`git_tree_clean=true` at launch, engine `--node`, source `working-tree`,
+`--anchor-platform macos` + explicit `--node lenovo-exit-1:exit --node
+lenovo-client-1:client` (full 61-stage plan — **no** `--skip-linux-live-suite`,
+per §2.3). Report dir `state/mac-cells/anchor4-1787957800`. Ledger row verified
+present in `live_lab_node_run_matrix.csv` (id, commit, clean, branch recorded).
+
+Invocation discovery, recorded because the runbook does not cover it post-W5.7:
+the direct CLI **retired** `--*-platform` selectors only when they would be the
+*sole* role source (`vm_lab/mod.rs:10296-10336` fails closed on empty
+`node_assignments`). Passing the Linux backbone as explicit `--node` flags plus
+`--anchor-platform macos` is accepted: `augment_assignments_from_platform_selectors`
+(`native.rs:928`) elects the first *unassigned* macOS entry as anchor, and
+`native.rs:260` sets `macos_anchor_validators_elected=true`. Combining
+`--node macos-utm-1:anchor` **with** the selector errors (no unassigned macOS
+entry remains). The QH-18 flock warning is real: `run_exclusion` cannot resolve
+the selector-elected `macos-utm-1`, so only the two lenovo guests are
+lock-protected (safe here — no concurrent run — but noted).
+
+One launch aborted before any stage (`anchor4-1787957600`): the pre-run
+readiness gate probed `ssh_port_open_count: 0` for **all seven** VMs while the
+UTM bundle scan TCC-parked after 20s — the §12.3.1 blind-probe signature in a
+TCC-degraded process context (mac answered `nc` :22 throughout). Re-launched
+with `--trust-inventory-ready` after shell-verifying all three guests. The
+readiness gate's post-restart probe then killed run 1 against a healthy mac.
+
+### 7.2 Outcome: 16 pass / 1 fail / 44 skip — `anchor_validation` **PASSED** for the first time
+
+Full setup ran green (`bootstrap_hosts`, `membership_init`,
+`distribute_*`, `enforce_baseline_runtime` — so the MAC-D2 owner-key fix is
+live-proven in passing: this run *is* a macOS node becoming membership owner
+under `--anchor-platform` election). `anchor_validation` passed with the
+side-car (`anchor_validation.reported_skips.json`) recording
+`runtime_skipped_nodes: []` and
+`runtime_delegated_nodes: [{ "alias": "macos-utm-1", "platform": "Macos" }]`.
+
+**MAC-D1 verdict: LIVE-CONFIRMED for what it changed.** The stage that
+structurally graded `Skipped` in run 3 (§2.1) now grades the macOS runtime
+coverage as delegated evidence and passes. The circularity is gone.
+
+### 7.3 NEW DEFECT (MAC-D3) — the delegation names a validator set that does not exist on `--node`
+
+The delegation claims coverage by `deploy_macos_anchor_profile`,
+`validate_macos_anchor_bundle_pull`,
+`validate_macos_anchor_port_mapping_authority` "in the same run". Those stages
+are **bash-era only**: they exist as registry specs
+(`live_lab_stage_registry.rs:1190,1197,1204`, `EnableRule::AnchorPlatform`)
+and stage functions under `vm_lab/mod.rs:12230+`, but the Rust `--node`
+engine's `StageId` set (`stage/mod.rs`) contains no such variants — its only
+anchor stages are `anchor_validation` and `live_anchor`. This run's
+`stages.tsv` confirms none of the three dispatched. So on the engine of record,
+`anchor_validation`'s green rests on a delegation with **no dispatching
+validator behind it** — a bookkeeping green, not runtime evidence. Honest cell
+status: `anchor_validation` gate unblocked (real), macOS anchor *runtime*
+still unproven until either (a) the three validators are ported to `--node`
+`StageId`s, or (b) `live_anchor` is confirmed to carry the macOS anchor
+runtime proof — it skipped this run behind `validate_baseline_runtime`, so
+today it is untested, not unavailable (same posture as §2.3).
+
+Classification: macOS parity code gap, engine-of-record stage-set hole. Remedy
+not applied (triage only).
+
+### 7.4 `validate_baseline_runtime` red — both macOS ops fail for NEW, precise reasons
+
+`macos-utm-1/MeshStatus` + `macos-utm-1/DnsFailclosed` red; both lenovos pass
+all six ops. Per-op detail (`validator_results.json`) is terse; root causes
+traced by hand on the guest:
+
+* **DnsFailclosed — M1 deployed but never executed.** The guest binary is
+  fresh (built this run, 16:19 PDT ≙ 23:19 UTC). `/etc/resolv.conf` still
+  names `127.0.0.1` but `scutil --dns` primary remains `1.1.1.1`/`8.8.8.8`
+  (same drift reason as §3.1), **and** the M1 machinery shows zero activity:
+  `/private/var/run/rustynet/` is empty (no
+  `networksetup-dns.failclosed.bak`), `networksetup -getdnsservers Ethernet`
+  still returns `1.1.1.1`/`8.8.8.8`, and the unified log records **zero**
+  `networksetup` invocations by the privileged helper. Cause: M1 lives in
+  `MacosCommandSystem::apply_dns_protection` (`phase10.rs:4201`), which runs
+  on protected-mode entry — and the **anchor role never enters DNS-protected
+  mode** in this lab shape (the launchd profile omits
+  `--dataplane-mode`/egress flags by audited omission,
+  `macos_install.rs:1975-2001`). The validator demands a posture the anchor
+  role never assumes. The task-brief expectation ("guest carries pre-fix
+  deployment until the run redeploys") was *half* right: the redeploy
+  happened; what is missing is any code path that *invokes* the enforcement
+  for an anchor. Fix direction: either the anchor role applies DNS
+  protection by default (default-deny reading), or the DnsFailclosed op is
+  scoped to roles that enter protected mode, with the anchor's posture
+  asserted by a role-appropriate check. Decision needed before code.
+* **MeshStatus — the QH-39 freshness bound fired (honest red), bound
+  CONFIRMED applied.** The native validator dispatches
+  `macos-mesh-status-check --max-age-seconds 180`
+  (`role_validation/mesh_status.rs:90`, `SNAPSHOT_MAX_AGE_SECONDS=180` at
+  `:56`) — the argv QH-39 asked for, closing §3.2's "not yet evidence"
+  caveat. The red means the anchor's state snapshot was missing or older
+  than 180 s at validation time. Linux exit/client refresh snapshots via
+  active dataplane and pass; the anchor is passive and its snapshot ages
+  out. Post-run reproduction cannot distinguish missing vs stale (cleanup
+  emptied `/usr/local/var/rustynet/`), so the open question is whether the
+  anchor daemon refreshes its snapshot at all while idle. Candidate fix:
+  periodic snapshot refresh on the anchor, or a role-aware freshness
+  margin. Either way §3.2's caveat is now closed in the *opposite*
+  direction: a macOS `MeshStatus` bare pass is no longer obtainable.
+
+### 7.5 Cell status
+
+macOS **anchor**: **partial, progressed**. `anchor_validation` went from
+structurally-skipped (run 3) to passed-with-delegation (this run) — MAC-D1
+LIVE-CONFIRMED. New blocker MAC-D3 (§7.3) means the green is not yet runtime
+evidence; `live_anchor` remains the untested runtime proof. The run matrix
+cell stays 🔴 with a named, narrow path to green: port the three macOS anchor
+validators to `--node` (or bind the delegation to `live_anchor`), resolve the
+§7.4 DnsFailclosed role/posture question, and re-run with the full suite.
+
+Remedy recorded against stub
+`livelab-1787959261-51746fdac765::validate_baseline_runtime` in
+`live_lab_stage_triage.jsonl` so the next launch is not gated.
