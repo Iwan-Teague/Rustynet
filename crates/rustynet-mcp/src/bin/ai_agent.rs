@@ -1886,6 +1886,7 @@ impl AiAgentServer {
                 m.insert("anchor_platform".into(), json!("macos"));
                 m.insert("skip_linux_live_suite".into(), json!(true));
                 m.insert("rust_engine".into(), json!(true));
+                self.add_default_backbone(&mut m, true);
             }
             "windows_anchor" => {
                 area = "Windows anchor live bundle-pull".into();
@@ -8955,6 +8956,32 @@ mod tests {
                 "{key} must not route through legacy bash"
             );
         }
+    }
+
+    #[test]
+    fn macos_anchor_target_carries_the_default_backbone_like_macos_exit() {
+        // The anchor cell runs on the macOS guest but still needs the Linux
+        // backbone (exit + client VMs) in its rendered args; without it the
+        // orchestrator's preflight sees a zero-exit topology and refuses. The
+        // sibling macos_exit target already does this via add_default_backbone,
+        // so pin macos_anchor to the same backbone keys whatever the local
+        // inventory resolves (with no inventory the backbone inserts nothing,
+        // and the equivalence assertion stays green).
+        let s = server();
+        let anchor = s.next_live_lab_target(Some("macos_anchor")).unwrap();
+        let exit = s.next_live_lab_target(Some("macos_exit")).unwrap();
+        for key in ["exit_vm", "client_vm", "entry_vm"] {
+            assert_eq!(
+                anchor.args.get(key),
+                exit.args.get(key),
+                "macos_anchor must populate {key} exactly as macos_exit does"
+            );
+        }
+        assert_eq!(
+            anchor.args.get("anchor_platform"),
+            Some(&json!("macos")),
+            "anchor election must be preserved"
+        );
     }
 
     #[test]
