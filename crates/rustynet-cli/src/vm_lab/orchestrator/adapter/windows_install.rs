@@ -1539,6 +1539,58 @@ mod tests {
         );
     }
 
+    /// W-FIX-1 (CP-4 Windows bootstrap triage verdict, 2026-08-28).
+    ///
+    /// `winget configure` is an opt-in WinGet feature that ships disabled.
+    /// The bootstrap hard-depends on it — it is what installs Git,
+    /// PowerShell 7, rustup and WireGuard — so a fresh Windows guest failed
+    /// bootstrap deterministically until the script started enabling the
+    /// feature itself. Pin both halves of the fix (state collection and the
+    /// enable-before-configure step) so neither can be dropped silently:
+    /// PowerShell has no unit-test harness in this repository, and the
+    /// content pin is the only regression guard the script has.
+    #[test]
+    fn bootstrap_script_enables_winget_configuration_feature_before_configuring() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("function Get-WingetConfigurationFeatureState"),
+            "bootstrap must probe whether the opt-in WinGet Configuration feature is enabled"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("winget_configuration_enabled"),
+            "bootstrap tooling-state report must record the WinGet Configuration feature state"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("function Enable-WingetConfigurationFeature"),
+            "bootstrap must enable the WinGet Configuration feature rather than assuming it"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("winget.exe configure --enable"),
+            "bootstrap must run `winget configure --enable`; the bootstrap already runs elevated"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("Enable-WingetConfigurationFeature -State $state"),
+            "Ensure-WingetConfigurationDependencies must enable the feature before `winget configure --file`"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("WinGet Configuration feature is not enabled and could not be enabled"),
+            "failing to enable the feature must fail closed with a named, actionable error"
+        );
+
+        // Ordering: the enable step has to precede the configure invocation
+        // it exists to unblock, otherwise the fix is inert.
+        let enable_call = BOOTSTRAP_SCRIPT
+            .find("Enable-WingetConfigurationFeature -State $state")
+            .expect("enable call must be present");
+        let configure_call = BOOTSTRAP_SCRIPT
+            .find("& winget configure --file $candidate")
+            .expect("configure invocation must be present");
+        assert!(
+            enable_call < configure_call,
+            "the WinGet Configuration enable step must run before `winget configure --file`"
+        );
+    }
+
     #[test]
     fn install_service_script_wraps_native_stderr_with_exit_code_checks() {
         assert!(
