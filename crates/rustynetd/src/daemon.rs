@@ -166,10 +166,32 @@ pub const DEFAULT_SOCKET_PATH: &str = "/private/var/run/rustynet/rustynetd.sock"
 pub const DEFAULT_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
 #[cfg(windows)]
 pub const DEFAULT_SOCKET_PATH: &str = DEFAULT_WINDOWS_DAEMON_PIPE_PATH;
-#[cfg(not(windows))]
+/// QH-40 (MacCellsHarvest 2026-08-28 §3.4) — the platform-default daemon
+/// state file path. On macOS this is the installer's `STATE_ROOT`
+/// (`/usr/local/var/rustynet`, see
+/// `scripts/bootstrap/macos/Install-RustyNetMacosService.sh`), matching the
+/// `--state` the launchd plist passes at deploy time; it is NOT the Linux
+/// `/var/lib/rustynet` path the previous `#[cfg(not(windows))]` arm silently
+/// leaked onto macOS.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_STATE_PATH: &str = "/usr/local/var/rustynet/rustynetd.state";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_STATE_PATH: &str = "/var/lib/rustynet/rustynetd.state";
 #[cfg(windows)]
 pub const DEFAULT_STATE_PATH: &str = DEFAULT_WINDOWS_STATE_PATH;
+
+/// The single resolution point for the platform-default daemon state file.
+///
+/// Every consumer that needs "where is the state file by default" — the
+/// `DaemonConfig` default the shutdown-residue *writer* records beside, and
+/// the `shutdown-residue-check` subcommand's implicit `--state` default —
+/// must resolve through this function rather than re-deriving a path. A
+/// checker that resolves a different default than the writer reads the wrong
+/// directory and reports a residue-carrying host as clean: a fail-open in a
+/// fail-closed check (MacCellsHarvest 2026-08-28 §3.4).
+pub fn default_state_path() -> &'static str {
+    DEFAULT_STATE_PATH
+}
 #[cfg(not(windows))]
 pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = "/var/lib/rustynet/rustynetd.trust";
 #[cfg(windows)]
@@ -2199,7 +2221,7 @@ impl Default for DaemonConfig {
             node_id: DEFAULT_NODE_ID.to_owned(),
             node_role: NodeRole::default(),
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
-            state_path: PathBuf::from(DEFAULT_STATE_PATH),
+            state_path: PathBuf::from(default_state_path()),
             trust_evidence_path: PathBuf::from(DEFAULT_TRUST_EVIDENCE_PATH),
             trust_verifier_key_path: PathBuf::from(DEFAULT_TRUST_VERIFIER_KEY_PATH),
             trust_watermark_path: PathBuf::from(DEFAULT_TRUST_WATERMARK_PATH),
