@@ -2034,6 +2034,17 @@ fn reduce_membership_state(
                 ));
             }
             decode_hex_to_fixed::<32>(&node.node_pubkey_hex)?;
+            // Blind-relay phase 1 gate (BlindRelayRoleDesign_2026-08-27.md
+            // §16, line-1129 mandate): the capability parses and reduces,
+            // but production signed state must not yet advertise it. The
+            // only production paths that mint capability-carrying state are
+            // AddNode and SetNodeCapabilities; both refuse blind_relay until
+            // the §16 wire-format decisions are signed off.
+            if node.capabilities.contains(&RoleCapability::BlindRelay) {
+                return Err(MembershipError::InvalidTransition(
+                    "blind_relay capability is design-only; pending §16 wire-format sign-off",
+                ));
+            }
             next.nodes.push(node.clone());
         }
         MembershipOperation::SetNodeCapabilities {
@@ -2057,6 +2068,13 @@ fn reduce_membership_state(
             if node.capabilities.contains(&RoleCapability::BlindExit) {
                 return Err(MembershipError::InvalidTransition(
                     "blind_exit is immutable; factory reset and fresh enrollment are required to change capabilities",
+                ));
+            }
+            // Blind-relay phase 1 gate: same design-only hold as the
+            // AddNode arm above — §16 sign-off pending.
+            if capabilities.contains(&RoleCapability::BlindRelay) {
+                return Err(MembershipError::InvalidTransition(
+                    "blind_relay capability is design-only; pending §16 wire-format sign-off",
                 ));
             }
             node.capabilities = canonicalize_role_capabilities(capabilities.iter().copied());
@@ -2712,6 +2730,31 @@ fn validate_membership_node_capabilities(node: &MembershipNode) -> Result<(), Me
             node.node_id
         )));
     }
+    if capabilities.contains(&RoleCapability::BlindRelay) {
+        // Blind-relay (design doc BlindRelayRoleDesign_2026-08-27.md §5.1,
+        // BR-C01): a blind-relay node is a zero-ingress forwarder with NO
+        // identity-bearing surface, so its canonical capability set must be
+        // EXACTLY {relay_host, blind_relay}. Comparing the full canonical
+        // set against the allowlist (not a forbidden-values list) fails
+        // closed: any capability added in the future is refused here until
+        // an explicit design amendment updates this rule AND its negative
+        // tests.
+        let exactly_blind_relay_set = capabilities.len() == 2
+            && capabilities.contains(&RoleCapability::RelayHost)
+            && capabilities.contains(&RoleCapability::BlindRelay);
+        if !capabilities.contains(&RoleCapability::RelayHost) {
+            return Err(MembershipError::InvalidFormat(format!(
+                "node {} blind_relay capability requires relay_host capability",
+                node.node_id
+            )));
+        }
+        if !exactly_blind_relay_set {
+            return Err(MembershipError::InvalidFormat(format!(
+                "node {} blind_relay permits exactly the canonical set {{relay_host, blind_relay}}; no other capability may co-exist",
+                node.node_id
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -3195,6 +3238,102 @@ mod tests {
         ];
         let err = state.validate().expect_err("state should be rejected");
         assert!(format!("{err}").contains("cannot combine anchor and blind_exit"));
+    }
+
+    #[test]
+    fn blind_relay_capability_requires_relay_host() {
+        let mut state = base_state();
+        state.nodes[0].capabilities = vec![RoleCapability::BlindRelay];
+        let err = state.validate().expect_err("state should be rejected");
+        assert!(format!("{err}").contains("blind_relay capability requires relay_host"));
+    }
+
+    #[test]
+    fn blind_relay_permits_exactly_relay_host_pair_in_signed_state() {
+        // BR-C01 target invariant: the canonical set {relay_host,
+        // blind_relay} validates (parses and reduces). Advertisement still
+        // refuses it — see the construction-gate tests below.
+        let mut state = base_state();
+        state.nodes[0].capabilities = vec![RoleCapability::BlindRelay, RoleCapability::RelayHost];
+        state
+            .validate()
+            .expect("exact blind-relay set should validate");
+    }
+
+    #[test]
+    fn blind_relay_rejects_every_other_co_capability() {
+        // §5.1 invariant: the reducer compares the FULL canonical set
+        // against exactly {relay_host, blind_relay}, so every other
+        // co-capability — present or future — is refused fail-closed.
+        // One negative per excluded capability; the exact-set compare
+        // (not a forbidden-values list) is what keeps future additions
+        // covered.
+        let excluded = [
+            RoleCapability::Client,
+            RoleCapability::EntryRelay,
+            RoleCapability::ExitServer,
+            RoleCapability::BlindExit,
+            RoleCapability::Anchor,
+            RoleCapability::AnchorGossipSeed,
+            RoleCapability::AnchorBundlePull,
+            RoleCapability::AnchorEnrollmentEndpoint,
+            RoleCapability::AnchorRelayColocation,
+            RoleCapability::AnchorPortMappingAuthoritative,
+            RoleCapability::AnchorPortMappingPinned,
+            RoleCapability::ServesNas,
+            RoleCapability::ServesLlm,
+        ];
+        for co_capability in excluded {
+            let mut state = base_state();
+            state.nodes[0].capabilities = vec![
+                RoleCapability::RelayHost,
+                RoleCapability::BlindRelay,
+                co_capability,
+            ];
+            let err = state
+                .validate()
+                .expect_err("mixed blind-relay state should be rejected");
+            let rendered = format!("{err}");
+            // Any refusal is fail-closed-safe: an earlier sequential rule
+            // (e.g. entry_relay requires client) may fire before the
+            // exact-set compare — both are rejections.
+            assert!(
+                rendered.contains("permits exactly the canonical set")
+                    || rendered.contains(" requires ")
+                    || rendered.contains("cannot combine"),
+                "co-capability {co_capability} must be refused; got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_node_operation_refuses_blind_relay_pending_sign_off() {
+        let state = base_state();
+        let operation = MembershipOperation::AddNode(MembershipNode {
+            node_id: "node-blind".to_owned(),
+            node_pubkey_hex: hex_encode(&[9; 32]),
+            owner: "blind@example.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec![],
+            capabilities: vec![RoleCapability::RelayHost, RoleCapability::BlindRelay],
+            joined_at_unix: 101,
+            updated_at_unix: 101,
+        });
+        let err = preview_next_state(&state, &operation, 1_700_000_000)
+            .expect_err("AddNode must refuse blind_relay");
+        assert!(format!("{err}").contains("design-only; pending §16 wire-format sign-off"));
+    }
+
+    #[test]
+    fn set_node_capabilities_operation_refuses_blind_relay_pending_sign_off() {
+        let state = base_state();
+        let operation = MembershipOperation::SetNodeCapabilities {
+            node_id: "node-a".to_owned(),
+            capabilities: vec![RoleCapability::RelayHost, RoleCapability::BlindRelay],
+        };
+        let err = preview_next_state(&state, &operation, 1_700_000_000)
+            .expect_err("SetNodeCapabilities must refuse blind_relay");
+        assert!(format!("{err}").contains("design-only; pending §16 wire-format sign-off"));
     }
 
     #[test]

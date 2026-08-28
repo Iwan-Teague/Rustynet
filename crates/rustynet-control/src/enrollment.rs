@@ -254,6 +254,16 @@ fn enrollee_capabilities_from_roles(
         // every other unrecognised token is an error.
         capabilities.push(RoleCapability::Client);
     }
+    // Blind-relay phase 1 gate (BlindRelayRoleDesign_2026-08-27.md §16):
+    // the token parses, but enrollment admission mints production signed
+    // state, so it refuses blind_relay until the §16 wire-format decisions
+    // are signed off. Same design-only hold as the membership
+    // AddNode/SetNodeCapabilities construction paths.
+    if capabilities.contains(&RoleCapability::BlindRelay) {
+        return Err(EnrollmentMembershipError::UnknownRole(
+            "blind_relay capability is design-only; pending §16 wire-format sign-off".to_owned(),
+        ));
+    }
     Ok(canonicalize_role_capabilities(capabilities))
 }
 
@@ -452,6 +462,22 @@ mod tests {
             assert!(
                 enrollee_capabilities_from_roles(&[token.to_owned()]).is_err(),
                 "non-canonical alias {token} must be rejected"
+            );
+        }
+    }
+
+    /// Blind-relay phase 1: the token parses, but enrollment admission
+    /// mints production signed state, so it must refuse blind_relay until
+    /// the §16 wire-format decisions are signed off.
+    #[test]
+    fn enrollment_admission_refuses_blind_relay_pending_sign_off() {
+        for token in ["blind_relay", "blind-relay"] {
+            let err = enrollee_capabilities_from_roles(&[token.to_owned()])
+                .expect_err("design-only capability must not be admitted");
+            let rendered = format!("{err}");
+            assert!(
+                rendered.contains("design-only; pending §16 wire-format sign-off"),
+                "{token} produced the wrong refusal: {rendered}"
             );
         }
     }

@@ -27,6 +27,17 @@ pub enum RoleCapability {
     /// `AnchorPortMappingAuthoritative` eligibility filter; validated
     /// in `validate_membership_node_capabilities`.
     AnchorPortMappingPinned,
+    /// DESIGN-ONLY (blind-relay phase 1): zero-ingress blind relay
+    /// modifier per `BlindRelayRoleDesign_2026-08-27.md`. Requires
+    /// `RelayHost`; the signed-state reducer permits a node carrying
+    /// this capability exactly `{RelayHost, BlindRelay}` and nothing
+    /// else. NOT yet advertisable by production signed state — the
+    /// construction paths (`SetNodeCapabilities` application and
+    /// enrollment admission) refuse it until the §16 wire-format
+    /// decisions are signed off. It parses and reduces so fixtures
+    /// and tests can exercise the target invariant, but no
+    /// production signed payload may carry it.
+    BlindRelay,
 }
 
 impl RoleCapability {
@@ -46,6 +57,7 @@ impl RoleCapability {
             RoleCapability::ServesNas => "serves_nas",
             RoleCapability::ServesLlm => "serves_llm",
             RoleCapability::AnchorPortMappingPinned => "anchor.port_mapping_pinned",
+            RoleCapability::BlindRelay => "blind_relay",
         }
     }
 
@@ -77,6 +89,7 @@ impl RoleCapability {
             "anchor.port_mapping_pinned" | "port_mapping_pinned" | "port-mapping-pinned" => {
                 Ok(RoleCapability::AnchorPortMappingPinned)
             }
+            "blind_relay" | "blind-relay" => Ok(RoleCapability::BlindRelay),
             "" => Err(RoleCapabilityParseError::Empty),
             other => Err(RoleCapabilityParseError::Unknown(other.to_owned())),
         }
@@ -179,7 +192,7 @@ pub fn role_capability_csv(capabilities: &[RoleCapability]) -> String {
 mod tests {
     use super::*;
 
-    const ALL_CAPABILITIES: [RoleCapability; 14] = [
+    const ALL_CAPABILITIES: [RoleCapability; 15] = [
         RoleCapability::Anchor,
         RoleCapability::Client,
         RoleCapability::ExitServer,
@@ -194,6 +207,7 @@ mod tests {
         RoleCapability::ServesNas,
         RoleCapability::ServesLlm,
         RoleCapability::AnchorPortMappingPinned,
+        RoleCapability::BlindRelay,
     ];
 
     #[test]
@@ -234,6 +248,7 @@ mod tests {
             ),
             ("serves-nas", RoleCapability::ServesNas),
             ("serves-llm", RoleCapability::ServesLlm),
+            ("blind-relay", RoleCapability::BlindRelay),
         ];
 
         for (input, expected) in cases {
@@ -265,6 +280,7 @@ mod tests {
             if capability == RoleCapability::ServesNas
                 || capability == RoleCapability::ServesLlm
                 || capability == RoleCapability::AnchorPortMappingPinned
+                || capability == RoleCapability::BlindRelay
             {
                 continue;
             }
@@ -272,6 +288,7 @@ mod tests {
         }
         assert!(RoleCapability::ServesNas < RoleCapability::ServesLlm);
         assert!(RoleCapability::ServesLlm < RoleCapability::AnchorPortMappingPinned);
+        assert!(RoleCapability::AnchorPortMappingPinned < RoleCapability::BlindRelay);
         assert_eq!(
             role_capability_csv(&[
                 RoleCapability::ServesLlm,
@@ -303,6 +320,28 @@ mod tests {
         // "anchor" role token must never auto-grant it.
         assert!(!ANCHOR_CAPABILITIES.contains(&RoleCapability::AnchorPortMappingPinned));
         assert!(!anchor_role_capabilities().contains(&RoleCapability::AnchorPortMappingPinned));
+    }
+
+    #[test]
+    fn role_capability_blind_relay_round_trips_canonical_and_alias() {
+        assert_eq!(RoleCapability::BlindRelay.as_str(), "blind_relay");
+        assert_eq!(
+            RoleCapability::parse("blind_relay"),
+            Ok(RoleCapability::BlindRelay)
+        );
+        assert_eq!(
+            RoleCapability::parse("blind-relay"),
+            Ok(RoleCapability::BlindRelay)
+        );
+        // Modifier, not standalone: the canonical renderer must emit it
+        // after its required `relay_host` capability.
+        assert_eq!(
+            role_capability_csv(&[RoleCapability::BlindRelay, RoleCapability::RelayHost]),
+            "relay_host,blind_relay"
+        );
+        // Not an anchor sub-capability and not service-hosting.
+        assert!(!RoleCapability::BlindRelay.is_anchor_capability());
+        assert!(!RoleCapability::BlindRelay.is_service_hosting_capability());
     }
 
     #[test]
