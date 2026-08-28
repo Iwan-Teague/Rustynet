@@ -6,6 +6,7 @@ pub enum NodeRole {
     Admin,
     Client,
     BlindExit,
+    BlindRelay,
 }
 
 impl NodeRole {
@@ -14,6 +15,7 @@ impl NodeRole {
             Self::Admin => "admin",
             Self::Client => "client",
             Self::BlindExit => "blind_exit",
+            Self::BlindRelay => "blind_relay",
         }
     }
 
@@ -22,6 +24,7 @@ impl NodeRole {
             "admin" => Some(Self::Admin),
             "client" => Some(Self::Client),
             "blind_exit" => Some(Self::BlindExit),
+            "blind_relay" => Some(Self::BlindRelay),
             _ => None,
         }
     }
@@ -37,6 +40,7 @@ pub enum RolePreset {
     Llm,
     Client,
     BlindExit,
+    BlindRelay,
 }
 
 impl RolePreset {
@@ -50,6 +54,7 @@ impl RolePreset {
             Self::Llm => "llm",
             Self::Client => "client",
             Self::BlindExit => "blind_exit",
+            Self::BlindRelay => "blind_relay",
         }
     }
 
@@ -63,6 +68,7 @@ impl RolePreset {
             "llm" => Some(Self::Llm),
             "client" => Some(Self::Client),
             "blind_exit" => Some(Self::BlindExit),
+            "blind_relay" => Some(Self::BlindRelay),
             _ => None,
         }
     }
@@ -71,6 +77,9 @@ impl RolePreset {
         match self {
             Self::Client => NodeRole::Client,
             Self::BlindExit => NodeRole::BlindExit,
+            // Blind relay is its own primary role (BlindRelayRoleDesign
+            // §4.2) — never an Admin checkbox.
+            Self::BlindRelay => NodeRole::BlindRelay,
             Self::Admin | Self::Exit | Self::Relay | Self::Anchor | Self::Nas | Self::Llm => {
                 NodeRole::Admin
             }
@@ -206,6 +215,18 @@ pub fn enforce_role_policy_defaults(
             };
             state.auto_launch_on_start = true;
             state.auto_launch_exit_node_id = None;
+            state.auto_launch_lan_mode = LanMode::Off;
+            state.fail_closed_ssh_allow = false;
+            state.fail_closed_ssh_cidrs.clear();
+        }
+        NodeRole::BlindRelay => {
+            // Blind relay (BlindRelayRoleDesign §4.2): unattended
+            // identity-blind relay hop. No exit-chain mutation (it is
+            // not an exit), no exit port-forwarding, no LAN exposure,
+            // no SSH allow rules — the node serves the relay only.
+            // The relay service lifecycle itself is the phase-3/4
+            // deliverable; this is the fail-closed policy posture.
+            state.auto_port_forward_exit = false;
             state.auto_launch_lan_mode = LanMode::Off;
             state.fail_closed_ssh_allow = false;
             state.fail_closed_ssh_cidrs.clear();
@@ -353,5 +374,52 @@ mod tests {
         state.auto_refresh_trust = true;
         let _ = enforce_role_policy_defaults(&mut state, false, "/etc/rustynet/trust.key");
         assert!(!state.auto_refresh_trust);
+    }
+
+    #[test]
+    fn blind_relay_preset_parses_and_maps_to_dedicated_primary() {
+        // BlindRelayRoleDesign §4.2: dedicated primary role, never an
+        // Admin checkbox.
+        let preset = RolePreset::parse("blind_relay").expect("preset should parse");
+        assert_eq!(preset, RolePreset::BlindRelay);
+        assert_eq!(preset.as_str(), "blind_relay");
+        assert_eq!(preset.primary_role(), NodeRole::BlindRelay);
+        assert_eq!(NodeRole::parse("blind_relay"), Some(NodeRole::BlindRelay));
+        assert_eq!(NodeRole::BlindRelay.as_str(), "blind_relay");
+        // Preset→role normalization coerces a mismatched NODE_ROLE to
+        // the blind_relay primary.
+        let (role, normalized, _) =
+            normalize_role(Some("admin"), Some("blind_relay"), true, HostProfile::Linux);
+        assert_eq!(role, NodeRole::BlindRelay);
+        assert_eq!(normalized, Some(RolePreset::BlindRelay));
+    }
+
+    #[test]
+    fn blind_relay_enforces_fail_closed_posture() {
+        let mut state = RolePolicyState {
+            node_role: NodeRole::BlindRelay,
+            manual_peer_override: true,
+            auto_refresh_trust: true,
+            default_launch_profile: LaunchProfile::Menu,
+            auto_port_forward_exit: true,
+            exit_chain: ExitChain {
+                hops: ExitChainHops::Two,
+                entry: Some("a".to_owned()),
+                final_node: Some("b".to_owned()),
+            },
+            auto_launch_on_start: false,
+            auto_launch_exit_node_id: Some("x".to_owned()),
+            auto_launch_lan_mode: LanMode::On,
+            fail_closed_ssh_allow: true,
+            fail_closed_ssh_cidrs: vec!["10.0.0.0/8".to_owned()],
+        };
+        let _ = enforce_role_policy_defaults(&mut state, true, "/etc/rustynet/trust.key");
+        // Fail-closed posture: no exit forwarding, no LAN exposure,
+        // no SSH allow rules, no manual peer override.
+        assert!(!state.auto_port_forward_exit);
+        assert_eq!(state.auto_launch_lan_mode, LanMode::Off);
+        assert!(!state.fail_closed_ssh_allow);
+        assert!(state.fail_closed_ssh_cidrs.is_empty());
+        assert!(!state.manual_peer_override);
     }
 }
