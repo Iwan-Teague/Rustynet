@@ -9,6 +9,17 @@ enforcement point, no test. It is the Windows counterpart examination that
 `LiveLabStageStatus_2026-08-14.md:176-179` flagged as unexamined; it closes that flag by
 **confirming a real gap** (verdict 1 below), not by clearing the Windows arm.
 
+**DONE DISPOSITION (2026-08-28, after the audit).** The §3 fix shape has since been implemented
+per its own text: verdict 1's enforcement point now exists — the Windows arm of
+`admit_host_firewall_forwarding` calls
+`rustynet_windows_native::assert_forwarded_traffic_admitted()` (portable arbiter
+`wfp_filter_shape::assess_forwarded_traffic_arbitration` + read-only `FwpmFilterEnum0`
+collector, fail-closed on unreadable WFP state), feeding the unchanged
+`reassert_host_firewall_admission` fail-closed rollback; 7 new off-Windows arbiter tests.
+Verdict 2's narrower shape remains OPEN by design. The Windows-guest live proof (a foreign
+forward-layer block tripping the fail-closed rollback on a real Windows exit node) remains
+pending. See the QH-46 addendum in `QualityHardeningTodo_2026-07-25.md`.
+
 ## Method
 
 All evidence below was gathered by direct reads of the working tree (HEAD `6d8997f8`): a full
@@ -170,6 +181,23 @@ pin explicit high `FWP_UINT64` weights on our own filters so they cannot be outr
 their own weight class — a one-line change at `lib.rs:1667` plus shape-validation updates in
 `wfp_filter_shape`.
 
+### Disposition (2026-08-28 — the §3 shape for verdict 1 is now IMPLEMENTED)
+
+The cheaper of the two shapes in step 1 was taken, scoped to the forward path: the Windows arm
+of `admit_host_firewall_forwarding` now calls
+`rustynet_windows_native::assert_forwarded_traffic_admitted()`, which enumerates
+`FWPM_LAYER_IPFORWARD_V4/V6` (read-only `FwpmFilterEnum0`, `layerKey`-scoped template) and
+verdicts in the portable `wfp_filter_shape::assess_forwarded_traffic_arbitration`. Why
+"any foreign non-permit filter at a forward layer" is the correct weight rule: at those layers
+RustyNet installs nothing, so its arbitration position is the *absence* of a block and any
+foreign block is at-or-above it by construction; default-deny treats any non-PERMIT action as
+an obstruction. Fail-closed on unreadable WFP state is enforced as
+`ForeignForwardObstruction::Unreadable` (the `FirewalldPosture` mirror). Steps 2–3 needed no
+new plumbing and carry over unchanged; 7 off-Windows arbiter tests cover
+block/unreadable/permit/own-sublayer. Verdict 2's shape above remains OPEN by design, and the
+Windows-guest live proof (foreign forward-layer block → fail-closed rollback on a real exit
+node) remains pending.
+
 ## 4. Provenance
 
 - Audit scope: working tree at `6d8997f8`, branch `ai-edit/edit-1787933835041-56044-15`.
@@ -177,4 +205,5 @@ their own weight class — a one-line change at `lib.rs:1667` plus shape-validat
   verified by grep at audit time.
 - Companion records: QH-46 ledger entry (`QualityHardeningTodo_2026-07-25.md`, 2026-08-14 fix),
   `LiveLabStageStatus_2026-08-14.md:176-179` (the flag this document closes),
-  `phase10.rs:4870-4876` (the self-documented gap).
+  `phase10.rs:4870-4876` (the self-documented gap — since closed by the §3 disposition above;
+  the "no `FwpmFilterEnum` anywhere" negative claim is now audit-time history).

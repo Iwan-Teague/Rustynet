@@ -228,6 +228,17 @@ pub fn wfp_tunnel_permit_present(
     Err("WFP killswitch filters are only available on Windows hosts".to_owned())
 }
 
+#[cfg(not(windows))]
+pub fn assert_forwarded_traffic_admitted()
+-> Result<(), crate::wfp_filter_shape::ForeignForwardObstruction> {
+    Err(
+        crate::wfp_filter_shape::ForeignForwardObstruction::Unreadable {
+            detail: "WFP forwarded-traffic arbitration is only available on Windows hosts"
+                .to_owned(),
+        },
+    )
+}
+
 pub fn detect_default_gateway() -> Result<IpAddr, String> {
     let adapters = get_adapters_addresses()?;
     select_default_gateway_from_adapters(&adapters)
@@ -1558,11 +1569,12 @@ mod imp {
     // idempotent: the sublayer (and its filters) is deleted by key first.
     use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
         FWP_ACTION_PERMIT, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_UINT64,
-        FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_FILTER_CONDITION0,
+        FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_FILTER_CONDITION0, FWPM_FILTER_ENUM_TEMPLATE0,
         FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
-        FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-        FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0,
-        FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmFilterGetByKey0, FwpmFreeMemory0,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_LAYER_IPFORWARD_V4,
+        FWPM_LAYER_IPFORWARD_V6, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0,
+        FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterCreateEnumHandle0, FwpmFilterDeleteByKey0,
+        FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFilterGetByKey0, FwpmFreeMemory0,
         FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
         FwpmTransactionCommit0,
     };
@@ -1897,6 +1909,99 @@ mod imp {
         unsafe { FwpmEngineClose0(engine) };
         result
     }
+
+    // ---- Forwarded-traffic arbitration enumeration (QH-46 on Windows) ----
+    //
+    // Enumerates the forward-path layers the NetNat exit path relies on and
+    // hands plain-value observations to the portable arbiter in
+    // [`crate::wfp_filter_shape`]. Any enumeration failure is an Err: an
+    // unreadable WFP state is treated as obstructed, exactly like the Linux
+    // firewalld unknown-presence rule.
+    //
+    // Drift pins: the portable layer/sublayer constants must never diverge
+    // from the GUIDs the engine actually reports.
+    const _: () = assert!(
+        guid_to_u128(&FWPM_LAYER_IPFORWARD_V4) == crate::wfp_filter_shape::LAYER_IPFORWARD_V4
+    );
+    const _: () = assert!(
+        guid_to_u128(&FWPM_LAYER_IPFORWARD_V6) == crate::wfp_filter_shape::LAYER_IPFORWARD_V6
+    );
+    const _: () = assert!(
+        guid_to_u128(&RUSTYNET_WFP_SUBLAYER_KEY) == crate::wfp_filter_shape::OUR_SUBLAYER_KEY
+    );
+
+    /// Enumerate every filter at the forwarded-traffic layers
+    /// (`FWPM_LAYER_IPFORWARD_V4/V6`) as plain-value observations for the
+    /// portable arbiter. Read-only: `FwpmFilterEnum0` inspects, never mutates.
+    fn wfp_enumerate_forward_layer_filters()
+    -> Result<Vec<crate::wfp_filter_shape::ForeignForwardFilterObservation>, String> {
+        let mut engine = wfp_engine_open()?;
+        let result = (|| {
+            let mut observations = Vec::new();
+            for layer in [FWPM_LAYER_IPFORWARD_V4, FWPM_LAYER_IPFORWARD_V6] {
+                // Only the layerKey is pinned; a zeroed template leaves the
+                // other fields at their engine defaults (match everything).
+                let mut template: FWPM_FILTER_ENUM_TEMPLATE0 = unsafe { std::mem::zeroed() };
+                template.layerKey = layer;
+                let mut enum_handle = null_mut();
+                let status =
+                    unsafe { FwpmFilterCreateEnumHandle0(engine, &template, &mut enum_handle) };
+                if status != 0 {
+                    return Err(format!(
+                        "FwpmFilterCreateEnumHandle0 failed with {status:#x}"
+                    ));
+                }
+                let enum_result = (|| {
+                    loop {
+                        let mut entries: *mut *mut FWPM_FILTER0 = null_mut();
+                        let mut returned: u32 = 0;
+                        let status = unsafe {
+                            FwpmFilterEnum0(engine, enum_handle, 32, &mut entries, &mut returned)
+                        };
+                        if status != 0 {
+                            return Err(format!("FwpmFilterEnum0 failed with {status:#x}"));
+                        }
+                        if returned == 0 || entries.is_null() {
+                            return Ok(());
+                        }
+                        for index in 0..returned as usize {
+                            let filter_ref = unsafe { &*entries.add(index) };
+                            observations.push(
+                                crate::wfp_filter_shape::ForeignForwardFilterObservation {
+                                    layer_key: guid_to_u128(&filter_ref.layerKey),
+                                    sublayer_key: guid_to_u128(&filter_ref.subLayerKey),
+                                    action_type: filter_ref.action.r#type,
+                                },
+                            );
+                        }
+                        // FwpmFilterEnum0 allocates the returned batch; free it.
+                        let mut freeable = entries.cast::<c_void>();
+                        unsafe { FwpmFreeMemory0(&mut freeable) };
+                    }
+                })();
+                unsafe { FwpmFilterDestroyEnumHandle0(engine, enum_handle) };
+                enum_result?;
+            }
+            Ok(observations)
+        })();
+        unsafe { FwpmEngineClose0(engine) };
+        result
+    }
+
+    /// Enforcement point for the QH-46 defect class on Windows: verify that
+    /// the forwarded-traffic path carries no foreign block (and that the WFP
+    /// state is readable at all) before the daemon reports exit-serving.
+    ///
+    /// Called by `admit_host_firewall_forwarding` on role transition and by
+    /// `reassert_host_firewall_admission` every
+    /// `HOST_FIREWALL_ADMISSION_ASSERT_INTERVAL_SECS` on an exit-serving node;
+    /// an `Err` there converts into the fail-closed rollback.
+    pub fn assert_forwarded_traffic_admitted()
+    -> Result<(), crate::wfp_filter_shape::ForeignForwardObstruction> {
+        crate::wfp_filter_shape::assess_forwarded_traffic_arbitration(
+            wfp_enumerate_forward_layer_filters(),
+        )
+    }
 }
 
 /// Portable validation of a read-back WFP filter's SHAPE.
@@ -2109,6 +2214,122 @@ pub mod wfp_filter_shape {
         ]
     }
 
+    // ---- Forwarded-traffic arbitration (QH-46 on Windows) ----
+    //
+    // The NetNat forward path installs no WFP filters of its own: forwarded
+    // exit traffic relies on the ABSENCE of a foreign block at the layers it
+    // traverses (`FWPM_LAYER_IPFORWARD_V4/V6`). That absence is the Windows
+    // analogue of the Linux firewalld zone bind, and it must be verified the
+    // same way: a foreign non-permit filter at those layers (or WFP state we
+    // cannot read) fails the admit, and `reassert_host_firewall_admission`
+    // converts the failure into the fail-closed rollback. Our own sublayer
+    // hosts only the two ALE_AUTH_CONNECT tunnel-permit filters, so anything
+    // observed at the forward layers in our sublayer key is a key-collision
+    // indicator and is skipped defensively; every other sublayer is foreign.
+    //
+    // Arbitration: WFP ranks explicit 64-bit filter weights above the u16
+    // sublayer-weight range, but at the forward layers nothing of ours
+    // competes at all — our arbitration position there is the absence of a
+    // block. Any foreign non-permit filter therefore sits at or above our
+    // position by construction, so the weight fields do not need to be
+    // compared to reach the verdict; the default-deny posture treats any
+    // action we do not positively recognise as a permit (BLOCK, CALLOUT,
+    // CONTINUE, anything newer) as an obstruction.
+    pub const ACTION_BLOCK: u32 = 4097;
+
+    pub const LAYER_IPFORWARD_V4: u128 = 0xa82acc24_4ee1_4ee1_b465_fd1d25cb10a4;
+    pub const LAYER_IPFORWARD_V6: u128 = 0x7b964818_19c7_493a_b71f_832c3684d28c;
+
+    /// RustyNet's own persistent sublayer key; filters observed under it are
+    /// ours and are never treated as foreign obstructions.
+    pub const OUR_SUBLAYER_KEY: u128 = 0x5b8f2a31_9c4d_4e7a_b1f0_3d6e8a2c9f44;
+
+    /// One filter observed at a forwarded-traffic layer by the Windows-side
+    /// enumerator. Marshalling stays in the `#[cfg(windows)]` shim; every
+    /// judgement is made here, on plain values, under tests that run on every
+    /// platform.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ForeignForwardFilterObservation {
+        pub layer_key: u128,
+        pub sublayer_key: u128,
+        pub action_type: u32,
+    }
+
+    /// Why forwarded-traffic admission cannot be confirmed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ForeignForwardObstruction {
+        /// The WFP state could not be read at all. Mirrors the Linux
+        /// `FirewalldPosture` rule: unknown presence is treated as present,
+        /// so an unreadable engine is treated as obstructed.
+        Unreadable { detail: String },
+        /// A foreign non-permit filter sits at a forwarded-traffic layer.
+        ForwardPathBlocked {
+            layer: &'static str,
+            sublayer_key: u128,
+            action_type: u32,
+        },
+    }
+
+    impl std::fmt::Display for ForeignForwardObstruction {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Unreadable { detail } => write!(
+                    f,
+                    "WFP forwarded-traffic state is unreadable and is treated as obstructed: {detail}"
+                ),
+                Self::ForwardPathBlocked {
+                    layer,
+                    sublayer_key,
+                    action_type,
+                } => write!(
+                    f,
+                    "host firewall would discard forwarded tunnel traffic: foreign filter with action type {action_type:#x} at layer {layer} (sublayer {sublayer_key:#034x})"
+                ),
+            }
+        }
+    }
+
+    fn forward_layer_name(layer_key: u128) -> &'static str {
+        if layer_key == LAYER_IPFORWARD_V4 {
+            "FWPM_LAYER_IPFORWARD_V4"
+        } else if layer_key == LAYER_IPFORWARD_V6 {
+            "FWPM_LAYER_IPFORWARD_V6"
+        } else {
+            "unknown forwarded-traffic layer"
+        }
+    }
+
+    /// Verify the forwarded-traffic admission posture from an enumeration the
+    /// caller already performed.
+    ///
+    /// `collected` is the Windows shim's enumeration outcome; `Err` means the
+    /// forward layers could not be read and fails closed exactly like the
+    /// Linux firewalld-presence rule. An `Ok` list is scanned for foreign
+    /// non-permit filters; the first one found is reported with its layer,
+    /// sublayer, and action type. Filters under [`OUR_SUBLAYER_KEY`] are
+    /// skipped: they are ours, and a foreign party cannot install under our
+    /// key without also colliding with our filters there (which the
+    /// tunnel-permit shape check detects separately).
+    pub fn assess_forwarded_traffic_arbitration(
+        collected: Result<Vec<ForeignForwardFilterObservation>, String>,
+    ) -> Result<(), ForeignForwardObstruction> {
+        let observations =
+            collected.map_err(|detail| ForeignForwardObstruction::Unreadable { detail })?;
+        for observation in &observations {
+            if observation.sublayer_key == OUR_SUBLAYER_KEY {
+                continue;
+            }
+            if observation.action_type != ACTION_PERMIT {
+                return Err(ForeignForwardObstruction::ForwardPathBlocked {
+                    layer: forward_layer_name(observation.layer_key),
+                    sublayer_key: observation.sublayer_key,
+                    action_type: observation.action_type,
+                });
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2268,6 +2489,126 @@ pub mod wfp_filter_shape {
                 validate_tunnel_permit_shape(&shape, TUNNEL_LUID, &[]),
                 Err(WfpShapeError::WrongConditionCount {
                     count: MAX_MATERIALIZED_CONDITIONS
+                })
+            );
+        }
+
+        // ---- Forwarded-traffic arbitration (QH-46 on Windows) ----
+
+        const FOREIGN_SUBLAYER: u128 = 0xaaaa_0000_0000_0000_0000_0000_0000_0001;
+
+        fn forward_observation(
+            layer_key: u128,
+            action_type: u32,
+        ) -> ForeignForwardFilterObservation {
+            ForeignForwardFilterObservation {
+                layer_key,
+                sublayer_key: FOREIGN_SUBLAYER,
+                action_type,
+            }
+        }
+
+        /// QH-46 enforcement point: a foreign BLOCK at the IPv4 forward layer
+        /// (exactly what a third-party WFP provider installs to discard
+        /// forwarded exit traffic) must fail the admit so the re-assert path
+        /// fail-closes instead of reporting exit-serving over a dead path.
+        #[test]
+        fn foreign_block_at_forward_v4_is_obstruction() {
+            assert_eq!(
+                assess_forwarded_traffic_arbitration(Ok(vec![forward_observation(
+                    LAYER_IPFORWARD_V4,
+                    ACTION_BLOCK
+                )])),
+                Err(ForeignForwardObstruction::ForwardPathBlocked {
+                    layer: "FWPM_LAYER_IPFORWARD_V4",
+                    sublayer_key: FOREIGN_SUBLAYER,
+                    action_type: ACTION_BLOCK
+                })
+            );
+        }
+
+        /// The IPv6 forward path is equally load-bearing for exit traffic.
+        #[test]
+        fn foreign_block_at_forward_v6_is_obstruction() {
+            assert_eq!(
+                assess_forwarded_traffic_arbitration(Ok(vec![forward_observation(
+                    LAYER_IPFORWARD_V6,
+                    ACTION_BLOCK
+                )])),
+                Err(ForeignForwardObstruction::ForwardPathBlocked {
+                    layer: "FWPM_LAYER_IPFORWARD_V6",
+                    sublayer_key: FOREIGN_SUBLAYER,
+                    action_type: ACTION_BLOCK
+                })
+            );
+        }
+
+        /// An explicit high 64-bit weight outranks everything, but the verdict
+        /// must not depend on the weight: at the forward layers our position
+        /// is the ABSENCE of a block, so even an auto-weighted foreign block
+        /// sits at or above our (absent) arbitration position.
+        #[test]
+        fn any_action_that_is_not_permit_is_obstruction() {
+            for action in [4099u32, 0, u32::MAX] {
+                assert_eq!(
+                    assess_forwarded_traffic_arbitration(Ok(vec![forward_observation(
+                        LAYER_IPFORWARD_V4,
+                        action
+                    )])),
+                    Err(ForeignForwardObstruction::ForwardPathBlocked {
+                        layer: "FWPM_LAYER_IPFORWARD_V4",
+                        sublayer_key: FOREIGN_SUBLAYER,
+                        action_type: action
+                    })
+                );
+            }
+        }
+
+        /// Default-deny's mirror: a positively-recognised PERMIT does not
+        /// discard traffic and must not produce a false alarm.
+        #[test]
+        fn foreign_permit_at_forward_layer_is_not_obstruction() {
+            assert_eq!(
+                assess_forwarded_traffic_arbitration(Ok(vec![forward_observation(
+                    LAYER_IPFORWARD_V4,
+                    ACTION_PERMIT
+                )])),
+                Ok(())
+            );
+        }
+
+        /// A clear forward path is the success verdict.
+        #[test]
+        fn no_forward_layer_filters_is_unobstructed() {
+            assert_eq!(assess_forwarded_traffic_arbitration(Ok(Vec::new())), Ok(()));
+        }
+
+        /// Filters under our own sublayer key are ours and never count as
+        /// foreign obstructions (our filters only ever live at the ALE
+        /// layers; their absence there is the tunnel-permit check's job).
+        #[test]
+        fn our_own_sublayer_is_exempt() {
+            assert_eq!(
+                assess_forwarded_traffic_arbitration(Ok(vec![ForeignForwardFilterObservation {
+                    layer_key: LAYER_IPFORWARD_V4,
+                    sublayer_key: OUR_SUBLAYER_KEY,
+                    action_type: ACTION_BLOCK,
+                }])),
+                Ok(())
+            );
+        }
+
+        /// Fail closed on unreadable WFP state: mirrors the Linux
+        /// FirewalldPosture rule that unknown presence is treated as present,
+        /// so the periodic re-assert cannot be blinded by a read failure.
+        #[test]
+        fn unreadable_wfp_state_fails_closed() {
+            assert_eq!(
+                assess_forwarded_traffic_arbitration(Err(
+                    "FwpmFilterCreateEnumHandle0 failed with 0x80320009".to_owned()
+                )),
+                Err(ForeignForwardObstruction::Unreadable {
+                    detail: "FwpmFilterCreateEnumHandle0 failed with 0x80320009".to_owned()
                 })
             );
         }
