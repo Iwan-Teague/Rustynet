@@ -569,3 +569,75 @@ until the power-off; daemon left NOT loaded (as found); `/usr/local/bin/rustynet
 replaced with the `4b0d18aa` build (the 2026-08-26 binary was overwritten — the next
 orchestrator deploy re-installs its own build regardless); probe scripts left in the
 guest's `/tmp`. The per-guest QH-18 flock for `macos-utm-1` was probed and free throughout.
+
+### 8.7 The §8.2 timeout asymmetry — FIXED, 2026-08-28
+
+The "real timeout defect neither prior document names" (§8.2, last paragraph) and item 3
+of the §8.5 re-scope are implemented on `work/helper-timeout-mismatch`. The ordering race
+(Option A) is untouched and still gated on sign-off — this change fixes only the
+client/server timeout asymmetry.
+
+**The invariant, stated once.** The daemon's *client* read timeout must be at least the
+helper's *server* processing window. The daemon process cannot check this itself: it is
+the client half and never learns the helper's `--timeout-ms` (no protocol field carries
+it). The only place both numbers exist at once is the installer that renders both plists,
+so that is where the invariant is enforced — by **rejection**, not a warning, per the
+fail-closed norm. A silently accepted mismatch is exactly the defect being fixed.
+
+**Enforcement points** (`crates/rustynetd/src/privileged_helper.rs`):
+
+* `DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS` (2000) is now explicitly the **server** budget.
+* `PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS` (1000) and
+  `privileged_helper_client_timeout_ms(server) = server + margin` derive the client value.
+* `daemon.rs`'s `DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS` is now that derivation
+  (**2000 → 3000**) instead of an independent copy of the server default, so a daemon
+  deployed with **no** flag — the case measured on `macos-utm-1` — satisfies the invariant
+  on its own.
+* `validate_privileged_helper_timeout_pair(server, client)` rejects `client < server` and
+  either value being zero.
+* `MACOS_LAUNCHD_EXIT_TIMEOUT_MS` (5000) pins §8.1's measurement, and
+  `validate_macos_privileged_helper_shutdown_budget(client)` rejects a client timeout above
+  it. macOS-only and deliberately separate: Linux has no such ceiling, so the historically
+  useful 10000 ms helper timeout stays legal there.
+
+**Deployed values, before and after:**
+
+| Renderer | Helper `--timeout-ms` | Daemon `--privileged-helper-timeout-ms` |
+| --- | --- | --- |
+| `Install-RustyNetMacosService.sh` — before | 30000 (hardcoded) | **flag absent** → 2000 default |
+| `Install-RustyNetMacosService.sh` — after | 2000 (`RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS`) | 3000 (derived, rendered) |
+| `macos_launchd_restart_config_from_env` — before | env, default 2000 | same env value (zero margin) |
+| `macos_launchd_restart_config_from_env` — after | env, default 2000 | derived + validated |
+| `scripts/systemd/*` (Linux) | unchanged | unchanged — one env value to both sides satisfies `client >= server` |
+
+`--privileged-helper-timeout-ms` moved from the install script's audited *intentional
+omission* list to its audited *added* list: the omission was safe only while both sides sat
+at the same default, which the hardcoded 30000 broke.
+
+**Shutdown-path budget — decision: one budget, sized to fit the ceiling; no separate
+shutdown timeout.** §8.1 requires every shutdown-path wait to sit under 5 s. The daemon
+builds ONE `PrivilegedCommandClient` in `daemon_system` (`daemon.rs`) and every call site —
+steady-state reconcile and shutdown rollback alike — shares it, so a distinct per-call
+shutdown budget would mean threading a second client through the shutdown call sites. Those
+sites are Option A's territory and are gated on sign-off, so rather than pre-empt that this
+change makes the **shared** budget fit the ceiling: 3000 ms client < 5000 ms, so a single
+in-flight helper call at SIGTERM completes or fails with ~2 s to spare. This is sufficient
+for one call and is *not* sufficient for a multi-step rollback whose steps each burn the
+full budget — that residual is a completion-race problem, which is precisely what Option A
+addresses. Revisit a separate, shorter shutdown budget as part of Option A, not before.
+
+**Also corrected here:** `annotate_helper_response_read_error` no longer claims a truncated
+response is caused by the helper's own I/O timeout — §8.2 refuted that mechanism live. It
+now names the two paths that actually send zero bytes (the helper process going away
+mid-request, and the oversized-response drop), states that a client-side read timeout
+reports `os error 35` instead, and demotes the timeout knobs to a contributing factor.
+
+**Verification:** four unit tests in `privileged_helper.rs` pin the invariant at the
+defaults, the derivation, the launchd-ceiling fit, and the rejection of the exact measured
+mismatch (helper 30000 / client 2000); one render test in
+`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs` pins both plists
+carrying coherent flags, the derivation, the two fail-closed guards, and the script's
+constants against their Rust source of truth.
+
+**Not measured live.** No lab run was authorized for this change; the guest still carries
+the pre-fix deployment. Re-installing `macos-utm-1` is what will first render the new pair.

@@ -2153,6 +2153,31 @@ That last one is the fail-closed question and should be answered first.
 > unmeasured (harness permission classifier blocked deploying the cycle driver); a
 > marker-carrying `4b0d18aa` binary is staged on the guest for the follow-up, and the design
 > doc §8.3 describes the prepared driver's cycle matrix.
+>
+> **STATUS 2026-08-28 — the §8.2 client/server timeout asymmetry is FIXED on
+> `work/helper-timeout-mismatch`; the ordering race (Option A) is untouched and still gated
+> on sign-off.** Details and the before/after value table:
+> [`MacOsHelperShutdownOrderingDesign_2026-08-27.md`](./MacOsHelperShutdownOrderingDesign_2026-08-27.md)
+> §8.7. In short: the invariant is **client read timeout >= helper server processing
+> window**, enforced at the installer (the only place both numbers exist — the daemon
+> process never learns the helper's `--timeout-ms`) and enforced by rejection, not a
+> warning. The daemon's client default is now DERIVED from the helper's server default
+> (2000 → **3000** = server + 1000 ms margin) so a daemon deployed with no flag — the case
+> measured on `macos-utm-1` — is coherent on its own.
+> `Install-RustyNetMacosService.sh` no longer hardcodes the helper at 30000 ms and now
+> renders the daemon flag it previously omitted; both values derive from one
+> `RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS`, and the install fails closed if the pair is
+> incoherent or if the client value exceeds launchd's measured 5 s exit ceiling (that
+> ceiling is now pinned in code as `MACOS_LAUNCHD_EXIT_TIMEOUT_MS`). Shutdown-path budget
+> decision: **one shared budget sized to fit under the 5 s ceiling**, not a separate
+> shutdown timeout — the daemon builds a single helper client that every call site shares,
+> so splitting the budget means touching the shutdown call sites, which is Option A's
+> territory. 3000 ms leaves ~2 s of headroom for one in-flight call at SIGTERM; a
+> multi-step rollback that burns the full budget per step remains a completion-race
+> problem for Option A. Also corrected: `annotate_helper_response_read_error` no longer
+> asserts the refuted "helper I/O timeout causes truncation" mechanism. Verified by four
+> unit tests plus one plist-render test; **no live lab run** — the guest still carries the
+> pre-fix deployment, so the new pair first renders on the next macOS install.
 
 ### QH-41 — `macos-utm-1` is on an isolated vmnet bridge, so every mixed-OS run fails its traffic matrix deterministically
 
