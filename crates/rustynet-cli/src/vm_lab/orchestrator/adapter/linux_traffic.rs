@@ -76,6 +76,45 @@ const LINUX_INTERFACE_RESET_COMMAND: &str = "export PATH=\"/usr/sbin:/sbin:$PATH
          done; \
      fi";
 
+/// Drop a `RUSTYNET_EGRESS_INTERFACE` pin in `/etc/default/rustynetd` that
+/// names an interface which no longer exists on this guest.
+///
+/// This is the second line of defence behind `cross_network_substrate_teardown`
+/// reverting its own pin. It matters for two cases teardown cannot reach: a pin
+/// written by a run whose teardown never got to this guest, and a pin already on
+/// disk from a run that predates that fix (those files carry no provenance
+/// marker at all).
+///
+/// Three conditions must all hold before anything is removed, so an operator's
+/// configuration is never touched:
+///   1. a pin is present, and
+///   2. the interface it names does not exist (`ip link show` fails) — a valid
+///      pin is therefore always left alone, and
+///   3. either the installer's provenance marker says the pin was derived
+///      rather than operator-set, or the pin names one of the lab overlay links
+///      this repository creates, which no operator deployment could legitimately
+///      pin as its egress NIC.
+///
+/// Only the value line is deleted. An orphaned provenance marker is inert — the
+/// installer reads it only to classify an inherited value — and the next
+/// `ops install-systemd` rewrites the file wholesale.
+///
+/// Best-effort like the sibling resets above: if this does not take, the stale
+/// pin surfaces as the same loud `egress interface does not exist` install
+/// failure it does today rather than as silent misconfiguration.
+const LINUX_EGRESS_PIN_RESET_COMMAND: &str = "export PATH=\"/usr/sbin:/sbin:$PATH\"; \
+     rn_env=/etc/default/rustynetd; \
+     if [ -f \"$rn_env\" ]; then \
+         rn_pin=$(sed -n 's/^RUSTYNET_EGRESS_INTERFACE=//p' \"$rn_env\" 2>/dev/null | head -1); \
+         if [ -n \"$rn_pin\" ] && ! ip link show \"$rn_pin\" >/dev/null 2>&1; then \
+             if grep -q '^RUSTYNET_EGRESS_INTERFACE_SOURCE=derived$' \"$rn_env\" 2>/dev/null \
+                 || [ \"$rn_pin\" = rustynet-vx0 ] || [ \"$rn_pin\" = rustynet-vxl ]; then \
+                 sudo -n sed -i '/^RUSTYNET_EGRESS_INTERFACE=/d' \"$rn_env\" 2>/dev/null || true; \
+             fi; \
+         fi; \
+     fi; \
+     true";
+
 /// Comprehensive post-cleanup verification probe used by [`assert_node_clean`].
 /// Emits exactly three space-separated tokens on a single line that
 /// [`parse_node_clean_probe`] interprets:
@@ -746,6 +785,14 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     // collide with the next bootstrap's fresh device bring-up. Best-effort and
     // idempotent — no matching link is a no-op.
     let _ = ssh::run_remote(conn, LINUX_INTERFACE_RESET_COMMAND, Duration::from_secs(30));
+    // Runs AFTER the interface reset so `ip link show` sees the post-reset
+    // reality: an interface this cleanup just deleted must read as absent, or a
+    // pin naming it would be judged valid and survive into the next install.
+    let _ = ssh::run_remote(
+        conn,
+        LINUX_EGRESS_PIN_RESET_COMMAND,
+        Duration::from_secs(30),
+    );
     // Restart systemd-resolved so the next bootstrap inherits a clean DNS
     // stub. The daemon's network plumbing can leave the stub at 127.0.0.53
     // in a degraded state after teardown, causing DNS timeouts during cargo
@@ -1339,6 +1386,55 @@ mod tests {
         // Tool-absence tolerant: a host without nft/ip is benign, not an error.
         assert!(p.contains("command -v nft"));
         assert!(p.contains("command -v ip"));
+    }
+
+    /// The egress-pin reset is a backstop for stale-pin residue and MUST NOT
+    /// become a way for the lab to quietly overwrite operator configuration.
+    /// Each guard below is the enforcement point for one of the three
+    /// conditions that must all hold before anything is deleted.
+    #[test]
+    fn linux_egress_pin_reset_only_removes_a_stale_lab_written_pin() {
+        let cmd = LINUX_EGRESS_PIN_RESET_COMMAND;
+        // Guard 1: only acts when the env file and a pin actually exist.
+        assert!(cmd.contains("if [ -f \"$rn_env\" ]"));
+        assert!(cmd.contains("rn_pin=$(sed -n 's/^RUSTYNET_EGRESS_INTERFACE=//p'"));
+        assert!(cmd.contains("[ -n \"$rn_pin\" ]"));
+        // Guard 2: a pin naming a LIVE interface is never touched.
+        assert!(cmd.contains("! ip link show \"$rn_pin\""));
+        // Guard 3: either the installer marked the pin as derived, or it names
+        // a lab overlay link no operator deployment could legitimately pin.
+        assert!(cmd.contains("grep -q '^RUSTYNET_EGRESS_INTERFACE_SOURCE=derived$'"));
+        assert!(cmd.contains("[ \"$rn_pin\" = rustynet-vx0 ]"));
+        assert!(cmd.contains("[ \"$rn_pin\" = rustynet-vxl ]"));
+        // Deletes only the value line; the provenance marker is inert without
+        // it and the next install rewrites the file wholesale.
+        assert!(cmd.contains("sed -i '/^RUSTYNET_EGRESS_INTERFACE=/d'"));
+        assert!(!cmd.contains("sed -i '/^RUSTYNET_EGRESS_INTERFACE_SOURCE=/d'"));
+        // Best-effort, like every sibling reset: a failure here resurfaces as
+        // the same loud install error it does today.
+        assert!(cmd.contains("|| true"));
+    }
+
+    /// Ordering is load-bearing: an interface this cleanup just deleted must
+    /// read as absent to the pin probe, or a pin naming it would be judged
+    /// valid and survive into the next install.
+    #[test]
+    fn egress_pin_reset_runs_after_the_interface_reset() {
+        let source = include_str!("linux_traffic.rs");
+        let body = source
+            .split_once("pub fn cleanup_runtime_state")
+            .expect("cleanup_runtime_state must exist")
+            .1;
+        let iface_at = body
+            .find("LINUX_INTERFACE_RESET_COMMAND")
+            .expect("interface reset must be invoked");
+        let pin_at = body
+            .find("LINUX_EGRESS_PIN_RESET_COMMAND")
+            .expect("egress pin reset must be invoked");
+        assert!(
+            iface_at < pin_at,
+            "pin reset must follow the interface reset"
+        );
     }
 
     #[test]
