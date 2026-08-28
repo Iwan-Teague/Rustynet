@@ -7,7 +7,8 @@ restated macOS-scoped — Linux `two_hop` is 35-pass, not a blocker — and its 
 flagged UNVERIFIED, first action = triage not fix), B2 (stability = §5.4
 flake-sized N-of-N at a single clean commit, not the replaced "two consecutive"),
 B3 (program restructured into 3 parallel tracks joining at cross-OS, not a false
-serial), S1 (cross-OS is 0/88 because never *attempted* — first step is run+triage),
+serial), S1 (cross-OS is 0/88 — 0/178 as re-counted 2026-08-28 — because never
+*attempted*; first step is run+triage),
 S2 (macOS exit `pf` divergence does NOT waive the end-to-end egress proof), S3
 (`SignedMembership` transitions restored to scope), S4 (`network_flap` G1 =
 "correctly adjudicated," not "must be RED"). This refresh
@@ -33,11 +34,17 @@ is in the `--node` ledger (`live_lab_node_run_matrix.csv`).** Since G2 reads the
 not count toward release.** On the engine of record:
 
 - `--node` ledger: **88 rows, zero overall `pass`** (81 fail / 7 partial).
+  *Re-counted 2026-08-28 at `34a9e6f8`: **178 rows**, still zero overall `pass`
+  (141 fail / 37 partial). The ledger is append-only — re-derive, do not cite.*
 - **Cross-OS is 0-proven:** `live_mixed_topology_validation` (the `--node` cross-OS
-  carrier per AcceptanceSpec §3-T3) has **never gone green** (0/88).
+  carrier per AcceptanceSpec §3-T3) has **never gone green** (0/88; **0-for-178**
+  as re-counted 2026-08-28 — 632 per-stage rows, every one `skip`).
 - **Windows is 0-proven and has not bootstrapped on `--node`** (every
   `windows_stage_bootstrap` row *where it ran* failed — n=3, all 2026-07-19; the
   other 85 rows are `not_run`, so this is a thin single-day signal, see CP-4).
+  *Re-counted 2026-08-28: **n=5 fail** across two days (three 2026-07-19 @
+  `db3ff1aaafe6`, two 2026-07-25 @ `b7667cce46db`), 173 `not_run`, still zero
+  `pass`. The claim holds; it is no longer single-day.*
 - **macOS is partially stage-green** (admin, relay-lifecycle, core, security stages
   pass in isolation) but **no macOS run passes overall** — `two_hop` fails every
   time, and exit/blind_exit/anchor were never elected onto a macOS `--node`.
@@ -141,7 +148,8 @@ consecutive" (which §5.4 explicitly replaced as arithmetically too weak).
   Windows all present and healthy, so it depends on Tracks M and W (and L for a
   clean mesh). **First sub-step is "run it once and triage," not "make it green"
   (review S1):** it is **0-for-88 because it has NEVER been attempted** — every row
-  is `skip`/`not_run`, zero `fail`, zero `pass` — so there is no triage signal yet;
+  is `skip`/`not_run`, zero `fail`, zero `pass` *(unchanged at **0-for-178**,
+  re-counted 2026-08-28)* — so there is no triage signal yet;
   the first execution is an unknown-unknown and deserves its own diagnosis step.
 - **Parked, deferred-with-reason** (AcceptanceSpec §6.1 fenced disposition): relay
   frame-forwarding (HP-3, all OS), Windows `blind_exit` (design-excluded), nas/llm
@@ -243,6 +251,6 @@ These are legitimate per-OS differences; do not force uniformity or treat as gap
 - Adapter gaps + lab prereqs: `RustNodeOrchestratorCompletionBrief_2026-07-12.md`
   (§5.2, §8).
 - Evidence ledger (G2): `documents/operations/live_lab_node_run_matrix.csv`
-  (88 rows; 0 overall pass; macOS admin pass @ `livelab-1784501586`; relay-lifecycle
+  (88 rows — **178** as re-counted 2026-08-28; 0 overall pass; macOS admin pass @ `livelab-1784501586`; relay-lifecycle
   pass @ `livelab-1784497253`; Windows bootstrap fail rows @ 2026-07-19).
 - Stage vocabulary present on `--node`: `crates/rustynet-cli/src/live_lab_stage_registry.rs`.
