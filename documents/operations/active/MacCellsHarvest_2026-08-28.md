@@ -239,6 +239,16 @@ a macOS DNS fail-closed **enforcement** gap: the posture is written to a file th
 OS does not consult. That enforcement gap is the defect to fix; the validator is
 now doing its job.
 
+**Disposition 2026-08-28:** investigated and dispositioned **design-only,
+owner-gated** —
+[`MacosDnsFailclosedEnforcementGap_2026-08-28.md`](./MacosDnsFailclosedEnforcementGap_2026-08-28.md)
+(root cause traced to `MacosCommandSystem::apply_dns_protection` writing only
+the cosmetic `resolv.conf` + the `*.rustynet`-scoped `/etc/resolver/rustynet`
+with no SystemConfiguration arm; M1 `networksetup` per-service vs M2 `scutil
+State:/` override specified, M3 bind-`:53` rejected; QH-39 ledger carries the
+same dated disposition). The red above stands as the honest expectation for
+every protected macOS node until owner-approved enforcement lands.
+
 Caveat recorded honestly: the by-hand reproduction above was taken *after* the
 run's `cleanup` stage, so it is the post-run state, not the exact in-stage
 snapshot. The in-stage verdict is the one in `validator_results.json`; the
