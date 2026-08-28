@@ -21,6 +21,25 @@ use rustynetd::daemon::{
 };
 
 const ENV_DST: &str = "/etc/default/rustynetd";
+/// Provenance marker for the `RUSTYNET_EGRESS_INTERFACE` pin written into
+/// [`ENV_DST`], recording WHO chose the value: an operator who set the variable
+/// explicitly, or this installer deriving it from live routing state.
+///
+/// The distinction exists because the two want opposite failure behaviour when
+/// the pinned interface has since disappeared. A derived pin describes the
+/// machine as it was during some earlier install; when the interface it names
+/// is gone, the pin is stale data and re-deriving it is the correct repair. An
+/// operator pin is a deliberate configuration statement, and silently routing
+/// egress somewhere the operator did not ask for is worse than refusing to
+/// install — so that case must keep failing loudly.
+///
+/// The marker is a plain `KEY=VALUE` line so the existing env reader/writer
+/// round-trips it with no format change.
+pub(crate) const EGRESS_INTERFACE_SOURCE_KEY: &str = "RUSTYNET_EGRESS_INTERFACE_SOURCE";
+/// Marker value for a pin an operator set explicitly.
+const EGRESS_SOURCE_OPERATOR: &str = "operator";
+/// Marker value for a pin this installer derived from live routing state.
+pub(crate) const EGRESS_SOURCE_DERIVED: &str = "derived";
 const SERVICE_CREDENTIAL_BLOB_PATH: &str = concat!(
     "/etc/rustynet/credentials/",
     "w",
@@ -493,17 +512,45 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         auto_tunnel_bundle_path.as_path(),
         Path::new(ASSIGNMENT_REFRESH_ENV_DST),
     )?;
-    let egress_interface = resolve_egress_interface(
+    let mut resolved_egress = resolve_egress_interface(
         env_optional_string("RUSTYNET_EGRESS_INTERFACE")?,
         existing_env.get("RUSTYNET_EGRESS_INTERFACE").cloned(),
+        EgressPinProvenance::from_marker(
+            existing_env
+                .get(EGRESS_INTERFACE_SOURCE_KEY)
+                .map(String::as_str),
+        ),
         selected_exit_endpoint.as_deref(),
     )?;
-    if egress_interface.trim().is_empty() {
+    if resolved_egress.interface.trim().is_empty() {
         return Err(
             "unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_owned(),
         );
     }
-    ensure_interface_exists(egress_interface.as_str())?;
+    // Do not blindly trust a pin inherited from the env file. A previous run
+    // can have derived an interface that no longer exists — a lab overlay link
+    // torn down since, a renamed or removed NIC — and the inherited value then
+    // fails `ensure_interface_exists` on every subsequent ordinary install even
+    // though live detection would produce a correct answer. Repair that case,
+    // loudly, and ONLY when the marker says this installer derived the value.
+    // An operator pin (or a pin of unknown provenance) still falls through to
+    // the hard failure below: overriding explicit operator configuration
+    // silently is worse than refusing to install.
+    if inherited_pin_may_be_rederived(&resolved_egress)
+        && ensure_interface_exists(resolved_egress.interface.as_str()).is_err()
+    {
+        let rederived = detect_default_egress_interface()?;
+        println!(
+            "warning: recorded egress interface {} no longer exists and was derived by a previous \
+             install (not set by an operator); re-deriving from live routing state as {rederived}",
+            resolved_egress.interface
+        );
+        resolved_egress.interface = rederived;
+        resolved_egress.inherited = false;
+    }
+    ensure_interface_exists(resolved_egress.interface.as_str())?;
+    let egress_interface_source = resolved_egress.provenance;
+    let egress_interface = resolved_egress.interface;
 
     for mutable_target in [
         state_path.as_path(),
@@ -1041,6 +1088,13 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         (
             "RUSTYNET_EGRESS_INTERFACE".to_owned(),
             egress_interface.clone(),
+        ),
+        // Written alongside the pin, never separately: the marker describes
+        // that exact value, and a marker outliving the value it describes
+        // would misreport provenance on the next install.
+        (
+            EGRESS_INTERFACE_SOURCE_KEY.to_owned(),
+            egress_interface_source.as_str().to_owned(),
         ),
         (
             "RUSTYNET_AUTO_PORT_FORWARD_EXIT".to_owned(),
@@ -1682,35 +1736,122 @@ fn detect_default_egress_interface() -> Result<String, String> {
     Err("unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_owned())
 }
 
+/// Who chose the `RUSTYNET_EGRESS_INTERFACE` value now in [`ENV_DST`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EgressPinProvenance {
+    /// An operator set `RUSTYNET_EGRESS_INTERFACE` explicitly (or a prior
+    /// install recorded that they had).
+    Operator,
+    /// This installer derived the value from live routing state.
+    Derived,
+}
+
+impl EgressPinProvenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => EGRESS_SOURCE_OPERATOR,
+            Self::Derived => EGRESS_SOURCE_DERIVED,
+        }
+    }
+
+    /// Read the marker written by a previous install.
+    ///
+    /// Anything that is not exactly `derived` — a missing marker (every env
+    /// file written before this marker existed), an empty value, or an
+    /// unrecognised one — reads as [`Self::Operator`]. That is the fail-closed
+    /// direction: unknown provenance keeps the strict behaviour of refusing to
+    /// install against a pin naming an absent interface, so an operator's
+    /// explicit configuration is never overridden on a guess.
+    fn from_marker(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some(value) if value == EGRESS_SOURCE_DERIVED => Self::Derived,
+            _ => Self::Operator,
+        }
+    }
+}
+
+/// The resolved egress interface plus enough provenance to decide whether a
+/// pin naming a now-absent interface may be repaired or must fail the install.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedEgressInterface {
+    interface: String,
+    provenance: EgressPinProvenance,
+    /// True only when the value was carried over from the existing env file
+    /// rather than computed from live state during this run. A value computed
+    /// this run is by construction not stale, so only an inherited one is ever
+    /// a re-derive candidate.
+    inherited: bool,
+}
+
+/// Whether an inherited pin whose interface no longer exists may be re-derived
+/// rather than failing the install.
+///
+/// Both conditions are required. `inherited` excludes values this run just
+/// computed (re-deriving those would loop on a genuine detection failure), and
+/// `Derived` excludes operator configuration, which must keep failing loudly.
+fn inherited_pin_may_be_rederived(resolved: &ResolvedEgressInterface) -> bool {
+    resolved.inherited && resolved.provenance == EgressPinProvenance::Derived
+}
+
 fn resolve_egress_interface(
     explicit_egress: Option<String>,
     existing_egress: Option<String>,
+    existing_provenance: EgressPinProvenance,
     selected_exit_endpoint: Option<&str>,
-) -> Result<String, String> {
+) -> Result<ResolvedEgressInterface, String> {
     if let Some(endpoint) = selected_exit_endpoint {
         let derived = detect_egress_interface_for_endpoint(endpoint)?;
+        let mut operator_confirmed = false;
         if let Some(explicit_value) = explicit_egress.as_deref()
             && !explicit_value.trim().is_empty()
-            && explicit_value != derived
         {
-            return Err(format!(
-                "explicit egress interface {explicit_value} does not route to selected exit endpoint {endpoint}; expected {derived}"
-            ));
+            if explicit_value != derived {
+                return Err(format!(
+                    "explicit egress interface {explicit_value} does not route to selected exit endpoint {endpoint}; expected {derived}"
+                ));
+            }
+            operator_confirmed = true;
         }
-        return Ok(derived);
+        return Ok(ResolvedEgressInterface {
+            interface: derived,
+            // The operator did state this value explicitly; it merely happens
+            // to agree with the derived one. Recording it as derived would
+            // downgrade a real operator pin into an auto-healable one.
+            provenance: if operator_confirmed {
+                EgressPinProvenance::Operator
+            } else {
+                EgressPinProvenance::Derived
+            },
+            inherited: false,
+        });
     }
 
     if let Some(value) = explicit_egress
         && !value.trim().is_empty()
     {
-        return Ok(value);
+        return Ok(ResolvedEgressInterface {
+            interface: value,
+            provenance: EgressPinProvenance::Operator,
+            inherited: false,
+        });
     }
     if let Some(value) = existing_egress
         && !value.trim().is_empty()
     {
-        return Ok(value);
+        return Ok(ResolvedEgressInterface {
+            interface: value,
+            // Carry the recorded provenance forward. Re-classifying an
+            // inherited value as derived would let one marker-less re-install
+            // turn an operator pin into one this installer may overwrite.
+            provenance: existing_provenance,
+            inherited: true,
+        });
     }
-    detect_default_egress_interface()
+    Ok(ResolvedEgressInterface {
+        interface: detect_default_egress_interface()?,
+        provenance: EgressPinProvenance::Derived,
+        inherited: false,
+    })
 }
 
 fn detect_egress_interface_for_endpoint(endpoint: &str) -> Result<String, String> {
@@ -2850,12 +2991,111 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        assignment_peer_endpoint, bytes_to_hex, installer_unit_start_order,
-        parse_dev_interface_token, parse_dns_resolver_bind_addr_install, parse_install_bool,
+        EGRESS_SOURCE_DERIVED, EGRESS_SOURCE_OPERATOR, EgressPinProvenance,
+        ResolvedEgressInterface, assignment_peer_endpoint, bytes_to_hex,
+        inherited_pin_may_be_rederived, installer_unit_start_order, parse_dev_interface_token,
+        parse_dns_resolver_bind_addr_install, parse_install_bool,
         parse_traversal_stun_servers_install, read_env_file_values,
-        render_assignment_refresh_env_contents, resolve_selected_exit_node_id,
-        systemctl_state_retryable, wait_for_unix_socket,
+        render_assignment_refresh_env_contents, resolve_egress_interface,
+        resolve_selected_exit_node_id, systemctl_state_retryable, wait_for_unix_socket,
     };
+
+    /// The provenance marker is the ONLY thing that distinguishes a pin this
+    /// installer derived from one an operator set. Every value other than the
+    /// exact `derived` token must read as operator — including a missing marker,
+    /// which is what every env file written before the marker existed looks
+    /// like. Reading those as derived would let the installer start silently
+    /// overriding real operator configuration.
+    #[test]
+    fn only_the_exact_derived_marker_reads_as_installer_derived() {
+        assert_eq!(
+            EgressPinProvenance::from_marker(Some(EGRESS_SOURCE_DERIVED)),
+            EgressPinProvenance::Derived
+        );
+        assert_eq!(
+            EgressPinProvenance::from_marker(Some("  derived  ")),
+            EgressPinProvenance::Derived
+        );
+        for raw in [
+            None,
+            Some(""),
+            Some(EGRESS_SOURCE_OPERATOR),
+            Some("DERIVED"),
+        ] {
+            assert_eq!(
+                EgressPinProvenance::from_marker(raw),
+                EgressPinProvenance::Operator,
+                "unexpected provenance for marker {raw:?}"
+            );
+        }
+    }
+
+    /// An operator pin naming an absent interface must keep failing the install
+    /// loudly; only an inherited, installer-derived pin may be re-derived.
+    #[test]
+    fn only_an_inherited_derived_pin_may_be_rederived() {
+        let cases = [
+            (EgressPinProvenance::Derived, true, true),
+            (EgressPinProvenance::Operator, true, false),
+            // Computed this run, so it is not stale by construction —
+            // re-deriving it would loop on a genuine detection failure.
+            (EgressPinProvenance::Derived, false, false),
+            (EgressPinProvenance::Operator, false, false),
+        ];
+        for (provenance, inherited, expected) in cases {
+            let resolved = ResolvedEgressInterface {
+                interface: "rustynet-vx0".to_owned(),
+                provenance,
+                inherited,
+            };
+            assert_eq!(
+                inherited_pin_may_be_rederived(&resolved),
+                expected,
+                "unexpected verdict for {provenance:?} inherited={inherited}"
+            );
+        }
+    }
+
+    /// An explicit `RUSTYNET_EGRESS_INTERFACE` is operator configuration and is
+    /// recorded as such, so a later install cannot auto-heal it away.
+    #[test]
+    fn an_explicit_egress_interface_is_recorded_as_operator_configuration() {
+        let resolved = resolve_egress_interface(
+            Some("eth0".to_owned()),
+            Some("rustynet-vx0".to_owned()),
+            EgressPinProvenance::Derived,
+            None,
+        )
+        .expect("explicit value should resolve");
+        assert_eq!(
+            resolved,
+            ResolvedEgressInterface {
+                interface: "eth0".to_owned(),
+                provenance: EgressPinProvenance::Operator,
+                inherited: false,
+            }
+        );
+    }
+
+    /// Re-installing without an explicit value must carry the RECORDED
+    /// provenance forward. Re-classifying an inherited value as derived would
+    /// let one re-install downgrade an operator pin into an auto-healable one.
+    #[test]
+    fn an_inherited_egress_interface_carries_its_recorded_provenance_forward() {
+        for provenance in [EgressPinProvenance::Derived, EgressPinProvenance::Operator] {
+            let resolved =
+                resolve_egress_interface(None, Some("rustynet-vx0".to_owned()), provenance, None)
+                    .expect("existing value should resolve");
+            assert_eq!(
+                resolved,
+                ResolvedEgressInterface {
+                    interface: "rustynet-vx0".to_owned(),
+                    provenance,
+                    inherited: true,
+                }
+            );
+        }
+    }
 
     /// Phase 27 reviewer fold-in (MED 3): the canonical install flow
     /// (`ops install-systemd`) must provision the
