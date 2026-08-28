@@ -134,6 +134,7 @@ const SYSCTL_BINARY_PATH_ENV: &str = "RUSTYNET_SYSCTL_BINARY_PATH";
 const IFCONFIG_BINARY_PATH_ENV: &str = "RUSTYNET_IFCONFIG_BINARY_PATH";
 const ROUTE_BINARY_PATH_ENV: &str = "RUSTYNET_ROUTE_BINARY_PATH";
 const PFCTL_BINARY_PATH_ENV: &str = "RUSTYNET_PFCTL_BINARY_PATH";
+const NETWORKSETUP_BINARY_PATH_ENV: &str = "RUSTYNET_NETWORKSETUP_BINARY_PATH";
 const WIREGUARD_GO_BINARY_PATH_ENV: &str = "RUSTYNET_WIREGUARD_GO_BINARY_PATH";
 const KILL_BINARY_PATH_ENV: &str = "RUSTYNET_KILL_BINARY_PATH";
 const WINDOWS_NETSH_BINARY_PATH_ENV: &str = "RUSTYNET_NETSH_BINARY_PATH";
@@ -146,6 +147,8 @@ const DEFAULT_SYSCTL_BINARY_PATH: &str = "/usr/sbin/sysctl";
 const DEFAULT_IFCONFIG_BINARY_PATH: &str = "/sbin/ifconfig";
 const DEFAULT_ROUTE_BINARY_PATH: &str = "/sbin/route";
 const DEFAULT_PFCTL_BINARY_PATH: &str = "/sbin/pfctl";
+const DEFAULT_NETWORKSETUP_BINARY_PATH: &str =
+    crate::macos_dns_sc_protect::NETWORKSETUP_BINARY_PATH;
 const DEFAULT_WIREGUARD_GO_BINARY_PATH: &str = "/usr/local/bin/wireguard-go";
 const DEFAULT_KILL_BINARY_PATH: &str = "/bin/kill";
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -3848,6 +3851,123 @@ impl MacosCommandSystem {
     }
 }
 
+impl MacosCommandSystem {
+    /// Enumerates the enabled macOS network services via the privileged
+    /// helper's fixed-path `/usr/sbin/networksetup` (M1). Fails closed on any
+    /// command or parse error — a partial service list must never be treated
+    /// as complete, or unlisted services would keep leaking.
+    fn enumerate_networksetup_services(&self) -> Result<Vec<String>, String> {
+        let argv = crate::macos_dns_sc_protect::networksetup_listall_args();
+        let output = self
+            .run_capture(PrivilegedCommandProgram::NetworkSetup, &argv)
+            .map_err(|err| err.to_string())?;
+        if !output.success() {
+            return Err(format!(
+                "networksetup -listallnetworkservices failed: status={} stderr={}",
+                output.status, output.stderr
+            ));
+        }
+        crate::macos_dns_sc_protect::parse_networksetup_service_list(&output.stdout)
+    }
+
+    /// Reads one service's current DNS servers through the privileged helper
+    /// (`networksetup -getdnsservers <service>`); `Ok(None)` means the service
+    /// has no DNS servers configured.
+    fn read_networksetup_service_dns(&self, service: &str) -> Result<Option<Vec<String>>, String> {
+        let argv = crate::macos_dns_sc_protect::networksetup_getdns_args(service)?;
+        let output = self
+            .run_capture(PrivilegedCommandProgram::NetworkSetup, &argv)
+            .map_err(|err| err.to_string())?;
+        if !output.success() {
+            return Err(format!(
+                "networksetup -getdnsservers '{service}' failed: status={} stderr={}",
+                output.status, output.stderr
+            ));
+        }
+        match crate::macos_dns_sc_protect::parse_networksetup_getdns_output(&output.stdout)? {
+            crate::macos_dns_sc_protect::NetworksetupDnsServers::None => Ok(None),
+            crate::macos_dns_sc_protect::NetworksetupDnsServers::Servers(servers) => {
+                Ok(Some(servers))
+            }
+        }
+    }
+
+    /// Restores every backed-up service DNS setting from the session-scoped
+    /// backup file. Called from `rollback_dns_protection` (ordered BEFORE the
+    /// pf anchor reload, §10.7) and reusable by the startup-recovery path.
+    /// Fails closed with an operator-actionable message when the backup is
+    /// missing while services are still pinned loopback, or when any restore
+    /// command fails — the backup file is retained in that case so a retry
+    /// (or the startup guard) can try again.
+    fn restore_networksetup_dns_from_backup(&self) -> Result<(), String> {
+        let backup_path =
+            std::path::Path::new(crate::macos_dns_sc_protect::NETWORKSETUP_DNS_BACKUP_PATH);
+        match crate::macos_dns_sc_protect::read_networksetup_dns_backup(backup_path) {
+            Ok(Some(backup)) => {
+                for entry in &backup.services {
+                    let argv = match &entry.servers {
+                        Some(servers) => {
+                            let server_refs: Vec<&str> =
+                                servers.iter().map(String::as_str).collect();
+                            crate::macos_dns_sc_protect::networksetup_setdns_restore_args(
+                                &entry.service,
+                                &server_refs,
+                            )?
+                        }
+                        None => crate::macos_dns_sc_protect::networksetup_setdns_empty_args(
+                            &entry.service,
+                        )?
+                        .to_vec(),
+                    };
+                    let output = self
+                        .run_capture(PrivilegedCommandProgram::NetworkSetup, &argv)
+                        .map_err(|err| err.to_string())?;
+                    if !output.success() {
+                        return Err(format!(
+                            "networksetup DNS restore for service '{}' failed: status={} stderr={} (manual fix: sudo /usr/sbin/networksetup -setdnsservers \"{}\" Empty; backup retained at {})",
+                            entry.service,
+                            output.status,
+                            output.stderr,
+                            entry.service,
+                            backup_path.display()
+                        ));
+                    }
+                }
+                crate::macos_dns_sc_protect::remove_networksetup_dns_backup(backup_path)?;
+                Ok(())
+            }
+            Ok(None) => {
+                // No backup: either protection never touched system
+                // configuration, or the backup was lost. Fail loud ONLY if the
+                // host is actually still pinned loopback (stranded); otherwise
+                // there is nothing to restore.
+                let services = self.enumerate_networksetup_services()?;
+                let mut stranded = Vec::new();
+                for service in &services {
+                    if let Some(servers) = self.read_networksetup_service_dns(service)?
+                        && crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers)
+                    {
+                        stranded.push(service.clone());
+                    }
+                }
+                if stranded.is_empty() {
+                    Ok(())
+                } else {
+                    Err(
+                        crate::macos_dns_sc_protect::startup_recovery_manual_restore_message(
+                            &stranded,
+                        ),
+                    )
+                }
+            }
+            Err(err) => Err(format!(
+                "the networksetup DNS backup at {} is unreadable ({err}); restore manually before retrying",
+                backup_path.display()
+            )),
+        }
+    }
+}
+
 impl DataplaneSystem for MacosCommandSystem {
     fn set_generation(&mut self, generation: u64) {
         self.generation = generation;
@@ -4084,6 +4204,58 @@ impl DataplaneSystem for MacosCommandSystem {
             self.dns_protected = false;
             return Err(SystemError::DnsApplyFailed(err.to_string()));
         }
+        // M1 (owner-approved; MacosDnsFailclosedEnforcementGap_2026-08-28 §4):
+        // enforce fail-closed DNS at the system-configuration layer. pf alone
+        // cannot stop macOS from RESOLVING through the LAN DNS servers its
+        // services still advertise — mDNSResponder keeps answering out of
+        // 1.1.1.1/8.8.8.8 via paths the pf anchor does not block. Pinning every
+        // enabled network service's DNS to the loopback resolver makes the OS's
+        // advertised posture match the enforced posture (the QH-39
+        // macos-dns-failclosed verifier passes).
+        //
+        // Fail-closed: enumeration, per-service backup capture, the backup
+        // write, and every per-service set are mandatory. Any failure aborts
+        // the apply. Note dns_protected intentionally stays TRUE on a
+        // system-configuration failure: the pf DNS-block rules above are
+        // installed, and reverting dns_protected would make the next reconcile
+        // re-render pf WITHOUT the DNS-block rules (killswitch_spec reads
+        // dns_protected), dropping protection entirely. Instead the failed
+        // apply propagates (protected-mode entry fails closed) and the
+        // reconcile loop's assert_dns_protection keeps surfacing the drift.
+        let services = self
+            .enumerate_networksetup_services()
+            .map_err(SystemError::DnsApplyFailed)?;
+        let mut backup_entries = Vec::with_capacity(services.len());
+        for service in &services {
+            let servers = self
+                .read_networksetup_service_dns(service)
+                .map_err(SystemError::DnsApplyFailed)?;
+            backup_entries.push(crate::macos_dns_sc_protect::NetworksetupDnsBackupEntry {
+                service: service.clone(),
+                servers,
+            });
+        }
+        // The backup is written BEFORE the first mutation: a crash mid-apply
+        // leaves the host in a state the startup-recovery guard (daemon.rs)
+        // can fully restore from.
+        let backup = crate::macos_dns_sc_protect::build_networksetup_dns_backup(backup_entries)
+            .map_err(SystemError::DnsApplyFailed)?;
+        crate::macos_dns_sc_protect::write_networksetup_dns_backup(
+            std::path::Path::new(crate::macos_dns_sc_protect::NETWORKSETUP_DNS_BACKUP_PATH),
+            &backup,
+        )
+        .map_err(SystemError::DnsApplyFailed)?;
+        for service in &services {
+            let argv = crate::macos_dns_sc_protect::networksetup_setdns_loopback_args(service)
+                .map_err(SystemError::DnsApplyFailed)?;
+            let output = self.run_capture(PrivilegedCommandProgram::NetworkSetup, &argv)?;
+            if !output.success() {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "networksetup -setdnsservers '{service}' 127.0.0.1 failed: status={} stderr={}",
+                    output.status, output.stderr
+                )));
+            }
+        }
         // Option-2 parity with Linux: point /etc/resolv.conf at the loopback
         // resolver (backing up the original) so the macos-dns-failclosed verifier
         // passes — every resolv.conf nameserver becomes loopback. The pf rules
@@ -4149,11 +4321,44 @@ impl DataplaneSystem for MacosCommandSystem {
                 )));
             }
         }
+        // M1 system-configuration assertion: every enabled network service
+        // must still advertise ONLY the loopback resolver. Drift here is
+        // exactly the leak the pf anchor cannot see (mDNSResponder resolving
+        // through LAN DNS), so failing this assert drives the reconcile loop
+        // to re-apply protection.
+        let services = self
+            .enumerate_networksetup_services()
+            .map_err(SystemError::DnsApplyFailed)?;
+        for service in &services {
+            let servers = self
+                .read_networksetup_service_dns(service)
+                .map_err(SystemError::DnsApplyFailed)?;
+            let Some(servers) = servers else {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "macOS DNS protection drifted: service '{service}' no longer pins any DNS server (expected 127.0.0.1)"
+                )));
+            };
+            if !crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "macOS DNS protection drifted: service '{service}' advertises non-loopback DNS servers {servers:?}"
+                )));
+            }
+        }
         Ok(())
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
         self.dns_protected = false;
+        // M1 teardown ordering (CLAUDE.md §10.7): restore every service's
+        // backed-up system-configuration DNS BEFORE the pf anchor reload below
+        // drops the DNS-block rules. The reverse order leaves a window where
+        // resolution is still advertised-loopback (nothing answers) while the
+        // block is already gone. A failed SC restore returns WITHOUT dropping
+        // the anchor: the host stays fail-closed (DNS blocked) and loud, and
+        // the backup file is retained for a retry.
+        if let Err(err) = self.restore_networksetup_dns_from_backup() {
+            return Err(SystemError::RollbackFailed(err));
+        }
         // Restore the original resolv.conf (best-effort; teardown must not fail
         // closed and strand the node — a missing backup is a no-op).
         self.run_allow_failure(
@@ -7277,6 +7482,11 @@ fn resolve_binary_path_for_program(
             PFCTL_BINARY_PATH_ENV,
             DEFAULT_PFCTL_BINARY_PATH,
             PrivilegedCommandProgram::Pfctl,
+        ),
+        PrivilegedCommandProgram::NetworkSetup => resolve_binary_path(
+            NETWORKSETUP_BINARY_PATH_ENV,
+            DEFAULT_NETWORKSETUP_BINARY_PATH,
+            PrivilegedCommandProgram::NetworkSetup,
         ),
         PrivilegedCommandProgram::WireguardGo => resolve_binary_path(
             WIREGUARD_GO_BINARY_PATH_ENV,

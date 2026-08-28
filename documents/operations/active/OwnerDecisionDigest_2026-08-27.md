@@ -26,6 +26,7 @@ Read those with `git show <branch>:<path>`.
 
 **Counts.** 17 entries: 13 `pending`, 1 `gated-on-measurement`, 2 `approved`, 1 `in-progress-elsewhere`.
 Addendum 2026-08-28: 6 entries (18–23) — 3 `pending`, 1 `approved`→`done`, 1 `physical`, 1 `gated-on-measurement` (with entry 3 `approved`) — plus in-place dated corrections to entries 1–3.
+Addendum 2026-08-28 (2): entry 24 — MAC-DNS `approved` → `done`, one residual VPN-service-scope sub-decision noted.
 
 ---
 
@@ -480,6 +481,28 @@ Entry 3 asked for the measurement before deciding entries 1 and 2; it now exists
 two named measurements only.**
 
 ---
+
+### 24. MAC-DNS — macOS DNS fail-closed enforcement mechanism (M1 selected)
+
+**Decision.** Close the macOS DNS leak — the OS keeps resolving through 1.1.1.1/8.8.8.8
+while RustyNet advertises loopback-only DNS, so the QH-39 `scutil --dns` green was never
+backed by enforced state. The owner selected **M1** — `networksetup -setdnsservers` per
+network service — over M2 (undocumented `scutil` dynamic-store overrides) and M3 (a new
+loopback `:53` listener, rejected). Full reasoning:
+`MacosDnsFailclosedEnforcementGap_2026-08-28.md` §4–§5.
+
+**Status: `approved` → `done` (2026-08-28, same-day implementation).** Privileged
+`NetworkSetup` program (fixed `/usr/sbin/networksetup`, argv-only allowlist),
+enforcement + reconcile re-assertion in `MacosCommandSystem`
+(`apply/assert/rollback_dns_protection`), session-scoped backup, teardown ordered
+SC-restore BEFORE pf-anchor unload (§10.7), and the QH-40-shaped startup-recovery guard
+(restores the backup on a stranded start; refuses loudly naming the manual fix when the
+backup is lost).
+
+**One residual sub-decision stays with the owner (gap doc §5 item 2):** M1 applies the
+loopback pin to ALL enabled network services — including any VPN/utun service that
+manages its own resolver; nothing is special-cased silently. If a VPN service proves to
+need its own resolver, the owner can exclude named services via configuration later.
 
 ## Appendix — related items that are not owner decisions
 
