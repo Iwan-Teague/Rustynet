@@ -40,6 +40,7 @@ pub mod linux_service_hardening;
 pub mod macos_authenticode;
 pub mod macos_blind_exit;
 pub mod macos_dns_failclosed;
+pub mod macos_dns_sc_protect;
 pub mod macos_exit_dns_failclosed;
 pub mod macos_exit_killswitch_precedence;
 pub mod macos_exit_nat;

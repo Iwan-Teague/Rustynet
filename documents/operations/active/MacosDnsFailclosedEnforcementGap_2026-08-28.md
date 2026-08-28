@@ -206,3 +206,64 @@ owner exception to run a privileged helper listener.
   persistence semantics) — per the repo's decision protocol it is specified
   here and gated on owner sign-off rather than guessed at. QH-39's ledger
   entry carries the same disposition.
+
+- **2026-08-28 — DONE: M1 implemented (owner-approved).** New privileged program
+  `NetworkSetup` — fixed path `/usr/sbin/networksetup`, argv-only, per-program allowlist
+  `validate_networksetup_args` in `privileged_helper.rs` (`-listallnetworkservices`,
+  `-getdnsservers <svc>`, `-setdnsservers <svc> 127.0.0.1|Empty|<exact saved IP list>`).
+  Service names cross the privileged argv boundary, so they are validated there
+  (`is_valid_networksetup_service_name`: non-empty, ≤128 bytes, no control characters),
+  mirroring `is_owned_nft_table_token`, with negative tests. Enforcement module:
+  `crates/rustynetd/src/macos_dns_sc_protect.rs` (service-list/getdns parsers, argv
+  builders, session-scoped backup at
+  `/private/var/run/rustynet/networksetup-dns.failclosed.bak`, startup-guard decision
+  function). Scope per §5 item 2: ALL ENABLED hardware network services (the
+  `*`-prefixed disabled services and the header/legend are skipped).
+  `MacosCommandSystem::apply_dns_protection` now enumerates the services, captures each
+  service's current DNS into the backup BEFORE the first mutation, and pins every
+  service to `127.0.0.1`; any enumeration, backup, or set failure fails the apply
+  (`SystemError::DnsApplyFailed`) with the pf DNS-block rules left installed
+  (`dns_protected` intentionally stays true so the reconcile re-render cannot drop
+  them — entry still fails closed). `assert_dns_protection` gained the
+  SystemConfiguration assertion: per-service `-getdnsservers` must show loopback-only;
+  drift fails the assert, driving the reconcile loop to re-assert.
+  `rollback_dns_protection` restores each backed-up service DNS exactly (or `Empty`
+  where none was set) BEFORE the pf anchor reload (§10.7 ordering — no
+  advertised-loopback-but-unfiltered window); a failed restore returns WITHOUT dropping
+  the anchor and retains the backup for retry. The approved startup-recovery guard
+  (daemon.rs, before any protection is applied in-process, QH-40-shaped) restores the
+  backup when SC DNS is loopback with no protection running; with no readable backup it
+  refuses to start, loudly, naming the manual fix per service
+   (`sudo /usr/sbin/networksetup -setdnsservers "<svc>" Empty`). Verification: the
+  shipped QH-39 `macos-dns-failclosed-check` — with enforcement applied the SC primary
+  resolver is loopback so the check passes; reverting the pin reds it. Unit coverage:
+  13 module tests (parsers incl. header/legend/`*`/blank handling, validators with
+  control-char/empty/overlong negatives, argv builders, backup round-trip and
+  corrupt/foreign-schema/empty refusals, startup-guard truth table) plus the helper
+  validator allowlist test. **Residual owner sub-decision (§5 item 2, still open):**
+  VPN/utun services that manage their own resolver are NOT special-cased — the loopback
+  pin applies to all enabled services. If that proves harmful in practice the owner can
+  exclude named services via config later.
+
+- **2026-08-28 — HARDENED: backup-baseline loopback-residue edge closed** (security
+  review follow-up to the M1 item above). The capture path could previously record a
+  service's CURRENT DNS as the backup baseline even when that value was ALREADY the
+  loopback posture M1 enforces — residue from a prior apply whose teardown never ran
+  (reachable when the startup-recovery guard was bypassed because scutil was unreadable:
+  `read_scutil_dns` → `None` ⇒ `NoAction`). A loopback baseline would have made any
+  later rollback "restore" the strand instead of the operator's real DNS. The capture
+  site (`MacosCommandSystem::apply_dns_protection` in `phase10.rs`) now reads the prior
+  backup document before building the baseline and resolves each service through the new
+  pure helper `resolve_backup_baseline_entry` (`macos_dns_sc_protect.rs`): a normal
+  (non-loopback) capture — including the no-servers case — is recorded unchanged;
+  loopback residue with a readable prior backup PRESERVES that document's entry for the
+  service (the real pre-enforcement original) instead of overwriting it with loopback;
+  loopback residue with NO prior entry for the service refuses the apply loudly
+  (`SystemError::DnsApplyFailed`) naming the manual fix (`sudo
+  /usr/sbin/networksetup -setdnsservers "<svc>" Empty`, or the operator's real DNS). A
+  prior backup that is PRESENT but unreadable also fails the apply before any baseline
+  is built (an unverifiable document cannot vouch for an original). Loopback is never
+  silently recorded as a baseline. Unit coverage: 3 new module tests
+  (`backup_baseline_refuses_loopback_residue_without_prior_original`,
+  `backup_baseline_preserves_prior_original_over_loopback_residue`,
+  `backup_baseline_records_normal_captured_dns_unchanged`).

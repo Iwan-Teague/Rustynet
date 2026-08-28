@@ -11339,6 +11339,24 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             );
         }
     }
+    // M1 startup-recovery guard (owner-approved;
+    // MacosDnsFailclosedEnforcementGap_2026-08-28 §4/§5): unlike pf anchors,
+    // the system-configuration DNS posture persists across reboot, so a crash
+    // between apply and rollback strands host DNS on the dead loopback port.
+    // This guard runs BEFORE any protection is applied in this process, so
+    // loopback SC DNS observed here is residue: restore the backed-up service
+    // DNS when possible, otherwise refuse loudly with the manual fix. This is
+    // deliberately stricter than the QH-40 report-not-refuse disposition above:
+    // here the residue is REMOVABLE (restore), so refusal only happens when
+    // removal is impossible, and proceeding would strand resolution either way.
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_dns_sc_protect::run_startup_dns_recovery(
+            config.privileged_helper_socket_path.as_deref(),
+            std::time::Duration::from_millis(config.privileged_helper_timeout_ms.get()),
+        )
+        .map_err(DaemonError::InvalidConfig)?;
+    }
     prepare_runtime_wireguard_key(&config)?;
     log::info!("rustynetd startup: runtime key material prepared");
     if let Err(err) = run_preflight_checks(&config) {
