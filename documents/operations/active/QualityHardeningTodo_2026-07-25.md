@@ -2150,8 +2150,9 @@ That last one is the fail-closed question and should be answered first.
 > stays with the §2 completion race. A real, unnamed timeout defect: the daemon plist sets
 > no `--privileged-helper-timeout-ms`, so the daemon talks at the 2000 ms client default to
 > a helper serving at 30000 ms. (3) Ordering matrix + residue-marker live firing remain
-> unmeasured (harness permission classifier blocked deploying the cycle driver); the driver
-> and a marker-carrying binary are staged on the guest for the follow-up.
+> unmeasured (harness permission classifier blocked deploying the cycle driver); a
+> marker-carrying `4b0d18aa` binary is staged on the guest for the follow-up, and the design
+> doc §8.3 describes the prepared driver's cycle matrix.
 
 ### QH-41 — `macos-utm-1` is on an isolated vmnet bridge, so every mixed-OS run fails its traffic matrix deterministically
 
