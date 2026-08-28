@@ -3346,16 +3346,11 @@ mod tests {
         let targets = tri_os_targets();
         let report_dir = tempfile::tempdir().expect("tempdir");
         let mut values = BTreeMap::new();
-        populate_stage_values(
-            &mut values,
-            &schema,
-            report_dir.path(),
-            &targets,
-            &[
-                stage_evidence("preflight", "fail"),
-                stage_evidence("bootstrap_hosts", "skip"),
-            ],
-        );
+        let stages = [
+            stage_evidence("preflight", "fail"),
+            stage_evidence("bootstrap_hosts", "skip"),
+        ];
+        populate_stage_values(&mut values, &schema, report_dir.path(), &targets, &stages);
 
         for platform in ["linux", "macos", "windows"] {
             let column = format!("{platform}_stage_bootstrap");
@@ -3371,6 +3366,20 @@ mod tests {
             Some("skip"),
             "cross_os_bootstrap is an OS-interop claim; a run-scoped preflight \
              failure is not evidence against it: {values:?}"
+        );
+        // The failure is not lost — it moves to the run-level columns, which
+        // are populated alias-preserving and were never fed by the per-OS
+        // merge. The row still reads as failed; it just stops blaming all
+        // three OSes for it.
+        assert_eq!(
+            super::overall_result(&None, &stages),
+            "fail",
+            "the run-level verdict must still carry the preflight failure"
+        );
+        assert_eq!(
+            super::first_failed_stage(&stages).as_deref(),
+            Some("preflight"),
+            "first_failed_stage must still name the run-scoped failure"
         );
     }
 
