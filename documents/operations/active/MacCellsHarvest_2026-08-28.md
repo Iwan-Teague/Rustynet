@@ -312,6 +312,17 @@ Remedy not applied (triage only): give `DEFAULT_STATE_PATH` a macOS arm matching
 the installer's path, or make the residue-check subcommand resolve the platform
 state path rather than the Linux constant.
 
+> **DISPOSITION 2026-08-28 — FIXED.** `DEFAULT_STATE_PATH` gained a
+> `#[cfg(target_os = "macos")]` arm at the installer's
+> `/usr/local/var/rustynet/rustynetd.state`, and both the writer
+> (`DaemonConfig::default`) and the checker (`shutdown-residue-check`'s
+> implicit `--state`) now resolve through one shared
+> `daemon::default_state_path()` function — no duplicated constant. The
+> fail-closed posture is untouched (an unreadable marker still counts as
+> residue). Pinned by three new unit tests (writer/checker identity,
+> macOS-not-Linux-path cfg-gated, Linux-unchanged counterpart); see the QH-40
+> entry's 2026-08-28 status in `QualityHardeningTodo_2026-07-25.md`.
+
 ---
 
 ## 4. Cell 2 — macOS `exit`

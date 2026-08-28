@@ -460,4 +460,50 @@ mod tests {
         }
         assert!(marker_path(&state).exists(), "scan must be non-destructive");
     }
+
+    // ── QH-40 / MacCellsHarvest 2026-08-28 §3.4: one state-path resolution ──
+
+    /// The shared resolution function and the daemon config default the
+    /// marker *writer* records beside must agree on every platform. The
+    /// residue-check subcommand resolves its implicit `--state` through the
+    /// same function, so this pins the writer side of the equality.
+    #[test]
+    fn default_state_path_resolution_matches_the_daemon_config_default() {
+        assert_eq!(
+            PathBuf::from(crate::daemon::default_state_path()),
+            crate::daemon::DaemonConfig::default().state_path,
+            "the shared resolution and the writer's config default must agree"
+        );
+    }
+
+    /// Mutation guard for the §3.4 defect: on macOS the default must be the
+    /// installer's `STATE_ROOT` (`/usr/local/var/rustynet`, where the launchd
+    /// plist points `--state`), NOT the Linux `/var/lib/rustynet` path the
+    /// old `#[cfg(not(windows))]` arm leaked onto this platform. A marker
+    /// written beside the real state file was invisible to a checker that
+    /// looked in the Linux directory and reported "clean".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_state_path_is_the_installer_root_not_the_linux_path() {
+        assert_eq!(
+            crate::daemon::default_state_path(),
+            "/usr/local/var/rustynet/rustynetd.state",
+            "macOS default must match the installer's state root"
+        );
+        assert_ne!(
+            crate::daemon::default_state_path(),
+            "/var/lib/rustynet/rustynetd.state",
+            "macOS must not inherit the Linux state path (fail-open, §3.4)"
+        );
+    }
+
+    /// Platform counterpart: on Linux the historical default is unchanged.
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_state_path_is_unchanged() {
+        assert_eq!(
+            crate::daemon::default_state_path(),
+            "/var/lib/rustynet/rustynetd.state"
+        );
+    }
 }
