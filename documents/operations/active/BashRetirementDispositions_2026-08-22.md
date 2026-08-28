@@ -23,10 +23,13 @@ T4 security cells are marked **[T4]** — owner-level sign-off only, not delegab
 
 ## A0 — Deletion-precondition evidence (delegate prep; owner decision SIGNED below)
 
-Delegate-enumerated facts (quote-aware reader, node ledger @ 151 rows, 2026-08-26):
+Delegate-enumerated facts (quote-aware reader, node ledger @ 151 rows, 2026-08-26).
+*Counts re-derived 2026-08-28 at `34a9e6f8`: the ledger now holds **178 rows** and every
+substantive claim below still holds at that size; only the numbers were stale.*
 
 1. **Green default-`--node` runs since the W5.6 flip (`a414ceb`, 2026-07-24): ZERO rows with
-   `overall_result=pass`.** Lifetime ledger: 0 pass / 131 fail / 21 partial (now 151 rows).
+   `overall_result=pass`.** Lifetime ledger: 0 pass / 131 fail / 21 partial (now 151 rows)
+   *(re-counted 2026-08-28: still 0 pass — 141 fail / 37 partial across 178 rows)*.
    Context the owner needs to weigh this: `overall_result=pass` requires **zero
    skipped stages** (`live_lab_run_matrix.rs::overall_result` — any `skip`/`not_run` in the
    plan → `partial`), and every realistic topology skips role-not-assigned + vxlan-substrate
@@ -59,7 +62,8 @@ Delegate-enumerated facts (quote-aware reader, node ledger @ 151 rows, 2026-08-2
 
 Direction verdict for all 12: **not a real gap** — the bash-dialect column name differs from
 the `--node` StageId-derived column; the capability is `--node`-proven under the column named.
-No prove-on-node work is scheduled. (Counts from the A4 enumeration, node ledger @ 151 rows.)
+No prove-on-node work is scheduled. (Counts from the A4 enumeration, node ledger @ 151 rows;
+**178 rows** as re-counted 2026-08-28.)
 
 | # | bash column (pass) | `--node` proof column (pass) | owner sign-off |
 |---|---|---|---|
