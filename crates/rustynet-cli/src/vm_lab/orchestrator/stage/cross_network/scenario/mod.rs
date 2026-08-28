@@ -53,6 +53,7 @@ pub mod node_network_switch;
 pub mod provisioning;
 pub mod relay_remote_exit;
 pub mod remote_exit_common;
+pub mod remote_exit_dns;
 pub mod traversal_adversarial;
 
 // CN-3 is landing scenario-by-scenario: a ported scenario has its dispatch arm
