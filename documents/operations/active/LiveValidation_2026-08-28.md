@@ -973,8 +973,31 @@ stages recognise an undispatchable topology and skip honestly, while this one
 turns the same topology into `overall_result=fail` and a `first_failed_stage`.
 The remedy is for `run_nat_matrix` to share `prepare_scenario_stage`'s guards —
 if the suites that feed it cannot dispatch, the matrix gate has nothing to
-validate and should skip with the same declared reason. **Not fixed here (triage
-only).** Attribution: `…/cross_network.rs:459-464`.
+validate and should skip with the same declared reason. Attribution:
+`…/cross_network.rs:459-464`.
+
+**Disposition: FIXED on `work/cnproof-d1-gate`** (this run was triage-only; the
+code change is separate). The three guards — substrate is vxlan,
+`CrossNetworkTopology::resolve` finds the roles, the client and exit sit on
+distinct underlay /24s — are now one function,
+`resolve_dispatchable_topology`, in
+`crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network.rs`.
+`prepare_scenario_stage` calls it (so all eight scenario suites keep their exact
+skip reasons) and `run_nat_matrix` calls it too, so the gate and the suites it
+grades cannot answer differently about the same topology. Nothing else is
+weakened: past that guard `run_nat_matrix` still shells to
+`ops validate-cross-network-nat-matrix --require-pass-status` unchanged, so a
+topology that CAN dispatch the suites and is then missing matrix evidence still
+fails closed — the honest case. Unit-tested at the stage entry points
+(`tests::nat_matrix_gate`): undispatchable-by-role and single-underlay-prefix
+topologies each assert the gate's outcome is EQUAL to a sibling suite's, a
+dispatchable topology asserts the guard lets the validator run, and a netns run
+asserts the shared substrate skip. The vxlan substrate handle is deliberately not
+consulted — a `provisioned: false` no-op handle arises exactly when the
+participants share one /24 (§12.3(a)), which the distinct-prefix guard already
+refuses, so reading it would make the gate stricter than the suites it mirrors.
+The §12.8 point stands unchanged: this makes the run grade honestly, it does not
+make CN-3 dispatchable on a single-LAN fleet.
 
 This is also why the run graded `fail` rather than `partial`. **No stage that
 executed real work failed.** Judged on what it could run, this suite is 43 for 43,
