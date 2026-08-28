@@ -9,7 +9,9 @@ not A3, is the Phase-B input.
 - **Generated:** 2026-08-26, on commit `b727df36` (clean tree).
 - **Method:** quote-aware `csv.DictReader` comparison (never `awk -F,` — QH-07) of
   `documents/operations/live_lab_run_matrix.csv` (bash archive, 549 rows) against
-  `documents/operations/live_lab_node_run_matrix.csv` (`--node` ledger, 151 rows), over the 246
+  `documents/operations/live_lab_node_run_matrix.csv` (`--node` ledger, 151 rows at the time
+  of this enumeration; **178** as re-counted 2026-08-28 at `34a9e6f8` — the ledger is append-only,
+  so re-derive before citing), over the 246
   shared stage/cell columns (metadata + `*_present` excluded). A **gap column** is one where
   bash `pass ≥ 1` and `--node` `pass == 0`.
 - **Result: 56 raw gap columns — 12 ledger-dialect false gaps + 44 real gaps** (matches the GAP

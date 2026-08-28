@@ -573,6 +573,31 @@ pub trait DataplaneSystem {
     /// every DryRun-driven test stays green. A new system type must decide
     /// explicitly.
     fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError>;
+    /// QH-52: the exact inverse of `admit_host_firewall_forwarding`. Remove the
+    /// tunnel interface's host-firewall (firewalld) zone binding when the node
+    /// stops serving a forwarding role — an in-place relay/exit demotion, a
+    /// fail-closed unwind, or daemon shutdown.
+    ///
+    /// CLAUDE.md §10.7: undeploy precedes revocation, and a control installed by
+    /// a role must be removed when the role is. A binding that outlives the role
+    /// is deploy residue on the operator's host firewall, and it is the residue
+    /// class this project treats as release-blocking precisely because nothing
+    /// else in the system will ever remove it — the binding is runtime-only, so
+    /// it is invisible in firewalld's on-disk configuration and survives until
+    /// firewalld itself is reloaded.
+    ///
+    /// Teardown semantics, NOT a fail-closed gate: a leftover binding can only
+    /// admit forwarded traffic this daemon has already stopped authorising
+    /// (our own forward chain is `policy drop` and a drop is terminal), so a
+    /// failed withdrawal must be REPORTED, never allowed to fail a healthy
+    /// generation closed. Call sites record it into the same teardown-failure
+    /// accounting every other rollback stage uses.
+    ///
+    /// Not defaulted, for the same reason `admit_host_firewall_forwarding` is
+    /// not: `RuntimeSystem` dispatches arm-by-arm, and a default would let a
+    /// missing arm silently no-op the removal on the real daemon while every
+    /// DryRun test stayed green.
+    fn withdraw_host_firewall_forwarding(&mut self) -> Result<(), SystemError>;
     fn rollback_firewall(&mut self) -> Result<(), SystemError>;
     fn apply_nat_forwarding(
         &mut self,
@@ -609,6 +634,12 @@ enum StageMarker {
     BackendRoutesApplied,
     SystemRoutesApplied,
     FirewallApplied,
+    /// QH-52: this generation bound the tunnel interface into the host
+    /// firewall's default zone (`admit_host_firewall_forwarding`). Recorded so
+    /// the binding can be given back when the role ends — a control installed
+    /// by a role and never removed is the §10.7 residue this marker exists to
+    /// make trackable.
+    HostFirewallAdmitted,
     NatApplied,
     DnsApplied,
     ExitModeApplied,
@@ -718,6 +749,13 @@ impl DataplaneSystem for DryRunSystem {
         // Through step() on purpose: fail_operation-driven tests must be able
         // to fail this stage and prove the controller propagates it.
         self.step("admit_host_firewall_forwarding")
+    }
+
+    fn withdraw_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        // Through step() for the same reason as the admit: tests must be able
+        // to fail the withdrawal and prove the controller reports it without
+        // failing an otherwise-healthy generation closed.
+        self.step("withdraw_host_firewall_forwarding")
     }
 
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
@@ -1013,6 +1051,53 @@ impl LinuxCommandSystem {
             return Err(SystemError::FirewallApplyFailed(format!(
                 "host firewall would discard forwarded tunnel traffic: firewalld {} and interface \
                  {} is not bound to its default zone{}",
+                posture.presence.as_str(),
+                self.interface_name,
+                posture
+                    .default_zone
+                    .as_deref()
+                    .map(|zone| format!(" ({zone})"))
+                    .unwrap_or_default()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Give back the firewalld zone binding when the forwarding role ends
+    /// (QH-52).
+    ///
+    /// The exact inverse of `ensure_host_firewall_admits_forwarding`, over the
+    /// same two-token grammar and the same single privileged builtin, differing
+    /// only in the op token and in the verdict it demands of the posture it
+    /// reads back. `addInterface` and `removeInterface` are both re-read rather
+    /// than trusted, so "the mutation returned success but had no effect" is
+    /// not reportable as success in either direction.
+    ///
+    /// Failure semantics are inverted along with the direction. The bind fails
+    /// the apply CLOSED, because serving a forwarding role whose traffic
+    /// firewalld silently rejects is a false advertisement. The unbind cannot:
+    /// the only thing a leftover binding does is admit forwarded traffic
+    /// through firewalld, and by the time this runs our own forward chain has
+    /// already stopped accepting that traffic — the binding grants nothing.
+    /// So an unremovable binding is reported as residue by the caller and never
+    /// used to tear down a node that is otherwise healthy.
+    fn ensure_host_firewall_forwarding_withdrawn(&mut self) -> Result<(), SystemError> {
+        use crate::linux_firewalld_zone::{FirewalldPosture, FirewalldZoneOp, FirewalldZoneSpec};
+
+        let spec = FirewalldZoneSpec::new(FirewalldZoneOp::Unbind, self.interface_name.as_str())
+            .map_err(SystemError::PrerequisiteCheckFailed)?;
+        let argv = spec.encode();
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let output = self.run_capture(
+            PrivilegedCommandProgram::LinuxFirewalldZone,
+            borrowed.as_slice(),
+        )?;
+        let posture = FirewalldPosture::parse(output.stdout.trim())
+            .map_err(|err| SystemError::FirewallApplyFailed(format!("firewalld posture: {err}")))?;
+        if !posture.forwarding_admission_withdrawn() {
+            return Err(SystemError::FirewallApplyFailed(format!(
+                "host firewall zone binding survived role demotion: firewalld {} and interface \
+                 {} is still bound to its default zone{}",
                 posture.presence.as_str(),
                 self.interface_name,
                 posture
@@ -2580,6 +2665,13 @@ impl DataplaneSystem for LinuxCommandSystem {
         self.ensure_host_firewall_admits_forwarding()
     }
 
+    fn withdraw_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        // Role gating lives at the controller call sites, exactly as it does
+        // for the admit, so the stage is visible in DryRun op ordering and the
+        // demotion edge is testable without a firewalld host.
+        self.ensure_host_firewall_forwarding_withdrawn()
+    }
+
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
         if let Some(table) = self.firewall_table.take() {
             self.run_allow_failure(
@@ -3627,6 +3719,12 @@ impl DataplaneSystem for MacosCommandSystem {
         Ok(())
     }
 
+    fn withdraw_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        // Nothing was ever bound, so nothing can be left behind. The macOS
+        // exit-NAT residue class is handled by `reconcile_exit_nat_residue`.
+        Ok(())
+    }
+
     fn set_full_tunnel_engaged(&mut self, _engaged: bool) {
         // The QH-60 wedge is policy-routing-shaped; macOS management
         // survival rides pf rules, not table-51820 routes. No context needed.
@@ -4623,6 +4721,12 @@ impl DataplaneSystem for WindowsCommandSystem {
         Ok(())
     }
 
+    fn withdraw_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        // Paired no-op with the admit above: nothing is bound on Windows, so
+        // demotion has no host-firewall binding to give back.
+        Ok(())
+    }
+
     fn set_full_tunnel_engaged(&mut self, _engaged: bool) {
         // The QH-60 wedge is policy-routing-shaped; Windows management
         // survival rides WFP/netsh rules, not table-51820 routes.
@@ -5250,6 +5354,15 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn withdraw_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.withdraw_host_firewall_forwarding(),
+            RuntimeSystem::Linux(system) => system.withdraw_host_firewall_forwarding(),
+            RuntimeSystem::Macos(system) => system.withdraw_host_firewall_forwarding(),
+            RuntimeSystem::Windows(system) => system.withdraw_host_firewall_forwarding(),
+        }
+    }
+
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.rollback_firewall(),
@@ -5590,18 +5703,22 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         // AND blind_exit (both exit_mode Off): all of them forward through
         // the same FORWARD hook a foreign firewall can reject, so the
         // narrower relay_with_upstream gate would leave exits unbound.
-        if options.serve_exit_node
-            && let Err(err) = self.system.admit_host_firewall_forwarding()
-        {
-            let rollback_result =
-                self.rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
-            let fail_closed_result = self.force_fail_closed("host_firewall_admit_failed");
-            if let Err(rollback_err) = rollback_result {
-                let _ = fail_closed_result;
-                return Err(rollback_err);
+        if options.serve_exit_node {
+            if let Err(err) = self.system.admit_host_firewall_forwarding() {
+                let rollback_result = self
+                    .rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
+                let fail_closed_result = self.force_fail_closed("host_firewall_admit_failed");
+                if let Err(rollback_err) = rollback_result {
+                    let _ = fail_closed_result;
+                    return Err(rollback_err);
+                }
+                fail_closed_result?;
+                return Err(err.into());
             }
-            fail_closed_result?;
-            return Err(err.into());
+            // QH-52: record the binding so the role that installed it can give
+            // it back. Pushed AFTER BackendStarted, so the reverse-order unwind
+            // withdraws the binding while the interface it names still exists.
+            applied_stages.push(StageMarker::HostFirewallAdmitted);
         }
 
         if options.serve_exit_node
@@ -5629,7 +5746,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             fail_closed_result?;
             return Err(err.into());
         }
-        if let Err(err) = self.rollback_obsolete_controls(options) {
+        if let Err(err) = self.rollback_obsolete_controls(options, &mut applied_stages) {
             let rollback_result =
                 self.rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
             let fail_closed_result = self.force_fail_closed("obsolete_control_rollback_failed");
@@ -5780,7 +5897,15 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         Ok(())
     }
 
-    fn rollback_obsolete_controls(&mut self, options: ApplyOptions) -> Result<(), Phase10Error> {
+    /// Remove controls the PREVIOUS generation installed that THIS generation
+    /// no longer justifies. `applied_stages` is the generation being built: a
+    /// control this pass fails to remove is re-recorded there, so the marker
+    /// survives the commit and the next apply — or shutdown — tries again.
+    fn rollback_obsolete_controls(
+        &mut self,
+        options: ApplyOptions,
+        applied_stages: &mut Vec<StageMarker>,
+    ) -> Result<(), Phase10Error> {
         // Flush fixed-name exit-NAT residue (macOS `com.rustynet/nat`) that the
         // NatApplied-gated branch below would miss after a crash — `active_stages`
         // is empty on a fresh process, but the kernel anchor persists. Gated on
@@ -5789,6 +5914,38 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.system
             .reconcile_exit_nat_residue(options.serve_exit_node)?;
         let previous_stages = self.active_stages.clone();
+        // QH-52, the in-place demotion edge. A node that served a relay/exit in
+        // the previous generation and does not in this one keeps its tunnel
+        // interface — the interface is not rebuilt, so nothing else drops the
+        // firewalld zone binding the forwarding role installed. Withdraw it
+        // here, alongside the exit-NAT rollback, for the same reason and under
+        // the same "previous generation had it, this one does not" gate.
+        //
+        // Deliberately NOT propagated: `rollback_obsolete_controls` failing
+        // fails the whole apply closed, and a binding that could not be removed
+        // must not take down a node that is otherwise fine. The binding grants
+        // only forwarded traffic, and this generation's forward chain no longer
+        // accepts any — so the cost of leaving it is residue, not exposure.
+        // The marker is re-recorded into the generation being built so the
+        // removal is retried on the next apply and again at shutdown, where the
+        // failure escalates into `RollbackFailed` and the durable shutdown
+        // residue marker.
+        if previous_stages.contains(&StageMarker::HostFirewallAdmitted) && !options.serve_exit_node
+        {
+            match self.system.withdraw_host_firewall_forwarding() {
+                Ok(()) => {
+                    self.active_stages
+                        .retain(|stage| *stage != StageMarker::HostFirewallAdmitted);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "host firewall zone binding survived relay/exit demotion; \
+                         retrying on the next apply and at shutdown: {err}"
+                    );
+                    applied_stages.push(StageMarker::HostFirewallAdmitted);
+                }
+            }
+        }
         if previous_stages.contains(&StageMarker::NatApplied)
             && options.exit_mode != ExitMode::FullTunnel
             && !options.serve_exit_node
@@ -5854,6 +6011,19 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 StageMarker::NatApplied => {
                     if let Err(err) = self.system.rollback_nat_forwarding() {
                         rollback_errors.push(format!("rollback nat forwarding: {err}"));
+                    }
+                }
+                // QH-52. Unlike DNS and the killswitch below, this is withdrawn
+                // under BOTH intents. Those two are HELD through a fail-closed
+                // unwind because removing them would fail OPEN. The zone binding
+                // is the opposite: it is a permission granted to a foreign
+                // firewall, so removing it can only ever be more restrictive.
+                // There is no fail-open direction to guard, and a fail-closed
+                // node that keeps advertising its interface in firewalld's
+                // default zone is exactly the residue QH-52 is about.
+                StageMarker::HostFirewallAdmitted => {
+                    if let Err(err) = self.system.withdraw_host_firewall_forwarding() {
+                        rollback_errors.push(format!("withdraw host firewall admission: {err}"));
                     }
                 }
                 StageMarker::FirewallApplied => match intent {
@@ -10208,6 +10378,272 @@ mod tests {
         );
     }
 
+    // ── QH-52: the demotion edge — a role that ends gives its binding back ──
+
+    /// Re-apply the same node as a plain mesh client. This is the in-place
+    /// relay/exit demotion: the tunnel interface is NOT rebuilt, so nothing
+    /// else in the system drops the zone binding the forwarding role installed.
+    fn demote_to_client(
+        controller: &mut Phase10Controller<RecordingBackend, DryRunSystem>,
+    ) -> Result<(), Phase10Error> {
+        controller.apply_dataplane_generation(
+            trust_ok(),
+            test_runtime_context(),
+            vec![sample_peer("node-b")],
+            vec![Route {
+                destination_cidr: "100.100.20.0/24".to_owned(),
+                via_node: NodeId::new("node-b").expect("node should parse"),
+                kind: RouteKind::Mesh,
+            }],
+            ApplyOptions::default(),
+        )
+    }
+
+    /// QH-52, the defect itself. Before this, `FirewalldZoneOp::Unbind` had no
+    /// daemon caller at all: a node demoted out of its relay/exit role kept its
+    /// tunnel interface bound into firewalld's default zone forever. That is
+    /// deploy residue on the operator's host firewall (CLAUDE.md §10.7) —
+    /// installed by a role, never removed when the role ended.
+    #[test]
+    fn a_demoted_relay_withdraws_its_host_firewall_zone_binding() {
+        let mut controller = serving_controller_after_apply();
+
+        demote_to_client(&mut controller).expect("demotion to a plain client should succeed");
+
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "withdraw_host_firewall_forwarding"),
+            "demotion must give the zone binding back: {:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "admit_host_firewall_forwarding"),
+            "a demoting apply must not re-admit what it is withdrawing: {:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller.serving_exit_node_active(),
+            "the demoted node must stop claiming it serves a forwarding role"
+        );
+    }
+
+    /// The withdrawal is gated on evidence that THIS daemon bound the interface.
+    /// A node that never served must never drive the firewalld builtin at all —
+    /// the mirror of the creation-path gate, and the reason a plain client on a
+    /// firewalld host pays nothing for this fix.
+    #[test]
+    fn a_node_that_never_served_never_withdraws_a_binding_it_never_took() {
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            allow_shared_exit_policy(),
+            TrustPolicy::default(),
+        );
+        demote_to_client(&mut controller).expect("plain client apply should succeed");
+        demote_to_client(&mut controller).expect("second plain client apply should succeed");
+
+        assert!(
+            !controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "withdraw_host_firewall_forwarding"),
+            "a node with no binding must not ask the host firewall for anything: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// QH-54 interaction, the edge this work had to not fight. The periodic
+    /// re-assert re-binds a SERVING node's interface. After a demotion it must
+    /// observe not-serving and do nothing — otherwise the re-assert would
+    /// silently restore the very binding the demotion just withdrew, and the
+    /// residue would come back on a timer.
+    #[test]
+    fn the_periodic_reassert_does_not_rebind_after_a_demotion() {
+        let mut controller = serving_controller_after_apply();
+        demote_to_client(&mut controller).expect("demotion to a plain client should succeed");
+        controller.system.operations.clear();
+
+        controller
+            .reassert_host_firewall_admission()
+            .expect("a re-assert on a demoted node is a no-op, not a failure");
+
+        assert!(
+            controller.system.operations.is_empty(),
+            "the re-assert must not touch the host firewall after a demotion: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// The chosen failure semantics, positive half. A withdrawal is TEARDOWN:
+    /// the binding it removes grants only forwarded traffic, and the demoting
+    /// generation's forward chain no longer accepts any. Failing the apply
+    /// closed over it would take down a healthy node to fix residue — the
+    /// availability cost with none of the security benefit. So the demotion
+    /// succeeds and the failure is reported instead.
+    #[test]
+    fn a_failed_withdrawal_does_not_fail_the_demotion_closed() {
+        let mut controller = serving_controller_after_apply();
+        controller
+            .system
+            .fail_on_from_now("withdraw_host_firewall_forwarding");
+
+        demote_to_client(&mut controller)
+            .expect("an unremovable zone binding must not fail a healthy demotion closed");
+
+        assert_ne!(
+            controller.state(),
+            DataplaneState::FailClosed,
+            "teardown residue must not fail the dataplane closed"
+        );
+        assert!(
+            controller.backend.started,
+            "the demoted generation must stay committed and running"
+        );
+    }
+
+    /// The chosen failure semantics, retry half. A binding that could not be
+    /// removed is still installed, so its marker is re-recorded into the
+    /// committed generation: the next apply tries again, and shutdown tries
+    /// again after that. Dropping the marker on failure would convert a
+    /// reported residue into a permanently forgotten one.
+    #[test]
+    fn an_unremovable_binding_is_retried_on_the_next_apply() {
+        let mut controller = serving_controller_after_apply();
+        controller
+            .system
+            .fail_on_from_now("withdraw_host_firewall_forwarding");
+        demote_to_client(&mut controller).expect("demotion should survive the failed withdrawal");
+
+        // Stop failing; the binding is still recorded as installed.
+        controller.system.fail_on_from_now("no_such_stage");
+        controller.system.operations.clear();
+        demote_to_client(&mut controller).expect("the retrying apply should succeed");
+
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "withdraw_host_firewall_forwarding"),
+            "a withdrawal that failed must be retried on the next apply: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// Shutdown of a still-serving node is the second demotion path: the role
+    /// ends because the daemon does. The binding is runtime-only and outlives
+    /// the process, so leaving it is residue on the operator's host firewall
+    /// with no owner left to remove it.
+    #[test]
+    fn shutdown_of_a_serving_node_withdraws_the_host_firewall_zone_binding() {
+        let mut controller = serving_controller_after_apply();
+
+        controller
+            .shutdown()
+            .expect("clean shutdown should succeed");
+
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "withdraw_host_firewall_forwarding"),
+            "shutdown must give the zone binding back: {:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller.backend.started,
+            "shutdown must still stop the backend"
+        );
+    }
+
+    /// The loud channel. On the shutdown path a failed withdrawal joins the
+    /// same teardown-failure accounting every other rollback stage uses, so it
+    /// becomes `RollbackFailed` — which QH-40's shutdown-residue marker turns
+    /// into a durable, operator-acknowledged signal. "Report, do not block" is
+    /// not "log and forget".
+    #[test]
+    fn a_failed_withdrawal_at_shutdown_surfaces_as_a_rollback_failure() {
+        let mut controller = serving_controller_after_apply();
+        controller
+            .system
+            .fail_on_from_now("withdraw_host_firewall_forwarding");
+
+        let err = controller
+            .shutdown()
+            .expect_err("an unremovable binding must be reported at shutdown");
+
+        match err {
+            Phase10Error::System(SystemError::RollbackFailed(message)) => assert!(
+                message.contains("withdraw host firewall admission"),
+                "the residue must be named in the rollback failure: {message}"
+            ),
+            other => panic!("a failed withdrawal must surface as a rollback failure: {other:?}"),
+        }
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+    }
+
+    /// The binding is withdrawn under BOTH rollback intents. DNS and the
+    /// killswitch are HELD through a fail-closed unwind because restoring them
+    /// would fail OPEN; the zone binding is a permission granted to a foreign
+    /// firewall, so removing it is strictly more restrictive and has no
+    /// fail-open direction to guard.
+    #[test]
+    fn a_fail_closed_unwind_also_withdraws_the_host_firewall_zone_binding() {
+        let mut controller = serving_controller_after_apply();
+        controller
+            .system
+            .fail_on_from_now("admit_host_firewall_forwarding");
+
+        controller
+            .reassert_host_firewall_admission()
+            .expect_err("a broken posture must fail the re-assert");
+
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "withdraw_host_firewall_forwarding"),
+            "a fail-closed unwind must not keep the zone binding: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// Source-pinned ordering. The binding names an interface, so it can only
+    /// be given back while that interface still exists. The marker is recorded
+    /// AFTER `BackendStarted`, and `rollback_generation_best_effort` unwinds in
+    /// reverse — so the withdrawal always runs before the backend teardown that
+    /// destroys the device. A future edit that hoists the marker push above the
+    /// backend start would silently make every shutdown withdrawal act on a
+    /// device that is already gone, and no behavioural test can see that
+    /// because the DryRun backend keeps no device.
+    #[test]
+    fn the_admission_marker_is_recorded_after_the_backend_start() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        let backend_started = code
+            .find("Ok(()) => applied_stages.push(StageMarker::BackendStarted)")
+            .expect("the apply must record the backend start");
+        let admitted = code
+            .find("applied_stages.push(StageMarker::HostFirewallAdmitted);")
+            .expect("the apply must record the host firewall admission");
+        assert!(
+            backend_started < admitted,
+            "the admission marker must be recorded after the backend start, so the \
+             reverse-order unwind withdraws the binding while its interface still exists"
+        );
+    }
+
     #[test]
     fn helper_less_direct_path_enforces_argv_schema_validation() {
         // RN-19: with no privileged client configured (daemon-as-root direct
@@ -10897,6 +11333,145 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         result.expect("firewall apply should succeed with no firewalld to coexist with");
+    }
+
+    // ── QH-52: the withdrawal direction, over the same scripted builtin ──
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forwarding_withdrawal_issues_the_unbind_for_the_configured_interface() {
+        // Non-default interface name for the same reason the bind test uses
+        // one: it distinguishes the interface FIELD from a hardcoded literal.
+        let socket_path = phase10_test_socket_path("fwzw");
+        let (commands, stop, helper_thread, mut system) = firewalld_scripted_system(
+            &socket_path,
+            "rnqh52",
+            "presence=running default_zone=public bound=false",
+        );
+        let result = DataplaneSystem::withdraw_host_firewall_forwarding(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        result.expect("a confirmed-unbound posture must report the withdrawal complete");
+        // The whole M1-detection value: with the call deleted the function
+        // still returns Ok.
+        let command_log = commands.lock().expect("command log should lock").clone();
+        let unbind_command = format!(
+            "{} op=unbind interface=rnqh52",
+            crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM
+        );
+        assert!(
+            command_log.iter().any(|cmd| cmd.contains(&unbind_command)),
+            "demotion must ask the builtin to unbind the CONFIGURED tunnel interface: \
+             {command_log:?}"
+        );
+        assert!(
+            !command_log.iter().any(|cmd| cmd.contains("op=bind")),
+            "the withdrawal must never re-bind: {command_log:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forwarding_withdrawal_is_satisfied_when_firewalld_is_absent() {
+        // The presence gate lives in exactly one place for both directions:
+        // inside the builtin. A host with no firewalld never had a binding, so
+        // the withdrawal has nothing to remove and must not report residue —
+        // the mirror of `forwarding_admit_passes_when_firewalld_absent`.
+        let socket_path = phase10_test_socket_path("fwzx");
+        let (_commands, stop, helper_thread, mut system) =
+            firewalld_scripted_system(&socket_path, "rustynet0", "presence=absent");
+        let result = DataplaneSystem::withdraw_host_firewall_forwarding(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        result.expect("with no firewalld there is no binding to give back");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forwarding_withdrawal_reports_a_binding_that_survived_demotion() {
+        let socket_path = phase10_test_socket_path("fwzs");
+        let (_commands, stop, helper_thread, mut system) = firewalld_scripted_system(
+            &socket_path,
+            "rustynet0",
+            "presence=running default_zone=public bound=true",
+        );
+        let result = DataplaneSystem::withdraw_host_firewall_forwarding(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        match result {
+            Err(SystemError::FirewallApplyFailed(message)) => assert!(
+                message.contains("host firewall zone binding survived role demotion"),
+                "the failure must come from the withdrawal verdict: {message}"
+            ),
+            other => panic!("a surviving zone binding must be reported as residue: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forwarding_withdrawal_reports_residue_when_binding_state_is_unknown() {
+        // `presence=running` with no `bound` token is what the builtin emits
+        // when the zone query itself fails. "I could not tell" must record
+        // possible residue, never a completed removal.
+        let socket_path = phase10_test_socket_path("fwzy");
+        let (_commands, stop, helper_thread, mut system) = firewalld_scripted_system(
+            &socket_path,
+            "rustynet0",
+            "presence=running default_zone=public",
+        );
+        let result = DataplaneSystem::withdraw_host_firewall_forwarding(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        match result {
+            Err(SystemError::FirewallApplyFailed(message)) => assert!(
+                message.contains("host firewall zone binding survived role demotion"),
+                "unknown binding state must report residue via the withdrawal verdict: {message}"
+            ),
+            other => panic!("an unreadable binding state must not read as removed: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forwarding_withdrawal_reports_an_unparseable_posture() {
+        let socket_path = phase10_test_socket_path("fwzp");
+        let (_commands, stop, helper_thread, mut system) =
+            firewalld_scripted_system(&socket_path, "rustynet0", "");
+        let result = DataplaneSystem::withdraw_host_firewall_forwarding(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        match result {
+            Err(SystemError::FirewallApplyFailed(message)) => assert!(
+                message.contains("firewalld posture"),
+                "the failure must come from the posture parse: {message}"
+            ),
+            other => panic!("an unparseable posture must not read as a removed binding: {other:?}"),
+        }
     }
 
     #[cfg(target_os = "linux")]
