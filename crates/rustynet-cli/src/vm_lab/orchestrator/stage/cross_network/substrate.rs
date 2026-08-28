@@ -1708,6 +1708,31 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
                 Ok(_) => {}
             }
         }
+        // Second residue class, on the same guests: the daemon env-file egress
+        // pin the overlay caused `ops install-systemd` to write. Runs after the
+        // links are gone, over exactly the aliases the removal loop above
+        // touched — a guest that never had an overlay link never had a route
+        // through one either, so it cannot carry a pin from this run, and
+        // widening the set to every recorded participant would newly fail
+        // teardown on a guest with no runner. Both well-known link names are
+        // offered every time; deletion is keyed on an exact value match, so a
+        // name that was never pinned costs nothing.
+        let mut pin_aliases: Vec<&str> =
+            targets.iter().map(|target| target.alias.as_str()).collect();
+        pin_aliases.sort_unstable();
+        pin_aliases.dedup();
+        for alias in pin_aliases {
+            match Self::runner_for(runners, alias) {
+                Err(err) => errors.push(err),
+                Ok(runner) => {
+                    if let Err(err) =
+                        revert_egress_pins(runner, alias, &[VXLAN_LINK_NAME, VXLAN_SITE_LAN_IF])
+                    {
+                        errors.push(err);
+                    }
+                }
+            }
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1716,6 +1741,74 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
                 errors.join("; ")
             ))
         }
+    }
+}
+
+/// The daemon environment file `ops install-systemd` writes on a Linux guest.
+/// Mirrors `ops_install_systemd::ENV_DST`; the substrate is Linux-only (setup
+/// fails closed on any non-Linux participant), so no per-OS variant is needed.
+const DAEMON_ENV_FILE: &str = "/etc/default/rustynetd";
+
+/// Build the `sed` program that deletes an egress pin naming `link`.
+///
+/// Every `ip link` name this substrate creates is plain ASCII, so an
+/// allowlisted character set keeps the value inert as a regular expression.
+/// A name outside that set is refused rather than interpolated — a metacharacter
+/// here would silently widen the deletion to lines it was never meant to touch.
+fn egress_pin_delete_program(link: &str) -> Result<String, String> {
+    if link.is_empty()
+        || !link
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err(format!(
+            "refusing to build an egress-pin deletion for interface name {link:?}: \
+             only ASCII letters, digits, '_' and '-' are permitted"
+        ));
+    }
+    Ok(format!("/^RUSTYNET_EGRESS_INTERFACE={link}$/d"))
+}
+
+/// Remove any `RUSTYNET_EGRESS_INTERFACE` pin in the guest's daemon env file
+/// that names an interface THIS substrate created.
+///
+/// Why teardown owns this at all: nothing here writes that file directly, but
+/// the overlay is what causes it to be written wrong. While the overlay is up,
+/// the route to the selected exit endpoint leaves through the vxlan link, so
+/// `ops install-systemd` derives that link as the egress interface and pins it
+/// (`ops_install_systemd.rs`, `resolve_egress_interface` →
+/// `RUSTYNET_EGRESS_INTERFACE`). Deleting the link without deleting the pin
+/// leaves a value naming a device that no longer exists, and the next ordinary
+/// install on that guest fails `egress interface does not exist`. That is
+/// residue in the §10.7 sense — the run that created it must revert it.
+///
+/// Keyed on an exact value match, so a pin naming a real NIC is never touched,
+/// and reverting a name that was never pinned is a no-op. The provenance marker
+/// line is deliberately left alone: with no value line to describe it, the
+/// installer never consults it, and the next install rewrites the file whole.
+fn revert_egress_pins(
+    runner: &dyn NetLeafRunner,
+    alias: &str,
+    links: &[&str],
+) -> Result<(), String> {
+    let mut programs = Vec::with_capacity(links.len());
+    for link in links {
+        programs.push(egress_pin_delete_program(link)?);
+    }
+    let mut argv: Vec<&str> = vec!["sudo", "-n", "sed", "-i"];
+    for program in &programs {
+        argv.push("-e");
+        argv.push(program.as_str());
+    }
+    argv.push(DAEMON_ENV_FILE);
+    match runner.run(&argv) {
+        Err(err) => Err(format!("{alias}: {err}")),
+        // A guest with no env file was never installed, so it carries no pin.
+        Ok(output) if !output.success && !already_removed(&output.stderr) => Err(format!(
+            "{alias}: reverting the egress interface pin in {DAEMON_ENV_FILE} failed: {}",
+            output.stderr.trim()
+        )),
+        Ok(_) => Ok(()),
     }
 }
 
@@ -2311,8 +2404,9 @@ mod tests {
             StageOutcome::Passed
         );
         assert!(ctx.substrate.is_none(), "teardown drains the live handle");
-        assert_eq!(td_a.recorded().len(), 1);
-        assert_eq!(td_b.recorded().len(), 1);
+        // One link removal plus the egress-pin revert, per participant.
+        assert_eq!(td_a.recorded().len(), 2);
+        assert_eq!(td_b.recorded().len(), 2);
     }
 
     /// Invariant (d) at the stage seam: after a PARTIAL setup the context
@@ -2354,16 +2448,144 @@ mod tests {
         );
         assert_eq!(
             td_a.recorded(),
-            [vec![
-                "sudo".to_owned(),
-                "-n".to_owned(),
-                "ip".to_owned(),
-                "link".to_owned(),
-                "del".to_owned(),
-                VXLAN_LINK_NAME.to_owned()
-            ]],
-            "one removal per created interface"
+            [
+                vec![
+                    "sudo".to_owned(),
+                    "-n".to_owned(),
+                    "ip".to_owned(),
+                    "link".to_owned(),
+                    "del".to_owned(),
+                    VXLAN_LINK_NAME.to_owned()
+                ],
+                vec![
+                    "sudo".to_owned(),
+                    "-n".to_owned(),
+                    "sed".to_owned(),
+                    "-i".to_owned(),
+                    "-e".to_owned(),
+                    format!("/^RUSTYNET_EGRESS_INTERFACE={VXLAN_LINK_NAME}$/d"),
+                    "-e".to_owned(),
+                    format!("/^RUSTYNET_EGRESS_INTERFACE={VXLAN_SITE_LAN_IF}$/d"),
+                    DAEMON_ENV_FILE.to_owned(),
+                ],
+            ],
+            "one removal per created interface, then the egress-pin revert"
         );
+    }
+
+    /// The residue that cost two live-lab runs: while the overlay is up, the
+    /// route to the selected exit endpoint leaves through the vxlan link, so
+    /// `ops install-systemd` derives THAT link as the egress interface and pins
+    /// it in `/etc/default/rustynetd`. Deleting the link without deleting the
+    /// pin leaves a value naming a device that no longer exists, and the next
+    /// ordinary install fails `egress interface does not exist`. Teardown owns
+    /// reverting what its overlay caused to be written.
+    #[test]
+    fn teardown_reverts_the_egress_pin_the_overlay_caused_to_be_written() {
+        use mock::MockLeafRunner;
+        let mut ctx = empty_ctx();
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned: true,
+            participants: vec!["a".to_owned()],
+        });
+        let td_a = MockLeafRunner::default();
+        let td_runners = runner_map(&[("a", &td_a)]);
+        assert_eq!(
+            CrossNetworkSubstrateTeardownStage::teardown_with(&mut ctx, &td_runners, Some("vxlan")),
+            StageOutcome::Passed
+        );
+        let recorded = td_a.recorded();
+        let revert = recorded
+            .iter()
+            .find(|argv| argv.iter().any(|element| element == "sed"))
+            .expect("teardown must revert the egress pin");
+        assert!(
+            revert.contains(&format!("/^RUSTYNET_EGRESS_INTERFACE={VXLAN_LINK_NAME}$/d")),
+            "{revert:?}"
+        );
+        assert!(revert.contains(&DAEMON_ENV_FILE.to_owned()), "{revert:?}");
+        // Only the value line is deleted. The provenance marker is inert
+        // without a value to describe, and the next install rewrites the file
+        // wholesale; deleting it here could not be made conditional on the
+        // value line actually having matched.
+        assert!(
+            !revert
+                .iter()
+                .any(|element| element.contains("RUSTYNET_EGRESS_INTERFACE_SOURCE")),
+            "{revert:?}"
+        );
+    }
+
+    /// A guest whose env file was never written is not residue: `sed -i` on a
+    /// missing file is the idempotent success case, exactly as `ip link del` on
+    /// an already-removed device is.
+    #[test]
+    fn a_guest_with_no_daemon_env_file_is_not_reported_as_residue() {
+        use mock::MockLeafRunner;
+        let mut ctx = empty_ctx();
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned: true,
+            participants: vec!["a".to_owned()],
+        });
+        // Calls 0..2 are the three record-derived removals; call 3 is the revert.
+        let td_a = MockLeafRunner {
+            fail_on: vec![3],
+            failure_stderr: "sed: can't read /etc/default/rustynetd: No such file or directory"
+                .to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let td_runners = runner_map(&[("a", &td_a)]);
+        assert_eq!(
+            CrossNetworkSubstrateTeardownStage::teardown_with(&mut ctx, &td_runners, Some("vxlan")),
+            StageOutcome::Passed
+        );
+    }
+
+    /// A revert that fails for any other reason is possible residue and must
+    /// fail the stage, never pass silently.
+    #[test]
+    fn a_failed_egress_pin_revert_fails_the_teardown_stage() {
+        use mock::MockLeafRunner;
+        let mut ctx = empty_ctx();
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned: true,
+            participants: vec!["a".to_owned()],
+        });
+        let td_a = MockLeafRunner {
+            fail_on: vec![3],
+            failure_stderr: "sed: couldn't open temporary file: Read-only file system".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let td_runners = runner_map(&[("a", &td_a)]);
+        let outcome =
+            CrossNetworkSubstrateTeardownStage::teardown_with(&mut ctx, &td_runners, Some("vxlan"));
+        assert!(
+            matches!(outcome, StageOutcome::Failed(ref msg) if msg.contains("egress interface pin")),
+            "{outcome:?}"
+        );
+    }
+
+    /// The link name is interpolated into a `sed` regular expression, so the
+    /// character set is allowlisted rather than trusted. A metacharacter would
+    /// silently widen the deletion to lines it was never meant to touch.
+    #[test]
+    fn egress_pin_deletion_refuses_a_regex_unsafe_interface_name() {
+        assert_eq!(
+            egress_pin_delete_program(VXLAN_LINK_NAME),
+            Ok(format!("/^RUSTYNET_EGRESS_INTERFACE={VXLAN_LINK_NAME}$/d"))
+        );
+        for unsafe_name in ["", ".*", "eth0$/d;/^X=/d", "eth 0", "eth/0"] {
+            assert!(
+                egress_pin_delete_program(unsafe_name).is_err(),
+                "accepted unsafe interface name {unsafe_name:?}"
+            );
+        }
     }
 
     #[test]
@@ -2591,14 +2813,29 @@ mod tests {
             .expect("teardown of the partial state");
         assert_eq!(
             lenovo_td.recorded(),
-            [vec![
-                "sudo".to_owned(),
-                "-n".to_owned(),
-                "ip".to_owned(),
-                "link".to_owned(),
-                "del".to_owned(),
-                VXLAN_LINK_NAME.to_owned()
-            ]]
+            [
+                vec![
+                    "sudo".to_owned(),
+                    "-n".to_owned(),
+                    "ip".to_owned(),
+                    "link".to_owned(),
+                    "del".to_owned(),
+                    VXLAN_LINK_NAME.to_owned()
+                ],
+                // The overlay also caused an egress pin to be written; teardown
+                // reverts it on the same guest.
+                vec![
+                    "sudo".to_owned(),
+                    "-n".to_owned(),
+                    "sed".to_owned(),
+                    "-i".to_owned(),
+                    "-e".to_owned(),
+                    format!("/^RUSTYNET_EGRESS_INTERFACE={VXLAN_LINK_NAME}$/d"),
+                    "-e".to_owned(),
+                    format!("/^RUSTYNET_EGRESS_INTERFACE={VXLAN_SITE_LAN_IF}$/d"),
+                    DAEMON_ENV_FILE.to_owned(),
+                ],
+            ]
         );
     }
 
@@ -2626,8 +2863,9 @@ mod tests {
         // Three per participant since CN-4: the record cannot say whether a NAT
         // profile was applied, so the router namespace and the site LAN are
         // targeted too and their absence is the idempotent success case.
-        assert_eq!(a.recorded().len(), 3);
-        assert_eq!(b.recorded().len(), 3);
+        // Plus one egress-pin revert per participant.
+        assert_eq!(a.recorded().len(), 4);
+        assert_eq!(b.recorded().len(), 4);
     }
 
     #[test]
@@ -2666,8 +2904,9 @@ mod tests {
             .teardown(&handle, &runners)
             .expect_err("real deletion failure must fail the teardown");
         assert!(err.contains("possible residue"), "{err}");
-        // The OTHER node's removals were still attempted (never stop early).
-        assert_eq!(ok2.recorded().len(), 3);
+        // The OTHER node's removals were still attempted (never stop early),
+        // plus its egress-pin revert.
+        assert_eq!(ok2.recorded().len(), 4);
     }
 
     #[test]
@@ -3317,12 +3556,23 @@ mod tests {
                 format!("sudo -n ip link del {VXLAN_SITE_LAN_IF}"),
                 format!("sudo -n ip netns del {VXLAN_ROUTER_NS}"),
                 format!("sudo -n ip link del {VXLAN_LINK_NAME}"),
+                format!(
+                    "sudo -n sed -i -e /^RUSTYNET_EGRESS_INTERFACE={VXLAN_LINK_NAME}$/d \
+                     -e /^RUSTYNET_EGRESS_INTERFACE={VXLAN_SITE_LAN_IF}$/d {DAEMON_ENV_FILE}"
+                ),
             ],
             "reverse creation order, and `ip netns del` for the namespace"
         );
         assert_eq!(
             joined(&utm),
-            [format!("sudo -n ip link del {VXLAN_LINK_NAME}")]
+            [
+                format!("sudo -n ip link del {VXLAN_LINK_NAME}"),
+                format!(
+                    "sudo -n sed -i -e /^RUSTYNET_EGRESS_INTERFACE={VXLAN_LINK_NAME}$/d \
+                     -e /^RUSTYNET_EGRESS_INTERFACE={VXLAN_SITE_LAN_IF}$/d {DAEMON_ENV_FILE}"
+                ),
+            ],
+            "the un-NAT'd site still gets its egress pin reverted"
         );
     }
 
@@ -3359,6 +3609,10 @@ mod tests {
                 format!("sudo -n ip netns del {VXLAN_ROUTER_NS}"),
                 format!("sudo -n ip link del {VXLAN_SITE_LAN_IF}"),
                 format!("sudo -n ip link del {VXLAN_LINK_NAME}"),
+                format!(
+                    "sudo -n sed -i -e /^RUSTYNET_EGRESS_INTERFACE={VXLAN_LINK_NAME}$/d \
+                     -e /^RUSTYNET_EGRESS_INTERFACE={VXLAN_SITE_LAN_IF}$/d {DAEMON_ENV_FILE}"
+                ),
             ]
         );
     }
