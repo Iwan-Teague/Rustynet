@@ -207,6 +207,12 @@ pub enum Capability {
     /// only; peer access is governed by signed service-access policy
     /// (default-deny).
     ServesLlm,
+    /// `rustydnsd` co-deploys as a sibling service on this host for
+    /// the RustyDNS tandem DNS integration (see
+    /// `RustydnsTandemIntegrationDesign_2026-08-27.md`). Mutually
+    /// exclusive with the `blind_exit` role (design §3 invariant 10);
+    /// grant is operator-signed, never granted by any preset.
+    ServesDns,
 }
 
 impl Capability {
@@ -223,6 +229,7 @@ impl Capability {
             Capability::AnchorPortMappingAuthoritative => "anchor.port_mapping_authoritative",
             Capability::ServesNas => "serves_nas",
             Capability::ServesLlm => "serves_llm",
+            Capability::ServesDns => "serves_dns",
         }
     }
 }
@@ -247,6 +254,7 @@ impl FromStr for Capability {
             "anchor.port_mapping_authoritative" => Ok(Capability::AnchorPortMappingAuthoritative),
             "serves_nas" => Ok(Capability::ServesNas),
             "serves_llm" => Ok(Capability::ServesLlm),
+            "serves_dns" => Ok(Capability::ServesDns),
             other => Err(format!("invalid capability: {other:?}")),
         }
     }
@@ -357,6 +365,14 @@ pub fn capabilities_require_llm_binary(capabilities: &[Capability]) -> bool {
         .any(|c| matches!(c, Capability::ServesLlm))
 }
 
+/// Whether a capability set requires the `rustydnsd` binary to be
+/// deployed as a sibling service (RustyDNS tandem integration).
+pub fn capabilities_require_dns_binary(capabilities: &[Capability]) -> bool {
+    capabilities
+        .iter()
+        .any(|c| matches!(c, Capability::ServesDns))
+}
+
 /// Sibling service binaries that co-deploy with capability-bearing
 /// presets. Each kind has an **independent** deploy/undeploy
 /// lifecycle: a single transition can undeploy one service and
@@ -369,6 +385,7 @@ pub enum ServiceKind {
     Relay,
     Nas,
     Llm,
+    Dns,
 }
 
 impl ServiceKind {
@@ -378,6 +395,7 @@ impl ServiceKind {
             ServiceKind::Relay => "relay",
             ServiceKind::Nas => "nas",
             ServiceKind::Llm => "llm",
+            ServiceKind::Dns => "dns",
         }
     }
 
@@ -387,12 +405,18 @@ impl ServiceKind {
             ServiceKind::Relay => "rustynet-relay",
             ServiceKind::Nas => "rustynet-nas",
             ServiceKind::Llm => "rustynet-llm-gateway",
+            ServiceKind::Dns => "rustydnsd",
         }
     }
 
     /// All service kinds in canonical (derived `Ord`) order.
-    pub fn all() -> &'static [ServiceKind; 3] {
-        &[ServiceKind::Relay, ServiceKind::Nas, ServiceKind::Llm]
+    pub fn all() -> &'static [ServiceKind; 4] {
+        &[
+            ServiceKind::Relay,
+            ServiceKind::Nas,
+            ServiceKind::Llm,
+            ServiceKind::Dns,
+        ]
     }
 
     /// Whether the given capability set requires this service binary
@@ -402,6 +426,7 @@ impl ServiceKind {
             ServiceKind::Relay => capabilities_require_relay_binary(capabilities),
             ServiceKind::Nas => capabilities_require_nas_binary(capabilities),
             ServiceKind::Llm => capabilities_require_llm_binary(capabilities),
+            ServiceKind::Dns => capabilities_require_dns_binary(capabilities),
         }
     }
 }
@@ -913,16 +938,51 @@ mod tests {
         assert_eq!(ServiceKind::Relay.as_str(), "relay");
         assert_eq!(ServiceKind::Nas.as_str(), "nas");
         assert_eq!(ServiceKind::Llm.as_str(), "llm");
+        assert_eq!(ServiceKind::Dns.as_str(), "dns");
         assert_eq!(ServiceKind::Relay.binary_name(), "rustynet-relay");
         assert_eq!(ServiceKind::Nas.binary_name(), "rustynet-nas");
         assert_eq!(ServiceKind::Llm.binary_name(), "rustynet-llm-gateway");
+        assert_eq!(ServiceKind::Dns.binary_name(), "rustydnsd");
     }
 
     #[test]
     fn service_kind_all_covers_every_variant_in_canonical_order() {
         assert_eq!(
             ServiceKind::all(),
-            &[ServiceKind::Relay, ServiceKind::Nas, ServiceKind::Llm]
+            &[
+                ServiceKind::Relay,
+                ServiceKind::Nas,
+                ServiceKind::Llm,
+                ServiceKind::Dns
+            ]
+        );
+    }
+
+    #[test]
+    fn serves_dns_capability_round_trips_and_no_preset_grants_it() {
+        assert_eq!(Capability::ServesDns.as_str(), "serves_dns");
+        assert_eq!(
+            "serves_dns".parse::<Capability>().unwrap(),
+            Capability::ServesDns
+        );
+        // Tandem DNS is a signed operator toggle, never a preset
+        // capability: no entry in ROLE_PRESET_TABLE grants it.
+        for entry in ROLE_PRESET_TABLE {
+            assert!(
+                !entry.capabilities.contains(&Capability::ServesDns),
+                "preset {:?} must not grant ServesDns",
+                entry.preset
+            );
+        }
+        assert!(capabilities_require_dns_binary(&[Capability::ServesDns]));
+        assert!(!capabilities_require_dns_binary(&[
+            Capability::ServesRelay,
+            Capability::ServesNas,
+            Capability::ServesLlm
+        ]));
+        assert_eq!(
+            required_service_binaries(&[Capability::ServesDns]),
+            vec![ServiceKind::Dns]
         );
     }
 

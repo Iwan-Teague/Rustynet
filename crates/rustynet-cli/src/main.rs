@@ -19754,6 +19754,20 @@ fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, Stri
         role_cli::ConcreteAction::UndeployNasService => execute_platform_nas_service_action(false),
         role_cli::ConcreteAction::DeployLlmService => execute_platform_llm_service_action(true),
         role_cli::ConcreteAction::UndeployLlmService => execute_platform_llm_service_action(false),
+        // RustyDNS tandem (Phase 1): the `dns` service kind exists for
+        // planning/parity, but no preset grants `serves_dns` and the
+        // `rustydnsd` deployment phase has not landed. Fail closed —
+        // never fall through to a no-op or a wrong service.
+        role_cli::ConcreteAction::DeployDnsService => Err(
+            "rustydnsd deployment is not available yet (RustyDNS tandem Phase 1 is \
+             control-plane only; service deployment is a later phase)"
+                .to_owned(),
+        ),
+        role_cli::ConcreteAction::UndeployDnsService => Err(
+            "rustydnsd undeployment is not available yet (RustyDNS tandem Phase 1 is \
+             control-plane only; service deployment is a later phase)"
+                .to_owned(),
+        ),
     }
 }
 
@@ -22777,11 +22791,16 @@ mod tests {
             super::MACOS_WG_KEY_PASSPHRASE_PATH,
             "/usr/local/var/rustynet/bootstrap/wireguard.passphrase"
         );
-        assert_ne!(
+        // The daemon's defaults are platform-cfg'd: on macOS they are
+        // BY DESIGN the installer roots (previously this asserted the
+        // paths diverge, which broke when rustynetd gained the macOS
+        // branch). The Linux-defaults guard is structural: the
+        // non-macOS cfg branches still point at /var/lib/rustynet.
+        assert_eq!(
             super::MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
             rustynetd::daemon::DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH
         );
-        assert_ne!(
+        assert_eq!(
             super::MACOS_WG_KEY_PASSPHRASE_PATH,
             rustynetd::daemon::DEFAULT_WG_KEY_PASSPHRASE_PATH
         );
