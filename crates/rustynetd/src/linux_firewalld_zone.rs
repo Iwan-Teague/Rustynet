@@ -326,6 +326,29 @@ impl FirewalldPosture {
             }
         }
     }
+
+    /// Is the interface confirmed NOT bound after an `Unbind` (QH-52)?
+    ///
+    /// The exact inverse of [`Self::forwarding_unobstructed`], and it inherits
+    /// the same "an unreadable answer is not a good answer" rule: `true` only
+    /// when firewalld is definitively absent (there was never a binding to
+    /// remove), or present WITH the interface confirmed unbound. A running
+    /// firewalld whose binding state could not be read reports `false`, so the
+    /// caller records unremoved residue rather than assuming the demotion
+    /// completed.
+    ///
+    /// Unlike the bind direction this is NOT a fail-closed security gate — a
+    /// leftover binding only ever grants forwarded traffic that this daemon has
+    /// stopped authorising anyway. It is a residue signal, and callers treat it
+    /// as one.
+    pub fn forwarding_admission_withdrawn(&self) -> bool {
+        match self.presence {
+            FirewalldPresence::Absent => true,
+            FirewalldPresence::Running | FirewalldPresence::Unknown => {
+                self.interface_bound == Some(false)
+            }
+        }
+    }
 }
 
 fn set_once<'a>(slot: &mut Option<&'a str>, key: &str, value: &'a str) -> Result<(), String> {
@@ -462,6 +485,60 @@ mod tests {
         assert!(!case(FirewalldPresence::Unknown, None));
         assert!(!case(FirewalldPresence::Unknown, Some(false)));
         assert!(case(FirewalldPresence::Unknown, Some(true)));
+    }
+
+    /// QH-52: the withdrawal decision table, the exact inverse of the bind one.
+    /// Only "firewalld absent" and "confirmed unbound" count as withdrawn; an
+    /// unreadable binding state must read as residue, never as success.
+    #[test]
+    fn admission_is_withdrawn_only_when_absent_or_confirmed_unbound() {
+        let case = |presence, bound| {
+            FirewalldPosture {
+                presence,
+                default_zone: None,
+                interface_bound: bound,
+            }
+            .forwarding_admission_withdrawn()
+        };
+
+        assert!(case(FirewalldPresence::Absent, None));
+        assert!(case(FirewalldPresence::Running, Some(false)));
+        assert!(case(FirewalldPresence::Unknown, Some(false)));
+
+        assert!(!case(FirewalldPresence::Running, Some(true)));
+        assert!(!case(FirewalldPresence::Running, None));
+        assert!(!case(FirewalldPresence::Unknown, None));
+        assert!(!case(FirewalldPresence::Unknown, Some(true)));
+    }
+
+    /// The two directions must never both report success for the same posture:
+    /// a binding cannot be simultaneously present-and-confirmed and removed.
+    #[test]
+    fn bind_and_unbind_verdicts_are_never_simultaneously_true_when_firewalld_runs() {
+        for presence in [FirewalldPresence::Running, FirewalldPresence::Unknown] {
+            for bound in [None, Some(true), Some(false)] {
+                let posture = FirewalldPosture {
+                    presence,
+                    default_zone: None,
+                    interface_bound: bound,
+                };
+                assert!(
+                    !(posture.forwarding_unobstructed()
+                        && posture.forwarding_admission_withdrawn()),
+                    "contradictory verdict for {posture:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unbind_argv_round_trips_and_carries_no_zone_token() {
+        let spec = FirewalldZoneSpec::new(FirewalldZoneOp::Unbind, "rustynet0").unwrap();
+        let argv = spec.encode();
+        assert_eq!(argv, vec!["op=unbind", "interface=rustynet0"]);
+        assert!(!argv.iter().any(|token| token.contains("zone=")));
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        assert_eq!(FirewalldZoneSpec::decode(&borrowed).unwrap(), spec);
     }
 
     #[test]
