@@ -24,8 +24,23 @@ pub const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
 pub const MACOS_KEYS_DIR: &str = "/usr/local/var/rustynet/keys";
 pub const MACOS_DAEMON_SOCKET: &str = "/private/var/run/rustynet/rustynetd.sock";
 pub const MACOS_MEMBERSHIP_DIR: &str = "/usr/local/var/rustynet/membership";
+/// Owner SIGNING (private) key path on macOS. Mirrors
+/// `ops_e2e::MACOS_OWNER_SIGNING_KEY_PATH`: the macOS genesis driver
+/// (`execute_ops_e2e_bootstrap_macos`, run by `ops e2e-bootstrap-host`
+/// during lab bootstrap) passes this as `rustynetd membership init
+/// --owner-signing-key`, and `run_membership_init` persists the encrypted
+/// private key exactly here.
+pub const MACOS_OWNER_SIGNING_KEY_PATH: &str = "/usr/local/etc/rustynet/membership.owner.key";
+/// Owner PUBLIC key path on macOS. `rustynetd membership init` writes the
+/// public key alongside the private key at `{owner_signing_key_path}.pub`,
+/// so with [`MACOS_OWNER_SIGNING_KEY_PATH`] the seeded location is
+/// `/usr/local/etc/rustynet/membership.owner.key.pub`. The membership
+/// reader (`macos_membership::issue_membership_owner_key`) must read
+/// exactly where genesis writes — a key placed anywhere else (e.g. the
+/// Linux-conventional `/etc/rustynet/...`, or a STATE_ROOT guess) is a
+/// hand-seeded leftover, not install provenance.
 pub const MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH: &str =
-    "/usr/local/var/rustynet/membership/membership.owner.key.pub";
+    "/usr/local/etc/rustynet/membership.owner.key.pub";
 pub const MACOS_MEMBERSHIP_SNAPSHOT_PATH: &str =
     "/usr/local/var/rustynet/membership/membership.snapshot";
 pub const MACOS_ENROLLMENT_SECRET_PATH: &str = "/usr/local/var/rustynet/keys/enrollment.secret";
@@ -975,6 +990,21 @@ mod tests {
         assert!(
             !INSTALL_SERVICE_SCRIPT.is_empty(),
             "Install-RustyNetMacosService.sh must not be empty"
+        );
+    }
+
+    /// MAC-D2 cross-check: the adapter's owner-signing-key constant must
+    /// equal the one the macOS genesis driver actually passes to
+    /// `rustynetd membership init` (`ops_e2e`), so the adapter's `.pub`
+    /// read path is provably the genesis write path. macOS-gated because
+    /// the ops_e2e constant is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_signing_key_path_matches_macos_genesis_driver() {
+        assert_eq!(
+            MACOS_OWNER_SIGNING_KEY_PATH,
+            crate::ops_e2e::MACOS_OWNER_SIGNING_KEY_PATH,
+            "adapter and genesis driver must agree on the macOS owner signing key path"
         );
     }
 

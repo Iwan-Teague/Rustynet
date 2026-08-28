@@ -456,6 +456,38 @@ wrong location; it does **not** prove that a fresh macOS install seeds the right
 one. Whether the macOS install path seeds an owner key at all is a follow-up
 question this run cannot answer.
 
+#### §4.2 disposition — DONE 2026-08-28 (MAC-D2 fix)
+
+The open question is answered from the code: **a fresh macOS install does seed
+an owner key, at `/usr/local/etc/rustynet/membership.owner.key.pub`.** The lab
+bootstrap path is `ops e2e-bootstrap-host` → the macOS genesis driver
+`execute_ops_e2e_bootstrap_macos` (`ops_e2e.rs`, Track B B1.2), which runs
+`rustynetd membership init --owner-signing-key /usr/local/etc/rustynet/
+membership.owner.key`; `run_membership_init` writes the public key at
+`{owner_signing_key_path}.pub`. Neither of the two locations probed on the
+guest is it: `/usr/local/var/rustynet/membership/` holds only snapshot/log
+state, and the guest's `/etc/rustynet/...` file is the Jul 9 leftover. (Tonight's
+`find` also never searched `/usr/local/etc` — the seeded location — so the
+key was likely present all along.) The fix therefore points the adapter at the
+genesis write path rather than copying the Linux path:
+
+* `MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH` (`macos_install.rs`) is now
+  `/usr/local/etc/rustynet/membership.owner.key.pub`, derived as
+  `{MACOS_OWNER_SIGNING_KEY_PATH}.pub`, with a macOS-gated test pinning the
+  adapter constant to `ops_e2e::MACOS_OWNER_SIGNING_KEY_PATH` so the read path
+  and the write path cannot drift again.
+* The read (`macos_membership::issue_membership_owner_key`) now uses `sudo -n`
+  like the Linux twin and **fails loud with distinct, non-empty errors** for
+  absent-file, unreadable-file (permission/sudo refusal — including a
+  passwordless-sudo-unavailable guard), and empty-output, instead of
+  collapsing all three into the same "has membership been initialized?"
+  empty string.
+
+Verified: `cargo test -p rustynet-cli --features vm-lab --lib
+vm_lab::orchestrator::adapter` 268 passed; `xtask gates --skip-test -p
+rustynet-cli` green. This unblocks the macOS exit cell (and blind_exit under
+the same shape) for a live re-run — a lab task, not done here.
+
 ### 4.3 QH-39 / QH-40 / timeout-pair exercise in Cell 2 — none
 
 The run died before `enforce_baseline_runtime`, so `validate_baseline_runtime`

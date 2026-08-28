@@ -387,7 +387,18 @@ The fix is mechanical (correct the path constant; escalate with `sudo -n`). The 
 run cannot answer: does a fresh macOS install seed an owner key at all — the found file is a July
 leftover? Owner approves the fix and the seeding question's answer before the cell is re-run.
 
-Source: `MacCellsHarvest_2026-08-28.md` §4.1–§4.2. **Status: `pending`.**
+**DONE 2026-08-28.** Seeding question answered from code: yes — the macOS genesis
+(`ops e2e-bootstrap-host` → `execute_ops_e2e_bootstrap_macos` → `rustynetd membership init
+--owner-signing-key /usr/local/etc/rustynet/membership.owner.key`) writes the pubkey at
+`/usr/local/etc/rustynet/membership.owner.key.pub`; the Jul 9 `/etc/rustynet/...` file is a
+leftover. Fixed accordingly: `MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH` now equals
+`{MACOS_OWNER_SIGNING_KEY_PATH}.pub` (pinned by test to the genesis constant), and the read uses
+`sudo -n` with fail-loud classification — absent-file, unreadable/permission, and empty-output
+produce distinct non-empty errors instead of one silent empty string. Adapter tests + scoped
+gates green; macOS exit cell unblocked for live re-run (lab task, pending). See
+`MacCellsHarvest_2026-08-28.md` §4.2 disposition.
+
+Source: `MacCellsHarvest_2026-08-28.md` §4.1–§4.2. **Status: `done` (fix landed 2026-08-28; cell re-run pending).**
 
 ### 21. W-FIX-1/2/3 — Windows bootstrap triage: dispositions
 

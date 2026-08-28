@@ -3,8 +3,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::vm_lab::orchestrator::adapter::macos_install::{
-    MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH, MACOS_MEMBERSHIP_SNAPSHOT_PATH, MACOS_RUSTYNET_PATH,
-    MACOS_STATE_ROOT,
+    MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH, MACOS_MEMBERSHIP_SNAPSHOT_PATH,
+    MACOS_OWNER_SIGNING_KEY_PATH, MACOS_RUSTYNET_PATH, MACOS_STATE_ROOT,
 };
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
@@ -22,27 +22,90 @@ const MACOS_MEMBERSHIP_LOG_PATH: &str = "/usr/local/var/rustynet/membership/memb
 
 const MACOS_STAGING_DIR: &str = "/tmp/rustynet-staging";
 
-/// Read the membership owner public key from a macOS exit node.
-/// Reads `MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH` via SSH `cat`.
-pub fn issue_membership_owner_key(
-    conn: &NodeConnection,
-) -> Result<MembershipOwnerKey, AdapterError> {
-    let pem = ssh::run_remote(
-        conn,
-        &format!("cat '{MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH}' 2>/dev/null || echo ''"),
-        SHORT_TIMEOUT,
-    )?;
-    let pem = pem.trim().to_owned();
-    if pem.is_empty() {
+/// Marker the remote probe emits when the owner public key file does not
+/// exist at all (`membership init` never ran / genesis never seeded it).
+const OWNER_KEY_ABSENT_MARKER: &str = "__RN_OWNER_KEY_ABSENT__:";
+/// Marker the remote probe emits when the file exists but could not be read
+/// (permission, sudo refusal, I/O error) — a different failure than absent.
+const OWNER_KEY_READ_FAILED_MARKER: &str = "__RN_OWNER_KEY_READ_FAILED__:";
+
+/// Build the remote shell probe that reads the membership owner public key.
+///
+/// Fail-closed contract (MAC-D2): the probe NEVER collapses a failure into
+/// an empty string. It always exits 0 and reports its outcome on stdout:
+/// the key body on success, or one of the classification markers
+/// (`OWNER_KEY_ABSENT_MARKER` / `OWNER_KEY_READ_FAILED_MARKER`) with the
+/// path and the underlying error. The reads use `sudo -n` like the Linux
+/// twin — the key directory is root/0700 territory and the SSH user is
+/// unprivileged — and `sudo -n` itself failing (no passwordless sudo)
+/// lands in the read-failed branch rather than reading as "absent".
+fn owner_key_read_script(path: &str) -> String {
+    format!(
+        "if ! sudo -n true 2>/dev/null; then \
+             printf '%s{path} rc=0 passwordless sudo unavailable\\n' '{OWNER_KEY_READ_FAILED_MARKER}'; exit 0; \
+         fi; \
+         key=\"$(sudo -n cat '{path}' 2>/dev/null)\"; rc=$?; \
+         if [ \"$rc\" -eq 0 ] && [ -n \"$key\" ]; then printf '%s\\n' \"$key\"; exit 0; fi; \
+         if sudo -n test -e '{path}'; then \
+             detail=\"$(sudo -n cat '{path}' 2>&1 >/dev/null | head -1)\"; \
+             printf '%s{path} rc=%s %s\\n' '{OWNER_KEY_READ_FAILED_MARKER}' \"$rc\" \"$detail\"; exit 0; \
+         fi; \
+         printf '%s{path}\\n' '{OWNER_KEY_ABSENT_MARKER}'; exit 0",
+        path = path,
+        OWNER_KEY_READ_FAILED_MARKER = OWNER_KEY_READ_FAILED_MARKER,
+        OWNER_KEY_ABSENT_MARKER = OWNER_KEY_ABSENT_MARKER,
+    )
+}
+
+/// Classify the output of [`owner_key_read_script`]. Absent and unreadable
+/// produce DISTINCT, non-empty errors so a permission problem can never
+/// masquerade as "has membership been initialized?" again.
+fn interpret_owner_key_read(output: &str) -> Result<MembershipOwnerKey, AdapterError> {
+    let out = output.trim();
+    if out.is_empty() {
         return Err(AdapterError::Protocol {
-            message: "membership owner public key not found on remote; \
-                      has membership been initialized?"
+            message: "membership owner public key read produced no output on remote \
+                      (neither key nor failure marker); refusing to guess"
                 .to_owned(),
         });
     }
+    if let Some(path) = out.strip_prefix(OWNER_KEY_ABSENT_MARKER) {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "membership owner public key not found on remote at '{path}'; \
+                 has membership genesis been run? (rustynetd membership init \
+                 seeds it at {MACOS_OWNER_SIGNING_KEY_PATH}.pub)"
+            ),
+        });
+    }
+    if let Some(rest) = out.strip_prefix(OWNER_KEY_READ_FAILED_MARKER) {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "membership owner public key exists on remote but could not be read: {rest}"
+            ),
+        });
+    }
     Ok(MembershipOwnerKey {
-        public_key_pem: pem,
+        public_key_pem: out.to_owned(),
     })
+}
+
+/// Read the membership owner public key from a macOS exit node.
+///
+/// Reads `MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH` — exactly where the macOS
+/// genesis (`rustynetd membership init --owner-signing-key
+/// {MACOS_OWNER_SIGNING_KEY_PATH}`) writes the `.pub` sibling — via
+/// `sudo -n cat`. Absent-file and permission-denied are distinguished and
+/// both fail loud; neither is collapsed into an empty string.
+pub fn issue_membership_owner_key(
+    conn: &NodeConnection,
+) -> Result<MembershipOwnerKey, AdapterError> {
+    let output = ssh::run_remote(
+        conn,
+        &owner_key_read_script(MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH),
+        SHORT_TIMEOUT,
+    )?;
+    interpret_owner_key_read(&output)
 }
 
 /// Initialize the membership snapshot on a macOS exit node.
@@ -349,10 +412,94 @@ mod tests {
     }
 
     #[test]
-    fn membership_owner_pubkey_path_is_under_membership_dir() {
+    fn membership_owner_pubkey_path_matches_genesis_write_path() {
+        // `rustynetd membership init` writes the owner public key at
+        // "{--owner-signing-key}.pub"; the macOS genesis driver passes
+        // MACOS_OWNER_SIGNING_KEY_PATH. The adapter must read exactly where
+        // genesis writes — this pin keeps the two from drifting again
+        // (MAC-D2: the old constant guessed a STATE_ROOT location genesis
+        // never used).
+        assert_eq!(
+            MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH,
+            format!("{MACOS_OWNER_SIGNING_KEY_PATH}.pub"),
+            "pubkey path must be the .pub sibling of the genesis signing key path"
+        );
+        assert_eq!(
+            MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH,
+            "/usr/local/etc/rustynet/membership.owner.key.pub"
+        );
+    }
+
+    #[test]
+    fn owner_key_read_script_uses_sudo_n_and_names_the_path() {
+        let script = owner_key_read_script(MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH);
         assert!(
-            MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH.starts_with(MACOS_MEMBERSHIP_DIR),
-            "pubkey path must be under membership dir: {MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH}"
+            script.contains("sudo -n cat"),
+            "read must be privileged like the Linux twin: {script}"
+        );
+        assert!(
+            script.contains(MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH),
+            "script must name the canonical path: {script}"
+        );
+        // No bare `cat` without sudo escalation.
+        for line in script.lines() {
+            let trimmed = line.trim_start();
+            assert!(
+                !trimmed.starts_with("cat "),
+                "bare cat found; every read must be sudo -n: {trimmed}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_key_read_success_yields_key() {
+        let key = interpret_owner_key_read(
+            "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----\n",
+        )
+        .unwrap();
+        assert!(key.public_key_pem.contains("BEGIN PUBLIC KEY"));
+    }
+
+    #[test]
+    fn owner_key_absent_and_permission_denied_are_distinct_loud_errors() {
+        let absent = interpret_owner_key_read(&format!(
+            "{OWNER_KEY_ABSENT_MARKER}/usr/local/etc/rustynet/membership.owner.key.pub"
+        ))
+        .unwrap_err();
+        let denied = interpret_owner_key_read(&format!(
+            "{OWNER_KEY_READ_FAILED_MARKER}/usr/local/etc/rustynet/membership.owner.key.pub \
+             rc=1 cat: ...: Permission denied"
+        ))
+        .unwrap_err();
+
+        let absent_msg = absent.to_string();
+        let denied_msg = denied.to_string();
+        assert!(!absent_msg.is_empty() && !denied_msg.is_empty());
+        assert_ne!(
+            absent_msg, denied_msg,
+            "absent-file and permission-denied must never collapse to one error"
+        );
+        assert!(
+            absent_msg.contains("not found on remote"),
+            "absent error must say so: {absent_msg}"
+        );
+        assert!(
+            absent_msg.contains(MACOS_OWNER_SIGNING_KEY_PATH),
+            "absent error must point at the genesis seed path: {absent_msg}"
+        );
+        assert!(
+            denied_msg.contains("could not be read") && denied_msg.contains("Permission denied"),
+            "read-failed error must carry the underlying error: {denied_msg}"
+        );
+    }
+
+    #[test]
+    fn owner_key_empty_output_is_loud_not_initialization_hint() {
+        let err = interpret_owner_key_read("   \n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no output"),
+            "empty read must not read as 'not initialized': {msg}"
         );
     }
 
