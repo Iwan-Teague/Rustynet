@@ -192,23 +192,43 @@ pub const DEFAULT_STATE_PATH: &str = DEFAULT_WINDOWS_STATE_PATH;
 pub fn default_state_path() -> &'static str {
     DEFAULT_STATE_PATH
 }
-#[cfg(not(windows))]
+// macOS: the launchd plist passes `--trust-evidence/-verifier-key/-watermark`
+// under the installer's STATE_ROOT (`/usr/local/var/rustynet`, set at
+// `Install-RustyNetMacosService.sh:31`; flags at :425-430), so the default
+// must resolve there instead of inheriting the Linux paths.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = "/usr/local/var/rustynet/trust/rustynetd.trust";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = "/var/lib/rustynet/rustynetd.trust";
 #[cfg(windows)]
 pub const DEFAULT_TRUST_EVIDENCE_PATH: &str = DEFAULT_WINDOWS_TRUST_EVIDENCE_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_TRUST_VERIFIER_KEY_PATH: &str =
+    "/usr/local/var/rustynet/trust/trust-evidence.pub";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_TRUST_VERIFIER_KEY_PATH: &str = "/etc/rustynet/trust-evidence.pub";
 #[cfg(windows)]
 pub const DEFAULT_TRUST_VERIFIER_KEY_PATH: &str = DEFAULT_WINDOWS_TRUST_VERIFIER_KEY_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_TRUST_WATERMARK_PATH: &str =
+    "/usr/local/var/rustynet/trust/rustynetd.trust.watermark";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_TRUST_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.trust.watermark";
 #[cfg(windows)]
 pub const DEFAULT_TRUST_WATERMARK_PATH: &str = DEFAULT_WINDOWS_TRUST_WATERMARK_PATH;
-#[cfg(not(windows))]
+// macOS: membership snapshot/log/watermark live under
+// `${STATE_ROOT}/membership/` (installer `--membership-snapshot/-log/-watermark`
+// at `Install-RustyNetMacosService.sh:436-441`).
+#[cfg(target_os = "macos")]
+pub const DEFAULT_MEMBERSHIP_SNAPSHOT_PATH: &str =
+    "/usr/local/var/rustynet/membership/membership.snapshot";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_MEMBERSHIP_SNAPSHOT_PATH: &str = "/var/lib/rustynet/membership.snapshot";
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_SNAPSHOT_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = "/usr/local/var/rustynet/membership/membership.log";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = "/var/lib/rustynet/membership.log";
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH;
@@ -265,7 +285,10 @@ const ANCHOR_ENROLLMENT_REQUEST_LINE_BUDGET: Duration = Duration::from_secs(2);
 const ANCHOR_ENROLLMENT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(5);
 pub const ANCHOR_ENROLLMENT_ADDR_ENV: &str = "RUSTYNET_ANCHOR_ENROLLMENT_ADDR";
 pub const ANCHOR_ENROLLMENT_ALLOW_LAN_ENV: &str = "RUSTYNET_ANCHOR_ENROLLMENT_ALLOW_LAN";
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str =
+    "/usr/local/var/rustynet/membership/membership.watermark";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH;
@@ -274,16 +297,28 @@ pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = "/etc/rustynet/membe
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =
     DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH;
-#[cfg(not(windows))]
+// macOS: the auto-tunnel assignment bundle/verifier/watermark live under
+// `${STATE_ROOT}/trust/` (installer `--auto-tunnel-bundle/-verifier-key/-watermark`
+// at `Install-RustyNetMacosService.sh:445-450`).
+#[cfg(target_os = "macos")]
+pub const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str =
+    "/usr/local/var/rustynet/trust/rustynetd.assignment";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.assignment";
 #[cfg(windows)]
 pub const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str = DEFAULT_WINDOWS_AUTO_TUNNEL_BUNDLE_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH: &str =
+    "/usr/local/var/rustynet/trust/assignment.pub";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH: &str = "/etc/rustynet/assignment.pub";
 #[cfg(windows)]
 pub const DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH: &str =
     DEFAULT_WINDOWS_AUTO_TUNNEL_VERIFIER_KEY_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str =
+    "/usr/local/var/rustynet/trust/rustynetd.assignment.watermark";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.assignment.watermark";
 #[cfg(windows)]
@@ -294,24 +329,41 @@ const ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV: &str =
     "RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE";
 const RELAY_SESSION_LOCAL_TOKEN_ISSUER_ENV: &str = "RUSTYNET_RELAY_SESSION_LOCAL_TOKEN_ISSUER";
 const RELAY_SESSION_TOKEN_SPOOL_DIR_ENV: &str = "RUSTYNET_RELAY_SESSION_TOKEN_SPOOL_DIR";
-#[cfg(not(windows))]
+// macOS: traversal bundle/verifier/watermark live under `${STATE_ROOT}/trust/`
+// (installer `--traversal-bundle/-verifier-key/-watermark` at
+// `Install-RustyNetMacosService.sh:452-457`). Relay-fleet has NO plist flag yet
+// (plist wiring is audit follow-up #4); its macOS arm is the direct STATE_ROOT
+// equivalent of the Linux layout until that wiring lands.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_TRAVERSAL_BUNDLE_PATH: &str = "/usr/local/var/rustynet/trust/rustynetd.traversal";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_TRAVERSAL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.traversal";
 #[cfg(windows)]
 pub const DEFAULT_TRAVERSAL_BUNDLE_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_BUNDLE_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_RELAY_FLEET_BUNDLE_PATH: &str = "/usr/local/var/rustynet/rustynetd.relay-fleet";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_RELAY_FLEET_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.relay-fleet";
 #[cfg(windows)]
 pub const DEFAULT_RELAY_FLEET_BUNDLE_PATH: &str = DEFAULT_WINDOWS_RELAY_FLEET_BUNDLE_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH: &str = "/usr/local/var/rustynet/trust/traversal.pub";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH: &str = "/etc/rustynet/traversal.pub";
 #[cfg(windows)]
 pub const DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_VERIFIER_KEY_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str =
+    "/usr/local/var/rustynet/trust/rustynetd.traversal.watermark";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.traversal.watermark";
 #[cfg(windows)]
 pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_RELAY_FLEET_WATERMARK_PATH: &str =
+    "/usr/local/var/rustynet/rustynetd.relay-fleet.watermark";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_RELAY_FLEET_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.relay-fleet.watermark";
 #[cfg(windows)]
@@ -351,15 +403,25 @@ pub const GOSSIP_SIGNING_SECRET_PASSPHRASE_PATH_ENV: &str =
 pub(crate) const ENROLLMENT_SECRET_PATH_ENV: &str = "RUSTYNET_ENROLLMENT_SECRET";
 /// D2.7 — env var matching the `--enrollment-ledger` CLI flag.
 pub(crate) const ENROLLMENT_LEDGER_PATH_ENV: &str = "RUSTYNET_ENROLLMENT_LEDGER";
-#[cfg(not(windows))]
+// macOS: the dns-zone bundle/verifier/watermark live under `${STATE_ROOT}/trust/`
+// (installer `--dns-zone-bundle/-verifier-key/-watermark` at
+// `Install-RustyNetMacosService.sh:460-465`).
+#[cfg(target_os = "macos")]
+pub const DEFAULT_DNS_ZONE_BUNDLE_PATH: &str = "/usr/local/var/rustynet/trust/rustynetd.dns-zone";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_DNS_ZONE_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.dns-zone";
 #[cfg(windows)]
 pub const DEFAULT_DNS_ZONE_BUNDLE_PATH: &str = DEFAULT_WINDOWS_DNS_ZONE_BUNDLE_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH: &str = "/usr/local/var/rustynet/trust/dns-zone.pub";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH: &str = "/etc/rustynet/dns-zone.pub";
 #[cfg(windows)]
 pub const DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH: &str = DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_DNS_ZONE_WATERMARK_PATH: &str =
+    "/usr/local/var/rustynet/trust/rustynetd.dns-zone.watermark";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_DNS_ZONE_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.dns-zone.watermark";
 #[cfg(windows)]
 pub const DEFAULT_DNS_ZONE_WATERMARK_PATH: &str = DEFAULT_WINDOWS_DNS_ZONE_WATERMARK_PATH;
@@ -384,20 +446,37 @@ const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_ATTEMPTS: usize = 10;
 const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS: u64 = 100;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
-#[cfg(not(windows))]
+// macOS WireGuard key custody (installer `--wg-private-key` at
+// `Install-RustyNetMacosService.sh:467-475`, `--wg-public-key` at :477-478,
+// encrypted-key/passphrase fragment at :299-319): the runtime key lives in the
+// ephemeral `/private/var/run/rustynet` dir (macos_key_custody forbids a
+// plaintext private key at rest); the encrypted key + public key live under
+// `${STATE_ROOT}/keys/`; the passphrase deliberately lives in the bootstrap dir
+// (NOT `keys/`, so the custody check never flags it as plaintext key material).
+#[cfg(target_os = "macos")]
+pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/private/var/run/rustynet/wireguard.key";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = "/run/rustynet/wireguard.key";
 #[cfg(windows)]
 pub const DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH: &str = DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str =
+    "/usr/local/var/rustynet/keys/wireguard.key.enc";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.key.enc";
 #[cfg(windows)]
 pub const DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str =
     DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str =
+    "/usr/local/var/rustynet/bootstrap/wireguard.passphrase";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str = "/var/lib/rustynet/keys/wireguard.passphrase";
 #[cfg(windows)]
 pub const DEFAULT_WG_KEY_PASSPHRASE_PATH: &str = DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = "/usr/local/var/rustynet/keys/wireguard.pub";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.pub";
 #[cfg(windows)]
 pub const DEFAULT_WG_PUBLIC_KEY_PATH: &str = DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH;
@@ -35828,6 +35907,251 @@ mod tests {
             !NodeRole::BlindExit.allows_command(&IpcCommand::MembershipApply {
                 signed_update_wire: Vec::new()
             })
+        );
+    }
+
+    // MacosPathConstantAudit_2026-08-28 follow-up #1: every daemon default
+    // path constant must resolve to the macOS installer's layout on macOS and
+    // keep the historical Linux value on Linux (mutation guards in the same
+    // spirit as the `macos_default_state_path_*` / `linux_default_state_path_*`
+    // pair in `shutdown_residue.rs`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_trust_paths_match_installer_layout() {
+        assert_eq!(
+            super::DEFAULT_TRUST_EVIDENCE_PATH,
+            "/usr/local/var/rustynet/trust/rustynetd.trust"
+        );
+        assert_eq!(
+            super::DEFAULT_TRUST_VERIFIER_KEY_PATH,
+            "/usr/local/var/rustynet/trust/trust-evidence.pub"
+        );
+        assert_eq!(
+            super::DEFAULT_TRUST_WATERMARK_PATH,
+            "/usr/local/var/rustynet/trust/rustynetd.trust.watermark"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_trust_paths_are_unchanged() {
+        assert_eq!(
+            super::DEFAULT_TRUST_EVIDENCE_PATH,
+            "/var/lib/rustynet/rustynetd.trust"
+        );
+        assert_eq!(
+            super::DEFAULT_TRUST_VERIFIER_KEY_PATH,
+            "/etc/rustynet/trust-evidence.pub"
+        );
+        assert_eq!(
+            super::DEFAULT_TRUST_WATERMARK_PATH,
+            "/var/lib/rustynet/rustynetd.trust.watermark"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_membership_paths_match_installer_layout() {
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
+            "/usr/local/var/rustynet/membership/membership.snapshot"
+        );
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_LOG_PATH,
+            "/usr/local/var/rustynet/membership/membership.log"
+        );
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_WATERMARK_PATH,
+            "/usr/local/var/rustynet/membership/membership.watermark"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_membership_paths_are_unchanged() {
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
+            "/var/lib/rustynet/membership.snapshot"
+        );
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_LOG_PATH,
+            "/var/lib/rustynet/membership.log"
+        );
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_WATERMARK_PATH,
+            "/var/lib/rustynet/membership.watermark"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_auto_tunnel_paths_match_installer_layout() {
+        assert_eq!(
+            super::DEFAULT_AUTO_TUNNEL_BUNDLE_PATH,
+            "/usr/local/var/rustynet/trust/rustynetd.assignment"
+        );
+        assert_eq!(
+            super::DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH,
+            "/usr/local/var/rustynet/trust/assignment.pub"
+        );
+        assert_eq!(
+            super::DEFAULT_AUTO_TUNNEL_WATERMARK_PATH,
+            "/usr/local/var/rustynet/trust/rustynetd.assignment.watermark"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_auto_tunnel_paths_are_unchanged() {
+        assert_eq!(
+            super::DEFAULT_AUTO_TUNNEL_BUNDLE_PATH,
+            "/var/lib/rustynet/rustynetd.assignment"
+        );
+        assert_eq!(
+            super::DEFAULT_AUTO_TUNNEL_VERIFIER_KEY_PATH,
+            "/etc/rustynet/assignment.pub"
+        );
+        assert_eq!(
+            super::DEFAULT_AUTO_TUNNEL_WATERMARK_PATH,
+            "/var/lib/rustynet/rustynetd.assignment.watermark"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_traversal_paths_match_installer_layout() {
+        assert_eq!(
+            super::DEFAULT_TRAVERSAL_BUNDLE_PATH,
+            "/usr/local/var/rustynet/trust/rustynetd.traversal"
+        );
+        assert_eq!(
+            super::DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH,
+            "/usr/local/var/rustynet/trust/traversal.pub"
+        );
+        assert_eq!(
+            super::DEFAULT_TRAVERSAL_WATERMARK_PATH,
+            "/usr/local/var/rustynet/trust/rustynetd.traversal.watermark"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_traversal_paths_are_unchanged() {
+        assert_eq!(
+            super::DEFAULT_TRAVERSAL_BUNDLE_PATH,
+            "/var/lib/rustynet/rustynetd.traversal"
+        );
+        assert_eq!(
+            super::DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH,
+            "/etc/rustynet/traversal.pub"
+        );
+        assert_eq!(
+            super::DEFAULT_TRAVERSAL_WATERMARK_PATH,
+            "/var/lib/rustynet/rustynetd.traversal.watermark"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_dns_zone_paths_match_installer_layout() {
+        assert_eq!(
+            super::DEFAULT_DNS_ZONE_BUNDLE_PATH,
+            "/usr/local/var/rustynet/trust/rustynetd.dns-zone"
+        );
+        assert_eq!(
+            super::DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH,
+            "/usr/local/var/rustynet/trust/dns-zone.pub"
+        );
+        assert_eq!(
+            super::DEFAULT_DNS_ZONE_WATERMARK_PATH,
+            "/usr/local/var/rustynet/trust/rustynetd.dns-zone.watermark"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_dns_zone_paths_are_unchanged() {
+        assert_eq!(
+            super::DEFAULT_DNS_ZONE_BUNDLE_PATH,
+            "/var/lib/rustynet/rustynetd.dns-zone"
+        );
+        assert_eq!(
+            super::DEFAULT_DNS_ZONE_VERIFIER_KEY_PATH,
+            "/etc/rustynet/dns-zone.pub"
+        );
+        assert_eq!(
+            super::DEFAULT_DNS_ZONE_WATERMARK_PATH,
+            "/var/lib/rustynet/rustynetd.dns-zone.watermark"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_wireguard_custody_paths_match_installer_layout() {
+        assert_eq!(
+            super::DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
+            "/private/var/run/rustynet/wireguard.key"
+        );
+        assert_eq!(
+            super::DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+            "/usr/local/var/rustynet/keys/wireguard.key.enc"
+        );
+        assert_eq!(
+            super::DEFAULT_WG_KEY_PASSPHRASE_PATH,
+            "/usr/local/var/rustynet/bootstrap/wireguard.passphrase"
+        );
+        assert_eq!(
+            super::DEFAULT_WG_PUBLIC_KEY_PATH,
+            "/usr/local/var/rustynet/keys/wireguard.pub"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_wireguard_custody_paths_are_unchanged() {
+        assert_eq!(
+            super::DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
+            "/run/rustynet/wireguard.key"
+        );
+        assert_eq!(
+            super::DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+            "/var/lib/rustynet/keys/wireguard.key.enc"
+        );
+        assert_eq!(
+            super::DEFAULT_WG_KEY_PASSPHRASE_PATH,
+            "/var/lib/rustynet/keys/wireguard.passphrase"
+        );
+        assert_eq!(
+            super::DEFAULT_WG_PUBLIC_KEY_PATH,
+            "/var/lib/rustynet/keys/wireguard.pub"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_relay_fleet_paths_are_state_root_equivalents() {
+        // No plist flag wires these yet (audit follow-up #4); the macOS arm is
+        // the direct STATE_ROOT equivalent of the Linux layout.
+        assert_eq!(
+            super::DEFAULT_RELAY_FLEET_BUNDLE_PATH,
+            "/usr/local/var/rustynet/rustynetd.relay-fleet"
+        );
+        assert_eq!(
+            super::DEFAULT_RELAY_FLEET_WATERMARK_PATH,
+            "/usr/local/var/rustynet/rustynetd.relay-fleet.watermark"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_relay_fleet_paths_are_unchanged() {
+        assert_eq!(
+            super::DEFAULT_RELAY_FLEET_BUNDLE_PATH,
+            "/var/lib/rustynet/rustynetd.relay-fleet"
+        );
+        assert_eq!(
+            super::DEFAULT_RELAY_FLEET_WATERMARK_PATH,
+            "/var/lib/rustynet/rustynetd.relay-fleet.watermark"
         );
     }
 }
