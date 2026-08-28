@@ -38,7 +38,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::host::{CHECK_PASS, ScenarioHost, all_pass};
+use super::host::{ScenarioHost, all_pass};
 use super::{Checks, ScenarioOutcome, Verdict};
 
 /// The three `rustynetd` required tests that together prove signed-traversal
@@ -294,7 +294,7 @@ fn path_arg(path: &Path) -> String {
 /// tests to build fixtures without importing the host module.
 #[cfg(test)]
 fn pass_values(count: usize) -> Vec<String> {
-    vec![CHECK_PASS.to_owned(); count]
+    vec![super::host::CHECK_PASS.to_owned(); count]
 }
 
 #[cfg(test)]

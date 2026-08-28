@@ -43,17 +43,26 @@ use std::fmt;
 
 use super::substrate::{LeafOutput, NetLeafRunner};
 
+pub mod direct_remote_exit;
 pub mod host;
+pub mod provisioning;
 pub mod traversal_adversarial;
 
 // CN-3 is landing scenario-by-scenario: a ported scenario has its dispatch arm
-// repointed here and its bin + bash script deleted in the same commit, while
-// the scenarios below still run through the legacy `cargo run --bin` path. The
-// module list grows as each one lands, so at no point is there a scenario that
-// is neither fully ported nor fully on the old path.
+// repointed here and its bin deleted in the same commit, while the scenarios
+// below still run through the legacy `cargo run --bin` path. The module list
+// grows as each one lands, so at no point is there a scenario that is neither
+// fully ported nor fully on the old path.
 //
 // Not yet ported: relay_remote_exit, node_network_switch, failback_roaming,
 // controller_switch, remote_exit_dns, remote_exit_soak.
+//
+// Script deletion lags bin deletion for `direct_remote_exit` specifically.
+// `scripts/e2e/live_linux_cross_network_{remote_exit_dns,node_network_switch,
+// remote_exit_soak}_test.sh` each invoke the direct remote-exit *script*
+// directly to establish their baseline, so deleting it before those three are
+// ported would break them. Its `[[bin]]` shim has no such consumer and is gone;
+// the script dies with the last of its three bash callers.
 
 /// Verdict of one named check inside a scenario report. The shell modelled
 /// these as `CHECK_*` string variables holding `"pass"` / `"fail"`, defaulted

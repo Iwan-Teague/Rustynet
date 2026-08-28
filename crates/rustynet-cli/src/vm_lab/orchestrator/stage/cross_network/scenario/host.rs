@@ -63,17 +63,45 @@ pub trait ScenarioHost {
         report_path: &Path,
         checks: &[&str],
     ) -> Result<Vec<String>, String>;
+
+    /// Write one of the scenario's own text artifacts to `path`, creating its
+    /// parent directory. The shell wrote these with `printf … > "$path"` from
+    /// inside the validator; they are part of the evidence the report declares,
+    /// so a scenario that cannot write one has not produced its evidence and
+    /// the failure is propagated rather than swallowed.
+    fn write_artifact(&self, path: &Path, contents: &str) -> Result<(), String>;
 }
 
 /// The production [`ScenarioHost`]: real subprocesses, real filesystem, and the
 /// in-process report reader.
 pub struct LocalScenarioHost {
     repo_root: PathBuf,
+    /// Forwarded to a sibling validator as `LIVE_LAB_PINNED_KNOWN_HOSTS_FILE`.
+    /// The siblings drive their own ssh transport and read the pin from the
+    /// environment, exactly as the shell exported it before invoking them.
+    known_hosts_file: Option<PathBuf>,
+    /// Forwarded as `RUSTYNET_EXPECTED_GIT_COMMIT`; the siblings stamp it into
+    /// the reports the cross-network report validator later checks.
+    expected_git_commit: Option<String>,
 }
 
 impl LocalScenarioHost {
     pub fn new(repo_root: PathBuf) -> Self {
-        Self { repo_root }
+        Self {
+            repo_root,
+            known_hosts_file: None,
+            expected_git_commit: None,
+        }
+    }
+
+    pub fn with_known_hosts_file(mut self, known_hosts_file: Option<PathBuf>) -> Self {
+        self.known_hosts_file = known_hosts_file;
+        self
+    }
+
+    pub fn with_expected_git_commit(mut self, expected_git_commit: Option<String>) -> Self {
+        self.expected_git_commit = expected_git_commit;
+        self
     }
 
     /// Run `command`, mapping a spawn failure to `Err` and the process's own
@@ -113,11 +141,30 @@ impl ScenarioHost for LocalScenarioHost {
                 "--",
             ])
             .args(args);
+        if let Some(known_hosts) = self.known_hosts_file.as_deref() {
+            command.env("LIVE_LAB_PINNED_KNOWN_HOSTS_FILE", known_hosts);
+        }
+        if let Some(commit) = self.expected_git_commit.as_deref() {
+            command.env("RUSTYNET_EXPECTED_GIT_COMMIT", commit);
+        }
         self.status_of(command, bin)
     }
 
     fn report_exists(&self, report_path: &Path) -> bool {
         report_path.is_file()
+    }
+
+    fn write_artifact(&self, path: &Path, contents: &str) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create artifact directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(path, contents)
+            .map_err(|err| format!("failed to write artifact {}: {err}", path.display()))
     }
 
     fn read_report_checks(
@@ -193,6 +240,10 @@ pub(crate) mod recording {
             report_path: PathBuf,
             checks: Vec<String>,
         },
+        WriteArtifact {
+            path: PathBuf,
+            contents: String,
+        },
     }
 
     /// Scriptable in-memory [`ScenarioHost`] for scenario unit tests.
@@ -213,6 +264,8 @@ pub(crate) mod recording {
         pub report_checks: BTreeMap<PathBuf, Vec<String>>,
         /// Report paths whose read fails outright.
         pub report_read_errors: Vec<PathBuf>,
+        /// Artifact paths whose write fails outright.
+        pub artifact_write_errors: Vec<PathBuf>,
     }
 
     impl RecordingHost {
@@ -275,6 +328,17 @@ pub(crate) mod recording {
                 .unwrap_or_default();
             values.resize(checks.len(), CHECK_FAIL.to_owned());
             Ok(values)
+        }
+
+        fn write_artifact(&self, path: &Path, contents: &str) -> Result<(), String> {
+            self.record(HostCall::WriteArtifact {
+                path: path.to_path_buf(),
+                contents: contents.to_owned(),
+            });
+            if self.artifact_write_errors.iter().any(|p| p == path) {
+                return Err(format!("mock: cannot write {}", path.display()));
+            }
+            Ok(())
         }
     }
 }

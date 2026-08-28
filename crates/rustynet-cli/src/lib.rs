@@ -69,15 +69,17 @@ mod live_lab_stage_registry;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
 mod live_lab_stage_triage;
-#[cfg(feature = "vm-lab")]
-#[allow(dead_code)]
 /// Cross-network report generation and reading. Declared here as well as in
 /// `main.rs` (the established pattern in this crate) so the orchestrator's
 /// CN-3 scenario functions can read a sibling validator's evidence IN-PROCESS
 /// rather than shelling out to `cargo run … ops read-cross-network-report-fields`
 /// — a subprocess built without the `vm-lab` feature lacks that verb, which
 /// silently turned passing assertions into a FAIL.
+#[cfg(feature = "vm-lab")]
+#[allow(dead_code)]
 mod ops_cross_network_reports;
+#[cfg(feature = "vm-lab")]
+#[allow(dead_code)]
 mod ops_e2e;
 // `pub` so the standalone `live_*` stage binaries can call the report writers
 // IN-PROCESS. They used to shell out via `cargo run -p rustynet-cli -- ops …`,
