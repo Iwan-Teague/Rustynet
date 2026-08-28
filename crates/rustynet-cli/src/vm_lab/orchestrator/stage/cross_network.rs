@@ -582,7 +582,10 @@ fn run_ported_scenario_profile(
     // Only the relay scenarios resolve a relay, and only the adversarial one a
     // probe. Building either unconditionally would open an ssh transport to a
     // node the scenario never touches.
-    let needs_relay = matches!(kind, CrossNetworkStageKind::RelayRemoteExit);
+    let needs_relay = matches!(
+        kind,
+        CrossNetworkStageKind::RelayRemoteExit | CrossNetworkStageKind::FailbackRoaming
+    );
     let needs_probe = matches!(kind, CrossNetworkStageKind::TraversalAdversarial);
     let client_remote = match remote_host_for_role(ctx, "client") {
         Ok(host) => host,
@@ -707,6 +710,17 @@ fn run_ported_scenario_profile(
                 &inputs,
                 &lab,
                 scenario::node_network_switch::NodeNetworkSwitchOptions::default(),
+            ),
+        ),
+        // Same reasoning as the node-switch arm: the SLO and iteration count
+        // were flags no orchestrator call site ever passed.
+        CrossNetworkStageKind::FailbackRoaming => (
+            scenario::failback_roaming::SUITE,
+            scenario::failback_roaming::run(
+                &host,
+                &inputs,
+                &lab,
+                scenario::failback_roaming::FailbackRoamingOptions::default(),
             ),
         ),
         // The adversarial scenario runs no remote commands of its own — it
@@ -925,10 +939,7 @@ fn add_common_hosts(
         .arg("--known-hosts-file")
         .arg(&topology.client.known_hosts);
 
-    if matches!(
-        kind,
-        CrossNetworkStageKind::FailbackRoaming | CrossNetworkStageKind::ControllerSwitch
-    ) {
+    if matches!(kind, CrossNetworkStageKind::ControllerSwitch) {
         cmd.arg("--relay-host")
             .arg(&topology.relay.target)
             .arg("--relay-node-id")
@@ -940,7 +951,6 @@ fn add_common_hosts(
 
 fn bin_name(kind: CrossNetworkStageKind) -> &'static str {
     match kind {
-        CrossNetworkStageKind::FailbackRoaming => "live_linux_cross_network_failback_roaming_test",
         CrossNetworkStageKind::ControllerSwitch => {
             "live_linux_cross_network_controller_switch_test"
         }
@@ -954,6 +964,7 @@ fn bin_name(kind: CrossNetworkStageKind) -> &'static str {
         | CrossNetworkStageKind::RelayRemoteExit
         | CrossNetworkStageKind::TraversalAdversarial
         | CrossNetworkStageKind::NodeNetworkSwitch
+        | CrossNetworkStageKind::FailbackRoaming
         | CrossNetworkStageKind::Preflight
         | CrossNetworkStageKind::NatClassification
         | CrossNetworkStageKind::NatMatrix => unreachable!("no script for this stage kind"),

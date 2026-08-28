@@ -46,6 +46,7 @@ use super::substrate::{LeafOutput, NetLeafRunner};
 pub mod baseline;
 pub mod direct_remote_exit;
 pub mod endpoint_switch;
+pub mod failback_roaming;
 pub mod host;
 pub mod node_network_switch;
 pub mod provisioning;
@@ -552,9 +553,18 @@ pub fn exit_serving_route(status_output: &str) -> bool {
     status_output.contains("serving_exit_node=true")
 }
 
-/// The client's route to the internet leaves via the tunnel interface.
+/// The tunnel interface every lab node brings up.
+pub const TUNNEL_INTERFACE: &str = "rustynet0";
+
+/// The client's route to the internet names the tunnel interface.
+///
+/// Note this asks whether the tunnel is named, NOT whether it is the only
+/// device named — see
+/// [`endpoint_switch::route_leaves_non_tunnel_dev`](endpoint_switch::route_leaves_non_tunnel_dev)
+/// for the stricter reading the failback scenario samples with, and why the two
+/// coexist.
 pub fn route_via_rustynet(route_output: &str) -> bool {
-    route_output.contains("dev rustynet0")
+    route_output.contains(&format!("dev {TUNNEL_INTERFACE}"))
 }
 
 /// The exit's nftables ruleset carries a masquerade rule, i.e. NAT is actually
