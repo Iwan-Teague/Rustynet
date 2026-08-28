@@ -119,6 +119,20 @@ pub fn menu_tree(role: NodeRole) -> MenuTree {
                 item("0", "Exit", MenuAction::Quit),
             ],
         },
+        NodeRole::BlindRelay => MenuTree {
+            // BlindRelayRoleDesign §4.2: the blind relay console is
+            // read-only status visibility — no trust refresh, no
+            // disconnect cleanup, no config writes from this menu.
+            title: "Rustynet Blind Relay Console",
+            items: vec![
+                item("1", "Status", MenuAction::Status),
+                item("2", "Netcheck", MenuAction::Netcheck),
+                item("3", "Service status", MenuAction::ServiceStatus),
+                item("4", "Doctor", MenuAction::Doctor),
+                item("5", "Role status", MenuAction::ShowRoleStatus),
+                item("0", "Exit", MenuAction::Quit),
+            ],
+        },
     }
 }
 
@@ -164,5 +178,29 @@ mod tests {
                 .iter()
                 .any(|item| item.action == MenuAction::SelectExitNode)
         );
+    }
+
+    #[test]
+    fn blind_relay_menu_is_read_only_status_visibility() {
+        // BlindRelayRoleDesign §4.2: small command surface for the
+        // dedicated blind-relay role — status visibility only, no
+        // trust refresh, no connection toggles, no config writes.
+        let tree = menu_tree(NodeRole::BlindRelay);
+        let allowed = [
+            MenuAction::Status,
+            MenuAction::Netcheck,
+            MenuAction::ServiceStatus,
+            MenuAction::Doctor,
+            MenuAction::ShowRoleStatus,
+            MenuAction::Quit,
+        ];
+        assert_eq!(tree.items.len(), allowed.len());
+        for item in tree.items.iter() {
+            assert!(
+                allowed.contains(&item.action),
+                "blind relay menu must not expose {:?}",
+                item.action
+            );
+        }
     }
 }

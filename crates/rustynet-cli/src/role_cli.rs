@@ -527,6 +527,9 @@ pub fn resolve_preset_from_status(status_line: &str) -> Result<RolePreset, RoleC
 pub fn resolve_preset_from_parts(primary: PrimaryRole, serving_exit: bool) -> RolePreset {
     match (primary, serving_exit) {
         (PrimaryRole::BlindExit, _) => RolePreset::BlindExit,
+        // Blind relay is its own primary role (BlindRelayRoleDesign
+        // §4.2): resolve directly regardless of exit-serving state.
+        (PrimaryRole::BlindRelay, _) => RolePreset::BlindRelay,
         (PrimaryRole::Admin, true) => RolePreset::Exit,
         (PrimaryRole::Admin, false) => RolePreset::Admin,
         (PrimaryRole::Client, _) => RolePreset::Client,
