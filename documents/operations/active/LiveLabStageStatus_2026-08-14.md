@@ -4,18 +4,23 @@
 and what has never been exercised. Every figure comes from a stage's own report artifact, never from
 a ledger column (§12.3 explains why the columns lie in both directions).
 
-Latest run: `qh46-firewalld-20260814c` → `qh51-keepalive-applied-20260814i`
-(`artifacts/live_lab/`). Topology: 5 nodes, **all Linux**.
+Latest run: `qh61-sudopath-20260816b` → `livelab-1787913512-a5e93c8dd781` (2026-08-28; Runs 45–48
+below). The Linux topology is 5 nodes; macOS was elected into two focused cells on 2026-08-28;
+Windows has never been elected.
 
 ---
 
 ## The one-line answer
 
-**Linux: 35 of 36 reachable stages pass. macOS and Windows: NOT EXERCISED AT ALL.**
+**Linux: 44 of 44 runnable stages pass — zero-failure end to end (first on 2026-08-16, re-proven
+2026-08-28, Run 45). macOS: elected for the first time on 2026-08-28 — anchor and exit cells both
+🔴 blocked with located blockers (Runs 47/48). Windows: never elected; bootstrap root-caused,
+fixes landed, guest currently unreachable.**
 
-The headline number (35/59) is a **Linux-only** result. It says nothing about cross-platform parity,
-which remains the larger release blocker per
-`CrossPlatformRoleParityPlan_2026-06-21.md`.
+The Linux figure is a **Linux-only** result. It says nothing about cross-platform parity, which
+remains the larger release blocker per
+`CrossPlatformRoleParityPlan_2026-06-21.md` — but parity now has its first `--node`-engine data
+points, and neither mac cell is green.
 
 ---
 
@@ -23,12 +28,16 @@ which remains the larger release blocker per
 
 | OS | Nodes in topology | Stages run | Status |
 | --- | --- | --- | --- |
-| **Linux** | 5 (Debian 13 ×2, Fedora 44, Rocky 10.2, Ubuntu 26.04) | 36 reachable | **35 pass / 1 fail** |
-| **macOS** | **0** | **0** | **UNPROVEN — not in topology, stages never appear** |
-| **Windows** | **0** | **0** | **UNPROVEN — not in topology, stages never appear** |
+| **Linux** | 5 (Debian 13 ×2, Fedora 44, Rocky 10.2, Ubuntu 26.04) | 44 runnable / 17 honest skips | **44 pass / 0 fail** (Run 45, 2026-08-28) |
+| **macOS** | 1 (elected 2026-08-28, focused cells) | 2 cells ran; 0 macOS role stages green | **🔴 BLOCKED** — anchor: posture gate circular (`role.rs:68-70`) + needs `--anchor-platform macos`; exit: membership owner-key path defect (`macos_membership.rs:29-34`). Runs 47/48. |
+| **Windows** | **0** | **0** | **NOT ELECTED** — `windows_stage_bootstrap` gates all; root-caused 2026-08-28 (winget Configuration, code primary); W-FIX-1/2/3 landed; guest currently has no remote management path. See the Windows section. |
 
-The macOS and Windows stages are **not among the 23 skips**. They are absent entirely, because no
-node of that platform was elected. Do not read "23 skipped" as covering them.
+*(Corrected 2026-08-28. The 2026-08-14 original read: Linux 35/36 reachable, 35 pass / 1 fail;
+macOS and Windows "UNPROVEN — not in topology, stages never appear".)*
+
+The macOS and Windows stages are still **not among the Linux runs' skips** — without a platform node
+elected they are not planned at all, so do not read the 17 skipped as covering them. macOS's first
+appearances came from its own focused elections (Runs 47/48); Windows stages remain absent entirely.
 
 ### The 23 Linux skips
 
@@ -38,6 +47,10 @@ node of that platform was elected. Do not read "23 skipped" as covering them.
 | Role not elected | 4 | `blind_exit` (×2), `anchor`, `admin` — no node in this topology holds them. Not defects; needs a topology that elects them. |
 
 Fixing the one failure should unblock ~19 stages, taking Linux to roughly 54/59.
+
+*(Resolution 2026-08-16/28: it did. Run 44 reached 44 pass / 0 fail with every skip
+topology-conditional, and Run 45 re-proved it at 44/0/17 on the larger 61-stage plan. This section
+describes the 2026-08-14 cascade and is retained for the record.)*
 
 ---
 
@@ -60,6 +73,18 @@ All seven are mutation-proven (the test was shown to fail when the fix is revert
 ## NOT WORKING — open
 
 ### `live_network_flap_validation` (Linux) — the only failing stage
+
+> **RESOLVED — superseded 2026-08-15 and 2026-08-27; everything below is retained for the record and
+> nothing in it is open.** The stage PASSED for the first time in `--node` history on Run 41, and has
+> passed every run since (including Run 45). QH-51 was resolved by measurement, not another patch: a
+> packet-level capture on live guests (`NetworkFlapHandshakeCapture_2026-08-27.md`, main `4b0d18aa`)
+> shows 4/4 flap cycles recovering in 8s — the peer keeps sending WG handshake initiations through
+> the whole blackout and the first one after the block lifts is answered within milliseconds, data
+> crossing seconds later. The historical `recovery_arrived=false` signature is explained by the
+> since-fixed instruments (hypothesis 8's stamp-based recovery oracle, plus a broken ENTRY
+> underneath the probe: QH-46's firewalld reject, then the QH-53 restart race) and the QH-04
+> reconcile rework. No assertion was widened; the data-crossing recovery check is stricter than the
+> stamp it replaced.
 
 3 of its 4 checks pass. `recovery_arrived=false`: after the block lifts, the handshake metric never
 refreshes inside the 180s poll, while `tunnel_active=true` and `membership_intact=true`.
@@ -128,24 +153,31 @@ Also note the daemon is UNREACHABLE after the run (`/run/rustynet/rustynetd.sock
 `final_cleanup` is `always_run`), so this cannot be sampled retroactively. It must run mid-stage or
 not at all.
 
-### Cross-platform — the larger blocker, untouched
+### Cross-platform — the larger blocker
 
 `CrossPlatformRoleParityPlan_2026-06-21.md` requires every role live-proven on **macOS AND Windows**,
-not just Linux. Nothing in this session addressed that. Specifically open:
+not just Linux. **Updated 2026-08-28: the frontier moved.** macOS anchor and exit were elected for
+the first time (Runs 47/48 — both 🔴 blocked with located blockers), and the Windows bootstrap
+failure was root-caused with its first three fixes landed (see the Windows section below). Still open:
 
-* **macOS/Windows stages have never run in this topology** — elect nodes of those platforms to find
-  out where they stand.
+* **Windows stages have never run** — no node elected; the cell is gated at bootstrap and the guest
+  currently has no remote management path at all.
+* **macOS anchor is not green**: the posture gate is circular as written (`role.rs:68-70`), and the
+  macOS-specific anchor validator set needs the `--anchor-platform macos` selector plus a full-suite
+  run; the exit/blind_exit cells additionally need the membership adapter's owner-key path fixed.
 * **`userspace_shared_macos` may need the QH-51c/d fixes mirrored.** The session-rebuild and roaming
   fixes landed in `userspace_shared`; macOS has its own variant. NOT checked — do this before
-  assuming macOS benefits from tonight's work.
+  assuming macOS benefits from the QH-51 work. (Still unexamined as of 2026-08-28.)
 * **QH-46's Windows analogue is unexamined.** firewalld is RHEL-specific, but the defect CLASS —
   a foreign filter at the same hook silently discarding traffic we authorised — has an obvious
-  Windows counterpart in WFP filter weights. Nobody has looked.
+  Windows counterpart in WFP filter weights. Nobody has looked. (The CP-4 triage did not examine
+  it either.)
 
 ### Also open (filed, not fixed)
 
 * **QH-47** — nothing flushes conntrack when NAT rules change; affects any node gaining an exit/relay
-  role while traffic flows.
+  role while traffic flows. *(Updated 2026-08-28: FIXED on Linux — a `linux-conntrack-flush` helper
+  builtin, unit- and mutation-tested; LIVE PROOF OUTSTANDING.)*
 * **QH-48** — the live suite is a strictly linear dependency chain, so one failure blocks ~19 stages
   and a 17-minute run surfaces at most one defect.
 
@@ -292,3 +324,130 @@ The first zero-failure run in the `--node` engine's recorded history, on main at
 The Linux live suite on this five-guest topology is, for the first time, fully green end to end.
 The remaining frontier is exactly the parity mandate: elect macOS and Windows nodes and drive the
 same suite through the mixed and cross-network stages.
+
+## Run 45 (`livelab-1787906534-877a0226693c`) — 2026-08-28: zero failures re-proven; six historical offenders green together
+
+44 pass / 0 fail / 17 skipped on main at `877a0226693c` (branch `work/live-validate2`, clean; ledger
+row 186; window 08:21:01Z→08:42:14Z). Topology: ubuntu-utm-1:client, rocky-utm-1:admin,
+debian-headless-4:exit, fedora-utm-1:relay, debian-headless-2:anchor; profile `mgmt_shared_smoke_v1`.
+This ties the all-time high set by Run 44 — on a larger plan: 61 planned stages (17 skips, up from
+15 — the two new `cross_network_substrate_setup`/`teardown` scaffolding stages, both pass). Zero
+per-stage flips against the night's baseline `livelab-1787825655-3afd39b18164`; the result is purely
+additive. (It was the night's fourth attempt: attempt 1 was refused by the fail-closed stage-triage
+gate on an undispositioned stub; attempt 2 `livelab-1787903378-068b29ebc54b` ran but failed at
+`bootstrap_hosts` on debian-headless-2 — the one guest its remedy never touched, via a stale
+`/etc/default/rustynetd` pinning `RUSTYNET_EGRESS_INTERFACE=rustynet-vx0`; attempt 3 failed
+preflight.)
+
+The run's real news (`LiveValidation_2026-08-28.md` §11.3): **six stages that historically failed
+are green together for the first time**, each against its recorded remedy — `traffic_test_matrix`
+(six null-patch stubs in late July), `live_managed_dns_validation` (four stubs),
+`live_network_flap_validation` (six stubs — QH-51's whole subject), `gossip_convergence_validation`
+(`gossip_accepted_total=0` on four nodes, run `livelab-1787843764`),
+`exit_dns_failclosed_validation` (missing `dig` on lenovo, run `livelab-1787885499`), and
+`bootstrap_hosts` (four failures from the stale egress pin, runs `livelab-1787849060` through
+`livelab-1787903378`). No new triage stub was opened: nothing failed.
+
+The 17 skips are all declared topology conditionals: blind_exit absent (×3), no second
+client/entry/aux (×4), not-every-platform (`live_mixed_topology_validation`), the vxlan-substrate
+block (×9), and chaos (opt-in `not_run`). Judged on what this topology can run, the suite is
+44 for 44. **The "35 of 36 reachable" headline that opened this document is thereby superseded: the
+Linux suite is zero-failure end to end.**
+
+## Run 46 (`livelab-1787908428-6d9224cfd954`) — 2026-08-28: CN-PROOF vxlan — the cross-network scenarios cannot dispatch on this fleet
+
+43 pass / 1 fail / 17 skipped on main at `6d9224cfd954` (branch `work/cn-proof`, clean; ledger row
+187; window 08:54:37Z→09:13:47Z). Identical topology to Run 45; the delta is exactly one flag,
+`--cross-network-substrate vxlan`. **All 8 CN-3 scenario stages skipped**, every one with the same
+verbatim reason: `cross-network topology requires a role that no node in this topology is assigned`
+— the relay/probe participants resolve from `entry`+`aux` (cross_network.rs:929-932), and this fleet
+has neither. Three structural gates were verified live: the vxlan `plan_overlay` returns `Ok(None)`
+on a single-LAN fleet (<2 /24 groups; substrate.rs:754-756, 1529-1532), `entry`/`aux` are absent
+from the topology, and `distinct_underlay_prefixes` reads the management SSH /24s
+(cross_network.rs:514-520, 944-949) — every guest sits on 192.168.64.0/24, so the scenarios would
+skip even with the roles elected.
+
+The one failure is the gate's own defect, CN-PROOF-D1: `cross_network_nat_matrix` failed the run on
+matrix evidence the skipped suites never wrote — `run_nat_matrix` lacked the topology guards its
+eight siblings share (the validator was right to fail closed; the gating one level up was wrong).
+**FIXED on `work/cnproof-d1-gate`**: the guards are now one shared `resolve_dispatchable_topology`
+function, so the gate and the suites it grades cannot answer differently about the same topology;
+past the guard it still fails closed on genuinely missing evidence. Also recorded: CN-PROOF-D2 —
+on this fleet the vxlan flag is a strictly losing trade, since it removes
+`cross_network_nat_classification` (netns-only) and adds nothing.
+
+Two standing conclusions (`LiveValidation_2026-08-28.md` §12, and the owner decision now recorded
+in `CrossNetworkSubstrateIntegrationSpec_2026-06-21.md` §0.6):
+
+* **A skip is not a pass: CN-3 (8 ported validators) and CN-4 remain unproven — 0 of 8 dispatched;
+  not one line of the ported validator code has executed on hardware.** CN-2's netns NAT gates ARE
+  live-proven for 3 of 5 profiles — by Run 45's `cross_network_nat_classification`, not by this run.
+* **Owner decision (spec §0.6): Tier B now REQUIRES a physically 2-LAN fleet as an input rather
+  than producing one.** No qualifying topology exists in the current fleet (probed 2026-08-28), so
+  every re-run of this topology reproduces this exact result until a fleet or design change lands.
+
+## Run 47 (`livelab-1787911937-77ff1933885f`) — 2026-08-28: macOS anchor elected for the FIRST time — 🔴 blocked, blocker located
+
+19 stages: 15 pass / 1 fail / 3 skipped on main at `77ff1933885f` (clean). Topology:
+macos-utm-1:anchor + lenovo-exit-1:exit + lenovo-client-1:client. **First macOS role election in
+`--node` history** — the per-OS table's original "macOS: UNPROVEN, stages never appear" row is
+thereby superseded — and the cell earned no green:
+
+* The one failure is `validate_baseline_runtime`'s macOS DnsFailclosed check, and it is an HONEST
+  red (QH-39): `/etc/resolv.conf` claims loopback while `scutil --dns` reports 1.1.1.1/8.8.8.8 — a
+  real macOS DNS fail-closed ENFORCEMENT gap, correctly exposed by the validator.
+* `anchor_validation` skipped honestly: the macOS capability advertisement PASSED (the cross-OS
+  shell seam works), but the bundle-pull runtime substages (`bundle_pull_loopback`, `invalid_token`,
+  `log_redaction`) are gated off by the posture gate at role.rs:68-70 (`Anchor|Admin|Relay` ⇒ Linux
+  only) — a gate that is CIRCULAR as written: it lifts only on a green run that the stage it
+  controls cannot produce. The promotion route is the macOS-specific anchor validator set
+  (`deploy_macos_anchor_profile`, `validate_macos_anchor_bundle_pull`,
+  `validate_macos_anchor_port_mapping_authority`; live_lab_stage_registry.rs:1151/1158/1168), which
+  requires the `--anchor-platform macos` selector — independent of role election — plus a
+  full-suite run (`--skip-linux-live-suite` drops `live_anchor` and all three exit validations).
+* QH-40's shutdown-residue marker FIRED CORRECTLY on macOS for the first time — and the check that
+  reads it was then found fail-open on macOS (its default state path was the Linux `/var/lib` path).
+  **Fixed the same day**: `DEFAULT_STATE_PATH` gained a macOS arm plus a shared
+  `daemon::default_state_path()` used by both writer and checker (disposition in
+  `QualityHardeningTodo_2026-07-25.md`, QH-40 entry, 2026-08-28).
+
+## Run 48 (`livelab-1787913512-a5e93c8dd781`) — 2026-08-28: macOS exit elected for the FIRST time — 🔴 blocked at membership_init
+
+19 stages: 9 pass / 1 fail / 9 skipped; **the run is recorded dirty, so it is diagnostic only and
+cannot count toward any stability claim.** Topology: macos-utm-1:exit + lenovo entry/client via
+`--macos-promote-exit`. The election itself worked — preflight passed with exactly one exit, and
+bootstrap deployed to all three nodes — then the cell died at `membership_init`:
+`membership owner public key not found on remote`. The macOS membership adapter reads the wrong
+path (`MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH` →
+`/usr/local/var/rustynet/membership/membership.owner.key.pub`, macos_install.rs:27-28) AND cats it
+without sudo (macos_membership.rs:29-34); the key actually lives at
+`/etc/rustynet/membership.owner.key.pub` (present since Jul 9, proving a wrong-path read rather
+than a fresh-install seeding gap). **This blocks macOS holding ANY membership-owner role** — the
+exit cell fully, blind_exit by the same shape — and no exit-stage evidence exists from any OS-mac
+path yet.
+
+Standing constraints for both mac cells (`MacCellsHarvest_2026-08-28.md`): the posture-gate
+circularity (Run 47), `--skip-linux-live-suite` dropping four of the five harvest stages, and the
+QH-41 vmnet bridge split (macOS sits alone on 192.168.65.0/24; lenovo guests stand in as peers, and
+the lenovo→mac direction is 100% loss).
+
+## Windows — 2026-08-28: bootstrap root-caused; fixes landed; no guest reachable (no run executed)
+
+No Windows node has ever been elected, and no run was launched — deliberately. `windows-utm-1`
+boots and answers ICMP/SMB, but OpenSSH never listens and RDP/WinRM/QEMU-guest-agent are all
+closed, so there is **no remote management path at all**; a run would only fail upstream at SSH
+reachability and (pre-W-FIX-3) poison the `windows_stage_bootstrap` column with another spurious
+fail. The CP-4 triage verdict (`WindowsNodeBootstrapTriageVerdict_2026-08-28.md`): the `--node`
+bootstrap failure is **BOTH code and guest, code primary** — `Bootstrap-RustyNetWindows.ps1:1130`
+hard-depends on WinGet **Configuration**, an opt-in per-machine feature that nothing in the
+repository ever enabled or precondition-checked, so every fresh guest reproduces the failure. The
+headline "5 fails" was in fact 3 bootstrap failures plus 2 upstream preflight skips, across four
+distinct causes. Landed 2026-08-28: **W-FIX-1** (the bootstrap now enables the feature itself and
+fails closed with a named, actionable error), **W-FIX-2** (the SSH adapter's error seam decodes the
+CLIXML that buried the real cause in the ledger for five weeks), **W-FIX-3** (run-scoped `preflight`
+failures no longer poison the per-OS `*_stage_bootstrap` columns — forward-only; historical rows
+stand as written). Still outstanding: **W-FIX-4** (guest remediation from the UTM console, then the
+minimal exit+client topology to produce the first `windows_stage_bootstrap=pass` in `--node`
+history) and **W-FIX-5** (restore `ubuntu-kvm-1` — unreachable, and the only home of failure #5 and
+the `windows-x86-1` guest). Until W-FIX-4 lands, Windows remains gated at bootstrap and every
+Windows cell below it is unreachable.
