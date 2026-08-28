@@ -393,6 +393,15 @@ impl LiveExecutor {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     }
 
+    /// Where a spawned agent's stdout/stderr are recorded for this cell. Same
+    /// `/`-free cell-id spelling the per-verify report directories use, so an
+    /// operator finds the transcript beside the run it explains.
+    fn agent_log_path(&self, cell: &Cell) -> PathBuf {
+        self.cfg
+            .report_root
+            .join(format!("agent_{}.log", cell.id().replace('/', "_")))
+    }
+
     fn verify_argv_for_cell(&self, cell: &Cell) -> Result<Vec<String>, String> {
         let inventory = super::super::load_inventory(self.cfg.inventory_path.as_path())?;
         let report_dir = self
@@ -600,17 +609,78 @@ enum AgentCapturedStatus {
     TimedOut,
 }
 
+/// Open (creating, truncating) the file a spawned agent's stdout/stderr are
+/// redirected into, along with the handle's twin for the second stream.
+///
+/// `Stdio` is not `Clone`, so stdout and stderr each need their own descriptor;
+/// both are opened in append mode onto the same freshly truncated file so the
+/// two streams interleave into one readable transcript.
+fn agent_log_stdio(log_path: &Path) -> Result<(Stdio, Stdio), String> {
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create agent log directory '{}': {e}", parent.display()))?;
+    }
+    let truncate = |path: &Path| -> Result<fs::File, String> {
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| format!("open agent log '{}': {e}", path.display()))
+    };
+    let append = |path: &Path| -> Result<fs::File, String> {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("open agent log '{}': {e}", path.display()))
+    };
+    // Truncate once, then take two independent append handles.
+    drop(truncate(log_path)?);
+    Ok((
+        Stdio::from(append(log_path)?),
+        Stdio::from(append(log_path)?),
+    ))
+}
+
 /// Spawn `program args` in its OWN process group and wait up to `timeout_secs`.
 /// On expiry, SIGKILL the whole group (the agent plus any orchestrate / lab
 /// grandchild it spawned) so a wedged agent cannot strand a mid-run lab or hang
 /// the multi-hour loop. `timeout_secs == 0` waits forever (test/interactive).
+///
+/// The child NEVER inherits this process's stdout/stderr (QH-38). Inherited
+/// stdio plus an own process group is the shape that makes nextest flag the
+/// tests here LEAK — a descendant still holding the test's pipes after the test
+/// returns — and in a ~10.4k-test suite run as a process per test under one
+/// global pool, a leaked child holding an inherited pipe is exactly the shape
+/// that turns into order-dependent flakiness.
+///
+/// `log_path` decides where the child's output goes instead, and the production
+/// caller passes one rather than discarding it. The child here is a headless
+/// coding agent driving an unattended multi-hour loop, and its own transcript is
+/// the only account of what it did and why; `run_agent` reports just an exit
+/// code, so silencing the child would leave a failed cell with no evidence at
+/// all. It is redirected to a FILE rather than captured through a pipe the way
+/// `spawn_capture_with_timeout` does: that sibling reads its pipes only after
+/// the child exits, which is safe for a reviewer emitting one small JSON verdict
+/// but would deadlock a chatty agent as soon as it filled the pipe buffer — the
+/// agent would block on write, never exit, and be killed as a spurious timeout.
+/// A file never blocks the writer, keeps the transcript durable for
+/// post-mortem, and can be tailed live. `None` (tests) discards the output.
 fn spawn_with_timeout(
     program: &str,
     args: &[String],
     timeout_secs: u64,
+    log_path: Option<&Path>,
 ) -> Result<AgentRunStatus, String> {
+    let (stdout, stderr) = match log_path {
+        Some(path) => agent_log_stdio(path)?,
+        None => (Stdio::null(), Stdio::null()),
+    };
     let mut child = Command::new(program)
         .args(args)
+        .stdout(stdout)
+        .stderr(stderr)
         // Child leads its own process group so grandchildren inherit it and the
         // whole tree can be killed via the negative pgid on timeout.
         .process_group(0)
@@ -823,23 +893,35 @@ impl WorkUnitExecutor for LiveExecutor {
             .split_first()
             .ok_or_else(|| "empty agent argv".to_owned())?;
 
-        let status = spawn_with_timeout(program, args, self.cfg.agent_timeout_secs)
-            .map_err(|e| format!("spawn agent for {} failed: {e}", cell.id()))?;
+        // The agent's own output is the only account of what it attempted, so it
+        // is kept — as a per-cell file under the report root, not on this
+        // process's console (QH-38). Every error below names the log so a
+        // failed cell is diagnosable without re-running the agent.
+        let log_path = self.agent_log_path(cell);
+        let status = spawn_with_timeout(
+            program,
+            args,
+            self.cfg.agent_timeout_secs,
+            Some(log_path.as_path()),
+        )
+        .map_err(|e| format!("spawn agent for {} failed: {e}", cell.id()))?;
         let status = match status {
             AgentRunStatus::Exited(s) => s,
             AgentRunStatus::TimedOut => {
                 return Err(format!(
-                    "agent for {} timed out after {}s (process group killed)",
+                    "agent for {} timed out after {}s (process group killed); output: {}",
                     cell.id(),
-                    self.cfg.agent_timeout_secs
+                    self.cfg.agent_timeout_secs,
+                    log_path.display()
                 ));
             }
         };
         if !status.success() {
             return Err(format!(
-                "agent for {} exited {}",
+                "agent for {} exited {}; output: {}",
                 cell.id(),
-                status.code().unwrap_or(-1)
+                status.code().unwrap_or(-1),
+                log_path.display()
             ));
         }
 
@@ -984,7 +1066,7 @@ mod tests {
         // A sleep far exceeding the 1s cap must be killed and reported TimedOut,
         // and control must return near the deadline, not after the full sleep.
         let start = Instant::now();
-        let r = spawn_with_timeout("sleep", &["30".to_owned()], 1).expect("spawn");
+        let r = spawn_with_timeout("sleep", &["30".to_owned()], 1, None).expect("spawn");
         assert!(matches!(r, AgentRunStatus::TimedOut));
         assert!(
             start.elapsed() < Duration::from_secs(10),
@@ -995,7 +1077,7 @@ mod tests {
 
     #[test]
     fn spawn_with_timeout_returns_exit_status_for_a_fast_command() {
-        match spawn_with_timeout("true", &[], 30).expect("spawn") {
+        match spawn_with_timeout("true", &[], 30, None).expect("spawn") {
             AgentRunStatus::Exited(s) => assert!(s.success()),
             AgentRunStatus::TimedOut => panic!("a fast command must not time out"),
         }
@@ -1003,10 +1085,77 @@ mod tests {
 
     #[test]
     fn zero_timeout_waits_for_completion() {
-        match spawn_with_timeout("true", &[], 0).expect("spawn") {
+        match spawn_with_timeout("true", &[], 0, None).expect("spawn") {
             AgentRunStatus::Exited(s) => assert!(s.success()),
             AgentRunStatus::TimedOut => panic!("zero timeout must wait, not time out"),
         }
+    }
+
+    /// QH-38: the spawned child must never inherit this process's stdout/stderr.
+    ///
+    /// Under nextest every test is its own process and a descendant still
+    /// holding the test's pipes after the test returns is flagged LEAK — which
+    /// this function's tests intermittently were. Both streams must land where
+    /// the caller directed them and nowhere else.
+    #[test]
+    fn spawn_with_timeout_redirects_child_output_to_the_named_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Deliberately a path whose parent does not exist yet: the production
+        // caller's report root may not have been created when the first agent
+        // for a cell is spawned.
+        let log = dir.path().join("nested/agent_linux_relay.log");
+
+        let status = spawn_with_timeout(
+            "sh",
+            &[
+                "-c".to_owned(),
+                "echo to-stdout; echo to-stderr >&2".to_owned(),
+            ],
+            30,
+            Some(log.as_path()),
+        )
+        .expect("spawn");
+        match status {
+            AgentRunStatus::Exited(s) => assert!(s.success(), "child must exit cleanly"),
+            AgentRunStatus::TimedOut => panic!("a fast command must not time out"),
+        }
+
+        let body = fs::read_to_string(&log).expect("agent log must exist");
+        assert!(
+            body.contains("to-stdout"),
+            "child stdout must reach the log, got: {body:?}"
+        );
+        assert!(
+            body.contains("to-stderr"),
+            "child stderr must reach the log, got: {body:?}"
+        );
+    }
+
+    /// A second spawn against the same cell must not accumulate the previous
+    /// attempt's transcript — the log names the LAST attempt, which is the one
+    /// the reported exit code belongs to.
+    #[test]
+    fn spawn_with_timeout_truncates_a_reused_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("agent.log");
+        for marker in ["first-attempt", "second-attempt"] {
+            spawn_with_timeout(
+                "sh",
+                &["-c".to_owned(), format!("echo {marker}")],
+                30,
+                Some(log.as_path()),
+            )
+            .expect("spawn");
+        }
+        let body = fs::read_to_string(&log).expect("agent log must exist");
+        assert!(
+            !body.contains("first-attempt"),
+            "a reused log must be truncated, got: {body:?}"
+        );
+        assert!(
+            body.contains("second-attempt"),
+            "the latest attempt must be recorded, got: {body:?}"
+        );
     }
 
     /// Scripted executor: returns a queued (outcome, verdict) per call and
