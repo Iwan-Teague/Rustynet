@@ -262,15 +262,16 @@ would actively damage the evidence base. Findings, all measured today:
 | `utmctl` power state (pre-triage) | `stopped` |
 | Power on | started via UTM; booted |
 | ICMP `192.168.64.25` | **replies**, 2/2 packets, ~2.3 ms |
-| TCP/22 (SSH) | **closed**, continuously, over 19 min of uptime |
+| TCP/22 (SSH) | **closed**, continuously across 27 min of uptime — including one uninterrupted 900 s poll at 10 s intervals that never once saw it open |
 | TCP/135 (RPC), 139 (NetBIOS), 445 (SMB) | **open** |
 | TCP/3389 (RDP) | closed |
 | TCP/5985 (WinRM) | closed |
 | QEMU guest agent | not installed — `power_on_vm` fails with *"The QEMU guest agent is not running or not installed on the guest"* |
-| Guest CPU after boot | ~0.7 %, i.e. idle at a login screen, not mid-boot |
+| Guest CPU | varies widely (0.7 % at +19 min, 94 % at +27 min) — consistent with post-boot servicing, and **not** a reliable signal either way |
 
 **Interpretation.** Core Windows services (RPC/NetBIOS/SMB) are listening, so the
-OS is fully booted and networked. The OpenSSH Server service is **not listening**.
+OS is fully booted and networked — that, not the CPU reading, is what establishes
+the boot completed. The OpenSSH Server service is **not listening**.
 Since RDP and WinRM are also closed and the QEMU guest agent is absent, there is
 **no remote management path into `windows-utm-1` at all**.
 
