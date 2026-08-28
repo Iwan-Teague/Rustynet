@@ -341,3 +341,242 @@ so that particular non-return is gone.
 
 Run from the `work/launch-path-fixes` worktree with a worktree-local
 `CARGO_TARGET_DIR`. Results are recorded in the branch's commit trailer.
+
+---
+
+## 9) Attempt 2 — the suite RAN. `livelab-1787903378-068b29ebc54b`, overall `fail` at `bootstrap_hosts`
+
+**Status: a real run executed and a real ledger row landed. It failed at
+`bootstrap_hosts` on `debian-headless-2` with the *same* `rustynet-vx0` error the
+§2 gate was holding open — because the remedy that cleared the gate had only ever
+been applied to the two lenovo guests, and `debian-headless-2` still carried the
+stale environment file.** The launch gate was dispositioned (§9.2), the run
+dispatched 61 planned stages, and 54 of them skipped behind the one failure. The
+failure is **environmental and pre-existing** — not a regression from any of the
+seven merges that landed on `main` after `e13132cb` (§9.5).
+
+### 9.1 What ran
+
+| field | value |
+|---|---|
+| run id | `livelab-1787903378-068b29ebc54b` |
+| started / finished | 2026-08-28T07:34:15Z → 07:49:38Z (15 min 23 s) |
+| commit recorded | `068b29ebc54b` on `work/live-validate`, `git_dirty_state=clean` |
+| relationship to `main` | **code byte-identical to `main` @ `22e707b2`** — `git diff main -- ':!documents'` is empty on that commit; the only non-`main` delta in the tree is documentation |
+| guests | `ubuntu-utm-1:client`, `rocky-utm-1:admin`, `debian-headless-4:exit`, `fedora-utm-1:relay`, `debian-headless-2:anchor` — the documented §7 topology |
+| planned stages | 61 (dry-run confirmed `5 node(s), 61 planned stage(s)`) |
+| result | `passed=6 failed=1 skipped=54`, `overall_result=fail`, `first_failed_stage=bootstrap_hosts` |
+| network profile | `mgmt_shared_smoke_v1`, digest `sha256:ab06a230…f4f67e4` — identical to attempt 1 and to the baseline runs |
+| report dir | `state/live-lab-validate2-20260828b/` |
+| ledger row | **confirmed** — row 184 of `documents/operations/live_lab_node_run_matrix.csv` |
+
+The six stages that ran to completion:
+
+| stage | result |
+|---|---|
+| `preflight` | pass |
+| `prepare_source_archive` | pass |
+| `verify_ssh_reachability` | pass |
+| `cleanup_hosts` | pass |
+| `bootstrap_hosts` | **fail** |
+| `cross_network_substrate_teardown` | pass |
+| `cleanup` | pass |
+
+Everything between `bootstrap_hosts` and teardown — all 54 remaining stages —
+reports `skipped: dependency … did not pass`. That is the fail-closed dependency
+graph behaving correctly, not 54 separate defects.
+
+Not a blocker but worth recording: the run also reported **36 historical unfilled
+triage stubs deferred by `TRIAGE_GATE_HISTORICAL_WATERMARK_UTC` (2026-07-28)**.
+They did not gate this launch; they are the retirement backlog named in that
+constant's rustdoc.
+
+### 9.2 The launch gate: dispositioned, and the disposition was justified
+
+The gate refused again, verbatim, on `livelab-1787849060-86f633c907cf::bootstrap_hosts`
+(`policy_reject (78)`, `patch: null`). Per the owner decision recorded in §6, a
+disposition was recorded — not invented, but anchored to the root cause the QH-51
+track had already isolated on `livelab-1787884299-4b0d18aa668d::bootstrap_hosts`:
+a stale `/etc/default/rustynetd` pinning `RUSTYNET_EGRESS_INTERFACE=rustynet-vx0`,
+which `install-systemd` prefers over live detection.
+
+Recorded with the documented tool, against the worktree ledger, and committed as
+`068b29eb` before launching so the run's own dirty-state reading stayed `clean`:
+
+```
+rustynet ops live-lab-record-stage-patch \
+  --ledger …/documents/operations/live_lab_stage_triage.jsonl \
+  --stub-id 'livelab-1787849060-86f633c907cf::bootstrap_hosts' \
+  --patch 'environment gap, not code — root cause isolated and remedied downstream. …'
+```
+
+The relaunch cleared the gate and dispatched stages. **The disposition was
+correct about the root cause and wrong about the remedy's coverage** — see next.
+
+### 9.3 The failure: the same stale egress pin, on a guest the remedy never touched
+
+```
+bootstrap_hosts fail: debian-headless-2: remote command failed (exit Some(1))
+  error [generic_failure (1)]: install-systemd failed during e2e bootstrap: status=1
+    stdout=error [generic_failure (1)]: egress interface does not exist: rustynet-vx0
+```
+
+Probed all five guests directly afterwards. The isolation is clean — **exactly one
+guest is affected, and it is the one the QH-51 remedy did not cover**:
+
+| guest | `/etc/default/rustynetd` mtime | `RUSTYNET_EGRESS_INTERFACE` | link present? |
+|---|---|---|---|
+| **`debian-headless-2`** | **2026-08-27T14:56:54Z** | **`rustynet-vx0`** | **MISSING** (only `lo`, `enp0s1`) |
+| `debian-headless-4` | 2026-08-28T07:42Z | `enp0s1` | exists |
+| `ubuntu-utm-1` | 2026-08-28T07:38Z | `enp0s1` | exists |
+| `rocky-utm-1` | 2026-08-28T07:40Z | `enp0s1` | exists |
+| `fedora-utm-1` | 2026-08-28T07:46Z | `enp0s1` | exists |
+
+Two things follow directly from that table:
+
+1. **The four healthy guests were rewritten by *this run*** (mtimes 07:38–07:46Z,
+   inside the run window) with the correct `enp0s1`. So `install-systemd` derives
+   the right interface whenever no stale pin exists — the code is not choosing
+   `rustynet-vx0`, it is *obeying a file*. `debian-headless-2`'s bootstrap aborted
+   before its own rewrite, which is why its file still reads 14:56:54Z.
+2. **The residue's timestamp is the tell.** 2026-08-27T14:56:54Z is the same
+   14:57Z cross-network run named in the `livelab-1787884299` disposition as the
+   source of the lenovo residue. One cross-network run left the pin on *at least
+   three* guests; only two of them were cleaned.
+
+The failing code path is unchanged and old:
+- `ensure_interface_exists` — `crates/rustynet-cli/src/ops_install_systemd.rs:2049`
+- the precedence that prefers the stale file over live detection —
+  `ops_install_systemd.rs:497-498`, where `existing_env.get("RUSTYNET_EGRESS_INTERFACE")`
+  is consulted as a `resolve_egress_interface` input
+- `VXLAN_LINK_NAME = "rustynet-vx0"` —
+  `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/substrate.rs:34`
+
+`git log -L 494,506:crates/rustynet-cli/src/ops_install_systemd.rs` puts the last
+change to that precedence chain at **`8578a25b`, 2026-05-18** — three months
+before tonight's merges.
+
+`cleanup_hosts` passed at 07:34:27Z and did **not** remove the file. That is the
+`cleanup_hosts` gap already flagged as a follow-up on the `1787884299` stub; this
+run is independent evidence that the gap affects UTM guests, not only the lenovo
+pair.
+
+### 9.4 Comparison against the most recent comparable run
+
+The closest comparable is `livelab-1787825655-3afd39b18164` (2026-08-27T09:55Z) —
+identical five-guest UTM topology, identical network profile:
+
+| | `1787825655` (baseline) | `1787903378` (this run) |
+|---|---|---|
+| overall | `partial` | `fail` |
+| linux stage columns | 27 pass / 0 fail / 9 skip | 1 pass / 1 fail / 34 skip |
+| `bootstrap` | pass | **fail** |
+
+**This is a regression in outcome and not a regression in the software.** The
+baseline ran at 09:55Z; the residue that breaks this run was written at 14:56Z,
+five hours *after* that baseline finished. The same code that passed at 09:55Z
+would pass now against a clean guest — as the four healthy guests in §9.3
+demonstrate within this very run.
+
+Against the historical ledger (183 prior rows, 145 `fail` / 38 `partial`, zero
+overall `pass`), this run adds no improvement and no new class of failure.
+
+### 9.5 Regression attribution: none of the seven merges is implicated
+
+Seven merges (22 commits) landed on `main` between `e13132cb` and `22e707b2`:
+
+| merge | authored | code touched |
+|---|---|---|
+| `f11bcd89` | 03:49 | `privileged_helper.rs`, `daemon.rs`, `main.rs`, macOS install adapter |
+| `2676d4a8` | 04:04 | cross-network scenario port (`stage/cross_network/scenario/**`) |
+| `4b96cb1f` | 04:24 | `linux_firewalld_zone.rs`, `phase10.rs` |
+| `028341c6` | 08:16 | `live_lab_run_matrix.rs`, stage registry, overnight executor, netns scripts |
+| `3c6a489b` | 08:18 | `vm_lab/mod.rs`, `rustynet-mcp/src/bin/lab_state.rs` |
+| `22e707b2` | 08:24 | docs only |
+
+`git diff --name-only e13132cb 22e707b2 -- crates/rustynet-cli/src/ops_install_systemd.rs
+crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/substrate.rs`
+returns **nothing**. Neither file in the failure path was touched by any of them.
+Combined with the 2026-05-18 blame date on the precedence chain and the guest-side
+mtime of 2026-08-27T14:56:54Z, there is no route by which tonight's merges caused
+this.
+
+**They also remain unproven.** The run never reached membership, assignments,
+baseline runtime, exit handoff, relay, DNS, or any of the security-check stages, so
+the QH-52 firewalld unbind, the helper IPC timeout pair, and the CN-3 scenario port
+still have no live evidence.
+
+### 9.6 Environment notes
+
+- **Disk.** The host was at **97% used / 32 GiB free** on arrival (down from the
+  84 GiB recorded in §4). `prune_jobs(keep=40)` removed **42 finished job records
+  and their logs**, report directories preserved. The real consumers are build
+  caches — `target/` 33 G, `target-livelab/` 9.7 G, `state/` 3.6 G — none of which
+  is safe to prune blind. The run completed without a disk failure, but this needs
+  an owner decision before a full-length suite.
+- **The §12.3.1 MCP LAN false-negative is back.** `check_vm_reachable` reported
+  **UP but UNREACHABLE for all five guests**; `nc -z -G3 <ip> 22` from the shell
+  returned **OPEN on all five**, and the orchestrator's own `discover_local_utm`
+  reported `unready=none`. Per §12.3.1 this is the sandbox permission, hits every
+  node identically, and must not be chased per-VM — no recovery was performed and
+  none was needed.
+- **The §8 D1 fix is NOT live in the running MCP server.** `start_live_lab_run`
+  still rendered
+  `--windows-vm windows-utm-1 --macos-vm macos-utm-1` into a Linux-only `--node`
+  argv. `bin/rustynet-mcp-lab-state` is dated **2026-08-13**, fifteen days behind
+  its source, which does contain `auto_topology_vm_aliases`. This is exactly the
+  silent `bin/` rot described in CLAUDE.md §12.5 — the fix is real, the deployed
+  binary is stale, and no reconnect is possible in a non-interactive session. The
+  run was therefore launched from the shell (the §7 reproduction), which took
+  **5 guest locks, not 7**, confirming the shell path was never affected.
+- The lenovo pair was not used. The suite topology is UTM-only by §7.
+
+### 9.7 What is blocked, and what the owner must decide
+
+**The remedy could not be applied.** Clearing `debian-headless-2`'s stale
+`/etc/default/rustynetd` — either removing the file as the QH-51 track did on the
+lenovo guests, or repointing the pin to `enp0s1` — was attempted twice and
+**refused by this session's command-permission policy** (remote `rm` and remote
+`sed -i` on a system config were both denied). No lab tool substitutes for it:
+`reset_vm_network`, `recover_stuck_vms`, and `ensure_lab_ready` all operate on
+networking and power state, not on guest config residue. That is precisely the
+missing capability the `cleanup_hosts` gap describes.
+
+**The new stub was deliberately left undispositioned.**
+`livelab-1787903378-068b29ebc54b::bootstrap_hosts` carries `patch: null` and will
+refuse the next Linux launch. That is the correct fail-closed state: the condition
+is real, understood, and **not remedied**, so a disposition would unblock a run
+that is guaranteed to fail identically. Do not fill it with a declination to get
+past the gate.
+
+Two things unblock the next attempt, in order:
+
+1. Clear the stale pin on `debian-headless-2` (remove `/etc/default/rustynetd`, or
+   set `RUSTYNET_EGRESS_INTERFACE=enp0s1`) and re-probe all five guests with the
+   table in §9.3 — the residue came from one cross-network run and has now been
+   found on three guests, so assume any guest that ever hosted that run is
+   suspect until probed.
+2. Record the disposition on `livelab-1787903378-068b29ebc54b::bootstrap_hosts`
+   naming that clearance, then re-run the §7 topology unchanged.
+
+The underlying defect worth an owner's attention is not the residue but the
+asymmetry that makes it fatal: `install-systemd` trusts a previous run's env file
+over live interface detection, and `cleanup_hosts` does not remove that file. Either
+half alone would make this class of failure impossible.
+
+### 9.8 Reproduction
+
+```
+cd .claude/worktrees/mgr-live-validate
+CARGO_TARGET_DIR=…/target-livelab \
+cargo run -q -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab \
+  --inventory documents/operations/active/vm_lab_inventory.json \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
+  --known-hosts-file ~/.ssh/known_hosts \
+  --report-dir state/live-lab-validate2-20260828b \
+  --node ubuntu-utm-1:client --node rocky-utm-1:admin --node debian-headless-4:exit \
+  --node fedora-utm-1:relay --node debian-headless-2:anchor
+```
+
+Note the orchestrator refuses a non-empty `--report-dir` outright (no silent
+reuse); each attempt needs a fresh directory or the provenance-bound resume path.
