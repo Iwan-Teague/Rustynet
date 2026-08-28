@@ -68,8 +68,8 @@ Every cell here is "as proven on `--node`," independent of the bash archive.
 | **admin** | 🟢 `macos_admin=pass` (`livelab-1784501586`, commit `537e1901`, clean) — run overall failed on `two_hop` | ⬛ bootstrap blocker |
 | **relay** (lifecycle) | 🟢 `macos_stage_relay_service_lifecycle=pass` (`livelab-1784497253`, `11620a6`, clean) | ⬛ / 🟠 SCM contract only |
 | **relay** (frame-forwarding) | 🔒 HP-3 (unproven on ALL OS) | 🔒 HP-3 |
-| **anchor** | ⬛ never elected on `--node` | ⬛ never exercised |
-| **exit** | ⬛ never elected on `--node` | 🔒 WinNAT hardware (§4) |
+| **anchor** | 🔴 **elected 2026-08-28** (`livelab-1787911937-77ff1933885f`, `77ff1933`, clean) — capability advertisement **passed** live; bundle-pull runtime reported-skipped on the `is_supported_for_platform` posture gate, so `anchor_validation=skip`. `live_anchor` not dispatched (dropped with `--skip-linux-live-suite`). See MacCellsHarvest §2 | ⬛ never exercised |
+| **exit** | 🔴 **elected 2026-08-28** (`livelab-1787913512-a5e93c8dd781`, **dirty** — diagnostic only, cannot count toward §5.4) — fails at `membership_init`: the macOS owner-key path constant points at a file that does not exist. No exit stage has ever dispatched. See MacCellsHarvest §4 | 🔒 WinNAT hardware (§4) |
 | **blind_exit** | ⬛ never elected on `--node` | 🚫 out-of-scope by design |
 | **role-transition** | ⬛ never run on `--node` | ⬛ never run on `--node` |
 
@@ -169,8 +169,35 @@ consecutive" (which §5.4 explicitly replaced as arithmetically too weak).
 ## 5. §5.2 platform-adapter gaps — current status
 
 - **mac/win role evaluators:** macOS `admin` + `relay` evaluators pass on `--node`;
-  `exit`/`blind_exit`/`anchor` macOS evaluators exist but were never elected.
-  Windows evaluators all blocked behind CP-4.
+  `blind_exit` macOS evaluator exists but was never elected. **`anchor` and `exit`
+  were elected 2026-08-28** (§1) and both produced real signal — neither is
+  "never elected" any more, and neither is green. Windows evaluators all blocked
+  behind CP-4. Two blockers were located in the process
+  (`MacCellsHarvest_2026-08-28.md`):
+  **(a)** the `Anchor`/`Admin`/`Relay` posture gate at
+  `vm_lab/orchestrator/role.rs:68-70` is Linux-only while its own comment
+  promises promotion "once a green run is archived" — but
+  `anchor_validation.rs:181` gates the runtime substages on that same predicate
+  and `outcome_for` (`:236-247`) grades any reported skip as `Skipped`, so the
+  green run required to lift the gate cannot be produced by the stage the gate
+  controls. The promotion route has to come from the `--anchor-platform macos`
+  stage set instead (`live_lab_stage_registry.rs:1151,1158,1168`), which the
+  role election alone does not enable.
+  **(b)** macOS cannot hold a membership-owner role: `membership_init` is
+  role-gated to `exit`, and the macOS adapter reads the owner pubkey from
+  `/usr/local/var/rustynet/membership/membership.owner.key.pub`
+  (`adapter/macos_install.rs:27-28`) with a bare `cat`
+  (`adapter/macos_membership.rs:29-34`), where the Linux twin reads
+  `/etc/rustynet/membership.owner.key.pub` with `sudo -n`
+  (`adapter/linux_membership.rs:25-31`). On the guest the key exists only at the
+  latter path, and the former directory is `0700 rustynetd` so the bare `cat`
+  cannot read it either.
+- **Harvest-form caveat (`--skip-linux-live-suite`).** The fast-path flag every
+  mac/win target key sets (`ai_agent.rs:1864-1892`) drops the whole post-baseline
+  suite — `plan.rs:545-549`, 61 → 19 stages. That excludes `live_anchor` and all
+  three `exit_*_validation` stages, which are `state_machine_only` and so have no
+  bash-archive substitute. **Role-cell greens for those stages cannot be
+  harvested on the fast path**; they require paying for the full Linux live suite.
 - **anchor gossip_seed:** the gossip **substrate now exists in the production
   daemon** (commits `001cc97`→`e804723`, post-roadmap — construct/attach gossip
   runtime, register peers from membership, epoch-bind bundles). No live anchor-gossip
