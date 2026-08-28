@@ -27,20 +27,36 @@ normalized node-level companion ledger for the `--node` engine. It records one
 row per run × node × stage with fetched exact OS/version evidence. Use it—not the
 Linux umbrella columns—to prove Debian, Rocky, Ubuntu, and Fedora separately.
 
-**Known defect — a `*_stage_bootstrap` column can read `fail` for a stage that
-was `skip`.** The per-OS bootstrap columns absorb the run-scoped `preflight`
-stage, and `merge_status` (`live_lab_run_matrix.rs:2215-2231`) correctly ranks
-`fail` above `skip` — so a `preflight` failure writes `fail` into
+**Defect — a per-OS stage column could read `fail` for a stage that was `skip`.
+FIXED 2026-08-28 (W-FIX-3), forward-only.** The per-OS bootstrap columns
+absorbed the run-scoped `preflight` stage, which shares their `bootstrap`
+logical column, so a `preflight` failure wrote `fail` into
 `linux_stage_bootstrap`, `macos_stage_bootstrap` **and**
-`windows_stage_bootstrap` at once, even though `bootstrap_hosts` never ran on any
+`windows_stage_bootstrap` at once even though `bootstrap_hosts` never ran on any
 node. Confirmed on `livelab-1784489499-db3ff1aaafe6` and
 `livelab-1785005557-b7667cce46db`. This inflated the published Windows bootstrap
 fail count from 3 to 5 and misdirected CP-4 triage for five weeks; see
 [`active/WindowsNodeBootstrapTriageVerdict_2026-08-28.md`](./active/WindowsNodeBootstrapTriageVerdict_2026-08-28.md)
-§0(c). Until it is fixed, join any bootstrap-column count against
-`live_lab_node_stage_results.csv` and check `first_failed_stage` before quoting a
-number — the same "take the verdict from the stage's own artifact, never from the
-column" rule AGENTS/CLAUDE §12.3 already imposes for `two_hop`.
+§0(c) for the evidence and §7.3 for the disposition.
+
+Note the fix is **not** in `merge_status` (`live_lab_run_matrix.rs:2215-2231`):
+ranking `fail` above `skip` is correct and was left alone. The bug was the
+column FEED. Stages whose outcome describes the run rather than any OS's nodes
+are now marked `run_scoped` in `live_lab_stage_registry.rs` and write neither a
+`{platform}_stage_*` nor a `cross_os_*` column; the run's failure is carried by
+`overall_result` + `first_failed_stage` as before. Four stages qualified —
+`preflight` and `prepare_source_archive` (bootstrap columns), plus
+`cross_network_substrate_setup` and `cross_network_preflight`, which were
+poisoning `{platform}_stage_cross_network` the same way.
+
+**Historical rows were NOT rewritten.** The ledgers are append-only evidence, so
+every pre-fix row still reads exactly as the tooling wrote it — same forward-only
+treatment the `traffic_test_matrix` de-aliasing got on 2026-07-27. When counting
+across rows written before 2026-08-28, join any bootstrap or cross-network column
+count against `live_lab_node_stage_results.csv` and check `first_failed_stage`
+before quoting a number — the same "take the verdict from the stage's own
+artifact, never from the column" rule AGENTS/CLAUDE §12.3 already imposes for
+`two_hop`.
 
 ## Purpose
 

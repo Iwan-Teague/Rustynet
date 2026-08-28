@@ -438,6 +438,36 @@ pub struct StageSpec {
     /// the Rust dialect becomes `enabled`, the bash dialect becomes
     /// not-planned — otherwise the manifest hides the stages that really run.
     pub state_machine_only: bool,
+    /// RUN-SCOPED: the stage's outcome describes the RUN or the ORCHESTRATOR
+    /// HOST, not any node's operating system, so it must never be written
+    /// into a per-OS `{platform}_stage_*` column or a `cross_os_*` column
+    /// (W-FIX-3).
+    ///
+    /// The criterion is the orchestrator's own fanout inside the shared
+    /// pipeline head: `StageGroup::Pre` **and** `StageFanout::Once`. A
+    /// `PerNode` Pre stage (`verify_ssh_reachability`, `cleanup_hosts`) has a
+    /// real per-node verdict and stays attributable; a `Once` Pre stage is a
+    /// precondition on the lab as a whole. That pairing is pinned by
+    /// `run_scoped_matches_orchestrator_fanout` in `live_lab_run_matrix.rs`,
+    /// so a newly added Pre/Once stage cannot silently miss this flag.
+    ///
+    /// Why it matters, measured on the committed ledger: `preflight` carries
+    /// `logical: Some("bootstrap")` with `PlatformRule::AllPlatforms`, so a
+    /// run that died at `preflight` recorded `linux_stage_bootstrap=fail`,
+    /// `macos_stage_bootstrap=fail` AND `windows_stage_bootstrap=fail` on runs
+    /// where the per-stage ledger has `bootstrap_hosts=skip` for every node
+    /// (`livelab-1784489499-db3ff1aaafe6`, `livelab-1785005557-b7667cce46db`).
+    /// `merge_status` is correct in isolation — `fail` genuinely outranks
+    /// `skip` — but the column feed was conflating a run-scoped failure with a
+    /// node-scoped stage status, inflating the fail count on every OS at once.
+    /// The run-level verdict is already carried losslessly by `overall_result`
+    /// and `first_failed_stage`, so suppressing the per-OS write discards no
+    /// evidence.
+    ///
+    /// Same aliasing class as the `traffic_test_matrix` contamination recorded
+    /// in AGENTS/CLAUDE §12.3, and the fix is forward-only for the same
+    /// reason: committed rows stay exactly as the tooling wrote them.
+    pub run_scoped: bool,
 }
 
 const DEFAULT_SPEC: StageSpec = StageSpec {
@@ -458,6 +488,7 @@ const DEFAULT_SPEC: StageSpec = StageSpec {
     synthetic: false,
     conditional_dispatch: false,
     state_machine_only: false,
+    run_scoped: false,
 };
 
 /// Control-ID sets shared by the per-OS variants of each audit stage.
@@ -478,6 +509,10 @@ pub const STAGES: &[StageSpec] = &[
         cross_os: Some("cross_os_bootstrap"),
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 60,
+        // Run-scoped: topology/clock preconditions for the lab as a whole.
+        // Its failure belongs to `overall_result`/`first_failed_stage`, never
+        // to a per-OS bootstrap column (W-FIX-3).
+        run_scoped: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -487,6 +522,10 @@ pub const STAGES: &[StageSpec] = &[
         cross_os: Some("cross_os_bootstrap"),
         platform_rule: PlatformRule::AllPlatforms,
         budget_secs: 30,
+        // Run-scoped: packages the source tree on the ORCHESTRATOR HOST. No
+        // guest is touched, so no OS's bootstrap column can be evidence for
+        // or against it (W-FIX-3).
+        run_scoped: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -2164,6 +2203,13 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::Always,
         conditional_dispatch: true,
         state_machine_only: true,
+        // Run-scoped: provisions the TOPOLOGY-LEVEL overlay substrate for the
+        // whole lab before any node is addressed. Failing to build the
+        // substrate says nothing about any OS's cross-network capability, so
+        // it must not red `{linux,macos,windows}_stage_cross_network` — the
+        // same aliasing W-FIX-3 fixed for `preflight`/bootstrap, reached
+        // through a different shared logical column.
+        run_scoped: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -2267,6 +2313,10 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::CrossNetworkSuite,
         conditional_dispatch: true,
         budget_secs: 60,
+        // Run-scoped: the CN suite's own precondition check. Like `preflight`
+        // it gates the whole suite, so its failure belongs to the run-level
+        // columns, not to any OS's cross_network column (W-FIX-3).
+        run_scoped: true,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -2402,6 +2452,18 @@ pub fn cross_os_column(stage: &str) -> Option<&'static str> {
 /// arms: the one-off check column a stage feeds, if any.
 pub fn special_column(stage: &str) -> Option<&'static str> {
     find_stage(stage)?.special
+}
+
+/// Whether a stage's outcome is RUN-scoped rather than node-scoped — see
+/// [`StageSpec::run_scoped`].
+///
+/// Unknown names are treated as node-scoped (`false`). That is the safe
+/// direction here: the flag SUPPRESSES a per-OS write, so defaulting it on for
+/// a name the registry does not know would silently blank columns that a real
+/// per-node stage is entitled to fill. A stage that needs suppression must say
+/// so in the registry.
+pub fn is_run_scoped(stage: &str) -> bool {
+    find_stage(stage).is_some_and(|spec| spec.run_scoped)
 }
 
 /// Registry-backed replacement for `is_rust_native_stage_name`.

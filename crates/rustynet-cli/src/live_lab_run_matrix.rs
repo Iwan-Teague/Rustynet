@@ -1821,6 +1821,27 @@ fn populate_stage_values(
     for stage in stages {
         let status = normalize_status(stage.status.as_str());
         let unaliased = strip_node_alias_prefix(stage.stage.as_str());
+        // W-FIX-3. A run-scoped stage describes the RUN, not any OS's nodes,
+        // so it may not address a per-OS `{platform}_stage_*` column or a
+        // `cross_os_*` column. Its own one-off `special` column (if it has
+        // one) is still written, by the unconditional second pass below —
+        // that column IS the stage, so it is attribution, not aliasing.
+        //
+        // This is the fix for the roll-up defect recorded in
+        // `WindowsNodeBootstrapTriageVerdict_2026-08-28.md` §0(c): `preflight`
+        // shares the `bootstrap` logical column with the node-scoped
+        // `bootstrap_hosts`, so a run that died at `preflight` wrote `fail`
+        // into `linux_stage_bootstrap`, `macos_stage_bootstrap` and
+        // `windows_stage_bootstrap` at once, while `bootstrap_hosts` itself
+        // was `skip` on every node. `merge_status` then correctly kept the
+        // `fail` — the merge was never wrong, the feed was. Suppressing the
+        // write leaves those columns at their never-reached value
+        // (`not_run` by default, or the real `skip` that `bootstrap_hosts`
+        // records when it is skip-cascaded), and the run's failure is carried
+        // by `overall_result` + `first_failed_stage` exactly as before.
+        if crate::live_lab_stage_registry::is_run_scoped(unaliased) {
+            continue;
+        }
         if let Some((platform, logical_stage)) = direct_platform_stage(unaliased) {
             set_status(
                 values,
@@ -2130,6 +2151,13 @@ fn populate_cross_os_values(
     targets: &[TargetEvidence],
 ) {
     let stage = strip_node_alias_prefix(stage);
+    // W-FIX-3, defence in depth. `populate_stage_values` already skips
+    // run-scoped stages before reaching here, but a `cross_os_*` column is an
+    // OS-interop claim by definition, so the suppression belongs at the
+    // writer too: any future caller inherits it without having to remember.
+    if crate::live_lab_stage_registry::is_run_scoped(stage) {
+        return;
+    }
     let platform_count = unique_platforms(targets).len();
     if platform_count < 2 && !stage.contains("windows") && !stage.contains("macos") {
         return;
@@ -3271,6 +3299,288 @@ mod tests {
                 .map(String::as_str),
             Some("fail"),
             "validate_macos_role_transition must populate macos_stage_role_transition: {values:?}"
+        );
+    }
+
+    /// The three per-OS targets used by the W-FIX-3 tests below.
+    fn tri_os_targets() -> Vec<TargetEvidence> {
+        ["linux", "macos", "windows"]
+            .into_iter()
+            .map(|platform| TargetEvidence {
+                label: platform.to_owned(),
+                target: platform.to_owned(),
+                alias: format!("{platform}-1"),
+                platform: platform.to_owned(),
+                node_id: format!("{platform}-node-1"),
+                bootstrap_role: "client".to_owned(),
+            })
+            .collect()
+    }
+
+    fn stage_evidence(stage: &str, status: &str) -> StageEvidence {
+        StageEvidence {
+            started_at: String::new(),
+            stage: stage.to_owned(),
+            status: status.to_owned(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// W-FIX-3. Reproduces `livelab-1784489499-db3ff1aaafe6`: the run died at
+    /// the run-scoped `preflight` (topology: "lab requires exactly 1 Exit
+    /// node, found 0") and `bootstrap_hosts` was `skip` on every node — yet
+    /// the recorded row read `linux_stage_bootstrap=fail`,
+    /// `macos_stage_bootstrap=fail` AND `windows_stage_bootstrap=fail`,
+    /// inflating the failure count on all three OSes at once.
+    ///
+    /// `preflight` shares the `bootstrap` logical column with the node-scoped
+    /// `bootstrap_hosts`, so its run-scoped `fail` was merged in by
+    /// `merge_status` — which ranks `fail` above `skip` correctly; the merge
+    /// was never the bug. The column FEED was.
+    #[test]
+    fn a_run_scoped_preflight_failure_leaves_every_per_os_bootstrap_column_never_reached() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let targets = tri_os_targets();
+        let report_dir = tempfile::tempdir().expect("tempdir");
+        let mut values = BTreeMap::new();
+        populate_stage_values(
+            &mut values,
+            &schema,
+            report_dir.path(),
+            &targets,
+            &[
+                stage_evidence("preflight", "fail"),
+                stage_evidence("bootstrap_hosts", "skip"),
+            ],
+        );
+
+        for platform in ["linux", "macos", "windows"] {
+            let column = format!("{platform}_stage_bootstrap");
+            assert_eq!(
+                values.get(&column).map(String::as_str),
+                Some("skip"),
+                "{column} must reflect bootstrap_hosts' own skip, not preflight's \
+                 run-scoped fail: {values:?}"
+            );
+        }
+        assert_eq!(
+            values.get("cross_os_bootstrap").map(String::as_str),
+            Some("skip"),
+            "cross_os_bootstrap is an OS-interop claim; a run-scoped preflight \
+             failure is not evidence against it: {values:?}"
+        );
+    }
+
+    /// Same defect, the harder shape: `bootstrap_hosts` never recorded at all
+    /// (the run died before the stage was even reached). The per-OS columns
+    /// must then be left entirely UNWRITTEN so the renderer's `not_run`
+    /// default stands — a run-scoped failure must not manufacture a per-OS
+    /// verdict out of nothing.
+    #[test]
+    fn a_run_scoped_failure_writes_no_per_os_column_when_the_stage_never_ran() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let targets = tri_os_targets();
+        let report_dir = tempfile::tempdir().expect("tempdir");
+        let mut values = BTreeMap::new();
+        populate_stage_values(
+            &mut values,
+            &schema,
+            report_dir.path(),
+            &targets,
+            &[
+                stage_evidence("preflight", "fail"),
+                stage_evidence("prepare_source_archive", "skip"),
+            ],
+        );
+
+        for platform in ["linux", "macos", "windows"] {
+            let column = format!("{platform}_stage_bootstrap");
+            assert_eq!(
+                values.get(&column),
+                None,
+                "{column} must stay unwritten (rendering as the not_run default) \
+                 when only run-scoped stages have outcomes: {values:?}"
+            );
+            assert_eq!(
+                super::default_cell_value(column.as_str()),
+                "not_run",
+                "the never-reached value this column renders as"
+            );
+        }
+        assert_eq!(
+            values.get("cross_os_bootstrap"),
+            None,
+            "cross_os_bootstrap must stay unwritten too: {values:?}"
+        );
+    }
+
+    /// The other half of the contract: suppressing the run-scoped feed must
+    /// not blunt a REAL per-OS failure. `bootstrap_windows_host` carries
+    /// `direct_platform: ("windows", "bootstrap")`, so its failure reds
+    /// exactly one OS and leaves the other two alone.
+    #[test]
+    fn a_genuine_per_os_bootstrap_failure_still_reds_only_that_os() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let targets = tri_os_targets();
+        let report_dir = tempfile::tempdir().expect("tempdir");
+        let mut values = BTreeMap::new();
+        populate_stage_values(
+            &mut values,
+            &schema,
+            report_dir.path(),
+            &targets,
+            &[
+                stage_evidence("preflight", "pass"),
+                stage_evidence("bootstrap_hosts", "pass"),
+                stage_evidence("bootstrap_windows_host", "fail"),
+            ],
+        );
+
+        assert_eq!(
+            values.get("windows_stage_bootstrap").map(String::as_str),
+            Some("fail"),
+            "the OS whose bootstrap genuinely failed must read fail: {values:?}"
+        );
+        for platform in ["linux", "macos"] {
+            let column = format!("{platform}_stage_bootstrap");
+            assert_eq!(
+                values.get(&column).map(String::as_str),
+                Some("pass"),
+                "{column} must be unaffected by another OS's bootstrap failure: {values:?}"
+            );
+        }
+    }
+
+    /// The defect was never bootstrap-only. `cross_network_substrate_setup`
+    /// and `cross_network_preflight` are the same shape one column over: both
+    /// are run-scoped preconditions sharing the `cross_network` logical column
+    /// with eleven node-exercising CN stages, so a substrate that failed to
+    /// provision reddened `linux_/macos_/windows_stage_cross_network` as
+    /// though each OS's cross-network capability had been tested and failed.
+    #[test]
+    fn a_run_scoped_cross_network_failure_does_not_red_any_per_os_cross_network_column() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let targets = tri_os_targets();
+        let report_dir = tempfile::tempdir().expect("tempdir");
+
+        for run_scoped_stage in ["cross_network_substrate_setup", "cross_network_preflight"] {
+            let mut values = BTreeMap::new();
+            populate_stage_values(
+                &mut values,
+                &schema,
+                report_dir.path(),
+                &targets,
+                &[stage_evidence(run_scoped_stage, "fail")],
+            );
+            for platform in ["linux", "macos", "windows"] {
+                let column = format!("{platform}_stage_cross_network");
+                assert_eq!(
+                    values.get(&column),
+                    None,
+                    "{run_scoped_stage} is run-scoped and must not write {column}: {values:?}"
+                );
+            }
+        }
+
+        // ... while a genuinely node-exercising CN stage still fills them.
+        let mut values = BTreeMap::new();
+        populate_stage_values(
+            &mut values,
+            &schema,
+            report_dir.path(),
+            &targets,
+            &[stage_evidence("cross_network_nat_matrix", "fail")],
+        );
+        for platform in ["linux", "macos", "windows"] {
+            let column = format!("{platform}_stage_cross_network");
+            assert_eq!(
+                values.get(&column).map(String::as_str),
+                Some("fail"),
+                "a node-exercising CN stage must still populate {column}: {values:?}"
+            );
+        }
+    }
+
+    /// Pins the run-scoped SET against the orchestrator's own fanout, so the
+    /// registry flag cannot drift from execution reality. The criterion is
+    /// `StageGroup::Pre` + `StageFanout::Once`: a Pre stage that fans out per
+    /// node has a genuine per-node verdict and stays attributable, while a Pre
+    /// stage that runs once is a precondition on the lab as a whole. A newly
+    /// added Pre/Once stage fails this test until it is flagged.
+    ///
+    /// Only names the Rust `--node` engine actually dispatches can be checked
+    /// this way; bash-dialect Pre names (`prime_remote_access`,
+    /// `macos_preflight_check`) have no `StageId` and no live producer, so
+    /// they are outside the pairing.
+    #[test]
+    fn run_scoped_matches_orchestrator_fanout_for_every_dispatched_pre_stage() {
+        use crate::live_lab_stage_registry::{STAGES, StageGroup};
+        use crate::vm_lab::orchestrator::plan::PlanBuilder;
+        use crate::vm_lab::orchestrator::stage::StageFanout;
+
+        // The real plan, with EVERY opt-in suite enabled so no stage escapes
+        // the pairing by living in a suite the default plan omits. The fanout
+        // read here is therefore the one execution actually uses.
+        let cross_network =
+            crate::vm_lab::orchestrator::stage::cross_network::CrossNetworkOptions {
+                enable_suite: true,
+                ..Default::default()
+            };
+        let plan = PlanBuilder::new()
+            .with_enable_chaos_suite(true)
+            .with_enable_negative_control(true)
+            .with_cross_network_options(cross_network)
+            .build();
+        let fanouts: BTreeMap<String, StageFanout> = plan
+            .iter()
+            .map(|stage| (stage.name().to_owned(), stage.fanout()))
+            .collect();
+
+        let mut checked = 0_usize;
+        for spec in STAGES {
+            let Some(fanout) = fanouts.get(spec.name).cloned() else {
+                continue;
+            };
+            checked += 1;
+            let expected = spec.group == StageGroup::Pre && fanout == StageFanout::Once;
+            assert_eq!(
+                spec.run_scoped, expected,
+                "{} : run_scoped={} but group={:?} / fanout={:?} imply {}",
+                spec.name, spec.run_scoped, spec.group, fanout, expected
+            );
+        }
+        assert!(
+            checked >= 20,
+            "the fanout pairing checked only {checked} stages; the lookup has \
+             probably stopped resolving and the guard is vacuous"
+        );
+        // The set this currently resolves to, named so a change is visible in
+        // the diff rather than absorbed silently by the rule above.
+        let flagged: Vec<&str> = STAGES
+            .iter()
+            .filter(|spec| spec.run_scoped)
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![
+                "preflight",
+                "prepare_source_archive",
+                "cross_network_substrate_setup",
+                "cross_network_preflight",
+            ]
         );
     }
 
