@@ -2133,6 +2133,25 @@ That last one is the fail-closed question and should be answered first.
 > the competing hypothesis in the 08-11 refutation that the failures are the helper's own I/O
 > timeout rather than ordering at all (`privileged_helper.rs:660-685` documents the 2000 ms →
 > 10000 ms observation; the rendered helper plist already runs `--timeout-ms 30000`).
+>
+> **STATUS 2026-08-27 (QH-40-MEASURE) — kill ceiling and competing hypothesis SETTLED by live
+> measurement on `macos-utm-1`; reload-ordering matrix still open.** Verdict:
+> [`MacOsHelperShutdownOrderingDesign_2026-08-27.md`](./MacOsHelperShutdownOrderingDesign_2026-08-27.md)
+> §8 (raw evidence in §8.6). Key results: (1) the launchd kill ceiling is **5 s**
+> (`exit timeout = 5` via `launchctl print` on all rustynet services AND Apple's sshd on
+> macOS 26.5) — every §3 wait/lease bound must sit under it; the refuted plan's 5 s claim is
+> confirmed and its 30 s bound is measured-unreachable. (2) The helper-I/O-timeout mechanism
+> is **refuted on the current build**: a live idle-connection probe against the deployed
+> helper showed it holds the socket 2 × `--timeout-ms` then writes a WELL-FORMED error
+> response frame and stays alive — it never silently drops, and `truncated frame header` is
+> emitted only for a genuine EOF. The truncated-while-alive signature attributes instead to
+> the helper's **oversized-response silent drop** (pf-load failure message unbounded until
+> `64774bdd`, 2026-08-25 — after every ledger observation); the `Connection refused` tail
+> stays with the §2 completion race. A real, unnamed timeout defect: the daemon plist sets
+> no `--privileged-helper-timeout-ms`, so the daemon talks at the 2000 ms client default to
+> a helper serving at 30000 ms. (3) Ordering matrix + residue-marker live firing remain
+> unmeasured (harness permission classifier blocked deploying the cycle driver); the driver
+> and a marker-carrying binary are staged on the guest for the follow-up.
 
 ### QH-41 — `macos-utm-1` is on an isolated vmnet bridge, so every mixed-OS run fails its traffic matrix deterministically
 
