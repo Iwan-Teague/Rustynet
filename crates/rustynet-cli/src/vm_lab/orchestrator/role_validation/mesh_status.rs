@@ -53,7 +53,7 @@ use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 /// rather than executing it. Raise the bound for those workflows, or give the
 /// daemon a heartbeat write; do not derive it from the reconcile interval, which
 /// would red every healthy converged node.
-const SNAPSHOT_MAX_AGE_SECONDS: &str = "180";
+pub(crate) const SNAPSHOT_MAX_AGE_SECONDS: &str = "180";
 
 /// True where mesh-status validation runs live (Linux, macOS, Windows).
 pub fn mesh_status_runtime_implemented(platform: VmGuestPlatform) -> bool {

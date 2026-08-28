@@ -396,6 +396,30 @@ pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 /// node. Nothing fails open while the timer runs: an unbound interface drops
 /// traffic, it does not admit any.
 pub const HOST_FIREWALL_ADMISSION_ASSERT_INTERVAL_SECS: u64 = 30;
+
+/// QH-39: how often a healthy, quiescent node rewrites its session-state
+/// snapshot even when nothing changed.
+///
+/// `persist_state` is otherwise only reached from an event — a command
+/// handler, or the reconcile pass's apply block, which is gated on
+/// `FailClosed || Recoverable || assignment_changed || membership_changed ||
+/// local_route_reconcile_pending`. On a converged healthy node none of the
+/// five holds, so the snapshot's age grew without bound and its
+/// `timestamp_unix` measured "time since something last changed", not
+/// "time since the daemon was last alive". That is why the first attempt at
+/// arming `--max-age-seconds` on the mesh-status validators was reverted: it
+/// would have failed HEALTHY nodes in the documented reuse loops
+/// (`--skip-setup` / `--rerun-stage`, 12-25 min per iteration).
+///
+/// With a heartbeat the snapshot becomes a real liveness signal: a live
+/// daemon refreshes it at this cadence, and a dead, wedged, or fail-closed
+/// one stops. The heartbeat deliberately does NOT run while the node is
+/// restricted or the last reconcile errored — refreshing the timestamp there
+/// would paper over exactly the state a freshness bound exists to catch.
+///
+/// 30 s matches the host-firewall assert cadence above and leaves the 180 s
+/// bound used by the mesh-status stages a 6x margin.
+pub const STATE_SNAPSHOT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
 pub const DEFAULT_AUTO_PORT_FORWARD_EXIT: bool = false;
 pub const DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS: u32 = 1_200;
@@ -4280,6 +4304,10 @@ struct DaemonRuntime {
     /// periodic posture check runs on its own slow cadence rather than on every
     /// one-second reconcile tick.
     last_host_firewall_admission_assert_unix: Option<u64>,
+    /// QH-39: unix time of the last successful session-state persist, so a
+    /// healthy quiescent node still refreshes the snapshot the mesh-status
+    /// validators read for freshness.
+    last_state_persist_unix: Option<u64>,
     last_reconcile_error: Option<String>,
     last_applied_assignment: Option<AutoTunnelWatermark>,
     local_route_reconcile_pending: bool,
@@ -4797,6 +4825,7 @@ impl DaemonRuntime {
             reconcile_failures: 0,
             last_reconcile_unix: None,
             last_host_firewall_admission_assert_unix: None,
+            last_state_persist_unix: None,
             last_reconcile_error: None,
             last_applied_assignment: None,
             local_route_reconcile_pending: false,
@@ -9759,8 +9788,9 @@ impl DaemonRuntime {
     }
 
     fn persist_state(&mut self) -> Result<(), String> {
+        let now_unix = unix_now();
         let snapshot = SessionStateSnapshot {
-            timestamp_unix: unix_now(),
+            timestamp_unix: now_unix,
             peer_ids: self.advertised_routes.iter().cloned().collect::<Vec<_>>(),
             selected_exit_node: self.selected_exit_node.clone(),
             lan_access_enabled: self.lan_access_enabled,
@@ -9769,7 +9799,34 @@ impl DaemonRuntime {
             self.restrict_permanent("state persist failure".to_owned());
             self.force_fail_closed_or_restrict("state_persist_failure");
             err.to_string()
-        })
+        })?;
+        self.last_state_persist_unix = Some(now_unix);
+        Ok(())
+    }
+
+    /// QH-39: rewrite the session-state snapshot on a slow cadence so its
+    /// timestamp measures daemon liveness rather than "time since something
+    /// last changed". See `STATE_SNAPSHOT_HEARTBEAT_INTERVAL_SECS`.
+    ///
+    /// Skipped while the node is restricted or the pass recorded an error:
+    /// a daemon that cannot reconcile must let its snapshot go stale, which is
+    /// the signal the mesh-status freshness bound reads.
+    fn maybe_heartbeat_persist_state(&mut self) {
+        if self.restriction_mode != RestrictionMode::None
+            || self.last_reconcile_error.is_some()
+            || self.controller.state() == DataplaneState::FailClosed
+        {
+            return;
+        }
+        let now_unix = unix_now();
+        if let Some(last) = self.last_state_persist_unix
+            && now_unix.saturating_sub(last) < STATE_SNAPSHOT_HEARTBEAT_INTERVAL_SECS
+        {
+            return;
+        }
+        if let Err(err) = self.persist_state() {
+            log::warn!("reconcile: heartbeat state persist failed: {err}");
+        }
     }
 
     /// Performs a full verified load (signature + freshness + replay-watermark check)
@@ -10208,6 +10265,7 @@ impl DaemonRuntime {
         }
 
         self.maybe_reassert_host_firewall_admission();
+        self.maybe_heartbeat_persist_state();
         self.poll_endpoint_monitor_and_maybe_refresh();
         self.maintain_exit_port_forward(
             self.is_serving_exit_node(self.selected_exit_node.as_deref()),
@@ -34879,6 +34937,97 @@ mod tests {
         assert!(
             state_path.exists(),
             "state file must be written after a successful reconcile"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// QH-39: a healthy node with NOTHING changing must still refresh the
+    /// snapshot, so its `timestamp_unix` measures daemon liveness rather than
+    /// "time since something last changed".
+    ///
+    /// Without the heartbeat, `persist_state` is only reachable from a command
+    /// handler or from the reconcile apply block, which is gated on
+    /// `FailClosed || Recoverable || assignment_changed || membership_changed ||
+    /// local_route_reconcile_pending`. None of the five holds on a converged
+    /// node, so the snapshot aged without bound — which is why arming a
+    /// freshness bound on the mesh-status validators was reverted once already.
+    #[test]
+    fn quiescent_reconcile_heartbeats_the_state_snapshot() {
+        let relay_addr: SocketAddr = "203.0.113.42:40099".parse().expect("relay addr");
+        let (mut runtime, test_dir) =
+            build_runtime_with_custom_relay("rustynetd-state-heartbeat", relay_addr, "relay-test");
+        let state_path = runtime.state_path.clone();
+
+        runtime.reconcile();
+        assert!(
+            state_path.exists(),
+            "first reconcile must write the snapshot"
+        );
+
+        // Age the snapshot AND the persist bookkeeping past the heartbeat
+        // interval, then reconcile with nothing changed: the apply block is
+        // skipped, so only the heartbeat can refresh it.
+        let stale_unix =
+            unix_now().saturating_sub(super::STATE_SNAPSHOT_HEARTBEAT_INTERVAL_SECS * 10);
+        super::persist_session_snapshot(
+            &super::SessionStateSnapshot {
+                timestamp_unix: stale_unix,
+                peer_ids: Vec::new(),
+                selected_exit_node: None,
+                lan_access_enabled: false,
+            },
+            &state_path,
+        )
+        .expect("plant a stale snapshot");
+        runtime.last_state_persist_unix = Some(stale_unix);
+
+        runtime.reconcile();
+
+        let refreshed =
+            super::load_session_snapshot(&state_path).expect("snapshot must still load");
+        assert!(
+            refreshed.timestamp_unix > stale_unix,
+            "quiescent reconcile must refresh the snapshot: {} !> {stale_unix}",
+            refreshed.timestamp_unix
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The heartbeat is a slow cadence, not a per-tick write: a snapshot
+    /// persisted moments ago must NOT be rewritten on the next tick.
+    #[test]
+    fn quiescent_reconcile_does_not_rewrite_a_fresh_snapshot() {
+        let relay_addr: SocketAddr = "203.0.113.42:40099".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-state-heartbeat-cadence",
+            relay_addr,
+            "relay-test",
+        );
+        let state_path = runtime.state_path.clone();
+
+        runtime.reconcile();
+
+        let planted_unix = unix_now().saturating_sub(1);
+        super::persist_session_snapshot(
+            &super::SessionStateSnapshot {
+                timestamp_unix: planted_unix,
+                peer_ids: Vec::new(),
+                selected_exit_node: None,
+                lan_access_enabled: false,
+            },
+            &state_path,
+        )
+        .expect("plant a fresh snapshot");
+        runtime.last_state_persist_unix = Some(unix_now());
+
+        runtime.reconcile();
+
+        let after = super::load_session_snapshot(&state_path).expect("snapshot must still load");
+        assert_eq!(
+            after.timestamp_unix, planted_unix,
+            "a snapshot inside the heartbeat interval must not be rewritten"
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
