@@ -146,6 +146,11 @@ That correction does not change Cell 1's verdict — `anchor_validation` did
 dispatch and its skip is genuine — but it does mean the `live_anchor` half of
 the cell is **untested today**, not unavailable.
 
+> Disposition 2026-08-28: the §2.4 driver defect's `macos_anchor` arm is fixed —
+> it now calls `add_default_backbone` like `macos_exit` (pinned by
+> `macos_anchor_target_carries_the_default_backbone_like_macos_exit`); the other
+> §2.4 arms (`macos_blind_exit`, `macos_relay`, admin/windows cells) remain open.
+
 ### 2.4 Role-election plumbing gap in the MCP driver
 
 Run 1 died in `preflight` with `lab requires exactly 1 Exit node, found 0`.
