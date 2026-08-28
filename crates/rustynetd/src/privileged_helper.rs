@@ -244,6 +244,18 @@ pub enum PrivilegedCommandProgram {
     /// firewalld resolves the default server-side, so `trusted` and every other
     /// zone are unrepresentable rather than merely validated against (QH-46).
     LinuxFirewalldZone,
+    /// In-helper conntrack flush builtin (`linux_conntrack_flush`). NOT an
+    /// external binary from the daemon's point of view: the arguments are a
+    /// validated STRUCTURED spec, and the helper — not the caller — builds the
+    /// `conntrack` argv, resolves the binary and interprets the result.
+    ///
+    /// The grammar expresses exactly one operation, `conntrack -D` filtered by
+    /// original source network, and the network must be a canonical, bounded
+    /// private/CGNAT IPv4 range. `-F` (flush every conntrack entry on the host,
+    /// which would kill the operator's own SSH session and every unrelated
+    /// long-lived flow) is therefore unrepresentable rather than merely
+    /// validated against, as are `-L`, `-E`, and any second filter (QH-47).
+    LinuxConntrackFlush,
 }
 
 impl PrivilegedCommandProgram {
@@ -266,6 +278,9 @@ impl PrivilegedCommandProgram {
             }
             PrivilegedCommandProgram::LinuxFirewalldZone => {
                 crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM
+            }
+            PrivilegedCommandProgram::LinuxConntrackFlush => {
+                crate::linux_conntrack_flush::LINUX_CONNTRACK_FLUSH_PROGRAM
             }
         }
     }
@@ -290,6 +305,9 @@ impl PrivilegedCommandProgram {
             _ if value == crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM => {
                 Some(PrivilegedCommandProgram::LinuxFirewalldZone)
             }
+            _ if value == crate::linux_conntrack_flush::LINUX_CONNTRACK_FLUSH_PROGRAM => {
+                Some(PrivilegedCommandProgram::LinuxConntrackFlush)
+            }
             _ => None,
         }
     }
@@ -303,6 +321,7 @@ impl PrivilegedCommandProgram {
             PrivilegedCommandProgram::DnsFailclosedFile
                 | PrivilegedCommandProgram::MacosPfLoad
                 | PrivilegedCommandProgram::LinuxFirewalldZone
+                | PrivilegedCommandProgram::LinuxConntrackFlush
         )
     }
 
@@ -337,7 +356,8 @@ impl PrivilegedCommandProgram {
             // Pfctl candidate set, not this one.)
             PrivilegedCommandProgram::DnsFailclosedFile
             | PrivilegedCommandProgram::MacosPfLoad
-            | PrivilegedCommandProgram::LinuxFirewalldZone => &[],
+            | PrivilegedCommandProgram::LinuxFirewalldZone
+            | PrivilegedCommandProgram::LinuxConntrackFlush => &[],
         }
     }
 
@@ -1167,6 +1187,8 @@ fn execute_builtin(
         }
         PrivilegedCommandProgram::MacosPfLoad => execute_macos_pf_load(args),
         #[cfg(not(windows))]
+        PrivilegedCommandProgram::LinuxConntrackFlush => execute_linux_conntrack_flush(args),
+        #[cfg(not(windows))]
         PrivilegedCommandProgram::LinuxFirewalldZone => execute_linux_firewalld_zone(args),
         // No other builtins exist; fail closed if one is added without a handler.
         _ => Err(format!("no in-process handler for builtin {program}")),
@@ -1368,6 +1390,103 @@ fn execute_linux_firewalld_zone(args: &[&str]) -> Result<PrivilegedCommandOutput
 /// Deliberately NOT a nameable `PrivilegedCommandProgram`: the daemon must never
 /// be able to ask the helper to run `busctl` with arguments of its choosing, so
 /// the only argv that ever reaches it are the constants above.
+/// Run the `linux-conntrack-flush` builtin (QH-47).
+///
+/// # What crosses the boundary
+///
+/// One value: the source network, already constrained by
+/// [`crate::linux_conntrack_flush::ConntrackFlushSpec`] to the canonical
+/// network address of a bounded private/CGNAT IPv4 range. Every other token in
+/// the `conntrack` argv is a helper-owned literal produced by
+/// `ConntrackFlushSpec::conntrack_argv`, so the caller cannot name an
+/// operation: `-D` filtered by original source is the only thing this builtin
+/// can do, and a table-wide `-F` — which would destroy the operator's own SSH
+/// session and every other unrelated flow on the host — is not expressible.
+///
+/// # Why the tool being absent is a reported OUTCOME, not an error
+///
+/// `conntrack-tools` is not installed by default on most distributions. If it
+/// is missing, the flush genuinely did not happen and the caller must know
+/// that — but the condition is not a failure of the privileged boundary and
+/// must not be indistinguishable from "the selector matched nothing". So it
+/// returns a distinct structured outcome the daemon logs loudly, rather than an
+/// error string the daemon would have to pattern-match, or a fabricated
+/// zero-entry success.
+///
+/// # Why a non-zero exit is not automatically a failure
+///
+/// `conntrack -D` exits non-zero when it deleted nothing, which is the normal
+/// result on a node with no established mesh flows. The deleted-entry count in
+/// its summary line is the success signal; the absence of that line is the
+/// failure signal.
+#[cfg(not(windows))]
+fn execute_linux_conntrack_flush(args: &[&str]) -> Result<PrivilegedCommandOutput, String> {
+    use crate::linux_conntrack_flush::{
+        ConntrackFlushOutcome, ConntrackFlushSpec, parse_deleted_entry_count,
+    };
+
+    let spec = ConntrackFlushSpec::decode(args)?;
+    let Some(conntrack) = resolve_conntrack_binary() else {
+        return Ok(PrivilegedCommandOutput {
+            status: 0,
+            stdout: ConntrackFlushOutcome::ToolAbsent.encode(),
+            stderr: String::new(),
+        });
+    };
+
+    let argv = spec.conntrack_argv();
+    let output = run_privileged_subprocess(
+        &conntrack,
+        &argv,
+        Duration::from_millis(DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS),
+    )
+    .map_err(|err| {
+        format!(
+            "conntrack flush execution failed ({}): {err}",
+            conntrack.display()
+        )
+    })?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let entries = parse_deleted_entry_count(&stderr)
+        .or_else(|| parse_deleted_entry_count(&stdout))
+        .ok_or_else(|| {
+            format!(
+                "conntrack flush reported no deletion summary: status={} stderr={}",
+                exit_status_code(output.status),
+                truncate_lossy(&output.stderr, 256)
+            )
+        })?;
+
+    Ok(PrivilegedCommandOutput {
+        status: 0,
+        stdout: ConntrackFlushOutcome::Flushed { entries }.encode(),
+        stderr: String::new(),
+    })
+}
+
+/// Resolve `conntrack` from the audited candidate paths, applying the same
+/// root-owned / non-group-writable / executable checks every other privileged
+/// binary gets. `None` means "not installed", which is a reportable outcome
+/// here rather than an error (see [`execute_linux_conntrack_flush`]).
+#[cfg(not(windows))]
+fn resolve_conntrack_binary() -> Option<PathBuf> {
+    for candidate in [
+        "/usr/sbin/conntrack",
+        "/sbin/conntrack",
+        "/usr/bin/conntrack",
+    ] {
+        let path = Path::new(candidate);
+        if path.exists()
+            && let Ok(validated) = validate_privileged_program_binary(path, "conntrack")
+        {
+            return Some(validated);
+        }
+    }
+    None
+}
+
 #[cfg(not(windows))]
 fn resolve_busctl_binary() -> Result<PathBuf, String> {
     for candidate in ["/usr/bin/busctl", "/bin/busctl"] {
@@ -1767,7 +1886,22 @@ pub fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Res
         PrivilegedCommandProgram::DnsFailclosedFile => validate_dns_failclosed_file_args(args),
         PrivilegedCommandProgram::MacosPfLoad => validate_macos_pf_load_args(args),
         PrivilegedCommandProgram::LinuxFirewalldZone => validate_linux_firewalld_zone_args(args),
+        PrivilegedCommandProgram::LinuxConntrackFlush => validate_linux_conntrack_flush_args(args),
     }
+}
+
+/// Validate the `linux-conntrack-flush` builtin (QH-47). Decode success IS the
+/// validation, exactly as for `macos-pf-load` and `linux-firewalld-zone`: the
+/// grammar is two `key=value` tokens (`family`, `orig-src`) with duplicate and
+/// unknown-key rejection, the family is an exact match against a single literal
+/// with no default arm, and the source must be the canonical network address of
+/// a bounded private/CGNAT IPv4 range.
+///
+/// There is no operation token to validate, because `conntrack -D` filtered by
+/// original source is the only thing the grammar can express — a table-wide
+/// `-F` is not a value the caller can name.
+fn validate_linux_conntrack_flush_args(args: &[&str]) -> Result<(), String> {
+    crate::linux_conntrack_flush::ConntrackFlushSpec::decode(args).map(|_| ())
 }
 
 /// Validate the `linux-firewalld-zone` builtin. Decode success IS the
@@ -3279,6 +3413,114 @@ mod tests {
             .resolve_binary()
             .expect_err("builtin must have no external binary");
         assert!(err.contains("builtin"), "{err}");
+    }
+
+    // QH-47: the conntrack-flush builtin. The privileged boundary here is the
+    // grammar itself — the daemon can name a mesh source network and nothing
+    // else, so `conntrack -F` (which would destroy the operator's own SSH
+    // session and every unrelated long-lived flow on the host) is
+    // unrepresentable rather than merely rejected.
+
+    #[test]
+    fn linux_conntrack_flush_builtin_permits_exactly_the_two_token_grammar() {
+        for cidr in ["100.64.0.0/10", "10.0.0.0/8", "192.168.7.0/24"] {
+            let source = format!("orig-src={cidr}");
+            assert!(
+                validate_request(
+                    PrivilegedCommandProgram::LinuxConntrackFlush,
+                    &["family=ipv4", source.as_str()],
+                )
+                .is_ok(),
+                "helper must permit the reviewed grammar for {cidr:?}"
+            );
+        }
+    }
+
+    /// The QH-45 near-miss pattern applied at the HELPER boundary: an argv one
+    /// token off the allowed shape is refused by `validate_request`, which is
+    /// the gate both the IPC helper and the helper-less direct path share.
+    #[test]
+    fn linux_conntrack_flush_builtin_rejects_near_miss_argv() {
+        for bad in [
+            // the blanket flush, in every spelling a caller might reach for
+            &["family=ipv4", "orig-src=0.0.0.0/0"][..],
+            &["family=ipv4", "orig-src=100.64.0.0/10", "-F"][..],
+            &["family=ipv4", "orig-src=100.64.0.0/10", "op=flush"][..],
+            &["-F"][..],
+            &["--flush"][..],
+            // one character off in a key
+            &["famly=ipv4", "orig-src=100.64.0.0/10"][..],
+            &["family=ipv4", "orig_src=100.64.0.0/10"][..],
+            &["family=ipv4", "--orig-src=100.64.0.0/10"][..],
+            // one character off in a value
+            &["family=IPv4", "orig-src=100.64.0.0/10"][..],
+            &["family=ipv6", "orig-src=100.64.0.0/10"][..],
+            &["family=ipv4", "orig-src=100.64.0.0/9"][..],
+            &["family=ipv4", "orig-src=100.64.0.1/10"][..],
+            // one token missing, duplicated, or unseparated
+            &["family=ipv4"][..],
+            &["orig-src=100.64.0.0/10"][..],
+            &["family=ipv4", "family=ipv4", "orig-src=100.64.0.0/10"][..],
+            &[
+                "family=ipv4",
+                "orig-src=100.64.0.0/10",
+                "orig-src=10.0.0.0/8",
+            ][..],
+            &["family ipv4", "orig-src=100.64.0.0/10"][..],
+            // a globally routable source, which would flush unrelated traffic
+            &["family=ipv4", "orig-src=8.8.8.0/24"][..],
+            &["family=ipv4", "orig-src=128.0.0.0/1"][..],
+            // shell/path smuggling attempts in the one free position
+            &["family=ipv4", "orig-src=100.64.0.0/10;reboot"][..],
+            &["family=ipv4", "orig-src=$MESH"][..],
+            &["family=ipv4", "orig-src="][..],
+        ] {
+            assert!(
+                validate_request(PrivilegedCommandProgram::LinuxConntrackFlush, bad).is_err(),
+                "helper must reject conntrack flush argv {bad:?}"
+            );
+        }
+    }
+
+    /// The daemon must not be able to reach `conntrack` through the generic
+    /// exec path: the program is a builtin, the helper owns the argv, and
+    /// binary resolution fails closed if it is ever reached.
+    #[test]
+    fn linux_conntrack_flush_builtin_never_resolves_an_external_binary() {
+        assert!(PrivilegedCommandProgram::LinuxConntrackFlush.is_builtin());
+        let err = PrivilegedCommandProgram::LinuxConntrackFlush
+            .resolve_binary()
+            .expect_err("builtin must have no external binary");
+        assert!(err.contains("builtin"), "{err}");
+    }
+
+    #[test]
+    fn linux_conntrack_flush_program_token_round_trips() {
+        let program = PrivilegedCommandProgram::LinuxConntrackFlush;
+        assert_eq!(
+            program.as_str(),
+            crate::linux_conntrack_flush::LINUX_CONNTRACK_FLUSH_PROGRAM
+        );
+        assert_eq!(
+            PrivilegedCommandProgram::parse(program.as_str()),
+            Some(program)
+        );
+    }
+
+    /// The helper-less direct path must apply the identical gate, so running
+    /// the daemon as root without a privilege-separated helper cannot bypass
+    /// the grammar (RN-19).
+    #[test]
+    fn linux_conntrack_flush_direct_path_applies_the_same_allowlist() {
+        let refused = crate::privileged_helper::try_execute_builtin_program(
+            PrivilegedCommandProgram::LinuxConntrackFlush,
+            &["family=ipv4", "orig-src=0.0.0.0/0"],
+        )
+        .expect("the builtin must be dispatched, not fall through to exec");
+        assert!(
+            refused.is_err(),
+            "the direct path must refuse a blanket source network too"
+        );
     }
 
     #[test]
