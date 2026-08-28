@@ -214,6 +214,18 @@ pub struct OrchestrationContext {
     /// `--resume-from` so a mismatched resume fails closed).
     pub substrate_record:
         Option<crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord>,
+    /// Whether THIS run elected the macOS anchor validator set
+    /// (`--anchor-platform macos`), which dispatches
+    /// `deploy_macos_anchor_profile` + `validate_macos_anchor_bundle_pull` +
+    /// `validate_macos_anchor_port_mapping_authority` in the same invocation.
+    /// Run-local only (never serialized): a resumed context reloads as
+    /// `false`, which grades macOS anchor runtime coverage as a reported
+    /// skip — the fail-closed direction (a re-run re-derives it from the
+    /// selector). `anchor_validation` consults this to distinguish a macOS
+    /// anchor whose bundle-pull runtime is delegated to that validator set
+    /// (this run) from one whose runtime has no evidence path (reported
+    /// skip; MAC-D1).
+    pub macos_anchor_validators_elected: bool,
 }
 
 impl OrchestrationContext {
@@ -239,6 +251,7 @@ impl OrchestrationContext {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         }
     }
 
@@ -360,6 +373,11 @@ impl OrchestrationContext {
             orchestrator_dialect: snapshot.orchestrator_dialect,
             substrate: None,
             substrate_record: snapshot.substrate_record,
+            // Run-local election flag is never persisted; a resumed context
+            // reloads `false` — the fail-closed direction (macOS anchor
+            // runtime grades as a reported skip until the run is re-derived
+            // from the `--anchor-platform macos` selector).
+            macos_anchor_validators_elected: false,
         })
     }
 }

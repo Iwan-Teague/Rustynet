@@ -37,9 +37,24 @@ impl NodeRole {
     /// Windows Exit remains fail-closed until W5.4 live evidence is recorded.
     /// macOS Exit maps to the reviewed `blind_exit` PF posture. Anchor, Admin,
     /// and Relay are supported on Linux today (live-evidenced) and remain
-    /// fail-closed on macOS + Windows until a green standard-orchestrator run
-    /// is archived (cross-OS role-testing Phase 8); they are still
-    /// lab-assignable everywhere so that evidence can be generated.
+    /// fail-closed on macOS + Windows until a green run is archived
+    /// (cross-OS role-testing Phase 8); they are still lab-assignable
+    /// everywhere so that evidence can be generated.
+    ///
+    /// MAC-D1 (2026-08-28): the promotion evidence for Anchor on macOS is the
+    /// DEDICATED macOS anchor validator set — `deploy_macos_anchor_profile` +
+    /// `validate_macos_anchor_bundle_pull` +
+    /// `validate_macos_anchor_port_mapping_authority`, dispatched by
+    /// `--anchor-platform macos` — NOT this stage's inline substages.
+    /// `anchor_validation` no longer consults this predicate for its runtime
+    /// gate (it keys on `anchor_lab_runtime_implemented` + the validator-set
+    /// election), so the green evidence this arm waits on is actually
+    /// producible; gating that stage on this same predicate was circular
+    /// (`MacCellsHarvest_2026-08-28.md` §2.2). This arm stays fail-closed
+    /// until that combined run is archived green. Admin and Relay keep the
+    /// original Linux-only posture (their macOS cells have their own
+    /// validator sets and are out of MAC-D1 scope).
+    ///
     /// BlindExit is macOS + Linux only (PF-level posture; Windows unsupported
     /// by design — no WFP blind-exit equivalent exists).
     ///
@@ -64,7 +79,9 @@ impl NodeRole {
             // generation (see `is_lab_assignable_for_platform`) and are
             // promoted to supported here only once a green run is archived,
             // mirroring the Windows-Exit posture-promotion gate. Strictest
-            // secure default until then: fail closed.
+            // secure default until then: fail closed. For Anchor on macOS the
+            // promotion evidence is the macOS anchor validator set (see the
+            // MAC-D1 note above) — never this predicate's own consumers.
             NodeRole::Anchor | NodeRole::Admin | NodeRole::Relay => {
                 matches!(platform, VmGuestPlatform::Linux)
             }

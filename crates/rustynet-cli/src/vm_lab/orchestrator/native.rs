@@ -249,6 +249,16 @@ pub(crate) fn execute_rust_native_orchestration(
         config.blind_exit_platform.as_deref(),
     )?;
 
+    // MAC-D1: record whether THIS run elected the macOS anchor validator set
+    // (`--anchor-platform macos`), which dispatches deploy_macos_anchor_profile
+    // + validate_macos_anchor_bundle_pull +
+    // validate_macos_anchor_port_mapping_authority in this same invocation.
+    // `anchor_validation` consults this run-local flag (never persisted; a
+    // resumed context reloads `false`, the fail-closed direction) to grade a
+    // macOS anchor's bundle-pull runtime as delegated evidence rather than a
+    // reported skip.
+    ctx.macos_anchor_validators_elected = config.anchor_platform.as_deref() == Some("macos");
+
     // Collect node hosts first so we can auto-derive ssh_allow_cidrs when not
     // provided. This mirrors the bash orchestrator's auto-detection behaviour.
     let node_entries: Vec<(

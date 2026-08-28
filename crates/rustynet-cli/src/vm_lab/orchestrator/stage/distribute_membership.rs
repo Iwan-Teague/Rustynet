@@ -97,6 +97,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         assert!(matches!(
             DistributeMembershipStage.execute(&mut ctx),
@@ -126,6 +127,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            macos_anchor_validators_elected: false,
         };
         // Only exit node — nothing to distribute to
         assert_eq!(
