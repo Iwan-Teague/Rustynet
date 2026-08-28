@@ -584,7 +584,9 @@ fn run_ported_scenario_profile(
     // node the scenario never touches.
     let needs_relay = matches!(
         kind,
-        CrossNetworkStageKind::RelayRemoteExit | CrossNetworkStageKind::FailbackRoaming
+        CrossNetworkStageKind::RelayRemoteExit
+            | CrossNetworkStageKind::FailbackRoaming
+            | CrossNetworkStageKind::ControllerSwitch
     );
     let needs_probe = matches!(kind, CrossNetworkStageKind::TraversalAdversarial);
     let client_remote = match remote_host_for_role(ctx, "client") {
@@ -721,6 +723,15 @@ fn run_ported_scenario_profile(
                 &inputs,
                 &lab,
                 scenario::failback_roaming::FailbackRoamingOptions::default(),
+            ),
+        ),
+        CrossNetworkStageKind::ControllerSwitch => (
+            scenario::controller_switch::SUITE,
+            scenario::controller_switch::run(
+                &host,
+                &inputs,
+                &lab,
+                scenario::controller_switch::ControllerSwitchOptions::default(),
             ),
         ),
         // The adversarial scenario runs no remote commands of its own — it
@@ -909,7 +920,7 @@ fn run_script_stage(
             ))
             .arg("--log-path")
             .arg(stage_log_path_for_idx(&stage_dir, spec.name, profile, idx));
-        add_common_hosts(&mut cmd, &topology, spec.kind);
+        add_common_hosts(&mut cmd, &topology);
         let outcome = run_command(cmd, bin_name(spec.kind));
         if !matches!(outcome, StageOutcome::Passed) {
             return outcome;
@@ -918,11 +929,12 @@ fn run_script_stage(
     StageOutcome::Passed
 }
 
-fn add_common_hosts(
-    cmd: &mut Command,
-    topology: &CrossNetworkTopology,
-    kind: CrossNetworkStageKind,
-) {
+/// The host and node identity every remaining `cargo run --bin` scenario takes.
+///
+/// The per-scenario branches are gone: the relay arm went with the last relay
+/// scenario's port, and the two validators still on this path take the same
+/// argument set.
+fn add_common_hosts(cmd: &mut Command, topology: &CrossNetworkTopology) {
     cmd.arg("--client-host")
         .arg(&topology.client.target)
         .arg("--exit-host")
@@ -938,22 +950,10 @@ fn add_common_hosts(
         .arg(&topology.exit.node_id)
         .arg("--known-hosts-file")
         .arg(&topology.client.known_hosts);
-
-    if matches!(kind, CrossNetworkStageKind::ControllerSwitch) {
-        cmd.arg("--relay-host")
-            .arg(&topology.relay.target)
-            .arg("--relay-node-id")
-            .arg(&topology.relay.node_id)
-            .arg("--relay-network-id")
-            .arg(&topology.relay_network_id);
-    }
 }
 
 fn bin_name(kind: CrossNetworkStageKind) -> &'static str {
     match kind {
-        CrossNetworkStageKind::ControllerSwitch => {
-            "live_linux_cross_network_controller_switch_test"
-        }
         CrossNetworkStageKind::RemoteExitDns => "live_linux_cross_network_remote_exit_dns_test",
         CrossNetworkStageKind::RemoteExitSoak => "live_linux_cross_network_remote_exit_soak_test",
         // The ported scenarios join these: CN-3 dispatches them in process via
@@ -965,6 +965,7 @@ fn bin_name(kind: CrossNetworkStageKind) -> &'static str {
         | CrossNetworkStageKind::TraversalAdversarial
         | CrossNetworkStageKind::NodeNetworkSwitch
         | CrossNetworkStageKind::FailbackRoaming
+        | CrossNetworkStageKind::ControllerSwitch
         | CrossNetworkStageKind::Preflight
         | CrossNetworkStageKind::NatClassification
         | CrossNetworkStageKind::NatMatrix => unreachable!("no script for this stage kind"),

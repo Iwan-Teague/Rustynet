@@ -44,6 +44,7 @@ use std::fmt;
 use super::substrate::{LeafOutput, NetLeafRunner};
 
 pub mod baseline;
+pub mod controller_switch;
 pub mod direct_remote_exit;
 pub mod endpoint_switch;
 pub mod failback_roaming;
