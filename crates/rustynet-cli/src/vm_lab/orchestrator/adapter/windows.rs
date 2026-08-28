@@ -193,11 +193,15 @@ impl NodeAdapter for WindowsNodeAdapter {
 
     // ── Validators ────────────────────────────────────────────────────────────
 
-    fn run_validator(&self, op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
+    fn run_validator(
+        &self,
+        op: DaemonProbeOp,
+        extra_args: &[String],
+    ) -> Result<ValidatorReport, AdapterError> {
         use crate::vm_lab::{DaemonProbe, WindowsDaemonProbe};
         let probe = WindowsDaemonProbe;
         let argv = probe
-            .build_argv(op, WINDOWS_RUSTYNETD_PATH.as_ref())
+            .build_argv_with_extra_args(op, WINDOWS_RUSTYNETD_PATH.as_ref(), extra_args)
             .map_err(|message| AdapterError::Protocol { message })?;
         // argv: [daemon_path, subcommand, "--no-fail-on-drift"]
         // All elements come from `WindowsDaemonProbe::build_argv`, which produces

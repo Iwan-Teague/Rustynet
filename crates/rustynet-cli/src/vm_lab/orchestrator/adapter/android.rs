@@ -102,7 +102,11 @@ impl NodeAdapter for AndroidNodeAdapter {
     fn distribute_verifier_key(&self, _: BundleKind, _: &Path) -> Result<(), AdapterError> {
         Err(android_unsupported())
     }
-    fn run_validator(&self, _: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
+    fn run_validator(
+        &self,
+        _: DaemonProbeOp,
+        _: &[String],
+    ) -> Result<ValidatorReport, AdapterError> {
         Err(android_unsupported())
     }
     fn ping_mesh_peer(&self, _: &str) -> Result<TrafficTestResult, AdapterError> {
