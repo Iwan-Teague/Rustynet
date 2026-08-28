@@ -3158,6 +3158,87 @@ firewalld or the interface — but the asymmetry violates the §10.7 shape ("und
 revocation") and should either gain an `Unbind` call on the demotion path or a documented
 decision that the bounded residue is acceptable.
 
+**FIXED 2026-08-28 — the `Unbind` call was added (the first of the two options above).**
+
+One correction to the paragraph above: the line numbers are stale (post-[[QH-53]] the bind is
+`ensure_host_firewall_admits_forwarding`, phase10.rs:1027, reached through the
+`admit_host_firewall_forwarding` stage the controller runs after backend start, NOT through
+`apply_firewall_killswitch`). The claim itself re-verified true: `FirewalldZoneOp::Unbind` had
+zero daemon callers, and the helper-side handler
+(`privileged_helper.rs:1311`, `removeInterface` + a re-read of the binding) was already
+implemented and waiting.
+
+**Which paths now unbind, and why.** The binding is recorded on the generation that installed it
+(new `StageMarker::HostFirewallAdmitted`, pushed after a successful admit and deliberately AFTER
+`BackendStarted`, so the reverse-order unwind withdraws it while the interface it names still
+exists — pinned by `the_admission_marker_is_recorded_after_the_backend_start`). Three paths
+consume it:
+
+1. **In-place relay/exit demotion** — `rollback_obsolete_controls`, alongside the exit-NAT
+   rollback and under the same "previous generation had it, this one does not" gate. This is the
+   path the defect describes: the tunnel interface is not rebuilt, so nothing else drops the
+   binding.
+2. **Daemon shutdown of a serving node** — the `HostFirewallAdmitted` arm of
+   `rollback_generation_best_effort` under `RollbackIntent::CleanShutdown`. NOT covered by the
+   shutdown-residue work merged the same night: that reports teardown failures, it does not add
+   teardown steps, and there was no step to run.
+3. **Fail-closed unwind** — the same arm under `RollbackIntent::FailClosed`. Withdrawn under BOTH
+   intents, unlike DNS and the killswitch, which are HELD through a fail-closed unwind because
+   restoring them would fail OPEN. The zone binding is a permission granted to a foreign
+   firewall, so removing it is strictly more restrictive and has no fail-open direction to guard.
+
+Crash-restart residue (a node that dies while serving and restarts as a client, where
+`active_stages` is empty and the marker is gone) is the sibling case `reconcile_exit_nat_residue`
+handles for exit NAT. It is NOT covered here and is deliberately out of scope: an unconditional
+per-apply probe would put a `busctl` round-trip on every plain-client apply and would report a
+spurious failure on every host without `busctl`. Tracked as remaining work under this entry.
+
+**Failure semantics: report, do not block — justified by direction, not by convenience.** The
+bind fails the apply CLOSED because serving a forwarding role whose traffic firewalld silently
+rejects is a false advertisement ([[QH-46]]). The unbind cannot: the only thing a leftover
+binding does is admit forwarded traffic through firewalld, and by the time it runs, this
+generation's own forward chain (`policy drop`, and a drop is terminal) no longer accepts any. So
+a failed withdrawal never fails a healthy node closed. On the apply path it logs at `warn` and
+RE-RECORDS the marker into the generation being built, so the removal is retried on the next
+apply and again at shutdown; on the shutdown path it joins `rollback_errors` exactly like every
+other teardown stage, becoming `RollbackFailed` — which is what [[QH-40]]'s durable
+shutdown-residue marker escalates. "Report" is a channel, not a log line.
+
+**Interaction with [[QH-54]]'s periodic re-assert.** No change was needed: the re-assert's
+existing `current_serve_exit_node` gate already covers demotion (a committing apply assigns
+`options.serve_exit_node`; `shutdown` and the `ExitModeApplied` rollback arm clear it), so a
+demoted node's re-assert is a no-op and cannot re-bind what the demotion withdrew. Verified
+rather than assumed — `the_periodic_reassert_does_not_rebind_after_a_demotion` demotes a serving
+fixture and asserts the following re-assert touches the host firewall not at all.
+
+Enforcement: `DataplaneSystem::withdraw_host_firewall_forwarding` (non-defaulted, for the same
+arm-by-arm-dispatch reason the admit is not defaulted), implemented by
+`LinuxCommandSystem::ensure_host_firewall_forwarding_withdrawn` over the same two-token grammar
+and the same builtin, and no-op on macOS/Windows. Verdict:
+`FirewalldPosture::forwarding_admission_withdrawn`, the exact inverse of
+`forwarding_unobstructed` — only "firewalld absent" and "confirmed unbound" count as withdrawn,
+so an unreadable binding state reads as residue, never as success.
+
+Verification: 16 new tests. `linux_firewalld_zone` — the withdrawal decision table, a
+contradiction check that the two verdicts are never simultaneously true, and the unbind argv
+round-trip (still no `zone=` token expressible). `phase10` controller —
+`a_demoted_relay_withdraws_its_host_firewall_zone_binding`,
+`a_node_that_never_served_never_withdraws_a_binding_it_never_took`,
+`the_periodic_reassert_does_not_rebind_after_a_demotion`,
+`a_failed_withdrawal_does_not_fail_the_demotion_closed`,
+`an_unremovable_binding_is_retried_on_the_next_apply`,
+`shutdown_of_a_serving_node_withdraws_the_host_firewall_zone_binding`,
+`a_failed_withdrawal_at_shutdown_surfaces_as_a_rollback_failure`,
+`a_fail_closed_unwind_also_withdraws_the_host_firewall_zone_binding`, and the source-pinned
+marker-ordering test. `phase10` Linux scripted-helper layer (mirroring the [[QH-46]] bind tests
+over the real helper protocol) — the unbind is issued for the CONFIGURED interface and never
+re-binds, firewalld-absent is satisfied without residue, and a surviving binding / unknown
+binding state / unparseable posture each report residue.
+
+Not live-proven: the scripted-helper tests exercise the daemon-to-helper protocol, not a real
+`busctl` against a real firewalld. A live demotion on `fedora-utm-1` observing
+`firewall-cmd --list-interfaces` before and after remains outstanding, as a separate follow-up.
+
 ### QH-53 — REGRESSION from the QH-46 fix: firewalld bind races interface creation on daemon
 restart, and a failed bootstrap apply is never retried
 
