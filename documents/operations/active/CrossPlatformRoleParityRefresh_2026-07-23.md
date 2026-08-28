@@ -45,6 +45,15 @@ not count toward release.** On the engine of record:
   *Re-counted 2026-08-28: **n=5 fail** across two days (three 2026-07-19 @
   `db3ff1aaafe6`, two 2026-07-25 @ `b7667cce46db`), 173 `not_run`, still zero
   `pass`. The claim holds; it is no longer single-day.*
+  **CORRECTED 2026-08-28 by [WindowsNodeBootstrapTriageVerdict_2026-08-28.md](./WindowsNodeBootstrapTriageVerdict_2026-08-28.md)
+  §0-§1: only THREE of those five are bootstrap failures.** The `n=5` is read
+  from the run-matrix roll-up column; joined against the per-stage ledger,
+  `bootstrap_hosts` ran and failed 3 times and was `skip` twice (both runs died
+  upstream at `preflight` — one on lab topology, one on a 3602 s guest clock
+  skew). The roll-up records `fail` for a `skip`ped stage on **every** OS column
+  at once, so the Linux and macOS bootstrap fail counts are inflated the same
+  way. Still zero `pass`; the "Windows has never bootstrapped on `--node`"
+  conclusion is unchanged, but the magnitude was overstated.
 - **macOS is partially stage-green** (admin, relay-lifecycle, core, security stages
   pass in isolation) but **no macOS run passes overall** — `two_hop` fails every
   time, and exit/blind_exit/anchor were never elected onto a macOS `--node`.
@@ -110,12 +119,40 @@ hardware; a fourth (Windows bootstrap) must be triaged.
   code-complete but needs `MSFT_NetNat`/HNS, which **cannot run in UTM on Apple
   Silicon** — requires a physical Windows-11-Pro/Ent-on-ARM device (CompletionBrief
   §8.1). External blocker; owner task. Blocks only the Windows *exit* cell.
-- **CP-4 (triage) — Windows `--node` bootstrap fails.** Every `windows_stage_
-  bootstrap` row **where it ran failed (n=3, all 2026-07-19; the other 85 rows are
-  `not_run`)**, which blocks **all** Windows `--node` cells (not just exit). Root
-  cause **unverified** — code vs guest health, on a thin single-day signal. It is the
-  single gate in front of the entire Windows column, so triage it **first among the
-  Windows work** (it can run in parallel with the macOS/Linux tracks — see §3).
+- **CP-4 (triage) — Windows `--node` bootstrap fails. TRIAGED 2026-08-28 →
+  [WindowsNodeBootstrapTriageVerdict_2026-08-28.md](./WindowsNodeBootstrapTriageVerdict_2026-08-28.md).
+  Verdict: BOTH, code primary.** Still zero `pass`, so CP-4 still gates **all**
+  Windows `--node` cells, but the root cause is no longer unverified.
+
+  **Named failing step:** `Ensure-WingetConfigurationDependencies` →
+  `& winget configure --file RustyNetBootstrap.winget.yml …` at
+  `scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1:1130`, throwing at
+  `:1132`. The guest's own stdout states it verbatim: *"Configuration is not
+  enabled. Run `winget configure --enable` to enable it."*
+
+  **Code half (primary, reproduces on every fresh guest):** the bootstrap hard-
+  depends on WinGet **Configuration**, an opt-in per-machine feature, and never
+  enables or precondition-checks it. `Require-Winget` (`:548-571`) gates only on
+  `winget.exe` presence; `Get-WindowsBootstrapToolingState` (`:456-…`) collects
+  ten-plus WinGet facts but not the Configuration feature's state; and nothing in
+  the repository ever runs `winget configure --enable`. The step is not optional —
+  it is what installs Git, PowerShell 7, rustup and **WireGuard**.
+
+  **Guest half:** the 2026-07-19 `windows-utm-1` had the feature disabled. Also,
+  as of 2026-08-28 that guest has **no remote management path at all** — it boots
+  and answers ICMP with RPC/NetBIOS/SMB listening, but TCP/22, 3389 and 5985 are
+  all closed and the QEMU guest agent is absent, so remediation needs the UTM
+  console. No fresh run was launched for that reason (see the verdict doc §6).
+
+  **Not one cause:** the five ledger rows are four distinct causes across two
+  guests and two commits, and only two of them share a root cause. One 2026-07-25
+  failure on `windows-x86-1` remains **unresolved** — its report lives on the
+  currently-unreachable `ubuntu-kvm-1` host.
+
+  **First Windows fix task:** W-FIX-1 — make the WinGet Configuration precondition
+  explicit and self-healing in `Bootstrap-RustyNetWindows.ps1` (verdict doc §7.2).
+  Do the code fix before the guest fix; the guest fix is only a testing
+  prerequisite and resolves nothing durable.
 
 ## 3. Program — three PARALLEL tracks joining at cross-OS (revised per review B3)
 
@@ -139,8 +176,15 @@ consecutive" (which §5.4 explicitly replaced as arithmetically too weak).
 - **Track L — Linux / traversal.** Land **CP-2** (`network_flap`) —
   `TraversalSelfSustenancePlan` I3-I6, live-verify green. Independent of Tracks
   M/W; unblocks the resilience tier everywhere.
-- **Track W — Windows.** **CP-4 first** (triage the bootstrap failure, code vs
-  guest) — it gates the entire Windows column, so it leads *this track* but runs in
+- **Track W — Windows.** **CP-4 triage is DONE (2026-08-28)** — verdict BOTH,
+  code primary, failing step named at
+  `Bootstrap-RustyNetWindows.ps1:1130` (see §2 and the
+  [verdict doc](./WindowsNodeBootstrapTriageVerdict_2026-08-28.md)). The track now
+  leads with **W-FIX-1** (make the WinGet Configuration precondition explicit and
+  self-healing), then W-FIX-4 (restore `windows-utm-1`'s SSH + WinGet Configuration
+  from the UTM console and re-run the minimal `debian-headless-2:exit` +
+  `windows-utm-1:client` topology to land the first `windows_stage_bootstrap=pass`).
+  It still gates the entire Windows column, and still runs in
   parallel with M and L. Then prove Windows `admin`, `anchor`, `relay`-lifecycle,
   `role-transition`. Windows `exit` waits on **CP-3** (WinNAT hardware); Windows
   `blind_exit` is design-excluded (§6).
@@ -161,7 +205,7 @@ consecutive" (which §5.4 explicitly replaced as arithmetically too weak).
 |---|---|---|---|
 | CP-1 `two_hop` client↔client handshake | **code** | dataplane | userspace shared-socket WG transport; §13.2 |
 | CP-2 `network_flap` traversal self-sustenance | **code** | traversal track | I3-I6 of the traversal plan |
-| CP-4 Windows `--node` bootstrap | **triage** | TBD | code-vs-guest unverified; gates all Windows |
+| CP-4 Windows `--node` bootstrap | **triaged 2026-08-28** | **BOTH — code primary** | Failing step `Bootstrap-RustyNetWindows.ps1:1130` (`winget configure`, Configuration feature never enabled or checked); guest `windows-utm-1` also has no remote management path. Still gates all Windows. Next: W-FIX-1 |
 | CP-3 Windows exit WinNAT | **hardware** | operator | physical Win-on-ARM device; not fixable in UTM/ASi |
 | Fedora passwordless-sudo + host-route sudo | environmental | operator | CompletionBrief §8.3-8.4 |
 | Healthy macOS/Windows guests | environmental | operator | CompletionBrief §8.2 (repair, not rebuild) |
