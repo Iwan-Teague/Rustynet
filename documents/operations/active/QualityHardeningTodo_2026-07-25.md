@@ -2267,6 +2267,30 @@ That last one is the fail-closed question and should be answered first.
 > asserts the refuted "helper I/O timeout causes truncation" mechanism. Verified by four
 > unit tests plus one plist-render test; **no live lab run** — the guest still carries the
 > pre-fix deployment, so the new pair first renders on the next macOS install.
+>
+> **STATUS 2026-08-28 — the §3.4 checker fail-open is FIXED: one shared
+> state-path resolution for writer and checker.** `MacCellsHarvest_2026-08-28.md`
+> §3.4 found that `shutdown-residue-check` without `--state` defaulted to the
+> Linux `/var/lib/rustynet/rustynetd.state` on macOS (the old
+> `#[cfg(not(windows))]` arm of `DEFAULT_STATE_PATH`) while the marker sits
+> under `/usr/local/var/rustynet/` — a residue-carrying host reported exit 0
+> "clean". Fix (`crates/rustynetd/src/daemon.rs`): `DEFAULT_STATE_PATH` gains
+> a `#[cfg(target_os = "macos")]` arm at the installer's
+> `/usr/local/var/rustynet/rustynetd.state`, and a single
+> `daemon::default_state_path()` resolution function is now the only default
+> both consumers use — `DaemonConfig::default` (the writer side) and
+> `run_shutdown_residue_check_command`'s implicit `--state` (checker side, via
+> `default_residue_check_state_path()` in `main.rs`). Fail-closed posture
+> untouched: `ResidueScan::Unreadable` still counts as residue. New tests:
+> `shutdown_residue::tests::default_state_path_resolution_matches_the_daemon_config_default`,
+> `shutdown_residue::tests::macos_default_state_path_is_the_installer_root_not_the_linux_path`
+> (cfg-gated; Linux counterpart
+> `linux_default_state_path_is_unchanged`),
+> `tests::shutdown_residue_checker_default_matches_the_writer_default`
+> (main.rs). Verified: `cargo test -p rustynetd --all-features shutdown_residue`
+> — 15 lib + 5 bin pass, 0 failed. No live-lab row: unit-pinned resolution
+> only; the live checker assertion still needs a macOS run with a marker
+> present.
 
 ### QH-41 — `macos-utm-1` is on an isolated vmnet bridge, so every mixed-OS run fails its traffic matrix deterministically
 
