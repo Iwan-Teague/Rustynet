@@ -1129,6 +1129,13 @@ Failing the privacy canary is a security incident, not a telemetry warning.
 Until items 1-6 are resolved, `blind_relay` remains design-only and must not be
 advertised by production signed state.
 
+> 2026-08-28: proposed selections for items 1-3, measurement plans for items 4
+> and 6, and a retention proposal for item 5 now exist in
+> `BlindRelayProtocolSelection_2026-08-28.md`, composed from in-tree primitives
+> with file:line evidence. They remain PROPOSED pending security review and
+> owner approval; this §16 list stays authoritative until that review, and
+> item 7 remains a separate open decision.
+
 ## 17. Design acceptance checklist
 
 Architecture/security reviewers should accept only if every answer is “yes”:
