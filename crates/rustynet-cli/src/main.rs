@@ -9764,7 +9764,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
 fn execute_ops_state_refresh_if_socket_present() -> Result<String, String> {
     require_root_execution()?;
 
-    let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+    let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_SOCKET_PATH)?;
     let socket_present = socket_exists_and_is_socket(socket_path.as_path(), "daemon socket")?;
     if !socket_present {
         return Ok(format!(
@@ -10825,7 +10825,15 @@ const DEFAULT_MACOS_PASSPHRASE_KEYCHAIN_SERVICE: &str = "rustynet.signing_passph
 const DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH: &str = "/etc/rustynet/assignment-refresh.env";
 const DEFAULT_AUTO_TUNNEL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.assignment";
 const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.assignment.watermark";
-const DEFAULT_DAEMON_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
+// The CLI no longer carries its own daemon/helper socket-path copies. The
+// former local `DEFAULT_SOCKET_PATH` / `DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH`
+// constants hardcoded the Linux `/run/rustynet/...` sockets with no macOS arm,
+// so every macOS launchd runtime operation resolved a nonexistent socket
+// (env-overridable, fail-closed, but always wrong by default). They are now
+// imported from `rustynetd`, whose `DEFAULT_SOCKET_PATH` is macOS-armed to the
+// installer's `/private/var/run/rustynet/rustynetd.sock` (see
+// `MacosPathConstantAudit_2026-08-28.md`, follow-up shape #2).
+use rustynetd::privileged_helper::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH;
 const DEFAULT_SYSTEMD_ENV_PATH: &str = "/etc/default/rustynetd";
 const MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS: u64 = 20;
 const DEFAULT_PHASE6_PARITY_RAW_DIR: &str = "artifacts/release/raw";
@@ -10839,13 +10847,22 @@ const DEFAULT_MACOS_LAUNCHD_DAEMON_LABEL: &str = "com.rustynet.rustynetd";
 const DEFAULT_MACOS_LAUNCHD_HELPER_LABEL: &str = "com.rustynet.rustynetd-privileged";
 const DEFAULT_MACOS_LAUNCHD_HELPER_PLIST_PATH: &str =
     "/Library/LaunchDaemons/com.rustynet.rustynetd-privileged.plist";
-const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd-privileged.sock";
 const MACOS_RUNTIME_SOCKET_WAIT_SECS: u64 = 5;
 const PHASE6_MAX_EVIDENCE_AGE_SECS: u64 = 31 * 24 * 60 * 60;
 const DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     concat!("/etc/rustynet/credentials/", "wg", "_key_passphrase.cred");
 const DEFAULT_LEGACY_LINUX_WG_PRIVATE_KEY_PATH: &str = "/etc/rustynet/wireguard.key";
 const DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE: &str = "net.rustynet.wg-key-passphrase";
+// macOS WireGuard custody paths per the installer's `STATE_ROOT`
+// (`/usr/local/var/rustynet`,
+// `scripts/bootstrap/macos/Install-RustyNetMacosService.sh`:299-319,
+// :477-478). The `rustynetd` daemon constants of the same names resolve the
+// Linux `/var/lib/rustynet/...` paths, which made `check_macos_doctor`'s
+// custody check dead code on macOS (audit follow-up shape #3).
+#[cfg(target_os = "macos")]
+const MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str = "/usr/local/var/rustynet/keys/wireguard.key.enc";
+#[cfg(target_os = "macos")]
+const MACOS_WG_KEY_PASSPHRASE_PATH: &str = "/usr/local/var/rustynet/bootstrap/wireguard.passphrase";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SigningPassphraseHostProfile {
@@ -10901,7 +10918,7 @@ fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
         .join(interface.as_str())
         .exists()
     {
-        let socket_path = PathBuf::from(DEFAULT_DAEMON_SOCKET_PATH);
+        let socket_path = PathBuf::from(DEFAULT_SOCKET_PATH);
         if let Ok(status) = send_command_with_socket(IpcCommand::Status, socket_path)
             && status.ok
             && status_field(status.message.as_str(), "restricted_safe_mode").as_deref()
@@ -12555,7 +12572,7 @@ fn macos_runtime_service_context_from_env() -> Result<MacosRuntimeServiceContext
         "RUSTYNET_MACOS_LAUNCHD_HELPER_PLIST",
         DEFAULT_MACOS_LAUNCHD_HELPER_PLIST_PATH,
     )?;
-    let daemon_socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+    let daemon_socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_SOCKET_PATH)?;
     let helper_socket_path = env_path_or_default(
         "RUSTYNET_PRIVILEGED_HELPER_SOCKET",
         DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH,
@@ -13249,7 +13266,7 @@ fn execute_ops_apply_lan_access_coupling(
         previous_lan_routes.as_slice(),
     );
 
-    let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+    let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_SOCKET_PATH)?;
     let status = send_command_with_socket(IpcCommand::Status, socket_path.clone())?;
     if !status.ok {
         return Err(format!(
@@ -13472,7 +13489,7 @@ fn execute_ops_apply_role_coupling(
             warnings
                 .push("skipped client exit route convergence wait after role coupling".to_owned());
         } else {
-            let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+            let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_SOCKET_PATH)?;
             if let Err(err) = wait_for_client_exit_route_convergence(
                 socket_path.as_path(),
                 assignment_refresh_env_path.as_path(),
@@ -14607,7 +14624,7 @@ fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
         // lightweight `launchctl kickstart -k` rather than
         // restart-runtime-service-macos, which regenerates the plist and
         // requires full launchd-config env not present in this context.
-        let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+        let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_SOCKET_PATH)?;
         let output = run_command_capture(
             "launchctl",
             &["kickstart", "-k", "system/com.rustynet.daemon"],
@@ -14634,7 +14651,7 @@ fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
         "RUSTYNET_AUTO_TUNNEL_WATERMARK",
         DEFAULT_AUTO_TUNNEL_WATERMARK_PATH,
     )?;
-    let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+    let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_SOCKET_PATH)?;
 
     refresh_local_traversal_bundle_from_assignment_env(assignment_refresh_env_path.as_path())?;
     remove_file_if_present(bundle_path.as_path())?;
@@ -17299,7 +17316,7 @@ fn check_linux_doctor(checks: &mut Vec<String>, all_pass: &mut bool) {
 }
 
 #[cfg(target_os = "macos")]
-fn check_macos_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
+fn check_macos_doctor(checks: &mut Vec<String>, all_pass: &mut bool) {
     // Check launchd plist
     let user_plist = PathBuf::from(
         std::env::var("HOME")
@@ -17318,16 +17335,24 @@ fn check_macos_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
         checks.push("⚠ rustynet launchd plist not found".to_owned());
     }
 
-    // Check key file existence
+    // Check key file existence at the installer's macOS custody paths. A
+    // missing custody file is a loud failure, not a silent omission: this
+    // check used to probe the Linux daemon defaults, which never exist on
+    // macOS, so the check silently vanished instead of reporting anything
+    // (MacosPathConstantAudit 2026-08-28, follow-up shape #3).
     let key_paths = vec![
-        DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
-        DEFAULT_WG_KEY_PASSPHRASE_PATH,
+        MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+        MACOS_WG_KEY_PASSPHRASE_PATH,
     ];
 
     for key_path_str in key_paths {
-        let key_path = PathBuf::from(key_path_str);
-        if key_path.exists() {
-            checks.push(format!("✓ key file present: {}", key_path.display()));
+        let (line, passed) = macos_custody_file_check_line(
+            PathBuf::from(key_path_str).exists(),
+            Path::new(key_path_str),
+        );
+        checks.push(line);
+        if !passed {
+            *all_pass = false;
         }
     }
 
@@ -17357,6 +17382,24 @@ fn check_macos_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
 
     if lib_dir.exists() {
         checks.push("✓ preference directory exists".to_owned());
+    }
+}
+
+/// Pure report line for one macOS WireGuard custody file, split out of
+/// `check_macos_doctor` so the loud-failure contract is testable without
+/// depending on the host's actual key material.
+#[cfg(target_os = "macos")]
+fn macos_custody_file_check_line(exists: bool, path: &Path) -> (String, bool) {
+    if exists {
+        (format!("✓ key file present: {}", path.display()), true)
+    } else {
+        (
+            format!(
+                "✗ key file missing: {} (macOS custody path)",
+                path.display()
+            ),
+            false,
+        )
     }
 }
 
@@ -22681,6 +22724,85 @@ mod tests {
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
     use std::fs;
+
+    // ── MacosPathConstantAudit 2026-08-28 follow-up shapes #2/#3 ────────────
+    // The CLI resolves its socket and custody defaults through `rustynetd`'s
+    // constants instead of carrying Linux-hardcoded local copies.
+
+    /// Shape #2: on macOS the CLI's daemon-socket default is the installer's
+    /// `/private/var/run/...` socket (the launchd plist `--socket`), not the
+    /// Linux `/run/...` path the deleted CLI-local constant hardcoded.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cli_daemon_socket_default_is_rustynetd_installer_path() {
+        assert_eq!(
+            super::DEFAULT_SOCKET_PATH,
+            rustynetd::daemon::DEFAULT_SOCKET_PATH,
+            "CLI and daemon must resolve one shared socket constant"
+        );
+        assert_eq!(
+            super::DEFAULT_SOCKET_PATH,
+            "/private/var/run/rustynet/rustynetd.sock",
+            "macOS default must match the installer's SOCKET_PATH"
+        );
+        assert_ne!(
+            super::DEFAULT_SOCKET_PATH,
+            "/run/rustynet/rustynetd.sock",
+            "macOS must not inherit the Linux socket path"
+        );
+    }
+
+    /// Shape #2: the privileged-helper default is rustynetd's constant, not a
+    /// CLI-local copy (pinning the symbol equality the import provides).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cli_helper_socket_default_is_rustynetd_constant() {
+        assert_eq!(
+            super::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH,
+            rustynetd::privileged_helper::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH,
+        );
+    }
+
+    /// Shape #3: the doctor's macOS custody check probes the installer's
+    /// STATE_ROOT paths, never the Linux daemon defaults it used to probe
+    /// (which made the check dead code on macOS).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_doctor_custody_paths_are_installer_roots_not_linux_defaults() {
+        assert_eq!(
+            super::MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+            "/usr/local/var/rustynet/keys/wireguard.key.enc"
+        );
+        assert_eq!(
+            super::MACOS_WG_KEY_PASSPHRASE_PATH,
+            "/usr/local/var/rustynet/bootstrap/wireguard.passphrase"
+        );
+        assert_ne!(
+            super::MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+            rustynetd::daemon::DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH
+        );
+        assert_ne!(
+            super::MACOS_WG_KEY_PASSPHRASE_PATH,
+            rustynetd::daemon::DEFAULT_WG_KEY_PASSPHRASE_PATH
+        );
+    }
+
+    /// Shape #3: a missing custody file is a loud ✗ failure line (which fails
+    /// the doctor), a present one a ✓ pass line.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_doctor_custody_line_fails_loudly_when_absent() {
+        let path = std::path::Path::new("/usr/local/var/rustynet/keys/wireguard.key.enc");
+        let (present_line, passed) = super::macos_custody_file_check_line(true, path);
+        assert!(present_line.starts_with("✓"));
+        assert!(passed);
+        let (missing_line, passed) = super::macos_custody_file_check_line(false, path);
+        assert!(
+            missing_line.starts_with("✗"),
+            "absence must be loud: {missing_line}"
+        );
+        assert!(!passed);
+    }
 
     // PKG-G — bounded, observation-only host diagnostics CLI surface.
     #[test]
