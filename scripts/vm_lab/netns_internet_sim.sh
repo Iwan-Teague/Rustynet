@@ -7,9 +7,11 @@
 # longer scp's or runs this script. Its topology is ported to
 # `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/netns.rs`
 # (`NetnsSubstrateProvider`), which drives the same `ip`/`nft`/`tc` leaf ops as
-# argv-only commands. This file survives ONLY as the dependency of
-# `netns_daemon_path.sh` and as the target of `vm-lab-network-audit`'s
-# transit/mesh collision check; it is on no active orchestrator path.
+# argv-only commands. This file survives ONLY as the target of
+# `vm-lab-network-audit`'s transit/mesh collision check
+# (`network_audit.rs`'s `NETNS_SIM_SCRIPT_RELATIVE_PATH`); it is on no active
+# orchestrator path. Its other former consumer, `netns_daemon_path.sh`, was
+# deleted with the rest of the CN-5 bash tail.
 #
 # WHY
 #   The UTM lab puts every VM on one L2 bridge, so VM-to-VM is same-LAN — there
