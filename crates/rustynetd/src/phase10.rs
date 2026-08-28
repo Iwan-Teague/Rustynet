@@ -607,6 +607,40 @@ pub trait DataplaneSystem {
         mesh_cidr: &str,
     ) -> Result<(), SystemError>;
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError>;
+    /// QH-47: invalidate the conntrack entries a masquerade generation change
+    /// makes wrong.
+    ///
+    /// A netfilter `nat` chain is traversed only for the FIRST packet of a
+    /// flow; afterwards the binding lives in the conntrack entry and later
+    /// packets never re-enter the hook. So a flow established BEFORE a
+    /// masquerade was installed is never masqueraded, and — because every
+    /// packet refreshes the entry — a steady stream keeps that stale binding
+    /// alive indefinitely instead of ageing it out. The withdrawal direction is
+    /// the §10.7 one: flows that hold a NAT binding keep egressing through a
+    /// host that has stopped serving the exit.
+    ///
+    /// The selector is the mesh source network and nothing else. See
+    /// [`crate::linux_conntrack_flush`] for why a table-wide flush is not just
+    /// avoided but unrepresentable.
+    ///
+    /// Callers must treat the result as a REPORT, not a gate: the outcome is
+    /// logged (including `ToolAbsent`, which must never be silently swallowed)
+    /// and never used to fail an otherwise-healthy generation. Refusing an
+    /// apply because `conntrack-tools` is not installed would make every
+    /// minimal-install host unable to serve as an exit, converting "some
+    /// pre-existing flows keep a stale binding until they close" into "the node
+    /// cannot serve the role at all" — disproportionate, since new flows are
+    /// bound correctly either way.
+    ///
+    /// Deliberately NOT defaulted, for the same reason
+    /// `admit_host_firewall_forwarding` is not: `RuntimeSystem` dispatches
+    /// arm-by-arm, and a default would let a missing arm silently no-op the
+    /// flush on the real daemon while every DryRun test stayed green.
+    fn flush_nat_conntrack(
+        &mut self,
+        mesh_cidr: &str,
+        reason: NatConntrackFlushReason,
+    ) -> Result<crate::linux_conntrack_flush::ConntrackFlushOutcome, SystemError>;
     fn apply_dns_protection(&mut self) -> Result<(), SystemError>;
     fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
         Ok(())
@@ -624,6 +658,73 @@ pub trait DataplaneSystem {
         self.assert_killswitch()
     }
     fn block_all_egress(&mut self) -> Result<(), SystemError>;
+}
+
+/// Why a conntrack flush is being issued (QH-47). Carried into logs and into
+/// the DryRun operation trace so a test can assert the DIRECTION of the
+/// transition, not merely that some flush happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatConntrackFlushReason {
+    /// This generation installed or changed a masquerade. Flows established
+    /// before it hold a stale un-NATed binding.
+    MasqueradeInstalled,
+    /// This generation removed a masquerade (exit/relay demotion, fail-closed
+    /// unwind, or shutdown). Flows still hold a NAT binding the node no longer
+    /// justifies.
+    MasqueradeWithdrawn,
+}
+
+impl NatConntrackFlushReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NatConntrackFlushReason::MasqueradeInstalled => "masquerade_installed",
+            NatConntrackFlushReason::MasqueradeWithdrawn => "masquerade_withdrawn",
+        }
+    }
+}
+
+/// The masquerade-relevant shape of a generation.
+///
+/// Two generations with EQUAL postures translate traffic identically, so a
+/// re-apply of an identical generation invalidates no conntrack binding and
+/// must not flush: the flush is bounded but not free (it drops mesh-sourced
+/// flows that were perfectly healthy), and the reconcile loop re-applies
+/// constantly. Only a genuine transition earns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NatPosture {
+    /// The egress masquerade is installed. False for `blind_exit`, which
+    /// forwards without translating.
+    masquerade: bool,
+    /// The relay-with-upstream hairpin SNAT is installed.
+    hairpin: bool,
+    /// The mesh source network the masquerade rewrites — part of the posture
+    /// because a changed mesh CIDR invalidates bindings just as surely as a
+    /// changed rule does.
+    mesh_cidr: String,
+}
+
+impl NatPosture {
+    /// The posture a generation will have, or `None` when the NAT stage does
+    /// not run at all for it.
+    fn for_generation(options: ApplyOptions, mesh_cidr: &str) -> Option<Self> {
+        if options.exit_mode != ExitMode::FullTunnel && !options.serve_exit_node {
+            return None;
+        }
+        Some(Self {
+            masquerade: !options.blind_exit,
+            hairpin: options.exit_mode == ExitMode::FullTunnel
+                && options.serve_exit_node
+                && !options.blind_exit,
+            mesh_cidr: mesh_cidr.to_owned(),
+        })
+    }
+
+    /// Does this posture translate anything? A `blind_exit` posture does not,
+    /// so a transition between two non-translating postures has no conntrack
+    /// binding to invalidate.
+    fn translates(posture: Option<&Self>) -> bool {
+        posture.is_some_and(|posture| posture.masquerade || posture.hairpin)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -781,6 +882,18 @@ impl DataplaneSystem for DryRunSystem {
 
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
         self.step("rollback_nat_forwarding")
+    }
+
+    fn flush_nat_conntrack(
+        &mut self,
+        mesh_cidr: &str,
+        reason: NatConntrackFlushReason,
+    ) -> Result<crate::linux_conntrack_flush::ConntrackFlushOutcome, SystemError> {
+        self.step(&format!(
+            "flush_nat_conntrack:{}:{mesh_cidr}",
+            reason.as_str()
+        ))?;
+        Ok(crate::linux_conntrack_flush::ConntrackFlushOutcome::Flushed { entries: 0 })
     }
 
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
@@ -2928,6 +3041,33 @@ impl DataplaneSystem for LinuxCommandSystem {
         self.restore_ipv4_forwarding()
     }
 
+    /// QH-47. The one privileged builtin that can invalidate conntrack, driven
+    /// over the two-token grammar; the daemon supplies only the mesh source
+    /// network and cannot name an operation.
+    ///
+    /// Runs AFTER the nat table has been created or deleted, never before: a
+    /// flush issued ahead of the rule change would be immediately undone by the
+    /// next packet of a steady stream, which would re-create the entry against
+    /// the OLD ruleset.
+    fn flush_nat_conntrack(
+        &mut self,
+        mesh_cidr: &str,
+        _reason: NatConntrackFlushReason,
+    ) -> Result<crate::linux_conntrack_flush::ConntrackFlushOutcome, SystemError> {
+        use crate::linux_conntrack_flush::{ConntrackFlushOutcome, ConntrackFlushSpec};
+
+        let spec = ConntrackFlushSpec::for_mesh_source(mesh_cidr)
+            .map_err(SystemError::PrerequisiteCheckFailed)?;
+        let argv = spec.encode();
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let output = self.run_capture(
+            PrivilegedCommandProgram::LinuxConntrackFlush,
+            borrowed.as_slice(),
+        )?;
+        ConntrackFlushOutcome::parse(output.stdout.trim())
+            .map_err(|err| SystemError::Io(format!("conntrack flush outcome: {err}")))
+    }
+
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
         let table = self
             .firewall_table
@@ -3922,6 +4062,20 @@ impl DataplaneSystem for MacosCommandSystem {
         self.allow_egress_interface = false;
         self.apply_pf_rules(false)
             .map_err(|err| SystemError::RollbackFailed(err.to_string()))
+    }
+
+    /// macOS translates through `pf`, not netfilter/conntrack, so the QH-47
+    /// builtin does not apply here and reports so explicitly rather than
+    /// pretending to have flushed. The equivalent `pf` state invalidation
+    /// (`pfctl -F states` scoped to the mesh source) is a separate change
+    /// against a different privileged surface; it is NOT silently covered by
+    /// this arm, and the ledger tracks it as follow-up.
+    fn flush_nat_conntrack(
+        &mut self,
+        _mesh_cidr: &str,
+        _reason: NatConntrackFlushReason,
+    ) -> Result<crate::linux_conntrack_flush::ConntrackFlushOutcome, SystemError> {
+        Ok(crate::linux_conntrack_flush::ConntrackFlushOutcome::PlatformUnsupported)
     }
 
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
@@ -4943,6 +5097,16 @@ impl DataplaneSystem for WindowsCommandSystem {
         Ok(())
     }
 
+    /// Windows NAT is `NetNat`, not netfilter/conntrack. Reported explicitly
+    /// rather than silently succeeding, for the same reason as the macOS arm.
+    fn flush_nat_conntrack(
+        &mut self,
+        _mesh_cidr: &str,
+        _reason: NatConntrackFlushReason,
+    ) -> Result<crate::linux_conntrack_flush::ConntrackFlushOutcome, SystemError> {
+        Ok(crate::linux_conntrack_flush::ConntrackFlushOutcome::PlatformUnsupported)
+    }
+
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
         // Block UDP/TCP port-53 outbound on LAN (non-tunnel) interfaces so all
         // DNS traffic is forced through the WireGuard tunnel.  This is the
@@ -5404,6 +5568,19 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn flush_nat_conntrack(
+        &mut self,
+        mesh_cidr: &str,
+        reason: NatConntrackFlushReason,
+    ) -> Result<crate::linux_conntrack_flush::ConntrackFlushOutcome, SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.flush_nat_conntrack(mesh_cidr, reason),
+            RuntimeSystem::Linux(system) => system.flush_nat_conntrack(mesh_cidr, reason),
+            RuntimeSystem::Macos(system) => system.flush_nat_conntrack(mesh_cidr, reason),
+            RuntimeSystem::Windows(system) => system.flush_nat_conntrack(mesh_cidr, reason),
+        }
+    }
+
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.apply_dns_protection(),
@@ -5519,6 +5696,14 @@ pub struct Phase10Controller<B: TunnelBackend, S: DataplaneSystem> {
     state: DataplaneState,
     generation: u64,
     last_safe_generation: u64,
+    /// QH-47: the masquerade-relevant shape of the COMMITTED generation, so an
+    /// identical re-apply can be told apart from a real NAT transition. `None`
+    /// means the committed generation installs no NAT stage at all.
+    current_nat_posture: Option<NatPosture>,
+    /// The mesh CIDR of the apply in flight. Needed by the rollback path, which
+    /// may have to flush a masquerade installed by a generation that never
+    /// committed (so `current_nat_posture` does not describe it).
+    in_flight_mesh_cidr: Option<String>,
     transitions: Vec<TransitionEvent>,
     selected_exit_node: Option<NodeId>,
     lan_access_enabled: bool,
@@ -5573,6 +5758,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             state: DataplaneState::Init,
             generation: 0,
             last_safe_generation: 0,
+            current_nat_posture: None,
+            in_flight_mesh_cidr: None,
             transitions: Vec::new(),
             selected_exit_node: None,
             lan_access_enabled: false,
@@ -5647,6 +5834,10 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         validate_apply_options(options)?;
         let target_generation = self.generation.saturating_add(1);
         let mesh_cidr = context.mesh_cidr.clone();
+        // QH-47: the rollback path may have to flush a masquerade installed by
+        // a generation that never committed, so the CIDR in flight is recorded
+        // before any stage runs rather than read back from committed state.
+        self.in_flight_mesh_cidr = Some(mesh_cidr.clone());
         self.system.set_generation(target_generation);
 
         if self.state == DataplaneState::Init {
@@ -5785,6 +5976,35 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             return Err(err);
         }
 
+        // QH-47: invalidate conntrack for a real NAT transition, and ONLY for a
+        // real one. Both mutation points are already behind us — a withdrawal
+        // was performed by `rollback_obsolete_controls` and an install by
+        // `apply_generation_stages` — so a single site here is after the rule
+        // change in either direction, which is the ordering that matters: a
+        // flush issued BEFORE the change would be undone by the next packet of
+        // a steady stream re-creating the entry against the old ruleset.
+        let next_nat_posture = NatPosture::for_generation(options, mesh_cidr.as_str());
+        if next_nat_posture != self.current_nat_posture
+            && (NatPosture::translates(next_nat_posture.as_ref())
+                || NatPosture::translates(self.current_nat_posture.as_ref()))
+        {
+            let (reason, flush_cidr) = if NatPosture::translates(next_nat_posture.as_ref()) {
+                (
+                    NatConntrackFlushReason::MasqueradeInstalled,
+                    mesh_cidr.clone(),
+                )
+            } else {
+                let previous_cidr = self
+                    .current_nat_posture
+                    .as_ref()
+                    .map(|posture| posture.mesh_cidr.clone())
+                    .unwrap_or_else(|| mesh_cidr.clone());
+                (NatConntrackFlushReason::MasqueradeWithdrawn, previous_cidr)
+            };
+            self.report_nat_conntrack_flush(flush_cidr.as_str(), reason);
+        }
+        self.current_nat_posture = next_nat_posture;
+
         self.active_stages = applied_stages;
         self.generation = self.generation.saturating_add(1);
         self.last_safe_generation = self.generation;
@@ -5800,6 +6020,51 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         }
 
         Ok(())
+    }
+
+    /// Issue the QH-47 conntrack flush and REPORT its outcome.
+    ///
+    /// Never returns an error and never fails a generation. The two conditions
+    /// worth an operator's attention — the tool being absent, and the flush
+    /// itself failing — are logged at warn so they surface, because the failure
+    /// mode this control exists to prevent (traffic that silently keeps its old
+    /// translation) is invisible without a log line saying the invalidation did
+    /// not happen.
+    fn report_nat_conntrack_flush(&mut self, mesh_cidr: &str, reason: NatConntrackFlushReason) {
+        use crate::linux_conntrack_flush::ConntrackFlushOutcome;
+
+        match self.system.flush_nat_conntrack(mesh_cidr, reason) {
+            Ok(ConntrackFlushOutcome::Flushed { entries }) => {
+                log::info!(
+                    "flushed {entries} conntrack entries sourced from {mesh_cidr} after NAT \
+                     generation change ({})",
+                    reason.as_str()
+                );
+            }
+            Ok(ConntrackFlushOutcome::ToolAbsent) => {
+                log::warn!(
+                    "conntrack-tools is not installed: conntrack entries sourced from \
+                     {mesh_cidr} keep their previous NAT binding after a {} transition, so \
+                     flows established before this generation are translated by the OLD rules \
+                     until they close. Install conntrack-tools on nodes that change exit or \
+                     relay role while traffic is flowing.",
+                    reason.as_str()
+                );
+            }
+            Ok(ConntrackFlushOutcome::PlatformUnsupported) => {
+                log::debug!(
+                    "conntrack flush not applicable on this platform ({})",
+                    reason.as_str()
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "conntrack flush for {mesh_cidr} failed after a {} transition; flows \
+                     established before this generation keep their previous NAT binding: {err}",
+                    reason.as_str()
+                );
+            }
+        }
     }
 
     fn validate_backend_exit_capabilities(
@@ -5973,6 +6238,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         intent: RollbackIntent,
     ) -> Result<(), Phase10Error> {
         let mut rollback_errors = Vec::new();
+        // QH-47: the committed posture is being unwound, so the next apply must
+        // treat itself as a transition. Cleared unconditionally — erring toward
+        // one extra flush of mesh-sourced flows is the safe direction; erring
+        // toward a missed flush leaves traffic translated by rules that no
+        // longer exist.
+        let unwound_posture = self.current_nat_posture.take();
         for stage in applied_stages.into_iter().rev() {
             match stage {
                 StageMarker::ExitModeApplied => {
@@ -6011,6 +6282,24 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 StageMarker::NatApplied => {
                     if let Err(err) = self.system.rollback_nat_forwarding() {
                         rollback_errors.push(format!("rollback nat forwarding: {err}"));
+                    }
+                    // QH-47: AFTER the nat table is gone, invalidate the
+                    // bindings it left behind, so a fail-closed unwind or a
+                    // shutdown cannot leave mesh flows still being translated
+                    // out of a host that has withdrawn the capability
+                    // (CLAUDE.md §10.7). Only when this generation actually
+                    // translated: a blind_exit installs no masquerade and has
+                    // no binding to invalidate.
+                    let flush_cidr = unwound_posture
+                        .as_ref()
+                        .filter(|posture| posture.masquerade || posture.hairpin)
+                        .map(|posture| posture.mesh_cidr.clone())
+                        .or_else(|| self.in_flight_mesh_cidr.clone());
+                    if let Some(flush_cidr) = flush_cidr {
+                        self.report_nat_conntrack_flush(
+                            flush_cidr.as_str(),
+                            NatConntrackFlushReason::MasqueradeWithdrawn,
+                        );
                     }
                 }
                 // QH-52. Unlike DNS and the killswitch below, this is withdrawn
@@ -6999,6 +7288,14 @@ fn resolve_binary_path_for_program(
         )),
         PrivilegedCommandProgram::LinuxFirewalldZone => Err(SystemError::PrerequisiteCheckFailed(
             "linux-firewalld-zone is an in-process builtin and has no external binary".to_owned(),
+        )),
+        // The conntrack flush IS backed by an external tool, but the HELPER
+        // resolves and invokes it — the daemon never names a binary for it, so
+        // this daemon-side resolver must refuse rather than open a second path
+        // to `conntrack` outside the builtin's argv construction (QH-47).
+        PrivilegedCommandProgram::LinuxConntrackFlush => Err(SystemError::PrerequisiteCheckFailed(
+            "linux-conntrack-flush is an in-helper builtin and has no daemon-resolved binary"
+                .to_owned(),
         )),
     }
 }
@@ -16018,6 +16315,422 @@ mod tests {
             second_ops.contains(&"rollback_ipv6_egress".to_owned()),
             "flipping ipv6_parity_supported false→true must rollback the \
              kernel disable; ops={second_ops:?}"
+        );
+    }
+
+    // ---- QH-47: conntrack invalidation on NAT generation change ----
+
+    /// Drive one apply and return the operations it recorded.
+    fn apply_and_capture(
+        controller: &mut Phase10Controller<WireguardBackend, DryRunSystem>,
+        options: ApplyOptions,
+    ) -> Vec<String> {
+        let start = controller.system.operations.len();
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                Vec::new(),
+                Vec::new(),
+                options,
+            )
+            .expect("apply should succeed");
+        controller.system.operations[start..].to_vec()
+    }
+
+    fn conntrack_flushes(ops: &[String]) -> Vec<&String> {
+        ops.iter()
+            .filter(|op| op.starts_with("flush_nat_conntrack:"))
+            .collect()
+    }
+
+    fn exit_controller() -> Phase10Controller<WireguardBackend, DryRunSystem> {
+        Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default(),
+            allow_shared_exit_policy(),
+            TrustPolicy::default(),
+        )
+    }
+
+    /// The defect QH-47 records: a masquerade installed while traffic is
+    /// already flowing never applies to those flows, because their conntrack
+    /// binding is fixed and every packet refreshes it. Installing NAT must
+    /// therefore invalidate the mesh-sourced entries.
+    #[test]
+    fn installing_masquerade_flushes_mesh_sourced_conntrack() {
+        let mut controller = exit_controller();
+        let ops = apply_and_capture(
+            &mut controller,
+            ApplyOptions {
+                exit_mode: ExitMode::FullTunnel,
+                ..ApplyOptions::default()
+            },
+        );
+
+        assert_eq!(
+            conntrack_flushes(&ops),
+            vec![&"flush_nat_conntrack:masquerade_installed:100.64.0.0/10".to_owned()],
+            "installing a masquerade must flush exactly the mesh source; ops={ops:?}"
+        );
+    }
+
+    /// The flush must land AFTER the nat table exists. Issued before, the next
+    /// packet of a steady stream re-creates the entry against the OLD ruleset
+    /// and the flush accomplishes nothing.
+    #[test]
+    fn the_flush_follows_the_nat_apply_rather_than_preceding_it() {
+        let mut controller = exit_controller();
+        let ops = apply_and_capture(
+            &mut controller,
+            ApplyOptions {
+                exit_mode: ExitMode::FullTunnel,
+                ..ApplyOptions::default()
+            },
+        );
+
+        let nat_at = ops
+            .iter()
+            .position(|op| op == "apply_nat_forwarding")
+            .expect("the NAT stage must run");
+        let flush_at = ops
+            .iter()
+            .position(|op| op.starts_with("flush_nat_conntrack:"))
+            .expect("the flush must run");
+        assert!(
+            nat_at < flush_at,
+            "the conntrack flush must follow the NAT apply; ops={ops:?}"
+        );
+    }
+
+    /// The reconcile loop re-applies constantly. An identical generation
+    /// invalidates no binding, and flushing on it would repeatedly destroy
+    /// healthy mesh flows for no reason.
+    #[test]
+    fn reapplying_an_identical_generation_does_not_flush_conntrack() {
+        let mut controller = exit_controller();
+        let options = ApplyOptions {
+            exit_mode: ExitMode::FullTunnel,
+            ..ApplyOptions::default()
+        };
+        let first = apply_and_capture(&mut controller, options);
+        assert_eq!(conntrack_flushes(&first).len(), 1, "ops={first:?}");
+
+        for round in 0..3 {
+            let again = apply_and_capture(&mut controller, options);
+            assert!(
+                conntrack_flushes(&again).is_empty(),
+                "identical re-apply {round} must not flush conntrack; ops={again:?}"
+            );
+        }
+    }
+
+    /// Withdrawing the masquerade is the §10.7 direction: flows holding a NAT
+    /// binding would otherwise keep egressing through a host that has stopped
+    /// serving the exit.
+    #[test]
+    fn withdrawing_masquerade_in_place_flushes_conntrack() {
+        let mut controller = exit_controller();
+        apply_and_capture(
+            &mut controller,
+            ApplyOptions {
+                exit_mode: ExitMode::FullTunnel,
+                ..ApplyOptions::default()
+            },
+        );
+
+        let demotion = apply_and_capture(&mut controller, ApplyOptions::default());
+        assert_eq!(
+            conntrack_flushes(&demotion),
+            vec![&"flush_nat_conntrack:masquerade_withdrawn:100.64.0.0/10".to_owned()],
+            "an in-place demotion must invalidate the bindings it leaves behind; ops={demotion:?}"
+        );
+        let rollback_at = demotion
+            .iter()
+            .position(|op| op == "rollback_nat_forwarding")
+            .expect("the demotion must roll the NAT back");
+        let flush_at = demotion
+            .iter()
+            .position(|op| op.starts_with("flush_nat_conntrack:"))
+            .expect("the demotion must flush");
+        assert!(
+            rollback_at < flush_at,
+            "the flush must follow the NAT removal; ops={demotion:?}"
+        );
+    }
+
+    /// A generation that never installs NAT has nothing to invalidate, so a
+    /// plain client must never pay the cost of a flush.
+    #[test]
+    fn client_generations_never_flush_conntrack() {
+        let mut controller = exit_controller();
+        for round in 0..3 {
+            let ops = apply_and_capture(&mut controller, ApplyOptions::default());
+            assert!(
+                conntrack_flushes(&ops).is_empty(),
+                "client apply {round} must not flush conntrack; ops={ops:?}"
+            );
+        }
+    }
+
+    /// `blind_exit` forwards without translating, so promoting into it WITHDRAWS
+    /// a masquerade rather than installing one — and demoting a blind_exit that
+    /// never translated must not flush at all.
+    #[test]
+    fn blind_exit_transitions_flush_only_in_the_withdrawing_direction() {
+        let mut controller = exit_controller();
+        apply_and_capture(
+            &mut controller,
+            ApplyOptions {
+                exit_mode: ExitMode::FullTunnel,
+                ..ApplyOptions::default()
+            },
+        );
+
+        let to_blind = apply_and_capture(
+            &mut controller,
+            ApplyOptions {
+                serve_exit_node: true,
+                blind_exit: true,
+                ..ApplyOptions::default()
+            },
+        );
+        assert_eq!(
+            conntrack_flushes(&to_blind),
+            vec![&"flush_nat_conntrack:masquerade_withdrawn:100.64.0.0/10".to_owned()],
+            "promoting into blind_exit removes the masquerade; ops={to_blind:?}"
+        );
+
+        let blind_again = apply_and_capture(
+            &mut controller,
+            ApplyOptions {
+                serve_exit_node: true,
+                blind_exit: true,
+                ..ApplyOptions::default()
+            },
+        );
+        assert!(
+            conntrack_flushes(&blind_again).is_empty(),
+            "an identical blind_exit re-apply must not flush; ops={blind_again:?}"
+        );
+    }
+
+    /// A changed mesh CIDR invalidates bindings exactly as a changed rule does,
+    /// so the posture carries it and a mesh renumber counts as a transition.
+    #[test]
+    fn a_changed_mesh_cidr_counts_as_a_nat_transition() {
+        let mut controller = exit_controller();
+        let options = ApplyOptions {
+            exit_mode: ExitMode::FullTunnel,
+            ..ApplyOptions::default()
+        };
+        apply_and_capture(&mut controller, options);
+
+        let start = controller.system.operations.len();
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                RuntimeContext {
+                    mesh_cidr: "10.42.0.0/16".to_owned(),
+                    ..test_runtime_context()
+                },
+                Vec::new(),
+                Vec::new(),
+                options,
+            )
+            .expect("renumbered apply should succeed");
+        let ops = controller.system.operations[start..].to_vec();
+
+        assert_eq!(
+            conntrack_flushes(&ops),
+            vec![&"flush_nat_conntrack:masquerade_installed:10.42.0.0/16".to_owned()],
+            "a mesh renumber must flush against the NEW source network; ops={ops:?}"
+        );
+    }
+
+    /// A fail-closed unwind must not leave the previous generation's
+    /// translations alive. The flush runs after the NAT rollback, under the
+    /// withdrawal reason.
+    #[test]
+    fn a_failed_apply_flushes_conntrack_while_unwinding_the_nat_stage() {
+        let mut controller = Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default().fail_on("apply_dns_protection"),
+            allow_shared_exit_policy(),
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                Vec::new(),
+                Vec::new(),
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("the seeded DNS failure must fail the apply");
+
+        let ops = &controller.system.operations;
+        let rollback_at = ops
+            .iter()
+            .position(|op| op == "rollback_nat_forwarding")
+            .expect("the unwind must roll the NAT back");
+        let flush_at = ops
+            .iter()
+            .position(|op| op == "flush_nat_conntrack:masquerade_withdrawn:100.64.0.0/10")
+            .expect("the unwind must flush the bindings the NAT left behind");
+        assert!(
+            rollback_at < flush_at,
+            "the unwind flush must follow the NAT removal; ops={ops:?}"
+        );
+    }
+
+    /// After an unwind the committed posture is gone, so the NEXT apply must be
+    /// treated as a transition — erring toward one extra flush, never toward a
+    /// missed one.
+    #[test]
+    fn the_apply_after_an_unwind_is_treated_as_a_transition() {
+        let mut controller = Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default().fail_on("apply_dns_protection"),
+            allow_shared_exit_policy(),
+            TrustPolicy::default(),
+        );
+        let options = ApplyOptions {
+            exit_mode: ExitMode::FullTunnel,
+            ..ApplyOptions::default()
+        };
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                Vec::new(),
+                Vec::new(),
+                options,
+            )
+            .expect_err("the seeded DNS failure must fail the apply");
+
+        controller.system.fail_operation = None;
+        let recovery = apply_and_capture(&mut controller, options);
+        assert_eq!(
+            conntrack_flushes(&recovery),
+            vec![&"flush_nat_conntrack:masquerade_installed:100.64.0.0/10".to_owned()],
+            "the recovery apply must re-flush; ops={recovery:?}"
+        );
+    }
+
+    /// The posture is the whole no-op guard, so pin its decision table directly
+    /// rather than only through the controller.
+    #[test]
+    fn nat_posture_distinguishes_translating_from_non_translating_generations() {
+        let client = NatPosture::for_generation(ApplyOptions::default(), "100.64.0.0/10");
+        assert_eq!(client, None, "a client generation runs no NAT stage");
+        assert!(!NatPosture::translates(client.as_ref()));
+
+        let blind = NatPosture::for_generation(
+            ApplyOptions {
+                serve_exit_node: true,
+                blind_exit: true,
+                ..ApplyOptions::default()
+            },
+            "100.64.0.0/10",
+        )
+        .expect("a blind exit runs the NAT stage");
+        assert!(!blind.masquerade, "blind_exit installs no masquerade");
+        assert!(!blind.hairpin);
+        assert!(!NatPosture::translates(Some(&blind)));
+
+        let relay = NatPosture::for_generation(
+            ApplyOptions {
+                exit_mode: ExitMode::FullTunnel,
+                serve_exit_node: true,
+                ..ApplyOptions::default()
+            },
+            "100.64.0.0/10",
+        )
+        .expect("a relay-with-upstream runs the NAT stage");
+        assert!(relay.masquerade && relay.hairpin);
+        assert!(NatPosture::translates(Some(&relay)));
+
+        let terminal_exit = NatPosture::for_generation(
+            ApplyOptions {
+                serve_exit_node: true,
+                ..ApplyOptions::default()
+            },
+            "100.64.0.0/10",
+        )
+        .expect("a terminal exit runs the NAT stage");
+        assert!(terminal_exit.masquerade && !terminal_exit.hairpin);
+        assert_ne!(
+            terminal_exit, relay,
+            "gaining the hairpin SNAT is a real transition, not a no-op re-apply"
+        );
+    }
+
+    /// Mutation proof for the QH-47 wiring: the shapes a plausible edit would
+    /// quietly remove.
+    #[test]
+    fn the_conntrack_flush_keeps_its_audited_shape() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        // (a) The production dispatch must forward the Linux arm — a missing or
+        // stubbed arm would silently no-op the flush on the real daemon while
+        // every DryRun-driven test stayed green.
+        assert!(
+            code.contains(
+                "RuntimeSystem::Linux(system) => system.flush_nat_conntrack(mesh_cidr, reason)"
+            ),
+            "the RuntimeSystem Linux arm must dispatch flush_nat_conntrack"
+        );
+
+        // (b) The no-op guard: without the posture comparison the flush would
+        // fire on every reconcile re-apply and repeatedly kill healthy flows.
+        assert!(
+            code.contains("next_nat_posture != self.current_nat_posture"),
+            "the flush must be gated on a real posture transition"
+        );
+
+        // (c) The daemon must not be able to name a conntrack operation: the
+        // selector is built from the validated spec, never assembled here.
+        let body_at = code
+            .find("/// QH-47. The one privileged builtin that can invalidate conntrack")
+            .expect("the Linux flush arm must exist");
+        let body: String = code[body_at..].chars().take(1400).collect();
+        assert!(
+            body.contains("ConntrackFlushSpec::for_mesh_source"),
+            "the Linux arm must build the argv from the validated spec"
+        );
+        for forbidden in ["\"-D\"", "\"-F\"", "\"--orig-src\"", "conntrack_argv"] {
+            assert!(
+                !body.contains(forbidden),
+                "the daemon must not construct conntrack arguments ({forbidden}); \
+                 the helper owns the argv"
+            );
+        }
+
+        // (d) An absent tool must surface. A flush that silently did not happen
+        // is the exact invisibility QH-47 exists to remove.
+        let report_at = code
+            .find("fn report_nat_conntrack_flush")
+            .expect("the reporting wrapper must exist");
+        let rest = &code[report_at..];
+        let report_end = rest[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(rest.len());
+        let report = &rest[..report_end];
+        assert!(
+            report.contains("ConntrackFlushOutcome::ToolAbsent) => {")
+                && report.contains("log::warn!"),
+            "an absent conntrack binary must be logged, never silently skipped"
+        );
+        assert!(
+            !report.contains("return Err"),
+            "a flush failure must never fail an otherwise-healthy generation"
         );
     }
 }

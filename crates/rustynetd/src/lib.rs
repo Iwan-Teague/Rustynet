@@ -24,6 +24,7 @@ pub mod killswitch_precedence;
 pub mod linux_authenticode;
 pub mod linux_blind_exit;
 pub mod linux_blind_exit_dataplane;
+pub mod linux_conntrack_flush;
 pub mod linux_dns_failclosed;
 pub mod linux_dns_protect;
 pub mod linux_exit_dns_failclosed;
