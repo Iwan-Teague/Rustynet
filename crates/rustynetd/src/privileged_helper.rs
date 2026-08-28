@@ -227,6 +227,16 @@ pub enum PrivilegedCommandProgram {
     Ifconfig,
     Route,
     Pfctl,
+    /// External macOS `networksetup` binary at its fixed Apple-installed path
+    /// (`/usr/sbin/networksetup`). Implements the owner-approved M1 System
+    /// Configuration DNS fail-closed enforcement
+    /// (`MacosDnsFailclosedEnforcementGap_2026-08-28.md` §4): enumerate network
+    /// services, read per-service DNS servers for backup, force loopback, and
+    /// restore. The per-service argument schema is allowlisted below; service
+    /// names are host-derived but cross the privileged argv boundary, so they
+    /// are re-validated here against the same validator the daemon-side argv
+    /// builders use (defense in depth).
+    NetworkSetup,
     WireguardGo,
     Kill,
     /// In-helper file-write builtin for protected-mode DNS fail-closed
@@ -274,6 +284,7 @@ impl PrivilegedCommandProgram {
             PrivilegedCommandProgram::Ifconfig => "ifconfig",
             PrivilegedCommandProgram::Route => "route",
             PrivilegedCommandProgram::Pfctl => "pfctl",
+            PrivilegedCommandProgram::NetworkSetup => "networksetup",
             PrivilegedCommandProgram::WireguardGo => "wireguard-go",
             PrivilegedCommandProgram::Kill => "kill",
             PrivilegedCommandProgram::DnsFailclosedFile => {
@@ -300,6 +311,7 @@ impl PrivilegedCommandProgram {
             "ifconfig" => Some(PrivilegedCommandProgram::Ifconfig),
             "route" => Some(PrivilegedCommandProgram::Route),
             "pfctl" => Some(PrivilegedCommandProgram::Pfctl),
+            "networksetup" => Some(PrivilegedCommandProgram::NetworkSetup),
             "wireguard-go" => Some(PrivilegedCommandProgram::WireguardGo),
             "kill" => Some(PrivilegedCommandProgram::Kill),
             _ if value == crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM => {
@@ -349,6 +361,12 @@ impl PrivilegedCommandProgram {
                 &["/sbin/route", "/usr/sbin/route", "/usr/bin/route"]
             }
             PrivilegedCommandProgram::Pfctl => &["/sbin/pfctl", "/usr/sbin/pfctl"],
+            // Single fixed Apple-installed path: no PATH search, no candidate
+            // drift. macOS-only in practice, but the variant exists on every
+            // target so the enum and its validators stay platform-uniform.
+            PrivilegedCommandProgram::NetworkSetup => {
+                &[crate::macos_dns_sc_protect::NETWORKSETUP_BINARY_PATH]
+            }
             PrivilegedCommandProgram::WireguardGo => &[
                 "/usr/local/bin/wireguard-go",
                 "/opt/homebrew/bin/wireguard-go",
@@ -1887,6 +1905,7 @@ pub fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Res
         PrivilegedCommandProgram::Ifconfig => validate_ifconfig_args(args),
         PrivilegedCommandProgram::Route => validate_route_args(args),
         PrivilegedCommandProgram::Pfctl => validate_pfctl_args(args),
+        PrivilegedCommandProgram::NetworkSetup => validate_networksetup_args(args),
         PrivilegedCommandProgram::WireguardGo => validate_wireguard_go_args(args),
         PrivilegedCommandProgram::Kill => validate_kill_args(args),
         PrivilegedCommandProgram::DnsFailclosedFile => validate_dns_failclosed_file_args(args),
@@ -2878,6 +2897,40 @@ fn validate_sysctl_args(args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Validate the M1 `networksetup` argv surface (macOS System Configuration DNS
+/// fail-closed enforcement). The helper accepts ONLY:
+///   * `-listallnetworkservices` (read/enumerate),
+///   * `-getdnsservers <service>` (read, backup capture),
+///   * `-setdnsservers <service> <server...>` with every server a valid IP
+///     literal — the single-entry loopback apply and the exact-list restore
+///     share this arm, and the "no servers set" restore uses the literal
+///     `Empty` keyword.
+///
+/// Service names are host-derived but cross the privileged argv boundary, so
+/// they are re-validated here against the same validator the daemon uses.
+/// Everything else (interface flags, locations, proxies, PPPoE, …) is default-denied.
+fn validate_networksetup_args(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["-listallnetworkservices"] => Ok(()),
+        ["-getdnsservers", service] => {
+            crate::macos_dns_sc_protect::is_valid_networksetup_service_name(service)
+                .then_some(())
+                .ok_or_else(|| "unsupported networksetup service name".to_owned())
+        }
+        ["-setdnsservers", service, servers @ ..]
+            if !servers.is_empty()
+                && crate::macos_dns_sc_protect::is_valid_networksetup_service_name(service)
+                && (servers == ["Empty"]
+                    || crate::macos_dns_sc_protect::is_valid_networksetup_dns_server_list(
+                        servers,
+                    )) =>
+        {
+            Ok(())
+        }
+        _ => Err("unsupported networksetup argument schema".to_owned()),
+    }
+}
+
 fn validate_ifconfig_args(args: &[&str]) -> Result<(), String> {
     match args {
         ["-l"] => Ok(()),
@@ -3060,9 +3113,9 @@ mod tests {
         MAX_MESSAGE_BYTES, MAX_PROGRAM_BYTES, PrivilegedCommandOutput, PrivilegedCommandProgram,
         decode_helper_request, encode_helper_request, handle_request, is_anchor_name_token,
         is_nft_token, is_path_token, is_safe_token, peer_uid, read_request, read_response_frame,
-        run_privileged_subprocess, validate_pfctl_args, validate_privileged_helper_socket_security,
-        validate_privileged_program_binary, validate_request, validate_sysctl_args,
-        write_request_frame, write_response,
+        run_privileged_subprocess, validate_networksetup_args, validate_pfctl_args,
+        validate_privileged_helper_socket_security, validate_privileged_program_binary,
+        validate_request, validate_sysctl_args, write_request_frame, write_response,
     };
 
     #[test]
@@ -5982,6 +6035,34 @@ mod tests {
         );
         // A non-allowlisted anchor stays denied even for the read-only show.
         assert!(validate_pfctl_args(&["-a", "com.rustynet/other", "-s", "nat"]).is_err());
+    }
+
+    #[test]
+    fn validate_networksetup_args_permits_only_the_m1_surface() {
+        // The M1 surface: enumerate, read per service, pin loopback, restore
+        // to none, restore an exact saved list.
+        assert!(validate_networksetup_args(&["-listallnetworkservices"]).is_ok());
+        assert!(validate_networksetup_args(&["-getdnsservers", "Wi-Fi"]).is_ok());
+        assert!(validate_networksetup_args(&["-setdnsservers", "Wi-Fi", "127.0.0.1"]).is_ok());
+        assert!(validate_networksetup_args(&["-setdnsservers", "Wi-Fi", "Empty"]).is_ok());
+        assert!(
+            validate_networksetup_args(&["-setdnsservers", "Wi-Fi", "8.8.8.8", "1.1.1.1"]).is_ok()
+        );
+        // Everything else is denied — unknown flags...
+        assert!(validate_networksetup_args(&["-listallhardwareports"]).is_err());
+        assert!(validate_networksetup_args(&["-getinfo", "Wi-Fi"]).is_err());
+        // ...empty, control-charactered, or overlong service names...
+        assert!(validate_networksetup_args(&["-getdnsservers", ""]).is_err());
+        assert!(validate_networksetup_args(&["-setdnsservers", "Wi\n-Fi", "Empty"]).is_err());
+        assert!(validate_networksetup_args(&["-getdnsservers", "Bad\x1B[1m"]).is_err());
+        assert!(validate_networksetup_args(&["-getdnsservers", &"x".repeat(129)]).is_err());
+        // ...wrong value payloads on -setdnsservers...
+        assert!(validate_networksetup_args(&["-setdnsservers", "Wi-Fi"]).is_err());
+        assert!(validate_networksetup_args(&["-setdnsservers", "Wi-Fi", "empty"]).is_err());
+        assert!(validate_networksetup_args(&["-setdnsservers", "Wi-Fi", "not-an-ip"]).is_err());
+        assert!(validate_networksetup_args(&["-setdnsservers", "Wi-Fi", "999.1.1.1"]).is_err());
+        // ...and empty argv entirely.
+        assert!(validate_networksetup_args(&[]).is_err());
     }
 
     #[test]

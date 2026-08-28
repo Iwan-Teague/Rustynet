@@ -229,7 +229,9 @@ pub fn build_macos_dns_failclosed_snapshot(
 
 /// Read `scutil --dns`. `None` on any failure (missing binary, non-zero
 /// exit) so the caller fails closed rather than assuming loopback.
-fn read_scutil_dns() -> Option<String> {
+/// Reads the live `scutil --dns` output through the reviewed fixed path.
+/// Exposed for the M1 startup-recovery guard in `macos_dns_sc_protect`.
+pub fn read_scutil_dns() -> Option<String> {
     let output = std::process::Command::new(REVIEWED_SCUTIL_PATH)
         .arg("--dns")
         .output()

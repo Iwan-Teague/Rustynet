@@ -2154,6 +2154,18 @@ used, justify it against the reuse loops, not only against continuous runs.
 > **Unrecorded finding 2 (raw substring match, all six probes) is NOT addressed** and remains
 > open.
 
+> **DISPOSITION 2026-08-28 — DNS half CLOSED by the owner-approved M1 enforcement.**
+> `MacosCommandSystem` now pins every enabled network service's DNS to `127.0.0.1`
+> through the privileged helper (`networksetup -setdnsservers`), so `scutil --dns`'s
+> primary resolver really is loopback whenever the daemon claims protected mode;
+> `assert_dns_protection` re-asserts it on every reconcile tick, and a crash between
+> apply and rollback is bounded by the QH-40-shaped startup-recovery guard
+> (`macos_dns_sc_protect.rs::run_startup_dns_recovery`). With enforcement applied this
+> check's green is backed by real system-configuration state; reverting the pin reds
+> it. Full mechanism + residual owner sub-decision (VPN-service scope):
+> `MacosDnsFailclosedEnforcementGap_2026-08-28.md` §7. The mesh-status half of this
+> entry remains tracked separately.
+
 ### QH-40 — launchd SIGTERMs the privileged helper BEFORE the daemon, so every macOS rollback path fails while the process still exits 0
 
 **Severity: HIGH (fail-closed). Confidence: VERIFIED from the guest's unified log,
