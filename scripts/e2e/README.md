@@ -11,11 +11,19 @@ orchestrator (`live_linux_lab_orchestrator.sh`) was retired under
 What remains here:
 
 - [`live_lab_common.sh`](./live_lab_common.sh) — shared SSH/file/snapshot
-  helpers, retained because the cross-network suite below sources it.
-- The **cross-network suite**: the eight `live_linux_cross_network_*_test.sh`
-  scripts plus `test_live_lab_ssh_windows.sh` (the only proof surface for the
-  bash-era `cross_os_*` evidence; retained under the owner's Option-A scope
-  decision).
+  helpers. The cross-network suite no longer sources it (see below); it is
+  retained for `test_live_lab_ssh_windows.sh`, which sources its Windows SSH
+  helpers, and for the macOS install adapter, whose `#[cfg(test)]` assertions
+  pin its cross-platform path helpers by content. It dies with the
+  macOS/Windows parity track, not with CN-3.
+- The **cross-network suite is gone.** All eight
+  `live_linux_cross_network_*_test.sh` validators were ported to Rust functions
+  under CN-3 (`crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/scenario/`)
+  and the orchestrator calls them directly; their scripts and `[[bin]]` shims
+  are deleted. `test_live_lab_ssh_windows.sh` remains (the only proof surface
+  for the bash-era `cross_os_*` evidence; retained under the owner's Option-A
+  scope decision), as does
+  [`apply_cross_network_impairment_profile.sh`](./apply_cross_network_impairment_profile.sh).
 - The focused `live_*` stage scripts — thin wrappers over the Rust test
   binaries of the same name (`live_linux_two_hop_test.sh` has been a two-line
   `exec cargo run` wrapper since `4f9689d9`; both engines always ran identical
