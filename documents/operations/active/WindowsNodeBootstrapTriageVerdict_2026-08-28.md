@@ -331,11 +331,13 @@ Recommended order:
    same style as the existing `winget.exe is not available; …` message. This is
    the change that turns a fresh Windows guest into a bootstrappable one, and it
    is a configuration/precondition fix inside the bootstrap script — not a
-   redesign.
+   redesign. **Landed 2026-08-28 — see §9.1 for the disposition and for the
+   answer to §3's open question.**
 2. **W-FIX-2 (code, S) — apply the existing CLIXML stripper to the SSH adapter
    path** (§5, `error.rs:154-156` + `mod.rs:35006`), and stop truncating
    `error_detail` from the front. Cheap, and it is what makes every *subsequent*
    Windows failure diagnosable on the first read instead of the fifth week.
+   **Landed 2026-08-28 — see §9.2.**
 3. **W-FIX-3 (ledger, S) — stop run-scoped `preflight` failures poisoning the
    per-OS `*_stage_bootstrap` columns** (§0(c)). Affects Linux and macOS counts
    too, so it is not Windows-column work and can be owned separately. Until it
@@ -375,3 +377,129 @@ CP-4 and keep their existing disposition.
   recorded"** — no fix has ever been attempted against this stage, so this is a
   first triage, not a repeat.
 - Guest-health probes of `windows-utm-1`: §6, measured 2026-08-28.
+- Bash-era engine, last content before deletion: `git show
+  c9ccf1a4^:scripts/e2e/live_linux_lab_orchestrator.sh` (9090 lines).
+
+## 9. Fix dispositions (added 2026-08-28, after the triage)
+
+### 9.1 W-FIX-1 — landed
+
+`scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1` now:
+
+- collects the feature's state in `Get-WindowsBootstrapToolingState` as
+  `winget_configuration_enabled` plus a `winget_configuration_probe` detail
+  block, sourced from a new side-effect-free `Get-WingetConfigurationFeatureState`
+  (`winget settings export`, parsed best-effort);
+- **enables** the feature rather than only asserting it. A new
+  `Enable-WingetConfigurationFeature` runs `winget configure --enable`
+  (idempotent, exit 0 when already enabled) and is called from
+  `Ensure-WingetConfigurationDependencies` before `winget configure --file`.
+  The bootstrap already runs elevated, and a guest built from the documented
+  runbook has no reason to have the feature on, so self-healing beats
+  precondition-only.
+- **fails closed** with a named, actionable error in the script's existing
+  style when enabling fails — `WinGet Configuration feature is not enabled and
+  could not be enabled; …; run \`winget configure --enable\` from an elevated
+  session on this guest or use a pre-baked Windows lab template` — carrying
+  the elevation state, winget's exit code, winget's own output, and the probe
+  detail. No silent continue.
+
+The probe is diagnostic only; enforcement is the enable call. That split is
+deliberate: WinGet does not expose the Configuration flag uniformly across
+versions, so gating on the probe would risk a false "disabled" verdict, while
+enabling unconditionally is safe and idempotent either way.
+
+Both native invocations lower `$ErrorActionPreference` to `Continue`
+function-scoped and gate on `$LASTEXITCODE`, matching the pattern the cargo
+and `icacls` call sites in this script already use — under PS 5.1's
+script-level `'Stop'`, native stderr would otherwise raise a
+`NativeCommandError` *before* the exit-code gate and mask the named error.
+
+Test: `bootstrap_script_enables_winget_configuration_feature_before_configuring`
+in `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs`.
+PowerShell has no unit-test harness in this repository, so the content-pin
+tests over the `include_str!`-embedded script are the only regression guard it
+has; the new pin asserts both halves of the fix and that the enable step
+precedes the configure invocation it exists to unblock.
+
+### 9.2 Answer to §3's open question — **always-gap, not a regression**
+
+§3 asked whether the bash era's 66 `windows_stage_bootstrap` passes mean the
+bash path did not route through `winget configure`, or that the feature was
+enabled on `windows-utm-1` at that time and has since been lost. **The first,
+and more precisely: neither engine has ever reached `winget configure` on a
+guest with a pre-baked toolchain.** Evidence:
+
+1. The deleted bash engine — `scripts/e2e/live_linux_lab_orchestrator.sh`,
+   9090 lines, recovered at `c9ccf1a4^` — contains **zero** occurrences of
+   `winget`.
+2. Its Windows worker `bootstrap_host_worker_windows` (`:3346`) scp'd the
+   source archive itself and invoked `scripts/e2e/rn_bootstrap_windows.ps1`,
+   which runs only `-Phase build-release` and `-Phase install-release`. That
+   wrapper's own comment says it skips `sync-source` because "we already
+   extracted the archive". So the bash path never entered `Sync-SourceGit` /
+   `Sync-SourceArchive`.
+3. It ran the **same** `Bootstrap-RustyNetWindows.ps1`, and the `--node` engine
+   also runs only `-Phase build-release`
+   (`orchestrator/adapter/windows_install.rs:484`). The asymmetry is therefore
+   not an engine-path difference at the phase level.
+4. **Correction to §2.2/§2.3.** The second call site is *not* "the archive
+   path", and it is *not* unconditional. `Sync-SourceArchive` does not call
+   `Ensure-WingetConfigurationDependencies` at all; the pre-fix `:1539` call
+   sits inside `Build-RustyNet`, guarded by
+   `if (-not ($cargoPresent -and $rustcPresent -and $buildToolsPresent))`.
+   That guard is the only route either engine has ever had to
+   `winget configure`.
+
+So the 66 bash passes are explained by a guest whose cargo, rustc and
+VsDevCmd were already present — the branch was never taken, and the feature's
+state was never consulted. The gap has existed for the whole life of the
+script; it only becomes fatal when the toolchain is missing, i.e. on a fresh
+or re-imaged guest, which is what rows #2 and #3 were. Nothing establishes
+that the feature was ever enabled on `windows-utm-1`, and nothing needs to.
+
+Practical consequence: `winget configure` is a *cold-guest* path. W-FIX-4's
+re-run only exercises W-FIX-1 if the guest genuinely lacks the toolchain, or
+if the run is otherwise forced down the sync-source path.
+
+### 9.3 W-FIX-2 — landed
+
+The SSH adapter's error seam in
+`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/ssh.rs` is now a pure,
+unit-testable `render_command_failure_detail(stderr_raw, stdout_trimmed)`,
+called from `run_remote_inner`. Nothing about what is *captured* changed; only
+the rendered summary did. When either stream carries CLIXML, the new
+`render_powershell_clixml_error` decodes the `<S>` string records —
+`_xHHHH_` escapes and XML entities included — and the result is **appended**
+as `[powershell error: …]`.
+
+Two deliberate choices:
+
+- **Decode, don't strip.** `strip_powershell_clixml_noise`
+  (`vm_lab/mod.rs:35006`) is right for the `utmctl exec` path, where the
+  CLIXML is progress-record noise wrapped around a plain-text host error. On
+  the SSH path the CLIXML **is** the error record, so dropping it would delete
+  the only copy of the message. The existing stripper is still wired in as the
+  fallback for the envelope-only shape that carries no `<S>` records.
+- **Appended, not substituted.** §5's claim that the raw form survives
+  elsewhere does **not** hold for this path. The Rust `--node` engine writes
+  its per-stage log from this same summary
+  (`orchestrator/evidence.rs` — `log_body` is the stage summary, unlike the
+  bash stage wrappers which tee real process output), and the Windows install
+  path uses `ssh::run_remote`, not `run_remote_with_log`, so no raw tee exists.
+  Replacing the raw text would have destroyed it. Appending keeps the raw
+  CLIXML in the prefix and puts the readable sentence at the end, where the
+  front-truncation described in §5(2) — the `.rev().take(600)` stderr tail
+  here, and the ledger's own `error_detail` truncation — cannot reach it.
+
+Tests: `powershell_clixml_rendering_tests` in the same file — the positive
+case feeds the exact CLIXML shape from rows #2/#3 through the SSH-path
+rendering and asserts the human-readable record surfaces with escapes and
+entities decoded; a second asserts the raw form is preserved and ordered
+before the decoded one; two negatives assert non-CLIXML stderr (single-stream
+and two-stream) passes through byte-identical.
+
+Not addressed here: §5(3), that PowerShell's error record points at the outer
+invocation rather than the cause, is a property of the guest-side
+`Write-Error $_` at `Bootstrap-RustyNetWindows.ps1:39`, not of the adapter
+seam.

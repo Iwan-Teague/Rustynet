@@ -12,6 +12,230 @@ use crate::vm_lab::orchestrator::error::AdapterError;
 
 const POLL_INTERVAL_MILLIS: u64 = 100;
 
+/// Upper bound on the decoded PowerShell error text appended to an
+/// `AdapterError::Command` message. Long enough for a multi-line PowerShell
+/// error record, short enough that it cannot crowd out the raw prefix.
+const POWERSHELL_ERROR_RENDER_LIMIT: usize = 1200;
+
+// ── PowerShell CLIXML rendering (W-FIX-2) ────────────────────────────────────
+
+/// Build the `stderr` payload of an `AdapterError::Command` from a failed
+/// remote command's two streams.
+///
+/// This is the single seam where captured output becomes the operator-visible
+/// `error_detail`. It changes nothing about what is *captured* — both raw
+/// buffers arrive intact — it only decides what the rendered summary says.
+fn render_command_failure_detail(stderr_raw: &str, stdout_trimmed: &str) -> String {
+    // Windows PowerShell over OpenSSH frequently writes diagnostic detail to
+    // stdout (CLIXML stream / Write-Host). When stderr is empty, fall back to
+    // a tail of stdout so the operator sees *something* rather than a bare
+    // "(exit Some(1)): ".
+    let base = if stderr_raw.is_empty() {
+        if stdout_trimmed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "(stderr empty; stdout tail) {}",
+                tail_chars(stdout_trimmed, 800)
+            )
+        }
+    } else if !stdout_trimmed.is_empty() {
+        // Both streams have content. Cargo writes progress to stderr; the
+        // rustynet binary writes errors to stdout via println!. Combine tails
+        // from both so the operator sees the actual failure message.
+        format!(
+            "{}\n[stdout: {}]",
+            tail_chars(stderr_raw, 600),
+            tail_chars(stdout_trimmed, 400)
+        )
+    } else {
+        stderr_raw.to_owned()
+    };
+
+    // Append the decoded PowerShell error record, if the guest sent one. It
+    // goes LAST on purpose: the tails above and the ledger's `error_detail`
+    // column both truncate from the FRONT, which is how
+    // "Configuration is not enabled. Run `winget configure --enable`" ended up
+    // cut out of the operator-visible error while sitting in the same buffer.
+    // Appending puts the readable sentence where front-truncation cannot reach
+    // it, and leaves the raw CLIXML in the prefix — the Rust `--node` engine
+    // writes its per-stage log from this same summary
+    // (`orchestrator/evidence.rs`), so the raw form has nowhere else to
+    // survive and must not be discarded here.
+    match render_powershell_clixml_error(stderr_raw)
+        .or_else(|| render_powershell_clixml_error(stdout_trimmed))
+    {
+        Some(decoded) => format!("{base}\n[powershell error: {decoded}]"),
+        None => base,
+    }
+}
+
+/// Last `limit` characters of `text`, char-wise (never splits a code point).
+fn tail_chars(text: &str, limit: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.len().saturating_sub(limit);
+    chars[start..].iter().collect()
+}
+
+/// Decode the human-readable text out of a PowerShell CLIXML error stream.
+///
+/// Windows guests are driven over OpenSSH by invoking `powershell.exe`, whose
+/// non-stdout streams are serialized as CLIXML. On the SSH adapter path that
+/// payload went into `AdapterError::Command`'s `stderr` verbatim, and
+/// `error.rs` renders `stderr` verbatim in turn — so the operator-visible
+/// `error_detail` was a wall of `<S S="Error">...</S>` fragments with
+/// `_x000D__x000A_` escapes, while the sentence naming the actual cause was
+/// unreadable inside it. That is the diagnosability defect §5 of
+/// `WindowsNodeBootstrapTriageVerdict_2026-08-28.md` blames for CP-4 sitting
+/// open for five weeks.
+///
+/// This is deliberately a DECODER, not a filter. The `utmctl exec` path's
+/// [`strip_powershell_clixml_noise`](crate::vm_lab::strip_powershell_clixml_noise)
+/// *drops* the envelope, which is right there: on that path the CLIXML is
+/// progress-record noise wrapped around a plain-text host error. On the SSH
+/// path the CLIXML **is** the error record, so dropping it would delete the
+/// only copy of the message. We therefore decode the `<S>` string records and
+/// fall back to the existing stripper when there are none.
+///
+/// Returns `None` when the input carries no CLIXML — non-PowerShell stderr
+/// (Linux, macOS, scp, ssh's own errors) must pass through untouched.
+fn render_powershell_clixml_error(raw: &str) -> Option<String> {
+    if !raw.contains("#< CLIXML") && !raw.contains("<S ") && !raw.contains("<S>") {
+        return None;
+    }
+
+    let records = extract_clixml_string_records(raw);
+    let decoded = if records.is_empty() {
+        // No `<S>` records to decode: this is the envelope-only shape the
+        // utmctl path already handles, so reuse the stripper the repo owns.
+        crate::vm_lab::strip_powershell_clixml_noise(raw)
+    } else {
+        records.join("")
+    };
+
+    let cleaned = decoded
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let truncated: String = cleaned
+        .chars()
+        .take(POWERSHELL_ERROR_RENDER_LIMIT)
+        .collect();
+    Some(truncated)
+}
+
+/// Pull the inner text out of every `<S ...>...</S>` element, in document
+/// order, decoding CLIXML's `_xHHHH_` escapes and XML entities as it goes.
+fn extract_clixml_string_records(raw: &str) -> Vec<String> {
+    let mut records = Vec::new();
+    let mut rest = raw;
+    while let Some(open_start) = rest.find("<S") {
+        let after_tag_name = &rest[open_start + 2..];
+        // `<S>` or `<S S="Error">` — but not `<Something>`.
+        if !after_tag_name.starts_with('>') && !after_tag_name.starts_with(' ') {
+            rest = &rest[open_start + 2..];
+            continue;
+        }
+        let Some(open_end) = after_tag_name.find('>') else {
+            break;
+        };
+        let body_start = open_start + 2 + open_end + 1;
+        let Some(close_rel) = rest[body_start..].find("</S>") else {
+            break;
+        };
+        records.push(decode_clixml_text(
+            &rest[body_start..body_start + close_rel],
+        ));
+        rest = &rest[body_start + close_rel + 4..];
+    }
+    records
+}
+
+/// Decode one CLIXML text node: `_xHHHH_` character escapes first (CR/LF are
+/// the ones that matter — they are what makes the raw form unreadable), then
+/// the XML entities PowerShell escapes on top of them.
+fn decode_clixml_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes: Vec<char> = text.chars().collect();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == '_'
+            && idx + 6 < bytes.len()
+            && (bytes[idx + 1] == 'x' || bytes[idx + 1] == 'X')
+            && bytes[idx + 6] == '_'
+            && let Some(decoded) = decode_hex_escape(&bytes[idx + 2..idx + 6])
+        {
+            out.push(decoded);
+            idx += 7;
+            continue;
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+    decode_xml_entities(&out)
+}
+
+fn decode_hex_escape(digits: &[char]) -> Option<char> {
+    let mut value: u32 = 0;
+    for ch in digits {
+        value = value * 16 + ch.to_digit(16)?;
+    }
+    // Carriage returns only add noise once line endings are normalized.
+    if value == u32::from(b'\r') {
+        return Some('\n');
+    }
+    char::from_u32(value)
+}
+
+fn decode_xml_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let Some(semi) = tail.find(';').filter(|semi| *semi <= 10) else {
+            out.push('&');
+            rest = &tail[1..];
+            continue;
+        };
+        let entity = &tail[1..semi];
+        let decoded = match entity {
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "amp" => Some('&'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            other => other
+                .strip_prefix('#')
+                .and_then(
+                    |num| match num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => num.parse::<u32>().ok(),
+                    },
+                )
+                .and_then(char::from_u32),
+        };
+        match decoded {
+            Some(ch) => {
+                out.push(ch);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 // ── Connection helpers ────────────────────────────────────────────────────────
 
 /// Extract SSH connection parameters from a `NodeConnection`.
@@ -245,54 +469,11 @@ fn run_remote_inner(
         })?;
     if !output.status.success() {
         let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        // Windows PowerShell over OpenSSH frequently writes diagnostic
-        // detail to stdout (CLIXML stream / Write-Host). When stderr is
-        // empty, fall back to a tail of stdout so the operator sees
-        // *something* rather than a bare "(exit Some(1)): ".
         let stdout_lossy = String::from_utf8_lossy(&output.stdout);
-        let stdout_trimmed = stdout_lossy.trim();
-        let stderr = if stderr_raw.is_empty() {
-            if stdout_trimmed.is_empty() {
-                String::new()
-            } else {
-                let tail: String = stdout_trimmed
-                    .chars()
-                    .rev()
-                    .take(800)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                format!("(stderr empty; stdout tail) {tail}")
-            }
-        } else if !stdout_trimmed.is_empty() {
-            // Both streams have content. Cargo writes progress to stderr; the
-            // rustynet binary writes errors to stdout via println!. Combine
-            // tails from both so the operator sees the actual failure message.
-            let stderr_tail: String = stderr_raw
-                .chars()
-                .rev()
-                .take(600)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            let stdout_tail: String = stdout_trimmed
-                .chars()
-                .rev()
-                .take(400)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            format!("{stderr_tail}\n[stdout: {stdout_tail}]")
-        } else {
-            stderr_raw
-        };
         let code = output.status.code();
         return Err(AdapterError::Command {
             exit_code: code,
-            stderr,
+            stderr: render_command_failure_detail(&stderr_raw, stdout_lossy.trim()),
         });
     }
     String::from_utf8(output.stdout)
@@ -849,5 +1030,98 @@ mod tests {
         assert!(!validator_report_ok(
             "{\"overall_ok\": false, \"sub\": {\"overall_ok\": true}}"
         ));
+    }
+}
+
+#[cfg(test)]
+mod powershell_clixml_rendering_tests {
+    use super::render_command_failure_detail;
+
+    /// The shape that actually reached the ledger for CP-4 failures #2 and #3
+    /// (`WindowsNodeBootstrapTriageVerdict_2026-08-28.md` §5): a CLIXML
+    /// envelope whose `<S S="Error">` records carry the PowerShell error text
+    /// with `_x000D__x000A_` line escapes.
+    const CLIXML_STDERR: &str = concat!(
+        "#< CLIXML\r\n",
+        "<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">",
+        "<S S=\"Error\">winget configure failed for RustyNet bootstrap configuration_x000D__x000A_</S>",
+        "<S S=\"Error\">At line:1 char:149_x000D__x000A_</S>",
+        "<S S=\"Error\">+ ... \\Rustynet&apos;; &amp; &apos;C:\\Windows\\Temp\\rustynet-stage\\Bootstrap ..._x000D__x000A_</S>",
+        "</Objs>"
+    );
+
+    #[test]
+    fn ssh_command_detail_surfaces_human_readable_powershell_error() {
+        let detail = render_command_failure_detail(CLIXML_STDERR, "");
+        assert!(
+            detail.contains("[powershell error: "),
+            "SSH-path rendering must decode CLIXML into a readable record; got: {detail}"
+        );
+        assert!(
+            detail.contains("winget configure failed for RustyNet bootstrap configuration"),
+            "the decoded record must carry the actual PowerShell error text; got: {detail}"
+        );
+        assert!(
+            detail.contains("At line:1 char:149"),
+            "every `<S>` record must be decoded, not just the first; got: {detail}"
+        );
+        assert!(
+            !detail
+                .split("[powershell error: ")
+                .nth(1)
+                .unwrap_or_default()
+                .contains("_x000D_"),
+            "the decoded record must not still carry CLIXML escapes; got: {detail}"
+        );
+        assert!(
+            detail.contains("&") || detail.contains("';"),
+            "XML entities must be decoded back to their characters; got: {detail}"
+        );
+    }
+
+    #[test]
+    fn ssh_command_detail_preserves_the_raw_clixml_alongside_the_decoded_record() {
+        let detail = render_command_failure_detail(CLIXML_STDERR, "");
+        // The Rust --node engine writes its per-stage log from this same
+        // summary, so decoding must ADD the readable form, never replace the
+        // raw one.
+        assert!(
+            detail.contains("<S S=\"Error\">"),
+            "raw CLIXML must remain reachable in the rendered detail; got: {detail}"
+        );
+        let raw_at = detail.find("<S S=\"Error\">").expect("raw CLIXML present");
+        let decoded_at = detail.find("[powershell error: ").expect("decoded present");
+        assert!(
+            raw_at < decoded_at,
+            "the decoded record must come last so front-truncation cannot cut it"
+        );
+    }
+
+    #[test]
+    fn ssh_command_detail_leaves_non_clixml_stderr_untouched() {
+        let plain = "bash: line 1: rustynetd: command not found";
+        assert_eq!(render_command_failure_detail(plain, ""), plain);
+    }
+
+    #[test]
+    fn ssh_command_detail_leaves_non_clixml_two_stream_output_untouched() {
+        let detail = render_command_failure_detail("error: linker `cc` not found", "build failed");
+        assert_eq!(
+            detail,
+            "error: linker `cc` not found\n[stdout: build failed]"
+        );
+        assert!(!detail.contains("[powershell error: "));
+    }
+
+    #[test]
+    fn ssh_command_detail_decodes_a_clixml_record_that_arrived_on_stdout() {
+        let detail = render_command_failure_detail(
+            "",
+            "#< CLIXML\r\n<Objs><S S=\"Error\">Configuration is not enabled._x000D__x000A_</S></Objs>",
+        );
+        assert!(
+            detail.contains("Configuration is not enabled."),
+            "stdout-carried CLIXML must decode too; got: {detail}"
+        );
     }
 }
