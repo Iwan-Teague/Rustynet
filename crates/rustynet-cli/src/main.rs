@@ -11770,8 +11770,26 @@ fn macos_launchd_restart_config_from_env() -> Result<MacosLaunchdRestartConfig, 
     let wg_passphrase_path = env_required_path("RUSTYNET_WG_KEY_PASSPHRASE")?;
     validate_macos_wg_passphrase_placeholder_path(wg_passphrase_path.as_path())?;
 
-    let helper_timeout_ms =
-        parse_env_u64_with_default("RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS", 2000)?;
+    // The helper's --timeout-ms is the SERVER budget; the daemon's
+    // --privileged-helper-timeout-ms is the CLIENT read wait on the other end
+    // of the same socket. Derive the client value from the server value rather
+    // than passing one number to both sides, and validate the pair (plus
+    // launchd's measured 5 s exit-timeout ceiling) before rendering either
+    // plist. QH-40: this restart path is the Rust twin of
+    // Install-RustyNetMacosService.sh, which deployed a 15x asymmetry.
+    let helper_timeout_ms = parse_env_u64_with_default(
+        "RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS",
+        rustynetd::privileged_helper::DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
+    )?;
+    let daemon_helper_client_timeout_ms =
+        rustynetd::privileged_helper::privileged_helper_client_timeout_ms(helper_timeout_ms);
+    rustynetd::privileged_helper::validate_privileged_helper_timeout_pair(
+        helper_timeout_ms,
+        daemon_helper_client_timeout_ms,
+    )?;
+    rustynetd::privileged_helper::validate_macos_privileged_helper_shutdown_budget(
+        daemon_helper_client_timeout_ms,
+    )?;
 
     let auto_tunnel_enforce = parse_bool_value(
         "RUSTYNET_AUTO_TUNNEL_ENFORCE",
@@ -11909,7 +11927,7 @@ fn macos_launchd_restart_config_from_env() -> Result<MacosLaunchdRestartConfig, 
         "--privileged-helper-socket".to_owned(),
         service.helper_socket_path.display().to_string(),
         "--privileged-helper-timeout-ms".to_owned(),
-        helper_timeout_ms.to_string(),
+        daemon_helper_client_timeout_ms.to_string(),
         "--reconcile-interval-ms".to_owned(),
         parse_env_u64_with_default("RUSTYNET_RECONCILE_INTERVAL_MS", 1000)?.to_string(),
         "--max-reconcile-failures".to_owned(),
