@@ -299,7 +299,14 @@ pub struct ScenarioInputs<'a> {
     pub relay: Option<ScenarioNode<'a>>,
     /// Present only for traversal-adversarial, whose shell took `--probe-host`.
     pub probe: Option<ScenarioNode<'a>>,
-    pub nat_profile: String,
+    /// The NAT profile this run is exercising, as the closed-vocabulary type
+    /// CN-4 introduced. It stays typed through the scenario and is rendered to
+    /// text only where the report schema demands a string, so an unknown
+    /// profile is unrepresentable here rather than caught late on a guest.
+    pub nat_profile: super::substrate::NatProfileId,
+    /// NOT a NAT profile: the netem impairment name, whose vocabulary lives in
+    /// [`netns::NetnsImpairment`](super::netns). Still a string, because the
+    /// impairment is applied by a substrate that may not be netns.
     pub impairment_profile: String,
 }
 

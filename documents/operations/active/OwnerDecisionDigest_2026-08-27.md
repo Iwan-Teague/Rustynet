@@ -284,7 +284,14 @@ started before CN-4: landing it earlier would reject profile strings that today 
 `apply_nat_profile` yet to justify the stricter contract.
 Source: `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/substrate.rs` (the
 `NatProfileId` doc comment) and `documents/operations/active/CrossNetworkSubstrateIntegrationSpec_2026-06-21.md`
-§0.4 CN-1/CN-4 rows. **Status: `approved`, sequenced behind CN-4.**
+§0.4 CN-1/CN-4 rows.
+
+**LANDED 2026-08-27 with CN-4** on `work/cn4-substrates`. `CrossNetworkOptions::nat_profiles` and
+`required_nat_profiles` are `Vec<NatProfileId>`; `--cross-network-nat-profiles` and
+`--cross-network-required-nat-profiles` reject any name outside the five with a parse-time error that
+lists the vocabulary. `--cross-network-impairment-profile` is deliberately untouched (it is a netem
+name, not a NAT profile). The sequencing condition was met: `apply_nat_profile` landed in the same
+change. **Status: `approved` → `done`.**
 
 ## 17. Blind relay — identity-free token/hello v2, no v1 fallback
 

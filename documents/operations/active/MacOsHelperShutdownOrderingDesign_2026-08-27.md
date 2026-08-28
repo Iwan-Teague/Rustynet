@@ -372,3 +372,200 @@ mechanism the code does not support.
   **done**: nothing half-built was left in the tree; the deferred work exists only as this
   document.
 * QH-40 ledger entry updated with status and a pointer here — **done**.
+
+---
+
+## 8. QH-40-MEASURE verdict — 2026-08-27, live measurement on `macos-utm-1`
+
+**Status: MEASURED IN PART, with the unmeasured half named precisely.** Lab access was
+authorized for this task and used surgically on `macos-utm-1` (macOS 26.5, build 25F71,
+arm64) over SSH. Two of the three measurements are settled; the reload-ordering matrix is
+not, for a stated tooling reason, and nothing below pretends otherwise. Raw outputs are in
+the appendix (§8.6) so a reader re-derives rather than trusts.
+
+### 8.1 The kill ceiling (§4.3) — SETTLED: 5 seconds
+
+`launchctl print` reports the effective per-service value directly; no induced shutdown was
+needed:
+
+| service | `exit timeout` |
+| --- | --- |
+| `system/com.rustynet.privileged-helper` | **5** |
+| `system/com.rustynet.anchor` | 5 |
+| `system/com.rustynet.exit` | 5 |
+| `system/com.openssh.sshd` (Apple's own) | 5 |
+
+No rustynet plist declares `ExitTimeOut` (§4.1), so these are launchd's default on macOS
+26.5. The refuted plan's `scheduling cleanup in 5 sec` line is corroborated; §4.3 is
+resolved. **Every wait or lease bound in §3 must sit under 5 s.** The helper's own
+`--timeout-ms 30000` is 6× the ceiling — any helper work outstanding at SIGTERM+5 s dies by
+SIGKILL regardless of what Option A/B negotiates.
+
+### 8.2 The competing hypothesis (§3.3) — the stated mechanism is REFUTED; a third cause,
+which both prior documents missed, fits the evidence
+
+**Protocol fact (code, re-runnable).** `truncated frame header` is produced ONLY by
+`UnexpectedEof` on the 10-byte header read (`map_read_exact_error`,
+`privileged_helper.rs`). A client-side read timeout maps to a *different* string —
+`read frame header failed: Resource temporarily unavailable (os error 35)`. So every
+"truncated" observation in the ledger is, by construction, a server-side close that sent
+**zero** response bytes. No timeout on the daemon's side of the socket can produce it.
+
+**Live measurement 1 — the helper does NOT silently drop on its own I/O timeout.** A root
+peer (root is an authorized peer, `privileged_helper.rs:548`) connected to the live helper
+(pid 311, deployed `--timeout-ms 30000`, 2026-08-26 build) and sent nothing. The helper
+held the idle connection **60.01 s** (= peek window + request-read window, 2 × 30000 ms),
+then wrote a **well-formed** RNHF response frame (version 1, type 2, 79-byte payload
+carrying `read frame header failed: Resource temporarily unavailable (os error 35)`) and
+only then closed. Helper alive throughout, same pid. Repeated twice, 60.007 s and 60.012 s.
+The daemon on this path receives the helper's error string — never `truncated frame
+header`. The causal claim inside `annotate_helper_response_read_error`
+(`privileged_helper.rs:660-685`) — timeout elapses → helper "drops the connection" →
+truncation — is therefore **wrong on the current build**: every timeout path
+(request-read timeout, and the `run_privileged_subprocess(timeout)` execution watchdog in
+`handle_request_with_timeout`) returns a well-formed error response.
+
+**The third cause, and it fits the 2026-08-11 signature exactly.** The helper has precisely
+one close-without-response path: the **oversized-response silent drop**, documented at
+`privileged_helper.rs:83-90` — a response exceeding the frame budget makes `write_frame`
+refuse and the server `let _ = write_response(...)` drop the connection with no bytes,
+while the helper stays alive. The un-clamped construction site named there is the pf-load
+**failure** message — and the 08-11 evidence's FIRST truncated step was exactly a pf
+rollback failure (`rollback dns protection: rollback failed: firewall apply failed`), seen
+**while the helper was alive for another 1.019 s**. That message was only bounded at the
+deliverability budget on **2026-08-25** (`64774bdd`) — *after every observation in the
+ledger*. So the "truncated while alive" evidence attributes to a since-fixed response-size
+defect, **not** to the helper's I/O timeout and **not** to signal ordering. The
+`Connection refused` failures on the *later* rollback steps remain fully consistent with
+the §2 completion race (the helper was booted out ~1 s after the daemon, mid-rollback).
+The 2000→10000 ms live fix most plausibly worked by relaxing the execution watchdog
+(slow commands on the 2-core guest stopped being killed at 2 s, so the failing —
+and budget-blowing — error path stopped being taken); the annotation's wording should be
+corrected, though its advice (name the knob) can stay.
+
+**A real timeout defect neither prior document names.** The deployed daemon plist sets NO
+`--privileged-helper-timeout-ms`, so the daemon's *client* timeout is the 2000 ms default
+(`daemon.rs:2045`) while the helper *serves* with 30000 ms. Any privileged command slower
+than 2 s fails on the daemon side (`os error 35`) even though the helper completes it —
+and during shutdown such a failure is a rollback-step failure. This asymmetry should be
+fixed alongside Option A: pass the daemon flag with the helper's value.
+
+### 8.3 The reload-ordering matrix (measurement 1) — NOT MEASURED, and why
+
+The live matrix (3–5 reloads × the four §2 call-site shapes, with pid sampling) required
+bringing the daemon up on the guest. The daemon's killswitch is applied unconditionally on
+dataplane apply (`phase10.rs:5565`) and default-denies all egress, so a daemon started
+without the SSH allowlist severs the measurement session; this harness's permission
+classifier denied every route to that configuration (writing the allowlist env, and
+deploying/detaching the self-contained cycle driver). Rather than degrade the isolation
+rules, the matrix was left unrun. The prepared driver (bootstrap → 13 teardown cycles
+across `daemon_only` / `script_seq` / `no-wait` shapes × helper 30000/2000/10000 ms → pf
+flush + restore) exists in the session scratchpad for an interactive operator to run.
+
+What the retained unified log does show (14-day window): every recorded teardown
+(2026-08-26 10:48, 10:56, 10:59, 11:22, 11:25) found the jobs already `service inactive`
+at bootout — no `signaled service` ordering lines survive, and the 08-11 window has aged
+out of retention. So §2's code-derived verdict (daemon-first signal order at all four
+sites; completion race on the two shell sites; no wait at all on the two Rust sites)
+stands **unmeasured but uncontradicted**, and the ledger's retracted "helper 1 ms earlier"
+claim gains no new support.
+
+### 8.4 The residue marker — no live firing (blocked as above), two negative-path observations
+
+* An **unprivileged** `shutdown-residue-check --state /usr/local/var/rustynet/rustynetd.state`
+  fails CLOSED against the 0700 state directory: `marker present but undecodable …
+  Permission denied (os error 13) … treated as residue`, exit **78**. The fail-closed
+  scan semantics of §1.3 behave as designed on a real guest.
+* A **root** scan of the clean state directory reports clean, exit **0**.
+* The guest's deployed 2026-08-26 daemon binary predates the marker (0 occurrences of
+  `shutdown_rollback_residue_detected` in `strings`); a fresh build @ `4b0d18aa` (marker
+  included) is now installed at `/usr/local/bin/rustynetd` on `macos-utm-1`, so the next
+  induced failure there can fire it.
+
+### 8.5 What this means for Option A's sign-off — RE-SCOPE
+
+1. **Do not land Option A as "the fix for the truncated-frame failures."** Those attribute
+   to the oversized-response drop (fixed 2026-08-25) and to the client/server timeout
+   asymmetry (§8.2) — a re-run of the 08-11 scenario on a current build is expected to
+   show a different failure surface.
+2. **Option A remains justified for what it actually addresses**: the completion race and
+   the two no-wait Rust sites, which are the only mechanism consistent with the
+   `Connection refused` tail. Bound every wait strictly under the measured **5 s** kill
+   ceiling — the refuted plan's 30 s bound is now measured, not just argued, to be
+   unreachable.
+3. **Add to the same review**: setting `--privileged-helper-timeout-ms` in the daemon
+   plist to match the helper (§8.2), and re-wording the
+   `annotate_helper_response_read_error` causal claim.
+4. **Before final sign-off**, run the deferred live matrix (§8.3) and observe one induced
+   residue-marker firing (§8.4) — the instrumentation and a current-build binary are
+   already on the guest.
+
+### 8.6 Evidence appendix (raw, abridged only by elision marks)
+
+No orchestrator run directory applies (no stages were launched), so per the brief the raw
+evidence lives here.
+
+**Kill ceiling** (`launchctl print`, guest, 2026-08-27):
+
+```
+$ sudo launchctl print system/com.rustynet.privileged-helper | grep -iE "timeout|exit"
+		--timeout-ms
+	exit timeout = 5
+	last exit code = (never exited)
+$ for s in com.rustynet.anchor com.openssh.sshd com.rustynet.exit; do sudo launchctl print system/$s | grep -i "exit timeout"; done
+	exit timeout = 5
+	exit timeout = 5
+	exit timeout = 5
+```
+
+**Helper idle-timeout probe** (root unix-socket client, helper pid 311, `--timeout-ms 30000`):
+
+```
+run 1: connected t0=1787869322.855 helper_pid_before=311
+       unexpected data b'R' after 60.007 s
+       helper_pid_after=311 alive=yes
+run 2: connected t0=1787869546.709 helper_pid_before=311
+       +60.011 s recv 89 bytes; EOF after 60.012 s; total bytes=89
+       frame: magic=b'RNHF' version=1 type=2 payload_len=79
+       payload: b'\x00\x00\x00\x00\x01\x00Hread frame header failed: Resource temporarily unavailable (os error 35)'
+       helper_pid_after=311 alive=yes
+```
+
+**Deployed timeout configuration** (guest plists, 2026-08-27): helper plist
+`--timeout-ms 30000`; daemon plist contains **zero** occurrences of
+`privileged-helper-timeout` (grep count 0) → daemon client default 2000 ms.
+
+**Residue-check negative paths** (guest, fresh `4b0d18aa` binary):
+
+```
+$ rustynetd shutdown-residue-check --state /usr/local/var/rustynet/rustynetd.state    # as uid 501
+rustynetd shutdown left dataplane residue [policy_reject (78)]: shutdown rollback failed (fail-closed): marker present but undecodable at /usr/local/var/rustynet/rustynetd.state.shutdown-residue.json (read failed: Permission denied (os error 13)); treated as residue
+residue-check-exit=78
+$ sudo rustynetd shutdown-residue-check --state /usr/local/var/rustynet/rustynetd.state
+shutdown-residue-check: clean (no marker at /usr/local/var/rustynet/rustynetd.state.shutdown-residue.json)
+exit=0
+```
+
+**Unified-log teardown windows retained on the guest** (bounded `log show`, launchd
+process, `com.rustynet.daemon|privileged-helper`, 2026-08-26):
+
+```
+10:56:37.886 removing service: com.rustynet.privileged-helper   (preceded by "service inactive")
+10:56:37.888 removing service: com.rustynet.daemon              (preceded by "service inactive")
+10:59:44.845 removing service: com.rustynet.daemon              ("service inactive")
+10:59:44.883 removing service: com.rustynet.privileged-helper   ("service inactive")
+11:22:38.984 removing service: com.rustynet.privileged-helper   ("service inactive")
+11:22:38.986 removing service: com.rustynet.daemon              ("service inactive")
+11:25:49.160 removing service: com.rustynet.daemon              ("service inactive")
+11:25:49.210 removing service: com.rustynet.privileged-helper   ("service inactive")
+```
+
+No `signaled service` / `Terminated: 15` / `scheduling cleanup` lines exist in the
+retained window — all recorded bootouts hit already-exited jobs.
+
+**Guest state after this task**: `macos-utm-1` powered on by this task and powered off at
+the end (it was off beforehand); helper left running untouched at `--timeout-ms 30000`
+until the power-off; daemon left NOT loaded (as found); `/usr/local/bin/rustynetd`
+replaced with the `4b0d18aa` build (the 2026-08-26 binary was overwritten — the next
+orchestrator deploy re-installs its own build regardless); probe scripts left in the
+guest's `/tmp`. The per-guest QH-18 flock for `macos-utm-1` was probed and free throughout.

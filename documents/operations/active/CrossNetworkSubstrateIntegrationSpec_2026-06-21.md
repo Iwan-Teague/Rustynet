@@ -230,8 +230,91 @@ buried inside `run_nat_classification`:
   listing, and both gates end to end). The single-host live run is the next evidence step.
 - **CN-3** Port the 8 scenario validators to `scenario::*` fns; delete the 8 bins + `run_script_stage`'s
   `cargo run` fan. Vxlan scenarios run in-process (still gated `Blocked` until the 2nd network).
-- **CN-4** `VxlanSubstrate` + `SlirpSubstrate` provision over `RemoteShellHost`; wire `NatModifiers`
-  (uPnP/v6) through. Live-proof deferred to when the hardware exists.
+- **CN-4** ✅ **DONE** (2026-08-27, `work/cn4-substrates`).
+  `apply_nat_profile` + `NatModifiers` on the provider trait, the vxlan NAT capability and the
+  matching `supports()` widening, the netns `double_nat_cgnat` carrier chain, `SlirpSubstrateProvider`
+  (`stage/cross_network/slirp.rs`), and the owner-approved CLI tightening onto `NatProfileId`.
+  **Deviations and decisions, each deliberate:**
+  (a) **`apply_nat_profile` hangs off the PROVIDER trait, not `SubstrateHandle`.** §0.1 puts it on the
+  handle, but CN-1 made the handle a struct of provisioned state with the per-node runners passed in by
+  the caller (§0.4 CN-1 deviation (b)), so a handle has nothing to run a command with. The signature is
+  `apply_nat_profile(&self, handle: &mut SubstrateHandle, site: &SiteRef, profile, modifiers, runners)`:
+  the handle is the state it mutates, `SiteRef` is §0.1's `site: SiteRef` (validated against the same
+  allowlist namespace names use), and the outcome is a typed `NatApplyError::{Refused(Support), Failed}`
+  so an honest skip and a stage failure never collapse into one error string.
+  (b) **`Support` gained a third arm, `UnsupportedModifier { modifier, reason }`,** because "this
+  substrate cannot shape that NAT" and "it can, but not with uPnP" are different answers to an operator
+  and collapsing them would make evidence blame the profile for a modifier refusal. `supports_with_modifiers`
+  is a REQUIRED trait method for the same reason `supports` is: a default that deferred to `supports`
+  would let a new substrate silently inherit a uPnP claim it never implements — i.e. re-create exactly
+  the `vxlan_tier_b.sh` drop this row exists to close.
+  (c) **The vxlan NAT boundary is a router NAMESPACE on each participating guest, not the shell tier's
+  fifth "router VM".** `vxlan_tier_b.sh` builds a 5-host topology (node A, node B, svc, router, work)
+  with per-LAN vxlan links terminating on a dedicated router guest; the landed `VxlanSubstrateProvider`
+  builds a flat head-end-replicated mesh with one device per guest, because THAT is what makes cross-LAN
+  `ctx.endpoints` routable (§0.5). Rebuilding the shell's topology would have undone the endpoint seam.
+  Instead `apply_nat_profile` moves `rustynet-vx0` into `rustynet-vxr` on the guest and puts the root
+  namespace (where `rustynetd` runs) behind it on a site LAN derived from the node's overlay address
+  (`172.20.G.H` → `10.G.H.0/24`). **The node's overlay address is unchanged** — it is now the router's
+  WAN address — so the endpoint every peer was handed is still the address on the wire, and
+  `collect_pubkeys` needs no change. SSH/management keeps the guest's ordinary default route; only
+  `172.20.0.0/16` is routed through the router.
+  (d) **`supports()` widened in the SAME change that wired the capability**, per the CN-1 report:
+  vxlan now claims `baseline_lan` + `port_restricted_cone` + `full_cone` + `symmetric`, and refuses
+  `double_nat_cgnat` (one router namespace per site; the carrier chain is netns's).
+  (e) **Modifiers are argv-only, so the config FILES `apply_nat_profile.sh` writes are gone.** miniupnpd
+  is configured through `-i`/`-a`/`-N` flags instead of a heredoc'd conf, and the v6 modifier assigns
+  `<prefix>::1` / `<prefix>::2` statically and routes natively **instead of running radvd**, which has no
+  argv-only configuration path. Reintroducing a shell to write either file would re-open the
+  construction hole AGENTS.md §4 forbids. The v6 prefix is fail-closed validated as a unique-local
+  (`fc00::/7`) network address: a lab must not advertise a globally routable prefix it does not own.
+  (f) **netns `apply_nat_profile` is a typed REFUSAL, by design.** Both NAT gates rebuild a clean
+  topology per profile precisely so stale conntrack cannot contaminate a cold-inbound verdict (CN-2
+  deviation (b)), and `double_nat_cgnat` is a different TOPOLOGY rather than a different rule set. The
+  refusal names `setup()` as the supported path instead of half-applying either. netns likewise refuses
+  every modifier: its probes speak STUN, not IGD, and its simulated transit is v4-only.
+  (g) **`double_nat_cgnat` on netns is a real second hop.** `build_site` adds `rnsim-cgn-<name>`; the WAN
+  veth and the site's transit address move to the CARRIER, the home router reaches it over
+  `100.64.<200+idx>.0/24`, the home router masquerades plainly onto that segment and the carrier
+  masquerades onto the transit with `random` — two translations, no uPnP at the outer hop. That segment
+  is RFC 6598 space **on purpose**, and is the one deliberate overlap with the mesh's 100.64.0.0/10 in
+  this module: CGNAT detection (§4.1.3) reads exactly that address, so numbering it out of 198.18/15
+  would make the profile prove nothing. It exists only on the veth between two of a site's namespaces.
+  (h) **`SlirpSubstrateProvider` verifies rather than provisions, and claims NO profile.** §4.2's slirp
+  arm ("return a documented SKIP") is written against the deleted bash orchestrator and asserts nothing;
+  §3 says the tier's job is cross-OS smoke behind UTM `Shared Network` NAT whose **type is not
+  selectable**. So the faithful minimum is: provision nothing (`provisioned: false`, no overlay,
+  `ctx.endpoints` untouched), but ASSERT each participant's default route really goes via the
+  slirp/user-mode gateway `10.0.2.2` — a bridged guest reaches the same validators over the same SSH, so
+  without that check a run labelled "cross-OS behind shared NAT" could silently be nothing of the sort.
+  Unreadable, non-zero and unparseable routes all fail CLOSED. Every profile is `UnsupportedByDesign` and
+  `apply_nat_profile` is a refusal: claiming the profile slirp happens to resemble would make NAT-matrix
+  evidence assert a profile nothing selected and nothing enforces.
+  (i) **Teardown now dispatches on `ResourceKind`** (`ip netns del` vs `ip link del`) and walks
+  `created_resources` in REVERSE creation order, so a router namespace holding the vxlan device is
+  removed before the interfaces recorded under it. The resume fallback (record only, no live handle)
+  targets the NAT objects too, because the record cannot say whether a profile was applied — their
+  absence is the idempotent success case.
+  **`supports()` per substrate × profile after this change:**
+
+  | Profile | netns | vxlan | slirp |
+  | --- | --- | --- | --- |
+  | `baseline_lan` | ❌ no-NAT case, every site is its NAT boundary | ✅ what `setup` builds | ❌ type not selectable |
+  | `port_restricted_cone` | ✅ | ✅ | ❌ |
+  | `full_cone` | ✅ | ✅ | ❌ |
+  | `symmetric` | ✅ | ✅ | ❌ |
+  | `double_nat_cgnat` | ✅ **new** — `rnsim-cgn-*` carrier chain | ❌ one router namespace per site | ❌ |
+  | modifiers (uPnP / v6) | ❌ every profile | ✅ on the three shaping profiles; ❌ with `baseline_lan` (no router to host them) | ❌ |
+
+  **CLI behavioural change (owner-approved, `OwnerDecisionDigest_2026-08-27.md` §16):**
+  `--cross-network-nat-profiles` and `--cross-network-required-nat-profiles` parse onto `NatProfileId`.
+  Names outside the five are now a parse-time error listing the vocabulary; `full-cone`, `FULL_CONE`,
+  `cone`, `baseline_lan_v2` and every other free-form label that passed the old shape-only check are
+  rejected. `--cross-network-impairment-profile` is untouched — it is a netem name, not a NAT profile.
+  **Not live-proven** — unit-tested against `MockLeafRunner` only (per-profile rule shapes, the
+  two-hop CGNAT chain, unsupported-combination refusals that touch no guest, apply/reset symmetry and
+  idempotence, and teardown residue sweeps over the new resources). Live proof waits on the hardware, as
+  this row always said.
 - **CN-5** ✅ **DONE by W5.7** (2026-08-27, closed retroactively 2026-08-27 — the row's own work was
   completed by the bash-orchestrator retirement rather than by a CN-numbered change).
   The row's scope was exactly "retire the legacy-bash orchestrator's duplicate
@@ -275,7 +358,9 @@ Verified findings from a grounded code audit after the bash orchestrator's remov
 - **Dead sections:** §4.2/§4.3/§7 target `scripts/e2e/live_linux_lab_orchestrator.sh`, which no longer exists. The integration seam is now `orchestrator/plan.rs` + `stage/mod.rs` + `live_lab_stage_registry.rs`. The registry's `cross_network_daemon_path` bash-dialect entry is dead weight.
 - **Unstarted (as of this 11:18 audit):** §0.1 traits (CN-1..CN-5), §0.3/§4.2 substrate lifecycle stages, any `VxlanSubstrate` provisioner (nothing invokes `vxlan_tier_b.sh` from Rust), NatModifiers plumbing, `double_nat_cgnat`.
   - **Superseded later the same day.** CN-1 landed in `56ec906c` / `9419cfb3` / `4b1d9467` (the three trait abstractions, `LocalCommandRunner` / `RemoteShellRunner` / `MockLeafRunner`, a `VxlanSubstrateProvider`, and the two topology-level lifecycle stages), and was completed by `NetLeafRunner::in_netns`, the `NatProfileId` + `Support` honest-skip gate, and `SubstrateHandle::endpoint` / `ResolvedEndpoint`. Deviations from the verbatim §0.1 signatures are itemised in the CN-1 row of §0.4.
-  - **CN-2 landed the same day** on `work/cn2-netns-substrate`: `NetnsSubstrateProvider` (the `netns_internet_sim.sh` topology ported onto `NetLeafRunner`), the in-process NAT mapping + filtering gates that replaced `netns_nat_classify.sh` / `netns_nat_filter.sh` (both DELETED), the widened `topology_level_seam()` / `provider_for_record()` dispatch, and `collect_pubkeys` now consuming `SubstrateHandle::endpoint()` rather than reaching into `overlay_ips`. Details, the per-profile `supports()` answer and the deliberate deviations are in the CN-2 row of §0.4. **Still unstarted:** the 8 scenario validators (CN-3), `SlirpSubstrate` + `apply_nat_profile` / `NatModifiers` + `double_nat_cgnat` (CN-4), and the CN-5 retirement of `netns_daemon_path.sh` + the dead `cross_network_daemon_path` registry entry.
+  - **CN-2 landed the same day** on `work/cn2-netns-substrate`: `NetnsSubstrateProvider` (the `netns_internet_sim.sh` topology ported onto `NetLeafRunner`), the in-process NAT mapping + filtering gates that replaced `netns_nat_classify.sh` / `netns_nat_filter.sh` (both DELETED), the widened `topology_level_seam()` / `provider_for_record()` dispatch, and `collect_pubkeys` now consuming `SubstrateHandle::endpoint()` rather than reaching into `overlay_ips`. Details, the per-profile `supports()` answer and the deliberate deviations are in the CN-2 row of §0.4.
+  - **CN-4 landed the same day** on `work/cn4-substrates`: `apply_nat_profile` + `NatModifiers` + `SiteRef` + `NatApplyError` on the provider trait (with `Support::UnsupportedModifier` added), the vxlan router-namespace NAT capability wired **together with** the `supports()` widening it justifies, the netns `double_nat_cgnat` carrier chain that finally retires `netns_internet_sim.sh:189`'s `exit 2`, `SlirpSubstrateProvider` (verify-only, claims no profile), and the owner-approved tightening of `--cross-network-nat-profiles` onto `NatProfileId`. The full substrate × profile matrix, the nine deliberate deviations (including why the vxlan NAT boundary is a router namespace rather than the shell tier's fifth VM, and why radvd/miniupnpd config files are gone) are in the CN-4 row of §0.4. Unit-tested against `MockLeafRunner`; **not live-proven**.
+  - **Still unstarted:** the 8 scenario validators (CN-3), and the CN-5 retirement of `netns_daemon_path.sh` + the dead `cross_network_daemon_path` registry entry.
 - **NEW, upstream gap the spec does not cover (live-proven, run `livelab-1787790884-c9ccf1a4d1cc`, first real 2-LAN --node cell: UTM 192.168.64/24 + lenovo 192.168.0/24):** `collect_pubkeys` records each node's raw discovered underlay endpoint and `distribute_assignments` feeds it into `NODES_SPEC` verbatim, so cross-LAN pairs receive peer endpoints on the other LAN's private prefix — unroutable, no traversal engaged, `traffic_test_matrix` fails every cross-LAN pair both directions. This sits tens of stages BEFORE the `cross_network_*` block where §4.2 hooks substrate setup.
   - **CN-2 closed the consuming half.** `collect_pubkeys` asks the substrate through `SubstrateHandle::endpoint()` and overrides the recorded endpoint ONLY on the `Overlay` plane, keeping each node's port; `distribute_assignments` then feeds those overridden endpoints into `NODES_SPEC` unchanged. An `Underlay`-plane answer (what a non-overlay substrate such as netns produces for every alias) overrides nothing, and with no substrate at all `ctx.endpoints` is byte-for-byte the adapters' discovered values — pinned by three tests in `collect_pubkeys.rs`. A malformed `host:port` under an overlay FAILS the stage rather than silently falling back to the unroutable address.
 - **DESIGN DECISION FORCED — RESOLVED 2026-08-27 in favour of TOPOLOGY LEVEL** (implemented in `56ec906c`/`4b1d9467`: `CrossNetworkSubstrateSetupStage` depends on `BootstrapHosts` and is ordered before `collect_pubkeys`, so overlay addresses are what land in `ctx.endpoints`, while SSH/management traffic keeps the management IPs). The original framing of the choice, retained for the record: the substrate seam must either move to topology level (provision the overlay before `collect_pubkeys` and populate `ctx.endpoints` with overlay addresses — what a real 2-LAN fleet needs) or stay a cross-network-suite concern (spec's framing — leaves the 2-LAN fleet's base mesh broken). Resolve before writing CN-2 code; the lifecycle stages' dependency-graph position follows from this choice.
