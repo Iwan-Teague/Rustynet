@@ -62,6 +62,17 @@ pub(crate) fn write_rust_native_report_state_initial(
         full_release_gate_requested: false,
         full_release_evidence_complete: false,
         last_run: None,
+        // QH-34: sample worktree cleanliness HERE, at run start. This function is
+        // called immediately before readiness, which is the first thing that
+        // rewrites `vm_lab_inventory.json` with live guest IPs; every later
+        // sample (the run summary's `git_tree_clean`, `last_run.git`, and the
+        // run-matrix renderer's own fallback `git status`) therefore reads the
+        // orchestrator's own inventory write as operator dirt and reports
+        // `dirty:worktree` on a run that started from a clean, committed tree.
+        // Sampling before the mutation is what keeps the signal meaningful for
+        // genuinely dirty trees instead of excluding the inventory and letting a
+        // hand-edited one go unflagged.
+        run_start_git_tree_clean: git_worktree_is_dirty().ok().map(|dirty| !dirty),
     };
     write_report_state_durable(report_dir, &state)
 }
@@ -1303,6 +1314,32 @@ mod finalize_tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, HashSet};
     use tempfile::tempdir;
+
+    /// QH-34: the initial report state must carry a run-start worktree reading.
+    ///
+    /// This write happens immediately before readiness, which is the first thing
+    /// that rewrites `vm_lab_inventory.json`. If the field is missing, the
+    /// run-matrix row falls back to a post-mutation sample and reports
+    /// `dirty:worktree` for every run, clean tree or not.
+    #[test]
+    fn initial_report_state_records_the_run_start_worktree_reading() {
+        let dir = tempdir().expect("tempdir");
+        let report_dir = dir.path();
+        fs::create_dir_all(report_dir.join("state")).expect("state dir");
+
+        write_rust_native_report_state_initial(report_dir, "working-tree", None)
+            .expect("initial report state");
+
+        let body = fs::read_to_string(report_dir.join("state/report_state.json"))
+            .expect("report_state.json must exist");
+        let state: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert!(
+            state
+                .get("run_start_git_tree_clean")
+                .is_some_and(|v| v.is_boolean()),
+            "initial state must record a boolean run-start worktree reading, got: {state}"
+        );
+    }
 
     #[test]
     fn stage_started_writes_log_path_not_summary_in_the_running_row() {

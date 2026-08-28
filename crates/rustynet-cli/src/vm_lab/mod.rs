@@ -2436,6 +2436,20 @@ struct LiveLabReportState {
     full_release_gate_requested: bool,
     full_release_evidence_complete: bool,
     last_run: Option<LiveLabRunProvenance>,
+    /// Worktree cleanliness sampled ONCE at run start, before the orchestrator
+    /// mutates anything it owns (QH-34). The end-of-run samples in `last_run`
+    /// and the run summary are taken after readiness has refreshed
+    /// `vm_lab_inventory.json` with live guest IPs, so they cannot distinguish
+    /// "the operator started from a tree with uncommitted edits" — the thing the
+    /// run matrix's `git_dirty_state` column exists to warn about — from "the
+    /// orchestrator updated the inventory, as designed". This field is the
+    /// pre-mutation reading and is what the run-matrix row prefers.
+    ///
+    /// `None` on a state file written before this field existed, and on a run
+    /// whose start-of-run `git status` could not be taken at all; consumers fall
+    /// back to the end-of-run samples in that case.
+    #[serde(default)]
+    run_start_git_tree_clean: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
