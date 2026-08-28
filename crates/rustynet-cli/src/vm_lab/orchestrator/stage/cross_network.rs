@@ -456,11 +456,23 @@ fn write_nat_gate_report(stage_dir: &Path, checks: &[netns::GateCheck], error: O
     let _ = fs::write(stage_dir.join(NAT_GATE_REPORT_FILE), body);
 }
 
+/// The NAT-matrix gate: it grades the matrix evidence the six scenario suites
+/// write, so it runs the SAME dispatchability guards those suites run.
+///
+/// CN-PROOF-D1 (`LiveValidation_2026-08-28.md` §12.4): this gate used to check
+/// only that the substrate was vxlan and then demand matrix evidence
+/// unconditionally. On a topology that could not dispatch a single scenario,
+/// the six suites skipped, wrote nothing, and this stage turned their honest
+/// skip into `overall_result=fail` while its eight siblings graded `skip`.
+///
+/// The fail-closed instinct is right and is preserved exactly: when the
+/// topology CAN dispatch the suites, missing evidence is still a hard failure —
+/// the validator below is what enforces that, and nothing here weakens it. Only
+/// the case where the preconditions were never satisfiable now skips, with the
+/// same declared reason the siblings report.
 fn run_nat_matrix(ctx: &OrchestrationContext, options: &CrossNetworkOptions) -> StageOutcome {
-    if options.substrate != CrossNetworkSubstrate::Vxlan {
-        return StageOutcome::Skipped(
-            "this stage requires a cross-network substrate that supports the NAT matrix".to_owned(),
-        );
+    if let Err(outcome) = resolve_dispatchable_topology(ctx, options) {
+        return outcome;
     }
     let mut cmd = cargo_ops_command("validate-cross-network-nat-matrix");
     cmd.arg("--artifact-dir")
@@ -486,16 +498,24 @@ fn run_nat_matrix(ctx: &OrchestrationContext, options: &CrossNetworkOptions) -> 
     run_command(cmd, "validate-cross-network-nat-matrix")
 }
 
-/// The topology guards and stage directory every cross-network scenario stage
-/// needs, resolved once. It stayed a separate function through CN-3 so the
-/// ported and unported dispatch paths could not drift on which topologies they
-/// refuse to run against; with the unported path gone it is simply the one
-/// place those guards live.
-fn prepare_scenario_stage(
+/// Whether this topology can dispatch the cross-network scenario suites at all,
+/// and the resolved topology when it can.
+///
+/// This is the ONE place those preconditions live. Every scenario stage reaches
+/// it through [`prepare_scenario_stage`], and [`run_nat_matrix`] — which grades
+/// the evidence those scenarios write — calls it directly, so the gate cannot
+/// drift from the suites it grades. CN-PROOF-D1 was exactly that drift.
+///
+/// The substrate HANDLE is deliberately not consulted here. A vxlan handle
+/// records `provisioned: false` precisely when the participants share a single
+/// underlay /24 (`substrate::plan_overlay` returns `None` below two groups),
+/// which the distinct-prefix guard below already refuses — so reading the handle
+/// would add no coverage while risking a gate stricter than the suites it must
+/// mirror.
+fn resolve_dispatchable_topology(
     ctx: &OrchestrationContext,
     options: &CrossNetworkOptions,
-    spec: &CrossNetworkStageSpec,
-) -> Result<(CrossNetworkTopology, PathBuf), StageOutcome> {
+) -> Result<CrossNetworkTopology, StageOutcome> {
     if options.substrate != CrossNetworkSubstrate::Vxlan {
         return Err(StageOutcome::Skipped(
             "this stage requires the vxlan cross-network substrate".to_owned(),
@@ -518,6 +538,20 @@ fn prepare_scenario_stage(
                 .to_owned(),
         ));
     }
+    Ok(topology)
+}
+
+/// The topology guards and stage directory every cross-network scenario stage
+/// needs, resolved once. It stayed a separate function through CN-3 so the
+/// ported and unported dispatch paths could not drift on which topologies they
+/// refuse to run against; with the unported path gone it adds the stage
+/// directory on top of the shared [`resolve_dispatchable_topology`] guards.
+fn prepare_scenario_stage(
+    ctx: &OrchestrationContext,
+    options: &CrossNetworkOptions,
+    spec: &CrossNetworkStageSpec,
+) -> Result<(CrossNetworkTopology, PathBuf), StageOutcome> {
+    let topology = resolve_dispatchable_topology(ctx, options)?;
 
     let stage_dir = ctx.report_dir.join(spec.name);
     if let Err(err) = fs::create_dir_all(stage_dir.as_path()) {
@@ -1576,6 +1610,256 @@ mod tests {
         assert_eq!(strip_ssh_host("debian@192.168.64.10"), "192.168.64.10");
         assert_eq!(strip_ssh_host("192.168.64.10:2222"), "192.168.64.10");
         assert_eq!(strip_ssh_host("debian@[fe80::1]:2222"), "fe80::1");
+    }
+
+    /// CN-PROOF-D1 fixtures. The NAT-matrix gate and the scenario suites it
+    /// grades must answer identically on a topology that cannot dispatch, so
+    /// both are driven through their real stage entry points here.
+    mod nat_matrix_gate {
+        use super::*;
+        use crate::vm_lab::DaemonProbeOp;
+        use crate::vm_lab::orchestrator::adapter::node_adapter::{
+            NodeAdapter, SshConnectionParams,
+        };
+        use crate::vm_lab::orchestrator::error::{
+            AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+            MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+            ValidatorReport, WireguardPublicKey,
+        };
+        use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+        use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+
+        /// Adapter double that answers only what topology resolution asks:
+        /// `platform` and `ssh_connection_params`. Everything else is
+        /// `unimplemented!()` so a future guard that starts touching a node
+        /// fails loudly instead of silently taking a default.
+        #[derive(Debug)]
+        struct FakeSshAdapter {
+            alias: String,
+            host: String,
+        }
+
+        impl NodeAdapter for FakeSshAdapter {
+            fn platform(&self) -> VmGuestPlatform {
+                VmGuestPlatform::Linux
+            }
+            fn alias(&self) -> &str {
+                &self.alias
+            }
+            fn ssh_connection_params(&self) -> Option<SshConnectionParams> {
+                Some(SshConnectionParams::new(
+                    self.host.clone(),
+                    22,
+                    Some("debian".to_owned()),
+                    PathBuf::from("/dev/null"),
+                    PathBuf::from("/dev/null"),
+                ))
+            }
+            fn install_daemon(
+                &self,
+                _source: &SourceArchive,
+                _ctx: &OrchestrationContext,
+            ) -> Result<InstallReport, AdapterError> {
+                unimplemented!()
+            }
+            fn start_daemon(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn stop_daemon(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn restart_daemon(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn uninstall_daemon(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {
+                unimplemented!()
+            }
+            fn init_membership_snapshot(
+                &self,
+                _owner_key: &MembershipOwnerKey,
+                _peers: &[NodeMembershipPeer],
+            ) -> Result<MembershipSnapshot, AdapterError> {
+                unimplemented!()
+            }
+            fn distribute_signed_bundle(
+                &self,
+                _kind: BundleKind,
+                _bundle_path: &Path,
+            ) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn distribute_verifier_key(
+                &self,
+                _kind: BundleKind,
+                _pub_key_path: &Path,
+            ) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn issue_bundles_to_dir(
+                &self,
+                _kind: BundleKind,
+                _env_content: &str,
+                _local_out_dir: &Path,
+            ) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
+                unimplemented!()
+            }
+            fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+                unimplemented!()
+            }
+            fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
+                unimplemented!()
+            }
+            fn run_validator(
+                &self,
+                _op: DaemonProbeOp,
+                _extra_args: &[String],
+            ) -> Result<ValidatorReport, AdapterError> {
+                unimplemented!()
+            }
+            fn ping_mesh_peer(&self, _peer: &str) -> Result<TrafficTestResult, AdapterError> {
+                unimplemented!()
+            }
+            fn probe_denied_peer(&self, _denied: &str) -> Result<TrafficTestResult, AdapterError> {
+                unimplemented!()
+            }
+            fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
+                unimplemented!()
+            }
+            fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn endpoint(&self) -> String {
+                unimplemented!()
+            }
+            fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+                unimplemented!()
+            }
+            fn collect_artifacts(&self, _dst: &Path) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+        }
+
+        /// A context whose assigned roles sit at the given management
+        /// addresses — the plane `distinct_underlay_prefixes` actually reads.
+        fn ctx_with(nodes: &[(&str, NodeRole, &str)]) -> OrchestrationContext {
+            let assignments = nodes
+                .iter()
+                .map(|(alias, role, _)| NodeRoleAssignment {
+                    alias: (*alias).to_owned(),
+                    role: role.clone(),
+                })
+                .collect();
+            let mut ctx =
+                OrchestrationContext::new(assignments, std::env::temp_dir(), "cnproof".to_owned());
+            for (alias, _, host) in nodes {
+                ctx.adapters.insert(
+                    (*alias).to_owned(),
+                    Box::new(FakeSshAdapter {
+                        alias: (*alias).to_owned(),
+                        host: (*host).to_owned(),
+                    }),
+                );
+            }
+            ctx
+        }
+
+        fn vxlan_options() -> CrossNetworkOptions {
+            CrossNetworkOptions {
+                substrate: CrossNetworkSubstrate::Vxlan,
+                ..CrossNetworkOptions::default()
+            }
+        }
+
+        /// The one topology CN-PROOF-D1 was found on: a single /24, no `entry`
+        /// or `aux` node, so not one scenario suite can dispatch. The gate must
+        /// skip with the sibling suites' verbatim reason — it used to shell to
+        /// the validator, find no matrix records, and fail the whole run.
+        #[test]
+        fn an_undispatchable_topology_skips_the_nat_matrix_gate_for_the_sibling_reason() {
+            let mut ctx = ctx_with(&[
+                ("client-1", NodeRole::Client, "192.168.64.10"),
+                ("exit-1", NodeRole::Exit, "192.168.64.11"),
+            ]);
+            let sibling = CrossNetworkDirectRemoteExitStage::new(vxlan_options()).execute(&mut ctx);
+            let matrix = CrossNetworkNatMatrixStage::new(vxlan_options()).execute(&mut ctx);
+            assert_eq!(matrix, sibling, "the gate must grade as its suites do");
+            assert!(
+                matches!(matrix, StageOutcome::Skipped(ref reason)
+                    if reason.contains("requires a role that no node in this topology is assigned")),
+                "{matrix:?}"
+            );
+        }
+
+        /// The second guard, reached only once the roles exist: every node on
+        /// one underlay /24. Same requirement — the gate skips for the reason
+        /// its suites skip for, not `fail`.
+        #[test]
+        fn a_single_underlay_prefix_skips_the_nat_matrix_gate_for_the_sibling_reason() {
+            let mut ctx = ctx_with(&[
+                ("client-1", NodeRole::Client, "192.168.64.10"),
+                ("exit-1", NodeRole::Exit, "192.168.64.11"),
+                ("entry-1", NodeRole::Entry, "192.168.64.12"),
+                ("aux-1", NodeRole::Aux, "192.168.64.13"),
+            ]);
+            let sibling = CrossNetworkRemoteExitSoakStage::new(vxlan_options()).execute(&mut ctx);
+            let matrix = CrossNetworkNatMatrixStage::new(vxlan_options()).execute(&mut ctx);
+            assert_eq!(matrix, sibling);
+            assert!(
+                matches!(matrix, StageOutcome::Skipped(ref reason)
+                    if reason.contains("distinct underlay prefixes")),
+                "{matrix:?}"
+            );
+        }
+
+        /// The fail-closed case, preserved. A topology that CAN dispatch the
+        /// suites passes the shared guard, so the gate reaches the validator —
+        /// which is what fails the stage on missing matrix evidence and passes
+        /// it on complete evidence. Asserted at the guard because everything
+        /// past it is an out-of-process `ops` validator call.
+        #[test]
+        fn a_dispatchable_topology_reaches_the_nat_matrix_validator() {
+            let ctx = ctx_with(&[
+                ("client-1", NodeRole::Client, "192.168.64.10"),
+                ("exit-1", NodeRole::Exit, "192.168.0.30"),
+                ("entry-1", NodeRole::Entry, "192.168.64.12"),
+                ("aux-1", NodeRole::Aux, "192.168.0.31"),
+            ]);
+            assert!(
+                resolve_dispatchable_topology(&ctx, &vxlan_options()).is_ok(),
+                "a dispatchable topology must not be skipped away from the validator"
+            );
+        }
+
+        /// The substrate guard is shared too: a netns run skips the gate and
+        /// every scenario suite with one reason, not two.
+        #[test]
+        fn a_non_vxlan_substrate_skips_the_gate_and_its_suites_alike() {
+            let mut ctx = ctx_with(&[
+                ("client-1", NodeRole::Client, "192.168.64.10"),
+                ("exit-1", NodeRole::Exit, "192.168.0.30"),
+                ("entry-1", NodeRole::Entry, "192.168.64.12"),
+                ("aux-1", NodeRole::Aux, "192.168.0.31"),
+            ]);
+            let options = CrossNetworkOptions::default();
+            assert_eq!(options.substrate, CrossNetworkSubstrate::Netns);
+            let sibling = CrossNetworkDirectRemoteExitStage::new(options.clone()).execute(&mut ctx);
+            let matrix = CrossNetworkNatMatrixStage::new(options).execute(&mut ctx);
+            assert_eq!(matrix, sibling);
+            assert!(
+                matches!(matrix, StageOutcome::Skipped(ref reason)
+                    if reason.contains("requires the vxlan cross-network substrate")),
+                "{matrix:?}"
+            );
+        }
     }
 
     #[test]
