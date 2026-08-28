@@ -2065,6 +2065,72 @@ used, justify it against the reuse loops, not only against continuous runs.
    drift-consistency check, unlike the typed evaluators the dedicated stages use. Every one
    of its six probes inherits that weakness, not just these two.
 
+> **STATUS 2026-08-28 (ATTEMPT 2) — BOTH HALVES IMPLEMENTED on branch
+> `work/qh39-macos-greens`. Gates green; the macOS-guest live confirmation is FOLLOW-UP and
+> neither half is evidence-grade until it runs.** Three commits, each with its negative case
+> written first.
+>
+> **DNS half — the dead assertion is now a real, independent observation.**
+> `collect_macos_dns_failclosed_snapshot` no longer hardcodes
+> `loopback_resolver_advertised = true`; it is derived from `scutil --dns`, macOS's own
+> resolver configuration, parsed from the PRIMARY unscoped `resolver #1` block. That is the
+> independent source REVISION 2 required — deriving it from the parsed `resolv.conf`
+> nameservers was rejected as the tautology it is. A `resolv.conf` reading `127.0.0.1` while
+> `scutil` resolves against a public server now FAILS the check, and unreadable `scutil`
+> output fails closed. Snapshot construction is split into a pure
+> `build_macos_dns_failclosed_snapshot(resolv_conf, scutil_dns)` so production and tests
+> share one path and the drift branch is reachable from the same function the daemon calls.
+> Six new unit tests, including the negative case where `resolv.conf` is CLEAN and only the
+> resolver has drifted (asserting the failure comes from that branch and not from the
+> nameserver rule). This does NOT close unrecorded finding 1 above — the check still reads
+> `/etc/resolv.conf` for its nameserver list; what changed is that the second field is now
+> sourced from the configuration macOS actually uses.
+>
+> **mesh-status half — the freshness bound is armed, and ATTEMPT 1's blocker is fixed at its
+> root first.** Blocker 1 was RE-VERIFIED against current code before any edit: the apply
+> block (and the `persist_state` inside it) is still gated on `will_apply_generation ||
+> FailClosed || Recoverable`, where `will_apply_generation` is the five-way disjunct
+> (`daemon.rs:9938-9942`, `:9957-9960`), so a converged healthy node's snapshot still aged
+> without bound. Arming a bound on top of that would have repeated the reverted commit. So
+> the daemon now HEARTBEATS the snapshot on a slow cadence
+> (`STATE_SNAPSHOT_HEARTBEAT_INTERVAL_SECS = 30`, following the existing
+> `maybe_reassert_host_firewall_admission` pattern), deliberately NOT while the node is
+> restricted, fail-closed, or the pass errored — so the timestamp measures daemon liveness
+> and a wedged daemon still goes stale. With that prerequisite, `--max-age-seconds 180` is
+> sound in the reuse loops too (6x the heartbeat), which is the justification ATTEMPT 1
+> could not give. The bound and its measurement are SHARED with
+> `role_validation/mesh_status.rs` rather than re-derived.
+>
+> **The probe is NOT removed** — ATTEMPT 1's second blocker stands, and the `Missing` /
+> `IntegrityMismatch` / `InvalidFormat` arms it would have discarded are kept.
+>
+> **`--no-fail-on-drift` is KEPT, and this is a decision, not an oversight.** It suppresses
+> only the daemon's non-zero exit; the report still carries `overall_ok=false` +
+> `drift_reasons`, and the orchestrator's verdict comes from that JSON
+> (`adapter/ssh.rs::validator_report_ok`). Dropping it would make `run_remote` turn a drifted
+> node into an `AdapterError::Ssh` and THROW THE REPORT AWAY, so the stage would fail with a
+> bare exit code instead of the reasons. Drift tolerance is not what made the check vacuous;
+> the missing expectations were.
+>
+> **`--expected-peer-id` is still NOT emitted, and the reason is now pinned to code.** The
+> daemon builds `SessionStateSnapshot.peer_ids` from `self.advertised_routes`
+> (`daemon.rs`, `persist_state`) — advertised route CIDRs, validated by `validate_cidr`, not
+> peer node ids. No node id can ever match one, so passing the run's identities would red
+> every node. REVISION 2's "the plumbing already exists at both ends" is correct about the
+> flags and wrong about what the field holds. **Asserting peer visibility at this probe is
+> blocked on a daemon-side fix** (persist the real mesh peer set, or rename the field to what
+> it is); that is a separate entry's worth of work and is not attempted here.
+>
+> **Tests answer ATTEMPT 1's "the tests did not discriminate" note.** Beyond the argv-shape
+> pin (all three platforms, plus a pin that `--no-fail-on-drift` survives), the bound is
+> checked SEMANTICALLY against `rustynetd::daemon::STATE_SNAPSHOT_HEARTBEAT_INTERVAL_SECS` —
+> the orchestrator's string and the daemon's cadence are now bound together across the crate
+> boundary, so a meaningless `86400` fails. Two daemon tests pin the heartbeat itself: a
+> quiescent reconcile refreshes a stale snapshot, and does NOT rewrite a fresh one.
+>
+> **Unrecorded finding 2 (raw substring match, all six probes) is NOT addressed** and remains
+> open.
+
 ### QH-40 — launchd SIGTERMs the privileged helper BEFORE the daemon, so every macOS rollback path fails while the process still exits 0
 
 **Severity: HIGH (fail-closed). Confidence: VERIFIED from the guest's unified log,
