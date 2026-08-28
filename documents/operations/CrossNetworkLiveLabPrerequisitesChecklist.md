@@ -83,9 +83,17 @@ Scope: direct remote exit, relay remote exit, failback/roaming, traversal advers
 
 ## 8) Reproducibility Controls
 - Use explicit NAT profile labels (`--cross-network-nat-profiles`).
-- Defined NAT profile labels (dataplane plan D5.1; applied on a lab router VM by
+- **The label vocabulary below is CLOSED, and the flags enforce it (CN-4, 2026-08-27).**
+  `--cross-network-nat-profiles` and `--cross-network-required-nat-profiles` parse onto
+  `substrate::NatProfileId`, so a name outside the five is a **parse-time error listing
+  the whole vocabulary** — it no longer travels as a free string to a substrate that can
+  only object much later, on a guest. Owner-approved in
+  `active/OwnerDecisionDigest_2026-08-27.md` §16. This intentionally rejects free-form
+  labels that parsed before; correct any saved invocation that used one.
+- Defined NAT profile labels (dataplane plan D5.1; the semantics of record are
   `scripts/vm_lab/apply_nat_profile.sh`, which records the active profile in
-  `/run/rustynet_nat_profile` for pre-run verification):
+  `/run/rustynet_nat_profile` for pre-run verification, and are implemented in Rust by
+  `CrossNetworkSubstrateProvider::apply_nat_profile`):
   - `baseline_lan` — plain routing, no NAT (legacy same-subnet baseline; cross-network
     suites must NOT claim cross-network results under this label).
   - `port_restricted_cone` — plain conntrack masquerade: endpoint-independent mapping,
@@ -97,9 +105,21 @@ Scope: direct remote exit, relay remote exit, failback/roaming, traversal advers
     mapping).
   - `double_nat_cgnat` — nested-namespace double NAT with an RFC 6598 (100.64.0.0/10)
     inner segment and a randomised outer hop; no uPnP at the outer hop (plan §4.1.3).
-  - Modifier `upnp_available` — miniupnpd answering on the router's LAN side (inner hop
-    only under `double_nat_cgnat`).
-  - Modifier `v6_native` — radvd-advertised IPv6 prefix routed natively (no NAT66).
+  - Modifier `upnp_available` — a uPnP/NAT-PMP responder answering on the router's LAN
+    side (inner hop only under `double_nat_cgnat`). In Rust this is
+    `NatModifiers::with_upnp()`, wired on the **vxlan** substrate only.
+  - Modifier `v6_native` — an IPv6 prefix routed natively, no NAT66. In Rust this is
+    `NatModifiers::with_ipv6_prefix(<ULA>/<len>)`, also vxlan-only; the prefix must be a
+    unique-local (`fc00::/7`) network address, and the two site addresses are assigned
+    statically rather than advertised by radvd (see the CN-4 deviation note in
+    `active/CrossNetworkSubstrateIntegrationSpec_2026-06-21.md` §0.4).
+  - **Which substrate realises which label** — ask the code, not this list:
+    `CrossNetworkSubstrateProvider::supports()` / `supports_with_modifiers()` answer per
+    substrate, and an unrealisable combination is a typed, reasoned refusal rather than
+    a silent no-op. As of CN-4: **netns** realises `port_restricted_cone`, `full_cone`,
+    `symmetric`, `double_nat_cgnat` (no modifiers); **vxlan** realises `baseline_lan`,
+    `port_restricted_cone`, `full_cone`, `symmetric` (modifiers on the three shaping
+    profiles); **slirp** realises none — UTM `Shared Network` NAT is not selectable.
 - Use explicit impairment profile labels for each run.
 - Stamp reports with commit-bound evidence (`git_commit`).
 - Store outputs in canonical artifact directory (`artifacts/phase10`).
