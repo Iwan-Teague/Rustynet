@@ -36,8 +36,10 @@ use std::process::Command;
 
 use crate::ops_cross_network_reports::{
     GenerateCrossNetworkRemoteExitReportConfig, ReadCrossNetworkReportFieldsConfig,
+    WriteCrossNetworkSoakMonitorSummaryConfig,
     execute_ops_generate_cross_network_remote_exit_report,
     execute_ops_read_cross_network_report_fields,
+    execute_ops_write_cross_network_soak_monitor_summary,
 };
 
 /// The orchestrator-host command surface a scenario needs.
@@ -109,6 +111,18 @@ pub trait ScenarioHost {
     fn write_report(
         &self,
         config: GenerateCrossNetworkRemoteExitReportConfig,
+    ) -> Result<(), String>;
+
+    /// Write the soak scenario's monitor summary.
+    ///
+    /// Its own writer rather than a plain [`Self::write_artifact`] because the
+    /// cross-network report validator does not merely require this file to
+    /// exist — it parses it and checks its fields. Rendering the JSON by hand
+    /// here would put the schema in two places; the ops writer is the one that
+    /// already agrees with the validator.
+    fn write_soak_monitor_summary(
+        &self,
+        config: WriteCrossNetworkSoakMonitorSummaryConfig,
     ) -> Result<(), String>;
 }
 
@@ -185,6 +199,13 @@ impl ScenarioHost for LocalScenarioHost {
         config: GenerateCrossNetworkRemoteExitReportConfig,
     ) -> Result<(), String> {
         execute_ops_generate_cross_network_remote_exit_report(config).map(|_| ())
+    }
+
+    fn write_soak_monitor_summary(
+        &self,
+        config: WriteCrossNetworkSoakMonitorSummaryConfig,
+    ) -> Result<(), String> {
+        execute_ops_write_cross_network_soak_monitor_summary(config).map(|_| ())
     }
 
     fn run_validator_bin(&self, bin: &str, args: &[&str]) -> Result<bool, String> {
@@ -312,7 +333,10 @@ pub fn all_pass(values: &[String]) -> bool {
 
 #[cfg(test)]
 pub(crate) mod recording {
-    use super::{CHECK_FAIL, GenerateCrossNetworkRemoteExitReportConfig, ScenarioHost};
+    use super::{
+        CHECK_FAIL, GenerateCrossNetworkRemoteExitReportConfig, ScenarioHost,
+        WriteCrossNetworkSoakMonitorSummaryConfig,
+    };
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -329,6 +353,9 @@ pub(crate) mod recording {
         /// the whole config so a test can assert on the suite, the status and
         /// the artifact lists the composing scenario declared.
         WriteReport(Box<GenerateCrossNetworkRemoteExitReportConfig>),
+        /// A soak monitor summary the scenario asked to have written, kept
+        /// whole so a test can assert on every counter it reported.
+        WriteSoakMonitorSummary(Box<WriteCrossNetworkSoakMonitorSummaryConfig>),
         ValidatorBin {
             bin: String,
             args: Vec<String>,
@@ -460,6 +487,18 @@ pub(crate) mod recording {
                 contents: contents.to_owned(),
             });
             if self.artifact_write_errors.iter().any(|p| p == path) {
+                return Err(format!("mock: cannot write {}", path.display()));
+            }
+            Ok(())
+        }
+
+        fn write_soak_monitor_summary(
+            &self,
+            config: WriteCrossNetworkSoakMonitorSummaryConfig,
+        ) -> Result<(), String> {
+            let path = config.path.clone();
+            self.record(HostCall::WriteSoakMonitorSummary(Box::new(config)));
+            if self.artifact_write_errors.contains(&path) {
                 return Err(format!("mock: cannot write {}", path.display()));
             }
             Ok(())
