@@ -173,10 +173,19 @@ failure was root-caused with its first three fixes landed (see the Windows secti
   `userspace_shared_macos`' own socket/runtime, and the QH-51 no-churn tests exist in the
   macOS runtime. Full verdicts + file:line evidence in the QH-51 ledger entry,
   `QualityHardeningTodo_2026-07-25.md` (2026-08-28 subsection).
-* **QH-46's Windows analogue is unexamined.** firewalld is RHEL-specific, but the defect CLASS —
+* ~~**QH-46's Windows analogue is unexamined.** firewalld is RHEL-specific, but the defect CLASS —
   a foreign filter at the same hook silently discarding traffic we authorised — has an obvious
   Windows counterpart in WFP filter weights. Nobody has looked. (The CP-4 triage did not examine
-  it either.)
+  it either.)~~ **CLOSED 2026-08-28 — examined, and the core hazard is confirmed REAL, not
+  cleared.** The full WFP coexistence audit is `WindowsWfpCoexistenceAudit_2026-08-28.md` (same
+  directory): verdict 1 (foreign WFP provider discards **forwarded exit traffic**) is
+  **real-and-undetected** — Windows `admit_host_firewall_forwarding` is a self-documented no-op
+  (`phase10.rs:4870-4876`), so the QH-54 periodic posture loop is vacuous on Windows. Verdicts
+  2-5 (client tunnel-permit vs a foreign explicit-weight block; self/netsh wipe detection) are
+  bounded availability risks that fail closed; apply/rollback orderings verified correct. Exact
+  fix shape stated in the audit (mirror the Linux verify+re-assert posture at the reserved
+  `phase10.rs:4870` hook); NOT implemented — an open work item, tracked via the audit doc and
+  the QH-46 ledger entry.
 
 ### Also open (filed, not fixed)
 
