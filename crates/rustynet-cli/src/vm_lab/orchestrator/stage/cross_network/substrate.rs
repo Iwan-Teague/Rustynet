@@ -21,7 +21,7 @@
 //! and single-quoted before it crosses the SSH boundary.
 
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -40,6 +40,28 @@ pub const VXLAN_DSTPORT: &str = "4789";
 /// assigned out of per-group /24s inside 172.20.0.0/16, but configured with
 /// the /16 mask so every group is on-link across the vxlan mesh.
 pub const OVERLAY_PREFIX_LEN: u8 = 16;
+/// The whole overlay pool, as the destination prefix a NAT'd site routes
+/// through its router namespace.
+pub const OVERLAY_POOL_CIDR: &str = "172.20.0.0/16";
+
+/// The router namespace a NAT-shaping profile builds on a participating guest
+/// (CN-4). `rustynet*`-prefixed so the final-cleanup residue assert flags it.
+///
+/// The vxlan device MOVES into this namespace and keeps the node's overlay
+/// address, so the address every peer was handed is still the address on the
+/// wire — only the hop behind it changes. The guest's root namespace (where
+/// `rustynetd` runs) sits on a private site LAN behind it, which is what makes
+/// the translation real rather than cosmetic.
+pub const VXLAN_ROUTER_NS: &str = "rustynet-vxr";
+/// Root-namespace end of the site LAN veth pair.
+pub const VXLAN_SITE_LAN_IF: &str = "rustynet-vxl";
+/// Router-namespace end of the same pair (the site's default gateway).
+pub const VXLAN_ROUTER_LAN_IF: &str = "rustynet-vxg";
+/// The nftables table the router namespace's NAT rules live in.
+pub const VXLAN_NAT_TABLE: &str = "rustynet_vxnat";
+/// The WireGuard/relay UDP range `full_cone` DNATs inbound to the site host,
+/// matching `scripts/vm_lab/apply_nat_profile.sh`'s default.
+pub const NAT_WAN_UDP_PORTS: &str = "51820-51900";
 
 /// Output of one leaf command. `success` is the command's own exit status;
 /// a transport failure (ssh unreachable, spawn error) is the `Err` arm of
@@ -365,10 +387,10 @@ pub const KNOWN_NAT_PROFILES: &[&str] = &[
 /// way in, so a `NatProfileId` in hand is always one of
 /// [`KNOWN_NAT_PROFILES`].
 ///
-/// Note this is NOT (yet) what `--cross-network-nat-profiles` parses into —
-/// that flag keeps its existing shape-only validation so CN-1 changes no
-/// behaviour. Tightening the CLI onto this type is a deliberate, separate
-/// behavioural change.
+/// This IS what `--cross-network-nat-profiles` parses into as of CN-4: the
+/// owner-approved tightening (`OwnerDecisionDigest_2026-08-27.md` §16) removed
+/// the flag's shape-only validation, so a name outside the vocabulary is a
+/// parse-time error rather than a free string that reaches a substrate.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NatProfileId(String);
 
@@ -407,6 +429,18 @@ impl std::fmt::Display for NatProfileId {
 pub enum Support {
     Supported,
     UnsupportedByDesign(String),
+    /// The PROFILE is realisable but a requested [`NatModifiers`] toggle is
+    /// not, on this substrate or in combination with this profile (CN-4).
+    ///
+    /// A separate arm rather than another `UnsupportedByDesign` string because
+    /// the two mean different things to an operator: "this substrate cannot
+    /// shape that NAT at all" versus "it can, but not with uPnP". Collapsing
+    /// them would make evidence say the profile was out of reach when it was
+    /// the modifier.
+    UnsupportedModifier {
+        modifier: String,
+        reason: String,
+    },
 }
 
 impl Support {
@@ -414,12 +448,221 @@ impl Support {
         matches!(self, Self::Supported)
     }
 
-    /// The documented reason a profile is out of reach, or `None` when it is
-    /// supported.
+    /// The documented reason a profile (or modifier combination) is out of
+    /// reach, or `None` when it is supported.
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Supported => None,
             Self::UnsupportedByDesign(reason) => Some(reason),
+            Self::UnsupportedModifier { reason, .. } => Some(reason),
+        }
+    }
+}
+
+/// The `apply_nat_profile.sh` modifiers, carried as types rather than flags
+/// (spec §0.2 point 5: "preserving `--enable-upnp`/`--enable-v6` as
+/// `NatModifiers` — closing the `vxlan_tier_b.sh` gap where they are dropped
+/// today").
+///
+/// - **uPnP available** starts an IGD/NAT-PMP responder on the site's LAN side
+///   so the guest's port-mapping client (dataplane plan D2.3 / D14.a) can
+///   obtain a real mapping. `cross_network_cold_enroll` needs it
+///   (`+upnp_available` must enrol end to end; the same stage without it must
+///   fail-with-correct-diagnosis).
+/// - **IPv6 prefix** gives the site a natively routed v6 path alongside the v4
+///   profile — no NAT66 — so `double_nat_anchor`'s "with `v6_native` the v4
+///   path is bypassed" claim (§4.1.3, D14.b) is testable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NatModifiers {
+    upnp_available: bool,
+    ipv6_prefix: Option<String>,
+}
+
+/// Longest lab IPv6 prefix length that still leaves host bits for the two site
+/// addresses this crate assigns.
+const MAX_LAB_V6_PREFIX_LEN: u8 = 120;
+
+impl NatModifiers {
+    /// No modifiers — the default, and what every existing caller means.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Request a uPnP/NAT-PMP responder on the site LAN.
+    #[must_use]
+    pub fn with_upnp(mut self) -> Self {
+        self.upnp_available = true;
+        self
+    }
+
+    /// Request a natively routed IPv6 prefix on the site LAN.
+    ///
+    /// Fail-closed validation: the prefix must parse as `<ipv6>/<len>`, must be
+    /// a unique-local address (`fc00::/7`), and must leave host bits. The ULA
+    /// requirement is deliberate — a lab that advertised a real global prefix
+    /// on a guest's LAN would be announcing routes for address space it does
+    /// not own, and there is no lab need for one.
+    pub fn with_ipv6_prefix(mut self, prefix: &str) -> Result<Self, String> {
+        let trimmed = prefix.trim();
+        let (addr, len) = trimmed
+            .split_once('/')
+            .ok_or_else(|| format!("IPv6 modifier prefix must be <addr>/<len>: {trimmed:?}"))?;
+        let parsed: Ipv6Addr = addr.parse().map_err(|_| {
+            format!("IPv6 modifier prefix address is not an IPv6 literal: {addr:?}")
+        })?;
+        let len: u8 = len
+            .parse()
+            .map_err(|_| format!("IPv6 modifier prefix length is not a number: {len:?}"))?;
+        if len == 0 || len > MAX_LAB_V6_PREFIX_LEN {
+            return Err(format!(
+                "IPv6 modifier prefix length must be 1..={MAX_LAB_V6_PREFIX_LEN}; got {len}"
+            ));
+        }
+        if parsed.octets()[0] & 0xfe != 0xfc {
+            return Err(format!(
+                "IPv6 modifier prefix must be a unique-local address (fc00::/7); got {parsed}"
+            ));
+        }
+        // The two site addresses are `<prefix>::1` and `<prefix>::2`, so the
+        // supplied base must be the network address itself.
+        if parsed.segments()[7] != 0 {
+            return Err(format!(
+                "IPv6 modifier prefix must be a network address ending in ::; got {parsed}"
+            ));
+        }
+        self.ipv6_prefix = Some(format!("{parsed}/{len}"));
+        Ok(self)
+    }
+
+    pub fn upnp_available(&self) -> bool {
+        self.upnp_available
+    }
+
+    pub fn ipv6_prefix(&self) -> Option<&str> {
+        self.ipv6_prefix.as_deref()
+    }
+
+    /// True when nothing is requested — the case every substrate can honour.
+    pub fn is_empty(&self) -> bool {
+        !self.upnp_available && self.ipv6_prefix.is_none()
+    }
+
+    /// The router-side and host-side site addresses for the requested prefix.
+    /// `None` when no v6 prefix was requested.
+    fn ipv6_site_addresses(&self) -> Option<(String, String, u8)> {
+        let prefix = self.ipv6_prefix.as_deref()?;
+        let (addr, len) = prefix.split_once('/')?;
+        let base: Ipv6Addr = addr.parse().ok()?;
+        let len: u8 = len.parse().ok()?;
+        let mut gw = base.segments();
+        gw[7] = 1;
+        let mut host = base.segments();
+        host[7] = 2;
+        Some((
+            Ipv6Addr::from(gw).to_string(),
+            Ipv6Addr::from(host).to_string(),
+            len,
+        ))
+    }
+
+    /// One-line evidence rendering.
+    pub fn describe(&self) -> String {
+        if self.is_empty() {
+            return "none".to_owned();
+        }
+        let mut parts = Vec::new();
+        if self.upnp_available {
+            parts.push("upnp_available".to_owned());
+        }
+        if let Some(prefix) = &self.ipv6_prefix {
+            parts.push(format!("ipv6={prefix}"));
+        }
+        parts.join("+")
+    }
+}
+
+/// Which NAT boundary inside a provisioned substrate a profile applies to
+/// (spec §0.1 `apply_nat_profile(&self, site: SiteRef, …)`).
+///
+/// What a "site" names differs by substrate — a participating node alias for
+/// vxlan, a simulated home network for netns — so the newtype carries only the
+/// validated name and each provider resolves it. Validated on construction
+/// against the same allowlist namespace names use, because it reaches argv
+/// embedded in interface and namespace names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SiteRef(String);
+
+impl SiteRef {
+    pub fn new(name: &str) -> Result<Self, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("site reference must not be empty".to_owned());
+        }
+        if trimmed.len() > 64 {
+            return Err(format!("site reference exceeds 64 bytes: {trimmed:?}"));
+        }
+        if trimmed.starts_with('-') {
+            return Err(format!(
+                "site reference must not look like an option: {trimmed:?}"
+            ));
+        }
+        if !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        {
+            return Err(format!(
+                "site reference must contain only ASCII letters, digits, '.', '_' or '-': \
+                 {trimmed:?}"
+            ));
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SiteRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Why an `apply_nat_profile` call did not leave the site in the requested
+/// shape. The two arms are deliberately distinct outcomes for the caller:
+/// a refusal is a typed, honest `Skipped` with a reason; a failure is a stage
+/// FAILURE over a site whose NAT state is now unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NatApplyError {
+    /// This substrate does not realise the requested profile/modifier
+    /// combination. Nothing was changed on the guest — the refusal is decided
+    /// BEFORE the first leaf command, so there is no partial apply to unwind.
+    Refused(Support),
+    /// The apply itself failed (leaf command or transport). The site was reset
+    /// to its un-NAT'd shape first, so what is left is knowable; teardown still
+    /// sweeps whatever the reset could not remove.
+    Failed(String),
+}
+
+impl NatApplyError {
+    /// The human-readable half, for stage evidence.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Refused(support) => support
+                .reason()
+                .unwrap_or("refused without a reason")
+                .to_owned(),
+            Self::Failed(message) => message.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for NatApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(_) => write!(f, "refused: {}", self.message()),
+            Self::Failed(_) => write!(f, "failed: {}", self.message()),
         }
     }
 }
@@ -435,6 +678,39 @@ pub trait CrossNetworkSubstrateProvider {
     /// Required (no default) so a new substrate cannot inherit an
     /// over-permissive answer by omission.
     fn supports(&self, profile: &NatProfileId) -> Support;
+
+    /// Can this substrate realise `profile` TOGETHER WITH `modifiers`?
+    ///
+    /// Required (no default) for the same reason [`Self::supports`] is: a
+    /// default that answered "whatever the profile answers" would let a new
+    /// substrate silently claim uPnP and IPv6 it never implements, and the
+    /// modifier would then be dropped exactly as `vxlan_tier_b.sh` drops it
+    /// today — the gap CN-4 exists to close.
+    fn supports_with_modifiers(&self, profile: &NatProfileId, modifiers: &NatModifiers) -> Support;
+
+    /// Reshape one already-provisioned site's NAT to `profile` + `modifiers`.
+    ///
+    /// Contract:
+    /// - **Fail closed.** An unsupported combination is
+    ///   [`NatApplyError::Refused`], decided before the first leaf command, so
+    ///   a refusal never leaves a half-applied ruleset.
+    /// - **Idempotent.** Every call resets the site to its un-NAT'd shape first
+    ///   and rebuilds, so the resulting ruleset is a pure function of the
+    ///   arguments (the property `apply_nat_profile.sh` documents as
+    ///   "IDEMPOTENCE / DETERMINISM").
+    /// - **argv-only.** Reshaping goes through the same [`NetLeafRunner`] as
+    ///   provisioning; no shell string is built from any value here.
+    /// - **Records what it creates.** Anything new lands in
+    ///   `handle.created_resources` as it is created, so a failure part-way
+    ///   still leaves teardown an exact target list.
+    fn apply_nat_profile(
+        &self,
+        handle: &mut SubstrateHandle,
+        site: &SiteRef,
+        profile: &NatProfileId,
+        modifiers: &NatModifiers,
+        runners: &BTreeMap<String, &dyn NetLeafRunner>,
+    ) -> Result<(), NatApplyError>;
 
     /// Stand up the overlay. On failure the partial handle inside the error
     /// still lists every link that was created. Boxed so the `Err` arm stays
@@ -580,6 +856,530 @@ impl VxlanSubstrateProvider {
             ))
         }
     }
+
+    /// As [`Self::run_required`], but inside the router namespace.
+    fn run_required_in_ns(
+        runner: &dyn NetLeafRunner,
+        alias: &str,
+        ns: &str,
+        argv: &[&str],
+    ) -> Result<(), String> {
+        let output = runner
+            .in_netns(ns, argv)
+            .map_err(|err| format!("{alias}: {ns}: {argv:?}: {err}"))?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(format!(
+                "{alias}: {ns}: {argv:?} failed: {}",
+                output.stderr.trim()
+            ))
+        }
+    }
+
+    /// Best-effort removal: an object that was never there is the idempotent
+    /// success case, but a TRANSPORT failure is not — we would be guessing
+    /// about residue we cannot see.
+    fn run_optional(runner: &dyn NetLeafRunner, alias: &str, argv: &[&str]) -> Result<(), String> {
+        runner
+            .run(argv)
+            .map(|_| ())
+            .map_err(|err| format!("{alias}: {argv:?}: {err}"))
+    }
+
+    /// Return the site to its flat, un-NAT'd shape: the vxlan device back in
+    /// the guest's root namespace carrying the overlay address, no router
+    /// namespace, no site LAN, no NAT table.
+    ///
+    /// This is both `baseline_lan`'s implementation AND the first half of every
+    /// other profile's, which is what makes `apply_nat_profile` idempotent: the
+    /// ruleset after a call depends only on that call's arguments, never on
+    /// what the previous one left behind.
+    fn reset_site_to_flat(
+        runner: &dyn NetLeafRunner,
+        alias: &str,
+        overlay_cidr: &str,
+    ) -> Result<(), String> {
+        // Move the device back out of the router namespace BEFORE deleting the
+        // namespace: deleting a namespace destroys the virtual devices inside
+        // it, and a destroyed vxlan device takes the node's overlay address
+        // off the wire with no way to tell the peers.
+        Self::run_optional(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "netns",
+                "exec",
+                VXLAN_ROUTER_NS,
+                "ip",
+                "link",
+                "set",
+                VXLAN_LINK_NAME,
+                "netns",
+                "1",
+            ],
+        )?;
+        Self::run_optional(
+            runner,
+            alias,
+            &["sudo", "-n", "ip", "netns", "del", VXLAN_ROUTER_NS],
+        )?;
+        // Deleting either end of a veth pair removes both.
+        Self::run_optional(
+            runner,
+            alias,
+            &["sudo", "-n", "ip", "link", "del", VXLAN_SITE_LAN_IF],
+        )?;
+        // Re-assert the flat addressing. `replace` is idempotent, and this is
+        // what restores the overlay address after the device came back from the
+        // namespace (moving a device between namespaces drops its addresses).
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                overlay_cidr,
+                "dev",
+                VXLAN_LINK_NAME,
+            ],
+        )?;
+        Self::run_required(
+            runner,
+            alias,
+            &["sudo", "-n", "ip", "link", "set", VXLAN_LINK_NAME, "up"],
+        )
+    }
+
+    /// Build the router namespace and put the site behind it.
+    fn build_router_site(
+        runner: &dyn NetLeafRunner,
+        handle: &mut SubstrateHandle,
+        alias: &str,
+        plan: &SiteAddressing,
+        profile: &NatProfileId,
+        modifiers: &NatModifiers,
+    ) -> Result<(), String> {
+        Self::run_required(
+            runner,
+            alias,
+            &["sudo", "-n", "ip", "netns", "add", VXLAN_ROUTER_NS],
+        )?;
+        handle
+            .created_resources
+            .push(CreatedResource::netns(alias, VXLAN_ROUTER_NS));
+
+        // The vxlan device becomes the router's WAN, keeping the overlay
+        // address the peers were handed.
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "link",
+                "set",
+                VXLAN_LINK_NAME,
+                "netns",
+                VXLAN_ROUTER_NS,
+            ],
+        )?;
+        Self::run_required_in_ns(
+            runner,
+            alias,
+            VXLAN_ROUTER_NS,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                &plan.overlay_cidr,
+                "dev",
+                VXLAN_LINK_NAME,
+            ],
+        )?;
+        Self::run_required_in_ns(
+            runner,
+            alias,
+            VXLAN_ROUTER_NS,
+            &["sudo", "-n", "ip", "link", "set", VXLAN_LINK_NAME, "up"],
+        )?;
+        Self::run_required_in_ns(
+            runner,
+            alias,
+            VXLAN_ROUTER_NS,
+            &["sudo", "-n", "ip", "link", "set", "lo", "up"],
+        )?;
+
+        // The site LAN: root namespace (where rustynetd runs) behind the router.
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "link",
+                "add",
+                VXLAN_SITE_LAN_IF,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                VXLAN_ROUTER_LAN_IF,
+            ],
+        )?;
+        handle
+            .created_resources
+            .push(CreatedResource::link(alias, VXLAN_SITE_LAN_IF));
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "link",
+                "set",
+                VXLAN_ROUTER_LAN_IF,
+                "netns",
+                VXLAN_ROUTER_NS,
+            ],
+        )?;
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                &plan.host_cidr,
+                "dev",
+                VXLAN_SITE_LAN_IF,
+            ],
+        )?;
+        Self::run_required(
+            runner,
+            alias,
+            &["sudo", "-n", "ip", "link", "set", VXLAN_SITE_LAN_IF, "up"],
+        )?;
+        Self::run_required_in_ns(
+            runner,
+            alias,
+            VXLAN_ROUTER_NS,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                &plan.gateway_cidr,
+                "dev",
+                VXLAN_ROUTER_LAN_IF,
+            ],
+        )?;
+        Self::run_required_in_ns(
+            runner,
+            alias,
+            VXLAN_ROUTER_NS,
+            &["sudo", "-n", "ip", "link", "set", VXLAN_ROUTER_LAN_IF, "up"],
+        )?;
+        // Only the overlay pool goes through the router — management/SSH keeps
+        // using the guest's ordinary default route, which is what keeps the
+        // control plane reachable while the dataplane is behind NAT.
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "route",
+                "replace",
+                OVERLAY_POOL_CIDR,
+                "via",
+                &plan.gateway_ip,
+                "dev",
+                VXLAN_SITE_LAN_IF,
+            ],
+        )?;
+        Self::run_required_in_ns(
+            runner,
+            alias,
+            VXLAN_ROUTER_NS,
+            &["sudo", "-n", "sysctl", "-qw", "net.ipv4.ip_forward=1"],
+        )?;
+
+        Self::install_nat_rules(runner, alias, plan, profile)?;
+        Self::apply_modifiers(runner, alias, plan, modifiers)
+    }
+
+    /// The per-profile nftables ruleset, matching
+    /// `scripts/vm_lab/apply_nat_profile.sh`'s audited semantics.
+    fn install_nat_rules(
+        runner: &dyn NetLeafRunner,
+        alias: &str,
+        plan: &SiteAddressing,
+        profile: &NatProfileId,
+    ) -> Result<(), String> {
+        Self::run_required_in_ns(
+            runner,
+            alias,
+            VXLAN_ROUTER_NS,
+            &["sudo", "-n", "nft", "add", "table", "ip", VXLAN_NAT_TABLE],
+        )?;
+        Self::run_required_in_ns(
+            runner,
+            alias,
+            VXLAN_ROUTER_NS,
+            &[
+                "sudo",
+                "-n",
+                "nft",
+                "add",
+                "chain",
+                "ip",
+                VXLAN_NAT_TABLE,
+                "post",
+                "{ type nat hook postrouting priority srcnat; policy accept; }",
+            ],
+        )?;
+        fn masquerade(extra: Option<&str>) -> Vec<&str> {
+            let mut argv = vec![
+                "sudo",
+                "-n",
+                "nft",
+                "add",
+                "rule",
+                "ip",
+                VXLAN_NAT_TABLE,
+                "post",
+                "oifname",
+                VXLAN_LINK_NAME,
+                "masquerade",
+            ];
+            if let Some(extra) = extra {
+                argv.push(extra);
+            }
+            argv
+        }
+        match profile.as_str() {
+            // Plain conntrack masquerade: endpoint-INDEPENDENT mapping (the
+            // source port is preserved when free) with endpoint-DEPENDENT
+            // filtering. The common consumer-router shape.
+            "port_restricted_cone" => {
+                Self::run_required_in_ns(runner, alias, VXLAN_ROUTER_NS, &masquerade(None))?;
+            }
+            // Forced port randomisation: every flow gets a fresh source port,
+            // so the mapping is endpoint-DEPENDENT and the peer cannot reuse a
+            // learned endpoint — the shape that forces relay fallback.
+            "symmetric" => {
+                Self::run_required_in_ns(
+                    runner,
+                    alias,
+                    VXLAN_ROUTER_NS,
+                    &masquerade(Some("random")),
+                )?;
+            }
+            // Masquerade plus a DMZ-style DNAT of the WireGuard UDP range to
+            // the site host: endpoint-independent mapping AND filtering, so an
+            // unsolicited inbound lands.
+            "full_cone" => {
+                Self::run_required_in_ns(runner, alias, VXLAN_ROUTER_NS, &masquerade(None))?;
+                Self::run_required_in_ns(
+                    runner,
+                    alias,
+                    VXLAN_ROUTER_NS,
+                    &[
+                        "sudo",
+                        "-n",
+                        "nft",
+                        "add",
+                        "chain",
+                        "ip",
+                        VXLAN_NAT_TABLE,
+                        "pre",
+                        "{ type nat hook prerouting priority dstnat; policy accept; }",
+                    ],
+                )?;
+                Self::run_required_in_ns(
+                    runner,
+                    alias,
+                    VXLAN_ROUTER_NS,
+                    &[
+                        "sudo",
+                        "-n",
+                        "nft",
+                        "add",
+                        "rule",
+                        "ip",
+                        VXLAN_NAT_TABLE,
+                        "pre",
+                        "iifname",
+                        VXLAN_LINK_NAME,
+                        "udp",
+                        "dport",
+                        NAT_WAN_UDP_PORTS,
+                        "dnat",
+                        "to",
+                        &plan.host_ip,
+                    ],
+                )?;
+            }
+            // Unreachable: `apply_nat_profile` gates on `supports_with_modifiers`
+            // before the first leaf command. Kept as a hard error rather than a
+            // silent no-op so a profile added to the vocabulary later cannot
+            // quietly build a NAT-less site that then "passes" its gate.
+            other => {
+                return Err(format!(
+                    "vxlan substrate has no rule set for NAT profile {other:?}; \
+                     supports_with_modifiers() must gate this before apply"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// uPnP and native IPv6, the two `apply_nat_profile.sh` modifiers.
+    fn apply_modifiers(
+        runner: &dyn NetLeafRunner,
+        alias: &str,
+        plan: &SiteAddressing,
+        modifiers: &NatModifiers,
+    ) -> Result<(), String> {
+        if modifiers.upnp_available() {
+            // miniupnpd is configured entirely through argv here rather than
+            // through the config file `apply_nat_profile.sh` writes: an
+            // argv-only leaf runner cannot redirect a heredoc into a file, and
+            // reintroducing a shell to do it would re-open exactly the
+            // construction hole AGENTS.md §4 forbids. `-i` names the external
+            // (overlay-facing) interface, `-a` the LAN address it listens on,
+            // `-N` enables NAT-PMP alongside IGD.
+            Self::run_required_in_ns(
+                runner,
+                alias,
+                VXLAN_ROUTER_NS,
+                &[
+                    "sudo",
+                    "-n",
+                    "miniupnpd",
+                    "-i",
+                    VXLAN_LINK_NAME,
+                    "-a",
+                    &plan.gateway_ip,
+                    "-N",
+                ],
+            )?;
+        }
+        if let Some((gateway_v6, host_v6, prefix_len)) = modifiers.ipv6_site_addresses() {
+            let gateway_cidr = format!("{gateway_v6}/{prefix_len}");
+            let host_cidr = format!("{host_v6}/{prefix_len}");
+            Self::run_required_in_ns(
+                runner,
+                alias,
+                VXLAN_ROUTER_NS,
+                &[
+                    "sudo",
+                    "-n",
+                    "sysctl",
+                    "-qw",
+                    "net.ipv6.conf.all.forwarding=1",
+                ],
+            )?;
+            Self::run_required_in_ns(
+                runner,
+                alias,
+                VXLAN_ROUTER_NS,
+                &[
+                    "sudo",
+                    "-n",
+                    "ip",
+                    "-6",
+                    "addr",
+                    "replace",
+                    &gateway_cidr,
+                    "dev",
+                    VXLAN_ROUTER_LAN_IF,
+                ],
+            )?;
+            Self::run_required(
+                runner,
+                alias,
+                &[
+                    "sudo",
+                    "-n",
+                    "ip",
+                    "-6",
+                    "addr",
+                    "replace",
+                    &host_cidr,
+                    "dev",
+                    VXLAN_SITE_LAN_IF,
+                ],
+            )?;
+            // Native v6 routing, no NAT66 — the point of the modifier is that
+            // the v4 NAT can be bypassed entirely.
+            Self::run_required(
+                runner,
+                alias,
+                &[
+                    "sudo",
+                    "-n",
+                    "ip",
+                    "-6",
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    &gateway_v6,
+                    "dev",
+                    VXLAN_SITE_LAN_IF,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The private site addressing a NAT'd vxlan node sits on, derived
+/// deterministically from its overlay address so two nodes never collide.
+///
+/// Overlay `172.20.G.H` yields site LAN `10.G.H.0/24` with the router at `.1`
+/// and the guest's root namespace at `.2`. The overlay third/fourth octets are
+/// unique per node by construction (`plan_overlay`), so the derived /24 is too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteAddressing {
+    pub overlay_cidr: String,
+    pub gateway_ip: String,
+    pub gateway_cidr: String,
+    pub host_ip: String,
+    pub host_cidr: String,
+}
+
+impl SiteAddressing {
+    /// Derive the site plan for one node's overlay address.
+    pub fn for_overlay(overlay: Ipv4Addr) -> Self {
+        let o = overlay.octets();
+        let gateway_ip = format!("10.{}.{}.1", o[2], o[3]);
+        let host_ip = format!("10.{}.{}.2", o[2], o[3]);
+        Self {
+            overlay_cidr: format!("{overlay}/{OVERLAY_PREFIX_LEN}"),
+            gateway_cidr: format!("{gateway_ip}/24"),
+            gateway_ip,
+            host_cidr: format!("{host_ip}/24"),
+            host_ip,
+        }
+    }
 }
 
 impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
@@ -587,27 +1387,111 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
         "vxlan"
     }
 
-    /// Today this provider builds a FLAT, routable vxlan overlay and applies
-    /// no NAT at all: it exists to make cross-LAN peer endpoints routable,
-    /// not to shape them. So the only profile it honestly realises is
-    /// `baseline_lan`. Every NAT-shaping profile needs the
-    /// `apply_nat_profile.sh` semantics ported into
-    /// `apply_nat_profile` + `NatModifiers` (CN-4), and `double_nat_cgnat`
-    /// additionally needs the two-router chain. Claiming support here would
-    /// turn "the profile silently did nothing" into a false pass.
+    /// WIDENED IN CN-4, in the same change that wired
+    /// [`CrossNetworkSubstrateProvider::apply_nat_profile`] — deliberately not
+    /// before it. Widening first would have turned "the profile silently did
+    /// nothing" into a false pass; leaving it narrow afterwards would have
+    /// turned a capability that exists into a false skip.
+    ///
+    /// - `baseline_lan` — SUPPORTED. Exactly what `setup` builds: a flat,
+    ///   routable overlay with no translation anywhere.
+    /// - `port_restricted_cone` / `full_cone` / `symmetric` — SUPPORTED.
+    ///   `apply_nat_profile` moves the node's vxlan device into a router
+    ///   namespace on its own guest and puts the root namespace (where
+    ///   `rustynetd` runs) behind it on a private site LAN, so the three
+    ///   `apply_nat_profile.sh` rulesets translate real traffic. The node's
+    ///   overlay address is unchanged — it is now the router's WAN address, so
+    ///   the endpoint every peer was handed is still the address on the wire.
+    /// - `double_nat_cgnat` — REFUSED. A vxlan site has exactly ONE router
+    ///   namespace; the carrier hop chained behind it is the netns substrate's
+    ///   `rnsim-cgn-*` chain (CN-4), which owns the CGNAT topology.
     fn supports(&self, profile: &NatProfileId) -> Support {
         match profile.as_str() {
-            "baseline_lan" => Support::Supported,
+            "baseline_lan" | "port_restricted_cone" | "full_cone" | "symmetric" => {
+                Support::Supported
+            }
             "double_nat_cgnat" => Support::UnsupportedByDesign(
-                "double_nat_cgnat needs a two-router chain; the vxlan overlay has one router hop \
-                 per site"
+                "double_nat_cgnat needs a two-router carrier chain; a vxlan site has exactly one \
+                 router namespace — the CGNAT chain lives in the netns substrate"
                     .to_owned(),
             ),
             other => Support::UnsupportedByDesign(format!(
-                "{other} needs per-site NAT shaping; the vxlan topology substrate provisions a \
-                 flat routable overlay and applies no NAT profile yet (CN-4)"
+                "{other} is outside the vxlan substrate's NAT vocabulary"
             )),
         }
+    }
+
+    /// Modifiers need somewhere to live, and on this substrate that place is
+    /// the router namespace — so a modifier requested alongside `baseline_lan`
+    /// (which builds no router) is refused rather than silently dropped, which
+    /// is the `vxlan_tier_b.sh` behaviour CN-4 exists to end.
+    fn supports_with_modifiers(&self, profile: &NatProfileId, modifiers: &NatModifiers) -> Support {
+        let base = self.supports(profile);
+        if !base.is_supported() || modifiers.is_empty() {
+            return base;
+        }
+        if profile.as_str() == "baseline_lan" {
+            return Support::UnsupportedModifier {
+                modifier: modifiers.describe(),
+                reason: "baseline_lan builds no router namespace on the guest, so there is no \
+                         NAT boundary for a uPnP responder or a routed IPv6 prefix to sit on; \
+                         request a NAT-shaping profile or no modifiers"
+                    .to_owned(),
+            };
+        }
+        Support::Supported
+    }
+
+    fn apply_nat_profile(
+        &self,
+        handle: &mut SubstrateHandle,
+        site: &SiteRef,
+        profile: &NatProfileId,
+        modifiers: &NatModifiers,
+        runners: &BTreeMap<String, &dyn NetLeafRunner>,
+    ) -> Result<(), NatApplyError> {
+        // Refuse BEFORE the first leaf command: a refusal must never leave a
+        // half-applied ruleset behind.
+        let support = self.supports_with_modifiers(profile, modifiers);
+        if !support.is_supported() {
+            return Err(NatApplyError::Refused(support));
+        }
+        if !handle.record.provisioned {
+            return Err(NatApplyError::Failed(format!(
+                "cannot apply NAT profile '{profile}' to site '{site}': the vxlan substrate \
+                 provisioned no overlay for this topology"
+            )));
+        }
+        // A vxlan site IS a participating node alias.
+        let alias = site.as_str();
+        let overlay = handle.overlay_ips.get(alias).cloned().ok_or_else(|| {
+            NatApplyError::Failed(format!(
+                "no vxlan overlay address for site '{site}'; it is not a participating node"
+            ))
+        })?;
+        let overlay: Ipv4Addr = overlay.parse().map_err(|_| {
+            NatApplyError::Failed(format!(
+                "vxlan overlay address for site '{site}' is not an IPv4 literal: {overlay:?}"
+            ))
+        })?;
+        let plan = SiteAddressing::for_overlay(overlay);
+        let runner =
+            Self::runner_for(runners, alias).map_err(|err| NatApplyError::Failed(err.clone()))?;
+
+        // Reset first, always: the ruleset after this call must be a pure
+        // function of its arguments, not of whatever the last one left.
+        Self::reset_site_to_flat(runner, alias, &plan.overlay_cidr)
+            .map_err(NatApplyError::Failed)?;
+        // Anything the previous profile created is gone now, so the recorded
+        // resource list must stop naming it.
+        handle
+            .created_resources
+            .retain(|resource| !is_vxlan_nat_resource(resource, alias));
+        if profile.as_str() == "baseline_lan" {
+            return Ok(());
+        }
+        Self::build_router_site(runner, handle, alias, &plan, profile, modifiers)
+            .map_err(NatApplyError::Failed)
     }
 
     fn setup(
@@ -764,19 +1648,33 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
         if !handle.record.provisioned {
             return Ok(());
         }
-        // Exact created links when we have them (covers partial setup);
-        // otherwise every recorded participant with the well-known link name
-        // (covers teardown after a resume where the live handle was rebuilt
-        // from the persisted record).
+        // Exact created resources when we have them (covers partial setup and
+        // whatever `apply_nat_profile` built); otherwise every recorded
+        // participant with the well-known names (covers teardown after a resume
+        // where the live handle was rebuilt from the persisted record and can
+        // no longer say whether a NAT profile was applied).
         let targets: Vec<CreatedResource> = if handle.created_resources.is_empty() {
             handle
                 .record
                 .participants
                 .iter()
-                .map(|alias| CreatedResource::link(alias, VXLAN_LINK_NAME))
+                .flat_map(|alias| {
+                    [
+                        // Namespace first: it owns the vxlan device while a NAT
+                        // profile is applied, and the link removal below is the
+                        // idempotent no-op when no profile ever was.
+                        CreatedResource::netns(alias, VXLAN_ROUTER_NS),
+                        CreatedResource::link(alias, VXLAN_SITE_LAN_IF),
+                        CreatedResource::link(alias, VXLAN_LINK_NAME),
+                    ]
+                })
                 .collect()
         } else {
-            handle.created_resources.clone()
+            // Reverse creation order so a namespace is removed before the
+            // interfaces recorded before it.
+            let mut ordered = handle.created_resources.clone();
+            ordered.reverse();
+            ordered
         };
         let mut errors = Vec::new();
         for target in &targets {
@@ -787,12 +1685,18 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
                     continue;
                 }
             };
-            match runner.run(&["sudo", "-n", "ip", "link", "del", &target.name]) {
+            // A namespace and an interface need different removal verbs;
+            // guessing wrong reports a pass over real residue.
+            let argv: Vec<&str> = match target.kind {
+                ResourceKind::Link => vec!["sudo", "-n", "ip", "link", "del", &target.name],
+                ResourceKind::Netns => vec!["sudo", "-n", "ip", "netns", "del", &target.name],
+            };
+            match runner.run(&argv) {
                 Err(err) => errors.push(format!("{}: {err}", target.alias)),
                 Ok(output) if !output.success => {
                     // Already-gone is the idempotent success case; anything
                     // else is potential residue and must fail the stage.
-                    if !output.stderr.contains("Cannot find device") {
+                    if !already_removed(&output.stderr) {
                         errors.push(format!(
                             "{}: delete {} failed: {}",
                             target.alias,
@@ -813,6 +1717,25 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
             ))
         }
     }
+}
+
+/// Resources `apply_nat_profile` creates on a vxlan site, so a re-apply can
+/// drop them from the recorded list once the reset has removed them.
+fn is_vxlan_nat_resource(resource: &CreatedResource, alias: &str) -> bool {
+    resource.alias == alias
+        && matches!(
+            (resource.kind, resource.name.as_str()),
+            (ResourceKind::Netns, VXLAN_ROUTER_NS) | (ResourceKind::Link, VXLAN_SITE_LAN_IF)
+        )
+}
+
+/// `ip link del` / `ip netns del` on something already gone is the idempotent
+/// success case; anything else is potential residue and must fail the stage.
+fn already_removed(stderr: &str) -> bool {
+    let lowered = stderr.to_ascii_lowercase();
+    lowered.contains("cannot find device")
+        || lowered.contains("no such file or directory")
+        || lowered.contains("cannot remove namespace file")
 }
 
 /// Whether a selected substrate owns the TOPOLOGY-LEVEL seam — i.e. whether
@@ -842,7 +1765,9 @@ pub fn topology_level_seam(substrate: CrossNetworkSubstrate) -> TopologySeam {
              cross_network_nat_classification gate",
         ),
         CrossNetworkSubstrate::Slirp => TopologySeam::NoOverlay(
-            "the slirp substrate is not implemented yet (CN-4); it provisions no overlay",
+            "the slirp substrate's NAT belongs to the hypervisor (UTM 'Shared Network', applied \
+             before boot), so it provisions no overlay and creates nothing on the guest; see \
+             `slirp::SlirpSubstrateProvider`, which verifies the guests really are behind it",
         ),
     }
 }
@@ -855,6 +1780,14 @@ pub fn topology_level_seam(substrate: CrossNetworkSubstrate) -> TopologySeam {
 /// hand a vxlan overlay to a netns teardown and silently leave the residue.
 /// (`check_record_against_request` rejects that mismatch first; this is the
 /// second lock on the same door.)
+///
+/// Only `vxlan` appears here because only `vxlan` ever records
+/// `provisioned: true` at topology level. The netns simulator is built and
+/// swept per profile by the classification gate, and the slirp substrate
+/// creates nothing at all (it records `provisioned: false`), so
+/// `teardown_with` returns before it would ever ask for either — and if one
+/// day one of them did record a provisioned topology, the `None` arm's hard
+/// failure is the correct answer rather than a guessed teardown.
 pub fn provider_for_record(substrate_id: &str) -> Option<Box<dyn CrossNetworkSubstrateProvider>> {
     match substrate_id {
         "vxlan" => Some(Box::new(VxlanSubstrateProvider)),
@@ -1690,8 +2623,11 @@ mod tests {
         VxlanSubstrateProvider
             .teardown(&handle, &runners)
             .expect("teardown");
-        assert_eq!(a.recorded().len(), 1);
-        assert_eq!(b.recorded().len(), 1);
+        // Three per participant since CN-4: the record cannot say whether a NAT
+        // profile was applied, so the router namespace and the site LAN are
+        // targeted too and their absence is the idempotent success case.
+        assert_eq!(a.recorded().len(), 3);
+        assert_eq!(b.recorded().len(), 3);
     }
 
     #[test]
@@ -1709,7 +2645,7 @@ mod tests {
             created_resources: Vec::new(),
         };
         let gone = MockLeafRunner {
-            fail_on: vec![0],
+            fail_on: vec![0, 1, 2],
             failure_stderr: "Cannot find device \"rustynet-vx0\"".to_owned(),
             ..MockLeafRunner::default()
         };
@@ -1730,8 +2666,8 @@ mod tests {
             .teardown(&handle, &runners)
             .expect_err("real deletion failure must fail the teardown");
         assert!(err.contains("possible residue"), "{err}");
-        // The OTHER node's removal was still attempted (never stop early).
-        assert_eq!(ok2.recorded().len(), 1);
+        // The OTHER node's removals were still attempted (never stop early).
+        assert_eq!(ok2.recorded().len(), 3);
     }
 
     #[test]
@@ -1896,35 +2832,534 @@ mod tests {
         }
     }
 
-    /// The vxlan topology substrate provisions a flat routable overlay and
-    /// applies no NAT, so it must claim only `baseline_lan` — every shaping
-    /// profile is a reasoned `UnsupportedByDesign`, never a silent pass.
+    /// The CN-4 `supports()` matrix for vxlan, widened in the SAME change that
+    /// wired `apply_nat_profile`: the flat overlay plus the router namespace
+    /// realise four of the five profiles, and `double_nat_cgnat` stays a
+    /// reasoned refusal because a vxlan site has exactly one router hop.
     #[test]
-    fn vxlan_supports_only_baseline_lan_and_explains_every_refusal() {
+    fn vxlan_supports_the_four_single_router_profiles_and_explains_the_refusal() {
         let provider = VxlanSubstrateProvider;
-        assert_eq!(
-            provider.supports(&NatProfileId::parse("baseline_lan").expect("known")),
-            Support::Supported
-        );
-        assert!(
-            provider
-                .supports(&NatProfileId::parse("baseline_lan").expect("known"))
-                .reason()
-                .is_none()
-        );
-        for shaping in ["full_cone", "port_restricted_cone", "symmetric"] {
-            let support = provider.supports(&NatProfileId::parse(shaping).expect("known"));
-            assert!(!support.is_supported(), "{shaping} must not be claimed");
-            assert!(
-                support.reason().expect("reason").contains("no NAT profile"),
-                "{shaping} refusal must name the missing NAT shaping"
-            );
+        for supported in [
+            "baseline_lan",
+            "port_restricted_cone",
+            "full_cone",
+            "symmetric",
+        ] {
+            let support = provider.supports(&profile(supported));
+            assert_eq!(support, Support::Supported, "{supported} must be claimed");
+            assert!(support.reason().is_none());
         }
-        let cgnat = provider.supports(&NatProfileId::parse("double_nat_cgnat").expect("known"));
+        let cgnat = provider.supports(&profile("double_nat_cgnat"));
         assert!(!cgnat.is_supported());
         assert!(
-            cgnat.reason().expect("reason").contains("two-router chain"),
+            cgnat.reason().expect("reason").contains("carrier chain"),
             "double_nat_cgnat refusal must state the topological reason"
+        );
+    }
+
+    // ── CN-4: NatModifiers, SiteRef, apply_nat_profile ─────────────────
+
+    fn profile(name: &str) -> NatProfileId {
+        NatProfileId::parse(name).expect("known profile")
+    }
+
+    fn site(name: &str) -> SiteRef {
+        SiteRef::new(name).expect("valid site reference")
+    }
+
+    /// A provisioned two-node handle, as `setup` would leave it.
+    fn provisioned_handle() -> SubstrateHandle {
+        SubstrateHandle {
+            record: SubstrateRecord {
+                substrate_id: "vxlan".to_owned(),
+                topology_digest: "digest".to_owned(),
+                provisioned: true,
+                participants: vec!["lenovo-1".to_owned(), "utm-1".to_owned()],
+            },
+            overlay_ips: BTreeMap::from([
+                ("lenovo-1".to_owned(), "172.20.10.2".to_owned()),
+                ("utm-1".to_owned(), "172.20.20.2".to_owned()),
+            ]),
+            underlay_ips: BTreeMap::from([
+                ("lenovo-1".to_owned(), "192.168.0.30".to_owned()),
+                ("utm-1".to_owned(), "192.168.64.10".to_owned()),
+            ]),
+            created_resources: vec![
+                CreatedResource::link("lenovo-1", VXLAN_LINK_NAME),
+                CreatedResource::link("utm-1", VXLAN_LINK_NAME),
+            ],
+        }
+    }
+
+    fn joined(runner: &mock::MockLeafRunner) -> Vec<String> {
+        runner
+            .recorded()
+            .into_iter()
+            .map(|argv| argv.join(" "))
+            .collect()
+    }
+
+    #[test]
+    fn nat_modifiers_default_to_none_and_describe_themselves() {
+        let none = NatModifiers::none();
+        assert!(none.is_empty());
+        assert!(!none.upnp_available());
+        assert_eq!(none.ipv6_prefix(), None);
+        assert_eq!(none.describe(), "none");
+
+        let both = NatModifiers::none()
+            .with_upnp()
+            .with_ipv6_prefix("fd77:1::/64")
+            .expect("a ULA prefix is accepted");
+        assert!(!both.is_empty());
+        assert!(both.upnp_available());
+        assert_eq!(both.ipv6_prefix(), Some("fd77:1::/64"));
+        assert_eq!(both.describe(), "upnp_available+ipv6=fd77:1::/64");
+    }
+
+    /// Negative path: the v6 modifier is the only modifier carrying operator
+    /// data, so it fails closed on everything malformed — and on a GLOBAL
+    /// prefix, because a lab must not advertise routes for address space it
+    /// does not own.
+    #[test]
+    fn nat_modifiers_reject_malformed_and_non_ula_ipv6_prefixes() {
+        for bad in [
+            "fd77:1::",
+            "fd77:1::/",
+            "fd77:1::/0",
+            "fd77:1::/129",
+            "fd77:1::/128",
+            "not-an-address/64",
+            // Global unicast: a real, routable prefix.
+            "2001:db8::/64",
+            // Link-local, also outside fc00::/7.
+            "fe80::/64",
+            // Not a network address — ::1 and ::2 are this crate's to assign.
+            "fd77:1::5/64",
+        ] {
+            assert!(
+                NatModifiers::none().with_ipv6_prefix(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn site_ref_rejects_names_that_could_smuggle_an_option_or_a_path() {
+        for bad in ["", "  ", "-rf", "site a", "site;reboot", "../etc", "a/b"] {
+            assert!(SiteRef::new(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert_eq!(site(" utm-1 ").as_str(), "utm-1", "surrounding space trims");
+        assert_eq!(site("utm-1").to_string(), "utm-1");
+    }
+
+    /// The site LAN a NAT'd node sits on is derived from its (unique) overlay
+    /// address, so two nodes can never collide on it.
+    #[test]
+    fn site_addressing_is_derived_uniquely_from_the_overlay_address() {
+        let a = SiteAddressing::for_overlay(Ipv4Addr::new(172, 20, 10, 2));
+        let b = SiteAddressing::for_overlay(Ipv4Addr::new(172, 20, 20, 2));
+        assert_eq!(a.overlay_cidr, "172.20.10.2/16");
+        assert_eq!(a.gateway_ip, "10.10.2.1");
+        assert_eq!(a.host_ip, "10.10.2.2");
+        assert_eq!(a.host_cidr, "10.10.2.2/24");
+        assert_ne!(a.host_ip, b.host_ip);
+        assert_ne!(a.gateway_ip, b.gateway_ip);
+    }
+
+    /// Per-profile rule shape: each of the three shaping profiles installs
+    /// exactly the `apply_nat_profile.sh` ruleset, inside the router namespace,
+    /// on the vxlan device.
+    #[test]
+    fn vxlan_apply_installs_the_documented_rule_shape_per_profile() {
+        use mock::MockLeafRunner;
+        let expectations: &[(&str, &str)] = &[
+            (
+                "port_restricted_cone",
+                "nft add rule ip rustynet_vxnat post oifname rustynet-vx0 masquerade",
+            ),
+            (
+                "symmetric",
+                "nft add rule ip rustynet_vxnat post oifname rustynet-vx0 masquerade random",
+            ),
+            (
+                "full_cone",
+                "nft add rule ip rustynet_vxnat pre iifname rustynet-vx0 udp dport \
+                 51820-51900 dnat to 10.10.2.2",
+            ),
+        ];
+        for (name, expected_rule) in expectations {
+            let runner = MockLeafRunner::default();
+            let runners = runner_map(&[("lenovo-1", &runner)]);
+            let mut handle = provisioned_handle();
+            VxlanSubstrateProvider
+                .apply_nat_profile(
+                    &mut handle,
+                    &site("lenovo-1"),
+                    &profile(name),
+                    &NatModifiers::none(),
+                    &runners,
+                )
+                .unwrap_or_else(|err| panic!("{name} must apply: {err}"));
+            let calls = joined(&runner);
+            assert!(
+                calls.iter().any(|call| call.ends_with(expected_rule)),
+                "{name} must install {expected_rule:?}; got {calls:#?}"
+            );
+            // Every rule lands inside the router namespace, never in the root
+            // namespace where it would NAT the guest's management traffic.
+            assert!(
+                calls
+                    .iter()
+                    .filter(|call| call.contains("nft add"))
+                    .all(|call| call.contains(&format!("ip netns exec {VXLAN_ROUTER_NS}"))),
+                "every nft rule must run inside {VXLAN_ROUTER_NS}; got {calls:#?}"
+            );
+            // `symmetric` must NOT be reachable as a plain masquerade and vice
+            // versa — the distinguishing token is the whole profile.
+            let has_random = calls.iter().any(|call| call.ends_with("masquerade random"));
+            assert_eq!(
+                has_random,
+                *name == "symmetric",
+                "only symmetric randomises source ports; {name} got {calls:#?}"
+            );
+            // The node keeps the overlay address peers were handed — now as the
+            // router's WAN address.
+            assert!(
+                calls.iter().any(|call| call.contains(&format!(
+                    "ip netns exec {VXLAN_ROUTER_NS} sudo -n ip addr replace 172.20.10.2/16 dev \
+                     {VXLAN_LINK_NAME}"
+                ))),
+                "the router must keep the node's overlay address: {calls:#?}"
+            );
+            // And the created objects are recorded for teardown.
+            assert!(
+                handle
+                    .created_resources
+                    .contains(&CreatedResource::netns("lenovo-1", VXLAN_ROUTER_NS))
+                    && handle
+                        .created_resources
+                        .contains(&CreatedResource::link("lenovo-1", VXLAN_SITE_LAN_IF)),
+                "{:?}",
+                handle.created_resources
+            );
+        }
+    }
+
+    /// `baseline_lan` is the reset: it removes the router namespace and the
+    /// site LAN and puts the overlay address back on the flat device — and
+    /// installs no NAT rule at all.
+    #[test]
+    fn vxlan_apply_baseline_lan_unwinds_the_nat_boundary_completely() {
+        use mock::MockLeafRunner;
+        let runner = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &runner)]);
+        let mut handle = provisioned_handle();
+        VxlanSubstrateProvider
+            .apply_nat_profile(
+                &mut handle,
+                &site("lenovo-1"),
+                &profile("baseline_lan"),
+                &NatModifiers::none(),
+                &runners,
+            )
+            .expect("baseline_lan applies");
+        let calls = joined(&runner);
+        assert!(
+            calls.iter().all(|call| !call.contains("nft")),
+            "baseline_lan installs no NAT rule: {calls:#?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains(&format!("ip netns del {VXLAN_ROUTER_NS}")))
+                && calls
+                    .iter()
+                    .any(|call| call.contains(&format!("ip link del {VXLAN_SITE_LAN_IF}"))),
+            "baseline_lan must remove the router namespace and the site LAN: {calls:#?}"
+        );
+        assert_eq!(
+            handle.created_resources,
+            [
+                CreatedResource::link("lenovo-1", VXLAN_LINK_NAME),
+                CreatedResource::link("utm-1", VXLAN_LINK_NAME),
+            ],
+            "the removed objects must stop being recorded as created"
+        );
+    }
+
+    /// Application/removal symmetry: applying a shaping profile with modifiers
+    /// and then resetting to `baseline_lan` leaves the recorded resource list
+    /// exactly as it started, and re-applying is idempotent rather than
+    /// additive.
+    #[test]
+    fn vxlan_apply_and_reset_are_symmetric_and_idempotent() {
+        use mock::MockLeafRunner;
+        let runner = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &runner)]);
+        let mut handle = provisioned_handle();
+        let before = handle.created_resources.clone();
+        let modifiers = NatModifiers::none()
+            .with_upnp()
+            .with_ipv6_prefix("fd77:1::/64")
+            .expect("ULA prefix");
+
+        for _ in 0..2 {
+            VxlanSubstrateProvider
+                .apply_nat_profile(
+                    &mut handle,
+                    &site("lenovo-1"),
+                    &profile("full_cone"),
+                    &modifiers,
+                    &runners,
+                )
+                .expect("apply");
+            // Re-applying must not accumulate duplicate resources: the reset at
+            // the head of every apply drops what the previous one created.
+            assert_eq!(
+                handle.created_resources.len(),
+                before.len() + 2,
+                "{:?}",
+                handle.created_resources
+            );
+        }
+
+        VxlanSubstrateProvider
+            .apply_nat_profile(
+                &mut handle,
+                &site("lenovo-1"),
+                &profile("baseline_lan"),
+                &NatModifiers::none(),
+                &runners,
+            )
+            .expect("reset");
+        assert_eq!(
+            handle.created_resources, before,
+            "reset must restore the pre-NAT resource list exactly"
+        );
+    }
+
+    /// The modifiers `vxlan_tier_b.sh` silently dropped are now real leaf ops:
+    /// a uPnP responder on the site LAN and a natively routed ULA prefix.
+    #[test]
+    fn vxlan_apply_wires_the_upnp_and_ipv6_modifiers() {
+        use mock::MockLeafRunner;
+        let runner = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &runner)]);
+        let mut handle = provisioned_handle();
+        VxlanSubstrateProvider
+            .apply_nat_profile(
+                &mut handle,
+                &site("lenovo-1"),
+                &profile("port_restricted_cone"),
+                &NatModifiers::none()
+                    .with_upnp()
+                    .with_ipv6_prefix("fd77:1::/64")
+                    .expect("ULA prefix"),
+                &runners,
+            )
+            .expect("apply with modifiers");
+        let calls = joined(&runner);
+        assert!(
+            calls.iter().any(|call| call
+                == &format!(
+                    "ip netns exec {VXLAN_ROUTER_NS} sudo -n miniupnpd -i {VXLAN_LINK_NAME} -a \
+                     10.10.2.1 -N"
+                )),
+            "uPnP must listen on the site LAN gateway and map through the overlay device: \
+             {calls:#?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("net.ipv6.conf.all.forwarding=1"))
+                && calls
+                    .iter()
+                    .any(|call| call.contains("ip -6 addr replace fd77:1::1/64"))
+                && calls
+                    .iter()
+                    .any(|call| call.contains("ip -6 addr replace fd77:1::2/64")),
+            "the v6 modifier must address both ends of the site LAN and forward: {calls:#?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("ip -6 route replace default via fd77:1::1")),
+            "the v6 path must be routed natively — no NAT66: {calls:#?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.contains("ip6") && !call.contains("masquerade\tv6")),
+            "no NAT66 rule may be installed: {calls:#?}"
+        );
+    }
+
+    /// Fail closed: an unsupported profile/modifier combination is a TYPED
+    /// refusal decided before the first leaf command, so there is never a
+    /// half-applied ruleset to unwind.
+    #[test]
+    fn vxlan_refuses_unsupported_combinations_without_touching_the_guest() {
+        use mock::MockLeafRunner;
+        // (a) an unsupported PROFILE.
+        let runner = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &runner)]);
+        let mut handle = provisioned_handle();
+        let err = VxlanSubstrateProvider
+            .apply_nat_profile(
+                &mut handle,
+                &site("lenovo-1"),
+                &profile("double_nat_cgnat"),
+                &NatModifiers::none(),
+                &runners,
+            )
+            .expect_err("double_nat_cgnat is out of reach for a vxlan site");
+        assert!(
+            matches!(err, NatApplyError::Refused(Support::UnsupportedByDesign(_))),
+            "{err:?}"
+        );
+        assert!(runner.recorded().is_empty(), "a refusal must run nothing");
+
+        // (b) a supported profile with an unsupported MODIFIER combination.
+        let runner = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &runner)]);
+        let err = VxlanSubstrateProvider
+            .apply_nat_profile(
+                &mut handle,
+                &site("lenovo-1"),
+                &profile("baseline_lan"),
+                &NatModifiers::none().with_upnp(),
+                &runners,
+            )
+            .expect_err("baseline_lan builds no router for a uPnP responder to sit on");
+        match &err {
+            NatApplyError::Refused(Support::UnsupportedModifier { modifier, reason }) => {
+                assert_eq!(modifier, "upnp_available");
+                assert!(reason.contains("no router namespace"), "{reason}");
+            }
+            other => panic!("expected a modifier refusal, got {other:?}"),
+        }
+        assert!(runner.recorded().is_empty(), "a refusal must run nothing");
+        assert_eq!(
+            handle.created_resources.len(),
+            provisioned_handle().created_resources.len(),
+            "a refusal must not change the recorded resources"
+        );
+    }
+
+    /// Fail closed on a site this substrate never provisioned, and on a handle
+    /// that provisioned no overlay at all.
+    #[test]
+    fn vxlan_apply_fails_closed_on_an_unknown_site_or_unprovisioned_handle() {
+        use mock::MockLeafRunner;
+        let runner = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &runner)]);
+
+        let mut handle = provisioned_handle();
+        let err = VxlanSubstrateProvider
+            .apply_nat_profile(
+                &mut handle,
+                &site("not-a-node"),
+                &profile("symmetric"),
+                &NatModifiers::none(),
+                &runners,
+            )
+            .expect_err("an unknown site must fail");
+        assert!(matches!(err, NatApplyError::Failed(_)), "{err:?}");
+        assert!(err.message().contains("not a participating node"), "{err}");
+
+        let mut unprovisioned = provisioned_handle();
+        unprovisioned.record.provisioned = false;
+        let err = VxlanSubstrateProvider
+            .apply_nat_profile(
+                &mut unprovisioned,
+                &site("lenovo-1"),
+                &profile("symmetric"),
+                &NatModifiers::none(),
+                &runners,
+            )
+            .expect_err("an unprovisioned handle must fail");
+        assert!(err.message().contains("provisioned no overlay"), "{err}");
+        assert!(runner.recorded().is_empty());
+    }
+
+    /// Teardown must remove the NAT resources `apply_nat_profile` created, with
+    /// the RIGHT verb per kind and the namespace before the interfaces recorded
+    /// under it — otherwise a router namespace holding the vxlan device is left
+    /// on the guest as release-blocking residue.
+    #[test]
+    fn vxlan_teardown_sweeps_the_nat_resources_with_the_right_verb() {
+        use mock::MockLeafRunner;
+        let apply_runner = MockLeafRunner::default();
+        let apply_runners = runner_map(&[("lenovo-1", &apply_runner)]);
+        let mut handle = provisioned_handle();
+        // Only one node is NAT'd, so teardown must still cover the other's
+        // plain vxlan link.
+        VxlanSubstrateProvider
+            .apply_nat_profile(
+                &mut handle,
+                &site("lenovo-1"),
+                &profile("symmetric"),
+                &NatModifiers::none(),
+                &apply_runners,
+            )
+            .expect("apply");
+
+        let lenovo = MockLeafRunner::default();
+        let utm = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm)]);
+        VxlanSubstrateProvider
+            .teardown(&handle, &runners)
+            .expect("teardown");
+        assert_eq!(
+            joined(&lenovo),
+            [
+                format!("sudo -n ip link del {VXLAN_SITE_LAN_IF}"),
+                format!("sudo -n ip netns del {VXLAN_ROUTER_NS}"),
+                format!("sudo -n ip link del {VXLAN_LINK_NAME}"),
+            ],
+            "reverse creation order, and `ip netns del` for the namespace"
+        );
+        assert_eq!(
+            joined(&utm),
+            [format!("sudo -n ip link del {VXLAN_LINK_NAME}")]
+        );
+    }
+
+    /// Resume case: with only the persisted record, teardown cannot know
+    /// whether a NAT profile was applied — so it must target the NAT objects
+    /// too, and tolerate their absence.
+    #[test]
+    fn vxlan_teardown_after_a_resume_targets_the_nat_objects_too() {
+        use mock::MockLeafRunner;
+        let handle = SubstrateHandle {
+            record: SubstrateRecord {
+                substrate_id: "vxlan".to_owned(),
+                topology_digest: "digest".to_owned(),
+                provisioned: true,
+                participants: vec!["a".to_owned()],
+            },
+            overlay_ips: BTreeMap::new(),
+            underlay_ips: BTreeMap::new(),
+            created_resources: Vec::new(),
+        };
+        // The namespace and the site LAN were never created on this guest.
+        let a = MockLeafRunner {
+            fail_on: vec![0, 1],
+            failure_stderr: "Cannot remove namespace file: No such file or directory".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let runners = runner_map(&[("a", &a)]);
+        VxlanSubstrateProvider
+            .teardown(&handle, &runners)
+            .expect("absent NAT objects are the idempotent success case");
+        assert_eq!(
+            joined(&a),
+            [
+                format!("sudo -n ip netns del {VXLAN_ROUTER_NS}"),
+                format!("sudo -n ip link del {VXLAN_SITE_LAN_IF}"),
+                format!("sudo -n ip link del {VXLAN_LINK_NAME}"),
+            ]
         );
     }
 
