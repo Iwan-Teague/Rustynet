@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 pub mod netns;
 pub mod scenario;
+pub mod slirp;
 pub mod substrate;
 
 use crate::vm_lab::VmGuestPlatform;
@@ -18,6 +19,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PROFILE: &str = "baseline_lan";
 const DEFAULT_IMPAIRMENT_PROFILE: &str = "none";
+
+/// The default NAT profile as the validated type. `DEFAULT_PROFILE` is one of
+/// `KNOWN_NAT_PROFILES`, which the
+/// [`default_nat_profile_is_in_the_closed_vocabulary`] test pins, so this
+/// cannot become an unrepresentable default without a failing test.
+fn default_nat_profile() -> substrate::NatProfileId {
+    substrate::NatProfileId::parse(DEFAULT_PROFILE)
+        .unwrap_or_else(|err| unreachable!("the default NAT profile must be known: {err}"))
+}
 // The netns NAT gates used to be three bash scripts scp'd to the exit guest
 // and run under `sudo -n bash`. They are now the typed in-process
 // `netns::run_nat_gates` (CN-2), so nothing is copied to the guest but the
@@ -28,8 +38,18 @@ const NAT_GATE_REPORT_FILE: &str = "cross_network_nat_gates.txt";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossNetworkOptions {
     pub enable_suite: bool,
-    pub nat_profiles: Vec<String>,
-    pub required_nat_profiles: Vec<String>,
+    /// The requested NAT profiles, as validated [`substrate::NatProfileId`]s.
+    ///
+    /// CN-4 tightened these from free strings onto the closed §D5.1 vocabulary
+    /// (owner-approved, `OwnerDecisionDigest_2026-08-27.md` §16): an unknown
+    /// name is now a parse-time error naming the five valid profiles, instead
+    /// of a shape-validated string that reached a substrate which could only
+    /// answer "I do not know that profile" much later, on a guest.
+    pub nat_profiles: Vec<substrate::NatProfileId>,
+    pub required_nat_profiles: Vec<substrate::NatProfileId>,
+    /// NOT a NAT profile: the netem impairment name, whose vocabulary lives in
+    /// [`netns::NetnsImpairment`]. It keeps shape-only validation here because
+    /// the impairment is applied by a substrate that may not be netns.
     pub impairment_profile: String,
     pub substrate: CrossNetworkSubstrate,
 }
@@ -79,12 +99,12 @@ impl CrossNetworkOptions {
     ) -> Result<Self, String> {
         let nat_profiles = match nat_profiles {
             Some(value) => parse_profile_csv(value, "--cross-network-nat-profiles")?,
-            None => vec![DEFAULT_PROFILE.to_owned()],
+            None => vec![default_nat_profile()],
         };
         let required_nat_profiles = match required_nat_profiles {
             Some(value) => parse_profile_csv(value, "--cross-network-required-nat-profiles")?,
-            None if nat_profiles.len() == 1 && nat_profiles[0] == DEFAULT_PROFILE => {
-                vec![DEFAULT_PROFILE.to_owned()]
+            None if nat_profiles.len() == 1 && nat_profiles[0] == default_nat_profile() => {
+                vec![default_nat_profile()]
             }
             None => nat_profiles.clone(),
         };
@@ -112,8 +132,8 @@ impl Default for CrossNetworkOptions {
     fn default() -> Self {
         Self {
             enable_suite: true,
-            nat_profiles: vec![DEFAULT_PROFILE.to_owned()],
-            required_nat_profiles: vec![DEFAULT_PROFILE.to_owned()],
+            nat_profiles: vec![default_nat_profile()],
+            required_nat_profiles: vec![default_nat_profile()],
             impairment_profile: DEFAULT_IMPAIRMENT_PROFILE.to_owned(),
             substrate: CrossNetworkSubstrate::Netns,
         }
@@ -446,7 +466,14 @@ fn run_nat_matrix(ctx: &OrchestrationContext, options: &CrossNetworkOptions) -> 
     cmd.arg("--artifact-dir")
         .arg(&ctx.report_dir)
         .arg("--required-nat-profiles")
-        .arg(options.required_nat_profiles.join(","))
+        .arg(
+            options
+                .required_nat_profiles
+                .iter()
+                .map(substrate::NatProfileId::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
         .arg("--require-pass-status")
         .arg("--output")
         .arg(
@@ -520,8 +547,12 @@ fn run_direct_remote_exit_stage(
     };
 
     for (idx, profile) in options.nat_profiles.iter().enumerate() {
-        let report_path = stage_report_path_for_idx(&stage_dir, spec.name, profile, idx);
-        let log_path = stage_log_path_for_idx(&stage_dir, spec.name, profile, idx);
+        // The path helpers are shared with the unported `cargo run --bin` fan
+        // and still key directories off the profile NAME, so the string is
+        // borrowed here and nowhere else; the profile itself stays typed all
+        // the way into the scenario.
+        let report_path = stage_report_path_for_idx(&stage_dir, spec.name, profile.as_str(), idx);
+        let log_path = stage_log_path_for_idx(&stage_dir, spec.name, profile.as_str(), idx);
         let outcome = run_direct_remote_exit_profile(
             ctx,
             &topology,
@@ -542,7 +573,7 @@ fn run_direct_remote_exit_profile(
     ctx: &OrchestrationContext,
     topology: &CrossNetworkTopology,
     options: &CrossNetworkOptions,
-    nat_profile: &str,
+    nat_profile: &substrate::NatProfileId,
     report_path: &Path,
     log_path: &Path,
 ) -> StageOutcome {
@@ -597,7 +628,7 @@ fn run_direct_remote_exit_profile(
         ),
         relay: None,
         probe: None,
-        nat_profile: nat_profile.to_owned(),
+        nat_profile: nat_profile.clone(),
         impairment_profile: options.impairment_profile.clone(),
     };
 
@@ -657,7 +688,7 @@ fn write_cross_network_scenario_report(
     outcome: &scenario::ScenarioOutcome,
     topology: &CrossNetworkTopology,
     options: &CrossNetworkOptions,
-    nat_profile: &str,
+    nat_profile: &substrate::NatProfileId,
     report_path: &Path,
     log_path: &Path,
 ) -> StageOutcome {
@@ -680,7 +711,9 @@ fn write_cross_network_scenario_report(
         client_network_id: Some(topology.client_network_id.clone()),
         exit_network_id: Some(topology.exit_network_id.clone()),
         relay_network_id: None,
-        nat_profile: nat_profile.to_owned(),
+        // The report schema is a JSON document with a string field; this is the
+        // one place the typed profile is rendered back to text.
+        nat_profile: nat_profile.as_str().to_owned(),
         impairment_profile: options.impairment_profile.clone(),
         check_overrides: outcome.checks.as_report_args(),
         path_status_line: outcome.path_status_line.clone(),
@@ -719,6 +752,7 @@ fn run_script_stage(
     };
 
     for (idx, profile) in options.nat_profiles.iter().enumerate() {
+        let profile = profile.as_str();
         let mut cmd = Command::new("cargo");
         cmd.current_dir(repo_root())
             .args([
@@ -1046,20 +1080,21 @@ fn write_nodes_tsv(ctx: &OrchestrationContext, path: &Path) -> Result<(), String
 }
 
 fn validate_cross_network_options(options: &CrossNetworkOptions) -> Result<(), String> {
-    for value in options
+    // NAT profiles are `NatProfileId`s now, so emptiness and control characters
+    // are unrepresentable by construction; only the impairment name still
+    // carries free-form shape.
+    let impairment = options.impairment_profile.as_str();
+    if impairment.trim().is_empty() {
+        return Err("cross-network profile values must not be empty".to_owned());
+    }
+    if impairment.chars().any(char::is_control) {
+        return Err("cross-network profile values must not contain control chars".to_owned());
+    }
+    let profiles: HashSet<&str> = options
         .nat_profiles
         .iter()
-        .chain(options.required_nat_profiles.iter())
-        .chain(std::iter::once(&options.impairment_profile))
-    {
-        if value.trim().is_empty() {
-            return Err("cross-network profile values must not be empty".to_owned());
-        }
-        if value.chars().any(char::is_control) {
-            return Err("cross-network profile values must not contain control chars".to_owned());
-        }
-    }
-    let profiles: HashSet<&str> = options.nat_profiles.iter().map(String::as_str).collect();
+        .map(substrate::NatProfileId::as_str)
+        .collect();
     for required in &options.required_nat_profiles {
         if !profiles.contains(required.as_str()) {
             return Err(format!(
@@ -1070,11 +1105,22 @@ fn validate_cross_network_options(options: &CrossNetworkOptions) -> Result<(), S
     Ok(())
 }
 
-fn parse_profile_csv(value: &str, flag: &str) -> Result<Vec<String>, String> {
+/// Parse a comma-separated NAT-profile list onto the closed §D5.1 vocabulary.
+///
+/// CN-4 behavioural change (owner-approved): a name outside
+/// `substrate::KNOWN_NAT_PROFILES` is a parse-time error naming the whole
+/// vocabulary. Before this, any `[A-Za-z0-9._-]+` string parsed and travelled
+/// as far as a substrate before anything could object.
+fn parse_profile_csv(value: &str, flag: &str) -> Result<Vec<substrate::NatProfileId>, String> {
     let mut profiles = Vec::new();
     let mut seen = HashSet::new();
     for raw in value.split(',') {
-        let profile = parse_profile_value(raw, flag)?;
+        // Keep the shape check first so a control character or an
+        // option-shaped token is reported as a malformed flag value rather
+        // than as an unknown profile.
+        let candidate = parse_profile_value(raw, flag)?;
+        let profile =
+            substrate::NatProfileId::parse(&candidate).map_err(|err| format!("{flag}: {err}"))?;
         if seen.insert(profile.clone()) {
             profiles.push(profile);
         }
@@ -1315,12 +1361,21 @@ fn stderr_snippet(stderr: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// The profile names as plain strings, so assertions stay readable now
+    /// that the flags parse onto `NatProfileId`.
+    fn names(profiles: &[substrate::NatProfileId]) -> Vec<&str> {
+        profiles
+            .iter()
+            .map(substrate::NatProfileId::as_str)
+            .collect()
+    }
+
     #[test]
     fn cross_network_options_default_to_baseline_lan() {
         let options = CrossNetworkOptions::default();
         assert!(options.enable_suite);
-        assert_eq!(options.nat_profiles, ["baseline_lan"]);
-        assert_eq!(options.required_nat_profiles, ["baseline_lan"]);
+        assert_eq!(names(&options.nat_profiles), ["baseline_lan"]);
+        assert_eq!(names(&options.required_nat_profiles), ["baseline_lan"]);
         assert_eq!(options.impairment_profile, "none");
         assert_eq!(options.substrate, CrossNetworkSubstrate::Netns);
     }
@@ -1335,10 +1390,75 @@ mod tests {
             Some("vxlan"),
         )
         .expect("cross-network CLI options should parse");
-        assert_eq!(options.nat_profiles, ["baseline_lan", "full_cone"]);
-        assert_eq!(options.required_nat_profiles, ["baseline_lan", "full_cone"]);
+        assert_eq!(names(&options.nat_profiles), ["baseline_lan", "full_cone"]);
+        assert_eq!(
+            names(&options.required_nat_profiles),
+            ["baseline_lan", "full_cone"]
+        );
         assert_eq!(options.impairment_profile, "netem_100ms");
         assert_eq!(options.substrate, CrossNetworkSubstrate::Vxlan);
+    }
+
+    /// CN-4, owner-approved (`OwnerDecisionDigest_2026-08-27.md` §16): the
+    /// flags parse onto the CLOSED §D5.1 vocabulary. Every one of these strings
+    /// PARSED before this change and reached a substrate as a free string.
+    #[test]
+    fn cross_network_nat_profile_flags_reject_names_outside_the_closed_vocabulary() {
+        for bad in [
+            "full-cone",
+            "FULL_CONE",
+            "baseline_lan_v2",
+            "cone",
+            "port_restricted",
+            "1.2.3",
+        ] {
+            let err = CrossNetworkOptions::from_cli(true, Some(bad), None, None, None)
+                .expect_err("an unknown NAT profile must fail at parse time");
+            assert!(
+                err.contains("--cross-network-nat-profiles")
+                    && err.contains("unknown NAT profile")
+                    // The error must NAME the vocabulary, not just refuse.
+                    && err.contains("baseline_lan")
+                    && err.contains("double_nat_cgnat"),
+                "{bad:?}: {err}"
+            );
+        }
+        // The same tightening applies to the `--required` half.
+        let err =
+            CrossNetworkOptions::from_cli(true, Some("full_cone"), Some("full-cone"), None, None)
+                .expect_err("the required-profile flag is tightened too");
+        assert!(
+            err.contains("--cross-network-required-nat-profiles"),
+            "{err}"
+        );
+        // One bad name in a list of good ones still fails the whole flag.
+        assert!(
+            CrossNetworkOptions::from_cli(
+                true,
+                Some("full_cone,typo_cone,symmetric"),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn every_known_nat_profile_parses_through_the_flag() {
+        for known in substrate::KNOWN_NAT_PROFILES {
+            let options = CrossNetworkOptions::from_cli(true, Some(known), None, None, None)
+                .unwrap_or_else(|err| panic!("{known} must parse: {err}"));
+            assert_eq!(names(&options.nat_profiles), [*known]);
+        }
+    }
+
+    /// The default must stay inside the closed vocabulary, or
+    /// `default_nat_profile()` would be an unreachable panic waiting to happen.
+    #[test]
+    fn default_nat_profile_is_in_the_closed_vocabulary() {
+        assert!(substrate::KNOWN_NAT_PROFILES.contains(&DEFAULT_PROFILE));
+        assert_eq!(default_nat_profile().as_str(), DEFAULT_PROFILE);
     }
 
     #[test]
