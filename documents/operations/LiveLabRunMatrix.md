@@ -27,6 +27,21 @@ normalized node-level companion ledger for the `--node` engine. It records one
 row per run × node × stage with fetched exact OS/version evidence. Use it—not the
 Linux umbrella columns—to prove Debian, Rocky, Ubuntu, and Fedora separately.
 
+**Known defect — a `*_stage_bootstrap` column can read `fail` for a stage that
+was `skip`.** The per-OS bootstrap columns absorb the run-scoped `preflight`
+stage, and `merge_status` (`live_lab_run_matrix.rs:2215-2231`) correctly ranks
+`fail` above `skip` — so a `preflight` failure writes `fail` into
+`linux_stage_bootstrap`, `macos_stage_bootstrap` **and**
+`windows_stage_bootstrap` at once, even though `bootstrap_hosts` never ran on any
+node. Confirmed on `livelab-1784489499-db3ff1aaafe6` and
+`livelab-1785005557-b7667cce46db`. This inflated the published Windows bootstrap
+fail count from 3 to 5 and misdirected CP-4 triage for five weeks; see
+[`active/WindowsNodeBootstrapTriageVerdict_2026-08-28.md`](./active/WindowsNodeBootstrapTriageVerdict_2026-08-28.md)
+§0(c). Until it is fixed, join any bootstrap-column count against
+`live_lab_node_stage_results.csv` and check `first_failed_stage` before quoting a
+number — the same "take the verdict from the stage's own artifact, never from the
+column" rule AGENTS/CLAUDE §12.3 already imposes for `two_hop`.
+
 ## Purpose
 
 Rustynet must be proven in mixed real-world topologies, not only Debian-only
