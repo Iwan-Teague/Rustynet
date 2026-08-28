@@ -47,7 +47,7 @@ use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
 use crate::privileged_helper::{
     DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH as HELPER_DEFAULT_SOCKET_PATH,
     DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS as HELPER_DEFAULT_TIMEOUT_MS, PrivilegedCommandClient,
-    PrivilegedCommandProgram,
+    PrivilegedCommandProgram, privileged_helper_client_timeout_ms,
 };
 use crate::relay_client::{
     MAX_RELAY_SESSION_TOKEN_TTL_SECS, PreissuedRelaySessionTokenIssuer, RelayClient,
@@ -416,7 +416,17 @@ pub const DEFAULT_FAIL_CLOSED_SSH_ALLOW: bool = false;
 pub const DEFAULT_TRUST_MAX_AGE_SECS: u64 = 300;
 pub const DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS: u64 = 300;
 pub const DEFAULT_TRUSTED_HELPER_SOCKET_PATH: &str = HELPER_DEFAULT_SOCKET_PATH;
-pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = HELPER_DEFAULT_TIMEOUT_MS;
+/// The daemon's *client-side* read/write timeout for the privileged-helper
+/// socket.
+///
+/// Derived from the helper's own server-side budget rather than declared
+/// independently: the client must outlast the server's processing window or a
+/// command the helper completes still fails daemon-side with `os error 35`.
+/// Deploying the daemon with no `--privileged-helper-timeout-ms` at all is the
+/// common case (QH-40 measured exactly that on `macos-utm-1`), so the default
+/// itself has to satisfy the invariant.
+pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 =
+    privileged_helper_client_timeout_ms(HELPER_DEFAULT_TIMEOUT_MS);
 const BLIND_EXIT_DEFAULT_ROUTE_CIDR: &str = "0.0.0.0/0";
 const MAX_BUNDLE_VERIFIER_KEY_BYTES: usize = 4 * 1024;
 const MAX_TRUST_EVIDENCE_BYTES: usize = 8 * 1024;

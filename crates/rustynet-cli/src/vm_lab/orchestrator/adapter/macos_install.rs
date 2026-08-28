@@ -1961,7 +1961,6 @@ mod tests {
             "--egress-interface",
             "--auto-port-forward-exit",
             "--auto-port-forward-lease-secs",
-            "--privileged-helper-timeout-ms",
             "--reconcile-interval-ms",
             "--max-reconcile-failures",
             "--dns-zone-name",
@@ -1986,6 +1985,104 @@ mod tests {
                 .contains("Audited Linux→macOS plist flag parity (HIGH 4 reviewer fold-in)"),
             "install script must keep the audited-omission header intact"
         );
+    }
+
+    /// QH-40: the two plists this script renders carry the two halves of ONE
+    /// timeout setting, and they must stay coherent.
+    ///
+    /// The helper plist's `--timeout-ms` is the SERVER budget; the daemon
+    /// plist's `--privileged-helper-timeout-ms` is the CLIENT read wait on the
+    /// other end of the same socket. The script used to hardcode 30000 on the
+    /// helper and pass NOTHING on the daemon, so the deployed daemon read at
+    /// the 2000 ms default against a helper serving at 30000 ms — a 15x
+    /// asymmetry in which any privileged command slower than 2 s failed
+    /// daemon-side while the helper was still serving it (measured on
+    /// macos-utm-1, MacOsHelperShutdownOrderingDesign_2026-08-27.md §8.2).
+    ///
+    /// This test pins the rendered shape: one configurable server value, a
+    /// client value DERIVED from it, both flags actually emitted, and the
+    /// fail-closed guards that reject an incoherent or unreachable pair.
+    #[test]
+    fn install_service_script_renders_coherent_privileged_helper_timeout_pair() {
+        // The literal 30000 must be gone — it is the defect.
+        assert!(
+            !INSTALL_SERVICE_SCRIPT.contains("<string>30000</string>"),
+            "the helper plist must not hardcode a 30000 ms timeout: it is 6x launchd's \
+             measured 5 s exit ceiling and 15x the daemon's client default"
+        );
+
+        // Helper plist renders the server value from the variable.
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<string>${PRIVILEGED_HELPER_TIMEOUT_MS}</string>"),
+            "the helper plist must render --timeout-ms from PRIVILEGED_HELPER_TIMEOUT_MS"
+        );
+        // Daemon plist renders the derived client value, and actually passes
+        // the flag — its absence is what deployed the mismatch.
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<string>--privileged-helper-timeout-ms</string>"),
+            "the daemon plist must pass --privileged-helper-timeout-ms; omitting it \
+             silently falls back to the client default regardless of the helper's value"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT
+                .contains("<string>${DAEMON_PRIVILEGED_HELPER_TIMEOUT_MS}</string>"),
+            "the daemon plist must render the DERIVED client timeout, not the server one"
+        );
+
+        // The client value is derived, not independently declared.
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains(
+                "DAEMON_PRIVILEGED_HELPER_TIMEOUT_MS=$((PRIVILEGED_HELPER_TIMEOUT_MS + \
+                 PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS))"
+            ),
+            "the daemon client timeout must be derived from the helper server timeout \
+             plus the shared margin, so the two cannot drift apart"
+        );
+
+        // Fail-closed guards: ordering and the launchd ceiling.
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("is shorter than the helper server timeout"),
+            "the script must reject a client timeout below the server timeout"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("exceeds launchd's measured"),
+            "the script must reject a client timeout above launchd's exit-timeout ceiling"
+        );
+
+        // The constants must match the Rust source of truth they are keyed to.
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains(&format!(
+                "PRIVILEGED_HELPER_TIMEOUT_MS=\"${{RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS:-{}}}\"",
+                rustynetd::privileged_helper::DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS
+            )),
+            "the script's helper-timeout default must equal \
+             DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains(&format!(
+                "PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS={}",
+                rustynetd::privileged_helper::PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS
+            )),
+            "the script's client margin must equal \
+             PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains(&format!(
+                "MACOS_LAUNCHD_EXIT_TIMEOUT_MS={}",
+                rustynetd::privileged_helper::MACOS_LAUNCHD_EXIT_TIMEOUT_MS
+            )),
+            "the script's launchd ceiling must equal MACOS_LAUNCHD_EXIT_TIMEOUT_MS"
+        );
+
+        // And the rendered pair must actually satisfy the invariant at the
+        // script's own defaults.
+        let server_ms = rustynetd::privileged_helper::DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS;
+        let client_ms =
+            rustynetd::privileged_helper::privileged_helper_client_timeout_ms(server_ms);
+        rustynetd::privileged_helper::validate_privileged_helper_timeout_pair(server_ms, client_ms)
+            .expect("the script's default pair must satisfy the client >= server invariant");
+        rustynetd::privileged_helper::validate_macos_privileged_helper_shutdown_budget(client_ms)
+            .expect("the script's default pair must fit under the launchd kill ceiling");
     }
 
     // ── Phase 23: cross-OS orchestrator bootstrap wrapper parity ────────────

@@ -61,7 +61,98 @@ use rustynet_local_security::{
 pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = "/run/rustynet/rustynetd-privileged.sock";
 #[cfg(windows)]
 pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH;
+/// The helper *server's* I/O + subprocess-watchdog budget (`privileged-helper
+/// --timeout-ms`).
+///
+/// One value drives three server-side waits: the accepted socket's read
+/// timeout, its write timeout, and the `run_privileged_subprocess` execution
+/// watchdog in `handle_request_with_timeout`. So the worst case a well-behaved
+/// client must wait for a response is bounded by this value plus the write.
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = 2_000;
+
+/// Slack added to the server budget to derive the daemon-side (client) read
+/// wait (`rustynetd daemon --privileged-helper-timeout-ms`).
+///
+/// The client's socket read timeout must outlast the server's processing
+/// window, otherwise a privileged command that the helper completes *inside*
+/// its own budget still fails on the daemon side with
+/// `Resource temporarily unavailable (os error 35)`. Deriving the client value
+/// from the server value — rather than letting the two be configured
+/// independently — is what keeps them coherent.
+pub const PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS: u64 = 1_000;
+
+/// launchd's per-service exit timeout on macOS, measured on `macos-utm-1`
+/// (macOS 26.5, build 25F71) 2026-08-27 via `launchctl print`: `exit timeout
+/// = 5` for every rustynet LaunchDaemon and for Apple's own `sshd`. No
+/// rustynet plist declares `ExitTimeOut`, so this is the platform default.
+///
+/// Anything the daemon does between `SIGTERM` and exit — including every
+/// privileged-helper call the shutdown rollback makes — dies by `SIGKILL` once
+/// this elapses. A helper client timeout above the ceiling can therefore never
+/// complete during shutdown, which is why the macOS service renderers reject
+/// one.
+pub const MACOS_LAUNCHD_EXIT_TIMEOUT_MS: u64 = 5_000;
+
+/// Derive the daemon-side client timeout from the helper-side server timeout.
+#[must_use]
+pub const fn privileged_helper_client_timeout_ms(server_timeout_ms: u64) -> u64 {
+    server_timeout_ms.saturating_add(PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS)
+}
+
+/// Fail closed on an incoherent helper timeout pair.
+///
+/// The daemon process cannot perform this check itself: it is the client half
+/// and never learns the helper's `--timeout-ms` (there is no protocol field
+/// carrying it). The only place both numbers exist at once is the installer /
+/// service renderer that emits both unit files, so that is where the invariant
+/// is enforced — and it is enforced by rejection, not by a warning, because a
+/// silently accepted mismatch reproduces exactly the defect this check exists
+/// to prevent (QH-40: helper serving at 30000 ms, daemon reading at 2000 ms).
+pub fn validate_privileged_helper_timeout_pair(
+    server_timeout_ms: u64,
+    client_timeout_ms: u64,
+) -> Result<(), String> {
+    if server_timeout_ms == 0 {
+        return Err("privileged helper server timeout must be greater than zero".to_owned());
+    }
+    if client_timeout_ms == 0 {
+        return Err("privileged helper client timeout must be greater than zero".to_owned());
+    }
+    if client_timeout_ms < server_timeout_ms {
+        return Err(format!(
+            "privileged helper timeout mismatch: the daemon's client read timeout \
+             ({client_timeout_ms} ms) is shorter than the helper's server processing \
+             window ({server_timeout_ms} ms). Any privileged command slower than the \
+             client timeout would fail daemon-side while the helper is still serving \
+             it. Set --privileged-helper-timeout-ms to at least the helper's \
+             --timeout-ms (recommended: helper + \
+             {PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS} ms)"
+        ));
+    }
+    Ok(())
+}
+
+/// Fail closed on a macOS helper timeout pair that cannot finish before
+/// launchd's `SIGKILL`.
+///
+/// macOS-specific and therefore separate from
+/// [`validate_privileged_helper_timeout_pair`]: Linux has no equivalent
+/// ceiling, and the historically useful 10000 ms helper timeout stays legal
+/// there.
+pub fn validate_macos_privileged_helper_shutdown_budget(
+    client_timeout_ms: u64,
+) -> Result<(), String> {
+    if client_timeout_ms > MACOS_LAUNCHD_EXIT_TIMEOUT_MS {
+        return Err(format!(
+            "privileged helper client timeout {client_timeout_ms} ms exceeds launchd's \
+             measured {MACOS_LAUNCHD_EXIT_TIMEOUT_MS} ms per-service exit timeout, so a \
+             shutdown-path helper call could not complete or fail before SIGKILL. Lower \
+             the helper --timeout-ms so that helper + \
+             {PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS} ms stays within the ceiling"
+        ));
+    }
+    Ok(())
+}
 
 // The frame/size constants below describe the unix helper wire protocol, which
 // Windows never speaks (the IPC path fails closed first). Gate them to match.
@@ -662,24 +753,39 @@ fn read_response_frame(stream: &mut UnixStream) -> Result<HelperResponse, String
 /// Add the operational cause to a truncated-response error.
 ///
 /// On a length-prefixed IPC, an `UnexpectedEof` mid-frame means the peer went
-/// away — it is never data corruption. The overwhelmingly common reason is the
-/// helper's own I/O timeout elapsing while it runs a privileged command, after
-/// which it drops the connection and the daemon reports a *framing* fault. That
-/// wording sends the reader looking for protocol damage instead of at a
-/// too-tight timeout: observed live on a 2-core guest as a continuous
-/// `truncated frame header` loop that stopped dead when the timeout was raised
-/// from 2000 ms to 10000 ms. Name the knob so the next reader does not have to
-/// rediscover it.
+/// away — it is never data corruption.
+///
+/// This annotation used to assert the cause was the helper's own I/O timeout
+/// elapsing mid-command. **That causal claim was refuted by live measurement**
+/// on `macos-utm-1`, 2026-08-27 (`MacOsHelperShutdownOrderingDesign_2026-08-27.md`
+/// §8.2): an idle connection against the deployed helper was held for the full
+/// two timeout windows and then answered with a *well-formed* error response
+/// frame, with the helper still alive. Every timeout path — the request-read
+/// timeout and the `run_privileged_subprocess` execution watchdog — returns a
+/// response; none of them closes silently, and a client-side read timeout
+/// surfaces as `Resource temporarily unavailable (os error 35)`, a different
+/// string entirely.
+///
+/// The two paths that actually produce zero response bytes are named below.
+/// The timeout knobs are still worth naming — a too-tight budget is what pushes
+/// execution onto the long error path in the first place — but they are listed
+/// as a contributing factor, not as the cause.
 #[cfg(not(windows))]
 fn annotate_helper_response_read_error(message: String) -> String {
     if !message.contains("truncated") {
         return message;
     }
     format!(
-        "{message} (the helper closed the connection mid-frame -- this is not protocol \
-         corruption; it is usually the helper's own I/O timeout elapsing while it runs a \
-         privileged command, so raise --timeout-ms / \
-         RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS before suspecting the transport)"
+        "{message} (the helper closed the connection having sent zero response bytes -- \
+         this is not protocol corruption. Two paths do that: the helper process went away \
+         mid-request (launchd booted it out, e.g. a teardown that stopped the helper while \
+         the daemon was still rolling back), or it built a response too large to frame and \
+         dropped the connection rather than send it. A helper I/O timeout does NOT cause \
+         this -- every timeout path answers with a well-formed error frame, and a \
+         client-side read timeout reports `Resource temporarily unavailable (os error 35)` \
+         instead. Check helper liveness first; --timeout-ms / \
+         RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS remain worth raising on a slow host because \
+         a watchdog kill is what routes execution onto the long error path)"
     )
 }
 
@@ -4910,10 +5016,13 @@ mod tests {
     fn truncated_response_error_names_the_timeout_not_corruption() {
         // Regression pin for a live 2-core-guest failure: the daemon logged
         // `privileged helper response read failed: truncated frame header` in a
-        // continuous loop, which reads as protocol corruption. It was the
-        // helper's own I/O timeout elapsing mid-command; raising it from
-        // 2000 ms to 10000 ms stopped it dead. On a length-prefixed IPC an EOF
-        // mid-frame can only mean the peer went away.
+        // continuous loop, which reads as protocol corruption. On a
+        // length-prefixed IPC an EOF mid-frame can only mean the peer went
+        // away. The original annotation blamed the helper's own I/O timeout;
+        // that mechanism was refuted by live measurement 2026-08-27 (the helper
+        // answers every timeout with a well-formed error frame and stays
+        // alive), so the text now names the two real zero-byte paths while
+        // still pointing at the timeout knobs as a contributing factor.
         let annotated = super::annotate_helper_response_read_error(
             "privileged helper response read failed: truncated frame header".to_owned(),
         );
@@ -5696,5 +5805,107 @@ mod tests {
             .expect_err("non-IP endpoint must be rejected");
         super::validate_route_args(&["-n", "add", "-inet", "-host", "192.168.65.3", "not-an-ip"])
             .expect_err("non-IP gateway must be rejected");
+    }
+
+    // ── QH-40: the client/server privileged-helper timeout invariant ────────
+    //
+    // The invariant is: the daemon's CLIENT read timeout must be at least the
+    // helper's SERVER processing window. Violating it makes a privileged
+    // command that the helper COMPLETES fail anyway on the daemon side, and
+    // during shutdown that is a rollback-step failure.
+
+    #[test]
+    fn default_client_timeout_is_at_least_the_default_server_timeout() {
+        let server_ms = super::DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS;
+        let client_ms = crate::daemon::DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS;
+
+        assert!(
+            client_ms >= server_ms,
+            "daemon client timeout {client_ms} ms must be >= helper server timeout \
+             {server_ms} ms; a shorter client wait fails commands the helper completes"
+        );
+        // The defaults are the values a deployment gets when it passes NO
+        // flags, which is exactly how the daemon was deployed when QH-40
+        // measured the mismatch. Pin the derivation, not just the ordering, so
+        // the two cannot drift apart by an edit to only one of them.
+        assert_eq!(
+            client_ms,
+            super::privileged_helper_client_timeout_ms(server_ms),
+            "the daemon default must stay derived from the helper default"
+        );
+        const {
+            assert!(
+                super::PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS > 0,
+                "a zero margin leaves the client deadline racing the server's own watchdog"
+            );
+        }
+        super::validate_privileged_helper_timeout_pair(server_ms, client_ms)
+            .expect("the shipped defaults must satisfy their own validator");
+    }
+
+    #[test]
+    fn default_timeouts_fit_under_the_measured_launchd_kill_ceiling() {
+        // §8.1: launchd's per-service exit timeout measured at 5 s on macOS
+        // 26.5. A shutdown-path helper call budgeted above it can only ever
+        // end in SIGKILL, so the defaults must leave room for one call.
+        let client_ms = crate::daemon::DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS;
+        assert!(
+            client_ms <= super::MACOS_LAUNCHD_EXIT_TIMEOUT_MS,
+            "default client timeout {client_ms} ms must fit within launchd's {} ms \
+             exit timeout so a shutdown-path call can complete or fail before SIGKILL",
+            super::MACOS_LAUNCHD_EXIT_TIMEOUT_MS
+        );
+        super::validate_macos_privileged_helper_shutdown_budget(client_ms)
+            .expect("the shipped defaults must satisfy the launchd shutdown budget");
+    }
+
+    #[test]
+    fn mismatched_explicit_timeout_configuration_is_rejected_not_warned() {
+        // The exact deployed mismatch QH-40 measured on macos-utm-1: helper
+        // plist at 30000 ms, daemon plist passing nothing so the client sat at
+        // the 2000 ms default. Fail closed — a warning would let the same
+        // configuration ship again.
+        let err = super::validate_privileged_helper_timeout_pair(30_000, 2_000)
+            .expect_err("a client timeout below the server timeout must be rejected");
+        assert!(
+            err.contains("privileged helper timeout mismatch"),
+            "the rejection must name the defect: {err}"
+        );
+        assert!(
+            err.contains("--privileged-helper-timeout-ms") && err.contains("--timeout-ms"),
+            "the rejection must name both knobs so the operator can act on it: {err}"
+        );
+
+        // Equal values satisfy the invariant (this is what the systemd unit
+        // renders today, passing one env value to both sides) even though the
+        // derived shape adds a margin.
+        super::validate_privileged_helper_timeout_pair(2_000, 2_000)
+            .expect("an equal pair satisfies client >= server");
+
+        // Zero on either side is rejected before the ordering check.
+        super::validate_privileged_helper_timeout_pair(0, 2_000)
+            .expect_err("a zero server timeout must be rejected");
+        super::validate_privileged_helper_timeout_pair(2_000, 0)
+            .expect_err("a zero client timeout must be rejected");
+    }
+
+    #[test]
+    fn macos_shutdown_budget_rejects_a_client_timeout_above_the_kill_ceiling() {
+        // The historically useful 10000 ms helper timeout stays legal on Linux
+        // (no ceiling there, so no equivalent check runs) but cannot be
+        // deployed on macOS, where launchd kills the daemon at 5 s.
+        let client_ms = super::privileged_helper_client_timeout_ms(10_000);
+        let err = super::validate_macos_privileged_helper_shutdown_budget(client_ms)
+            .expect_err("a client timeout above the launchd ceiling must be rejected");
+        assert!(
+            err.contains("exit timeout"),
+            "the rejection must name the launchd ceiling: {err}"
+        );
+
+        // The boundary itself is allowed; only exceeding it is not.
+        super::validate_macos_privileged_helper_shutdown_budget(
+            super::MACOS_LAUNCHD_EXIT_TIMEOUT_MS,
+        )
+        .expect("a client timeout exactly at the ceiling is allowed");
     }
 }
