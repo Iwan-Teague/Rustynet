@@ -4596,3 +4596,79 @@ replay/gensis/genesis-binding/non-monotonic/corrupt-hash, role-presets lockout p
 - crypto: signature binds to seed+payload only — key_identifier never perturbs
   signature bytes; provider-policy acceptance matrix (hardware-primary,
   software-primary-ok, local-fallback-forbidden) pinned.
+
+### QH-63 — FIXED: a cross-network run pins a vxlan egress interface that outlives the overlay, and `cleanup_hosts` never removes it
+
+Cost two live-lab runs. A cross-network run leaves
+`RUSTYNET_EGRESS_INTERFACE=rustynet-vx0` in `/etc/default/rustynetd` on every
+overlay participant; the next ordinary run's `install-systemd` prefers that
+stale value over live detection and dies with `egress interface does not exist`.
+Seeded on at least three guests (two lenovo hosts plus `debian-headless-2`) by
+the cross-network run of 2026-08-27 ~14:57Z. Evidence: `LiveValidation_2026-08-28.md`
+§9 (on branch `work/live-validate`) plus the dispositioned stubs in
+`live_lab_stage_triage.jsonl`.
+
+**Who writes the pin.** Not the substrate code — `ops install-systemd` itself,
+at `crates/rustynet-cli/src/ops_install_systemd.rs` (the
+`RUSTYNET_EGRESS_INTERFACE` entry in `env_entries`). Its value comes from
+`resolve_egress_interface`, which, when a selected exit endpoint is present,
+derives the interface with `ip route get` against that endpoint. While the
+overlay is up that route leaves through `rustynet-vx0`, so the derived — and
+correct-at-the-time — answer is the overlay link. Teardown then deletes the
+link and the pin is left naming a device that no longer exists.
+
+Three independent defects, all three now fixed:
+
+1. **The writer did not own its residue.** `cross_network_substrate_teardown`
+   removed every link it created but not the env-file pin the overlay caused to
+   be written. It now reverts the pin on each guest it tore a link down on,
+   keyed on an exact value match against the substrate's own link names
+   (`rustynet-vx0`, `rustynet-vxl`), so a pin naming a real NIC is never
+   touched. A missing env file is the idempotent success case; any other
+   failure fails the stage, exactly like a failed `ip link del`.
+
+2. **The reader blindly trusted an inherited pin.** `install-systemd` now
+   records provenance alongside the pin, as a plain `KEY=VALUE` line
+   (`RUSTYNET_EGRESS_INTERFACE_SOURCE=operator|derived`) that the existing env
+   reader/writer round-trips with no format change. An inherited pin marked
+   `derived` whose interface is absent is re-derived from live routing state,
+   with a warning. An operator pin still fails loudly — silently overriding an
+   operator's explicit configuration is worse than refusing to install. A
+   MISSING or unrecognised marker reads as `operator`, so every env file
+   written before this change keeps today's strict behaviour and nothing is
+   auto-healed on a guess. Provenance is carried forward on re-install rather
+   than recomputed, so one marker-less re-install cannot downgrade an operator
+   pin into an auto-healable one.
+
+3. **`cleanup_hosts` passed over the residue.** Kept as a backstop rather than
+   made redundant by (1), because (1) cannot reach two real cases: a run whose
+   teardown never got to a given guest, and the pins already on disk from runs
+   that predate this fix — those files carry no provenance marker at all.
+   `linux_traffic::cleanup_runtime_state` now removes a pin only when all three
+   hold: a pin exists, `ip link show` says its interface does not, AND either
+   the marker says `derived` or the pinned value is one of this repository's
+   own overlay link names (which no operator deployment could legitimately pin
+   as its egress NIC). Best-effort like its sibling resets: if it does not
+   take, the stale pin resurfaces as the same loud install failure it does
+   today. It runs AFTER the interface reset so an interface this cleanup just
+   deleted reads as absent.
+
+**Reach of the fix on the currently poisoned guests.** The teardown revert in
+(1) is marker-independent (exact value match), and the overlay-link-name arm of
+(3) is too, so both heal the three guests seeded on 2026-08-27 without operator
+intervention. The provenance-based auto-heal in (2) deliberately does not — an
+unmarked file is treated as operator configuration.
+
+Tests: `only_the_exact_derived_marker_reads_as_installer_derived`,
+`only_an_inherited_derived_pin_may_be_rederived`,
+`an_explicit_egress_interface_is_recorded_as_operator_configuration`,
+`an_inherited_egress_interface_carries_its_recorded_provenance_forward`
+(`ops_install_systemd.rs`);
+`teardown_reverts_the_egress_pin_the_overlay_caused_to_be_written`,
+`a_guest_with_no_daemon_env_file_is_not_reported_as_residue`,
+`a_failed_egress_pin_revert_fails_the_teardown_stage`,
+`egress_pin_deletion_refuses_a_regex_unsafe_interface_name`
+(`stage/cross_network/substrate.rs`);
+`linux_egress_pin_reset_only_removes_a_stale_lab_written_pin`,
+`egress_pin_reset_runs_after_the_interface_reset` (`adapter/linux_traffic.rs`).
+Live proof still pending the next cross-network run.
