@@ -97,7 +97,9 @@ mirror image, making them read **redder**.
 ### How to re-verify
 
 - Ledger tallies: quote-aware `csv.DictReader` over
-  `documents/operations/live_lab_node_run_matrix.csv` (106 rows, 267 columns).
+  `documents/operations/live_lab_node_run_matrix.csv` (**178 rows** as re-counted
+  2026-08-28 at `34a9e6f8`; 106 when this plan was written — the ledger is
+  append-only, so re-derive the count rather than citing one).
   Per §12.3 an `awk -F,` read of this file is wrong by construction.
 - Stage vocabulary: the `=> "…"` wire-name arms in
   `vm_lab/orchestrator/stage/mod.rs`.
@@ -120,7 +122,7 @@ active, ports bound, `/healthz` ok, stop/restart (`stage/relay_validation.rs:10-
 zero occurrences of forward/frame/payload/plaintext in the validator body). The
 bash dialect's `validate_linux_relay_forwards_frame` (registry `:1849`, impl
 `vm_lab/mod.rs:16459`) has **never run** — `linux_relay_forwards_frame` is
-`not_run` in all 106 rows.
+`not_run` in all 106 rows *(re-counted 2026-08-28: still `not_run` in all **178**)*.
 
 **[REVIEW — MINOR]** `role_validation/relay.rs:142-144` already documents this
 gap and scopes the forwarded-frame proof to "Wave 4". Cite it rather than
@@ -131,7 +133,8 @@ inferring.
 **VERIFIED, survived review, and CLOSED for the audit family by I1.**
 
 All 24 `{platform}_{audit_id}` cells and `linux_relay_forwards_frame` were
-`not_run` in all 106 rows. The work was being done: the eight audit identifiers
+`not_run` in all 106 rows *(re-counted 2026-08-28: `linux_relay_forwards_frame`
+is still `not_run` in all **178**)*. The work was being done: the eight audit identifiers
 in `LINUX_SECURITY_AUDITS` are byte-identical to the column suffixes, and each is
 accepted only on its typed evaluator's full contract, not the daemon's
 `overall_ok` flag. The columns stayed empty because `special:` is declared on the
