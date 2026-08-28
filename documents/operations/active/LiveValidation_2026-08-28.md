@@ -234,3 +234,110 @@ ops vm-lab-orchestrate-live-lab \
 Run it from a shell, not through the MCP wrapper, until D1 is fixed. Partial artifacts from the
 refused attempt (discovery + network evidence only, no stages) are under
 `state/live-lab-validate-20260828/`.
+
+## 8) Follow-up: D1 and D2 fixed on `work/launch-path-fixes`
+
+Both defects triaged in §3 are now closed in code. No lab run was performed for this
+work — the fixes are pinned by unit tests, not by hardware, and the §6 owner decision
+on `livelab-1787849060-86f633c907cf::bootstrap_hosts` is still outstanding and still
+blocks any Linux run.
+
+*(This file was brought onto `work/launch-path-fixes` from `work/live-validate` so the
+follow-up could live with the triage it answers. It is the same blob plus this section;
+the branches were NOT merged.)*
+
+### D1 — the MCP launcher no longer injects mac/windows VM flags into a Linux-only run
+
+`start_live_lab_run` (`crates/rustynet-mcp/src/bin/lab_state.rs`) filled
+`--windows-vm` / `--macos-vm` from the inventory whenever `auto_topology` was on
+(the default), regardless of what `nodes` asked for. Two changes:
+
+- Auto-topology is now scoped to the case it was written for — a request that names
+  NO topology. When `nodes` is set, that list is the complete guest set, exactly as
+  it is on the shell path, and nothing extends it (`auto_topology_vm_aliases`).
+- An *explicit* `windows_vm` / `macos_vm` next to `nodes` is now REFUSED rather than
+  silently dropped, matching the existing rejection of the role-platform selectors.
+  Under the `--node` engine such an alias assigns no role but is not inert: it claims
+  that guest's QH-18 flock (`run_exclusion::guest_refs_for_orchestrate`) and flips
+  `wants_windows` / `wants_macos` in `orchestrator::evidence`, planning stages for an
+  OS the topology does not contain.
+
+Negative test: `a_linux_only_node_topology_renders_no_windows_or_macos_vm_flags`
+renders the argv for the exact five-node Linux topology from §7 with both aliases
+resolvable from the inventory, and asserts no `--windows-vm` / `--macos-vm` appears
+and exactly five `--node` flags do. `auto_topology_still_fills_both_when_no_nodes_are_given`
+pins that 3-OS coverage runs are unaffected;
+`explicit_windows_or_macos_vm_next_to_nodes_is_refused` pins the refusal.
+
+### D2(a) — the UTM bundle read is bounded
+
+`mac_address_from_utm_config_plist` (`vm_lab/mod.rs`) called bare
+`fs::read_to_string`; its sibling `resolve_local_utm_live_host_via_utmctl` was already
+bounded by `run_output_with_timeout`. The plist read now goes through a new
+`read_to_string_with_timeout` on the same `DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS`
+constant. The worker thread is not joined on timeout — a thread blocked in an
+uninterruptible kernel `open()` cannot be cancelled, and leaking it is what lets the
+caller return and drop the fleet's locks.
+
+Failure classification is the load-bearing part, and it is fail-closed:
+
+- a plain I/O miss (no bundle, no `config.plist`) stays `Ok(None)` — the historical
+  best-effort "this guest has no ARP fallback";
+- an unexpected I/O error is additionally named on stderr rather than dropped;
+- a **timeout** returns `Err` naming the path, and readiness turns that into
+  `ProbeState::Error` instead of falling through to `inventory.last_known_ip`. The
+  guest is reported NOT ready. A host that cannot read its own bundles cannot vouch
+  for the guest's address either, so dressing an unknown up as a `Fallback` — which
+  is what the old chain did — let a wedged host look ready.
+
+Tests: `a_read_that_never_completes_is_bounded_and_names_the_path` drives the bound
+against a writer-less FIFO (same never-completing `open()` shape as the live wedge)
+and asserts both the deadline and that the message names the path;
+`a_timed_out_bundle_read_fails_closed_rather_than_reading_as_a_clean_miss` pins the
+Timeout-vs-Io classification the readiness path depends on.
+
+### D2(b) — lock ordering: KEPT as lock-then-probe, deliberately
+
+§3 D2 suggested acquiring guest locks after readiness. Examined and rejected;
+the reasoning is recorded in the doc comment on `resolve_controller_live_host`
+so it is not silently re-litigated:
+
+1. The flock is taken at the single `execute_ops` dispatch chokepoint, which also
+   covers `vm-lab-setup-live-lab` / `vm-lab-run-live-lab` — including when the
+   orchestrator calls them in-process as its own phases. Probing first would mean
+   hoisting readiness into the dispatcher, i.e. redesigning the chokepoint.
+2. Readiness is not read-only. With `--update-inventory-live-ips` it WRITES the
+   shared inventory (`persist_local_utm_ready_states_to_inventory`) and power-probes
+   guests; a probe-then-lock shape leaves that write in the unlocked window — the
+   exact concurrent mutation the flock exists to prevent.
+3. It would not have helped here anyway: the claim set is derived from the run's
+   config before any probing, so probing first narrows no lock set. The
+   seven-locks-for-five-guests symptom was an argv defect, and is fixed at the argv
+   (D1 above).
+
+Self-recovery therefore comes from (a): every branch of the readiness resolver now
+has a deadline, so a wedged host releases its locks by failing that guest's readiness
+rather than by holding the fleet indefinitely.
+
+### §4 `preflight_check` / `update_inventory` timeouts — structural, not fixed here
+
+Both were checked. Neither is a case of over-generous per-guest timeouts:
+
+- `preflight_check`'s own per-node probe is already tight (`tcp_reachable` at 2 s).
+  Its cost is `controller_status_map` → `discovered_hosts_json`, which shells out to
+  `cargo run … ops vm-lab-discover-hosts` with a **120 s** budget — a cargo build
+  plus a fleet-wide discovery.
+- `update_inventory` is `run_ops("vm-lab-discover-local-utm-summary", …)` at
+  **600 s**, likewise behind a `cargo run`.
+
+Both per-call budgets already exceed a typical MCP client limit before any guest is
+touched, so trimming per-guest timeouts cannot bring them under it; the fix is
+structural (pre-build the CLI, or make these async jobs like `start_live_lab_run`)
+and is left for the owner of that surface. One contributing cause IS closed here:
+`update_inventory` runs the discovery path that wedged in the unbounded plist read,
+so that particular non-return is gone.
+
+### Gates
+
+Run from the `work/launch-path-fixes` worktree with a worktree-local
+`CARGO_TARGET_DIR`. Results are recorded in the branch's commit trailer.

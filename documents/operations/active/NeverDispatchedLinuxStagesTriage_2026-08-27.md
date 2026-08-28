@@ -410,6 +410,11 @@ off. Not edited here — those are signed dispositions and the correction is the
 Every *substantive* claim above re-verified as still true at 178 rows. Only the counts
 are stale. Re-derive counts; do not cite them.
 
+**Applied 2026-08-28.** All five documents carry dated in-place corrections to 178 rows
+(re-derived at `34a9e6f8`); the substantive claims were left as written. The signed
+disposition content in `BashRetirementDispositions_2026-08-22.md` was not touched — only
+its counts — so §4.1's owner-gated B1.6 misfiling remains open.
+
 ### 4.3 `BashRetirementDispositions_2026-08-22.md` B6.2 — incomplete, not wrong
 
 > **B6.2 `linux_stage_chaos`** — "deferred / out of mac-win-cross-OS program scope"

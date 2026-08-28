@@ -33,6 +33,35 @@ LOG_DIR="/usr/local/var/log/rustynet"
 PLIST_DST="/Library/LaunchDaemons/com.rustynet.daemon.plist"
 SOCKET_PATH="/private/var/run/rustynet/rustynetd.sock"
 PRIVILEGED_HELPER_SOCKET="/private/var/run/rustynet/rustynetd-privileged.sock"
+# ── Privileged-helper timeout pair (QH-40) ───────────────────────────────────
+#
+# These two values are one setting rendered into two plists, not two
+# independent knobs. The helper's --timeout-ms is the SERVER budget (socket
+# read/write plus the subprocess execution watchdog); the daemon's
+# --privileged-helper-timeout-ms is the CLIENT read wait on the other end of
+# the same socket. The client must outlast the server, otherwise a privileged
+# command the helper completes inside its own budget still fails daemon-side
+# with `Resource temporarily unavailable (os error 35)` — and during shutdown
+# such a failure is a rollback-step failure.
+#
+# This script used to render exactly that mismatch: the helper plist hardcoded
+# 30000 while the daemon plist passed no flag at all and fell back to the
+# 2000 ms client default, a 15x asymmetry (measured on macos-utm-1 2026-08-27,
+# MacOsHelperShutdownOrderingDesign_2026-08-27.md §8.2).
+#
+# The ceiling is not a preference either. launchd's per-service exit timeout
+# was measured at 5 s on macOS 26.5 for every rustynet LaunchDaemon and for
+# Apple's own sshd (§8.1), and no rustynet plist declares ExitTimeOut. So a
+# client timeout above 5000 ms can never complete a shutdown-path helper call
+# before SIGKILL, which is why the derived value is checked against it below
+# and the install fails closed rather than deploying an unreachable budget.
+#
+# Keep these in sync with DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
+# PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS, and MACOS_LAUNCHD_EXIT_TIMEOUT_MS
+# in crates/rustynetd/src/privileged_helper.rs.
+PRIVILEGED_HELPER_TIMEOUT_MS="${RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS:-2000}"
+PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS=1000
+MACOS_LAUNCHD_EXIT_TIMEOUT_MS=5000
 NODE_ID=""
 NODE_ROLE=""
 NETWORK_ID=""
@@ -114,6 +143,23 @@ fi
 # Fail closed — an invalid or missing value must never silently end up in the plist.
 if [[ ! "${WG_INTERFACE}" =~ ^utun[0-9]+$ ]]; then
   echo "error: --wg-interface '${WG_INTERFACE}' must match ^utun[0-9]+$" >&2
+  exit 2
+fi
+
+# Derive and validate the privileged-helper timeout pair (see the block by the
+# variable definitions above). Fail closed on every branch: an incoherent or
+# unreachable pair must never reach a rendered plist.
+if [[ ! "${PRIVILEGED_HELPER_TIMEOUT_MS}" =~ ^[0-9]+$ ]] || [[ "${PRIVILEGED_HELPER_TIMEOUT_MS}" -le 0 ]]; then
+  echo "error: RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS '${PRIVILEGED_HELPER_TIMEOUT_MS}' must be a positive integer" >&2
+  exit 2
+fi
+DAEMON_PRIVILEGED_HELPER_TIMEOUT_MS=$((PRIVILEGED_HELPER_TIMEOUT_MS + PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS))
+if [[ "${DAEMON_PRIVILEGED_HELPER_TIMEOUT_MS}" -lt "${PRIVILEGED_HELPER_TIMEOUT_MS}" ]]; then
+  echo "error: derived daemon privileged-helper client timeout ${DAEMON_PRIVILEGED_HELPER_TIMEOUT_MS} ms is shorter than the helper server timeout ${PRIVILEGED_HELPER_TIMEOUT_MS} ms" >&2
+  exit 2
+fi
+if [[ "${DAEMON_PRIVILEGED_HELPER_TIMEOUT_MS}" -gt "${MACOS_LAUNCHD_EXIT_TIMEOUT_MS}" ]]; then
+  echo "error: derived daemon privileged-helper client timeout ${DAEMON_PRIVILEGED_HELPER_TIMEOUT_MS} ms exceeds launchd's measured ${MACOS_LAUNCHD_EXIT_TIMEOUT_MS} ms per-service exit timeout; a shutdown-path helper call could not complete or fail before SIGKILL. Lower RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS so that helper + ${PRIVILEGED_HELPER_CLIENT_TIMEOUT_MARGIN_MS} ms stays within the ceiling" >&2
   exit 2
 fi
 
@@ -313,6 +359,19 @@ fi
 #       survive daemon restarts. Without an explicit spool path the
 #       daemon loses replay protection across restarts on macOS.
 #       macOS spool: ${STATE_ROOT}/membership/rustynetd.gossip.watermark
+#   --privileged-helper-timeout-ms
+#       systemd value: ${RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS} (same env value
+#       the systemd unit gives the helper's own --timeout-ms)
+#       daemon default: 3000 (helper default 2000 + 1000 ms client margin)
+#       reason: this flag is the CLIENT half of a pair whose SERVER half this
+#       same script renders into the helper plist. Omitting it was safe only
+#       while both sides sat at the same default; the helper plist hardcoded
+#       30000 ms, so the omission deployed a 15x client/server asymmetry in
+#       which any privileged command slower than 2 s failed daemon-side while
+#       the helper was still serving it (QH-40,
+#       MacOsHelperShutdownOrderingDesign_2026-08-27.md §8.2). Both halves are
+#       now derived from one value and validated against each other and against
+#       launchd's measured 5 s exit-timeout ceiling before rendering.
 #
 # Flags INTENTIONALLY OMITTED because the daemon default already matches
 # the Linux-validated value on macOS:
@@ -323,7 +382,6 @@ fi
 #   --egress-interface               default: "auto" — matches systemd
 #   --auto-port-forward-exit         default: false — matches systemd
 #   --auto-port-forward-lease-secs   default: 1200 — matches systemd
-#   --privileged-helper-timeout-ms   default: 2000 — matches systemd
 #   --reconcile-interval-ms          default: 1000 — matches systemd
 #   --max-reconcile-failures         default: 5 — matches systemd
 #   --dns-zone-name                  default: "rustynet" — matches systemd
@@ -426,6 +484,8 @@ ${WG_ENCRYPTED_KEY_PLIST_FRAGMENT}
         <string>${SOCKET_PATH}</string>
         <string>--privileged-helper-socket</string>
         <string>${PRIVILEGED_HELPER_SOCKET}</string>
+        <string>--privileged-helper-timeout-ms</string>
+        <string>${DAEMON_PRIVILEGED_HELPER_TIMEOUT_MS}</string>
 ${FAIL_CLOSED_SSH_PLIST_FRAGMENT}
     </array>
     <key>UserName</key>
@@ -513,7 +573,7 @@ cat > "${HELPER_PLIST_DST}" <<HELPER_PLIST
         <string>--allowed-gid</string>
         <string>${RUSTYNETD_GID}</string>
         <string>--timeout-ms</string>
-        <string>30000</string>
+        <string>${PRIVILEGED_HELPER_TIMEOUT_MS}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
