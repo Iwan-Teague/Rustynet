@@ -41,16 +41,16 @@
 
 use std::time::Duration;
 
-use super::super::substrate::NetLeafRunner;
-use super::host::{CHECK_PASS, ScenarioHost};
+use super::host::ScenarioHost;
 use super::provisioning::{
     self, AllowSpec, AssignmentsSpec, EnvFile, LabContext, NodeSpec, during,
 };
+use super::remote_exit_common::{BypassRun, run_bypass_validator, write_trust_summary};
 use super::{
-    Checks, DAEMON_SOCKET, REMOTE_RUSTYNET_BIN, ScenarioInputs, ScenarioOutcome, WIREGUARD_PORT,
-    capture_root_allow_failure, client_exit_selected, exit_masquerade_present, exit_serving_route,
-    netcheck, no_plaintext_passphrase_check, path_proven_direct, retry_root, route_via_rustynet,
-    signed_state_healthy, status, wait_for_daemon_socket,
+    Checks, ScenarioInputs, ScenarioOutcome, WIREGUARD_PORT, capture_root_allow_failure,
+    client_exit_selected, exit_masquerade_present, exit_serving_route, netcheck,
+    no_plaintext_passphrase_check, path_proven_direct, route_via_rustynet, signed_state_healthy,
+    status, wait_for_daemon_socket,
 };
 
 /// The report's check names, in the shell's emission order.
@@ -79,10 +79,6 @@ const STEADY_STATE_CHECKS: &[&str] = &[
     "cross_network_topology_heuristic",
 ];
 
-/// `live_lab_retry_root … 10 2` around `route advertise`.
-pub(crate) const ROUTE_ADVERTISE_ATTEMPTS: u32 = 10;
-/// The inter-attempt sleep of that retry.
-pub(crate) const ROUTE_ADVERTISE_SLEEP: Duration = Duration::from_secs(2);
 /// The `sleep 5` that lets the advertised route converge before evidence is
 /// captured. Sampling before it turns a slow convergence into a false failure.
 pub(crate) const POST_ADVERTISE_SETTLE: Duration = Duration::from_secs(5);
@@ -98,15 +94,6 @@ const BYPASS_REPORT_FILE: &str = "cross_network_direct_remote_exit_server_ip_byp
 const BYPASS_LOG_FILE: &str = "cross_network_direct_remote_exit_server_ip_bypass.log";
 /// Artifact basename of the ssh trust summary.
 const TRUST_SUMMARY_FILE: &str = "cross_network_direct_remote_exit_ssh_trust_summary.txt";
-
-/// The checks the server-IP bypass report is read for, in the shell's order.
-/// The aggregation below indexes into this list, so the two cannot drift.
-const BYPASS_CHECKS: &[&str] = &[
-    "internet_route_via_rustynet0",
-    "probe_service_blocked_from_client",
-    "probe_endpoint_route_direct_not_tunnelled",
-    "no_unexpected_bypass_routes",
-];
 
 /// Run the direct remote-exit scenario.
 ///
@@ -188,7 +175,15 @@ fn execute(
     // spec requires that artifact to exist for a pass, so it is written first
     // here too: a scenario that cannot write its own evidence must fail before
     // it starts making claims, not after.
-    write_trust_summary(host, lab)?;
+    write_trust_summary(
+        host,
+        &lab.artifact(TRUST_SUMMARY_FILE),
+        "cross_network_direct_remote_exit",
+        &[
+            ("client-host", lab.client_ssh_target.as_str()),
+            ("exit-host", lab.exit_ssh_target.as_str()),
+        ],
+    )?;
 
     provision(inputs, lab)?;
 
@@ -255,7 +250,7 @@ fn execute(
     );
 
     // ── leak resistance and bypass narrowness ──
-    run_bypass_validator(host, lab, checks)?;
+    record_bypass_verdicts(host, lab, checks)?;
 
     if !checks.passed("direct_remote_exit_success") {
         if !checks.passed("cross_network_topology_heuristic") {
@@ -465,30 +460,12 @@ fn provision(inputs: &ScenarioInputs<'_>, lab: &LabContext) -> Result<(), String
     during(phase, wait_for_daemon_socket(client.runner))?;
 
     let phase = "advertising default route on remote exit";
-    during(phase, advertise_default_route(exit.runner, lab))?;
+    during(
+        phase,
+        super::advertise_default_route(exit.runner, lab.pace(super::ROUTE_ADVERTISE_SLEEP)),
+    )?;
     lab.sleep(POST_ADVERTISE_SETTLE);
     Ok(())
-}
-
-/// `rustynet route advertise 0.0.0.0/0` on the exit, retried as the shell did.
-pub(crate) fn advertise_default_route(
-    runner: &dyn NetLeafRunner,
-    lab: &LabContext,
-) -> Result<(), String> {
-    let socket_assignment = format!("RUSTYNET_DAEMON_SOCKET={DAEMON_SOCKET}");
-    retry_root(
-        runner,
-        &[
-            "env",
-            socket_assignment.as_str(),
-            REMOTE_RUSTYNET_BIN,
-            "route",
-            "advertise",
-            "0.0.0.0/0",
-        ],
-        ROUTE_ADVERTISE_ATTEMPTS,
-        lab.pace(ROUTE_ADVERTISE_SLEEP),
-    )
 }
 
 /// Run the server-IP bypass validator and fold its verdicts in.
@@ -501,100 +478,33 @@ pub(crate) fn advertise_default_route(
 /// `probe_service_blocked_from_client` is intentional: it is the observation
 /// that separates "the tunnel carries traffic" from "the tunnel is the only
 /// thing that carries traffic".
-fn run_bypass_validator(
+/// Run the server-IP bypass validator and fold its verdicts in.
+fn record_bypass_verdicts(
     host: &dyn ScenarioHost,
     lab: &LabContext,
     checks: &mut Checks,
 ) -> Result<(), String> {
     let report_path = lab.artifact(BYPASS_REPORT_FILE);
     let log_path = lab.artifact(BYPASS_LOG_FILE);
-
-    let phase = "validating narrow server-IP bypass and leak resistance on direct \
-                 remote-exit path";
-
-    let identity = provisioning::path_arg(&lab.ssh_identity_file);
-    let report_arg = provisioning::path_arg(&report_path);
-    let log_arg = provisioning::path_arg(&log_path);
-    let args = [
-        "--ssh-identity-file",
-        identity.as_str(),
-        "--client-host",
-        lab.client_ssh_target.as_str(),
-        // The exit node is the bypass validator's *probe*: the scenario asks
-        // whether the client can still reach a service on the exit's underlay
-        // address without going through the tunnel.
-        "--probe-host",
-        lab.exit_ssh_target.as_str(),
-        "--ssh-allow-cidrs",
-        lab.ssh_allow_cidrs.as_str(),
-        "--report-path",
-        report_arg.as_str(),
-        "--log-path",
-        log_arg.as_str(),
-    ];
-
-    let succeeded = during(
-        phase,
-        host.run_validator_bin(provisioning::BIN_SERVER_IP_BYPASS, &args),
+    let verdicts = run_bypass_validator(
+        host,
+        lab,
+        &BypassRun {
+            report_path: &report_path,
+            log_path: &log_path,
+            // The exit node is the bypass validator's *probe*: the scenario asks
+            // whether the client can still reach a service on the exit's
+            // underlay address without going through the tunnel.
+            probe_ssh_target: lab.exit_ssh_target.as_str(),
+            missing_evidence_summary: "server-IP bypass validator failed before emitting evidence",
+            phase: "validating narrow server-IP bypass and leak resistance on direct \
+                    remote-exit path",
+        },
     )?;
-    if !succeeded && !host.report_exists(&report_path) {
-        return Err("server-IP bypass validator failed before emitting evidence".to_owned());
-    }
-
-    let results = during(phase, host.read_report_checks(&report_path, BYPASS_CHECKS))?;
-    let verdicts = bypass_verdicts(&results);
-
     checks.record_bool("remote_exit_no_underlay_leak", verdicts.no_underlay_leak);
     checks.record_bool(
         "remote_exit_server_ip_bypass_is_narrow",
         verdicts.bypass_is_narrow,
     );
     Ok(())
-}
-
-/// The two conclusions the scenario draws from the bypass report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BypassVerdicts {
-    pub no_underlay_leak: bool,
-    pub bypass_is_narrow: bool,
-}
-
-/// Fold the four bypass checks into those two conclusions, reproducing the
-/// shell's two `[[ … == 'pass' ]]` conjunctions exactly.
-///
-/// The overlap on `probe_service_blocked_from_client` (index 1, in both) is
-/// intentional and load-bearing: it is the single observation that separates
-/// "the tunnel carries traffic" from "the tunnel is the only thing that carries
-/// traffic". A `results` slice shorter than [`BYPASS_CHECKS`] reads every
-/// missing index as fail, so a truncated report cannot produce a pass.
-pub(crate) fn bypass_verdicts(results: &[String]) -> BypassVerdicts {
-    let verdict = |index: usize| results.get(index).is_some_and(|value| value == CHECK_PASS);
-    BypassVerdicts {
-        no_underlay_leak: verdict(0) && verdict(1),
-        bypass_is_narrow: verdict(1) && verdict(2) && verdict(3),
-    }
-}
-
-/// Write the ssh trust summary the report spec requires as a pass artifact.
-///
-/// The shell's `live_lab_write_ssh_trust_summary` dumped the host keys its own
-/// ad-hoc ssh setup had pinned. That setup is gone — the orchestrator owns
-/// host-key pinning for every stage — so the summary now records what is
-/// actually true of this run: which targets took part and that their keys were
-/// pinned by the orchestrator rather than accepted on first use. Dropping the
-/// artifact entirely was not an option: the report validator lists it in
-/// `required_pass_source_artifacts`, so a report without it cannot pass.
-fn write_trust_summary(host: &dyn ScenarioHost, lab: &LabContext) -> Result<(), String> {
-    let path = lab.artifact(TRUST_SUMMARY_FILE);
-    let contents = format!(
-        "suite: cross_network_direct_remote_exit\n\
-         host-key-policy: orchestrator-pinned known_hosts (no trust-on-first-use)\n\
-         client-host: {}\n\
-         exit-host: {}\n",
-        lab.client_ssh_target, lab.exit_ssh_target,
-    );
-    during(
-        "writing ssh trust summary",
-        host.write_artifact(&path, &contents),
-    )
 }
