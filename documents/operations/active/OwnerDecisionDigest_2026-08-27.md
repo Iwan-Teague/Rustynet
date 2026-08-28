@@ -22,8 +22,10 @@ Read those with `git show <branch>:<path>`.
 | `gated-on-measurement` | The owner should not decide until a named measurement exists; deciding first risks landing a fix against the wrong cause. |
 | `approved` | Decided. Listed so the decision is not re-litigated, and so its follow-on work is visible. |
 | `in-progress-elsewhere` | Decided and delegated; a separate manager owns the execution. |
+| `physical` | Waiting on the operator at a console or host — unreachable remotely; no repo work unblocks it. |
 
 **Counts.** 17 entries: 13 `pending`, 1 `gated-on-measurement`, 2 `approved`, 1 `in-progress-elsewhere`.
+Addendum 2026-08-28: 6 entries (18–23) — 3 `pending`, 1 `approved`→`done`, 1 `physical`, 1 `gated-on-measurement` (with entry 3 `approved`) — plus in-place dated corrections to entries 1–3.
 
 ---
 
@@ -48,6 +50,9 @@ Doc's recommendation: **A + B together**, A first. Neither is implemented.
 Source: `work/d7-qh40-helper-order:documents/operations/active/MacOsHelperShutdownOrderingDesign_2026-08-27.md`
 §3.2, deferral list §5(1).
 **Status: `gated-on-measurement`** — see entry 3.
+**UPDATE 2026-08-28:** re-scoped by the measurement (entry 23) — Option A targets only the completion
+race plus the two no-wait Rust sites; every wait bounded strictly under the measured 5 s kill ceiling;
+still `gated-on-measurement`, now on §8.5(4)'s two named measurements only.
 
 ## 2. D-7B — startup disposition when a residue marker is present
 
@@ -67,6 +72,8 @@ asked for a start that *refuses*. The owner decides which posture ships.
 Doc's recommendation: the third option, recorded as the escalation and deliberately not taken
 unilaterally. Changes the availability semantics of every macOS and Windows node.
 Source: same doc, §1.6 and §5(2). **Status: `pending`.**
+**UPDATE 2026-08-28:** the §1.6 question stands (entry 23); note the residue marker's checker has a
+macOS fail-open path defect — see entry 23's fourth bullet.
 
 ## 3. D-7C — measure the root cause before deciding entries 1 and 2
 
@@ -84,6 +91,8 @@ build produced the ledger evidence.
   green-looking change that fixes nothing. That is exactly how the previous QH-40 remedy was refuted.
 
 Source: same doc, §3.3, §4.3, §5(3)(4). **Status: `pending` (this is the gate on entry 1).**
+**UPDATE 2026-08-28:** the measurement now exists — see entry 23. **Status: `approved` (measurement
+done); the gate on entry 1 is lifted and re-scoped.**
 
 ## 4. Anchor enrollment LAN listener — approved, delegated
 
@@ -310,6 +319,134 @@ acceptance (6). Until 1–6 are resolved the role stays design-only and must not
 production signed state.
 Source: `documents/operations/active/BlindRelayRoleDesign_2026-08-27.md` §0, §7.3, §16.
 **Status: `approved` (architecture) with §16.1–.6 open.**
+
+---
+
+## Addendum — 2026-08-28 wave
+
+Same rules as above: a digest with pointers, not a re-argument. Entries 18–23 are new; entries 1–3
+carry in-place dated corrections above.
+
+### 18. CN-6 — no qualifying cross-network topology exists for Tier B (vxlan)
+
+Measured in run `livelab-1787908428-6d9224cfd954` (`LiveValidation_2026-08-28.md` §12):
+`--cross-network-substrate vxlan` on the five-guest `192.168.64.x` UTM fleet provisions nothing and
+dispatches none of the eight CN-3 validators — `plan_overlay` returns `Ok(None)` below two underlay
+/24s (`substrate.rs:754-756`), and the scenarios additionally require `entry`/`aux` roles plus
+client/exit on distinct /24s **judged on the management plane** (`cross_network.rs:514-520`,
+`944-949`). The vxlan substrate cannot manufacture the cross-network condition it exists to provide,
+and probing (2026-08-28) found no fleet with two genuinely routable /24s: UTM Shared NAT is
+one-directional (lenovo→mac 100% loss), `192.168.121.0/24` is unreachable from both hosts, and
+`192.168.65.0/24` is macOS-only with its bridge down.
+
+- **(a) Fix the physical path** — bridge the participating UTM guests onto the real LAN (including
+  the lenovo reverse path) so two routable /24s exist. Real 2-LAN proof; an operator network change
+  outside the repo, and QH-41's vmnet-vs-QEMU backend split still stands.
+- **(b) Accept netns-only proof** — record Tier B's contract as "overlay an already-2-LAN fleet"
+  (spec §0.6 option b). Honest and zero-code; CN-3 stays unproven on any real cross-network
+  substrate, forever.
+- **(c) Treat gates (1)/(3) as defects** — Tier B should synthesize the separate LANs, as the shell
+  tier `vxlan_tier_b.sh` did. CN-3 becomes provable on the existing five guests; real code work in
+  the substrate/scenario gate.
+
+Source: `CrossNetworkSubstrateIntegrationSpec_2026-06-21.md` §0.6. **Status: `pending`.**
+
+### 19. MAC-D1 — macOS anchor cell blocked: the posture gate is circular as written
+
+Both mac cells were elected live on `--node` for the first time and neither earns a green. The
+anchor blocker: `role.rs:68-70` gates Anchor/Admin/Relay to Linux pending "a green run", but
+`anchor_validation` gates its runtime substages on that same predicate and only reaches `Passed`
+with no runtime skip — the green run required to lift the gate can never be produced by the stage
+the gate controls. The intended route exists but is a second, independent switch: the macOS anchor
+validators (`live_lab_stage_registry.rs:1151,1158,1168`) dispatch only under `--anchor-platform
+macos`, and `live_anchor` needs a run without `--skip-linux-live-suite` (which drops 4 of the 5
+harvest stages).
+
+- **Promote via the macOS validator set** — run anchor election + `--anchor-platform macos` + the
+  full Linux live suite; the green evidence then lifts `role.rs`. Costs the full suite per attempt,
+  and the driver's `macos_anchor` target first needs its missing backbone call fixed
+  (`ai_agent.rs:1885-1892` — every run through it dies in preflight).
+- **Re-design the promotion rule** — let the gate be lifted by evidence the gated stage cannot
+  produce (e.g. grade a runtime-skip as promotable once the macOS validators pass). Code work in
+  `role.rs`/`anchor_validation.rs`; the fail-closed default itself stays.
+
+Source: `MacCellsHarvest_2026-08-28.md` §2.2–§2.3. **Status: `pending`.**
+
+### 20. MAC-D2 — macOS exit cell blocked: membership-owner adapter reads the wrong path, without privilege
+
+The exit cell fails before any exit stage: `membership_init` → "membership owner public key not
+found". Two defects, either alone fatal: the macOS path constant points at
+`/usr/local/var/rustynet/membership/membership.owner.key.pub` (`macos_install.rs:27-28`), which
+holds no key, while a valid one sits at the Linux-conventional `/etc/rustynet/
+membership.owner.key.pub`; and the read is a bare `cat` (`macos_membership.rs:29-34`) where the
+Linux twin uses `sudo -n` with a fallback — so a permission error and an absent file both surface
+as the same empty string. Consequence: macOS cannot hold any membership-owner role (`exit`, and
+`blind_exit` under the same topology shape) on `--node` until fixed.
+
+The fix is mechanical (correct the path constant; escalate with `sudo -n`). The open question this
+run cannot answer: does a fresh macOS install seed an owner key at all — the found file is a July
+leftover? Owner approves the fix and the seeding question's answer before the cell is re-run.
+
+Source: `MacCellsHarvest_2026-08-28.md` §4.1–§4.2. **Status: `pending`.**
+
+### 21. W-FIX-1/2/3 — Windows bootstrap triage: dispositions
+
+`WindowsNodeBootstrapTriageVerdict_2026-08-28.md` verdict: the Windows `--node` bootstrap failure
+is a code defect (hard dependency on the opt-in WinGet Configuration feature, enabled by no repo
+code — `Bootstrap-RustyNetWindows.ps1:1130`) plus guest drift. All three code fixes are landed;
+recorded so they are not re-argued.
+
+- **W-FIX-1 — landed 2026-08-28** (§9.1): the bootstrap enables the feature itself and fails closed
+  with a named error. §3's open question answered: the bash era's 66 passes are an **always-gap**
+  (`winget configure` is a cold-guest path never taken on a pre-baked toolchain), not a regression
+  (§9.2).
+- **W-FIX-2 — landed 2026-08-28** (§9.3): the SSH adapter error seam decodes CLIXML and appends the
+  readable record, so front-truncation can no longer eat it. §5(3) (PowerShell points at the
+  invocation, not the cause) is guest-side and untouched.
+- **W-FIX-3 — done 2026-08-28** (§7.3, `work/wfix-3`): a `run_scoped` StageSpec flag stops
+  run-scoped `preflight`/cross-network stages poisoning the per-OS
+  `*_stage_bootstrap`/`*_stage_cross_network` columns. Forward-only; no historical rows rewritten.
+
+**No owner action pending. Status: `approved` → `done`.**
+
+### 22. W-FIX-4 / W-FIX-5 — operator-physical prerequisites (no remote path exists)
+
+- **W-FIX-4 — `windows-utm-1` guest remediation; UTM console access required.** No remote
+  management path exists at all (RPC/SMB up; SSH, WinRM, RDP closed; no QEMU guest agent — §6). At
+  the console (§7.1): restore `sshd` + its firewall rule, `winget configure --enable`,
+  `w32tm /resync`; then re-run the minimal topology (`debian-headless-2:exit` +
+  `windows-utm-1:client`) for the first `windows_stage_bootstrap=pass` row in `--node` history.
+- **W-FIX-5 — restore the `ubuntu-kvm-1` host.** Both endpoints time out on TCP/22 (tailnet
+  `100.117.1.47`, LAN `172.23.56.5`). Without it, failure #5's inner cause stays unclosable (§4)
+  and `windows-x86-1` (the CP-3 WinNAT candidate) stays out of the pool.
+
+Source: `WindowsNodeBootstrapTriageVerdict_2026-08-28.md` §4, §6, §7.1–§7.2.
+**Status: `physical` — operator at the console/host; no repo work unblocks either.**
+
+### 23. QH-40 measurement verdict — the D-7 re-scope (updates entries 1–3)
+
+Entry 3 asked for the measurement before deciding entries 1 and 2; it now exists
+(`MacOsHelperShutdownOrderingDesign_2026-08-27.md` §8, live on `macos-utm-1`).
+
+- **Kill ceiling settled: 5 s** (launchd default on all rustynet services, §8.1). Every Option A
+  wait and any Option B lease bound must sit strictly under it; the refuted plan's 30 s bound is
+  measured unreachable.
+- **Competing hypothesis resolved** (§8.2): the I/O-timeout mechanism is refuted (live 60 s idle
+  probe — every timeout path returns a well-formed error frame). The `truncated frame header`
+  observations attribute to the oversized-response drop, fixed 2026-08-25 (`64774bdd`). The
+  `Connection refused` tail stays consistent with the §2 completion race — that race plus the two
+  no-wait Rust sites is now **Option A's only target**; do not land it as "the fix for the
+  truncated-frame failures".
+- **Timeout asymmetry fixed 2026-08-28** (§8.7, `work/helper-timeout-mismatch`): client default
+  2000→3000 ms derived from the server value; install-time rejection on mismatch.
+- **Still gated before final sign-off** (§8.5(4)): the deferred §8.3 reload-ordering matrix and one
+  induced residue-marker firing. The marker has since fired organically on macOS (harvest §3.3) —
+  but its checker has a macOS fail-open defect (`DEFAULT_STATE_PATH` inherits the Linux path,
+  harvest §3.4) that must be fixed for the report posture to mean anything on macOS.
+- **Entry 2's §1.6 residue-refuse question stands**, unchanged by the measurement.
+
+**Entry 3: `approved` (measurement done). Entry 1: still `gated-on-measurement`, now on §8.5(4)'s
+two named measurements only.**
 
 ---
 
