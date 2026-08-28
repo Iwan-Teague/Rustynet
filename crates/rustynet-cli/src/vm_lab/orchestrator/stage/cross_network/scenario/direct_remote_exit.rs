@@ -499,6 +499,7 @@ fn record_bypass_verdicts(
             // whether the client can still reach a service on the exit's
             // underlay address without going through the tunnel.
             probe_ssh_target: lab.exit_ssh_target.as_str(),
+            probe_bind_ip: None,
             missing_evidence_summary: "server-IP bypass validator failed before emitting evidence",
             phase: "validating narrow server-IP bypass and leak resistance on direct \
                     remote-exit path",

@@ -103,27 +103,78 @@ pub fn parse_default_route_iface(route_output: &str) -> Option<String> {
         })
 }
 
+/// The interface a route to `address` leaves by — `ip -4 route get <addr>`, then
+/// the token after `dev`.
+///
+/// Distinct from [`read_default_route`]: the roaming scenario needs the
+/// interface the *exit* reaches the *client* on, which is not necessarily the
+/// one carrying its default route.
+pub fn route_dev_to(runner: &dyn NetLeafRunner, address: &str) -> Result<String, String> {
+    validate_argv_value("route target address", address)?;
+    let output =
+        provisioning::capture_allow_failure(runner, &["ip", "-4", "route", "get", address])?;
+    let iface = parse_route_dev(&output)
+        .ok_or_else(|| format!("no route to {address} names an interface"))?;
+    validate_argv_value("route interface", &iface)?;
+    Ok(iface)
+}
+
+/// The token after the first `dev` in a route-query result.
+///
+/// The shell's `awk '{for (i=1;i<=NF;i++) if ($i == "dev") {print $(i+1); exit}}'`
+/// scanned every field of every line and stopped at the first hit, so unlike
+/// [`parse_default_route_iface`] there is no `^default` filter here.
+pub fn parse_route_dev(route_output: &str) -> Option<String> {
+    let mut tokens = route_output.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "dev" {
+            return tokens.next().map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// True when any line of a route-query result leaves by an interface that is
+/// **not** the tunnel.
+///
+/// This is deliberately not the negation of [`super::route_via_rustynet`], and
+/// the two scenarios use different ones on purpose. `route_via_rustynet` asks
+/// "is the tunnel named at all", which a result naming both the tunnel and an
+/// underlay device still satisfies; this asks "does anything here leave by an
+/// underlay device", which such a result does not. The failback scenario wants
+/// the second reading because it is sampling a path mid-transition, where a
+/// partially-installed route table can legitimately name both.
+pub fn route_leaves_non_tunnel_dev(route_output: &str) -> bool {
+    route_output
+        .lines()
+        .any(|line| parse_route_dev(line).is_some_and(|iface| iface != super::TUNNEL_INTERFACE))
+}
+
+/// Add `alias` to `iface` if it is not already there.
+///
+/// Conditional exactly as the shell's `ip addr show … | grep -Fq … ||
+/// ip addr add …` was: re-adding an address that is already present is an error,
+/// and a scenario that has already switched once must not fail on its second
+/// call.
+pub fn add_alias(runner: &dyn NetLeafRunner, iface: &str, alias: &RoamAlias) -> Result<(), String> {
+    let cidr = alias.cidr();
+    validate_argv_value("roam alias", &cidr)?;
+    validate_argv_value("roam interface", iface)?;
+    let present = capture_root_allow_failure(runner, &["ip", "addr", "show", "dev", iface])?;
+    if !present.contains(&cidr) {
+        run_root(runner, &["ip", "addr", "add", &cidr, "dev", iface])?;
+    }
+    Ok(())
+}
+
 /// Add `alias` to the default-route interface and move the default route's
 /// source address onto it.
-///
-/// The add is conditional exactly as the shell's
-/// `ip addr show … | grep -Fq … || ip addr add …` was: re-adding an address that
-/// is already present is an error, and a scenario that has already switched
-/// once must not fail on its second call.
 pub fn apply_alias(
     runner: &dyn NetLeafRunner,
     route: &DefaultRoute,
     alias: &RoamAlias,
 ) -> Result<(), String> {
-    let cidr = alias.cidr();
-    validate_argv_value("roam alias", &cidr)?;
-    let present = capture_root_allow_failure(runner, &["ip", "addr", "show", "dev", &route.iface])?;
-    if !present.contains(&cidr) {
-        run_root(
-            runner,
-            &["ip", "addr", "add", &cidr, "dev", route.iface.as_str()],
-        )?;
-    }
+    add_alias(runner, route.iface.as_str(), alias)?;
     run_root(
         runner,
         &[

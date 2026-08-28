@@ -489,6 +489,7 @@ fn record_bypass_verdicts(
             // whether the client can reach the far end of the chain without
             // traversing it.
             probe_ssh_target: lab.exit_ssh_target.as_str(),
+            probe_bind_ip: None,
             missing_evidence_summary: "server-IP bypass validator failed before emitting relay evidence",
             phase: "validating narrow server-IP bypass and leak resistance on relay \
                     remote-exit path",

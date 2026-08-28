@@ -138,50 +138,6 @@ fn run() -> Result<(), String> {
 
     run_expect_fail(
         &root_dir,
-        "scripts/e2e/live_linux_cross_network_failback_roaming_test.sh",
-        &[
-            "--ssh-identity-file",
-            ssh_identity.to_str().ok_or_else(|| {
-                format!(
-                    "ssh identity path is not valid utf-8: {}",
-                    ssh_identity.display()
-                )
-            })?,
-            "--client-host",
-            "client@example",
-            "--exit-host",
-            "exit@example",
-            "--relay-host",
-            "relay@example",
-            "--client-node-id",
-            "client-1",
-            "--exit-node-id",
-            "exit-1",
-            "--relay-node-id",
-            "relay-1",
-            "--client-network-id",
-            "net-a",
-            "--exit-network-id",
-            "net-b",
-            "--relay-network-id",
-            "net-c",
-            "--report-path",
-            temp_dir
-                .path()
-                .join("cross_network_failback_roaming_report.json")
-                .to_str()
-                .ok_or_else(|| "report path is not valid utf-8".to_owned())?,
-            "--log-path",
-            temp_dir
-                .path()
-                .join("cross_network_failback_roaming.log")
-                .to_str()
-                .ok_or_else(|| "log path is not valid utf-8".to_owned())?,
-        ],
-    )?;
-
-    run_expect_fail(
-        &root_dir,
         "scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh",
         &[
             "--ssh-identity-file",

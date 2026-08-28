@@ -533,7 +533,10 @@ fn render_sample(sampled_at: u64, sample: u32, fields: &[(&str, &String)]) -> St
 
 /// The shell's `tr -s ' ' | tr '\n' ';'`: collapse runs of spaces, then turn
 /// newlines into `;` so one sample is one line.
-fn squeeze(value: &str) -> String {
+///
+/// Shared with [`failback_roaming`](super::failback_roaming), whose monitor log
+/// uses the same layout — one greppable line per sample.
+pub(super) fn squeeze(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut last_was_space = false;
     for ch in value.chars() {
