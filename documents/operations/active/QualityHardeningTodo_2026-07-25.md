@@ -4738,3 +4738,10 @@ Tests: `only_the_exact_derived_marker_reads_as_installer_derived`,
 `linux_egress_pin_reset_only_removes_a_stale_lab_written_pin`,
 `egress_pin_reset_runs_after_the_interface_reset` (`adapter/linux_traffic.rs`).
 Live proof still pending the next cross-network run.
+
+Candidate follow-up (unnumbered, deliberately out of QH-63's scope): the same
+stale-residue class may exist for `/etc/rustynet/assignment-refresh.env` — no
+cleanup path removes it, and `install-systemd` reads its selected exit endpoint
+when deriving egress. Endpoint-based derivation queries live route state, so a
+stale endpoint fails loud rather than silent today; promote to a numbered item
+only if a live run shows it steering derivation wrong.
