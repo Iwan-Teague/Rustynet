@@ -580,3 +580,98 @@ cargo run -q -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-la
 
 Note the orchestrator refuses a non-empty `--report-dir` outright (no silent
 reuse); each attempt needs a fresh directory or the provenance-bound resume path.
+
+---
+
+## 10) Attempt 3 — `bootstrap_hosts` PASSES. `livelab-1787904828-2307d6731123`, stopped early on disk exhaustion
+
+**Status: the §9.3 diagnosis is confirmed. With the stale env file removed from
+`debian-headless-2`, `bootstrap_hosts` went `fail` → `pass` with no code change of
+any kind. The run was then stopped deliberately at 510 MB of free host disk,
+before it could reach the stages that matter. `passed=7 failed=0 skipped=54`,
+overall `partial`, zero failures.**
+
+### 10.1 The clearance, verified
+
+The manager session removed `/etc/default/rustynetd` from `debian-headless-2`. Re-probed
+all five guests before launching:
+
+| guest | file | pin | link |
+|---|---|---|---|
+| `debian-headless-2` | **absent (clean)** | — | — |
+| `debian-headless-4`, `ubuntu-utm-1`, `rocky-utm-1`, `fedora-utm-1` | present | `enp0s1` | exists |
+
+Stub `livelab-1787903378-068b29ebc54b::bootstrap_hosts` was dispositioned naming that
+clearance and committed (`2307d673`) before launch, so the run's dirty state read `clean`.
+
+### 10.2 What ran
+
+| field | value |
+|---|---|
+| run id | `livelab-1787904828-2307d6731123` |
+| window | 2026-08-28T08:01:04Z → 08:13:48Z |
+| commit | `2307d67311235e77954069ea27ae7889b855ae1a`, `work/live-validate`, `clean` |
+| result | `overall_result=partial`, **`first_failed_stage` empty**, `passed=7 failed=0 skipped=54` |
+| ledger row | **confirmed** — row 185 |
+
+| stage | attempt 2 | attempt 3 |
+|---|---|---|
+| `preflight` … `cleanup_hosts` | pass | pass |
+| **`bootstrap_hosts`** | **fail** | **pass** (12 min 17 s) |
+| `cross_network_substrate_teardown`, `cleanup` | pass | pass |
+
+**That single flip is the whole finding.** Identical topology, identical network
+profile digest, identical code — the only delta between the two runs is one file
+deleted on one guest. It closes §9 conclusively: the failure was guest state, and
+nothing in the seven merges was ever implicated.
+
+### 10.3 Why it stopped, and why that was the right call
+
+Host free space collapsed *during* the run: 8.4 GiB → 6.5 → 2.35 → **504 MiB**. At
+the 1.2 GiB threshold the run was stopped with `SIGTERM`, which let the orchestrator
+unwind properly — `cross_network_substrate_teardown` and `cleanup` both ran and
+passed, all five guest flocks released, and the ledger row was still appended. A
+`SIGKILL` or a disk-full would have produced neither.
+
+**The run was not the consumer.** Its total host footprint is 520 KiB of report
+artifacts, and `target-livelab` did not grow at all (10 G before and after). The
+consumer is elsewhere:
+
+```
+.claude/worktrees   258 GB  →  272 GB   (during this run)
+```
+
+**Twenty-five sibling worktrees are each carrying their own multi-gigabyte `target/`:**
+`mgr-cn3-scenario-port` 25 G, `mgr-qh39-macos-greens` 18 G, `mgr-cn2-netns-substrate`
+18 G, `mgr-stop-pgrep-and-harness` 15 G, `mgr-small-fixes` 15 G, `mgr-enrollment-listener`
+15 G, and so on. That is a quarter of a terabyte of build cache, and it is growing while
+other sessions work. Nothing in `state/` (3.6 G), `target/` (33 G) or `artifacts/` (6.5 G)
+comes close, and `prune_jobs` cannot touch any of it.
+
+**This is now the binding constraint on live validation, ahead of any code defect.**
+The lab cannot complete a full 61-stage suite until worktree build caches are
+consolidated onto a shared `CARGO_TARGET_DIR` or pruned. This validation worktree
+already shares `target-livelab`, which is why it contributes nothing.
+
+### 10.4 What is proven, and what still is not
+
+Proven on hardware for the first time since `e13132cb`: source archive preparation,
+SSH reachability, host cleanup, **full five-guest bootstrap including
+`install-systemd` on every guest**, cross-network substrate teardown, and run
+cleanup — all green, on code byte-identical to `main` @ `22e707b2`.
+
+Still unproven: everything downstream of bootstrap — membership, assignments,
+baseline runtime, anchor, relay, exit handoff, DNS, traversal, and all security-check
+stages. The seven merges (QH-52 firewalld unbind, helper IPC timeout pair, CN-3
+scenario port, and the rest) therefore **still have no live evidence**, exactly as at
+the end of §9. No new stub was created — there were no failures to stub.
+
+### 10.5 Next attempt
+
+1. **Reclaim host disk first.** Consolidate or prune the worktree `target/` caches;
+   a full suite needs headroom in the tens of gigabytes, not hundreds of megabytes.
+2. Re-probe the five guests with the §9.3 table (the residue has now been found on
+   three separate guests, so treat any guest that ever hosted a cross-network run as
+   suspect).
+3. Relaunch the §7 topology unchanged into a fresh report dir. The launch gate is
+   currently clear — no undispositioned stub blocks it.
