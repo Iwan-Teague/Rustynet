@@ -1,0 +1,474 @@
+# MAC-CELLS — macOS `anchor` and `exit` election on the `--node` engine — 2026-08-28
+
+**Scope.** Harvest tasks 7+8 of `CrossPlatformRoleParityRefresh_2026-07-23.md` §3
+Track M sub-stream (b): elect the macOS guest as `anchor`, then as `exit`, on the
+Rust `--node` orchestrator (the engine of record) and record what the parity
+cells actually earn. Both cells were ⬛ *never elected on `--node`* before today.
+
+**Result in one line.** Both roles were **elected live on `--node` for the first
+time**; neither cell earns a green. The macOS `anchor` cell is blocked by a
+deliberate posture gate that is **circular as written**, and the run reddened on
+a genuine macOS DNS fail-closed gap that the QH-39 work newly exposes. Three
+tonight-merged changes (QH-39 resolver observation, QH-39 mesh-status freshness
+bound, the QH-40 shutdown-residue marker) got their first macOS exercise; the
+residue marker **fired correctly and its checker then failed to find it**.
+
+Triage only — **no code was changed** by this work.
+
+---
+
+## 1. Runs
+
+All at commit `77ff1933885fcb6c86e27a3ffbe3013dddc6c6fe`, `git_dirty_state=clean`,
+operator `iwan`, engine `--node`, `--skip-linux-live-suite --skip-cross-network`.
+
+| # | Run id | Topology | Overall | First failed stage |
+|---|---|---|---|---|
+| 1 | `livelab-1787910442-77ff1933885f` | `macos-utm-1:anchor` only | fail | `preflight` |
+| 2 | *(refused at launch gate — no run id)* | as #1 + exit + client | — | launch gate |
+| 3 | `livelab-1787911937-77ff1933885f` | `macos-utm-1:anchor` + `lenovo-exit-1:exit` + `lenovo-client-1:client` | fail | `validate_baseline_runtime` |
+
+Run 3 is the Cell-1 evidence run: 19 stages, **passed=15 failed=1 skipped=3**.
+Report dir `state/mac-cells/anchor3-1787910672`. Ledger rows verified present for
+runs 1 and 3 in `documents/operations/live_lab_node_run_matrix.csv`.
+
+Run 2 never produced a run id: the launch gate correctly refused it because run
+1's `preflight` failure had no recorded remedy. Both remedies are now recorded in
+`documents/operations/live_lab_stage_triage.jsonl`.
+
+---
+
+## 2. Cell 1 — macOS `anchor`
+
+### 2.1 Outcome: `anchor_validation = skip` (honest), cell stays unproven
+
+Per §12.3's "row exists ≠ stage passed" rule the verdict is read from the stage's
+own artifact, not the ledger column. The artifact
+(`state/mac-cells/anchor3-1787910672/anchor_validation.reported_skips.json`)
+records:
+
+```json
+"runtime_skipped_nodes": [ { "alias": "macos-utm-1", "platform": "Macos" } ]
+```
+
+What this means, precisely — and the distinction matters, because it is the
+first real signal this cell has ever produced:
+
+* The macOS anchor **did** run the capability-advertisement half, and it
+  **passed**. In `crates/rustynet-cli/src/vm_lab/orchestrator/stage/anchor_validation.rs:170-176`
+  a failing `validate_anchor_capability_advertisement` pushes to `failures` and
+  `continue`s; the node instead reached the runtime-skip branch, which is only
+  reachable *after* capability advertisement succeeds. So macOS advertises its
+  full anchor capability set correctly over the live cross-OS shell seam.
+* The **bundle-pull runtime substages** (`bundle_pull_loopback`,
+  `invalid_token`, `log_redaction`) did not run. They are gated at
+  `anchor_validation.rs:181` on `NodeRole::Anchor.is_supported_for_platform(&platform)`.
+* `outcome_for` (`anchor_validation.rs:236-247`) grades any reported runtime-skip
+  as `Skipped`, deliberately, so the run goes Partial rather than falsely green.
+
+This is the code behaving exactly as documented. The cell is **not** red — it is
+honestly unproven.
+
+### 2.2 The posture gate is circular as written — CELL-BLOCKER
+
+`crates/rustynet-cli/src/vm_lab/orchestrator/role.rs:68-70`:
+
+```rust
+NodeRole::Anchor | NodeRole::Admin | NodeRole::Relay => {
+    matches!(platform, VmGuestPlatform::Linux)
+}
+```
+
+The comment immediately above it (`role.rs:62-67`) states that macOS and Windows
+"are promoted to supported here only once a green run is archived."
+
+Those two facts cannot both be satisfied through this stage. `anchor_validation`
+gates its runtime substages on `is_supported_for_platform`; the stage can only
+reach `Passed` when no node reports a runtime skip; a macOS anchor always reports
+one while the gate is Linux-only. **The green run required to lift the gate can
+never be produced by the stage the gate controls.** The macOS `anchor` cell is
+therefore unreachable via `anchor_validation` no matter how many times it is run.
+
+This is a **macOS-specific code gap in the promotion path**, not an environmental
+or role-election problem. It is not necessarily a defect in the gate itself — the
+fail-closed default is right — but the promotion route has to come from
+somewhere, and today it does not exist for `anchor`.
+
+**The intended escape hatch is a different stage set.** The registry carries
+macOS-specific anchor validators —
+`deploy_macos_anchor_profile`, `validate_macos_anchor_bundle_pull`,
+`validate_macos_anchor_port_mapping_authority`
+(`crates/rustynet-cli/src/live_lab_stage_registry.rs:1151,1158,1168`) — which are
+enabled by the `--anchor-platform macos` selector, **not** by the `--node
+macos-utm-1:anchor` role election. Run 3 elected the role without the selector,
+so none of those three dispatched. Electing the role and enabling the macOS
+anchor validators are two independent switches, and the parity cell needs both.
+That run is **still open** (see §5).
+
+### 2.3 `live_anchor` was excluded by `--skip-linux-live-suite`, not by dialect
+
+**Correction to my own first reading, recorded rather than silently fixed.** My
+initial conclusion was that `live_anchor` is a bash-dialect name that never
+records on `--node`. **That is wrong.** `StageId::LiveAnchor` is a first-class
+member of the Rust `--node` stage order — it is asserted in the canonical
+order-of-stages test at `crates/rustynet-cli/src/vm_lab/orchestrator/plan.rs:653`
+("orchestrator stage order is security-sensitive").
+
+The real reason it is absent from both runs' resolved plans is the fast-path
+flag. `--skip-linux-live-suite` drops **the entire post-baseline suite**:
+`plan.rs:545-549` documents the arithmetic exactly —
+
+> `skip_live_suite_drops_the_post_baseline_suite_but_keeps_setup_and_cleanup`
+> … `// 61 total - 30 live-suite stages - 11 cross-network stages - 1 soak stage = 19.`
+
+Both of my runs resolved to exactly **19 stages**, matching that count.
+
+**This is the single most consequential finding for the harvest brief.** Of the
+five stages the brief names, `--skip-linux-live-suite` structurally excludes
+**four**:
+
+| Harvest target | Dispatched under `--skip-linux-live-suite`? |
+|---|---|
+| `anchor_validation` | yes — it is a setup-tier stage |
+| `live_anchor` | **no** — dropped with the live suite |
+| `exit_nat_lifecycle_validation` | **no** — dropped with the live suite |
+| `exit_demotion_residue_validation` | **no** — dropped with the live suite |
+| `exit_dns_failclosed_validation` | **no** — dropped with the live suite |
+
+All four are `state_machine_only: true` (`live_lab_stage_registry.rs:820,833,845`
+and the `LiveAnchor` spec), i.e. **only** the `--node` plan dispatches them — so
+there is no bash-archive substitute either. The runbook's fast-path form
+(`skip_linux_live_suite`, which `ai_agent.rs` sets on *every* mac/win target key
+`:1864-1892`) therefore **cannot** harvest these cells at all. Harvesting them
+requires paying for the full Linux live suite.
+
+That correction does not change Cell 1's verdict — `anchor_validation` did
+dispatch and its skip is genuine — but it does mean the `live_anchor` half of
+the cell is **untested today**, not unavailable.
+
+### 2.4 Role-election plumbing gap in the MCP driver
+
+Run 1 died in `preflight` with `lab requires exactly 1 Exit node, found 0`.
+That was an operator topology error on my part, but the same shape is reachable
+from the sanctioned driver and would fail identically:
+
+`crates/rustynet-mcp/src/bin/ai_agent.rs:1885-1892` — the `macos_anchor` target
+sets `macos` + `anchor_platform` + `skip_linux_live_suite` + `rust_engine` but
+never calls `add_default_backbone` (`:1932-1946`), unlike the sibling
+`macos_exit` target at `:1864-1872` which does. `synthesize_rust_node_args`
+(`:6267-6323`) then emits a single `macos-utm-1:anchor` assignment, and preflight
+rejects the zero-exit topology. **Any `ai_lab_run` driven from the `macos_anchor`
+target dies in preflight.** Same for `macos_blind_exit` (`:1875-1883`) and
+`macos_relay`, which also omit the backbone.
+
+Classification: **role-election plumbing**, driver-side, one missing call.
+
+---
+
+## 3. First macOS exercise of the tonight-merged work
+
+### 3.1 QH-39 resolver observation — RED, and honestly so
+
+`validate_baseline_runtime` failed: `macos-utm-1/DnsFailclosed: validation not
+passed`. Per-op results from `validator_results.json`: `RuntimeAcls`,
+`ServiceHardening`, `KeyCustody`, `Authenticode`, `MeshStatus` all pass;
+`DnsFailclosed` alone fails. Both Linux nodes pass all six.
+
+Reproduced by hand on the guest:
+
+```
+$ sudo /usr/local/bin/rustynetd macos-dns-failclosed-check
+  "loopback_resolver_advertised": false
+  "drift_reasons": [ "macOS loopback resolver is not advertised by
+    /usr/sbin/scutil --dns (primary resolver is off-loopback, empty, or
+    unreadable); DNS fail-closed posture cannot be verified" ]
+exit: policy_reject (78)
+
+$ cat /etc/resolv.conf
+# rustynet protected-mode DNS fail-closed
+nameserver 127.0.0.1
+
+$ /usr/sbin/scutil --dns        # resolver #1 (the primary)
+  nameserver[0] : 1.1.1.1
+  nameserver[1] : 8.8.8.8
+```
+
+**Verdict: the check is correct and the finding underneath it is real.**
+`/etc/resolv.conf` carries RustyNet's protected-mode marker claiming loopback-only
+resolution, while macOS's actual resolver configuration points at two public
+resolvers. On macOS `/etc/resolv.conf` is a configd-generated compatibility shim,
+not the system resolver, so writing it does not redirect resolution.
+
+This is exactly the false-green QH-39 was filed against. The pre-fix collector
+hardcoded `loopback_resolver_advertised = true` whenever the file merely read;
+the new code derives it from the independent `scutil --dns` source
+(`crates/rustynetd/src/macos_dns_failclosed.rs:183-207`, read at `:230-246`) and
+fails closed when scutil is unreadable (`:29`). QH-39's own acceptance criterion
+— "the only derivations that carry new information come from an **independent**
+source: `scutil --dns` … or probing that something answers on loopback:53" — is
+met.
+
+So the new check **reds honestly on its first macOS run**, and what it reveals is
+a macOS DNS fail-closed **enforcement** gap: the posture is written to a file the
+OS does not consult. That enforcement gap is the defect to fix; the validator is
+now doing its job.
+
+Caveat recorded honestly: the by-hand reproduction above was taken *after* the
+run's `cleanup` stage, so it is the post-run state, not the exact in-stage
+snapshot. The in-stage verdict is the one in `validator_results.json`; the
+by-hand output explains it and matches its drift reason verbatim.
+
+### 3.2 QH-39 mesh-status freshness bound — ran, passed, bound NOT confirmed applied
+
+`MeshStatus` returned `passed: true` on `macos-utm-1`. **This must not be read as
+the freshness bound working.** QH-39's mesh-status half is precisely the defect
+that `overall_ok: true` means "a state file exists and parses" when the probe is
+dispatched without `--expected-peer-ids` / `--max-age-seconds`. A bare `pass` on
+this op is the *same observable* as the false green QH-39 documented.
+
+I did not confirm from this run's artifacts that the `--node` probe path actually
+emitted the freshness flags, so the honest status is **unverified, not proven**.
+Confirming it needs the dispatched argv for the `MeshStatus` `DaemonProbeOp` on
+the `--node` path (`vm_lab/mod.rs:11420-11432`, `build_argv` at `:11338`) — that
+is the plumbing QH-39 called for. Until that argv is observed carrying
+`--max-age-seconds`, treat `macos MeshStatus = pass` as **not yet evidence**.
+
+### 3.3 QH-40 shutdown-residue marker — FIRED CORRECTLY on macOS (first time)
+
+The marker was written on the guest during run 3, at
+`/usr/local/var/rustynet/rustynetd.state.shutdown-residue.json`:
+
+```json
+{ "schema_version": 1, "recorded_unix": 1787911895, "platform": "macos",
+  "node_id": "macos-utm-1-bootstrap", "trigger": "unix_shutdown_signal",
+  "rollback_error": "rollback failed: rollback dns protection: … privileged
+    helper response read failed: truncated frame header …; backend shutdown: …
+    Connection refused (os error 61); exit-mode rollback failed: …; cleanup
+    failed: …; interface cleanup failed: …" }
+```
+
+This is the QH-40 signature reproduced in full — every teardown path failing
+(DNS protection, firewall, backend shutdown, exit-mode rollback, cleanup,
+interface cleanup) — but now, unlike every prior observation, it is **durably
+recorded rather than invisible**. That was the whole point of the marker, and it
+works on macOS.
+
+Pointed at the real state path the exit-78 contract also works:
+
+```
+$ sudo rustynetd shutdown-residue-check --state /usr/local/var/rustynet/rustynetd.state
+rustynetd shutdown left dataplane residue [policy_reject (78)]: shutdown rollback
+failed (fail-closed): node_id=macos-utm-1-bootstrap trigger=unix_shutdown_signal
+platform=macos …
+```
+
+The observed failure signature is `truncated frame header` followed by
+`Connection refused (os error 61)` on
+`/private/var/run/rustynet/rustynetd-privileged.sock` — consistent with the
+QH-40-MEASURE §2 completion race (the helper is gone by the time the daemon's
+rollback reaches it), not with the refuted I/O-timeout mechanism. Note the guest
+still carries the **pre-fix** deployment with respect to the helper/client
+timeout pair: the `work/helper-timeout-mismatch` change (client default 2000 →
+3000 ms, derived from the helper's server default) renders at install time, and
+this run's bootstrap deployed from `main`, which does not carry it. So this run
+does **not** exercise the timeout-pair fix; it exercises the marker only.
+
+### 3.4 DEFECT — `shutdown-residue-check` reports **clean** on macOS while a marker exists
+
+```
+$ sudo /usr/local/bin/rustynetd shutdown-residue-check
+shutdown-residue-check: clean (no marker at /var/lib/rustynet/rustynetd.state.shutdown-residue.json)
+```
+
+…while the marker sits at `/usr/local/var/rustynet/rustynetd.state.shutdown-residue.json`.
+
+Cause: `crates/rustynetd/src/main.rs:183` defaults the state path to
+`DEFAULT_STATE_PATH`, and `crates/rustynetd/src/daemon.rs:169-170` defines it as
+
+```rust
+#[cfg(not(windows))]
+pub const DEFAULT_STATE_PATH: &str = "/var/lib/rustynet/rustynetd.state";
+```
+
+i.e. macOS silently inherits the Linux path. The asymmetry is visible three lines
+up: `DEFAULT_SOCKET_PATH` **does** get a `#[cfg(target_os = "macos")]` arm
+(`daemon.rs:163-164`) pointing at `/private/var/run/…`, while the state path does
+not, and the macOS installer deploys state under `/usr/local/var/rustynet/`.
+
+**Severity: this is a fail-closed check that fails OPEN on macOS.** A caller that
+invokes `shutdown-residue-check` without `--state` gets exit 0 and the word
+"clean" on a host that is carrying real dataplane residue — precisely the
+invisible-residue condition QH-40 exists to eliminate, reintroduced one layer up
+in the tool built to detect it. Any macOS residue assertion wired without an
+explicit `--state` is worthless.
+
+Classification: **macOS-specific code gap**, one missing cfg arm.
+Remedy not applied (triage only): give `DEFAULT_STATE_PATH` a macOS arm matching
+the installer's path, or make the residue-check subcommand resolve the platform
+state path rather than the Linux constant.
+
+---
+
+## 4. Cell 2 — macOS `exit`
+
+Run `livelab-1787913512-a5e93c8dd781`, report dir
+`state/mac-cells/exit-1787912119`, topology
+`macos-utm-1:exit` + `lenovo-exit-1:entry` + `lenovo-client-1:client` with
+`--macos-promote-exit` (the Option-B shape: `synthesize_rust_node_args`
+excludes a Linux exit whenever a non-Linux exit is selected,
+`ai_agent.rs:6303-6315`). 19 stages, **passed=9 failed=1 skipped=9**.
+
+**Provenance caveat, recorded honestly.** This run is at commit
+`a5e93c8dd781adce0a99d629d347674b5fd5952a` with `git_dirty_state=dirty:recorded`
+— *not* Cell 1's clean `77ff1933`. `main` advanced under the run (`work/leak-fix`
+merged while it was in flight) and the working tree carried the ledger CSV
+appends from the earlier runs. Under the AcceptanceSpec §5.4
+"N-of-N at a single clean commit" rule this run **cannot** contribute to a
+stability count. It is diagnostic evidence only.
+
+### 4.1 Outcome: `membership_init = fail`; none of the three exit stages ran
+
+```
+membership_init fail: issue_membership_owner_key: protocol error:
+  membership owner public key not found on remote; has membership been initialized?
+```
+
+Everything downstream skipped on the dependency. The three brief-named exit
+stages (`exit_nat_lifecycle_validation`, `exit_demotion_residue_validation`,
+`exit_dns_failclosed_validation`) were **never planned** in the first place per
+§2.3, and would have been unreachable anyway behind this failure.
+
+So the macOS `exit` cell yields **no exit-stage evidence at all**. It fails
+earlier than the exit role: it fails at becoming the membership owner.
+
+### 4.2 Root cause — the macOS owner-key path constant points at the wrong file
+
+On the `--node` engine `membership_init` is role-gated to `exit`
+(`node_stage_plan.json` records `"roles": ["exit"]`), so **electing macOS as exit
+also makes macOS the membership owner**. `MembershipInitStage::execute`
+(`stage/membership_init.rs:50,55`) calls `issue_membership_owner_key()` *before*
+`init_membership_snapshot()`, so the owner pubkey must already exist on the host.
+
+The macOS adapter reads the wrong path, with the wrong privilege:
+
+`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_membership.rs:29-34`
+```rust
+&format!("cat '{MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH}' 2>/dev/null || echo ''"),
+```
+where `MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH`
+(`adapter/macos_install.rs:27-28`) = `/usr/local/var/rustynet/membership/membership.owner.key.pub`.
+
+Its Linux twin, `adapter/linux_membership.rs:25-31`, does this instead:
+```rust
+"sudo -n cat /etc/rustynet/membership.owner.key.pub 2>/dev/null || \
+ sudo -n cat /var/lib/rustynet/membership.owner.key.pub 2>/dev/null || echo ''"
+```
+
+Measured on `macos-utm-1`:
+
+```
+$ cat /usr/local/var/rustynet/membership/membership.owner.key.pub
+cat: …: Permission denied                     # dir is drwx------ rustynetd:rustynetd
+$ sudo cat /usr/local/var/rustynet/membership/membership.owner.key.pub
+cat: …: No such file or directory             # nothing there even with privilege
+$ sudo find /usr/local/var/rustynet /etc/rustynet -name '*owner*'
+/etc/rustynet/membership.owner.key.pub        # -rw-r--r-- root:wheel, 32 bytes
+```
+
+**A valid owner pubkey is present on the macOS host — at the same
+`/etc/rustynet/membership.owner.key.pub` the Linux adapter looks in first — and
+the macOS adapter never looks there.** Two independent defects, either of which
+alone breaks the stage:
+
+1. **Wrong path constant** (`macos_install.rs:27-28`) — the configured location
+   holds no key; the key that exists is at the Linux-conventional path.
+2. **Missing privilege escalation** (`macos_membership.rs:31`) — a bare `cat`
+   where the Linux twin uses `sudo -n`. The configured directory is mode `0700`
+   owned by `rustynetd` while the SSH user is `mac`, so even a correctly-placed
+   key would read `Permission denied`, and `2>/dev/null || echo ''` converts that
+   into the same indistinguishable empty-string result.
+
+Defect 2 also degrades the diagnostic: a permission error and a genuinely absent
+file both surface as "has membership been initialized?", which is why the message
+points at initialization rather than at access.
+
+**Classification: macOS-specific code gap**, in the membership adapter — not
+environmental, not role-election plumbing. The role election itself worked: the
+orchestrator accepted `macos-utm-1:exit`, preflight passed with exactly one exit,
+and `bootstrap_hosts` deployed to all three nodes.
+
+**Consequence for the parity matrix:** macOS cannot hold *any*
+membership-owner role on `--node` until this is fixed. Since `membership_init`
+is gated on `exit`, this blocks the macOS `exit` cell completely and would block
+`blind_exit` under the same topology shape.
+
+Honesty note on the `/etc/rustynet/membership.owner.key.pub` file: it is dated
+`Jul 9 16:10`, i.e. it is a leftover from an earlier era of this guest, not
+something today's bootstrap seeded. So this evidence proves the adapter reads the
+wrong location; it does **not** prove that a fresh macOS install seeds the right
+one. Whether the macOS install path seeds an owner key at all is a follow-up
+question this run cannot answer.
+
+### 4.3 QH-39 / QH-40 / timeout-pair exercise in Cell 2 — none
+
+The run died before `enforce_baseline_runtime`, so `validate_baseline_runtime`
+never ran and neither QH-39 check was exercised in this run. The QH-40
+observations in §3.3–§3.4 come from Cell 1 only. The macOS exit `pf` NAT path,
+and therefore the §6 "equivalent-strength end-to-end egress assertion" the parity
+doc requires of a macOS exit cell, was **not touched**.
+
+---
+
+## 5. Matrix cells — updated vs still open
+
+**Updated** in `CrossPlatformRoleParityRefresh_2026-07-23.md` §1 — both cells move
+off ⬛ *never elected*, because both roles were in fact elected and produced a
+real signal. Neither moves to 🟢; both become 🔴 with a named blocker.
+
+* macOS **anchor** — elected live on `--node` (`livelab-1787911937-77ff1933885f`,
+  `77ff1933`, clean). Capability advertisement **passed**; bundle-pull runtime
+  reported-skipped on the §2.2 posture gate.
+* macOS **exit** — elected live on `--node` (`livelab-1787913512-a5e93c8dd781`,
+  **dirty**). Fails at `membership_init` per §4.2, before any exit stage.
+
+**Still open — nothing here earns a green:**
+
+* macOS anchor **green** — needs the §2.2 circularity resolved *and* a run with
+  `--anchor-platform macos` (so `validate_macos_anchor_bundle_pull` /
+  `validate_macos_anchor_port_mapping_authority` dispatch) *and* a run without
+  `--skip-linux-live-suite` (so `live_anchor` dispatches, §2.3). None run today.
+* macOS exit — blocked on the §4.2 adapter defect. No exit stage has ever
+  dispatched on macOS; the §6 end-to-end egress assertion remains untouched.
+* `exit_nat_lifecycle_validation`, `exit_demotion_residue_validation`,
+  `exit_dns_failclosed_validation` — **never dispatched**, on either the
+  fast-path form (§2.3) or behind the §4.2 blocker.
+* QH-39 mesh-status freshness bound — passed, but **not confirmed applied**
+  (§3.2). Needs the dispatched argv observed.
+* The helper/client timeout pair — not exercised; the guest carries the pre-fix
+  install (§3.3).
+* Stability — no cell has an N-of-N count. Cell 1 is n=1 at a clean commit;
+  Cell 2 is n=1 at a dirty one and cannot count at all.
+
+**Process observation.** The exit run's `membership_init` failure produced **no
+stub** in `live_lab_stage_triage.jsonl` (verified by scanning for
+`livelab-1787913512-*`), unlike the two earlier failures which did. The launch
+gate keys on recorded stubs, so a failure with no stub is one the gate will not
+ask about on the next launch. Flagged, not diagnosed.
+
+## 6. Environmental note — QH-41 still in force, and it shaped the topology
+
+`macos-utm-1` remains on the isolated Apple-Virtualization vmnet bridge
+(192.168.65.101) while the local UTM Linux guests are on the QEMU bridge
+(192.168.64.0/24). Measured today: mac → `192.168.64.4` **100% loss**. As QH-41's
+2026-08-12 correction records, both sides are already `Mode = "Shared"` and the
+split is a *backend* property, so no mode change or boot ordering merges them.
+
+The local Debian guests are therefore unusable as the macOS run's peers. The
+LAN-bridged Lenovo guests are reachable outbound from the mac
+(`192.168.0.30/.31`, 0% loss) and were used instead. The reverse direction does
+**not** work — `lenovo-exit-1 → 192.168.65.101` is 100% loss, the mac being
+behind vmnet NAT — which is a standing constraint on any macOS cell whose proof
+requires a peer to initiate toward the mac.
+
+Per the §12.3.1 note, every reachability verdict here is from `nc`/`ping`/`ssh`
+in the shell, not from an MCP probe.
