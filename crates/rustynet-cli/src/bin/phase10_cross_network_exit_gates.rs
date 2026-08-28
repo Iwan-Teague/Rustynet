@@ -74,11 +74,13 @@ fn run() -> Result<(), i32> {
     )?;
     run_bin(&root_dir, "test_validate_cross_network_nat_matrix", &[])?;
     run_bin(&root_dir, "test_validate_network_discovery_bundle", &[])?;
-    run_bin(
-        &root_dir,
-        "test_cross_network_remote_exit_skeleton_validators",
-        &[],
-    )?;
+    // CN-3 retired `test_cross_network_remote_exit_skeleton_validators`. It
+    // asserted that each cross-network bash validator exited non-zero without
+    // live-lab prerequisites — a property of scripts that no longer exist. The
+    // scenarios are Rust functions now, and their fail-closed behaviour is
+    // covered by their own unit tests against a mock `ScenarioHost` and
+    // `NetLeafRunner`, which assert on WHICH check failed rather than only on a
+    // non-zero exit.
 
     run_ops(
         &root_dir,

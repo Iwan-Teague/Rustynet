@@ -32,14 +32,20 @@
 //!   stderr rather than a generic pre-flight message. Keeping it would be a
 //!   second, weaker copy of a check the transport already makes.
 //!
-//! Note the SSH trust summary artifact is likewise not re-derived here: the
-//! orchestrator pins host keys for the whole run before any stage executes, so
-//! a per-scenario summary of that pinning would restate run-level state.
+//! The SSH trust summary is written, but it records what is actually true of
+//! this run rather than the shell's own ad-hoc pinning — see
+//! [`write_trust_summary`](super::remote_exit_common::write_trust_summary). It
+//! could not simply be dropped: the report validator lists it in
+//! `required_pass_source_artifacts`, so a report without it cannot pass.
 
 use std::path::{Path, PathBuf};
 
 use super::host::{ScenarioHost, all_pass};
+use super::remote_exit_common::write_trust_summary;
 use super::{Checks, ScenarioOutcome, Verdict};
+
+/// The scenario name used in fail-closed errors and the report suite field.
+pub const SUITE: &str = "cross_network_traversal_adversarial";
 
 /// The three `rustynetd` required tests that together prove signed-traversal
 /// forgery, staleness and replay are rejected.
@@ -101,6 +107,12 @@ pub struct TraversalAdversarialPaths {
     pub endpoint_log: PathBuf,
     pub control_report: PathBuf,
     pub control_log: PathBuf,
+    /// Where the three `rustynetd` gates' combined output is appended. The
+    /// report validator requires this file for a pass, which is why the gate
+    /// runner takes a log path rather than discarding the output.
+    pub local_tests_log: PathBuf,
+    /// The ssh trust summary the report validator requires for a pass.
+    pub trust_summary: PathBuf,
 }
 
 impl TraversalAdversarialPaths {
@@ -114,6 +126,10 @@ impl TraversalAdversarialPaths {
                 .join("cross_network_traversal_adversarial_control_surface_report.json"),
             control_log: artifact_dir
                 .join("cross_network_traversal_adversarial_control_surface.log"),
+            local_tests_log: artifact_dir
+                .join("cross_network_traversal_adversarial_local_tests.log"),
+            trust_summary: artifact_dir
+                .join("cross_network_traversal_adversarial_ssh_trust_summary.txt"),
         }
     }
 }
@@ -143,6 +159,22 @@ pub fn run(host: &dyn ScenarioHost, inputs: &TraversalAdversarialInputs<'_>) -> 
 
     let paths = TraversalAdversarialPaths::in_dir(inputs.artifact_dir);
 
+    // The shell wrote the trust summary before doing any work, and the report
+    // spec requires it for a pass, so a scenario that cannot write its own
+    // evidence fails before it starts making claims rather than after.
+    if let Err(err) = write_trust_summary(
+        host,
+        &paths.trust_summary,
+        SUITE,
+        &[
+            ("client-host", inputs.client_host),
+            ("exit-host", inputs.exit_host),
+            ("probe-host", inputs.probe_host),
+        ],
+    ) {
+        return ScenarioOutcome::failed(checks, err);
+    }
+
     // ── 1. signed traversal tamper and replay regression tests ──────────────
     //
     // The shell ran all three unconditionally (via `&&`, so it short-circuited
@@ -151,7 +183,7 @@ pub fn run(host: &dyn ScenarioHost, inputs: &TraversalAdversarialInputs<'_>) -> 
     // adds no information once an earlier one has failed the trio.
     let mut gates_passed = true;
     for test_name in TRAVERSAL_GATE_TESTS {
-        match host.run_required_test(TRAVERSAL_GATE_CRATE, test_name) {
+        match host.run_required_test(TRAVERSAL_GATE_CRATE, test_name, &paths.local_tests_log) {
             Ok(true) => {}
             Ok(false) => {
                 gates_passed = false;
@@ -275,8 +307,13 @@ pub fn run(host: &dyn ScenarioHost, inputs: &TraversalAdversarialInputs<'_>) -> 
     let source_artifacts = vec![
         path_arg(&paths.endpoint_report),
         path_arg(&paths.control_report),
+        path_arg(&paths.trust_summary),
     ];
-    let log_artifacts = vec![path_arg(&paths.endpoint_log), path_arg(&paths.control_log)];
+    let log_artifacts = vec![
+        path_arg(&paths.local_tests_log),
+        path_arg(&paths.endpoint_log),
+        path_arg(&paths.control_log),
+    ];
     let mut outcome = ScenarioOutcome::passed(checks);
     outcome.source_artifacts = source_artifacts;
     outcome.log_artifacts = log_artifacts;
@@ -377,8 +414,11 @@ mod tests {
                 HostCall::RequiredTest {
                     crate_name,
                     test_name,
+                    log_path,
                 } => {
                     assert_eq!(crate_name, TRAVERSAL_GATE_CRATE);
+                    // Every gate appends to the one log the report declares.
+                    assert_eq!(log_path, paths().local_tests_log);
                     Some(test_name)
                 }
                 _ => None,
@@ -702,6 +742,75 @@ mod tests {
             assert!(!checks.passed(name), "{name} must default to fail");
         }
         assert_eq!(checks.len(), 5);
+    }
+
+    #[test]
+    fn a_pass_declares_every_artifact_the_report_validator_requires() {
+        // These six basenames are `required_pass_source_artifacts` /
+        // `required_pass_log_artifacts` for this suite in
+        // `ops_cross_network_reports`. A pass that omits one produces a report
+        // that fails its own schema validation, so the declaration is a
+        // correctness requirement rather than bookkeeping.
+        let host = healthy_host();
+        let dir = artifact_dir();
+        let identity = PathBuf::from("/home/op/.ssh/id");
+        let outcome = run(&host, &inputs(&identity, &dir));
+        assert!(outcome.is_pass(), "summary: {}", outcome.failure_summary);
+
+        let p = paths();
+        for required in [&p.endpoint_report, &p.control_report, &p.trust_summary] {
+            let rendered = path_arg(required);
+            assert!(
+                outcome.source_artifacts.contains(&rendered),
+                "source artifacts must name {rendered}"
+            );
+        }
+        for required in [&p.local_tests_log, &p.endpoint_log, &p.control_log] {
+            let rendered = path_arg(required);
+            assert!(
+                outcome.log_artifacts.contains(&rendered),
+                "log artifacts must name {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_trust_summary_is_written_before_any_evidence_is_gathered() {
+        // The report validator reads the summary's contents, so it must exist;
+        // writing it first means a scenario that cannot produce its own evidence
+        // fails before it starts making claims.
+        let host = healthy_host();
+        let dir = artifact_dir();
+        let identity = PathBuf::from("/home/op/.ssh/id");
+        let _ = run(&host, &inputs(&identity, &dir));
+
+        let recorded = host.recorded();
+        let first = recorded.first().expect("at least one recorded call");
+        match first {
+            HostCall::WriteArtifact { path, contents } => {
+                assert_eq!(*path, paths().trust_summary);
+                assert!(contents.contains("probe-host: debian@probe-host"));
+            }
+            other => panic!("expected the trust summary write first, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_trust_summary_that_cannot_be_written_fails_the_scenario_closed() {
+        let mut host = healthy_host();
+        host.artifact_write_errors.push(paths().trust_summary);
+        let dir = artifact_dir();
+        let identity = PathBuf::from("/home/op/.ssh/id");
+        let outcome = run(&host, &inputs(&identity, &dir));
+
+        assert!(!outcome.is_pass());
+        assert!(
+            outcome
+                .failure_summary
+                .starts_with("writing ssh trust summary:"),
+            "got: {}",
+            outcome.failure_summary
+        );
     }
 
     #[test]

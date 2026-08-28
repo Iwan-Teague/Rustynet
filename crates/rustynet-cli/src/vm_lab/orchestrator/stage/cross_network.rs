@@ -140,7 +140,7 @@ impl Default for CrossNetworkOptions {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum CrossNetworkStageKind {
     Preflight,
     DirectRemoteExit,
@@ -297,17 +297,16 @@ fn run_cross_network_stage(
         CrossNetworkStageKind::Preflight => run_preflight(ctx, spec.name),
         CrossNetworkStageKind::NatClassification => run_nat_classification(ctx, options),
         CrossNetworkStageKind::NatMatrix => run_nat_matrix(ctx, options),
-        // CN-3: ported scenarios run in-process; the rest still go through the
-        // `cargo run --bin` fan below until their own port lands.
-        CrossNetworkStageKind::DirectRemoteExit | CrossNetworkStageKind::RelayRemoteExit => {
-            run_ported_scenario_stage(ctx, options, spec)
-        }
-        CrossNetworkStageKind::NodeNetworkSwitch
+        // CN-3 is complete: all eight scenario validators are Rust functions
+        // this stage calls directly. There is no `cargo run --bin` fan left.
+        CrossNetworkStageKind::DirectRemoteExit
+        | CrossNetworkStageKind::RelayRemoteExit
+        | CrossNetworkStageKind::TraversalAdversarial
+        | CrossNetworkStageKind::NodeNetworkSwitch
         | CrossNetworkStageKind::FailbackRoaming
         | CrossNetworkStageKind::ControllerSwitch
-        | CrossNetworkStageKind::TraversalAdversarial
         | CrossNetworkStageKind::RemoteExitDns
-        | CrossNetworkStageKind::RemoteExitSoak => run_script_stage(ctx, options, spec),
+        | CrossNetworkStageKind::RemoteExitSoak => run_ported_scenario_stage(ctx, options, spec),
     }
 }
 
@@ -488,9 +487,10 @@ fn run_nat_matrix(ctx: &OrchestrationContext, options: &CrossNetworkOptions) -> 
 }
 
 /// The topology guards and stage directory every cross-network scenario stage
-/// needs, resolved once. Factored out of [`run_script_stage`] so the ported
-/// (in-process) and unported (`cargo run --bin`) paths cannot drift on which
-/// topologies they refuse to run against.
+/// needs, resolved once. It stayed a separate function through CN-3 so the
+/// ported and unported dispatch paths could not drift on which topologies they
+/// refuse to run against; with the unported path gone it is simply the one
+/// place those guards live.
 fn prepare_scenario_stage(
     ctx: &OrchestrationContext,
     options: &CrossNetworkOptions,
@@ -580,9 +580,16 @@ fn run_ported_scenario_profile(
     report_path: &Path,
     log_path: &Path,
 ) -> StageOutcome {
-    // Only the relay scenarios resolve a relay. Building one unconditionally
-    // would open an ssh transport to a node the direct scenario never touches.
-    let needs_relay = matches!(kind, CrossNetworkStageKind::RelayRemoteExit);
+    // Only the relay scenarios resolve a relay, and only the adversarial one a
+    // probe. Building either unconditionally would open an ssh transport to a
+    // node the scenario never touches.
+    let needs_relay = matches!(
+        kind,
+        CrossNetworkStageKind::RelayRemoteExit
+            | CrossNetworkStageKind::FailbackRoaming
+            | CrossNetworkStageKind::ControllerSwitch
+    );
+    let needs_probe = matches!(kind, CrossNetworkStageKind::TraversalAdversarial);
     let client_remote = match remote_host_for_role(ctx, "client") {
         Ok(host) => host,
         Err(err) => return StageOutcome::Failed(err),
@@ -670,10 +677,13 @@ fn run_ported_scenario_profile(
         client_ssh_target: topology.client.target.clone(),
         exit_ssh_target: topology.exit.target.clone(),
         relay_ssh_target: needs_relay.then(|| topology.relay.target.clone()),
-        probe_ssh_target: None,
+        probe_ssh_target: needs_probe.then(|| topology.probe.target.clone()),
         client_src_dir,
         exit_src_dir,
         relay_src_dir,
+        client_network_id: topology.client_network_id.clone(),
+        exit_network_id: topology.exit_network_id.clone(),
+        relay_network_id: needs_relay.then(|| topology.relay_network_id.clone()),
         time_scale: scenario::provisioning::TimeScale::Real,
     };
 
@@ -686,17 +696,98 @@ fn run_ported_scenario_profile(
 
     let (suite, outcome) = match kind {
         CrossNetworkStageKind::DirectRemoteExit => (
-            "cross_network_direct_remote_exit",
+            scenario::direct_remote_exit::SUITE,
             scenario::direct_remote_exit::run(&host, &inputs, &lab),
         ),
         CrossNetworkStageKind::RelayRemoteExit => (
             scenario::relay_remote_exit::SUITE,
             scenario::relay_remote_exit::run(&host, &inputs, &lab),
         ),
+        // The reconnect SLO stays at the shell's default. It was a
+        // `--reconnect-slo-secs` flag no orchestrator call site ever passed, so
+        // exposing it as a stage option would add a knob with no caller.
+        CrossNetworkStageKind::NodeNetworkSwitch => (
+            scenario::node_network_switch::SUITE,
+            scenario::node_network_switch::run(
+                &host,
+                &inputs,
+                &lab,
+                scenario::node_network_switch::NodeNetworkSwitchOptions::default(),
+            ),
+        ),
+        // Same reasoning as the node-switch arm: the SLO and iteration count
+        // were flags no orchestrator call site ever passed.
+        CrossNetworkStageKind::FailbackRoaming => (
+            scenario::failback_roaming::SUITE,
+            scenario::failback_roaming::run(
+                &host,
+                &inputs,
+                &lab,
+                scenario::failback_roaming::FailbackRoamingOptions::default(),
+            ),
+        ),
+        CrossNetworkStageKind::ControllerSwitch => (
+            scenario::controller_switch::SUITE,
+            scenario::controller_switch::run(
+                &host,
+                &inputs,
+                &lab,
+                scenario::controller_switch::ControllerSwitchOptions::default(),
+            ),
+        ),
+        // The zone name, DNS interface and bind address stay at the shell's
+        // defaults: they were flags no orchestrator call site ever passed.
+        CrossNetworkStageKind::RemoteExitDns => (
+            scenario::remote_exit_dns::SUITE,
+            scenario::remote_exit_dns::run(
+                &host,
+                &inputs,
+                &lab,
+                &scenario::remote_exit_dns::RemoteExitDnsOptions::default(),
+            ),
+        ),
+        // The soak's four tunables stay at the shell's defaults, so a live run
+        // still takes the two minutes the stability claim is measured over.
+        // `LabContext::time_scale` is `Real` here; only tests collapse it.
+        CrossNetworkStageKind::RemoteExitSoak => (
+            scenario::remote_exit_soak::SUITE,
+            scenario::remote_exit_soak::run(
+                &host,
+                &inputs,
+                &lab,
+                scenario::remote_exit_soak::SoakOptions::default(),
+            ),
+        ),
+        // The adversarial scenario runs no remote commands of its own — it
+        // composes two sibling validator binaries that drive their own ssh
+        // transport — so it takes ssh targets rather than the runner triple the
+        // others need, and never builds a `NetLeafRunner` at all.
+        CrossNetworkStageKind::TraversalAdversarial => {
+            let probe_target =
+                match lab.require_probe_ssh_target(scenario::traversal_adversarial::SUITE) {
+                    Ok(target) => target.to_owned(),
+                    Err(err) => return StageOutcome::Failed(err),
+                };
+            let adversarial_inputs = scenario::traversal_adversarial::TraversalAdversarialInputs {
+                ssh_identity_file: lab.ssh_identity_file.as_path(),
+                client_host: lab.client_ssh_target.as_str(),
+                exit_host: lab.exit_ssh_target.as_str(),
+                probe_host: probe_target.as_str(),
+                rogue_endpoint_ip: scenario::traversal_adversarial::DEFAULT_ROGUE_ENDPOINT_IP,
+                artifact_dir: lab.artifact_dir.as_path(),
+            };
+            (
+                scenario::traversal_adversarial::SUITE,
+                scenario::traversal_adversarial::run(&host, &adversarial_inputs),
+            )
+        }
+        // Unreachable in practice: `run_cross_network_stage` only routes the
+        // eight scenario kinds here. Kept as a typed fail-closed arm rather
+        // than an `unreachable!`, because a new stage kind added to the enum
+        // should surface as a stage failure naming itself, not a panic.
         other => {
             return StageOutcome::Failed(format!(
-                "{} is not a ported cross-network scenario",
-                bin_name(other)
+                "{other:?} is not a cross-network scenario stage"
             ));
         }
     };
@@ -706,9 +797,33 @@ fn run_ported_scenario_profile(
         topology,
         options,
         nat_profile,
-        report_path,
-        log_path,
+        &ScenarioParticipants {
+            relay: needs_relay,
+            probe: needs_probe,
+        },
+        &ScenarioReportPaths {
+            report: report_path,
+            log: log_path,
+        },
     )
+}
+
+/// Where one ported scenario's own report and log go.
+struct ScenarioReportPaths<'a> {
+    report: &'a Path,
+    log: &'a Path,
+}
+
+/// Which optional participants a scenario's report must name.
+///
+/// The report schema requires `participants.relay_host` +
+/// `network_context.relay_network_id` for the relay suites and
+/// `participants.probe_host` for the adversarial one, and rejects a report that
+/// omits them — so this is not cosmetic metadata but a pass/fail gate on the
+/// report itself.
+struct ScenarioParticipants {
+    relay: bool,
+    probe: bool,
 }
 
 /// `live_lab_remote_src_dir` for a resolved role, derived from its ssh user.
@@ -735,9 +850,11 @@ fn write_cross_network_scenario_report(
     topology: &CrossNetworkTopology,
     options: &CrossNetworkOptions,
     nat_profile: &substrate::NatProfileId,
-    report_path: &Path,
-    log_path: &Path,
+    participants: &ScenarioParticipants,
+    paths: &ScenarioReportPaths<'_>,
 ) -> StageOutcome {
+    let report_path = paths.report;
+    let log_path = paths.log;
     let mut source_artifacts: Vec<PathBuf> = vec![repo_root().join(SCENARIO_SOURCE_ARTIFACT)];
     source_artifacts.extend(outcome.source_artifacts.iter().map(PathBuf::from));
     let config = crate::ops_cross_network_reports::GenerateCrossNetworkRemoteExitReportConfig {
@@ -752,11 +869,13 @@ fn write_cross_network_scenario_report(
         log_artifacts: outcome.log_artifacts.iter().map(PathBuf::from).collect(),
         client_host: Some(topology.client.target.clone()),
         exit_host: Some(topology.exit.target.clone()),
-        relay_host: None,
-        probe_host: None,
+        relay_host: participants.relay.then(|| topology.relay.target.clone()),
+        probe_host: participants.probe.then(|| topology.probe.target.clone()),
         client_network_id: Some(topology.client_network_id.clone()),
         exit_network_id: Some(topology.exit_network_id.clone()),
-        relay_network_id: None,
+        relay_network_id: participants
+            .relay
+            .then(|| topology.relay_network_id.clone()),
         // The report schema is a JSON document with a string field; this is the
         // one place the typed profile is rendered back to text.
         nat_profile: nat_profile.as_str().to_owned(),
@@ -786,124 +905,6 @@ fn write_cross_network_scenario_report(
 /// its own `.sh` file here; the Rust scenario names the module that replaced it.
 const SCENARIO_SOURCE_ARTIFACT: &str =
     "crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/scenario/mod.rs";
-
-fn run_script_stage(
-    ctx: &OrchestrationContext,
-    options: &CrossNetworkOptions,
-    spec: &CrossNetworkStageSpec,
-) -> StageOutcome {
-    let (topology, stage_dir) = match prepare_scenario_stage(ctx, options, spec) {
-        Ok(prepared) => prepared,
-        Err(outcome) => return outcome,
-    };
-
-    for (idx, profile) in options.nat_profiles.iter().enumerate() {
-        let profile = profile.as_str();
-        let mut cmd = Command::new("cargo");
-        cmd.current_dir(repo_root())
-            .args([
-                "run",
-                "--quiet",
-                "-p",
-                "rustynet-cli",
-                "--features",
-                "vm-lab",
-                "--bin",
-                bin_name(spec.kind),
-                "--",
-            ])
-            .env(
-                "LIVE_LAB_PINNED_KNOWN_HOSTS_FILE",
-                &topology.client.known_hosts,
-            )
-            .arg("--ssh-identity-file")
-            .arg(&topology.client.identity_file)
-            .arg("--nat-profile")
-            .arg(profile)
-            .arg("--impairment-profile")
-            .arg(&options.impairment_profile)
-            .arg("--report-path")
-            .arg(stage_report_path_for_idx(
-                &stage_dir, spec.name, profile, idx,
-            ))
-            .arg("--log-path")
-            .arg(stage_log_path_for_idx(&stage_dir, spec.name, profile, idx));
-        add_common_hosts(&mut cmd, &topology, spec.kind);
-        let outcome = run_command(cmd, bin_name(spec.kind));
-        if !matches!(outcome, StageOutcome::Passed) {
-            return outcome;
-        }
-    }
-    StageOutcome::Passed
-}
-
-fn add_common_hosts(
-    cmd: &mut Command,
-    topology: &CrossNetworkTopology,
-    kind: CrossNetworkStageKind,
-) {
-    cmd.arg("--client-host")
-        .arg(&topology.client.target)
-        .arg("--exit-host")
-        .arg(&topology.exit.target)
-        .arg("--client-network-id")
-        .arg(&topology.client_network_id)
-        .arg("--exit-network-id")
-        .arg(&topology.exit_network_id);
-
-    if !matches!(kind, CrossNetworkStageKind::TraversalAdversarial) {
-        cmd.arg("--client-node-id")
-            .arg(&topology.client.node_id)
-            .arg("--exit-node-id")
-            .arg(&topology.exit.node_id)
-            .arg("--known-hosts-file")
-            .arg(&topology.client.known_hosts);
-    }
-
-    if matches!(
-        kind,
-        CrossNetworkStageKind::RelayRemoteExit
-            | CrossNetworkStageKind::FailbackRoaming
-            | CrossNetworkStageKind::ControllerSwitch
-    ) {
-        cmd.arg("--relay-host")
-            .arg(&topology.relay.target)
-            .arg("--relay-node-id")
-            .arg(&topology.relay.node_id)
-            .arg("--relay-network-id")
-            .arg(&topology.relay_network_id);
-    }
-
-    if matches!(kind, CrossNetworkStageKind::TraversalAdversarial) {
-        cmd.arg("--probe-host").arg(&topology.probe.target);
-    }
-}
-
-fn bin_name(kind: CrossNetworkStageKind) -> &'static str {
-    match kind {
-        CrossNetworkStageKind::NodeNetworkSwitch => {
-            "live_linux_cross_network_node_network_switch_test"
-        }
-        CrossNetworkStageKind::FailbackRoaming => "live_linux_cross_network_failback_roaming_test",
-        CrossNetworkStageKind::ControllerSwitch => {
-            "live_linux_cross_network_controller_switch_test"
-        }
-        CrossNetworkStageKind::TraversalAdversarial => {
-            "live_linux_cross_network_traversal_adversarial_test"
-        }
-        CrossNetworkStageKind::RemoteExitDns => "live_linux_cross_network_remote_exit_dns_test",
-        CrossNetworkStageKind::RemoteExitSoak => "live_linux_cross_network_remote_exit_soak_test",
-        // `DirectRemoteExit` joins these: CN-3 ported it, so it is dispatched
-        // in process by `run_direct_remote_exit_stage` and never reaches the
-        // `cargo run --bin` fan. Its bin shim is deleted, so naming it here
-        // would name a binary that does not exist.
-        CrossNetworkStageKind::DirectRemoteExit
-        | CrossNetworkStageKind::RelayRemoteExit
-        | CrossNetworkStageKind::Preflight
-        | CrossNetworkStageKind::NatClassification
-        | CrossNetworkStageKind::NatMatrix => unreachable!("no script for this stage kind"),
-    }
-}
 
 #[derive(Debug)]
 enum TopologyError {

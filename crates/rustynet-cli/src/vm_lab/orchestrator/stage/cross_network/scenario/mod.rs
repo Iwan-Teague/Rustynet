@@ -43,28 +43,31 @@ use std::fmt;
 
 use super::substrate::{LeafOutput, NetLeafRunner};
 
+pub mod baseline;
+pub mod controller_switch;
 pub mod direct_remote_exit;
+pub mod endpoint_switch;
+pub mod failback_roaming;
 pub mod host;
+pub mod node_network_switch;
 pub mod provisioning;
 pub mod relay_remote_exit;
 pub mod remote_exit_common;
+pub mod remote_exit_dns;
+pub mod remote_exit_soak;
 pub mod traversal_adversarial;
 
-// CN-3 is landing scenario-by-scenario: a ported scenario has its dispatch arm
-// repointed here and its bin deleted in the same commit, while the scenarios
-// below still run through the legacy `cargo run --bin` path. The module list
-// grows as each one lands, so at no point is there a scenario that is neither
-// fully ported nor fully on the old path.
+// All eight scenarios are ported. The orchestrator calls each as a function,
+// no `[[bin]]` shim or `.sh` remains for any of them, and `run_script_stage`'s
+// `cargo run --bin` fan is deleted rather than merely unused.
 //
-// Not yet ported: node_network_switch, failback_roaming, controller_switch,
-// remote_exit_dns, remote_exit_soak.
-//
-// Script deletion lags bin deletion for `direct_remote_exit` specifically.
-// `scripts/e2e/live_linux_cross_network_{remote_exit_dns,node_network_switch,
-// remote_exit_soak}_test.sh` each invoke the direct remote-exit *script*
-// directly to establish their baseline, so deleting it before those three are
-// ported would break them. Its `[[bin]]` shim has no such consumer and is gone;
-// the script dies with the last of its three bash callers.
+// `scripts/e2e/live_lab_common.sh` SURVIVES, which is a deviation from the plan
+// and is deliberate: it has two consumers outside this family. The macOS
+// install adapter pins its cross-platform path helpers by content in
+// `#[cfg(test)]` assertions, and `scripts/e2e/test_live_lab_ssh_windows.sh`
+// sources it for the Windows SSH helpers. Both belong to the macOS/Windows
+// parity track, not to CN-3, so the file dies with that track rather than this
+// one. What CN-3 did remove is every cross-network *caller* of it.
 
 /// Verdict of one named check inside a scenario report. The shell modelled
 /// these as `CHECK_*` string variables holding `"pass"` / `"fail"`, defaulted
@@ -452,7 +455,7 @@ pub const DAEMON_SOCKET_SLEEP_SECS: u64 = 2;
 ///
 /// The shell branched here on a Windows named-pipe spelling of the socket path.
 /// That branch is dropped: every cross-network scenario host is a Linux guest
-/// (`run_script_stage` resolves them from the Linux cross-network topology),
+/// (the stage resolves them from the Linux cross-network topology),
 /// so the named-pipe arm was unreachable from these eight validators.
 pub fn wait_for_daemon_socket(runner: &dyn NetLeafRunner) -> Result<(), String> {
     retry_root(
@@ -549,9 +552,18 @@ pub fn exit_serving_route(status_output: &str) -> bool {
     status_output.contains("serving_exit_node=true")
 }
 
-/// The client's route to the internet leaves via the tunnel interface.
+/// The tunnel interface every lab node brings up.
+pub const TUNNEL_INTERFACE: &str = "rustynet0";
+
+/// The client's route to the internet names the tunnel interface.
+///
+/// Note this asks whether the tunnel is named, NOT whether it is the only
+/// device named — see
+/// [`endpoint_switch::route_leaves_non_tunnel_dev`](endpoint_switch::route_leaves_non_tunnel_dev)
+/// for the stricter reading the failback scenario samples with, and why the two
+/// coexist.
 pub fn route_via_rustynet(route_output: &str) -> bool {
-    route_output.contains("dev rustynet0")
+    route_output.contains(&format!("dev {TUNNEL_INTERFACE}"))
 }
 
 /// The exit's nftables ruleset carries a masquerade rule, i.e. NAT is actually

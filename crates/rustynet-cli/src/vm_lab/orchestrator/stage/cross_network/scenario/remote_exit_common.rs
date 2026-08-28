@@ -59,6 +59,14 @@ pub struct BypassRun<'a> {
     /// The node whose underlay address the client must NOT be able to reach
     /// around the tunnel — the final exit in both scenarios.
     pub probe_ssh_target: &'a str,
+    /// `--probe-bind-ip`: which of the probe's addresses it should serve on.
+    ///
+    /// `None` lets the sibling pick, which is what the two remote-exit
+    /// scenarios do. The failback scenario pins it to the exit's freshly added
+    /// roam alias, because the question there is specifically whether the
+    /// client can reach the exit at its NEW address around the tunnel — probing
+    /// the old one would test a path the roam was supposed to abandon.
+    pub probe_bind_ip: Option<&'a str>,
     /// The `FAILURE_SUMMARY` for "the validator failed before emitting
     /// evidence". Each scenario spelled this differently and the operator-facing
     /// text is preserved verbatim.
@@ -82,20 +90,28 @@ pub fn run_bypass_validator(
     let identity = provisioning::path_arg(&lab.ssh_identity_file);
     let report_arg = provisioning::path_arg(run.report_path);
     let log_arg = provisioning::path_arg(run.log_path);
-    let args = [
+    let mut args: Vec<&str> = vec![
         "--ssh-identity-file",
         identity.as_str(),
         "--client-host",
         lab.client_ssh_target.as_str(),
         "--probe-host",
         run.probe_ssh_target,
+    ];
+    // Positioned here, between the probe host and the allow-cidrs, exactly
+    // where the shell spelled it.
+    if let Some(bind_ip) = run.probe_bind_ip {
+        args.push("--probe-bind-ip");
+        args.push(bind_ip);
+    }
+    args.extend_from_slice(&[
         "--ssh-allow-cidrs",
         lab.ssh_allow_cidrs.as_str(),
         "--report-path",
         report_arg.as_str(),
         "--log-path",
         log_arg.as_str(),
-    ];
+    ]);
 
     let succeeded = during(
         run.phase,

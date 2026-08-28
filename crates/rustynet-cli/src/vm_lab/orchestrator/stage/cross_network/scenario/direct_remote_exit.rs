@@ -53,6 +53,9 @@ use super::{
     status, wait_for_daemon_socket,
 };
 
+/// The scenario name used in fail-closed errors and the report suite field.
+pub const SUITE: &str = "cross_network_direct_remote_exit";
+
 /// The report's check names, in the shell's emission order.
 pub const CHECKS: &[&str] = &[
     "direct_remote_exit_success",
@@ -178,7 +181,7 @@ fn execute(
     write_trust_summary(
         host,
         &lab.artifact(TRUST_SUMMARY_FILE),
-        "cross_network_direct_remote_exit",
+        SUITE,
         &[
             ("client-host", lab.client_ssh_target.as_str()),
             ("exit-host", lab.exit_ssh_target.as_str()),
@@ -496,6 +499,7 @@ fn record_bypass_verdicts(
             // whether the client can still reach a service on the exit's
             // underlay address without going through the tunnel.
             probe_ssh_target: lab.exit_ssh_target.as_str(),
+            probe_bind_ip: None,
             missing_evidence_summary: "server-IP bypass validator failed before emitting evidence",
             phase: "validating narrow server-IP bypass and leak resistance on direct \
                     remote-exit path",
