@@ -100,7 +100,11 @@ impl NodeAdapter for IosNodeAdapter {
     fn distribute_verifier_key(&self, _: BundleKind, _: &Path) -> Result<(), AdapterError> {
         Err(ios_unsupported())
     }
-    fn run_validator(&self, _: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
+    fn run_validator(
+        &self,
+        _: DaemonProbeOp,
+        _: &[String],
+    ) -> Result<ValidatorReport, AdapterError> {
         Err(ios_unsupported())
     }
     fn ping_mesh_peer(&self, _: &str) -> Result<TrafficTestResult, AdapterError> {

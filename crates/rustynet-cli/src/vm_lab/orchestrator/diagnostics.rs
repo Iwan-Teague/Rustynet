@@ -791,7 +791,11 @@ mod failure_diagnostics_tests {
         fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
             unimplemented!()
         }
-        fn run_validator(&self, _op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
+        fn run_validator(
+            &self,
+            _op: DaemonProbeOp,
+            _extra_args: &[String],
+        ) -> Result<ValidatorReport, AdapterError> {
             unimplemented!()
         }
         fn ping_mesh_peer(&self, _peer: &str) -> Result<TrafficTestResult, AdapterError> {

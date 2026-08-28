@@ -207,7 +207,19 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
 
     // ── Validators ────────────────────────────────────────────────
 
-    fn run_validator(&self, op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError>;
+    /// Dispatch a `DaemonProbeOp` check on the node.
+    ///
+    /// `extra_args` carries the per-run expectation flags the op needs in
+    /// order to assert something (e.g. mesh-status' `--max-age-seconds`
+    /// freshness bound). It is a required parameter rather than an optional
+    /// second method so a new adapter cannot silently drop the expectations
+    /// and turn the check back into a content-free pass (QH-39). Pass `&[]`
+    /// for ops that carry no expectations.
+    fn run_validator(
+        &self,
+        op: DaemonProbeOp,
+        extra_args: &[String],
+    ) -> Result<ValidatorReport, AdapterError>;
 
     /// Run a typed role validator, gated by the §4.7 node-identity challenge.
     ///

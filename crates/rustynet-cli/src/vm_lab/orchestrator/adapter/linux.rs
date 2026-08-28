@@ -181,11 +181,19 @@ impl NodeAdapter for LinuxNodeAdapter {
 
     // ── Validators ────────────────────────────────────────────────────────────
 
-    fn run_validator(&self, op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
+    fn run_validator(
+        &self,
+        op: DaemonProbeOp,
+        extra_args: &[String],
+    ) -> Result<ValidatorReport, AdapterError> {
         use crate::vm_lab::{DaemonProbe, LinuxDaemonProbe};
         let probe = LinuxDaemonProbe;
         let argv = probe
-            .build_argv(op, linux_install::LINUX_RUSTYNETD_PATH.as_ref())
+            .build_argv_with_extra_args(
+                op,
+                linux_install::LINUX_RUSTYNETD_PATH.as_ref(),
+                extra_args,
+            )
             .map_err(|message| AdapterError::Protocol { message })?;
         // All argv elements come from `LinuxDaemonProbe::build_argv`, which produces
         // a fixed set of known-safe strings: binary path + a `linux-*-check` subcommand

@@ -270,6 +270,7 @@ mod tests {
         fn run_validator(
             &self,
             _op: crate::vm_lab::DaemonProbeOp,
+            _extra_args: &[String],
         ) -> Result<ValidatorReport, AdapterError> {
             unimplemented!()
         }
