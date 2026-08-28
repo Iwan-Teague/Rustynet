@@ -3103,6 +3103,13 @@ stage that had been cascade-blocked behind this one and reached its own verdict 
 
 The root cause, the fix, and the refuted hypotheses are kept below so the reasoning stays auditable.**
 
+**2026-08-28 — the Windows analogue of this defect class is now examined**: see
+`WindowsWfpCoexistenceAudit_2026-08-28.md` (same directory). Verdict: the core hazard
+(a foreign WFP provider discarding authorized traffic) is **real and undetected on Windows** —
+the Windows arm of `admit_host_firewall_forwarding` is a self-documented no-op
+(`phase10.rs:4870-4876`), so the QH-54 posture loop cannot fire there. The audit states the
+exact fix shape; it implements nothing.
+
 Rustynet installs its forward chain at `type filter hook forward priority 0` and appends the relay
 hairpin allow `iifname rustynet0 oifname rustynet0 counter accept` (`phase10.rs:2265-2294`). In
 netfilter a base chain's `accept` is `NF_ACCEPT` — "continue to the next base chain at this hook" —
