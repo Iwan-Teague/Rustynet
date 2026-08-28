@@ -840,3 +840,303 @@ re-run:
    nine chaos stages (see `NeverDispatchedLinuxStagesTriage_2026-08-27.md`).
 
 The launch gate is clear — no undispositioned stub blocks the next run.
+
+---
+
+## 12) CN-PROOF — the vxlan substrate run. `livelab-1787908428-6d9224cfd954`, `passed=43 failed=1 skipped=17`
+
+**Status: the cross-network track is NOT live-proven, and it cannot be proven on
+this fleet. Selecting `--cross-network-substrate vxlan` on the §7 five-guest
+topology provisions nothing, dispatches none of the eight CN-3 validators, loses
+the one cross-network stage that was passing, and turns the run red on a
+consequential failure. The blocker is structural and has three independent
+causes, all of which this run exercised live.**
+
+### 12.1 The run
+
+| field | value |
+|---|---|
+| run id | `livelab-1787908428-6d9224cfd954` |
+| window | 2026-08-28T08:54:37Z → 09:13:47Z (19 min 10 s) |
+| commit | `6d9224cfd954` (`main` HEAD), branch `work/cn-proof`, `git_dirty_state=clean` |
+| worktree | `.claude/worktrees/mgr-cn-proof` |
+| topology | the §7 five-guest UTM set, unchanged: `ubuntu-utm-1:client`, `rocky-utm-1:admin`, `debian-headless-4:exit`, `fedora-utm-1:relay`, `debian-headless-2:anchor` |
+| network profile | `mgmt_shared_smoke_v1`, digest `sha256:ab06a230…f4f67e4` — unchanged from §11 |
+| delta vs §11 | exactly one flag: `--cross-network-substrate vxlan` |
+| result | **`passed=43 failed=1 skipped=17`**, `overall_result=fail`, `first_failed_stage=cross_network_nat_matrix` |
+| ledger row | **confirmed** — row 187 of `live_lab_node_run_matrix.csv` |
+| report dir | `state/live-lab-cnproof-20260828/` |
+
+Host disk 204 GiB free at launch and unchanged at completion; the 5 GiB stop
+threshold was never approached. All five guests probed `ready`, `unready=none`.
+
+### 12.2 Per-stage outcome, the whole cross-network block
+
+| stage | §11 baseline (netns) | this run (vxlan) | why |
+|---|---|---|---|
+| `cross_network_substrate_setup` | pass | **pass** | but a *recorded no-op* — see §12.3 |
+| `cross_network_preflight` | pass | **pass** | substrate-independent |
+| `cross_network_direct_remote_exit` | skip | **skip** | missing role |
+| `cross_network_relay_remote_exit` | skip | **skip** | missing role |
+| `cross_network_node_network_switch` | skip | **skip** | missing role |
+| `cross_network_failback_roaming` | skip | **skip** | missing role |
+| `cross_network_controller_switch` | skip | **skip** | missing role |
+| `cross_network_traversal_adversarial` | skip | **skip** | missing role |
+| `cross_network_remote_exit_dns` | skip | **skip** | missing role |
+| `cross_network_remote_exit_soak` | skip | **skip** | missing role |
+| `cross_network_nat_classification` | **pass** | **skip** | netns-only stage; the flag took it away |
+| `cross_network_nat_matrix` | skip | **FAIL** | demands evidence the skipped suites never wrote |
+| `cross_network_substrate_teardown` | pass | **pass** | drains an empty handle |
+
+The eight scenario skips all carry the *same* verbatim reason, and it is **not**
+the baseline's reason:
+
+```
+skipped: cross-network topology requires a role that no node in this topology is assigned
+```
+
+The baseline's reason was `this stage requires the vxlan cross-network substrate`.
+So the flag did move the block past its first gate — and it stopped at the second.
+
+### 12.3 Three independent structural gates, each verified live
+
+**(a) The vxlan substrate provisions nothing on a single-LAN fleet.**
+`plan_overlay` groups the participating nodes by underlay /24 and returns
+`Ok(None)` when there are fewer than two groups
+(`crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/substrate.rs:754-756`).
+`VxlanSubstrateProvider::setup` then short-circuits to an empty handle with
+`provisioned: false`, no participants and no created resources
+(`…/substrate.rs:1529-1532`). All five §7 guests sit on `192.168.64.0/24`, so
+this is the branch that ran. **`cross_network_substrate_setup` passing is
+therefore not evidence that any vxlan code path works** — it is evidence that the
+no-op branch is honest. No `rustynet-vx0` device was created on any guest (§12.5
+confirms none exists), no overlay address entered `ctx.endpoints`, and
+`collect_pubkeys` saw byte-identical values to the baseline.
+
+**(b) The scenarios need `entry` and `aux` roles that the §7 topology has no
+slot for.** `CrossNetworkTopology::resolve` fills the *relay* participant from
+`["entry", "aux"]` and the *probe* participant from `["aux", "entry"]`
+(`crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network.rs:929-932`);
+neither resolves from the `relay` role. Absent both, it returns
+`TopologyError::MissingRole`, which `prepare_scenario_stage` converts to the skip
+quoted above (`…/cross_network.rs:506-511`). This is the gate all eight
+validators hit. It is a *topology* gap, not a code defect — but it means the §7
+topology can never dispatch CN-3, with or without a substrate.
+
+**(c) Even with `entry`/`aux` assigned, the §7 topology would still skip.**
+`prepare_scenario_stage` additionally requires the client and exit nodes to sit on
+different /24s (`…/cross_network.rs:514-520`), and `distinct_underlay_prefixes`
+reads the **management SSH addresses**, not the overlay plane
+(`…/cross_network.rs:944-949`, via `ResolvedParams::host` which
+`ssh_params_for_role` fills from `adapter.ssh_connection_params()` at
+`…/cross_network.rs:1085-1105`). Every UTM guest is `192.168.64.x`, so the check
+is false for every pairing available here.
+
+**This is the finding that matters.** (a) and (c) together mean the vxlan
+substrate cannot *manufacture* the cross-network condition it exists to provide:
+it overlays LANs that are already separate, and the scenario gate then asks
+whether they were already separate. On a fleet with one LAN, both answers are no.
+Whether that is the intended contract is a design question for the spec owner —
+`vxlan_tier_b.sh`, the shell tier this provider ports, built its own per-LAN
+topology on one wire, and the CN-4 row (§0.4 deviation (c)) records the
+deliberate decision to build a flat head-end-replicated mesh instead "because
+THAT is what makes cross-LAN `ctx.endpoints` routable". The consequence, not
+recorded anywhere until now, is that **Tier B now requires a physically 2-LAN
+fleet as an input rather than producing one.**
+
+### 12.4 Defects found
+
+#### CN-PROOF-D1 — `cross_network_nat_matrix` fails the run on evidence its own
+suites were skipped for
+
+`run_nat_matrix` gates only on `options.substrate != CrossNetworkSubstrate::Vxlan`
+(`…/cross_network.rs:459-464`) and then unconditionally shells to
+`ops validate-cross-network-nat-matrix --require-pass-status`. It does not ask
+whether the six suites that write matrix evidence actually ran. Here they all
+skipped, so the validator found `Matrix Records: none` and reported, correctly:
+
+```
+missing matrix evidence: suite=cross_network_direct_remote_exit nat_profile=baseline_lan
+missing matrix evidence: suite=cross_network_relay_remote_exit nat_profile=baseline_lan
+missing matrix evidence: suite=cross_network_failback_roaming nat_profile=baseline_lan
+missing matrix evidence: suite=cross_network_traversal_adversarial nat_profile=baseline_lan
+missing matrix evidence: suite=cross_network_remote_exit_dns nat_profile=baseline_lan
+missing matrix evidence: suite=cross_network_remote_exit_soak nat_profile=baseline_lan
+```
+
+(`state/live-lab-cnproof-20260828/cross_network_nat_matrix_validation.md`.)
+
+**Classification: new code defect, in the orchestrator's gating — not in the
+validator.** The validator is right to fail closed; missing evidence must never
+read as passing evidence. The defect is the asymmetry one level up: eight sibling
+stages recognise an undispatchable topology and skip honestly, while this one
+turns the same topology into `overall_result=fail` and a `first_failed_stage`.
+The remedy is for `run_nat_matrix` to share `prepare_scenario_stage`'s guards —
+if the suites that feed it cannot dispatch, the matrix gate has nothing to
+validate and should skip with the same declared reason. **Not fixed here (triage
+only).** Attribution: `…/cross_network.rs:459-464`.
+
+This is also why the run graded `fail` rather than `partial`. **No stage that
+executed real work failed.** Judged on what it could run, this suite is 43 for 43,
+matching §11 minus the one stage the flag took away.
+
+#### CN-PROOF-D2 — the substrate flag is a straight trade, and on this fleet it
+is a losing one
+
+`run_nat_classification` refuses any substrate other than netns
+(`…/cross_network.rs:346-350`), which is correct — its gates provision `rnsim-*`
+namespaces inside one guest and mean nothing under another substrate. But the
+consequence on a single-LAN fleet is that `--cross-network-substrate vxlan`
+**removes** the only cross-network stage that was doing real work and adds
+nothing, because of §12.3(a). Not a code defect on its own; recorded because it
+makes "run the suite with vxlan" a strictly worse run here, and any future
+operator reaching for that flag on this fleet should know that before spending
+20 minutes.
+
+#### Not a defect: the historical decap thread is not implicated
+
+The "vxlan decap silent drop" diagnosed on 2026-08-27 and closed by the
+clone-MAC fix (`8abea28b`, evidence `34a9e6f8`, triage `86f633c9`) concerned
+frames that encapped and crossed the wire but never decapped, because cloned
+guests sharing `/etc/machine-id` derived an identical `rustynet-vx0` MAC. **That
+code never executed in this run.** `overlay_mac`
+(`…/substrate.rs:801-804`) is called from the per-participant provisioning loop
+(`…/substrate.rs:1549-1556`), which `setup` returns before reaching (§12.3(a)).
+Nothing in this run's evidence bears on that thread in either direction — it is
+neither re-proven nor re-opened.
+
+### 12.5 Post-run residue: clean, but QH-63's revert was not exercised
+
+All five guests probed directly over SSH after the run:
+
+| guest | `/etc/default/rustynetd` egress pin | provenance | `rustynet-vx0` | netns | `rnsim-*` |
+|---|---|---|---|---|---|
+| ubuntu-utm-1 | `enp0s1` | `derived` | absent | none | 0 |
+| rocky-utm-1 | `enp0s1` | `derived` | absent | none | 0 |
+| debian-headless-4 | `enp0s1` | `operator` | absent | none | 0 |
+| fedora-utm-1 | `enp0s1` | `derived` | absent | none | 0 |
+| debian-headless-2 | `enp0s1` | `derived` | absent | none | 0 |
+
+**No stale `RUSTYNET_EGRESS_INTERFACE` pin anywhere.** Every pin names `enp0s1`,
+the guest's real management NIC, which exists — this is the ordinary
+`ops install-systemd` derivation, not residue. No vxlan link, no
+`rustynet-vxr` router namespace, no `rnsim-*` namespace or interface survived on
+any guest.
+
+**But state this honestly: the QH-63 teardown revert did NOT get its first live
+proof here.** `revert_egress_pins` is keyed on an exact value match against the
+names this substrate creates — `rustynet-vx0` / `rustynet-vxl`
+(`…/substrate.rs:1789` and its doc comment above it), deliberately, so a pin
+naming a real NIC is never touched. Since §12.3(a) meant no vxlan device was ever
+created, no such pin was ever written, so the revert had nothing to revert and its
+no-op path is all that ran. The complementary guard —
+`LINUX_EGRESS_PIN_RESET_COMMAND`
+(`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/linux_traffic.rs:105-116`),
+which deletes a pin naming a *non-existent* interface — likewise had no work: no
+pin named a missing device. **QH-63 remains unproven live, and this run does not
+change that.** The absence of residue is real and worth having; it is just not
+proof that the reverting code works.
+
+One observation for the record: `debian-headless-4` carries
+`RUSTYNET_EGRESS_INTERFACE_SOURCE=operator` where the other four carry `derived`.
+The value is correct (`enp0s1`, present), so nothing is broken, but an `operator`
+marker means the installer will treat an inherited value as deliberate and the
+QH-63 sweep's `derived`-only condition would not clear it if it ever went stale.
+Worth a look when someone next touches that guest; not a defect this run produced.
+
+### 12.6 What IS live-proven, and it is not what the brief expected
+
+Re-reading the ledger while triaging this run turned up a proof that was already
+on the record and is not reflected in the spec:
+
+**CN-2's `NetnsSubstrateProvider` is live-proven.**
+`cross_network_nat_classification` **passed** in attempt 4
+(`livelab-1787906534-877a0226693c`, §11), and that stage is not a stub — it
+builds the netns simulator on the exit guest through `NetnsSubstrateProvider::setup`,
+runs the in-process mapping and filtering gates over
+`port_restricted_cone`, `full_cone` and `symmetric`
+(`…/cross_network/netns.rs:1263-1269`), and tears the site down through
+`NetnsSubstrateProvider::teardown` and its `rnsim-*` sweep. That is the core of
+CN-2 exercised end to end on hardware. The §0.4 CN-2 row's "Not live-proven yet —
+unit-tested against `MockLeafRunner` only" is **stale**, and the row has been
+corrected with that run id. Note the *scope* precisely: three NAT profiles, one
+guest, no cross-LAN overlay. `double_nat_cgnat` — CN-4's new carrier chain — is
+**not** in either gate's profile list and remains unproven.
+
+### 12.7 Verdict, per row, no rounding up
+
+| row | claim | verdict |
+|---|---|---|
+| **CN-1** | trait seam, runners, lifecycle stages | **partially proven.** The two lifecycle stages dispatch, order correctly against `BootstrapHosts`, and drain cleanly on hardware — but only over the empty-handle path. `RemoteShellRunner` is proven by CN-2's gate, not by this run. |
+| **CN-2** | `NetnsSubstrateProvider` + NAT gates | **LIVE-PROVEN** for 3 of 5 profiles, by `livelab-1787906534-877a0226693c`, not by this run. |
+| **CN-3** | 8 ported scenario validators | **UNPROVEN. 0 of 8 dispatched.** All eight skipped on the missing `entry`/`aux` roles. Not one line of the ported validator code executed. |
+| **CN-4** | `apply_nat_profile`, vxlan NAT, `SlirpSubstrateProvider`, CGNAT chain | **UNPROVEN.** `apply_nat_profile` is only ever called from the scenario path, which did not dispatch; the vxlan router namespace was never built; `double_nat_cgnat` is outside both netns gates' profile lists; slirp was not selected. |
+| **QH-63** | teardown reverts egress pins | **UNPROVEN** — no pin was ever written to revert (§12.5). Residue independently verified clean. |
+
+**A skip is not a pass. CN-3 and CN-4 cannot be called live-proven, and no §0.4
+row has been marked as such on the strength of this run.**
+
+### 12.8 What a real CN-PROOF needs
+
+The blocker is the fleet, not the code, and it is one requirement with three
+faces (§12.3). A qualifying run needs a topology where:
+
+1. **at least two participating guests sit on genuinely different, mutually
+   routable /24s** — this satisfies `plan_overlay` (≥2 groups) and
+   `distinct_underlay_prefixes` (client and exit on different prefixes) at once;
+2. **`entry` and `aux` roles are assigned**, in addition to `client`/`exit`;
+3. all participants are Linux (Phase 10 dataplane constraint).
+
+**No such topology exists in the current fleet.** Measured directly, 2026-08-28,
+before this run was launched:
+
+| path | result |
+|---|---|
+| all five §7 UTM guests | one /24 (`192.168.64.0/24`) — one overlay group |
+| UTM `debian-headless-4` → `lenovo-client-1` (`192.168.0.30`) | ping 0% loss, TCP/22 open |
+| `lenovo-client-1` → UTM `debian-headless-4` (`192.168.64.10`) | **100% packet loss, TCP/22 refused** |
+| orchestrator host → `192.168.121.x` (ubuntu-kvm-1 libvirt guests) | TCP/22 unreachable |
+| `lenovo-client-1` → `192.168.121.137`, → orchestrator host | unreachable |
+
+The UTM `Shared` attachment is host NAT (`VmLabNetworkStandard.md` §"The
+standard"), so UTM→LAN is outbound-only: the reverse direction has no route, and
+a head-end-replicated vxlan mesh needs both nodes to send to the other's underlay
+address. The `192.168.65.0/24` second vmnet subnet is Apple-backend and carries
+only `macos-utm-1` (macOS, therefore out of scope), and its bridge is not
+currently up. So the options are, in order of cost:
+
+1. **Bridge the participating UTM guests onto the real LAN** (`apply_vm_bridged_network`
+   / the `br0` model the lenovo host already uses), giving UTM + lenovo guests a
+   common routable plane and two real /24s. Note the `UTMVirtualMachineInventory`
+   probe-and-recover runbook exists precisely because a network reconfig can leave
+   the nft killswitch blocking SSH — budget for recovery.
+2. **Run the whole cross-network cell on the lenovo host** if a second bridged
+   segment can be stood up there.
+3. **Decide the design question in §12.3 instead**: if Tier B is *supposed* to
+   synthesize separate LANs on one wire (as `vxlan_tier_b.sh` did), then
+   `plan_overlay`'s ≥2-group precondition and `distinct_underlay_prefixes`'s use
+   of the management plane are both wrong, and CN-3 becomes provable on the
+   existing five-guest fleet. That is an owner decision, not a triage call.
+
+Until one of those lands, **the cross-network track has no path to live proof**,
+and every re-run of the existing topology will reproduce this exact result.
+
+### 12.9 Reproduction
+
+```
+cd .claude/worktrees/mgr-cn-proof
+CARGO_TARGET_DIR=…/target-livelab \
+cargo run -q -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab \
+  --inventory documents/operations/active/vm_lab_inventory.json \
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
+  --known-hosts-file ~/.ssh/known_hosts \
+  --report-dir state/live-lab-cnproof-20260828 \
+  --cross-network-substrate vxlan \
+  --node ubuntu-utm-1:client --node rocky-utm-1:admin --node debian-headless-4:exit \
+  --node fedora-utm-1:relay --node debian-headless-2:anchor
+```
+
+Launched from the shell, not the MCP wrapper (the `bin/rustynet-mcp-lab-state`
+binary is 15 days stale; §10, §9.6 remain open). The `cross_network_nat_matrix`
+stub for this run is dispositioned in `live_lab_stage_triage.jsonl`, so the launch
+gate is clear for the next run.

@@ -227,9 +227,19 @@ buried inside `run_nat_classification`:
   session, so the gate trades wall clock for typed evidence and deterministic teardown. SSH `ControlMaster`
   multiplexing is the obvious optimisation and was deliberately NOT taken, because a persistent control
   socket is itself residue.
-  **Not live-proven yet** — unit-tested against `MockLeafRunner` only (38 netns tests incl. mid-provision
-  failure, transport failure, failed pre-build sweep, unlistable guest, hostile names from the guest
-  listing, and both gates end to end). The single-host live run is the next evidence step.
+  **LIVE-PROVEN 2026-08-28**, run `livelab-1787906534-877a0226693c`, stage `cross_network_nat_classification`
+  = `pass` on the five-guest §7 UTM topology. That stage is the whole provider end to end on hardware:
+  `NetnsSubstrateProvider::setup` builds the simulator on the exit guest, the in-process mapping and
+  filtering gates classify `port_restricted_cone`, `full_cone` and `symmetric`
+  (`netns.rs` `MAPPING_GATE_PROFILES` / `FILTER_GATE_PROFILES`), and `teardown` + the `rnsim-*` sweep
+  clear the guest — verified residue-free afterwards. **Scope the claim precisely:** three of the five
+  profiles, one guest, no cross-LAN overlay. `double_nat_cgnat` is in neither gate's profile list and is
+  still unproven live (it belongs to CN-4). Before this run the row read "not live-proven"; the correction
+  was made while triaging `livelab-1787908428-6d9224cfd954`
+  (`../active/LiveValidation_2026-08-28.md` §12.6).
+  Behind that live proof sit 38 netns unit tests against `MockLeafRunner` (mid-provision failure,
+  transport failure, failed pre-build sweep, unlistable guest, hostile names from the guest listing, and
+  both gates end to end).
 - **CN-3** ✅ **DONE** (2026-08-28, `work/cn3-scenario-port`). All 8 scenario validators are Rust
   functions the orchestrator calls directly; the 8 `[[bin]]` shims, the 8 `.sh` validators and
   `run_script_stage`'s `cargo run --bin` fan are deleted. Vxlan scenarios run in-process (still gated
@@ -337,7 +347,16 @@ buried inside `run_nat_classification`:
   "is the tunnel named"; failback's monitor loop not breaking at first reconvergence; controller-switch's
   leak/signed counters spanning both the outage and recovery phases, its reconnect target being the
   RELAY, and its pull-refresh evidence being `OR` across nodes while its active fallback is `AND`.
-  **Not live-proven** — unit-tested against `MockLeafRunner`/`RecordingHost` only (103 scenario tests).
+  **Not live-proven — and BLOCKED from live proof on the current fleet.** Unit-tested against
+  `MockLeafRunner`/`RecordingHost` only (103 scenario tests). Attempted 2026-08-28, run
+  `livelab-1787908428-6d9224cfd954` with `--cross-network-substrate vxlan` on the §7 five-guest
+  topology: **0 of 8 validators dispatched.** All eight skipped at `prepare_scenario_stage`
+  (`stage/cross_network.rs:506-511`) because `CrossNetworkTopology::resolve` fills its relay and probe
+  participants from the `entry`/`aux` roles (`cross_network.rs:929-932`), which that topology does not
+  assign. Even with those roles assigned it would still skip: the same function requires the client and
+  exit nodes on distinct /24s and reads the **management** SSH addresses to decide
+  (`cross_network.rs:514-520`, `944-949`), and every UTM guest is `192.168.64.x`. See the §0.5
+  "LIVE-PROOF BLOCKER" note below and `../active/LiveValidation_2026-08-28.md` §12 for the full triage.
 - **CN-4** ✅ **DONE** (2026-08-27, `work/cn4-substrates`).
   `apply_nat_profile` + `NatModifiers` on the provider trait, the vxlan NAT capability and the
   matching `supports()` widening, the netns `double_nat_cgnat` carrier chain, `SlirpSubstrateProvider`
@@ -423,6 +442,11 @@ buried inside `run_nat_classification`:
   two-hop CGNAT chain, unsupported-combination refusals that touch no guest, apply/reset symmetry and
   idempotence, and teardown residue sweeps over the new resources). Live proof waits on the hardware, as
   this row always said.
+  **Attempted and still blocked, 2026-08-28** (run `livelab-1787908428-6d9224cfd954`): `apply_nat_profile`
+  is reached only from the scenario path, which did not dispatch (see the CN-3 row), so the vxlan router
+  namespace was never built; `double_nat_cgnat` is outside both netns gates' profile lists so CN-2's live
+  run does not cover it either; and `SlirpSubstrateProvider` was not selected. Zero of this row's code has
+  executed on hardware.
 - **CN-5** ✅ **DONE by W5.7** (2026-08-27, closed retroactively 2026-08-27 — the row's own work was
   completed by the bash-orchestrator retirement rather than by a CN-numbered change).
   The row's scope was exactly "retire the legacy-bash orchestrator's duplicate
@@ -492,6 +516,43 @@ Verified findings from a grounded code audit after the bash orchestrator's remov
 - **NEW, upstream gap the spec does not cover (live-proven, run `livelab-1787790884-c9ccf1a4d1cc`, first real 2-LAN --node cell: UTM 192.168.64/24 + lenovo 192.168.0/24):** `collect_pubkeys` records each node's raw discovered underlay endpoint and `distribute_assignments` feeds it into `NODES_SPEC` verbatim, so cross-LAN pairs receive peer endpoints on the other LAN's private prefix — unroutable, no traversal engaged, `traffic_test_matrix` fails every cross-LAN pair both directions. This sits tens of stages BEFORE the `cross_network_*` block where §4.2 hooks substrate setup.
   - **CN-2 closed the consuming half.** `collect_pubkeys` asks the substrate through `SubstrateHandle::endpoint()` and overrides the recorded endpoint ONLY on the `Overlay` plane, keeping each node's port; `distribute_assignments` then feeds those overridden endpoints into `NODES_SPEC` unchanged. An `Underlay`-plane answer (what a non-overlay substrate such as netns produces for every alias) overrides nothing, and with no substrate at all `ctx.endpoints` is byte-for-byte the adapters' discovered values — pinned by three tests in `collect_pubkeys.rs`. A malformed `host:port` under an overlay FAILS the stage rather than silently falling back to the unroutable address.
 - **DESIGN DECISION FORCED — RESOLVED 2026-08-27 in favour of TOPOLOGY LEVEL** (implemented in `56ec906c`/`4b1d9467`: `CrossNetworkSubstrateSetupStage` depends on `BootstrapHosts` and is ordered before `collect_pubkeys`, so overlay addresses are what land in `ctx.endpoints`, while SSH/management traffic keeps the management IPs). The original framing of the choice, retained for the record: the substrate seam must either move to topology level (provision the overlay before `collect_pubkeys` and populate `ctx.endpoints` with overlay addresses — what a real 2-LAN fleet needs) or stay a cross-network-suite concern (spec's framing — leaves the 2-LAN fleet's base mesh broken). Resolve before writing CN-2 code; the lifecycle stages' dependency-graph position follows from this choice.
+
+### 0.6 LIVE-PROOF BLOCKER (2026-08-28) — Tier B requires a 2-LAN fleet as an INPUT
+
+Measured live in run `livelab-1787908428-6d9224cfd954`
+(`../active/LiveValidation_2026-08-28.md` §12). Selecting
+`--cross-network-substrate vxlan` on the five-guest §7 UTM topology provisions **nothing** and
+dispatches **none** of the eight CN-3 validators. Three independent gates, all verified on hardware:
+
+1. **`plan_overlay` returns `Ok(None)` below two underlay /24 groups**
+   (`stage/cross_network/substrate.rs:754-756`), and `VxlanSubstrateProvider::setup` short-circuits to an
+   empty handle with `provisioned: false` (`substrate.rs:1529-1532`). All five §7 guests are
+   `192.168.64.x`. `cross_network_substrate_setup` = `pass` therefore records an **honest no-op**, not a
+   working overlay — no `rustynet-vx0` was created on any guest.
+2. **The scenarios need `entry` and `aux` roles** — `CrossNetworkTopology::resolve` fills its relay and
+   probe participants from those labels, never from the `relay` role (`cross_network.rs:929-932`).
+3. **The scenarios additionally require client and exit on distinct /24s, judged on the MANAGEMENT
+   plane** (`cross_network.rs:514-520`, `944-949`; `ssh_params_for_role` fills the host from
+   `adapter.ssh_connection_params()` at `cross_network.rs:1085-1105`) — i.e. **not** from the overlay the
+   substrate provisions.
+
+(1) and (3) together are the substantive finding: **the vxlan substrate cannot manufacture the
+cross-network condition it exists to provide.** It overlays LANs that are already separate, and the
+scenario gate then asks whether they were already separate. `vxlan_tier_b.sh`, the shell tier this
+provider ports, built its own per-LAN topology on one wire; the CN-4 row's deviation (c) records the
+deliberate switch to a flat head-end-replicated mesh, and this is its unrecorded consequence.
+
+**No qualifying topology exists in the current fleet** (probed 2026-08-28): the UTM `Shared` attachment
+is host NAT, so UTM→`192.168.0.x` works (ping 0% loss, TCP/22 open) while `192.168.0.x`→UTM is 100%
+loss / TCP refused — and a head-end-replicated mesh needs both directions. The `192.168.121.0/24`
+libvirt guests are unreachable from both the orchestrator host and the lenovo LAN. `192.168.65.0/24`
+carries only the macOS guest (out of scope for the Linux-only Phase 10 dataplane) and its bridge is down.
+
+**Owner decision required.** Either (a) bridge the participating UTM guests onto the real LAN so two
+genuinely routable /24s exist, or (b) accept that Tier B's contract is "overlay an already-2-LAN fleet"
+and record it as such, or (c) treat gates (1) and (3) as defects — Tier B should synthesize the separate
+LANs, in which case CN-3 becomes provable on the existing five guests. Until one of these lands, every
+re-run of the existing topology reproduces this result exactly.
 
 ## 1. Problem statement
 
