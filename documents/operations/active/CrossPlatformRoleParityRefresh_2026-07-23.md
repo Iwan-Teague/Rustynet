@@ -11,7 +11,11 @@ serial), S1 (cross-OS is 0/88 — 0/178 as re-counted 2026-08-28 — because nev
 *attempted*; first step is run+triage),
 S2 (macOS exit `pf` divergence does NOT waive the end-to-end egress proof), S3
 (`SignedMembership` transitions restored to scope), S4 (`network_flap` G1 =
-"correctly adjudicated," not "must be RED"). This refresh
+"correctly adjudicated," not "must be RED"). **Matrix updated 2026-08-28:** the
+macOS Track M cells now reflect the first `--node` elections of `anchor`/`exit`
+(runs 47/48) and the MAC-D1/MAC-D2 fixes (`fix-landed-rerun-pending`), plus the
+owner-gated macOS DNS fail-closed enforcement gap and the landed path-constant
+hardening. This refresh
 re-scopes the release-blocking parity mandate to the **engine of record** — the
 Rust `--node` orchestrator, which the `NodeEngineAcceptanceSpec_2026-07-23.md`
 **G2 (parity attainment → release)** gate reads. It supersedes the *status* half of
@@ -56,7 +60,10 @@ not count toward release.** On the engine of record:
   conclusion is unchanged, but the magnitude was overstated.
 - **macOS is partially stage-green** (admin, relay-lifecycle, core, security stages
   pass in isolation) but **no macOS run passes overall** — `two_hop` fails every
-  time, and exit/blind_exit/anchor were never elected onto a macOS `--node`.
+  time, and `blind_exit` has never been elected onto a macOS `--node`. *Update
+  2026-08-28: `anchor` and `exit` were elected for the FIRST time on `--node`
+  (runs 47/48) — both blocked with the blocker located, then both blockers fixed
+  in code (MAC-D1 `8ec851a9`, MAC-D2 `03619d0f`); re-runs pending.*
 
 Both old docs also record their Definition-of-Done evidence against the **bash
 archive** (ParityPlan §5/§8; Roadmap §10) — a stale pointer for G2.
@@ -64,7 +71,7 @@ archive** (ParityPlan §5/§8; Roadmap §10) — a stale pointer for G2.
 **Net:** the honest G2 status is *far* less green than the ParityPlan implies. This
 refresh states the `--node` reality and sequences the work to close it.
 
-## 1. `--node`-native status matrix (the G2 picture, 2026-07-23)
+## 1. `--node`-native status matrix (the G2 picture, 2026-07-23; macOS cells updated 2026-08-28)
 
 Legend: 🟢 stage-green on `--node` (isolated) · 🔴 fails on `--node` · ⬛ never
 elected/run on `--node` · 🔒 blocked (hardware/env) · 🚫 out-of-scope by design.
@@ -77,8 +84,8 @@ Every cell here is "as proven on `--node`," independent of the bash archive.
 | **admin** | 🟢 `macos_admin=pass` (`livelab-1784501586`, commit `537e1901`, clean) — run overall failed on `two_hop` | ⬛ bootstrap blocker |
 | **relay** (lifecycle) | 🟢 `macos_stage_relay_service_lifecycle=pass` (`livelab-1784497253`, `11620a6`, clean) | ⬛ / 🟠 SCM contract only |
 | **relay** (frame-forwarding) | 🔒 HP-3 (unproven on ALL OS) | 🔒 HP-3 |
-| **anchor** | 🔴 **elected 2026-08-28** (`livelab-1787911937-77ff1933885f`, `77ff1933`, clean) — capability advertisement **passed** live; bundle-pull runtime reported-skipped on the `is_supported_for_platform` posture gate, so `anchor_validation=skip`. `live_anchor` not dispatched (dropped with `--skip-linux-live-suite`). See MacCellsHarvest §2 | ⬛ never exercised |
-| **exit** | 🔴 **elected 2026-08-28** (`livelab-1787913512-a5e93c8dd781`, **dirty** — diagnostic only, cannot count toward §5.4) — fails at `membership_init`: the macOS owner-key path constant points at a file that does not exist. No exit stage has ever dispatched. See MacCellsHarvest §4 | 🔒 WinNAT hardware (§4) |
+| **anchor** | 🔴 **elected-blocked → fix-landed-rerun-pending.** Elected 2026-08-28 (`livelab-1787911937-77ff1933885f`, `77ff1933`, clean) — capability advertisement **passed** live; bundle-pull runtime reported-skipped on the `is_supported_for_platform` posture gate, so `anchor_validation=skip` (blocker located: MAC-D1 circularity). **MAC-D1 fix landed 2026-08-28 (`8ec851a9`)** — the posture-gate circularity is de-circularised via validator-set election — but **no post-fix lab run exists yet**, so the cell is unblocked-for-rerun, NOT green. `live_anchor` was not dispatched (dropped with `--skip-linux-live-suite`). See MacCellsHarvest §2 | ⬛ never exercised |
+| **exit** | 🔴 **elected-blocked → fix-landed-rerun-pending.** Elected 2026-08-28 (`livelab-1787913512-a5e93c8dd781`, **dirty** — diagnostic only, cannot count toward §5.4) — failed at `membership_init`: the macOS owner-key path constant pointed at a file that does not exist (blocker located: MAC-D2). No exit stage has ever dispatched. **MAC-D2 fix landed 2026-08-28 (`03619d0f`)** — the owner-pubkey constant now points at the genesis write path (`/usr/local/etc/rustynet/membership.owner.key.pub`) and the read fails loud — but **no post-fix lab run exists yet**, so the cell is unblocked-for-rerun, NOT green; and `DnsFailclosed` will stay red until the owner-gated enforcement-gap design lands (§5). See MacCellsHarvest §4 | 🔒 WinNAT hardware (§4) |
 | **blind_exit** | ⬛ never elected on `--node` | 🚫 out-of-scope by design |
 | **role-transition** | ⬛ never run on `--node` | ⬛ never run on `--node` |
 
@@ -168,7 +175,19 @@ consecutive" (which §5.4 explicitly replaced as arithmetically too weak).
   then fix CP-1** (macOS `two_hop`) — needed for the macOS `client` cell and any
   *overall*-green macOS run; (b) **elect + prove the other macOS roles** (`exit`,
   `blind_exit`, `anchor`, `role-transition`) via the role-platform selectors /
-  `--macos-promote-exit`. Sub-stream (b) does **not** wait on CP-1: the ledger shows
+  `--macos-promote-exit`. **Progress 2026-08-28:** `anchor` and `exit` are
+  elected (runs 47/48) and both of their located blockers are fixed in code —
+  MAC-D1 `8ec851a9` (anchor posture gate de-circularised via validator-set
+  election) and MAC-D2 `03619d0f` (membership owner-key path + fail-loud read)
+  — and the macOS path-constant hardening landed (`a0851175`: all 21 daemon
+  path constants + helper socket armed to the installer layout). Both cells are
+  `fix-landed-rerun-pending`: the fixes are unverified in the lab until a
+  post-fix run. **Standing caveat:** the DNS fail-closed **enforcement** gap is
+  a known real leak, dispositioned design-only / owner-gated
+  ([MacosDnsFailclosedEnforcementGap_2026-08-28.md](./MacosDnsFailclosedEnforcementGap_2026-08-28.md),
+  `1278af04`) — the `DnsFailclosed` stage reds honestly today and will keep
+  any macOS run red even after the MAC-D1/MAC-D2 re-runs, until that
+  enforcement design lands. Sub-stream (b) still does **not** wait on CP-1: the ledger shows
   per-CELL stage-greens accrue even in overall-*failed* runs (that is exactly how
   `macos_admin`/`macos_relay` earned their green cells while `two_hop` failed). So
   role-cell greens can be harvested in parallel; only the `client` cell + a fully-
@@ -216,26 +235,38 @@ consecutive" (which §5.4 explicitly replaced as arithmetically too weak).
   `blind_exit` macOS evaluator exists but was never elected. **`anchor` and `exit`
   were elected 2026-08-28** (§1) and both produced real signal — neither is
   "never elected" any more, and neither is green. Windows evaluators all blocked
-  behind CP-4. Two blockers were located in the process
-  (`MacCellsHarvest_2026-08-28.md`):
-  **(a)** the `Anchor`/`Admin`/`Relay` posture gate at
-  `vm_lab/orchestrator/role.rs:68-70` is Linux-only while its own comment
-  promises promotion "once a green run is archived" — but
-  `anchor_validation.rs:181` gates the runtime substages on that same predicate
-  and `outcome_for` (`:236-247`) grades any reported skip as `Skipped`, so the
-  green run required to lift the gate cannot be produced by the stage the gate
-  controls. The promotion route has to come from the `--anchor-platform macos`
-  stage set instead (`live_lab_stage_registry.rs:1151,1158,1168`), which the
-  role election alone does not enable.
-  **(b)** macOS cannot hold a membership-owner role: `membership_init` is
-  role-gated to `exit`, and the macOS adapter reads the owner pubkey from
-  `/usr/local/var/rustynet/membership/membership.owner.key.pub`
-  (`adapter/macos_install.rs:27-28`) with a bare `cat`
-  (`adapter/macos_membership.rs:29-34`), where the Linux twin reads
-  `/etc/rustynet/membership.owner.key.pub` with `sudo -n`
-  (`adapter/linux_membership.rs:25-31`). On the guest the key exists only at the
-  latter path, and the former directory is `0700 rustynetd` so the bare `cat`
-  cannot read it either.
+  behind CP-4. Both macOS blockers located in the process
+  (`MacCellsHarvest_2026-08-28.md`) are now **FIXED in code — the cells are
+  unblocked for re-run but no post-fix lab run exists yet:**
+  **(a) MAC-D1 — FIXED 2026-08-28 (`8ec851a9`).** The `Anchor`/`Admin`/`Relay`
+  posture gate at `vm_lab/orchestrator/role.rs:68-70` was Linux-only while
+  `anchor_validation.rs` gated its runtime substages on the same predicate and
+  graded any reported skip as `Skipped`, so the green run required to lift the
+  gate could not be produced by the stage the gate controls. The fix
+  de-circularises the gate via validator-set election (the promotion route now
+  comes from the `--anchor-platform macos` stage set,
+  `live_lab_stage_registry.rs:1151,1158,1168`) — re-run pending.
+  **(b) MAC-D2 — FIXED 2026-08-28 (`03619d0f`).** The macOS adapter read the
+  owner pubkey from a path the genesis driver never writes
+  (`/usr/local/var/rustynet/membership/membership.owner.key.pub`, bare `cat`)
+  while the key is seeded at `/usr/local/etc/rustynet/membership.owner.key.pub`;
+  the fix points `MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH` at the genesis write
+  location, derives it from `ops_e2e::MACOS_OWNER_SIGNING_KEY_PATH` (drift-
+  pinned by test), reads via `sudo -n`, and fails loud with distinct errors for
+  absent/unreadable/empty — re-run pending.
+- **macOS DNS fail-closed — enforcement gap, `owner-gated-leak` (dispositioned
+  2026-08-28, `1278af04`).** The validator now reds honestly
+  (`validate_baseline_runtime` failed on `macos-utm-1/DnsFailclosed`), and the
+  investigation confirmed a **real enforcement leak**: the posture is written
+  to files the OS does not consult (`/etc/resolv.conf` is a configd-generated
+  shim on macOS), dispositioned **design-only / owner-gated** in
+  [MacosDnsFailclosedEnforcementGap_2026-08-28.md](./MacosDnsFailclosedEnforcementGap_2026-08-28.md).
+  Consequence for the matrix: even once the MAC-D1/MAC-D2 cells re-run,
+  `DnsFailclosed` stays red until that enforcement design lands — no macOS run
+  can pass overall before it.
+- **macOS path-constant hardening — LANDED 2026-08-28 (`a0851175`).** All 21
+  daemon path constants + the helper socket are armed to the installer layout,
+  removing the class of wrong-location constants that produced MAC-D2.
 - **Harvest-form caveat (`--skip-linux-live-suite`).** The fast-path flag every
   mac/win target key sets (`ai_agent.rs:1864-1892`) drops the whole post-baseline
   suite — `plan.rs:545-549`, 61 → 19 stages. That excludes `live_anchor` and all
