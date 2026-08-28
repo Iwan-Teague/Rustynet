@@ -47,8 +47,6 @@ use zip::{CompressionMethod, ZipWriter};
 
 const DEFAULT_UTMCTL_PATH: &str = "/Applications/UTM.app/Contents/MacOS/utmctl";
 const DEFAULT_VM_LAB_INVENTORY_PATH: &str = "documents/operations/active/vm_lab_inventory.json";
-const DEFAULT_CROSS_NETWORK_DIRECT_SCRIPT: &str =
-    "scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh";
 const DEFAULT_CROSS_NETWORK_RELAY_SCRIPT: &str =
     "scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh";
 const DEFAULT_CROSS_NETWORK_FAILBACK_SCRIPT: &str =
@@ -2571,10 +2569,6 @@ fn workspace_root_path() -> PathBuf {
 
 pub fn default_inventory_path() -> PathBuf {
     workspace_root_path().join(DEFAULT_VM_LAB_INVENTORY_PATH)
-}
-
-pub fn default_cross_network_direct_script_path() -> PathBuf {
-    workspace_root_path().join(DEFAULT_CROSS_NETWORK_DIRECT_SCRIPT)
 }
 
 pub fn default_cross_network_relay_script_path() -> PathBuf {
@@ -36747,36 +36741,20 @@ fn build_suite_command(
     let mut command = Command::new("bash");
     let rendered = match suite {
         "direct-remote-exit" => {
-            let script = default_cross_network_direct_script_path();
-            let client = topology_role_node(topology, &["client"])?;
-            let exit = topology_role_node(topology, &["exit"])?;
-            let report_path = report_dir.join("cross_network_direct_remote_exit_report.json");
-            let log_path = report_dir.join("cross_network_direct_remote_exit.log");
-            command
-                .arg(script.as_path())
-                .arg("--ssh-identity-file")
-                .arg(ssh_identity_file)
-                .arg("--client-host")
-                .arg(client.normalized_target.as_str())
-                .arg("--exit-host")
-                .arg(exit.normalized_target.as_str())
-                .arg("--client-node-id")
-                .arg(client.node_id.as_str())
-                .arg("--exit-node-id")
-                .arg(exit.node_id.as_str())
-                .arg("--client-network-id")
-                .arg(client.network_id.as_str())
-                .arg("--exit-network-id")
-                .arg(exit.network_id.as_str())
-                .arg("--nat-profile")
-                .arg(nat_profile)
-                .arg("--impairment-profile")
-                .arg(impairment_profile)
-                .arg("--report-path")
-                .arg(report_path.as_path())
-                .arg("--log-path")
-                .arg(log_path.as_path());
-            render_command_for_display(&command)
+            // CN-3: this suite arm shelled straight to the bash validator,
+            // independently of the orchestrator's own dispatch, so the same
+            // scenario had two entry points that could drift. The scenario is
+            // now a Rust function the orchestrator calls directly, and this
+            // second entry point is retired rather than re-pointed: it cannot
+            // build the `NetLeafRunner`s and `OrchestrationContext` the ported
+            // scenario needs without becoming a second orchestrator.
+            return Err(
+                "vm-lab-run-suite direct-remote-exit was retired with the bash \
+                 cross-network validator (CN-3); use `ops vm-lab-orchestrate-live-lab \
+                 --node <alias>:<role> ...`, which runs the ported \
+                 cross_network_direct_remote_exit stage in process"
+                    .to_owned(),
+            );
         }
         "relay-remote-exit" => {
             let script = default_cross_network_relay_script_path();
@@ -43358,7 +43336,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
-    fn build_suite_command_renders_direct_suite_arguments() {
+    fn build_suite_command_rejects_retired_direct_suite() {
         let inventory_path = write_temp_inventory(
             r#"{
   "version": 1,
@@ -43408,7 +43386,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             ]
         }))
         .expect("topology should parse");
-        let command = build_suite_command(
+        let err = build_suite_command(
             "direct-remote-exit",
             &topology,
             inventory.as_slice(),
@@ -43417,15 +43395,17 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             Some("none"),
             Path::new("/tmp/vm-lab-report"),
         )
-        .expect("suite command should build");
+        .expect_err("the direct-remote-exit suite arm was retired by CN-3");
+        // The retirement must be explicit and must say where the scenario went.
+        // A bare "unsupported suite" would read as a typo to an operator who
+        // has been running this command for months.
+        assert!(err.contains("retired"), "{err}");
+        assert!(err.contains("vm-lab-orchestrate-live-lab"), "{err}");
+        // And it must not still be reaching for the bash validator.
         assert!(
-            command
-                .rendered
-                .contains("live_linux_cross_network_direct_remote_exit_test.sh")
+            !err.contains("live_linux_cross_network_direct_remote_exit_test.sh"),
+            "{err}"
         );
-        assert!(command.rendered.contains("--client-host"));
-        assert!(command.rendered.contains("debian@client-host"));
-        assert!(command.rendered.contains("--exit-network-id"));
 
         cleanup_temp_inventory(inventory_path.as_path());
     }
