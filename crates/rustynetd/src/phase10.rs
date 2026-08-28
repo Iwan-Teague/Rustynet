@@ -4225,15 +4225,42 @@ impl DataplaneSystem for MacosCommandSystem {
         let services = self
             .enumerate_networksetup_services()
             .map_err(SystemError::DnsApplyFailed)?;
+        // M1 capture guard (MacosDnsFailclosedEnforcementGap_2026-08-28 §7):
+        // the backup baseline must never record loopback. If a service's
+        // CURRENT DNS is already the loopback posture this apply is about to
+        // enforce, that value is residue from a prior apply whose teardown
+        // did not run, and writing it into the backup would make a later
+        // rollback "restore" the strand. The prior backup document (readable
+        // ⇒ Some) holds the real originals and is preserved per service; a
+        // present-but-unreadable prior backup fails the apply here (an
+        // unverifiable document cannot vouch for an original); residue with
+        // no prior entry refuses loudly naming the manual fix.
+        let backup_path =
+            std::path::Path::new(crate::macos_dns_sc_protect::NETWORKSETUP_DNS_BACKUP_PATH);
+        let prior_backup = match crate::macos_dns_sc_protect::read_networksetup_dns_backup(
+            backup_path,
+        ) {
+            Ok(found) => found,
+            Err(err) => {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "a prior networksetup DNS backup exists at {} but is unreadable; refusing to build a new baseline over possible loopback residue: {err}",
+                    backup_path.display()
+                )));
+            }
+        };
         let mut backup_entries = Vec::with_capacity(services.len());
         for service in &services {
             let servers = self
                 .read_networksetup_service_dns(service)
                 .map_err(SystemError::DnsApplyFailed)?;
-            backup_entries.push(crate::macos_dns_sc_protect::NetworksetupDnsBackupEntry {
-                service: service.clone(),
-                servers,
-            });
+            backup_entries.push(
+                crate::macos_dns_sc_protect::resolve_backup_baseline_entry(
+                    service,
+                    servers,
+                    prior_backup.as_ref(),
+                )
+                .map_err(SystemError::DnsApplyFailed)?,
+            );
         }
         // The backup is written BEFORE the first mutation: a crash mid-apply
         // leaves the host in a state the startup-recovery guard (daemon.rs)

@@ -234,7 +234,7 @@ owner exception to run a privileged helper listener.
   (daemon.rs, before any protection is applied in-process, QH-40-shaped) restores the
   backup when SC DNS is loopback with no protection running; with no readable backup it
   refuses to start, loudly, naming the manual fix per service
-  (`sudo /usr/sbin/networksetup -setdnsservers "<svc>" Empty`). Verification: the
+   (`sudo /usr/sbin/networksetup -setdnsservers "<svc>" Empty`). Verification: the
   shipped QH-39 `macos-dns-failclosed-check` — with enforcement applied the SC primary
   resolver is loopback so the check passes; reverting the pin reds it. Unit coverage:
   13 module tests (parsers incl. header/legend/`*`/blank handling, validators with
@@ -244,3 +244,26 @@ owner exception to run a privileged helper listener.
   VPN/utun services that manage their own resolver are NOT special-cased — the loopback
   pin applies to all enabled services. If that proves harmful in practice the owner can
   exclude named services via config later.
+
+- **2026-08-28 — HARDENED: backup-baseline loopback-residue edge closed** (security
+  review follow-up to the M1 item above). The capture path could previously record a
+  service's CURRENT DNS as the backup baseline even when that value was ALREADY the
+  loopback posture M1 enforces — residue from a prior apply whose teardown never ran
+  (reachable when the startup-recovery guard was bypassed because scutil was unreadable:
+  `read_scutil_dns` → `None` ⇒ `NoAction`). A loopback baseline would have made any
+  later rollback "restore" the strand instead of the operator's real DNS. The capture
+  site (`MacosCommandSystem::apply_dns_protection` in `phase10.rs`) now reads the prior
+  backup document before building the baseline and resolves each service through the new
+  pure helper `resolve_backup_baseline_entry` (`macos_dns_sc_protect.rs`): a normal
+  (non-loopback) capture — including the no-servers case — is recorded unchanged;
+  loopback residue with a readable prior backup PRESERVES that document's entry for the
+  service (the real pre-enforcement original) instead of overwriting it with loopback;
+  loopback residue with NO prior entry for the service refuses the apply loudly
+  (`SystemError::DnsApplyFailed`) naming the manual fix (`sudo
+  /usr/sbin/networksetup -setdnsservers "<svc>" Empty`, or the operator's real DNS). A
+  prior backup that is PRESENT but unreadable also fails the apply before any baseline
+  is built (an unverifiable document cannot vouch for an original). Loopback is never
+  silently recorded as a baseline. Unit coverage: 3 new module tests
+  (`backup_baseline_refuses_loopback_residue_without_prior_original`,
+  `backup_baseline_preserves_prior_original_over_loopback_residue`,
+  `backup_baseline_records_normal_captured_dns_unchanged`).
