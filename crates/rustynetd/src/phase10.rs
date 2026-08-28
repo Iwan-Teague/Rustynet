@@ -4868,16 +4868,26 @@ impl DataplaneSystem for WindowsCommandSystem {
     }
 
     fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
-        // firewalld is Linux-only. The Windows analogue of this defect class
-        // (a foreign WFP filter at a competing weight discarding authorised
-        // forwarded traffic) is tracked in the parity plan; when it gains an
-        // enforcement point, it belongs here.
-        Ok(())
+        // QH-46 on Windows (WindowsWfpCoexistenceAudit_2026-08-28 §3): the
+        // NetNat forward path installs no WFP filters of its own — forwarded
+        // exit traffic relies on the ABSENCE of a foreign block at the
+        // forwarded-traffic layers. Verify that posture the way the Linux arm
+        // verifies its firewalld zone bind: a foreign non-permit filter at
+        // IPFORWARD_V4/V6, or WFP state that cannot be read at all (unknown
+        // treated as obstructed, mirroring FirewalldPosture), fails the
+        // admit, and reassert_host_firewall_admission converts the failure
+        // into the fail-closed rollback.
+        rustynet_windows_native::assert_forwarded_traffic_admitted()
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
     }
 
     fn withdraw_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
-        // Paired no-op with the admit above: nothing is bound on Windows, so
-        // demotion has no host-firewall binding to give back.
+        // Paired with the admit above: Windows binds nothing at the forward
+        // layers (the admit is detection-only), so demotion has no
+        // host-firewall binding to give back. A surviving FOREIGN filter is
+        // not ours to delete; it is re-detected (and fail-closed) by the next
+        // admit or periodic re-assert, never torn down here — same rule as
+        // the Linux unbind.
         Ok(())
     }
 
