@@ -228,8 +228,64 @@ buried inside `run_nat_classification`:
   **Not live-proven yet** — unit-tested against `MockLeafRunner` only (38 netns tests incl. mid-provision
   failure, transport failure, failed pre-build sweep, unlistable guest, hostile names from the guest
   listing, and both gates end to end). The single-host live run is the next evidence step.
-- **CN-3** Port the 8 scenario validators to `scenario::*` fns; delete the 8 bins + `run_script_stage`'s
-  `cargo run` fan. Vxlan scenarios run in-process (still gated `Blocked` until the 2nd network).
+- **CN-3** 🟡 **PARTIAL** (2026-08-28, `work/cn3-scenario-port`). Port the 8 scenario validators to
+  `scenario::*` fns; delete the 8 bins + `run_script_stage`'s `cargo run` fan. Vxlan scenarios run
+  in-process (still gated `Blocked` until the 2nd network).
+  **3 of 8 ported, each with its dispatch arm repointed and its bin deleted:**
+  `traversal_adversarial` (`d10fdd1a`), `direct_remote_exit` (`c2274695`), `relay_remote_exit`
+  (`7e0c99fe`). **5 remain on the `cargo run --bin` fan, untouched and fully working:**
+  `node_network_switch`, `failback_roaming`, `controller_switch`, `remote_exit_dns`,
+  `remote_exit_soak`. The contract (`Verdict`/`Checks`/`ScenarioOutcome`, `ScenarioHost`,
+  `provisioning`, `remote_exit_common`) is complete and is what the remaining five plug into.
+  **Deviations and decisions, each deliberate:**
+  (a) **`ScenarioHost` is a second seam alongside `NetLeafRunner`, and is manager-accepted.** CN-1's
+  leaf seam models one argv on one guest. Three things the validators do are neither: running a
+  required-test gate (`scripts/ci/run_required_test.sh`), invoking a sibling validator that is already
+  its own Rust bin, and reading named checks back out of the report that sibling emitted. Those are
+  local process invocations and report reads on the orchestrator host, so they get their own trait —
+  mockable, which is how the argv-only property is pinned in tests. Remote work still goes exclusively
+  through `NetLeafRunner`/`SudoRunner`. Same shape of deviation as the CN-1 row's (b).
+  (b) **The bash scripts outlive their bins for the ported scenarios.** `direct_remote_exit` and
+  `relay_remote_exit` each still have a `.sh` in `scripts/e2e/`, because three *unported* scripts
+  (`remote_exit_dns`, `node_network_switch`, `remote_exit_soak`) invoke the direct one directly, and two
+  (`failback_roaming`, `controller_switch`) invoke the relay one, to establish their baselines. Deleting
+  either now would break a working validator. Each dies with the last of its bash callers; the shell
+  -retirement rule is satisfied at the END of CN-3, not per scenario. `live_lab_common.sh` (3,523 ln)
+  and the `live_cross_network_script_bin` shim therefore also survive, as does the skeleton gate bin —
+  it asserts the *scripts* exist, and the ones it names all still do.
+  (c) **The four sibling validators are still separate processes.** `live_linux_server_ip_bypass_test`,
+  `live_linux_managed_dns_test`, `live_linux_endpoint_hijack_test` and
+  `live_linux_control_surface_exposure_test` were Rust-ported ahead of CN-3 and are out of its deletion
+  scope. Collapsing them means lifting four `main()`s into library functions — a separate change with
+  its own review surface. What did change: their *evidence* is read in-process via
+  `execute_ops_read_cross_network_report_fields` rather than by shelling to `cargo run … ops
+  read-cross-network-report-fields`, which, built without `vm-lab`, lacked the verb and failed the stage
+  after its assertions had already passed.
+  (d) **`live_lab_write_ssh_trust_summary` is reproduced, not dropped.** The shell dumped the host keys
+  its own ad-hoc ssh setup had pinned; that setup is gone. The artifact could not be dropped either —
+  the report validator lists it in `required_pass_source_artifacts`, so a report without it cannot pass
+  — so it now records what is actually true of the run: the participating targets, and that keys were
+  orchestrator-pinned rather than accepted on first use.
+  (e) **Bundle bytes cross the argv seam as single-line base64 through a FIXED script.**
+  `substrate::validate_argv` rejects control characters, so a multi-line signed bundle cannot be an argv
+  element. The script text is a compile-time constant and the path/mode/payload arrive as `$1`/`$2`/`$3`
+  — no value is ever substituted into a command string. Node ids are additionally held to an allowlist
+  (they become staging filenames) and spec fields reject the `;`/`|` delimiters the shell concatenated
+  unchecked, where a node id carrying one could forge an extra signed-assignment entry.
+  (f) **`signed_state_healthy` keeps a POSITIVE clause.** The shell's condition is six negated globs
+  plus `traversal_error=none`. The positive half is load-bearing: a `netcheck` that simply omits the
+  field satisfies every negative clause while proving nothing, so absence must not read as health.
+  Pinned by test.
+  (g) **Two `ops vm-lab-run-suite` arms retired, not repointed.** `direct-remote-exit` and
+  `relay-remote-exit` shelled straight to the bash validators independently of the orchestrator's
+  dispatch — one scenario, two entry points that could drift. Repointing them would mean rebuilding the
+  `OrchestrationContext` and per-node runners inside `vm_lab/mod.rs`, i.e. a second orchestrator, so
+  both now fail with a message naming `ops vm-lab-orchestrate-live-lab`. `failback-roaming` still has
+  its arm, since that scenario is unported.
+  (h) **The `--*-underlay-ip` overrides are gone.** The orchestrator resolves each node's underlay
+  address once, in `CrossNetworkTopology`, so the peer spec and the endpoint assertion cannot disagree
+  about which address a node is dialled on. The old path never passed those flags anyway.
+  **Not live-proven** — unit-tested against `MockLeafRunner`/`RecordingHost` only (40 scenario tests).
 - **CN-4** ✅ **DONE** (2026-08-27, `work/cn4-substrates`).
   `apply_nat_profile` + `NatModifiers` on the provider trait, the vxlan NAT capability and the
   matching `supports()` widening, the netns `double_nat_cgnat` carrier chain, `SlirpSubstrateProvider`
@@ -360,7 +416,22 @@ Verified findings from a grounded code audit after the bash orchestrator's remov
   - **Superseded later the same day.** CN-1 landed in `56ec906c` / `9419cfb3` / `4b1d9467` (the three trait abstractions, `LocalCommandRunner` / `RemoteShellRunner` / `MockLeafRunner`, a `VxlanSubstrateProvider`, and the two topology-level lifecycle stages), and was completed by `NetLeafRunner::in_netns`, the `NatProfileId` + `Support` honest-skip gate, and `SubstrateHandle::endpoint` / `ResolvedEndpoint`. Deviations from the verbatim §0.1 signatures are itemised in the CN-1 row of §0.4.
   - **CN-2 landed the same day** on `work/cn2-netns-substrate`: `NetnsSubstrateProvider` (the `netns_internet_sim.sh` topology ported onto `NetLeafRunner`), the in-process NAT mapping + filtering gates that replaced `netns_nat_classify.sh` / `netns_nat_filter.sh` (both DELETED), the widened `topology_level_seam()` / `provider_for_record()` dispatch, and `collect_pubkeys` now consuming `SubstrateHandle::endpoint()` rather than reaching into `overlay_ips`. Details, the per-profile `supports()` answer and the deliberate deviations are in the CN-2 row of §0.4.
   - **CN-4 landed the same day** on `work/cn4-substrates`: `apply_nat_profile` + `NatModifiers` + `SiteRef` + `NatApplyError` on the provider trait (with `Support::UnsupportedModifier` added), the vxlan router-namespace NAT capability wired **together with** the `supports()` widening it justifies, the netns `double_nat_cgnat` carrier chain that finally retires `netns_internet_sim.sh:189`'s `exit 2`, `SlirpSubstrateProvider` (verify-only, claims no profile), and the owner-approved tightening of `--cross-network-nat-profiles` onto `NatProfileId`. The full substrate × profile matrix, the nine deliberate deviations (including why the vxlan NAT boundary is a router namespace rather than the shell tier's fifth VM, and why radvd/miniupnpd config files are gone) are in the CN-4 row of §0.4. Unit-tested against `MockLeafRunner`; **not live-proven**.
-  - **Still unstarted:** the 8 scenario validators (CN-3), and the CN-5 retirement of `netns_daemon_path.sh` + the dead `cross_network_daemon_path` registry entry.
+  - **CN-3 is PARTIAL as of 2026-08-28** on `work/cn3-scenario-port`: the scenario contract
+    (`Verdict`/`Checks`/`ScenarioOutcome`, the `ScenarioHost` orchestrator-host seam, `provisioning`
+    as the `live_lab_common.sh` port, and `remote_exit_common`) is complete, and **3 of the 8
+    validators are ported** with their dispatch arms repointed and their bin shims deleted —
+    `traversal_adversarial`, `direct_remote_exit`, `relay_remote_exit`. **5 remain on the
+    `cargo run --bin` fan and are untouched and fully working:** `node_network_switch`,
+    `failback_roaming`, `controller_switch`, `remote_exit_dns`, `remote_exit_soak`. Because those
+    five bash scripts still invoke the direct and relay scripts to establish their baselines, NO
+    cross-network `.sh` has been deleted yet and `live_lab_common.sh` (3,523 ln), the
+    `live_cross_network_script_bin` shim and the skeleton gate bin all still stand; they go with the
+    last bash caller, at the end of CN-3 rather than per scenario. The eight deliberate deviations —
+    including the manager-accepted `ScenarioHost` second seam and the two retired
+    `ops vm-lab-run-suite` arms — are in the CN-3 row of §0.4. Unit-tested against
+    `MockLeafRunner`/`RecordingHost`; **not live-proven**.
+  - **Still unstarted:** the CN-5 retirement of `netns_daemon_path.sh` + the dead
+    `cross_network_daemon_path` registry entry.
 - **NEW, upstream gap the spec does not cover (live-proven, run `livelab-1787790884-c9ccf1a4d1cc`, first real 2-LAN --node cell: UTM 192.168.64/24 + lenovo 192.168.0/24):** `collect_pubkeys` records each node's raw discovered underlay endpoint and `distribute_assignments` feeds it into `NODES_SPEC` verbatim, so cross-LAN pairs receive peer endpoints on the other LAN's private prefix — unroutable, no traversal engaged, `traffic_test_matrix` fails every cross-LAN pair both directions. This sits tens of stages BEFORE the `cross_network_*` block where §4.2 hooks substrate setup.
   - **CN-2 closed the consuming half.** `collect_pubkeys` asks the substrate through `SubstrateHandle::endpoint()` and overrides the recorded endpoint ONLY on the `Overlay` plane, keeping each node's port; `distribute_assignments` then feeds those overridden endpoints into `NODES_SPEC` unchanged. An `Underlay`-plane answer (what a non-overlay substrate such as netns produces for every alias) overrides nothing, and with no substrate at all `ctx.endpoints` is byte-for-byte the adapters' discovered values — pinned by three tests in `collect_pubkeys.rs`. A malformed `host:port` under an overlay FAILS the stage rather than silently falling back to the unroutable address.
 - **DESIGN DECISION FORCED — RESOLVED 2026-08-27 in favour of TOPOLOGY LEVEL** (implemented in `56ec906c`/`4b1d9467`: `CrossNetworkSubstrateSetupStage` depends on `BootstrapHosts` and is ordered before `collect_pubkeys`, so overlay addresses are what land in `ctx.endpoints`, while SSH/management traffic keeps the management IPs). The original framing of the choice, retained for the record: the substrate seam must either move to topology level (provision the overlay before `collect_pubkeys` and populate `ctx.endpoints` with overlay addresses — what a real 2-LAN fleet needs) or stay a cross-network-suite concern (spec's framing — leaves the 2-LAN fleet's base mesh broken). Resolve before writing CN-2 code; the lifecycle stages' dependency-graph position follows from this choice.
