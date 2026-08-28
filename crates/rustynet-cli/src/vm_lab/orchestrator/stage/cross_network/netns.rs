@@ -38,9 +38,9 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
 use super::substrate::{
-    CreatedResource, CrossNetworkSubstrateProvider, LeafOutput, NatProfileId, NetLeafRunner,
-    SubstrateHandle, SubstrateRecord, SubstrateSetupFailure, SubstrateTopology, Support,
-    topology_digest, validate_argv, validate_netns_name,
+    CreatedResource, CrossNetworkSubstrateProvider, LeafOutput, NatApplyError, NatModifiers,
+    NatProfileId, NetLeafRunner, SiteRef, SubstrateHandle, SubstrateRecord, SubstrateSetupFailure,
+    SubstrateTopology, Support, topology_digest, validate_argv, validate_netns_name,
 };
 
 /// Every namespace, bridge and veth this substrate creates carries this
@@ -79,6 +79,38 @@ pub const PROBE_BIN: &str = "/tmp/rustynet-netns-probe";
 
 /// The mesh overlay the simulated transit must never collide with.
 const MESH_OVERLAY_FIRST_OCTET: u8 = 100;
+
+/// Second octet of the carrier segment (see [`CGN_SECOND_OCTET`]).
+const CGN_FIRST_OCTET: u8 = 100;
+/// Third-octet base for the `double_nat_cgnat` carrier segment: site `i` links
+/// its home router to its carrier router over `100.64.<200+i>.0/24`.
+///
+/// This is RFC 6598 shared address space **on purpose**, and it is the one
+/// place in this module that deliberately overlaps the Rustynet mesh's
+/// 100.64.0.0/10. The whole point of `double_nat_cgnat` is that the address
+/// between the two NAT hops is carrier-grade space: the daemon's CGNAT
+/// detection (dataplane plan §4.1.3 — "uPnP-WAN vs STUN mismatch, or
+/// 100.64.0.0/10 WAN") reads exactly that, so numbering it out of the
+/// benchmarking range the rest of the simulator uses would make the stage
+/// prove nothing. `scripts/vm_lab/apply_nat_profile.sh` makes the same choice
+/// (`CGN_HOME_ADDR=100.64.10.2/24`).
+///
+/// The overlap is safe because the segment exists ONLY on the veth between a
+/// site's `rnsim-rtr-*` and `rnsim-cgn-*` namespaces — it is never on the
+/// simulated transit, never on an endpoint namespace, and never in the guest's
+/// root namespace where a real mesh interface could live. The /24 is taken
+/// from the top of the third octet to stay clear of the low addresses a lab
+/// mesh actually allocates.
+const CGN_SECOND_OCTET: u8 = 64;
+const CGN_THIRD_OCTET_BASE: u8 = 200;
+
+/// The carrier segment for site `idx`: `100.64.<200+idx>.0/24`.
+fn cgn_base(idx: usize) -> String {
+    format!(
+        "{CGN_FIRST_OCTET}.{CGN_SECOND_OCTET}.{}",
+        CGN_THIRD_OCTET_BASE.saturating_add(idx as u8)
+    )
+}
 
 /// Maximum sites: site `i` takes `10.<10*i>.0.0/24` and WAN host `10 + i`, so
 /// the WAN /24 runs out well before the LAN space does.
@@ -247,6 +279,7 @@ impl NetnsSite {
         // bad namespace never reaches the guest.
         validate_netns_name(&format!("{NS_PREFIX}rtr-{name}"))?;
         validate_netns_name(&format!("{NS_PREFIX}ep-{name}"))?;
+        validate_netns_name(&format!("{NS_PREFIX}cgn-{name}"))?;
         Ok(Self {
             name: name.to_owned(),
             profile,
@@ -268,6 +301,17 @@ impl NetnsSite {
 
     fn endpoint_ns(&self) -> String {
         format!("{NS_PREFIX}ep-{}", self.name)
+    }
+
+    /// The carrier ("ISP") namespace chained behind the home router. Only
+    /// built for `double_nat_cgnat`.
+    fn carrier_ns(&self) -> String {
+        format!("{NS_PREFIX}cgn-{}", self.name)
+    }
+
+    /// True when this site needs the second, carrier NAT hop.
+    fn is_double_nat(&self) -> bool {
+        self.profile.as_str() == "double_nat_cgnat"
     }
 }
 
@@ -433,7 +477,12 @@ impl NetnsSubstrateProvider {
         let ep_lan_if = format!("{NS_PREFIX}e{idx}l");
         let router_lan_if = format!("{NS_PREFIX}r{idx}l");
 
-        for ns in [&router_ns, &endpoint_ns] {
+        let carrier_ns = site.carrier_ns();
+        let mut namespaces: Vec<&String> = vec![&router_ns, &endpoint_ns];
+        if site.is_double_nat() {
+            namespaces.push(&carrier_ns);
+        }
+        for ns in namespaces {
             required(runner, &["ip", "netns", "add", ns])?;
             handle
                 .created_resources
@@ -441,7 +490,18 @@ impl NetnsSubstrateProvider {
             required_in_ns(runner, ns, &["ip", "link", "set", "lo", "up"])?;
         }
 
-        // router ↔ wan bridge
+        // The namespace that faces the simulated transit and carries the site's
+        // WAN address. For a single-hop profile that is the site router itself;
+        // for `double_nat_cgnat` it is the carrier, and the home router reaches
+        // it over the RFC 6598 segment built below — two translations between
+        // the endpoint and the transit, which is the whole point of the profile.
+        let wan_facing_ns = if site.is_double_nat() {
+            carrier_ns.clone()
+        } else {
+            router_ns.clone()
+        };
+
+        // wan-facing namespace ↔ wan bridge
         required(
             runner,
             &[
@@ -461,7 +521,7 @@ impl NetnsSubstrateProvider {
             .push(CreatedResource::link(&alias, &router_wan_br));
         required(
             runner,
-            &["ip", "link", "set", &router_wan_if, "netns", &router_ns],
+            &["ip", "link", "set", &router_wan_if, "netns", &wan_facing_ns],
         )?;
         required(
             runner,
@@ -471,14 +531,119 @@ impl NetnsSubstrateProvider {
         let wan_cidr = format!("{wan_ip}/24");
         required_in_ns(
             runner,
-            &router_ns,
+            &wan_facing_ns,
             &["ip", "addr", "add", &wan_cidr, "dev", &router_wan_if],
         )?;
         required_in_ns(
             runner,
-            &router_ns,
+            &wan_facing_ns,
             &["ip", "link", "set", &router_wan_if, "up"],
         )?;
+
+        // The carrier segment: home router ──100.64.<200+idx>.0/24── carrier.
+        let cgn_home_if = format!("{NS_PREFIX}h{idx}c");
+        let cgn_carrier_if = format!("{NS_PREFIX}c{idx}h");
+        if site.is_double_nat() {
+            let cgn = cgn_base(idx);
+            let home_ip = format!("{cgn}.2");
+            let carrier_ip = format!("{cgn}.1");
+            required(
+                runner,
+                &[
+                    "ip",
+                    "link",
+                    "add",
+                    &cgn_home_if,
+                    "type",
+                    "veth",
+                    "peer",
+                    "name",
+                    &cgn_carrier_if,
+                ],
+            )?;
+            handle
+                .created_resources
+                .push(CreatedResource::link(&alias, &cgn_home_if));
+            required(
+                runner,
+                &["ip", "link", "set", &cgn_home_if, "netns", &router_ns],
+            )?;
+            required(
+                runner,
+                &["ip", "link", "set", &cgn_carrier_if, "netns", &carrier_ns],
+            )?;
+            let home_cidr = format!("{home_ip}/24");
+            let carrier_cidr = format!("{carrier_ip}/24");
+            required_in_ns(
+                runner,
+                &router_ns,
+                &["ip", "addr", "add", &home_cidr, "dev", &cgn_home_if],
+            )?;
+            required_in_ns(
+                runner,
+                &router_ns,
+                &["ip", "link", "set", &cgn_home_if, "up"],
+            )?;
+            required_in_ns(
+                runner,
+                &carrier_ns,
+                &["ip", "addr", "add", &carrier_cidr, "dev", &cgn_carrier_if],
+            )?;
+            required_in_ns(
+                runner,
+                &carrier_ns,
+                &["ip", "link", "set", &cgn_carrier_if, "up"],
+            )?;
+            // The home router's only way out is the carrier.
+            required_in_ns(
+                runner,
+                &router_ns,
+                &["ip", "route", "add", "default", "via", &carrier_ip],
+            )?;
+            required_in_ns(
+                runner,
+                &carrier_ns,
+                &["sysctl", "-qw", "net.ipv4.ip_forward=1"],
+            )?;
+            // Outer hop: the carrier masquerades the whole RFC 6598 segment
+            // onto the transit, with randomised source ports — carrier NATs are
+            // typically endpoint-dependent, and NO uPnP is offered here, which
+            // is what makes the CGNAT case unmappable from inside.
+            required_in_ns(
+                runner,
+                &carrier_ns,
+                &["nft", "add", "table", "ip", "rnsim_nat"],
+            )?;
+            required_in_ns(
+                runner,
+                &carrier_ns,
+                &[
+                    "nft",
+                    "add",
+                    "chain",
+                    "ip",
+                    "rnsim_nat",
+                    "post",
+                    "{ type nat hook postrouting priority srcnat; policy accept; }",
+                ],
+            )?;
+            required_in_ns(
+                runner,
+                &carrier_ns,
+                &[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "rnsim_nat",
+                    "post",
+                    "oifname",
+                    &router_wan_if,
+                    "masquerade",
+                    "random",
+                ],
+            )?;
+        }
 
         // endpoint ↔ router (the simulated home LAN)
         required(
@@ -547,7 +712,14 @@ impl NetnsSubstrateProvider {
             &router_ns,
             &["sysctl", "-qw", "net.ipv4.ip_forward=1"],
         )?;
-        self.apply_site_nat(runner, site, &router_wan_if, &ep_ip)
+        // The site router's UPLINK interface: the transit-facing veth normally,
+        // the carrier-facing veth when a carrier hop sits behind it.
+        let router_uplink_if = if site.is_double_nat() {
+            cgn_home_if.as_str()
+        } else {
+            router_wan_if.as_str()
+        };
+        self.apply_site_nat(runner, site, router_uplink_if, &ep_ip)
     }
 
     /// The NAT profile, as nftables rules inside the router namespace. Same
@@ -575,7 +747,12 @@ impl NetnsSubstrateProvider {
             ],
         )?;
         match site.profile.as_str() {
-            "port_restricted_cone" => {
+            // Inner ("home router") hop of the carrier chain: a plain
+            // masquerade onto the RFC 6598 segment. The outer, port-randomising
+            // carrier hop is built in `build_site` inside `rnsim-cgn-*`, so the
+            // finished site has TWO translations between the endpoint and the
+            // transit.
+            "double_nat_cgnat" | "port_restricted_cone" => {
                 required_in_ns(
                     runner,
                     &ns,
@@ -795,26 +972,79 @@ impl CrossNetworkSubstrateProvider for NetnsSubstrateProvider {
     ///   here is defined by having a NAT boundary. Claiming it would report a
     ///   NAT'd topology as the un-NAT'd baseline, i.e. a false pass for the
     ///   one profile whose whole point is the absence of translation.
-    /// - `double_nat_cgnat` — REFUSED. It needs a carrier router chained
-    ///   behind the site router; a site here has exactly one router hop. This
-    ///   is the typed, reasoned form of `netns_internet_sim.sh`'s `exit 2`.
+    /// - `double_nat_cgnat` — SUPPORTED as of CN-4. `build_site` chains a
+    ///   carrier namespace (`rnsim-cgn-<name>`) behind the site router over an
+    ///   RFC 6598 segment: the home router masquerades the LAN onto
+    ///   100.64.x/24 and the carrier masquerades that onto the transit with
+    ///   randomised ports, so the endpoint sits behind TWO translations. This
+    ///   replaces `netns_internet_sim.sh:189`'s `exit 2` with a built topology
+    ///   rather than a typed refusal.
     fn supports(&self, profile: &NatProfileId) -> Support {
         match profile.as_str() {
-            "port_restricted_cone" | "full_cone" | "symmetric" => Support::Supported,
+            "port_restricted_cone" | "full_cone" | "symmetric" | "double_nat_cgnat" => {
+                Support::Supported
+            }
             "baseline_lan" => Support::UnsupportedByDesign(
                 "baseline_lan is the no-NAT same-LAN case and needs no substrate; every netns \
                  site is defined by its NAT boundary"
-                    .to_owned(),
-            ),
-            "double_nat_cgnat" => Support::UnsupportedByDesign(
-                "double_nat_cgnat needs a two-router carrier chain; a netns site has exactly one \
-                 router hop"
                     .to_owned(),
             ),
             other => Support::UnsupportedByDesign(format!(
                 "{other} is outside the netns simulator's NAT vocabulary"
             )),
         }
+    }
+
+    /// The netns simulator realises every profile it claims, but NO modifier.
+    ///
+    /// uPnP would need `miniupnpd` inside each router namespace and an IGD
+    /// client on the far side; the gates this substrate drives are the mapping
+    /// and filtering classifiers, whose probes speak STUN, not IGD — a uPnP
+    /// claim here would advertise a capability nothing exercises. A routed IPv6
+    /// prefix is the same story: the simulated transit is v4-only, so `v6` has
+    /// nowhere to route. Both belong to the vxlan tier, where the real daemon
+    /// runs on a real guest (spec §8 open question 2).
+    fn supports_with_modifiers(&self, profile: &NatProfileId, modifiers: &NatModifiers) -> Support {
+        let base = self.supports(profile);
+        if !base.is_supported() || modifiers.is_empty() {
+            return base;
+        }
+        Support::UnsupportedModifier {
+            modifier: modifiers.describe(),
+            reason: "the netns simulator drives the STUN-based mapping and filtering classifiers \
+                     over a v4-only simulated transit; uPnP needs an IGD client and a routed IPv6 \
+                     prefix needs a v6 transit, neither of which this substrate has — apply \
+                     modifiers on the vxlan tier"
+                .to_owned(),
+        }
+    }
+
+    /// Reshaping a netns site in place is deliberately NOT offered.
+    ///
+    /// Both NAT gates rebuild a clean topology per profile precisely so
+    /// conntrack state from the previous profile cannot hide a cold-inbound
+    /// result (spec §0.4 CN-2 deviation (b)), and `double_nat_cgnat` is a
+    /// different TOPOLOGY — a whole extra namespace and veth pair — not a
+    /// different rule set. An in-place reshape would therefore either produce
+    /// a verdict contaminated by stale conntrack or silently fail to build the
+    /// carrier hop. The typed refusal names `setup` as the supported path
+    /// instead of half-applying either.
+    fn apply_nat_profile(
+        &self,
+        _handle: &mut SubstrateHandle,
+        site: &SiteRef,
+        profile: &NatProfileId,
+        _modifiers: &NatModifiers,
+        _runners: &BTreeMap<String, &dyn NetLeafRunner>,
+    ) -> Result<(), NatApplyError> {
+        Err(NatApplyError::Refused(Support::UnsupportedByDesign(
+            format!(
+                "the netns simulator does not reshape site '{site}' to '{profile}' in place: its \
+                 gates rebuild a clean topology per profile so stale conntrack cannot contaminate \
+                 a verdict, and double_nat_cgnat is a different topology rather than a different \
+                 rule set — rebuild the substrate through setup() with the site's profile instead"
+            ),
+        )))
     }
 
     fn setup(
@@ -1563,7 +1793,7 @@ mod tests {
     // ── supports(): the honest per-profile answer ──────────────────────
 
     #[test]
-    fn netns_supports_the_three_single_router_profiles() {
+    fn netns_supports_the_three_single_router_profiles_and_the_cgnat_chain() {
         let provider = provider("full_cone");
         for supported in ["port_restricted_cone", "full_cone", "symmetric"] {
             assert_eq!(
@@ -1572,10 +1802,17 @@ mod tests {
                 "{supported} is realisable by one nftables router"
             );
         }
+        // CN-4 flipped this one: `build_site` now chains a carrier namespace,
+        // so the claim is backed by a topology rather than being a refusal.
+        assert_eq!(
+            provider.supports(&profile("double_nat_cgnat")),
+            Support::Supported,
+            "double_nat_cgnat is realisable by the rnsim-cgn-* carrier chain"
+        );
     }
 
     #[test]
-    fn netns_refuses_baseline_lan_and_double_nat_with_reasons() {
+    fn netns_refuses_baseline_lan_with_a_reason() {
         let provider = provider("full_cone");
         let baseline = provider.supports(&profile("baseline_lan"));
         assert!(!baseline.is_supported());
@@ -1583,12 +1820,60 @@ mod tests {
             baseline.reason().expect("reason").contains("no-NAT"),
             "baseline_lan refusal must state that it is the un-NAT'd case"
         );
-        let cgnat = provider.supports(&profile("double_nat_cgnat"));
-        assert!(!cgnat.is_supported());
-        assert!(
-            cgnat.reason().expect("reason").contains("two-router"),
-            "double_nat_cgnat refusal must state the topological reason"
+    }
+
+    /// Modifiers are the one thing this substrate claims for NO profile: its
+    /// probes speak STUN, not IGD, and its transit is v4-only.
+    #[test]
+    fn netns_refuses_every_modifier_on_every_supported_profile() {
+        let provider = provider("full_cone");
+        for supported in [
+            "port_restricted_cone",
+            "full_cone",
+            "symmetric",
+            "double_nat_cgnat",
+        ] {
+            let support = provider
+                .supports_with_modifiers(&profile(supported), &NatModifiers::none().with_upnp());
+            match support {
+                Support::UnsupportedModifier { modifier, reason } => {
+                    assert_eq!(modifier, "upnp_available");
+                    assert!(reason.contains("IGD client"), "{reason}");
+                }
+                other => panic!("{supported} must refuse the modifier, got {other:?}"),
+            }
+        }
+        // No modifiers requested is the case every supported profile honours.
+        assert_eq!(
+            provider.supports_with_modifiers(&profile("full_cone"), &NatModifiers::none()),
+            Support::Supported
         );
+    }
+
+    /// In-place reshaping is deliberately refused, and the refusal names the
+    /// supported path rather than half-applying a rule set over stale
+    /// conntrack.
+    #[test]
+    fn netns_apply_nat_profile_is_a_typed_refusal_naming_setup() {
+        let provider = provider("full_cone");
+        let runner = MockLeafRunner::default();
+        let mut handle = provider.empty_handle(&topology(), true);
+        let err = provider
+            .apply_nat_profile(
+                &mut handle,
+                &SiteRef::new(SITE_NAME).expect("site"),
+                &profile("symmetric"),
+                &NatModifiers::none(),
+                &runners(&runner),
+            )
+            .expect_err("the netns simulator does not reshape in place");
+        assert!(matches!(err, NatApplyError::Refused(_)), "{err:?}");
+        assert!(
+            err.message()
+                .contains("rebuild the substrate through setup()"),
+            "{err}"
+        );
+        assert!(runner.recorded().is_empty(), "a refusal must run nothing");
     }
 
     /// An unsupported profile must be refused BEFORE any leaf command runs —
@@ -1598,17 +1883,13 @@ mod tests {
     fn setup_refuses_an_unsupported_profile_without_touching_the_guest() {
         let provider = provider("full_cone");
         let unsupported =
-            NetnsSubstrateProvider::single_site("exit-1", SITE_NAME, profile("double_nat_cgnat"))
+            NetnsSubstrateProvider::single_site("exit-1", SITE_NAME, profile("baseline_lan"))
                 .expect("provider");
         let runner = MockLeafRunner::default();
         let failure = unsupported
             .setup(&topology(), &runners(&runner))
             .expect_err("unsupported profile must fail closed");
-        assert!(
-            failure.message.contains("two-router"),
-            "{}",
-            failure.message
-        );
+        assert!(failure.message.contains("no-NAT"), "{}", failure.message);
         assert!(
             !failure.partial.record.provisioned,
             "nothing was provisioned"
@@ -1761,6 +2042,153 @@ mod tests {
         ));
         assert!(calls.iter().any(|c| c
             == "sudo -n ip netns exec rnsim-ep-B tc qdisc add dev rnsim-e2l root netem loss 5%"));
+    }
+
+    /// The CN-4 CGNAT chain, and the property that makes it that rather than a
+    /// relabelled single NAT: TWO translation hops are visible in the rule set,
+    /// in two DIFFERENT namespaces, with RFC 6598 space between them.
+    #[test]
+    fn double_nat_cgnat_builds_two_translation_hops_in_a_carrier_chain() {
+        let runner = MockLeafRunner::default();
+        let cgnat_provider =
+            NetnsSubstrateProvider::single_site("exit-1", SITE_NAME, profile("double_nat_cgnat"))
+                .expect("provider");
+        let handle = cgnat_provider
+            .setup(&topology(), &runners(&runner))
+            .expect("setup");
+        let calls = recorded_joined(&runner);
+
+        // Both routers exist, and the carrier is a namespace of its own.
+        assert!(
+            handle
+                .created_resources
+                .contains(&CreatedResource::netns("exit-1", "rnsim-cgn-A")),
+            "{:?}",
+            handle.created_resources
+        );
+
+        // Hop 1 (home router): plain masquerade onto the carrier segment.
+        assert!(
+            calls.iter().any(|c| c
+                == "sudo -n ip netns exec rnsim-rtr-A nft add rule ip rnsim_nat post oifname \
+                    rnsim-h1c masquerade"),
+            "{calls:#?}"
+        );
+        // Hop 2 (carrier): port-randomising masquerade onto the transit. No
+        // uPnP is offered here, matching real CGNAT deployments.
+        assert!(
+            calls.iter().any(|c| c
+                == "sudo -n ip netns exec rnsim-cgn-A nft add rule ip rnsim_nat post oifname \
+                    rnsim-r1w masquerade random"),
+            "{calls:#?}"
+        );
+
+        // Exactly two translation hops, one per namespace — a third would mean
+        // a rule leaked into the wrong namespace.
+        let mut masquerade_namespaces: Vec<&str> = calls
+            .iter()
+            .filter(|c| c.contains("masquerade"))
+            .map(|c| {
+                c.split_whitespace()
+                    .nth(5)
+                    .expect("ip netns exec <ns> is the argv prefix")
+            })
+            .collect();
+        assert_eq!(
+            masquerade_namespaces.len(),
+            2,
+            "exactly two translation hops: {calls:#?}"
+        );
+        masquerade_namespaces.sort_unstable();
+        assert_eq!(
+            masquerade_namespaces,
+            ["rnsim-cgn-A", "rnsim-rtr-A"],
+            "one hop per namespace, carrier and home: {calls:#?}"
+        );
+
+        // The segment between them is RFC 6598 shared space — the address the
+        // daemon's CGNAT detection reads.
+        assert!(
+            calls.iter().any(|c| c
+                == "sudo -n ip netns exec rnsim-rtr-A ip addr add 100.64.201.2/24 dev rnsim-h1c")
+                && calls.iter().any(|c| c
+                    == "sudo -n ip netns exec rnsim-cgn-A ip addr add 100.64.201.1/24 dev \
+                        rnsim-c1h"),
+            "{calls:#?}"
+        );
+        assert!(
+            cgn_base(1).starts_with("100.64."),
+            "the carrier segment must be RFC 6598 shared address space, or CGNAT detection has \
+             nothing to detect"
+        );
+
+        // The site's WAN address is on the CARRIER, not the home router: the
+        // home router's only way out is the carrier.
+        assert!(
+            calls.iter().any(|c| c
+                == "sudo -n ip netns exec rnsim-cgn-A ip addr add 198.18.0.11/24 dev rnsim-r1w"),
+            "{calls:#?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c
+                    == "sudo -n ip netns exec rnsim-rtr-A ip route add default via 100.64.201.1"),
+            "{calls:#?}"
+        );
+        // And a single-hop profile keeps building exactly one namespace pair.
+        let single = MockLeafRunner::default();
+        let single_handle = provider("port_restricted_cone")
+            .setup(&topology(), &runners(&single))
+            .expect("setup");
+        assert!(
+            !single_handle
+                .created_resources
+                .iter()
+                .any(|resource| resource.name.starts_with("rnsim-cgn-")),
+            "a single-router profile must not build a carrier namespace"
+        );
+    }
+
+    /// Both hops are swept by the same `rnsim-*` prefix teardown — a carrier
+    /// namespace left behind is residue exactly like a router one.
+    #[test]
+    fn teardown_sweeps_the_carrier_namespace_too() {
+        let runner = MockLeafRunner {
+            stdout_by_match: vec![
+                (
+                    "ip netns list".to_owned(),
+                    "rnsim-rtr-A\nrnsim-cgn-A\nrnsim-ep-A\nrnsim-svc\nunrelated-ns\n".to_owned(),
+                ),
+                (
+                    "ip -o link show".to_owned(),
+                    "1: lo: <LOOPBACK>\n2: rnsim-wan: <BROADCAST>\n3: rnsim-h1c@if4: \
+                     <BROADCAST>\n"
+                        .to_owned(),
+                ),
+            ],
+            ..MockLeafRunner::default()
+        };
+        let provider =
+            NetnsSubstrateProvider::single_site("exit-1", SITE_NAME, profile("double_nat_cgnat"))
+                .expect("provider");
+        let handle = provider.empty_handle(&topology(), true);
+        provider
+            .teardown(&handle, &runners(&runner))
+            .expect("teardown");
+        let calls = recorded_joined(&runner);
+        assert!(
+            calls.contains(&"sudo -n ip netns del rnsim-cgn-A".to_owned()),
+            "{calls:#?}"
+        );
+        assert!(
+            calls.contains(&"sudo -n ip link del rnsim-h1c".to_owned()),
+            "{calls:#?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("unrelated-ns")),
+            "the sweep is prefix-scoped: {calls:#?}"
+        );
     }
 
     // ── setup() failure paths ──────────────────────────────────────────
