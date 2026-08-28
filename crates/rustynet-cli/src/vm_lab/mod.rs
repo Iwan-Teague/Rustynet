@@ -51435,7 +51435,62 @@ mod host_run_status_probe_tests {
     #[cfg(unix)]
     #[test]
     fn the_run_status_probe_reports_only_a_genuinely_recorded_live_run() {
-        use std::process::Command;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command, Stdio};
+
+        /// A fixture process that is guaranteed to be torn down, whichever way
+        /// the test leaves this scope — a panicking assertion included.
+        ///
+        /// Two things are load-bearing, and both were leaks before:
+        ///
+        /// 1. **Explicit null stdio.** An inherited stdout/stderr is the test
+        ///    binary's own pipe, so any descendant still holding it after the
+        ///    test returns is what nextest reports as LEAK (QH-38's shape).
+        /// 2. **Killing the whole process group, not just the leader.**
+        ///    `bash -c '…; sleep 30; …'` does not exec-replace itself, so
+        ///    SIGKILLing bash orphans its `sleep` — which then outlived the
+        ///    test holding the inherited handles. `process_group(0)` plus a
+        ///    negative-pgid kill takes the grandchild with it.
+        struct ReapedChild(Child);
+
+        impl ReapedChild {
+            fn spawn(program: &str, args: &[&str]) -> Self {
+                Self(
+                    Command::new(program)
+                        .args(args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .process_group(0)
+                        .spawn()
+                        .expect("spawn the fixture process"),
+                )
+            }
+
+            fn id(&self) -> u32 {
+                self.0.id()
+            }
+        }
+
+        impl Drop for ReapedChild {
+            fn drop(&mut self) {
+                // Negative pgid via the `kill` binary — no unsafe/libc. `--`
+                // is load-bearing: some procps builds parse a bare `-12345`
+                // as `-1` plus discarded digits (see the same guard in
+                // `vm_lab::overnight::executor`).
+                let pgid = i64::from(self.0.id());
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg("--")
+                    .arg(format!("-{pgid}"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
 
         let dir = std::env::temp_dir().join(format!(
             "rustynet-run-status-probe-{}",
@@ -51471,10 +51526,7 @@ mod host_run_status_probe_tests {
 
         // (b) A recorded pid recycled onto an unrelated live process, plus a
         // malformed handle. Neither may be reported.
-        let mut bystander = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn the bystander");
+        let bystander = ReapedChild::spawn("sleep", &["30"]);
         std::fs::write(
             handles.join("recycled.pid"),
             format!("{}\n", bystander.id()).as_bytes(),
@@ -51489,11 +51541,8 @@ mod host_run_status_probe_tests {
 
         // (c) A live process whose OWN argv carries the marker, recorded in a
         // pidfile — the only thing that counts as a run in flight.
-        let mut orchestrator = Command::new("bash")
-            .arg("-c")
-            .arg(format!(": {MARKER}; sleep 30; :"))
-            .spawn()
-            .expect("spawn the stand-in orchestrator");
+        let orchestrator =
+            ReapedChild::spawn("bash", &["-c", format!(": {MARKER}; sleep 30; :").as_str()]);
         let orchestrator_pid = orchestrator.id();
         std::fs::write(
             handles.join("live.pid"),
@@ -51513,10 +51562,10 @@ mod host_run_status_probe_tests {
             "only the live recorded pid may be reported: {reported}"
         );
 
-        let _ = orchestrator.kill();
-        let _ = orchestrator.wait();
-        let _ = bystander.kill();
-        let _ = bystander.wait();
+        // `orchestrator` and `bystander` are torn down by `ReapedChild::drop`,
+        // which runs on the panicking paths above as well as this one.
+        drop(orchestrator);
+        drop(bystander);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
