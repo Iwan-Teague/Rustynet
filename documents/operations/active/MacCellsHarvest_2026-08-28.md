@@ -146,10 +146,31 @@ That correction does not change Cell 1's verdict — `anchor_validation` did
 dispatch and its skip is genuine — but it does mean the `live_anchor` half of
 the cell is **untested today**, not unavailable.
 
-> Disposition 2026-08-28: the §2.4 driver defect's `macos_anchor` arm is fixed —
-> it now calls `add_default_backbone` like `macos_exit` (pinned by
-> `macos_anchor_target_carries_the_default_backbone_like_macos_exit`); the other
-> §2.4 arms (`macos_blind_exit`, `macos_relay`, admin/windows cells) remain open.
+> Disposition 2026-08-28 (updated same day): **every §2.4 arm is now fixed.**
+> The `macos_anchor` arm was fixed first — it now calls `add_default_backbone`
+> like `macos_exit` (pinned by
+> `macos_anchor_target_carries_the_default_backbone_like_macos_exit`). The
+> same-day sweep then audited **all ten** `target_from_key` arms
+> (`crates/rustynet-mcp/src/bin/ai_agent.rs`) and fixed the six remaining
+> missing-backbone arms the same way: `macos_admin`, `macos_blind_exit`,
+> `macos_relay` (each `add_default_backbone(m, true)`, mirroring `macos_exit`'s
+> exit+client+entry shape) and `windows_admin`, `windows_anchor`,
+> `windows_relay` (each `add_default_backbone(m, false)`, mirroring
+> `windows_exit`'s exit+client shape). Verified complete, no change needed:
+> `macos_exit` and `windows_exit` (the reference shapes), and `full` (already
+> carries the backbone with entry; macos/windows default to `client` and the
+> Linux `exit_vm` still renders because no non-Linux exit selector is set —
+> `non_linux_exit_selected` is false there). Preflight evidence:
+> `stage/preflight.rs:139-149` counts only `NodeRole::Exit`, so an elected
+> `admin`/`blind_exit`/`anchor`/`relay` node can never satisfy the
+> exactly-one-exit requirement by itself — every single-role arm needed the
+> Linux exit+client backbone. Pinned by two new loop-style equivalence tests
+> (`macos_role_cell_targets_carry_the_default_backbone_like_macos_exit`,
+> `windows_role_cell_targets_carry_the_default_backbone_like_windows_exit`)
+> alongside the original anchor one. Not touched (out of scope, no defect
+> found): the windows arms' absent explicit `rust_engine` key is harmless —
+> `ai_agent.rs` defaults `rust_engine` to `true` (the W5.7 fail-closed
+> default), so those arms still route through the Rust `--node` engine.
 
 ### 2.4 Role-election plumbing gap in the MCP driver
 
