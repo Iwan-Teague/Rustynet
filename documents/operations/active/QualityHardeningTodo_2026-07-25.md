@@ -3346,6 +3346,58 @@ reconcile actually restores handshakes within the stage's recovery window is sti
 the open probe-pacing question above and remains unproven until a live run samples
 `traversal_probe_next_reprobe_unix` / `traversal_probe_attempts` per the capture protocol.
 
+**2026-08-28 — macOS mirror audit closed: `userspace_shared_macos` delegates to the shared
+engine; every QH-51c/d (and adjacent) fix is already covered, none need mirroring.**
+`LiveLabStageStatus_2026-08-14.md` flagged that the QH-51c/d fixes landed in
+`userspace_shared/` while `userspace_shared_macos/` "is its own variant" and might need the
+fixes mirrored. Audited in a worktree (branch `ai-edit/edit-1787927785239-56044-14`); the
+premise is wrong — the macOS variant is NOT a divergent copy of the fixed paths, it
+DELEGATES to the shared engine. Verdict per fix (paths under
+`crates/rustynet-backend-wireguard/src/`):
+
+* **QH-51c (9aae96ae, unchanged→no-rebuild) — shared-so-covered.**
+  `userspace_shared_macos/runtime.rs:589` `configure_peer` calls
+  `self.engine.configure_peer(&peer)` (`:592`) and clears handshake telemetry only on
+  `ConfigurePeerDisposition::Replaced` (`:613-615`), with the same rollback path
+  (`:596-611`). The disposition logic lives entirely in the shared engine.
+* **QH-51d roam (78c84a6e) — shared-so-covered.** macOS `update_peer_endpoint`
+  (`runtime.rs:619-642`) delegates to `engine.update_peer_endpoint` (`:630`) with
+  previous-endpoint rollback (`:631-640`).
+* **QH-51d keepalive (d886ac68) + timers (0c49397a) — shared-so-covered.** The keepalive fix
+  lives in `userspace_shared/engine.rs:377-392` (was hardcoded `None`); the macOS worker loop
+  drives `engine.update_peer_timers(transport_generation, &mut sink)`
+  (`userspace_shared_macos/runtime.rs:906/931`, pinned by the source-assert test at `:1555`).
+* **QH-51 macOS tests ALREADY EXIST**: `userspace_shared_macos/runtime.rs:1968-2006`
+  ("QH-51: network-flap recovery — reconcile must not churn sessions"), asserting an
+  unchanged re-apply must not wipe the recorded handshake with
+  `persistent_keepalive_secs: Some(25)`. Plus the cross-platform mirror pins recorded above
+  (`{linux,macos}_runtime_*` at base 4148cdae).
+* **Transient egress tolerance (7901939a) — already mirrored.**
+  `userspace_shared_macos/socket.rs:114-125` returns `Ok(false)` on
+  `is_transient_dataplane_send_error`; `:183-185` is the PF-aware helper whose doc-comment
+  says "Mirrors userspace_shared::socket::is_transient_dataplane_send_error"; tests `:222/:233`.
+* **Worker exit-cause surfacing (4a05355a) — already mirrored.**
+  `userspace_shared_macos/runtime.rs:141-142/220-222` `worker_exit_cause` (first writer
+  wins), `:431-441` appends the recorded cause; recovery test
+  `userspace_shared_macos/mod.rs:1949`
+  `macos_userspace_shared_backend_recovers_dead_worker_before_configure_peer`.
+* **QH-54 (firewalld re-bind recovery) — macOS path doesn't exist by design; covered at the
+  daemon level.** The fix is `Phase10Controller::reassert_host_firewall_admission`
+  (`rustynetd/src/phase10.rs:5957`), driven from the reconcile tail by
+  `DaemonRuntime::maybe_reassert_host_firewall_admission` (`daemon.rs:9769`) every
+  `HOST_FIREWALL_ADMISSION_ASSERT_INTERVAL_SECS` (30s) while serving as exit node, calling the
+  apply path's own `DataplaneSystem::admit_host_firewall_forwarding` (single place, no
+  second re-bind). macOS pf is a FIRST-CLASS admit target in the same machinery
+  (`phase10.rs:148` `DEFAULT_PFCTL_BINARY_PATH=/sbin/pfctl`, anchor handling
+  `:3246-3745`), so the same 30s re-assert cadence covers macOS pf; firewalld vocabulary
+  never entered the backend crate (rejected as backend leakage, see QH-54). The macOS twin
+  of the worker-recovery function exists at `userspace_shared_macos/mod.rs:224`.
+* **Sweep for other `userspace_shared` fixes this month:** the only other ledger mentions are
+  file-path references (this section and QH-54); no other fix entry names the directory as a
+  landing site needing a macOS verdict.
+
+Net: zero `divergent-needs-mirror` findings, zero code changes — documentation-only
+close-out. The LiveLabStageStatus flag was updated in the same change.
 
 ### QH-52 — the firewalld zone bind is never undone: role demotion leaves the binding behind
 
