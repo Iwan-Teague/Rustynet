@@ -155,6 +155,14 @@ fn classify_top_level_error(message: &str) -> rustynetd::exit_codes::ExitCode {
 /// `--acknowledge` is the ONLY way a marker is ever removed. It is a deliberate
 /// operator act performed after the residue has actually been cleaned up; the
 /// daemon never clears the marker on its own start.
+/// QH-40 (MacCellsHarvest 2026-08-28 §3.4): the checker's implicit state
+/// default must be the SAME path the marker writer uses, so it resolves
+/// through the daemon's single platform function — never a duplicated
+/// constant that can drift onto the wrong OS path.
+fn default_residue_check_state_path() -> PathBuf {
+    PathBuf::from(rustynetd::daemon::default_state_path())
+}
+
 fn run_shutdown_residue_check_command(args: &[String]) -> Result<(), String> {
     let mut state: Option<PathBuf> = None;
     let mut acknowledge = false;
@@ -180,7 +188,7 @@ fn run_shutdown_residue_check_command(args: &[String]) -> Result<(), String> {
             None => break,
         }
     }
-    let state = state.unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_PATH));
+    let state = state.unwrap_or_else(default_residue_check_state_path);
 
     if acknowledge {
         let scan = rustynetd::shutdown_residue::scan(&state);
@@ -4753,7 +4761,7 @@ fn help_text() -> String {
 mod tests {
     use super::run_shutdown_residue_check_command;
     use super::{
-        classify_top_level_error, help_text, parse_daemon_config,
+        classify_top_level_error, default_residue_check_state_path, help_text, parse_daemon_config,
         run_blind_exit_reversal_audit_command, run_enrollment_replay_audit_command,
         run_gossip_revoked_readmit_audit_command, run_linux_blind_exit_dataplane_check_command,
         run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
@@ -4770,6 +4778,20 @@ mod tests {
     };
 
     // ── QH-40: `shutdown-residue-check` exit contract ────────────────────────
+
+    /// MacCellsHarvest 2026-08-28 §3.4: the checker's implicit `--state`
+    /// default and the daemon config default the marker *writer* records
+    /// beside must resolve identically. A drift here re-introduces the
+    /// fail-open where a macOS checker looks in `/var/lib/rustynet` while the
+    /// marker sits under `/usr/local/var/rustynet`.
+    #[test]
+    fn shutdown_residue_checker_default_matches_the_writer_default() {
+        assert_eq!(
+            default_residue_check_state_path(),
+            rustynetd::daemon::DaemonConfig::default().state_path,
+            "checker and writer must resolve the same default state path"
+        );
+    }
 
     fn residue_state_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
