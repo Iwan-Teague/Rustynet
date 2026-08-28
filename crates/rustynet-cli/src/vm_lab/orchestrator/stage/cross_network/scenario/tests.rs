@@ -128,6 +128,65 @@ fn a_proven_path_needs_both_the_mode_and_the_liveness_proof() {
     ));
 }
 
+#[test]
+fn a_relay_path_needs_a_live_session_on_top_of_a_proven_relay_path() {
+    // The relay scenario requires three independent clauses. `relay_active` is
+    // the daemon's choice, `path_live_proven` says a path was proven, and only
+    // `relay_session_state=live` says the relay session itself is carrying
+    // traffic. A session that is merely negotiating satisfies the first two.
+    let negotiating = "path_mode=relay_active path_live_proven=true relay_session_state=pending";
+    assert!(path_proven_relay(negotiating));
+    assert!(
+        !relay_session_live(negotiating),
+        "a pending relay session must not read as live"
+    );
+
+    let live = "path_mode=relay_active path_live_proven=true relay_session_state=live";
+    assert!(path_proven_relay(live) && relay_session_live(live));
+
+    // An omitted field is not a live session.
+    assert!(!relay_session_live(
+        "path_mode=relay_active path_live_proven=true"
+    ));
+}
+
+#[test]
+fn the_two_remote_exit_scenarios_agree_on_their_shared_check_names() {
+    // Both reports carry the same two bypass conclusions and the same topology
+    // heuristic. If one scenario renamed its check, the cross-network report
+    // validator would start reading a field the other never writes.
+    for shared in [
+        "remote_exit_no_underlay_leak",
+        "remote_exit_server_ip_bypass_is_narrow",
+        "cross_network_topology_heuristic",
+        "no_plaintext_passphrase_files",
+        "client_route_via_rustynet0",
+    ] {
+        assert!(
+            direct_remote_exit::CHECKS.contains(&shared),
+            "direct remote exit must emit {shared}"
+        );
+        assert!(
+            relay_remote_exit::CHECKS.contains(&shared),
+            "relay remote exit must emit {shared}"
+        );
+    }
+}
+
+#[test]
+fn each_remote_exit_scenario_leads_its_report_with_its_own_aggregate() {
+    // The report spec's `required_checks` reads the aggregate first, so the
+    // emission order is load-bearing rather than cosmetic.
+    assert_eq!(
+        direct_remote_exit::CHECKS.first(),
+        Some(&"direct_remote_exit_success")
+    );
+    assert_eq!(
+        relay_remote_exit::CHECKS.first(),
+        Some(&"relay_remote_exit_success")
+    );
+}
+
 // ─────────────────────── provisioning helpers ───────────────────────
 
 #[test]
@@ -156,9 +215,9 @@ fn remote_src_dir_refuses_a_user_that_would_escape_the_path() {
 
 // ───────────────── direct remote-exit bypass aggregation ─────────────────
 
-fn bypass(values: &[&str]) -> direct_remote_exit::BypassVerdicts {
+fn bypass(values: &[&str]) -> remote_exit_common::BypassVerdicts {
     let owned: Vec<String> = values.iter().map(|value| (*value).to_owned()).collect();
-    direct_remote_exit::bypass_verdicts(&owned)
+    remote_exit_common::bypass_verdicts(&owned)
 }
 
 #[test]

@@ -299,9 +299,10 @@ fn run_cross_network_stage(
         CrossNetworkStageKind::NatMatrix => run_nat_matrix(ctx, options),
         // CN-3: ported scenarios run in-process; the rest still go through the
         // `cargo run --bin` fan below until their own port lands.
-        CrossNetworkStageKind::DirectRemoteExit => run_direct_remote_exit_stage(ctx, options, spec),
+        CrossNetworkStageKind::DirectRemoteExit | CrossNetworkStageKind::RelayRemoteExit => {
+            run_ported_scenario_stage(ctx, options, spec)
+        }
         CrossNetworkStageKind::NodeNetworkSwitch
-        | CrossNetworkStageKind::RelayRemoteExit
         | CrossNetworkStageKind::FailbackRoaming
         | CrossNetworkStageKind::ControllerSwitch
         | CrossNetworkStageKind::TraversalAdversarial
@@ -536,7 +537,7 @@ fn prepare_scenario_stage(
 /// report is written here from the single [`scenario::ScenarioOutcome`] the
 /// scenario returns, so the report cannot disagree with what the scenario
 /// proved.
-fn run_direct_remote_exit_stage(
+fn run_ported_scenario_stage(
     ctx: &OrchestrationContext,
     options: &CrossNetworkOptions,
     spec: &CrossNetworkStageSpec,
@@ -553,10 +554,11 @@ fn run_direct_remote_exit_stage(
         // the way into the scenario.
         let report_path = stage_report_path_for_idx(&stage_dir, spec.name, profile.as_str(), idx);
         let log_path = stage_log_path_for_idx(&stage_dir, spec.name, profile.as_str(), idx);
-        let outcome = run_direct_remote_exit_profile(
+        let outcome = run_ported_scenario_profile(
             ctx,
             &topology,
             options,
+            spec.kind,
             profile,
             report_path.as_path(),
             log_path.as_path(),
@@ -568,15 +570,19 @@ fn run_direct_remote_exit_stage(
     StageOutcome::Passed
 }
 
-/// One NAT profile's run of the direct remote-exit scenario.
-fn run_direct_remote_exit_profile(
+/// One NAT profile's run of a ported scenario.
+fn run_ported_scenario_profile(
     ctx: &OrchestrationContext,
     topology: &CrossNetworkTopology,
     options: &CrossNetworkOptions,
+    kind: CrossNetworkStageKind,
     nat_profile: &substrate::NatProfileId,
     report_path: &Path,
     log_path: &Path,
 ) -> StageOutcome {
+    // Only the relay scenarios resolve a relay. Building one unconditionally
+    // would open an ssh transport to a node the direct scenario never touches.
+    let needs_relay = matches!(kind, CrossNetworkStageKind::RelayRemoteExit);
     let client_remote = match remote_host_for_role(ctx, "client") {
         Ok(host) => host,
         Err(err) => return StageOutcome::Failed(err),
@@ -592,6 +598,22 @@ fn run_direct_remote_exit_profile(
     let exit_src_dir = match scenario_src_dir(&topology.exit) {
         Ok(dir) => dir,
         Err(err) => return StageOutcome::Failed(err),
+    };
+    let relay_remote = if needs_relay {
+        match remote_host_for_any_role(ctx, &["entry", "aux"]) {
+            Ok(host) => Some(host),
+            Err(err) => return StageOutcome::Failed(err),
+        }
+    } else {
+        None
+    };
+    let relay_src_dir = if needs_relay {
+        match scenario_src_dir(&topology.relay) {
+            Ok(dir) => Some(dir),
+            Err(err) => return StageOutcome::Failed(err),
+        }
+    } else {
+        None
     };
     let artifact_dir = match report_path.parent() {
         Some(dir) => dir.to_path_buf(),
@@ -610,6 +632,9 @@ fn run_direct_remote_exit_profile(
     );
     let exit_runner =
         substrate::RemoteShellRunner::new(exit_remote, log_path.to_path_buf(), "exit".to_owned());
+    let relay_runner = relay_remote.map(|remote| {
+        substrate::RemoteShellRunner::new(remote, log_path.to_path_buf(), "relay".to_owned())
+    });
 
     let inputs = scenario::ScenarioInputs {
         // The underlay address is the resolved management host, which is what
@@ -626,7 +651,13 @@ fn run_direct_remote_exit_profile(
             topology.exit.node_id.as_str(),
             topology.exit.host.as_str(),
         ),
-        relay: None,
+        relay: relay_runner.as_ref().map(|runner| {
+            scenario::ScenarioNode::new(
+                runner,
+                topology.relay.node_id.as_str(),
+                topology.relay.host.as_str(),
+            )
+        }),
         probe: None,
         nat_profile: nat_profile.clone(),
         impairment_profile: options.impairment_profile.clone(),
@@ -638,11 +669,11 @@ fn run_direct_remote_exit_profile(
         artifact_dir,
         client_ssh_target: topology.client.target.clone(),
         exit_ssh_target: topology.exit.target.clone(),
-        relay_ssh_target: None,
+        relay_ssh_target: needs_relay.then(|| topology.relay.target.clone()),
         probe_ssh_target: None,
         client_src_dir,
         exit_src_dir,
-        relay_src_dir: None,
+        relay_src_dir,
         time_scale: scenario::provisioning::TimeScale::Real,
     };
 
@@ -653,9 +684,24 @@ fn run_direct_remote_exit_profile(
     let host = scenario::host::LocalScenarioHost::new(repo_root())
         .with_known_hosts_file(Some(topology.client.known_hosts.clone()));
 
-    let outcome = scenario::direct_remote_exit::run(&host, &inputs, &lab);
+    let (suite, outcome) = match kind {
+        CrossNetworkStageKind::DirectRemoteExit => (
+            "cross_network_direct_remote_exit",
+            scenario::direct_remote_exit::run(&host, &inputs, &lab),
+        ),
+        CrossNetworkStageKind::RelayRemoteExit => (
+            scenario::relay_remote_exit::SUITE,
+            scenario::relay_remote_exit::run(&host, &inputs, &lab),
+        ),
+        other => {
+            return StageOutcome::Failed(format!(
+                "{} is not a ported cross-network scenario",
+                bin_name(other)
+            ));
+        }
+    };
     write_cross_network_scenario_report(
-        "cross_network_direct_remote_exit",
+        suite,
         &outcome,
         topology,
         options,
@@ -838,7 +884,6 @@ fn bin_name(kind: CrossNetworkStageKind) -> &'static str {
         CrossNetworkStageKind::NodeNetworkSwitch => {
             "live_linux_cross_network_node_network_switch_test"
         }
-        CrossNetworkStageKind::RelayRemoteExit => "live_linux_cross_network_relay_remote_exit_test",
         CrossNetworkStageKind::FailbackRoaming => "live_linux_cross_network_failback_roaming_test",
         CrossNetworkStageKind::ControllerSwitch => {
             "live_linux_cross_network_controller_switch_test"
@@ -853,6 +898,7 @@ fn bin_name(kind: CrossNetworkStageKind) -> &'static str {
         // `cargo run --bin` fan. Its bin shim is deleted, so naming it here
         // would name a binary that does not exist.
         CrossNetworkStageKind::DirectRemoteExit
+        | CrossNetworkStageKind::RelayRemoteExit
         | CrossNetworkStageKind::Preflight
         | CrossNetworkStageKind::NatClassification
         | CrossNetworkStageKind::NatMatrix => unreachable!("no script for this stage kind"),
@@ -978,6 +1024,25 @@ fn alias_and_remote_host_for_role(
     let alias = assignment.alias.clone();
     let host = remote_host_for_alias(ctx, &alias)?;
     Ok((alias, host))
+}
+
+/// The first of `labels` that has a node assigned. Mirrors
+/// [`ssh_params_for_any_role`], which `CrossNetworkTopology::resolve` already
+/// uses for the relay slot, so the runner and the resolved params cannot end up
+/// pointing at different nodes.
+fn remote_host_for_any_role(
+    ctx: &OrchestrationContext,
+    labels: &[&str],
+) -> Result<RemoteHost, String> {
+    for label in labels {
+        if let Ok(host) = remote_host_for_role(ctx, label) {
+            return Ok(host);
+        }
+    }
+    Err(format!(
+        "no node assigned to any of roles {}",
+        labels.join(", ")
+    ))
 }
 
 fn remote_host_for_role(ctx: &OrchestrationContext, label: &str) -> Result<RemoteHost, String> {

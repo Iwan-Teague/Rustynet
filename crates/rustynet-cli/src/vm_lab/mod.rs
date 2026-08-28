@@ -47,8 +47,6 @@ use zip::{CompressionMethod, ZipWriter};
 
 const DEFAULT_UTMCTL_PATH: &str = "/Applications/UTM.app/Contents/MacOS/utmctl";
 const DEFAULT_VM_LAB_INVENTORY_PATH: &str = "documents/operations/active/vm_lab_inventory.json";
-const DEFAULT_CROSS_NETWORK_RELAY_SCRIPT: &str =
-    "scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh";
 const DEFAULT_CROSS_NETWORK_FAILBACK_SCRIPT: &str =
     "scripts/e2e/live_linux_cross_network_failback_roaming_test.sh";
 const DEFAULT_START_TIMEOUT_SECS: u64 = 60;
@@ -2569,10 +2567,6 @@ fn workspace_root_path() -> PathBuf {
 
 pub fn default_inventory_path() -> PathBuf {
     workspace_root_path().join(DEFAULT_VM_LAB_INVENTORY_PATH)
-}
-
-pub fn default_cross_network_relay_script_path() -> PathBuf {
-    workspace_root_path().join(DEFAULT_CROSS_NETWORK_RELAY_SCRIPT)
 }
 
 pub fn default_cross_network_failback_script_path() -> PathBuf {
@@ -36757,43 +36751,17 @@ fn build_suite_command(
             );
         }
         "relay-remote-exit" => {
-            let script = default_cross_network_relay_script_path();
-            let client = topology_role_node(topology, &["client"])?;
-            let exit = topology_role_node(topology, &["exit"])?;
-            let relay = topology_role_node(topology, &["relay", "entry"])?;
-            let report_path = report_dir.join("cross_network_relay_remote_exit_report.json");
-            let log_path = report_dir.join("cross_network_relay_remote_exit.log");
-            command
-                .arg(script.as_path())
-                .arg("--ssh-identity-file")
-                .arg(ssh_identity_file)
-                .arg("--client-host")
-                .arg(client.normalized_target.as_str())
-                .arg("--exit-host")
-                .arg(exit.normalized_target.as_str())
-                .arg("--relay-host")
-                .arg(relay.normalized_target.as_str())
-                .arg("--client-node-id")
-                .arg(client.node_id.as_str())
-                .arg("--exit-node-id")
-                .arg(exit.node_id.as_str())
-                .arg("--relay-node-id")
-                .arg(relay.node_id.as_str())
-                .arg("--client-network-id")
-                .arg(client.network_id.as_str())
-                .arg("--exit-network-id")
-                .arg(exit.network_id.as_str())
-                .arg("--relay-network-id")
-                .arg(relay.network_id.as_str())
-                .arg("--nat-profile")
-                .arg(nat_profile)
-                .arg("--impairment-profile")
-                .arg(impairment_profile)
-                .arg("--report-path")
-                .arg(report_path.as_path())
-                .arg("--log-path")
-                .arg(log_path.as_path());
-            render_command_for_display(&command)
+            // CN-3: retired alongside direct-remote-exit, and for the same
+            // reason — this arm shelled straight to the bash validator
+            // independently of the orchestrator's own dispatch, so one scenario
+            // had two entry points that could drift.
+            return Err(
+                "vm-lab-run-suite relay-remote-exit was retired with the bash \
+                 cross-network validator (CN-3); use `ops vm-lab-orchestrate-live-lab \
+                 --node <alias>:<role> ...`, which runs the ported \
+                 cross_network_relay_remote_exit stage in process"
+                    .to_owned(),
+            );
         }
         "failback-roaming" => {
             let script = default_cross_network_failback_script_path();

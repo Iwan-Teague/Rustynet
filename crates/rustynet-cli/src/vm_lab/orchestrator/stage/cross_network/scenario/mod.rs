@@ -46,6 +46,8 @@ use super::substrate::{LeafOutput, NetLeafRunner};
 pub mod direct_remote_exit;
 pub mod host;
 pub mod provisioning;
+pub mod relay_remote_exit;
+pub mod remote_exit_common;
 pub mod traversal_adversarial;
 
 // CN-3 is landing scenario-by-scenario: a ported scenario has its dispatch arm
@@ -54,8 +56,8 @@ pub mod traversal_adversarial;
 // grows as each one lands, so at no point is there a scenario that is neither
 // fully ported nor fully on the old path.
 //
-// Not yet ported: relay_remote_exit, node_network_switch, failback_roaming,
-// controller_switch, remote_exit_dns, remote_exit_soak.
+// Not yet ported: node_network_switch, failback_roaming, controller_switch,
+// remote_exit_dns, remote_exit_soak.
 //
 // Script deletion lags bin deletion for `direct_remote_exit` specifically.
 // `scripts/e2e/live_linux_cross_network_{remote_exit_dns,node_network_switch,
@@ -531,6 +533,17 @@ pub fn client_exit_selected(status_output: &str, exit_node_id: &str) -> bool {
         && status_output.contains("state=ExitActive")
 }
 
+/// The client's relay session is actually carrying traffic.
+///
+/// Kept separate from [`path_proven_relay`] because it is a third, independent
+/// clause the relay scenario requires: `path_mode=relay_active` says the daemon
+/// chose the relay and `path_live_proven=true` says a path was proven, but only
+/// `relay_session_state=live` says the relay session itself is up. A session
+/// that is negotiating or stale satisfies neither of the first two's absence.
+pub fn relay_session_live(netcheck_output: &str) -> bool {
+    netcheck_output.contains("relay_session_state=live")
+}
+
 /// The exit node reports it is serving the default route.
 pub fn exit_serving_route(status_output: &str) -> bool {
     status_output.contains("serving_exit_node=true")
@@ -545,6 +558,40 @@ pub fn route_via_rustynet(route_output: &str) -> bool {
 /// installed rather than merely advertised.
 pub fn exit_masquerade_present(nft_output: &str) -> bool {
     nft_output.contains("masquerade")
+}
+
+// ───────────────────────── route advertisement ─────────────────────────
+
+/// `live_lab_retry_root … 10 2` around `route advertise`.
+pub const ROUTE_ADVERTISE_ATTEMPTS: u32 = 10;
+/// The nominal inter-attempt sleep of that retry. Callers pass it through
+/// [`provisioning::LabContext::pace`] so tests keep the attempt count while
+/// collapsing the wait.
+pub const ROUTE_ADVERTISE_SLEEP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `rustynet route advertise 0.0.0.0/0` on a node, retried as the shell did.
+///
+/// Shared because both remote-exit scenarios advertise a default route and the
+/// relay one does it twice; a second copy of the retry bound would be a second
+/// place for the lab's convergence budget to drift.
+pub fn advertise_default_route(
+    runner: &dyn NetLeafRunner,
+    sleep: std::time::Duration,
+) -> Result<(), String> {
+    let socket_assignment = format!("RUSTYNET_DAEMON_SOCKET={DAEMON_SOCKET}");
+    retry_root(
+        runner,
+        &[
+            "env",
+            socket_assignment.as_str(),
+            REMOTE_RUSTYNET_BIN,
+            "route",
+            "advertise",
+            "0.0.0.0/0",
+        ],
+        ROUTE_ADVERTISE_ATTEMPTS,
+        sleep,
+    )
 }
 
 #[cfg(test)]
