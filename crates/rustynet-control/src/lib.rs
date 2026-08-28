@@ -13,6 +13,7 @@ pub mod role_presets;
 pub mod role_signing_subflow;
 pub mod roles;
 pub mod scale;
+pub mod tandem_dns;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;

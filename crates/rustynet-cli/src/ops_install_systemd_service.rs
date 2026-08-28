@@ -59,6 +59,12 @@ impl InstallServiceConfig {
             // (ops_install_systemd_relay.rs); routing it through
             // here is a programming error surfaced at validate().
             ServiceKind::Relay => "rustynet-relay.service",
+            // RustyDNS tandem (Phase 1): the `dns` service kind exists
+            // for planning/parity only. There is no reviewed
+            // `rustydnsd` unit yet, so routing it through this
+            // installer is surfaced as a programming error at
+            // validate(), exactly like the relay.
+            ServiceKind::Dns => "rustydnsd.service",
         }
     }
 
@@ -93,6 +99,13 @@ impl InstallServiceConfig {
         if self.kind == ServiceKind::Relay {
             return Err(
                 "relay unit lifecycle is owned by ops_install_systemd_relay; refusing".to_owned(),
+            );
+        }
+        if self.kind == ServiceKind::Dns {
+            return Err(
+                "rustydnsd unit lifecycle is not available yet (RustyDNS tandem \
+                 Phase 1 is control-plane only); refusing"
+                    .to_owned(),
             );
         }
         Ok(Self::unit_file_name(self.kind))

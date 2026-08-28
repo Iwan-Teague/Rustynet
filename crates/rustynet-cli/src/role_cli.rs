@@ -142,6 +142,21 @@ pub enum ConcreteAction {
     /// `rustynet-llm-gateway` service. Undeploy (after stream
     /// severance) precedes the signed `serves_llm` revocation.
     UndeployLlmService,
+    /// Install, enable, and start the sibling `rustydnsd` service
+    /// (RustyDNS tandem integration; see
+    /// `RustydnsTandemIntegrationDesign_2026-08-27.md`). Deploy
+    /// precedes the signed `serves_dns` advertisement (decree:
+    /// deploy-before-signed-bundle). Planning-only in Phase 1: no
+    /// preset grants `serves_dns`, and the executor refuses this
+    /// action fail-closed until the tandem service deployment phase
+    /// lands.
+    DeployDnsService,
+    /// Stop, disable, and remove the sibling `rustydnsd` service.
+    /// Undeploy (after resolver severance) precedes the signed
+    /// `serves_dns` revocation. Planning-only in Phase 1; the
+    /// executor refuses this action fail-closed until the tandem
+    /// service deployment phase lands.
+    UndeployDnsService,
 }
 
 /// Map a sibling-service kind to its deploy action.
@@ -150,6 +165,7 @@ fn deploy_action_for(kind: ServiceKind) -> ConcreteAction {
         ServiceKind::Relay => ConcreteAction::DeployRelayService,
         ServiceKind::Nas => ConcreteAction::DeployNasService,
         ServiceKind::Llm => ConcreteAction::DeployLlmService,
+        ServiceKind::Dns => ConcreteAction::DeployDnsService,
     }
 }
 
@@ -159,6 +175,7 @@ fn undeploy_action_for(kind: ServiceKind) -> ConcreteAction {
         ServiceKind::Relay => ConcreteAction::UndeployRelayService,
         ServiceKind::Nas => ConcreteAction::UndeployNasService,
         ServiceKind::Llm => ConcreteAction::UndeployLlmService,
+        ServiceKind::Dns => ConcreteAction::UndeployDnsService,
     }
 }
 
@@ -895,6 +912,8 @@ fn render_action(action: &ConcreteAction) -> String {
         ConcreteAction::UndeployLlmService => {
             "disable+remove rustynet-llm-gateway.service".to_owned()
         }
+        ConcreteAction::DeployDnsService => "install+enable rustydnsd.service".to_owned(),
+        ConcreteAction::UndeployDnsService => "disable+remove rustydnsd.service".to_owned(),
     }
 }
 
@@ -1961,6 +1980,12 @@ mod tests {
                 }
                 ConcreteAction::UndeployLlmService => {
                     Some(SubflowStep::UndeployService(ServiceKind::Llm))
+                }
+                ConcreteAction::DeployDnsService => {
+                    Some(SubflowStep::DeployService(ServiceKind::Dns))
+                }
+                ConcreteAction::UndeployDnsService => {
+                    Some(SubflowStep::UndeployService(ServiceKind::Dns))
                 }
             }
         }
