@@ -2291,6 +2291,33 @@ That last one is the fail-closed question and should be answered first.
 > — 15 lib + 5 bin pass, 0 failed. No live-lab row: unit-pinned resolution
 > only; the live checker assertion still needs a macOS run with a marker
 > present.
+>
+> **STATUS 2026-08-28 — DNS-half ENFORCEMENT GAP confirmed live and
+> DISPOSITIONED design-only, owner-gated.**
+> [`MacosDnsFailclosedEnforcementGap_2026-08-28.md`](./MacosDnsFailclosedEnforcementGap_2026-08-28.md)
+> (from MAC-CELLS run 3, `livelab-1787911937-77ff1933885f`, §3.1 of
+> `MacCellsHarvest_2026-08-28.md`). The observation fix above (ATTEMPT 2) is
+> correct and did its job on first macOS exercise: `macos-utm-1` carries
+> `/etc/resolv.conf` = loopback-only (the RustyNet apply path's own write) while
+> `scutil --dns` primary resolver #1 reports 1.1.1.1 / 8.8.8.8 — the check reds
+> honestly and the red is a REAL enforcement gap, not validator noise. Root
+> cause: `MacosCommandSystem::apply_dns_protection`
+> (`crates/rustynetd/src/phase10.rs:4081-4130`) writes `/etc/resolv.conf`
+> (cosmetic — mDNSResponder/SystemConfiguration does not consult it for the
+> default lookup path) plus the `*.rustynet`-scoped `/etc/resolver/rustynet`
+> (per-domain only, cannot set the default resolver), and pf asserts egress
+> `:53` only; nothing locks the SystemConfiguration resolver state macOS
+> actually resolves with. Linux enforces because resolv.conf IS the resolver
+> source there; macOS has no SystemConfiguration arm at all. The design doc
+> specifies the two candidate mechanisms — M1 `networksetup -setdnsservers`
+> per service (documented, persistent, strand-on-crash risk) vs M2 a fixed-path
+> `scutil -f` State:/ override (volatile, undocumented, needs reconcile
+> re-assertion) — M3 (bind :53) rejected as structurally unavailable, and gates
+> implementation on five owner decisions (M1-vs-M2, service scope, new
+> privileged argv surface + validation, posture/RustyDNS-tandem interaction,
+> teardown ordering). Until owner-approved enforcement lands, DnsFailclosed is
+> expected to red on every protected macOS node; the red is the leak being
+> reported, not a regression of this entry's fix. No code changed.
 
 ### QH-41 — `macos-utm-1` is on an isolated vmnet bridge, so every mixed-OS run fails its traffic matrix deterministically
 
