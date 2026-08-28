@@ -2520,7 +2520,28 @@ would strengthen the control beyond the defect being fixed, so it is recorded ra
 
 ### QH-51 — network-flap recovery: the handshake never returns after the block is lifted
 
-**Status: OPEN — 3 of 4 checks pass. TWO hypotheses now tested and REFUTED (2026-08-14).**
+**Status: RESOLVED BY MEASUREMENT — NON-REPRODUCTION captured 2026-08-28. See
+[NetworkFlapHandshakeCapture_2026-08-27.md](./NetworkFlapHandshakeCapture_2026-08-27.md).**
+
+The capture this entry demanded was taken on live guests (lenovo-client-1/lenovo-exit-1, current
+main `4b0d18aa`, mesh built from source by the Rust `--node` orchestrator): tcpdump on both
+endpoints' WG ports + a 5s daemon-state sampler (the exact
+`traversal_probe_result/attempts/next_reprobe_unix/latest_handshake_unix` tuple prescribed
+below) + journals, wrapped around the FIXED `live_linux_network_flap_test` harness. **4/4 flap
+cycles recovered in 8s** — three on `linux-wireguard`, one on `linux-wireguard-userspace-shared`
+(the backend the failing series ran on). Packet-level mechanism: the peer keeps sending WG
+handshake initiations (~every 5.4s) through the whole blackout; the first initiation after the
+block lifts is answered by the client within milliseconds and data crosses seconds later. The
+client's `traversal_probe_latest_handshake_unix` refreshed within one 5s sample of the on-wire
+handshake — the "metric is paced, not dead" hypothesis below is moot on current code, which
+reads backend handshake evidence every sync pass (daemon.rs:6857/6990) rather than only when a
+probe runs. No flap-breaker transition, no restrict, no reconcile failure in either journal.
+The historical signature is explained by the since-fixed instruments (stamp-based recovery
+oracle — hypothesis 8; phantom `ops verify-membership` verb) plus the QH-04 reconcile rework.
+No assertion was widened; the data-crossing recovery check is stricter than the stamp it
+replaced. Historical analysis below retained for the record.
+
+**Status (superseded): OPEN — 3 of 4 checks pass. TWO hypotheses now tested and REFUTED (2026-08-14).**
 
 Refuted #1 — roaming churn destroying the record (run `qh51-roam-20260814h`).
 Refuted #2 — the keepalive never reaching the tunnel (run `qh51-keepalive-applied-20260814i`):
