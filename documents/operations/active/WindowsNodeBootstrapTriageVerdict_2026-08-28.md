@@ -343,6 +343,7 @@ Recommended order:
    per-OS `*_stage_bootstrap` columns** (§0(c)). Affects Linux and macOS counts
    too, so it is not Windows-column work and can be owned separately. Until it
    lands, every published Windows/Linux/macOS bootstrap fail count is inflated.
+   **DONE (2026-08-28, branch `work/wfix-3`) — see §7.3 for the disposition.**
 4. **W-FIX-4 (guest/ops) — apply §7.1, then re-run** the minimal topology
    (`debian-headless-2:exit` + `windows-utm-1:client`, the smallest topology that
    satisfies preflight's "exactly 1 Exit node" rule and still plans
@@ -356,7 +357,64 @@ Only after W-FIX-4 produces a pass does the AcceptanceSpec §5.4 stability rule
 apply (3-of-3 at a single clean commit) before any Windows cell below bootstrap
 can be called proven.
 
-### 7.3 Explicitly out of scope
+### 7.3 W-FIX-3 disposition — FIXED, forward-only (2026-08-28)
+
+**The conflation point.** `crates/rustynet-cli/src/live_lab_run_matrix.rs`,
+`populate_stage_values` — the `logical_stage_name` branch that fans a shared
+stage's status across `platforms_for_stage`. The `preflight` spec in
+`live_lab_stage_registry.rs` carries `logical: Some("bootstrap")` with
+`PlatformRule::AllPlatforms`, so its run-scoped `fail` was written into
+`linux_stage_bootstrap`, `macos_stage_bootstrap` and `windows_stage_bootstrap`,
+and `merge_status` (`:2215-2231`) then correctly kept it over the `skip` that
+`bootstrap_hosts` had recorded on every node. **The merge was never wrong. The
+column feed was.** §0(c) attributed this to `merge_status`; that attribution is
+hereby corrected — ranking `fail` above `skip` is right, and left unchanged.
+
+**Not one column — four stages across two column families.** The same shape was
+found one column over by the invariant test described below:
+
+| Stage | Shares logical column with | Columns it was poisoning |
+| --- | --- | --- |
+| `preflight` | `bootstrap_hosts`, `collect_pubkeys`, … | `{linux,macos,windows}_stage_bootstrap`, `cross_os_bootstrap` |
+| `prepare_source_archive` | same | same |
+| `cross_network_substrate_setup` | the 11 node-exercising `cross_network_*` stages | `{linux,macos,windows}_stage_cross_network` |
+| `cross_network_preflight` | same | same |
+
+**The fix.** A `run_scoped: bool` on `StageSpec`, consumed by
+`populate_stage_values` and (defence in depth) by `populate_cross_os_values`: a
+run-scoped stage writes neither a per-OS `{platform}_stage_*` column nor a
+`cross_os_*` column. Its own one-off `special` column, where it has one, is
+still written — that column IS the stage, which is attribution rather than
+aliasing. The run-level verdict was already carried losslessly by
+`overall_result` + `first_failed_stage`, so nothing is discarded; the per-OS
+columns now read their real never-reached value (`skip` when the stage was
+skip-cascaded, the `not_run` default when it was never recorded at all).
+
+The criterion is not hand-maintained. `run_scoped` is pinned against the
+orchestrator's own fanout — `StageGroup::Pre` **and** `StageFanout::Once` — by
+`run_scoped_matches_orchestrator_fanout_for_every_dispatched_pre_stage`, which
+builds the real plan with every opt-in suite enabled and compares. A Pre stage
+that fans out `PerNode` (`verify_ssh_reachability`, `cleanup_hosts`) has a
+genuine per-node verdict and stays attributable; a newly added Pre/Once stage
+fails the test until it is flagged. That test is what found the two
+cross-network stages, which manual inspection of the bootstrap column had
+missed.
+
+**Forward-only. No historical row was rewritten.** The CSV ledgers are
+append-only evidence and the inflated rows stay exactly as the tooling wrote
+them — `livelab-1784489499-db3ff1aaafe6` and `livelab-1785005557-b7667cce46db`
+still read `fail` in all three bootstrap columns. §0(a)/§0(c) above are the
+correction of record for those rows, exactly as the `traffic_test_matrix`
+removal of 2026-07-27 left its 35 contaminated rows in place. Any re-count that
+reads a pre-fix row's roll-up column alone still reproduces the error; per
+§12.3, take the verdict from the stage's own report artifact.
+
+**Not lab-verified, and does not need to be.** This is pure recording-layer
+logic with no guest behaviour, proven by unit tests over synthetic run records.
+The first live run after this lands will be the first row written under the new
+feed.
+
+### 7.4 Explicitly out of scope
 
 The two standing Windows code gaps recorded in
 `BashOrchestratorRetirementProgram_2026-08-22.md` — no gossip transport
