@@ -1906,6 +1906,29 @@ inherits the harness pipes. Check first whether any production caller *relies* o
 child writing to the parent's console — `:810` is the one to read — because piping would
 silence it, and that is a behaviour change rather than pure hygiene.
 
+**CLOSED 2026-08-28 — the last leaking test is fixed; the suite now reports 0 leaky.**
+`spawn_with_timeout` itself was fixed earlier (commit "Stop the overnight agent spawn from
+leaking harness stdio to its children", merged via `work/small-fixes`), which removed the
+original QH-38 instance. A full run at `77ff1933` still reported
+`11689 tests run: 11689 passed (3 slow, 2 leaky), 2 skipped` — both remaining leaks were
+the SAME test counted once per binary (the lib and `bin/rustynet-cli` copies of
+`vm_lab::host_run_status_probe_tests::the_run_status_probe_reports_only_a_genuinely_recorded_live_run`,
+added by the QH-54 bonus fix). Mechanism, confirmed by running the test binary against a
+FIFO and watching who kept it open, not inferred: the fixture
+`bash -c ': <marker>; sleep 30; :'` does not exec-replace itself, so `Child::kill()`
+SIGKILLed bash and ORPHANED its `sleep 30`, which inherited the harness stdout/stderr and
+outlived the test (`ps` showed exactly one `sleep 30` reparented to pid 1 after every run).
+Fixed in the test only — no production spawn site was implicated — by a `ReapedChild` guard
+that (a) spawns both fixture processes with `Stdio::null()` on all three handles and
+`process_group(0)`, and (b) on `Drop` — so a panicking assertion reaps too, not just the
+happy path — kills the whole group with the same `kill -KILL -- -<pgid>` form
+`vm_lab::overnight::executor` already uses, then waits. Verified: the targeted run reports
+`4 tests run: 4 passed` with no leaky count, and no orphaned `sleep` survives the binary.
+Note the sibling test named in the original brief,
+`vm_lab::tests::revoked_peer_denied_audit_producer_to_validator_round_trip_passes`, did NOT
+leak in either the targeted or the full baseline run on this tree — it spawns no
+subprocess, so there is nothing there to fix.
+
 ---
 
 ### QH-39 — two macOS baseline checks return `overall_ok: true` on a host with NO daemon running, and that green reaches the ledger
