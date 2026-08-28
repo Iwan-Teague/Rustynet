@@ -1205,8 +1205,12 @@ const MACOS_MEMBERSHIP_DIR: &str = "/usr/local/var/rustynet/membership";
 /// macOS owner signing key path. Plaintext custody is rejected by the
 /// daemon's macOS preflight; the operator stages the key via Keychain
 /// or via this file with 0600/root permissions only.
+///
+/// `pub(crate)` so the vm_lab macOS adapter can pin its owner-PUBKEY read
+/// path to this genesis write path (`{self}.pub`) — MAC-D2.
 #[cfg(target_os = "macos")]
-const MACOS_OWNER_SIGNING_KEY_PATH: &str = "/usr/local/etc/rustynet/membership.owner.key";
+pub(crate) const MACOS_OWNER_SIGNING_KEY_PATH: &str =
+    "/usr/local/etc/rustynet/membership.owner.key";
 
 /// macOS anchor bundle-pull token path. The anchor profile's loopback
 /// bundle-pull listener authenticates pulling peers against this token
