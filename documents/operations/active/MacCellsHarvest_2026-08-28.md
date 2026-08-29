@@ -1054,3 +1054,109 @@ skipped as no-role-in-topology as before).
 MAC-D3 (b) / §8.2 remains the single owner gate between this cell and green
 (remediate DNS-protected-mode entry, then the validator stages run live on
 the next re-run).
+## 9. MAC-D4 disposition — 2026-08-29 (isolated edit branch)
+
+### 9.1 FIXED: the macOS `--node` bootstrap now seeds the membership genesis
+
+`Bootstrap-RustyNetMacos.sh` gained `seed_membership_genesis()` (wired into
+BOTH main paths — full install and `SKIP_BUILD=1` — between
+`seed_trust_evidence` and `install_launchd_service`). It mirrors the Linux
+bootstrap's per-install re-seed: `clear_residual_state` wipes `membership/`
+signed state on every bootstrap, so genesis re-runs with `--force` each
+install, which also self-heals the §8.3 secondary hazard
+(`macos_install.rs:629` wholesale uninstall wipe — the next bootstrap
+re-seeds, no manual guest fix).
+
+What it seeds:
+
+- `rustynetd membership init --snapshot …/membership.snapshot --log …
+  --watermark … --owner-signing-key /usr/local/etc/rustynet/
+  membership.owner.key --owner-signing-key-passphrase-file … --node-id …
+  --network-id … --force` — the same genesis the Linux bootstrap reaches via
+  `e2e-bootstrap-host`. `membership init` itself generates the keypair and
+  writes the `.pub` sibling (`rustynetd/src/main.rs:4524`) — exactly the
+  file MAC-D2's fail-loud adapter read path demands
+  (`macos_membership::issue_membership_owner_key`, reads via `sudo -n cat`,
+  so the directory tightening below does not block it).
+- A 64-hex-char passphrase via the same atomic-write protocol as the
+  wireguard passphrase (chmod-before-write tmpfile in `BOOTSTRAP_DIR`).
+- The canonical System.keychain unwrap item (service
+  `signing_key_passphrase`, account `membership-owner-signing-key`) via the
+  same idempotent delete-then-add `/usr/bin/security` provisioning
+  `execute_ops_e2e_bootstrap_macos::provision_macos_membership_signing_keychain_item`
+  performs, so membership-mutation ops can unwrap.
+- Daemon-service ownership restore (`chown rustynetd:rustynetd`) on the
+  genesis snapshot/log — the same restore
+  `ops_e2e::set_membership_state_permissions_for` applies after root-run
+  membership mutations; the launchd daemon runs as the `rustynetd` service
+  account and rewrites snapshot/log (and creates the absent watermark) at
+  runtime, so root-owned genesis state would otherwise fail-closed it.
+
+Fail-closed: the script runs under `set -euo pipefail`; any failed genesis
+step aborts the whole bootstrap — a node can never ship without a seeded
+owner key. Drift guard: new test
+`bootstrap_script_seeds_membership_owner_key_at_canonical_genesis_path`
+(`macos_install.rs`) pins the genesis invocation, canonical owner-key path
+(`==` the MAC-D2-pinned `MACOS_OWNER_SIGNING_KEY_PATH` via the existing
+`owner_signing_key_path_matches_macos_genesis_driver`), `.pub` ownership/
+mode, ownership restore, keychain descriptor, both-path wiring, and no
+`|| true` softening.
+
+### 9.2 Custody posture (no owner gate needed — no posture weakened)
+
+- The owner SIGNING (private) key is NEVER plaintext at rest:
+  `membership init` → `persist_owner_signing_key_encrypted`
+  (`main.rs:4560`) writes an Argon2+XChaCha20 passphrase-sealed envelope,
+  mode 0600, symlink-refusing, and tightens the containing directory to
+  0700. This is the daemon's own reviewed encrypted-at-rest custody; the
+  seed simply invokes it. (Directory tightening of
+  `/usr/local/etc/rustynet` from 0750→0700 is safe: the daemon reads
+  nothing from CONFIG_ROOT — `trust-evidence.key` there is read only by
+  root-run `rustynet ops refresh-signed-trust`.)
+- The passphrase is a bootstrap artifact in `BOOTSTRAP_DIR` (0600,
+  root-owned, outside `keys/` so `macos-key-custody-check` does not flag
+  it) — identical posture to the reviewed wireguard passphrase — AND is
+  provisioned into the System.keychain descriptor. This is exactly the
+  reviewed production macOS genesis driver's contract (`ops_e2e` stages the
+  passphrase file 0600 and provisions the keychain item from it); Linux
+  keeps its signing credential file at rest 0600 the same way.
+- Only the PUBLIC half (`.pub`) is world-readable (0644 root:rustynetd) —
+  it is the MAC-D2 read target and carries no secret.
+
+Known runtime exposure, recorded honestly (not a new decision): the
+signing-key keychain item is created by `/usr/bin/security` without
+`-A`/owned-identity binding, matching the reviewed `ops_e2e` provisioner
+verbatim. The Phase-26 WG lesson (`Bootstrap-RustyNetMacos.sh`
+generate_wireguard_keys comment) found `-A` items unreadable cross-session
+on macOS 26; whether the security-tool-created signing descriptor is
+readable by `rustynetd` membership ops at runtime will be proven (or
+fail-loud) on the next macOS exit/anchor run — membership mutations fail
+closed if not. If it proves unreadable, the owner-gated follow-up is
+re-provisioning the signing descriptor via the owned-identity
+`rustynetd key store-passphrase` path (as the WG passphrase already does).
+
+### 9.3 Gate evidence — 2026-08-29
+
+fmt pass; clippy `--workspace --all-targets --all-features --locked -D
+warnings` pass; check pass; audit + deny pass; secrets_hygiene_gates.sh
+pass (18 checks); scoped tests rustynet-cli + rustynetd
+(`--all-targets --all-features --locked`): 92 test binaries ok, rustynetd
+lib 2259 passed / 1 failed. The single failure is the SAME pre-existing
+host-environment failure §8.4 already recorded
+(`phase10::tests::macos_assert_dns_protection_requires_active_dns_rules`,
+real-`networksetup` enumeration vs this host's disabled network service);
+verified identical at HEAD via stash (fails without this branch's
+changes) — unrelated to MAC-D4. A pre-existing import-order fmt drift in
+`macos_install.rs` (at base) was fixed by `cargo fmt -p rustynet-cli` to
+unblock the fmt gate. No lab run per scope.
+
+### 9.4 Next step
+
+Re-run the Cell-2 shape from §8.1 (`--node macos-utm-1:exit --node
+lenovo-exit-1:entry --node lenovo-client-1:client`). `membership_init`
+should now pass on macOS (genesis seeds the `.pub` at the exact path the
+MAC-D2 reader demands); the §8.2 skip chain
+(`active_exit` → `exit_dns_failclosed_validation` →
+`exit_nat_lifecycle_validation` → `exit_demotion_residue_validation`)
+then runs for the first time. Watch §9.2's keychain-unwrap exposure in any
+membership-mutation stage.

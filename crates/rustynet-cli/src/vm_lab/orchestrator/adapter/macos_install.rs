@@ -1042,6 +1042,83 @@ mod tests {
         );
     }
 
+    /// MAC-D4 drift guard: the bootstrap script must seed the membership
+    /// owner keypair at the canonical genesis location the adapter reads
+    /// (MAC-D2). The Linux bootstrap re-seeds its owner key on every install
+    /// via `e2e-bootstrap-host`'s membership-init step; the macOS bootstrap
+    /// previously had no genesis step at all, so a fresh macOS deploy could
+    /// never hold an owner key and the orchestrator's membership_init stage
+    /// failed on every macOS exit run (MacCellsHarvest_2026-08-28 §8.3).
+    #[test]
+    fn bootstrap_script_seeds_membership_owner_key_at_canonical_genesis_path() {
+        // Genesis must run `rustynetd membership init` against the canonical
+        // owner-signing-key path (== MACOS_OWNER_SIGNING_KEY_PATH, pinned to
+        // ops_e2e by owner_signing_key_path_matches_macos_genesis_driver),
+        // with a passphrase file (the encrypted-at-rest envelope requires
+        // one) and --force (re-genesis per bootstrap, mirroring Linux).
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("membership init \\\n    --snapshot"),
+            "bootstrap must run `rustynetd membership init` genesis (MAC-D4)"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("local owner_key=\"${CONFIG_ROOT}/membership.owner.key\"")
+                && BOOTSTRAP_SCRIPT.contains("--owner-signing-key \"${owner_key}\""),
+            "genesis must seed the owner signing key at the canonical \
+             MACOS_OWNER_SIGNING_KEY_PATH location"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("--owner-signing-key-passphrase-file"),
+            "genesis must seal the owner signing key with a passphrase (no plaintext key at rest)"
+        );
+        // The .pub sibling is the MAC-D2 read target: deterministic
+        // ownership/mode must be pinned after genesis.
+        for expected in [
+            "chown root:rustynetd \"${owner_key}.pub\"",
+            "chmod 0644 \"${owner_key}.pub\"",
+        ] {
+            assert!(
+                BOOTSTRAP_SCRIPT.contains(expected),
+                "genesis must pin the .pub read target ({expected})"
+            );
+        }
+        // Genesis snapshot/log must be handed to the daemon service account
+        // (same ownership restore ops_e2e applies after root-run membership
+        // mutations) or the launchd daemon cannot persist membership state.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(
+                "chown rustynetd:rustynetd \\\n    \"${membership_dir}/membership.snapshot\""
+            ),
+            "genesis must restore daemon-service ownership of the signed state"
+        );
+        // The signing-key passphrase must ALSO land in the System.keychain
+        // under the canonical unwrap descriptor (service/account pair from
+        // credential_unwrap::membership_signing_key_passphrase_descriptor),
+        // matching execute_ops_e2e_bootstrap_macos's provisioner.
+        for expected in [
+            "-a membership-owner-signing-key",
+            "-s signing_key_passphrase",
+        ] {
+            assert!(
+                BOOTSTRAP_SCRIPT.contains(expected),
+                "genesis must provision the keychain unwrap descriptor ({expected})"
+            );
+        }
+        // Genesis must run in BOTH the full-install and SKIP_BUILD paths —
+        // the definition plus the two call sites.
+        assert!(
+            BOOTSTRAP_SCRIPT.matches("seed_membership_genesis").count() >= 3,
+            "seed_membership_genesis must be defined and invoked in both main paths"
+        );
+        // Fail-closed: the genesis function must not soften membership init
+        // with an allow-failure escape hatch.
+        for softened in ["membership init ||", "|| membership init"] {
+            assert!(
+                !BOOTSTRAP_SCRIPT.contains(softened),
+                "genesis must fail the bootstrap loud, not soften with '{softened}'"
+            );
+        }
+    }
+
     #[test]
     fn bootstrap_script_refuses_root_homebrew_fallback() {
         assert!(
