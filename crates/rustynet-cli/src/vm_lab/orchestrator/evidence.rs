@@ -410,6 +410,35 @@ impl RustNativeStageRecorder<'_> {
     }
 }
 
+/// The QH-32 heartbeat line for a stage start, as a pure function so its
+/// exact shape is unit-testable: one line, timestamped, naming the stage.
+fn stage_started_heartbeat_line(now: &str, stage: &str) -> String {
+    format!("[stage] {now} {stage} started")
+}
+
+/// The QH-32 heartbeat line for a stage finish. An outcome with no summary
+/// (e.g. a pass) prints bare; anything else carries the first line of the
+/// summary truncated to 200 characters plus a pointer to the full stage log,
+/// so a terminal watcher learns what failed without leaving the console.
+fn stage_finished_heartbeat_line(
+    now: &str,
+    stage: &str,
+    status: &str,
+    summary: &str,
+    log_path: &std::path::Path,
+) -> String {
+    if summary.trim().is_empty() {
+        format!("[stage] {now} {stage} {status}")
+    } else {
+        let first_line = summary.lines().next().unwrap_or_default();
+        let brief: String = first_line.chars().take(200).collect();
+        format!(
+            "[stage] {now} {stage} {status}: {brief} (complete stage log: {})",
+            log_path.display()
+        )
+    }
+}
+
 impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
     fn stage_started(&self, id: &orchestrator::stage::StageId) {
         let name = id.as_str();
@@ -421,7 +450,7 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
         // healthy run has been diagnosed as crashed on exactly that basis.
         // stderr, not stdout, so machine-readable stdout contracts are
         // unaffected.
-        eprintln!("[stage] {now} {name} started");
+        eprintln!("{}", stage_started_heartbeat_line(&now, name));
         self.started_at
             .borrow_mut()
             .insert(name.to_owned(), now.clone());
@@ -491,16 +520,10 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
         // console; QH-09: the console line NAMES the stage log so the brief is
         // never read as the whole evidence when the full text sits beside it.
         let log_path = self.stage_log_path(name);
-        if summary.trim().is_empty() {
-            eprintln!("[stage] {now} {name} {status}");
-        } else {
-            let first_line = summary.lines().next().unwrap_or_default();
-            let brief: String = first_line.chars().take(200).collect();
-            eprintln!(
-                "[stage] {now} {name} {status}: {brief} (complete stage log: {})",
-                log_path.display()
-            );
-        }
+        eprintln!(
+            "{}",
+            stage_finished_heartbeat_line(&now, name, status, &summary, &log_path)
+        );
         // Write the per-stage log so downstream readers (get_stage_log, diagnose,
         // the monitor tail, validate_live_lab_run_artifacts) have a real file.
         // A Rust stage runs in-process; its outcome detail IS the log content
@@ -1387,6 +1410,109 @@ mod finalize_tests {
         assert_eq!(
             cols[5], "",
             "summary column (5) must be empty for a just-started stage, got: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn stage_finished_heartbeat_line_truncates_summary_to_first_line_200_chars() {
+        let log = Path::new("/tmp/stage.log");
+
+        // Long single-line summary: truncated to the first 200 characters.
+        let long = format!("boom: {}", "y".repeat(500));
+        let line = stage_finished_heartbeat_line("t", "preflight", "fail", &long, log);
+        assert!(
+            !line.contains('\n'),
+            "heartbeat must stay one line, got: {line:?}"
+        );
+        assert_eq!(
+            line.matches('y').count(),
+            194,
+            "brief must carry exactly the first 200 chars ('boom: ' + 194 y's), got: {line}"
+        );
+        assert!(line.contains("fail: boom:"), "got: {line}");
+        assert!(
+            line.ends_with("(complete stage log: /tmp/stage.log)"),
+            "heartbeat must name the stage log, got: {line}"
+        );
+
+        // Multi-line summary: only the first line survives.
+        let line = stage_finished_heartbeat_line("t", "preflight", "fail", "first\nsecond", log);
+        assert!(line.contains("first"), "got: {line}");
+        assert!(!line.contains("second"), "got: {line}");
+
+        // Empty summary (a pass): bare line, no summary colon.
+        let line = stage_finished_heartbeat_line("t", "preflight", "pass", "", log);
+        assert_eq!(line, "[stage] t preflight pass");
+    }
+
+    /// QH-32: the observer tees exactly one stderr line per stage transition
+    /// — start and finish — with the stage name and outcome present. The
+    /// heartbeat is printed with `eprintln!` straight to process stderr, which
+    /// an in-process test cannot capture, so this test re-execs this test
+    /// binary in a child process (guarded by an env var), runs one
+    /// start+finish pair there, and asserts on the captured stderr.
+    #[test]
+    fn stage_transitions_emit_exactly_one_stderr_line_each() {
+        const CHILD_ENV: &str = "RUSTYNET_QH32_HEARTBEAT_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // Child mode: emit one start + one finish, nothing else to assert.
+            let dir = tempdir().expect("tempdir");
+            let report_dir = dir.path();
+            fs::create_dir_all(report_dir.join("state")).expect("state dir");
+            let recorder = RustNativeStageRecorder {
+                report_dir,
+                started_at: RefCell::new(HashMap::new()),
+                errors: RefCell::new(Vec::new()),
+                run_instance_id: None,
+            };
+            let id = StageId::Preflight;
+            recorder.stage_started(&id);
+            recorder.stage_finished(&id, &StageOutcome::Passed);
+            assert!(
+                recorder.take_errors().is_empty(),
+                "recorder must emit the stage cleanly"
+            );
+            return;
+        }
+
+        // NOTE: the filter is the bare fn name as a substring, not
+        // `--exact <full path>` — full-path exact matching proved
+        // binary-dependent under `cargo test` (registered vs module_path!()
+        // naming diverged in one target), while the substring form matches
+        // in every target that contains this test. The name is unique, so
+        // the child runs exactly this one test.
+        let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["stage_transitions_emit_exactly_one_stderr_line_each", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("re-exec this test binary");
+        assert!(
+            output.status.success(),
+            "child harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("[stage] "))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "start + finish must produce exactly two heartbeat lines, got: {lines:?} \
+             (child stderr: {:?}, child stdout: {:?})",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            lines[0].contains("preflight") && lines[0].ends_with(" started"),
+            "start line must name the stage and the transition, got: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("preflight") && lines[1].ends_with(" pass"),
+            "finish line must name the stage and the outcome, got: {:?}",
+            lines[1]
         );
     }
 

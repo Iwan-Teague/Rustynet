@@ -2040,6 +2040,29 @@ This compounds QH-31 (the TUI, the other way of watching, was simultaneously
 showing idle) and matters more for the remote host, where there is no terminal to
 glance at and `host_run_status` reads the same ledger.
 
+**Disposition — FIXED 2026-08-29** (echo landed in `944ea399`; tests + doc this
+change). The seam was the `RustNativeStageRecorder` `StageObserver` — which
+lives in `orchestrator/evidence.rs`, not `native.rs` as guessed above — and it
+now prints one line to **stderr** per stage transition: `[stage] <utc> <name>
+started` on start, and `[stage] <utc> <name> pass|fail|skipped|…` on finish.
+Failures (and any outcome carrying a summary) additionally carry the first line
+of the summary truncated to 200 characters plus a pointer to the full per-stage
+log (`(complete stage log: …)`, the QH-09 disclosure rule), so a terminal
+watcher learns what failed without leaving the console. Lines go to stderr, not
+stdout, so every machine-readable stdout contract is unaffected; the tee is
+unconditional, which also serves remote-host runs. Transition lines carry the
+UTC timestamp rather than an elapsed `(Ns)` duration: `started_at` records
+formatted timestamps, and the timestamp already answers "is it alive" without a
+refactor. Emission is proven by
+`stage_transitions_emit_exactly_one_stderr_line_each`, which re-execs the test
+binary in a child process (env-guarded), runs one start+finish pair there, and
+asserts exactly two `[stage] ` lines on the captured stderr with the stage name
+and outcome present — the direct `eprintln!` cannot be captured in-process.
+`stage_finished_heartbeat_line_truncates_summary_to_first_line_200_chars`
+covers the line format itself (one line, 200-char cap, first-line-only, bare
+pass line). Gate: `cargo clippy -p rustynet-cli --all-targets --all-features
+--locked -- -D warnings` clean; both tests green.
+
 ---
 
 ### QH-33 — Several `vm_lab` unit tests perform real network I/O against the live lab subnet, making the full suite intermittently red and ~5 minutes slower
