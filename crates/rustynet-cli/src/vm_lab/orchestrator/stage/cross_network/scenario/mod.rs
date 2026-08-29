@@ -467,23 +467,33 @@ pub fn wait_for_daemon_socket(runner: &dyn NetLeafRunner) -> Result<(), String> 
     .map_err(|err| format!("daemon control socket did not appear: {err}"))
 }
 
-/// The marker `rustynet ops check-no-plaintext-passphrase-files` prints when a
-/// node holds no plaintext passphrase material.
-pub const NO_PLAINTEXT_MARKER: &str = "no-plaintext-passphrase-files";
+/// The paths whose PRESENCE means the node holds plaintext passphrase
+/// material — the exact literals the shell's
+/// `live_lab_no_plaintext_passphrase_check` tested with `test ! -e`.
+const PLAINTEXT_PASSPHRASE_PATHS: &[&str] = &[
+    "/var/lib/rustynet/keys/wireguard.passphrase",
+    "/etc/rustynet/wireguard.passphrase",
+    "/etc/rustynet/signing_key_passphrase",
+];
 
 /// Assert a node stores no plaintext passphrase files — the shell's
-/// `live_lab_no_plaintext_passphrase_check`, which compared the command's
-/// output against this exact marker string.
+/// `live_lab_no_plaintext_passphrase_check`.
+///
+/// There is NO `rustynet ops check-no-plaintext-passphrase-files` subcommand:
+/// an earlier revision invented one, and the CLI's `bad_args` output behind
+/// `capture_root_allow_failure` graded the check on captured error text
+/// instead of the node's state. The real predicate is the bash-era one: none
+/// of [`PLAINTEXT_PASSPHRASE_PATHS`] may exist. Each path is probed
+/// argv-only with `test ! -e` (success = absent = clean), so a missing verb
+/// is structurally impossible and a leftover file is a real `false`, not a
+/// parse artifact.
 pub fn no_plaintext_passphrase_check(runner: &dyn NetLeafRunner) -> Result<bool, String> {
-    let output = capture_root_allow_failure(
-        runner,
-        &[
-            REMOTE_RUSTYNET_BIN,
-            "ops",
-            "check-no-plaintext-passphrase-files",
-        ],
-    )?;
-    Ok(output.trim() == NO_PLAINTEXT_MARKER)
+    for path in PLAINTEXT_PASSPHRASE_PATHS {
+        if !run_root_allow_failure(runner, &["test", "!", "-e", path])? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ───────────────────────── netcheck predicates ─────────────────────────

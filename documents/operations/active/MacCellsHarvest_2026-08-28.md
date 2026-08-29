@@ -1373,6 +1373,36 @@ Triage stub appended:
 `livelab-1787977339-571e6bf7cc6f::membership_init` in
 `documents/operations/live_lab_stage_triage.jsonl`.
 
+**DISPOSITION (2026-08-29, MAC-D6 FIXED in code — pending live re-run):**
+Fixed in `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_membership.rs`:
+the invented `ops owner-approver-id` shell-out is replaced by
+`peer_add_script()`, which DERIVES the approver id as
+`"{exit_node_id}-owner"` — the Linux-twin shape
+(`linux_membership.rs:72-74`) and exactly what `rustynetd membership init`
+registers as the genesis owner approver (`crates/rustynetd/src/main.rs:4416`,
+`format!("{node_id}-owner")`). No `|| echo none` swallowing remains. Pins:
+`peer_add_script_derives_owner_approver_id_from_the_exit_peer` and
+`peer_add_script_never_invokes_an_owner_approver_id_verb`. Harness verb
+audit (same sweep as the live_linux_enrollment_restart fix): every other
+`ops <verb>` on the macOS exit harness path parses against the real parser —
+`init-membership`, `e2e-membership-add`, `e2e-bootstrap-host`,
+`install-macos-relay`, `e2e-issue-{assignment,traversal,dns-zone}-bundles-from-env`
+— and the audit found ONE further invented verb elsewhere in the harness
+family: `ops check-no-plaintext-passphrase-files`
+(`cross_network/scenario/mod.rs`, behind `capture_root_allow_failure`), now
+replaced by the bash-era argv-only `test ! -e` probes over the three
+plaintext-passphrase paths. Regression pins added in `main.rs`:
+`every_ops_verb_the_harness_invokes_parses` (positive) and
+`verbs_that_were_once_invented_by_harnesses_stay_rejected` (negative).
+**Exit cell should now progress past `membership_init`**: the §11.3 skip
+chain (`distribute_membership`, `exit_handoff`, `active_exit`,
+`exit_dns_failclosed_validation`, `exit_nat_lifecycle_validation`,
+`exit_demotion_residue_validation`) was armed solely by the peer-add failure;
+the `e2e-membership-add` loop now receives a valid approver id, so a re-run
+of the §11.1 shape should reach the exit validation stages for the first
+time on macOS. Live confirmation still required — this disposition is
+code-level, not lab-verified.
+
 ### 11.4 Verdict
 
 Exit cell: **BLOCKED-partial, but the membership chain advanced one
