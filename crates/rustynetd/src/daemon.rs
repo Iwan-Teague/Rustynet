@@ -2109,41 +2109,34 @@ fn validate_node_role_membership_alignment(
         NodeRole::BlindExit if node.capabilities.contains(&RoleCapability::Anchor) => {
             Err("blind_exit role cannot use membership carrying anchor capability".to_owned())
         }
-        // Blind-relay exclusivity (BlindRelayRoleDesign §5.1): the
-        // signed membership for a blind_relay node must carry the
-        // exact set {RelayHost, BlindRelay} and nothing else — no
-        // client/entry/exit/anchor/application-service co-location.
-        // Unlike blind_exit there is NO warn-and-continue exception
-        // here (§5.2: that exception is not precedent); a violating
-        // bundle fails the alignment check closed.
+        // Blind-relay exclusivity (BlindRelayRoleDesign §5.1, BR-C01): the
+        // signed membership for a blind_relay node must be EXACTLY the
+        // canonical set {RelayHost, BlindRelay} — a full canonical-set
+        // compare, NOT a forbidden-values list. A forbidden list verifies
+        // only the absence of today's known capabilities, so a capability
+        // added in the future would pass by default (the §5.1
+        // reject-future anti-pattern; second adversarial review finding
+        // F5). The exact-set compare fails closed: any capability outside
+        // the canonical set — present or future, including anchor
+        // sub-capabilities — is refused here until an explicit design
+        // amendment updates this rule AND its negative tests. Unlike
+        // blind_exit there is NO warn-and-continue exception (§5.2: that
+        // exception is not precedent); a violating bundle fails closed.
         NodeRole::BlindRelay => {
-            const FORBIDDEN: [RoleCapability; 7] = [
-                RoleCapability::Client,
-                RoleCapability::EntryRelay,
-                RoleCapability::ExitServer,
-                RoleCapability::BlindExit,
-                RoleCapability::Anchor,
-                RoleCapability::ServesNas,
-                RoleCapability::ServesLlm,
-            ];
-            if let Some(offending) = FORBIDDEN
-                .iter()
-                .find(|capability| node.capabilities.contains(capability))
-            {
-                return Err(format!(
-                    "blind_relay role cannot use membership carrying {} capability (exact blind-relay set required, §5.1)",
-                    offending.as_str()
-                ));
+            let exactly_blind_relay_set = node.capabilities.len() == 2
+                && node.capabilities.contains(&RoleCapability::RelayHost)
+                && node.capabilities.contains(&RoleCapability::BlindRelay);
+            if !node.capabilities.contains(&RoleCapability::RelayHost) {
+                return Err(
+                    "blind_relay role requires signed membership capability relay_host (exact blind-relay set required, §5.1)"
+                        .to_owned(),
+                );
             }
-            if let Some(offending) = node
-                .capabilities
-                .iter()
-                .find(|capability| capability.is_anchor_capability())
-            {
-                return Err(format!(
-                    "blind_relay role cannot use membership carrying anchor sub-capability {} (§5.1)",
-                    offending.as_str()
-                ));
+            if !exactly_blind_relay_set {
+                return Err(
+                    "blind_relay role permits exactly the canonical set {relay_host, blind_relay}; no other capability may co-exist (§5.1)"
+                        .to_owned(),
+                );
             }
             Ok(())
         }
@@ -19872,6 +19865,61 @@ mod tests {
         );
         validate_node_role_membership_alignment(&state, "local", NodeRole::BlindExit)
             .expect("blind_exit capability pair should pass");
+    }
+
+    #[test]
+    fn blind_relay_membership_alignment_is_exact_set_rejecting_future_capabilities() {
+        // The exact canonical set is accepted.
+        let state = membership_state_with_capabilities(
+            "local",
+            vec![RoleCapability::RelayHost, RoleCapability::BlindRelay],
+        );
+        validate_node_role_membership_alignment(&state, "local", NodeRole::BlindRelay)
+            .expect("exact canonical blind_relay set should pass");
+
+        // Canonical set plus a KNOWN capability is refused: the exact-set
+        // compare, not a forbidden list, decides.
+        let state = membership_state_with_capabilities(
+            "local",
+            vec![
+                RoleCapability::RelayHost,
+                RoleCapability::BlindRelay,
+                RoleCapability::Anchor,
+            ],
+        );
+        let err = validate_node_role_membership_alignment(&state, "local", NodeRole::BlindRelay)
+            .expect_err("anchor co-location must refuse");
+        assert!(err.contains("exactly the canonical set"));
+
+        // Canonical set plus one capability the old forbidden list never
+        // named is ALSO refused — reject-future-by-default (§5.1; second
+        // adversarial review F5). A forbidden-list check would have passed
+        // this here.
+        let state = membership_state_with_capabilities(
+            "local",
+            vec![
+                RoleCapability::RelayHost,
+                RoleCapability::BlindRelay,
+                RoleCapability::EntryRelay,
+            ],
+        );
+        let err = validate_node_role_membership_alignment(&state, "local", NodeRole::BlindRelay)
+            .expect_err("entry_relay co-location must refuse");
+        assert!(err.contains("exactly the canonical set"));
+
+        // Anchor sub-capabilities are refused by the same exact-set rule
+        // (they are outside the canonical set, present or future).
+        let state = membership_state_with_capabilities(
+            "local",
+            vec![
+                RoleCapability::RelayHost,
+                RoleCapability::BlindRelay,
+                RoleCapability::AnchorPortMappingAuthoritative,
+            ],
+        );
+        let err = validate_node_role_membership_alignment(&state, "local", NodeRole::BlindRelay)
+            .expect_err("anchor sub-capability co-location must refuse");
+        assert!(err.contains("exactly the canonical set"));
     }
 
     #[test]
