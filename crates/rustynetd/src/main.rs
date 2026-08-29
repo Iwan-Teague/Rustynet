@@ -4549,9 +4549,20 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 fn encrypted_secret_permission_policy(path: &std::path::Path) -> KeyCustodyPermissionPolicy {
     let mut policy = KeyCustodyPermissionPolicy::default();
-    if matches!(path.parent(), Some(parent) if parent == std::path::Path::new("/etc/rustynet")) {
-        // Encrypted signing artifacts currently coexist with daemon-readable verifier
-        // material under /etc/rustynet on Linux.
+    if matches!(
+        path.parent(),
+        Some(parent)
+            if parent == std::path::Path::new("/etc/rustynet")
+                || parent == std::path::Path::new("/usr/local/etc/rustynet")
+    ) {
+        // Encrypted signing artifacts coexist with daemon-readable verifier
+        // material under the config root (/etc/rustynet on Linux,
+        // /usr/local/etc/rustynet on macOS), which is 0750 root:rustynetd.
+        // Locking the macOS config root to the default 0o700 demoted the
+        // reviewed 0o750 posture and failed `macos-runtime-acls-check`
+        // (MAC-D7); mirror the CLI's `encrypted_secret_permission_policy`
+        // in rustynet-cli/src/secret_material.rs, which already pins 0o750
+        // for both roots.
         policy.required_directory_mode = 0o750;
     }
     policy
@@ -6707,6 +6718,64 @@ mod tests {
             pub_path.ends_with(".pub"),
             "pub key path must end with .pub: {pub_path}"
         );
+    }
+
+    // ---- MAC-D7: config-root permission policy must pin 0o750 on BOTH
+    // reviewed config roots (Linux + macOS). The default policy is 0o700;
+    // applying it to the macOS config root demoted the reviewed 0o750
+    // posture and failed macos-runtime-acls-check on the anchor cell.
+
+    #[test]
+    fn encrypted_secret_policy_pins_0750_for_linux_config_root() {
+        let policy = super::encrypted_secret_permission_policy(std::path::Path::new(
+            "/etc/rustynet/membership.owner.key",
+        ));
+        assert_eq!(
+            policy.required_directory_mode, 0o750,
+            "Linux config root must keep the reviewed 0750 directory mode"
+        );
+        assert_eq!(
+            policy.required_file_mode, 0o600,
+            "file mode must stay owner-only regardless of root"
+        );
+    }
+
+    #[test]
+    fn encrypted_secret_policy_pins_0750_for_macos_config_root() {
+        // MAC-D7 regression pin: the macOS config root
+        // /usr/local/etc/rustynet is reviewed as 0750 root:rustynetd by
+        // macos_runtime_acls. membership init writes the owner signing key
+        // there during bootstrap; the policy must restore 0750, not the
+        // 0o700 default that clobbered it.
+        let policy = super::encrypted_secret_permission_policy(std::path::Path::new(
+            "/usr/local/etc/rustynet/membership.owner.key",
+        ));
+        assert_eq!(
+            policy.required_directory_mode, 0o750,
+            "macOS config root must keep the reviewed 0750 directory mode"
+        );
+        assert_eq!(
+            policy.required_file_mode, 0o600,
+            "file mode must stay owner-only regardless of root"
+        );
+    }
+
+    #[test]
+    fn encrypted_secret_policy_keeps_default_0700_outside_config_roots() {
+        // Non-config-root locations (the state root and its subdirs) keep
+        // the default 0o700 posture — the reviewed mode for
+        // /var/lib/rustynet and /usr/local/var/rustynet.
+        for path in [
+            "/var/lib/rustynet/rustynetd.trust.watermark",
+            "/usr/local/var/rustynet/trust/rustynetd.trust.watermark",
+            "/tmp/somewhere/key.file",
+        ] {
+            let policy = super::encrypted_secret_permission_policy(std::path::Path::new(path));
+            assert_eq!(
+                policy.required_directory_mode, 0o700,
+                "non-config-root {path} must keep the default 0o700 directory mode"
+            );
+        }
     }
 
     // ---- X6: classify_top_level_error coverage --------------------------
