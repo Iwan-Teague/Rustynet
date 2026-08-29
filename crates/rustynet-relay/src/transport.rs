@@ -1047,7 +1047,9 @@ fn session_is_expired(expires_at_unix: u64, now_unix: Option<u64>) -> bool {
     now_unix.is_some_and(|now| expires_at_unix <= now)
 }
 
-fn now_unix_checked() -> Option<u64> {
+/// Shared with the blind-relay v2 admission listener, whose replay store and
+/// admission path follow the same fail-closed clock discipline (RLY-15).
+pub(crate) fn now_unix_checked() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1079,7 +1081,10 @@ fn should_warn_replay_stat_skip(err: &std::io::Error) -> bool {
     err.kind() != std::io::ErrorKind::NotFound
 }
 
-fn validate_replay_store_path(path: &Path) -> Result<(), String> {
+/// Shared with the blind-relay v2 admission listener, whose replay store uses
+/// the identical path/permission validation (regular file, mode 0600, sane
+/// parent directory).
+pub(crate) fn validate_replay_store_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("replay store path must not be empty".to_owned());
     }
