@@ -546,19 +546,38 @@ echo "domstate: $(virsh -c qemu:///system domstate "$DOM" 2>&1)"
 "#,
 );
 
-/// The toolchain a Debian-family lab guest needs before `rn_bootstrap.sh` will run.
+/// The toolchain a lab guest needs before `rn_bootstrap.sh` will run, installed
+/// with the package manager its distro actually ships.
 ///
 /// `rn_bootstrap` **verifies** prerequisites and fails when they are missing — it
 /// does not install them — so a fresh cloud image needs this first. Shipped over
 /// SSH on **stdin**, never argv, and it interpolates exactly one value (the pinned
 /// toolchain channel, validated before use).
 ///
+/// The distro family is detected from /etc/os-release ($ID first, then $ID_LIKE —
+/// the same order rustynet-sysinfo's `pkg_family_for` uses): Debian-family
+/// installs with apt, Fedora/RHEL-family with dnf (yum fallback), openSUSE with
+/// zypper, Arch-family with pacman. An unrecognized distro fails loudly HERE,
+/// naming the distro and the implemented families, instead of dying obscurely at
+/// apt-get (the pre-2026-08 behavior on a Fedora guest). A failed install also
+/// fails loudly: the exit status is captured and the output tail printed rather
+/// than silently discarded into /dev/null.
+///
 /// Every non-obvious line here is a lesson that cost real time; see the inline
 /// comments before "simplifying" any of them.
 const GUEST_TOOLCHAIN_SCRIPT: ScriptTemplate = ScriptTemplate(
     r#"#!/bin/bash
 set -uo pipefail
-echo "[toolchain] $(. /etc/os-release; echo "$PRETTY_NAME") on $(uname -m)"
+# Detect the distro ONCE. The pre-2026-08 script only *printed* PRETTY_NAME and
+# then unconditionally ran apt-get — on Fedora that surfaced as
+# "timeout: failed to run command 'apt-get': No such file or directory".
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+else
+  ID=""; ID_LIKE=""; PRETTY_NAME=""
+fi
+DISTRO="${PRETTY_NAME:-${ID:-unknown}}"
+echo "[toolchain] ${DISTRO} on $(uname -m)"
 
 # rn_bootstrap runs `sudo -n`, so passwordless sudo is a hard prerequisite, not a
 # nicety. Fail here with the reason rather than deep inside a build.
@@ -568,37 +587,146 @@ if ! sudo -n true 2>/dev/null; then
 fi
 echo "[toolchain] passwordless sudo: ok"
 
-export DEBIAN_FRONTEND=noninteractive
+# Package-manager family, matched the same way rustynet-sysinfo's
+# `pkg_family_for` does: $ID first, then $ID_LIKE. An unrecognized distro fails
+# loudly HERE, naming what IS implemented, instead of dying obscurely at apt-get.
+PKG_FAMILY=""
+case "$ID" in
+  debian|ubuntu|linuxmint|raspbian) PKG_FAMILY="apt" ;;
+  fedora|rocky|almalinux|rhel|centos) PKG_FAMILY="dnf" ;;
+  opensuse-leap|opensuse-tumbleweed|sles|sled) PKG_FAMILY="zypper" ;;
+  arch|manjaro|endeavouros|garuda) PKG_FAMILY="pacman" ;;
+  *)
+    case "$ID_LIKE" in
+      *debian*) PKG_FAMILY="apt" ;;
+      *fedora*|*rhel*) PKG_FAMILY="dnf" ;;
+      *suse*|*sles*) PKG_FAMILY="zypper" ;;
+      *arch*) PKG_FAMILY="pacman" ;;
+    esac
+    ;;
+esac
+if [ -z "$PKG_FAMILY" ]; then
+  echo "[toolchain] FATAL: unsupported distro '$ID' ($DISTRO) — only apt, dnf/yum, zypper and pacman provisioning are implemented" >&2
+  exit 1
+fi
+echo "[toolchain] package manager family: $PKG_FAMILY"
 
-# Retry apt rather than pinning a mirror. An update was observed to stall on a
-# connection that never delivered, while EVERY mirror edge served a full payload
-# in <0.25s when probed directly — including the exact IP apt was stuck on. That
-# is a transient stall on a flaky link, not a broken mirror. The last attempt is
-# verbose because `-qq` is what hid the explanation the first time.
-apt_update() {
-  for attempt in 1 2 3; do
-    if sudo -n timeout 180 apt-get update -qq >/dev/null 2>&1; then
-      echo "[toolchain] apt-get update ok (attempt $attempt)"; return 0
-    fi
-    echo "[toolchain] apt-get update stalled/failed (attempt $attempt), retrying"
-  done
-  echo "[toolchain] apt-get update failing — verbose attempt:" >&2
-  sudo -n timeout 180 apt-get update 2>&1 | tail -5 >&2
-  return 1
-}
+# Per-family install. Every family FAILS LOUD on install failure: the exit
+# status is captured (the script runs under `set -u`, not `-e`, so `|| rc=$?`
+# is what propagates it) and the tail of the captured output printed — a
+# "completed" run that actually failed to install would otherwise be
+# rediscovered much later as a confusing rustup or build failure.
+install_log=/tmp/toolchain-install.log
 if [ "${VERIFY_ONLY:-0}" != "1" ]; then
-  apt_update || exit 1
-  # nft=nftables, wg=wireguard-tools, ping=iputils-ping; clang+llvm for bindgen;
-  # dnsutils=dig, required by the exit_dns_failclosed_validation live-lab stage
-  # (Debian cloud images ship no dnsutils, so dig is absent without this).
-  sudo -n timeout 1200 apt-get install -y -qq \
-    curl git make pkg-config clang llvm libclang-dev \
-    build-essential \
-    nftables wireguard-tools iproute2 \
-    tar gzip tcpdump iputils-ping dnsutils \
-    libssl-dev libsqlite3-dev ca-certificates \
-    >/dev/null 2>&1
-  echo "[toolchain] apt packages installed"
+  case "$PKG_FAMILY" in
+  apt)
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Retry apt rather than pinning a mirror. An update was observed to stall on a
+    # connection that never delivered, while EVERY mirror edge served a full payload
+    # in <0.25s when probed directly — including the exact IP apt was stuck on. That
+    # is a transient stall on a flaky link, not a broken mirror. The last attempt is
+    # verbose because `-qq` is what hid the explanation the first time.
+    apt_update() {
+      for attempt in 1 2 3; do
+        if sudo -n timeout 180 apt-get update -qq >/dev/null 2>&1; then
+          echo "[toolchain] apt-get update ok (attempt $attempt)"; return 0
+        fi
+        echo "[toolchain] apt-get update stalled/failed (attempt $attempt), retrying"
+      done
+      echo "[toolchain] apt-get update failing — verbose attempt:" >&2
+      sudo -n timeout 180 apt-get update 2>&1 | tail -5 >&2
+      return 1
+    }
+    apt_update || exit 1
+    # nft=nftables, wg=wireguard-tools, ping=iputils-ping; clang+llvm for bindgen;
+    # dnsutils=dig, required by the exit_dns_failclosed_validation live-lab stage
+    # (Debian cloud images ship no dnsutils, so dig is absent without this).
+    rc=0
+    sudo -n timeout 1200 apt-get install -y -qq \
+      curl git make pkg-config clang llvm libclang-dev \
+      build-essential \
+      nftables wireguard-tools iproute2 \
+      tar gzip tcpdump iputils-ping dnsutils \
+      libssl-dev libsqlite3-dev ca-certificates \
+      >"$install_log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "[toolchain] FATAL: apt-get install failed (exit $rc) — last lines of $install_log:" >&2
+      tail -20 "$install_log" >&2
+      exit 1
+    fi
+    echo "[toolchain] apt packages installed"
+    ;;
+  dnf)
+    # Rocky/RHEL minimal images may carry only yum; use whichever exists, and
+    # fail loudly naming both when neither does.
+    if command -v dnf >/dev/null 2>&1; then PKG="dnf"
+    elif command -v yum >/dev/null 2>&1; then PKG="yum"
+    else
+      echo "[toolchain] FATAL: Fedora-family distro ($DISTRO) has neither dnf nor yum on PATH" >&2
+      exit 1
+    fi
+    # Debian-name mapping: build-essential→gcc gcc-c++ make diffutils;
+    # libclang-dev→clang-devel; libssl-dev→openssl-devel;
+    # libsqlite3-dev→sqlite-devel; dnsutils→bind-utils; iputils-ping→iputils;
+    # pkg-config→pkgconf-pkg-config; iproute2→iproute. clang-devel brings
+    # libclang.so for bindgen; llvm-devel brings llvm-config.
+    rc=0
+    sudo -n timeout 1800 "$PKG" install -y \
+      curl git make diffutils pkgconf-pkg-config \
+      clang clang-devel llvm llvm-devel \
+      gcc gcc-c++ \
+      nftables wireguard-tools iproute \
+      tar gzip tcpdump iputils bind-utils \
+      openssl-devel sqlite-devel ca-certificates \
+      >"$install_log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "[toolchain] FATAL: $PKG install failed (exit $rc) — last lines of $install_log:" >&2
+      tail -20 "$install_log" >&2
+      exit 1
+    fi
+    echo "[toolchain] $PKG packages installed"
+    ;;
+  zypper)
+    # Debian-name mapping: build-essential→gcc gcc-c++ make diffutils;
+    # libclang-dev→clang-devel; libssl-dev→libopenssl-devel;
+    # libsqlite3-dev→sqlite3-devel (openSUSE keeps the 3 in the name);
+    # dnsutils→bind-utils; pkg-config keeps its name; llvm-devel brings
+    # llvm-config.
+    rc=0
+    sudo -n timeout 1800 zypper --non-interactive install \
+      curl git make diffutils pkg-config \
+      clang clang-devel llvm llvm-devel \
+      gcc gcc-c++ \
+      nftables wireguard-tools iproute2 \
+      tar gzip tcpdump iputils bind-utils \
+      libopenssl-devel sqlite3-devel ca-certificates \
+      >"$install_log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "[toolchain] FATAL: zypper install failed (exit $rc) — last lines of $install_log:" >&2
+      tail -20 "$install_log" >&2
+      exit 1
+    fi
+    echo "[toolchain] zypper packages installed"
+    ;;
+  pacman)
+    # Arch ships headers inside the runtime packages (openssl, sqlite), and
+    # base-devel already covers gcc/make/pkg-config/diffutils; bind provides dig.
+    rc=0
+    sudo -n timeout 1800 pacman -Sy --noconfirm --needed \
+      base-devel clang llvm \
+      nftables wireguard-tools iproute2 \
+      curl tar gzip tcpdump iputils bind \
+      openssl sqlite ca-certificates \
+      >"$install_log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "[toolchain] FATAL: pacman install failed (exit $rc) — last lines of $install_log:" >&2
+      tail -20 "$install_log" >&2
+      exit 1
+    fi
+    echo "[toolchain] pacman packages installed"
+    ;;
+  esac
 
   # rustup pinned to the repo's rust-toolchain.toml channel, so the guest builds
   # with the same compiler as CI instead of whatever is newest.
@@ -2661,8 +2789,8 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             .expect("the toolchain must install packages");
         let install_end = install_start
             + script[install_start..]
-                .find(">/dev/null")
-                .expect("the install command must terminate");
+                .find("2>&1 || rc=$?")
+                .expect("the install command must terminate at its rc capture");
         let install_cmd = &script[install_start..install_end];
         assert!(
             install_cmd.contains("dnsutils"),
@@ -2674,6 +2802,131 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             script.contains(" ping dig; do"),
             "dig must be in the command verification loop, or a failed install \
              is not detected until the stage that needs it"
+        );
+    }
+
+    /// The toolchain script must speak each detected distro's package manager,
+    /// not apt alone. The original defect (QH-14) was that the script printed
+    /// the distro's PRETTY_NAME and then ran apt-get unconditionally — a Fedora
+    /// guest died with `timeout: failed to run command 'apt-get': No such file
+    /// or directory`, indistinguishable from a lab fault. Three things are
+    /// pinned per family: the detection guard on os-release's $ID/$ID_LIKE, the
+    /// manager's install invocation, and at least one Distro-SPECIFIC package
+    /// name (a name that exists only in that family's repos), so a regression
+    /// that drops a family's branch or reuses Debian names fails this test.
+    /// The unsupported-distro branch is pinned too: it must name the distro and
+    /// exit non-zero rather than guess a manager.
+    #[test]
+    fn the_guest_toolchain_installs_with_each_detected_distros_package_manager() {
+        let script = render_guest_toolchain_script("1.88.0")
+            .expect("the toolchain script should render for a valid channel");
+
+        // Detection: $ID first, then $ID_LIKE — the same order rustynet-sysinfo's
+        // pkg_family_for uses — and a loud refusal when neither matches.
+        assert!(
+            script.contains("case \"$ID\" in"),
+            "family selection must match os-release $ID first"
+        );
+        assert!(
+            script.contains("*debian*) PKG_FAMILY=\"apt\""),
+            "debian-like distros must select apt"
+        );
+        assert!(
+            script.contains("*fedora*|*rhel*) PKG_FAMILY=\"dnf\""),
+            "fedora/rhel-like distros must select dnf"
+        );
+        assert!(
+            script.contains("*suse*|*sles*) PKG_FAMILY=\"zypper\""),
+            "suse-like distros must select zypper"
+        );
+        assert!(
+            script.contains("*arch*) PKG_FAMILY=\"pacman\""),
+            "arch-like distros must select pacman"
+        );
+        assert!(
+            script.contains("FATAL: unsupported distro '$ID'"),
+            "an unrecognized distro must fail loudly naming it, not fall back to apt"
+        );
+
+        // dnf/yum family: install invocation + fedora-specific package names.
+        assert!(
+            script.contains("install -y \\\n      curl git make diffutils pkgconf-pkg-config"),
+            "the dnf branch must install with -y and Fedora's pkgconf-pkg-config"
+        );
+        for fedora_name in [
+            "clang-devel",
+            "llvm-devel",
+            "openssl-devel",
+            "sqlite-devel",
+            "bind-utils",
+            "iproute ",
+        ] {
+            assert!(
+                script.contains(fedora_name),
+                "dnf branch must carry Fedora package name {fedora_name:?}"
+            );
+        }
+        assert!(
+            script.contains("FATAL: Fedora-family distro"),
+            "a fedora-family image with neither dnf nor yum must fail loudly naming both"
+        );
+
+        // zypper family: openSUSE names (sqlite3-devel keeps the 3; libopenssl).
+        assert!(
+            script.contains("zypper --non-interactive install"),
+            "the suse branch must install via zypper --non-interactive"
+        );
+        for suse_name in ["libopenssl-devel", "sqlite3-devel"] {
+            assert!(
+                script.contains(suse_name),
+                "zypper branch must carry openSUSE package name {suse_name:?}"
+            );
+        }
+
+        // pacman family: Arch names (bind for dig; base-devel for the toolchain).
+        assert!(
+            script.contains("pacman -Sy --noconfirm --needed"),
+            "the arch branch must install via pacman -Sy --noconfirm --needed"
+        );
+        for arch_name in ["base-devel", " bind ", "openssl sqlite"] {
+            assert!(
+                script.contains(arch_name),
+                "pacman branch must carry Arch package name {arch_name:?}"
+            );
+        }
+
+        // Loud install failure is per-family: rc captured, tail printed, exit 1.
+        assert!(
+            script.matches("2>&1 || rc=$?").count() == 4,
+            "every family's install must capture its exit status (expected 4 branches)"
+        );
+        for fatal in [
+            "FATAL: apt-get install failed",
+            "FATAL: $PKG install failed",
+            "FATAL: zypper install failed",
+            "FATAL: pacman install failed",
+        ] {
+            assert!(
+                script.contains(fatal),
+                "a failed install must fail loudly: missing {fatal:?}"
+            );
+        }
+        assert!(
+            script.contains("last lines of $install_log"),
+            "a failed install must print the captured output tail before exiting"
+        );
+
+        // VERIFY_ONLY needs no package manager: the verify block sits outside the
+        // family case, so it must run on any distro regardless of detection.
+        let verify_only_pos = script
+            .find("VERIFY_ONLY:-0")
+            .expect("VERIFY_ONLY gate must exist");
+        let verify_pos = script
+            .find("--- rn_bootstrap prerequisite check")
+            .expect("verify block must exist");
+        assert!(
+            verify_pos > verify_only_pos,
+            "the prerequisite verification must follow the VERIFY_ONLY gate (skipping install)"
         );
     }
 
