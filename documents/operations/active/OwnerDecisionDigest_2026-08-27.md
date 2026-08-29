@@ -27,6 +27,7 @@ Read those with `git show <branch>:<path>`.
 **Counts.** 17 entries: 13 `pending`, 1 `gated-on-measurement`, 2 `approved`, 1 `in-progress-elsewhere`.
 Addendum 2026-08-28: 6 entries (18–23) — 3 `pending`, 1 `approved`→`done`, 1 `physical`, 1 `gated-on-measurement` (with entry 3 `approved`) — plus in-place dated corrections to entries 1–3.
 Addendum 2026-08-28 (2): entry 24 — MAC-DNS `approved` → `done`, one residual VPN-service-scope sub-decision noted.
+Addendum 2026-08-29: entries 25–28 — owner-ratified STRICT dispositions for decisions 1–4 (security-maximalism); entry 24's residual RESOLVED strict (no exclusion hatch), entry 18 `approved` → option (a).
 
 ---
 
@@ -350,7 +351,12 @@ one-directional (lenovo→mac 100% loss), `192.168.121.0/24` is unreachable from
   tier `vxlan_tier_b.sh` did. CN-3 becomes provable on the existing five guests; real code work in
   the substrate/scenario gate.
 
-Source: `CrossNetworkSubstrateIntegrationSpec_2026-06-21.md` §0.6. **Status: `pending`.**
+Source: `CrossNetworkSubstrateIntegrationSpec_2026-06-21.md` §0.6.
+**Status: `approved` → option (a), owner-ratified 2026-08-29 (see entry 25 / decision 2).** The
+owner chose the real 2-LAN proof: (b) is a headline feature whose only evidence would be a namespace
+simulation — rejected as a papered-over weakness; (c) is the honest fallback ONLY if the hardware
+genuinely cannot be made 2-LAN. Blocked on the operator-`physical` reverse-route step
+(`TwoLanFleetSetupRunbook_2026-08-28.md`); no repo work unblocks it.
 
 ### 19. MAC-D1 — macOS anchor cell blocked: the posture gate is circular as written
 
@@ -499,10 +505,54 @@ SC-restore BEFORE pf-anchor unload (§10.7), and the QH-40-shaped startup-recove
 (restores the backup on a stranded start; refuses loudly naming the manual fix when the
 backup is lost).
 
-**One residual sub-decision stays with the owner (gap doc §5 item 2):** M1 applies the
-loopback pin to ALL enabled network services — including any VPN/utun service that
-manages its own resolver; nothing is special-cased silently. If a VPN service proves to
-need its own resolver, the owner can exclude named services via configuration later.
+**Residual sub-decision RESOLVED (owner-ratified strict, 2026-08-29 — see entry 25 / decision 1):**
+M1 applies the loopback pin to ALL enabled network services — including any VPN/utun service that
+manages its own resolver; nothing is special-cased silently. The owner ratified the **strictest**
+posture: **NO operator exclusion hatch is added.** In protected mode a second unpinned resolver IS
+the DNS leak fail-closed exists to prevent; a user needing split-DNS with another VPN leaves
+protected mode rather than punching a hole in it. Defense-in-depth is required: the config-layer SC
+pin is backstopped by the packet-layer pf DNS-deny floor (`macos_dns_failclosed.rs`) so any service
+the SC pin does not know about still cannot leak :53 — verify that floor is at Linux-nft parity.
+
+---
+
+## Addendum — 2026-08-29: owner-ratified STRICT dispositions (decisions 1–4)
+
+The owner reviewed the four remaining decisions under an explicit governing principle: **security
+maximalism — take the hardest path now for higher security and product quality; account for and
+cover weaknesses thoroughly; §2's "strictest secure practical default" governs, and adoption-friction
+never trades against fail-closed.** An earlier recommendation set that leaned toward operator escape
+hatches (decisions 1, 3) was corrected and rejected on that basis. The ratified calls:
+
+### 25. Decision 1 — macOS DNS enforcement scope: STRICT, no exclusion hatch
+**Pin ALL enabled services including VPN/utun; add NO operator exclusion config.** Defense-in-depth:
+config-layer SC pin (`macos_dns_sc_protect.rs`) backstopped by the packet-layer pf DNS-deny floor
+(`macos_dns_failclosed.rs`) — verify that floor is at Linux-`nft` parity so any service the SC pin
+misses still cannot leak `:53`. Recovery guard (`resolve_backup_baseline_entry` + startup-recovery)
+makes strict safe (no permanently DNS-dead box). Strict scope only bites in protected mode, so it is
+also "practical" (§2). **Net effect: LESS work than the hatch — the strict answer is to not build the
+exclusion.** Updates entry 24. **Status: `approved` (strict); pf-floor-parity verification in flight.**
+
+### 26. Decision 2 — cross-network topology: real 2-LAN (option a)
+See entry 18 (now `approved` → (a)). Real substrate proof; (b) rejected as papered-over weakness;
+(c) honest fallback only if hardware can't be made 2-LAN. **Status: `physical`** (operator reverse
+route).
+
+### 27. Decision 3 — RustyDNS exit DoT/DoH: block by DEFAULT (fail-closed direction)
+Plain `:53` redirect always on (D-6c, in flight). **Block DoT (`:853`) by default** and **block the
+known-DoH-endpoint list by default** — a false positive fails CLOSED (breaks visibly, recoverable),
+a false negative fails OPEN (silent DNS leak); security-first always prefers the closed-direction
+error, so blocking is NOT opt-in. **Honest residual:** DoH-over-`:443`-to-arbitrary-host is
+technically indistinguishable from HTTPS without SNI inspection — so "block all DoH" is unachievable
+by any mechanism, documented as a **known mechanism limit requiring an SNI-inspection follow-up**, not
+an open door left by choice. **Status: `approved` (default-on); stacks behind the D-6c redirect job.**
+
+### 28. Decision 4 — macOS mesh-status peer-visibility: additive node-id field
+Add a SEPARATE, additive `peer_node_ids` field from signed membership (do NOT repurpose the existing
+`peer_ids`/CIDRs — additive keeps existing consumers working); strengthen the anchor peer-visibility
+assertion from CIDR-range to node-id-exact; fail-closed when membership is unavailable. Closes a
+weak-proof gap (coarse "routes exist" masquerading as "correct peers visible"). **Status: `approved`;
+in flight (GLM edit job).**
 
 ## Appendix — related items that are not owner decisions
 
