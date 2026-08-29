@@ -2497,8 +2497,35 @@ used, justify it against the reuse loops, not only against continuous runs.
 > boundary, so a meaningless `86400` fails. Two daemon tests pin the heartbeat itself: a
 > quiescent reconcile refreshes a stale snapshot, and does NOT rewrite a fresh one.
 >
-> **Unrecorded finding 2 (raw substring match, all six probes) is NOT addressed** and remains
-> open.
+> **Unrecorded finding 2 (raw substring match, all six probes) — IMPLEMENTED 2026-08-29 on
+> branch `ai-edit/edit-1788028834912-58818-9`.**
+> `validator_report_ok` (`adapter/ssh.rs`, formerly `:584-589`, now the typed
+> `validator_report_ok` + `json_object_candidates` pair) no longer substring-matches
+> `"overall_ok": true`. It now extracts every OUTERMOST balanced JSON object from the
+> output (string-aware brace scan, so pretty-printed reports and merged stderr/log lines
+> still parse — the robustness the old comment claimed) and reads each object's
+> TOP-LEVEL `overall_ok` field only. Fail-closed rules: no parseable report → false;
+> any top-level `overall_ok: false` → false; an INCONSISTENT report (`overall_ok: true`
+> with a non-empty `drift_reasons`, which no honest probe can emit — every baseline
+> probe derives `overall_ok` from `drift_reasons.is_empty()`, and the authenticode
+> report carries no `drift_reasons` field at all, so the constraint is conditional on
+> field presence) → false; nested `overall_ok` (e.g. `{"passed": true,
+> "detail": {"overall_ok": true}}`) is NOT a verdict → false. This closes both halves
+> of the weakness the finding named for the substring half: a verdict-shaped string
+> inside a log line, string value, or truncated report no longer greens, and a report
+> contradicting its own drift list no longer greens. The schema-version half of the
+> finding remains NOT implemented — adding a required `schema_version` field is a
+> daemon-schema change (all reports would need to carry it) and was deliberately not
+> attempted here. Four new tests in `ssh.rs::tests`
+> (`validator_report_ok_rejects_ok_report_with_nonempty_drift_reasons`,
+> `validator_report_ok_ignores_verdict_shaped_text_outside_json`,
+> `validator_report_ok_rejects_truncated_report`,
+> `validator_report_ok_reads_pretty_report_after_merged_stderr`); the two pre-existing
+> `validator_report_ok` tests pass unchanged. Verified: fmt + `cargo clippy -p
+> rustynet-cli --all-targets --all-features --locked -- -D warnings` clean; 299
+> `orchestrator::adapter` tests pass. No live-lab row — unit-pinned only; the
+> subprocess-level effect on the six baseline probes is unchanged argv, so the first
+> macOS/Windows baseline run exercises it as a side effect.
 
 > **DISPOSITION 2026-08-28 — DNS half CLOSED by the owner-approved M1 enforcement.**
 > `MacosCommandSystem` now pins every enabled network service's DNS to `127.0.0.1`

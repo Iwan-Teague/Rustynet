@@ -779,18 +779,102 @@ pub fn parse_status_node_id(status_text: &str) -> Option<String> {
 /// it detected drift; the verdict must therefore be read from the report body,
 /// not the process exit code.
 ///
-/// Fail closed: returns `true` only when `overall_ok: true` is present AND
-/// `overall_ok: false` is absent. Empty, truncated, non-JSON, field-missing, or
-/// `false` output all return `false`. Substring matching (rather than strict
-/// JSON parsing) is deliberate: a check whose stdout has stderr merged into it,
-/// is pretty-printed across multiple lines, or carries a leading log line is
-/// still evaluated correctly instead of fail-closing on output that is valid
-/// but not a single parseable JSON value.
+/// The verdict is read from TYPED JSON, not from a raw substring. Every balanced
+/// JSON object in the output is parsed (a check whose stdout has stderr merged
+/// into it, is pretty-printed across multiple lines, or carries a leading log
+/// line is still evaluated correctly), and each parsed object is judged by its
+/// TOP-LEVEL `overall_ok` field only. Fail closed, QH-39 finding 2:
+///
+/// - empty, truncated, non-JSON, or field-missing output → `false`;
+/// - any report with a top-level `overall_ok: false` → `false`;
+/// - an INCONSISTENT report — `overall_ok: true` alongside a non-empty
+///   `drift_reasons` array — → `false` (every baseline probe derives
+///   `overall_ok` from `drift_reasons.is_empty()`, so such a report is
+///   self-contradictory evidence and must not green a stage);
+/// - an `overall_ok` occurrence inside a string value or log line, with no
+///   parseable report verdict, → `false` (a substring match would green on
+///   exactly this output);
+/// - otherwise, at least one `overall_ok: true` → `true`.
 pub fn validator_report_ok(output: &str) -> bool {
-    let has_ok = output.contains("\"overall_ok\": true") || output.contains("\"overall_ok\":true");
-    let has_not_ok =
-        output.contains("\"overall_ok\": false") || output.contains("\"overall_ok\":false");
-    has_ok && !has_not_ok
+    let mut saw_ok = false;
+    for candidate in json_object_candidates(output) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let Some(verdict) = object
+            .get("overall_ok")
+            .and_then(serde_json::Value::as_bool)
+        else {
+            continue;
+        };
+        if !verdict {
+            return false;
+        }
+        let drifted = object
+            .get("drift_reasons")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|reasons| !reasons.is_empty());
+        if drifted {
+            return false;
+        }
+        saw_ok = true;
+    }
+    saw_ok
+}
+
+/// Extract every balanced JSON object candidate from `output`, string-aware so
+/// braces inside string values do not break the scan. Candidates that fail to
+/// parse are ignored by the caller (fail closed), not by this function.
+fn json_object_candidates(output: &str) -> Vec<&str> {
+    let bytes = output.as_bytes();
+    let mut candidates = Vec::new();
+    // Only OUTERMOST objects are candidates: a nested `overall_ok` belongs to a
+    // sub-report, not to the top-level verdict, and scanning it separately
+    // would let `{"passed": true, "detail": {"overall_ok": true}}` green.
+    let mut scan_from = 0usize;
+    let mut start = scan_from;
+    while start < bytes.len() {
+        if bytes[start] != b'{' {
+            start += 1;
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, byte) in bytes[start..].iter().enumerate() {
+            let b = *byte;
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        candidates.push(&output[start..=start + offset]);
+                        scan_from = start + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Continue scanning AFTER the emitted candidate so nested objects are
+        // never scanned as candidates of their own.
+        start = scan_from.max(start + 1);
+    }
+    candidates
 }
 
 /// Parse any `key=<value>` field from a `rustynet status` space-separated output.
@@ -1029,6 +1113,55 @@ mod tests {
         // Both present (top-level false plus a nested true) → fail closed.
         assert!(!validator_report_ok(
             "{\"overall_ok\": false, \"sub\": {\"overall_ok\": true}}"
+        ));
+    }
+
+    #[test]
+    fn validator_report_ok_rejects_ok_report_with_nonempty_drift_reasons() {
+        // QH-39 finding 2, drift-consistency half: `overall_ok: true` alongside
+        // a non-empty `drift_reasons` is self-contradictory evidence — every
+        // baseline probe derives `overall_ok` from `drift_reasons.is_empty()` —
+        // so the report must not green a stage. Empty reasons stay green.
+        assert!(!validator_report_ok(
+            "{\n  \"overall_ok\": true,\n  \"drift_reasons\": [\"resolver drifted\"]\n}"
+        ));
+        assert!(validator_report_ok(
+            "{\n  \"overall_ok\": true,\n  \"drift_reasons\": []\n}"
+        ));
+        // Absent field (e.g. the authenticode report carries no drift_reasons)
+        // imposes no constraint.
+        assert!(validator_report_ok("{\"overall_ok\": true}"));
+    }
+
+    #[test]
+    fn validator_report_ok_ignores_verdict_shaped_text_outside_json() {
+        // QH-39 finding 2, raw-substring half: the verdict must come from a
+        // typed JSON report, not from any text that happens to contain the
+        // substring. An occurrence inside a string value, a log line, or a
+        // wrong-schema object is not a verdict.
+        assert!(!validator_report_ok(
+            r#"{"drift_reasons": ["note: \"overall_ok\": true observed in log"]}"#
+        ));
+        assert!(!validator_report_ok(r#"log line: "overall_ok": true"#));
+        // Wrong-schema object that parses but has no top-level overall_ok.
+        assert!(!validator_report_ok(
+            r#"{"passed": true, "detail": {"overall_ok": true}}"#
+        ));
+    }
+
+    #[test]
+    fn validator_report_ok_rejects_truncated_report() {
+        // A truncated report that merely CLAIMS ok must fail closed; the old
+        // substring match greened on exactly this shape.
+        assert!(!validator_report_ok("{\"overall_ok\": true, \"drift_re"));
+    }
+
+    #[test]
+    fn validator_report_ok_reads_pretty_report_after_merged_stderr() {
+        // The robustness the typed parser must keep: pretty-printed report with
+        // a merged stderr line before AND after, plus braces in the log noise.
+        assert!(validator_report_ok(
+            "WARN {init} something\n{\n  \"overall_ok\": true,\n  \"drift_reasons\": []\n}\nbye"
         ));
     }
 }
