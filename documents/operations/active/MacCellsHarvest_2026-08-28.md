@@ -1666,3 +1666,106 @@ provisioning gap (MAC-D7 shape in §13.3) — first failure that is about
 the GUEST-side install state rather than the host-side harness. Cell
 should reach `active_exit` + the three exit validation stages (and give
 M1 DnsFailclosed its first macOS exercise) once MAC-D7 lands.
+
+## 14. Anchor cell re-run after MAC-D7 — 2026-08-29 (latest session)
+
+Re-ran the macOS `anchor` cell now that MAC-D7 (preserve macOS config-root
+0700/0600 custody through membership-init) landed. Worktree
+`ai-edit/edit-1787983013115-56044-51`, HEAD `81a71286960e0fb61d307d7da011c1cc02dfe2e8`
+(the MAC-D7 merge), tree clean at launch. Fresh bootstrap (no source skip), full
+live suite.
+
+### 14.1 Run
+
+- Run `livelab-1787984750-81a71286960e` (internal `rust-1787983455`), report
+  dir `state/mac-cells/anchor6c-20260829-070406`, elapsed 21m 34s, profile
+  `mgmt_shared_smoke_v1` (derived, not enforced). Topology 3 nodes:
+  `macos-utm-1:anchor` + `lenovo-exit-1:exit` + `lenovo-client-1:client`.
+  64 stages: **16 pass / 1 fail / 47 skip**, overall fail,
+  `first_failed_stage = validate_baseline_runtime` — identical shape to §12.
+- Invocation: `ops vm-lab-orchestrate-live-lab --anchor-platform macos --node
+  lenovo-exit-1:exit --node lenovo-client-1:client --trust-inventory-ready
+  --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --known-hosts-file
+  ~/.ssh/known_hosts`. Two launch notes for the next runner: (a) the
+  `--anchor-platform` selector (`native.rs`
+  `augment_assignments_from_platform_selectors`) requires the macOS entry to be
+  **UNASSIGNED** — passing an explicit `--node macos-utm-1:anchor` alongside it
+  hard-errors "no unassigned inventory entry found for that platform"; the
+  §9-verbatim shape is correct and does elect `macos-utm-1:anchor` (verified in
+  `orchestration/stage_manifest.json` `node_assignments`). (b) The QH-18 lock
+  warning "could not resolve --anchor-platform from this config" at launch is a
+  lock-coverage-only gap (the platform-elected guest is not flock-protected at
+  preflight time); it does not affect the plan. The first two launch attempts
+  (`anchor6-20260829-070035` 2-guest topology, `anchor6b-20260829-070228`
+  selector error) were aborted before any stage mutation; anchor6c is the real
+  run.
+- MAC-D7 retro-repair applied before launch: the guest's
+  `/usr/local/etc/rustynet` was still the demoted `0700 root:rustynetd` (the fix
+  prevents recurrence but does not repair live state, as §12.3 predicted), so
+  `sudo -n install -d -m 0750 -o root -g rustynetd /usr/local/etc/rustynet` was
+  run over SSH first; `stat` confirmed `750 root rustynetd`. The fresh
+  `bootstrap_hosts` pass (18m05s, re-ran on all three nodes) then exercised the
+  fixed custody code end-to-end.
+
+### 14.2 MAC-D7: LIVE-CONFIRMED
+
+`validator_results.json` per-op verdicts, `validate_baseline_runtime`:
+
+| host | RuntimeAcls | MeshStatus | DnsFailclosed |
+| --- | --- | --- | --- |
+| macos-utm-1 (anchor) | **pass** | fail | fail |
+| lenovo-exit-1 (exit) | pass | pass | pass |
+| lenovo-client-1 (client) | pass | pass | pass |
+
+**RuntimeAcls on the macOS anchor now PASSES** — the config-root mode clobber
+(§12.3) is gone at source. All other ops on macos-utm-1 (ServiceHardening,
+KeyCustody, Authenticode) also pass. The stage failure summary is now exactly
+`macos-utm-1/MeshStatus: validation not passed; macos-utm-1/DnsFailclosed:
+validation not passed` — the two remaining items of the §12.6 three-item list,
+both previously characterized as independent of MAC-D7.
+
+### 14.3 Anchor-cell reach — unchanged (dependency cascade)
+
+Everything downstream of `validate_baseline_runtime` skipped fail-closed with
+explicit dependency reasons, per `state/stages.tsv`:
+
+- `anchor_validation` — **pass** (delegation machinery healthy).
+- `deploy_macos_anchor_profile` / `validate_macos_anchor_bundle_pull` /
+  `validate_macos_anchor_port_mapping_authority` — in plan (§9/§12 wiring
+  proven), **skipped**: dependency `validate_baseline_runtime` did not pass.
+- `live_anchor` — **skipped**: dependency `live_mixed_topology_validation`.
+- `dns_failclosed_validation` — **skipped** (dependency
+  `security_audit_validation`); the DnsFailclosed red this run is the
+  baseline-runtime op-level verdict, same as §12.4.
+- `membership_init` — **pass** (not the anchor cell's blocker; the exit-cell
+  MAC-D6 blocker does not gate this topology).
+
+### 14.4 Next blocker — unchanged, two items, both code-side
+
+1. **MeshStatus** — QH-39 snapshot freshness: `mesh_status.rs:90`
+   `SNAPSHOT_MAX_AGE_SECONDS = 180` vs the passive anchor's aging snapshot
+   (`--max-age-seconds 180`; `MeshStatus: validation not passed`).
+2. **DnsFailclosed** — anchor role never enters DNS-protected mode: the launchd
+   profile audited-omits `--dataplane-mode` (`macos_install.rs:1975-2001`) and
+   `phase10.rs` `apply_dns_protection` is never invoked for anchor. §8.2 owner
+   gate still open.
+
+Either fix unblocks the cascade: `validate_baseline_runtime` green lets the
+three `macos_anchor_*` validator stages run live on the next re-run.
+
+### 14.5 Ledger + triage bookkeeping
+
+- Ledger row appended and verified (quote-aware parse) in
+  `documents/operations/live_lab_node_run_matrix.csv`: run
+  `livelab-1787984750-81a71286960e`, commit `81a71286960e0fb61d307d7da011c1cc02dfe2e8`,
+  branch `ai-edit/edit-1787983013115-56044-51`, clean, overall fail,
+  `first_failed_stage = validate_baseline_runtime`, 64 stages 16/1/47,
+  anchor = `macos-utm-1` via `macos-utm-1-bootstrap` `192.168.65.101`.
+- Remedy stub recorded against
+  `livelab-1787984750-81a71286960e::validate_baseline_runtime` in
+  `documents/operations/live_lab_stage_triage.jsonl` ("none: measurement run",
+  with the two owned blockers named).
+
+**Cell status: PARTIAL — MAC-D7 closed with live evidence; the anchor cell
+remains blocked at `validate_baseline_runtime` on MeshStatus (QH-39) +
+DnsFailclosed (§8.2 owner gate), both pre-characterized and independent.**
