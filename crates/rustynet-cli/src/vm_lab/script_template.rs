@@ -776,42 +776,92 @@ echo "LAUNCHED launch_id=__LAUNCH_ID__ pid=$PID log=$LOG"
 /// and a fresh lease. A **healthy** guest — running with an IP — is left alone
 /// unless `--force`, so running this against a host with healthy guests is a safe
 /// no-op that reports "skip (healthy)" rather than needlessly bouncing them.
+///
+/// QH-03 fail-closed contract: the caller accepts a run only as
+/// **exit 0 AND `RECOVER-END` present** (`run_guest_script` rejects a non-zero
+/// status, and `execute_ops_vm_lab_recover_host_vms` requires the sentinel). The
+/// two halves must therefore agree:
+///
+/// - **Required steps** (domain enumeration, every recovery action, and the
+///   post-action "is it actually running" verification) print
+///   `RECOVER-ERROR: ...` to stderr and `exit 1` — no `RECOVER-END` is printed, so
+///   a wholly failed run can never read as success.
+/// - **Tolerated steps** are *visibly* tolerated, never silently `|| true`: a
+///   named domain absent from the host prints `NOT FOUND ... (skipped)` and a
+///   healthy guest prints `skip (healthy: ...)`, and the run still succeeds.
 const HOST_RECOVER_VMS_SCRIPT: ScriptTemplate = ScriptTemplate(
     r#"#!/bin/bash
 set -uo pipefail
 FORCE=__FORCE__
 TARGETS=__TARGETS__
 
-if [ -z "$TARGETS" ]; then
-  TARGETS="$(virsh -c qemu:///system list --name --all 2>/dev/null | grep -v '^$' | tr '\n' ' ')"
-fi
+recover_error() {
+  echo "RECOVER-ERROR: $*" >&2
+  exit 1
+}
 
 echo "RECOVER-BEGIN"
+if [ -z "$TARGETS" ]; then
+  # REQUIRED: enumerating the host's domains is the operation's input. A failing
+  # virsh is not "no guests" (an empty-but-valid list is) — it is "cannot run the
+  # recovery at all".
+  list_out="$(virsh -c qemu:///system list --name --all 2>/dev/null)" \
+    || recover_error "cannot enumerate domains on this host: 'virsh list' failed (is libvirtd reachable?)"
+  TARGETS="$(printf '%s\n' "$list_out" | grep -v '^$' | tr '\n' ' ')"
+fi
+
 for d in $TARGETS; do
-  st="$(virsh -c qemu:///system domstate "$d" 2>/dev/null || echo missing)"
-  if [ "$st" = "missing" ]; then echo "  $d: NOT FOUND on this host"; continue; fi
+  # TOLERATED (visible): a named domain that is not on this host is an operator
+  # listing mistake, not a recovery failure — report it and continue.
+  st="$(virsh -c qemu:///system domstate "$d" 2>/dev/null)" || st=""
+  if [ -z "$st" ]; then echo "  $d: NOT FOUND on this host (skipped)"; continue; fi
   ip="$(virsh -c qemu:///system domifaddr "$d" 2>/dev/null | grep -oE '([0-9]+\.){3}[0-9]+' | grep -v '^127\.' | head -1)"
   case "$st" in
     running)
       if [ "$FORCE" = "1" ] || [ -z "$ip" ]; then
-        virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 || true
-        virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true
+        # REQUIRED: the reset must actually take effect. `destroy || true` here is
+        # exactly the QH-03 defect — a failed start after a successful destroy
+        # leaves the guest SHUT OFF while the script printed success.
+        virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 \
+          || recover_error "domain $d: destroy failed during reset (guest left as-is)"
+        virsh -c qemu:///system start "$d" >/dev/null 2>&1 \
+          || recover_error "domain $d: start failed after destroy — GUEST LEFT SHUT OFF"
+        st_now="$(virsh -c qemu:///system domstate "$d" 2>/dev/null)" || st_now=""
+        [ "$st_now" = "running" ] \
+          || recover_error "domain $d: reset did not take effect (state now: ${st_now:-unknown})"
         echo "  $d: RESET (was running${ip:+, ip=$ip}${ip:+, forced}${ip:-, no lease})"
       else
         echo "  $d: skip (healthy: running, ip=$ip)"
       fi
       ;;
     paused)
-      virsh -c qemu:///system resume "$d" >/dev/null 2>&1 \
-        || { virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 || true; virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true; }
+      # REQUIRED: resume first; if that fails, fall back to a full reset — but
+      # every fallback leg is itself checked, and the end state is verified.
+      if ! virsh -c qemu:///system resume "$d" >/dev/null 2>&1; then
+        virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 \
+          || recover_error "domain $d: resume failed and destroy fallback failed"
+        virsh -c qemu:///system start "$d" >/dev/null 2>&1 \
+          || recover_error "domain $d: start failed after destroy fallback — GUEST LEFT SHUT OFF"
+      fi
+      st_now="$(virsh -c qemu:///system domstate "$d" 2>/dev/null)" || st_now=""
+      [ "$st_now" = "running" ] \
+        || recover_error "domain $d: paused recovery did not take effect (state now: ${st_now:-unknown})"
       echo "  $d: RECOVERED (was paused)"
       ;;
     *)
-      virsh -c qemu:///system start "$d" >/dev/null 2>&1 || true
+      # REQUIRED: starting a shut-off guest is the whole action; a failed start
+      # must not print STARTED.
+      virsh -c qemu:///system start "$d" >/dev/null 2>&1 \
+        || recover_error "domain $d: start failed (was $st)"
+      st_now="$(virsh -c qemu:///system domstate "$d" 2>/dev/null)" || st_now=""
+      [ "$st_now" = "running" ] \
+        || recover_error "domain $d: start did not take effect (state now: ${st_now:-unknown})"
       echo "  $d: STARTED (was $st)"
       ;;
   esac
 done
+# Sentinel printed ONLY on success: every required step above either succeeded or
+# the script already exited 1 through recover_error without reaching this line.
 echo "RECOVER-END"
 "#,
 );
@@ -822,19 +872,59 @@ echo "RECOVER-END"
 /// The `du` is capped to one directory level (`--max-depth=1`) and to the pool, so
 /// it stays fast and cannot wander the whole disk. Sizes are listed largest-first
 /// because "what do I delete to reclaim space?" is the question this answers.
+///
+/// QH-03 fail-closed contract: the caller accepts a run only as **exit 0 AND
+/// `DISK-END` present** (`run_guest_script` rejects a non-zero status, and
+/// `execute_ops_vm_lab_host_disk_status` requires the sentinel — a truncated run
+/// is an error, not a short report).
+///
+/// - **Required steps** (the pool directory must exist and be measurable — it is
+///   the *subject* of the report; the `df` headroom line and the `du` pool total
+///   are the two headline numbers) print `DISK-ERROR: ...` to stderr and `exit 1`
+///   with no `DISK-END`, so a failed report can never read as success.
+/// - **Tolerated steps** are *visibly* tolerated: the advisory largest-files
+///   listing prints `(largest-files listing unavailable: ...)` when it cannot be
+///   produced and `(size unavailable)` next to any file whose individual `du`
+///   fails, and the run still succeeds — the headline numbers above are the
+///   answer the caller asked for.
 const HOST_DISK_STATUS_SCRIPT: ScriptTemplate = ScriptTemplate(
     r#"#!/bin/bash
 set -uo pipefail
 POOL=__POOL__
+disk_error() {
+  echo "DISK-ERROR: $*" >&2
+  exit 1
+}
+
+# REQUIRED: the pool is the subject of the report. A missing pool is not an empty
+# report — it is "the thing you asked about is not here".
+if [ ! -d "$POOL" ]; then
+  disk_error "pool directory $POOL does not exist on this host"
+fi
 echo "DISK-BEGIN"
 echo "-- filesystem holding the pool --"
-df -h "$POOL" 2>/dev/null || echo "(df failed for $POOL)"
+df -h "$POOL" 2>/dev/null || disk_error "df failed for $POOL (cannot report headroom)"
 echo "-- pool total --"
-du -sh "$POOL" 2>/dev/null || echo "(du failed)"
+du -sh "$POOL" 2>/dev/null || disk_error "du failed for $POOL (cannot report pool usage)"
 echo "-- largest files in the pool (base images + guest overlays) --"
-ls -1S "$POOL" 2>/dev/null | head -20 | while IFS= read -r f; do
-  [ -e "$POOL/$f" ] && printf '  %s\t%s\n' "$(du -h "$POOL/$f" 2>/dev/null | cut -f1)" "$f"
-done
+# TOLERATED (visible): this section is advisory; if it cannot be produced the
+# run still succeeds because the two headline numbers above are the answer.
+if ! listing="$(ls -1S "$POOL" 2>/dev/null)"; then
+  echo "  (largest-files listing unavailable: ls failed for $POOL)"
+else
+  printf '%s\n' "$listing" | head -20 | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -e "$POOL/$f" ] || continue
+    sz="$(du -h "$POOL/$f" 2>/dev/null | cut -f1)"
+    if [ -n "$sz" ]; then
+      printf '  %s\t%s\n' "$sz" "$f"
+    else
+      printf '  (size unavailable)\t%s\n' "$f"
+    fi
+  done
+fi
+# Sentinel printed ONLY on success: every required step above either succeeded or
+# the script already exited 1 through disk_error without reaching this line.
 echo "DISK-END"
 "#,
 );
