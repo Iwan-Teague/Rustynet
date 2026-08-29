@@ -687,6 +687,108 @@ mismatch on the orchestrator source specifically.
 Proposed fix: runs execute from a dedicated worktree that is never edited or
 committed in, removing the class rather than relying on everyone remembering.
 
+### Design (drafted 2026-08-29, for review before implementation)
+
+**Finding up front: the dedicated-worktree-per-run fix as stated is the wrong
+shape, and the good news is the isolation this item wants is mostly already
+built.** A guest build never sources from the live working tree. The default
+`working-tree` source mode (`resolve_iteration_source_selection`,
+`vm_lab/mod.rs:26487`; the same default in `orchestrator/context.rs:437,474,502`)
+is resolved at launch by `prepare_local_source_archive`
+(`vm_lab/mod.rs:32369`), whose git-managed path `write_git_worktree_archive`
+(`vm_lab/mod.rs:32493`) snapshots exactly `git ls-files -z --cached --others
+--exclude-standard` — tracked files plus untracked-not-ignored, i.e.
+**including uncommitted edits** — into a unique tarball under
+`std::env::temp_dir()/rustynet-vm-lab-source-{suffix}.tar` (raw-directory
+fallback `write_raw_directory_archive`, `mod.rs:32429`; Windows ZIP variant
+`prepare_local_source_zip_archive`, `mod.rs:32408`; macOS metadata sidecars
+excluded, `mod.rs:32394`). The `RepoSyncSource::LocalSource` call site
+(`mod.rs:7995-8066`) then ships that snapshot to every guest via
+`sync_local_source_archive_to_target` (`mod.rs:8046`, def `mod.rs:33039`), and
+guests build **from the extracted snapshot**, not from anything a later edit
+could touch. The snapshot is also preserved as run evidence at report-dir
+`state/rustynet-source.tar.gz` (`mod.rs:11074-11110`). `SourceArchive` is
+explicitly "constructed once at the start of an orchestration run"
+(`orchestrator/source_archive.rs:9`). A mid-run rebase in the live tree
+therefore cannot change what guests build — it can only desynchronize the
+*evidence* from the *content*, which is the residual exposure, not the build.
+
+**Residual gaps (what actually remains of QH-08):**
+
+1. **No refusal, only a note.** The clean-tree refusal already exists —
+   `resolve_iteration_source_selection` errors
+   `"git worktree must be clean for this live-lab iteration"` when
+   `require_clean_tree || require_local_head` and the worktree is dirty
+   (`mod.rs:26467-26469`) — but the default orchestrate path passes
+   `false, false, false` (`mod.rs:8314-8320`), so it never fires. A dirty
+   launch proceeds and merely records `dirty_state` in the ledger row.
+2. **Uncommitted edits ship unmarked.** The archive intentionally includes
+   uncommitted content, so the evidence tarball's bytes are not the HEAD the
+   row's `git_commit` column claims. The audit/replay path has no way to
+   detect that divergence after the fact.
+3. **TOCTOU inside launch.** Dirty-check/provenance read and tarball creation
+   are separate operations in launch; an edit landing between them produces a
+   row that says clean-at-HEAD describing a snapshot of something else.
+4. **The item's named hard failure mode is dead code on the default path** (the
+   adversarial review's §5 item 9 verdict stands): the setup-manifest hash runs
+   only where the setup manifest exists; the Rust `--node` engine writes the
+   sentinel `rust-native-no-setup-manifest` and hashes nothing under
+   `orchestrator/**`. Chasing that hash is chasing a guard that never runs.
+
+**Recommended design (Option A — enforcement tightening on the existing
+archive path; small, no new worktree management):**
+
+- **Fail closed on dirty by default.** Wire the existing refusal into the
+  default orchestrate launch: compute `git_worktree_is_dirty` (which already
+  uses the QH-34 single-source `GIT_DIRTY_STATE_EXCLUDE_PATHSPECS`, so the
+  orchestrator's own telemetry writes — run-matrix row, gate timings, inventory
+  refresh — don't self-flag, `mod.rs:26500`) at launch, before anything else;
+  refuse when dirty unless the caller passed an explicit `--allow-dirty`
+  escape hatch. `--allow-dirty` must be recorded in the matrix row so a
+  dirty-tree run is self-identifying forever, per the repo's fail-closed norm
+  (a refusal is one line to bypass deliberately; a silent dirty snapshot is
+  corrupted evidence discovered weeks later).
+- **Pin content, not just the SHA.** Compute provenance (HEAD sha + dirty
+  state) and create the tarball inside one step — dirty/HEAD read
+  *immediately before* `write_git_worktree_archive` — and record the
+  tarball's `sha256` + byte size in the run-matrix row alongside
+  `git_commit`. After this, any mid-launch mutation is detectable: the row's
+  provenance no longer re-derives to the pinned hash, and the evidence tarball
+  already in the report dir is the authoritative bytes either way.
+- **This is the whole change.** "Always archive, never build in-place" is
+  already true for guest builds; Option A makes the *policy* match the
+  *mechanism* (archive-of-clean-or-explicit, content-pinned), which is what
+  the item's own constraint — "no tracked edits in the tree a run executes
+  from" — reduces to once the tree a run executes *from* is a snapshot, not
+  the live directory.
+
+**Alternative considered and NOT recommended (Option B — dedicated worktree):**
+a fixed dedicated worktree (e.g. `state/lab-run-worktree`) that the orchestrator
+checks out HEAD into and never edits, with launch happening from there. It adds
+real failure modes for the isolation it duplicates: **staleness** (the worktree
+must be refreshed to the intended commit every launch; a missed refresh runs
+old code while the ledger claims HEAD — strictly worse than today's honest
+dirty flag), **concurrency** (two overlapping runs sharing one fixed worktree
+re-create the original race at a different path; per-run worktrees multiply
+that), and **disk** (a fresh worktree per run is a full checkout plus, if
+anything builds in it, a private `target/` measured in gigabytes — compare the
+archive, which is one tarball per run already retained as evidence). Option B
+is justified only if a future design needs the orchestrator itself to rebuild
+from launch-pinned source mid-run; today the engine binary is fixed at launch,
+so there is nothing for a mid-run edit to corrupt.
+
+**Enforcement note carried from the adversarial review:** whichever option is
+implemented, the exclusion-list unification (§5 item 9) still applies — one
+constant, no duplicate lists to drift. The bash-path list the review named
+(`live_linux_lab_orchestrator.sh:5059`) no longer exists as a live risk (bash
+engine deleted in W5.7), so the unification is now purely forward-looking
+prevention.
+
+**Not done here:** no code change; this subsection is the design for review.
+Item stays OPEN until Option A (or a revised variant) is implemented with a
+verifying launch (refusal observed on a dirty tree, pass with
+`--allow-dirty`, hash column present in the appended matrix row).
+
 ---
 
 ## P3 — Quality of life
