@@ -1004,3 +1004,53 @@ agent does not re-derive it: candidate fix is filtering
 disabled (asterisk-flagged) services in
 `macos_dns_sc_protect::parse_networksetup_service_list` — owner review
 required since it is fail-closed DNS code.
+
+## 9. Anchor cell re-run after MAC-D3 — 2026-08-29 (latest session)
+
+Run `livelab-1787964361-9e1b877d6b31` (internal `rust-1787964361`), commit
+`9e1b877d` (the MAC-D3 merge), branch `ai-edit/edit-1787962758946-56044-34`,
+tree clean, report dir `state/mac-cells/anchor5-1787962990`. Same proven
+invocation as §7: `ops vm-lab-orchestrate-live-lab --anchor-platform macos
+--node lenovo-exit-1:exit --node lenovo-client-1:client --trust-inventory-ready`
+with the FULL live suite (no `--skip-linux-live-suite`), 3 nodes, lenovo pair
+as backbone. Ledger row appended to
+`documents/operations/live_lab_node_run_matrix.csv` and verified
+(id, commit, clean, branch, 64 stages, fail=`validate_baseline_runtime`,
+passed=16 failed=1 skipped=47). Remedy stub recorded against
+`livelab-1787964361-9e1b877d6b31::validate_baseline_runtime` in
+`documents/operations/live_lab_stage_triage.jsonl`.
+
+**MAC-D3 part (a) is LIVE-CONFIRMED.** The plan grew 61 → 64 stages and all
+three macOS anchor validator stages are now engine-of-record stages:
+
+- `deploy_macos_anchor_profile` — in plan, graded **skipped** ("dependency
+  `validate_baseline_runtime` did not pass, so this stage never ran")
+- `validate_macos_anchor_bundle_pull` — in plan, graded **skipped** (dependency
+  `deploy_macos_anchor_profile` did not pass)
+- `validate_macos_anchor_port_mapping_authority` — in plan, graded **skipped**
+  (same dependency reason)
+
+This is exactly the §8.2-predicted shape: the tightened MAC-D1 election saw
+the anchor platform elected and the three ids present, so they dispatch; each
+skips FAIL-CLOSED with an explicit dependency reason (with a per-stage log
+artifact), never silently. Per the §8.2 rule a skip-with-reason is acceptable
+evidence the stages are in the plan — the task-level question "do the
+validators now dispatch" is answered yes. Their live outcomes remain gated
+behind the §8.2 owner decision.
+
+`anchor_validation` PASSED again (delegation machinery healthy).
+`validate_baseline_runtime` remains the sole hard failure, red on
+macos-utm-1 with both expected op verdicts — `MeshStatus: validation not
+passed` (QH-39 freshness bound, `--max-age-seconds 180`,
+`mesh_status.rs:90`, passive anchor snapshot ages out) and `DnsFailclosed:
+validation not passed` (the anchor role never enters DNS-protected mode; the
+launchd profile audited-omits `--dataplane-mode`,
+`macos_install.rs:1975-2001`) — identical to the anchor4 run, NOT a new
+blocker. Everything downstream of it skipped with dependency reasons
+(expected cascade; both lenovos' own ops all passed, admin_issue/blind_exit
+skipped as no-role-in-topology as before).
+
+**Cell status: PARTIAL — progressed.** MAC-D3 (a) closed with live evidence;
+MAC-D3 (b) / §8.2 remains the single owner gate between this cell and green
+(remediate DNS-protected-mode entry, then the validator stages run live on
+the next re-run).
