@@ -1861,6 +1861,36 @@ failed on different runs, each passing in isolation. Two contributing causes:
 `utmctl` (they pass an `utmctl_path` to a fake script; the TCP probe has no
 equivalent). That fixes the flakiness and the runtime together.
 
+**Disposition — FIXED 2026-08-29.** The probe seam now exists and the tests use
+it. `crates/rustynet-cli/src/vm_lab/mod.rs` gains `UtmDiscoveryProbes`, a
+`Copy` struct of three fn pointers wiring the real implementations by default
+(`tcp_probe` → `probe_tcp_port_status`, `ssh_auth_shell` →
+`run_remote_shell_command`, `windows_ssh_readiness` →
+`probe_windows_local_utm_ssh_readiness`; typed via the `TcpProbeFn` /
+`SshAuthShellFn` / `WindowsSshReadinessFn` aliases for clippy). The discovery
+body moved to `execute_ops_vm_lab_discover_local_utm_with_probes(config,
+probes)` (and a matching `execute_ops_vm_lab_discover_local_utm_summary_with_probes`);
+the public entry points delegate with `UtmDiscoveryProbes::default()`, so every
+production caller (including `orchestrator/readiness.rs`) is unchanged and still
+probes for real. The three call sites that did the real I/O — the raw TCP probe,
+the ssh-binary auth probe, and the Windows SSH readiness helper — all go through
+the injected pointers. Four tests converted to deterministic stubs via
+`hermetic_discovery_probes()` (TCP always "closed", auth always unreachable,
+Windows readiness always errored — the same state transitions they asserted
+before, minus the network): `reports_live_bundle_status`,
+`summary_renders_setup_view`, `marks_windows_unmatched_without_debian_guess`,
+and `updates_inventory_ip_even_when_ssh_unreachable`.
+`skips_inventory_update_when_no_live_ip_observed` needed no change (its fixture
+never reaches a probe path). All assertions kept; nothing weakened. Measured:
+the whole `discover_local_utm` group now runs in **7.3 s** (was ~2:10 with three
+~106 s outliers), and the full `cargo test -p rustynet-cli --features vm-lab
+--all-targets --all-features` suite passes in 10.6 s (2688 tests, 0 failed).
+Gates at the fix commit: fmt, `clippy --workspace --all-targets --all-features
+--locked -- -D warnings`, audit, and `cargo deny` all clean. The
+`LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS` floor stays: it still protects every
+local process probe on the production path, and its doc comments now mark the
+6.6 s/55.7 s numbers as historical.
+
 ---
 
 ### QH-34 — Every run records `dirty:worktree` because the run itself mutates a tracked file that the dirty-state exclude list does not cover

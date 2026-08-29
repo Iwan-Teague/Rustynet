@@ -6,8 +6,8 @@ use std::time::Duration;
 use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    ps_quote, run_remote_ps, run_remote_ps_check, WINDOWS_RELAY_SERVICE_NAME, WINDOWS_SERVICE_NAME,
-    WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
+    WINDOWS_RELAY_SERVICE_NAME, WINDOWS_SERVICE_NAME, WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
+    ps_quote, run_remote_ps, run_remote_ps_check,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
@@ -854,7 +854,7 @@ pub fn issue_bundles_to_dir(
     env_content: &str,
     local_out_dir: &std::path::Path,
 ) -> Result<(), AdapterError> {
-    use crate::vm_lab::orchestrator::adapter::windows_install::{ps_quote, WINDOWS_STAGING_DIR};
+    use crate::vm_lab::orchestrator::adapter::windows_install::{WINDOWS_STAGING_DIR, ps_quote};
     use std::io::Write as IoWrite;
     let pid = std::process::id();
     let remote_env = format!(r"{WINDOWS_STAGING_DIR}\rn_issue_env_{pid}.env");
@@ -1156,10 +1156,12 @@ mod tests {
     #[test]
     fn parse_winnat_nat_session_line_fails_closed_on_non_ok_output() {
         // The FAIL line from the inline script parses to nothing.
-        assert!(parse_winnat_nat_session_line(
-            "FAIL: no WinNAT session translating a mesh-sourced (100.64.0.0/10) client address"
-        )
-        .is_none());
+        assert!(
+            parse_winnat_nat_session_line(
+                "FAIL: no WinNAT session translating a mesh-sourced (100.64.0.0/10) client address"
+            )
+            .is_none()
+        );
         // Empty / garbage / malformed pair syntax also parse to nothing.
         assert!(parse_winnat_nat_session_line("").is_none());
         assert!(parse_winnat_nat_session_line("garbage").is_none());
@@ -1505,20 +1507,26 @@ mod tests {
 
     #[test]
     fn parse_windows_node_clean_probe_accepts_fully_clean_node() {
-        assert!(parse_windows_node_clean_probe(
-            "rules=0 outbound=allow service=stopped relay=stopped adapter=-\n"
-        )
-        .is_ok());
+        assert!(
+            parse_windows_node_clean_probe(
+                "rules=0 outbound=allow service=stopped relay=stopped adapter=-\n"
+            )
+            .is_ok()
+        );
         // An absent service is benign (a never-installed / uninstalled node).
-        assert!(parse_windows_node_clean_probe(
-            "rules=0 outbound=allow service=absent relay=absent adapter=-"
-        )
-        .is_ok());
+        assert!(
+            parse_windows_node_clean_probe(
+                "rules=0 outbound=allow service=absent relay=absent adapter=-"
+            )
+            .is_ok()
+        );
         // Tolerates a leading banner/log line before the result line.
-        assert!(parse_windows_node_clean_probe(
-            "WARNING: blah\nrules=0 outbound=allow service=stopped relay=stopped adapter=-"
-        )
-        .is_ok());
+        assert!(
+            parse_windows_node_clean_probe(
+                "WARNING: blah\nrules=0 outbound=allow service=stopped relay=stopped adapter=-"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1527,9 +1535,10 @@ mod tests {
             "rules=3 outbound=allow service=stopped relay=stopped adapter=-",
         )
         .expect_err("leftover firewall rules must fail");
-        assert!(err
-            .to_string()
-            .contains("3 leftover RustyNet firewall rule"));
+        assert!(
+            err.to_string()
+                .contains("3 leftover RustyNet firewall rule")
+        );
         let err2 = parse_windows_node_clean_probe(
             "rules=0 outbound=block service=stopped relay=stopped adapter=-",
         )

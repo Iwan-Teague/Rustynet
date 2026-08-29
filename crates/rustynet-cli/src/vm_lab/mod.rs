@@ -69,7 +69,10 @@ const DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
 /// can exceed two seconds, which is what made
 /// `execute_ops_vm_lab_discover_local_utm_updates_inventory_ip_even_when_ssh_unreachable`
 /// fail intermittently -- passing in isolation in 6.6s and failing once inside
-/// the full suite.
+/// the full suite. (QH-33, 2026-08-29: the discovery tests now inject hermetic
+/// probe seams and no longer perform real network I/O, but the floor still
+/// protects every local process probe on the production path and in any other
+/// test that exercises one.)
 ///
 /// A floor here is free rather than merely cheap, and that was measured, not
 /// assumed: a timeout is an upper bound, so a probe that answers promptly returns
@@ -6766,8 +6769,52 @@ fn render_discovered_hosts_json(hosts: &[DiscoveredHost]) -> String {
         .unwrap_or_else(|_| "{\"hosts\":[]}".to_owned())
 }
 
+/// Network- and process-touching probe seams used by the local UTM discovery
+/// command. The defaults wire up the real probe implementations; unit tests
+/// inject deterministic stubs so a test run never opens a TCP connection to
+/// the physical lab subnet, never spawns a real `ssh` auth probe, and never
+/// asks the live UTM app for a Windows readiness report.
+/// Function-pointer type for the raw SSH-port TCP reachability probe.
+type TcpProbeFn = fn(&str, u16, Duration) -> Result<(String, Option<String>), String>;
+/// Function-pointer type for the ssh-binary auth probe.
+type SshAuthShellFn = fn(
+    &str,
+    Option<&str>,
+    Option<&Path>,
+    Option<&Path>,
+    &str,
+    Duration,
+) -> Result<std::process::ExitStatus, String>;
+/// Function-pointer type for the Windows SSH readiness probe.
+type WindowsSshReadinessFn =
+    fn(&str, Option<&str>, Duration) -> ProbeState<WindowsSshReadinessProbe>;
+
+#[derive(Clone, Copy)]
+struct UtmDiscoveryProbes {
+    tcp_probe: TcpProbeFn,
+    ssh_auth_shell: SshAuthShellFn,
+    windows_ssh_readiness: WindowsSshReadinessFn,
+}
+
+impl Default for UtmDiscoveryProbes {
+    fn default() -> Self {
+        Self {
+            tcp_probe: probe_tcp_port_status,
+            ssh_auth_shell: run_remote_shell_command,
+            windows_ssh_readiness: probe_windows_local_utm_ssh_readiness,
+        }
+    }
+}
+
 pub fn execute_ops_vm_lab_discover_local_utm(
     config: VmLabDiscoverLocalUtmConfig,
+) -> Result<String, String> {
+    execute_ops_vm_lab_discover_local_utm_with_probes(config, UtmDiscoveryProbes::default())
+}
+
+fn execute_ops_vm_lab_discover_local_utm_with_probes(
+    config: VmLabDiscoverLocalUtmConfig,
+    probes: UtmDiscoveryProbes,
 ) -> Result<String, String> {
     let documents_root = match config.utm_documents_root.as_deref() {
         Some(path) => resolve_path(path)?,
@@ -7047,7 +7094,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         let mut ssh_port_status = "skipped".to_owned();
         let mut ssh_port_error = None;
         if let Some(ip) = live_ip.as_deref() {
-            match probe_tcp_port_status(ip, ssh_port, timeout) {
+            match (probes.tcp_probe)(ip, ssh_port, timeout) {
                 Ok((status, error)) => {
                     ssh_port_status = status;
                     ssh_port_error = error;
@@ -7087,7 +7134,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                     reason: "process-not-ready".to_owned(),
                 })
             } else if live_ip.is_some() {
-                Some(probe_windows_local_utm_ssh_readiness(
+                Some((probes.windows_ssh_readiness)(
                     utm_name.as_str(),
                     inventory_utm_staging_dir.as_deref(),
                     timeout,
@@ -7134,7 +7181,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             // connect, so do NOT veto the auth probe on the raw-TCP result.
             (Some(_), Some(ssh_user), Some(ssh_target)) => {
                 match ssh_auth_probe_command(discovery_platform_profile) {
-                    Ok(probe_command) => match run_remote_shell_command(
+                    Ok(probe_command) => match (probes.ssh_auth_shell)(
                         ssh_target,
                         Some(ssh_user),
                         config.ssh_identity_file.as_deref(),
@@ -7333,8 +7380,15 @@ pub fn execute_ops_vm_lab_discover_local_utm(
 pub fn execute_ops_vm_lab_discover_local_utm_summary(
     config: VmLabDiscoverLocalUtmConfig,
 ) -> Result<String, String> {
+    execute_ops_vm_lab_discover_local_utm_summary_with_probes(config, UtmDiscoveryProbes::default())
+}
+
+fn execute_ops_vm_lab_discover_local_utm_summary_with_probes(
+    config: VmLabDiscoverLocalUtmConfig,
+    probes: UtmDiscoveryProbes,
+) -> Result<String, String> {
     let summary_report_dir = config.report_dir.clone();
-    let report = execute_ops_vm_lab_discover_local_utm(config)?;
+    let report = execute_ops_vm_lab_discover_local_utm_with_probes(config, probes)?;
     let report: Value = serde_json::from_str(report.as_str())
         .map_err(|err| format!("parse local UTM discovery report failed: {err}"))?;
     let rendered = render_local_utm_discovery_summary(
@@ -37283,7 +37337,9 @@ mod tests {
         discover_local_utm_bundle_paths_bounded, encode_powershell_command,
         ensure_inventory_entries_share_network, ensure_provision_guest_name,
         ensure_provision_image_name, execute_ops_vm_lab_diff_live_lab_runs,
-        execute_ops_vm_lab_discover_local_utm, execute_ops_vm_lab_discover_local_utm_summary,
+        execute_ops_vm_lab_discover_local_utm,
+        execute_ops_vm_lab_discover_local_utm_summary_with_probes,
+        execute_ops_vm_lab_discover_local_utm_with_probes,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         extract_ip_candidates_for_macs_from_ip_neigh_output, extract_ip_for_mac_from_arp_output,
         is_macos_metadata_artifact_name, libvirt_ready_state_reason_codes,
@@ -37324,6 +37380,51 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    // Hermetic probe seams for `execute_ops_vm_lab_discover_local_utm_*`.
+    // QH-33: these tests used to drive the real TCP prober (with macOS
+    // bind-to-source fallbacks), a real `ssh` spawn, and the real Windows
+    // readiness helper against lab-subnet addresses, which made them slow
+    // (tens of seconds each) and flaky whenever a lab guest was reachable.
+    // The seams are deterministic and touch no network; every probe-dependent
+    // assertion still exercises the same code paths with the same expected
+    // state transitions ("closed" port, failed auth, errored readiness).
+    fn stub_closed_tcp_probe(
+        _ip: &str,
+        _port: u16,
+        _timeout: Duration,
+    ) -> Result<(String, Option<String>), String> {
+        Ok(("closed".to_owned(), Some("stub-unreachable".to_owned())))
+    }
+
+    fn stub_unreachable_ssh_auth_shell(
+        _target: &str,
+        _ssh_user: Option<&str>,
+        _ssh_identity_file: Option<&Path>,
+        _known_hosts_path: Option<&Path>,
+        _remote_script: &str,
+        _timeout: Duration,
+    ) -> Result<std::process::ExitStatus, String> {
+        Err("stub ssh auth unreachable".to_owned())
+    }
+
+    fn stub_error_windows_ssh_readiness(
+        _utm_name: &str,
+        _staging_dir: Option<&str>,
+        _timeout: Duration,
+    ) -> super::ProbeState<super::WindowsSshReadinessProbe> {
+        super::ProbeState::Error {
+            reason: "stub windows readiness".to_owned(),
+        }
+    }
+
+    fn hermetic_discovery_probes() -> super::UtmDiscoveryProbes {
+        super::UtmDiscoveryProbes {
+            tcp_probe: stub_closed_tcp_probe,
+            ssh_auth_shell: stub_unreachable_ssh_auth_shell,
+            windows_ssh_readiness: stub_error_windows_ssh_readiness,
+        }
+    }
 
     #[test]
     fn validate_collected_os_version_accepts_real_desktop_versions() {
@@ -39808,17 +39909,20 @@ mod tests {
         );
         let ssh_port = 65_534;
 
-        let report = execute_ops_vm_lab_discover_local_utm(VmLabDiscoverLocalUtmConfig {
-            inventory_path: Some(inventory.clone()),
-            utm_documents_root: Some(root.clone()),
-            utmctl_path: Some(utmctl.clone()),
-            ssh_identity_file: None,
-            known_hosts_path: None,
-            ssh_port,
-            timeout_secs: 30,
-            update_inventory_live_ips: false,
-            report_dir: None,
-        })
+        let report = execute_ops_vm_lab_discover_local_utm_with_probes(
+            VmLabDiscoverLocalUtmConfig {
+                inventory_path: Some(inventory.clone()),
+                utm_documents_root: Some(root.clone()),
+                utmctl_path: Some(utmctl.clone()),
+                ssh_identity_file: None,
+                known_hosts_path: None,
+                ssh_port,
+                timeout_secs: 30,
+                update_inventory_live_ips: false,
+                report_dir: None,
+            },
+            hermetic_discovery_probes(),
+        )
         .expect("discovery report should be produced");
         let parsed: serde_json::Value =
             serde_json::from_str(report.as_str()).expect("discovery report should parse as JSON");
@@ -39896,17 +40000,20 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"alpha\" ]; then\n  printf '192.168.64.8\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
         );
 
-        let report = execute_ops_vm_lab_discover_local_utm_summary(VmLabDiscoverLocalUtmConfig {
-            inventory_path: Some(inventory.clone()),
-            utm_documents_root: Some(root.clone()),
-            utmctl_path: Some(utmctl.clone()),
-            ssh_identity_file: None,
-            known_hosts_path: None,
-            ssh_port: 65_534,
-            timeout_secs: 30,
-            update_inventory_live_ips: false,
-            report_dir: None,
-        })
+        let report = execute_ops_vm_lab_discover_local_utm_summary_with_probes(
+            VmLabDiscoverLocalUtmConfig {
+                inventory_path: Some(inventory.clone()),
+                utm_documents_root: Some(root.clone()),
+                utmctl_path: Some(utmctl.clone()),
+                ssh_identity_file: None,
+                known_hosts_path: None,
+                ssh_port: 65_534,
+                timeout_secs: 30,
+                update_inventory_live_ips: false,
+                report_dir: None,
+            },
+            hermetic_discovery_probes(),
+        )
         .expect("summary report should be produced");
 
         assert!(report.contains("discovery_summary.status=partial"));
@@ -41180,17 +41287,20 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"windows-utm-1\" ]; then\n  printf '192.168.64.20\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
         );
 
-        let report = execute_ops_vm_lab_discover_local_utm(VmLabDiscoverLocalUtmConfig {
-            inventory_path: Some(inventory.clone()),
-            utm_documents_root: Some(root.clone()),
-            utmctl_path: Some(utmctl.clone()),
-            ssh_identity_file: None,
-            known_hosts_path: None,
-            ssh_port: 65_534,
-            timeout_secs: 30,
-            update_inventory_live_ips: false,
-            report_dir: None,
-        })
+        let report = execute_ops_vm_lab_discover_local_utm_with_probes(
+            VmLabDiscoverLocalUtmConfig {
+                inventory_path: Some(inventory.clone()),
+                utm_documents_root: Some(root.clone()),
+                utmctl_path: Some(utmctl.clone()),
+                ssh_identity_file: None,
+                known_hosts_path: None,
+                ssh_port: 65_534,
+                timeout_secs: 30,
+                update_inventory_live_ips: false,
+                report_dir: None,
+            },
+            hermetic_discovery_probes(),
+        )
         .expect("discovery report should be produced");
         let parsed: serde_json::Value =
             serde_json::from_str(report.as_str()).expect("discovery report should parse as JSON");
@@ -41527,14 +41637,17 @@ mod tests {
     /// A local process probe must not inherit the operator's short network
     /// timeout, or spawning it becomes a real-time race under concurrency.
     ///
-    /// This is the mechanism behind an intermittent failure of
+    /// This mechanism once explained an intermittent failure of
     /// `execute_ops_vm_lab_discover_local_utm_updates_inventory_ip_even_when_ssh_unreachable`:
     /// it passed in isolation in 6.6s and failed once inside the full workspace
     /// suite, where ~150 test binaries share one pool. The test sets a 2s
     /// discovery timeout deliberately -- it points the SSH probe at a blackholed
     /// RFC 5737 address, and raising the shared knob to 20s took the test from
     /// 6.6s to 55.7s -- so the network side must stay short while the local side
-    /// must not.
+    /// must not. (QH-33, 2026-08-29: the discovery tests now inject hermetic
+    /// probe seams instead of driving real network probes, so that historical
+    /// runtime no longer applies to them; the floor itself stays mandatory for
+    /// the production path and for every local exec under the shared pool.)
     #[test]
     fn a_local_process_probe_timeout_is_never_tighter_than_the_floor() {
         let floor = Duration::from_secs(LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS);
@@ -41598,23 +41711,27 @@ mod tests {
             bundle.display()
         ));
 
-        // Reserved TEST-NET-1 address (RFC 5737): never routable, so the SSH
-        // TCP/auth probes are guaranteed to fail exactly like a sandbox-blind
-        // probe would — this is the scenario being regression-tested.
+        // Reserved TEST-NET-1 address (RFC 5737): never routable. QH-33
+        // (2026-08-29): the SSH TCP/auth probes run through hermetic seam
+        // stubs, so the test asserts the same "unreachable guest" state
+        // transitions deterministically without touching the network.
         let utmctl = write_temp_executable(
             "#!/bin/sh\nif [ \"$1\" = \"list\" ]; then\n  printf 'UUID Status Name\\nabc started alpha\\n'\n  exit 0\nfi\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"alpha\" ]; then\n  printf '192.0.2.99\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
         );
-        let report = execute_ops_vm_lab_discover_local_utm(VmLabDiscoverLocalUtmConfig {
-            inventory_path: Some(inventory.clone()),
-            utm_documents_root: Some(root.clone()),
-            utmctl_path: Some(utmctl.clone()),
-            ssh_identity_file: None,
-            known_hosts_path: None,
-            ssh_port: 65_534,
-            timeout_secs: 2,
-            update_inventory_live_ips: true,
-            report_dir: None,
-        })
+        let report = execute_ops_vm_lab_discover_local_utm_with_probes(
+            VmLabDiscoverLocalUtmConfig {
+                inventory_path: Some(inventory.clone()),
+                utm_documents_root: Some(root.clone()),
+                utmctl_path: Some(utmctl.clone()),
+                ssh_identity_file: None,
+                known_hosts_path: None,
+                ssh_port: 65_534,
+                timeout_secs: 2,
+                update_inventory_live_ips: true,
+                report_dir: None,
+            },
+            hermetic_discovery_probes(),
+        )
         .expect("discovery report should be produced");
         let parsed: serde_json::Value =
             serde_json::from_str(report.as_str()).expect("discovery report should parse as JSON");
