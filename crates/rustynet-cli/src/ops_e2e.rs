@@ -2271,6 +2271,41 @@ impl MembershipMutationPaths {
 fn stage_membership_signing_passphrase(
     paths: &MembershipMutationPaths,
 ) -> Result<(PathBuf, PathBuf), String> {
+    stage_signing_passphrase_leaf(paths, "signing-key.passphrase")
+}
+
+/// MAC-D12 — the shared, platform-correct credential materialization core.
+///
+/// `stage_membership_signing_passphrase` (membership mutations) and
+/// `materialize_signing_passphrase_workspace` (assignment/traversal/dns-zone
+/// bundle issuance) previously used DIFFERENT credential backends: the
+/// membership path dispatched through
+/// `rustynet_control::credential_unwrap` (systemd-creds on Linux,
+/// System.keychain on macOS, DPAPI on Windows), while the bundle-issuance
+/// path unconditionally spawned Linux-only `systemd-creds decrypt` — which
+/// made `distribute_assignments` structurally impossible on macOS (blocker
+/// MAC-D12, MacCellsHarvest_2026-08-28 §17.3). Both callers now go through
+/// THIS core, so every signing-passphrase materialization site dispatches
+/// through the per-platform `CredentialUnwrapBackend` and the macOS exit
+/// cell unwraps from System.keychain exactly like the membership path it
+/// already proved live.
+///
+/// The contract is unchanged from the reviewed membership staging path:
+///
+/// Returns the populated workspace + passphrase file path. The caller
+/// must call `secure_remove_file` on the passphrase path and
+/// `fs::remove_dir_all` on the workspace once the mutation completes
+/// (success or failure). The workspace is created atomically with
+/// 0700 mode (Unix) — see `create_membership_workspace_dir_atomic`
+/// for the reviewed TOCTOU-safe creation contract — or under the
+/// SYSTEM/Administrators-ACLed credentials-workspace root (Windows,
+/// then re-validated by the W4 runtime ACL gate) so plaintext
+/// material cannot be read by other local identities during the
+/// brief window between unwrap and shred.
+fn stage_signing_passphrase_leaf(
+    paths: &MembershipMutationPaths,
+    leaf: &str,
+) -> Result<(PathBuf, PathBuf), String> {
     use rustynet_control::credential_unwrap::{
         CredentialUnwrapBackend, membership_signing_key_passphrase_descriptor,
     };
@@ -2282,7 +2317,8 @@ fn stage_membership_signing_passphrase(
     let parent_metadata = fs::symlink_metadata(&paths.secure_workspace_parent).map_err(|err| {
         format!(
             "credential workspace parent missing or unreadable ({}): {err}; \
-             run the platform install adapter so the parent is provisioned with the reviewed ACL",
+             run `rustynet ops install-systemd` (Linux) or the platform install adapter \
+             so the parent is provisioned with the reviewed ACL",
             paths.secure_workspace_parent.display()
         )
     })?;
@@ -2295,7 +2331,7 @@ fn stage_membership_signing_passphrase(
 
     let work_dir = create_membership_workspace_dir_atomic(paths.secure_workspace_parent.as_path())?;
 
-    let passphrase_path = work_dir.join("signing-key.passphrase");
+    let passphrase_path = work_dir.join(leaf);
     let descriptor = membership_signing_key_passphrase_descriptor();
 
     #[cfg(target_os = "linux")]
@@ -5409,8 +5445,15 @@ fn prepare_clean_issue_dir(path: &Path, label: &str) -> Result<(), String> {
 ///     `create_membership_workspace_dir_atomic` (mkdir(2) with mode 0700
 ///     applied at creation; rejects pre-existing leaves including
 ///     symlinks).
-///   - Decrypts the systemd-creds credential into a 0600 file inside
-///     the workspace.
+///   - Unwraps the signing-passphrase credential through the per-platform
+///     `CredentialUnwrapBackend` (`stage_signing_passphrase_leaf`) into a
+///     0600 file inside the workspace — MAC-D12: this used to
+///     unconditionally spawn Linux-only `systemd-creds decrypt`, which
+///     blocked `distribute_assignments` on macOS; macOS now unwraps from
+///     System.keychain exactly like the (already live-proven) membership
+///     path, Linux keeps systemd-creds, Windows uses DPAPI. Custody is
+///     unchanged: OS-secure storage on every platform, no plaintext at
+///     rest outside the 0600/0700 workspace.
 ///   - Returns `(workspace_dir, passphrase_path)` so the caller can
 ///     shred both on success and failure (mirrors
 ///     `stage_membership_signing_passphrase` for the membership
@@ -5420,55 +5463,7 @@ fn prepare_clean_issue_dir(path: &Path, label: &str) -> Result<(), String> {
 /// messages stay descriptive ("assignment", "traversal", "dns-zone").
 fn materialize_signing_passphrase_workspace(prefix: &str) -> Result<(PathBuf, PathBuf), String> {
     let paths = MembershipMutationPaths::for_current_platform();
-
-    // Fail closed if the platform install adapter has not provisioned
-    // the workspace parent. The Linux install path now creates it via
-    // both `ops install-systemd` and the e2e bootstrap; macOS via
-    // `execute_ops_e2e_bootstrap_macos`; Windows via the canonical ACL
-    // repair fragment and Install-RustyNetWindowsService.ps1.
-    let parent_metadata = fs::symlink_metadata(&paths.secure_workspace_parent).map_err(|err| {
-        format!(
-            "credential workspace parent missing or unreadable ({}): {err}; \
-             run `rustynet ops install-systemd` (Linux) or the platform install adapter \
-             so the parent is provisioned with the reviewed ACL",
-            paths.secure_workspace_parent.display()
-        )
-    })?;
-    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
-        return Err(format!(
-            "credential workspace parent must be a real directory, not a symlink or file: {}",
-            paths.secure_workspace_parent.display()
-        ));
-    }
-
-    let work_dir = create_membership_workspace_dir_atomic(paths.secure_workspace_parent.as_path())?;
-    let passphrase_path = work_dir.join(format!("{prefix}.passphrase"));
-
-    let decrypt_result = run_status(
-        "systemd-creds",
-        &[
-            "decrypt",
-            "--name=signing_key_passphrase",
-            "/etc/rustynet/credentials/signing_key_passphrase.cred",
-            passphrase_path.to_string_lossy().as_ref(),
-        ],
-        &[],
-        "decrypting signing passphrase credential failed",
-    );
-    if let Err(err) = decrypt_result {
-        // Clean up the empty workspace so we never leave stale dirs
-        // behind on a failed unwrap.
-        let _ = fs::remove_dir_all(&work_dir);
-        return Err(err);
-    }
-
-    if let Err(err) = set_unix_mode(passphrase_path.as_path(), 0o600) {
-        secure_remove_file(passphrase_path.as_path());
-        let _ = fs::remove_dir_all(&work_dir);
-        return Err(err);
-    }
-
-    Ok((work_dir, passphrase_path))
+    stage_signing_passphrase_leaf(&paths, &format!("{prefix}.passphrase"))
 }
 
 fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
@@ -7446,6 +7441,78 @@ mod tests {
         parse_generic_assignment_specs, parse_generic_nodes, resolve_self_program,
         system_useradd_args, traversal_verifier_key_hex, write_assignment_refresh_env,
     };
+
+    /// MAC-D12 source pin: the bundle-issuance credential materializer
+    /// (`materialize_signing_passphrase_workspace`) must NEVER spawn
+    /// `systemd-creds` directly — it must dispatch through the shared
+    /// per-platform core (`stage_signing_passphrase_leaf`), which selects
+    /// `LinuxSystemdCredsBackend` / `MacosKeychainBackend` /
+    /// `WindowsDpapiBackend` at compile time. This is the regression that
+    /// made `distribute_assignments` structurally impossible on macOS
+    /// (MacCellsHarvest_2026-08-28 §17.3): the helper hardcoded the
+    /// Linux-only `systemd-creds decrypt` spawn, so the macOS exit cell
+    /// failed with "failed to spawn systemd-creds: No such file or
+    /// directory". Mirrors the source-pinning test style of
+    /// `rustynet_control::credential_unwrap`.
+    #[test]
+    fn materialize_signing_passphrase_workspace_pins_platform_backend_dispatch() {
+        let source = include_str!("ops_e2e.rs");
+
+        let materialize_start = source
+            .find("fn materialize_signing_passphrase_workspace(")
+            .expect("materialize_signing_passphrase_workspace must exist");
+        let materialize_end = source[materialize_start..]
+            .find("\n}\n")
+            .expect("materialize_signing_passphrase_workspace body must terminate");
+        let materialize_body = &source[materialize_start..materialize_start + materialize_end];
+
+        // The materializer is a thin caller: no direct backend spawn, no
+        // hardcoded credential path, and it must delegate to the shared
+        // core with the descriptive leaf prefix.
+        assert!(
+            !materialize_body.contains("systemd-creds"),
+            "materialize_signing_passphrase_workspace must not spawn systemd-creds \
+             directly; it must dispatch through stage_signing_passphrase_leaf"
+        );
+        assert!(
+            !materialize_body.contains("/etc/rustynet/credentials"),
+            "materialize_signing_passphrase_workspace must not hardcode the Linux \
+             credential path"
+        );
+        assert!(
+            materialize_body.contains("stage_signing_passphrase_leaf"),
+            "materialize_signing_passphrase_workspace must delegate to the shared \
+             per-platform core"
+        );
+
+        // The shared core must select a backend per platform (all three
+        // names appear in its cfg dispatch) rather than spawning any
+        // helper binary directly.
+        let core_start = source
+            .find("fn stage_signing_passphrase_leaf(")
+            .expect("stage_signing_passphrase_leaf must exist");
+        let core_end = source[core_start..]
+            .find("\n}\n")
+            .expect("stage_signing_passphrase_leaf body must terminate");
+        let core_body = &source[core_start..core_start + core_end];
+
+        for backend in [
+            "LinuxSystemdCredsBackend",
+            "MacosKeychainBackend",
+            "WindowsDpapiBackend",
+        ] {
+            assert!(
+                core_body.contains(backend),
+                "stage_signing_passphrase_leaf must dispatch {backend} in its \
+                 per-platform backend selection"
+            );
+        }
+        assert!(
+            !core_body.contains("systemd-creds\""),
+            "stage_signing_passphrase_leaf must unwrap via the CredentialUnwrapBackend \
+             trait, not by spawning the systemd-creds binary directly"
+        );
+    }
     use rustynet_control::ControlPlaneCore;
     use rustynet_policy::PolicySet;
 
