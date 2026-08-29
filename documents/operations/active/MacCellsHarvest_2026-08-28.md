@@ -1478,6 +1478,43 @@ Fix shape: the parent-lock must not fire when the parent is the reviewed
 config root (or must restore 0o750 root:rustynetd there), same review the
 Linux twin already encodes (`linux_runtime_acls.rs:50`).
 
+**Disposition (2026-08-29, MAC-D7 fix, branch
+`ai-edit/edit-1787980468854-56044-47`): FIXED — code-side, mechanical.**
+Root cause refined from the fix-shape guess above: the daemon's
+state-root watermark persist writers (`daemon.rs` `persist_*_watermark`)
+were never the clobber — they only touch `/usr/local/var/rustynet`
+(state root, reviewed 0o700). The real writer is MAC-D4 genesis:
+`rustynetd membership init --owner-signing-key
+/usr/local/etc/rustynet/membership.owner.key` (run by
+`Bootstrap-RustyNetMacos.sh` `seed_membership_genesis`) persists the
+encrypted key via `write_encrypted_key_file`, whose directory mode comes
+from rustynetd's `encrypted_secret_permission_policy`
+(`crates/rustynetd/src/main.rs:4550`) — which recognized ONLY
+`/etc/rustynet` as config root, so the macOS config root fell to the
+0o700 default and demoted the reviewed 0o750. The CLI twin
+(`rustynet-cli/src/secret_material.rs:24-38`) already pinned 0o750 for
+both roots; the fix mirrors it into rustynetd (adds
+`/usr/local/etc/rustynet` to the 0o750 match). Tests added: 3 policy
+pins in `crates/rustynetd/src/main.rs` (Linux root 0750, macOS root
+0750, non-config-root keeps 0700 default) + `daemon.rs`
+`macos_anchor_watermark_layout_persists_reads_and_fails_closed_when_missing`
+(persist+read at the macOS canonical `trust/`+`membership/` layout,
+parent 0o700 / file 0o600, missing watermark → Ok(None) → consumer fails
+closed "trust watermark is missing"). Gates: fmt/clippy --workspace
+--all-targets --all-features --locked clean; check+test rustynetd +
+rustynet-cli green except PRE-EXISTING `phase10::tests::macos_assert_dns_protection_requires_active_dns_rules`
+failure, reproduced on clean base `6caf2de9` via stash — unrelated to
+this fix; cargo audit + deny + secrets_hygiene green. **Verdict: the
+RuntimeAcls config-root mode clobber is removed at source; next anchor
+run should show RuntimeAcls PASS provided the guest's config root is
+re-seeded at 0o750 (rerun `Bootstrap-RustyNetMacos.sh` `setup_directories`
+or `install -d -m 0750 -o root -g rustynetd
+/usr/local/etc/rustynet` once to repair the already-demoted directory —
+the code fix prevents recurrence but does not retro-repair live state),
+and the two remaining anchor blockers (MeshStatus QH-39, DnsFailclosed
+§8.2 owner gate) are independent of this one.** No lab run per task
+scope.
+
 ### 12.4 MeshStatus + DnsFailclosed — unchanged, owner-gated
 
 - MeshStatus still red (QH-39 snapshot freshness,
