@@ -790,7 +790,7 @@ pub fn execute_ops_e2e_enforce_host(
         return enforce_host_macos(role.as_str(), node_id.as_str(), ssh_allow_cidrs.as_str());
     }
     let auto_refresh = Path::new("/etc/rustynet/trust-evidence.key").is_file();
-    let assignment_auto_refresh = Path::new("/etc/rustynet/assignment.signing.secret").is_file()
+    let assignment_auto_refresh = Path::new(ASSIGNMENT_SIGNING_SECRET_PATH).is_file()
         && Path::new("/etc/rustynet/assignment-refresh.env").is_file();
     let backend_mode = e2e_backend_mode_from_env()?;
 
@@ -1232,6 +1232,48 @@ const MACOS_MEMBERSHIP_DIR: &str = "/usr/local/var/rustynet/membership";
 pub(crate) const MACOS_OWNER_SIGNING_KEY_PATH: &str =
     "/usr/local/etc/rustynet/membership.owner.key";
 
+/// Canonical encrypted assignment-signing-secret path, per platform.
+///
+/// MAC-D13 (MacCellsHarvest_2026-08-28 §18.3): every bundle-issuance verb
+/// (assignment, traversal) and the two-node auto-init hardcoded the Linux
+/// `/etc/rustynet/assignment.signing.secret`, which nothing mints on macOS —
+/// `distribute_assignments` failed closed with
+/// "assignment signing secret missing (/etc/rustynet/assignment.signing.secret)"
+/// on exit run #9. The macOS genesis (`execute_ops_e2e_bootstrap_macos`) now
+/// seeds the secret at the macOS canonical config root, so the issuers must
+/// resolve the same platform path. The macOS root matches
+/// `crates/rustynetd/src/macos_runtime_acls.rs` and
+/// `secret_material::encrypted_secret_permission_policy`, which arm
+/// `/usr/local/etc/rustynet` at 0750; the Windows path matches the config
+/// dir the Windows enforce-host check already probes
+/// (`execute_ops_e2e_enforce_host`, `C:\ProgramData\RustyNet\config`).
+/// Linux is byte-for-byte unchanged.
+#[cfg(target_os = "linux")]
+pub(crate) const ASSIGNMENT_SIGNING_SECRET_PATH: &str = "/etc/rustynet/assignment.signing.secret";
+#[cfg(target_os = "macos")]
+pub(crate) const ASSIGNMENT_SIGNING_SECRET_PATH: &str =
+    "/usr/local/etc/rustynet/assignment.signing.secret";
+#[cfg(target_os = "windows")]
+pub(crate) const ASSIGNMENT_SIGNING_SECRET_PATH: &str =
+    r"C:\ProgramData\RustyNet\config\assignment.signing.secret";
+
+/// Canonical encrypted membership owner-signing-key path, per platform.
+///
+/// The dns-zone issuer signs with this key (not the assignment signing
+/// secret) and previously hardcoded the Linux literal — the same MAC-D13
+/// gap class that would have failed `distribute_dns_zone` on macOS next.
+/// On macOS the genesis `membership init` mints the key at
+/// [`MACOS_OWNER_SIGNING_KEY_PATH`], so the issuer resolves that same
+/// path; the Windows arm mirrors the Windows genesis write path. Linux is
+/// unchanged.
+#[cfg(target_os = "linux")]
+pub(crate) const MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = "/etc/rustynet/membership.owner.key";
+#[cfg(target_os = "macos")]
+pub(crate) const MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = MACOS_OWNER_SIGNING_KEY_PATH;
+#[cfg(target_os = "windows")]
+pub(crate) const MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =
+    rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH;
+
 /// macOS anchor bundle-pull token path. The anchor profile's loopback
 /// bundle-pull listener authenticates pulling peers against this token
 /// (>=32 printable-ASCII bytes). Matches the
@@ -1374,6 +1416,40 @@ pub fn execute_ops_e2e_bootstrap_macos(
     // selected explicitly so the item survives across user sessions
     // and is reachable by the launchd-managed daemon at startup.
     provision_macos_membership_signing_keychain_item(passphrase_file.as_path())?;
+
+    // MAC-D13 (MacCellsHarvest_2026-08-28 §18.3): seed the encrypted
+    // assignment-signing secret at the macOS canonical config root so the
+    // signed-bundle issuance verbs (`e2e-issue-assignment-bundles-from-env`
+    // and the traversal issuer) find it at genesis. Mirrors the Linux host
+    // bootstrap's `assignment init-signing-secret` step (ops_e2e bootstrap
+    // host): the secret is minted from OS randomness and encrypted AT REST
+    // under the same operator-staged passphrase this genesis just
+    // provisioned into System.keychain as the canonical
+    // `membership_signing_key_passphrase_descriptor` item — exactly the
+    // credential the issuers unwrap via `MacosKeychainBackend` (MAC-D12,
+    // live-proven on exit run #9). Custody is unchanged from the reviewed
+    // contract: `persist_encrypted_secret_material` ->
+    // `write_encrypted_key_file` writes the file 0600 root-owned, sets the
+    // config root to its reviewed 0750 mode, and validates ownership and
+    // modes before returning; no plaintext secret is ever at rest.
+    // Fail-closed on both halves: if this init fails, genesis aborts — and
+    // an issuer run on a node where genesis never seeded the secret still
+    // errors loudly (`ensure_regular_file` "assignment signing secret
+    // missing"), it never silently skips signing.
+    run_status(
+        "rustynet",
+        &[
+            "assignment",
+            "init-signing-secret",
+            "--output",
+            ASSIGNMENT_SIGNING_SECRET_PATH,
+            "--signing-secret-passphrase-file",
+            passphrase_text.as_str(),
+            "--force",
+        ],
+        &[],
+        "assignment signing secret init failed during macOS e2e bootstrap",
+    )?;
 
     // Track B Cross-Platform Role Parity — seed the anchor bundle-pull
     // token so the macOS anchor profile's loopback bundle-pull listener
@@ -2756,14 +2832,14 @@ pub fn execute_ops_e2e_issue_assignments(
         materialize_signing_passphrase_workspace("two-node-assignment")?;
     let passphrase_path = passphrase_pathbuf.display().to_string();
     let result = (|| -> Result<(), String> {
-        if !Path::new("/etc/rustynet/assignment.signing.secret").is_file() {
+        if !Path::new(ASSIGNMENT_SIGNING_SECRET_PATH).is_file() {
             run_status(
                 "rustynet",
                 &[
                     "assignment",
                     "init-signing-secret",
                     "--output",
-                    "/etc/rustynet/assignment.signing.secret",
+                    ASSIGNMENT_SIGNING_SECRET_PATH,
                     "--signing-secret-passphrase-file",
                     passphrase_path.as_str(),
                     "--force",
@@ -2794,7 +2870,7 @@ pub fn execute_ops_e2e_issue_assignments(
                 "--allow",
                 allow_spec.as_str(),
                 "--signing-secret",
-                "/etc/rustynet/assignment.signing.secret",
+                ASSIGNMENT_SIGNING_SECRET_PATH,
                 "--signing-secret-passphrase-file",
                 passphrase_path.as_str(),
                 "--output",
@@ -2819,7 +2895,7 @@ pub fn execute_ops_e2e_issue_assignments(
                 "--allow",
                 allow_spec.as_str(),
                 "--signing-secret",
-                "/etc/rustynet/assignment.signing.secret",
+                ASSIGNMENT_SIGNING_SECRET_PATH,
                 "--signing-secret-passphrase-file",
                 passphrase_path.as_str(),
                 "--output",
@@ -2836,7 +2912,7 @@ pub fn execute_ops_e2e_issue_assignments(
         )?;
 
         let signing_secret = crate::secret_material::load_assignment_signing_secret(
-            Path::new("/etc/rustynet/assignment.signing.secret"),
+            Path::new(ASSIGNMENT_SIGNING_SECRET_PATH),
             passphrase_pathbuf.as_path(),
         )?;
         let traversal_artifacts = issue_two_node_traversal_artifacts(
@@ -2997,11 +3073,11 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
     let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("assignment")?;
     let result = (|| -> Result<(), String> {
         ensure_regular_file(
-            Path::new("/etc/rustynet/assignment.signing.secret"),
+            Path::new(ASSIGNMENT_SIGNING_SECRET_PATH),
             "assignment signing secret",
         )?;
         let signing_secret = crate::secret_material::load_assignment_signing_secret(
-            Path::new("/etc/rustynet/assignment.signing.secret"),
+            Path::new(ASSIGNMENT_SIGNING_SECRET_PATH),
             passphrase_path.as_path(),
         )?;
         let (verifier_key_hex, bundles) = issue_assignment_bundle_artifacts(
@@ -3116,11 +3192,11 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
     let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("traversal")?;
     let result = (|| -> Result<(), String> {
         ensure_regular_file(
-            Path::new("/etc/rustynet/assignment.signing.secret"),
+            Path::new(ASSIGNMENT_SIGNING_SECRET_PATH),
             "assignment signing secret",
         )?;
         let signing_secret = crate::secret_material::load_assignment_signing_secret(
-            Path::new("/etc/rustynet/assignment.signing.secret"),
+            Path::new(ASSIGNMENT_SIGNING_SECRET_PATH),
             passphrase_path.as_path(),
         )?;
         let traversal_artifacts = issue_traversal_bundle_artifacts(
@@ -3261,11 +3337,11 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
     let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("dns-zone")?;
     let result = (|| -> Result<(), String> {
         ensure_regular_file(
-            Path::new("/etc/rustynet/membership.owner.key"),
+            Path::new(MEMBERSHIP_OWNER_SIGNING_KEY_PATH),
             "membership owner signing key",
         )?;
         let signing_secret = crate::secret_material::load_assignment_signing_secret(
-            Path::new("/etc/rustynet/membership.owner.key"),
+            Path::new(MEMBERSHIP_OWNER_SIGNING_KEY_PATH),
             passphrase_path.as_path(),
         )?;
         let (verifier_key_hex, bundles) = issue_dns_zone_bundle_artifacts(
@@ -7511,6 +7587,200 @@ mod tests {
             !core_body.contains("systemd-creds\""),
             "stage_signing_passphrase_leaf must unwrap via the CredentialUnwrapBackend \
              trait, not by spawning the systemd-creds binary directly"
+        );
+    }
+
+    /// MAC-D13 source pin (MacCellsHarvest_2026-08-28 §18.3): the macOS
+    /// genesis must SEED the encrypted assignment-signing secret at the
+    /// platform-canonical config root, under the same operator-staged
+    /// passphrase it provisions into System.keychain, and every
+    /// signed-bundle issuer must resolve the secret / owner key through
+    /// the per-platform path constants instead of the Linux literals.
+    /// Regression context: exit run #9's `distribute_assignments` failed
+    /// closed with "assignment signing secret missing
+    /// (/etc/rustynet/assignment.signing.secret)" because nothing on the
+    /// macOS path minted that file. Mirrors the source-pinning style of
+    /// `materialize_signing_passphrase_workspace_pins_platform_backend_dispatch`
+    /// (genesis shells out to real OS paths, so a source pin is the
+    /// cross-platform-verifiable contract).
+    #[test]
+    fn macos_bootstrap_seeds_assignment_signing_secret_and_issuers_resolve_platform_paths() {
+        let source = include_str!("ops_e2e.rs");
+
+        // 1. The Linux genesis contract is preserved verbatim: the host
+        //    bootstrap still runs `assignment init-signing-secret` against
+        //    the Linux canonical path.
+        let linux_bootstrap_start = source
+            .find("fn execute_ops_e2e_bootstrap_host(")
+            .expect("execute_ops_e2e_bootstrap_host must exist");
+        let linux_bootstrap_end = source[linux_bootstrap_start..]
+            .find("\n}\n")
+            .expect("execute_ops_e2e_bootstrap_host body must terminate");
+        let linux_bootstrap_body =
+            &source[linux_bootstrap_start..linux_bootstrap_start + linux_bootstrap_end];
+        assert!(
+            linux_bootstrap_body.contains("\"init-signing-secret\""),
+            "Linux host bootstrap must keep seeding the assignment signing secret"
+        );
+
+        // 2. The macOS genesis now seeds the secret too, at the
+        //    platform-canonical path, encrypted under the SAME staged
+        //    passphrase file it provisions into System.keychain
+        //    (custody chain: keychain item -> decrypts the at-rest
+        //    secret; no plaintext secret at rest). Anchor on the
+        //    macOS-gated definition: a non-macOS build also carries a
+        //    `#[cfg(not(target_os = "macos"))]` stub of the same name,
+        //    and `.find` must never pin the stub.
+        let macos_bootstrap_start = source
+            .find("#[cfg(target_os = \"macos\")]\npub fn execute_ops_e2e_bootstrap_macos(")
+            .expect("cfg(target_os = \"macos\") genesis must exist");
+        let macos_bootstrap_end = source[macos_bootstrap_start..]
+            .find("\n}\n")
+            .expect("macOS genesis body must terminate");
+        let macos_bootstrap_body =
+            &source[macos_bootstrap_start..macos_bootstrap_start + macos_bootstrap_end];
+        for required in [
+            "\"init-signing-secret\"",
+            "ASSIGNMENT_SIGNING_SECRET_PATH",
+            "--signing-secret-passphrase-file",
+            "\"--force\"",
+            "provision_macos_membership_signing_keychain_item",
+        ] {
+            assert!(
+                macos_bootstrap_body.contains(required),
+                "macOS genesis must contain {required} so the assignment \
+                 signing secret is seeded with the keychain-provisioned \
+                 passphrase (MAC-D13)"
+            );
+        }
+
+        // 3. The per-platform constants carry the canonical paths for all
+        //    three platforms.
+        for (constant, canonical) in [
+            (
+                "ASSIGNMENT_SIGNING_SECRET_PATH",
+                [
+                    "#[cfg(target_os = \"linux\")]",
+                    "/etc/rustynet/assignment.signing.secret",
+                    "#[cfg(target_os = \"macos\")]",
+                    "/usr/local/etc/rustynet/assignment.signing.secret",
+                    "#[cfg(target_os = \"windows\")]",
+                    "C:\\ProgramData\\RustyNet\\config\\assignment.signing.secret",
+                ],
+            ),
+            (
+                "MEMBERSHIP_OWNER_SIGNING_KEY_PATH",
+                [
+                    "#[cfg(target_os = \"linux\")]",
+                    "/etc/rustynet/membership.owner.key",
+                    "#[cfg(target_os = \"macos\")]",
+                    "MACOS_OWNER_SIGNING_KEY_PATH",
+                    "#[cfg(target_os = \"windows\")]",
+                    "DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH",
+                ],
+            ),
+        ] {
+            let const_start = source
+                .find(&format!("const {constant}: &str"))
+                .unwrap_or_else(|| {
+                    panic!("the {constant} per-platform constant must exist");
+                });
+            // Walk back to the constant's doc block, then take the whole
+            // constant group (doc + every cfg arm) up to the first blank
+            // line, so every platform arm is covered, not just the one the
+            // running build compiles.
+            let block_start = source[..const_start]
+                .rfind("\n/// Canonical")
+                .unwrap_or(const_start);
+            let block_end_rel = source[block_start..]
+                .find("\n\n")
+                .expect("constant group must be blank-line terminated");
+            let block = &source[block_start..block_start + block_end_rel];
+            for fragment in canonical {
+                assert!(
+                    block.contains(fragment),
+                    "the {constant} constant block must contain {fragment}"
+                );
+            }
+        }
+
+        // 4. The bundle issuers resolve the platform constants and keep
+        //    the fail-closed existence check: a node where genesis never
+        //    seeded the secret errors loudly (`ensure_regular_file`
+        //    "missing"), it never silently skips signing.
+        for (fn_name, constant, banned_linux_literal) in [
+            (
+                "fn execute_ops_e2e_issue_assignment_bundles_from_env(",
+                "ASSIGNMENT_SIGNING_SECRET_PATH",
+                "/etc/rustynet/assignment.signing.secret",
+            ),
+            (
+                "fn execute_ops_e2e_issue_traversal_bundles_from_env(",
+                "ASSIGNMENT_SIGNING_SECRET_PATH",
+                "/etc/rustynet/assignment.signing.secret",
+            ),
+            (
+                "fn execute_ops_e2e_issue_dns_zone_bundles_from_env(",
+                "MEMBERSHIP_OWNER_SIGNING_KEY_PATH",
+                "/etc/rustynet/membership.owner.key",
+            ),
+        ] {
+            let fn_start = source.find(fn_name).unwrap_or_else(|| {
+                panic!("issuer {fn_name} must exist");
+            });
+            let fn_end = source[fn_start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("issuer {fn_name} body must terminate"));
+            let fn_body = &source[fn_start..fn_start + fn_end];
+            assert!(
+                fn_body.contains(constant),
+                "{fn_name} must resolve the signing material via {constant} \
+                 instead of a hardcoded Linux path (MAC-D13)"
+            );
+            assert!(
+                !fn_body.contains(banned_linux_literal),
+                "{fn_name} must not hardcode the Linux path {banned_linux_literal}"
+            );
+            if fn_name.contains("assignment") || fn_name.contains("traversal") {
+                assert!(
+                    fn_body.contains("ensure_regular_file"),
+                    "{fn_name} must keep the fail-closed ensure_regular_file \
+                     check: a missing signing secret must error, never skip \
+                     signing"
+                );
+            }
+        }
+
+        // 5. The two-node assignment path's auto-init resolves the same
+        //    platform constant (its `is_file` probe and its issue/load
+        //    calls), so it stays usable on macOS too.
+        let two_node_start = source
+            .find("fn execute_ops_e2e_issue_assignments(")
+            .expect("two-node assignment issuer must exist");
+        let two_node_end = source[two_node_start..]
+            .find("\n}\n")
+            .expect("two-node issuer body must terminate");
+        let two_node_body = &source[two_node_start..two_node_start + two_node_end];
+        assert!(
+            two_node_body.contains("Path::new(ASSIGNMENT_SIGNING_SECRET_PATH)"),
+            "the two-node auto-init must probe the platform-canonical path"
+        );
+        assert!(
+            !two_node_body.contains("/etc/rustynet/assignment.signing.secret"),
+            "the two-node issuer must not hardcode the Linux signing-secret path"
+        );
+
+        // 6. On Linux (where this test runs in CI) the compiled constant is
+        //    the Linux canonical path — behavior unchanged.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            ASSIGNMENT_SIGNING_SECRET_PATH,
+            "/etc/rustynet/assignment.signing.secret"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "/etc/rustynet/membership.owner.key"
         );
     }
     use rustynet_control::ControlPlaneCore;
