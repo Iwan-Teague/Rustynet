@@ -3959,6 +3959,54 @@ mod tests {
     }
 
     #[test]
+    fn validate_request_accepts_killswitch_established_related_rule() {
+        // Cross-pins the emitter-side QH-29 regression pin in `phase10`
+        // (`established_related_rule_argv_is_helper_allowlist_shaped`): the
+        // established/related killswitch rule must reach this allowlist as
+        // per-token nft keywords. The 2026-08-29 live-lab failure shipped an
+        // emitter that sent `"ct state established,related"` as ONE argv
+        // element — this arm refused it, every Linux reconcile apply failed,
+        // and the node restricted permanently — while a `join(" ")` of the
+        // refused argv rendered identically to this accepted spelling.
+        validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "ct",
+                "state",
+                "established,related",
+                "accept",
+            ],
+        )
+        .expect("per-token established/related killswitch rule should be accepted");
+    }
+
+    #[test]
+    fn validate_request_refuses_phrase_token_established_related_rule() {
+        // The exact defect shape: the phrase packed into a single argv
+        // element. Same rendering after join, different (refused) argv.
+        let err = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "ct state established,related",
+                "accept",
+            ],
+        )
+        .expect_err("phrase-token rule argv must stay refused");
+        assert!(err.contains("unsupported nft add rule argument schema"));
+        assert!(err.contains("ct state established,related"));
+    }
+
+    #[test]
     fn validate_request_accepts_known_ip_schema() {
         validate_request(
             PrivilegedCommandProgram::Ip,
