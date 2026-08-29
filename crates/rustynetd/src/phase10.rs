@@ -551,6 +551,24 @@ pub trait DataplaneSystem {
     fn reconcile_exit_nat_residue(&mut self, _serving_exit: bool) -> Result<(), SystemError> {
         Ok(())
     }
+    /// QH-52 residual: clear a firewalld zone binding left behind by a CRASH —
+    /// a process that served a forwarding role died while bound; on restart as
+    /// a plain client `active_stages` is empty, so the demotion arm (which
+    /// keys on the recorded `HostFirewallAdmitted` marker) never runs and
+    /// nothing else drops the binding. The crash-restart sibling of
+    /// `reconcile_exit_nat_residue`, with the same shape: called once per
+    /// process by the controller before the generation stages, probe-first so
+    /// a node whose host firewall holds no binding pays one query and nothing
+    /// more.
+    ///
+    /// Default no-op: firewalld is Linux-only, and (unlike the admit/withdraw
+    /// pair) this is teardown reporting, not a fail-closed gate — a platform
+    /// with nothing to reconcile genuinely has nothing to do, so a defaulted
+    /// body cannot hide a missing enforcement the way it could for a stage the
+    /// controller gates an apply on.
+    fn reconcile_firewalld_zone_residue(&mut self) -> Result<(), SystemError> {
+        Ok(())
+    }
     fn check_prerequisites(&mut self) -> Result<(), SystemError>;
     fn preflight_exit_serving(&mut self, _mesh_cidr: &str) -> Result<(), SystemError> {
         Ok(())
@@ -860,6 +878,13 @@ impl DataplaneSystem for DryRunSystem {
         // to fail the withdrawal and prove the controller reports it without
         // failing an otherwise-healthy generation closed.
         self.step("withdraw_host_firewall_forwarding")
+    }
+
+    fn reconcile_firewalld_zone_residue(&mut self) -> Result<(), SystemError> {
+        // Through step() so DryRun-driven tests can observe when the probe ran
+        // (once-per-process gating) and fail it to prove the controller's
+        // residue accounting.
+        self.step("reconcile_firewalld_zone_residue")
     }
 
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
@@ -2825,6 +2850,57 @@ impl DataplaneSystem for LinuxCommandSystem {
             let _ = self.set_ipv4_forwarding(false);
         }
         Ok(())
+    }
+
+    /// QH-52 residual: crash-restart reconcile of a firewalld zone binding.
+    ///
+    /// A process crash loses `active_stages`, so the demotion arm's
+    /// `HostFirewallAdmitted` marker is gone on restart and a restart-as-client
+    /// would otherwise leave the interface bound forever. Probe first
+    /// (`FirewalldZoneOp::Query` — mutates nothing), then unbind ONLY when the
+    /// posture is not already withdrawn:
+    ///
+    /// - probe capture could not run at all (no busctl on the host, helper
+    ///   unavailable): log and return Ok. Returning Err here would make the
+    ///   controller re-record the marker on EVERY apply on such hosts,
+    ///   manufacturing per-apply withdrawal churn out of a missing diagnostic
+    ///   tool — exactly the spurious-failure hazard the QH-52 note rejected.
+    /// - posture unreadable or not withdrawn (bound, or presence unknown):
+    ///   run the full idempotent withdrawal. It self-verifies by re-reading
+    ///   the posture, so an unremovable binding surfaces as residue the same
+    ///   way a demotion-time withdrawal does.
+    fn reconcile_firewalld_zone_residue(&mut self) -> Result<(), SystemError> {
+        use crate::linux_firewalld_zone::{FirewalldZoneOp, FirewalldZoneSpec};
+
+        let spec = FirewalldZoneSpec::new(FirewalldZoneOp::Query, self.interface_name.as_str())
+            .map_err(SystemError::PrerequisiteCheckFailed)?;
+        let argv = spec.encode();
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let output = match self.run_capture(
+            PrivilegedCommandProgram::LinuxFirewalldZone,
+            borrowed.as_slice(),
+        ) {
+            Ok(output) => output,
+            Err(err) => {
+                log::warn!(
+                    "host firewall zone binding reconcile probe unavailable, assuming no residue \
+                     to clear: {err}"
+                );
+                return Ok(());
+            }
+        };
+        match crate::linux_firewalld_zone::FirewalldPosture::parse(output.stdout.trim()) {
+            Ok(posture) if posture.forwarding_admission_withdrawn() => Ok(()),
+            posture => {
+                if let Err(parse_err) = posture {
+                    log::warn!(
+                        "host firewall zone binding reconcile could not read the posture \
+                         ({parse_err}); attempting the idempotent withdrawal"
+                    );
+                }
+                self.ensure_host_firewall_forwarding_withdrawn()
+            }
+        }
     }
 
     fn apply_nat_forwarding(
@@ -5694,6 +5770,15 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn reconcile_firewalld_zone_residue(&mut self) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.reconcile_firewalld_zone_residue(),
+            RuntimeSystem::Linux(system) => system.reconcile_firewalld_zone_residue(),
+            RuntimeSystem::Macos(system) => system.reconcile_firewalld_zone_residue(),
+            RuntimeSystem::Windows(system) => system.reconcile_firewalld_zone_residue(),
+        }
+    }
+
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.check_prerequisites(),
@@ -5953,6 +6038,12 @@ pub struct Phase10Controller<B: TunnelBackend, S: DataplaneSystem> {
     lan_route_acl: HashMap<(String, String), bool>,
     managed_peers: BTreeMap<NodeId, ManagedPeer>,
     active_stages: Vec<StageMarker>,
+    /// QH-52 residual: whether this process still owes its one-time
+    /// crash-restart firewalld probe (see
+    /// `reconcile_firewalld_zone_residue`). Consumed on the first apply that
+    /// qualifies, so a plain-client node pays the probe busctl round-trip once
+    /// per process rather than on every re-enforce apply.
+    firewalld_zone_residue_probe_pending: bool,
     current_routes: Vec<Route>,
     current_exit_mode: ExitMode,
     current_serve_exit_node: bool,
@@ -6009,6 +6100,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             lan_route_acl: HashMap::new(),
             managed_peers: BTreeMap::new(),
             active_stages: Vec::new(),
+            firewalld_zone_residue_probe_pending: true,
             current_routes: Vec::new(),
             current_exit_mode: ExitMode::Off,
             current_serve_exit_node: false,
@@ -6421,6 +6513,32 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.system
             .reconcile_exit_nat_residue(options.serve_exit_node)?;
         let previous_stages = self.active_stages.clone();
+        // QH-52 residual, the crash-restart edge. A process that died while
+        // bound restarts with an empty `active_stages`, so the demotion arm
+        // below never fires; this one-time probe covers it. Gated three ways:
+        // consumed once per process (a plain-client node must not pay a
+        // busctl round-trip on every re-enforce apply), never on an apply that
+        // is about to serve (the admit stage below re-binds anyway, and a
+        // serving node's binding is not residue), and never when the marker is
+        // already recorded (the demotion arm below owns that reconcile —
+        // double-withdrawing the same binding in one apply is noise). Same
+        // deliberate non-propagation as the demotion arm: a leftover binding
+        // is residue, not exposure, so a failed clear is re-recorded for the
+        // next apply / shutdown retry instead of failing a healthy generation
+        // closed.
+        if self.firewalld_zone_residue_probe_pending
+            && !options.serve_exit_node
+            && !previous_stages.contains(&StageMarker::HostFirewallAdmitted)
+        {
+            self.firewalld_zone_residue_probe_pending = false;
+            if let Err(err) = self.system.reconcile_firewalld_zone_residue() {
+                log::warn!(
+                    "host firewall zone binding survived a crash-restart reconcile; \
+                     recording it for retry on the next apply and at shutdown: {err}"
+                );
+                applied_stages.push(StageMarker::HostFirewallAdmitted);
+            }
+        }
         // QH-52, the in-place demotion edge. A node that served a relay/exit in
         // the previous generation and does not in this one keeps its tunnel
         // interface — the interface is not rebuilt, so nothing else drops the
@@ -11188,6 +11306,222 @@ mod tests {
         );
     }
 
+    // ---- QH-52 residual: the crash-restart edge ----
+    //
+    // QH-52's demotion arm keys on the recorded `HostFirewallAdmitted` marker,
+    // and `active_stages` dies with the process. A crash while bound, then a
+    // restart as a plain client, therefore left the binding BOUND with nothing
+    // left to remove it. The reconcile probe (`reconcile_firewalld_zone_residue`)
+    // closes that edge — the tests below pin its gating, its once-per-process
+    // cost, and the marker handoff to the existing retry machinery.
+
+    /// The defect itself. A fresh process (empty `active_stages`) applying a
+    /// plain-client generation must run the one-time reconcile probe: on a
+    /// firewalld host this is the ONLY thing that can find a binding the
+    /// crashed predecessor installed. A second client apply must NOT probe
+    /// again — the probe costs a busctl round-trip, and QH-52's note
+    /// explicitly rejected putting one on every plain-client apply.
+    #[test]
+    fn a_crash_restarted_client_probes_for_a_stale_zone_binding_once() {
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            allow_shared_exit_policy(),
+            TrustPolicy::default(),
+        );
+
+        demote_to_client(&mut controller).expect("plain-client apply should succeed");
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "reconcile_firewalld_zone_residue"),
+            "the first apply of a fresh (crash-restart analog) process must run the \
+             residue probe: {:?}",
+            controller.system.operations
+        );
+
+        controller.system.operations.clear();
+        demote_to_client(&mut controller).expect("second plain-client apply should succeed");
+        assert!(
+            !controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "reconcile_firewalld_zone_residue"),
+            "the probe is once per process, not once per apply: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// An apply that is about to SERVE never probes: the admit stage below
+    /// re-binds the interface anyway, so the probe could only find residue
+    /// this same apply is about to overwrite — and unbinding a binding a
+    /// serving generation wants would be fighting ourselves.
+    #[test]
+    fn a_serving_apply_never_probes_for_crash_residue() {
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            allow_shared_exit_policy(),
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("serving apply should succeed");
+
+        assert!(
+            !controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "reconcile_firewalld_zone_residue"),
+            "a serving apply must not run the crash-residue probe: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// The in-process demotion edge is owned by the marker arm, not the
+    /// probe: when `HostFirewallAdmitted` is recorded, the demotion arm
+    /// withdraws and the probe must stay out of the way (no double reconcile
+    /// of the same binding in one apply).
+    #[test]
+    fn an_in_process_demotion_does_not_double_probe() {
+        let mut controller = serving_controller_after_apply();
+
+        demote_to_client(&mut controller).expect("demotion should succeed");
+
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "withdraw_host_firewall_forwarding"),
+            "the marker arm must own the withdrawal: {:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "reconcile_firewalld_zone_residue"),
+            "a demotion with the marker recorded must not also probe: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// A failed crash-restart reconcile must NOT fail the apply closed (a
+    /// leftover binding is residue, not exposure), but it must not be
+    /// forgotten either: the marker is recorded so the EXISTING QH-52 retry
+    /// machinery picks the withdrawal up on the next apply and at shutdown.
+    #[test]
+    fn a_failed_crash_reconcile_is_recorded_and_retried_on_the_next_apply() {
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            allow_shared_exit_policy(),
+            TrustPolicy::default(),
+        );
+        controller
+            .system
+            .fail_on_from_now("reconcile_firewalld_zone_residue");
+
+        demote_to_client(&mut controller)
+            .expect("a failed residue probe must not fail a healthy generation closed");
+        assert!(
+            controller.backend.started,
+            "the generation must have committed despite the failed probe"
+        );
+        assert_eq!(
+            controller.state(),
+            DataplaneState::DataplaneApplied,
+            "a failed teardown-report must not leave the node fail-closed"
+        );
+
+        controller.system.fail_on_from_now("no_such_stage");
+        controller.system.operations.clear();
+        demote_to_client(&mut controller).expect("the retrying apply should succeed");
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "withdraw_host_firewall_forwarding"),
+            "the failed probe must hand off to the marker arm, which retries the \
+             withdrawal on the next apply: {:?}",
+            controller.system.operations
+        );
+    }
+
+    /// Source pin, in the style of
+    /// `the_admission_marker_is_recorded_after_the_backend_start`: the probe's
+    /// gating conditions are controller logic invisible to any single DryRun
+    /// ordering, so pin the structure — consumed-once flag, the serving gate,
+    /// the marker gate, the non-propagating error arm, and the marker
+    /// handoff — directly in `rollback_obsolete_controls`.
+    #[test]
+    fn the_crash_reconcile_is_gated_once_per_process_and_never_while_serving() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        let arm_at = code
+            .find("if let Err(err) = self.system.reconcile_firewalld_zone_residue()")
+            .expect("the controller must call the reconcile probe non-propagating");
+        // The arm lives in rollback_obsolete_controls, after previous_stages
+        // is snapshotted (the demotion arm reads the same snapshot).
+        let rollback_at = code
+            .rfind("fn rollback_obsolete_controls")
+            .expect("rollback_obsolete_controls must exist");
+        assert!(
+            arm_at > rollback_at,
+            "the reconcile call must live in rollback_obsolete_controls"
+        );
+        let window = &code[rollback_at..arm_at];
+        assert!(
+            window.contains("self.firewalld_zone_residue_probe_pending"),
+            "the probe must be gated on the once-per-process flag"
+        );
+        assert!(
+            window.contains("!options.serve_exit_node"),
+            "the probe must never run on an apply that is about to serve"
+        );
+        assert!(
+            window.contains("!previous_stages.contains(&StageMarker::HostFirewallAdmitted)"),
+            "the probe must defer to the marker arm when the marker is recorded"
+        );
+        assert!(
+            window.contains("self.firewalld_zone_residue_probe_pending = false;"),
+            "the flag must be consumed when the probe runs (once per process)"
+        );
+        let after = &code[arm_at..code.len().min(arm_at + 1400)];
+        assert!(
+            after.contains("if let Err(err) ="),
+            "a failed probe must be reported, never propagated (teardown semantics)"
+        );
+        assert!(
+            after.contains("applied_stages.push(StageMarker::HostFirewallAdmitted);"),
+            "a failed probe must record the marker so the next apply / shutdown \
+             retries the withdrawal"
+        );
+    }
+
     #[test]
     fn helper_less_direct_path_enforces_argv_schema_validation() {
         // RN-19: with no privileged client configured (daemon-as-root direct
@@ -11993,6 +12327,221 @@ mod tests {
             ),
             other => panic!("an unreadable binding state must not read as removed: {other:?}"),
         }
+    }
+
+    // ── QH-52 residual: the crash-restart reconcile, over the same builtin ──
+    //
+    // These need per-op scripting (the probe must QUERY first and only then
+    // decide to unbind), so they drive `spawn_privileged_scripted_helper`
+    // directly with `op=`-token needles instead of the single-posture
+    // `firewalld_scripted_system` the direction tests above use.
+
+    /// The defect itself, live over the builtin: a stale binding (what a
+    /// crashed predecessor left) is cleared — query first, then unbind, never
+    /// a bind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crash_reconcile_clears_a_stale_binding_query_first() {
+        let socket_path = phase10_test_socket_path("fwzr");
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "op=query".to_owned(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "presence=running default_zone=public bound=true".to_owned(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "op=unbind".to_owned(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "presence=running default_zone=public bound=false".to_owned(),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let mut system = firewalld_client_system(&socket_path, "rnqh52");
+        let result = DataplaneSystem::reconcile_firewalld_zone_residue(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        result.expect("a cleared stale binding must report the reconcile complete");
+        let command_log = commands.lock().expect("command log should lock").clone();
+        let query_command = format!(
+            "{} op=query interface=rnqh52",
+            crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM
+        );
+        let unbind_command = format!(
+            "{} op=unbind interface=rnqh52",
+            crate::linux_firewalld_zone::LINUX_FIREWALLD_ZONE_PROGRAM
+        );
+        assert!(
+            command_log.iter().any(|cmd| cmd.contains(&query_command)),
+            "the reconcile must probe before mutating: {command_log:?}"
+        );
+        assert!(
+            command_log.iter().any(|cmd| cmd.contains(&unbind_command)),
+            "a probe that finds the interface still bound must unbind the CONFIGURED \
+             tunnel interface: {command_log:?}"
+        );
+        assert!(
+            !command_log.iter().any(|cmd| cmd.contains("op=bind")),
+            "a reconcile must never re-bind: {command_log:?}"
+        );
+    }
+
+    /// A node whose posture is already withdrawn pays the probe and nothing
+    /// more: no mutation on the plain-client path, which is what makes the
+    /// once-per-process probe affordable on hosts that never served.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crash_reconcile_is_a_noop_when_the_posture_is_already_withdrawn() {
+        let socket_path = phase10_test_socket_path("fwzn");
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![(
+                "op=query".to_owned(),
+                PrivilegedCommandOutput {
+                    status: 0,
+                    stdout: "presence=absent".to_owned(),
+                    stderr: String::new(),
+                },
+            )],
+        );
+        let mut system = firewalld_client_system(&socket_path, "rustynet0");
+        let result = DataplaneSystem::reconcile_firewalld_zone_residue(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        result.expect("no firewalld means no residue and a clean reconcile");
+        let command_log = commands.lock().expect("command log should lock").clone();
+        assert!(
+            command_log.iter().any(|cmd| cmd.contains("op=query")),
+            "the reconcile must probe even on a firewalld-less host: {command_log:?}"
+        );
+        assert!(
+            !command_log.iter().any(|cmd| cmd.contains("op=unbind")),
+            "an already-withdrawn posture must not be mutated: {command_log:?}"
+        );
+    }
+
+    /// The fail-closed middle case: the probe ran but the posture could not
+    /// be read (empty stdout). "I could not tell" must attempt the idempotent
+    /// withdrawal — the same posture-unreadable rule the withdrawal direction
+    /// tests pin — and an unconfirmable result is reported, never read as
+    /// success.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crash_reconcile_attempts_the_unbind_when_the_posture_is_unreadable() {
+        let socket_path = phase10_test_socket_path("fwzu");
+        // Default response (no needle matched) is empty stdout, which the
+        // posture parser rejects — exactly the unreadable case, for BOTH the
+        // query and the follow-up unbind's re-read.
+        let (commands, stop, helper_thread) =
+            spawn_privileged_scripted_helper(&socket_path, Vec::new());
+        let mut system = firewalld_client_system(&socket_path, "rustynet0");
+        let result = DataplaneSystem::reconcile_firewalld_zone_residue(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            matches!(result, Err(SystemError::FirewallApplyFailed(_))),
+            "an unreadable posture must not read as a completed reconcile: {result:?}"
+        );
+        let command_log = commands.lock().expect("command log should lock").clone();
+        assert!(
+            command_log.iter().any(|cmd| cmd.contains("op=unbind")),
+            "an unreadable posture must still attempt the idempotent withdrawal: \
+             {command_log:?}"
+        );
+    }
+
+    /// The no-busctl hazard, live: when the probe could not run AT ALL (the
+    /// builtin answers with a protocol error — helper refused, binary
+    /// missing), the reconcile must report Ok so the controller does not
+    /// re-record the marker and manufacture withdrawal churn on every apply
+    /// of a host that simply lacks the diagnostic tool.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crash_reconcile_tolerates_an_unavailable_probe() {
+        let socket_path = phase10_test_socket_path("fwzv");
+        let (stop, helper_thread) = spawn_privileged_firewalld_error_helper(&socket_path);
+        let mut system = firewalld_client_system(&socket_path, "rustynet0");
+        let result = DataplaneSystem::reconcile_firewalld_zone_residue(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        result.expect("an unavailable probe is a diagnostic gap, not residue evidence");
+    }
+
+    /// A binding that survives the reconcile's own unbind is residue, exactly
+    /// as at demotion time — reported through the same verdict message.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn crash_reconcile_reports_a_binding_that_survived_the_reconcile() {
+        let socket_path = phase10_test_socket_path("fwzb2");
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "op=query".to_owned(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "presence=running default_zone=public bound=true".to_owned(),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "op=unbind".to_owned(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: "presence=running default_zone=public bound=true".to_owned(),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let mut system = firewalld_client_system(&socket_path, "rustynet0");
+        let result = DataplaneSystem::reconcile_firewalld_zone_residue(&mut system);
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        match result {
+            Err(SystemError::FirewallApplyFailed(message)) => assert!(
+                message.contains("host firewall zone binding survived role demotion"),
+                "the failure must come from the withdrawal verdict: {message}"
+            ),
+            other => panic!("a surviving zone binding must be reported as residue: {other:?}"),
+        }
+        let command_log = commands.lock().expect("command log should lock").clone();
+        assert!(
+            command_log.iter().any(|cmd| cmd.contains("op=unbind")),
+            "the reconcile must have attempted the removal before reporting: {command_log:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]

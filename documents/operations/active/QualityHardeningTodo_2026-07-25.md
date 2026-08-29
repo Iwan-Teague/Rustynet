@@ -3704,6 +3704,58 @@ Not live-proven: the scripted-helper tests exercise the daemon-to-helper protoco
 `busctl` against a real firewalld. A live demotion on `fedora-utm-1` observing
 `firewall-cmd --list-interfaces` before and after remains outstanding, as a separate follow-up.
 
+**RESIDUAL CLOSED 2026-08-29 — the crash-restart case now reconciles.** The paragraph above
+("crash-restart residue ... deliberately out of scope") described the remaining gap: a process
+that died while bound restarts with an empty `active_stages`, so the marker is gone and none of
+the three consuming paths fires — the binding stays BOUND with no owner left to remove it. The
+out-of-scope reasoning was about COST SHAPE (a busctl round-trip and a spurious failure on every
+plain-client apply), not about the case itself, and both costs are avoided rather than accepted:
+
+- `DataplaneSystem::reconcile_firewalld_zone_residue` (DEFAULTED no-op — unlike the
+  admit/withdraw pair, this is teardown reporting, not a fail-closed gate, so a defaulted body
+  cannot hide a missing enforcement) — the crash-restart sibling of
+  `reconcile_exit_nat_residue`. `LinuxCommandSystem` implements it probe-first
+  (`FirewalldZoneOp::Query` — mutates nothing, the op that had zero callers until now): an
+  already-withdrawn posture returns Ok after one query; an unreadable or not-withdrawn posture
+  falls through to the idempotent
+  `ensure_host_firewall_forwarding_withdrawn`, whose verdict failure reports residue through the
+  same message as demotion time. When the probe capture itself cannot run (no busctl, helper
+  unavailable) it logs and returns Ok — an Err here would re-record the marker on every apply of
+  such a host and manufacture the exact withdrawal churn the out-of-scope note rejected; a
+  missing diagnostic tool is not evidence of residue.
+- The controller runs it ONCE PER PROCESS (`firewalld_zone_residue_probe_pending`, consumed on
+  the qualifying apply), inside `rollback_obsolete_controls` after the `previous_stages`
+  snapshot, gated on `!serve_exit_node` (a serving apply re-admits anyway) and on the marker
+  being absent (the in-process demotion arm owns that reconcile; no double withdraw). A failed
+  reconcile is NOT propagated — it re-records `HostFirewallAdmitted` into the generation being
+  built, handing the retry to the existing machinery (next apply's demotion arm + shutdown, where
+  the failure escalates per the failure-semantics paragraph above).
+
+Verification: 6 controller tests —
+`a_crash_restarted_client_probes_for_a_stale_zone_binding_once` (the probe runs on the first
+fresh-process client apply and NOT on the second), `a_serving_apply_never_probes_for_crash_residue`,
+`an_in_process_demotion_does_not_double_probe`,
+`a_failed_crash_reconcile_is_recorded_and_retried_on_the_next_apply` (failed probe leaves the
+generation committed at `DataplaneApplied`, and the NEXT apply runs the marker-arm withdrawal —
+the handoff, end to end), and the source-pinned
+`the_crash_reconcile_is_gated_once_per_process_and_never_while_serving` (pins the flag, both
+gates, the consumed-once write, the non-propagating `if let Err`, and the marker handoff — the
+Linux scripted twins are `cfg(target_os = "linux")` and invisible on the macOS CI leg). 5 Linux
+scripted-helper tests over the real protocol with per-op scripting (needles on the `op=` token,
+so query and unbind get different postures) —
+`crash_reconcile_clears_a_stale_binding_query_first` (query then unbind of the CONFIGURED
+interface, never a bind), `crash_reconcile_is_a_noop_when_the_posture_is_already_withdrawn`
+(probe only, no mutation),
+`crash_reconcile_attempts_the_unbind_when_the_posture_is_unreadable` (empty stdout → conservative
+unbind, unconfirmable result reported not read as success),
+`crash_reconcile_tolerates_an_unavailable_probe` (protocol error → Ok, the no-busctl case, live),
+and `crash_reconcile_reports_a_binding_that_survived_the_reconcile`. The Linux tests compile on
+the Debian CI leg; they were not executed on this macOS authoring host.
+
+Still not live-proven (unchanged): a live crash-then-restart-as-client on `fedora-utm-1`
+observing `firewall-cmd --query-interface` before and after remains outstanding, folded into the
+same follow-up as the demotion live proof above.
+
 ### QH-53 — REGRESSION from the QH-46 fix: firewalld bind races interface creation on daemon
 restart, and a failed bootstrap apply is never retried
 
