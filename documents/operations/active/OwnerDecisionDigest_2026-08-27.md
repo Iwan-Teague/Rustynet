@@ -332,6 +332,20 @@ circuit, §7.6). See
 `BlindRelayAdversarialReview2_2026-08-29.md` §13 for evidence. §11's
 advertisement NO-GO remains in force: §16 items 1–7 and the §13.2 live-lab
 stages are still unmet — the gate flips are a later phase.
+**UPDATE 2026-08-29 (go-live Phase B, owner-authorized):** review findings O1
+(listener dormant — zero callers) and O2 (address-validation issuance never
+called) are **WIRED** into the relay runtime (`rustynet-relay/src/main.rs`) —
+the daemon resolves the listener from real signed state + operator flag with
+the §5.1 exact-set compare, routes v2 hello frames to the reviewed admission
+only while the listener is open (dormant relays answer them byte-for-byte as
+the legacy unknown type, so a normal relay gains zero pre-auth surface), and
+first-contact `AddressValidation` rejections now issue the reviewed artifact
+(`[0x05] ++ artifact[32]`, bounded by the admission step-2 rate limiter).
+`BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED` is NOT flipped: the daemon starts
+gated-closed by design and no reviewed listener logic changed. Evidence and
+gates: `BlindRelayAdversarialReview2_2026-08-29.md` §14. §11's advertisement
+NO-GO still holds — opening the listener is the later gate-flip phase with
+live-lab evidence.
 
 ---
 
