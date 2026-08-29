@@ -531,7 +531,12 @@ config-layer SC pin (`macos_dns_sc_protect.rs`) backstopped by the packet-layer 
 misses still cannot leak `:53`. Recovery guard (`resolve_backup_baseline_entry` + startup-recovery)
 makes strict safe (no permanently DNS-dead box). Strict scope only bites in protected mode, so it is
 also "practical" (§2). **Net effect: LESS work than the hatch — the strict answer is to not build the
-exclusion.** Updates entry 24. **Status: `approved` (strict); pf-floor-parity verification in flight.**
+exclusion.** Updates entry 24. **Status: `approved` (strict); pf-floor parity
+VERIFIED 2026-08-29 — the macOS pf DNS floor is already at Linux-`nft` parity
+(rule-by-rule documentation and the no-exclusion pin test in
+`MacosDnsFailclosedEnforcementGap_2026-08-28.md` §7); no exclusion config was
+built. A field-caught `networksetup` legend-parsing defect that could mint a
+phantom service (release-blocking on real hosts) is fixed in the same change.**
 
 ### 26. Decision 2 — cross-network topology: real 2-LAN (option a)
 See entry 18 (now `approved` → (a)). Real substrate proof; (b) rejected as papered-over weakness;
