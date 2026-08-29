@@ -49,6 +49,11 @@ static INSTALL_SERVICE_SCRIPT: &str =
 static UNINSTALL_SERVICE_SCRIPT: &str = include_str!(
     "../../../../../../scripts/bootstrap/windows/Uninstall-RustyNetWindowsService.ps1"
 );
+static PROVISION_LAB_IMAGE_SCRIPT: &str = include_str!(
+    "../../../../../../scripts/bootstrap/windows/Provision-RustyNetWindowsLabImage.ps1"
+);
+static VSCONFIG_FILE: &str =
+    include_str!("../../../../../../scripts/bootstrap/windows/RustyNetBuildTools.vsconfig");
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(3600); // cold release build on Windows VM can take 30-60 min
@@ -1618,6 +1623,62 @@ mod tests {
         assert!(
             !UNINSTALL_SERVICE_SCRIPT.is_empty(),
             "Uninstall-RustyNetWindowsService.ps1 must not be empty"
+        );
+    }
+
+    /// QH-17: the lab-image provisioning script must not mutate the
+    /// machine cargo/rustup environment when -SkipRustup is passed, and
+    /// VS Build Tools component selection must come from the single
+    /// authoritative vsconfig (no inline component list).
+    #[test]
+    fn provision_lab_image_script_respects_skip_rustup_and_single_vsconfig() {
+        assert!(
+            !PROVISION_LAB_IMAGE_SCRIPT.is_empty(),
+            "Provision-RustyNetWindowsLabImage.ps1 must not be empty"
+        );
+        // Fix 1: the -SkipRustup guard must precede the machine env
+        // mutation so a skip run leaves CARGO_HOME/RUSTUP_HOME/PATH
+        // untouched.
+        let guard = PROVISION_LAB_IMAGE_SCRIPT
+            .find("if ($SkipRustup)")
+            .expect("provision script must gate on -SkipRustup");
+        let cargo_env = PROVISION_LAB_IMAGE_SCRIPT
+            .find("Set-MachineEnv -Name 'CARGO_HOME'")
+            .expect("provision script must set machine CARGO_HOME when installing");
+        assert!(
+            guard < cargo_env,
+            "machine CARGO_HOME mutation must sit inside the -SkipRustup guard (QH-17)"
+        );
+        assert!(
+            PROVISION_LAB_IMAGE_SCRIPT
+                .contains("skipped machine toolchain env mutation (-SkipRustup)"),
+            "skip run must record that the toolchain env was left untouched"
+        );
+        // Fix 2: component selection comes from the vsconfig, never an
+        // inline --add list; exactly one SDK component id exists repo-wide.
+        assert!(
+            PROVISION_LAB_IMAGE_SCRIPT.contains("--config"),
+            "provision script must pass --config <vsconfig> to vs_BuildTools.exe"
+        );
+        assert!(
+            PROVISION_LAB_IMAGE_SCRIPT.contains("RustyNetBuildTools.vsconfig"),
+            "provision script must reference the shared vsconfig"
+        );
+        assert!(
+            !PROVISION_LAB_IMAGE_SCRIPT.contains("Windows11SDK"),
+            "no inline SDK component id may remain in the provision script (QH-17)"
+        );
+        assert!(
+            !PROVISION_LAB_IMAGE_SCRIPT.contains("'--add'"),
+            "no inline --add component list may remain in the provision script (QH-17)"
+        );
+        assert!(
+            VSCONFIG_FILE.contains("Microsoft.VisualStudio.Component.Windows11SDK.26100"),
+            "vsconfig is the authoritative SDK component definition (.26100)"
+        );
+        assert!(
+            !VSCONFIG_FILE.contains("22621"),
+            "stale SDK id 22621 must not reappear (QH-17)"
         );
     }
 

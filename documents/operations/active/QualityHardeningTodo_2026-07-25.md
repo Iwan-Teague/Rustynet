@@ -1072,6 +1072,30 @@ nothing about parallelism — so it is a soft default with no recorded rationale
 stability guard, and serialising a release build on a 2-vCPU guest is the main risk to the
 unoverridable 3600 s budget.
 
+**STATUS 2026-08-29 — CLOSED.** Both fixes implemented on the proposed-fix shape:
+1. The `RUSTUP_HOME`/`CARGO_HOME`/PATH machine-scoped mutation now sits inside a
+   `if ($SkipRustup) { notes } else { ... }` guard at the top of
+   `Provision-RustyNetWindowsLabImage.ps1` (the skip run records
+   `skipped machine toolchain env mutation (-SkipRustup)`); doc header
+   `.PARAMETER SkipRustup` updated to promise the untouched environment.
+2. The inline `--add` component list (the `Windows11SDK.22621` divergence) is
+   removed; the provisioning script now resolves
+   `Join-Path $PSScriptRoot 'RustyNetBuildTools.vsconfig'` (fail-closed `throw`
+   if absent) and passes `--config` to `vs_BuildTools.exe`, matching the
+   bootstrap path's single authoritative component set (VCTools +
+   **Windows11SDK.26100** + VC.CMake.Project). Acceptance criterion 2 holds by
+   grep: the only SDK component id left in the bootstrap tree is `.26100` in the
+   vsconfig.
+
+Verification: new content-pin test
+`provision_lab_image_script_respects_skip_rustup_and_single_vsconfig` in
+`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs`
+`include_str!`s both files and asserts (a) the `-SkipRustup` guard precedes the
+`Set-MachineEnv -Name 'CARGO_HOME'` mutation plus the skip-note marker, and
+(b) `--config` + vsconfig reference present, no `Windows11SDK`/`'--add'` inline
+in the script, vsconfig contains `.26100` and never `22621`. Gated
+(fmt/clippy/check) on the touched crate; no Windows live run (guest offline).
+
 ### QH-18 — The live-lab singleton gate is a `pgrep -f` pattern match that can match its own launcher
 **Severity: HIGH — both directions now VERIFIED. There is no per-host run exclusion at all for the documented invocation form.**
 **Verified against `main` @ `b7667cce`, on `ubuntu-kvm-1`.**
