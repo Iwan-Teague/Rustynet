@@ -1191,6 +1191,87 @@ mod tests {
         }
     }
 
+    /// MAC-D13 parity on the ORCHESTRATOR bootstrap path: genesis must seed
+    /// the encrypted assignment-signing secret at the canonical config root.
+    /// MAC-D13 initially landed the seed step only inside
+    /// `execute_ops_e2e_bootstrap_macos` (`ops e2e-bootstrap-host`), a driver
+    /// the Rust --node orchestrator never invokes for macOS — unlike Linux,
+    /// whose rn_bootstrap.sh calls e2e-bootstrap-host and therefore got the
+    /// secret. The orchestrator's macOS nodes shipped without
+    /// /usr/local/etc/rustynet/assignment.signing.secret and
+    /// distribute_assignments kept failing closed with "assignment signing
+    /// secret missing" even after a verified rebuild (observed live:
+    /// livelab-1788024350, commit 022952bc7e55 — bootstrap_hosts pass, then
+    /// the macOS issuer errored). Pinned here so the seed cannot regress out
+    /// of the path that actually runs.
+    #[test]
+    fn bootstrap_script_seeds_assignment_signing_secret_at_canonical_path() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("assignment init-signing-secret"),
+            "macOS genesis must seed the assignment signing secret \
+             (distribute_assignments fails closed without it)"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("--output \"${CONFIG_ROOT}/assignment.signing.secret\""),
+            "the secret must be seeded at the canonical macOS config root \
+             (/usr/local/etc/rustynet/assignment.signing.secret)"
+        );
+        // Encrypted-at-rest envelope requires a passphrase file, and --force
+        // keeps the secret re-seeded with each per-bootstrap re-genesis so it
+        // never outlives the owner keypair it is bound to.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("--signing-secret-passphrase-file \"${passphrase_file}\"")
+                && BOOTSTRAP_SCRIPT.contains("--force"),
+            "the seed must encrypt the secret under the genesis passphrase and \
+             re-seed with --force per bootstrap"
+        );
+        // The seed must live INSIDE seed_membership_genesis, ordered after the
+        // keychain unwrap descriptor is provisioned (the issuers unwrap the
+        // secret's passphrase via MacosKeychainBackend) — not in a general
+        // cleanup or install phase that could run without genesis.
+        let genesis = BOOTSTRAP_SCRIPT
+            .find("seed_membership_genesis()")
+            .expect("genesis function must exist");
+        let keychain = BOOTSTRAP_SCRIPT[genesis..]
+            .find("-s signing_key_passphrase")
+            .expect("genesis must provision the keychain descriptor");
+        let seed = BOOTSTRAP_SCRIPT[genesis..]
+            .find("assignment init-signing-secret")
+            .expect("genesis must seed the assignment signing secret");
+        assert!(
+            keychain < seed,
+            "the assignment-signing-secret seed must follow the keychain \
+             provisioning inside seed_membership_genesis (keychain at byte \
+             {keychain}, seed at byte {seed})"
+        );
+        // Fail-closed: no allow-failure escape hatch on the seed.
+        for softened in [
+            "assignment init-signing-secret ||",
+            "|| assignment init-signing-secret",
+        ] {
+            assert!(
+                !BOOTSTRAP_SCRIPT.contains(softened),
+                "the seed must fail the bootstrap loud, not soften with '{softened}'"
+            );
+        }
+    }
+
+    /// MAC-D13 drift guard (macOS-gated, mirrors
+    /// owner_signing_key_path_matches_macos_genesis_driver): the path the
+    /// bootstrap script seeds must equal the one the issuance verbs resolve
+    /// (ops_e2e::ASSIGNMENT_SIGNING_SECRET_PATH), or distribute_assignments
+    /// fails closed with "assignment signing secret missing" at the resolved
+    /// path even though genesis seeded a different one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_script_assignment_secret_path_matches_issuance_verbs() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(crate::ops_e2e::ASSIGNMENT_SIGNING_SECRET_PATH),
+            "bootstrap-seeded secret path must match the issuers' resolved path \
+             (ops_e2e::ASSIGNMENT_SIGNING_SECRET_PATH)"
+        );
+    }
+
     #[test]
     fn bootstrap_script_refuses_root_homebrew_fallback() {
         assert!(
