@@ -28,17 +28,23 @@
 //! to stay within the per-argument byte cap, so even a full 128-peer mesh fits
 //! the framing without raising any global limit.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::macos_blind_exit::{
-    DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR, MacosBlindExitManagementCidr, MacosBlindExitPfConfig,
-    build_macos_blind_exit_pf_rules,
+    build_macos_blind_exit_pf_rules, MacosBlindExitManagementCidr, MacosBlindExitPfConfig,
+    DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR,
 };
 use crate::macos_exit_nat::{
-    DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR, MacosExitNatPfConfig, build_macos_exit_nat_pf_rules,
+    build_macos_exit_nat_pf_rules, MacosExitNatPfConfig, DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR,
 };
-use crate::phase10::{MacosKillswitchSpec, ManagementCidr, render_macos_killswitch_pf_rules};
+use crate::macos_tandem_dns_redirect::{
+    build_macos_tandem_dns_redirect_pf_rules, MacosTandemDnsRedirectPfConfig,
+    MACOS_TANDEM_DNS_PF_ANCHOR_PREFIX,
+};
+use crate::phase10::{render_macos_killswitch_pf_rules, MacosKillswitchSpec, ManagementCidr};
 use crate::privileged_helper::MAX_ARG_BYTES;
+use rustynet_control::managed_dns_handoff::{ManagedDnsEndpoint, MeshIpv4Prefix};
+use rustynet_control::tandem_dns::TandemScope;
 
 /// Privileged-command program name for the macOS `pf` load builtin. The daemon
 /// names this program instead of `pfctl` when it needs to load a filter/NAT
@@ -53,6 +59,7 @@ const MAX_SSH_CIDRS: usize = 64;
 const MAX_TRAVERSAL_ENDPOINTS: usize = 64;
 const MAX_MANAGED_PEER_ENDPOINTS: usize = 256;
 const MAX_MESH_CIDRS: usize = 64;
+const MAX_TANDEM_SOURCES: usize = 256;
 
 /// A macOS `pf` anchor load request, addressed by kind. The daemon builds one of
 /// these from its current dataplane state; the helper decodes + re-renders it.
@@ -69,6 +76,12 @@ pub(crate) enum MacosPfLoadSpec {
     BlindExit { config: MacosBlindExitPfConfig },
     /// The fixed-name regular-exit NAT translation anchor (`com.rustynet/nat`).
     ExitNat { config: MacosExitNatPfConfig },
+    /// The generation-scoped tandem DNS redirect anchor
+    /// (`com.rustynet/tdns_g<generation>`): reviewed `rdr` translation forms
+    /// plus the tandem containment filter, additive to every base anchor.
+    TandemDnsRedirect {
+        config: MacosTandemDnsRedirectPfConfig,
+    },
 }
 
 impl MacosPfLoadSpec {
@@ -144,6 +157,21 @@ impl MacosPfLoadSpec {
                 args.push(format!("egress={}", config.egress_interface));
                 push_list(&mut args, "mesh_cidr", config.mesh_cidrs.iter().cloned());
             }
+            MacosPfLoadSpec::TandemDnsRedirect { config } => {
+                args.push("kind=tandem_dns_redirect".to_owned());
+                args.push(format!("tunnel={}", config.tunnel_interface()));
+                args.push(format!("generation={}", config.generation()));
+                args.push(format!("svc={}", config.service_address()));
+                let prefix = config.mesh_prefix();
+                args.push(format!(
+                    "mesh_cidr={}/{}",
+                    prefix.network(),
+                    prefix.prefix_len()
+                ));
+                if let Some(sources) = config.selected_sources() {
+                    push_list(&mut args, "source", sources.iter().map(ToString::to_string));
+                }
+            }
         }
         args
     }
@@ -159,6 +187,11 @@ impl MacosPfLoadSpec {
             }
             MacosPfLoadSpec::BlindExit { .. } => DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR.to_owned(),
             MacosPfLoadSpec::ExitNat { .. } => DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR.to_owned(),
+            // Derived from the generation alone (never from any daemon-supplied
+            // anchor string), mirroring the killswitch derivation.
+            MacosPfLoadSpec::TandemDnsRedirect { config } => {
+                format!("{MACOS_TANDEM_DNS_PF_ANCHOR_PREFIX}{}", config.generation())
+            }
         }
     }
 
@@ -174,6 +207,9 @@ impl MacosPfLoadSpec {
             } => render_macos_killswitch_pf_rules(spec, *strict_fail_closed),
             MacosPfLoadSpec::BlindExit { config } => build_macos_blind_exit_pf_rules(config)?,
             MacosPfLoadSpec::ExitNat { config } => build_macos_exit_nat_pf_rules(config)?,
+            MacosPfLoadSpec::TandemDnsRedirect { config } => {
+                build_macos_tandem_dns_redirect_pf_rules(config)
+            }
         };
         self.assert_rule_invariants(&rules)?;
         Ok(rules)
@@ -220,6 +256,34 @@ impl MacosPfLoadSpec {
                     }
                 }
             }
+            MacosPfLoadSpec::TandemDnsRedirect { .. } => {
+                // The tandem anchor must contain ONLY the reviewed translation
+                // (`rdr ...`) forms and the containment filter forms
+                // (`pass in quick on ...` / `block drop in quick on ...`); at
+                // least one rdr must be present and no `nat ...` rule may
+                // appear (translation in the tandem anchor is rdr-only).
+                let mut rdr_count = 0usize;
+                for line in rules.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if trimmed.starts_with("rdr ") {
+                        rdr_count += 1;
+                    } else if !trimmed.starts_with("pass in quick on ")
+                        && !trimmed.starts_with("block drop in quick on ")
+                    {
+                        return Err(format!(
+                            "macos pf-load tandem anchor contains an unreviewed rule: {trimmed}"
+                        ));
+                    }
+                }
+                if rdr_count == 0 {
+                    return Err(
+                        "macos pf-load tandem anchor contains no rdr translation rule".to_owned(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -248,6 +312,8 @@ impl MacosPfLoadSpec {
         let mut traversal: Vec<&str> = Vec::new();
         let mut managed_peer: Vec<&str> = Vec::new();
         let mut mesh_cidr: Vec<&str> = Vec::new();
+        let mut svc: Option<&str> = None;
+        let mut source: Vec<&str> = Vec::new();
         // PF-14: presence is tracked separately from the parsed values, because
         // `extend_csv` drops empty parts. A token whose value is only separators
         // (`ssh_cidr=,`) leaves the vector EMPTY while the token was very much
@@ -258,6 +324,7 @@ impl MacosPfLoadSpec {
         let mut traversal_seen = false;
         let mut managed_peer_seen = false;
         let mut mesh_cidr_seen = false;
+        let mut source_seen = false;
 
         for arg in args {
             let (key, value) = arg
@@ -291,6 +358,11 @@ impl MacosPfLoadSpec {
                     mesh_cidr_seen = true;
                     extend_csv(&mut mesh_cidr, value);
                 }
+                "svc" => set_once(&mut svc, key, value)?,
+                "source" => {
+                    source_seen = true;
+                    extend_csv(&mut source, value);
+                }
                 other => return Err(format!("unknown macos pf-load token key: {other}")),
             }
         }
@@ -303,13 +375,16 @@ impl MacosPfLoadSpec {
             MAX_MANAGED_PEER_ENDPOINTS,
         )?;
         bound_list("mesh_cidr", mesh_cidr.len(), MAX_MESH_CIDRS)?;
+        bound_list("source", source.len(), MAX_TANDEM_SOURCES)?;
 
         match kind {
             Some("killswitch") => {
                 // Reject fields that do not belong to this kind (fail closed).
                 reject_present("killswitch", "tunnel", tunnel)?;
                 reject_present("killswitch", "ipv6_tunnel_allowed", ipv6_tunnel_allowed)?;
+                reject_present("killswitch", "svc", svc)?;
                 reject_list_present("killswitch", "mesh_cidr", mesh_cidr_seen)?;
+                reject_list_present("killswitch", "source", source_seen)?;
 
                 let generation = parse_u64(require(generation, "generation")?, "generation")?;
                 let strict_fail_closed = parse_bool(require(strict, "strict")?, "strict")?;
@@ -368,8 +443,10 @@ impl MacosPfLoadSpec {
                 )?;
                 reject_present("blind_exit", "fail_closed_ssh_allow", fail_closed_ssh_allow)?;
                 reject_present("blind_exit", "ipv6_blocked", ipv6_blocked)?;
+                reject_present("blind_exit", "svc", svc)?;
                 reject_list_present("blind_exit", "traversal", traversal_seen)?;
                 reject_list_present("blind_exit", "managed_peer", managed_peer_seen)?;
+                reject_list_present("blind_exit", "source", source_seen)?;
 
                 let tunnel_interface = require(tunnel, "tunnel")?.to_owned();
                 let egress_interface = require(egress, "egress")?.to_owned();
@@ -414,9 +491,11 @@ impl MacosPfLoadSpec {
                 reject_present("exit_nat", "fail_closed_ssh_allow", fail_closed_ssh_allow)?;
                 reject_present("exit_nat", "ipv6_blocked", ipv6_blocked)?;
                 reject_present("exit_nat", "ipv6_tunnel_allowed", ipv6_tunnel_allowed)?;
+                reject_present("exit_nat", "svc", svc)?;
                 reject_list_present("exit_nat", "ssh_cidr", ssh_cidr_seen)?;
                 reject_list_present("exit_nat", "traversal", traversal_seen)?;
                 reject_list_present("exit_nat", "managed_peer", managed_peer_seen)?;
+                reject_list_present("exit_nat", "source", source_seen)?;
 
                 let egress_interface = require(egress, "egress")?.to_owned();
                 if mesh_cidr.is_empty() {
@@ -426,6 +505,67 @@ impl MacosPfLoadSpec {
                 // `new` validates the egress interface and every mesh CIDR.
                 let config = MacosExitNatPfConfig::new(egress_interface, mesh_cidrs)?;
                 Ok(MacosPfLoadSpec::ExitNat { config })
+            }
+            Some("tandem_dns_redirect") => {
+                // Reject fields that do not belong to this kind (fail closed).
+                reject_present("tandem_dns_redirect", "strict", strict)?;
+                reject_present("tandem_dns_redirect", "interface", interface)?;
+                reject_present("tandem_dns_redirect", "egress", egress)?;
+                reject_present("tandem_dns_redirect", "dns_protected", dns_protected)?;
+                reject_present(
+                    "tandem_dns_redirect",
+                    "allow_egress_interface",
+                    allow_egress_interface,
+                )?;
+                reject_present(
+                    "tandem_dns_redirect",
+                    "fail_closed_ssh_allow",
+                    fail_closed_ssh_allow,
+                )?;
+                reject_present("tandem_dns_redirect", "ipv6_blocked", ipv6_blocked)?;
+                reject_present(
+                    "tandem_dns_redirect",
+                    "ipv6_tunnel_allowed",
+                    ipv6_tunnel_allowed,
+                )?;
+                reject_list_present("tandem_dns_redirect", "ssh_cidr", ssh_cidr_seen)?;
+                reject_list_present("tandem_dns_redirect", "traversal", traversal_seen)?;
+                reject_list_present("tandem_dns_redirect", "managed_peer", managed_peer_seen)?;
+
+                let tunnel_interface = parse_interface(require(tunnel, "tunnel")?)?;
+                let generation = parse_u64(require(generation, "generation")?, "generation")?;
+                let svc_raw = require(svc, "svc")?;
+                let service_address: Ipv4Addr = svc_raw.parse().map_err(|_| {
+                    format!("macos pf-load tandem svc must be an IPv4 address, got {svc_raw:?}")
+                })?;
+                let mesh = match mesh_cidr.as_slice() {
+                    [single] => (*single).to_owned(),
+                    [] => return Err("tandem_dns_redirect spec missing mesh_cidr".to_owned()),
+                    _ => {
+                        return Err(
+                            "tandem_dns_redirect spec expects exactly one mesh_cidr".to_owned()
+                        );
+                    }
+                };
+                let mesh_prefix = parse_mesh_prefix(&mesh)?;
+                // An absent `source` list means all clients using this exit
+                // (tunnel-input-scoped); a present list is the explicit
+                // NodeIds mesh-address set. `new` re-validates every field,
+                // including service-in-mesh membership, fail-closed.
+                let scope = if source.is_empty() {
+                    TandemScope::AllClientsUsingExit
+                } else {
+                    TandemScope::NodeIds(source.iter().map(|value| (*value).to_owned()).collect())
+                };
+                let config = MacosTandemDnsRedirectPfConfig::new(
+                    &tunnel_interface,
+                    generation,
+                    &scope,
+                    &ManagedDnsEndpoint::new(service_address),
+                    Some(&mesh_prefix),
+                )
+                .map_err(|err| err.to_string())?;
+                Ok(MacosPfLoadSpec::TandemDnsRedirect { config })
             }
             Some(other) => Err(format!("unknown macos pf-load kind: {other}")),
             None => Err("macos pf-load spec missing kind".to_owned()),
@@ -597,6 +737,22 @@ fn parse_socket_addr(value: &str) -> Result<SocketAddr, String> {
         .map_err(|_| format!("macos pf-load invalid endpoint: {value:?}"))
 }
 
+/// Parse a validated IPv4 mesh prefix (`a.b.c.d/len`) used to re-prove, on the
+/// helper side, that the tandem service address sits inside the mesh.
+fn parse_mesh_prefix(value: &str) -> Result<MeshIpv4Prefix, String> {
+    let (base, len) = value
+        .split_once('/')
+        .ok_or_else(|| format!("macos pf-load invalid mesh_cidr: {value:?}"))?;
+    let network: Ipv4Addr = base
+        .parse()
+        .map_err(|_| format!("macos pf-load invalid mesh_cidr address: {value:?}"))?;
+    let prefix_len: u8 = len
+        .parse()
+        .map_err(|_| format!("macos pf-load invalid mesh_cidr prefix length: {value:?}"))?;
+    MeshIpv4Prefix::new(network, prefix_len)
+        .ok_or_else(|| format!("macos pf-load invalid mesh_cidr: {value:?}"))
+}
+
 fn pf_family_for_cidr_str(value: &str) -> Result<&'static str, String> {
     let base = value
         .split_once('/')
@@ -681,7 +837,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::privileged_helper::{MAX_ARG_BYTES, MAX_ARGS};
+    use crate::privileged_helper::{MAX_ARGS, MAX_ARG_BYTES};
     use std::str::FromStr;
 
     fn killswitch(spec: MacosKillswitchSpec, generation: u64, strict: bool) -> MacosPfLoadSpec {
@@ -699,9 +855,7 @@ mod tests {
             dns_protected: true,
             allow_egress_interface: false,
             fail_closed_ssh_allow: true,
-            fail_closed_ssh_allow_cidrs: vec![
-                ManagementCidr::from_str("192.168.128.0/24").unwrap(),
-            ],
+            fail_closed_ssh_allow_cidrs: vec![ManagementCidr::from_str("192.168.128.0/24").unwrap()],
             traversal_bootstrap_allow_endpoints: vec!["203.0.113.10:3478".parse().unwrap()],
             managed_peer_egress_endpoints: vec!["192.168.65.3:51820".parse().unwrap()],
             ipv6_blocked: true,
@@ -972,13 +1126,11 @@ mod tests {
         assert_eq!(decoded, original);
         assert_eq!(decoded.render().unwrap(), original.render().unwrap());
         assert_eq!(decoded.anchor_name(), "com.rustynet/blind_exit");
-        assert!(
-            decoded
-                .render()
-                .unwrap()
-                .trim_end()
-                .ends_with("block drop out quick all")
-        );
+        assert!(decoded
+            .render()
+            .unwrap()
+            .trim_end()
+            .ends_with("block drop out quick all"));
     }
 
     #[test]
@@ -1108,12 +1260,11 @@ mod tests {
         // never produced by the daemon, but accept-or-reject it cannot weaken
         // the killswitch, so we only require it not to bypass the terminal block.
         if let Ok(spec) = MacosPfLoadSpec::decode(&refs) {
-            assert!(
-                spec.render()
-                    .unwrap()
-                    .trim_end()
-                    .ends_with("block drop out quick all")
-            );
+            assert!(spec
+                .render()
+                .unwrap()
+                .trim_end()
+                .ends_with("block drop out quick all"));
         }
 
         let mut bad_ip = base();
@@ -1184,33 +1335,29 @@ mod tests {
         // must catch it before the rules ever load.
         let ks = killswitch(rich_killswitch_spec(), 1, false);
         // Filter anchor missing the terminal default-deny -> rejected.
-        assert!(
-            ks.assert_rule_invariants("set block-policy drop\npass out quick all\n")
-                .is_err()
-        );
+        assert!(ks
+            .assert_rule_invariants("set block-policy drop\npass out quick all\n")
+            .is_err());
         // route-to bypass primitive in a filter anchor -> rejected.
-        assert!(
-            ks.assert_rule_invariants(
+        assert!(ks
+            .assert_rule_invariants(
                 "pass out quick on en0 route-to (en0 1.2.3.4) all\nblock drop out quick all\n"
             )
-            .is_err()
-        );
+            .is_err());
 
         let nat = MacosPfLoadSpec::ExitNat {
             config: MacosExitNatPfConfig::new("en0", vec!["100.64.0.0/10".to_owned()]).unwrap(),
         };
         // A filter rule smuggled into the translation anchor -> rejected.
-        assert!(
-            nat.assert_rule_invariants(
+        assert!(nat
+            .assert_rule_invariants(
                 "nat on en0 inet from 100.64.0.0/10 to any -> (en0)\npass out quick all\n"
             )
-            .is_err()
-        );
+            .is_err());
         // A clean nat-only ruleset passes.
-        assert!(
-            nat.assert_rule_invariants("nat on en0 inet from 100.64.0.0/10 to any -> (en0)\n")
-                .is_ok()
-        );
+        assert!(nat
+            .assert_rule_invariants("nat on en0 inet from 100.64.0.0/10 to any -> (en0)\n")
+            .is_ok());
     }
 
     #[test]
@@ -1304,5 +1451,197 @@ mod tests {
         } else {
             panic!("expected killswitch");
         }
+    }
+
+    fn tandem_service() -> Ipv4Addr {
+        Ipv4Addr::new(100, 64, 0, 7)
+    }
+
+    fn tandem_mesh_prefix() -> MeshIpv4Prefix {
+        MeshIpv4Prefix::new(Ipv4Addr::new(100, 64, 0, 0), 10).unwrap()
+    }
+
+    fn tandem_config(scope: &TandemScope) -> MacosTandemDnsRedirectPfConfig {
+        MacosTandemDnsRedirectPfConfig::new(
+            "utun9",
+            3,
+            scope,
+            &ManagedDnsEndpoint::new(tandem_service()),
+            Some(&tandem_mesh_prefix()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tandem_all_clients_roundtrip_renders_rdr_only() {
+        let original = MacosPfLoadSpec::TandemDnsRedirect {
+            config: tandem_config(&TandemScope::AllClientsUsingExit),
+        };
+        let encoded = original.encode();
+        assert!(
+            encoded.contains(&"kind=tandem_dns_redirect".to_owned())
+                && !encoded.iter().any(|t| t.starts_with("source=")),
+            "absent source list must mean all-clients"
+        );
+        let refs: Vec<&str> = encoded.iter().map(String::as_str).collect();
+        let decoded = MacosPfLoadSpec::decode(&refs).expect("decode");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.anchor_name(), "com.rustynet/tdns_g3");
+        let rules = decoded.render().unwrap();
+        // Only rdr translation + containment filter forms; no `nat ` rule.
+        for line in rules
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+        {
+            assert!(
+                line.starts_with("rdr ")
+                    || line.starts_with("pass in quick on ")
+                    || line.starts_with("block drop in quick on ")
+                    || line.starts_with("# "),
+                "unreviewed tandem rule: {line}"
+            );
+        }
+        assert!(rules.contains(
+            "rdr on utun9 inet proto udp from any to ! 100.64.0.7 port 53 -> 100.64.0.7 port 53"
+        ));
+    }
+
+    #[test]
+    fn tandem_node_ids_roundtrip_carries_the_source_set() {
+        let scope = TandemScope::NodeIds(vec!["100.64.0.11".to_owned(), "100.64.0.12".to_owned()]);
+        let original = MacosPfLoadSpec::TandemDnsRedirect {
+            config: tandem_config(&scope),
+        };
+        let encoded = original.encode();
+        assert!(encoded
+            .iter()
+            .any(|t| t.contains("source=100.64.0.11,100.64.0.12")));
+        let refs: Vec<&str> = encoded.iter().map(String::as_str).collect();
+        let decoded = MacosPfLoadSpec::decode(&refs).expect("decode");
+        assert_eq!(decoded, original);
+        let MacosPfLoadSpec::TandemDnsRedirect { config } = &decoded else {
+            panic!("expected tandem kind");
+        };
+        assert_eq!(
+            config.selected_sources(),
+            Some(&[Ipv4Addr::new(100, 64, 0, 11), Ipv4Addr::new(100, 64, 0, 12)][..])
+        );
+        // The explicit set appears on every rendered rule.
+        let rules = decoded.render().unwrap();
+        assert_eq!(
+            rules.matches("from { 100.64.0.11, 100.64.0.12 } ").count(),
+            6
+        );
+    }
+
+    #[test]
+    fn tandem_decode_rejects_cross_kind_and_bad_fields() {
+        let base = MacosPfLoadSpec::TandemDnsRedirect {
+            config: tandem_config(&TandemScope::AllClientsUsingExit),
+        }
+        .encode();
+
+        // Any other-kind scalar or list token must be refused.
+        for hostile in [
+            "egress=en0",
+            "interface=en0",
+            "strict=true",
+            "dns_protected=true",
+            "ssh_cidr=192.168.0.0/24",
+            "traversal=1.2.3.4:53",
+            "managed_peer=1.2.3.4:53",
+        ] {
+            let mut tokens = base.clone();
+            tokens.push(hostile.to_owned());
+            let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            assert!(
+                MacosPfLoadSpec::decode(&refs).is_err(),
+                "tandem spec must refuse {hostile}"
+            );
+        }
+
+        // Bad service address and bad mesh prefix refuse (fail-closed: the
+        // helper cannot prove service-in-mesh without them).
+        for mutation in ["svc=not-an-ip", "mesh_cidr=100.64.0.0", "mesh_cidr=bogus"] {
+            let key = format!(
+                "{}=",
+                mutation.split('=').next().expect("mutation carries a key")
+            );
+            let tokens: Vec<String> = base
+                .iter()
+                .map(|t| {
+                    if t.starts_with(&key) {
+                        mutation.to_owned()
+                    } else {
+                        t.clone()
+                    }
+                })
+                .collect();
+            let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            assert!(
+                MacosPfLoadSpec::decode(&refs).is_err(),
+                "tandem spec must refuse {mutation}"
+            );
+        }
+
+        // An off-mesh service address refuses on the helper side too: decode
+        // re-proves containment against the transported mesh prefix.
+        let off_mesh: Vec<String> = base
+            .iter()
+            .map(|t| {
+                if t.starts_with("svc=") {
+                    "svc=192.0.2.9".to_owned()
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = off_mesh.iter().map(String::as_str).collect();
+        assert!(MacosPfLoadSpec::decode(&refs).is_err());
+
+        // The unmodified spec still decodes.
+        let refs: Vec<&str> = base.iter().map(String::as_str).collect();
+        MacosPfLoadSpec::decode(&refs).expect("the unmodified tandem spec must still decode");
+    }
+
+    #[test]
+    fn other_kinds_reject_tandem_tokens() {
+        // svc / source do not belong to the base kinds.
+        let mut killswitch = killswitch(rich_killswitch_spec(), 3, false).encode();
+        killswitch.push("svc=100.64.0.7".to_owned());
+        killswitch.push("source=100.64.0.11".to_owned());
+        let refs: Vec<&str> = killswitch.iter().map(String::as_str).collect();
+        assert!(MacosPfLoadSpec::decode(&refs).is_err());
+
+        let mut nat = MacosPfLoadSpec::ExitNat {
+            config: MacosExitNatPfConfig::new("en0", vec!["100.64.0.0/10".to_owned()]).unwrap(),
+        }
+        .encode();
+        nat.push("svc=100.64.0.7".to_owned());
+        let refs: Vec<&str> = nat.iter().map(String::as_str).collect();
+        assert!(MacosPfLoadSpec::decode(&refs).is_err());
+    }
+
+    #[test]
+    fn tandem_assert_invariants_catch_builder_regressions() {
+        let tandem = MacosPfLoadSpec::TandemDnsRedirect {
+            config: tandem_config(&TandemScope::AllClientsUsingExit),
+        };
+        let rules = tandem.render().unwrap();
+        assert!(tandem.assert_rule_invariants(&rules).is_ok());
+        // A nat rule in the tandem anchor is unreviewed.
+        assert!(tandem
+            .assert_rule_invariants(&format!(
+                "nat on en0 inet from any to any -> (en0)\n{rules}"
+            ))
+            .is_err());
+        // A broad permissive pass is unreviewed.
+        assert!(tandem
+            .assert_rule_invariants(&format!("pass out quick all\n{rules}"))
+            .is_err());
+        // No rdr at all is rejected.
+        assert!(tandem
+            .assert_rule_invariants("pass in quick on utun9 all\n")
+            .is_err());
     }
 }
