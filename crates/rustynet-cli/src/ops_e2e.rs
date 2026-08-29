@@ -32,7 +32,24 @@ const MEMBERSHIP_STATE_OWNER: &str = "rustynetd";
 const MEMBERSHIP_STATE_GROUP: &str = "rustynetd";
 const MEMBERSHIP_STATE_MODE: &str = "0600";
 const MEMBERSHIP_STATE_OWNER_GROUP: &str = "rustynetd:rustynetd";
-const ROOT_OWNER_GROUP: &str = "root:root";
+
+/// MAC-D9: the gid-0 group NAME differs by Unix platform — `wheel` on macOS,
+/// `root` on Linux. BSD chown on macOS rejects `root:root` with
+/// "chown: root: illegal group name", which failed `membership_init` on the
+/// macOS exit cell. Every chown/install that targets the root GROUP on a
+/// Unix guest must go through this helper instead of a literal `root:root`.
+///
+/// (Ownership of the membership snapshot/log/watermark remains root-owned
+/// with the gid-0 group here: the CLI runs as root at mutation time and the
+/// daemon takes the files back via the daemon-group fixture afterwards —
+/// see `set_membership_state_permissions_for`.)
+fn root_owner_group() -> String {
+    if cfg!(target_os = "macos") {
+        "root:wheel".to_owned()
+    } else {
+        "root:root".to_owned()
+    }
+}
 
 fn fill_os_random_bytes(bytes: &mut [u8], label: &str) -> Result<(), String> {
     OsRng
@@ -527,7 +544,7 @@ pub fn execute_ops_e2e_bootstrap_host(
         run_status(
             "chown",
             &[
-                "root:root",
+                root_owner_group().as_str(),
                 "/etc/rustynet/credentials/wg_key_passphrase.cred",
             ],
             &[],
@@ -554,7 +571,7 @@ pub fn execute_ops_e2e_bootstrap_host(
         run_status(
             "chown",
             &[
-                "root:root",
+                root_owner_group().as_str(),
                 "/etc/rustynet/credentials/signing_key_passphrase.cred",
             ],
             &[],
@@ -646,7 +663,10 @@ pub fn execute_ops_e2e_bootstrap_host(
         )?;
         run_status(
             "chown",
-            &["root:root", "/var/lib/rustynet/rustynetd.trust"],
+            &[
+                root_owner_group().as_str(),
+                "/var/lib/rustynet/rustynetd.trust",
+            ],
             &[],
             "chown trust evidence failed during e2e bootstrap",
         )?;
@@ -2034,7 +2054,7 @@ pub fn execute_ops_e2e_membership_add(
     let state_path_refs = state_paths.iter().map(String::as_str).collect::<Vec<_>>();
 
     let result = (|| -> Result<(), String> {
-        set_membership_state_permissions_for(state_path_refs.as_slice(), ROOT_OWNER_GROUP)?;
+        set_membership_state_permissions_for(state_path_refs.as_slice(), &root_owner_group())?;
 
         run_status(
             "rustynet",
@@ -2487,7 +2507,7 @@ pub fn execute_ops_e2e_membership_set_capabilities(
     let state_path_refs = state_paths.iter().map(String::as_str).collect::<Vec<_>>();
 
     let result = (|| -> Result<(), String> {
-        set_membership_state_permissions_for(state_path_refs.as_slice(), ROOT_OWNER_GROUP)?;
+        set_membership_state_permissions_for(state_path_refs.as_slice(), &root_owner_group())?;
 
         run_status(
             "rustynet",
@@ -6989,8 +7009,10 @@ fn normalize_membership_permissions(
 ///
 /// Used by both the Linux-only legacy path (membership add) and the
 /// cross-platform Phase 22 rewrite of `e2e-membership-set-capabilities`.
-/// Linux + macOS: chown the snapshot/log/watermark to `<owner_group>` and
-/// reset mode to 0600 so the running daemon can take ownership back via
+/// Linux + macOS: chown the snapshot/log/watermark to `<owner_group>` —
+/// pass `root_owner_group()` (`root:root` on Linux, `root:wheel` on
+/// macOS, MAC-D9) — and reset mode to 0600 so the running daemon can take
+/// ownership back via
 /// the daemon-group fixture once the mutation is applied. On Windows the
 /// CLI is running as Administrator and the existing NTFS ACLs on the
 /// reviewed membership-root grant SYSTEM + Administrators write access,
@@ -9057,5 +9079,26 @@ mod macos_enforce_tests {
         assert!(!is_valid_utun("en0"));
         assert!(!is_valid_utun("utunX"));
         assert!(!is_valid_utun("rustynet0"));
+    }
+
+    /// MAC-D9: the root owner:group string must name the platform's real
+    /// gid-0 group — `wheel` on macOS (there is NO group named `root`;
+    /// BSD chown rejects `root:root` with "illegal group name") and `root`
+    /// on Linux. This pins the platform gate so a future refactor cannot
+    /// reintroduce the Linux-only literal on the macOS membership path.
+    #[test]
+    fn root_owner_group_uses_platform_gid0_group_name() {
+        let owner_group = super::root_owner_group();
+        assert_eq!(owner_group.split(':').next(), Some("root"));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(owner_group, "root:wheel");
+            assert!(!owner_group.ends_with(":root"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(owner_group, "root:root");
+        }
     }
 }
