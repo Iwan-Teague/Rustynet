@@ -903,6 +903,32 @@ against a shared lab host that another line is using.
 ### QH-14 — `ops vm-lab-provision-toolchain` is Debian/apt-only despite detecting other distros
 **Severity: medium (tooling completeness). Confidence: VERIFIED live.**
 
+**CLOSED 2026-08-29.** `GUEST_TOOLCHAIN_SCRIPT` (now in
+`crates/rustynet-cli/src/vm_lab/script_template.rs`) detects the distro family
+from `/etc/os-release` ($ID first, then $ID_LIKE — the same order
+rustynet-sysinfo's `pkg_family_for` uses) and installs with the matching package
+manager: apt for Debian/Ubuntu/Mint, dnf (yum fallback) for
+Fedora/Rocky/Alma/RHEL/CentOS, zypper for openSUSE/SLES, pacman for Arch-family.
+Debian package names are mapped per family (build-essential→gcc gcc-c++ make
+diffutils, libclang-dev→clang-devel, libssl-dev→openssl-devel,
+libsqlite3-dev→sqlite-devel/sqlite3-devel, dnsutils→bind-utils,
+iputils-ping→iputils, pkg-config→pkgconf-pkg-config, iproute2→iproute; Arch uses
+base-devel + bind + headerful runtime packages). An unrecognized distro fails
+loudly and specifically (`FATAL: unsupported distro '$ID' (...) — only apt,
+dnf/yum, zypper and pacman provisioning are implemented`), as does a failed
+install on any family (exit status captured, output tail printed — the old
+script discarded the install rc into /dev/null). A fedora-family image with
+neither dnf nor yum also fails loudly naming both. Content-pinned by
+`the_guest_toolchain_installs_with_each_detected_distros_package_manager` in the
+script_template tests (guards, per-family invocations, per-family package names,
+4× rc capture, the unsupported-distro FATAL, and VERIFY_ONLY independence); the
+detection case statement was additionally exercised directly for fedora, debian,
+ubuntu, rocky, opensuse-leap, arch, linuxmint, an unknown ID, and four ID_LIKE
+fallbacks. One correction to the original write-up: the script never "detected
+Fedora" — it only *printed* PRETTY_NAME as a banner; the substance (apt-only,
+Fedora fails at apt-get) was accurate.
+
+Original report (pre-fix):
 `GUEST_TOOLCHAIN_SCRIPT` in `crates/rustynet-cli/src/vm_lab/mod.rs` detects Fedora
 correctly and then unconditionally invokes `apt-get`. There are **zero** `dnf`
 occurrences anywhere under `crates/rustynet-cli/src/vm_lab/`. Provisioning a
