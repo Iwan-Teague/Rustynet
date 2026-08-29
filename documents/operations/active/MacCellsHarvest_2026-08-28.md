@@ -1512,3 +1512,120 @@ baseline-runtime goes green. Exit track remains blocked on MAC-D6
 (`macos_membership.rs:197-202` invented `ops owner-approver-id`
 subcommand; fix shape = derive `"{exit_node_id}-owner"` per
 `linux_membership.rs:72-74`) — not this cell's blocker.
+
+## 13. Exit cell re-run after MAC-D6 — 2026-08-29 (isolated edit branch)
+
+Isolated worktree `ai-edit/edit-1787980490991-56044-48`, HEAD `6caf2de9`
+(carries MAC-D2/D4/D5/D6 + D-4a sequencer merge), tree clean. Fresh
+bootstrap, same §10.1 shape: `--node macos-utm-1:exit --node
+lenovo-exit-1:entry --node lenovo-client-1:client --trust-inventory-ready
+--ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --known-hosts-file
+~/.ssh/known_hosts`. Guests SSH-verified pre-launch (macos-utm-1
+192.168.65.101 had one transient ssh-tcp-not-open flap at the first
+launch attempt; clean on re-probe).
+
+### 13.1 Launch gate: anchor-cell failure declined (not bypassed)
+
+First launch (06:21) was REFUSED by `enforce_launch_gate`: the concurrent
+ANCHOR-cell run `livelab-1787979574-8dea0044ce94::validate_baseline_runtime`
+(§12) had an unremedied triage stub. Recorded a `none:` decline patch
+against the stub in this worktree's
+`documents/operations/live_lab_stage_triage.jsonl`: the failure is the
+anchor cell's own blocker (§12.6 three-item list), different role cell /
+worktree (`-46`) / commit (`8dea0044`), untouched by MAC-D2/D4/D5/D6
+(exit-cell membership harness only). No bypass flag used; the gate's
+sanctioned decline path is the mechanism.
+
+### 13.2 Run result — MAC-D6 LIVE-CONFIRMED, deeper blocker
+
+Run `livelab-1787982560-6caf2de92b72`, 2026-08-29T05:30:50Z →
+05:49:19Z, commit `6caf2de9`, dirty=clean, 3 nodes / 64 stages:
+**9 pass / 1 fail (`membership_init`) / 54 skip** (report
+`state/mac-cells/exit5-20260829-062831`; stage evidence from
+`logs/membership_init.log` + `orchestration/orchestrate_result.json`,
+not the CSV column).
+
+The §11 failure signature is GONE — no `exit Some(64): unknown ops
+subcommand: owner-approver-id`, no `owner-approver-id contains
+unsupported characters`. The peer-add loop's approver-id derivation
+(MAC-D6's `"{exit_node_id}-owner"` mirroring `linux_membership.rs:72-74`)
+was accepted by the real CLI: membership_init now reaches the REMOTE
+`init_membership_snapshot` command on the guest and fails there.
+MAC-D2+D4+D5+D6 are all live-confirmed at their respective layers.
+
+### 13.3 New blocker: macOS install adapter never provisions the credential workspace
+
+Full stage error (exit Some(1), stdout):
+
+```
+error [generic_failure (1)]: credential workspace parent missing or
+unreadable (/usr/local/var/rustynet/credentials-workspace): No such
+file or directory (os error 2); run the platform install adapter so the
+parent is provisioned with the reviewed ACL
+```
+
+Classification: **macOS install-adapter CODE GAP (provisioning-parity
+miss), not env.** Chain:
+
+1. Enforcing check (fail-closed, by design):
+   `crates/rustynet-cli/src/ops_e2e.rs:2262-2271`
+   (`stage_membership_signing_passphrase` symlink_metadata on
+   `paths.secure_workspace_parent`; symlink/file also rejected) with
+   constant `MACOS_CREDENTIALS_WORKSPACE_DIR` at
+   `crates/rustynet-cli/src/ops_e2e.rs:2173`
+   (`/usr/local/var/rustynet/credentials-workspace`).
+2. Windows parity exists:
+   `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs:34`
+   + `INSTALL_SERVICE_SCRIPT` (`Join-Path $StateRoot
+   'credentials-workspace'`).
+3. Linux parity exists AND fixed the identical bug:
+   `crates/rustynet-cli/src/ops_install_systemd.rs:170-179`
+   (`ensure_directory_with_owner_mode(..., 0o700, root, daemon_gid)`;
+   comment records the same "credential workspace parent missing"
+   failure class and the Phase 27 reviewer fold-in).
+4. macOS gap: `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs`
+   defines `MACOS_STATE_ROOT`/`MACOS_KEYS_DIR`/`MACOS_MEMBERSHIP_DIR`
+   (lines 23-26) and its install script creates
+   `${STATE_ROOT}/membership` etc., but `credentials-workspace` appears
+   NOWHERE in the file (grep-verified), so a fresh bootstrap never
+   creates the 0700 parent.
+
+Fix shape (MAC-D7 candidate, install-adapter parity): add
+`install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}/credentials-workspace"`
+to the macOS install service script in `macos_install.rs` (same pattern
+as the trust-dir provisioning at lines ~1897-1921), plus a
+verifier-assertion test mirroring the existing
+`INSTALL_SERVICE_SCRIPT.contains(...)` assertions, and re-run the exit
+cell. Ops verbs run as root and create per-invocation 0700 subdirs via
+`mkdir(2)` atomically (same fence as Linux, `ops_install_systemd.rs`
+comment).
+
+### 13.4 Exit stages + DnsFailclosed (M1)
+
+All downstream stages graded skip again behind `membership_init`
+(`distribute_membership`, `exit_handoff`, `active_exit`,
+`exit_dns_failclosed_validation`, `exit_nat_lifecycle_validation`,
+`exit_demotion_residue_validation`, `blind_exit_dataplane_validation`).
+**DnsFailclosed remains unexercised on the macOS exit cell** — M1 still
+pending; first gate it must clear is MAC-D7.
+
+### 13.5 Ledger row verified
+
+Row appended (worktree
+`documents/operations/live_lab_node_run_matrix.csv`, quote-aware parse):
+run `livelab-1787982560-6caf2de92b72`, commit `6caf2de9`, dirty=clean,
+overall fail, first_failed_stage `membership_init`, report
+`state/mac-cells/exit5-20260829-062831`, summary `passed=9 failed=1
+skipped=54`, macos exit alias macos-utm-1 @ 192.168.65.101,
+lenovo-exit-1 entry @ 192.168.0.31, lenovo-client-1 client @
+192.168.0.30.
+
+### 13.6 Verdict
+
+Exit cell: **BLOCKED**, one step deeper than §11. MAC-D6
+live-confirmed; the membership harness (seed → node-id → approver-id)
+is fully proven live. Next blocker is a single-item install-adapter
+provisioning gap (MAC-D7 shape in §13.3) — first failure that is about
+the GUEST-side install state rather than the host-side harness. Cell
+should reach `active_exit` + the three exit validation stages (and give
+M1 DnsFailclosed its first macOS exercise) once MAC-D7 lands.
