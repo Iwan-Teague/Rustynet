@@ -1805,3 +1805,109 @@ review/merge:
   giving M1 DnsFailclosed its first macOS exercise — **needs a live-lab
   re-run to prove; not yet verified live** (no lab run was part of this
   fix).
+
+## 15. Exit cell re-run after MAC-D8 — 2026-08-29 (isolated edit branch)
+
+Re-ran the macOS `exit` cell now that MAC-D8 (provision
+`${STATE_ROOT}/credentials-workspace` in the macOS bootstrap, §13.7) landed.
+Worktree `ai-edit/edit-1787985624508-56044-53`, HEAD `f2d215f76b58` (the MAC-D8
+merge), tree clean at launch. Fresh bootstrap, fresh report dir. This was the
+first run expected to get past the credentials-workspace gap and reach the
+three exit dataplane validation stages (`exit_nat_lifecycle_validation` /
+`exit_demotion_residue_validation` / `exit_dns_failclosed_validation`) — the
+first real macOS EXIT ROLE dataplane test.
+
+### 15.1 Run
+
+- Run `livelab-1787987090-f2d215f76b58` (internal summary id `rust-1787985803`
+  — both ids name the same run; noted honestly), report dir
+  `state/mac-cells/exit5-20260829-074238`, elapsed ~20m, profile
+  `mgmt_shared_smoke_v1` (derived). Topology 3 nodes via the §8.1 post-W5.7
+  shape: `--node macos-utm-1:exit --node lenovo-exit-1:entry --node
+  lenovo-client-1:client`. 64 stages: **9 pass / 1 fail / 54 skip**, overall
+  fail, `first_failed_stage = membership_init`.
+- Passed before the failure: `preflight`, `prepare_source_archive`,
+  `verify_ssh_reachability`, `cleanup_hosts`, **`bootstrap_hosts`** (fresh mac
+  bootstrap incl. MAC-D8 provisioning), `cross_network_substrate_setup`,
+  `collect_pubkeys`.
+
+### 15.2 MAC-D8: LIVE-CONFIRMED (bootstrap side)
+
+`bootstrap_hosts` passed on all three nodes including the fresh macOS
+bootstrap — `setup_directories` provisioning the `credentials-workspace`
+parent (root:rustynetd 0700) now works live. The §13 blocker that failed the
+previous exit run (`livelab-1787967356-494dc61437ef`, §13, failure inside
+membership passphrase staging) is gone. MAC-D8's bootstrap half is proven.
+
+### 15.3 New blocker — MAC-D9: membership-state chown uses Linux group name on macOS
+
+`membership_init` failed with:
+
+```
+init_membership_snapshot: remote command failed (exit Some(1)): error
+[generic_failure (1)]: membership state chown failed: status=1 stderr=chown:
+root: illegal group name
+```
+
+Root cause pinned:
+
+- `crates/rustynet-cli/src/ops_e2e.rs:35` — `ROOT_OWNER_GROUP: &str =
+  "root:root"` (Linux-style `owner:group` string).
+- `crates/rustynet-cli/src/ops_e2e.rs:6999` — `fn
+  set_membership_state_permissions_for(paths, owner_group)`; the non-Windows
+  branch runs `Command::new("chown").arg(owner_group).args(paths)` on the mac
+  guest; the error string emits at ~`:7035`.
+- Call sites `:2037` and `:2490` both pass `ROOT_OWNER_GROUP` — so the macOS
+  membership snapshot/log/watermark files (e.g.
+  `/var/lib/rustynet/membership.snapshot`) get chowned to group `root`.
+
+macOS has **no group named `root`** — gid 0 is `wheel`. Verified live on the
+guest: `grep '^root:' /etc/group` → empty; `dscl . -read /Groups/root` →
+`DS Error -14136 eDSRecordNotFound`; `id root` → `gid=0(**wheel**)`. BSD
+chown therefore rejects `root:root`, the remote command exits 1, and the
+stage fails. **Classification: macOS CODE GAP** — a Linux-parity chown target
+reused verbatim on macOS; not env, not owner-gated. (The doc comment at
+~`:6986` claims "Linux + macOS: chown the snapshot/log/watermark to
+<owner_group>" — the macOS half of that claim is wrong.) Fix direction:
+platform-specific group (`root:wheel` on macOS, or resolve the daemon group
+via the same fixture the Linux path uses). An earlier run on a sibling
+worktree (`livelab-1787982560-6caf2de92b72`, commit `6caf2de9`, report
+`exit5-20260829-062831`) failed with the identical shape — same blocker,
+independently reproducing it.
+
+### 15.4 Exit dataplane stages — never reached
+
+All downstream stages skipped fail-closed (54 skips) behind `membership_init`:
+`distribute_membership`, `anchor_validation`, `admin_issue`, the
+`distribute_*` set, `enforce`/`validate_baseline_runtime`, `security_audit`,
+`dns_failclosed`, `runtime_acls`, `service_hardening`, `key_custody`, all
+exit stages (`exit_nat_lifecycle_validation` /
+`exit_demotion_residue_validation` / `exit_dns_failclosed_validation`), and
+the `cross_network_nat_*` set. The macOS exit dataplane remains untested; the
+cascade kills the run before `exit_handoff`/`active_exit`.
+
+### 15.5 DnsFailclosed — unchanged
+
+Not exercised (M1 owner-gated enforcement still open per §8.2; anchor-cell
+status per §12.6/§14.4 unchanged). The exit-cell DNS-failclosed stage never
+ran this run.
+
+### 15.6 Ledger + triage bookkeeping
+
+- Ledger row appended and verified (quote-aware parse) in
+  `documents/operations/live_lab_node_run_matrix.csv`: run
+  `livelab-1787987090-f2d215f76b58`, commit `f2d215f76b58…`, branch
+  `ai-edit/edit-1787985624508-56044-53`, clean, overall fail,
+  `first_failed_stage = membership_init`, notes "3 node(s), 64 stage(s);
+  passed=9 failed=1 skipped=54", `macos_stage_bootstrap=pass`,
+  `macos_stage_membership=fail`, exit alias `macos-utm-1`.
+- Lock coordination: worktree-local flock dir
+  `state/mac-cells/lock-exit-cell` (main-repo `state/` writes blocked from
+  this worktree context); no concurrent orchestrator observed; cleaned after
+  the run.
+
+**Cell status: BLOCKED — MAC-D8's bootstrap provisioning verified live, but
+the exit cell still cannot pass `membership_init`: new MAC-D9 blocker
+(`ops_e2e.rs:35`/`:7035`, chown group `root` does not exist on macOS; macOS
+code gap, not owner-gated). Fix MAC-D9, then re-run: the exit dataplane
+stages should finally execute.**
