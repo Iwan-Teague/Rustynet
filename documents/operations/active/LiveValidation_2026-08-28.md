@@ -1163,3 +1163,80 @@ Launched from the shell, not the MCP wrapper (the `bin/rustynet-mcp-lab-state`
 binary is 15 days stale; §10, §9.6 remain open). The `cross_network_nat_matrix`
 stub for this run is dispositioned in `live_lab_stage_triage.jsonl`, so the launch
 gate is clear for the next run.
+
+## 13) Night-merge regression run — Linux full suite re-proven at `9dd5f7c3`. `livelab-1787974284-9dd5f7c3c5dc`, `passed=44 failed=0 skipped=20`
+
+**Purpose.** After the night's ~20 merges to `main` (blind_relay phases 1–4 with
+their adversarial-review hardening, RustyDNS tandem D-6a/D-6b, MAC-D1/D3/D4,
+macOS path-constant hardening, DNS M1), re-run the §11 5-guest Linux full
+validation suite to confirm none of them regressed the Linux baseline.
+blind_relay and the RustyDNS tandem are feature-gated closed and expected to be
+inert on this Linux topology; the run tests that expectation end-to-end.
+
+**Where it ran.** In the isolated ai-edit worktree
+`state/edit-worktrees/edit-1787967876168-56044-40` on branch
+`ai-edit/edit-1787967876168-56044-40`, whose HEAD `9dd5f7c3` ("Merge ai-edit:
+RustyDNS D-6b") sits on top of the night's merges. Host-side `rustynet-cli` was
+built from the worktree (`--features vm-lab`, release); the orchestrator
+deployed the worktree's working tree to the guests (`source_mode=working-tree`).
+
+**Run identity.**
+
+| Field | Value |
+| --- | --- |
+| run id | `livelab-1787974284-9dd5f7c3c5dc` |
+| window | 2026-08-29T03:10:58Z → 03:31:24Z (20m 26s) |
+| commit | `9dd5f7c3c5dcd951502b368f0b833afd5b96bbd2`, dirty state `clean` |
+| topology | ubuntu-utm-1:client, rocky-utm-1:admin, debian-headless-4:exit, fedora-utm-1:relay, debian-headless-2:anchor (same 5 guests as §11) |
+| network profile | `mgmt_shared_smoke_v1`, digest `sha256:ab06a230edea88e605e3a81c6d0d1a5d413e65d1e8cd6771c93dccc92f4f67e4` — identical to §11 |
+| result | `run_complete=true`, `run_passed=true`, **passed=44 failed=0 skipped=20** (64 planned stages) |
+| report dir | `state/live-lab-validate5e-20260828/` (worktree) |
+| ledger row | appended to `documents/operations/live_lab_node_run_matrix.csv` |
+| command | §7 reproduction command + `--trust-inventory-ready`, fresh report dir, `--report-dir state/live-lab-validate5e-20260828` |
+
+**Per-stage diff vs the §11 baseline (`livelab-1787906534-877a0226693c`).**
+
+- **Zero flips among shared stages.** Every stage present in both runs has the
+  identical status; the 44 baseline passes all passed again, and the 17
+  baseline skips all skipped again for the same structural reasons
+  (blind-exit-role, second-client/entry/aux, mixed-topology tri-OS, vxlan CN-3
+  substrate stages, chaos/not_run).
+- **3 stages are NEW in this run, all `skipped`:**
+  `deploy_macos_anchor_profile`, `validate_macos_anchor_bundle_pull`,
+  `validate_macos_anchor_port_mapping_authority` — the macOS-anchor trio added
+  by the night's merges. On a Linux-only topology they skip structurally
+  ("no macOS node is assigned the anchor role in this topology"), exactly as
+  designed. They are accounted for below the 61→64 planned-stage growth.
+
+**Verdict.** The night's ~20 merges are **regression-free on Linux**: the
+44-pass / 0-fail baseline is reproduced exactly at `9dd5f7c3`, with the only
+delta being the 3 new macOS-anchor stages that skip structurally. The Linux
+reference is intact and the new stages join the planned set awaiting their
+macOS live cells.
+
+**Incident during the session (documented for honesty, not a code defect).**
+An intermediate run at 02:52Z (`livelab-1787971970-9dd5f7c3c5dc`, report dir
+`state/live-lab-validate5b-20260828/`) recorded
+`cross_network_nat_classification failed` with
+`netns build failed for profile 'full_cone': site 'A' (full_cone): ["ip", "netns", "add", "rnsim-ep-A"] failed: ssh: connect to host 192.168.64.10 port 22: No route to host`
+— a transient host→guest SSH reachability loss to debian-headless-4 (the UTM
+app itself had restarted ~25 min earlier, taking all 10 local VMs down;
+bridge100 was re-established minutes before the run). The same stage **passed**
+in the 5e re-run with no code change in between. The failure was dispositioned
+in the fail-closed stage-triage gate as
+`none: environmental transient ...` in
+`documents/operations/live_lab_stage_triage.jsonl`
+(stub `livelab-1787971970-9dd5f7c3c5dc::cross_network_nat_classification`);
+no bypass flag was used (none exists by design). The 5b run's other 63 stages
+matched the baseline exactly (43 pass after the one fail, 20 skip).
+
+**Operational notes.** (1) `--trust-inventory-ready` was required: the raw
+TCP :22 readiness probe reported all five healthy guests `ssh-tcp-not-open`,
+and without the flag the pre-run restart gate hard-stops every "unready" guest
+(the default destructive restart consumed by a blind probe — the documented
+behavior). Reachability was verified out-of-band (per-guest `ssh` banner)
+before launching with the flag. (2) The follow-up `--rerun-stage
+cross_network_nat_classification` attempt against the failed run's report dir
+was refused by design: "reuse requires a prior completed, passing run state" —
+a full clean re-run is the only re-prove path after a failed run, which is what
+5e is.
