@@ -134,6 +134,7 @@ Fast local iteration: `cargo run -p rustynet-xtask -- gates` (fmt → check → 
 | M5 live-lab rows | ☐ open — next step; blocked 2026-06-11 on the in-flight vm-lab simulator stream | `../live_lab_node_run_matrix.csv` (the live `--node` ledger; `../live_lab_run_matrix.csv` is the frozen bash-orchestrator archive — pointer corrected 2026-08-29) |
 | M6 RustyBackup / RustyAI | ☐ future | separate program |
 | Phase-1 control-plane verification | ✅ re-verified in-tree 2026-08-29 — audit-only pass; every phase-1 control already has enforcement + verification in-tree, so no code was added (see §7.1) | §7.1 evidence map below |
+| Phase-2 design (enforcement wiring) | ✅ written 2026-08-29 — doc-only design making M2–M3 runtime wiring buildable: exists-vs-needed primitive map, three fail-closed enforcement layers, controller-drive task breakdown (P2-M1/M2/M3 → M5), owner-gated decisions flagged (§5 there: OG-1 grant-without-scope posture, OG-2 nas scope type, OG-3 wire-format gate) | [`ServiceHostingPhase2Design_2026-08-29.md`](./ServiceHostingPhase2Design_2026-08-29.md) |
 
 Legend: ✅ done · ☐ open · ⛔ blocked.
 
