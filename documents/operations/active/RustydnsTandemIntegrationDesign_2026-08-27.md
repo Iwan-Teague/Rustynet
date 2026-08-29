@@ -1408,3 +1408,34 @@ questions require evidence rather than design-by-assumption:
 Each blocker fails closed and is visible in the support matrix. None permits a
 silent fallback, a wildcard listener, generic physical-interface egress, or a
 claim of parity before evidence exists.
+
+## D-6c disposition — 2026-08-29 (control-plane rule generation + Linux nft render)
+
+Status: **Linux control plane + rule render implemented; macOS/Windows dataplanes and the DoT/DoH policy block remain open owner decisions.** All work is control-plane and pure-render only; no rule installer or live dataplane mutation is wired yet.
+
+### Implemented (Linux)
+
+- **Pure decision function** `rustynet-control::tandem_dns_redirect::tandem_dns_redirect_decision(TandemDnsRedirectInput) -> TandemDnsRedirectDecision` (new module `crates/rustynet-control/src/tandem_dns_redirect.rs`, registered in the control crate). Fail-closed ladder:
+  - `TandemTogglePhase::Active(TandemMode::ManagedRedirect)` + readiness `Ready` + scope present + endpoint on the mesh prefix + `ExitAssignment::ProvenSameExit` ⇒ `Redirect { ManagedRedirect, scope, service_address }` — the only verdict that authorizes DNAT rule generation.
+  - `Off` / `PreparingContained` / `Prepared` / `Draining` / `Active(Managed)` ⇒ `NoRedirect { reason: Option<TandemReasonCode> }` (benign absence — `None`; plain managed mode keeps the D-6b handoff and never translates :53). `ResidueError` ⇒ `NoRedirect { Some(Residue) }`.
+  - `RuntimeContained { reason }` ⇒ `ContainNoRedirect { reason }`. Any readiness/scope/endpoint/prefix failure while in `ManagedRedirect` ⇒ `ContainNoRedirect` with the mapped closed-vocabulary code. **Contained posture means no redirect rule is generated and the base DNS-fail-closed layer continues to block plain DNS — the redirect's absence never opens a plaintext escape.**
+  - No new `TandemReasonCode` variants were introduced; the 24-variant closed vocabulary is unchanged.
+- **Linux nft render** `crates/rustynetd/src/linux_tandem_dns_redirect.rs` (pure render mirroring the `render_service_port_tunnel_scope_table` precedent: strict validation first — interface 1-15 chars `[A-Za-z0-9._-]`, non-zero generation, non-empty valid IPv4 selected sources, endpoint address must sit inside the mesh prefix — then deterministic canonical `nft -f` text; error `Display` prefixed `render refused`). Output:
+  - `ip rustynet_tdns_nat4_g<N>` — prerouting `dstnat`-priority chain, DNAT rules `iifname "<tunnel_iface>" [ip saddr { ... }] ip daddr != <svc> udp|tcp dport 53 dnat to <svc>:53`. `AllClientsUsingExit` scope renders tunnel-iface-scoped (no explicit source set); `NodeIds` renders the explicit validated source set. Additive to and disjoint from the base exit-NAT table (`ip rustynet_nat_g<N>`) and base killswitch tables — the renderer never references base tables.
+  - `inet rustynet_tdns_filter_g<N>` — forward containment chain: accept post-DNAT queries (tunnel input + selected source + exact service address + :53 udp/tcp), then drop selected-source port-53 traffic **not** translated, so translation absence cannot leak plaintext while ON.
+  - **Exact teardown** renders precisely `delete table ip rustynet_tdns_nat4_g<N>` + `delete table inet rustynet_tdns_filter_g<N>` — nothing else, no residue (§10.7).
+- **Privileged-helper allowlist extension** (`crates/rustynetd/src/privileged_helper.rs`): new `is_owned_tandem_dns_table_token` (prefix `rustynet_tdns_`), folded into `is_owned_nft_table_token`, with pin tests including negatives (`evil_rustynet_tdns_g1`, `rustynet_g5; nft flush ruleset` all still rejected). **Security-sensitive: this widens the argv-only helper's accepted nft table ownership tokens — reviewed as part of this change.** Rule strings still flow exclusively through the existing argv-only privileged path; no shell construction.
+
+### Flagged — per-OS dataplane (STOP, owner decision)
+
+- **macOS pf (§9.2)**: the existing `MacosPfLoadSpec` permits only `nat`-kind anchors; a transparent :53 redirect needs a **new reviewed pf `rdr` spec kind** plus anchor-ordering rules. Not implemented; flagged.
+- **Windows WFP (§9.3)**: redirect path unproven on Windows; per design the pre-mutation refusal `PlatformRedirectUnsupported` must gate any attempt. Not implemented; flagged.
+
+### Flagged — policy block (owner decision, deliberately NOT shipped)
+
+- **DoT/:853 blocking and DoH-endpoint blocking** remain OFF per §5.4 defaults (`block_port_853 = false`, `known_doh_feed` default OFF). Blocking known DoH bypass endpoints carries false-positive risk (blocking legitimate DoH resolvers); options for the owner: keep off by default, or a configurable allowlist-backed blocklist. D-6c implements only the core plain :53 redirect.
+- **Mesh-IP signed carriage** (endpoint as a signed policy field) remains owner-gated, carried from D-6b.
+
+### Test/evidence notes
+
+- Control crate: 556+ tests green incl. 14 new D-6c decision tests (redirect-only-when-eligible ladder, contained-still-blocks, benign-absence mapping, reconcile agreement). rustynetd: 8 new render tests (determinism, generation scoping, DNAT/containment rule strings, teardown exactness, validation refusals, base-table disjointness) + extended helper allowlist pin tests all green. `cargo fmt` / `clippy --workspace --all-targets --all-features --locked -D warnings` / `cargo audit --deny warnings` / `cargo deny check` all pass. One pre-existing environment-dependent phase10 macOS test (`macos_assert_dns_protection_requires_active_dns_rules`, host `networksetup` dependency) fails identically on clean HEAD — not caused by this change.
