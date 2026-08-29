@@ -308,8 +308,8 @@ phase-4 defect.
 | F1 | Minor | `blind_relay.rs:702` | CONFIRM — signature value trimmed at token level; inert (hello full-wire compare catches it; listener consumes only hello). Fix: reject whitespace in the signature value. |
 | F2 | Minor | `blind_relay.rs` `lines()` | CONFIRM — `\r` stripped, CRLF normalizes at token level; inert at hello level. Fix: reject `\r` at the UTF-8 gate. |
 | F3 | Minor | `blind_relay.rs:97,126,155` | CONFIRM — enum `from_wire` errors echo attacker value (≤4096 B, no identity); violates §7.3 closed-class phrasing. Fix: fixed-string field-named errors. |
-| F4 | **Blocking before forwarding** | `blind_relay_listener.rs:1263–1268` | CONFIRM — third leg for a paired `(epoch, circuit_handle)` allocates a fresh waiting circuit instead of close/quarantine (§7.6). Not exploitable while nothing forwards. Fix: track `Paired` circuits (bounded, expiring); post-pair leg ⇒ close/quarantine. |
-| F5 | **§5.1 violation at site (3) — fix before go-live** | `daemon.rs:2119–2148` | CONFIRM + ELEVATE — alignment is a forbidden-list, so it is future-permissive (the exact anti-pattern §5.1 forbids) and does not assert the exact pair. Unreachable today; fix to a full-canonical-set compare mirroring `membership.rs:2742`. |
+| F4 | **Blocking before forwarding** | `blind_relay_listener.rs:1263–1268` | CONFIRM — third leg for a paired `(epoch, circuit_handle)` allocates a fresh waiting circuit instead of close/quarantine (§7.6). Not exploitable while nothing forwards. Fix: track `Paired` circuits (bounded, expiring); post-pair leg ⇒ close/quarantine. **CLOSED 2026-08-29 (`0e8ab840`)** — see §13. |
+| F5 | **§5.1 violation at site (3) — fix before go-live** | `daemon.rs:2119–2148` | CONFIRM + ELEVATE — alignment is a forbidden-list, so it is future-permissive (the exact anti-pattern §5.1 forbids) and does not assert the exact pair. Unreachable today; fix to a full-canonical-set compare mirroring `membership.rs:2742`. **CLOSED 2026-08-29 (`0e8ab840`)** — see §13. |
 | O1 | Positive (strengthens gate) | `rustynet-relay/src/lib.rs:3,10` | NEW — the listener is never instantiated on any production path; `try_open` has zero callers. Dormant code, stronger than the triple gate. |
 | O2 | Positive (extra closed door) | `blind_relay_listener.rs:1035` | NEW — the address-validation first-exchange (artifact issuance) is unwired, so an opened listener would reject every hello at step 3. Moot given O1. |
 | O3 | Doc nit | first review §2 | NEW — first review says hello is "19 lines"; code is 18 (`15 + 3`, `blind_relay.rs:1033`). Code correct; prose wrong. Non-material. |
@@ -383,3 +383,50 @@ gates must stay as they are. Production advertisement is **NO-GO**.
   `crates/rustynet-control/src/lib.rs`
 - `crates/rustynet-relay/src/blind_relay_listener.rs`, `crates/rustynet-relay/src/lib.rs`
 - `crates/rustynetd/src/daemon.rs`
+
+## 13. Defect closure (2026-08-29 — owner-authorized go-live Phase A)
+
+Both go-live-blocking findings F4 and F5 are CLOSED at commit `0e8ab840`
+(`ai-edit/edit-1788017999058-1389-3`). **No go-live gate was flipped** —
+`BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED` remains `false`; this change is
+defect-closure only, and §11's NO-GO stays in force until the §16 owner
+sign-off and §13.2 live-lab evidence gates are met.
+
+**F5 — forbidden-list → exact-set compare (`daemon.rs`, local-role alignment).**
+The `NodeRole::BlindRelay` arm of `validate_node_role_membership_alignment` no
+longer enumerates forbidden capabilities. It now mirrors the signed-state
+allowlist (`membership.rs:2742`): the node's capability set must be EXACTLY
+`{RelayHost, BlindRelay}` (`len == 2 && contains(RelayHost) &&
+contains(BlindRelay)`), so any capability outside the canonical set — present,
+anchor sub-, or future — is refused by default (§5.1 reject-future-by-default;
+default-deny). Verification:
+`rustynetd::daemon::tests::blind_relay_membership_alignment_is_exact_set_rejecting_future_capabilities`
+asserts the exact set is ACCEPTED and canonical-plus-one-extra is REFUSED for
+`Anchor` (the old list knew it), `EntryRelay` (the old list never named it — a
+forbidden-list would have passed), and `AnchorPortMappingAuthoritative` (anchor
+sub-capability).
+
+**F4 — post-pair third leg quarantined (`blind_relay_listener.rs`).** Paired
+`(privacy_epoch, circuit_handle)` handles are now recorded in a bounded,
+expiring structure at the pairing commit (`BlindPairedCircuits`: capacity
+`MAX_BLIND_PAIRED_TRACKING_ENTRIES = 256`, oldest-first FIFO eviction at
+capacity, per-record expiry at the token's own expiry, pruned with the waiting
+map). A leg arriving for an already-paired handle is rejected at the §2.2(f)
+step-9 pairing decision with the single closed-class `Unauthorized` reason and
+never reaches the waiting-map allocation — close/quarantine per §7.6. The
+bound + TTL keep the quarantine bookkeeping itself from becoming a
+memory-exhaustion vector; an evicted record degrades only that one handle's
+quarantine (the paired circuit holds no payload state). Verification:
+`post_pair_third_leg_is_quarantined_never_re_admitted` (third leg rejected, no
+fresh waiting circuit, paired record unchanged, unrelated circuits unaffected),
+`paired_tracking_is_bounded_and_expiring` (capacity enforced with oldest-first
+eviction, first-pairing-wins with no expiry refresh, expired records pruned,
+zero capacity clamped to one), and the pre-existing
+`pairing_happy_path_and_duplicate_slot_rejection` (first + second legs still
+pair normally).
+
+Gates at closure: `cargo fmt --all -- --check`; `cargo clippy --workspace
+--all-targets --all-features --locked -- -D warnings`;
+`cargo test -p rustynetd -p rustynet-control -p rustynet-relay --all-targets
+--all-features` (3306 passed, 0 failed); `scripts/ci/secrets_hygiene_gates.sh`
+(18 checks, PASS). No lab run — none required for defect closure.
