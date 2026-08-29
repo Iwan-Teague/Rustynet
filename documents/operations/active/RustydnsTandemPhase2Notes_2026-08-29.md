@@ -176,3 +176,57 @@ Still flagged after D-6c-macOS:
 - **Mesh-IP signed carriage**: owner-gated (carried from D-6b).
 - **Daemon installer wiring**: the tandem reconcile loop calling `activate_tandem_dns_redirect`/`teardown_tandem_dns_redirect` (mirrors the Linux gap).
 - **Live-proof conditions** (§9.2): root-anchor reachability for `com.rustynet/tdns_g<N>`, `pfctl -s` tuple exposure, and a live-lab run remain unproven — no lab evidence claimed here.
+
+## D-6c-egress delivered — 2026-08-29 (owner decision 3: DoT + known-DoH block, DEFAULT-ON, Linux nft + macOS pf parity)
+
+Implemented (control plane + both OS dataplane renderers; no installer wiring change, no live-lab run):
+
+- **Control plane** `rustynet-control::tandem_dns_redirect` — the `Redirect` arm now carries
+  `egress_block: TandemDnsEgressBlockPolicy` (owner decision 3, digest entry 27: DEFAULT-ON
+  whenever the redirect is active, NOT opt-in — a false positive fails closed/breaks visibly,
+  a false negative fails open/silent leak). The policy is the single canonical value
+  `always_on()`: `block_dot = true` (drop outbound tcp+udp `:853` for the selected sources
+  except the sanctioned tunnel path to the mesh resolver) plus the pinned known-DoH set on
+  `:443`. `NoRedirect`/`ContainNoRedirect` carry nothing — the DoT/DoH layer never installs
+  when contained/off; the base DNS-fail-closed posture remains the only DNS behavior.
+- **Named, versioned DoH set** — `KNOWN_DOH_RESOLVER_IPS` (const, pinned by test, version
+  `KNOWN_DOH_RESOLVER_IPS_VERSION = "2026-08-29.1"`): Cloudflare 1.1.1.1/1.0.0.1, Google
+  8.8.8.8/8.8.4.4, Quad9 9.9.9.9/149.112.112.112, Cisco OpenDNS 208.67.222.222/208.67.220.220.
+  IPs, not SNI.
+- **Linux nft** `rustynetd::linux_tandem_dns_redirect` — the DoT drops (`ip daddr != <svc>`
+  udp/tcp `dport 853 drop`) and the DoH drops (each pinned IP, tcp AND udp — the latter covers
+  HTTP/3 DoH — `dport 443 drop`) render into the SAME `inet rustynet_tdns_filter_g<N>` forward
+  containment chain as the :53 drops. Teardown is unchanged (deletes the two tandem-owned
+  tables), so the DoT/DoH drops are removed TOGETHER with the redirect — no separate residue (§10.7).
+- **macOS pf** `rustynetd::macos_tandem_dns_redirect` — the pf equivalents (`block drop in quick
+  on <tunnel> ... to ! <svc> port 853 label "rustynet-tdns-dot-{proto}"` and
+  `block drop in quick on <tunnel> ... to <ip> port 443 label "rustynet-tdns-doh-{proto}"`)
+  render into the SAME generation-scoped `com.rustynet/tdns_g<N>` anchor; teardown stays the
+  single anchor flush (`pfctl -a com.rustynet/tdns_g<N> -F all`). The filter evaluator's
+  expected exact set now includes all 22 pass/block forms (rdr set unchanged). The load-spec
+  invariant arm (rdr-only + containment-filter-only) accepts the new forms as-is; encode/decode
+  carries no new fields because the policy is inherent to the decision, so helper-side
+  re-rendering is byte-identical to daemon-side rendering.
+- **Fail-closed bridge** — `MacosTandemDnsRedirectPfConfig::from_redirect_decision` refuses any
+  `Redirect` whose `egress_block` is not exactly `always_on()` ("non-canonical DoT/DoH
+  egress-block policy"): the renderers always install the full layer, so a non-canonical policy
+  would be a silent gap — refused, never partially rendered.
+- **HONEST RESIDUAL (documented, not an open door)** — DoH-over-`:443` to an ARBITRARY host is
+  technically indistinguishable from HTTPS without SNI inspection, so "block all DoH" is
+  unachievable by any IP-list mechanism. The pinned set blocks the well-known public resolvers
+  (the 95% case); arbitrary self-hosted DoH is a KNOWN MECHANISM LIMIT with a named future work
+  item: **SNI-inspection egress filtering** (follow-up, not in scope here).
+- Tests: control plane +5 (canonical policy on active redirect, pinned-set pin, exhaustive
+  non-redirect arms carry nothing, reconcile agreement), rustynetd +6 (Linux DoT/DoH render in
+  the generation-scoped table + scoped-count + teardown-together; macOS anchor render + bridge
+  non-canonical refusals), plus updated count pins (pf ruleset 24 lines; NodeIds fragment on all
+  24 rules).
+
+Evidence: `cargo test -p rustynet-control --lib --all-features` 573 pass; `cargo test
+-p rustynetd --lib --all-features` 2309 pass; `cargo fmt --all -- --check` clean; `cargo clippy
+--workspace --all-targets --all-features --locked -- -D warnings` clean; `secrets_hygiene_gates.sh`
+PASS (18 checks). No lab run (per scope).
+
+Still open beyond D-6c-egress: Windows WFP dataplane (§9.3, unproven), daemon installer wiring
+(reconcile loop calling activate/teardown), RustyDNS process management, real §6.2 compound
+readiness probe, signed wire formats, live-lab evidence, and the SNI-inspection follow-up named above.
