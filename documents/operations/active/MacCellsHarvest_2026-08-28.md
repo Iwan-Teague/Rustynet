@@ -1990,3 +1990,177 @@ fail-closed downstream stages (distribute/anchor/admin/exit dataplane)
 finally execute. A live re-run of the exit cell is still required to convert
 this code fix into lab-proven status; the cell stays BLOCKED-pending-re-run
 until then.**
+
+## 16. Exit cell re-run after MAC-D9 — 2026-08-29 (run #7 of the exit chain)
+
+Re-ran the macOS `exit` cell now that MAC-D9 (platform-correct `root:wheel`
+chown target, §15.7) is merged on `main`. Worktree
+`ai-edit/edit-1787988905593-56044-58`, HEAD `77fd20d7` (the QH-03 merge whose
+ancestors include the MAC-D9 merge `d0084759`), tree clean at launch. Fresh
+bootstrap, fresh report dir, full 64-stage plan. TRIAGE ONLY — no code changed
+in this session.
+
+### 16.1 Run
+
+- Run `livelab-1787990932-77fd20d75f62`, report dir
+  `state/mac-cells/exit6-20260829-084804`, elapsed ~18m, profile
+  `mgmt_shared_smoke_v1` (derived, not enforced). Topology 3 nodes (the §8.1
+  post-W5.7 shape; the brief's `--macos-promote-exit` spelling is retired —
+  `vm_lab/mod.rs:10316` fails closed on it): `--node macos-utm-1:exit --node
+  lenovo-exit-1:entry --node lenovo-client-1:client`, `--trust-inventory-ready`
+  after real-ssh reachability probes of all three guests. Orchestrator rebuilt
+  from this worktree's HEAD before launch (§2 handover rule: a stale binary
+  would verify a fix it does not contain).
+- Lock coordination: an ORPHANED orchestrator from a sibling session
+  (worktree `edit-1787987754437-56044-56`, deleted mid-run — its report dir
+  died with the tree, so its evidence is unrecoverable) was still holding all
+  three guests when this session started; it predated the MAC-D9 merge (started
+  08:26:22, merge landed 08:34:16), so it could not have produced the answer
+  even if it had finished. Per the never-two-rules-same-guests rule this
+  session WAITED for it to exit (~10 min) and launched only after
+  `pgrep`-confirmed quiet. Its run cannot contaminate this run's evidence:
+  different report dir, different commit, and this run's fresh bootstrap
+  re-deployed from the D9 tree.
+- 64 stages: **9 pass / 1 fail / 54 skip**, overall fail,
+  `first_failed_stage = membership_init`. Passed before the failure:
+  `preflight`, `prepare_source_archive`, `verify_ssh_reachability`,
+  `cleanup_hosts`, **`bootstrap_hosts`** (fresh 18m02s bootstrap on all three
+  nodes), `cross_network_substrate_setup`, `collect_pubkeys`.
+
+### 16.2 MAC-D9 + MAC-D8: LIVE-CONFIRMED (the chown signature is gone)
+
+The §15.3 failure signature —
+`membership state chown failed: status=1 stderr=chown: root: illegal group
+name` — did NOT recur. The `root_owner_group()` fix is deployed and behaves as
+coded. Also live-verified on the guest: the MAC-D8 provisioning survives a
+fresh bootstrap (`/usr/local/var/rustynet/credentials-workspace` present as
+`drwx------ root:rustynetd`), and the bootstrap genesis step seeded both
+keychain items (`rustynet.signing_passphrase` account
+`trust-passphrase-macos-utm-1-bootstrap`, and the e2e descriptor item
+`signing_key_passphrase` account `membership-owner-signing-key` —
+Bootstrap-RustyNetMacos.sh:1310-1323).
+
+### 16.3 New blocker — MAC-D10: the genesis snapshot vanishes mid-stage; read-back fails silently
+
+`membership_init` failed with an EMPTY error body:
+
+```
+init_membership_snapshot: remote command failed (exit Some(1)):
+```
+
+(that trailing colon is the whole body — stderr AND stdout were empty; same in
+the stage log, the failure digest, and the orchestrator stdout.)
+
+Step-by-step elimination, all evidence live on the guest or in the run
+artifacts:
+
+1. `issue_membership_owner_key` (the MAC-D2/MAC-D4 gate) PASSED — its failure
+   wrapper names that function; this one does not.
+2. Step 1 (`sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID=<id> …
+   ops init-membership`, `macos_membership.rs:149-154`) cannot be the silent
+   failure: every CLI error path prints (`AdapterError` rendering, and
+   reproduced live — see §16.4).
+3. Step 2 (`ops e2e-membership-add` per non-exit peer,
+   `macos_membership.rs:170-187` → `ops_e2e.rs:2003`) also prints on every
+   failure path (run #6's chown error surfaced through exactly this pipe), so
+   it cannot produce an empty body either.
+4. Step 3 (`test -s '<snapshot>' && cat <snapshot> | base64`,
+   `macos_membership.rs:242-249`) is the ONLY command in the sequence that can
+   exit 1 with zero output — `test -s` prints nothing when the file is
+   missing. Its `test -s` guard was added (§ comment at :238-241) precisely to
+   fail loudly on an empty snapshot; it does fail, but the ADAPTER surfaces
+   only the empty stderr, so the loud design does not survive the pipe.
+
+Post-run guest state proves the snapshot is genuinely gone:
+`/usr/local/var/rustynet/membership/` exists but is EMPTY (born at stage time,
+01:08 guest-local = 08:08 UTC), no `membership.snapshot`, no `.log`, no
+`.watermark` anywhere under the state root. Yet the bootstrap genesis
+(Bootstrap-RustyNetMacos.sh:1291-1307) writes all three and chowns them
+`rustynetd:rustynetd` — and `bootstrap_hosts` PASSED (with `set -e`, a failed
+genesis aborts the install), so the files existed at bootstrap end, 08:08:35.
+The stage ran 08:08:38-39. **The snapshot/log/watermark are deleted during the
+stage itself, i.e. inside the step-2 membership mutation** (the
+`execute_ops_e2e_membership_add` path, `ops_e2e.rs:2003`, whose daemon
+`membership add` rewrites the signed state) or a daemon-rewrite race against
+it. Pinpointing the deleting write is the code worker's first task; the
+delete-then-fail sequence leaves the node with NO valid signed state, which is
+fail-closed-correct for the node but wrong for the harness that then cannot
+read back what it just mutated.
+
+Classification: **macOS exit dataplane CODE GAP (membership state-lifecycle),
+not env, not owner-gated.** The exit cell has now advanced one full layer:
+MAC-D9 closed live, membership harness proven through mutation dispatch; the
+remaining defect is the state file lifecycle around the mutation.
+
+### 16.4 Secondary latent gap (MAC-D11 candidate) — keychain-account env never passed to `ops init-membership`
+
+Reproduced live on the guest after the run, running the stage's EXACT step-1
+command by hand on the now-clean guest:
+
+```
+error [generic_failure (1)]: macOS keychain account is required
+  (RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT)
+```
+
+Chain: `execute_ops_init_membership` → `ensure_signing_passphrase_material_ops`
+(main.rs:14871) → `ensure_signing_passphrase_material_macos` (main.rs:14974,
+hard error at :14977-14982 when `macos_keychain_account` is empty) ←
+`RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT` defaults to EMPTY
+(main.rs:14809-14812) ← `membership_init_script` (`macos_membership.rs:149-154`)
+and `peer_add_script` (`:181-187`) pass only NODE_ROLE/NODE_ID — the account
+env var appears NOWHERE in the macOS membership adapter. It is masked on every
+healthy guest because the bootstrap genesis files make step 1 take the
+idempotent early-out (`main.rs:13845-13856`, "membership files already
+present") BEFORE the keychain check. Any guest without genesis files (fresh
+state, wiped membership dir, or a future bootstrap that stops seeding genesis)
+makes the exit cell fail HERE. Fix shape for the code worker: pass
+`RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=trust-passphrase-<node_id>`
+(the account name is node-scoped, Bootstrap-RustyNetMacos.sh:1189) in
+`membership_init_script`/`peer_add_script`, mirroring how the install adapter
+plumbs `RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT`
+(`macos_install.rs:1482`).
+
+### 16.5 Exit dataplane stages + DnsFailclosed
+
+All downstream stages skipped fail-closed (54 skips) behind `membership_init`:
+`distribute_membership`, `exit_handoff`, `active_exit`,
+`exit_nat_lifecycle_validation`, `exit_demotion_residue_validation`,
+`exit_dns_failclosed_validation`, and the rest. **The first real macOS EXIT
+dataplane test still has not executed; DnsFailclosed (M1) remains
+unexercised on the exit role** — the owner-gated §8.2 question is untouched.
+
+### 16.6 Ledger + bookkeeping
+
+- Ledger row appended and verified (quote-aware parse) in
+  `documents/operations/live_lab_node_run_matrix.csv`: run
+  `livelab-1787990932-77fd20d75f62`, commit `77fd20d75f62…`, branch
+  `ai-edit/edit-1787988905593-56044-58`, clean, overall fail,
+  `first_failed_stage = membership_init`, notes "3 node(s), 64 stage(s);
+  passed=9 failed=1 skipped=54", exit alias `macos-utm-1`.
+- No triage stub was auto-created for this run (jsonl has no
+  `1787990932` entry), so the next launch gate has nothing pending to
+  classify; the classification lives in this section instead.
+- Evidence-fidelity note for the quality backlog: `run_remote`
+  (`ssh.rs:470-477`) faithfully captured empty streams here — the gap is that
+  a `test -s` guard can only fail silently by construction. A read-back step
+  that fails SHOULD emit its own message (`echo "snapshot missing/empty at
+  <path>" >&2; exit 1`) so the next occurrence is self-describing instead of
+  requiring this session's elimination chain.
+
+### 16.7 Verdict
+
+Exit cell: **BLOCKED at a NEW blocker (MAC-D10)** — but materially deeper than
+§15: MAC-D9 is live-confirmed (chown signature gone), MAC-D8's workspace and
+the keychain provisioning are live-confirmed, and the membership harness now
+reaches the snapshot READ-BACK — the failure is the state file lifecycle
+around the mutation itself. Fix MAC-D10 (pin the deleting write inside the
+`e2e-membership-add` path; make the read-back fail loudly), then re-run: the
+exit dataplane stages (`active_exit` → the three exit validation stages)
+should finally execute. MAC-D11 (keychain env plumbing) should ride along in
+the same patch — it is one clean-guest bootstrap away from becoming the next
+re blocker.
+
+**Cell status: BLOCKED — MAC-D10 documented (`ops_e2e.rs:2003` mutation path
+deletes the genesis snapshot/log before `macos_membership.rs:245` read-back;
+macOS code gap, not owner-gated). Next action belongs to a code worker; this
+session changed no code.**
