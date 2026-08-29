@@ -33,7 +33,7 @@
 
 #[cfg(feature = "daemon")]
 mod daemon {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::fs;
     use std::net::{IpAddr, SocketAddr};
     #[cfg(unix)]
@@ -41,9 +41,10 @@ mod daemon {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use ed25519_dalek::VerifyingKey;
+    use rand::TryRngCore;
     use serde::{Deserialize, Serialize};
     use subtle::ConstantTimeEq;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,7 +54,14 @@ mod daemon {
     use tokio::time::interval;
 
     use rustynet_control::RELAY_TOKEN_SCOPE;
+    use rustynet_control::blind_relay::parse_blind_relay_hello_v2_wire_bytes;
     use rustynet_control::canonical_relay_id_from_label;
+    use rustynet_control::membership::{MembershipNodeStatus, load_membership_snapshot};
+    use rustynet_control::roles::RoleCapability;
+    use rustynet_relay::blind_relay_listener::{
+        AddressValidationKeyRing, BlindListenerOpenError, BlindNoopObserver, BlindRejectReason,
+        BlindRelayListener, BlindRelayListenerConfig, BlindRelayListenerLimits,
+    };
     use rustynet_relay::session::SessionId;
     use rustynet_relay::transport::{RelayForwardError, RelayHelloResponse, RelayTransport};
 
@@ -160,6 +168,23 @@ mod daemon {
         pub cleanup_interval_secs: u64,
         /// Optional loopback-only HTTP health/metrics bind address.
         pub health_bind_addr: Option<SocketAddr>,
+        /// Operator switch for the blind-relay v2 listener (O1 wiring). Off by
+        /// default: without this flag the relay stays a legacy relay even when
+        /// the signed state names this node a blind relay.
+        pub blind_relay_listener_enabled: bool,
+        /// Absolute path to the signed membership snapshot consulted for the
+        /// blind_relay role + capability grant. Read/verified per startup.
+        pub blind_membership_state_path: String,
+        /// This node's id inside that signed snapshot.
+        pub blind_node_id: String,
+        /// Durable replay store for the blind listener's nonce tracking. The
+        /// blind path has no memory-only mode.
+        pub blind_replay_store_path: String,
+        /// Token issuer key id this relay accepts for blind legs (the
+        /// control-plane verifier key is bound to this id).
+        pub blind_issuer_key_id: String,
+        /// Public profile ids the blind listener admits (must be non-empty).
+        pub blind_profiles: Vec<String>,
     }
 
     impl Default for RelayConfig {
@@ -176,6 +201,12 @@ mod daemon {
                 clock_skew_tolerance_secs: 90,
                 cleanup_interval_secs: 10,
                 health_bind_addr: None,
+                blind_relay_listener_enabled: false,
+                blind_membership_state_path: String::new(),
+                blind_node_id: String::new(),
+                blind_replay_store_path: String::new(),
+                blind_issuer_key_id: String::new(),
+                blind_profiles: Vec::new(),
             }
         }
     }
@@ -234,6 +265,47 @@ mod daemon {
                     return Err("--health-bind must use a loopback address".to_owned());
                 }
             }
+            if self.blind_relay_listener_enabled {
+                // Every blind-listener input must be present and absolute
+                // up front: the listener may never open from a partially
+                // specified configuration.
+                if self.blind_membership_state_path.trim().is_empty() {
+                    return Err(
+                        "--blind-membership-state is required when the blind relay listener is enabled"
+                            .to_owned(),
+                    );
+                }
+                if !Path::new(&self.blind_membership_state_path).is_absolute() {
+                    return Err("--blind-membership-state must be an absolute path".to_owned());
+                }
+                if self.blind_node_id.trim().is_empty() {
+                    return Err(
+                        "--blind-node-id is required when the blind relay listener is enabled"
+                            .to_owned(),
+                    );
+                }
+                if self.blind_replay_store_path.trim().is_empty() {
+                    return Err(
+                        "--blind-replay-store is required when the blind relay listener is enabled"
+                            .to_owned(),
+                    );
+                }
+                if !Path::new(&self.blind_replay_store_path).is_absolute() {
+                    return Err("--blind-replay-store must be an absolute path".to_owned());
+                }
+                if self.blind_issuer_key_id.trim().is_empty() {
+                    return Err(
+                        "--blind-issuer-key-id is required when the blind relay listener is enabled"
+                            .to_owned(),
+                    );
+                }
+                if self.blind_profiles.is_empty() {
+                    return Err(
+                        "--blind-profiles is required when the blind relay listener is enabled"
+                            .to_owned(),
+                    );
+                }
+            }
             Ok(())
         }
     }
@@ -244,6 +316,19 @@ mod daemon {
     const RELAY_REJECT_MSG_TYPE: u8 = 0x03;
     const RELAY_REJECT_GENERIC_REASON: &str = "Rejected";
     const RELAY_KEEPALIVE_MSG_TYPE: u8 = 0x04;
+    /// Relay control-plane framing byte for the blind-relay v2
+    /// address-validation response datagram. Framing only: the payload is the
+    /// opaque 32-byte artifact produced by the reviewed
+    /// `AddressValidationKeyRing` — no new cryptographic construction is
+    /// defined here.
+    const BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE: u8 = 0x05;
+    /// Pinned ASCII prefix of a blind-relay v2 hello datagram. The canonical
+    /// line order (`version=2` then `token_kind=blind_relay_leg`) is fixed by
+    /// the rustynet-control v2 parser, so this cheap byte-prefix match is
+    /// enough for ROUTING; the full envelope is still parsed and verified by
+    /// the listener's own reviewed admission step 1. A legacy binary v1 frame
+    /// starts with `RELAY_HELLO_MSG_TYPE` (0x01) and can never match.
+    const BLIND_RELAY_V2_HELLO_WIRE_PREFIX: &[u8] = b"version=2\ntoken_kind=blind_relay_leg\n";
     const MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC: u32 = 50;
     const MAX_PRE_AUTH_HELLO_SOURCE_IPS: usize = 4096;
     /// Per-source-IP ceiling on what the relay emits — reject datagram or log
@@ -399,6 +484,19 @@ mod daemon {
         next_port: Arc<RwLock<u16>>,
         /// Forwarded-frame/byte counters (see `ForwardStats`).
         forward_stats: Arc<ForwardStats>,
+        /// Blind-relay v2 admission listener (O1 wiring). `None` unless the
+        /// daemon opened it at startup from real signed state — every gate
+        /// below must have held: operator flag, a verifiable signed snapshot
+        /// naming this node Active with EXACTLY the {RelayHost, BlindRelay}
+        /// capability set, and the compile-time go-live bit inside
+        /// `try_open` (currently `false`, so the listener is closed in
+        /// production until design-§16 approval). Routing consults this ONLY
+        /// to decide whether v2 frames go to admission or to the legacy
+        /// unknown-type path, so a dormant listener adds zero pre-auth
+        /// surface. Synchronous `std::sync::Mutex`, like `transport`: every
+        /// critical section is sync-only. **Never hold this guard across an
+        /// `.await` point.**
+        blind_listener: Mutex<Option<BlindRelayListener>>,
     }
 
     /// Locks `transport`, recovering from mutex poisoning rather than
@@ -417,6 +515,128 @@ mod daemon {
     /// by the methods called through the returned guard.
     fn lock_transport(transport: &Mutex<RelayTransport>) -> MutexGuard<'_, RelayTransport> {
         transport.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the blind-relay listener slot, recovering from mutex poisoning
+    /// rather than propagating it (same rationale as `lock_transport`).
+    fn lock_blind_listener(
+        listener: &Mutex<Option<BlindRelayListener>>,
+    ) -> MutexGuard<'_, Option<BlindRelayListener>> {
+        listener.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Cheap pre-parse discriminator for blind-relay v2 hello datagrams.
+    ///
+    /// Routing-only: matching the pinned byte prefix decides WHERE the frame
+    /// goes (admission vs. the legacy unknown-type path), never whether
+    /// anything is trusted. The full envelope is re-parsed and verified by
+    /// the listener's reviewed admission step 1.
+    fn is_blind_relay_hello_v2_frame(data: &[u8]) -> bool {
+        data.starts_with(BLIND_RELAY_V2_HELLO_WIRE_PREFIX)
+    }
+
+    /// Frames an address-validation artifact as a relay control datagram:
+    /// `[0x05] ++ artifact[32]`. Pure framing over the opaque artifact the
+    /// reviewed `AddressValidationKeyRing` produced.
+    fn serialize_blind_relay_addr_validation_response(artifact: &[u8; 32]) -> [u8; 33] {
+        let mut datagram = [0u8; 33];
+        datagram[0] = BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE;
+        datagram[1..].copy_from_slice(artifact);
+        datagram
+    }
+
+    /// Checked wall-clock read for artifact issuance (`now_unix`). A clock
+    /// reading before the epoch is a failure, never a zero.
+    fn checked_unix_now() -> Option<u64> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_secs())
+    }
+
+    /// Resolves the blind-relay v2 listener configuration from REAL signed
+    /// membership state (O1 wiring; adversarial review
+    /// BlindRelayAdversarialReview2_2026-08-29).
+    ///
+    /// Fail-closed by construction — `None` unless EVERY gate holds:
+    ///
+    /// 1. the operator passed `--blind-relay-listener`;
+    /// 2. the signed membership snapshot at the configured path loads AND
+    ///    verifies (`load_membership_snapshot` enforces file security, the
+    ///    bounded size, the self digest, and the full state validation —
+    ///    including blind-relay capability exclusivity — before returning);
+    /// 3. that snapshot names THIS node (`--blind-node-id`) as an Active node;
+    /// 4. the node's signed capabilities are EXACTLY the canonical blind-relay
+    ///    set {RelayHost, BlindRelay} — the same full-set compare the daemon's
+    ///    `validate_local_role_membership_alignment` enforces
+    ///    (BlindRelayRoleDesign §5.1), never a loose contains-check a future
+    ///    capability could slip past.
+    ///
+    /// A read or validation error of any kind returns `None`: the listener
+    /// stays closed and the relay keeps its exact legacy pre-auth surface.
+    /// This function only ever PRODUCES a config; it never opens the
+    /// listener. The caller still runs `try_open`, whose compile-time go-live
+    /// gate (`BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED`, currently `false`)
+    /// has the final say.
+    fn build_blind_listener_config(
+        config: &RelayConfig,
+        verifier_key: VerifyingKey,
+    ) -> Option<BlindRelayListenerConfig> {
+        if !config.blind_relay_listener_enabled {
+            // Operator switch off: dormant regardless of signed state.
+            return None;
+        }
+        // Verify-before-use: nothing from an unverified snapshot is inspected.
+        let state = match load_membership_snapshot(&config.blind_membership_state_path) {
+            Ok(state) => state,
+            // Missing/stale/invalid signed state: fail closed.
+            Err(_) => return None,
+        };
+        let node = state
+            .nodes
+            .iter()
+            .find(|node| node.node_id == config.blind_node_id)?;
+        if node.status != MembershipNodeStatus::Active {
+            return None;
+        }
+        let signed_capability_granted = node.capabilities.len() == 2
+            && node.capabilities.contains(&RoleCapability::RelayHost)
+            && node.capabilities.contains(&RoleCapability::BlindRelay);
+        if !signed_capability_granted {
+            return None;
+        }
+        let mut issuer_keys = BTreeMap::new();
+        issuer_keys.insert(config.blind_issuer_key_id.clone(), verifier_key);
+        let mut allowed_profiles = BTreeSet::new();
+        for profile in &config.blind_profiles {
+            allowed_profiles.insert(profile.clone());
+        }
+        // Fresh per-start rotating key for the address-validation artifact
+        // HMAC (kernel CSPRNG, never persisted). Artifacts are short-lived by
+        // design; a restart invalidates outstanding artifacts, costing a
+        // client at most one extra exchange.
+        let mut key_material = [0u8; 32];
+        if rand::rngs::OsRng.try_fill_bytes(&mut key_material).is_err() {
+            // No CSPRNG: fail closed rather than issue predictable artifacts.
+            return None;
+        }
+        let address_validation_keys = match AddressValidationKeyRing::new(1, key_material) {
+            Ok(keys) => keys,
+            Err(_) => return None,
+        };
+        Some(BlindRelayListenerConfig {
+            relay_id: config.relay_id,
+            issuer_keys,
+            allowed_profiles,
+            address_validation_keys,
+            replay_store_path: PathBuf::from(&config.blind_replay_store_path),
+            limits: BlindRelayListenerLimits::default(),
+            clock_skew_tolerance_secs: config.clock_skew_tolerance_secs,
+            // Both gates were just proven above; the reviewed `try_open`
+            // re-checks them plus the compile-time approval bit.
+            signed_capability_granted: true,
+            operator_enabled: true,
+        })
     }
 
     impl RelayDaemon {
@@ -441,6 +661,36 @@ mod daemon {
             .map_err(|e| format!("failed to initialize relay replay store: {e}"))?;
             transport.set_max_total_sessions(config.max_total_sessions)?;
 
+            // O1 open-from-runtime: resolve the blind-relay v2 listener from
+            // real signed state + the operator switch. `try_open` still
+            // enforces the compile-time go-live bit, so with
+            // BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED == false the
+            // GateClosed outcome below is the EXPECTED production behavior:
+            // the wiring exists, the listener stays closed. Every failure
+            // mode here leaves `blind_listener` as None — never a degraded
+            // or partial open.
+            let blind_listener = match build_blind_listener_config(&config, verifier_key) {
+                Some(blind_config) => match BlindRelayListener::try_open(blind_config) {
+                    Ok(listener) => {
+                        eprintln!("blind_relay v2 listener opened");
+                        Some(listener)
+                    }
+                    Err(BlindListenerOpenError::GateClosed) => {
+                        eprintln!(
+                            "blind_relay v2 listener stays gated closed (adversarial-review approval pending)"
+                        );
+                        None
+                    }
+                    Err(BlindListenerOpenError::ReplayStoreInvalid(reason)) => {
+                        eprintln!(
+                            "blind_relay v2 listener failed to open; staying closed: {reason}"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
             Ok(Self {
                 config: config.clone(),
                 transport: Arc::new(Mutex::new(transport)),
@@ -453,6 +703,7 @@ mod daemon {
                 allocated_sockets: Arc::new(RwLock::new(HashMap::new())),
                 next_port: Arc::new(RwLock::new(config.port_range_start)),
                 forward_stats: Arc::new(ForwardStats::default()),
+                blind_listener: Mutex::new(blind_listener),
             })
         }
 
@@ -605,6 +856,18 @@ mod daemon {
                 return Err("empty packet".to_owned());
             }
 
+            // Blind-relay v2 hellos are ASCII-framed (see
+            // `BLIND_RELAY_V2_HELLO_WIRE_PREFIX`) and so cannot collide with
+            // the binary v1 message-type byte space. Route them ONLY while
+            // the blind listener is actually open; a closed listener — the
+            // state of every non-blind relay and of every blind relay
+            // awaiting go-live approval — falls through to the unknown-type
+            // error below, preserving the legacy pre-auth surface
+            // byte-for-byte.
+            if is_blind_relay_hello_v2_frame(data) {
+                return self.handle_blind_relay_v2_frame(data, from_addr).await;
+            }
+
             match data[0] {
                 RELAY_HELLO_MSG_TYPE => {
                     if !self
@@ -627,6 +890,95 @@ mod daemon {
                 }
                 _ => Err(format!("unknown message type: {:#04x}", data[0])),
             }
+        }
+
+        /// Handles a blind-relay v2 hello datagram.
+        ///
+        /// Routing contract (O1): reached only when the frame carries the v2
+        /// wire prefix, and only while `blind_listener` is `Some`. All
+        /// admission work is synchronous under the listener mutex; the guard
+        /// is dropped before the single `.await` (the artifact reply
+        /// `send_to`), because a std::sync::Mutex guard must never be held
+        /// across an await point.
+        ///
+        /// Address-validation first exchange (O2): a client's first contact
+        /// carries a client-chosen placeholder in `relay_challenge` (the
+        /// envelope parse rejects all-zero values, so a real first contact is
+        /// non-zero by construction), which fails admission at the step-3
+        /// artifact check. On that specific rejection the relay ISSUES the
+        /// reviewed address-validation artifact for this exchange and replies
+        /// with it; the client retries with the artifact in the challenge
+        /// slot. Missing or invalid artifacts still reject exactly as
+        /// reviewed — issuance only adds a path, it removes no check.
+        ///
+        /// Identity blindness (BR-P1): nothing here logs token contents,
+        /// key ids, or any client identity; the outcome variant and the
+        /// source address are the only admitted residuals.
+        async fn handle_blind_relay_v2_frame(
+            &self,
+            data: &[u8],
+            from_addr: SocketAddr,
+        ) -> Result<(), String> {
+            let reply: Option<[u8; 33]> = {
+                let mut listener_slot = lock_blind_listener(&self.blind_listener);
+                let listener = match listener_slot.as_mut() {
+                    Some(listener) => listener,
+                    // Closed listener: answer exactly as the legacy
+                    // unknown-message-type path would for this datagram —
+                    // no new pre-auth surface while dormant.
+                    None => return Err(format!("unknown message type: {:#04x}", data[0])),
+                };
+
+                // Parse once for the O2 reply inputs. A malformed datagram
+                // also fails admission at the envelope-parse step, so the
+                // issuance branch can rely on this being `Some` — but it is
+                // matched explicitly anyway: fail closed, never unwrap.
+                let parsed = parse_blind_relay_hello_v2_wire_bytes(data).ok();
+
+                match listener.handle_hello(data, from_addr, &mut BlindNoopObserver) {
+                    Ok(outcome) => {
+                        // Phase 4 ends at pairing; bounded frame forwarding
+                        // is later-phase work. Pairing state is tracked
+                        // inside the listener.
+                        eprintln!("blind_relay v2 admission: {outcome:?} from {from_addr}");
+                        None
+                    }
+                    Err(BlindRejectReason::AddressValidation) => {
+                        // O2 first-exchange issuance. Volume is bounded: the
+                        // per-source-prefix limiter at admission step 2 ran
+                        // before this, so an attacker cannot farm artifacts
+                        // faster than the reviewed hello rate limit.
+                        let artifact = parsed.as_ref().and_then(|hello| {
+                            let now = checked_unix_now()?;
+                            listener
+                                .issue_address_validation_artifact(
+                                    &from_addr,
+                                    &hello.client_nonce,
+                                    hello.token.privacy_epoch,
+                                    now,
+                                )
+                                .ok()
+                        });
+                        // No parse, no clock, or issuance failure: stay
+                        // silent — closed reason classes only (§7.3), never
+                        // echo signed contents.
+                        artifact.map(|artifact| {
+                            serialize_blind_relay_addr_validation_response(&artifact)
+                        })
+                    }
+                    // Every other rejection was already accounted inside the
+                    // listener; the datagram is dropped silently.
+                    Err(_) => None,
+                }
+            };
+
+            if let Some(reply) = reply {
+                self.control_socket
+                    .send_to(&reply, from_addr)
+                    .await
+                    .map_err(|e| format!("failed to send address-validation response: {e}"))?;
+            }
+            Ok(())
         }
 
         /// Handles a `RelayHello` message.
@@ -2677,6 +3029,53 @@ mod daemon {
                             .map_err(|e| format!("invalid health bind address: {e}"))?,
                     );
                 }
+                "--blind-relay-listener" => {
+                    config.blind_relay_listener_enabled = true;
+                }
+                "--blind-membership-state" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--blind-membership-state requires an argument".to_owned());
+                    }
+                    config.blind_membership_state_path = args[i].clone();
+                }
+                "--blind-node-id" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--blind-node-id requires an argument".to_owned());
+                    }
+                    config.blind_node_id = args[i].clone();
+                }
+                "--blind-replay-store" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--blind-replay-store requires an argument".to_owned());
+                    }
+                    config.blind_replay_store_path = args[i].clone();
+                }
+                "--blind-issuer-key-id" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--blind-issuer-key-id requires an argument".to_owned());
+                    }
+                    config.blind_issuer_key_id = args[i].clone();
+                }
+                "--blind-profiles" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--blind-profiles requires an argument".to_owned());
+                    }
+                    let profiles: Vec<String> = args[i]
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|profile| !profile.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    if profiles.is_empty() {
+                        return Err("--blind-profiles requires at least one profile id".to_owned());
+                    }
+                    config.blind_profiles = profiles;
+                }
                 "--help" | "-h" => {
                     eprintln!(
                         "Usage: rustynet-relay [OPTIONS]\n\n\
@@ -2689,6 +3088,12 @@ mod daemon {
                           --max-sessions-per-node <N> Max sessions per node (default: 8)\n  \
                           --max-total-sessions <N>   Max active sessions across all nodes (default: 4096)\n  \
                           --health-bind <ADDR>       Loopback-only HTTP health/metrics bind address\n  \
+                          --blind-relay-listener     Open the blind-relay v2 listener (still gated by signed role + review approval)\n  \
+                          --blind-membership-state <PATH>  Signed membership snapshot for the blind_relay role grant\n  \
+                          --blind-node-id <ID>       This node's id inside the signed snapshot\n  \
+                          --blind-replay-store <PATH> Durable replay store for the blind listener\n  \
+                          --blind-issuer-key-id <ID> Token issuer key id accepted for blind legs\n  \
+                          --blind-profiles <CSV>     Public profile ids the blind listener admits\n  \
                           --help                     Show this help"
                     );
                     std::process::exit(0);
@@ -3015,18 +3420,21 @@ mod daemon {
     #[cfg(test)]
     mod tests {
         use super::{
-            ForwardStats, HealthSnapshot, MAX_PRE_AUTH_HELLO_SOURCE_IPS, MAX_RELAY_NODE_ID_BYTES,
-            PRE_AUTH_HELLO_WINDOW, PortAllocation, PreAuthHelloLimiter, PreAuthNoticeBudget,
-            PreAuthStats, RELAY_HELLO_MSG_TYPE, RELAY_KEEPALIVE_MSG_TYPE,
-            RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE, RelayConfig, RelayDaemon,
-            RelayForwardError, RelayHelloResponse, RelayHostEntrySelection, RelayTransport,
-            WindowsRelayServiceHardeningSnapshot, WindowsRelayServiceOptions, bind_health_listener,
+            BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE, ForwardStats, HealthSnapshot,
+            MAX_PRE_AUTH_HELLO_SOURCE_IPS, MAX_RELAY_NODE_ID_BYTES, PRE_AUTH_HELLO_WINDOW,
+            PortAllocation, PreAuthHelloLimiter, PreAuthNoticeBudget, PreAuthStats,
+            RELAY_HELLO_MSG_TYPE, RELAY_KEEPALIVE_MSG_TYPE, RELAY_REJECT_GENERIC_REASON,
+            RELAY_REJECT_MSG_TYPE, RelayConfig, RelayDaemon, RelayForwardError, RelayHelloResponse,
+            RelayHostEntrySelection, RelayTransport, WindowsRelayServiceHardeningSnapshot,
+            WindowsRelayServiceOptions, bind_health_listener, build_blind_listener_config,
             build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
-            http_request_path, load_control_verifier_key, parse_relay_hello, parse_relay_id_arg,
-            parse_windows_image_path_argv, record_forward, render_health_json, render_metrics,
-            run_hello_limiter_audit_command, select_relay_host_entry, serialize_relay_reject,
-            serve_health_endpoint, should_prune_on_forward_error,
+            http_request_path, is_blind_relay_hello_v2_frame, load_control_verifier_key,
+            parse_relay_hello, parse_relay_id_arg, parse_windows_image_path_argv, record_forward,
+            render_health_json, render_metrics, run_hello_limiter_audit_command,
+            select_relay_host_entry, serialize_blind_relay_addr_validation_response,
+            serialize_relay_reject, serve_health_endpoint, should_prune_on_forward_error,
         };
+        use rustynet_control::roles::RoleCapability;
 
         // ---- Negative regression tests for the 2026-07-29 adversarial review ----
 
@@ -3301,7 +3709,7 @@ mod daemon {
         use rustynet_relay::transport::RelayHello;
         use std::collections::HashMap;
         use std::fs;
-        use std::net::{IpAddr, Ipv4Addr};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
@@ -5633,6 +6041,363 @@ mod daemon {
             );
 
             fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        // ---- Blind-relay v2 runtime wiring (O1/O2; BlindRelayAdversarialReview2_2026-08-29) ----
+
+        fn test_verifier_key() -> ed25519_dalek::VerifyingKey {
+            ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key()
+        }
+
+        fn hex_encode(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        /// Writes a loadable signed membership snapshot containing one Active
+        /// node with `capabilities`, plus the minimal approver set the state
+        /// validation requires. Goes through the real
+        /// `persist_membership_snapshot` so the file format, self digest, and
+        /// permissions are exactly what `load_membership_snapshot` verifies.
+        fn write_membership_snapshot_with_caps(
+            dir: &Path,
+            node_id: &str,
+            capabilities: &[RoleCapability],
+        ) -> PathBuf {
+            use rustynet_control::membership::{
+                MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+                MembershipApproverStatus, MembershipNode, MembershipState,
+                persist_membership_snapshot,
+            };
+
+            let approver = |id: &str, key_byte: u8, role: MembershipApproverRole| {
+                let signing = ed25519_dalek::SigningKey::from_bytes(&[key_byte; 32]);
+                MembershipApprover {
+                    approver_id: id.to_owned(),
+                    approver_pubkey_hex: hex_encode(signing.verifying_key().as_bytes()),
+                    role,
+                    status: MembershipApproverStatus::Active,
+                    created_at_unix: 100,
+                }
+            };
+            let state = MembershipState {
+                schema_version: MEMBERSHIP_SCHEMA_VERSION,
+                network_id: "net-1".to_owned(),
+                epoch: 1,
+                nodes: vec![MembershipNode {
+                    node_id: node_id.to_owned(),
+                    node_pubkey_hex: hex_encode(&[9u8; 32]),
+                    owner: "owner@example.local".to_owned(),
+                    status: rustynet_control::membership::MembershipNodeStatus::Active,
+                    roles: vec!["tag:servers".to_owned()],
+                    capabilities: capabilities.to_vec(),
+                    joined_at_unix: 100,
+                    updated_at_unix: 100,
+                }],
+                approver_set: vec![
+                    approver("owner-1", 1, MembershipApproverRole::Owner),
+                    approver("guardian-1", 2, MembershipApproverRole::Guardian),
+                    approver("guardian-2", 3, MembershipApproverRole::Guardian),
+                ],
+                quorum_threshold: 2,
+                metadata_hash: None,
+            };
+            let path = dir.join("membership.snapshot");
+            persist_membership_snapshot(&path, &state).expect("snapshot should persist");
+            path
+        }
+
+        fn blind_relay_gate_config(
+            snapshot_path: &Path,
+            replay_path: &Path,
+            enabled: bool,
+        ) -> RelayConfig {
+            RelayConfig {
+                relay_id: parse_relay_id_arg("blind-relay-1").expect("relay id should parse"),
+                blind_relay_listener_enabled: enabled,
+                blind_membership_state_path: snapshot_path
+                    .to_str()
+                    .expect("utf8 snapshot path")
+                    .to_owned(),
+                blind_node_id: "blind-relay-1".to_owned(),
+                blind_replay_store_path: replay_path.to_str().expect("utf8 replay path").to_owned(),
+                blind_issuer_key_id: "control-key-1".to_owned(),
+                blind_profiles: vec!["default".to_owned()],
+                ..RelayConfig::default()
+            }
+        }
+
+        #[test]
+        fn blind_listener_config_requires_the_operator_switch() {
+            // Operator flag OFF: no listener config even with a fully aligned
+            // signed blind_relay node. Dormancy is the default posture.
+            let dir = restricted_temp_dir("blind-gate-operator-off");
+            let snapshot = write_membership_snapshot_with_caps(
+                &dir,
+                "blind-relay-1",
+                &[RoleCapability::RelayHost, RoleCapability::BlindRelay],
+            );
+            let config = blind_relay_gate_config(&snapshot, &dir.join("blind-replay.store"), false);
+            assert!(build_blind_listener_config(&config, test_verifier_key()).is_none());
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn blind_listener_config_requires_the_signed_blind_relay_capability_set() {
+            // A plain relay (RelayHost only) in the signed state must stay
+            // dormant: the exact-set compare fails.
+            let dir = restricted_temp_dir("blind-gate-plain-relay");
+            let snapshot = write_membership_snapshot_with_caps(
+                &dir,
+                "blind-relay-1",
+                &[RoleCapability::RelayHost],
+            );
+            let config = blind_relay_gate_config(&snapshot, &dir.join("blind-replay.store"), true);
+            assert!(build_blind_listener_config(&config, test_verifier_key()).is_none());
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn blind_listener_config_fails_closed_on_an_unreadable_snapshot() {
+            // A snapshot that cannot load (here: absent) must leave the gate
+            // closed — the same fail-closed path a state-validation failure
+            // (e.g. a §5.1 capability-exclusivity violation) takes inside
+            // `load_membership_snapshot`.
+            let dir = restricted_temp_dir("blind-gate-missing-snapshot");
+            let snapshot = dir.join("membership.snapshot");
+            let config = blind_relay_gate_config(&snapshot, &dir.join("blind-replay.store"), true);
+            assert!(build_blind_listener_config(&config, test_verifier_key()).is_none());
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn blind_listener_config_requires_the_node_to_be_present_in_the_snapshot() {
+            let dir = restricted_temp_dir("blind-gate-node-id");
+            let snapshot = write_membership_snapshot_with_caps(
+                &dir,
+                "some-other-node",
+                &[RoleCapability::RelayHost, RoleCapability::BlindRelay],
+            );
+            let config = blind_relay_gate_config(&snapshot, &dir.join("blind-replay.store"), true);
+            assert!(build_blind_listener_config(&config, test_verifier_key()).is_none());
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn blind_listener_config_is_built_from_aligned_signed_state() {
+            // The wiring-decision test: with every gate aligned the runtime
+            // produces a config with both grant flags set from REAL signed
+            // state + the operator switch (never hardcoded), ready to hand
+            // to `try_open`. Whether `try_open` opens is its own reviewed
+            // gate (currently closed while
+            // BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED is false) and is
+            // unit-tested in blind_relay_listener.rs.
+            let dir = restricted_temp_dir("blind-gate-aligned");
+            let snapshot = write_membership_snapshot_with_caps(
+                &dir,
+                "blind-relay-1",
+                &[RoleCapability::RelayHost, RoleCapability::BlindRelay],
+            );
+            let replay_path = dir.join("blind-replay.store");
+            let config = blind_relay_gate_config(&snapshot, &replay_path, true);
+            let built = build_blind_listener_config(&config, test_verifier_key())
+                .expect("aligned signed blind_relay node must produce a listener config");
+            assert!(built.signed_capability_granted);
+            assert!(built.operator_enabled);
+            assert_eq!(built.issuer_keys.len(), 1);
+            assert!(built.issuer_keys.contains_key("control-key-1"));
+            assert_eq!(
+                built.allowed_profiles.iter().collect::<Vec<_>>(),
+                vec!["default"]
+            );
+            assert_eq!(built.replay_store_path, replay_path);
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        async fn build_test_daemon(dir: &Path) -> RelayDaemon {
+            let key_path = dir.join("control.pub");
+            write_verifier_key(&key_path);
+            let mut built = None;
+            for _ in 0..16 {
+                let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe bind");
+                let port = probe.local_addr().expect("probe addr").port();
+                drop(probe);
+                let config = RelayConfig {
+                    relay_id: parse_relay_id_arg("relay-test-1").expect("relay id should parse"),
+                    verifier_key_path: key_path.to_str().expect("utf8 path").to_owned(),
+                    replay_store_path: dir
+                        .join("replay.store")
+                        .to_str()
+                        .expect("utf8 path")
+                        .to_owned(),
+                    bind_addr: std::net::SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        port,
+                    ),
+                    port_range_start: 1024,
+                    port_range_end: 5119,
+                    health_bind_addr: None,
+                    ..RelayConfig::default()
+                };
+                if let Ok(daemon) = RelayDaemon::new(config).await {
+                    built = Some(daemon);
+                    break;
+                }
+            }
+            built.expect("relay daemon should build on a free loopback port")
+        }
+
+        #[test]
+        fn v2_hello_discriminator_matches_only_the_pinned_text_prefix() {
+            let frame = b"version=2\ntoken_kind=blind_relay_leg\nclient_nonce=00";
+            assert!(is_blind_relay_hello_v2_frame(frame));
+            // Legacy binary v1 frames can never match the ASCII prefix.
+            assert!(!is_blind_relay_hello_v2_frame(&[
+                RELAY_HELLO_MSG_TYPE,
+                0x00,
+                0x01
+            ]));
+            // Truncated text and other versions don't match.
+            assert!(!is_blind_relay_hello_v2_frame(b"version=2\n"));
+            assert!(!is_blind_relay_hello_v2_frame(
+                b"version=3\ntoken_kind=blind_relay_leg\n"
+            ));
+            assert!(!is_blind_relay_hello_v2_frame(&[]));
+        }
+
+        #[tokio::test]
+        async fn default_relay_stays_dormant_and_routes_v2_frames_as_unknown_type() {
+            // A relay built WITHOUT any blind inputs (the state of every
+            // normal relay deployment) must have no listener and must treat
+            // a v2 frame exactly as today: the legacy unknown-message-type
+            // error. No new pre-auth surface while dormant.
+            let dir = restricted_temp_dir("blind-dormant-routing");
+            let daemon = build_test_daemon(&dir).await;
+            assert!(
+                daemon.blind_listener.lock().expect("unpoisoned").is_none(),
+                "a default relay must never open the blind listener"
+            );
+
+            let peer: SocketAddr = "127.0.0.1:54321".parse().expect("peer addr");
+            let frame = b"version=2\ntoken_kind=blind_relay_leg\nclient_nonce=00";
+            let err = daemon
+                .handle_control_packet(frame, peer)
+                .await
+                .expect_err("dormant relay must not admit v2 frames");
+            assert_eq!(err, format!("unknown message type: {:#04x}", frame[0]));
+            assert_eq!(err, "unknown message type: 0x76");
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[tokio::test]
+        async fn aligned_blind_inputs_leave_the_listener_gated_closed_without_panicking() {
+            // With every wiring gate aligned, the daemon reaches `try_open`,
+            // which returns GateClosed while the adversarial-review const is
+            // false — the EXPECTED outcome. The daemon must start anyway with
+            // the listener closed: the wiring must not panic or abort on the
+            // gate, and no partially-open listener may exist.
+            let dir = restricted_temp_dir("blind-aligned-gated-closed");
+            let snapshot = write_membership_snapshot_with_caps(
+                &dir,
+                "blind-relay-1",
+                &[RoleCapability::RelayHost, RoleCapability::BlindRelay],
+            );
+            let key_path = dir.join("control.pub");
+            write_verifier_key(&key_path);
+            let mut built = None;
+            for _ in 0..16 {
+                let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe bind");
+                let port = probe.local_addr().expect("probe addr").port();
+                drop(probe);
+                let base =
+                    blind_relay_gate_config(&snapshot, &dir.join("blind-replay.store"), true);
+                let config = RelayConfig {
+                    verifier_key_path: key_path.to_str().expect("utf8 path").to_owned(),
+                    replay_store_path: dir
+                        .join("replay.store")
+                        .to_str()
+                        .expect("utf8 path")
+                        .to_owned(),
+                    bind_addr: std::net::SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        port,
+                    ),
+                    port_range_start: 1024,
+                    port_range_end: 5119,
+                    health_bind_addr: None,
+                    ..base
+                };
+                if let Ok(daemon) = RelayDaemon::new(config).await {
+                    built = Some(daemon);
+                    break;
+                }
+            }
+            let daemon = built.expect("relay daemon should build on a free loopback port");
+            assert!(daemon.blind_listener.lock().expect("unpoisoned").is_none());
+
+            // And a v2 frame arriving at the gated-closed daemon still gets
+            // the legacy unknown-type answer (listener stayed None).
+            let peer: SocketAddr = "127.0.0.1:54322".parse().expect("peer addr");
+            let frame = b"version=2\ntoken_kind=blind_relay_leg\nclient_nonce=00";
+            let err = daemon
+                .handle_control_packet(frame, peer)
+                .await
+                .expect_err("gated-closed relay must not admit v2 frames");
+            assert_eq!(err, "unknown message type: 0x76");
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn address_validation_response_framing_is_exact() {
+            let artifact = [7u8; 32];
+            let datagram = serialize_blind_relay_addr_validation_response(&artifact);
+            assert_eq!(datagram.len(), 33);
+            assert_eq!(
+                datagram[0],
+                BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE
+            );
+            assert_eq!(&datagram[1..], &artifact[..]);
+        }
+
+        #[test]
+        fn address_validation_artifact_issues_then_verifies_and_binds_all_inputs() {
+            // O2 mechanics at the reviewed keyring level: a first-contact
+            // issuance verifies when replayed faithfully, and every bound
+            // input (nonce, observed address, privacy epoch) plus freshness
+            // is enforced — a missing/invalid artifact still fails.
+            let keys = rustynet_relay::AddressValidationKeyRing::new(1, [9u8; 32])
+                .expect("keyring should build");
+            let observed: SocketAddr = "203.0.113.7:45001".parse().expect("observed addr");
+            let foreign: SocketAddr = "203.0.113.8:45001".parse().expect("foreign addr");
+            let nonce = [3u8; 32];
+            let now = 1_800_000_000_u64;
+            let artifact = keys
+                .issue_artifact(&observed, &nonce, 7, now)
+                .expect("issuance should succeed");
+            keys.verify_artifact(&observed, &nonce, 7, &artifact, now, 90)
+                .expect("faithful replay should verify");
+
+            assert!(
+                keys.verify_artifact(&observed, &[4u8; 32], 7, &artifact, now, 90)
+                    .is_err()
+            );
+            assert!(
+                keys.verify_artifact(&foreign, &nonce, 7, &artifact, now, 90)
+                    .is_err()
+            );
+            assert!(
+                keys.verify_artifact(&observed, &nonce, 8, &artifact, now, 90)
+                    .is_err()
+            );
+            // Past the 30s artifact TTL plus the 90s skew window: stale
+            // artifacts fail closed.
+            assert!(
+                keys.verify_artifact(&observed, &nonce, 7, &artifact, now + 300, 90)
+                    .is_err()
+            );
+            assert!(
+                keys.verify_artifact(&observed, &nonce, 7, &[0u8; 32], now, 90)
+                    .is_err()
+            );
         }
     }
 }
