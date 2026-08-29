@@ -584,6 +584,11 @@ setup_directories() {
   install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}/membership"
   install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}/secrets"
   install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}/trust"
+  # Membership signing credential-workspace parent (parity with the Linux
+  # systemd install adapter, which provisions /var/lib/rustynet/credentials-workspace
+  # root:rustynetd 0700): only root ops verbs write per-invocation 0700 leaves
+  # here via mkdir(2); the daemon never opens this parent on macOS.
+  install -d -m 0700 -o root      -g rustynetd "${STATE_ROOT}/credentials-workspace"
   install -d -m 0750 -o root      -g rustynetd "${CONFIG_ROOT}"
   install -d -m 0750 -o rustynetd -g rustynetd "${LOG_DIR}"
   # Bootstrap credential dir: 0700 root:rustynetd so only root (bootstrap) and
