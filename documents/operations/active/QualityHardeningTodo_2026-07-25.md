@@ -2153,7 +2153,7 @@ it yet. It will need an arm when the endpoint-attribution work lands.
 
 ---
 
-### QH-36 — Gossip peer registration is additive-only, so a node's key rotation leaves the OLD key registered for the process lifetime and revocation removes only the NEW one
+### QH-36 — RESOLVED `e4de5502` — Gossip peer registration was additive-only, so a node's key rotation left the OLD key registered for the process lifetime and revocation removed only the NEW one
 
 **Verified against `58b19ce4`.** Raised by the review of
 `GossipProducerAlignmentIncrement1_2026-08-08.md`, which cannot land until this is
@@ -2196,6 +2196,110 @@ node_id whose membership entry now carries a different key would close the rotat
 gap without touching the enrollment window. That requires a node_id→gossip_id reverse
 map the runtime does not currently keep, which is why this is a design item rather than
 a one-line fix. A restart masks the gap, which is why it has not been noticed.
+
+**Resolved 2026-08-27 by `e4de5502`** — the reverse map and the
+membership-attributed registration path below are implemented exactly as this
+entry's fix shape sketched. The design subsection that follows was drafted
+2026-08-29 as the design-of-record for that commit (the ledger had not caught up
+when the drafting job was filed); a reviewer checks `e4de5502` against it.
+
+### Design (drafted 2026-08-29; implemented by `e4de5502`)
+
+The design answers the four questions an implementer must not get wrong. All
+citations are to the landed code so review is direct.
+
+**1. The closing data structure — a reverse map, membership node id → live
+gossip id.** `peer_id_by_member_node: HashMap<String, [u8; 32]>`, a field on
+`GossipNode` (`crates/rustynetd/src/gossip_runtime.rs:214`). The gap existed
+because `peers: HashMap<[u8; 32], GossipPeer>` (`gossip_runtime.rs:203`) is
+keyed by the 32-byte gossip id (the node's Ed25519 verifying key bytes), so a
+rotated key simply accumulated a second entry. The reverse map is keyed by the
+membership `String` node id and holds the ONE gossip id currently attributed to
+that member. It is mutated only by `register_member_peer` and
+`unregister_peer`; the identity-less `register_peer`
+(`gossip_runtime.rs:323-336`) never touches it — that is what keeps the
+enrollment window additive.
+
+**2. The sync logic, stated as invariants.** `sync_gossip_data_plane`
+(`crates/rustynetd/src/daemon.rs:6268`) keeps its additive shape and gains the
+attributed path:
+
+- **NEVER unregister a peer whose node_id is not in membership.** No
+  absence-driven prune exists anywhere in the function — removal happens only
+  via (a) explicit revocation (`daemon.rs:6304-6311`: `set_revoked_peer_ids`
+  then `unregister_peer` per revoked id) and (b) rotation replacement inside
+  `register_member_peer`. The consume path
+  (`crates/rustynetd/src/enrollment_consume.rs:220`) still registers through
+  plain `register_peer`, so an in-flight D2.7 enrollee registered before its
+  membership admit lands survives every sync tick. The doc comment at
+  `daemon.rs:6263-6267` pins the rationale ("Absence is not revocation").
+- **ONLY evict a prior key when the node IS in membership with a DIFFERENT
+  key.** `register_member_peer` (`gossip_runtime.rs:343-362`): insert the new
+  id into the attribution index; if the insert displaced a `previous` id and
+  `previous != peer_node_id`, remove `previous` from `peers` in the same call
+  (seen-sequence ledger retained — it is the anti-replay watermark, same rule
+  as `unregister_peer`), then insert the new `GossipPeer`. If the key is
+  unchanged (same-key re-registration, e.g. an endpoint change), no eviction —
+  plain replace. The member path is fed ONLY by
+  `gossip_peer_registrations_from_membership` (`gossip_runtime.rs:890-926`),
+  which yields entries for Active members with a decodable, verified pubkey and
+  a proven overlay address — so "attributed" and "in membership" are the same
+  set by construction.
+- **Per-tick ordering** (`daemon.rs:6268-6358`): epoch stamp → transport bind →
+  revocation FIRST → anchor-seed set → member registrations. A node that flips
+  to Revoked in the same snapshot that introduces its new key therefore never
+  regains a routing entry for either key.
+
+**3. Race and ordering risks, and how the design answers each.**
+
+- *Enrollment bootstrap ordering.* The pre-membership entry lives only in
+  `peers`, unindexed. When membership later admits the node, the member path
+  registers the admission key; if it differs from the consume-registered key,
+  the consume entry is evicted by the rotation rule — correct, because the
+  signed membership key is the authority. An unindexed consume entry whose
+  admit never lands still expires only at process restart; that residue is
+  unchanged by this design and remains deliberate.
+- *Tick-to-tick re-registration.* Registrations are derived purely from the one
+  verified snapshot, deterministic-sorted and deduped
+  (`gossip_runtime.rs:923-924`), so replaying a tick is idempotent: same key →
+  replace-in-place; the eviction fires only once because after it the stored
+  `previous` already equals the new id.
+- *Replayed OLD key via the identity-less path.* `register_peer` is still
+  additive, so an old key could re-enter `peers` unindexed for a live member.
+  It is not wire-triggerable by an arbitrary peer (the consume path requires a
+  valid enrollment token), and a revoked node cannot benefit (revocation-first
+  unregister plus the `revoked_peer_ids` inbound check,
+  `gossip_runtime.rs:221-228`). A member-attributed re-registration of the old
+  key replaces rather than coexists (pinned by the index-hygiene test below).
+  Residual and accepted: the one-node-two-entries guarantee holds on the
+  member path, not for a token-authenticated re-enrollment replay.
+- *Concurrency.* Every mutation is `&mut self` on the `GossipNode` owned by the
+  daemon; both `register_member_peer` and `unregister_peer` run on the main
+  loop (commit seams and `drain_gossip_inbound`), so index and `peers` are
+  mutated under single-threaded ownership and need no lock. Do not introduce a
+  second mutation site off the main loop.
+- *Index/`peers` divergence.* `unregister_peer` prunes the attribution index
+  before removing from `peers` (`gossip_runtime.rs:370-380`), so no dangling
+  attribution survives revocation. Hazard to keep visible: `peers` is `pub`,
+  so any future direct `peers` mutation must either route through the
+  register/unregister pair or maintain the index in the same breath.
+
+**4. Verification — the four pins `e4de5502` added
+(`crates/rustynetd/src/gossip_runtime.rs`, `mod tests`):**
+
+- `member_key_rotation_evicts_the_old_key_entry` (`:1352`) — rotation
+  eviction: registering the new key for a member removes the old key from
+  `peers`, so it can neither route nor verify inbound bundles.
+- `member_registration_does_not_touch_other_members_keys` (`:1375`) —
+  cross-node isolation: rotating one member's key never evicts another
+  member's entry.
+- `plain_register_peer_stays_additive_for_pre_membership_enrollment`
+  (`:1394`) — the pre-membership additive window: two identity-less
+  registrations coexist, proving the enrollment bootstrap path is untouched.
+- `unregister_clears_the_member_attribution_index` (`:1410`) — index hygiene
+  after unregister: revocation clears the attribution, a later member-path
+  registration lands cleanly, and a replayed old key replaces rather than
+  coexists (one membership node never holds two live key entries).
 
 ---
 
