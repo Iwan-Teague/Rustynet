@@ -36,6 +36,25 @@ pub(crate) fn extract_daemon_failure_reason(log_tail: &str) -> Option<String> {
     reconcile.or(error_fallback)
 }
 
+/// One observed client-egress NAT session on an exit node — the concrete
+/// evidence pair for the active-exit egress proof (QH-25). The assertion
+/// returns addresses, not a bare verdict, so a report can carry checkable
+/// data instead of only "the check passed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshClientNatSession {
+    /// Pre-translation mesh-sourced (`100.64.0.0/10`) client address observed
+    /// on the exit (the ORIGINAL `src` in conntrack terms; WinNAT's
+    /// `InternalSourceAddress`).
+    pub client_source: String,
+    /// The translated side as the platform reports it: Linux conntrack's reply
+    /// `dst` (post-SNAT source, the exit's egress address) or Windows WinNAT's
+    /// `ExternalDestinationAddress` (the external destination the client
+    /// reached).
+    pub translated_side: String,
+    /// Which platform view produced the evidence (`"conntrack"` | `"winnat"`).
+    pub observed_via: &'static str,
+}
+
 /// The daemon launch flags every platform's bring-up path MUST pass, so the
 /// node's runtime identity / role / backend / enforce-mode can never silently
 /// drift between platforms. This is the contract behind the N4 failure class: a
@@ -309,11 +328,19 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     }
 
     /// On the EXIT node, assert a NAT session translates a mesh-sourced
-    /// (`100.64.0.0/10`) client address outbound — direct proof that client
-    /// traffic egresses *via this exit's NAT*, the W1/D7 "client mesh traffic
-    /// egresses via the exit" evidence. Retries internally for convergence.
+    /// (`100.64.0.0/10`) client address outbound, and return the concrete
+    /// observed address pair as evidence (QH-25). When
+    /// `expected_client_mesh_addr` is supplied, ONLY a session whose
+    /// pre-translation source equals that address is accepted — the identity
+    /// of the probed client is then proven. Without it, the result proves only
+    /// that *a* mesh-sourced flow was translated (a range check, not an
+    /// identity check). Retries internally for convergence.
     /// Default: not applicable to this platform.
-    fn assert_mesh_client_nat_session(&self) -> Result<(), AdapterError> {
+    fn assert_mesh_client_nat_session(
+        &self,
+        expected_client_mesh_addr: Option<&str>,
+    ) -> Result<MeshClientNatSession, AdapterError> {
+        let _ = expected_client_mesh_addr;
         Err(AdapterError::UnsupportedPlatform {
             platform: self.platform(),
             message:

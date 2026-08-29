@@ -5,6 +5,7 @@ use std::time::Duration;
 // `vm_lab` is feature-gated, so the validator has to live there or the two copies
 // drift.
 use crate::ops_e2e::parse_gossip_verifying_key_hex;
+use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
@@ -655,10 +656,14 @@ pub fn assert_exit_actively_serving(conn: &NodeConnection) -> Result<(), Adapter
 }
 
 /// On the Linux exit, assert a conntrack entry shows a mesh-sourced
-/// (`100.64.0.0/10`) client flow being NAT-translated outbound — direct proof
-/// that a client's full-tunnel traffic egresses via THIS exit's NAT (the W1/D7
-/// "client mesh traffic egresses via the exit" evidence). Retries internally to
-/// cover the client's full-tunnel convergence + the egress-probe window.
+/// (`100.64.0.0/10`) client flow being NAT-translated outbound, and return the
+/// concrete observed pair as evidence (QH-25). When `expected_client_mesh_addr`
+/// is supplied, only a flow whose ORIGINAL `src` equals that address is
+/// accepted — proof that THE probed client's full-tunnel traffic egressed via
+/// THIS exit's NAT (the W1/D7 evidence); without it, the result proves only
+/// that *a* mesh-sourced flow was translated (a range check, not an identity
+/// check). Retries internally to cover the client's full-tunnel convergence +
+/// the egress-probe window.
 ///
 /// Reads conntrack via `conntrack -L`, falling back to `/proc/net/nf_conntrack`
 /// when the `conntrack` tool is absent, and matches a line whose ORIGINAL `src`
@@ -666,7 +671,10 @@ pub fn assert_exit_actively_serving(conn: &NodeConnection) -> Result<(), Adapter
 /// differs from the original `src`, i.e. SNAT/masquerade rewrote the source).
 ///
 /// Fails closed: no matching translated mesh flow => `Err`.
-pub fn assert_mesh_client_nat_session(conn: &NodeConnection) -> Result<(), AdapterError> {
+pub fn assert_mesh_client_nat_session(
+    conn: &NodeConnection,
+    expected_client_mesh_addr: Option<&str>,
+) -> Result<MeshClientNatSession, AdapterError> {
     // conntrack -L is the canonical view; if the userspace tool is missing fall
     // back to the kernel's /proc/net/nf_conntrack. Both are root-readable only.
     let probe = "if command -v conntrack >/dev/null 2>&1; then \
@@ -676,19 +684,42 @@ pub fn assert_mesh_client_nat_session(conn: &NodeConnection) -> Result<(), Adapt
          fi || true";
     for attempt in 0..10 {
         let out = ssh::run_remote(conn, probe, MEDIUM_TIMEOUT)?;
-        if out.lines().any(conntrack_line_is_translated_mesh) {
-            return Ok(());
+        if let Some(session) = select_mesh_nat_session(out.lines(), expected_client_mesh_addr) {
+            return Ok(session);
         }
         if attempt < 9 {
             std::thread::sleep(Duration::from_millis(1500));
         }
     }
     Err(AdapterError::Protocol {
-        message:
-            "Linux exit shows no conntrack session translating a mesh-sourced (100.64.0.0/10) \
-             client address outbound (no client-egress NAT session converged)"
-                .to_owned(),
+        message: match expected_client_mesh_addr {
+            Some(expected) => format!(
+                "Linux exit shows no conntrack session translating the expected client mesh \
+                 address {expected} outbound (no client-egress NAT session converged)"
+            ),
+            None => {
+                "Linux exit shows no conntrack session translating a mesh-sourced (100.64.0.0/10) \
+                 client address outbound (no client-egress NAT session converged)"
+                    .to_owned()
+            }
+        },
     })
+}
+
+/// Pick the conntrack NAT-session evidence from a probe's output lines. With an
+/// expected client mesh address, only a session whose original source equals it
+/// qualifies (identity match); without one, the first translated mesh-sourced
+/// session qualifies (range match).
+fn select_mesh_nat_session<'a>(
+    mut lines: impl Iterator<Item = &'a str>,
+    expected_client_mesh_addr: Option<&str>,
+) -> Option<MeshClientNatSession> {
+    match expected_client_mesh_addr {
+        Some(expected) => lines.find_map(|line| {
+            conntrack_line_mesh_nat_session(line).filter(|s| s.client_source == expected)
+        }),
+        None => lines.find_map(conntrack_line_mesh_nat_session),
+    }
 }
 
 /// Collect diagnostic artifacts from the remote host to `dst`.
@@ -1081,6 +1112,14 @@ fn ruleset_has_rustynet_masquerade(ruleset: &str) -> bool {
 /// e.g. `[UNREPLIED]` with no SNAT yet, or intra-mesh traffic) returns false, as
 /// does any non-mesh-sourced line.
 fn conntrack_line_is_translated_mesh(line: &str) -> bool {
+    conntrack_line_mesh_nat_session(line).is_some()
+}
+
+/// Extract the observed client-egress NAT-session pair (QH-25 evidence) from a
+/// single conntrack line: the same conditions as
+/// [`conntrack_line_is_translated_mesh`], but returning the concrete
+/// original-source → post-SNAT pair instead of a bare verdict.
+fn conntrack_line_mesh_nat_session(line: &str) -> Option<MeshClientNatSession> {
     // Collect the ordered list of src= and dst= values across both tuples.
     let mut srcs: Vec<&str> = Vec::new();
     let mut dsts: Vec<&str> = Vec::new();
@@ -1093,14 +1132,21 @@ fn conntrack_line_is_translated_mesh(line: &str) -> bool {
     }
     // Need both directions present (original + reply): >=2 src and >=2 dst.
     let (Some(orig_src), Some(reply_dst)) = (srcs.first(), dsts.get(1)) else {
-        return false;
+        return None;
     };
     if !is_mesh_source_addr(orig_src) {
-        return false;
+        return None;
     }
     // Translated iff the reply destination (post-SNAT source) differs from the
     // original source. Equal => no SNAT was applied (untranslated) => reject.
-    orig_src != reply_dst
+    if orig_src == reply_dst {
+        return None;
+    }
+    Some(MeshClientNatSession {
+        client_source: orig_src.to_string(),
+        translated_side: reply_dst.to_string(),
+        observed_via: "conntrack",
+    })
 }
 
 fn decode_wireguard_pubkey_to_hex(value: &str) -> Result<String, String> {
@@ -1481,10 +1527,9 @@ mod tests {
     fn parse_node_clean_probe_reports_running_daemon() {
         let err = parse_node_clean_probe("nft=- daemon=up iface=-")
             .expect_err("running daemon must fail");
-        assert!(
-            err.to_string()
-                .contains("rustynetd or rustynet-relay still running")
-        );
+        assert!(err
+            .to_string()
+            .contains("rustynetd or rustynet-relay still running"));
     }
 
     #[test]
@@ -1702,6 +1747,62 @@ table ip other_nat {
         assert!(!conntrack_line_is_translated_mesh(
             "garbage line with no tuples"
         ));
+    }
+
+    #[test]
+    fn conntrack_line_mesh_nat_session_returns_concrete_pair() {
+        // QH-25: the translated-mesh verdict now carries the concrete observed
+        // pair (original mesh source → post-SNAT source) as evidence.
+        let line = "tcp      6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=54321 \
+            dport=443 [UNREPLIED] src=1.1.1.1 dst=192.168.1.50 sport=443 dport=54321 mark=0 use=1";
+        let session = conntrack_line_mesh_nat_session(line)
+            .expect("translated mesh line must yield a session");
+        assert_eq!(session.client_source, "100.64.0.3");
+        assert_eq!(session.translated_side, "192.168.1.50");
+        assert_eq!(session.observed_via, "conntrack");
+    }
+
+    #[test]
+    fn conntrack_line_mesh_nat_session_rejects_untranslated_and_non_mesh() {
+        // Untranslated mesh flow (reply dst == original src) => None.
+        let untranslated = "tcp      6 117 SYN_SENT src=100.64.0.3 dst=100.64.0.9 sport=54321 \
+            dport=443 [UNREPLIED] src=100.64.0.9 dst=100.64.0.3 sport=443 dport=54321 use=1";
+        assert!(conntrack_line_mesh_nat_session(untranslated).is_none());
+        // Non-mesh original source => None even when translated.
+        let non_mesh = "tcp      6 117 SYN_SENT src=192.168.1.10 dst=1.1.1.1 sport=54321 \
+            dport=443 [UNREPLIED] src=1.1.1.1 dst=203.0.113.7 sport=443 dport=54321 use=1";
+        assert!(conntrack_line_mesh_nat_session(non_mesh).is_none());
+        // Single tuple / empty => None.
+        assert!(conntrack_line_mesh_nat_session(
+            "tcp 6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=1 dport=443"
+        )
+        .is_none());
+        assert!(conntrack_line_mesh_nat_session("").is_none());
+    }
+
+    #[test]
+    fn select_mesh_nat_session_matches_expected_client_identity() {
+        // QH-25: with an expected client mesh address, only the session whose
+        // original source equals it qualifies (identity match, not range match).
+        let other_client = "tcp 6 10 ESTABLISHED src=100.64.0.8 dst=1.1.1.1 sport=1 dport=443 \
+            src=1.1.1.1 dst=192.168.1.50 sport=443 dport=1";
+        let probed_client = "tcp 6 10 ESTABLISHED src=100.64.0.3 dst=1.1.1.1 sport=2 dport=443 \
+            src=1.1.1.1 dst=192.168.1.50 sport=443 dport=2";
+        let lines = [other_client, probed_client];
+
+        let session = select_mesh_nat_session(lines.into_iter(), Some("100.64.0.3"))
+            .expect("expected client's session must be selected");
+        assert_eq!(session.client_source, "100.64.0.3");
+
+        // Wrong-client-only input fails closed even though mesh-range sessions
+        // exist.
+        assert!(select_mesh_nat_session([other_client].into_iter(), Some("100.64.0.3")).is_none());
+
+        // Without an expected address the first translated mesh session
+        // qualifies (honest weaker range claim).
+        let session = select_mesh_nat_session(lines.into_iter(), None)
+            .expect("range-only match must pick the first translated session");
+        assert_eq!(session.client_source, "100.64.0.8");
     }
 
     #[test]
