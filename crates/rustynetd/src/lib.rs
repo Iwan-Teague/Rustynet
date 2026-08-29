@@ -53,6 +53,7 @@ pub mod macos_pf_load_spec;
 pub(crate) mod macos_pf_mesh_cidr;
 pub mod macos_runtime_acls;
 pub mod macos_service_hardening;
+pub mod macos_tandem_dns_redirect;
 #[cfg(target_os = "macos")]
 pub mod macos_utun_helper;
 #[cfg(target_os = "macos")]
