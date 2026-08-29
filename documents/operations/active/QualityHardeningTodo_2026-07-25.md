@@ -1398,6 +1398,26 @@ below it: **106 s → 6.7 s**, outcome now environment-invariant, and still sens
 Generalisable check worth applying elsewhere: **grep the test fixtures for addresses inside the lab's
 live subnets.** A test that happens to target a real guest passes or fails on what that guest is doing.
 
+**QH-20 CLOSED 2026-08-29 — the last non-hermetic path is gone; no network at all now.** The `.invalid`
+name still cost one guaranteed-NXDOMAIN DNS round-trip (~2.7 s on this Mac's mDNS resolver) per run,
+because the **QH-44 authorized_keys fingerprint probe** (`probe_authorized_keys_fingerprint`,
+`crates/rustynet-cli/src/vm_lab/mod.rs`) was the one probe in the discovery flow that had not been
+routed through the QH-33 hermetic seam: the utmctl stub *does* answer `ip-address`, so `live_ip` is
+`Some`, and the fingerprint runs on the same probe window even though the update itself is refused for
+lack of a confirmed process — spawning a real `ssh` against `alpha-host.invalid`. Fixed by extending
+`UtmDiscoveryProbes` with an `authorized_keys_fingerprint` function-pointer field (default: the real
+probe; hermetic tests: `stub_error_authorized_keys_fingerprint`, which returns instantly), so the
+target test and all four sibling discovery tests drive the flow with zero sockets and zero `ssh`
+children. Verified 5× in a row: passing every time, **~0.6 s wall per run** (from 2.73 s after the
+QH-33 seam, from 6.7 s after the 2026-07-26 fix, from 60–106 s originally), deterministic, and
+network-free. The remaining ~0.4 s is not network: it is two local helper spawns (`ps` for the
+process-presence probe and the temp `utmctl` stub script) — each macOS process spawn from a test
+binary carries ~200 ms of Gatekeeper `syspolicyd` validation tax (§7). Reaching single-digit
+milliseconds would require seaming the local process-presence/utmctl interactions too, which changes
+the semantics the sibling tests assert on (process-present gating of readiness), so it is left as a
+measured floor rather than a large refactor for diminishing returns. The reserved addresses and the
+`.invalid` name stay as documentation of the never-routable intent.
+
 ### QH-21 — Windows failure-artifact collection throws, losing diagnostics and inventing a second failure
 **Severity: medium-high (destroys evidence exactly when it is needed). Confidence: VERIFIED live.**
 
