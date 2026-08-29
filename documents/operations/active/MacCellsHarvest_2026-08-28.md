@@ -1247,11 +1247,36 @@ Triage stub appended:
 `livelab-1787967356-494dc61437ef::membership_init` in
 `documents/operations/live_lab_stage_triage.jsonl`.
 
+**2026-08-28 disposition — FIXED in code (`macos_membership.rs`), rerun
+pending.** `init_membership_snapshot` now mirrors the Linux twin: a new
+`exit_node_id_from_peers` helper sources the id from the
+`NodeRole::Exit` peer (`peers.iter().find(...).node_id`, Linux
+`linux_membership.rs:54-65` shape) and **fails closed** — loud error on
+no exit peer or a blank id, never a blank `RUSTYNET_NODE_ID`; the remote
+command is built by `membership_init_script` as
+`sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='<exit-node-id>'
+<rustynet> ops init-membership` — env AFTER `sudo -n` so sudo's
+`env_reset` can no longer strip it (the §10.3 secondary suspect is also
+closed). Pinned by five new adapter tests
+(`membership_init_script_carries_node_id_after_sudo`,
+`exit_node_id_resolution_sources_the_exit_peer`,
+`exit_node_id_resolution_fails_loud_without_exit_peer`,
+`exit_node_id_resolution_fails_loud_on_blank_id`,
+`resolved_exit_node_id_survives_shell_safety_guard`);
+`cargo test -p rustynet-cli --all-targets --all-features --locked` green
+(92 binaries, 0 failures) plus fmt/clippy/check/audit/deny. NO post-fix
+lab run exists yet — per the Parity Refresh rule the exit cell remains
+🔴 fix-landed-rerun-pending, NOT green; a rerun of the §10.1 shape is
+the proof obligation and should un-skip the whole §8.2 skip chain.
+
 ### 10.4 Verdict
 
 Exit cell: **BLOCKED-partial** — MAC-D2/MAC-D4 live-confirmed (membership
 genesis seed + read path both work on a fresh macOS bootstrap), but the
-cell's first stage beyond the seed fails on the macOS membership adapter's
-missing `RUSTYNET_NODE_ID`. Next step after the owner fixes
-`macos_membership.rs`: re-run this exact §10.1 shape; membership_init
-should then pass and the exit stages run for the first time.
+cell's first stage beyond the seed failed on the macOS membership
+adapter's missing `RUSTYNET_NODE_ID`. **2026-08-28: that adapter defect is
+now fixed in code** (§10.3 disposition — node id sourced from the exit
+peer, env after `sudo -n`, fail-closed on blank/missing id, tests pinning
+the wiring). Next step unchanged: re-run this exact §10.1 shape;
+membership_init should then pass and the exit stages run for the first
+time — until that run exists the cell stays 🔴, not green.
