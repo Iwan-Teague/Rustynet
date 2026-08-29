@@ -1483,6 +1483,107 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_exit_with_passing_output_is_failure() {
+        // QH-16 negative control: a gate that PRINTS a passing verdict but
+        // exits nonzero must be reported as a failure — output never replaces
+        // the tool's own exit code.
+        let outcome = run_with_timeout(
+            "sh",
+            &["-c", "echo 'test result: ok. 100 passed'; exit 3"],
+            Path::new("."),
+            &[],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(!outcome.success, "nonzero exit must not count as success");
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.code, Some(3));
+        assert!(outcome.stdout.contains("100 passed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signaled_exit_is_failure_with_unknown_code() {
+        // Fail-closed on an unreadable exit: a signal-killed gate has no exit
+        // code, which must classify as failure, never as success.
+        let outcome = run_with_timeout(
+            "sh",
+            &["-c", "echo partial-output; kill -TERM $$"],
+            Path::new("."),
+            &[],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(!outcome.success, "signaled exit must not count as success");
+        assert!(!outcome.timed_out);
+        assert_eq!(outcome.code, None, "signal death has no exit code");
+    }
+
+    #[test]
+    fn exit_zero_with_failing_output_is_success() {
+        // Inverse control: the exit code is authoritative in both directions —
+        // a zero exit wins even when output looks like a failure banner.
+        let outcome = run_with_timeout(
+            "sh",
+            &["-c", "echo 'test result: FAILED. 0 passed'; exit 0"],
+            Path::new("."),
+            &[],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(outcome.success);
+        assert_eq!(outcome.code, Some(0));
+    }
+
+    #[test]
+    fn outcome_to_result_marks_failure_as_tool_error() {
+        let failed = CommandOutcome {
+            code: Some(3),
+            stdout: "test result: ok. 100 passed".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+            success: false,
+        };
+        let rendered = |r: &ToolCallResult| {
+            r.content
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let result = outcome_to_result("demo gate", &failed);
+        assert_eq!(result.is_error, Some(true));
+        let text = rendered(&result);
+        assert!(text.contains("❌ FAILED"));
+        assert!(text.contains("Exit code:** 3"));
+        assert!(text.contains("100 passed"));
+
+        let killed = CommandOutcome {
+            code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            success: false,
+        };
+        let result = outcome_to_result("demo gate", &killed);
+        assert_eq!(result.is_error, Some(true));
+        let text = rendered(&result);
+        assert!(text.contains("Exit code:** killed"));
+
+        let passed = CommandOutcome {
+            code: Some(0),
+            stdout: "test result: ok. 5 passed".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+            success: true,
+        };
+        let result = outcome_to_result("demo gate", &passed);
+        assert_eq!(result.is_error, None);
+        let text = rendered(&result);
+        assert!(text.contains("✅ PASSED"));
+    }
+
+    #[test]
     fn spawn_logged_runs_detached_and_logs() {
         let log = std::env::temp_dir().join(format!("mcp-spawn-test-{}.log", std::process::id()));
         let mut child =
