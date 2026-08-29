@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::vm_lab::DaemonProbeOp;
 use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
 use crate::vm_lab::orchestrator::adapter::node_adapter::SshConnectionParams;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
@@ -239,8 +240,11 @@ impl NodeAdapter for WindowsNodeAdapter {
         windows_traffic::assert_exit_actively_serving(&self.conn)
     }
 
-    fn assert_mesh_client_nat_session(&self) -> Result<(), AdapterError> {
-        windows_traffic::assert_mesh_client_nat_session(&self.conn)
+    fn assert_mesh_client_nat_session(
+        &self,
+        expected_client_mesh_addr: Option<&str>,
+    ) -> Result<MeshClientNatSession, AdapterError> {
+        windows_traffic::assert_mesh_client_nat_session(&self.conn, expected_client_mesh_addr)
     }
 
     // ── Diagnostics + cleanup ─────────────────────────────────────────────────
