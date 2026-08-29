@@ -2283,7 +2283,33 @@ struct LocalUtmReadyState {
     live_ip: Option<String>,
     ssh_port_status: String,
     ssh_auth_status: String,
+    /// QH-44 evidence: `~/.ssh/authorized_keys` mtime + sha256 observed over
+    /// SSH during the same readiness probe that produces `ssh_auth_status`.
+    /// `None` when the guest was not fingerprinted (Windows / no live IP /
+    /// no SSH user); a probed-but-missing file still yields `Some` with
+    /// `status: "missing"` so the disappearance is timestamped in evidence.
+    authorized_keys_fingerprint: Option<AuthorizedKeysFingerprint>,
     platform: VmGuestPlatform,
+}
+
+/// Read-only fingerprint of a guest's `~/.ssh/authorized_keys`.
+///
+/// QH-44: four lab guests silently lost their authorized_keys and the only
+/// symptom was `ssh_auth_status=failed-exit-255` at readiness time, with no
+/// record of WHEN the file disappeared. Recording the mtime + content hash on
+/// every readiness probe lets the next occurrence be correlated against run
+/// history. Purely observational — this never mutates the guest file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AuthorizedKeysFingerprint {
+    /// `"ok"` (file read, mtime+hash captured), `"missing"` (readable probe
+    /// found no file), or `"error:<reason>"` (transport/command failure).
+    status: String,
+    /// `stat` mtime as epoch seconds (GNU `stat -c %Y` / BSD `stat -f %m`),
+    /// `None` unless `status == "ok"`.
+    mtime_epoch_secs: Option<String>,
+    /// sha256 hex digest of the file contents, `None` unless
+    /// `status == "ok"`.
+    sha256_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -7202,6 +7228,31 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
                 }
             }
         };
+        // QH-44: fingerprint authorized_keys on the same probe window that
+        // produced `ssh_auth_state`, so a key loss carries a timestamp+hash
+        // correlatable against run history. Read-only observation only.
+        let authorized_keys_fingerprint =
+            if authorized_keys_fingerprint_supported(discovery_platform) {
+                live_ip
+                    .as_deref()
+                    .zip(ssh_user.as_deref())
+                    .zip(
+                        authoritative_ssh_target
+                            .as_deref()
+                            .or(advisory_ssh_target.as_deref()),
+                    )
+                    .map(|((_, user), ssh_target)| {
+                        probe_authorized_keys_fingerprint(
+                            ssh_target,
+                            Some(user),
+                            config.ssh_identity_file.as_deref(),
+                            config.known_hosts_path.as_deref(),
+                            timeout,
+                        )
+                    })
+            } else {
+                None
+            };
         let readiness = build_utm_readiness(UtmReadinessInputs {
             platform: discovery_platform,
             process_state: &process_state,
@@ -7260,6 +7311,7 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
                     ProbeState::Ok { value } | ProbeState::Fallback { value, .. } => value.clone(),
                     ProbeState::Missing { reason } | ProbeState::Error { reason } => reason.clone(),
                 },
+                authorized_keys_fingerprint: authorized_keys_fingerprint.clone(),
                 platform: discovery_platform,
             });
         }
@@ -7299,6 +7351,7 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
             "live_ip_state": live_ip_state,
             "ssh_port_state": ssh_port_state,
             "ssh_auth_state": ssh_auth_state,
+            "authorized_keys_fingerprint": authorized_keys_fingerprint,
             "known_hosts_state": known_hosts_state,
             "windows_ssh_probe_state": windows_ssh_probe_state,
             "readiness": readiness,
@@ -29668,6 +29721,118 @@ fn wait_for_local_utm_targets_ready(
     }
 }
 
+/// QH-44 read-only probe: emit the authorized_keys mtime + sha256 without
+/// modifying anything. POSIX-sh only (Linux + macOS guests); the first rung
+/// of each lookup is the GNU/Linux tool, the fallbacks cover BSD/macOS. The
+/// guard test `authorized_keys_probe_is_read_only` pins that this string can
+/// never grow a mutating construct.
+const AUTHORIZED_KEYS_FINGERPRINT_PROBE: &str = "f=\"$HOME/.ssh/authorized_keys\"; \
+if [ -r \"$f\" ]; then \
+m=$(stat -c %Y \"$f\" 2>/dev/null); [ -n \"$m\" ] || m=$(stat -f %m \"$f\" 2>/dev/null); \
+h=$(sha256sum \"$f\" 2>/dev/null | cut -d ' ' -f1); \
+[ -n \"$h\" ] || h=$(shasum -a 256 \"$f\" 2>/dev/null | cut -d ' ' -f1); \
+[ -n \"$h\" ] || h=$(openssl dgst -sha256 -r \"$f\" 2>/dev/null | cut -d ' ' -f1); \
+printf 'ak_mtime=%s\\nak_sha256=%s\\n' \"$m\" \"$h\"; \
+else echo 'ak_status=missing'; fi";
+
+/// Parse the output of [`AUTHORIZED_KEYS_FINGERPRINT_PROBE`] into a
+/// fingerprint. Unrecognized output (partial lines, foreign banners) is an
+/// `"error:..."` status, never a silent `"ok"` — a hash must only be recorded
+/// when it actually came from the probe.
+fn parse_authorized_keys_fingerprint(output: &str) -> AuthorizedKeysFingerprint {
+    let mut mtime: Option<String> = None;
+    let mut sha256: Option<String> = None;
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("ak_mtime=") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                mtime = Some(rest.to_owned());
+            }
+        } else if let Some(rest) = line.strip_prefix("ak_sha256=") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                sha256 = Some(rest.to_owned());
+            }
+        }
+    }
+    match (mtime, sha256) {
+        (Some(mtime_epoch_secs), Some(sha256_hex)) => AuthorizedKeysFingerprint {
+            status: "ok".to_owned(),
+            mtime_epoch_secs: Some(mtime_epoch_secs),
+            sha256_hex: Some(sha256_hex),
+        },
+        (mtime, _sha256) => {
+            let status = if output.lines().any(|l| l.trim() == "ak_status=missing") {
+                "missing".to_owned()
+            } else {
+                format!(
+                    "error:unrecognized-output:{reason}",
+                    reason = if mtime.is_some() {
+                        "sha256-absent"
+                    } else {
+                        "mtime-absent"
+                    }
+                )
+            };
+            AuthorizedKeysFingerprint {
+                status,
+                mtime_epoch_secs: None,
+                sha256_hex: None,
+            }
+        }
+    }
+}
+
+/// Run [`AUTHORIZED_KEYS_FINGERPRINT_PROBE`] over SSH and fingerprint the
+/// result. Read-only instrumentation for QH-44; failures degrade to an
+/// `"error:..."` status rather than aborting the readiness probe.
+fn probe_authorized_keys_fingerprint(
+    ssh_target: &str,
+    ssh_user: Option<&str>,
+    ssh_identity_file: Option<&Path>,
+    known_hosts_path: Option<&Path>,
+    timeout: Duration,
+) -> AuthorizedKeysFingerprint {
+    match capture_remote_shell_command(
+        ssh_target,
+        ssh_user,
+        ssh_identity_file,
+        known_hosts_path,
+        AUTHORIZED_KEYS_FINGERPRINT_PROBE,
+        timeout,
+    ) {
+        Ok(output) => parse_authorized_keys_fingerprint(&output),
+        Err(err) => AuthorizedKeysFingerprint {
+            status: format!("error:{err}"),
+            mtime_epoch_secs: None,
+            sha256_hex: None,
+        },
+    }
+}
+
+/// Should this platform's readiness probe fingerprint authorized_keys?
+/// Only Linux and macOS guests run the SSH auth probe today (§ Windows is
+/// ready once powered + networked), so the fingerprint follows the same gate.
+fn authorized_keys_fingerprint_supported(platform: VmGuestPlatform) -> bool {
+    matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
+}
+
+/// Render fields for the one-line readiness summary: `(mtime, sha256)` with
+/// `"n/a"` placeholders so the line format stays fixed-width-parseable.
+fn authorized_keys_render_fields(
+    fingerprint: Option<&AuthorizedKeysFingerprint>,
+) -> (String, String) {
+    match fingerprint {
+        Some(AuthorizedKeysFingerprint {
+            mtime_epoch_secs: Some(mtime),
+            sha256_hex: Some(sha256),
+            ..
+        }) => (mtime.clone(), sha256.clone()),
+        Some(_) => ("n/a".to_owned(), "n/a".to_owned()),
+        None => ("not-probed".to_owned(), "not-probed".to_owned()),
+    }
+}
+
 fn ssh_auth_probe_command(profile: VmPlatformProfile) -> Result<&'static str, String> {
     match profile.remote_shell {
         VmRemoteShell::Posix => Ok("true"),
@@ -29790,6 +29955,25 @@ fn observe_local_utm_target_ready(
             },
         }
     };
+    // QH-44: fingerprint authorized_keys in the same probe window as the auth
+    // probe above, so a lost key carries an mtime+hash for later correlation.
+    // Read-only observation only; never mutates the guest file.
+    let authorized_keys_fingerprint = if requires_ssh
+        && authorized_keys_fingerprint_supported(target.platform_profile.platform)
+    {
+        match (live_ip.as_deref(), target.ssh_user.as_deref()) {
+            (Some(ip), Some(ssh_user)) => Some(probe_authorized_keys_fingerprint(
+                ip,
+                Some(ssh_user),
+                ssh_identity_file,
+                known_hosts_path,
+                timeout,
+            )),
+            _ => None,
+        }
+    } else {
+        None
+    };
     LocalUtmReadyState {
         alias: target.alias.clone(),
         utm_name: target.display_name().to_owned(),
@@ -29797,6 +29981,7 @@ fn observe_local_utm_target_ready(
         live_ip,
         ssh_port_status,
         ssh_auth_status,
+        authorized_keys_fingerprint,
         platform: target.platform_profile.platform,
     }
 }
@@ -29826,13 +30011,18 @@ fn render_local_utm_ready_states(states: &[LocalUtmReadyState]) -> String {
     states
         .iter()
         .map(|state| {
+            let (ak_mtime, ak_sha256) =
+                authorized_keys_render_fields(state.authorized_keys_fingerprint.as_ref());
             format!(
-                "{} ready process_present={} live_ip={} ssh_port_status={} ssh_auth_status={}",
+                "{} ready process_present={} live_ip={} ssh_port_status={} ssh_auth_status={} \
+                 authorized_keys_mtime={} authorized_keys_sha256={}",
                 state.alias,
                 state.process_present,
                 state.live_ip.as_deref().unwrap_or("unavailable"),
                 state.ssh_port_status,
-                state.ssh_auth_status
+                state.ssh_auth_status,
+                ak_mtime,
+                ak_sha256
             )
         })
         .collect::<Vec<_>>()
@@ -37345,9 +37535,11 @@ mod tests {
         VmGuestPlatform, VmInventoryEntry, VmLabCommandOverallStatus, VmLabDiscoverLocalUtmConfig,
         VmLabStageOutcome, VmLabStageStatus, VmLabValidateLiveLabProfileConfig,
         VmLabWriteLiveLabProfileConfig, VmRemoteShell, VmServiceManager, WindowsSshReadinessProbe,
-        alias_to_host_map, append_unique_stage_outcomes_collect_new, build_assignment_refresh_env,
-        build_local_source_extract_script, build_local_source_presync_cleanup_script,
-        build_remote_argv_script, build_remote_argv_script_for_target, build_repo_sync_script,
+        alias_to_host_map, append_unique_stage_outcomes_collect_new,
+        authorized_keys_fingerprint_supported, authorized_keys_render_fields,
+        build_assignment_refresh_env, build_local_source_extract_script,
+        build_local_source_presync_cleanup_script, build_remote_argv_script,
+        build_remote_argv_script_for_target, build_repo_sync_script,
         build_repo_sync_script_for_target, build_ssh_powershell_encoded_invocation,
         build_suite_command, build_utm_readiness, build_vendored_cargo_config,
         build_vm_lab_topology, build_windows_local_source_extract_result_script,
@@ -37369,17 +37561,19 @@ mod tests {
         load_live_lab_profile, local_process_probe_timeout, local_utm_process_present_in_ps_output,
         local_utm_process_present_with_ps, mac_address_from_utm_config_plist,
         macos_peer_list_indicates_mesh_join, materialize_orchestration_staging_dir,
-        normalize_mac_address, parse_libvirt_domifaddr_candidates, parse_libvirt_domiflist_macs,
+        normalize_mac_address, parse_authorized_keys_fingerprint,
+        parse_libvirt_domifaddr_candidates, parse_libvirt_domiflist_macs,
         parse_libvirt_domstate_running, parse_libvirt_list_names, parse_live_lab_stage_records,
         parse_local_utm_list_started_status, parse_membership_active_nodes, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
         pinned_toolchain_channel, privileged_rustynet_cli_script, read_to_string_with_timeout,
         remote_copy_destination_for_target, remote_script_for_ssh_transport,
         render_live_lab_stage_forensics_review, render_local_utm_discovery_summary,
-        render_matrix_compare, render_preflight, render_vm_lab_progress_complete_line,
-        render_vm_lab_progress_outcome_line, repo_sync_dispatch_kind_for_target,
-        resolve_discovery_bundle_paths, resolve_iteration_source_selection, resolve_remote_targets,
-        resolve_repo_sync_source, resolve_start_targets, resolve_utm_documents_root,
+        render_local_utm_ready_states, render_matrix_compare, render_preflight,
+        render_vm_lab_progress_complete_line, render_vm_lab_progress_outcome_line,
+        repo_sync_dispatch_kind_for_target, resolve_discovery_bundle_paths,
+        resolve_iteration_source_selection, resolve_remote_targets, resolve_repo_sync_source,
+        resolve_start_targets, resolve_utm_documents_root,
         resolved_inventory_ssh_target_with_utmctl, rewrite_ssh_target_host,
         select_inventory_entries, select_live_ssh_host_from_utm_output,
         select_preferred_live_ssh_ip, selected_local_utm_readiness_from_report,
@@ -38983,6 +39177,7 @@ mod tests {
             live_ip: Some("192.168.121.26".to_owned()),
             ssh_port_status: "open".to_owned(),
             ssh_auth_status: "ok".to_owned(),
+            authorized_keys_fingerprint: None,
             platform: VmGuestPlatform::Linux,
         };
         // Powered off: no process, no IP.
@@ -40075,6 +40270,142 @@ mod tests {
                 .expect("windows probe should exist"),
             "powershell.exe -NoLogo -NoProfile -NonInteractive -Command exit 0"
         );
+    }
+
+    // ---- QH-44: authorized_keys fingerprint instrumentation -----------------
+
+    #[test]
+    fn authorized_keys_probe_is_read_only() {
+        let probe = super::AUTHORIZED_KEYS_FINGERPRINT_PROBE;
+        // The probe runs on production lab guests over SSH, so it must never
+        // be able to mutate the file it fingerprints. Pin the absence of any
+        // mutating construct (write redirect, remove, rename, permission or
+        // ownership change, truncate-in-place). `2>/dev/null` suppressions
+        // are fine; any other write redirect is not.
+        let probe_without_suppressions = probe.replace("2>/dev/null", "");
+        for forbidden in [
+            ">", "rm ", "mv ", "chmod", "chown", "chgrp", "tee ", "truncate", "install ", "cp ",
+            "dd ",
+        ] {
+            assert!(
+                !probe_without_suppressions.contains(forbidden),
+                "authorized_keys probe must stay read-only; found {forbidden:?}"
+            );
+        }
+        // It must actually address the file and report both fields.
+        assert!(probe.contains(".ssh/authorized_keys"));
+        assert!(probe.contains("ak_mtime="));
+        assert!(probe.contains("ak_sha256="));
+        // Missing files are reported as an explicit status, not an empty ok.
+        assert!(probe.contains("ak_status=missing"));
+    }
+
+    #[test]
+    fn parse_authorized_keys_fingerprint_classifies_probe_output() {
+        // Happy path: both fields captured, mtime/hash surfaced verbatim.
+        let ok = parse_authorized_keys_fingerprint("ak_mtime=1755900000\nak_sha256=abc123\n");
+        assert_eq!(ok.status, "ok");
+        assert_eq!(ok.mtime_epoch_secs.as_deref(), Some("1755900000"));
+        assert_eq!(ok.sha256_hex.as_deref(), Some("abc123"));
+
+        // File absent: explicit "missing", no fabricated mtime/hash.
+        let missing = parse_authorized_keys_fingerprint("ak_status=missing\n");
+        assert_eq!(missing.status, "missing");
+        assert!(missing.mtime_epoch_secs.is_none());
+        assert!(missing.sha256_hex.is_none());
+
+        // Foreign/partial output must NOT be recorded as a fingerprint.
+        let garbage = parse_authorized_keys_fingerprint("Host key verification failed.\n");
+        assert!(garbage.status.starts_with("error:"));
+        assert!(garbage.sha256_hex.is_none());
+
+        // One field without the other is an error, never a silent "ok".
+        let half = parse_authorized_keys_fingerprint("ak_mtime=1755900000\n");
+        assert_eq!(half.status, "error:unrecognized-output:sha256-absent");
+        assert!(half.mtime_epoch_secs.is_none());
+    }
+
+    #[test]
+    fn authorized_keys_render_fields_use_fixed_placeholders() {
+        let ok = super::AuthorizedKeysFingerprint {
+            status: "ok".to_owned(),
+            mtime_epoch_secs: Some("1755900000".to_owned()),
+            sha256_hex: Some("abc123".to_owned()),
+        };
+        let missing = super::AuthorizedKeysFingerprint {
+            status: "missing".to_owned(),
+            mtime_epoch_secs: None,
+            sha256_hex: None,
+        };
+        assert_eq!(
+            authorized_keys_render_fields(Some(&ok)),
+            ("1755900000".to_owned(), "abc123".to_owned())
+        );
+        assert_eq!(
+            authorized_keys_render_fields(Some(&missing)),
+            ("n/a".to_owned(), "n/a".to_owned())
+        );
+        assert_eq!(
+            authorized_keys_render_fields(None),
+            ("not-probed".to_owned(), "not-probed".to_owned())
+        );
+    }
+
+    #[test]
+    fn ready_state_line_carries_authorized_keys_fields() {
+        let state = LocalUtmReadyState {
+            alias: "fedora-utm-1".to_owned(),
+            utm_name: "fedora-utm-1".to_owned(),
+            process_present: true,
+            live_ip: Some("192.168.64.103".to_owned()),
+            ssh_port_status: "open".to_owned(),
+            ssh_auth_status: "failed-exit-255".to_owned(),
+            authorized_keys_fingerprint: Some(super::AuthorizedKeysFingerprint {
+                status: "missing".to_owned(),
+                mtime_epoch_secs: None,
+                sha256_hex: None,
+            }),
+            platform: VmGuestPlatform::Linux,
+        };
+        let rendered = render_local_utm_ready_states(std::slice::from_ref(&state));
+        assert!(
+            rendered.contains("ssh_auth_status=failed-exit-255"),
+            "existing fields must survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("authorized_keys_mtime=n/a"),
+            "mtime field missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("authorized_keys_sha256=n/a"),
+            "sha256 field missing: {rendered}"
+        );
+
+        // Serialization carries the fingerprint struct for the JSON summary.
+        let json = serde_json::to_value(&state).expect("ready state must serialize");
+        let fingerprint = json
+            .get("authorized_keys_fingerprint")
+            .expect("fingerprint field must be present in serialized ready state");
+        assert_eq!(
+            fingerprint.get("status").and_then(|v| v.as_str()),
+            Some("missing")
+        );
+        assert!(fingerprint.get("mtime_epoch_secs").unwrap().is_null());
+        assert!(fingerprint.get("sha256_hex").unwrap().is_null());
+    }
+
+    #[test]
+    fn authorized_keys_fingerprint_supported_matches_ssh_probe_gate() {
+        assert!(authorized_keys_fingerprint_supported(
+            VmGuestPlatform::Linux
+        ));
+        assert!(authorized_keys_fingerprint_supported(
+            VmGuestPlatform::Macos
+        ));
+        assert!(!authorized_keys_fingerprint_supported(
+            VmGuestPlatform::Windows
+        ));
+        assert!(!authorized_keys_fingerprint_supported(VmGuestPlatform::Ios));
     }
 
     #[test]
@@ -41552,6 +41883,7 @@ mod tests {
                 live_ip: Some("192.168.64.8".to_owned()),
                 ssh_port_status: "open".to_owned(),
                 ssh_auth_status: "ok".to_owned(),
+                authorized_keys_fingerprint: None,
                 platform: super::VmGuestPlatform::Linux,
             }],
         )
@@ -42680,6 +43012,7 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
             live_ip: Some("192.168.64.3".to_owned()),
             ssh_port_status: ssh_port_status.to_owned(),
             ssh_auth_status: ssh_auth_status.to_owned(),
+            authorized_keys_fingerprint: None,
             platform: super::VmGuestPlatform::Linux,
         }
     }
@@ -42816,6 +43149,7 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
             live_ip: Some("192.168.64.14".to_owned()),
             ssh_port_status: "n/a".to_owned(),
             ssh_auth_status: "n/a".to_owned(),
+            authorized_keys_fingerprint: None,
             platform: super::VmGuestPlatform::Windows,
         };
         assert!(super::local_utm_ready_state_is_ready(&win));
