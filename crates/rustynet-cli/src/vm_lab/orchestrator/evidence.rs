@@ -488,19 +488,23 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
         // terminal watcher otherwise learns only that something failed, and has
         // to go find the per-stage log to learn what — the first question asked
         // every time. Truncated so one pathological error cannot flood the
-        // console; the untruncated text is in the stage log either way.
+        // console; QH-09: the console line NAMES the stage log so the brief is
+        // never read as the whole evidence when the full text sits beside it.
+        let log_path = self.stage_log_path(name);
         if summary.trim().is_empty() {
             eprintln!("[stage] {now} {name} {status}");
         } else {
             let first_line = summary.lines().next().unwrap_or_default();
             let brief: String = first_line.chars().take(200).collect();
-            eprintln!("[stage] {now} {name} {status}: {brief}");
+            eprintln!(
+                "[stage] {now} {name} {status}: {brief} (complete stage log: {})",
+                log_path.display()
+            );
         }
         // Write the per-stage log so downstream readers (get_stage_log, diagnose,
         // the monitor tail, validate_live_lab_run_artifacts) have a real file.
         // A Rust stage runs in-process; its outcome detail IS the log content
         // (the Failed error carries the per-node failure reason). Best-effort.
-        let log_path = self.stage_log_path(name);
         if let Some(parent) = log_path.parent()
             && let Err(err) = fs::create_dir_all(parent)
         {
