@@ -16,9 +16,11 @@ per its own text: verdict 1's enforcement point now exists — the Windows arm o
 `wfp_filter_shape::assess_forwarded_traffic_arbitration` + read-only `FwpmFilterEnum0`
 collector, fail-closed on unreadable WFP state), feeding the unchanged
 `reassert_host_firewall_admission` fail-closed rollback; 7 new off-Windows arbiter tests.
-Verdict 2's narrower shape remains OPEN by design. The Windows-guest live proof (a foreign
-forward-layer block tripping the fail-closed rollback on a real Windows exit node) remains
-pending. See the QH-46 addendum in `QualityHardeningTodo_2026-07-25.md`.
+Verdict 2's narrower shape was also implemented the same day (see the verdict-2 disposition in
+§2): the tunnel-permit filters now pin the maximal explicit `FWP_UINT64` weight and the read-back
+shape validation rejects an auto (`FWP_EMPTY`) or lower weight as drift/tamper. The Windows-guest
+live proof (a foreign forward-layer block tripping the fail-closed rollback on a real Windows
+exit node) remains pending. See the QH-46 addendum in `QualityHardeningTodo_2026-07-25.md`.
 
 ## Method
 
@@ -38,7 +40,11 @@ consumers in `crates/rustynetd/src/phase10.rs` and a smoke harness in
 
 - One dedicated **persistent RustyNet sublayer** at **max weight `u16::MAX`** (`FWPM_SUBLAYER_FLAG_PERSISTENT` + `weight = 0xFFFF`, `lib.rs:1633-1634`), deliberately out-weighing the `netsh advfirewall set allprofiles firewallpolicy … blockoutbound` default-block so our permit arbitrates over Defender Firewall. Stable GUID `5b8f2a31-9c4d-4e7a-b1f0-3d6e8a2c9f44`.
 - Two **hard-permit filters** (`FWP_ACTION_PERMIT` + `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`) at **ALE_AUTH_CONNECT_V4** and **ALE_AUTH_CONNECT_V6** (GUIDs `…a32…` / `…a33…`), each with a **single condition**: `FWPM_CONDITION_IP_LOCAL_INTERFACE == <tunnel interface LUID>` (`lib.rs:1656-1659`, `:1661-1670`).
-- The filters carry **`FWP_EMPTY` (auto) weight** — no explicit 64-bit weight (`lib.rs:1667`). Key arbitration fact: WFP ranks explicit `FWP_UINT64` filter weights **above** the u16 sublayer-weight range, so a foreign filter with an explicit high weight can outrank our permit even inside our max-weight sublayer's arbitration neighborhood.
+- At audit time the filters carried **`FWP_EMPTY` (auto) weight** — no explicit 64-bit weight
+  (`lib.rs:1667` then). Key arbitration fact: WFP ranks explicit `FWP_UINT64` filter weights
+  **above** the u16 sublayer-weight range, so a foreign filter with an explicit high weight could
+  outrank our permit even inside our max-weight sublayer's arbitration neighborhood. This gap is
+  now closed — the filters pin an explicit maximal weight (see the verdict-2 disposition in §2).
 - `PERSISTENT` on both sublayer and filters is deliberate (`lib.rs:1555-1557`): the persistent killswitch block must not outlive its persistent permit into a daemon crash, or the box is locked out.
 
 **Apply/remove/verify:**
@@ -114,6 +120,44 @@ fail **closed** — traffic is discarded (availability loss), not leaked. Residu
 therefore an availability defect, not a confidentiality one, and it is strictly smaller than
 verdict 1 (which is also a correctness lie: the node reports exit-serving while discarding).
 
+#### Verdict-2 disposition (2026-08-28 — IMPLEMENTED)
+
+The §3 fix shape was implemented in `crates/rustynet-windows-native/src/lib.rs`, branch
+`ai-edit/edit-1787975795249-56044-43`:
+
+- **Enforcement point (weight pin).** `wfp_add_permit_filter` no longer leaves the weight at
+  `FWP_EMPTY` auto; both tunnel-permit filters (ALE_AUTH_CONNECT_V4/V6) now pin
+  `FWP_UINT64` with value `wfp_filter_shape::TUNNEL_PERMIT_WEIGHT = u64::MAX`. Why u64::MAX:
+  an explicit `FWP_UINT64` weight ranks above the auto/u16 sublayer-derived range, and u64::MAX
+  is the highest explicit weight the API accepts, so only a foreign filter pinning the identical
+  value can reach arbitration at all; the next tiebreak (sublayer weight) is UINT16-only and
+  ours is already `u16::MAX` (0xFFFF, the absolute maximum), so a tie at u64::MAX resolves in
+  our favor against any foreign sublayer except one that forges both values (residual below).
+  The pointed-to `u64` local outlives `FwpmFilterAdd0`, same marshalling discipline as the
+  condition LUID value.
+- **Read-back validation (drift/tamper detection).** `wfp_read_filter_shape` now also reads
+  `filter.weight` (type + null-checked pointer value) into `WfpFilterShape`, and
+  `validate_tunnel_permit_shape` requires `weight_type == FWP_UINT64` **and**
+  `weight_uint64 == TUNNEL_PERMIT_WEIGHT`; anything else — `FWP_EMPTY` auto (the drift case) or
+  a lower explicit weight (the tamper case) — returns the new
+  `WfpShapeError::WrongWeight { weight_type, weight }` and the caller fails closed exactly as
+  for every other shape violation.
+- **Const drift pins.** `FWP_EMPTY == wfp_filter_shape::DATA_TYPE_EMPTY` is pinned alongside the
+  existing FWP_ACTION_PERMIT/FWP_UINT64/FWP_MATCH_EQUAL pins, and
+  `TUNNEL_PERMIT_WEIGHT == u64::MAX` is asserted in an off-Windows test, so a windows-sys crate
+  bump cannot silently change either value under the portable validator.
+- **Tests (off-Windows, portable module, same discipline as verdict 1).** The pinned filter
+  validates; an `FWP_EMPTY`-auto weight is rejected as `WrongWeight`; a lower explicit weight
+  (`u64::MAX - 1`) is rejected with both error fields named.
+- **Honest residual.** `FWP_UINT64::MAX` cannot be "outranked" by any larger weight — there is
+  none — but WFP's final tiebreak is filter identifier (installation order), which we do not
+  control. A foreign provider that deliberately forges *both* a `u16::MAX` sublayer weight and
+  an identical `u64::MAX` filter weight ties into that final tiebreak. That residual is strictly
+  narrower than the audit-time gap (any explicit weight sufficed then), requires maximal
+  deliberate forgery rather than a routine AV policy, and stays an availability-only risk in
+  kind. Sublayer weight is UINT16-only in the API, so our 0xFFFF is the absolute maximum and
+  nothing above it exists to lose to.
+
 ### Verdict 3 — our own permit removed mid-run: detected, but only lazily
 
 `wfp_tunnel_permit_present` returns `Ok(false)` on a missing filter (`lib.rs:1865-1899`) and
@@ -181,7 +225,7 @@ pin explicit high `FWP_UINT64` weights on our own filters so they cannot be outr
 their own weight class — a one-line change at `lib.rs:1667` plus shape-validation updates in
 `wfp_filter_shape`.
 
-### Disposition (2026-08-28 — the §3 shape for verdict 1 is now IMPLEMENTED)
+### Disposition (2026-08-28 — the §3 shape for verdict 1 is now IMPLEMENTED; verdict 2 too)
 
 The cheaper of the two shapes in step 1 was taken, scoped to the forward path: the Windows arm
 of `admit_host_firewall_forwarding` now calls
@@ -194,9 +238,10 @@ foreign block is at-or-above it by construction; default-deny treats any non-PER
 an obstruction. Fail-closed on unreadable WFP state is enforced as
 `ForeignForwardObstruction::Unreadable` (the `FirewalldPosture` mirror). Steps 2–3 needed no
 new plumbing and carry over unchanged; 7 off-Windows arbiter tests cover
-block/unreadable/permit/own-sublayer. Verdict 2's shape above remains OPEN by design, and the
-Windows-guest live proof (foreign forward-layer block → fail-closed rollback on a real exit
-node) remains pending.
+block/unreadable/permit/own-sublayer. Verdict 2's shape — the second alternative, pin explicit
+high `FWP_UINT64` weights plus `wfp_filter_shape` read-back updates — is implemented as of the
+same day; see the verdict-2 disposition under §2. The Windows-guest live proof (foreign
+forward-layer block → fail-closed rollback on a real exit node) remains pending.
 
 ## 4. Provenance
 
