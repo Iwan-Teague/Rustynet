@@ -27767,6 +27767,62 @@ mod tests {
     }
 
     #[test]
+    fn every_ops_verb_the_harness_invokes_parses() {
+        // MAC-D6 audit: each `ops <verb>` the live-lab harnesses shell out to
+        // must be a real subcommand. A harness that invents a verb gets a
+        // `bad_args` error — which the capture_*_allow_failure wrappers
+        // swallow — so the ONLY place this can fail loud is here, against the
+        // parser itself.
+        const HARNESS_OPS_VERBS: &[&str] = &[
+            // macOS exit harness (vm_lab/orchestrator/adapter/macos_*.rs)
+            "init-membership",
+            "e2e-membership-add",
+            "e2e-bootstrap-host",
+            "install-macos-relay",
+            "e2e-issue-assignment-bundles-from-env",
+            "e2e-issue-traversal-bundles-from-env",
+            "e2e-issue-dns-zone-bundles-from-env",
+            // cross-network scenario validators
+            // (vm_lab/orchestrator/stage/cross_network/scenario/)
+            "e2e-enforce-host",
+            "apply-role-coupling",
+        ];
+        for verb in HARNESS_OPS_VERBS {
+            let parsed = parse_command(&["ops".to_owned(), (*verb).to_owned()]);
+            let invented = match &parsed {
+                // A verb the parser has never heard of is the MAC-D6 defect
+                // class. A verb that parses but rejects missing flags (e.g.
+                // `e2e-membership-add` requiring its pubkey flag) is REAL —
+                // argument validation is exactly what a known verb does.
+                CliCommand::UsageError(m) => m.contains("unknown"),
+                _ => false,
+            };
+            assert!(
+                !invented,
+                "harness verb `{verb}` does not parse — it is an INVENTED \
+                 subcommand and any harness calling it will silently degrade: \
+                 {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verbs_that_were_once_invented_by_harnesses_stay_rejected() {
+        // Negative pins for the two invented verbs the MAC-D6 audit removed:
+        // if anyone ever adds them to the parser by accident (or a harness
+        // reintroduces a call), this test names the defect class.
+        for verb in ["owner-approver-id", "check-no-plaintext-passphrase-files"] {
+            let parsed = parse_command(&["ops".to_owned(), verb.to_owned()]);
+            assert!(
+                matches!(parsed, CliCommand::UsageError(ref m) if m.contains("unknown ops subcommand")),
+                "`ops {verb}` must remain a parser error: the harnesses derive \
+                 this data themselves, they must never query a verb for it \
+                 (got {parsed:?})"
+            );
+        }
+    }
+
+    #[test]
     fn help_is_still_help_and_stays_exit_zero() {
         // The fix must not turn a help request into an error.
         assert!(matches!(parse(&[]), CliCommand::Help));
