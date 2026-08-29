@@ -4,6 +4,41 @@
 or live-proven. No code, schema, platform claim, evidence date, or release claim is
 created by this document.
 
+> **2026-08-29 — phase 3 (v2 wire format: token/hello/fleet + PoP transcript)
+> landed.** The §16 items 1–3 selections from
+> `BlindRelayProtocolSelection_2026-08-28.md` are implemented in
+> `rustynet-control` as a new `blind_relay` module, with no v1 change and no
+> runtime wiring: `BlindRelayLegTokenV2` (§7.3 field set; identity-free),
+> `BlindRelayHelloV2` (token + client_nonce + relay_challenge + pop_signature;
+> deterministic fixed-line split, whole-document canonical re-encode check),
+> and `BlindRelayFleetDescriptorV2` (§8.1 mode/hello_versions/token_versions/
+> minimum_privacy_epoch/profile_ids + monotonic `generation`, with the §8.4
+> anti-fork/anti-rollback acceptance function). All three use the §1.3
+> canonical line grammar with the v1 house discipline (key allowlist, seen-set
+> duplicate reject, signature-final-line, fixed-width hex, canonical decimal
+> with leading-zero/sign reject, closed enums checked before signature use,
+> TTL bounds, per-field §1.3 bounds: wire ≤4096, fleet ≤16 KiB, text ≤32 ASCII
+> bytes, ≤20-digit integers) and a canonical re-encode equality check before
+> any signature use. The §2.2b PoP transcript
+> (`domain=rustynet-control-blind-relay-pop-v1`, token_digest=SHA-256 of the
+> token canonical payload, relay_challenge, circuit_handle, leg_handle,
+> leg_slot, privacy_epoch, client_nonce) is implemented with a standalone
+> `verify_strict` verifier (ed25519-dalek v2) that rejects the degenerate
+> all-zero presenter key before library decode. All 16 §1.3 test vectors are
+> implemented as in-tree tests (`v2_token_roundtrip` … `v2_hello_envelope`),
+> including a byte-pinned signed-preimage fixture under a fixed test seed.
+> Strictest-interpretation choices where the selection was open: hello
+> `client_nonce`/`relay_challenge` are fixed 32-byte CSPRNG values (the
+> rotating-key HMAC address-validation token format stays phase 4); list
+> fields are canonical-sorted with duplicate reject; `identity_blind`
+> descriptors must list exactly hello/token `[2]`. **Still phase-gated (phase
+> 4):** relay-side listener and admission ordering, HMAC address-validation
+> token format + `LocalKeyRotationLedger` wiring, digest-keyed replay store,
+> PoP runtime sequencing, fleet-bundle dual publication, production
+> advertisement (phase-1 refusals stay closed), and presenter-key
+> zeroize-on-erasure wrappers. No `RelaySessionToken` v1 or v1 fleet-bundle
+> wire change was touched.
+
 > **2026-08-29 — phase 2 (dedicated role scaffolding) landed.** The §0 item 2
 > role scaffolding is implemented, again ahead of (and without preempting) §16
 > sign-off and with the phase-1 gates untouched: `RolePreset::BlindRelay` and
