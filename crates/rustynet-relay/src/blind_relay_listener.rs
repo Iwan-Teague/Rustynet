@@ -55,7 +55,7 @@
 //! the composition before `blind_relay` may be advertised by production
 //! signed state. Phase 4 implements the listener path; it does not open it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -113,6 +113,19 @@ pub const MAX_BLIND_REPLAY_ENTRIES: usize =
 
 /// Global cap on waiting (unpaired) circuits held in memory.
 pub const MAX_BLIND_WAITING_LEGS_TOTAL: usize = 256;
+
+/// Cap on paired-circuit records retained for third-leg quarantine
+/// (design §7.6 / second adversarial review F4): a leg arriving for an
+/// already-paired `(privacy_epoch, circuit_handle)` must be closed, never
+/// re-admitted to a fresh waiting circuit. The tracking map is BOUNDED —
+/// at capacity the OLDEST record is evicted first — and every record also
+/// EXPIRES at its token's expiry, so the quarantine bookkeeping can never
+/// itself become a memory-exhaustion vector. An evicted record degrades
+/// only the quarantine of a long-forgotten handle; the paired circuit
+/// holds no payload state (design §7.6: nothing is buffered before or
+/// after pairing), so the worst case is exactly the pre-fix behavior for
+/// that one handle, never an allocation amplification.
+pub const MAX_BLIND_PAIRED_TRACKING_ENTRIES: usize = 256;
 
 /// Per-source-prefix cap on waiting circuits a single network prefix may hold.
 pub const MAX_BLIND_WAITING_LEGS_PER_SOURCE_PREFIX: usize = 16;
@@ -863,6 +876,69 @@ impl BlindWaitingCircuit {
     }
 }
 
+/// Bounded, expiring record of circuits that have PAIRED (design §7.6;
+/// second adversarial review F4). A third leg arriving for an
+/// already-paired `(privacy_epoch, circuit_handle)` is closed/quarantined,
+/// never allocated a fresh waiting circuit. Two hard bounds keep the
+/// quarantine bookkeeping itself from becoming a memory-exhaustion vector:
+/// a capacity cap with OLDEST-FIRST eviction, and per-record TTL expiry at
+/// the token's own expiry.
+#[derive(Debug)]
+struct BlindPairedCircuits {
+    max_entries: usize,
+    /// Insertion-ordered keys backing the FIFO capacity eviction.
+    order: VecDeque<BlindCircuitKey>,
+    /// Key → token expiry (`expires_at_unix`). A record lives no longer
+    /// than the token that produced it.
+    by_key: HashMap<BlindCircuitKey, u64>,
+}
+
+impl BlindPairedCircuits {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            order: VecDeque::new(),
+            by_key: HashMap::new(),
+        }
+    }
+
+    fn contains(&self, key: &BlindCircuitKey) -> bool {
+        self.by_key.contains_key(key)
+    }
+
+    /// Record a freshly paired circuit. The FIRST pairing of a key wins —
+    /// a duplicate record never refreshes or extends an existing expiry.
+    /// At capacity the oldest record is evicted (bounded before insert).
+    fn record(&mut self, key: BlindCircuitKey, expires_at_unix: u64) {
+        if self.by_key.contains_key(&key) {
+            return;
+        }
+        while self.order.len() >= self.max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.by_key.remove(&oldest);
+        }
+        self.order.push_back(key);
+        self.by_key.insert(key, expires_at_unix);
+    }
+
+    /// Drop records whose token expiry has passed. Mirrors
+    /// [`Self::record`]'s order list so the two views never diverge.
+    fn retain_unexpired(&mut self, now: u64) {
+        self.order
+            .retain(|key| self.by_key.get(key).is_some_and(|expires| *expires > now));
+        self.by_key.retain(|_, expires| *expires > now);
+    }
+
+    /// Test-only size probe; production code never reads the count, it
+    /// only enforces the bound.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_key.len()
+    }
+}
+
 /// Result of a successful admission. Phase 4 ends at pairing; bounded frame
 /// forwarding between bound tuples is later-phase work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -951,6 +1027,7 @@ pub struct BlindRelayListener {
     prefix_limiter: SourcePrefixLimiter,
     replay: BlindReplayStore,
     circuits: HashMap<BlindCircuitKey, BlindWaitingCircuit>,
+    paired: BlindPairedCircuits,
     limits: BlindRelayListenerLimits,
     clock_skew_tolerance_secs: u64,
 }
@@ -1023,6 +1100,7 @@ impl BlindRelayListener {
             prefix_limiter: SourcePrefixLimiter::new(limits.max_hellos_per_source_prefix_per_sec),
             replay,
             circuits: HashMap::new(),
+            paired: BlindPairedCircuits::new(MAX_BLIND_PAIRED_TRACKING_ENTRIES),
             limits,
             clock_skew_tolerance_secs: skew,
         })
@@ -1185,7 +1263,14 @@ impl BlindRelayListener {
             NewCircuit,
             PairWithExisting,
         }
-        let plan = if let Some(existing) = self.circuits.get(&circuit_key) {
+        let plan = if self.paired.contains(&circuit_key) {
+            // §7.6 / second adversarial review F4: a third leg for an
+            // ALREADY-PAIRED (epoch, circuit_handle) is closed/quarantined
+            // — it must never enter the pairing branch or allocate a fresh
+            // waiting circuit. The rejection is a single closed class
+            // (§7.3): the wire does not learn which check fired.
+            return Err(BlindRejectReason::Unauthorized);
+        } else if let Some(existing) = self.circuits.get(&circuit_key) {
             // Pairing branch: the circuit holds the complementary leg.
             if existing.leg_for(slot).is_some() {
                 // Same slot twice (distinct token — an exact replay was
@@ -1261,8 +1346,12 @@ impl BlindRelayListener {
                 Ok(BlindAdmissionOutcome::WaitingLegRecorded)
             }
             Plan::PairWithExisting => {
-                // Paired circuits leave the waiting map; forwarding-plane
-                // handoff is later-phase work.
+                // Paired circuits leave the waiting map, but the handle is
+                // remembered (bounded, expiring) so a THIRD leg for the
+                // same (epoch, circuit_handle) is quarantined at step 9
+                // instead of being re-admitted as a fresh waiting circuit
+                // (§7.6; second adversarial review F4).
+                self.paired.record(circuit_key, hello.token.expires_at_unix);
                 self.circuits.remove(&circuit_key);
                 Ok(BlindAdmissionOutcome::CircuitPaired)
             }
@@ -1272,6 +1361,7 @@ impl BlindRelayListener {
     fn prune_expired_circuits(&mut self, now: u64) {
         self.circuits
             .retain(|_, circuit| circuit.expires_at_unix > now);
+        self.paired.retain_unexpired(now);
     }
 }
 
@@ -2310,6 +2400,151 @@ mod tests {
             Ok(BlindAdmissionOutcome::CircuitPaired)
         );
         assert_eq!(rig.listener.waiting_circuit_count(), 0);
+    }
+
+    #[test]
+    fn post_pair_third_leg_is_quarantined_never_re_admitted() {
+        let mut rig = build_rig("post_pair_third_leg");
+        let source_a = source_addr(70, 6020);
+        let source_b = source_addr(71, 6021);
+        let source_c = source_addr(72, 6022);
+        let circuit = distinct(110);
+        let presenter_a = SigningKey::from_bytes(&[0x41u8; 32]);
+        let presenter_b = SigningKey::from_bytes(&[0x42u8; 32]);
+        let presenter_c = SigningKey::from_bytes(&[0x43u8; 32]);
+        let key = BlindCircuitKey {
+            privacy_epoch: 1,
+            circuit_handle: circuit,
+        };
+        let mut observer = RecordedObserver::default();
+
+        // First + second leg pair normally (no regression).
+        let wire0 = signed_hello_wire(
+            &rig,
+            source_a,
+            &presenter_a,
+            1,
+            circuit,
+            distinct(111),
+            BlindRelayLegSlot::Slot0,
+            distinct16(112),
+            distinct(113),
+        );
+        assert_eq!(
+            rig.listener
+                .handle_hello_with_now(&wire0, source_a, Some(rig.now), &mut observer),
+            Ok(BlindAdmissionOutcome::WaitingLegRecorded)
+        );
+        let wire1 = signed_hello_wire(
+            &rig,
+            source_b,
+            &presenter_b,
+            1,
+            circuit,
+            distinct(114),
+            BlindRelayLegSlot::Slot1,
+            distinct16(115),
+            distinct(116),
+        );
+        assert_eq!(
+            rig.listener
+                .handle_hello_with_now(&wire1, source_b, Some(rig.now), &mut observer),
+            Ok(BlindAdmissionOutcome::CircuitPaired)
+        );
+        assert_eq!(rig.listener.waiting_circuit_count(), 0);
+        assert!(rig.listener.paired.contains(&key));
+
+        // A THIRD leg for the already-paired (epoch, circuit_handle) —
+        // fresh token, nonce, presenter, and source, so it passes every
+        // cryptographic step — must be closed/quarantined at the pairing
+        // decision, never allocated a fresh waiting circuit (design §7.6;
+        // second adversarial review F4).
+        let wire2 = signed_hello_wire(
+            &rig,
+            source_c,
+            &presenter_c,
+            1,
+            circuit,
+            distinct(117),
+            BlindRelayLegSlot::Slot0,
+            distinct16(118),
+            distinct(119),
+        );
+        assert_eq!(
+            rig.listener
+                .handle_hello_with_now(&wire2, source_c, Some(rig.now), &mut observer),
+            Err(BlindRejectReason::Unauthorized)
+        );
+        // Nothing entered the waiting map: the quarantine held.
+        assert_eq!(rig.listener.waiting_circuit_count(), 0);
+        // The paired record survived the attempt unchanged (first pairing
+        // wins; the quarantine never refreshes or extends it).
+        assert_eq!(rig.listener.paired.len(), 1);
+        assert!(rig.listener.paired.contains(&key));
+
+        // An unrelated NEW circuit is unaffected by the quarantine.
+        let wire_other = signed_hello_wire(
+            &rig,
+            source_a,
+            &presenter_a,
+            1,
+            distinct(120),
+            distinct(121),
+            BlindRelayLegSlot::Slot0,
+            distinct16(122),
+            distinct(123),
+        );
+        assert_eq!(
+            rig.listener
+                .handle_hello_with_now(&wire_other, source_a, Some(rig.now), &mut observer),
+            Ok(BlindAdmissionOutcome::WaitingLegRecorded)
+        );
+    }
+
+    #[test]
+    fn paired_tracking_is_bounded_and_expiring() {
+        let mut paired = BlindPairedCircuits::new(3);
+        let key = |byte: u8| BlindCircuitKey {
+            privacy_epoch: 1,
+            circuit_handle: distinct(byte),
+        };
+
+        // Capacity is enforced: the OLDEST record is evicted first.
+        paired.record(key(1), 1_000);
+        paired.record(key(2), 2_000);
+        paired.record(key(3), 3_000);
+        assert_eq!(paired.len(), 3);
+        assert!(paired.contains(&key(1)));
+        paired.record(key(4), 4_000);
+        assert_eq!(paired.len(), 3);
+        assert!(!paired.contains(&key(1)), "oldest record must expire first");
+        assert!(paired.contains(&key(2)));
+        assert!(paired.contains(&key(3)));
+        assert!(paired.contains(&key(4)));
+
+        // The first pairing of a key wins: a re-record never refreshes or
+        // extends its expiry.
+        paired.record(key(2), 9_999);
+        paired.retain_unexpired(2_500);
+        assert!(
+            !paired.contains(&key(2)),
+            "re-recording must not extend the original expiry"
+        );
+        assert!(paired.contains(&key(3)));
+        assert!(paired.contains(&key(4)));
+
+        // Records expire at their token expiry, never later.
+        paired.retain_unexpired(3_500);
+        assert!(!paired.contains(&key(3)), "expired record must be pruned");
+        assert!(paired.contains(&key(4)));
+        paired.retain_unexpired(4_500);
+        assert_eq!(paired.len(), 0, "expired records must be pruned");
+
+        // A capacity of zero is clamped to one, never unbounded.
+        let mut clamped = BlindPairedCircuits::new(0);
+        clamped.record(key(5), 1_000);
+        clamped.record(key(6), 1_000);
+        assert_eq!(clamped.len(), 1);
     }
 
     #[test]

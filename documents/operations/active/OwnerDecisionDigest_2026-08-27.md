@@ -321,6 +321,17 @@ acceptance (6). Until 1–6 are resolved the role stays design-only and must not
 production signed state.
 Source: `documents/operations/active/BlindRelayRoleDesign_2026-08-27.md` §0, §7.3, §16.
 **Status: `approved` (architecture) with §16.1–.6 open.**
+**UPDATE 2026-08-29 (go-live Phase A, owner-authorized):** both review-mandated
+go-live blockers are CLOSED at commit `0e8ab840` with no gate flipped — F5
+(daemon local-role alignment converted from a future-permissive forbidden-list
+to the §5.1 exact-set compare `{relay_host, blind_relay}`, mirroring
+`membership.rs:2742`, reject-future-by-default) and F4 (a third protocol leg
+for an already-paired `(epoch, circuit_handle)` is now quarantined via a
+bounded, expiring `Paired` tracker instead of being allocated a fresh waiting
+circuit, §7.6). See
+`BlindRelayAdversarialReview2_2026-08-29.md` §13 for evidence. §11's
+advertisement NO-GO remains in force: §16 items 1–7 and the §13.2 live-lab
+stages are still unmet — the gate flips are a later phase.
 
 ---
 
