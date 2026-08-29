@@ -267,6 +267,28 @@ consecutive" (which §5.4 explicitly replaced as arithmetically too weak).
 - **macOS path-constant hardening — LANDED 2026-08-28 (`a0851175`).** All 21
   daemon path constants + the helper socket are armed to the installer layout,
   removing the class of wrong-location constants that produced MAC-D2.
+- **macOS mesh-status peer visibility — node-id-exact — LANDED 2026-08-29
+  (`7d6f5c98`, no lab run yet).** The macOS mesh-status report previously
+  exposed only the session snapshot's `peer_ids`, which hold ADVERTISED ROUTE
+  CIDRS — so the anchor peer-visibility assertion could prove "some routes
+  exist" but never that the right peers are visible. A separate, ADDITIVE
+  `member_node_ids` field now carries the VERIFIED active roster node ids,
+  read from the SIGNED membership snapshot via rustynet-control
+  `load_membership_snapshot` (permission/digest/state verification before any
+  node id is read; same primitive as `anchor-port-mapping-status-check`).
+  STRICT fail-closed: an unreadable/unverifiable membership snapshot is a
+  drift reason even with no node-id expectations requested; the field
+  defaults to `Invalid` for pre-addition reports (never an empty roster);
+  revoked/quarantined rows never satisfy an assertion; roster staleness is
+  NOT time-checked (roster `updated_at_unix` measures last change, not
+  liveness — node-view freshness stays on `max_age_seconds`). The
+  orchestrator's typed macOS MeshStatus validator now dispatches the
+  §4.7-challenged node id as `--expected-node-id`, and
+  `evaluate_macos_mesh_status_report` rejects any report without a `Verified`
+  roster — the assertion is node-id-exact while the CIDR-range check keeps
+  working unchanged (`windows_mesh_status.rs` untouched; serialization is
+  serde-default additive). Live-lab proof pending: next macOS anchor cell run
+  must exercise the strengthened dispatch.
 - **Harvest-form caveat (`--skip-linux-live-suite`).** The fast-path flag every
   mac/win target key sets (`ai_agent.rs:1864-1892`) drops the whole post-baseline
   suite — `plan.rs:545-549`, 61 → 19 stages. That excludes `live_anchor` and all

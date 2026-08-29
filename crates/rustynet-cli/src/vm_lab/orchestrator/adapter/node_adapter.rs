@@ -570,7 +570,14 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
             mesh_status::validate_linux_mesh_status(&*shell, daemon_path, alias)
         }
         (RoleValidatorKind::MeshStatus, VmGuestPlatform::Macos) => {
-            mesh_status::validate_macos_mesh_status(&*shell, daemon_path, alias)
+            mesh_status::validate_macos_mesh_status(
+                &*shell,
+                daemon_path,
+                alias,
+                // Node-id-exact peer visibility: the §4.7-challenged node id
+                // must appear in the report's VERIFIED membership node ids.
+                expected_node_id,
+            )
         }
         (RoleValidatorKind::MeshStatus, VmGuestPlatform::Windows) => {
             mesh_status::validate_windows_mesh_status(&*shell, daemon_path, alias)

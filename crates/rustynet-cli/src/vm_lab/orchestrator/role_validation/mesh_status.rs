@@ -87,18 +87,31 @@ pub fn validate_linux_mesh_status(
     Ok(())
 }
 
+/// Run the macOS mesh-status daemon self-check through the shell seam,
+/// applying the typed evaluator. `expected_node_id` is the node id the
+/// orchestrator recorded for this slot (§4.7 identity challenge) — when
+/// known it is dispatched as `--expected-node-id` so the daemon must find it
+/// among the VERIFIED membership node ids: the peer-visibility assertion
+/// becomes node-id-exact instead of the route-CIDR presence check alone.
+/// The evaluator additionally fails closed when the report does not carry a
+/// verified membership node-id list at all.
 pub fn validate_macos_mesh_status(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
     alias: &str,
+    expected_node_id: Option<&str>,
 ) -> Result<(), String> {
     const SUBCOMMAND: &str = "macos-mesh-status-check";
-    let argv = [
+    let mut argv: Vec<&str> = vec![
         daemon_path,
         SUBCOMMAND,
         "--max-age-seconds",
         SNAPSHOT_MAX_AGE_SECONDS,
     ];
+    if let Some(node_id) = expected_node_id {
+        argv.push("--expected-node-id");
+        argv.push(node_id);
+    }
     let out = shell
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
@@ -193,6 +206,114 @@ mod tests {
         );
     }
 
+    /// Good macOS report body: membership VERIFIED so it clears the
+    /// evaluator's fail-closed member_node_ids check.
+    fn macos_good_report() -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "state_path": "/usr/local/var/rustynet/rustynetd.state",
+            "overall_ok": true,
+            "snapshot": {
+                "load_status": "ok",
+                "timestamp_unix": 1_700_000_000u64,
+                "age_seconds": 5,
+                "peer_ids": [],
+                "selected_exit_node": serde_json::Value::Null,
+                "lan_access_enabled": false
+            },
+            "expected_peer_ids": [],
+            "max_age_seconds": 180,
+            "drift_reasons": [],
+            "membership_snapshot_path": "/usr/local/var/rustynet/membership/membership.snapshot",
+            "expected_node_ids": ["node-9"],
+            "member_node_ids": {
+                "membership_load_status": "verified",
+                "node_ids": ["node-9"]
+            }
+        })
+        .to_string()
+    }
+
+    fn macos_argv(extra: &[&'static str]) -> Vec<&'static str> {
+        let mut argv: Vec<&'static str> = vec![
+            TEST_DAEMON,
+            "macos-mesh-status-check",
+            "--max-age-seconds",
+            SNAPSHOT_MAX_AGE_SECONDS,
+        ];
+        argv.extend_from_slice(extra);
+        argv
+    }
+
+    /// The dispatch MUST carry `--expected-node-id` when the orchestrator
+    /// knows the slot's node id: the peer-visibility assertion is
+    /// node-id-exact, not just the route-CIDR presence check.
+    #[test]
+    fn macos_dispatch_carries_expected_node_id_when_known() {
+        let mock = MockShellHost::new();
+        let argv = macos_argv(&["--expected-node-id", "node-9"]);
+        mock.program_run_response(&argv, exit_ok(&macos_good_report()));
+        validate_macos_mesh_status(&mock, TEST_DAEMON, "mac-1", Some("node-9"))
+            .unwrap_or_else(|err| panic!("expected node id must be dispatched; got: {err}"));
+    }
+
+    /// With no recorded node id the dispatch stays bare (no vacuous flag
+    /// value), and the report must still carry VERIFIED membership node ids
+    /// to pass the evaluator.
+    #[test]
+    fn macos_dispatch_bare_when_node_id_unknown_but_requires_verified_roster() {
+        let mock = MockShellHost::new();
+        let argv = macos_argv(&[]);
+        mock.program_run_response(&argv, exit_ok(&macos_good_report()));
+        validate_macos_mesh_status(&mock, TEST_DAEMON, "mac-1", None)
+            .expect("a verified report must pass with no expected node id");
+    }
+
+    /// FAIL-CLOSED: a report whose member_node_ids is Missing (membership
+    /// snapshot unavailable on the node) must fail the stage, not read as
+    /// "no peers".
+    #[test]
+    fn macos_dispatch_fails_closed_when_membership_unavailable() {
+        let missing_roster = serde_json::json!({
+            "schema_version": 1,
+            "state_path": "/usr/local/var/rustynet/rustynetd.state",
+            "overall_ok": false,
+            "snapshot": {
+                "load_status": "ok",
+                "timestamp_unix": 1_700_000_000u64,
+                "age_seconds": 5,
+                "peer_ids": [],
+                "selected_exit_node": serde_json::Value::Null,
+                "lan_access_enabled": false
+            },
+            "expected_peer_ids": [],
+            "max_age_seconds": 180,
+            "drift_reasons": [
+                "membership node ids unavailable (fail-closed): membership snapshot \
+                 unreadable at /usr/local/var/rustynet/membership/membership.snapshot"
+            ],
+            "membership_snapshot_path": "/usr/local/var/rustynet/membership/membership.snapshot",
+            "expected_node_ids": [],
+            "member_node_ids": {
+                "membership_load_status": "missing",
+                "reason": "membership snapshot unreadable"
+            }
+        })
+        .to_string();
+        let mock = MockShellHost::new();
+        let argv = macos_argv(&[]);
+        mock.program_run_response(&argv, exit_ok(&missing_roster));
+        let err = validate_macos_mesh_status(&mock, TEST_DAEMON, "mac-1", None)
+            .expect_err("an unverified membership roster must fail the stage");
+        // The evaluator may reject via the overall_ok=false drift path or the
+        // explicit member_node_ids gate — both are fail-closed.
+        assert!(
+            err.contains("membership node ids unavailable (fail-closed)")
+                || err.contains("does not carry verified membership node ids"),
+            "should reject a missing membership read, got: {err}"
+        );
+    }
+
     /// The dispatch MUST carry `--max-age-seconds`, on every platform.
     ///
     /// This is the test whose absence let the defect live. Without the flag the
@@ -230,7 +351,6 @@ mod tests {
                 validate_linux_mesh_status
                     as fn(&dyn RemoteShellHost, &str, &str) -> Result<(), String>,
             ),
-            ("macos-mesh-status-check", validate_macos_mesh_status),
             ("windows-mesh-status-check", validate_windows_mesh_status),
         ] {
             let mock = MockShellHost::new();
@@ -247,6 +367,10 @@ mod tests {
                 panic!("{subcommand} must dispatch with --max-age-seconds; got: {err}")
             });
         }
+        // macOS is asserted with its node-id-aware contract by
+        // macos_dispatch_carries_expected_node_id_when_known /
+        // macos_dispatch_bare_when_node_id_unknown_but_requires_verified_roster,
+        // which program the same --max-age-seconds-bearing argv.
     }
 
     /// The bound must be a positive integer the daemon can parse, and must sit
