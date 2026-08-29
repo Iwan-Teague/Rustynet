@@ -1996,6 +1996,20 @@ local process probe on the production path, and its doc comments now mark the
 ### QH-34 — Every run records `dirty:worktree` because the run itself mutates a tracked file that the dirty-state exclude list does not cover
 **Severity: low-medium (devalues the provenance field on every evidence row). Confidence: VERIFIED 2026-07-29.**
 
+**CLOSED 2026-08-29.** Chose the one-line exclude (option one), per the accepted
+disposition: `:(exclude)documents/operations/active/vm_lab_inventory.json` is now in
+the dirty-state pathspec list, hoisted into a single shared constant
+`GIT_DIRTY_STATE_EXCLUDE_PATHSPECS` (`crates/rustynet-cli/src/live_lab_run_matrix.rs`)
+that both call sites — `current_git_dirty_state` and `vm_lab::git_worktree_is_dirty` —
+read, so the lists can no longer drift. A run that touches only the inventory now
+reads clean; a hand-edited inventory is accepted as unflagged. As defense in depth,
+the earlier of the two options' concerns is ALSO addressed by the
+`run_start_git_tree_clean` field (sampled in `vm_lab::orchestrator::evidence` before
+readiness mutates anything) and its preferred use in the run-matrix
+`git_dirty_state` resolution; and the two test pins in `live_lab_run_matrix.rs` prove
+an inventory-only change is not reported dirty while any other tracked-file change
+still is.
+
 The run at `f22be5af` started from a **clean, committed tree** — `host_preflight`
 reported `local_clean PASS` moments before launch — yet its run-matrix row records
 `dirty:worktree`. The orchestrator legitimately refreshes
