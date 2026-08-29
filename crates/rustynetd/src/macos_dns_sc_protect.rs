@@ -58,6 +58,24 @@ pub const NETWORKSETUP_EMPTY_DNS_KEYWORD: &str = "Empty";
 pub const NETWORKSETUP_SERVICE_LIST_LEGEND: &str =
     "An asterisk (*) denotes that a network service is currently disabled.";
 
+/// Invariant substring shared by every observed wording of the
+/// `-listallnetworkservices` legend. macOS hosts in the field have shipped
+/// the shorter variant "An asterisk (*) denotes that a network service is
+/// disabled." (no "currently"), so the parser matches on this substring
+/// instead of the full sentence — an exact-match skip silently turned the
+/// variant legend into a phantom service name and failed every later
+/// `networksetup` call against it. No real service name contains this
+/// phrase (it names the tool's own convention), so the match is unambiguous.
+pub const NETWORKSETUP_SERVICE_LIST_LEGEND_MARKER: &str =
+    "asterisk (*) denotes that a network service is";
+
+/// True when a `-listallnetworkservices` output line is the disclaimer
+/// legend (any observed wording variant). Such lines are structural output,
+/// never service names.
+pub fn is_networksetup_service_list_legend(line: &str) -> bool {
+    line.contains(NETWORKSETUP_SERVICE_LIST_LEGEND_MARKER)
+}
+
 /// Marker prefix `networksetup` puts on disabled services. Disabled services
 /// are out of M1 scope (§5 owner decision: all ENABLED services only).
 pub const NETWORKSETUP_DISABLED_SERVICE_PREFIX: char = '*';
@@ -216,8 +234,9 @@ pub fn parse_networksetup_getdns_output(output: &str) -> Result<NetworksetupDnsS
 /// Parse `-listallnetworkservices` stdout into the ENABLED service names.
 ///
 /// Layout (observed macOS behavior, §4 M1):
-/// - line 1 is the legend ("An asterisk (*) denotes that a network service
-///   is currently disabled.") and is skipped,
+/// - the legend line ("An asterisk (*) denotes that a network service is
+///   [currently] disabled.", matched by wording-invariant substring) is
+///   skipped,
 /// - `*`-prefixed lines are disabled services and are skipped (§5 owner
 ///   decision 2: M1 scope is all enabled hardware services),
 /// - blank lines are skipped,
@@ -230,14 +249,12 @@ pub fn parse_networksetup_getdns_output(output: &str) -> Result<NetworksetupDnsS
 /// so an empty list means we parsed something we do not understand.
 pub fn parse_networksetup_service_list(output: &str) -> Result<Vec<String>, String> {
     let mut services = Vec::new();
-    let mut saw_legend = false;
     for raw_line in output.lines() {
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
         }
-        if !saw_legend && line == NETWORKSETUP_SERVICE_LIST_LEGEND {
-            saw_legend = true;
+        if is_networksetup_service_list_legend(line) {
             continue;
         }
         if let Some(disabled) = line.strip_prefix(NETWORKSETUP_DISABLED_SERVICE_PREFIX) {
@@ -673,6 +690,39 @@ Thunderbolt Bridge
         assert!(parse_networksetup_service_list(&carriage_return).is_err());
         let tab = format!("{NETWORKSETUP_SERVICE_LIST_LEGEND}\nBad\x09Service\n");
         assert!(parse_networksetup_service_list(&tab).is_err());
+    }
+
+    #[test]
+    fn service_list_parser_skips_legend_wording_variants_and_disabled_entries() {
+        // Field-observed macOS variants of the legend: with and without
+        // "currently". Both must be recognized as structural output, never
+        // as service names (an unrecognized variant previously became a
+        // phantom service and failed every later `networksetup` call against
+        // it with status 4). Disabled `*` entries are likewise never
+        // enumerable (§5 owner decision 2).
+        let short_variant = "An asterisk (*) denotes that a network service is disabled.";
+        let long_variant = NETWORKSETUP_SERVICE_LIST_LEGEND;
+        let output =
+            format!("{short_variant}\nWi-Fi\n*Thunderbolt Bridge\n{long_variant}\nEthernet\n");
+        let parsed = parse_networksetup_service_list(&output).expect("variant list must parse");
+        assert_eq!(
+            parsed,
+            vec!["Wi-Fi".to_owned(), "Ethernet".to_owned()],
+            "neither legend variant nor a disabled service may be enumerable"
+        );
+
+        // The substring predicate itself: exact consts, and a line that
+        // merely CONTAINS the invariant phrase, all classify as legend.
+        assert!(is_networksetup_service_list_legend(short_variant));
+        assert!(is_networksetup_service_list_legend(long_variant));
+        assert!(!is_networksetup_service_list_legend("Wi-Fi"));
+        assert!(!is_networksetup_service_list_legend("Ethernet 2"));
+
+        // Variant-legend-only output is still an error (no enabled services),
+        // never an empty success.
+        let err = parse_networksetup_service_list(short_variant)
+            .expect_err("legend-only output must not parse as an empty success");
+        assert!(err.contains("no enabled services"));
     }
 
     #[test]

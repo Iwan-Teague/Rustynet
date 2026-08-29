@@ -267,3 +267,73 @@ owner exception to run a privileged helper listener.
   (`backup_baseline_refuses_loopback_residue_without_prior_original`,
   `backup_baseline_preserves_prior_original_over_loopback_residue`,
   `backup_baseline_records_normal_captured_dns_unchanged`).
+
+- **2026-08-29 — pf DNS floor VERIFIED at Linux-`nft` parity (rule-by-rule); NO
+  rules added.** Owner decision 1 (STRICT, digest entry 25) required the
+  packet-layer pf DNS-deny floor to be at parity with the Linux `nft` floor
+  (`linux_exit_dns_failclosed.rs`: `udp dport 53 oifname != "rustynet0" drop` +
+  `tcp dport 53 oifname != "rustynet0" drop`, `inet` family ⇒ v4+v6). Comparison
+  against `MacosCommandSystem::render_macos_killswitch_pf_rules`
+  (`phase10.rs`, the single source shared by the daemon renderer and the
+  privileged helper; the blind-exit builder in `macos_blind_exit.rs` renders the
+  same shape) shows parity already holds, so per the decision no redundant rules
+  were added. The non-strict `dns_protected` anchor renders, in order:
+
+  1. `set block-policy drop` — drop (not return) as the policy default.
+  2. `pass quick on lo0 all` — loopback is never DNS-restricted.
+  3. `pass out quick on <tunnel> inet proto {udp,tcp} to any port 53 keep state`
+     — the ONLY `:53` pass rules in the anchor, scoped to the sanctioned tunnel
+     interface (both protocols, `inet` ⇒ v4+v6 destinations via the v4 ruleset).
+  4. `block drop out quick inet proto {udp,tcp} to any port 53 label
+     "rustynet-dns-block-lan-{udp,tcp}"` (labels shared with the Linux
+     `DNS_BLOCK_LAN_*` constants) — interface-AGNOSTIC `:53` drops, so every
+     non-tunnel interface's v4 DNS is denied at parity with the `nft`
+     `oifname !=` form.
+  5. `pass out quick on <tunnel> inet all keep state` + optionally
+     `pass out quick on <egress> inet all keep state` (`allow_egress_interface`).
+     pf `quick` semantics make ordering safe: every rule above carries `quick`
+     (first match wins), so the interface-agnostic `:53` block in step 4 fires
+     before this broad egress pass can reopen DNS — the egress pass can never
+     carry a `:53` leak.
+  6. SSH allow CIDR passes and traversal/managed-peer endpoint passes
+     (family per address). None target `:53`; an endpoint that DID resolve DNS
+     would still be caught by step 4's earlier quick block.
+  7. Optionally `block drop out quick inet6 all` (`ipv6_blocked`).
+  8. Terminal `block drop out quick all` (`MACOS_PF_TERMINAL_BLOCK_RULE`, last
+     rule) — the default-deny floor. IPv6 `:53` on any non-tunnel interface is
+     never passed by any earlier rule (the step-5 passes are `inet`-only), so it
+     falls through to the `inet6` block or this terminal drop: v6 parity holds
+     via the default-deny floor rather than a `:53`-specific rule.
+
+  STRICT killswitch mode renders NO DNS-specific rules at all — everything
+  except lo0/SSH/endpoint allowlist hits the terminal block, which is
+  stronger-than-parity (no `:53` egress exists to leak). New pin test
+  `macos_render_pf_rules_dns_pass_is_tunnel_scoped_for_every_knob_combination`
+  holds the no-exclusion invariant the decision demands: across every
+  `allow_egress_interface` × `ipv6_blocked` combination, any rendered `pass`
+  rule naming `port 53` MUST be tunnel-scoped, the labeled off-tunnel drops MUST
+  render, and the strict render contains no `:53` rule at all — no knob can
+  weaken the floor.
+
+- **2026-08-29 — FIXED: `networksetup` legend drift minted a phantom service
+  (release-blocking on real hosts).** `parse_networksetup_service_list`
+  (`macos_dns_sc_protect.rs`) skipped the `-listallnetworkservices` header line
+  by EXACT match against `NETWORKSETUP_SERVICE_LIST_LEGEND` ("…is currently
+  disabled."). Field output on a real host omits "currently" ("An asterisk (*)
+  denotes that a network service is disabled."), so the legend fell through to
+  the generic argv validator (which correctly accepts benign prose), became a
+  phantom service, and `networksetup -getdnsservers '<the legend>'` returned
+  status 4 — failing `assert_dns_protection` (and, before it, the apply) with
+  `DnsApplyFailed` on any host with the variant wording. The parser now skips any
+  line containing the wording-invariant substring
+  `NETWORKSETUP_SERVICE_LIST_LEGEND_MARKER` ("asterisk (*) denotes that a
+  network service is") via `is_networksetup_service_list_legend`; the exact
+  `*`-disabled prefix skip and the fail-closed abort on invalid names are
+  unchanged. New module test feeds both legend variants plus an
+  asterisk-disabled service and asserts neither the legends nor the disabled
+  entry is enumerable while real services survive. The previously
+  environment-dependent `macos_assert_dns_protection_requires_active_dns_rules`
+  is restructured host-independently: the rule-render half is deterministic;
+  the live SystemConfiguration half accepts Ok or a genuine drift error and
+  fails loudly if the error text ever leaks the legend (i.e. a phantom service
+  is being minted again).
