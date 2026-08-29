@@ -1855,6 +1855,123 @@ mod tests {
         assert_eq!(engine.resolve_destination_peer(&[0u8; 3]), None);
     }
 
+    // Property test: after every mutation in a randomized (but
+    // deterministically seeded) configure/move/remove sequence, the
+    // `endpoint_index` reverse map must answer EXACTLY what a fresh linear
+    // scan over the NodeId-ordered `peer_states` map would answer — same
+    // winning NodeId on duplicate endpoints (the lowest), same presence
+    // answer for `has_endpoint`, same absence after the last sharer is
+    // removed. This is the invariant the fail-closed
+    // `reject_round_trip_target` check and inbound dispatch both stand on.
+    #[test]
+    fn endpoint_index_agrees_with_linear_scan_reference_under_random_mutations() {
+        let mut engine = fresh_engine(0x5E);
+
+        // Deterministic xorshift64* PRNG: no external rand dependency, and a
+        // fixed seed keeps a failure exactly reproducible.
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_u64 = || {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        // Small endpoint pool forces duplicate-endpoint collisions; a small
+        // name pool forces reconfigures of existing peers (the Replaced and
+        // EndpointMoved paths) rather than only fresh additions.
+        let endpoints: Vec<SocketAddr> = (0..6)
+            .map(|i| {
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 100 + i as u8)),
+                    51820 + i as u16,
+                )
+            })
+            .collect();
+        let peer_names: Vec<String> = (0..8).map(|i| format!("peer-{i}")).collect();
+
+        // Linear-scan REFERENCE implementation: the exact tie-break the old
+        // per-packet scan had — `peer_states` is a BTreeMap keyed by NodeId,
+        // so `.find()` over it in ascending order resolves a shared endpoint
+        // to the LOWEST NodeId holding it.
+        let reference_lookup = |engine: &UserspaceEngine, addr: SocketAddr| -> Option<NodeId> {
+            engine
+                .peer_states
+                .iter()
+                .find(|(_node_id, state)| state.endpoint == addr)
+                .map(|(node_id, _state)| node_id.clone())
+        };
+
+        for step in 0..400_u32 {
+            let roll = next_u64() % 3;
+            match roll {
+                // Configure (fresh or re-configure of an existing name).
+                0 => {
+                    let name = &peer_names[(next_u64() as usize) % peer_names.len()];
+                    let endpoint = endpoints[(next_u64() as usize) % endpoints.len()];
+                    configure_peer_at(
+                        &mut engine,
+                        name,
+                        endpoint,
+                        (next_u64() as u8) | 0x80,
+                        "100.64.9.0/24",
+                    );
+                }
+                // Move an existing peer to a new endpoint.
+                1 => {
+                    let node_ids: Vec<NodeId> = engine.peer_states.keys().cloned().collect();
+                    if let Some(node_id) =
+                        node_ids.get((next_u64() as usize) % node_ids.len().max(1))
+                    {
+                        let node_id = node_id.clone();
+                        let endpoint = endpoints[(next_u64() as usize) % endpoints.len()];
+                        engine
+                            .update_peer_endpoint(
+                                &node_id,
+                                rustynet_backend_api::SocketEndpoint {
+                                    addr: endpoint.ip(),
+                                    port: endpoint.port(),
+                                },
+                            )
+                            .expect("endpoint update succeeds");
+                    }
+                }
+                // Remove an existing peer.
+                _ => {
+                    let node_ids: Vec<NodeId> = engine.peer_states.keys().cloned().collect();
+                    if let Some(node_id) =
+                        node_ids.get((next_u64() as usize) % node_ids.len().max(1))
+                    {
+                        let node_id = node_id.clone();
+                        assert!(engine.remove_peer(&node_id));
+                    }
+                }
+            }
+
+            // After EVERY mutation, the index must match the reference for
+            // every probe address (each pool endpoint plus one never-used
+            // address).
+            let mut probe_addrs = endpoints.clone();
+            probe_addrs.push(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+                9,
+            ));
+            for addr in &probe_addrs {
+                let expected = reference_lookup(&engine, *addr);
+                assert_eq!(
+                    engine.find_node_id_by_endpoint(*addr),
+                    expected,
+                    "step {step}: index lookup diverged from linear-scan reference for {addr}"
+                );
+                assert_eq!(
+                    engine.has_endpoint(*addr),
+                    expected.is_some(),
+                    "step {step}: has_endpoint diverged from linear-scan reference for {addr}"
+                );
+            }
+        }
+    }
+
     // ---- AllowedIpNetwork::parse: pure CIDR validation ----
 
     #[test]
