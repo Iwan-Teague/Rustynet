@@ -1658,11 +1658,13 @@ mod imp {
         luid: u64,
         display_name: &str,
     ) -> Result<(), String> {
-        // `luid_value`, `cond`, and `name` must outlive the FwpmFilterAdd0 call:
-        // the condition stores a *pointer* to the u64 LUID (windows-sys models
-        // FWP_VALUE0.uint64 as `*mut u64`), and the filter points at the
-        // condition + display name.
+        // `luid_value`, `weight_value`, `cond`, and `name` must outlive the
+        // FwpmFilterAdd0 call: the condition stores a *pointer* to the u64 LUID
+        // (windows-sys models FWP_VALUE0.uint64 as `*mut u64`), the filter
+        // weight stores a *pointer* to the u64 weight, and the filter points
+        // at the condition + display name.
         let mut luid_value: u64 = luid;
+        let mut weight_value: u64 = crate::wfp_filter_shape::TUNNEL_PERMIT_WEIGHT;
         let mut name = to_wide(display_name);
         let mut cond: FWPM_FILTER_CONDITION0 = unsafe { std::mem::zeroed() };
         cond.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
@@ -1676,7 +1678,12 @@ mod imp {
         filter.flags = FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT;
         filter.layerKey = layer_key;
         filter.subLayerKey = RUSTYNET_WFP_SUBLAYER_KEY;
-        filter.weight.r#type = FWP_EMPTY; // auto-weight within our sublayer
+        // Pin an explicit maximal FWP_UINT64 weight (see TUNNEL_PERMIT_WEIGHT
+        // in wfp_filter_shape for the arbitration rationale). Auto-weight
+        // (FWP_EMPTY) ranks below any foreign explicit-weight block, which
+        // would let a third-party WFP provider outrank this permit.
+        filter.weight.r#type = FWP_UINT64;
+        filter.weight.Anonymous.uint64 = &mut weight_value as *mut u64;
         filter.numFilterConditions = 1;
         filter.filterCondition = &mut cond;
         filter.action.r#type = FWP_ACTION_PERMIT;
@@ -1776,6 +1783,7 @@ mod imp {
     );
     const _: () = assert!(FWP_ACTION_PERMIT == crate::wfp_filter_shape::ACTION_PERMIT);
     const _: () = assert!(FWP_UINT64 == crate::wfp_filter_shape::DATA_TYPE_UINT64);
+    const _: () = assert!(FWP_EMPTY == crate::wfp_filter_shape::DATA_TYPE_EMPTY);
     const _: () = assert!(FWP_MATCH_EQUAL == crate::wfp_filter_shape::MATCH_EQUAL);
 
     /// Read one RustyNet WFP filter back and reduce it to plain values.
@@ -1842,8 +1850,26 @@ mod imp {
             // exactly-one-condition check instead of being silently truncated
             // to a passing shape.
             conditions = crate::wfp_filter_shape::reduce_readback_conditions(count, &conditions);
+            // The filter weight is an FWP_VALUE0 whose `uint64` arm is a
+            // POINTER. Read it only when the declared type says it is a uint64
+            // and the pointer is real; anything else keeps the type and a zero
+            // value so validation can name the mismatch.
+            let (weight_type, weight_uint64) = if filter_ref.weight.r#type == FWP_UINT64 {
+                let pointer = unsafe { filter_ref.weight.Anonymous.uint64 };
+                if pointer.is_null() {
+                    return Err(
+                        "WFP filter declares FWP_UINT64 weight but its value pointer is null"
+                            .to_owned(),
+                    );
+                }
+                (filter_ref.weight.r#type, unsafe { *pointer })
+            } else {
+                (filter_ref.weight.r#type, 0)
+            };
             Ok(crate::wfp_filter_shape::WfpFilterShape {
                 action_type: filter_ref.action.r#type,
+                weight_type,
+                weight_uint64,
                 conditions,
             })
         })();
@@ -2037,8 +2063,39 @@ pub mod wfp_filter_shape {
     pub const ACTION_PERMIT: u32 = 4098;
     /// `FWP_UINT64` — the data type an interface-LUID condition must carry.
     pub const DATA_TYPE_UINT64: i32 = 4;
+    /// `FWP_EMPTY` — the "auto weight" marker a filter weight carries when the
+    /// engine picks its weight. That is exactly what must NOT be on a
+    /// tunnel-permit filter (see [`TUNNEL_PERMIT_WEIGHT`]).
+    pub const DATA_TYPE_EMPTY: i32 = 0;
     /// `FWP_MATCH_EQUAL`.
     pub const MATCH_EQUAL: i32 = 0;
+
+    /// The explicit `FWP_UINT64` weight pinned on every RustyNet
+    /// tunnel-permit filter: `u64::MAX`, the highest weight the filter API
+    /// accepts.
+    ///
+    /// # Why an explicit weight, and why this one
+    ///
+    /// WFP arbitration ranks filters with an explicit `FWP_UINT64` weight
+    /// ABOVE the entire auto-weight (u16 sublayer-derived) range. With the
+    /// historical `FWP_EMPTY` (auto) weight, a foreign third-party provider
+    /// pinning ANY explicit high weight on an outbound block could outrank
+    /// this permit even inside our own max-weight sublayer — silently
+    /// defeating the tunnel permit while the shape check reported healthy.
+    ///
+    /// `u64::MAX` is the maximal value the API accepts, so the only way a
+    /// foreign filter can outrank or tie this one is to deliberately pin the
+    /// identical `u64::MAX`. On a tie, arbitration falls through to sublayer
+    /// weight: `FWPM_SUBLAYER0::weight` is `UINT16`-only, and ours is already
+    /// pinned at `u16::MAX` (0xFFFF) — the absolute maximum — so the tie
+    /// resolves in our favour against any foreign sublayer. The honest
+    /// residual is a foreign provider that ALSO holds a `u16::MAX` sublayer
+    /// AND pins an identical `u64::MAX` filter weight: arbitration then falls
+    /// through to filter-id (installation) order, which we do not control.
+    /// That residual is a bounded availability risk, unchanged in kind, and
+    /// now requires deliberate maximal forgery rather than any ordinary
+    /// explicit-weight block.
+    pub const TUNNEL_PERMIT_WEIGHT: u64 = u64::MAX;
 
     /// One condition of a read-back filter, as plain values.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2060,6 +2117,15 @@ pub mod wfp_filter_shape {
         pub action_type: u32,
         /// Every condition on the filter, in order.
         pub conditions: Vec<WfpConditionShape>,
+        /// `FWPM_FILTER0::weight::type` — the weight's data type. The tunnel
+        /// permit must carry `FWP_UINT64` with [`TUNNEL_PERMIT_WEIGHT`];
+        /// `FWP_EMPTY` (auto weight) here is drift or tamper, because an
+        /// auto-weighted permit can be outranked by any foreign
+        /// explicit-weight block.
+        pub weight_type: i32,
+        /// The explicit weight value, when `weight_type` is
+        /// [`DATA_TYPE_UINT64`]; zero otherwise.
+        pub weight_uint64: u64,
     }
 
     /// Why a read-back filter is not the tunnel-permit it should be.
@@ -2074,6 +2140,11 @@ pub mod wfp_filter_shape {
         WrongFieldKey { field_key: u128 },
         /// The condition is not an equality match on a `uint64`.
         WrongConditionValueEncoding { match_type: i32, value_type: i32 },
+        /// The filter does not carry the pinned explicit tunnel-permit weight
+        /// ([`TUNNEL_PERMIT_WEIGHT`]) — it is auto-weighted (`FWP_EMPTY`) or
+        /// carries a lower explicit weight, so a foreign explicit-weight block
+        /// can outrank it.
+        WrongWeight { weight_type: i32, weight: u64 },
         /// The LUID does not match the tunnel.
         LuidMismatch { found: u64, expected: u64 },
         /// The LUID matches an interface known NOT to be the tunnel.
@@ -2105,6 +2176,16 @@ pub mod wfp_filter_shape {
                     f,
                     "WFP tunnel-permit condition is match_type={match_type} value_type=\
                      {value_type}, expected FWP_MATCH_EQUAL on FWP_UINT64"
+                ),
+                Self::WrongWeight {
+                    weight_type,
+                    weight,
+                } => write!(
+                    f,
+                    "WFP tunnel-permit filter weight is type={weight_type} value={weight}, \
+                     expected the pinned explicit FWP_UINT64 weight {TUNNEL_PERMIT_WEIGHT} \
+                     (u64::MAX); an auto (FWP_EMPTY) or lower weight lets a foreign \
+                     explicit-weight block outrank the permit"
                 ),
                 Self::LuidMismatch { found, expected } => write!(
                     f,
@@ -2154,6 +2235,16 @@ pub mod wfp_filter_shape {
             return Err(WfpShapeError::WrongConditionValueEncoding {
                 match_type: condition.match_type,
                 value_type: condition.value_type,
+            });
+        }
+        // The weight must be the pinned explicit maximum. FWP_EMPTY (auto
+        // weight) here means the filter lost its pinned weight — drift, or a
+        // foreign provider rewriting the store — and re-opens the verdict-2
+        // outranking hazard.
+        if shape.weight_type != DATA_TYPE_UINT64 || shape.weight_uint64 != TUNNEL_PERMIT_WEIGHT {
+            return Err(WfpShapeError::WrongWeight {
+                weight_type: shape.weight_type,
+                weight: shape.weight_uint64,
             });
         }
         // Name the hazard before the generic mismatch: "this permits your WAN
@@ -2340,6 +2431,8 @@ pub mod wfp_filter_shape {
         fn tunnel_permit() -> WfpFilterShape {
             WfpFilterShape {
                 action_type: ACTION_PERMIT,
+                weight_type: DATA_TYPE_UINT64,
+                weight_uint64: TUNNEL_PERMIT_WEIGHT,
                 conditions: vec![WfpConditionShape {
                     field_key: CONDITION_IP_LOCAL_INTERFACE,
                     match_type: MATCH_EQUAL,
@@ -2347,6 +2440,44 @@ pub mod wfp_filter_shape {
                     uint64_value: TUNNEL_LUID,
                 }],
             }
+        }
+
+        /// The weight constant is exactly the maximal explicit `FWP_UINT64`
+        /// weight the filter API accepts — anything lower is a decision
+        /// someone must justify against the arbitration rationale.
+        #[test]
+        fn tunnel_permit_weight_is_the_maximal_explicit_weight() {
+            assert_eq!(TUNNEL_PERMIT_WEIGHT, u64::MAX);
+        }
+
+        /// Auto weight (`FWP_EMPTY`) is the historical vulnerable shape: it is
+        /// what the engine assigns, and it ranks inside the range a foreign
+        /// explicit-weight block can outrank. It must fail validation.
+        #[test]
+        fn an_auto_weighted_filter_is_rejected() {
+            let mut shape = tunnel_permit();
+            shape.weight_type = DATA_TYPE_EMPTY;
+            shape.weight_uint64 = 0;
+            assert!(matches!(
+                validate_tunnel_permit_shape(&shape, TUNNEL_LUID, &[]),
+                Err(WfpShapeError::WrongWeight { weight_type, weight })
+                    if weight_type == DATA_TYPE_EMPTY && weight == 0
+            ));
+        }
+
+        /// An explicit but lower weight is the downgrade attack: the filter
+        /// still looks like ours, but a foreign `u64::MAX` block outranks it.
+        #[test]
+        fn a_lower_explicit_weight_is_rejected() {
+            let mut shape = tunnel_permit();
+            shape.weight_uint64 = u64::MAX - 1;
+            assert!(matches!(
+                validate_tunnel_permit_shape(&shape, TUNNEL_LUID, &[]),
+                Err(WfpShapeError::WrongWeight {
+                    weight_type: DATA_TYPE_UINT64,
+                    weight: w
+                }) if w == u64::MAX - 1
+            ));
         }
 
         #[test]
@@ -2483,6 +2614,8 @@ pub mod wfp_filter_shape {
         fn oversized_declared_count_still_fails_tunnel_permit_validation() {
             let shape = WfpFilterShape {
                 action_type: ACTION_PERMIT,
+                weight_type: DATA_TYPE_UINT64,
+                weight_uint64: TUNNEL_PERMIT_WEIGHT,
                 conditions: reduce_readback_conditions(u32::MAX as usize, &[]),
             };
             assert_eq!(
