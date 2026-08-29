@@ -1336,35 +1336,49 @@ fn existing_path_string(path: &Path) -> Option<String> {
 }
 
 fn current_git_commit() -> Option<String> {
-    git_stdout(["rev-parse", "HEAD"])
+    git_stdout(&["rev-parse", "HEAD"])
 }
 
 fn current_git_branch() -> Option<String> {
-    git_stdout(["rev-parse", "--abbrev-ref", "HEAD"])
+    git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
+/// Pathspecs the dirty-state check excludes because the orchestrator writes
+/// them BY DESIGN during a run: the evidence ledgers it appends to, the
+/// gate/stage timing telemetry, and the live-VM inventory it refreshes with
+/// live guest IPs during readiness. Their churn must never make a run that
+/// started from a clean, committed tree record ITSELF as `dirty:worktree`.
+/// Shared by `current_git_dirty_state` (this module) and
+/// `vm_lab::git_worktree_is_dirty` so the two cannot drift.
+///
+/// QH-34: `documents/operations/active/vm_lab_inventory.json` was missing from
+/// this list, so every run that performed its readiness inventory refresh
+/// reported `dirty:worktree` regardless of how the tree started — a provenance
+/// flag that is always set carries no information. A hand-edited inventory is
+/// accepted as unflagged by this fix; the alternative (sampling dirty-state
+/// before the run mutates anything, also implemented via
+/// `run_start_git_tree_clean`) is tracked separately.
+pub(crate) const GIT_DIRTY_STATE_EXCLUDE_PATHSPECS: &[&str] = &[
+    ":(exclude)documents/operations/live_lab_run_matrix.csv",
+    ":(exclude)documents/operations/live_lab_node_run_matrix.csv",
+    ":(exclude)documents/operations/live_lab_node_stage_results.csv",
+    ":(exclude)documents/operations/live_lab_stage_triage.jsonl",
+    ":(exclude)documents/operations/gate_timings.csv",
+    ":(exclude)documents/operations/live_lab_stage_timings.csv",
+    ":(exclude)documents/operations/active/vm_lab_inventory.json",
+];
+
 fn current_git_dirty_state() -> Option<String> {
-    // Exclude the orchestrator's OWN evidence ledgers, exactly as
-    // `vm_lab::git_worktree_is_dirty` does: this run appends to them by design
-    // (the run-matrix row, per-stage results, triage and gate/stage timings), so
-    // their churn must not make a clean-tree run record ITSELF as
+    // Exclude the orchestrator's OWN evidence ledgers (see
+    // `GIT_DIRTY_STATE_EXCLUDE_PATHSPECS`): this run appends to them by design
+    // (the run-matrix row, per-stage results, triage and gate/stage timings),
+    // so their churn must not make a clean-tree run record ITSELF as
     // `dirty:worktree`. Without this, no `--node` run can satisfy the
     // NodeEngineAcceptanceSpec §5.4 clean-flip-candidate stability bar. Any real
     // code (or other tracked-file) change still surfaces and still reads dirty.
-    // Keep this exclude list in sync with `vm_lab::git_worktree_is_dirty`.
-    git_stdout([
-        "status",
-        "--porcelain",
-        "--",
-        ".",
-        ":(exclude)documents/operations/live_lab_run_matrix.csv",
-        ":(exclude)documents/operations/live_lab_node_run_matrix.csv",
-        ":(exclude)documents/operations/live_lab_node_stage_results.csv",
-        ":(exclude)documents/operations/live_lab_stage_triage.jsonl",
-        ":(exclude)documents/operations/gate_timings.csv",
-        ":(exclude)documents/operations/live_lab_stage_timings.csv",
-    ])
-    .map(|stdout| {
+    let mut args: Vec<&str> = vec!["status", "--porcelain", "--", "."];
+    args.extend_from_slice(GIT_DIRTY_STATE_EXCLUDE_PATHSPECS);
+    git_stdout(&args).map(|stdout| {
         if stdout.trim().is_empty() {
             "clean".to_owned()
         } else {
@@ -1373,7 +1387,7 @@ fn current_git_dirty_state() -> Option<String> {
     })
 }
 
-fn git_stdout<const N: usize>(args: [&str; N]) -> Option<String> {
+fn git_stdout(args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .current_dir(workspace_root_path())
         .args(args)
@@ -2840,14 +2854,99 @@ pub(crate) fn parse_csv_record(line: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MATRIX_COLUMNS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome,
-        NodeRow, StageEvidence, TargetEvidence, Value, build_live_lab_run_matrix_values,
-        csv_escape, git_dirty_state, normalize_os_family, parse_csv_record,
-        populate_cross_os_values, populate_role_result_values, populate_stage_values,
-        render_csv_row, set_special_stage_values, validate_target_evidence,
+        DEFAULT_MATRIX_COLUMNS, GIT_DIRTY_STATE_EXCLUDE_PATHSPECS, LiveLabRunMatrixAppendConfig,
+        LiveLabRunMatrixStageOutcome, NodeRow, StageEvidence, TargetEvidence, Value,
+        build_live_lab_run_matrix_values, csv_escape, git_dirty_state, normalize_os_family,
+        parse_csv_record, populate_cross_os_values, populate_role_result_values,
+        populate_stage_values, render_csv_row, set_special_stage_values, validate_target_evidence,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
+    use std::process::Command;
+
+    /// QH-34: the dirty-state exclude list must cover the live-VM inventory,
+    /// which the orchestrator refreshes with live guest IPs during readiness.
+    /// A run that touches ONLY that file (the common clean-tree case) must not
+    /// be recorded as `dirty:worktree`, so the exclude lives in the single
+    /// shared source both call sites read.
+    #[test]
+    fn dirty_state_excludes_cover_the_live_vm_inventory_and_evidence_ledgers() {
+        for expected in [
+            ":(exclude)documents/operations/live_lab_run_matrix.csv",
+            ":(exclude)documents/operations/live_lab_node_run_matrix.csv",
+            ":(exclude)documents/operations/live_lab_node_stage_results.csv",
+            ":(exclude)documents/operations/live_lab_stage_triage.jsonl",
+            ":(exclude)documents/operations/gate_timings.csv",
+            ":(exclude)documents/operations/live_lab_stage_timings.csv",
+            ":(exclude)documents/operations/active/vm_lab_inventory.json",
+        ] {
+            assert!(
+                GIT_DIRTY_STATE_EXCLUDE_PATHSPECS.contains(&expected),
+                "dirty-state exclude list is missing {expected}"
+            );
+        }
+    }
+
+    /// QH-34, end-to-end over real git semantics: in a scratch repo laid out
+    /// like the workspace, a change to ONLY
+    /// `documents/operations/active/vm_lab_inventory.json` produces an EMPTY
+    /// dirty-state check (the run reads clean), while any other tracked-file
+    /// change still produces a NON-empty one.
+    #[test]
+    fn inventory_only_change_is_not_reported_dirty_but_other_changes_still_are() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .expect("git should be invocable");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).to_string()
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        git(&["config", "user.name", "QH-34 Test"]);
+
+        let inventory = repo
+            .path()
+            .join("documents/operations/active/vm_lab_inventory.json");
+        std::fs::create_dir_all(inventory.parent().expect("inventory parent"))
+            .expect("create inventory dir");
+        std::fs::write(&inventory, r#"{"version":1}"#).expect("write inventory");
+        // A stand-in "real" tracked file, representing code under review.
+        let code = repo.path().join("crates/example/src/lib.rs");
+        std::fs::create_dir_all(code.parent().expect("code parent")).expect("create code dir");
+        std::fs::write(&code, "pub fn example() {}\n").expect("write code");
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "baseline"]);
+
+        // Baseline: clean tree reports nothing.
+        let mut args: Vec<&str> = vec!["status", "--porcelain", "--", "."];
+        args.extend_from_slice(GIT_DIRTY_STATE_EXCLUDE_PATHSPECS);
+        assert_eq!(git(&args), "", "clean baseline must read clean");
+
+        // The orchestrator's readiness inventory refresh, in isolation.
+        std::fs::write(&inventory, r#"{"version":2,"ips":{"a":"10.0.0.1"}}"#)
+            .expect("rewrite inventory");
+        assert_eq!(
+            git(&args),
+            "",
+            "an inventory-only change must NOT read dirty (QH-34)"
+        );
+
+        // A real tracked-file change still surfaces.
+        std::fs::write(&code, "pub fn example() -> u32 { 1 }\n").expect("rewrite code");
+        assert_ne!(
+            git(&args),
+            "",
+            "a non-excluded tracked-file change must still read dirty"
+        );
+    }
 
     #[test]
     fn normalize_os_family_rejects_bare_platform_umbrella_placeholders() {
