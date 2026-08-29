@@ -101,7 +101,8 @@ gap is **running them green**, not missing stages — which is why the critical 
 Nothing macOS/Windows can be G2-proven until these clear. Two are code, one is
 hardware; a fourth (Windows bootstrap) must be triaged.
 
-- **CP-1 (code) — macOS `two_hop` (client↔client).** On macOS `--node`, `two_hop`
+- **CP-1 (environmental — triaged 2026-08-29, see verdict below) — macOS `two_hop`
+  (client↔client).** On macOS `--node`, `two_hop`
   fails **8/8 where it ran** → `traffic_test_matrix=fail`, so no macOS run passes
   overall and the macOS `client` cell is red. **On Linux this is NOT a blocker** —
   `linux_stage_two_hop` is 35 pass including all four most recent runs; the sole
@@ -115,6 +116,61 @@ hardware; a fourth (Windows bootstrap) must be triaged.
   is *probably* the highest-value macOS-column lever (it caps every macOS run's
   overall verdict), but that ranking is provisional pending triage. Owning area is
   core-dataplane, §13.2 security-sensitive.
+
+  **CP-1 TRIAGE VERDICT (2026-08-29) — ENVIRONMENTAL (lab network topology), NOT
+  code.** Fresh triage on current evidence re-classifies CP-1 from *code* to
+  *environmental*. The freshest real `two_hop` failure digest
+  (`state/live-lab-ll-1784714940526-68753-0/failure_digest.json`, run
+  `rust-1784714964`, 2026-07-22) shows the macOS node (`macos-utm-1`,
+  mesh `100.64.181.171`) with **100% ping loss to and from every peer in both
+  directions** while Linux↔Linux pairs pass — the macOS WG interface passes zero
+  packets either way. The stale shared-socket hypothesis is disproven: the current
+  macOS userspace-shared transport is implemented and tested end-to-end
+  (`userspace_shared_macos/socket.rs` — authoritative UDP socket binds
+  `0.0.0.0:listen_port`, dataplane egress tolerates transient refusal;
+  `userspace_shared_macos/runtime.rs` — peer endpoints validated non-zero and
+  non-unspecified, handshake initiation + tun/UDP worker loop present;
+  `userspace_shared_macos/tun.rs:1057` — mesh route reconciliation programs
+  `route -n add -inet <cidr> -interface utunX`; `third_party/rustynet-tun` — utun
+  4-byte AF framing handled and unit-tested).
+
+  **Root cause (measured live on the lab, 2026-08-29):** the macOS UTM guest and
+  the Debian lab nodes sit on **mutually unreachable IP subnets, so WG endpoint
+  packets can never arrive in either direction**. `macOS.utm/config.plist`
+  declares a single NIC `Mode = Shared` — the guest's only address is
+  `192.168.65.101/24` behind UTM's NAT (`192.168.65.1` default). The Debian lab
+  guests (`debian-headless-2` @ `192.168.64.4`, `debian-headless-4` @
+  `192.168.64.10`) live on the host bridge `bridge100` (`192.168.64.1/24`).
+  Live probes with all daemons stopped, pure L3: `debian-headless-4 → ping
+  192.168.65.101` = **0/2 received**; `macos-utm-1 → ping 192.168.64.10` =
+  **0/2 received**; the host itself pings `192.168.64.10` fine over
+  `bridge100`. There is no host forward/NAT between the UTM-shared subnet
+  (192.168.65.0/24) and `bridge100` (192.168.64.0/24), and no return route from
+  `bridge100` into the UTM-shared subnet — so a WG endpoint pointing either way
+  is dead and no handshake can ever complete. This exactly reproduces the
+  7/19–7/22 `two_hop` signature (both-direction 100% loss, default-deny
+  INCONCLUSIVE "reached no mesh peer"), and also explains why post-7/22 macOS
+  runs fail even earlier (`membership_init` / `validate_baseline_runtime` /
+  `distribute_assignments`): the node cannot reach its peers at all in the
+  current topology. (The `192.168.64.18` entry in the mac's inventory
+  `live_ips` is a stale record from an era when the guest had a bridged NIC on
+  that segment; the guest currently has no such interface — `en1` is
+  `status: inactive`.)
+
+  **Fix path (operator, not code):** give the macOS guest L3 adjacency with the
+  Debian nodes — add/enable a second UTM NIC bridged onto the host's
+  `bridge100`/192.168.64.0/24 segment (the attachment the stale
+  `192.168.64.18` lease came from), or move the whole mac↔debian lab cell onto
+  one profile-managed segment. Per the LiveLabVmConnectivityRulebook this is an
+  explicit operator-authorized `prepare_lab_network` reconfiguration
+  (`approve_reconfigure`), never an autonomous mutation. After re-attachment,
+  re-run the focused macOS `two_hop` cell (`rebuild_nodes` fast path) and expect
+  the WG handshake to complete with no further code change; if it does, CP-1
+  closes as environmental and the §4 table row below flips accordingly.
+  Residual code-side gap (optional hardening, not a blocker): the orchestrator
+  can fail louder by pre-checking endpoint-subnet reachability before
+  `traffic_test_matrix` so a partitioned topology fails with "no L3 path
+  <src>→<endpoint>" instead of a dataplane-looking packet loss.
 - **CP-2 (code) — `network_flap` / traversal self-sustenance.** The sole Linux
   `--node` fail and a real production gap (mesh fail-closes ~120 s after the last
   distribution). Approved design + in-flight implementation in
@@ -222,7 +278,7 @@ consecutive" (which §5.4 explicitly replaced as arithmetically too weak).
 
 | Blocker | Kind | Owner | Notes |
 |---|---|---|---|
-| CP-1 `two_hop` client↔client handshake | **code** | dataplane | userspace shared-socket WG transport; §13.2 |
+| CP-1 `two_hop` client↔client | **environmental (triaged 2026-08-29)** | operator | macOS UTM guest (Shared-NAT 192.168.65.0/24) and Debian nodes (host bridge100 192.168.64.0/24) have no L3 path between them — WG endpoints mutually unreachable; needs a bridged NIC / profile re-attach (see CP-1 verdict above) |
 | CP-2 `network_flap` traversal self-sustenance | **code** | traversal track | I3-I6 of the traversal plan |
 | CP-4 Windows `--node` bootstrap | **triaged 2026-08-28** | **BOTH — code primary** | Failing step `Bootstrap-RustyNetWindows.ps1:1130` (`winget configure`, Configuration feature never enabled or checked); guest `windows-utm-1` also has no remote management path. Still gates all Windows. Next: W-FIX-1 |
 | CP-3 Windows exit WinNAT | **hardware** | operator | physical Win-on-ARM device; not fixable in UTM/ASi |
