@@ -6814,12 +6814,16 @@ type SshAuthShellFn = fn(
 /// Function-pointer type for the Windows SSH readiness probe.
 type WindowsSshReadinessFn =
     fn(&str, Option<&str>, Duration) -> ProbeState<WindowsSshReadinessProbe>;
+/// Function-pointer type for the QH-44 authorized_keys fingerprint probe.
+type AuthorizedKeysFingerprintFn =
+    fn(&str, Option<&str>, Option<&Path>, Option<&Path>, Duration) -> AuthorizedKeysFingerprint;
 
 #[derive(Clone, Copy)]
 struct UtmDiscoveryProbes {
     tcp_probe: TcpProbeFn,
     ssh_auth_shell: SshAuthShellFn,
     windows_ssh_readiness: WindowsSshReadinessFn,
+    authorized_keys_fingerprint: AuthorizedKeysFingerprintFn,
 }
 
 impl Default for UtmDiscoveryProbes {
@@ -6828,6 +6832,7 @@ impl Default for UtmDiscoveryProbes {
             tcp_probe: probe_tcp_port_status,
             ssh_auth_shell: run_remote_shell_command,
             windows_ssh_readiness: probe_windows_local_utm_ssh_readiness,
+            authorized_keys_fingerprint: probe_authorized_keys_fingerprint,
         }
     }
 }
@@ -7242,7 +7247,7 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
                             .or(advisory_ssh_target.as_deref()),
                     )
                     .map(|((_, user), ssh_target)| {
-                        probe_authorized_keys_fingerprint(
+                        (probes.authorized_keys_fingerprint)(
                             ssh_target,
                             Some(user),
                             config.ssh_identity_file.as_deref(),
@@ -37551,7 +37556,6 @@ mod tests {
         discover_local_utm_bundle_paths_bounded, encode_powershell_command,
         ensure_inventory_entries_share_network, ensure_provision_guest_name,
         ensure_provision_image_name, execute_ops_vm_lab_diff_live_lab_runs,
-        execute_ops_vm_lab_discover_local_utm,
         execute_ops_vm_lab_discover_local_utm_summary_with_probes,
         execute_ops_vm_lab_discover_local_utm_with_probes,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
@@ -37634,11 +37638,26 @@ mod tests {
         }
     }
 
+    fn stub_error_authorized_keys_fingerprint(
+        _ssh_target: &str,
+        _ssh_user: Option<&str>,
+        _ssh_identity_file: Option<&Path>,
+        _known_hosts_path: Option<&Path>,
+        _timeout: Duration,
+    ) -> super::AuthorizedKeysFingerprint {
+        super::AuthorizedKeysFingerprint {
+            status: "error:stub".to_owned(),
+            mtime_epoch_secs: None,
+            sha256_hex: None,
+        }
+    }
+
     fn hermetic_discovery_probes() -> super::UtmDiscoveryProbes {
         super::UtmDiscoveryProbes {
             tcp_probe: stub_closed_tcp_probe,
             ssh_auth_shell: stub_unreachable_ssh_auth_shell,
             windows_ssh_readiness: stub_error_windows_ssh_readiness,
+            authorized_keys_fingerprint: stub_error_authorized_keys_fingerprint,
         }
     }
 
@@ -41924,6 +41943,23 @@ mod tests {
     /// is only reached if that resolution fails); and `timeout_secs` is small
     /// enough to bound every probe even if one of those guarantees is violated.
     /// A unit test must not depend on the host's network or resolver.
+    ///
+    /// QH-20 (2026-08-29): even the `.invalid` name left one real DNS lookup
+    /// on the critical path — guaranteed NXDOMAIN, but still a resolver
+    /// round-trip whose latency belongs to the host, not the test. The culprit
+    /// was the QH-44 authorized_keys fingerprint probe: the utmctl stub *does*
+    /// answer `ip-address`, so `live_ip` is `Some` and the fingerprint runs on
+    /// the same probe window even though the update itself is refused for lack
+    /// of a confirmed process. That probe spawned a real `ssh` against the
+    /// `.invalid` name. The TCP, SSH-auth, and authorized-keys fingerprint
+    /// probes now all run through the same hermetic seam stubs (QH-33), so the
+    /// name is never resolved at all and the whole test is deterministic and
+    /// network-free. The only remaining cost is two *local* helper spawns
+    /// (`ps` and the temp `utmctl` stub), each taxed ~200 ms by macOS
+    /// Gatekeeper validation (§7 of AGENTS.md) — no network is touched. The
+    /// reserved addresses
+    /// stay: they document the never-routable intent and keep the test safe
+    /// if the seams are ever removed.
     #[test]
     fn execute_ops_vm_lab_discover_local_utm_skips_inventory_update_when_no_live_ip_observed() {
         let unique = super::unique_suffix();
@@ -41956,17 +41992,20 @@ mod tests {
         let utmctl = write_temp_executable(
             "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"alpha\" ]; then\n  printf '192.0.2.8\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
         );
-        let report = execute_ops_vm_lab_discover_local_utm(VmLabDiscoverLocalUtmConfig {
-            inventory_path: Some(inventory.clone()),
-            utm_documents_root: Some(root.clone()),
-            utmctl_path: Some(utmctl.clone()),
-            ssh_identity_file: None,
-            known_hosts_path: None,
-            ssh_port: 65_534,
-            timeout_secs: 2,
-            update_inventory_live_ips: true,
-            report_dir: None,
-        })
+        let report = execute_ops_vm_lab_discover_local_utm_with_probes(
+            VmLabDiscoverLocalUtmConfig {
+                inventory_path: Some(inventory.clone()),
+                utm_documents_root: Some(root.clone()),
+                utmctl_path: Some(utmctl.clone()),
+                ssh_identity_file: None,
+                known_hosts_path: None,
+                ssh_port: 65_534,
+                timeout_secs: 2,
+                update_inventory_live_ips: true,
+                report_dir: None,
+            },
+            hermetic_discovery_probes(),
+        )
         .expect("discovery report should be produced");
         let parsed: serde_json::Value =
             serde_json::from_str(report.as_str()).expect("discovery report should parse as JSON");
