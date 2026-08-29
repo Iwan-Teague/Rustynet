@@ -1527,9 +1527,10 @@ mod tests {
     fn parse_node_clean_probe_reports_running_daemon() {
         let err = parse_node_clean_probe("nft=- daemon=up iface=-")
             .expect_err("running daemon must fail");
-        assert!(err
-            .to_string()
-            .contains("rustynetd or rustynet-relay still running"));
+        assert!(
+            err.to_string()
+                .contains("rustynetd or rustynet-relay still running")
+        );
     }
 
     #[test]
@@ -1773,10 +1774,12 @@ table ip other_nat {
             dport=443 [UNREPLIED] src=1.1.1.1 dst=203.0.113.7 sport=443 dport=54321 use=1";
         assert!(conntrack_line_mesh_nat_session(non_mesh).is_none());
         // Single tuple / empty => None.
-        assert!(conntrack_line_mesh_nat_session(
-            "tcp 6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=1 dport=443"
-        )
-        .is_none());
+        assert!(
+            conntrack_line_mesh_nat_session(
+                "tcp 6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=1 dport=443"
+            )
+            .is_none()
+        );
         assert!(conntrack_line_mesh_nat_session("").is_none());
     }
 
