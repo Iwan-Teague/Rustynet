@@ -3181,6 +3181,131 @@ stage that genuinely needs prior state must keep its gate, or it will produce co
 broken mesh. Do not treat converting a skip into a run as progress in itself — the value is more
 real verdicts per run, and some newly unblocked stages will legitimately fail.
 
+### Dependency graph proposal (drafted 2026-08-29, for adversarial review before implementation)
+
+This subsection is a design document only — no `.rs` file has been modified for it. It turns the
+fix direction above into a concrete, evidence-cited proposal for adversarial review. The item is
+**not** closed by this entry.
+
+**The mechanism already exists; nothing has been migrated to it.** The `OrchestrationStage` trait
+already separates the two semantics this item asks for (`crates/rustynet-cli/src/vm_lab/orchestrator/stage/mod.rs`):
+
+- `fn dependencies(&self) -> &[StageId]` (mod.rs:343) — TRUTH PREREQUISITES: every entry must PASS
+  before this stage runs; a failure or skip of one triggers skip-cascade on this stage. The
+  doc-comment already states the interim rule ("the interim rule for every un-migrated stage") and
+  the migration rule ("a migrated scenario stage that needs a predecessor only *ordered* before it
+  — without gating on its pass — declares that in `ordering_after` instead, never here").
+- `fn ordering_after(&self) -> &[StageId] { &[] }` (mod.rs:352) — ORDERING-ONLY edges for
+  destructive/shared-resource serialisation: no pass requirement, no skip-cascade; an ordering edge
+  to a stage not in the plan is ignored.
+- `fn always_run(&self) -> bool` (mod.rs:370) — teardown stages exempt from the cascade so
+  killswitch/exit-NAT residue is always removed.
+
+The runner consumes exactly this split: skip rule 2 "Dependency cascade"
+(`crates/rustynet-cli/src/vm_lab/orchestrator/stage/runner.rs:246-257`) consults **only**
+`dependencies()` — a stage is skipped with "dependency `{dep}` did not pass, so this stage never
+ran" when an entry is blocking or already `blocked`, and the cascade propagates because a
+cascade-skipped stage is itself marked blocked (runner.rs:122, 185-186, 234-235). Ordering comes
+from plan edges built from `dependencies().iter().chain(ordering_after())` (runner.rs:333). The
+loop itself is sequential (`for stage in stages`, runner.rs:283), so today serialization is
+structural, not declared.
+
+**Current declarations (verified in this worktree).** The live chain is strictly linear — each
+stage declares exactly its predecessor in `dependencies()`, and no stage file overrides
+`ordering_after` at all (only the trait default exists):
+
+- `live_two_hop_validation.rs:19-21` → `BlindExitDataplaneValidation`
+- `live_managed_dns_validation.rs:19-21` → `LiveTwoHopValidation`
+- `live_network_flap_validation.rs:19-21` → `LiveManagedDnsValidation`
+- `live_reboot_recovery_validation.rs:19-21` → `LiveNetworkFlapValidation`
+- `live_secrets_not_in_logs_validation.rs:19-21` → `LiveRebootRecoveryValidation`
+- `live_key_custody_validation.rs:22-24` → `LiveSecretsNotInLogsValidation`
+- `live_enrollment_restart_validation.rs:18-20` → `LiveKeyCustodyValidation`
+- `live_lan_toggle_validation.rs:21-23` → `LiveEnrollmentRestartValidation`
+- `live_mixed_topology_validation.rs:19-21` → `LiveLanToggleValidation`
+- `live_anchor.rs:21-23` → `LiveMixedTopologyValidation`
+- all ten cross-network stages share one impl: `cross_network.rs:191-193` → `LiveMixedTopologyValidation`
+- siblings with the same gate: `chaos.rs:48-50` and `live_extended_soak_validation.rs:21-23` →
+  `LiveMixedTopologyValidation`
+- substrate is separate and sound: `cross_network/substrate.rs:2050-2052` (setup →
+  `BootstrapHosts`, genuine) and `substrate.rs:2174-2178` (teardown declares no dependencies — a
+  `finally`-style stage gated on nothing).
+
+**Per-edge classification.** "Genuine" = keep in `dependencies()` (the successor consumes state
+the predecessor's PASS is the evidence of). "False-gating" = move to `ordering_after()`
+(keep the run order, drop the pass requirement). "Must-serialize-regardless" = the ordering edge
+must exist no matter what the semantics of the gate are, because both stages mutate shared lab
+state and must never overlap — under the current sequential runner this is free, but the
+declaration is what a future scheduler would need.
+
+| Edge (A → B) | Current declaration | Classification | Reasoning |
+| --- | --- | --- | --- |
+| blind_exit_dataplane → two_hop | `live_two_hop_validation.rs:19-21` | genuine | two_hop validates the two-hop exit path on top of the blind-exit dataplane result. Out of this item's chain scope; left untouched. |
+| two_hop → managed_dns | `live_managed_dns_validation.rs:19-21` | **genuine** (flagged in §QH-48 body) | managed-DNS validation exercises DNS resolution across the multi-hop exit topology that two_hop's PASS is the evidence of. On a broken mesh it would produce confident garbage — keep the gate. |
+| managed_dns → network_flap | `live_network_flap_validation.rs:19-21` | false-gating + must-serialize-regardless | flap tears the underlay down/up and checks reconnection; it consumes mesh state from setup, not the DNS verdict. Review must confirm the dispatched `live_linux_*_test` binary does not itself exercise the managed-DNS path — if it does, the two_hop gate must be preserved transitively instead. Serialize: flap is a lab-wide destructive network mutation. |
+| network_flap → reboot_recovery | `live_reboot_recovery_validation.rs:19-21` | false-gating + must-serialize-regardless | reboot recovery reboots guests and validates recovery; it does not consume the flap verdict. Serialize: both are destructive on the same guests; overlapping them would invalidate both evidence sets. |
+| reboot_recovery → secrets_not_in_logs | `live_secrets_not_in_logs_validation.rs:19-21` | false-gating (order-only) | the secrets scan greps logs across nodes; it consumes no reboot verdict. Keep the ordering so it scans a settled, post-restart log set rather than racing a mid-reboot guest, but a reboot failure is not a reason to skip the scan. |
+| secrets_not_in_logs → key_custody | `live_key_custody_validation.rs:22-24` | **false-gating** (flagged in §QH-48 body) | key custody manipulates key-file permissions on a running daemon (client) and validates rejection + recovery; it shares no state with the log scan. Review check: key custody is node-local destructive — it still needs ordering against other destructive stages. |
+| key_custody → enrollment_restart | `live_enrollment_restart_validation.rs:18-20` | false-gating + must-serialize-regardless | enrollment restart re-drives membership/enrollment on the mesh; it does not consume the key-custody verdict. Review check: both mutate trust-adjacent state on overlapping nodes — if the re-enrollment path reads the very key files key custody mutates, the gate must stay. |
+| enrollment_restart → lan_toggle | `live_lan_toggle_validation.rs:21-23` | **false-gating** (flagged in §QH-48 body) | LAN toggle changes VM network attachment; it consumes no enrollment verdict. Must-serialize regardless: it is the most invasive mutation in the chain (host-adjacent, network-attachment level). |
+| lan_toggle → mixed_topology | `live_mixed_topology_validation.rs:19-21` | genuine (conservative call — review) | mixed topology validates the cross-OS mesh after the chain's destructive middle. A mid-toggle failure can leave the LAN in a degraded state, and mixed_topology's PASS would then be evidence about a broken network. Until review shows the stage independently re-establishes/verifies LAN health, keep the gate. |
+| mixed_topology → live_anchor | `live_anchor.rs:21-23` | genuine (conservative call — review) | anchor validation runs on the mesh; after the destructive middle, mixed_topology's PASS is the only recorded health evidence. Relaxable only if anchor validation independently proves mesh health first. |
+| mixed_topology → cross_network ×10 | `cross_network.rs:191-193` | genuine (conservative call — review) | the cross-network family exercises traversal/NAT/soak over the mixed-OS mesh and substrate. Substrate setup gates correctly on `BootstrapHosts` (substrate.rs:2050-2052); the question for review is whether the family needs mixed_topology's verdict or only the setup-produced mesh. Same conservative default as above. |
+| mixed_topology → chaos, extended_soak | `chaos.rs:48-50`, `live_extended_soak_validation.rs:21-23` | genuine (conservative) + chaos must-serialize-regardless | chaos injects faults into the mesh (destructive); soak consumes long-lived mesh state. Same treatment as the cross-network family. |
+
+**Proposed structure (concrete).** Keep `dependencies()` exactly as-is for: blind_exit_dataplane →
+two_hop, two_hop → managed_dns, lan_toggle → mixed_topology, mixed_topology → {live_anchor,
+cross_network ×10, chaos, extended_soak}, and the substrate pair. Move to `ordering_after()` —
+preserving today's plan order — for: managed_dns → network_flap, network_flap → reboot_recovery,
+reboot_recovery → secrets_not_in_logs, secrets_not_in_logs → key_custody, key_custody →
+enrollment_restart, enrollment_restart → lan_toggle. Because the runner is sequential and plan
+order is unchanged, no stage runs earlier than it does today; the only behavioral change is which
+stages a failure cascades through. Replay of the measured run qh46-snat-20260813x (33 pass / 1
+fail / 24 skip, ~17 min, ≤1 defect found): the single two_hop failure would cascade to
+live_managed_dns_validation only — 1 skip instead of 21 — and the resilience/security chain
+(flap, reboot, secrets, key custody, enrollment, LAN toggle) plus mixed topology, anchor, and the
+cross-network family would still have produced verdicts. Per the §QH-48 body: some of those newly
+unblocked stages would legitimately have failed, and that is the point — more real verdicts per
+run.
+
+**"Runs after" vs "requires the predecessor to have passed"** is exactly the
+`ordering_after` / `dependencies` split above (mod.rs:343 vs mod.rs:352, consumed at
+runner.rs:246-257 and runner.rs:333). The distinction the run-matrix caution in §12.3 of AGENTS.md
+forces: a stage that ran while an ordering predecessor failed must be attributable as such in the
+run matrix, so a pass on a possibly-degraded mesh is never read as parity proof. Review should
+decide the minimal reporting change that makes that attribution visible (this entry does not
+propose one).
+
+**Serialization regardless of pass/fail.** The destructive set that must stay mutually exclusive
+against each other and against the mesh-validating stages — network flap (lab-wide underlay
+mutation), reboot recovery (guest power cycles), LAN toggle (network-attachment reconfig),
+enrollment restart (membership re-drive), key custody (node-local key mutation), chaos (fault
+injection), two_hop itself (installs management-bypass routes into table 51820 on the underlay
+interface — its own shared-resource hazard is documented in `live_two_hop_validation.rs:95-130`),
+and the impairment-injecting cross-network cells (nat matrix, traversal adversarial, soak). Today
+this is guaranteed only by the sequential runner loop (runner.rs:283); the `ordering_after`
+declarations above are what make the constraint explicit and survive any future parallelization.
+
+**What adversarial review must specifically check** (before any `.rs` change lands):
+
+1. For every edge proposed for `ordering_after`, read the dispatched `live_linux_*_test` binary
+   (each live stage is a thin dispatcher over SSH — report JSON + log into `ctx.report_dir`, then
+   the test binary) and answer: does it exercise state whose only health evidence was the removed
+   gate's verdict? The §QH-48 body's rule governs: a stage that genuinely needs prior state keeps
+   its gate, or it produces confident garbage on a broken mesh.
+2. The two transitive-gate risks by name: does the flap test exercise the managed-DNS path (if
+   yes, the two_hop gate must reach it transitively), and does enrollment restart read the key
+   files key custody mutates (if yes, that gate must stay)?
+3. The three conservative calls (lan_toggle → mixed_topology, mixed_topology → anchor,
+   mixed_topology → cross_network family): either produce evidence each successor independently
+   re-establishes/verifies mesh health and relax them, or confirm the gates stay.
+4. That no stage is removed from plan order, no stage is deleted, `always_run` teardown semantics
+   are untouched (substrate.rs:2174-2178 stays a no-dependency `finally` stage), and the cascade
+   reporting ("dependency … did not pass, so this stage never ran") is preserved for genuinely
+   dependent stages.
+5. That converting a skip into a run is not counted as progress in itself — the acceptance
+   measure is more real verdicts per run, with failures kept visible.
+
 ### QH-49 — the LAN-toggle stage hardcodes the SSH username, so it cannot drive a non-Debian guest
 
 **Severity: medium. FIXED (fix landed with this entry); it had never been exercised before.**
