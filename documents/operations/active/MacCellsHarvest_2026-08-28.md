@@ -755,3 +755,128 @@ validators to `--node` (or bind the delegation to `live_anchor`), resolve the
 Remedy recorded against stub
 `livelab-1787959261-51746fdac765::validate_baseline_runtime` in
 `live_lab_stage_triage.jsonl` so the next launch is not gated.
+
+---
+
+## 8. Re-run Cell 2 after MAC-D2 — 2026-08-28 (latest session)
+
+**Scope.** Re-run Cell 2 (macOS `exit`) now that MAC-D2 (`03619d0f`, the macOS
+membership owner-key read path fixed to the genesis location
+`/usr/local/etc/rustynet/membership.owner.key.pub`, fail-loud read with
+distinct absent/permission/empty errors) is on `main`. Triage only — no code
+changed in this session. Run from a worktree on `e3585ffd` (MAC-D2 ancestor,
+verified with `git merge-base --is-ancestor`), tree clean.
+
+### 8.1 Run
+
+`livelab-1787961892-e3585ffdf8ad`, commit `e3585ffdf8ad…`, branch
+`ai-edit/edit-1787960287037-56044-31`, `git_dirty_state=clean`, engine
+`--node`, full 61-stage plan (no `--skip-linux-live-suite`), topology
+`macos-utm-1:exit` + `lenovo-exit-1:entry` + `lenovo-client-1:client`, report
+dir `state/mac-cells/exit2-1787960643` (worktree-local). Ledger row verified
+present in `live_lab_node_run_matrix.csv` (id, commit, clean, branch, topology
+recorded).
+
+**Invocation discovery, recorded because the brief's shape is retired.** The
+direct CLI `--macos-promote-exit` selector **fails closed post-W5.7**
+(`vm_lab/mod.rs:10316`: "the legacy bash orchestrator was retired …
+--macos-vm / --macos-promote-exit (add the macOS node via --node
+<alias>:<role>)"). The equivalent supported shape is explicit assignments:
+`--node macos-utm-1:exit --node lenovo-exit-1:entry --node
+lenovo-client-1:client` — the same topology the MCP driver synthesizes for
+`macos_promote_exit`. `--trust-inventory-ready` was used after shell-verifying
+all three guests over SSH (the readiness gate's raw TCP probe answered
+`ssh-tcp-not-open` for the mac while `ssh mac@…` worked — the §12.3.1
+blind-probe signature again; `nc -z` is likewise blind from this context, so
+every reachability verdict here is from real `ssh` runs). A
+`mkdir`-based lock on the exit-cell guests was held for the run's duration
+(`flock` is unavailable on the orchestrating macOS host); no concurrent run
+was in flight (`pgrep`).
+
+### 8.2 Outcome: 9 pass / 1 fail / 51 skip — `membership_init` fails again, but DIFFERENTLY
+
+```
+membership_init fail: issue_membership_owner_key: protocol error:
+  membership owner public key not found on remote at
+  '/usr/local/etc/rustynet/membership.owner.key.pub'; has membership genesis
+  been run? (rustynetd membership init seeds it at
+  /usr/local/etc/rustynet/membership.owner.key.pub)
+```
+
+This is **MAC-D2's new fail-loud error, not the old one.** The run before the
+fix said "membership owner public key not found on remote; has membership been
+initialized?" (empty-string collapse, wrong path, no privilege). This run
+names the exact path, distinguishes absence, and points at genesis. The fixed
+adapter deployed and behaved exactly as coded. MAC-D2 as a *code* change:
+**deployed and correct.** MAC-D2 as the *exit-cell unblocker*: **insufficient —
+it exposed the next blocker (MAC-D4, §8.3).** The key genuinely is not there.
+
+All three exit stages were again never planned to run: `active_exit` →
+`exit_dns_failclosed_validation` → `exit_nat_lifecycle_validation` →
+`exit_demotion_residue_validation` all skipped behind `membership_init`
+(`stages.tsv` dependency chain, verified per stage). The exit-role DnsFailclosed
+op never dispatched, so the M1 enforcement question for the *exit* role is
+still untouched (the §7.4 red was the *anchor* role's posture). Linux setup
+stages that ran all passed (`bootstrap_hosts` incl. both lenovo rebuilds,
+`cross_network_substrate_setup`, `collect_pubkeys`).
+
+### 8.3 NEW BLOCKER (MAC-D4) — the macOS `--node` bootstrap never seeds the membership owner key
+
+Ground truth on `macos-utm-1` immediately after the run: `/usr/local/etc/rustynet/`
+exists fresh (recreated during this run's bootstrap) containing **only**
+`trust-evidence.key` — no `membership.owner.key`, no `.pub`. The freshly built
+`rustynetd` is installed. So nothing on the macOS deploy path ever *writes*
+the owner keypair:
+
+1. The `--node` orchestrator's macOS install is
+   `macos_install::install_daemon` (`macos_install.rs:73`), which runs
+   `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh` directly. That script
+   has **no membership-genesis step at all** — no `rustynetd membership init`,
+   no `--owner-signing-key`, anywhere. It creates the *state* membership dir
+   (`:584`) and seeds `trust-evidence.key` (`:1131`); that is all.
+2. §4.2's disposition assumed the genesis driver
+   (`execute_ops_e2e_bootstrap_macos`, `ops_e2e.rs:1243`, which runs
+   `rustynetd membership init --owner-signing-key
+   /usr/local/etc/rustynet/membership.owner.key`) is on the lab bootstrap
+   path. It is only reached via `ops e2e-bootstrap-host` — which the **Linux**
+   bootstrap invokes (`linux_install.rs` BOOTSTRAP_SCRIPT, pinned by test at
+   `:598`) but the macOS adapter never does.
+3. The Linux twin stays correct end-to-end because its bootstrap re-seeds
+   `/etc/rustynet/membership.owner.key.pub` on every install; its wholesale
+   uninstall `rm -rf /etc/rustynet` (`linux_install.rs:395`) is therefore
+   safe. The macOS uninstall does the same wholesale remove
+   (`sudo -n rm -rf … /usr/local/etc/rustynet …`, `macos_install.rs:629`) with
+   **no re-seed anywhere** — so on the engine of record a fresh macOS deploy
+   can never hold an owner key.
+
+**Correction to §7.2, recorded honestly:** the anchor re-run did *not*
+"live-prove MAC-D2 in passing". `membership_init` is role-gated to `exit`
+with fanout `once` (`node_stage_plan.json`), and in that run the exit role sat
+on `lenovo-exit-1` — so its PASS came from the *Linux* owner-key read. The
+macOS read path was first exercised by *this* run (mac elected `exit`), and
+its first live exercise is what surfaced MAC-D4.
+
+**Classification: macOS parity code gap** — missing genesis/owner-key seeding
+in the macOS `--node` bootstrap path (the same class as the §4.2 honesty note
+feared: "whether the macOS install path seeds an owner key at all" — answer:
+it does not). Fix direction: seed the owner keypair during the macOS
+bootstrap/genesis (mirror Linux: invoke `rustynetd membership init
+--owner-signing-key /usr/local/etc/rustynet/membership.owner.key` from
+`Bootstrap-RustyNetMacos.sh` or wire the macOS install through
+`ops e2e-bootstrap-host`), keeping the MAC-D2 test that pins the adapter read
+path to `ops_e2e::MACOS_OWNER_SIGNING_KEY_PATH` as the drift guard. Secondary
+hazard to fix in the same stroke: `macos_install.rs:629`'s uninstall wipes the
+genesis location, so any seed must live *below* the bootstrap, not as a
+one-time manual guest fix.
+
+No triage stub was produced for this failure either (same as
+`livelab-1787913512`; §5's process observation stands — the stub-append path
+does not cover `membership_init` failures).
+
+### 8.4 Cell status
+
+macOS **exit**: **still 🔴 blocked**, but the failure has moved one level
+deeper and is now a single named fix: the guest *install* never creates the
+key MAC-D2's reader (correctly) demands. No exit stage has yet dispatched on
+macOS; the §6 egress assertion remains untouched. Path to green: implement
+MAC-D4 seeding → re-run this exact cell shape.
