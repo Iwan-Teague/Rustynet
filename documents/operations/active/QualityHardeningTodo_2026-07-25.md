@@ -1401,6 +1401,28 @@ live subnets.** A test that happens to target a real guest passes or fails on wh
 ### QH-21 — Windows failure-artifact collection throws, losing diagnostics and inventing a second failure
 **Severity: medium-high (destroys evidence exactly when it is needed). Confidence: VERIFIED live.**
 
+**CLOSED 2026-08-29 — already fixed; this entry was stale.** The exact prescribed fix landed
+in `45d27d56` ("live-lab: stop Windows artifact collection throwing on an empty log
+directory"), which wrapped the conditional assignment in the array subexpression —
+`$filesToArchive = @(if (Test-Path -LiteralPath $logsDir) {{ ... }} else {{ @() }})` — and, in
+the same commit, extracted the script into `build_diag_archive_script`
+(`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_traffic.rs:334`, current
+line numbers; the entry's `:257-261` has drifted) precisely so the empty-directory branch
+became unit-testable, and pinned it with
+`diag_archive_script_forces_an_array_so_empty_log_dir_cannot_throw` (asserts StrictMode is
+set, the array subexpression opens the assignment, and it closes after the `else`). The
+"cleanup recorded as failed while it completed" half is addressed by the same commit: the
+collection error no longer aborts into `cleanup`'s result path. Follow-up hardening of the
+same failure path landed in `15ea8c0f` ("live-lab: recover Windows failure diagnostics
+instead of destroying them"): assembly-free empty-archive write, content-based
+(empty-archive-bytes) acceptance instead of parsing `unzip` prose, per-node error isolation
+so one node's failure no longer discards every other node's artifacts, and node attribution
+in the message. Both commits cite the live runs that motivated them
+(`winnat-20260725T190000Z`, `winnat-20260727T095740Z`). Verified against the current
+worktree at HEAD: the array wrap is present at `windows_traffic.rs:435` and the
+regression-guard test is present and green. The ★ sweep note below remains accurate and
+forward-looking; only the defect claim above it is closed.
+
 `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_traffic.rs:257-261` runs under
 `Set-StrictMode -Version Latest` and does:
 
