@@ -24350,6 +24350,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    // MAC-D7: the macOS anchor/runtime path persists and reads watermarks
+    // at the canonical macOS layout the launchd plist passes
+    // (`${STATE_ROOT}/trust/...` and `${STATE_ROOT}/membership/...`), and a
+    // missing watermark fails closed (loader returns Ok(None); the trust
+    // consumer surfaces `trust watermark is missing` rather than proceeding
+    // unsigned). The parent directory stays at the reviewed state-root
+    // posture 0o700 and the artifact at 0o600.
+    #[test]
+    fn macos_anchor_watermark_layout_persists_reads_and_fails_closed_when_missing() {
+        let state_root = secure_test_dir("rustynetd-macos-anchor-watermark-layout");
+        let trust_dir = state_root.join("trust");
+        let membership_dir = state_root.join("membership");
+        std::fs::create_dir_all(&trust_dir).expect("trust dir should create");
+        std::fs::create_dir_all(&membership_dir).expect("membership dir should create");
+
+        // Missing watermark fails closed: the loader must report absent
+        // (Ok(None)) — never synthesize a watermark — so the consumer
+        // rejects the bootstrap envelope instead of accepting unsigned
+        // state.
+        let trust_watermark_path = trust_dir.join("rustynetd.trust.watermark");
+        let membership_watermark_path = membership_dir.join("membership.watermark");
+        assert!(
+            load_trust_watermark(&trust_watermark_path)
+                .expect("absent trust watermark is not an IO error")
+                .is_none()
+        );
+        assert!(
+            rustynet_control::membership::load_membership_watermark(&membership_watermark_path)
+                .expect("absent membership watermark is not an IO error")
+                .is_none()
+        );
+
+        // Persist + read back through the canonical layout.
+        let expected = super::TrustWatermark {
+            updated_at_unix: 900,
+            nonce: 21,
+            payload_digest: Some([0x77u8; 32]),
+        };
+        persist_trust_watermark(&trust_watermark_path, expected)
+            .expect("trust watermark should persist into the macOS trust layout");
+        let loaded = load_trust_watermark(&trust_watermark_path)
+            .expect("trust watermark should load")
+            .expect("persisted trust watermark must exist");
+        assert_eq!(loaded, expected);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let trust_dir_mode = std::fs::metadata(&trust_dir)
+                .expect("trust dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                trust_dir_mode, 0o700,
+                "watermark parent under the macOS state root must keep the reviewed 0o700 posture"
+            );
+            let file_mode = std::fs::metadata(&trust_watermark_path)
+                .expect("watermark file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600, "watermark artifact must stay owner-only");
+        }
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
+
     // The four bootstrap watermark loaders must bound their reads before
     // allocating (same class as the fetcher watermark store and resilience
     // snapshot fixes). Oversized disk state surfaces as a typed Io error
