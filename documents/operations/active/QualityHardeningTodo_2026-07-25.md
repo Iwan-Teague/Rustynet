@@ -1470,6 +1470,44 @@ text becomes assertable — the pattern already proven by `build_diag_archive_sc
 the two fail-closed/teardown entries over the largest by line count. Do **not** mass-refactor:
 inventory first (done), then extract where a real assertion follows.
 
+**Disposition 2026-08-29 — FIXED for the two ★ release-blocking fail-closed paths (partial for
+the table as a whole).** The killswitch-teardown half of `cleanup_runtime_state` had already been
+extracted in `64987dc8` (`windows_dataplane_reset_script`, pinned by
+`windows_dataplane_reset_script_clears_killswitch_dns_and_nrpt`). This change extracts the
+remaining three inline scripts:
+
+1. `windows_traffic.rs::build_runtime_state_cleanup_script` — the runtime-state removal half of
+   `cleanup_runtime_state`. Pinned by
+   `runtime_state_cleanup_script_removes_every_state_file_including_watermarks`: ALL ten state
+   paths (membership/trust artifacts **and each anti-replay watermark**) are asserted present,
+   staging purge + best-effort posture pinned, and the script must NOT reference `keys` or
+   `Program Files` (keys/installation stay untouched).
+2. `windows_install.rs::build_auto_tunnel_enforce_patch_script` — the `rustynetd.env`
+   JSON-args patch that flips `--auto-tunnel-enforce` to `true`. Pinned by
+   `auto_tunnel_enforce_patch_script_flips_enforce_and_threads_max_ages`: StrictMode+Stop, the
+   `RUSTYNETD_DAEMON_ARGS_JSON` match + JSON round-trip, the `'true'` flip, both freshness
+   ceilings (`86400`), the IPv4-regex-guarded C-STUN `:3478` threading, the write-back, and a
+   negative pin that the script can never write `'false'`.
+3. `macos_install.rs::build_auto_tunnel_enforce_install_script` — the enforce-mode re-invocation
+   of the compiled install script. Pinned by
+   `auto_tunnel_enforce_install_script_pins_enforce_posture` (`--auto-tunnel-enforce true`
+   present / `false` impossible, all four `--*-max-age-secs 86400` ceilings, fail-closed SSH
+   allow flags, `sudo -n`, the C-STUN detection prelude + gateway regex) and
+   `auto_tunnel_enforce_install_script_preserves_shell_escaping` (pre-escaped `'\''` values
+   round-trip; empty CIDRS renders as `''`). The prior
+   `enforce_daemon_constructs_wg_interface_flag_with_derived_value` test reconstructed the
+   command by hand — it now asserts against the real builder, so it can no longer pass while
+   the actual command drifts.
+
+Behaviour-preserving refactor: each caller invokes the builder and runs the returned string
+verbatim; no interpolation, defaults, or ordering changed, and no untrusted value is newly
+interpolated (the Windows patch quotes only the compile-time state-root env path via
+`ps_quote`; the macOS builder takes the same pre-escaped arguments the caller already formed).
+The remaining table rows (`deploy_relay_service`, `run_windows_e2e_bootstrap`,
+`install_daemon`, `assert_mesh_client_nat_session`'s inline probe, the linux_/macos_ siblings)
+are still open under the original inventory — extraction continues where a real assertion
+follows, per the direction above.
+
 ### QH-25 — The NAT-session assertion is weaker than its own doc comment claims
 **Severity: medium (it gates a release claim). Confidence: VERIFIED by hand-review of the script.**
 

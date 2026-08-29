@@ -2,7 +2,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
@@ -10,6 +9,7 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+use crate::vm_lab::VmGuestPlatform;
 
 pub const MACOS_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 pub const MACOS_RUSTYNET_PATH: &str = "/usr/local/bin/rustynet";
@@ -496,6 +496,65 @@ pub fn restart_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     start_daemon(conn)
 }
 
+/// Build the remote shell command that re-invokes the compiled macOS
+/// install-service script in ENFORCE mode (QH-24): same parameters as
+/// bootstrap but with `--auto-tunnel-enforce true` and extended max-age
+/// windows, so the daemon applies the assignment bundles on its next start.
+///
+/// trust-max-age-secs 86400: macOS has no periodic trust-evidence refresh
+/// timer (unlike Linux rustynetd-trust-refresh.service). The lab issues
+/// trust evidence once during bootstrap; 86400 s keeps it valid for the
+/// duration of any reasonable lab run without requiring a separate refresh.
+/// This matches the Linux lab setting.
+///
+/// The STUN detection prelude (C-STUN, BashOrchestratorRetirementProgram)
+/// mirrors Bootstrap-RustyNetMacos.sh: the enforce re-render would otherwise
+/// silently drop the bootstrap-time --traversal-stun-servers (the same trap
+/// as --wg-interface, which is threaded explicitly). Detection failure passes
+/// no flag, preserving the pre-C-STUN plist.
+///
+/// Split out of `enforce_daemon` so the generated command is unit-testable
+/// without a live `NodeConnection`. This is the fail-closed enforcement path:
+/// until it runs, the daemon is in non-enforcing mode
+/// (`auto_tunnel_enforce=false`), so a regression that drops the flag or a
+/// max-age silently weakens the enforced posture. `node_id_arg`,
+/// `network_id_arg`, and `ssh_allow_cidrs_arg` must arrive ALREADY
+/// single-quote-escaped by the caller (the caller's own values are
+/// interpolated into single-quoted shell args); `daemon_node_role` comes from
+/// a fixed enum mapping and `wg_interface` is digit-validated upstream.
+/// Pinned by `auto_tunnel_enforce_install_script_pins_enforce_posture`.
+fn build_auto_tunnel_enforce_install_script(
+    daemon_node_role: &str,
+    node_id_arg: &str,
+    network_id_arg: &str,
+    wg_interface: &str,
+    ssh_allow_flag: &str,
+    ssh_allow_cidrs_arg: &str,
+) -> String {
+    format!(
+        "chmod 700 /tmp/Install-RustyNetMacosService.sh && \
+         RN_LAB_GW=\"$(route -n get default 2>/dev/null | awk '/gateway:/{{print $2; exit}}')\" ; \
+         RN_STUN_FLAG='' ; RN_STUN_VAL='' ; \
+         if echo \"$RN_LAB_GW\" | grep -Eq '^[0-9]{{1,3}}(\\.[0-9]{{1,3}}){{3}}$'; then \
+           RN_STUN_FLAG='--traversal-stun-servers' ; RN_STUN_VAL=\"$RN_LAB_GW:3478\" ; fi ; \
+         sudo -n /tmp/Install-RustyNetMacosService.sh \
+           --rustynetd-bin {MACOS_RUSTYNETD_PATH} \
+           --state-root {MACOS_STATE_ROOT} \
+           --node-id '{node_id_arg}' \
+           --node-role '{daemon_node_role}' \
+           --network-id '{network_id_arg}' \
+           --wg-interface '{wg_interface}' \
+           --auto-tunnel-enforce true \
+           --trust-max-age-secs 86400 \
+           --auto-tunnel-max-age-secs 86400 \
+           --traversal-max-age-secs 86400 \
+           --dns-zone-max-age-secs 86400 \
+           $RN_STUN_FLAG $RN_STUN_VAL \
+           --fail-closed-ssh-allow '{ssh_allow_flag}' \
+           --fail-closed-ssh-allow-cidrs '{ssh_allow_cidrs_arg}'",
+    )
+}
+
 /// Enforce production runtime for the macOS daemon.
 ///
 /// Mirrors `enforce_daemon` on Linux: re-installs the launchd plist with
@@ -572,39 +631,16 @@ pub fn enforce_daemon(
     )?;
     let _ = std::fs::remove_file(&install_tmp);
 
-    // Build the re-install command: same params as bootstrap but with
-    // auto-tunnel-enforce=true and extended max-age windows.
-    // trust-max-age-secs 86400: macOS has no periodic trust-evidence refresh
-    // timer (unlike Linux rustynetd-trust-refresh.service).  The lab issues
-    // trust evidence once during bootstrap; 86400 s keeps it valid for the
-    // duration of any reasonable lab run without requiring a separate refresh.
-    //
-    // The STUN detection prelude (C-STUN, BashOrchestratorRetirementProgram)
-    // mirrors Bootstrap-RustyNetMacos.sh: the enforce re-render would
-    // otherwise silently drop the bootstrap-time --traversal-stun-servers
-    // (the same trap as --wg-interface, which is threaded explicitly above).
-    // Detection failure passes no flag, preserving the pre-C-STUN plist.
-    let script = format!(
-        "chmod 700 /tmp/Install-RustyNetMacosService.sh && \
-         RN_LAB_GW=\"$(route -n get default 2>/dev/null | awk '/gateway:/{{print $2; exit}}')\" ; \
-         RN_STUN_FLAG='' ; RN_STUN_VAL='' ; \
-         if echo \"$RN_LAB_GW\" | grep -Eq '^[0-9]{{1,3}}(\\.[0-9]{{1,3}}){{3}}$'; then \
-           RN_STUN_FLAG='--traversal-stun-servers' ; RN_STUN_VAL=\"$RN_LAB_GW:3478\" ; fi ; \
-         sudo -n /tmp/Install-RustyNetMacosService.sh \
-           --rustynetd-bin {MACOS_RUSTYNETD_PATH} \
-           --state-root {MACOS_STATE_ROOT} \
-           --node-id '{node_id_arg}' \
-           --node-role '{daemon_node_role}' \
-           --network-id '{network_id_arg}' \
-           --wg-interface '{wg_interface}' \
-           --auto-tunnel-enforce true \
-           --trust-max-age-secs 86400 \
-           --auto-tunnel-max-age-secs 86400 \
-           --traversal-max-age-secs 86400 \
-           --dns-zone-max-age-secs 86400 \
-           $RN_STUN_FLAG $RN_STUN_VAL \
-           --fail-closed-ssh-allow '{ssh_allow_flag}' \
-           --fail-closed-ssh-allow-cidrs '{ssh_allow_cidrs_arg}'",
+    // Build the re-install command via the extracted builder (QH-24): same
+    // params as bootstrap but with auto-tunnel-enforce=true and extended
+    // max-age windows.
+    let script = build_auto_tunnel_enforce_install_script(
+        daemon_node_role,
+        &node_id_arg,
+        &network_id_arg,
+        &wg_interface,
+        ssh_allow_flag,
+        &ssh_allow_cidrs_arg,
     );
     ssh::run_remote(conn, &script, Duration::from_secs(60))?;
     // The install script reloads the launchd plist, which bounces the daemon.
@@ -1647,22 +1683,28 @@ mod tests {
     }
 
     /// enforce_daemon's invocation string is the actual surface that
-    /// reaches the install-script. Reconstruct the same format!() shape
-    /// the fn uses to pin that the derived utun name lands as
+    /// reaches the install-script. Assert against the REAL builder output
+    /// (QH-24 extraction) that the derived utun name lands as
     /// `--wg-interface 'utun<N>'` for the lab macOS node.
     #[test]
     fn enforce_daemon_constructs_wg_interface_flag_with_derived_value() {
         let node_id = "macos-client-1";
         let expected_iface = utun_name_for_node_id(node_id);
-        // Reconstruct the relevant portion of the enforce_daemon command.
-        let script = format!(
-            "sudo -n /tmp/Install-RustyNetMacosService.sh \
-               --node-id '{node_id}' \
-               --wg-interface '{expected_iface}'"
+        let script = build_auto_tunnel_enforce_install_script(
+            "client",
+            node_id,
+            "lab-net",
+            &expected_iface,
+            "false",
+            "",
         );
         assert!(
             script.contains(&format!("--wg-interface '{expected_iface}'")),
-            "enforce_daemon must pass --wg-interface with the derived utun name"
+            "enforce_daemon must pass --wg-interface with the derived utun name: {script}"
+        );
+        assert!(
+            script.contains(&format!("--node-id '{node_id}'")),
+            "enforce_daemon must pass the node id: {script}"
         );
         // Pin that the derived name is in the legal range, not the
         // install-script default (utun9). For node_id "macos-client-1"
@@ -1670,6 +1712,106 @@ mod tests {
         assert_ne!(
             expected_iface, "utun9",
             "derived name for macos-client-1 must not collide with the install-script default"
+        );
+    }
+
+    /// QH-24 content pin for the macOS fail-closed enforcement path: the
+    /// enforce re-invocation must carry `--auto-tunnel-enforce true`, all
+    /// four freshness ceilings, the fail-closed SSH posture, and the C-STUN
+    /// detection prelude. A regression that drops any of these silently
+    /// weakens the enforced posture (the daemon would start non-enforcing,
+    /// or without its traversal/SSH posture) while downstream stages assume
+    /// enforcement is live.
+    #[test]
+    fn auto_tunnel_enforce_install_script_pins_enforce_posture() {
+        let script = build_auto_tunnel_enforce_install_script(
+            "exit",
+            "exit-1",
+            "lab-net",
+            "utun1234",
+            "true",
+            "192.168.64.0/24",
+        );
+
+        // The whole point of the enforce path: enforcement ON, explicitly.
+        assert!(
+            script.contains("--auto-tunnel-enforce true"),
+            "enforce must set --auto-tunnel-enforce true: {script}"
+        );
+        assert!(
+            !script.contains("--auto-tunnel-enforce false"),
+            "the enforce command must never be able to pass false: {script}"
+        );
+        // Freshness ceilings: the lab issues bundles once, so production
+        // relies on these windows — each must be present with 86400.
+        for flag in [
+            "--trust-max-age-secs 86400",
+            "--auto-tunnel-max-age-secs 86400",
+            "--traversal-max-age-secs 86400",
+            "--dns-zone-max-age-secs 86400",
+        ] {
+            assert!(
+                script.contains(flag),
+                "freshness ceiling `{flag}` must be threaded: {script}"
+            );
+        }
+        // Fail-closed SSH posture.
+        assert!(
+            script.contains("--fail-closed-ssh-allow 'true'")
+                && script.contains("--fail-closed-ssh-allow-cidrs '192.168.64.0/24'"),
+            "fail-closed SSH allow flags must be threaded: {script}"
+        );
+        // Privilege boundary: sudo -n (non-interactive), against the
+        // installed-by-the-binary script.
+        assert!(
+            script.contains("sudo -n /tmp/Install-RustyNetMacosService.sh"),
+            "the install script must be re-invoked via sudo -n: {script}"
+        );
+        // The C-STUN prelude must survive the enforce re-render, or the
+        // bootstrap-time --traversal-stun-servers would be silently dropped.
+        assert!(
+            script.contains("--traversal-stun-servers") && script.contains("$RN_LAB_GW:3478"),
+            "STUN detection prelude must be preserved: {script}"
+        );
+        assert!(
+            script.contains("grep -Eq '^[0-9]{1,3}(\\.[0-9]{1,3}){3}$'"),
+            "the gateway must be IPv4-regex-guarded: {script}"
+        );
+        // Role and interface are threaded.
+        assert!(script.contains("--node-role 'exit'"), "{script}");
+        assert!(script.contains("--wg-interface 'utun1234'"), "{script}");
+    }
+
+    /// Single-quote escaping parity: values interpolated into single-quoted
+    /// shell args must arrive escaped (`'\''`), or a crafted value could
+    /// break out of the quoting. The builder takes pre-escaped values; this
+    /// pins that they land verbatim inside the quoted args.
+    #[test]
+    fn auto_tunnel_enforce_install_script_preserves_shell_escaping() {
+        // Values arrive PRE-ESCAPED from the caller (node_id.replace('\'',
+        // "'\\''")), so pass the escaped forms here, exactly as enforce_daemon
+        // does.
+        let script = build_auto_tunnel_enforce_install_script(
+            "client",
+            r"node'\''x",
+            r"net'\''id",
+            "utun10",
+            "false",
+            "",
+        );
+        assert!(
+            script.contains("--node-id 'node'\\''x'"),
+            "escaped node id must round-trip through the single quotes: {script}"
+        );
+        assert!(
+            script.contains("--network-id 'net'\\''id'"),
+            "escaped network id must round-trip: {script}"
+        );
+        // Empty allow-list renders as an empty quoted arg, not a bare flag.
+        assert!(
+            script.contains("--fail-closed-ssh-allow 'false'")
+                && script.contains("--fail-closed-ssh-allow-cidrs ''"),
+            "the disabled SSH-allow posture must render exactly: {script}"
         );
     }
 
