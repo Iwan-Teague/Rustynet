@@ -31,17 +31,17 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::macos_blind_exit::{
-    build_macos_blind_exit_pf_rules, MacosBlindExitManagementCidr, MacosBlindExitPfConfig,
-    DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR,
+    DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR, MacosBlindExitManagementCidr, MacosBlindExitPfConfig,
+    build_macos_blind_exit_pf_rules,
 };
 use crate::macos_exit_nat::{
-    build_macos_exit_nat_pf_rules, MacosExitNatPfConfig, DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR,
+    DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR, MacosExitNatPfConfig, build_macos_exit_nat_pf_rules,
 };
 use crate::macos_tandem_dns_redirect::{
-    build_macos_tandem_dns_redirect_pf_rules, MacosTandemDnsRedirectPfConfig,
-    MACOS_TANDEM_DNS_PF_ANCHOR_PREFIX,
+    MACOS_TANDEM_DNS_PF_ANCHOR_PREFIX, MacosTandemDnsRedirectPfConfig,
+    build_macos_tandem_dns_redirect_pf_rules,
 };
-use crate::phase10::{render_macos_killswitch_pf_rules, MacosKillswitchSpec, ManagementCidr};
+use crate::phase10::{MacosKillswitchSpec, ManagementCidr, render_macos_killswitch_pf_rules};
 use crate::privileged_helper::MAX_ARG_BYTES;
 use rustynet_control::managed_dns_handoff::{ManagedDnsEndpoint, MeshIpv4Prefix};
 use rustynet_control::tandem_dns::TandemScope;
@@ -837,7 +837,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::privileged_helper::{MAX_ARGS, MAX_ARG_BYTES};
+    use crate::privileged_helper::{MAX_ARG_BYTES, MAX_ARGS};
     use std::str::FromStr;
 
     fn killswitch(spec: MacosKillswitchSpec, generation: u64, strict: bool) -> MacosPfLoadSpec {
@@ -855,7 +855,9 @@ mod tests {
             dns_protected: true,
             allow_egress_interface: false,
             fail_closed_ssh_allow: true,
-            fail_closed_ssh_allow_cidrs: vec![ManagementCidr::from_str("192.168.128.0/24").unwrap()],
+            fail_closed_ssh_allow_cidrs: vec![
+                ManagementCidr::from_str("192.168.128.0/24").unwrap(),
+            ],
             traversal_bootstrap_allow_endpoints: vec!["203.0.113.10:3478".parse().unwrap()],
             managed_peer_egress_endpoints: vec!["192.168.65.3:51820".parse().unwrap()],
             ipv6_blocked: true,
@@ -1126,11 +1128,13 @@ mod tests {
         assert_eq!(decoded, original);
         assert_eq!(decoded.render().unwrap(), original.render().unwrap());
         assert_eq!(decoded.anchor_name(), "com.rustynet/blind_exit");
-        assert!(decoded
-            .render()
-            .unwrap()
-            .trim_end()
-            .ends_with("block drop out quick all"));
+        assert!(
+            decoded
+                .render()
+                .unwrap()
+                .trim_end()
+                .ends_with("block drop out quick all")
+        );
     }
 
     #[test]
@@ -1260,11 +1264,12 @@ mod tests {
         // never produced by the daemon, but accept-or-reject it cannot weaken
         // the killswitch, so we only require it not to bypass the terminal block.
         if let Ok(spec) = MacosPfLoadSpec::decode(&refs) {
-            assert!(spec
-                .render()
-                .unwrap()
-                .trim_end()
-                .ends_with("block drop out quick all"));
+            assert!(
+                spec.render()
+                    .unwrap()
+                    .trim_end()
+                    .ends_with("block drop out quick all")
+            );
         }
 
         let mut bad_ip = base();
@@ -1335,29 +1340,33 @@ mod tests {
         // must catch it before the rules ever load.
         let ks = killswitch(rich_killswitch_spec(), 1, false);
         // Filter anchor missing the terminal default-deny -> rejected.
-        assert!(ks
-            .assert_rule_invariants("set block-policy drop\npass out quick all\n")
-            .is_err());
+        assert!(
+            ks.assert_rule_invariants("set block-policy drop\npass out quick all\n")
+                .is_err()
+        );
         // route-to bypass primitive in a filter anchor -> rejected.
-        assert!(ks
-            .assert_rule_invariants(
+        assert!(
+            ks.assert_rule_invariants(
                 "pass out quick on en0 route-to (en0 1.2.3.4) all\nblock drop out quick all\n"
             )
-            .is_err());
+            .is_err()
+        );
 
         let nat = MacosPfLoadSpec::ExitNat {
             config: MacosExitNatPfConfig::new("en0", vec!["100.64.0.0/10".to_owned()]).unwrap(),
         };
         // A filter rule smuggled into the translation anchor -> rejected.
-        assert!(nat
-            .assert_rule_invariants(
+        assert!(
+            nat.assert_rule_invariants(
                 "nat on en0 inet from 100.64.0.0/10 to any -> (en0)\npass out quick all\n"
             )
-            .is_err());
+            .is_err()
+        );
         // A clean nat-only ruleset passes.
-        assert!(nat
-            .assert_rule_invariants("nat on en0 inet from 100.64.0.0/10 to any -> (en0)\n")
-            .is_ok());
+        assert!(
+            nat.assert_rule_invariants("nat on en0 inet from 100.64.0.0/10 to any -> (en0)\n")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1513,9 +1522,11 @@ mod tests {
             config: tandem_config(&scope),
         };
         let encoded = original.encode();
-        assert!(encoded
-            .iter()
-            .any(|t| t.contains("source=100.64.0.11,100.64.0.12")));
+        assert!(
+            encoded
+                .iter()
+                .any(|t| t.contains("source=100.64.0.11,100.64.0.12"))
+        );
         let refs: Vec<&str> = encoded.iter().map(String::as_str).collect();
         let decoded = MacosPfLoadSpec::decode(&refs).expect("decode");
         assert_eq!(decoded, original);
@@ -1526,11 +1537,12 @@ mod tests {
             config.selected_sources(),
             Some(&[Ipv4Addr::new(100, 64, 0, 11), Ipv4Addr::new(100, 64, 0, 12)][..])
         );
-        // The explicit set appears on every rendered rule.
+        // The explicit set appears on every rendered rule (24: 2 rdr + 2
+        // pass + 2 block-53 + 2 DoT + 16 DoH, owner decision 3).
         let rules = decoded.render().unwrap();
         assert_eq!(
             rules.matches("from { 100.64.0.11, 100.64.0.12 } ").count(),
-            6
+            24
         );
     }
 
@@ -1630,18 +1642,24 @@ mod tests {
         let rules = tandem.render().unwrap();
         assert!(tandem.assert_rule_invariants(&rules).is_ok());
         // A nat rule in the tandem anchor is unreviewed.
-        assert!(tandem
-            .assert_rule_invariants(&format!(
-                "nat on en0 inet from any to any -> (en0)\n{rules}"
-            ))
-            .is_err());
+        assert!(
+            tandem
+                .assert_rule_invariants(&format!(
+                    "nat on en0 inet from any to any -> (en0)\n{rules}"
+                ))
+                .is_err()
+        );
         // A broad permissive pass is unreviewed.
-        assert!(tandem
-            .assert_rule_invariants(&format!("pass out quick all\n{rules}"))
-            .is_err());
+        assert!(
+            tandem
+                .assert_rule_invariants(&format!("pass out quick all\n{rules}"))
+                .is_err()
+        );
         // No rdr at all is rejected.
-        assert!(tandem
-            .assert_rule_invariants("pass in quick on utun9 all\n")
-            .is_err());
+        assert!(
+            tandem
+                .assert_rule_invariants("pass in quick on utun9 all\n")
+                .is_err()
+        );
     }
 }
