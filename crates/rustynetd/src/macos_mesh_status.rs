@@ -137,6 +137,75 @@ mod tests {
         assert!(DEFAULT_MACOS_STATE_PATH.starts_with("/usr/local/var/rustynet"));
     }
 
+    /// The validator's default state path MUST equal the daemon's default
+    /// state path on macOS (QH-40 / QH-39 regression guard).
+    ///
+    /// These two constants live in different modules and drifted once: before
+    /// QH-40 (8f9e7f5a) the daemon's `#[cfg(target_os = "macos")]` arm silently
+    /// leaked the Linux `/var/lib` path, so the anchor daemon persisted its
+    /// snapshot somewhere the `macos-mesh-status-check` validator never looked
+    /// and the check red with `state file missing` on an otherwise healthy
+    /// node. The anchor6c run (livelab-1787984750-81a71286960e, 2026-08-29)
+    /// ran with both fixes already landed and still red, which is why the
+    /// disposition landed in `MacCellsHarvest_2026-08-28.md` §14.4 is "honest
+    /// fail-closed red, not a path defect" — but nothing pinned the agreement,
+    /// so this test closes the drift class for good. On non-macOS builds the
+    /// daemon arm holds the Linux path, so the equality is only assertable
+    /// (and only meaningful) on macOS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validator_default_path_matches_daemon_default_state_path() {
+        assert_eq!(
+            PathBuf::from(crate::daemon::default_state_path()),
+            PathBuf::from(DEFAULT_MACOS_STATE_PATH),
+            "the macOS daemon must persist its snapshot where macos-mesh-status-check reads it"
+        );
+    }
+
+    /// A healthy macOS anchor must produce a snapshot the validator accepts:
+    /// the daemon's reconcile-tick heartbeat
+    /// (`maybe_heartbeat_persist_state`, 30s) keeps the snapshot fresh while
+    /// the node is unrestricted, and the anchor's passive unix runloop drives
+    /// the same `reconcile()` every second. This test pins the contract the
+    /// anchor6c MeshStatus red was originally attributed to: given a snapshot
+    /// written at the DEFAULT path within the heartbeat interval, the
+    /// validator's drift list is empty at the orchestrator's 180s bound.
+    ///
+    /// The companion honesty guarantee (stale/missing MUST red) is pinned by
+    /// `missing_state_file_reports_drift` above.
+    #[test]
+    fn fresh_snapshot_at_default_path_passes_the_orchestrator_bound() {
+        let dir = std::env::temp_dir().join(format!("macos-mesh-fresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let state_path = dir.join("rustynetd.state");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        crate::resilience::persist_session_snapshot(
+            &crate::resilience::SessionStateSnapshot {
+                timestamp_unix: now,
+                peer_ids: Vec::new(),
+                selected_exit_node: None,
+                lan_access_enabled: false,
+            },
+            &state_path,
+        )
+        .expect("plant a fresh snapshot");
+        let report = collect_macos_mesh_status_report(&MacosMeshStatusOptions {
+            state_path: Some(state_path),
+            expected_peer_ids: vec![],
+            max_age_seconds: Some(180),
+        });
+        assert!(
+            report.drift_reasons.is_empty(),
+            "a heartbeat-fresh snapshot at the default path must pass the orchestrator's \
+             180s bound: drift = {:?}",
+            report.drift_reasons
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     // ----- X4 coverage parity sweep ---------------------------------------
 
     #[test]
