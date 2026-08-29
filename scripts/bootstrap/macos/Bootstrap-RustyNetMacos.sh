@@ -1207,6 +1207,137 @@ seed_trust_evidence() {
   echo "[bootstrap] trust evidence seeded at ${trust_evidence}"
 }
 
+# ── Membership genesis (MAC-D4) ───────────────────────────────────────────────
+# Seeds the membership owner keypair at the canonical macOS genesis location
+# so the MAC-D2 fail-loud owner-pubkey read path
+# (${CONFIG_ROOT}/membership.owner.key.pub, pinned by test to
+# `ops_e2e::MACOS_OWNER_SIGNING_KEY_PATH`) has install provenance. The Linux
+# bootstrap runs `rustynet ops e2e-bootstrap-host`, whose membership-init step
+# re-seeds /etc/rustynet/membership.owner.key(.pub) on every install; the
+# macOS bootstrap previously had no genesis step at all, so a fresh deploy
+# could never hold an owner key and the orchestrator's membership_init stage
+# failed on every macOS exit run (MAC-D4, MacCellsHarvest_2026-08-28 §8.3).
+#
+# Custody (mirrors the reviewed genesis drivers; nothing weakened):
+#   - the owner SIGNING (private) key is written by `rustynetd membership
+#     init` itself, passphrase-ENCRYPTED at rest (Argon2+XChaCha20 envelope,
+#     mode 0600; the writer refuses symlinks and tightens the directory to
+#     0700) — never plaintext private key material;
+#   - the passphrase is generated as a bootstrap artifact in BOOTSTRAP_DIR
+#     (outside keys/, so macos-key-custody-check does not flag it; 0600
+#     root-owned; same atomic-write protocol as the wireguard passphrase)
+#     AND is provisioned into the System.keychain under the canonical
+#     membership-mutation unwrap descriptor (service
+#     "signing_key_passphrase", account "membership-owner-signing-key")
+#     with the same idempotent delete-then-add provisioning
+#     `execute_ops_e2e_bootstrap_macos` performs;
+#   - only the PUBLIC half (.pub) is world-readable — exactly the file the
+#     orchestrator's membership_init stage reads back via `sudo -n cat`;
+#   - the genesis snapshot/log are chowned to the daemon service account
+#     after genesis (the same ownership restore
+#     ops_e2e::set_membership_state_permissions_for applies after every
+#     root-run membership mutation) so the launchd daemon, which runs as the
+#     rustynetd service account, can persist membership log/snapshot/watermark
+#     updates at runtime (the watermark itself is deliberately absent at
+#     genesis and is created by the daemon on first start);
+#   - fail-closed: `set -euo pipefail` aborts the whole bootstrap if any
+#     genesis step fails — a node must never ship without a seeded owner key.
+#
+# Re-genesis per bootstrap is deliberate and mirrors Linux:
+# `clear_residual_state` wipes the membership/ signed state on every install
+# (a stale epoch watermark makes the daemon reject the fresh genesis bundle
+# as a replay/rollback), so the owner keypair must be regenerated with it,
+# and `macos_install.rs`'s wholesale uninstall wipe of CONFIG_ROOT is
+# repaired by the very next bootstrap rather than a one-time manual fix.
+seed_membership_genesis() {
+  local membership_dir="${STATE_ROOT}/membership"
+  local owner_key="${CONFIG_ROOT}/membership.owner.key"
+  local passphrase_file="${BOOTSTRAP_DIR}/membership-owner.passphrase"
+
+  # Atomic passphrase write: chmod the tmpfile BEFORE writing entropy so the
+  # secret bytes never appear under the default umask (same protocol as
+  # generate_wireguard_keys). 32 raw bytes -> 64 hex chars, no trailing
+  # newline (the keychain item must round-trip exactly the genesis bytes).
+  local passphrase_tmp=""
+  # shellcheck disable=SC2064
+  trap 'secure_remove_file "${passphrase_tmp}"' EXIT
+  passphrase_tmp="$(mktemp "${BOOTSTRAP_DIR}/membership-owner.passphrase.tmp.XXXXXX")"
+  if [[ -z "${passphrase_tmp}" || ! -f "${passphrase_tmp}" ]]; then
+    echo "[bootstrap] failed to create membership-owner passphrase tmpfile under ${BOOTSTRAP_DIR}" >&2
+    exit 1
+  fi
+  chmod 0600 "${passphrase_tmp}"
+  od -A n -t x1 -N 32 /dev/urandom | tr -d ' \n' > "${passphrase_tmp}"
+  local passphrase_size
+  passphrase_size="$(wc -c < "${passphrase_tmp}" | tr -d ' ')"
+  if [[ "${passphrase_size}" -ne 64 ]]; then
+    echo "[bootstrap] membership owner passphrase generation produced ${passphrase_size} bytes; expected 64" >&2
+    exit 1
+  fi
+  chown root:wheel "${passphrase_tmp}"
+  mv "${passphrase_tmp}" "${passphrase_file}"
+  trap - EXIT
+
+  # Genesis. `rustynetd membership init` generates the owner keypair,
+  # persists the encrypted private half at ${owner_key} (0600) and the
+  # public half at ${owner_key}.pub, and mints the single-node genesis
+  # snapshot (full bootstrap capability set) the daemon starts from.
+  # Fail-closed via set -e: a failed genesis aborts the install.
+  "${RUSTYNETD_BIN}" membership init \
+    --snapshot "${membership_dir}/membership.snapshot" \
+    --log "${membership_dir}/membership.log" \
+    --watermark "${membership_dir}/membership.watermark" \
+    --owner-signing-key "${owner_key}" \
+    --owner-signing-key-passphrase-file "${passphrase_file}" \
+    --node-id "${NODE_ID}" \
+    --network-id "${NETWORK_ID}" \
+    --force
+
+  # Restore daemon-service ownership of the genesis signed state (the same
+  # restore the CLI ops path applies after every root-run membership
+  # mutation): the launchd daemon runs as the rustynetd service account and
+  # rewrites snapshot/log/watermark as membership updates are applied.
+  chown rustynetd:rustynetd \
+    "${membership_dir}/membership.snapshot" \
+    "${membership_dir}/membership.log"
+
+  # Provision the canonical System.keychain item for the membership-mutation
+  # unwrap path — the same provisioning contract as
+  # execute_ops_e2e_bootstrap_macos's provisioner (idempotent
+  # delete-then-add, argv-only, System.keychain so the item survives across
+  # sessions and is reachable by root-run membership ops). The service/
+  # account pair MUST match the canonical
+  # rustynet_control::credential_unwrap
+  # ::membership_signing_key_passphrase_descriptor.
+  local passphrase_text
+  passphrase_text="$(cat "${passphrase_file}")"
+  /usr/bin/security delete-generic-password \
+    -a membership-owner-signing-key \
+    -s signing_key_passphrase \
+    /Library/Keychains/System.keychain >/dev/null 2>&1 || true
+  /usr/bin/security add-generic-password \
+    -a membership-owner-signing-key \
+    -s signing_key_passphrase \
+    -w "${passphrase_text}" \
+    /Library/Keychains/System.keychain
+  unset passphrase_text
+
+  # The passphrase file stays as a bootstrap artifact in BOOTSTRAP_DIR (0600,
+  # root-owned — same posture as the wireguard passphrase): it is the
+  # bootstrap-time material for re-provisioning the keychain item after a
+  # rebuild; the daemon and the ops unwrap path resolve the passphrase from
+  # the keychain descriptor, not from disk.
+  chown root:rustynetd "${passphrase_file}"
+  chmod 0600 "${passphrase_file}"
+
+  # The public half is the MAC-D2 read target: pin deterministic ownership
+  # and mode (membership init writes it under the process umask).
+  chown root:rustynetd "${owner_key}.pub"
+  chmod 0644 "${owner_key}.pub"
+
+  echo "[bootstrap] membership genesis seeded: owner key ${owner_key} (.pub published at ${owner_key}.pub), snapshot ${membership_dir}/membership.snapshot"
+}
+
 # ── Launchd service installation ──────────────────────────────────────────────
 install_launchd_service() {
   local install_script="${PLIST_SCRIPT_DIR}/Install-RustyNetMacosService.sh"
@@ -1321,6 +1452,7 @@ if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
   generate_wireguard_keys
   provision_enrollment_secret
   seed_trust_evidence
+  seed_membership_genesis
   install_launchd_service
 else
   install_prereqs
@@ -1333,6 +1465,7 @@ else
   generate_wireguard_keys
   provision_enrollment_secret
   seed_trust_evidence
+  seed_membership_genesis
   install_launchd_service
 fi
 
