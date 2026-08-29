@@ -535,6 +535,30 @@ recheck. Re-verify before inheriting.
 ### QH-07 — A ledger column reports `pass` for a stage that has never passed
 **Severity: HIGH — corrected 2026-07-25, was "medium". Confidence: VERIFIED (quote-aware parse, reproduced independently twice; alias table and lifetime records read directly).**
 
+**CLOSED 2026-08-29.** Fix (a) is landed, forward-only. The production alias
+source of truth is the `logical` field on the stage spec in
+`crates/rustynet-cli/src/live_lab_stage_registry.rs`: `traffic_test_matrix` now
+declares `logical: None` (dropped 2026-07-27), so it feeds NO run-matrix roll-up
+column — its per-stage results remain in `live_lab_node_stage_results.csv`, and
+its `cross_os_peer_visibility` declaration is kept so `counts_as_check` is not
+demoted. The two genuine chained-exit synonyms keep collapsing onto `two_hop`:
+`live_two_hop` and `live_two_hop_validation`. The historical oracle mirror in
+`crates/rustynet-cli/src/live_lab_run_matrix.rs` (`oracle_logical_stage_name`, a
+test-side change detector) matches. Two independent pins guard the decision —
+the equivalence test alone would stay green if both sides were re-aliased
+together:
+`live_lab_stage_registry::tests::traffic_test_matrix_feeds_no_two_hop_rollup_but_keeps_cross_os`
+and
+`live_lab_run_matrix::registry_equivalence_tests::traffic_test_matrix_feeds_no_column_while_both_two_hop_synonyms_do`.
+**Forward-only:** the pre-fix `linux_stage_two_hop = pass` rows in
+`live_lab_node_run_matrix.csv` are NOT rewritten — they remain `traffic_test_matrix`
+results sitting in the `two_hop` column, covered by the reading caveat in
+`CLAUDE.md`/`AGENTS.md` §12.3. The line refs in the finding below
+(`live_lab_run_matrix.rs:3744/3747/3770`) are stale — those lines sit in a test
+module; the alias was struck at the registry spec, the single source of truth.
+(b) the explicit synonym table and (c) an own-column schema migration remain
+open, tracked as the items below.
+
 > **[REVIEW 2026-07-25] THE RETRACTION BELOW IS FALSE — reclassify this item to
 > SEVERITY HIGH and act on it FIRST.** The retracted "43 false-green `pass` rows" claim
 > was **CORRECT**. Verified by hand with a quote-aware parser (`csv.reader`, column

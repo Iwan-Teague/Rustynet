@@ -4786,6 +4786,34 @@ mod registry_equivalence_tests {
         }
     }
 
+    /// QH-07: a direct pin on the mapping THIS writer feeds the `two_hop`
+    /// column through. The registry guard
+    /// (`traffic_test_matrix_feeds_no_two_hop_rollup_but_keeps_cross_os`) owns
+    /// the authority, and the equivalence test above only checks that the
+    /// registry and the historical oracle AGREE — so a change that moved both
+    /// sides at once would leave both green. This test fails independently of
+    /// either: `traffic_test_matrix` must roll up to no column, while the two
+    /// genuine chained-exit synonyms keep feeding `two_hop`.
+    #[test]
+    fn traffic_test_matrix_feeds_no_column_while_both_two_hop_synonyms_do() {
+        assert_eq!(
+            super::logical_stage_name("traffic_test_matrix"),
+            None,
+            "traffic_test_matrix proves mesh-ping reachability, not the chained \
+             exit path; feeding the two_hop column from it is the false-green \
+             defect QH-07 records"
+        );
+        for synonym in ["live_two_hop", "live_two_hop_validation"] {
+            assert_eq!(
+                super::logical_stage_name(synonym),
+                Some("two_hop"),
+                "{synonym} is a genuine chained-exit proof and must keep feeding \
+                 the two_hop column; dropping it would orphan the column's only \
+                 honest feeders"
+            );
+        }
+    }
+
     #[test]
     fn rust_native_vocabulary_is_the_stage_id_authority() {
         use crate::vm_lab::orchestrator::stage::StageId;
