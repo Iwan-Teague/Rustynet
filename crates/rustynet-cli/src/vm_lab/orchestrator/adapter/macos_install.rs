@@ -2,6 +2,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
@@ -9,7 +10,6 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
-use crate::vm_lab::VmGuestPlatform;
 
 pub const MACOS_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 pub const MACOS_RUSTYNET_PATH: &str = "/usr/local/bin/rustynet";

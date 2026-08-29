@@ -3,12 +3,12 @@ use std::time::Duration;
 
 use base64::prelude::*;
 
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::VmGuestPlatform;
 
 pub const WINDOWS_SERVICE_NAME: &str = "RustyNet";
 pub const WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
@@ -945,7 +945,7 @@ fn run_windows_e2e_bootstrap(
 /// Returns `(verifier_key_file_content, trust_evidence_file_content)`.
 fn generate_local_trust_material() -> Result<(String, String), String> {
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::{rngs::OsRng, TryRngCore};
+    use rand::{TryRngCore, rngs::OsRng};
     use zeroize::Zeroize;
 
     let mut seed = [0u8; 32];
