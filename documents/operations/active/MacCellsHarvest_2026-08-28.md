@@ -880,3 +880,127 @@ deeper and is now a single named fix: the guest *install* never creates the
 key MAC-D2's reader (correctly) demands. No exit stage has yet dispatched on
 macOS; the §6 egress assertion remains untouched. Path to green: implement
 MAC-D4 seeding → re-run this exact cell shape.
+## 8. MAC-D3 disposition — 2026-08-29 (isolated edit branch)
+
+### 8.1 Part (a) — FIXED: the three macOS anchor validators are now engine-of-record stages
+
+The remedy chosen was to port the delegation into the `--node` engine rather
+than re-bind it to `live_anchor` (whose live cell also gates on
+`validate_baseline_runtime` and the Linux live suite, and which cannot prove
+the macOS-specific bundle-pull/port-authority checks). Each bash-era validator
+now has a first-class `StageId` in
+`crates/rustynet-cli/src/vm_lab/orchestrator/stage/mod.rs`, wired names kept
+identical to the legacy registry vocabulary so the run-matrix stage columns
+align:
+
+- `MacosAnchorProfileDeploy` => `deploy_macos_anchor_profile`
+  (`stage/macos_anchor_profile_deploy.rs`, deps `[validate_baseline_runtime]`)
+- `MacosAnchorBundlePullValidation` => `validate_macos_anchor_bundle_pull`
+  (`stage/macos_anchor_bundle_pull_validation.rs`, deps
+  `[deploy_macos_anchor_profile]`)
+- `MacosAnchorPortMappingAuthorityValidation` =>
+  `validate_macos_anchor_port_mapping_authority`
+  (`stage/macos_anchor_port_mapping_authority_validation.rs`, deps
+  `[deploy_macos_anchor_profile]`)
+
+All three are `Live`-suite / `T1Role` / fanout-once stages placed after
+`live_anchor` in the canonical pipeline order. Their `execute` shells into the
+previously-quarantined bash-era helpers `deploy_macos_anchor_profile`,
+`exercise_macos_anchor_bundle_pull_live` (which still writes its live report
+with the loopback / token-gate / LAN-refused / secrets-hygiene sub-checks) and
+`exercise_macos_anchor_port_mapping_authority_live` in `vm_lab/mod.rs`, now
+`pub(crate)` with the W5.7 `#[allow(dead_code)]` quarantine attributes removed
+— this wiring IS the G2 native re-wire those attributes were retained for.
+
+Skip semantics stay fail-closed: with no macOS node assigned the anchor role,
+or when the validator set is not elected, each stage returns
+`StageOutcome::Skipped(<reason>)` (a graded skip, never a silent pass). The
+helpers need the inventory path, so `OrchestrationContext` gained a run-local
+`inventory_path: Option<PathBuf>` (never serialized; a resumed context reloads
+`None` and the stages then FAIL rather than silently skip — fail-closed).
+
+**MAC-D1 election tightened (the bookkeeping-green defect, closed).**
+`native.rs` previously set `macos_anchor_validators_elected` purely from
+`--anchor-platform macos`, so `anchor_validation` graded the macOS bundle-pull
+runtime as "delegated" even when nothing would dispatch. The flag is now set
+only when the anchor platform is elected AND all three validator stage ids are
+present in the built plan (`skip_live_suite` / setup-only runs therefore drop
+the election to false and `anchor_validation` grades a **reported skip**).
+The MAC-D1 `runtime_coverage` gate is preserved: delegation now means
+"first-class stages in this same run", not "names that go nowhere".
+
+Tests: `plan::tests::macos_anchor_validator_stages_follow_the_live_suite_gate`
+(full plan contains the three ids; `with_skip_live_suite(true)` drops them),
+per-stage `stage_metadata_matches_the_catalog` +
+`skips_when_no_node_is_assigned_the_anchor_role`, and the updated plan-count
+asserts (61 → 64 stages; chaos/negative-control/soak counts moved accordingly).
+
+### 8.2 Part (b) — validate_baseline_runtime red on macOS anchor: OWNER-GATED
+
+Not fixed in code; this is a security-posture design decision (per the
+harvest rule: do not guess what protected-mode posture a macOS ANCHOR should
+carry).
+
+**Question for the owner:** should the macOS `anchor` role enter DNS-protected
+mode (and which posture), given that in the current lab shape it serves the
+bundle-pull on loopback and runs no exit dataplane?
+
+Options, as identified in §7.4:
+
+1. **Anchor applies DNS protection by default** (default-deny reading): the
+   launchd profile for the anchor role gains the `--dataplane-mode` /
+   egress flags (today audited-omitted, `macos_install.rs:1975-2001`), so
+   `apply_dns_protection` (M1, `phase10.rs:4201`) runs on protected-mode
+   entry and the `DnsFailclosed` op has something real to assert. Stronger
+   posture; changes anchor behavior on every OS unless scoped, and needs the
+   anchor's own egress requirements (mesh membership, bundle-pull) verified
+   against the protected DNS path before rollout.
+2. **Scope the `DnsFailclosed` op to roles that actually enter protected
+   mode**, and assert the anchor's posture with a role-appropriate check
+   (e.g. anchor identity/capability advertisement + bundle-pull liveness)
+   instead of DNS fail-closed evidence. No behavior change; the validation
+   set becomes role-aware. Must be written so it does not read as "skip the
+   security op on macOS" — the substitution has to be a named,
+   anchor-appropriate control, not an omission.
+
+Either option resolves the red; the choice (and whether the anchor's
+DNS-protected posture should differ per OS) is owner-gated. Until decided,
+the macOS anchor cell stays blocked at `validate_baseline_runtime` even
+though part (a) unblocks the three validator stages themselves.
+
+Adjacent, NOT part of MAC-D3: the `MeshStatus` red is the QH-39 freshness
+bound firing honestly on a passive anchor (§7.4, SNAPSHOT_MAX_AGE_SECONDS =
+180) — separate question (periodic snapshot refresh vs role-aware margin),
+tracked under QH-39, not fixed here.
+
+### 8.3 Cell status after this fix
+
+macOS **anchor**: part (a) closed — the three validators dispatch as
+engine-of-record stages and the delegation is honest. The cell can PROGRESS
+on the next lab run (the validator stages will go live), but it cannot go
+GREEN until the owner answers §8.2: `validate_baseline_runtime` still fails
+on the macOS anchor (DnsFailclosed + MeshStatus). Recommended next run:
+`--anchor-platform macos` with the full live suite (no
+`--skip-linux-live-suite`, so the validator stages are in-plan), expecting
+the three new stages to dispatch and `validate_baseline_runtime` to remain
+red until the §8.2 decision lands.
+
+### 8.4 Gate evidence note — 2026-08-29
+
+All gates pass on the edit branch (fmt, clippy `--workspace --all-targets
+--all-features --locked -D warnings` 0 findings, check, audit, deny; scoped
+tests: rustynet-cli lib 2653 passed / 0 failed, plan + anchor + new-stage
+tests green) with one pre-existing exception: rustynetd
+`phase10::tests::macos_assert_dns_protection_requires_active_dns_rules`
+fails on THIS host right now for a reason unrelated to MAC-D3 — the test
+enumerates the host's real `networksetup` services and one network service
+is currently disabled, so
+`read_networksetup_service_dns` (`phase10.rs:3883`) gets status=4 with the
+disabled-service artifact as the "service name" (`parse_networksetup_service_list`
+does not filter disabled services out of the enumeration). Zero rustynetd
+files are touched by this branch, so the failure is identical at HEAD; it is
+host-state dependent, not a MAC-D3 regression. Recording it here so the next
+agent does not re-derive it: candidate fix is filtering
+disabled (asterisk-flagged) services in
+`macos_dns_sc_protect::parse_networksetup_service_list` — owner review
+required since it is fail-closed DNS code.
