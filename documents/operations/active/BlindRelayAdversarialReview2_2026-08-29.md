@@ -430,3 +430,51 @@ Gates at closure: `cargo fmt --all -- --check`; `cargo clippy --workspace
 `cargo test -p rustynetd -p rustynet-control -p rustynet-relay --all-targets
 --all-features` (3306 passed, 0 failed); `scripts/ci/secrets_hygiene_gates.sh`
 (18 checks, PASS). No lab run — none required for defect closure.
+
+---
+
+## 14. Go-live Phase B — O1/O2 runtime wiring (2026-08-29)
+
+O1 and O2 are now **WIRED** into the relay runtime (`crates/rustynet-relay/src/main.rs`) while
+`BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED` remains **`false`** — the wiring compiles and
+unit-tests against the closed gate, exactly as Phase A left the listener's own posture.
+
+- **O1 open-from-signed-role.** `RelayDaemon::new` now resolves the listener via
+  `build_blind_listener_config(&config, verifier_key) -> Option<BlindRelayListenerConfig>`, a
+  fail-closed gate chain: operator flag (`--blind-relay-listener`) AND a verify-before-use
+  `load_membership_snapshot` AND the configured node Active in that snapshot AND its signed
+  capabilities EXACTLY `{RelayHost, BlindRelay}` (the same full-set compare the daemon alignment
+  check enforces per F5). Every failure mode — including snapshot load/validation error, missing
+  CSPRNG, keyring build error — returns `None`; nothing is hardcoded `true`. `try_open` still has
+  the final say; with the const `false` the daemon logs "gated closed" and starts with
+  `blind_listener: None`. Config/CLI surface: `--blind-membership-state`, `--blind-node-id`,
+  `--blind-replay-store`, `--blind-issuer-key-id`, `--blind-profiles` (all mandatory and
+  absolute-path-checked when the flag is set; see `RelayConfig::validate`).
+- **O1 frame routing.** `handle_control_packet` recognizes a v2 hello by the pinned ASCII prefix
+  (`is_blind_relay_hello_v2_frame`: `version=2\ntoken_kind=blind_relay_leg\n`; a legacy binary v1
+  frame starts `0x01` and can never match) and routes it ONLY when the listener is open;
+  `handle_blind_relay_v2_frame` runs the reviewed ten-step admission under a sync mutex dropped
+  before the single reply `.await`. With the listener `None` the frame falls through to the legacy
+  `unknown message type` error byte-for-byte — a dormant relay (every non-blind relay, and every
+  blind relay before gate flip) gains zero new pre-auth surface.
+- **O2 first-exchange issuance.** On the specific `BlindRejectReason::AddressValidation` rejection,
+  the daemon parses the hello for `client_nonce`/`privacy_epoch` and calls the reviewed
+  `issue_address_validation_artifact(&from_addr, ...)` with a checked wall-clock, replying
+  `[0x05] ++ artifact[32]` (`BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE = 0x05`, pure
+  framing — the artifact bytes are the opaque reviewed HMAC output). Volume is bounded by the
+  admission step-2 per-source-prefix limiter that ran first. Missing/invalid artifacts still
+  reject exactly as reviewed; issuance only adds a path.
+
+Reviewed admission logic, wire parsing, PoP verification, and the fail-closed tables inside
+`blind_relay_listener.rs` are UNCHANGED; the const is NOT flipped. Verification tests (in
+`main.rs::tests`): operator-flag-off and plain-relay and missing-snapshot dormancy;
+aligned-state config construction with both grant flags from real signed state; discriminator
+(v1 frame never matches); default and aligned-but-gated daemons keep `blind_listener` `None` and
+answer v2 frames with the legacy unknown-type error; artifact issue→verify binding (nonce, source
+address, epoch, TTL) and `[0x05]` framing. Gates at closure: `cargo fmt --all -- --check`;
+`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`;
+`cargo check -p rustynet-relay -p rustynetd -p rustynet-control --all-targets --all-features`;
+`cargo test -p rustynet-relay -p rustynetd -p rustynet-control --all-targets --all-features`
+(217 / 2523 / 579 passed, 0 failed); `scripts/ci/secrets_hygiene_gates.sh` (18 checks, PASS).
+No lab run — none required for wiring-only work. Opening the listener for real remains the
+later phase that flips the const with live-lab evidence (§11 NO-GO otherwise unchanged).
