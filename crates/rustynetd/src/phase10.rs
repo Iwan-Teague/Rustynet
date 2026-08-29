@@ -16452,6 +16452,64 @@ mod tests {
         );
     }
 
+    /// Owner decision 2026-08-27 (24): the macOS pf DNS floor must hold at
+    /// Linux-nft parity (`udp/tcp dport 53 oifname != <tunnel> drop`, inet
+    /// covering v4+v6) for EVERY knob combination — no egress-interface
+    /// allowance, no IPv6 posture, and no other renderer input may ever
+    /// produce a `:53` pass rule scoped to anything but the tunnel. This
+    /// pins the no-exclusion invariant: an operator-facing knob can
+    /// strengthen the floor (strict mode renders no `:53` egress at all)
+    /// but can never weaken it into a non-tunnel DNS escape.
+    #[test]
+    fn macos_render_pf_rules_dns_pass_is_tunnel_scoped_for_every_knob_combination() {
+        for allow_egress in [false, true] {
+            for ipv6_blocked in [false, true] {
+                let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+                    .expect("macos system should construct");
+                system.dns_protected = true;
+                system.allow_egress_interface = allow_egress;
+                system.ipv6_blocked = ipv6_blocked;
+
+                let rules = system
+                    .render_pf_rules(false)
+                    .expect("rule render should succeed");
+                for line in rules.lines() {
+                    if line.contains("port 53") && line.starts_with("pass ") {
+                        assert!(
+                            line.contains("on utun9"),
+                            "a :53 pass rule scoped away from the tunnel is a DNS exclusion \
+                             hatch (allow_egress={allow_egress}, ipv6_blocked={ipv6_blocked}): {line}"
+                        );
+                    }
+                }
+                // The interface-agnostic drops must render whenever the DNS
+                // rules do: off-tunnel v4 :53 is denied by explicit rule.
+                assert!(
+                    rules.contains("block drop out quick inet proto udp to any port 53"),
+                    "udp/53 off-tunnel block must render (allow_egress={allow_egress}, \
+                     ipv6_blocked={ipv6_blocked})"
+                );
+                assert!(
+                    rules.contains("block drop out quick inet proto tcp to any port 53"),
+                    "tcp/53 off-tunnel block must render (allow_egress={allow_egress}, \
+                     ipv6_blocked={ipv6_blocked})"
+                );
+
+                // Strict mode is stronger than parity: no :53 egress pass
+                // exists at all, and the terminal default-deny holds the
+                // floor for every interface and family.
+                let strict = system
+                    .render_pf_rules(true)
+                    .expect("strict rule render should succeed");
+                assert!(
+                    !strict.contains("port 53"),
+                    "strict mode must render no :53 pass at all \
+                     (allow_egress={allow_egress}, ipv6_blocked={ipv6_blocked}): {strict}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn macos_render_pf_rules_relay_with_upstream_snapshot() {
         let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
@@ -16592,8 +16650,46 @@ mod tests {
         assert!(err.to_string().contains("DNS protection is not active"));
 
         system.dns_protected = true;
-        DataplaneSystem::assert_dns_protection(&mut system)
-            .expect("active macOS DNS protection must render tunnel-pass and egress-block rules");
+        // The pf half of the assertion is host-independent: the rendered
+        // ruleset must contain, for both protocols, the tunnel-scoped :53
+        // pass and the interface-agnostic :53 block.
+        let rules = system
+            .render_pf_rules(false)
+            .expect("rule render should succeed");
+        for proto in ["udp", "tcp"] {
+            assert!(
+                MacosCommandSystem::ruleset_contains_dns_rule(&rules, "pass", proto, Some("utun9"),),
+                "active macOS DNS protection must render the on-tunnel {proto} :53 pass rule"
+            );
+            assert!(
+                MacosCommandSystem::ruleset_contains_dns_rule(&rules, "block", proto, None),
+                "active macOS DNS protection must render the off-tunnel {proto} :53 block rule"
+            );
+        }
+        // The system-configuration half runs against the LIVE host, so it can
+        // only expect Ok when every enabled service is already pinned to
+        // loopback. What must hold on EVERY host — including hosts with
+        // disabled services, whose `-listallnetworkservices` output carries
+        // the legend disclaimer — is that the legend line is never mistaken
+        // for a service name. (That regression fabricated a phantom service
+        // and failed the assert with `networksetup -getdnsservers '<legend>'
+        // failed: status=4` instead of a meaningful result.) Any residual
+        // failure must therefore be genuine drift about a real, enumerable
+        // service — never a getdnsservers failure against the disclaimer.
+        match DataplaneSystem::assert_dns_protection(&mut system) {
+            Ok(()) => {}
+            Err(SystemError::DnsApplyFailed(msg)) => {
+                assert!(
+                    !msg.contains("asterisk") && !msg.contains("denotes that a network service"),
+                    "the -listallnetworkservices legend leaked through as a service: {msg}"
+                );
+                assert!(
+                    msg.contains("drifted"),
+                    "active protection must either pass or report real service drift, got: {msg}"
+                );
+            }
+            Err(err) => panic!("unexpected assert_dns_protection error shape: {err}"),
+        }
     }
 
     /// A redirect decision for the tests below: active managed redirect for
