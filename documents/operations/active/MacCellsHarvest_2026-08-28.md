@@ -2160,7 +2160,83 @@ should finally execute. MAC-D11 (keychain env plumbing) should ride along in
 the same patch — it is one clean-guest bootstrap away from becoming the next
 re blocker.
 
-**Cell status: BLOCKED — MAC-D10 documented (`ops_e2e.rs:2003` mutation path
-deletes the genesis snapshot/log before `macos_membership.rs:245` read-back;
-macOS code gap, not owner-gated). Next action belongs to a code worker; this
-session changed no code.**
+**Cell status: FIXED (code applied 2026-08-29, commit on `ai-edit/edit-1787991797527-56044-61`;
+live re-verify pending — see §16.8).** Two patches landed for MAC-D10 and one
+ride-along for MAC-D11:
+
+1. **Deleting write pinned (MAC-D10 deletion half).** Root-cause trace across
+   the whole mutation path (`ops_e2e.rs` e2e-membership-add → CLI
+   propose/sign/apply → `rustynetd` init/apply) found NO snapshot deletion in
+   any of them — every failure there prints. The only code that empties
+   `membership/` is the bootstrap's `clear_residual_state`
+   (`Bootstrap-RustyNetMacos.sh`, `find "${STATE_ROOT}/membership" … rm -rf`),
+   which ran as a GENERAL cleanup pass, decoupled from the re-genesis: any
+   bootstrap (re)entry that failed between the wipe and `seed_membership_genesis`
+   — or re-ran the cleanup after genesis — strands the node with NO signed
+   state while the stage is mid-flight, exactly the observed vanish. Fix: the
+   membership/ wipe moved INSIDE `seed_membership_genesis`, immediately before
+   `membership init` re-seeds the state (the trust/ wipe stays in
+   `clear_residual_state`, re-seeded right after by `seed_trust_evidence`).
+   The deletion is now inseparable from the replacement, mirroring the Linux
+   order (cleanup → genesis inside one sequence). Gate updated:
+   `macos_install.rs::bootstrap_script_pins_membership_wipe_inside_genesis_seeder`
+   asserts the wipe exists, is NOT in `clear_residual_state`, and is ordered
+   before `membership init` inside the seeder.
+
+2. **Read-back fails LOUD (MAC-D10 read half).** The old probe
+   `test -s '<snapshot>' && cat '<snapshot>' | base64` was the only command
+   in the stage that can exit 1 with zero output (`test` is silent by
+   construction), so a vanished genesis surfaced as a bare `exit Some(1)`
+   with empty stderr AND stdout. New `membership_snapshot_readback_script()`
+   emits its own stderr diagnostic naming the path
+   ("membership snapshot missing or empty at <path>; … did not leave a
+   readable genesis") and exits 1, and BOTH halves now run under `sudo -n`
+   (the snapshot is 0600 rustynetd:rustynetd; the SSH session is
+   unprivileged — the old plain `cat` could not have succeeded anyway).
+   Signed-state handling is unchanged: the probe reads, never verifies-or-
+   applies, so §10.5 verify-before-apply semantics are untouched. Tests:
+   `snapshot_readback_script_fails_loud_naming_the_path`,
+   `snapshot_readback_script_reads_under_sudo`.
+
+3. **MAC-D11 ride-along.** `membership_init_script` and `peer_add_script` now
+   pass `RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-<exit_node_id>'`
+   inside the `sudo -n env` (matching the node-scoped System.keychain item the
+   bootstrap provisions at `rustynet.signing_passphrase`), so
+   `ops init-membership`'s passphrase gate no longer depends on the session
+   environment the moment its early-out misses. Tests:
+   `membership_init_script_carries_node_scoped_keychain_account`,
+   `peer_add_script_carries_node_scoped_keychain_account`.
+
+With the vanish fixed and the read-back loud, the exit cell should pass
+`membership_init` and reach the exit dataplane stages (`active_exit` → the
+three exit validation stages) on the next lab run. Observed follow-up, out of
+scope here: the Linux twin `linux_membership.rs:113` uses the same silent
+`test -s … && …` read-back shape and should get the same loud treatment.
+
+**Cell status (superseded by the FIXED note above): BLOCKED — MAC-D10
+documented (`ops_e2e.rs:2003` mutation path deletes the genesis snapshot/log
+before `macos_membership.rs:245` read-back; macOS code gap, not owner-gated).
+Next action belongs to a code worker; this session changed no code.**
+
+### 16.8 Fix disposition (2026-08-29, code worker session)
+
+- Branch `ai-edit/edit-1787991797527-56044-61` (isolated edit worktree), base
+  `8caeeb30`. Files: `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh`,
+  `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_membership.rs`,
+  `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs`.
+- Gates: clippy `--workspace --all-targets --all-features --locked -D warnings`
+  exit 0; `cargo check -p rustynetd -p rustynet-cli --all-targets
+  --all-features --locked` exit 0; `cargo test -p rustynet-cli --all-targets
+  --all-features --locked` all green (27/27 macos_membership adapter tests,
+  10/10 macos_install bootstrap-script gates); `cargo audit --deny warnings`
+  exit 0; `cargo deny check` exit 0. Two PRE-EXISTING, environment-caused
+  failures unrelated to this diff (verified identical on clean HEAD
+  `8caeeb30` via `git stash`): `cargo fmt --all -- --check` flags
+  `linux_traffic.rs:1527/:1773` + a pre-existing import-order nit in
+  `macos_install.rs` (both pre-date this session; the two in-scope files are
+  rustfmt-clean), and `rustynetd phase10::tests::macos_assert_dns_protection_requires_active_dns_rules`
+  fails because the HOST's `networksetup` reports a disabled network service
+  (phase10.rs:15534) — host env, not code.
+- Next action: lab worker re-runs the macOS exit cell (exit_platform=macos,
+  skip_linux_live_suite) to live-verify genesis survival + loud read-back and
+  progress the exit dataplane stages.

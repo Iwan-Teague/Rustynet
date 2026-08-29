@@ -146,9 +146,19 @@ fn exit_node_id_from_peers(peers: &[NodeMembershipPeer]) -> Result<&str, Adapter
 /// `env_reset` cannot strip the role/node-id variables (the previous
 /// macOS form ran `env RUSTYNET_NODE_ROLE=admin sudo …`, which sudo
 /// stripped — leaving RUSTYNET_NODE_ID unset entirely).
+///
+/// MAC-D11: `RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT` is passed
+/// alongside them, pointing at the node-scoped System.keychain item the
+/// bootstrap provisions (`trust-passphrase-<node_id>`,
+/// `Bootstrap-RustyNetMacos.sh` store-passphrase step). Without it,
+/// `ops init-membership`'s passphrase-material gate hard-errors with
+/// "macOS keychain account is required" the moment its idempotent
+/// early-out misses (a fresh node or wiped state dir), so the account
+/// must travel with the invocation, not with the session environment.
 fn membership_init_script(exit_node_id_arg: &str) -> String {
     format!(
         "sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='{exit_node_id_arg}' \
+         RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-{exit_node_id_arg}' \
          '{MACOS_RUSTYNET_PATH}' ops init-membership"
     )
 }
@@ -178,13 +188,45 @@ fn peer_add_script(
     // and rustynetd membership init). There is no `rustynet ops
     // owner-approver-id` command; derive from the exit peer.
     let owner_approver_id_arg = shell_safe_arg(&format!("{exit_node_id}-owner"))?;
+    // MAC-D11: same keychain-account plumbing as `membership_init_script` —
+    // `env` after `sudo -n` so `env_reset` cannot strip it. The e2e mutation
+    // path resolves its passphrase via a hardcoded credential descriptor, so
+    // today this variable is inert here; carrying it keeps the invocation
+    // self-describing and correct if the e2e path ever honours it, and
+    // matches the node-scoped item the bootstrap provisions.
     Ok(format!(
-        "sudo '{MACOS_RUSTYNET_PATH}' ops e2e-membership-add \
+        "sudo -n env RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-{exit_node_id}' \
+         '{MACOS_RUSTYNET_PATH}' ops e2e-membership-add \
              --client-node-id '{node_id_arg}' \
              {pubkey_flag} '{pubkey_arg}' \
              --capabilities '{capabilities_arg}' \
              --owner-approver-id '{owner_approver_id_arg}'",
     ))
+}
+
+/// Build the remote read-back probe for the genesis membership snapshot.
+///
+/// MAC-D10 (read half): the previous form was `test -s '<path>' && cat …`,
+/// whose ONLY failure output is silence — `test` exits 1 and prints
+/// nothing, so a vanished snapshot surfaced to the orchestrator as
+/// "remote command failed (exit Some(1)):" with empty stderr AND stdout,
+/// and the loud fail-closed design of the guard never survived the SSH
+/// pipe. The probe now emits its own diagnostic on stderr and exits 1
+/// when the snapshot is missing or empty, naming the path, so the
+/// failure envelope always carries the cause.
+///
+/// Both halves run under `sudo -n` (the snapshot is mode 0600 owned by
+/// the `rustynetd` service account; the SSH session is unprivileged),
+/// matching [`owner_key_read_script`]'s privilege pattern.
+fn membership_snapshot_readback_script() -> String {
+    format!(
+        "if ! sudo -n test -s '{MACOS_MEMBERSHIP_SNAPSHOT_PATH}'; then \
+             echo 'membership snapshot missing or empty at {MACOS_MEMBERSHIP_SNAPSHOT_PATH}; \
+ init-membership/e2e-membership-add did not leave a readable genesis' >&2; \
+             exit 1; \
+         fi; \
+         sudo -n cat '{MACOS_MEMBERSHIP_SNAPSHOT_PATH}' | base64"
+    )
 }
 
 pub fn init_membership_snapshot(
@@ -235,18 +277,12 @@ pub fn init_membership_snapshot(
         ssh::run_remote(conn, &script, MEDIUM_TIMEOUT)?;
     }
 
-    // 3. Read snapshot back as base64. `test -s` first so a missing/empty
-    //    snapshot fails loudly here instead of being masked by the pipe
-    //    (cat's non-zero exit is swallowed by base64's success, yielding an
-    //    empty "valid" snapshot that would later be distributed and rejected).
-    let snapshot_b64 = ssh::run_remote(
-        conn,
-        &format!(
-            "test -s '{MACOS_MEMBERSHIP_SNAPSHOT_PATH}' && \
-             cat '{MACOS_MEMBERSHIP_SNAPSHOT_PATH}' | base64"
-        ),
-        SHORT_TIMEOUT,
-    )?;
+    // 3. Read snapshot back as base64. The probe fails LOUDLY (own stderr
+    //    message + exit 1, naming the path) when the snapshot is missing or
+    //    empty — a vanished genesis must surface as a named failure, never
+    //    as a silent empty read (MAC-D10).
+    let snapshot_b64 =
+        ssh::run_remote(conn, &membership_snapshot_readback_script(), SHORT_TIMEOUT)?;
     let data = base64_decode(snapshot_b64.trim())?;
     if data.is_empty() {
         return Err(AdapterError::Protocol {
@@ -665,6 +701,92 @@ mod tests {
         assert!(
             script.contains(MACOS_RUSTYNET_PATH),
             "script must use the canonical macOS rustynet path: {script}"
+        );
+    }
+
+    // ── MAC-D11: the init/peer-add invocations must carry the keychain
+    //    account, not depend on the session environment ─────────────────────
+
+    #[test]
+    fn membership_init_script_carries_node_scoped_keychain_account() {
+        // MAC-D11: `ops init-membership`'s passphrase gate hard-errors the
+        // moment its idempotent early-out misses unless the keychain account
+        // is in the invocation env. The account is the node-scoped item the
+        // bootstrap provisions (`trust-passphrase-<node_id>`), passed after
+        // `sudo -n env` so env_reset cannot strip it.
+        let script = membership_init_script("node-exit-1");
+        assert!(
+            script.contains(
+                "RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-node-exit-1'"
+            ),
+            "init must carry the node-scoped keychain account: {script}"
+        );
+        assert!(
+            script.starts_with("sudo -n env "),
+            "account env must sit inside the sudo invocation: {script}"
+        );
+    }
+
+    #[test]
+    fn peer_add_script_carries_node_scoped_keychain_account() {
+        // MAC-D11 ride-along: same env plumbing on the mutation verb.
+        let script = peer_add_script(
+            "node-exit-1",
+            "node-client-1",
+            "--client-gossip-pubkey-hex",
+            &"a".repeat(64),
+            "client",
+        )
+        .unwrap();
+        assert!(
+            script.contains(
+                "RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-node-exit-1'"
+            ),
+            "peer-add must carry the node-scoped keychain account: {script}"
+        );
+        assert!(
+            script.starts_with("sudo -n env "),
+            "account env must sit inside the sudo invocation: {script}"
+        );
+    }
+
+    // ── MAC-D10: the snapshot read-back must fail LOUD, never silent ────────
+
+    #[test]
+    fn snapshot_readback_script_fails_loud_naming_the_path() {
+        // The previous `test -s '<path>' && cat …` form's only failure output
+        // was SILENCE (test exits 1, prints nothing), so a vanished genesis
+        // surfaced as a bare "exit Some(1)" with empty stderr AND stdout.
+        // The probe must emit its own diagnostic on stderr and exit 1,
+        // naming the snapshot path.
+        let script = membership_snapshot_readback_script();
+        assert!(
+            script.contains(">&2") && script.contains("exit 1"),
+            "read-back failure must emit its own message and exit 1: {script}"
+        );
+        assert!(
+            script.contains(MACOS_MEMBERSHIP_SNAPSHOT_PATH),
+            "the failure message must name the snapshot path: {script}"
+        );
+        assert!(
+            script.contains("missing or empty"),
+            "the failure message must distinguish the vanish: {script}"
+        );
+    }
+
+    #[test]
+    fn snapshot_readback_script_reads_under_sudo() {
+        // The snapshot is 0600 rustynetd:rustynetd; the SSH session is
+        // unprivileged. Both the size probe and the read need `sudo -n`,
+        // matching the owner-key probe's privilege pattern.
+        let script = membership_snapshot_readback_script();
+        assert!(
+            script.contains("sudo -n test -s") && script.contains("sudo -n cat"),
+            "probe and read must both run under sudo -n: {script}"
+        );
+        assert!(
+            script.contains("| base64"),
+            "the snapshot body must still be base64-encoded for transport: {script}"
         );
     }
 
