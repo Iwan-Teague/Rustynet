@@ -1383,3 +1383,102 @@ adapter defect (invented subcommand) with a known-good Linux-twin fix
 shape. Next step: land MAC-D6, re-run this exact §11.1 shape; the
 `e2e-membership-add` loop and steps 3+ (snapshot read-back, distribution,
 exit handoff) remain unproven until then.
+
+## 12. Anchor cell re-run after MAC-D4 + MAC-D5 — 2026-08-29 (isolated edit branch)
+
+First anchor-cell run with the MAC-D4 genesis seed (`06f828a7`) and MAC-D5
+node-id env (`7447c5a9`) membership fixes in place, and the first on the
+MAC-D3 validator-wiring commit.
+
+### 12.1 Run
+
+- Worktree: `state/edit-worktrees/edit-1787977991980-56044-46`, branch
+  `ai-edit/edit-1787977991980-56044-46`, HEAD `8dea0044` (clean, 0 behind
+  origin/main; carries MAC-D3 + D4 + D5).
+- Run id (ledger): `livelab-1787979574-8dea0044ce94` (internal
+  `rust-1787978267`), report
+  `state/mac-cells/anchor6-1787978256`.
+- Invocation: `ops vm-lab-orchestrate-live-lab --anchor-platform macos
+  --node lenovo-exit-1:exit --node lenovo-client-1:client
+  --trust-inventory-ready --ssh-identity-file ~/.ssh/rustynet_lab_ed25519
+  --known-hosts-file ~/.ssh/known_hosts` — FULL live suite (no
+  `--skip-linux-live-suite`), so `live_anchor` was genuinely eligible had
+  its dependency chain passed.
+- 2026-08-29T04:39:56Z → 04:59:34Z (~20 min).
+
+### 12.2 Outcome
+
+`validate_baseline_runtime` FAILED on macos-utm-1 — **16 pass / 1 fail /
+47 skip**, verdict `rejected` ("16 passed, 1 failed, 0 not_proven, 47
+skipped"). Everything downstream of baseline-runtime skipped fail-closed,
+including all three MAC-D3 validators (`deploy_macos_anchor_profile`,
+`validate_macos_anchor_bundle_pull`,
+`validate_macos_anchor_port_mapping_authority`) and `live_anchor`. They
+were correctly ELECTED and in-plan (MAC-D3 wiring works); the dependency
+gate is doing its job.
+
+Per-node validators (`validator_results.json`): lenovo pair all 6/6
+PASS. macos-utm-1: ServiceHardening / KeyCustody / Authenticode PASS;
+RuntimeAcls / MeshStatus / DnsFailclosed FAIL.
+
+### 12.3 RuntimeAcls — NEW red this run, root cause found (macOS code gap)
+
+Fresh defect signature: prior anchor runs showed only MeshStatus +
+DnsFailclosed red. Live repro on the guest
+(`rustynetd macos-runtime-acls-check --no-fail-on-drift`) returns:
+
+```json
+"drift_reasons": ["config root drifted: config root mode is 0o700, expected 0o750"]
+```
+
+Root cause is CODE, not guest environment: the bootstrap script installs
+the config root correctly (`Bootstrap-RustyNetMacos.sh:587`,
+`install -d -m 0750 -o root -g rustynetd`), but multiple daemon-side
+bootstrap writers lock their file's PARENT to 0o700 — e.g.
+`persist_trust_watermark` (`crates/rustynetd/src/daemon.rs:14173`),
+`persist_auto_tunnel_watermark` (`daemon.rs:14823`),
+`persist_dns_zone_watermark` (`daemon.rs:15052`) — and the macOS config
+root holds exactly such files (`membership.owner.key`, `trust-evidence.key`,
+both written during MAC-D4/D5 bootstrap). Any write into
+`/usr/local/etc/rustynet` therefore clobbers the reviewed 0o750 mode that
+`macos_runtime_acls.rs:33-40` requires (0o750 root:rustynetd). This
+answers §8.2's sibling question for RuntimeAcls: the anchor role can never
+pass baseline runtime while any config-root write demotes the directory.
+Fix shape: the parent-lock must not fire when the parent is the reviewed
+config root (or must restore 0o750 root:rustynetd there), same review the
+Linux twin already encodes (`linux_runtime_acls.rs:50`).
+
+### 12.4 MeshStatus + DnsFailclosed — unchanged, owner-gated
+
+- MeshStatus still red (QH-39 snapshot freshness,
+  `mesh_status.rs:90` SNAPSHOT_MAX_AGE_SECONDS=180 vs passive anchor);
+  MAC-D4/D5 membership did not alter it.
+- DnsFailclosed still red (expected): anchor role never enters
+  DNS-protected mode (`macos_install.rs` launchd profile audited-omits
+  `--dataplane-mode`; `phase10.rs` `apply_dns_protection` never invoked
+  for anchor). §8.2 owner gate still open.
+
+### 12.5 Ledger row verified
+
+Row appended (line 199 of the worktree's
+`documents/operations/live_lab_node_run_matrix.csv`, quote-aware parse):
+run `livelab-1787979574-8dea0044ce94`, commit `8dea0044`, dirty=clean,
+overall fail, first_failed_stage `validate_baseline_runtime`,
+macos_anchor_alias=macos-utm-1, macos bootstrap/membership/assignments =
+pass, macos_stage_baseline_runtime = fail, macos_stage_anchor and the
+three validator check columns = skip.
+
+### 12.6 Verdict
+
+Anchor cell: **BLOCKED** at `validate_baseline_runtime`, but the blocker
+is now fully characterized and is a three-item list, all code-side:
+1. RuntimeAcls config-root mode clobber (§12.3, new, fixable — daemon
+   writer parent-lock).
+2. MeshStatus QH-39 freshness bound (known).
+3. DnsFailclosed anchor protected-mode posture (§8.2 owner decision).
+MAC-D3 wiring itself is proven: election + in-plan placement + fail-closed
+skip semantics all behaved correctly; the cell advances the moment
+baseline-runtime goes green. Exit track remains blocked on MAC-D6
+(`macos_membership.rs:197-202` invented `ops owner-approver-id`
+subcommand; fix shape = derive `"{exit_node_id}-owner"` per
+`linux_membership.rs:72-74`) — not this cell's blocker.
