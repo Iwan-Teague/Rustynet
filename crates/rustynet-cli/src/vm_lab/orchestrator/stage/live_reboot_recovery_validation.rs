@@ -95,11 +95,15 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
                     StageOutcome::Passed
                 } else {
                     StageOutcome::Failed(
-                        crate::vm_lab::orchestrator::stage::format_stage_binary_failure(
+                        // QH-09: name the binary's own complete log (--log-path
+                        // above) so the clip disclosure cannot read as evidence
+                        // loss when the unclipped output sits beside it.
+                        crate::vm_lab::orchestrator::stage::format_stage_binary_failure_with_log(
                             "live_reboot_recovery binary",
                             output.status,
                             &output.stdout,
                             &output.stderr,
+                            Some(log_path_str),
                         ),
                     )
                 }
