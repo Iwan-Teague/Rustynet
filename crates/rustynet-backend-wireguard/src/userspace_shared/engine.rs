@@ -2087,4 +2087,248 @@ mod tests {
             err.message
         );
     }
+
+    // --- EngineIoSink dispatch tests (P1 follow-up to commit 049ed1e5) ---
+    //
+    // 049ed1e5 replaced the owned per-frame outcome Vecs with the `EngineIoSink`
+    // streaming dispatch but shipped no tests that exercise the dispatch seam
+    // directly. These tests pin the sink contract at the dispatch level:
+    // ciphertext is sent immediately (borrowed), inbound plaintext is returned
+    // borrowed WITHOUT touching the sink, Done/Err dispatch to nothing, and
+    // `drive_inbound_result` flushes the deferred inbound plaintext only AFTER
+    // the follow-up drain loop — the ciphertext-then-plaintext ordering every
+    // caller relies on. The full mixed case (initial WriteToTunnelV4 whose
+    // follow-up drain flushes boringtun's queued outbound backlog as
+    // ciphertext) needs choreographed boringtun session/timer state and remains
+    // documented as a known gap in 049ed1e5's commit message; a fresh tunnel's
+    // drain deterministically yields Done, which is what lets these tests pin
+    // the defer-then-flush sequencing without that choreography.
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SinkEvent {
+        Ciphertext { to: SocketAddr, payload: Vec<u8> },
+        Plaintext(Vec<u8>),
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        events: Vec<SinkEvent>,
+    }
+
+    impl super::EngineIoSink for RecordingSink {
+        fn send_ciphertext(
+            &mut self,
+            remote_addr: SocketAddr,
+            payload: &[u8],
+        ) -> Result<(), rustynet_backend_api::BackendError> {
+            self.events.push(SinkEvent::Ciphertext {
+                to: remote_addr,
+                payload: payload.to_vec(),
+            });
+            Ok(())
+        }
+
+        fn write_plaintext(
+            &mut self,
+            payload: &[u8],
+        ) -> Result<(), rustynet_backend_api::BackendError> {
+            self.events.push(SinkEvent::Plaintext(payload.to_vec()));
+            Ok(())
+        }
+    }
+
+    fn remote_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 70)), 51820)
+    }
+
+    #[test]
+    fn dispatch_sends_outbound_ciphertext_immediately_and_returns_no_plaintext() {
+        use boringtun::noise::TunnResult;
+        use boringtun::noise::errors::WireGuardError;
+
+        let node_id = NodeId::new("sender").expect("node id");
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut packet = vec![7u8; 64];
+        let expected_payload = packet.clone();
+
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            42,
+            TunnResult::WriteToNetwork(&mut packet),
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("ciphertext dispatch never errors");
+
+        assert_eq!(dispatched, None, "WriteToNetwork produces no plaintext");
+        assert_eq!(
+            sink.events,
+            vec![SinkEvent::Ciphertext {
+                to: remote_addr(),
+                payload: expected_payload,
+            }],
+            "ciphertext must be sent to the peer's address with untouched bytes"
+        );
+        assert!(
+            recorded.is_empty(),
+            "ciphertext results must not touch the plaintext recorder"
+        );
+
+        // Done and Err dispatch to nothing at all: no send, no write, no error.
+        for (label, result) in [
+            ("Done", TunnResult::Done),
+            ("Err", TunnResult::Err(WireGuardError::ConnectionExpired)),
+        ] {
+            let mut sink = RecordingSink::default();
+            let dispatched = super::handle_single_tunn_result(
+                &node_id,
+                remote_addr(),
+                42,
+                result,
+                &mut recorded,
+                &mut sink,
+            )
+            .unwrap_or_else(|err| panic!("{label} result must not dispatch to an error: {err:?}"));
+            assert_eq!(dispatched, None, "{label} produces no plaintext");
+            assert!(sink.events.is_empty(), "{label} must emit nothing");
+        }
+    }
+
+    #[test]
+    fn dispatch_returns_borrowed_inbound_plaintext_without_touching_sink() {
+        use boringtun::noise::TunnResult;
+
+        let node_id = NodeId::new("sender").expect("node id");
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut v4_frame = vec![0xAB; 100];
+        let v4_expected = v4_frame.clone();
+
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            7,
+            TunnResult::WriteToTunnelV4(&mut v4_frame, Ipv4Addr::from([10, 0, 0, 1])),
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("inbound plaintext dispatch never errors");
+
+        assert_eq!(
+            dispatched,
+            Some(&v4_expected[..]),
+            "inbound plaintext must be returned BORROWED, byte-identical"
+        );
+        assert!(
+            sink.events.is_empty(),
+            "handle_single_tunn_result must never write plaintext itself — the caller sequences the flush"
+        );
+        assert_eq!(
+            recorded,
+            vec![super::RecordedTunnelPlaintextPacket {
+                node_id: node_id.clone(),
+                packet: v4_expected,
+                transport_generation: 7,
+            }],
+            "the cfg(test) plaintext recorder must still capture the frame (same bytes, same generation)"
+        );
+
+        let mut v6_frame = vec![0xCD; 80];
+        let v6_expected = v6_frame.clone();
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            8,
+            TunnResult::WriteToTunnelV6(&mut v6_frame, std::net::Ipv6Addr::LOCALHOST),
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("inbound plaintext dispatch never errors");
+        assert_eq!(dispatched, Some(&v6_expected[..]));
+        assert_eq!(recorded.len(), 2, "V6 frame recorded too");
+        assert!(sink.events.is_empty());
+    }
+
+    #[test]
+    fn drive_inbound_result_flushes_deferred_plaintext_after_the_follow_up_drain() {
+        use boringtun::noise::TunnResult;
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(3);
+        let node_id = configure_peer_at(&mut engine, "peer-a", endpoint, 0x33, "100.64.0.5/32");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+        let mut plaintext_frame = vec![0x42; 96];
+        let plaintext_expected = plaintext_frame.clone();
+
+        // A freshly configured tunnel has no established session, so the
+        // follow-up drain's `decapsulate(None, &[], _)` deterministically
+        // yields Done — the loop below must emit nothing and then flush the
+        // deferred inbound plaintext exactly once, at the END.
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        let outcome = super::drive_inbound_result(
+            &node_id,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV4(&mut plaintext_frame, Ipv4Addr::from([10, 0, 0, 2])),
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("fresh-tunnel drain is inert");
+
+        assert_eq!(outcome, None, "no handshake has completed yet");
+        assert_eq!(
+            sink.events,
+            vec![SinkEvent::Plaintext(plaintext_expected.clone())],
+            "deferred inbound plaintext must be flushed exactly once, AFTER the (inert) drain loop"
+        );
+        assert_eq!(
+            recorded,
+            vec![super::RecordedTunnelPlaintextPacket {
+                node_id: node_id.clone(),
+                packet: plaintext_expected,
+                transport_generation: 42,
+            }],
+            "recorder must see the same frame with the same generation"
+        );
+    }
+
+    #[test]
+    fn drive_inbound_result_with_initial_err_emits_nothing_and_stays_ok() {
+        use boringtun::noise::TunnResult;
+        use boringtun::noise::errors::WireGuardError;
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(4);
+        let node_id = configure_peer_at(&mut engine, "peer-b", endpoint, 0x44, "100.64.0.6/32");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+
+        // An initial Err skips the drain entirely (fail closed on that call's
+        // results) and emits nothing; the drive returns Ok with no handshake.
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        let outcome = super::drive_inbound_result(
+            &node_id,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::Err(WireGuardError::ConnectionExpired),
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("initial Err is not a drive-level failure");
+
+        assert_eq!(outcome, None);
+        assert!(sink.events.is_empty(), "an initial Err must emit nothing");
+        assert!(recorded.is_empty());
+    }
 }
