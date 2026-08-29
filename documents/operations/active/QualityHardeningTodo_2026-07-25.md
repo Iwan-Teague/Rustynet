@@ -2901,7 +2901,8 @@ correlated against run history.
 
 ### QH-45 — the `entry` role emits an nft rule the privileged helper's allowlist rejects
 
-**Status: OPEN, fully diagnosed. The fix is SECURITY-SENSITIVE and must not be a quick widen.**
+**Status: OPEN (step 1 of the ordered fix is DONE — see below; steps 2–3 remain). The remaining
+fix is SECURITY-SENSITIVE and must not be a quick widen.**
 
 First seen in `enroll-diag-20260813r`, the first run in which `live_two_hop_validation` ever
 executed (it needs an `entry` node, which no prior topology elected).
@@ -2932,9 +2933,19 @@ and a local-only redirect target).
 
 **What the fix must establish first, in this order:**
 
-1. **Which exact argv is rejected.** Not yet captured — the helper logs the refusal but the run
-   evidence does not carry the offending argument vector. Capturing it is step one, and is itself
-   an evidence gap worth closing.
+1. **Which exact argv is rejected. DONE (commit `af01f67c`, 2026-08-25; re-verified on this
+   worktree).** The `validate_nft_add_rule_args` fallthrough now embeds the rejected argv —
+   `args.join(" ")`, clamped to `RESPONSE_FIELD_BUDGET_BYTES` so the refusal itself always
+   encodes and delivers in one frame — and the daemon surfaces it verbatim end to end: helper
+   error field → `run_capture` → `SystemError::Io` → `restrict_recoverable` (journald eprintln +
+   `bootstrap_error`), so the orchestrator's failure digest now captures the exact shape instead
+   of the bare schema string. Two tests pin it: `nft_refusal_names_the_argv_and_wg_refusal_never_does`
+   (an nft refusal must name the argv; a `wg` refusal must NEVER echo its arguments, because `wg`
+   argv can carry a private key — the disclosure is deliberately scoped to nft rule shape) and
+   `nft_schema_refusal_embedding_a_max_size_argv_still_encodes` (a max-size argv refusal still
+   encodes). Disclosure hygiene re-checked 2026-08-29 with `scripts/ci/secrets_hygiene_gates.sh`
+   (18/18 pass): nft rule argv carries table/chain names, addresses, ports, protocols and marks —
+   rule SHAPE, never key material.
 2. **Whether that rule is legitimate for `entry` at all.** An entry/relay hop forwarding for
    peers may need a shape no other role needs — or may be emitting something it should not.
 3. **Only then**, if legitimate, a new allowlist arm as narrowly bounded as its siblings, with
