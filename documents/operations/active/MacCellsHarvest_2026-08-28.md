@@ -2240,3 +2240,146 @@ Next action belongs to a code worker; this session changed no code.**
 - Next action: lab worker re-runs the macOS exit cell (exit_platform=macos,
   skip_linux_live_suite) to live-verify genesis survival + loud read-back and
   progress the exit dataplane stages.
+
+## 17. Exit cell re-run after MAC-D10 — 2026-08-29 (run #8 of the exit chain)
+
+Re-ran the macOS `exit` cell now that MAC-D10 (membership wipe pinned inside
+genesis seeding + fail-loud snapshot read-back, §16.8) and the MAC-D11
+ride-along (node-scoped keychain-account env) are merged on `main`. Worktree
+`ai-edit/edit-1787993559749-56044-64`, HEAD `bf469478` (whose ancestors include
+the MAC-D10 merge `f2ae05f4`), tree clean, 0 commits behind `origin/main` at
+launch. Fresh bootstrap, fresh report dir, full 64-stage plan. TRIAGE ONLY —
+no code changed in this session.
+
+### 17.1 Run
+
+- Run `livelab-1787995026-bf46947825c0` (orchestrator-internal id
+  `rust-1787993778`), report dir
+  `/Users/iwan/Desktop/Rustynet/state/mac-cells/exit8-20260829-095608`,
+  elapsed 20m48s, profile `mgmt_shared_smoke_v1` (derived, not enforced).
+  The brief's `--macos-promote-exit` spelling is retired —
+  `vm_lab/mod.rs:10316` fails closed on it — so the launch used the `--node`
+  shape: `--node macos-utm-1:exit --node lenovo-exit-1:entry --node
+  lenovo-client-1:client`, `--trust-inventory-ready`, after real `nc`/TCP-22
+  reachability probes of all three guests (`192.168.65.101`,
+  `192.168.0.31`, `192.168.0.30` — all open). Orchestrator rebuilt from this
+  worktree's HEAD immediately before launch (§2 handover rule).
+- Lock coordination: `ps` scan found NO `vm-lab-orchestrate-live-lab` process
+  holding any guest at session start; the run acquired all three guest locks
+  cleanly and no sibling run contended.
+- 64 stages: **11 pass / 1 fail / 52 skip**, overall fail,
+  `first_failed_stage = distribute_assignments`. Passed before the failure:
+  `preflight`, `prepare_source_archive`, `verify_ssh_reachability`,
+  `cleanup_hosts`, **`bootstrap_hosts`** (fresh 18m10s bootstrap on all three
+  nodes), `cross_network_substrate_setup`, `collect_pubkeys`,
+  **`membership_init`**, **`distribute_membership`**, plus the two teardown
+  wrappers.
+
+### 17.2 MAC-D2 … MAC-D10: LIVE-CONFIRMED — membership_init PASSES for the first time
+
+The exit chain's target layer is green. `membership_init` passed (2s,
+09:16:51Z) and `distribute_membership` passed immediately after — both for
+the first time in the eight-run exit-chain history (runs #1–#7 all died at or
+before `membership_init`).
+
+Read against the §16 defect record:
+
+- **MAC-D10 deletion half (§16.3):** the genesis snapshot survived the stage —
+  the read-back `test -s` guard found a non-empty snapshot, so the
+  mid-stage vanish did NOT recur. The §16.8 fix (wipe pinned inside
+  `seed_membership_genesis`, decoupled from `clear_residual_state`) held
+  through a full fresh bootstrap.
+- **MAC-D10 read half (§16.8):** the loud, sudo-wrapped
+  `membership_snapshot_readback_script` executed as coded (the stage's only
+  output was its pass line; no silent-empty `exit Some(1)` signature).
+- **MAC-D11 (§16.4):** no `macOS keychain account is required` error
+  surfaced; `membership_init_script`/`peer_add_script` now carry
+  `RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT`.
+- **MAC-D9 (§15.3) / MAC-D8 (§15.2):** the earlier chown/workspace/keychain
+  signatures stayed absent across the fresh bootstrap.
+
+The whole membership/genesis layer (MAC-D2 through D10) is now live-proven on
+the exit topology. The stage log is empty by design — a clean pass emits
+nothing — so the pass claim rests on the stage status plus the absent failure
+signatures, per the FAIL-LOUD live-stage spec.
+
+### 17.3 New blocker — MAC-D12: assignment-bundle issuing spawns `systemd-creds` on macOS
+
+`distribute_assignments` failed with:
+
+```
+issue assignment bundles: remote command failed (exit Some(1)):
+(stdout tail) error [generic_failure (1)]: decrypting signing passphrase
+credential failed: failed to spawn systemd-creds: No such file or directory
+(os error 2)
+  hint: unclassified failure; check the error message above
+```
+
+Root cause is a single Linux-only call site with no platform gate:
+
+- `materialize_signing_passphrase_workspace()`
+  (`crates/rustynet-cli/src/ops_e2e.rs:5421`) unconditionally spawns
+  `systemd-creds decrypt --name=signing_key_passphrase
+  /etc/rustynet/credentials/signing_key_passphrase.cred …`
+  (`ops_e2e.rs:5451-5460`, error label at `:5456`) against a hardcoded
+  `/etc/rustynet` credential path. On macOS there is no `systemd-creds`
+  binary and no `/etc/rustynet`, so the spawn fails with `os error 2` and the
+  stage fails closed (correct posture — the failure is loud; the defect is
+  that the macOS path has no credential backend at all).
+- The stage reaches it via `execute_ops_e2e_issue_assignment_bundles_from_env`
+  (`ops_e2e.rs:2896`) → call at `ops_e2e.rs:2961`. The same helper is called
+  on the traversal path (`ops_e2e.rs:3080`) and the dns-zone path
+  (`ops_e2e.rs:3225`), so both would fail identically once reached — fix the
+  helper once, not the callers.
+- The repo already owns the right abstraction:
+  `crates/rustynet-control/src/credential_unwrap.rs` defines per-platform
+  unwrap backends (`"linux-systemd-creds"`, `"macos-keychain"`, …,
+  `credential_unwrap.rs:114`, Linux backend at `:131`) — this call site
+  bypasses that model entirely. The macOS bootstrap already seeds the
+  node-scoped System.keychain item (`rustynet.signing_passphrase`, §16.2), so
+  the macOS half of the fix is reading the passphrase through the keychain
+  backend (or the MAC-D11-style env) instead of `systemd-creds`.
+
+Classification: **macOS exit dataplane CODE GAP (credential custody in the
+signed-bundle issuing path), not env, not owner-gated.** The cell has
+advanced one full layer past §16: membership green through distribution; the
+remaining defect is that assignment (and, latently, traversal/dns-zone)
+issuing has no macOS credential backend.
+
+### 17.4 Exit dataplane stages + DnsFailclosed
+
+All downstream stages skipped fail-closed (52 skips) behind
+`distribute_assignments`: `distribute_traversal`, `distribute_dns_zone`,
+`enforce_baseline_runtime`, `exit_handoff`, `active_exit`,
+`exit_nat_lifecycle_validation`, `exit_demotion_residue_validation`,
+`exit_dns_failclosed_validation`, and the rest. **The first real macOS EXIT
+dataplane test still has not executed; DnsFailclosed (M1) remains
+unexercised on the exit role** — the owner-gated §8.2 question is untouched.
+
+### 17.5 Ledger + bookkeeping
+
+- Ledger row appended and verified (quote-aware parse) in
+  `documents/operations/live_lab_node_run_matrix.csv`: run
+  `livelab-1787995026-bf46947825c0`, commit `bf46947825c03c…`, branch
+  `ai-edit/edit-1787993559749-56044-64`, clean, overall fail,
+  `first_failed_stage = distribute_assignments`, notes "3 node(s), 64
+  stage(s); passed=11 failed=1", exit alias `macos-utm-1`.
+- No triage stub was auto-created for this run, so the next launch gate has
+  nothing pending to classify; the classification lives in §17.3.
+
+### 17.6 Verdict
+
+Exit cell: **BLOCKED at a NEW blocker (MAC-D12)** — but materially deeper
+than §16: the MAC-D2–D10 membership/genesis chain is live-confirmed green for
+the first time, the membership harness now runs through bundle distribution,
+and the failure moved to the NEXT layer (signed-assignment issuing). Fix
+MAC-D12 (platform-gate `materialize_signing_passphrase_workspace` onto the
+`rustynet-control` credential-unwrap backends, macOS = keychain), then
+re-run: `distribute_assignments` → traversal/dns-zone distribution → the
+Linux reference suite equivalent → `exit_handoff` → `active_exit` → the
+three exit dataplane validation stages should then execute, giving the first
+real macOS exit dataplane answer.
+
+**Cell status: BLOCKED — MAC-D12 documented (`ops_e2e.rs:5451-5460` via
+`:2961`; macOS code gap, not owner-gated). Next action belongs to a code
+worker; this session changed no code.**
