@@ -153,6 +153,40 @@ fn membership_init_script(exit_node_id_arg: &str) -> String {
     )
 }
 
+/// Build the remote `ops e2e-membership-add` command for one peer.
+///
+/// MAC-D6: the owner approver id is DERIVED from the exit node id —
+/// `"{exit_node_id}-owner"` — exactly like the Linux twin
+/// (`linux_membership.rs`) and exactly what `rustynetd membership init`
+/// registers as the genesis owner approver (`crates/rustynetd/src/main.rs`,
+/// `format!("{node_id}-owner")`). There is no `rustynet ops
+/// owner-approver-id` subcommand: an earlier revision shelled out to one,
+/// the CLI's `bad_args` error (printed to STDOUT, so `2>/dev/null`
+/// suppressed nothing, `|| echo none` appended `none`) was captured and
+/// passed as `--owner-approver-id '<error text>none'`, and
+/// `ensure_safe_token` rejected it — failing the whole `membership_init`
+/// stage. Deriving keeps the approver id real and the stage unblocked; the
+/// derived value still passes `shell_safe_arg` so the guard is never lost.
+fn peer_add_script(
+    exit_node_id: &str,
+    node_id_arg: &str,
+    pubkey_flag: &str,
+    pubkey_arg: &str,
+    capabilities_arg: &str,
+) -> Result<String, AdapterError> {
+    // owner_approver_id convention: "{exit_node_id}-owner" (matches ops_e2e.rs
+    // and rustynetd membership init). There is no `rustynet ops
+    // owner-approver-id` command; derive from the exit peer.
+    let owner_approver_id_arg = shell_safe_arg(&format!("{exit_node_id}-owner"))?;
+    Ok(format!(
+        "sudo '{MACOS_RUSTYNET_PATH}' ops e2e-membership-add \
+             --client-node-id '{node_id_arg}' \
+             {pubkey_flag} '{pubkey_arg}' \
+             --capabilities '{capabilities_arg}' \
+             --owner-approver-id '{owner_approver_id_arg}'",
+    ))
+}
+
 pub fn init_membership_snapshot(
     conn: &NodeConnection,
     _owner_key: &MembershipOwnerKey,
@@ -191,18 +225,14 @@ pub fn init_membership_snapshot(
             ),
         };
         let capabilities_arg = shell_safe_arg(&role_capability_csv(&peer.capabilities))?;
-        ssh::run_remote(
-            conn,
-            &format!(
-                "owner_approver_id=\"$('{MACOS_RUSTYNET_PATH}' ops owner-approver-id 2>/dev/null || echo none)\"; \
-                 sudo '{MACOS_RUSTYNET_PATH}' ops e2e-membership-add \
-                     --client-node-id '{node_id_arg}' \
-                     {pubkey_flag} '{pubkey_arg}' \
-                     --capabilities '{capabilities_arg}' \
-                     --owner-approver-id \"$owner_approver_id\"",
-            ),
-            MEDIUM_TIMEOUT,
+        let script = peer_add_script(
+            exit_node_id,
+            &node_id_arg,
+            pubkey_flag,
+            &pubkey_arg,
+            &capabilities_arg,
         )?;
+        ssh::run_remote(conn, &script, MEDIUM_TIMEOUT)?;
     }
 
     // 3. Read snapshot back as base64. `test -s` first so a missing/empty
@@ -675,6 +705,73 @@ mod tests {
         let peers = vec![peer(NodeRole::Exit, "node-exit-1")];
         let id = exit_node_id_from_peers(&peers).unwrap();
         assert_eq!(shell_safe_arg(id).unwrap(), "node-exit-1");
+    }
+
+    // ── MAC-D6: the peer-add approver id must be DERIVED, never shelled out ──
+
+    #[test]
+    fn peer_add_script_derives_owner_approver_id_from_the_exit_peer() {
+        // The genesis owner approver `rustynetd membership init` registers is
+        // "{node_id}-owner"; the harness must pass exactly that, not query a
+        // CLI verb for it.
+        let script = peer_add_script(
+            "node-exit-1",
+            "node-client-1",
+            "--client-pubkey-hex-unaligned-wireguard",
+            &"a".repeat(64),
+            "client",
+        )
+        .unwrap();
+        assert!(
+            script.contains("--owner-approver-id 'node-exit-1-owner'"),
+            "approver id must be derived as {{exit_node_id}}-owner: {script}"
+        );
+    }
+
+    #[test]
+    fn peer_add_script_never_invokes_an_owner_approver_id_verb() {
+        // MAC-D6 regression pin: `ops owner-approver-id` does not exist. Any
+        // return to querying a verb for the approver id must fail here.
+        let script = peer_add_script(
+            "node-exit-1",
+            "node-client-1",
+            "--client-pubkey-hex-unaligned-wireguard",
+            &"a".repeat(64),
+            "client",
+        )
+        .unwrap();
+        assert!(
+            !script.contains("ops owner-approver-id"),
+            "no `ops owner-approver-id` subcommand exists; the approver id must \
+             stay derived: {script}"
+        );
+        assert!(
+            !script.contains("|| echo none"),
+            "no failure may be swallowed into the approver id: {script}"
+        );
+        assert!(
+            script.contains("ops e2e-membership-add"),
+            "the peer-add must still run the real verb: {script}"
+        );
+    }
+
+    #[test]
+    fn derived_owner_approver_id_survives_shell_safety_guard() {
+        // The derived value goes inside single quotes on a root remote shell;
+        // the guard that validated it for the Linux twin must gate it here too.
+        let script = peer_add_script(
+            "node-exit-1",
+            "node-client-1",
+            "--client-pubkey-hex-unaligned-wireguard",
+            &"a".repeat(64),
+            "client",
+        )
+        .unwrap();
+        // A malicious exit id would have been rejected upstream, but the
+        // derivation itself must not smuggle characters past the guard.
+        let approver = format!("{0}-owner", "node-exit-1");
+        assert_eq!(shell_safe_arg(&approver).unwrap(), "node-exit-1-owner");
+        assert!(script.contains("node-exit-1-owner"));
     }
 }
 
