@@ -14886,8 +14886,7 @@ fn evaluate_anchor_port_mapping_status_report(
 /// new `anchor-port-mapping-status-check` daemon subcommand. Requires
 /// `anchor.port_mapping_authoritative` in the elected anchor's membership
 /// grant (`macos_membership_capabilities`).
-#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
-fn exercise_macos_anchor_port_mapping_authority_live(
+pub(crate) fn exercise_macos_anchor_port_mapping_authority_live(
     macos_alias: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
@@ -14945,8 +14944,7 @@ fn exercise_macos_anchor_port_mapping_authority_live(
 /// `amend_membership_for_macos` (the daemon fails closed without it), so after
 /// this stage the live test's four controls (loopback byte-for-byte, token
 /// gate, LAN refused, secrets hygiene) can pass.
-#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
-fn deploy_macos_anchor_profile(
+pub(crate) fn deploy_macos_anchor_profile(
     macos_alias: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
@@ -15047,8 +15045,7 @@ fn deploy_macos_anchor_profile(
 /// (wrong/short token rejected, LAN bind refused, no raw token in the
 /// served bytes). It writes a typed JSON report which this exerciser
 /// parses to surface a single-line summary and to confirm overall pass.
-#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
-fn exercise_macos_anchor_bundle_pull_live(
+pub(crate) fn exercise_macos_anchor_bundle_pull_live(
     macos_alias: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
@@ -37969,7 +37966,8 @@ mod tests {
         // ipv6_leak_validation + exit_demotion_residue_validation +
         // exit_dns_failclosed_validation + exit_nat_lifecycle_validation +
         // blind_exit_dataplane_validation + gossip_convergence_validation.
-        assert_eq!(cli_ids.len(), 61);
+        // MAC-D3 (2026-08-29): 61 + the 3 macOS anchor validator stages.
+        assert_eq!(cli_ids.len(), 64);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

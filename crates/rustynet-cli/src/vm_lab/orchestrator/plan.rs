@@ -83,6 +83,9 @@ use crate::vm_lab::orchestrator::stage::live_network_flap_validation::LiveNetwor
 use crate::vm_lab::orchestrator::stage::live_reboot_recovery_validation::LiveRebootRecoveryValidationStage;
 use crate::vm_lab::orchestrator::stage::live_secrets_not_in_logs_validation::LiveSecretsNotInLogsValidationStage;
 use crate::vm_lab::orchestrator::stage::live_two_hop_validation::LiveTwoHopValidationStage;
+use crate::vm_lab::orchestrator::stage::macos_anchor_bundle_pull_validation::MacosAnchorBundlePullValidationStage;
+use crate::vm_lab::orchestrator::stage::macos_anchor_port_mapping_authority_validation::MacosAnchorPortMappingAuthorityValidationStage;
+use crate::vm_lab::orchestrator::stage::macos_anchor_profile_deploy::MacosAnchorProfileDeployStage;
 use crate::vm_lab::orchestrator::stage::membership_init::MembershipInitStage;
 use crate::vm_lab::orchestrator::stage::mesh_status_validation::MeshStatusValidationStage;
 use crate::vm_lab::orchestrator::stage::negative_control::{
@@ -350,6 +353,17 @@ impl PlanBuilder {
                         Box::new(BlindExitDataplaneValidationStage)
                     }
                     StageId::LiveAnchor => Box::new(LiveAnchorStage),
+                    // MAC-D3: the three macOS anchor validators are first-class
+                    // engine-of-record stages now — they dispatch live whenever a
+                    // macOS anchor is elected and the live suite is enabled, and
+                    // skip-with-reason otherwise (never silently).
+                    StageId::MacosAnchorProfileDeploy => Box::new(MacosAnchorProfileDeployStage),
+                    StageId::MacosAnchorBundlePullValidation => {
+                        Box::new(MacosAnchorBundlePullValidationStage)
+                    }
+                    StageId::MacosAnchorPortMappingAuthorityValidation => {
+                        Box::new(MacosAnchorPortMappingAuthorityValidationStage)
+                    }
                     StageId::LiveTwoHopValidation => Box::new(LiveTwoHopValidationStage),
                     StageId::LiveManagedDnsValidation => Box::new(LiveManagedDnsValidationStage),
                     StageId::LiveNetworkFlapValidation => Box::new(LiveNetworkFlapValidationStage),
@@ -447,9 +461,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_61_stages() {
+    fn build_returns_64_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 61, "plan must contain exactly 61 stages");
+        assert_eq!(stages.len(), 64, "plan must contain exactly 64 stages");
+    }
+
+    // MAC-D3: the three macOS anchor validators must be part of the
+    // engine-of-record plan so a macOS anchor run dispatches them live, and
+    // they must drop out with the rest of the live suite when it is skipped
+    // (the anchor election tightening in native.rs then grades the delegated
+    // coverage as a reported skip instead of a silent pass).
+    #[test]
+    fn macos_anchor_validator_stages_follow_the_live_suite_gate() {
+        let ids = |builder: PlanBuilder| -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
+            builder.build().iter().map(|stage| stage.id()).collect()
+        };
+        let expected = [
+            crate::vm_lab::orchestrator::stage::StageId::MacosAnchorProfileDeploy,
+            crate::vm_lab::orchestrator::stage::StageId::MacosAnchorBundlePullValidation,
+            crate::vm_lab::orchestrator::stage::StageId::MacosAnchorPortMappingAuthorityValidation,
+        ];
+        let full = ids(PlanBuilder::new());
+        for id in &expected {
+            let id = id.clone();
+            assert!(
+                full.contains(&id),
+                "full plan must dispatch {:?} for the macOS anchor cell (MAC-D3)",
+                id
+            );
+        }
+        let without_live = ids(PlanBuilder::new().with_skip_live_suite(true));
+        for id in &expected {
+            let id = id.clone();
+            assert!(
+                !without_live.contains(&id),
+                "skip_live_suite must drop {:?}; the elected flag then degrades to a reported skip",
+                id
+            );
+        }
     }
 
     #[test]
@@ -457,7 +506,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        assert_eq!(ids.len(), 70, "chaos-enabled plan must contain 70 stages");
+        assert_eq!(ids.len(), 73, "chaos-enabled plan must contain 73 stages");
         for chaos_id in PlanBuilder::chaos_suite_stages() {
             assert!(
                 ids.contains(&chaos_id),
@@ -480,10 +529,10 @@ mod tests {
             .with_enable_negative_control(true)
             .build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        // Opt-in and out of the default plan (like chaos): default 61 + 4.
+        // Opt-in and out of the default plan (like chaos): default 64 + 4.
         assert_eq!(
             ids.len(),
-            65,
+            68,
             "negative-control-enabled plan must contain 65 stages"
         );
         for control_id in PlanBuilder::negative_control_suite_stages() {
@@ -519,8 +568,8 @@ mod tests {
             .build();
         assert_eq!(
             stages.len(),
-            74,
-            "61 default + 9 chaos + 4 negative-control"
+            77,
+            "64 default + 9 chaos + 4 negative-control"
         );
     }
 
@@ -546,10 +595,10 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 61 total - 30 live-suite stages - 11 cross-network stages - 1 soak stage = 19.
+        // 64 total - 33 live-suite stages - 11 cross-network stages - 1 soak stage = 19.
         assert_eq!(
             ids.len(),
-            61 - PlanBuilder::live_suite_stages().len()
+            64 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -591,7 +640,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            61 - PlanBuilder::live_suite_stages().len()
+            64 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -650,6 +699,9 @@ mod tests {
                 StageId::ExitDemotionResidueValidation,
                 StageId::BlindExitDataplaneValidation,
                 StageId::LiveAnchor,
+                StageId::MacosAnchorProfileDeploy,
+                StageId::MacosAnchorBundlePullValidation,
+                StageId::MacosAnchorPortMappingAuthorityValidation,
                 StageId::LiveTwoHopValidation,
                 StageId::LiveManagedDnsValidation,
                 StageId::LiveNetworkFlapValidation,
@@ -684,7 +736,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_soak(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        assert_eq!(ids.len(), 60);
+        assert_eq!(ids.len(), 63);
         assert!(!ids.contains(&StageId::LiveExtendedSoakValidation));
         assert!(ids.contains(&StageId::LiveMixedTopologyValidation));
         assert!(ids.contains(&StageId::CrossNetworkPreflight));
@@ -704,7 +756,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            61 - PlanBuilder::cross_network_suite_stages().len()
+            64 - PlanBuilder::cross_network_suite_stages().len()
         );
         for dropped in PlanBuilder::cross_network_suite_stages() {
             assert!(

@@ -78,6 +78,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            inventory_path: None,
             macos_anchor_validators_elected: false,
         };
         assert!(matches!(

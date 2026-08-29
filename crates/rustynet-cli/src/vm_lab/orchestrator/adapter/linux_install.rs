@@ -479,6 +479,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            inventory_path: None,
             macos_anchor_validators_elected: false,
         };
         let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx).expect("env");
@@ -537,6 +538,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            inventory_path: None,
             macos_anchor_validators_elected: false,
         };
         for role in [
