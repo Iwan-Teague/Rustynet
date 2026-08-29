@@ -1221,6 +1221,16 @@ const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, &str, &str)] = &[
         "canonical-payload structural equality on relay session token (canonicalisation check; the signature is verified separately via ct_eq)",
     ),
     (
+        "crates/rustynet-control/src/blind_relay.rs",
+        "token.canonical_payload() != payload",
+        "canonical-payload structural equality on blind-relay leg token v2 (same reviewed canonicalisation check as the v1 site above; the signature is verified separately via ct_eq)",
+    ),
+    (
+        "crates/rustynet-control/src/blind_relay.rs",
+        "nonce == 0",
+        "u64 nonce zero-check on blind-relay fleet descriptor v2 input (compare to the literal 0, never a secret-vs-secret compare; the byte-array secret fields go through reject_all_zero/ct_eq instead)",
+    ),
+    (
         "crates/rustynet-control/src/lib.rs",
         "record.session_id.iter().all(|value| *value == 0)",
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
