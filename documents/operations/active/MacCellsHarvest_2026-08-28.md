@@ -1769,3 +1769,39 @@ three `macos_anchor_*` validator stages run live on the next re-run.
 **Cell status: PARTIAL — MAC-D7 closed with live evidence; the anchor cell
 remains blocked at `validate_baseline_runtime` on MeshStatus (QH-39) +
 DnsFailclosed (§8.2 owner gate), both pre-characterized and independent.**
+### 13.7 MAC-D8 disposition (2026-08-29): FIXED
+
+The §13.3 provisioning gap (tracked as MAC-D8) is fixed on the isolated
+review branch `ai-edit/edit-1787982992154-56044-50` (worktree
+`state/edit-worktrees/edit-1787982992154-56044-50`), pending human
+review/merge:
+
+- `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh` `setup_directories`
+  now provisions
+  `install -d -m 0700 -o root -g rustynetd "${STATE_ROOT}/credentials-workspace"`
+  alongside the sibling STATE_ROOT dirs. **Custody is root:rustynetd
+  0700 — deliberately stricter than the rustynetd:rustynetd first
+  sketched in §13.3** — because that is the Linux parity custody
+  (`ops_install_systemd.rs` provisions
+  `/var/lib/rustynet/credentials-workspace` root:daemon-gid 0700, and the
+  `ops_e2e.rs` doc comment specifies "Root-owned 0700"): ops verbs run as
+  root and create per-invocation 0700 leaves via `mkdir(2)`; the daemon
+  never opens the parent on macOS, so a rustynetd-owned parent would
+  only widen the fence.
+- Placement note: §13.3 said "install service script", but the evidence
+  shows `Install-RustyNetMacosService.sh` creates no state dirs (plists +
+  launchctl only); `setup_directories` in the bootstrap script is where
+  the sibling dirs live, so the fix went there — single source of truth.
+- Enforcement/verification: the existing fail-closed runtime check
+  (`stage_membership_signing_passphrase`, `ops_e2e.rs` symlink_metadata
+  on `secure_workspace_parent`, symlink-or-file rejected) is unchanged,
+  and a new regression test
+  `vm_lab::orchestrator::adapter::macos_install::tests::bootstrap_provisions_credentials_workspace_root_rustynetd_0700`
+  pins the exact provisioning line (and rejects a rustynetd-owned
+  variant), mirroring the trust-dir assertion tests.
+- Exit-cell outlook: with the parent provisioned, `membership_init`
+  should pass and the cell should progress `distribute_membership` →
+  `exit_handoff` → `active_exit` + the three exit validation stages,
+  giving M1 DnsFailclosed its first macOS exercise — **needs a live-lab
+  re-run to prove; not yet verified live** (no lab run was part of this
+  fix).

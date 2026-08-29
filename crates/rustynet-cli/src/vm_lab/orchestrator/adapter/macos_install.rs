@@ -1923,6 +1923,37 @@ mod tests {
         );
     }
 
+    /// MAC-D8 regression test: the macOS bootstrap must provision the
+    /// membership signing credential-workspace parent alongside its sibling
+    /// STATE_ROOT dirs. Without it, `stage_membership_signing_passphrase`
+    /// fails closed with "credential workspace parent missing or unreadable"
+    /// and the whole macOS exit cell never gets past `membership_init`.
+    ///
+    /// Custody matches the Linux systemd install adapter
+    /// (`ops_install_systemd.rs`, /var/lib/rustynet/credentials-workspace):
+    /// root:rustynetd 0700. Ops verbs run as root and create per-invocation
+    /// 0700 leaves via mkdir(2); the daemon never opens this parent on macOS.
+    #[test]
+    fn bootstrap_provisions_credentials_workspace_root_rustynetd_0700() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(
+                "install -d -m 0700 -o root      -g rustynetd \"${STATE_ROOT}/credentials-workspace\""
+            ),
+            "setup_directories must create credentials-workspace as 0700 root:rustynetd \
+             (Linux install-adapter parity)"
+        );
+        // Negative: a rustynetd-owned workspace parent would let the daemon
+        // write into the parent, diverging from the Linux fence where only
+        // root ops verbs provision per-invocation leaves.
+        assert!(
+            !BOOTSTRAP_SCRIPT
+                .contains("install -d -m 0700 -o rustynetd -g rustynetd \"${STATE_ROOT}/credentials-workspace\"")
+                && !BOOTSTRAP_SCRIPT
+                    .contains("install -d -m 0755 -o rustynetd -g rustynetd \"${STATE_ROOT}/credentials-workspace\""),
+            "credentials-workspace must stay root-owned 0700, not rustynetd-owned"
+        );
+    }
+
     fn live_status_transcript(node_id: &str) -> String {
         // Shape of a real `rustynet status` reply, followed by the marker the
         // in-guest probe loop echoes on exit 0.
