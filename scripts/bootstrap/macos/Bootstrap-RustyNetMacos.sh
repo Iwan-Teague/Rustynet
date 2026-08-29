@@ -767,18 +767,30 @@ clear_residual_state() {
   # Clear residual distributed signed-state + anti-replay watermarks from any
   # prior enrollment. This is the macOS analogue of the Linux cleanup's
   # `rm -rf /var/lib/rustynet`: a fresh (re)enrollment must not inherit a stale
-  # membership/trust epoch watermark, or the daemon rejects the fresh genesis
-  # bundle as a replay/rollback ("membership replay/rollback detected by
+  # trust epoch watermark, or the daemon rejects the fresh genesis bundle
+  # as a replay/rollback ("membership replay/rollback detected by
   # watermark") and fail-closes (observed live: macOS stuck state=FailClosed,
   # reconcile_failures, membership_active_nodes=none). Key custody (keys/,
-  # bootstrap/, secrets/) is deliberately preserved — only the membership/ and
-  # trust/ signed-state plus the top-level session state are removed, and only
+  # bootstrap/, secrets/) is deliberately preserved — only the trust/
+  # signed-state plus the top-level session state are removed, and only
   # here on an operator-driven fresh bootstrap (the running daemon's
-  # anti-rollback protection between enrollments is unchanged). `seed_trust_evidence`
-  # re-seeds trust/, the orchestrator re-distributes the signed bundles, and the
-  # daemon rebuilds its watermarks from the fresh genesis.
+  # anti-rollback protection between enrollments is unchanged).
+  # `seed_trust_evidence` re-seeds trust/, the orchestrator re-distributes
+  # the signed bundles, and the daemon rebuilds its watermarks from the
+  # fresh genesis.
+  #
+  # MAC-D10: the membership/ wipe deliberately does NOT live here. Wiping
+  # membership/ in a general cleanup pass leaves a destructive window where
+  # any bootstrap (re)entry that fails between the wipe and the re-genesis —
+  # or re-runs the cleanup after genesis — strands the node with NO signed
+  # state while the orchestrator's membership stage is mid-flight (observed
+  # live: genesis seeded by bootstrap, membership/ empty by the time the
+  # stage's read-back ran). The wipe now lives inside `seed_membership_genesis`,
+  # immediately before `membership init` re-seeds the state, so the deleting
+  # write can never execute without the re-seed following it in the same
+  # function.
   local _residual_dir
-  for _residual_dir in membership trust; do
+  for _residual_dir in trust; do
     if [[ -d "${STATE_ROOT}/${_residual_dir}" ]]; then
       find "${STATE_ROOT}/${_residual_dir}" -mindepth 1 -maxdepth 1 \
         -exec rm -rf {} + 2>/dev/null || true
@@ -1249,9 +1261,10 @@ seed_trust_evidence() {
 #     genesis step fails — a node must never ship without a seeded owner key.
 #
 # Re-genesis per bootstrap is deliberate and mirrors Linux:
-# `clear_residual_state` wipes the membership/ signed state on every install
-# (a stale epoch watermark makes the daemon reject the fresh genesis bundle
-# as a replay/rollback), so the owner keypair must be regenerated with it,
+# `seed_membership_genesis` wipes the membership/ signed state immediately
+# before re-seeding it (a stale epoch watermark makes the daemon reject the
+# fresh genesis bundle as a replay/rollback), so the owner keypair must be
+# regenerated with it,
 # and `macos_install.rs`'s wholesale uninstall wipe of CONFIG_ROOT is
 # repaired by the very next bootstrap rather than a one-time manual fix.
 seed_membership_genesis() {
@@ -1288,6 +1301,23 @@ seed_membership_genesis() {
   # public half at ${owner_key}.pub, and mints the single-node genesis
   # snapshot (full bootstrap capability set) the daemon starts from.
   # Fail-closed via set -e: a failed genesis aborts the install.
+  #
+  # MAC-D10: the stale signed-state wipe is pinned HERE — immediately before
+  # `membership init` re-seeds the state — not in `clear_residual_state`.
+  # A fresh (re)enrollment must not inherit a stale membership/epoch
+  # watermark (the daemon rejects the fresh genesis bundle as a
+  # replay/rollback and fail-closes), but a general cleanup pass that wipes
+  # membership/ can strand the node with NO signed state if it ever runs
+  # without the re-genesis immediately following it (observed live:
+  # membership/ empty while the orchestrator's membership stage was
+  # mid-flight). Pinning the wipe inside the same function that re-seeds
+  # keeps the anti-rollback guarantee while making the deletion inseparable
+  # from the replacement. This also clears the daemon's gossip watermark
+  # spool, which lives in the same directory.
+  if [[ -d "${membership_dir}" ]]; then
+    find "${membership_dir}" -mindepth 1 -maxdepth 1 \
+      -exec rm -rf {} + 2>/dev/null || true
+  fi
   "${RUSTYNETD_BIN}" membership init \
     --snapshot "${membership_dir}/membership.snapshot" \
     --log "${membership_dir}/membership.log" \
