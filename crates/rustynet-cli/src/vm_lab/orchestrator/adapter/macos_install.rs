@@ -1012,15 +1012,16 @@ mod tests {
 
     #[test]
     fn bootstrap_script_clears_stale_signed_state_on_fresh_enroll() {
-        // A fresh (re)enrollment must wipe the prior membership/trust signed-state
-        // + anti-replay watermarks, or the daemon rejects the fresh genesis bundle
-        // as a replay/rollback ("membership replay/rollback detected by watermark")
-        // and fail-closes (observed live: macOS stuck state=FailClosed,
-        // membership_active_nodes=none). macOS analogue of the Linux cleanup's
-        // `rm -rf /var/lib/rustynet`; key custody must be preserved.
+        // A fresh (re)enrollment must wipe the prior trust signed-state +
+        // anti-replay watermarks, or the daemon rejects the fresh genesis
+        // bundle as a replay/rollback ("membership replay/rollback detected
+        // by watermark") and fail-closes (observed live: macOS stuck
+        // state=FailClosed, membership_active_nodes=none). macOS analogue of
+        // the Linux cleanup's `rm -rf /var/lib/rustynet`; key custody must be
+        // preserved.
         assert!(
-            BOOTSTRAP_SCRIPT.contains("for _residual_dir in membership trust"),
-            "clear_residual_state must wipe the membership/ and trust/ signed-state"
+            BOOTSTRAP_SCRIPT.contains("for _residual_dir in trust"),
+            "clear_residual_state must wipe the trust/ signed-state"
         );
         assert!(
             BOOTSTRAP_SCRIPT.contains("rm -f \"${STATE_ROOT}/rustynetd.state\""),
@@ -1028,7 +1029,8 @@ mod tests {
         );
         // The reset must NOT touch key-custody material.
         assert!(
-            !BOOTSTRAP_SCRIPT.contains("for _residual_dir in membership trust keys")
+            !BOOTSTRAP_SCRIPT.contains("for _residual_dir in membership trust")
+                && !BOOTSTRAP_SCRIPT.contains("for _residual_dir in membership trust keys")
                 && !BOOTSTRAP_SCRIPT.contains("rm -rf \"${KEYS_DIR}\""),
             "key custody (keys/) must be preserved by the fresh-enroll reset"
         );
@@ -1039,6 +1041,40 @@ mod tests {
             BOOTSTRAP_SCRIPT.matches("  clear_residual_state\n").count(),
             2,
             "clear_residual_state must be invoked in both the full and SKIP_BUILD paths"
+        );
+    }
+
+    /// MAC-D10: the membership/ wipe must be pinned INSIDE
+    /// `seed_membership_genesis`, immediately before `membership init`
+    /// re-seeds the state — never in a general cleanup pass. A cleanup that
+    /// wipes membership/ without the re-genesis directly following it leaves
+    /// a destructive window (observed live: genesis seeded by bootstrap,
+    /// membership/ empty while the orchestrator's membership stage was
+    /// mid-flight, and the stage's silent `test -s` read-back could not even
+    /// name the failure).
+    #[test]
+    fn bootstrap_script_pins_membership_wipe_inside_genesis_seeder() {
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("for _residual_dir in membership"),
+            "clear_residual_state must NOT wipe membership/; the wipe is pinned \
+             inside seed_membership_genesis (MAC-D10)"
+        );
+        let wipe = BOOTSTRAP_SCRIPT
+            .find("find \"${membership_dir}\" -mindepth 1 -maxdepth 1")
+            .unwrap_or_else(|| {
+                panic!(
+                    "seed_membership_genesis must wipe the stale membership/ signed-state \
+                     before re-seeding: {}",
+                    BOOTSTRAP_SCRIPT.len()
+                )
+            });
+        let membership_init = BOOTSTRAP_SCRIPT
+            .find("\"${RUSTYNETD_BIN}\" membership init")
+            .expect("bootstrap must seed genesis via `membership init`");
+        assert!(
+            wipe < membership_init,
+            "the membership/ wipe must be ordered immediately before `membership init` \
+             inside the same function (wipe at byte {wipe}, init at byte {membership_init})"
         );
     }
 
