@@ -87,6 +87,8 @@ use rustynet_backend_api::{
     ExitMode, NodeId, PeerConfig, Route, RuntimeContext, SocketEndpoint, TunnelBackend,
 };
 use rustynet_control::managed_dns_handoff::MeshIpv4Prefix;
+#[cfg(test)]
+use rustynet_control::tandem_dns_redirect::TandemDnsEgressBlockPolicy;
 use rustynet_control::tandem_dns_redirect::TandemDnsRedirectDecision;
 use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicySet, Decision, MembershipDirectory, MembershipStatus,
@@ -16699,6 +16701,7 @@ mod tests {
             mode: rustynet_control::tandem_dns::TandemMode::ManagedRedirect,
             scope: rustynet_control::tandem_dns::TandemScope::AllClientsUsingExit,
             service_address: std::net::Ipv4Addr::new(100, 64, 0, 7),
+            egress_block: TandemDnsEgressBlockPolicy::always_on(),
         }
     }
 

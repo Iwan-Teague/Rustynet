@@ -20,7 +20,13 @@
 //!   admit only post-translation queries (tunnel input + selected source +
 //!   exact service address + port 53) and drop any selected-source port-53
 //!   input that was NOT translated, so translation absence never opens a
-//!   plaintext escape while the redirect is active.
+//!   plaintext escape while the redirect is active. The SAME anchor carries
+//!   the owner-decision-3 DoT/DoH egress block, DEFAULT-ON whenever the
+//!   redirect is active: `block drop` selected-source udp/tcp `:853` (DoT,
+//!   except the sanctioned path to the mesh resolver) and `:443` to the
+//!   pinned `KNOWN_DOH_RESOLVER_IPS` set (tcp+udp). These drops are
+//!   INSEPARABLE from the redirect — same anchor, same generation, one
+//!   teardown-by-anchor flush, no residue (§10.7).
 //!
 //! The terminal `block drop out quick all` stays in the killswitch anchor;
 //! the tandem anchor never relaxes base egress posture.
@@ -31,7 +37,12 @@
 
 use rustynet_control::managed_dns_handoff::{ManagedDnsEndpoint, MeshIpv4Prefix};
 use rustynet_control::tandem_dns::TandemScope;
-use rustynet_control::tandem_dns_redirect::{TANDEM_DNS_REDIRECT_PORT, TandemDnsRedirectDecision};
+#[cfg(test)]
+use rustynet_control::tandem_dns_redirect::TandemDnsEgressBlockPolicy;
+use rustynet_control::tandem_dns_redirect::{
+    KNOWN_DOH_RESOLVER_IPS, TANDEM_DNS_DOH_BLOCK_PORT, TANDEM_DNS_DOT_PORT,
+    TANDEM_DNS_REDIRECT_PORT, TandemDnsRedirectDecision,
+};
 use std::net::Ipv4Addr;
 
 /// Prefix of the generation-scoped tandem anchor name. The full name is
@@ -231,14 +242,34 @@ impl MacosTandemDnsRedirectPfConfig {
             TandemDnsRedirectDecision::Redirect {
                 scope,
                 service_address,
+                egress_block,
                 ..
-            } => Self::new(
-                tunnel_interface,
-                generation,
-                scope,
-                &ManagedDnsEndpoint::new(*service_address),
-                mesh_prefix,
-            ),
+            } => {
+                // Fail-closed: the renderers ALWAYS install the DoT/DoH
+                // egress block in the same anchor (owner decision 3,
+                // default-on). A decision carrying any other policy would
+                // render a partial layer — a silent gap — so refuse instead
+                // of rendering.
+                if !egress_block.is_canonical() {
+                    return Err(TandemDnsRedirectRenderError {
+                        reason: format!(
+                            "decision carries a non-canonical DoT/DoH egress-block policy \
+                             (block_dot={}, pinned_doh_set={}, version={}): refusing to \
+                             render a partial layer",
+                            egress_block.block_dot,
+                            egress_block.doh_endpoint_ips.as_slice() == KNOWN_DOH_RESOLVER_IPS,
+                            egress_block.doh_endpoint_ips_version
+                        ),
+                    });
+                }
+                Self::new(
+                    tunnel_interface,
+                    generation,
+                    scope,
+                    &ManagedDnsEndpoint::new(*service_address),
+                    mesh_prefix,
+                )
+            }
             TandemDnsRedirectDecision::NoRedirect { .. } => Err(TandemDnsRedirectRenderError {
                 reason: "decision is NoRedirect: plain DNS stays blocked by the base \
                              fail-closed posture and no redirect rule may be installed"
@@ -339,8 +370,38 @@ impl MacosTandemDnsRedirectPfConfig {
         )
     }
 
+    /// DoT egress-block rule (owner decision 3, DEFAULT-ON): selected
+    /// sources may not bypass the redirect via DNS-over-TLS on `:853`. The
+    /// mesh resolver itself is exempt (the sanctioned tunnel path),
+    /// mirroring the `!` loop guard on the rdr form.
+    fn dot_block_rule(&self, protocol: &str) -> String {
+        format!(
+            "block drop in quick on {iface} inet proto {protocol} {source_match}to ! {service} port {dot} label \"rustynet-tdns-dot-{protocol}\"",
+            iface = self.tunnel_interface,
+            source_match = self.source_match_fragment(),
+            service = self.service_address,
+            dot = TANDEM_DNS_DOT_PORT,
+        )
+    }
+
+    /// Known-DoH-endpoint block rule (owner decision 3, DEFAULT-ON): the
+    /// pinned, versioned public-resolver set on `:443`, tcp AND udp (the
+    /// latter covers HTTP/3 DoH; fail-closed prefers the closed-direction
+    /// error). KNOWN MECHANISM LIMIT: DoH-over-`:443` to an arbitrary host
+    /// is indistinguishable from HTTPS without SNI inspection — the
+    /// documented residual owned by an SNI-inspection follow-up, NOT an
+    /// open door left by choice.
+    fn doh_block_rule(&self, protocol: &str, ip: Ipv4Addr) -> String {
+        format!(
+            "block drop in quick on {iface} inet proto {protocol} {source_match}to {ip} port {doh} label \"rustynet-tdns-doh-{protocol}\"",
+            iface = self.tunnel_interface,
+            source_match = self.source_match_fragment(),
+            doh = TANDEM_DNS_DOH_BLOCK_PORT,
+        )
+    }
+
     fn all_rules(&self) -> Vec<String> {
-        let mut rules = Vec::with_capacity(6);
+        let mut rules = Vec::with_capacity(2 + 2 + 2 + 2 + KNOWN_DOH_RESOLVER_IPS.len() * 2);
         for protocol in ["udp", "tcp"] {
             rules.push(self.rdr_rule(protocol));
         }
@@ -349,6 +410,14 @@ impl MacosTandemDnsRedirectPfConfig {
         }
         for protocol in ["udp", "tcp"] {
             rules.push(self.block_in_rule(protocol));
+        }
+        for protocol in ["udp", "tcp"] {
+            rules.push(self.dot_block_rule(protocol));
+        }
+        for ip in KNOWN_DOH_RESOLVER_IPS {
+            for protocol in ["tcp", "udp"] {
+                rules.push(self.doh_block_rule(protocol, ip));
+            }
         }
         rules
     }
@@ -402,15 +471,18 @@ pub fn evaluate_macos_tandem_dns_redirect_filter(
     live_rules: &str,
     config: &MacosTandemDnsRedirectPfConfig,
 ) -> Vec<String> {
-    let expected: Vec<String> = ["udp", "tcp"]
-        .iter()
-        .flat_map(|p| {
-            vec![
-                normalize_pf_rule_line(&config.pass_in_rule(p)),
-                normalize_pf_rule_line(&config.block_in_rule(p)),
-            ]
-        })
-        .collect();
+    let mut expected: Vec<String> =
+        Vec::with_capacity(2 + 2 + 2 + 2 + KNOWN_DOH_RESOLVER_IPS.len() * 2);
+    for protocol in ["udp", "tcp"] {
+        expected.push(normalize_pf_rule_line(&config.pass_in_rule(protocol)));
+        expected.push(normalize_pf_rule_line(&config.block_in_rule(protocol)));
+        expected.push(normalize_pf_rule_line(&config.dot_block_rule(protocol)));
+    }
+    for ip in KNOWN_DOH_RESOLVER_IPS {
+        for protocol in ["tcp", "udp"] {
+            expected.push(normalize_pf_rule_line(&config.doh_block_rule(protocol, ip)));
+        }
+    }
     evaluate_against_expected(live_rules, &expected, "filter")
 }
 
@@ -496,6 +568,7 @@ mod tests {
             mode: rustynet_control::tandem_dns::TandemMode::ManagedRedirect,
             scope: TandemScope::AllClientsUsingExit,
             service_address: SERVICE,
+            egress_block: TandemDnsEgressBlockPolicy::always_on(),
         }
     }
 
@@ -504,10 +577,11 @@ mod tests {
         let first = build_macos_tandem_dns_redirect_pf_rules(&all_clients_config());
         let second = build_macos_tandem_dns_redirect_pf_rules(&all_clients_config());
         assert_eq!(first, second);
-        // Six rules: rdr/pass/block x udp/tcp, deterministic order, no
-        // comment or decoration — every line is a reviewed rule form.
+        // 24 rules: rdr/pass/block53/dot x udp+tcp (8) + 8 pinned DoH IPs x
+        // tcp+udp (16), deterministic order, no comment or decoration —
+        // every line is a reviewed rule form.
         assert!(first.starts_with("rdr on "));
-        assert_eq!(first.lines().count(), 6);
+        assert_eq!(first.lines().count(), 24);
         // The anchor name is generation-scoped and disjoint from every base
         // anchor namespace.
         let anchor = all_clients_config().anchor_name().to_owned();
@@ -544,9 +618,10 @@ mod tests {
     fn node_ids_scope_renders_explicit_source_set_on_every_rule() {
         let rules = build_macos_tandem_dns_redirect_pf_rules(&node_ids_config());
         let fragment = "from { 100.64.0.11, 100.64.0.12 } ";
-        // The explicit set must appear on all six rules (2 rdr + 2 pass +
-        // 2 block), never just on the translation half.
-        assert_eq!(rules.matches(fragment).count(), 6);
+        // The explicit set must appear on ALL rules: 2 rdr + 2 pass + 2
+        // block-53 + 2 DoT + 16 DoH = 24 (never just on the translation
+        // half).
+        assert_eq!(rules.matches(fragment).count(), 24);
         assert!(rules.contains(&format!(
             "rdr on utun9 inet proto udp {fragment}to ! 100.64.0.7 port 53 -> 100.64.0.7 port 53"
         )));
@@ -577,6 +652,80 @@ mod tests {
         assert!(!rules.contains("pass in quick on utun9 all"));
         assert!(!rules.contains("\nnat "));
         assert!(!rules.starts_with("nat "));
+    }
+
+    /// Owner decision 3: the DoT/DoH egress block is DEFAULT-ON and rendered
+    /// into the SAME generation-scoped tandem anchor as the :53 redirect.
+    #[test]
+    fn dot_and_doh_blocks_render_in_the_tandem_anchor() {
+        let rules = build_macos_tandem_dns_redirect_pf_rules(&all_clients_config());
+        // DoT: udp+tcp :853, mesh resolver exempt.
+        assert!(rules.contains(
+            "block drop in quick on utun9 inet proto udp from any to ! 100.64.0.7 port 853 label \"rustynet-tdns-dot-udp\""
+        ));
+        assert!(rules.contains(
+            "block drop in quick on utun9 inet proto tcp from any to ! 100.64.0.7 port 853 label \"rustynet-tdns-dot-tcp\""
+        ));
+        // DoH: every pinned IP on :443, tcp AND udp (HTTP/3 covered).
+        for ip in KNOWN_DOH_RESOLVER_IPS {
+            assert!(rules.contains(&format!(
+                "block drop in quick on utun9 inet proto tcp from any to {ip} port 443 label \"rustynet-tdns-doh-tcp\""
+            )));
+            assert!(rules.contains(&format!(
+                "block drop in quick on utun9 inet proto udp from any to {ip} port 443 label \"rustynet-tdns-doh-udp\""
+            )));
+        }
+        // The :443 block is scoped to the pinned set only.
+        assert_eq!(
+            rules
+                .lines()
+                .filter(|l| l.contains("port 443 label"))
+                .count(),
+            KNOWN_DOH_RESOLVER_IPS.len() * 2
+        );
+    }
+
+    /// Fail-closed bridge: a Redirect carrying anything other than the
+    /// canonical default-on DoT/DoH policy refuses rendering — the layer is
+    /// inseparable, so a non-canonical policy can never produce a partial
+    /// install.
+    #[test]
+    fn bridge_refuses_non_canonical_egress_block_policy() {
+        let mut tampered = redirect_decision_all_clients();
+        if let TandemDnsRedirectDecision::Redirect {
+            ref mut egress_block,
+            ..
+        } = tampered
+        {
+            egress_block.block_dot = false;
+        }
+        let err = MacosTandemDnsRedirectPfConfig::from_redirect_decision(
+            "utun9",
+            3,
+            &tampered,
+            mesh_prefix().as_ref(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("non-canonical DoT/DoH"));
+
+        // A tampered DoH set refuses too.
+        let mut tampered = redirect_decision_all_clients();
+        if let TandemDnsRedirectDecision::Redirect {
+            ref mut egress_block,
+            ..
+        } = tampered
+        {
+            egress_block.doh_endpoint_ips.clear();
+        }
+        assert!(
+            MacosTandemDnsRedirectPfConfig::from_redirect_decision(
+                "utun9",
+                3,
+                &tampered,
+                mesh_prefix().as_ref()
+            )
+            .is_err()
+        );
     }
 
     #[test]

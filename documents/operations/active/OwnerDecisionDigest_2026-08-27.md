@@ -552,6 +552,16 @@ technically indistinguishable from HTTPS without SNI inspection — so "block al
 by any mechanism, documented as a **known mechanism limit requiring an SNI-inspection follow-up**, not
 an open door left by choice. **Status: `approved` (default-on); stacks behind the D-6c redirect job.**
 
+**LANDED 2026-08-29 (D-6c-egress)** — control plane + BOTH OS dataplanes, Linux nft and macOS pf
+parity: the `Redirect` decision carries the canonical default-on `TandemDnsEgressBlockPolicy`
+(DoT blocked; pinned named/versioned `KNOWN_DOH_RESOLVER_IPS` v`2026-08-29.1` = Cloudflare, Google,
+Quad9, OpenDNS on `:443` tcp+udp); drops render in the SAME generation-scoped table/anchor as the
+:53 redirect and tear down together (§10.7, no residue); the render bridge refuses any
+non-canonical policy fail-closed. Contained/off ⇒ no DoT/DoH layer, base fail-closed posture only.
+Disposition: default-on landed; arbitrary self-hosted DoH over `:443` remains the documented
+mechanism limit owned by the named SNI-inspection follow-up. Detail + evidence:
+`RustydnsTandemPhase2Notes_2026-08-29.md` §"D-6c-egress delivered".
+
 ### 28. Decision 4 — macOS mesh-status peer-visibility: additive node-id field
 Add a SEPARATE, additive `peer_node_ids` field from signed membership (do NOT repurpose the existing
 `peer_ids`/CIDRs — additive keeps existing consumers working); strengthen the anchor peer-visibility
