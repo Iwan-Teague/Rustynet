@@ -6,8 +6,8 @@ use std::time::Duration;
 use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    WINDOWS_RELAY_SERVICE_NAME, WINDOWS_SERVICE_NAME, WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
-    ps_quote, run_remote_ps, run_remote_ps_check,
+    ps_quote, run_remote_ps, run_remote_ps_check, WINDOWS_RELAY_SERVICE_NAME, WINDOWS_SERVICE_NAME,
+    WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
@@ -576,6 +576,48 @@ fn windows_dataplane_reset_script() -> String {
     )
 }
 
+/// Build the remote PowerShell that removes runtime state files, leaving the
+/// installation and keys intact.
+///
+/// Split out of `cleanup_runtime_state` (QH-24) so the generated script is
+/// unit-testable without a live `NodeConnection`: the exact file list — every
+/// membership/trust state file INCLUDING its anti-replay watermark — is what
+/// makes the next bootstrap start from a clean trust state. A list entry that
+/// silently disappears (a rename, a refactor) would leave stale signed state
+/// behind, which the next bootstrap could then replay or trip over. Pinned by
+/// `runtime_state_cleanup_script_removes_every_state_file_including_watermarks`.
+fn build_runtime_state_cleanup_script() -> Result<String, AdapterError> {
+    // Best-effort: mirrors the Linux `rm -rf … 2>/dev/null; true` pattern. We
+    // deliberately do not enable Set-StrictMode here — the cleanup target list is
+    // allowed to contain paths that do not exist on a fresh box, and any other
+    // anomaly should not cascade-fail subsequent stages whose preconditions
+    // are independent of cleanup (e.g. install).
+    Ok(format!(
+        "$ErrorActionPreference = 'Continue'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $stateRoot = {state_root_q}; \
+         $toRemove = @( \
+             (Join-Path $stateRoot 'membership\\membership.snapshot'), \
+             (Join-Path $stateRoot 'membership\\membership.log'), \
+             (Join-Path $stateRoot 'membership\\membership.watermark'), \
+             (Join-Path $stateRoot 'rustynetd.state'), \
+             (Join-Path $stateRoot 'trust\\rustynetd.assignment'), \
+             (Join-Path $stateRoot 'trust\\rustynetd.assignment.watermark'), \
+             (Join-Path $stateRoot 'trust\\rustynetd.traversal'), \
+             (Join-Path $stateRoot 'trust\\rustynetd.traversal.watermark'), \
+             (Join-Path $stateRoot 'trust\\rustynetd.dns-zone'), \
+             (Join-Path $stateRoot 'trust\\rustynetd.dns-zone.watermark') \
+         ); \
+         foreach ($f in $toRemove) {{ \
+             try {{ Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }} catch {{ }} \
+         }}; \
+         try {{ Remove-Item -Path {staging_q} -Recurse -Force -ErrorAction SilentlyContinue }} catch {{ }}; \
+         exit 0",
+        state_root_q = ps_quote(WINDOWS_STATE_ROOT)?,
+        staging_q = ps_quote(WINDOWS_STAGING_DIR)?
+    ))
+}
+
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
     // Stop the daemon service first (best-effort).
@@ -605,36 +647,7 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     // cargo downloads. Non-fatal + idempotent: a clean node is a no-op.
     let _ = run_remote_ps(conn, &windows_dataplane_reset_script(), SHORT_TIMEOUT);
 
-    // Remove runtime state but keep keys and installation. Best-effort:
-    // mirrors the Linux `rm -rf … 2>/dev/null; true` pattern. We deliberately
-    // do not enable Set-StrictMode here — the cleanup target list is allowed
-    // to contain paths that do not exist on a fresh box, and any other
-    // anomaly should not cascade-fail subsequent stages whose preconditions
-    // are independent of cleanup (e.g. install).
-    let cleanup_script = format!(
-        "$ErrorActionPreference = 'Continue'; \
-         $ProgressPreference = 'SilentlyContinue'; \
-         $stateRoot = {state_root_q}; \
-         $toRemove = @( \
-             (Join-Path $stateRoot 'membership\\membership.snapshot'), \
-             (Join-Path $stateRoot 'membership\\membership.log'), \
-             (Join-Path $stateRoot 'membership\\membership.watermark'), \
-             (Join-Path $stateRoot 'rustynetd.state'), \
-             (Join-Path $stateRoot 'trust\\rustynetd.assignment'), \
-             (Join-Path $stateRoot 'trust\\rustynetd.assignment.watermark'), \
-             (Join-Path $stateRoot 'trust\\rustynetd.traversal'), \
-             (Join-Path $stateRoot 'trust\\rustynetd.traversal.watermark'), \
-             (Join-Path $stateRoot 'trust\\rustynetd.dns-zone'), \
-             (Join-Path $stateRoot 'trust\\rustynetd.dns-zone.watermark') \
-         ); \
-         foreach ($f in $toRemove) {{ \
-             try {{ Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }} catch {{ }} \
-         }}; \
-         try {{ Remove-Item -Path {staging_q} -Recurse -Force -ErrorAction SilentlyContinue }} catch {{ }}; \
-         exit 0",
-        state_root_q = ps_quote(WINDOWS_STATE_ROOT)?,
-        staging_q = ps_quote(WINDOWS_STAGING_DIR)?
-    );
+    let cleanup_script = build_runtime_state_cleanup_script()?;
     run_remote_ps(conn, &cleanup_script, SHORT_TIMEOUT)?;
     Ok(())
 }
@@ -841,7 +854,7 @@ pub fn issue_bundles_to_dir(
     env_content: &str,
     local_out_dir: &std::path::Path,
 ) -> Result<(), AdapterError> {
-    use crate::vm_lab::orchestrator::adapter::windows_install::{WINDOWS_STAGING_DIR, ps_quote};
+    use crate::vm_lab::orchestrator::adapter::windows_install::{ps_quote, WINDOWS_STAGING_DIR};
     use std::io::Write as IoWrite;
     let pid = std::process::id();
     let remote_env = format!(r"{WINDOWS_STAGING_DIR}\rn_issue_env_{pid}.env");
@@ -1143,12 +1156,10 @@ mod tests {
     #[test]
     fn parse_winnat_nat_session_line_fails_closed_on_non_ok_output() {
         // The FAIL line from the inline script parses to nothing.
-        assert!(
-            parse_winnat_nat_session_line(
-                "FAIL: no WinNAT session translating a mesh-sourced (100.64.0.0/10) client address"
-            )
-            .is_none()
-        );
+        assert!(parse_winnat_nat_session_line(
+            "FAIL: no WinNAT session translating a mesh-sourced (100.64.0.0/10) client address"
+        )
+        .is_none());
         // Empty / garbage / malformed pair syntax also parse to nothing.
         assert!(parse_winnat_nat_session_line("").is_none());
         assert!(parse_winnat_nat_session_line("garbage").is_none());
@@ -1494,26 +1505,20 @@ mod tests {
 
     #[test]
     fn parse_windows_node_clean_probe_accepts_fully_clean_node() {
-        assert!(
-            parse_windows_node_clean_probe(
-                "rules=0 outbound=allow service=stopped relay=stopped adapter=-\n"
-            )
-            .is_ok()
-        );
+        assert!(parse_windows_node_clean_probe(
+            "rules=0 outbound=allow service=stopped relay=stopped adapter=-\n"
+        )
+        .is_ok());
         // An absent service is benign (a never-installed / uninstalled node).
-        assert!(
-            parse_windows_node_clean_probe(
-                "rules=0 outbound=allow service=absent relay=absent adapter=-"
-            )
-            .is_ok()
-        );
+        assert!(parse_windows_node_clean_probe(
+            "rules=0 outbound=allow service=absent relay=absent adapter=-"
+        )
+        .is_ok());
         // Tolerates a leading banner/log line before the result line.
-        assert!(
-            parse_windows_node_clean_probe(
-                "WARNING: blah\nrules=0 outbound=allow service=stopped relay=stopped adapter=-"
-            )
-            .is_ok()
-        );
+        assert!(parse_windows_node_clean_probe(
+            "WARNING: blah\nrules=0 outbound=allow service=stopped relay=stopped adapter=-"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1522,10 +1527,9 @@ mod tests {
             "rules=3 outbound=allow service=stopped relay=stopped adapter=-",
         )
         .expect_err("leftover firewall rules must fail");
-        assert!(
-            err.to_string()
-                .contains("3 leftover RustyNet firewall rule")
-        );
+        assert!(err
+            .to_string()
+            .contains("3 leftover RustyNet firewall rule"));
         let err2 = parse_windows_node_clean_probe(
             "rules=0 outbound=block service=stopped relay=stopped adapter=-",
         )
@@ -1613,6 +1617,54 @@ mod tests {
         assert!(s.contains("set dnsservers") && s.contains("source=dhcp"));
         // Best-effort: never abort on a clean node.
         assert!(s.contains("$ErrorActionPreference = 'Continue'"));
+    }
+
+    /// QH-24 content pin for `cleanup_runtime_state`'s state-removal half:
+    /// every runtime state file — including each anti-replay watermark — must
+    /// be named in the generated script. A dropped entry leaves stale signed
+    /// state (assignment / traversal / dns-zone / membership) behind for the
+    /// next bootstrap, so the pin enumerates ALL ten paths rather than
+    /// sampling. Keys and the installation must remain untouched.
+    #[test]
+    fn runtime_state_cleanup_script_removes_every_state_file_including_watermarks() {
+        let s = build_runtime_state_cleanup_script().expect("cleanup script should render");
+        // Every reviewed runtime state file, watermarks included.
+        for rel in [
+            r"membership\membership.snapshot",
+            r"membership\membership.log",
+            r"membership\membership.watermark",
+            r"rustynetd.state",
+            r"trust\rustynetd.assignment",
+            r"trust\rustynetd.assignment.watermark",
+            r"trust\rustynetd.traversal",
+            r"trust\rustynetd.traversal.watermark",
+            r"trust\rustynetd.dns-zone",
+            r"trust\rustynetd.dns-zone.watermark",
+        ] {
+            assert!(
+                s.contains(&format!("Join-Path $stateRoot '{rel}'")),
+                "cleanup script must remove {rel} (stale signed state is a \
+                 release blocker): {s}"
+            );
+        }
+        // Removal is per-file and best-effort, and never aborts the stage.
+        assert!(s.contains("Remove-Item -LiteralPath $f -Force"));
+        assert!(s.contains("$ErrorActionPreference = 'Continue'"));
+        assert!(s.contains("exit 0"));
+        // The staging tree goes too (recursive), under the reviewed constant.
+        assert!(
+            s.contains(&format!(
+                "Remove-Item -Path {} -Recurse -Force",
+                ps_quote(WINDOWS_STAGING_DIR).expect("staging dir must quote")
+            )),
+            "staging dir must be purged recursively: {s}"
+        );
+        // Fail-safe boundary: keys and the installation are NOT targets.
+        assert!(!s.contains("keys"), "cleanup must never touch keys: {s}");
+        assert!(
+            !s.contains(r"Program Files"),
+            "cleanup must never touch the installation: {s}"
+        );
     }
 
     #[test]

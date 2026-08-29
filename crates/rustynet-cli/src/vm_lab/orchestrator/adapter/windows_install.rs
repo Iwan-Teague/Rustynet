@@ -3,12 +3,12 @@ use std::time::Duration;
 
 use base64::prelude::*;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::VmGuestPlatform;
 
 pub const WINDOWS_SERVICE_NAME: &str = "RustyNet";
 pub const WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
@@ -295,26 +295,33 @@ pub fn install_daemon(
 /// patch the daemon env file to `--auto-tunnel-enforce true` and restart the
 /// service.  The daemon then applies the assignment bundle and brings up
 /// `WireGuard` tunnels on the next reconcile tick.
-pub fn enforce_daemon(
-    conn: &NodeConnection,
-    _alias: &str,
-    _ctx: &OrchestrationContext,
-) -> Result<(), AdapterError> {
-    let env_path = format!(r"{WINDOWS_STATE_ROOT}\config\rustynetd.env");
-    // Patch --auto-tunnel-enforce in the RUSTYNETD_DAEMON_ARGS_JSON line.
-    // The env file has the form:
-    //   # comment
-    //   RUSTYNETD_DAEMON_ARGS_JSON=["--backend","...",
-    //       "--auto-tunnel-enforce","false","--node-id","..."]
-    // We parse the JSON array, flip the value, and write it back.
-    //
-    // The same patch threads --traversal-stun-servers with the guest's default
-    // gateway on 3478 (C-STUN, BashOrchestratorRetirementProgram) — an empty
-    // value disables srflx candidate gathering, and no Windows deploy path set
-    // it anywhere. Gateway detection failure adds no flag (prior behaviour);
-    // a live responder is optional (gathering fails soft on a bounded timeout).
-    let env_path_q = ps_quote(&env_path)?;
-    let patch_script = format!(
+/// Build the remote PowerShell that patches `rustynetd.env` into enforce mode
+/// (QH-24): flips `--auto-tunnel-enforce` to `true` in the
+/// `RUSTYNETD_DAEMON_ARGS_JSON` line and threads the freshness ceilings.
+///
+/// The env file has the form:
+///   # comment
+///   RUSTYNETD_DAEMON_ARGS_JSON=["--backend","...",
+///       "--auto-tunnel-enforce","false","--node-id","..."]
+/// The JSON array is parsed, the value flipped, and the result written back.
+///
+/// The same patch threads `--traversal-stun-servers` with the guest's default
+/// gateway on 3478 (C-STUN, BashOrchestratorRetirementProgram) — an empty
+/// value disables srflx candidate gathering, and no Windows deploy path set
+/// it anywhere. Gateway detection failure adds no flag (prior behaviour);
+/// a live responder is optional (gathering fails soft on a bounded timeout).
+///
+/// Split out of `enforce_daemon` so the generated script is unit-testable
+/// without a live `NodeConnection`. This is the fail-closed enforcement path:
+/// until this patch runs the daemon is in non-enforcing mode
+/// (`auto_tunnel_enforce=false` → reconcile applies an empty dataplane, no
+/// mesh adapter), so a script that silently drops the flip — or regresses a
+/// `true` back toward `false` — leaves the node bootstrapped but never
+/// enforcing. Pinned by
+/// `auto_tunnel_enforce_patch_script_flips_enforce_and_threads_max_ages`.
+fn build_auto_tunnel_enforce_patch_script(env_path: &str) -> Result<String, AdapterError> {
+    let env_path_q = ps_quote(env_path)?;
+    Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
@@ -356,7 +363,17 @@ pub fn enforce_daemon(
              }} else {{ $_ }} \
          }}; \
          $updated | Out-File -Encoding ASCII $envPath",
-    );
+    ))
+}
+
+pub fn enforce_daemon(
+    conn: &NodeConnection,
+    _alias: &str,
+    _ctx: &OrchestrationContext,
+) -> Result<(), AdapterError> {
+    let env_path = format!(r"{WINDOWS_STATE_ROOT}\config\rustynetd.env");
+    // Patch --auto-tunnel-enforce in the RUSTYNETD_DAEMON_ARGS_JSON line.
+    let patch_script = build_auto_tunnel_enforce_patch_script(&env_path)?;
     run_remote_ps(conn, &patch_script, SHORT_TIMEOUT)?;
     // The daemon was started during bootstrap with --auto-tunnel-enforce false and
     // is still running. sc.exe start no-ops on an already-running service (exit
@@ -928,7 +945,7 @@ fn run_windows_e2e_bootstrap(
 /// Returns `(verifier_key_file_content, trust_evidence_file_content)`.
 fn generate_local_trust_material() -> Result<(String, String), String> {
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::{TryRngCore, rngs::OsRng};
+    use rand::{rngs::OsRng, TryRngCore};
     use zeroize::Zeroize;
 
     let mut seed = [0u8; 32];
@@ -1286,6 +1303,71 @@ mod tests {
     fn ps_quote_rejects_cr_lf() {
         assert!(ps_quote("abc\ndef").is_err());
         assert!(ps_quote("abc\rdef").is_err());
+    }
+
+    /// QH-24 content pin for the Windows fail-closed enforcement path: the
+    /// patch script must flip `--auto-tunnel-enforce` to `true` under
+    /// StrictMode, thread both freshness ceilings, keep the C-STUN gateway
+    /// threading, and write the result back. A regression that drops the
+    /// flip — or writes anything but `true` — leaves the daemon in
+    /// non-enforcing mode (empty dataplane, no mesh adapter) while every
+    /// downstream stage believes it is enforcing.
+    #[test]
+    fn auto_tunnel_enforce_patch_script_flips_enforce_and_threads_max_ages() {
+        let script =
+            build_auto_tunnel_enforce_patch_script(r"C:\ProgramData\RustyNet\config\rustynetd.env")
+                .expect("patch script should render");
+
+        // Strict mode + Stop: a silent partial failure must terminate.
+        assert!(
+            script.contains("Set-StrictMode -Version Latest")
+                && script.contains("$ErrorActionPreference = 'Stop'"),
+            "the patch must run strict and fail loudly: {script}"
+        );
+        // The DAEMON_ARGS_JSON line is matched, stripped, parsed as JSON.
+        assert!(
+            script.contains("$_ -match '^RUSTYNETD_DAEMON_ARGS_JSON='")
+                && script.contains("ConvertFrom-Json")
+                && script.contains("ConvertTo-Json -Compress"),
+            "the args line must be round-tripped through JSON: {script}"
+        );
+        // THE flip: the value following --auto-tunnel-enforce becomes 'true'.
+        // This is the fail-closed posture of the whole path.
+        assert!(
+            script.contains("'--auto-tunnel-enforce'")
+                && script.contains("$arr[$idx + 1] = 'true'"),
+            "the patch must set --auto-tunnel-enforce to true: {script}"
+        );
+        assert!(
+            !script.contains("'false'"),
+            "the enforce patch must never be able to write 'false': {script}"
+        );
+        // Freshness ceilings: added when absent, refreshed when present.
+        for flag in ["--auto-tunnel-max-age-secs", "--dns-zone-max-age-secs"] {
+            assert!(
+                script.contains(&format!("'{flag}'")) && script.contains("'86400'"),
+                "freshness ceiling {flag} must be threaded: {script}"
+            );
+        }
+        // C-STUN threading: gateway regex-guarded, port 3478.
+        assert!(
+            script.contains("'--traversal-stun-servers'") && script.contains("':3478'"),
+            "the STUN gateway threading must be preserved: {script}"
+        );
+        assert!(
+            script.contains("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"),
+            "the gateway must be IPv4-regex-guarded before interpolation: {script}"
+        );
+        // The patched array is written back to the env file.
+        assert!(
+            script.contains("Out-File -Encoding ASCII $envPath"),
+            "the patched args must be written back: {script}"
+        );
+        // The env path is the reviewed state-root config file, quoted.
+        assert!(
+            script.contains(&ps_quote(r"C:\ProgramData\RustyNet\config\rustynetd.env").unwrap()),
+            "the rendered script must target the quoted env path: {script}"
+        );
     }
 
     #[test]
