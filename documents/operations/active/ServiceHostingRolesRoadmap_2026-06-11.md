@@ -131,10 +131,73 @@ Fast local iteration: `cargo run -p rustynet-xtask -- gates` (fmt → check → 
 | M2 D13.c (nas) | ✅ crate+bin+installer+tests landed 2026-06-11 (daemon access-state materialisation ✅ `de02cc2`; live evidence open) | delta plan D13.c status + `scripts/ci/nas_default_deny_gates.sh` |
 | M3 D13.d (llm) | ✅ crate+bin+verbs+coexistence guard+tests landed 2026-06-11 (daemon access-state materialisation ✅ `de02cc2`; live evidence open) | delta plan D13.d status + `scripts/ci/llm_default_deny_gates.sh` + `llm_exit_coexistence_gates.sh` |
 | M4 D13.e surface | ✅ docs+gates landed 2026-06-11 (SecurityMinimumBar §6.E, Requirements §6.1, platform matrix ⛔ rows, hardening + redaction sections, `service_hosting_role_gates.sh`, `role_transition_audit_gates.sh`); wizard already lists eight presets via `RolePreset::all()` | this commit |
-| M5 live-lab rows | ☐ open — next step; blocked 2026-06-11 on the in-flight vm-lab simulator stream | `../live_lab_run_matrix.csv` |
+| M5 live-lab rows | ☐ open — next step; blocked 2026-06-11 on the in-flight vm-lab simulator stream | `../live_lab_node_run_matrix.csv` (the live `--node` ledger; `../live_lab_run_matrix.csv` is the frozen bash-orchestrator archive — pointer corrected 2026-08-29) |
 | M6 RustyBackup / RustyAI | ☐ future | separate program |
+| Phase-1 control-plane verification | ✅ re-verified in-tree 2026-08-29 — audit-only pass; every phase-1 control already has enforcement + verification in-tree, so no code was added (see §7.1) | §7.1 evidence map below |
 
 Legend: ✅ done · ☐ open · ⛔ blocked.
+
+### 7.1) Phase-1 control-plane scaffolding — verification note (2026-08-29)
+
+A focused audit of the phase-1 scope (signed service-access policy, service-capability
+advertisement gates, membership-alignment validation arm, daemon-side role recognition)
+found every control already landed in-tree; adding anything would have duplicated
+existing controls, so this pass is documentation-only. Evidence (line numbers as of
+this commit):
+
+- **Presets + capabilities**: `crates/rustynet-control/src/role_presets.rs` —
+  `Capability::ServesNas`/`ServesLlm`, serde `serves_nas`/`serves_llm`, preset rows,
+  `capabilities_require_nas_binary`/`capabilities_require_llm_binary`,
+  blind_exit→nas/llm transition blocked, transition tests (L1537–1795).
+  `crates/rustynet-control/src/roles.rs` — `RoleCapability::ServesNas`/`ServesLlm`,
+  `is_service_hosting_capability()` (L115).
+- **Signed co-location validation (fail-closed at signed-state level)**:
+  `crates/rustynet-control/src/membership.rs` ~L2726 refuses blind_exit ×
+  service-hosting ("strictest default"); blind_relay requires exactly
+  `{relay_host, blind_relay}` and refuses serves_*; tamper test
+  `tampered_service_hosting_capability_invalidates_signature` (L3419) proves the
+  capability is signed metadata that fails closed at signature verification.
+- **Membership-alignment arm**: nas/llm are deliberately **not** `NodeRole`
+  primaries — both design docs state "Deliberately unchanged: `NodeRole` enum"
+  (NasNodeRoleDesign L204/L29, LlmNodeRoleDesign L274/L30). The daemon-side
+  `validate_node_role_membership_alignment` (`crates/rustynetd/src/daemon.rs`
+  L2069) therefore correctly has no nas/llm arm; capability-level coherence is
+  enforced by the signed-state validation above, and its BlindRelay arm refuses
+  serves_* co-location (daemon.rs L2119–2137).
+- **Advertisement gate**: `crates/rustynetd/src/service_exposure.rs` —
+  `service_hosting_view_from_membership` derives serves_nas/serves_llm only from
+  an Active signed membership row; absent/inactive node serves nothing (test
+  `service_hosting_view_serves_nothing_for_absent_or_inactive_node`, L756).
+  Tunnel-only bind enforced by `validate_tunnel_only_bind` (tests L657–710).
+- **Signed service-access policy (default-deny, empty ⇒ deny)**:
+  `crates/rustynetd/src/service_access_state.rs` — `derive_service_access_snapshot`
+  + `evaluate_service_access` (test
+  `evaluate_service_access_default_denies_and_honours_explicit_allow`, L957);
+  an empty grant set is written explicitly as deny-all; `force_deny_all` is the
+  fail-closed fallback when a refresh write fails.
+- **Daemon-side recognition + materialisation**: `crates/rustynetd/src/daemon.rs`
+  `materialize_service_access_state` (L5327) is wired at all four signed-state
+  commit points (L5795, L8635, L9696, L10355). Write failure degrades to
+  deny-all — never to a stale grant list; removal tears `grants.v1` down first
+  (teardown-before-revoke at the materialisation layer).
+
+Still open / flagged (unchanged by this audit):
+
+- **M5 live-lab evidence rows** remain ☐ — the only phase gap. This audit changes
+  nothing about that requirement; the M5 ledger pointer above was corrected to the
+  live `--node` ledger per AGENTS.md §2/§10.9.
+- **Phase-2 wiring stays flagged**: `ServiceExposureController`
+  (service_exposure.rs lifecycle — deploy-before-advertise, fail-closed health
+  gate, `admit_session`, session severance on policy change,
+  teardown-before-capability-release) is unit-tested scaffolding not yet driven
+  by the daemon runtime; it activates with the D13.c/D13.d sibling-binary
+  co-deployment work.
+- **`handle_membership_apply` seam** rewrites grants/scopes immediately but keeps
+  the last-verified `peers.v1` rather than faking an identity map — documented,
+  deliberate behaviour (delta plan D13.b status note), not a gap.
+- **No wire-format invention**: the sibling-service access-state files
+  (`grants.v1`/`peers.v1`/`scopes.v1`) already exist from D13.b; this pass
+  introduced none.
 
 ---
 
