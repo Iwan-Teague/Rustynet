@@ -22899,12 +22899,39 @@ fn evaluate_macos_mesh_status_report(macos_alias: &str, raw_json: &str) -> Resul
             report.drift_reasons.join("; ")
         ));
     }
+    // STRICT peer visibility: the report must carry VERIFIED membership node
+    // ids. A Missing/Invalid membership read (or a pre-addition report whose
+    // field defaults to Invalid) is a hard failure — never an empty roster —
+    // so a peer-visibility claim without verified signed-membership backing
+    // cannot pass this stage.
+    let verified_node_ids = match &report.member_node_ids {
+        rustynetd::macos_mesh_status::MembershipNodeIdsLoad::Verified { node_ids } => {
+            node_ids.clone()
+        }
+        rustynetd::macos_mesh_status::MembershipNodeIdsLoad::Missing { reason } => {
+            return Err(format!(
+                "macOS mesh status report does not carry verified membership node ids \
+                 (fail-closed): {reason}"
+            ));
+        }
+        rustynetd::macos_mesh_status::MembershipNodeIdsLoad::Invalid { reason } => {
+            return Err(format!(
+                "macOS mesh status report carries unverifiable membership node ids \
+                 (fail-closed): {reason}"
+            ));
+        }
+    };
     let summary_detail = match &report.snapshot {
         rustynetd::windows_mesh_status::WindowsMeshSnapshotLoad::Ok {
             peer_ids,
             age_seconds,
             ..
-        } => format!("peers={} age_seconds={}", peer_ids.len(), age_seconds),
+        } => format!(
+            "peers={} age_seconds={} verified_member_nodes={}",
+            peer_ids.len(),
+            age_seconds,
+            verified_node_ids.len()
+        ),
         _ => "inconsistent snapshot load".to_owned(),
     };
     Ok(format!(

@@ -1837,6 +1837,8 @@ fn run_macos_mesh_status_check_command(args: &[String]) -> Result<(), String> {
     let mut state_path: Option<std::path::PathBuf> = None;
     let mut expected_peer_ids: Vec<String> = Vec::new();
     let mut max_age_seconds: Option<i64> = None;
+    let mut expected_node_ids: Vec<String> = Vec::new();
+    let mut membership_snapshot_path: Option<std::path::PathBuf> = None;
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -1871,6 +1873,20 @@ fn run_macos_mesh_status_check_command(args: &[String]) -> Result<(), String> {
                 max_age_seconds = Some(parsed);
                 index += 2;
             }
+            Some("--expected-node-id") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--expected-node-id requires a value".to_owned())?;
+                expected_node_ids.push(value.clone());
+                index += 2;
+            }
+            Some("--membership-snapshot-path") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--membership-snapshot-path requires a value".to_owned())?;
+                membership_snapshot_path = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
             Some(flag) => {
                 return Err(format!("unknown macos-mesh-status-check argument: {flag}"));
             }
@@ -1881,6 +1897,8 @@ fn run_macos_mesh_status_check_command(args: &[String]) -> Result<(), String> {
         state_path,
         expected_peer_ids,
         max_age_seconds,
+        expected_node_ids,
+        membership_snapshot_path,
     };
     let report = collect_macos_mesh_status_report(&options);
     println!(
