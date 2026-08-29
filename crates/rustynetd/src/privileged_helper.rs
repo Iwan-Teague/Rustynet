@@ -2101,10 +2101,23 @@ fn is_anchor_name_token(value: &str) -> bool {
 }
 
 fn is_owned_nft_table_token(value: &str) -> bool {
-    (value.starts_with("rustynet_g") || value.starts_with("rustynet_nat_g"))
+    (value.starts_with("rustynet_g")
+        || value.starts_with("rustynet_nat_g")
+        || is_owned_tandem_dns_table_token(value))
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+/// True ONLY for the tandem-DNS transparent redirect tables built by
+/// `linux_tandem_dns_redirect` (`rustynet_tdns_nat4_g<gen>` and
+/// `rustynet_tdns_filter_g<gen>`). Deliberately distinct from the base
+/// killswitch (`rustynet_g`), exit masquerade (`rustynet_nat_g`), and
+/// protected-mode DNS-redirect (`rustynet_g<gen>_dns`) ownership families so
+/// tandem generation-scoped tables can never be confused with (or slip rules
+/// into) any other reviewed table.
+fn is_owned_tandem_dns_table_token(value: &str) -> bool {
+    value.starts_with("rustynet_tdns_")
 }
 
 fn is_owned_failclosed_table_token(value: &str) -> bool {
@@ -3136,9 +3149,12 @@ mod tests {
         // any character that could break the argv into a second command.
         assert!(is_owned_nft_table_token("rustynet_g5"));
         assert!(is_owned_nft_table_token("rustynet_nat_g12"));
+        assert!(is_owned_nft_table_token("rustynet_tdns_nat4_g1"));
+        assert!(is_owned_nft_table_token("rustynet_tdns_filter_g3"));
         assert!(!is_owned_nft_table_token("filter"));
         assert!(!is_owned_nft_table_token("rustynet_g5; nft flush ruleset"));
         assert!(!is_owned_nft_table_token("evil_rustynet_g5"));
+        assert!(!is_owned_nft_table_token("evil_rustynet_tdns_g1"));
 
         // WireGuard public keys: base64 alphabet, non-empty, <=128.
         assert!(is_wg_public_key_token("abcDEF123+/="));
