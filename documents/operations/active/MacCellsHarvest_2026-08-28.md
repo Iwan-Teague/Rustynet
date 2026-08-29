@@ -1745,6 +1745,34 @@ explicit dependency reasons, per `state/stages.tsv`:
 1. **MeshStatus** — QH-39 snapshot freshness: `mesh_status.rs:90`
    `SNAPSHOT_MAX_AGE_SECONDS = 180` vs the passive anchor's aging snapshot
    (`--max-age-seconds 180`; `MeshStatus: validation not passed`).
+   **Disposition (2026-08-29, code-audit): freshness wiring is complete and
+   was already complete at this run's commit** — the heartbeat
+   (`STATE_SNAPSHOT_HEARTBEAT_INTERVAL_SECS = 30`,
+   `daemon.rs` `maybe_heartbeat_persist_state`, landed cd58d48f) and the QH-40
+   macOS state-path fix (8f9e7f5a) are both ancestors of
+   `81a71286960e0fb61d307d7da011c1cc02dfe2e8`; the macOS daemon runs the
+   shared unix reconcile loop (1s tick) whose tail heartbeats the snapshot,
+   the anchor launchd plist passes no `--state` override so daemon and
+   validator both resolve `/usr/local/var/rustynet/rustynetd.state`
+   (`MACOS_STATE_ROOT` = same root, `macos_install.rs:23`), and the macOS
+   dispatch passes no `--expected-peer-id`, so the owner-gated
+   peer-ids-vs-CIDRs mismatch is NOT implicated in this red. With staleness,
+   path drift, and peer-visibility all excluded, the anchor6c red was an
+   honest fail-closed red: the heartbeat intentionally skips while the daemon
+   is restricted, `FailClosed`, or carrying a `last_reconcile_error`, so a
+   daemon unhealthy at check time ages its snapshot past 180s by design (the
+   post-run artifact cleanup — the anchor6c report dir
+   `state/mac-cells/anchor6c-20260829-070406` no longer exists — makes
+   missing-vs-stale indistinguishable, per §3.2/line-738 caution).
+   **MeshStatus should pass on the next macOS anchor run if the daemon is
+   healthy at check time.** If it reds again, capture `rustynetd`
+   restriction state + the daemon journal + the raw
+   `macos-mesh-status-check` stdout into the run's report dir BEFORE cleanup
+   so the restriction cause is attributable. New regression guards
+   (`macos_mesh_status.rs` tests): `validator_default_path_matches_daemon_default_state_path`
+   (macOS-only; pins the QH-40 path agreement) and
+   `fresh_snapshot_at_default_path_passes_the_orchestrator_bound` (a
+   heartbeat-fresh snapshot at the default path yields empty drift at 180s).
 2. **DnsFailclosed** — anchor role never enters DNS-protected mode: the launchd
    profile audited-omits `--dataplane-mode` (`macos_install.rs:1975-2001`) and
    `phase10.rs` `apply_dns_protection` is never invoked for anchor. §8.2 owner
