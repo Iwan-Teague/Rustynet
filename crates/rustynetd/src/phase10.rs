@@ -1695,6 +1695,186 @@ impl LinuxCommandSystem {
         )))
     }
 
+    fn assert_chain_contains_strings(
+        &self,
+        chain_lines: &[String],
+        tokens: &[String],
+        message: &str,
+    ) -> Result<(), SystemError> {
+        let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        self.assert_chain_contains(chain_lines, &borrowed, message)
+    }
+
+    // ── QH-29: shared rule-token builders ────────────────────────────────────
+    //
+    // Every nft rule the Linux dataplane emits is built from ONE of these
+    // token sets, and the runtime self-assertions (`assert_nat_forwarding`,
+    // `assert_firewall_ruleset`) match the SAME builder output. This is the
+    // coupling point the QH-29 audit was about: before it, the emitters and
+    // the matchers each spelled the rule tokens inline, so a format change on
+    // one side (e.g. the `counter` observability token) could silently stop
+    // the fail-closed assertion from matching — wrongly failing a healthy
+    // node, or worse, matching nothing while reporting success. With a shared
+    // builder, changing a token changes BOTH sides in the same commit, and
+    // the `*_rule_tokens_agree_with_emitted_nft_argv` tests in `mod tests`
+    // pin the pairing end-to-end by driving the real emitters through the
+    // privileged-capture helper and checking these tokens against the
+    // rendered `nft add rule` argv.
+    //
+    // Note on `counter`: it is an OBSERVABILITY-ONLY argv token (packet
+    // counters for live debugging) deliberately OMITTED from every builder —
+    // `chain_contains_all_tokens` matches each token as an independent
+    // substring of the rendered line, so the extra `counter packets N bytes N`
+    // text nft renders between match terms and the verdict never breaks the
+    // match. Keep it that way: adding `counter` to a builder would couple the
+    // assertion to nft's counter rendering.
+
+    /// Killswitch: allow loopback (managed DNS resolver on 127.0.0.1 must
+    /// survive the default-deny OUTPUT policy).
+    fn loopback_accept_tokens() -> Vec<String> {
+        vec!["oifname".into(), "lo".into(), "accept".into()]
+    }
+
+    /// Killswitch + forward: allow established/related traffic.
+    fn established_related_accept_tokens() -> Vec<String> {
+        vec!["ct state established,related".into(), "accept".into()]
+    }
+
+    /// Killswitch: allow anything leaving via the tunnel interface.
+    fn tunnel_interface_accept_tokens(tunnel_interface: &str) -> Vec<String> {
+        vec!["oifname".into(), tunnel_interface.into(), "accept".into()]
+    }
+
+    /// Killswitch: allow the node's own egress while NAT forwarding is active.
+    fn killswitch_egress_allow_tokens(egress_interface: &str) -> Vec<String> {
+        vec!["oifname".into(), egress_interface.into(), "accept".into()]
+    }
+
+    /// Killswitch: allow WireGuard handshake traffic by destination OR source
+    /// port (traversal peers reply from arbitrary NAT-mapped ports, so the
+    /// source-port rule is load-bearing, not redundant).
+    fn wg_listen_port_allow_tokens(
+        port_match: &str,
+        egress_interface: &str,
+        wg_listen_port: u16,
+    ) -> Vec<String> {
+        vec![
+            "oifname".into(),
+            egress_interface.into(),
+            "udp".into(),
+            port_match.into(),
+            wg_listen_port.to_string(),
+            "accept".into(),
+        ]
+    }
+
+    /// Killswitch DNS protection: drop off-tunnel :53 (fail-closed half).
+    fn dns_off_tunnel_drop_tokens(proto: &str, tunnel_interface: &str) -> Vec<String> {
+        vec![
+            proto.into(),
+            "dport".into(),
+            "53".into(),
+            "oifname".into(),
+            "!=".into(),
+            tunnel_interface.into(),
+            "drop".into(),
+        ]
+    }
+
+    /// Killswitch DNS protection: allow on-tunnel :53 (tunnel half).
+    fn dns_accept_tokens(proto: &str) -> Vec<String> {
+        vec![proto.into(), "dport".into(), "53".into(), "accept".into()]
+    }
+
+    /// Forward chain: allow tunnel-sourced traffic out the underlay egress.
+    fn forward_tunnel_to_egress_tokens(
+        tunnel_interface: &str,
+        egress_interface: &str,
+    ) -> Vec<String> {
+        vec![
+            "iifname".into(),
+            tunnel_interface.into(),
+            "oifname".into(),
+            egress_interface.into(),
+            "accept".into(),
+        ]
+    }
+
+    /// Forward chain: allow tunnel→tunnel hairpin forwarding for
+    /// relay-with-upstream.
+    fn forward_hairpin_accept_tokens(tunnel_interface: &str) -> Vec<String> {
+        vec![
+            "iifname".into(),
+            tunnel_interface.into(),
+            "oifname".into(),
+            tunnel_interface.into(),
+            "accept".into(),
+        ]
+    }
+
+    /// NAT postrouting: masquerade tunnel traffic leaving the underlay
+    /// egress (the rule whose absence once failed every exit node).
+    fn nat_egress_masquerade_tokens(egress_interface: &str) -> Vec<String> {
+        vec![
+            "oifname".into(),
+            egress_interface.into(),
+            "masquerade".into(),
+        ]
+    }
+
+    /// NAT postrouting: hairpin SNAT for relay-with-upstream (rewrites the
+    /// inner source so packets satisfy the upstream exit's /32 cryptokey
+    /// routing).
+    fn nat_hairpin_masquerade_tokens(tunnel_interface: &str) -> Vec<String> {
+        vec![
+            "iifname".into(),
+            tunnel_interface.into(),
+            "oifname".into(),
+            tunnel_interface.into(),
+            "masquerade".into(),
+        ]
+    }
+
+    /// Assemble a full `nft add rule` argv from a shared token builder,
+    /// inserting `observability_tokens` (e.g. `counter`) before the final
+    /// verdict/action token so emitters can add observability without the
+    /// assertion builders ever seeing it.
+    fn nft_add_rule_argv(
+        family: &str,
+        table: &str,
+        chain: &str,
+        rule_tokens: &[String],
+        observability_tokens: &[&str],
+    ) -> Vec<String> {
+        let mut argv: Vec<String> = vec![
+            "add".into(),
+            "rule".into(),
+            family.into(),
+            table.into(),
+            chain.into(),
+        ];
+        let split_at = rule_tokens.len().saturating_sub(1);
+        argv.extend(rule_tokens[..split_at].iter().cloned());
+        argv.extend(observability_tokens.iter().map(|token| token.to_string()));
+        if let Some(verdict) = rule_tokens.last() {
+            argv.push(verdict.clone());
+        }
+        argv
+    }
+
+    fn run_nft_rule_argv(
+        &self,
+        family: &str,
+        table: &str,
+        chain: &str,
+        rule_tokens: &[String],
+        observability_tokens: &[&str],
+    ) -> Result<(), SystemError> {
+        let argv = Self::nft_add_rule_argv(family, table, chain, rule_tokens, observability_tokens);
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        self.run(PrivilegedCommandProgram::Nft, &borrowed)
+    }
+
     fn expected_bypass_route(addr_or_cidr: String, interface_name: String) -> ExpectedBypassRoute {
         let family = if addr_or_cidr.contains(':') {
             RouteTableFamily::V6
@@ -1816,6 +1996,11 @@ impl LinuxCommandSystem {
         )))
     }
 
+    /// QH-29: runtime self-assertion for NAT forwarding. Matches the LIVE
+    /// `nft list table ip <nat>` output against the SAME shared token
+    /// builders `apply_nat_forwarding` emits its rules from — the pairing is
+    /// pinned by `nat_rule_tokens_agree_with_emitted_nft_argv` in `mod tests`,
+    /// so a rule-format change cannot silently stop this check from matching.
     fn assert_nat_forwarding(&self) -> Result<(), SystemError> {
         let Some(table) = self.nat_table.as_deref() else {
             return Ok(());
@@ -1824,21 +2009,15 @@ impl LinuxCommandSystem {
         let postrouting = Self::nft_chain_lines(&ruleset, "postrouting").ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("nat postrouting chain missing".to_owned())
         })?;
-        self.assert_chain_contains(
+        self.assert_chain_contains_strings(
             &postrouting,
-            &["oifname", self.egress_interface.as_str(), "masquerade"],
+            &Self::nat_egress_masquerade_tokens(self.egress_interface.as_str()),
             "egress masquerade rule missing",
         )?;
         if self.allow_tunnel_relay_forward {
-            self.assert_chain_contains(
+            self.assert_chain_contains_strings(
                 &postrouting,
-                &[
-                    "iifname",
-                    self.interface_name.as_str(),
-                    "oifname",
-                    self.interface_name.as_str(),
-                    "masquerade",
-                ],
+                &Self::nat_hairpin_masquerade_tokens(self.interface_name.as_str()),
                 "relay-with-upstream masquerade rule missing",
             )?;
         }
@@ -1897,6 +2076,15 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
+    /// QH-29: runtime self-assertion for the inet fail-closed table. Matches
+    /// the LIVE `nft list table inet <fw>` output against the SAME shared
+    /// token builders `ensure_failclosed_table` / `apply_firewall_killswitch`
+    /// / `apply_nat_forwarding` / `apply_dns_protection` emit their rules
+    /// from — the pairing is pinned by
+    /// `killswitch_and_dns_rule_tokens_agree_with_emitted_nft_argv` in
+    /// `mod tests`. FAIL-CLOSED: every missing allow rule below is an error;
+    /// the shared builders exist to keep these checks honest across rule
+    /// format changes, never to weaken them.
     fn assert_firewall_ruleset(&self) -> Result<(), SystemError> {
         let table = self.firewall_table.clone().ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("killswitch table missing".to_owned())
@@ -1908,121 +2096,81 @@ impl LinuxCommandSystem {
         let forward = Self::nft_chain_lines(&ruleset, "forward").ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("forward chain missing".to_owned())
         })?;
-        self.assert_chain_contains(
+        self.assert_chain_contains_strings(
             &killswitch,
-            &["oifname", "lo", "accept"],
+            &Self::loopback_accept_tokens(),
             "loopback killswitch allow rule missing",
         )?;
-        self.assert_chain_contains(
+        self.assert_chain_contains_strings(
             &killswitch,
-            &["ct state established,related", "accept"],
+            &Self::established_related_accept_tokens(),
             "established/related killswitch allow rule missing",
         )?;
-        self.assert_chain_contains(
+        self.assert_chain_contains_strings(
             &killswitch,
-            &["oifname", self.interface_name.as_str(), "accept"],
+            &Self::tunnel_interface_accept_tokens(self.interface_name.as_str()),
             "tunnel-interface killswitch allow rule missing",
         )?;
         if self.wg_listen_port != 0 {
-            let port_str = self.wg_listen_port.to_string();
-            self.assert_chain_contains(
+            self.assert_chain_contains_strings(
                 &killswitch,
-                &[
-                    "oifname",
-                    self.egress_interface.as_str(),
-                    "udp",
+                &Self::wg_listen_port_allow_tokens(
                     "dport",
-                    port_str.as_str(),
-                    "accept",
-                ],
+                    self.egress_interface.as_str(),
+                    self.wg_listen_port,
+                ),
                 "wireguard listen port killswitch allow rule missing",
             )?;
-            self.assert_chain_contains(
+            self.assert_chain_contains_strings(
                 &killswitch,
-                &[
-                    "oifname",
-                    self.egress_interface.as_str(),
-                    "udp",
+                &Self::wg_listen_port_allow_tokens(
                     "sport",
-                    port_str.as_str(),
-                    "accept",
-                ],
+                    self.egress_interface.as_str(),
+                    self.wg_listen_port,
+                ),
                 "wireguard source port killswitch allow rule missing",
             )?;
         }
-        self.assert_chain_contains(
+        self.assert_chain_contains_strings(
             &forward,
-            &["ct state established,related", "accept"],
+            &Self::established_related_accept_tokens(),
             "forward established/related allow rule missing",
         )?;
-        self.assert_chain_contains(
+        self.assert_chain_contains_strings(
             &forward,
-            &[
-                "iifname",
+            &Self::forward_tunnel_to_egress_tokens(
                 self.interface_name.as_str(),
-                "oifname",
                 self.egress_interface.as_str(),
-                "accept",
-            ],
+            ),
             "forwarding allow rule to underlay egress missing",
         )?;
         if self.allow_tunnel_relay_forward {
-            self.assert_chain_contains(
+            self.assert_chain_contains_strings(
                 &forward,
-                &[
-                    "iifname",
-                    self.interface_name.as_str(),
-                    "oifname",
-                    self.interface_name.as_str(),
-                    "accept",
-                ],
+                &Self::forward_hairpin_accept_tokens(self.interface_name.as_str()),
                 "relay-with-upstream forwarding allow rule missing",
             )?;
         }
         if self.nat_table.is_some() {
-            self.assert_chain_contains(
+            self.assert_chain_contains_strings(
                 &killswitch,
-                &["oifname", self.egress_interface.as_str(), "accept"],
+                &Self::killswitch_egress_allow_tokens(self.egress_interface.as_str()),
                 "egress-interface killswitch allow rule missing while nat forwarding is active",
             )?;
         }
         if self.dns_protected {
-            self.assert_chain_contains(
-                &killswitch,
-                &[
-                    "udp",
-                    "dport",
-                    "53",
-                    "oifname",
-                    "!=",
-                    self.interface_name.as_str(),
-                    "drop",
-                ],
-                "dns udp fail-closed rule missing",
-            )?;
-            self.assert_chain_contains(
-                &killswitch,
-                &[
-                    "tcp",
-                    "dport",
-                    "53",
-                    "oifname",
-                    "!=",
-                    self.interface_name.as_str(),
-                    "drop",
-                ],
-                "dns tcp fail-closed rule missing",
-            )?;
-            self.assert_chain_contains(
-                &killswitch,
-                &["udp", "dport", "53", "accept"],
-                "dns udp allow rule missing",
-            )?;
-            self.assert_chain_contains(
-                &killswitch,
-                &["tcp", "dport", "53", "accept"],
-                "dns tcp allow rule missing",
-            )?;
+            for proto in ["udp", "tcp"] {
+                self.assert_chain_contains_strings(
+                    &killswitch,
+                    &Self::dns_off_tunnel_drop_tokens(proto, self.interface_name.as_str()),
+                    &format!("dns {proto} fail-closed rule missing"),
+                )?;
+                self.assert_chain_contains_strings(
+                    &killswitch,
+                    &Self::dns_accept_tokens(proto),
+                    &format!("dns {proto} allow rule missing"),
+                )?;
+            }
         }
         // RN-27: everything above is a PRESENCE check on allow rules, and none
         // of it asserts a terminal drop at all -- so a chain whose `policy drop`
@@ -2377,39 +2525,29 @@ impl LinuxCommandSystem {
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         // Add loopback accept immediately after chain creation so the managed DNS
         // resolver on 127.0.0.1:53535 is never blocked during rule setup.
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "inet",
-                table.as_str(),
-                "killswitch",
-                "oifname",
-                "lo",
-                "accept",
-            ],
+        // QH-29: rule bodies come from the shared token builders that
+        // assert_firewall_ruleset matches against.
+        self.run_nft_rule_argv(
+            "inet",
+            table.as_str(),
+            "killswitch",
+            &Self::loopback_accept_tokens(),
+            &[],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         self.apply_fail_closed_management_allow_rules(table.as_str())?;
         self.apply_traversal_bootstrap_allow_rules(table.as_str())?;
         if self.wg_listen_port != 0 {
-            let port_str = self.wg_listen_port.to_string();
-            self.run(
-                PrivilegedCommandProgram::Nft,
-                &[
-                    "add",
-                    "rule",
-                    "inet",
-                    table.as_str(),
-                    "killswitch",
-                    "oifname",
-                    self.egress_interface.as_str(),
-                    "udp",
+            self.run_nft_rule_argv(
+                "inet",
+                table.as_str(),
+                "killswitch",
+                &Self::wg_listen_port_allow_tokens(
                     "dport",
-                    port_str.as_str(),
-                    "accept",
-                ],
+                    self.egress_interface.as_str(),
+                    self.wg_listen_port,
+                ),
+                &[],
             )
             .map_err(|err| {
                 SystemError::FirewallApplyFailed(format!(
@@ -2426,21 +2564,16 @@ impl LinuxCommandSystem {
             // Every datagram the daemon emits leaves its bound WireGuard socket
             // with this source port, so matching on it keeps the rule as narrow
             // as the dport form while covering any peer endpoint.
-            self.run(
-                PrivilegedCommandProgram::Nft,
-                &[
-                    "add",
-                    "rule",
-                    "inet",
-                    table.as_str(),
-                    "killswitch",
-                    "oifname",
-                    self.egress_interface.as_str(),
-                    "udp",
+            self.run_nft_rule_argv(
+                "inet",
+                table.as_str(),
+                "killswitch",
+                &Self::wg_listen_port_allow_tokens(
                     "sport",
-                    port_str.as_str(),
-                    "accept",
-                ],
+                    self.egress_interface.as_str(),
+                    self.wg_listen_port,
+                ),
+                &[],
             )
             .map_err(|err| {
                 SystemError::FirewallApplyFailed(format!(
@@ -2689,94 +2822,64 @@ impl DataplaneSystem for LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "inet",
-                table.as_str(),
-                "killswitch",
-                "ct",
-                "state",
-                "established,related",
-                "accept",
-            ],
+        // QH-29: every rule body below comes from the shared token builders
+        // that assert_firewall_ruleset matches against — the generator and
+        // the fail-closed matcher cannot drift apart silently.
+        self.run_nft_rule_argv(
+            "inet",
+            table.as_str(),
+            "killswitch",
+            &Self::established_related_accept_tokens(),
+            &[],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "inet",
-                table.as_str(),
-                "killswitch",
-                "oifname",
+        self.run_nft_rule_argv(
+            "inet",
+            table.as_str(),
+            "killswitch",
+            &Self::tunnel_interface_accept_tokens(self.interface_name.as_str()),
+            &[],
+        )
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        self.run_nft_rule_argv(
+            "inet",
+            table.as_str(),
+            "forward",
+            &Self::established_related_accept_tokens(),
+            &[],
+        )
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        self.run_nft_rule_argv(
+            "inet",
+            table.as_str(),
+            "forward",
+            &Self::forward_tunnel_to_egress_tokens(
                 self.interface_name.as_str(),
-                "accept",
-            ],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "inet",
-                table.as_str(),
-                "forward",
-                "ct",
-                "state",
-                "established,related",
-                "accept",
-            ],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "inet",
-                table.as_str(),
-                "forward",
-                "iifname",
-                self.interface_name.as_str(),
-                "oifname",
                 self.egress_interface.as_str(),
-                "accept",
-            ],
+            ),
+            &[],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         if self.allow_tunnel_relay_forward {
-            self.run(
-                PrivilegedCommandProgram::Nft,
-                &[
-                    "add",
-                    "rule",
-                    "inet",
-                    table.as_str(),
-                    "forward",
-                    "iifname",
-                    self.interface_name.as_str(),
-                    "oifname",
-                    self.interface_name.as_str(),
-                    // OBSERVABILITY, not behaviour: `counter` turns "the hairpin
-                    // forward-accept rule exists" into "it matched N packets". Whether
-                    // this rule ever matches is the single most useful fact when
-                    // diagnosing a relay-with-upstream forwarding failure, and its
-                    // absence cost multiple live-lab cycles: rule presence was
-                    // observable, rule *matching* was not.
-                    //
-                    // Safe for the runtime self-assertion: `assert_chain_contains` →
-                    // `chain_contains_all_tokens` matches each token as a SUBSTRING of
-                    // the rendered line independently (`phase10.rs:1160-1163`), not as an
-                    // adjacent sequence, so the extra `counter packets N bytes N` between
-                    // `oifname` and the verdict does not break it.
-                    "counter",
-                    "accept",
-                ],
+            // OBSERVABILITY, not behaviour: `counter` turns "the hairpin
+            // forward-accept rule exists" into "it matched N packets". Whether
+            // this rule ever matches is the single most useful fact when
+            // diagnosing a relay-with-upstream forwarding failure, and its
+            // absence cost multiple live-lab cycles: rule presence was
+            // observable, rule *matching* was not.
+            //
+            // Safe for the runtime self-assertion: `counter` is inserted as an
+            // observability token BEFORE the verdict and never enters the
+            // shared builder, and `chain_contains_all_tokens` matches each
+            // builder token as an independent substring of the rendered line,
+            // so the extra `counter packets N bytes N` nft prints between the
+            // match terms and the verdict does not break the match.
+            self.run_nft_rule_argv(
+                "inet",
+                table.as_str(),
+                "forward",
+                &Self::forward_hairpin_accept_tokens(self.interface_name.as_str()),
+                &["counter"],
             )
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         }
@@ -2980,60 +3083,47 @@ impl DataplaneSystem for LinuxCommandSystem {
             let _ = self.restore_ipv4_forwarding();
             return Err(SystemError::NatApplyFailed(err.to_string()));
         }
-        if let Err(err) = self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "ip",
-                nat_table.as_str(),
-                "postrouting",
-                "oifname",
-                self.egress_interface.as_str(),
-                "masquerade",
-            ],
-        ) {
+        // QH-29: rule bodies come from the shared token builders that
+        // assert_nat_forwarding / assert_firewall_ruleset match against.
+        self.run_nft_rule_argv(
+            "ip",
+            nat_table.as_str(),
+            "postrouting",
+            &Self::nat_egress_masquerade_tokens(self.egress_interface.as_str()),
+            &[],
+        )
+        .map_err(|err| {
             self.run_allow_failure(
                 PrivilegedCommandProgram::Nft,
                 &["delete", "table", "ip", nat_table.as_str()],
             );
             let _ = self.restore_ipv4_forwarding();
-            return Err(SystemError::NatApplyFailed(err.to_string()));
-        }
+            SystemError::NatApplyFailed(err.to_string())
+        })?;
         if self.allow_tunnel_relay_forward {
-            match self.run(
-                PrivilegedCommandProgram::Nft,
-                &[
-                    "add",
-                    "rule",
-                    "ip",
-                    nat_table.as_str(),
-                    "postrouting",
-                    "iifname",
-                    self.interface_name.as_str(),
-                    "oifname",
-                    self.interface_name.as_str(),
-                    // OBSERVABILITY, not behaviour — see the matching `counter` on the
-                    // hairpin forward-accept rule. This one matters even more: the
-                    // hairpin SNAT is load-bearing for the request leg (it rewrites the
-                    // inner source so the packet satisfies the upstream exit's cryptokey
-                    // routing, whose AllowedIPs for this node is a single /32), and
-                    // whether it MATCHED was previously unobservable — only that the rule
-                    // existed. Substring-token matching makes this safe for
-                    // `assert_nat_forwarding` (`phase10.rs:1160-1163`).
-                    "counter",
-                    "masquerade",
-                ],
+            // OBSERVABILITY, not behaviour — see the matching `counter` on the
+            // hairpin forward-accept rule. This one matters even more: the
+            // hairpin SNAT is load-bearing for the request leg (it rewrites the
+            // inner source so the packet satisfies the upstream exit's cryptokey
+            // routing, whose AllowedIPs for this node is a single /32), and
+            // whether it MATCHED was previously unobservable — only that the rule
+            // existed. `counter` is inserted before the verdict and never enters
+            // the shared builder, and `chain_contains_all_tokens` matches each
+            // builder token as an independent substring of the rendered line, so
+            // it is safe for `assert_nat_forwarding`.
+            if let Err(err) = self.run_nft_rule_argv(
+                "ip",
+                nat_table.as_str(),
+                "postrouting",
+                &Self::nat_hairpin_masquerade_tokens(self.interface_name.as_str()),
+                &["counter"],
             ) {
-                Ok(()) => {}
-                Err(err) => {
-                    self.run_allow_failure(
-                        PrivilegedCommandProgram::Nft,
-                        &["delete", "table", "ip", nat_table.as_str()],
-                    );
-                    let _ = self.restore_ipv4_forwarding();
-                    return Err(SystemError::NatApplyFailed(err.to_string()));
-                }
+                self.run_allow_failure(
+                    PrivilegedCommandProgram::Nft,
+                    &["delete", "table", "ip", nat_table.as_str()],
+                );
+                let _ = self.restore_ipv4_forwarding();
+                return Err(SystemError::NatApplyFailed(err.to_string()));
             }
         }
         // Collect firewall table name and egress interface before moving nat_table.
@@ -3050,18 +3140,12 @@ impl DataplaneSystem for LinuxCommandSystem {
         // while acting as an exit node.
         if let Some((fw_table, egress_iface)) = egress_allow {
             let nat_name = self.nat_table.as_deref().unwrap_or("").to_owned();
-            if let Err(err) = self.run(
-                PrivilegedCommandProgram::Nft,
-                &[
-                    "add",
-                    "rule",
-                    "inet",
-                    fw_table.as_str(),
-                    "killswitch",
-                    "oifname",
-                    egress_iface.as_str(),
-                    "accept",
-                ],
+            if let Err(err) = self.run_nft_rule_argv(
+                "inet",
+                fw_table.as_str(),
+                "killswitch",
+                &Self::killswitch_egress_allow_tokens(egress_iface.as_str()),
+                &[],
             ) {
                 self.run_allow_failure(
                     PrivilegedCommandProgram::Nft,
@@ -3152,72 +3236,26 @@ impl DataplaneSystem for LinuxCommandSystem {
             .firewall_table
             .clone()
             .ok_or_else(|| SystemError::DnsApplyFailed("killswitch table missing".to_owned()))?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
+        // QH-29: rule bodies come from the shared token builders that
+        // assert_firewall_ruleset matches against.
+        for proto in ["udp", "tcp"] {
+            self.run_nft_rule_argv(
                 "inet",
                 table.as_str(),
                 "killswitch",
-                "udp",
-                "dport",
-                "53",
-                "oifname",
-                "!=",
-                self.interface_name.as_str(),
-                "drop",
-            ],
-        )
-        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
+                &Self::dns_off_tunnel_drop_tokens(proto, self.interface_name.as_str()),
+                &[],
+            )
+            .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+            self.run_nft_rule_argv(
                 "inet",
                 table.as_str(),
                 "killswitch",
-                "tcp",
-                "dport",
-                "53",
-                "oifname",
-                "!=",
-                self.interface_name.as_str(),
-                "drop",
-            ],
-        )
-        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "inet",
-                table.as_str(),
-                "killswitch",
-                "udp",
-                "dport",
-                "53",
-                "accept",
-            ],
-        )
-        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "inet",
-                table.as_str(),
-                "killswitch",
-                "tcp",
-                "dport",
-                "53",
-                "accept",
-            ],
-        )
-        .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+                &Self::dns_accept_tokens(proto),
+                &[],
+            )
+            .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
+        }
         // Option 2: the rustynet resolver owns loopback DNS. The killswitch
         // rules above are defense-in-depth (drop off-tunnel :53); this is what
         // makes the dns-failclosed verifier pass — every resolv.conf nameserver
@@ -3316,6 +3354,15 @@ impl DataplaneSystem for LinuxCommandSystem {
         .map_err(|err| SystemError::BlockEgressFailed(err.to_string()))
     }
 }
+
+/// QH-29: the terminal default-deny rule every macOS killswitch anchor ends
+/// with. `render_macos_killswitch_pf_rules` appends it (last line, unconditionally)
+/// and `MacosCommandSystem::assert_killswitch` requires it in the LIVE
+/// `pfctl -a <anchor> -s rules` output; both sides reference this one constant so
+/// the generator↔matcher pairing cannot drift silently. The existing render
+/// snapshot tests in `mod tests` (e.g. `macos_render_pf_rules_full_tunnel_dns_snapshot`)
+/// additionally pin the full rendered rule text.
+pub(crate) const MACOS_PF_TERMINAL_BLOCK_RULE: &str = "block drop out quick all";
 
 /// The inputs `render_macos_killswitch_pf_rules` consumes to render the macOS
 /// killswitch filter anchor. Mirrors EXACTLY the `MacosCommandSystem` fields the
@@ -3429,7 +3476,8 @@ pub(crate) fn render_macos_killswitch_pf_rules(
     if spec.ipv6_blocked {
         rules.push_str("block drop out quick inet6 all\n");
     }
-    rules.push_str("block drop out quick all\n");
+    rules.push_str(MACOS_PF_TERMINAL_BLOCK_RULE);
+    rules.push('\n');
     rules
 }
 
@@ -4505,7 +4553,7 @@ impl DataplaneSystem for MacosCommandSystem {
                 output.status, output.stderr
             )));
         }
-        if !output.stdout.contains("block drop out quick all") {
+        if !output.stdout.contains(MACOS_PF_TERMINAL_BLOCK_RULE) {
             return Err(SystemError::KillSwitchAssertionFailed(
                 "pf killswitch rule missing".to_owned(),
             ));
@@ -5144,6 +5192,16 @@ const WINDOWS_PS_GET_FORWARDING: &str = "& { param($Alias) $ErrorActionPreferenc
 const WINDOWS_PS_SET_FORWARDING: &str = "& { param($Alias, $State) $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -Forwarding $State -ErrorAction Stop }";
 const WINDOWS_PS_REMOVE_NAT: &str = "& { param($Name) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
 const WINDOWS_PS_NEW_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; New-NetNat -Name $Name -InternalIPInterfaceAddressPrefix $Prefix -ErrorAction Stop | Out-Null }";
+// QH-29 coupling note (Windows): the runtime self-assertions
+// (`assert_dns_protection` / `assert_killswitch` / `assert_exit_serving`)
+// do NOT pattern-match generated rule text. They query LIVE OS state
+// (Get-NetFirewallRule / Get-NetNat / Get-NetIPInterface) keyed by the SAME
+// shared rule-name constants (`WINDOWS_KS_RULE_*`, `WINDOWS_DNS_RULE_*`,
+// the NAT name) that the apply/delete paths use, and delegate the shape
+// checking to these pinned PowerShell payloads. The generator↔matcher
+// coupling is therefore compile-time (one constant per rule name) and needs
+// no separate agreement test; renaming a rule constant renames both sides in
+// the same commit.
 const WINDOWS_PS_ASSERT_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction Stop; if ($nat.InternalIPInterfaceAddressPrefix -ne $Prefix) { throw 'RustyNet NAT prefix mismatch' } }";
 const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; $state = (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding; if ($state -ne 'Enabled') { throw 'RustyNet IP forwarding not enabled' } }";
 /// Verify the OS still has every reviewed killswitch rule in place AND the
@@ -15035,6 +15093,189 @@ mod tests {
         );
     }
 
+    /// QH-29: generator↔matcher agreement for the NAT table. Drives the REAL
+    /// `apply_nat_forwarding` emitter through the privileged-capture helper,
+    /// then checks that every shared token builder the runtime matcher
+    /// (`assert_nat_forwarding`) matches with is present in the rendered
+    /// `nft add rule` argv — including the relay-with-upstream hairpin rule
+    /// emitted with its observability-only `counter` token, which the matcher
+    /// deliberately does NOT require. If the emitter and the matcher ever
+    /// drift apart, this fails loudly instead of the fail-closed assertion
+    /// silently matching nothing on a live node.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nat_rule_tokens_agree_with_emitted_nft_argv() {
+        let socket_path = phase10_test_socket_path("nat");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        DataplaneSystem::apply_nat_forwarding(
+            &mut system,
+            false,
+            ExitMode::FullTunnel,
+            false,
+            "10.6.0.0/16",
+        )
+        .expect("nat apply should succeed against the capture helper");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Matcher-side expectations (the SAME builders assert_nat_forwarding
+        // consumes) must each match some emitted argv line.
+        let egress_masquerade = LinuxCommandSystem::nat_egress_masquerade_tokens("enp0s9");
+        let hairpin_masquerade = LinuxCommandSystem::nat_hairpin_masquerade_tokens("rustynet0");
+        let egress_allow = LinuxCommandSystem::killswitch_egress_allow_tokens("enp0s9");
+        for (name, tokens) in [
+            ("egress masquerade", egress_masquerade),
+            ("hairpin masquerade", hairpin_masquerade),
+            ("killswitch egress allow", egress_allow),
+        ] {
+            let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            assert!(
+                LinuxCommandSystem::chain_contains_all_tokens(&command_log, &borrowed),
+                "matcher token set for the {name} rule must appear in the emitted nft argv: \
+                 tokens={borrowed:?} log={command_log:?}"
+            );
+        }
+        // Negative control: a mutated token must NOT match, proving the
+        // agreement check above is not vacuously true.
+        assert!(
+            !LinuxCommandSystem::chain_contains_all_tokens(
+                &command_log,
+                &["oifname", "enp0s9", "masqueradee"]
+            ),
+            "mutated token must not match any emitted rule"
+        );
+    }
+
+    /// QH-29: generator↔matcher agreement for the inet fail-closed table.
+    /// Drives the REAL `apply_firewall_killswitch` → `apply_nat_forwarding` →
+    /// `apply_dns_protection` emitter chain through the privileged-capture
+    /// helper, then checks that every shared token builder the runtime
+    /// matcher (`assert_firewall_ruleset`) matches with — loopback,
+    /// established/related, tunnel accept, both WireGuard port rules, both
+    /// DNS fail-closed drops, both DNS allows, forward tun→egress, forward
+    /// hairpin, and the NAT-activated killswitch egress allow — is present
+    /// in the rendered `nft add rule` argv.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn killswitch_and_dns_rule_tokens_agree_with_emitted_nft_argv() {
+        let socket_path = phase10_test_socket_path("ks");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize")
+        .with_wg_listen_port(51820);
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("killswitch apply should succeed against the capture helper");
+        DataplaneSystem::apply_nat_forwarding(
+            &mut system,
+            false,
+            ExitMode::FullTunnel,
+            false,
+            "10.6.0.0/16",
+        )
+        .expect("nat apply should succeed against the capture helper");
+        DataplaneSystem::apply_dns_protection(&mut system)
+            .expect("dns apply should succeed against the capture helper");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Matcher-side expectations (the SAME builders assert_firewall_ruleset
+        // consumes), paired with the chain the matcher searches for them in.
+        let expectations: Vec<(&str, Vec<String>)> = vec![
+            ("killswitch", LinuxCommandSystem::loopback_accept_tokens()),
+            (
+                "killswitch",
+                LinuxCommandSystem::established_related_accept_tokens(),
+            ),
+            (
+                "killswitch",
+                LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
+            ),
+            (
+                "killswitch",
+                LinuxCommandSystem::wg_listen_port_allow_tokens("dport", "enp0s9", 51820),
+            ),
+            (
+                "killswitch",
+                LinuxCommandSystem::wg_listen_port_allow_tokens("sport", "enp0s9", 51820),
+            ),
+            (
+                "killswitch",
+                LinuxCommandSystem::killswitch_egress_allow_tokens("enp0s9"),
+            ),
+            (
+                "killswitch",
+                LinuxCommandSystem::dns_off_tunnel_drop_tokens("udp", "rustynet0"),
+            ),
+            (
+                "killswitch",
+                LinuxCommandSystem::dns_off_tunnel_drop_tokens("tcp", "rustynet0"),
+            ),
+            ("killswitch", LinuxCommandSystem::dns_accept_tokens("udp")),
+            ("killswitch", LinuxCommandSystem::dns_accept_tokens("tcp")),
+            (
+                "forward",
+                LinuxCommandSystem::established_related_accept_tokens(),
+            ),
+            (
+                "forward",
+                LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9"),
+            ),
+            (
+                "forward",
+                LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0"),
+            ),
+        ];
+        for (chain, tokens) in expectations {
+            let chain_argv: Vec<String> = command_log
+                .iter()
+                .filter(|cmd| {
+                    cmd.contains(" add rule inet ") && cmd.contains(&format!(" {chain} "))
+                })
+                .cloned()
+                .collect();
+            let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            assert!(
+                LinuxCommandSystem::chain_contains_all_tokens(&chain_argv, &borrowed),
+                "matcher token set must appear in the emitted {chain}-chain nft argv: \
+                 tokens={borrowed:?} chain_argv={chain_argv:?}"
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn fail_closed_management_allow_rules_preserve_inbound_and_outbound_ssh() {
@@ -15882,6 +16123,66 @@ mod tests {
         assert!(rules.contains("pass out quick on utun9 inet proto tcp to any port 53 keep state"));
         assert!(rules.contains("block drop out quick inet proto udp to any port 53"));
         assert!(rules.contains("block drop out quick inet proto tcp to any port 53"));
+    }
+
+    /// QH-29: generator↔matcher agreement for the macOS killswitch anchor.
+    /// Renders the REAL pf ruleset via `render_pf_rules` and checks it
+    /// satisfies every expectation `MacosCommandSystem::assert_killswitch`
+    /// enforces against the LIVE `pfctl -s rules` output: the shared
+    /// `MACOS_PF_TERMINAL_BLOCK_RULE` constant (used verbatim by BOTH the
+    /// renderer and the matcher) must be the LAST rule, the loopback pass
+    /// must exist, and the DNS matcher (`ruleset_contains_dns_rule` with the
+    /// matcher's exact argument shapes) must accept the rendered dns_protected
+    /// pass/block pairs. A renderer change that breaks the matcher now fails
+    /// this test instead of silently weakening a live fail-closed check.
+    #[test]
+    fn macos_rendered_rules_satisfy_assert_killswitch_expectations() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.dns_protected = true;
+        let rules = system
+            .render_pf_rules(false)
+            .expect("rule render should succeed");
+
+        let last_line = rules.lines().last().expect("rendered rules are non-empty");
+        assert_eq!(
+            last_line, MACOS_PF_TERMINAL_BLOCK_RULE,
+            "the terminal default-deny rule must be the LAST rule in the anchor"
+        );
+        assert!(
+            rules.contains("pass quick on lo0 all"),
+            "loopback pass rule must render"
+        );
+        for proto in ["udp", "tcp"] {
+            assert!(
+                MacosCommandSystem::ruleset_contains_dns_rule(
+                    &rules,
+                    "pass out quick",
+                    proto,
+                    Some("utun9"),
+                ),
+                "matcher must accept the rendered on-tunnel {proto} :53 pass rule"
+            );
+            assert!(
+                MacosCommandSystem::ruleset_contains_dns_rule(
+                    &rules,
+                    "block drop out quick",
+                    proto,
+                    None,
+                ),
+                "matcher must accept the rendered off-tunnel {proto} :53 block rule"
+            );
+        }
+        // Negative control: a direction the renderer never emits must not match.
+        assert!(
+            !MacosCommandSystem::ruleset_contains_dns_rule(
+                &rules,
+                "pass in quick",
+                "udp",
+                Some("utun9"),
+            ),
+            "mutated action token must not match any rendered rule"
+        );
     }
 
     #[test]
