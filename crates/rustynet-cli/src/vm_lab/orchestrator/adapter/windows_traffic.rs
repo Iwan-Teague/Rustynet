@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
     WINDOWS_RELAY_SERVICE_NAME, WINDOWS_SERVICE_NAME, WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
@@ -236,33 +237,35 @@ pub fn assert_exit_actively_serving(conn: &NodeConnection) -> Result<(), Adapter
     }
 }
 
-/// On the Windows exit, assert that THIS exit's WinNAT is translating **some**
+/// On the Windows exit, assert that THIS exit's WinNAT is translating a
 /// mesh-range (`100.64.0.0/10`, i.e. first octet 100, second 64–127) source
-/// address outbound. Retries internally to cover the client's full-tunnel
-/// convergence + the probe window.
+/// address outbound, and return the concrete observed pair as evidence (QH-25).
+/// Retries internally to cover the client's full-tunnel convergence + the probe
+/// window.
 ///
-/// Scope of the claim — stated precisely, because it is weaker than
-/// "client egress is proven" and has been described that way before:
+/// Scope of the claim — stated precisely:
 /// * It IS this exit's NAT: `Get-NetNatSession` is queried on the exit host, so
 ///   a translating session here means traffic egressed through this node.
-/// * It is a **range check, not an identity check.** Any source in
-///   `100.64.0.0/10` satisfies it, so it does not establish *which* peer's
-///   traffic egressed, and in a multi-client topology it cannot attribute the
-///   session to the client the stage just probed. With exactly one non-exit node
+/// * **Identity check when `expected_client_mesh_addr` is supplied** (QH-25):
+///   only a session whose `InternalSourceAddress` equals that address is
+///   accepted, which proves THE probed client's traffic egressed here. A
+///   mesh-range session from a different client is rejected and the retry loop
+///   keeps waiting.
+/// * Without an expected address it remains a **range check, not an identity
+///   check**: any source in `100.64.0.0/10` satisfies it, so it does not
+///   establish *which* peer's traffic egressed. With exactly one non-exit node
 ///   it is unambiguous; beyond that, treat it as "a mesh peer egressed here".
 /// * It does not distinguish a session created by the stage's own probe from a
 ///   pre-existing one, so it is evidence of NAT translation being live rather
 ///   than of the probe specifically having caused it.
 ///
-/// Tightening this to an identity check means threading the client's mesh
-/// address through the `NodeAdapter::assert_mesh_client_nat_session` trait
-/// method and both OS implementations; deliberately not done here so the
-/// signature change is scheduled rather than smuggled into a bug fix.
-///
 /// The success output carries the concrete pair
-/// (`OK nat_session <internal> -> <external>`) so the caller can report the
-/// observed addresses as evidence instead of a bare verdict.
-pub fn assert_mesh_client_nat_session(conn: &NodeConnection) -> Result<(), AdapterError> {
+/// (`OK nat_session <internal> -> <external>`), parsed in Rust and returned as
+/// the evidence — not a bare verdict.
+pub fn assert_mesh_client_nat_session(
+    conn: &NodeConnection,
+    expected_client_mesh_addr: Option<&str>,
+) -> Result<MeshClientNatSession, AdapterError> {
     let script = "$found = $false; $seen = ''; \
          for ($i = 0; $i -lt 10 -and -not $found; $i++) { \
              $s = @(Get-NetNatSession -EA SilentlyContinue | Where-Object { \
@@ -273,15 +276,53 @@ pub fn assert_mesh_client_nat_session(conn: &NodeConnection) -> Result<(), Adapt
          }; \
          if ($found) { Write-Output ('OK nat_session ' + $seen) } \
          else { Write-Output 'FAIL: no WinNAT session translating a mesh-sourced (100.64.0.0/10) client address' }";
-    let out = run_remote_ps(conn, script, MEDIUM_TIMEOUT)?;
-    let out = out.trim();
-    if out.starts_with("OK") {
-        Ok(())
-    } else {
-        Err(AdapterError::Protocol {
-            message: format!("Windows exit shows no client-egress NAT session: {out}"),
-        })
+    // The expected client mesh address is deliberately applied in Rust, not
+    // interpolated into the script: the range filter stays a fixed literal (no
+    // injection surface) and the identity match re-uses the same parsed pair.
+    let mut last_out = String::new();
+    for attempt in 0..10 {
+        let out = run_remote_ps(conn, script, MEDIUM_TIMEOUT)?;
+        let trimmed = out.trim().to_owned();
+        if let Some(session) = parse_winnat_nat_session_line(&trimmed) {
+            let identity_matched =
+                expected_client_mesh_addr.is_none_or(|expected| session.client_source == expected);
+            if identity_matched {
+                return Ok(session);
+            }
+            // A mesh-range session exists but belongs to a different client;
+            // keep retrying — the stage's probe traffic may not have converged.
+        }
+        last_out = trimmed;
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(1500));
+        }
     }
+    let message = match (expected_client_mesh_addr, last_out.starts_with("OK")) {
+        (Some(expected), true) => format!(
+            "Windows exit shows a WinNAT session but not for the expected client mesh address \
+             {expected}: {last_out}"
+        ),
+        _ => format!("Windows exit shows no client-egress NAT session: {last_out}"),
+    };
+    Err(AdapterError::Protocol { message })
+}
+
+/// Parse the success line the inline script prints —
+/// `OK nat_session <InternalSourceAddress> -> <ExternalDestinationAddress>` —
+/// into the concrete evidence pair. Returns `None` for anything else (the
+/// `FAIL:` line, garbage, empty output), so the caller keeps retrying.
+fn parse_winnat_nat_session_line(out: &str) -> Option<MeshClientNatSession> {
+    let payload = out.lines().find(|l| l.starts_with("OK nat_session "))?;
+    let pair = payload.strip_prefix("OK nat_session ")?;
+    let (client_source, translated_side) = pair.split_once(" -> ")?;
+    if client_source.is_empty() || translated_side.is_empty() {
+        return None;
+    }
+    Some(MeshClientNatSession {
+        client_source: client_source.to_owned(),
+        translated_side: translated_side.to_owned(),
+        observed_via: "winnat",
+    })
 }
 
 /// Build the remote PowerShell that archives the Windows diagnostic logs,
@@ -1088,6 +1129,33 @@ fn verify_no_key_material_zip(path: &Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_winnat_nat_session_line_returns_concrete_pair() {
+        // QH-25: the OK line parses into the evidence pair, not a bare verdict.
+        let session = parse_winnat_nat_session_line("OK nat_session 100.64.0.3 -> 203.0.113.9")
+            .expect("OK line must parse");
+        assert_eq!(session.client_source, "100.64.0.3");
+        assert_eq!(session.translated_side, "203.0.113.9");
+        assert_eq!(session.observed_via, "winnat");
+    }
+
+    #[test]
+    fn parse_winnat_nat_session_line_fails_closed_on_non_ok_output() {
+        // The FAIL line from the inline script parses to nothing.
+        assert!(
+            parse_winnat_nat_session_line(
+                "FAIL: no WinNAT session translating a mesh-sourced (100.64.0.0/10) client address"
+            )
+            .is_none()
+        );
+        // Empty / garbage / malformed pair syntax also parse to nothing.
+        assert!(parse_winnat_nat_session_line("").is_none());
+        assert!(parse_winnat_nat_session_line("garbage").is_none());
+        assert!(parse_winnat_nat_session_line("OK nat_session 100.64.0.3").is_none());
+        // An empty half of the pair is not evidence.
+        assert!(parse_winnat_nat_session_line("OK nat_session  -> 203.0.113.9").is_none());
+    }
 
     /// Regression guard for the QH-21 failure-path defect: under
     /// `Set-StrictMode -Version Latest`, `.Count` on a non-collection throws
