@@ -1829,4 +1829,76 @@ mod tests {
     fn loopback_target(local_addr: SocketAddr) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], local_addr.port()))
     }
+
+    // Fail-closed pin for `reject_round_trip_target`: an authoritative
+    // transport round trip aimed at a CONFIGURED peer's endpoint must be
+    // refused — that check is exactly `engine.has_endpoint`, which since the
+    // P4 endpoint reverse index is a `contains_key` on the index rather than
+    // the old linear `peer_states` scan. This test pins that the fail-closed
+    // behavior survived the index swap, and that removing the peer retires
+    // the indexed answer in lockstep (the check must stop firing).
+    #[test]
+    fn authoritative_round_trip_rejects_a_configured_peer_endpoint_fail_closed() {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+
+        let (mut state, _tun_state, _key) = test_runtime_state("utun-reject-rt");
+        let peer_endpoint: SocketAddr = "203.0.113.77:51820".parse().expect("addr");
+        let node_id = NodeId::new("peer-target").expect("node id");
+        state
+            .engine
+            .configure_peer(&PeerConfig {
+                node_id: node_id.clone(),
+                endpoint: SocketEndpoint {
+                    addr: peer_endpoint.ip(),
+                    port: peer_endpoint.port(),
+                },
+                public_key: [0x33; 32],
+                allowed_ips: vec!["100.64.11.0/24".to_owned()],
+                persistent_keepalive_secs: None,
+            })
+            .expect("peer configures");
+
+        // With the peer configured, a round trip at its endpoint must be
+        // rejected by the endpoint-match check specifically.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        state.start_authoritative_round_trip(
+            peer_endpoint,
+            b"probe".to_vec(),
+            std::time::Duration::from_millis(100),
+            tx,
+        );
+        let err = rx
+            .recv()
+            .expect("reply delivered")
+            .expect_err("round trip at a peer endpoint must be rejected");
+        assert!(
+            err.to_string()
+                .contains("matches a configured peer endpoint"),
+            "unexpected rejection reason: {err}"
+        );
+
+        // After the peer is removed, the same target must no longer be
+        // rejected by THIS check — the index entry is retired in lockstep
+        // with `peer_states`. The round trip may then proceed (no worker is
+        // running to deliver a response) or fail on the socket; both are
+        // fine, only the endpoint-match rejection would be wrong. A
+        // recv_timeout bounds the wait because with no worker loop nothing
+        // answers the timeout expiry either.
+        assert!(state.engine.remove_peer(&node_id));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        state.start_authoritative_round_trip(
+            peer_endpoint,
+            b"probe".to_vec(),
+            std::time::Duration::from_millis(100),
+            tx,
+        );
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(err)) => assert!(
+                !err.to_string()
+                    .contains("matches a configured peer endpoint"),
+                "endpoint-match rejection must not fire after the peer was removed: {err}"
+            ),
+        }
+    }
 }
