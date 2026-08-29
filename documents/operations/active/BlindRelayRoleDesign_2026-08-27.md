@@ -4,6 +4,58 @@
 or live-proven. No code, schema, platform claim, evidence date, or release claim is
 created by this document.
 
+> **2026-08-29 — phase 4 (relay-side v2 admission listener + PoP runtime
+> sequencing) landed.** The §2.2(f) ten-step admission order is implemented in
+> a new `rustynet-relay` module `blind_relay_listener.rs`, v2-ONLY (design §0
+> item 5 — no v1 fallback, no translation, no dual-mode listener; the v1
+> transport is untouched): 1. bounded datagram size + exact phase-3 envelope
+> parse (no crypto); 2. per-source-prefix pre-auth rate limit with an
+> identity-free /24 (IPv4) or /48 (IPv6) key — deliberately NOT the v1
+> per-node-id limiter key, since v2 carries no node_id — bounded-map
+> fail-closed exactly like the v1 `HelloLimiter` (RSA-0037); 3. the stateless
+> §2.2(d) address-validation artifact verified (HMAC-SHA256 under a rotating
+> `AddressValidationKeyRing`, zeroized keys, bounded forward-only epochs)
+> BEFORE any session/circuit allocation; 4. issuer key-id allowlist +
+> `verify_strict`; 5. audience/kind/scope/profile policy checks (version,
+> canonical fields, degenerate values, and slot already pinned by the parser);
+> 6. usable clock (RLY-15 — an unusable clock is a reject, never a default),
+> not-before/future-date, expiry, TTL; 7. PoP transcript `verify_strict`
+> against the token presenter key; 8. durable digest-keyed replay store —
+> keys exactly `sha256("v2"|privacy_epoch|nonce|leg_handle)` per §3 plus two
+> defense-in-depth domains (nonce-within-epoch, presented PoP triple),
+> insert-then-persist with full rollback, RLY-15 clock refusal, retention
+> `TTL + 2*skew + 1` const-asserted, hard byte cap (4 MiB → ~61k entries)
+> whose exhaustion REJECTS ADMISSION without evicting live entries (BR-C11),
+> corrupt store refuses listener open (never TOFU re-init), memory-only
+> mode deliberately absent; 9. global / per-source-prefix / per-profile
+> waiting-leg caps; 10. atomic three-digest commit then bounded waiting-leg
+> allocation, with the §7.6 pairing decision (complementary slot, matching
+> profile+expiry, distinct leg handle, distinct presenter key, distinct
+> observed tuple — self-pair/anti-hijack per BR-C13). Cheap-before-expensive
+> is structural and test-witnessed via a `BlindAdmissionStage` observer:
+> malformed or oversize frames produce zero crypto calls, and the rate limit
+> sheds before the HMAC. Where the selection was open, strictest choice: the
+> §7.5 address-validation artifact rides INSIDE the fixed 32-byte
+> `relay_challenge` slot (already reserved for it by the phase-3 landing) as
+> `epoch:u32 BE | expiry:u64 BE | truncated HMAC tag:20` — a 160-bit tag
+> (QUIC Retry uses 128) is proportionate for an anti-amplification token, so
+> the landed v2 wire format is unchanged. 26 in-tree negative/ordering tests
+> cover every step's rejection, the cheap-before-expensive ordering, replay
+> (exact, nonce-reuse), the full store, corrupt store, cross-circuit PoP
+> digests, pairing violations, the v1 refusal, and the key ring.
+>
+> **GO-LIVE GATE — INDEPENDENT ADVERSARIAL REVIEW STILL REQUIRED.** The
+> listener is implemented but CANNOT open in production:
+> `BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED` is a compile-time `false`
+> const, and `BlindRelayListener::try_open` additionally requires BOTH the
+> signed-state capability (still unadvertisable per the phase-1 refusals)
+> AND an explicit operator flag; a pinned test fails if the const is flipped
+> without the review. Per design §16 and protocol-selection §6, the
+> independent adversarial review of the composition remains THE gate before
+> `blind_relay` may be advertised by production signed state or any live
+> cell goes green. This landing does not open production advertisement, does
+> not touch v1 behavior, and adds no fleet-bundle publication.
+
 > **2026-08-29 — phase 3 (v2 wire format: token/hello/fleet + PoP transcript)
 > landed.** The §16 items 1–3 selections from
 > `BlindRelayProtocolSelection_2026-08-28.md` are implemented in

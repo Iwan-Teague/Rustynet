@@ -1,11 +1,19 @@
 #![forbid(unsafe_code)]
 
+pub mod blind_relay_listener;
 #[cfg(feature = "daemon")]
 pub mod hello_limiter_audit;
 pub mod rate_limit;
 pub mod session;
 pub mod transport;
 
+pub use blind_relay_listener::{
+    AddressArtifactError, AddressValidationKeyRing, BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED,
+    BlindAdmissionOutcome, BlindAdmissionStage, BlindCircuitKey, BlindListenerOpenError,
+    BlindNoopObserver, BlindRejectReason, BlindRelayListener, BlindRelayListenerConfig,
+    BlindRelayListenerLimits, blind_replay_digest_leg, blind_replay_digest_nonce,
+    blind_replay_digest_pop,
+};
 pub use rate_limit::RateLimiter;
 pub use session::{RelaySession, SessionId};
 pub use transport::{
