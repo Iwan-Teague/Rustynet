@@ -340,6 +340,20 @@ Assignment expiry while the parent policy remains desired ON is containment,
 not fallback. Assignment removal caused by signed OFF restores the ordinary
 Rustynet DNS posture after the deactivation barrier.
 
+> **Disposition (2026-08-29, tandem phase 2 / D-6b):** the control-plane
+> resolver-assignment decision is wired in
+> `crates/rustynet-control/src/managed_dns_handoff.rs`
+> (`managed_dns_handoff_decision`): `Active` plus proven scope, exit
+> assignment, readiness, and a mesh-range-contained endpoint hands out the
+> RustyDNS mesh IP; every failing predicate contains with its §11 reason and
+> nothing falls back to a non-tandem resolver; signed OFF, prepare-only
+> phases, draining, and unselected NodeIds produce no assignment. The
+> resolver mesh address is **not** carried in signed wire format yet — that
+> carriage is an owner/security-gated decision (same class as blind-relay
+> §16 and phase-1 notes §3.2), so the endpoint is an abstract typed input.
+> Details, flagged sub-decisions, and verification:
+> `RustydnsTandemPhase2Notes_2026-08-29.md`.
+
 ### 5.6 Identity snapshot contract
 
 RustyDNS cannot trust an EDNS option, source header, QNAME, reverse DNS, or
