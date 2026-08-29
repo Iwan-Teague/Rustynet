@@ -1744,8 +1744,26 @@ impl LinuxCommandSystem {
     }
 
     /// Killswitch + forward: allow established/related traffic.
+    ///
+    /// These tokens feed TWO consumers that must agree (QH-29): the
+    /// `nft add rule` argv sent through the privileged helper, and the
+    /// fail-closed chain assertions. They are therefore ONE WORD PER ARGV
+    /// ELEMENT, never a multi-word phrase: the helper's argv allowlist
+    /// matches nft keywords as individual tokens (`"ct"`, `"state"`,
+    /// `"established,related"`), and a phrase-shaped element
+    /// (`"ct state established,related"`) renders identically in a
+    /// `join(" ")` echo while being refused by every allowlist arm — which
+    /// is exactly how the QH-29 refactor (f1b40e9e) briefly broke every
+    /// Linux reconcile apply live (2026-08-29 run: permanent restriction,
+    /// no `rustynet0`, managed-DNS oneshot timeout, NotRunning shutdown
+    /// residue on both Debian nodes).
     fn established_related_accept_tokens() -> Vec<String> {
-        vec!["ct state established,related".into(), "accept".into()]
+        vec![
+            "ct".into(),
+            "state".into(),
+            "established,related".into(),
+            "accept".into(),
+        ]
     }
 
     /// Killswitch: allow anything leaving via the tunnel interface.
@@ -15488,6 +15506,115 @@ mod tests {
                  tokens={borrowed:?} chain_argv={chain_argv:?}"
             );
         }
+    }
+
+    /// QH-29 regression pin for the 2026-08-29 live-lab failure: a shared
+    /// builder may NEVER emit a token carrying internal whitespace. The
+    /// emitters splice these tokens into a real `nft add rule` argv, where
+    /// each element must be ONE nft keyword — the privileged helper's
+    /// allowlist matches per-token literals, and a phrase-shaped element
+    /// (`"ct state established,related"`) is refused even though its
+    /// `join(" ")` rendering looks byte-identical to the accepted spelling
+    /// in any log. The substring-based pairing test above cannot see this
+    /// class of defect (the joined phrase still matches as a substring),
+    /// which is exactly how `established_related_accept_tokens` shipped a
+    /// phrase token and broke every Linux dataplane apply live.
+    #[test]
+    fn nft_rule_builder_tokens_never_carry_internal_whitespace() {
+        let builder_sets: Vec<(&str, Vec<String>)> = vec![
+            ("loopback", LinuxCommandSystem::loopback_accept_tokens()),
+            (
+                "established_related",
+                LinuxCommandSystem::established_related_accept_tokens(),
+            ),
+            (
+                "tunnel_interface",
+                LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
+            ),
+            (
+                "egress_allow",
+                LinuxCommandSystem::killswitch_egress_allow_tokens("enp0s9"),
+            ),
+            (
+                "wg_dport",
+                LinuxCommandSystem::wg_listen_port_allow_tokens("dport", "enp0s9", 51820),
+            ),
+            (
+                "wg_sport",
+                LinuxCommandSystem::wg_listen_port_allow_tokens("sport", "enp0s9", 51820),
+            ),
+            (
+                "dns_off_tunnel_drop_udp",
+                LinuxCommandSystem::dns_off_tunnel_drop_tokens("udp", "rustynet0"),
+            ),
+            (
+                "dns_off_tunnel_drop_tcp",
+                LinuxCommandSystem::dns_off_tunnel_drop_tokens("tcp", "rustynet0"),
+            ),
+            (
+                "dns_accept_udp",
+                LinuxCommandSystem::dns_accept_tokens("udp"),
+            ),
+            (
+                "dns_accept_tcp",
+                LinuxCommandSystem::dns_accept_tokens("tcp"),
+            ),
+            (
+                "forward_tunnel_to_egress",
+                LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9"),
+            ),
+            (
+                "forward_hairpin",
+                LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0"),
+            ),
+            (
+                "nat_egress_masquerade",
+                LinuxCommandSystem::nat_egress_masquerade_tokens("enp0s9"),
+            ),
+            (
+                "nat_hairpin_masquerade",
+                LinuxCommandSystem::nat_hairpin_masquerade_tokens("rustynet0"),
+            ),
+        ];
+        for (name, tokens) in builder_sets {
+            for token in tokens {
+                assert!(
+                    !token.chars().any(char::is_whitespace),
+                    "nft rule builder {name} emitted a token with internal \
+                     whitespace ({token:?}); the privileged-helper argv \
+                     allowlist matches per-token nft keywords and would \
+                     refuse the rule"
+                );
+            }
+        }
+    }
+
+    /// Pins the established/related killswitch rule's FULL argv to the exact
+    /// shape the privileged-helper allowlist accepts, so an emitter-side
+    /// regression fails this test instead of every Linux reconcile apply.
+    #[test]
+    fn established_related_rule_argv_is_helper_allowlist_shaped() {
+        let argv = LinuxCommandSystem::nft_add_rule_argv(
+            "inet",
+            "rustynet_g1",
+            "killswitch",
+            &LinuxCommandSystem::established_related_accept_tokens(),
+            &[],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "ct",
+                "state",
+                "established,related",
+                "accept"
+            ]
+        );
     }
 
     #[cfg(target_os = "linux")]
