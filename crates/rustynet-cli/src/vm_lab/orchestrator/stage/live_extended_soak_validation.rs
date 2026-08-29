@@ -76,6 +76,30 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
     // CIDR is exactly the wedge class QH-57 documents. Fail closed instead.
     let ssh_allow_cidrs = soak_ssh_allow_cidrs(&ctx.ssh_allow_cidrs)?;
 
+    // QH-09: each substep's binary writes its own complete log via --log-path;
+    // thread that path into the failure formatter so a clipped summary names
+    // the unclipped sidecar instead of reading as evidence loss.
+    let two_hop_pre_log = ctx
+        .report_dir
+        .join("live_linux_two_hop_soak_pre_reboot.log")
+        .to_string_lossy()
+        .into_owned();
+    let exit_handoff_log = ctx
+        .report_dir
+        .join("live_linux_exit_handoff_soak.log")
+        .to_string_lossy()
+        .into_owned();
+    let lan_toggle_log = ctx
+        .report_dir
+        .join("live_linux_lan_toggle_soak.log")
+        .to_string_lossy()
+        .into_owned();
+    let reboot_recovery_log = ctx
+        .report_dir
+        .join("live_linux_reboot_recovery.log")
+        .to_string_lossy()
+        .into_owned();
+
     run_substep(
         "extended_soak pre-reboot two-hop",
         cargo_bin_command(
@@ -109,12 +133,10 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
                     .to_string_lossy()
                     .into_owned(),
                 "--log-path".to_owned(),
-                ctx.report_dir
-                    .join("live_linux_two_hop_soak_pre_reboot.log")
-                    .to_string_lossy()
-                    .into_owned(),
+                two_hop_pre_log.clone(),
             ],
         ),
+        &two_hop_pre_log,
     )?;
 
     run_substep(
@@ -152,10 +174,7 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
                     .to_string_lossy()
                     .into_owned(),
                 "--log-path".to_owned(),
-                ctx.report_dir
-                    .join("live_linux_exit_handoff_soak.log")
-                    .to_string_lossy()
-                    .into_owned(),
+                exit_handoff_log.clone(),
                 "--monitor-log".to_owned(),
                 ctx.report_dir
                     .join("live_linux_exit_handoff_soak_monitor.log")
@@ -163,6 +182,7 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
                     .into_owned(),
             ],
         ),
+        &exit_handoff_log,
     )?;
 
     run_substep(
@@ -194,12 +214,10 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
                     .to_string_lossy()
                     .into_owned(),
                 "--log-path".to_owned(),
-                ctx.report_dir
-                    .join("live_linux_lan_toggle_soak.log")
-                    .to_string_lossy()
-                    .into_owned(),
+                lan_toggle_log.clone(),
             ],
         ),
+        &lan_toggle_log,
     )?;
 
     run_substep(
@@ -235,12 +253,10 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
                     .to_string_lossy()
                     .into_owned(),
                 "--log-path".to_owned(),
-                ctx.report_dir
-                    .join("live_linux_reboot_recovery.log")
-                    .to_string_lossy()
-                    .into_owned(),
+                reboot_recovery_log.clone(),
             ],
         ),
+        &reboot_recovery_log,
     )
 }
 
@@ -267,24 +283,27 @@ fn cargo_bin_command(bin: &str, extra_args: Vec<String>) -> Command {
     command
 }
 
-fn run_substep(label: &str, mut command: Command) -> Result<(), String> {
+fn run_substep(label: &str, mut command: Command, full_log: &str) -> Result<(), String> {
     match command.output() {
         Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(format_substep_failure(label, &output)),
+        Ok(output) => Err(format_substep_failure(label, &output, Some(full_log))),
         Err(err) => Err(format!("{label}: invocation failed: {err}")),
     }
 }
 
-fn format_substep_failure(label: &str, output: &Output) -> String {
+fn format_substep_failure(label: &str, output: &Output, full_log: Option<&str>) -> String {
     // Was: stdout only when stderr is empty. That is not enough — the guest's
     // cause arrives on stdout while the wrapper's terse message goes to
     // stderr, so a non-empty stderr (the common case) hid the cause. Surface
-    // both; see `format_stage_binary_failure`.
-    crate::vm_lab::orchestrator::stage::format_stage_binary_failure(
+    // both; see `format_stage_binary_failure`. QH-09: the substep binary's own
+    // complete log (--log-path) is named when the summary is clipped, so the
+    // disclosure never reads as evidence loss.
+    crate::vm_lab::orchestrator::stage::format_stage_binary_failure_with_log(
         label,
         output.status,
         &output.stdout,
         &output.stderr,
+        full_log,
     )
 }
 
@@ -411,9 +430,35 @@ mod tests {
             .args(["-c", "printf problem >&2; exit 7"])
             .output()
             .expect("shell output");
-        let msg = format_substep_failure("label", &output);
+        let msg = format_substep_failure("label", &output, Some("soak.log"));
         assert!(msg.contains("label"));
         assert!(msg.contains("problem"));
         assert!(msg.contains("exit status: 7"));
+    }
+
+    #[test]
+    fn a_clipped_substep_failure_names_the_sidecar_log() {
+        // QH-09: when the summary is clipped, the disclosure must point at the
+        // complete unclipped log instead of reading as evidence loss.
+        let mut noisy = vec![b'y'; 6000];
+        noisy.extend_from_slice(b"THE SOAK ERROR");
+        let output = Command::new("sh")
+            .args(["-c", "cat; exit 9"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write as _;
+                child.stdin.as_mut().expect("stdin").write_all(&noisy)?;
+                child.wait_with_output()
+            })
+            .expect("shell output");
+        let msg = format_substep_failure("soak substep", &output, Some("live_two_hop_soak.log"));
+        assert!(msg.contains("clipped"), "{msg}");
+        assert!(
+            msg.contains("complete unclipped output: live_two_hop_soak.log"),
+            "the clipped summary must name the sidecar: {msg}"
+        );
     }
 }

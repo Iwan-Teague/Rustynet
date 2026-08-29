@@ -632,6 +632,75 @@ committed in, removing the class rather than relying on everyone remembering.
 **Severity: medium. Confidence: VERIFIED for the stage log; other sites UNAUDITED.**
 **Status: a fix for the stage-log site is already assigned (sidecar spill).**
 
+**Disposition 2026-08-29 — FIXED across all stage sites; the disclosure now names
+its sidecar everywhere a complete copy exists.**
+
+Sites fixed (each was calling the bare `format_stage_binary_failure` while the
+invocation already passed `--log-path`, so the clip disclosure hid a sidecar it
+had in hand; all now call `format_stage_binary_failure_with_log` and the clipped
+summary reads "; complete unclipped output: <path>"):
+
+- `vm_lab/orchestrator/stage/live_two_hop_validation.rs` — already fixed
+  (2026-07-25), the reference implementation.
+- `vm_lab/orchestrator/stage/live_reboot_recovery_validation.rs`
+- `vm_lab/orchestrator/stage/live_key_custody_validation.rs`
+- `vm_lab/orchestrator/stage/live_secrets_not_in_logs_validation.rs`
+- `vm_lab/orchestrator/stage/live_network_flap_validation.rs`
+- `vm_lab/orchestrator/stage/live_managed_dns_validation.rs`
+- `vm_lab/orchestrator/stage/live_lan_toggle_validation.rs`
+- `vm_lab/orchestrator/stage/live_mixed_topology_validation.rs`
+- `vm_lab/orchestrator/stage/live_enrollment_restart_validation.rs`
+- `vm_lab/orchestrator/stage/live_extended_soak_validation.rs` — all four soak
+  substeps (two-hop pre-reboot, exit-handoff, lan-toggle, reboot-recovery) now
+  thread their `--log-path` through `run_substep`/`format_substep_failure`.
+
+Also fixed in the same shape: `vm_lab/orchestrator/evidence.rs` (stage finish)
+printed a 200-char first-line brief of the summary to the console while the full
+text went to the per-stage log; the console line now names that log
+("(complete stage log: <path>)") so the brief is never read as the whole
+evidence.
+
+Verification: `cargo test -p rustynet-cli --lib --all-features` —
+`failure_format_tests` (6) + `substep_failure_surfaces_stderr` +
+`a_clipped_substep_failure_names_the_sidecar_log` (new) pass; clippy
+`-p rustynet-cli --all-targets --all-features --locked -- -D warnings` clean.
+
+**Audit: truncation WITHOUT a complete copy elsewhere (residual, flagged — not
+fixed here).** These clip or head-truncate command output and no full copy is
+written anywhere; the extract IS the whole evidence:
+
+1. `vm_lab/orchestrator/adapter/ssh.rs` — the adapter command-failure summary
+   tail-clips `stdout` to 800/400 chars and `stderr` to 600 (`tail_chars`,
+   `ssh.rs:39-50`), and caps the decoded PowerShell CLIXML error at
+   `POWERSHELL_ERROR_RENDER_LIMIT = 1200` (`ssh.rs:18`, `ssh.rs:126-130`) — all
+   silently, and its own comment admits "the raw form has nowhere else to
+   survive". The Rust `--node` engine's per-stage log is written FROM this
+   summary (`evidence.rs`), so what is clipped here is lost. Fix shape: have
+   the adapter error path spill the raw streams to a sidecar file in the report
+   directory and name it, exactly as the stage binaries do with `--log-path`.
+2. Same class, smaller: the in-process stages that extract a bounded snippet of
+   a failed command's stderr with no sidecar — `stderr_snippet` head-clips to
+   500 chars in `stage/chaos.rs:239-247`, `stage/live_anchor.rs:205-213`, and
+   `stage/cross_network.rs:1450-1458`; `adapter/node_adapter.rs:31-33` clips
+   reconcile/error lines to 400; `role_validation/relay.rs:589` and
+   `role_validation/anchor.rs:180` clip to 200. These extracts become the
+   stage log content via `evidence.rs` (an in-process stage's outcome detail
+   IS the log content), so anything past the bound is destroyed.
+
+Reviewed, no change needed (truncation disclosed or display-only):
+`capability.rs` `SANITIZED_TRUNCATION_SUFFIX` (deterministic inline marker on
+untrusted guest observations), `network_audit.rs:1248` (truncation disclosed in
+separate artifact fields per QH-42), `run_history.rs truncate_key` (display
+trim of a stable key stored in full in the history record), `evidence.rs`
+stage-log writer (writes the FULL summary; only the console echo is brief, now
+with a pointer), and the MCP servers' `truncate_output`/`truncate_tail`
+(tools name their own sidecar log paths / `tail_job_log`).
+
+QH-09 is CLOSED for the disclosure fix; items 1-2 above remain open as
+evidence-gap follow-ups (severities: item 1 medium — adapter failure evidence
+can be destroyed; item 2 low).
+
+
 ★ **THIS ITEM WAS SUBSTANTIALLY WRONG AND IS CORRECTED BELOW. The wrong version is
 kept visible because it is the alarming one and would otherwise be re-derived.**
 
