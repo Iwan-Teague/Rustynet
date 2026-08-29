@@ -1311,3 +1311,113 @@ Architecture/security reviewers should accept only if every answer is “yes”:
 - [RFC 9614 — Partitioning as an Architecture for Privacy](https://www.rfc-editor.org/rfc/rfc9614.html)
 - [RFC 8747 — Proof-of-Possession Key Semantics for CWTs](https://www.rfc-editor.org/rfc/rfc8747.html)
 - [RFC 9000 — QUIC Transport, address validation](https://www.rfc-editor.org/rfc/rfc9000.html)
+
+### Go-live readiness snapshot (drafted 2026-08-29, evidence only, not a go/no-go decision)
+
+Evidence-only audit of the §16 open-decision list and the §17 design-acceptance
+checklist against the working tree at commit `eeff5ba7` (local `main`, clean).
+Neither adversarial review (`BlindRelayAdversarialReview_2026-08-29.md`,
+`BlindRelayAdversarialReview2_2026-08-29.md`) nor this snapshot flips any gate:
+`BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED` remains `false`
+(`crates/rustynet-relay/src/blind_relay_listener.rs:83`) and no go/no-go
+recommendation is made here.
+
+#### §16 open-decision items
+
+| # | Item | Status | Evidence |
+| --- | --- | --- | --- |
+| 1 | Encoding/framing selection | OPEN (proposed, unapproved) | `BlindRelayProtocolSelection_2026-08-28.md` header: "Status: PROPOSED — doc-only. Selections for §16 items 1–3"; review 2 §11: owner sign-off unmet |
+| 2 | Proof-of-possession suite | OPEN (proposed, unapproved) | Same doc §2 (v1 selection implemented in phase code, `blind_relay.rs:924–936`), still PROPOSED pending owner approval; review 2 §11 |
+| 3 | Replay persistence | OPEN (proposed, unapproved) | Same doc §3; implementation present (`BlindReplayStore`, no TOFU, full-store reject — review 2 §4), still PROPOSED pending owner approval |
+| 4 | Public privacy profiles (TTL/lifetime/limits) | OPEN | No approved selection; measurement plan only in `BlindRelayProtocolSelection_2026-08-28.md`; §16 list authoritative |
+| 5 | Operational retention | OPEN | Retention proposal exists in the selection doc; not approved |
+| 6 | Performance acceptance (baseline + p95/p99) | OPEN | Measurement plan only; no baseline/budget results recorded |
+| 7 | Stronger privacy (two-relay split-trust) | OPEN (separate decision) | §16 item 7; no document resolves it |
+
+The design-doc rule "until items 1–6 are resolved, blind_relay remains
+design-only and must not be advertised by production signed state" is still
+enforced in code: reducer blocks on `AddNode`/`SetNodeCapabilities`
+(`membership.rs:2045`, `:2077`, message "design-only; pending §16 wire-format
+sign-off") and enrollment admission refusal (`enrollment.rs`, two BlindRelay
+references incl. test).
+
+#### §17 design-acceptance checklist
+
+| # | Item | Status | Evidence |
+| --- | --- | --- | --- |
+| 1 | BR-P1 falsifiable, BR-R1 prominent | Satisfied (design + phase code) | Both reviews verdict Yes (review 2 §7, §10 #1); no identity field in v2 token/hello |
+| 2 | Adversary explicit incl. compromised relay-host | Satisfied | Design §3.1; review 2 §10 #2 |
+| 3 | No IP/timing/flow anonymity claim | Satisfied | Design §3.3; review 2 §10 #3 |
+| 4 | Same-circuit leg association admitted | Satisfied | Design §3.2/§3.3; observed tuple stored as residual (`blind_relay_listener.rs`) |
+| 5 | BlindRelay modifier requiring RelayHost + dedicated local role | Satisfied | `role_presets.rs:364` (`{ServesRelay, BlindRelay}`), `daemon.rs:1974` (`{RelayHost, BlindRelay}`) |
+| 6 | Signed state exactly {RelayHost, BlindRelay}, future co-caps rejected | Satisfied | `membership.rs:2742–2756` exact-set validator + tests `:3244–3301` |
+| 7 | Reversibility without ENR-06 hazard | Satisfied | Only `blind_exit` irreversible (`role_presets.rs:624`); blind_relay reversible (`:698`, `:733`) |
+| 8 | Transition ordering / crash recovery / residue explicit | Design yes; live-lab code/stages pending | Design §6/§13.2; reviews 1+2 both record implementation as later-phase (§14.7) |
+| 9 | Token/hello v2 eliminate identities, not hash them | Satisfied | Review 2 §7 — no identity fields exist |
+| 10 | Endpoint-bound fresh PoP keys | Satisfied | Review 2 §3; transcript binds token digest + per-circuit key |
+| 11 | Negotiation/downgrade/anti-rollback/anti-fork/replay fail-closed | Satisfied | `identity_blind ⇒ [2]` (`blind_relay.rs:1325`); acceptance check `:1598`; three replay namespaces (review 2 §4) |
+| 12 | Every control names enforcement + verification | Satisfied | Mutation-obligation tests: gate tests, stage-order witnesses, 16 vectors (review 2 §10 #12) |
+| 13 | Linux/macOS/Windows independently enforced + verified | OPEN (design yes; per-OS code §14.8 not built) | Review 2 §10 #13 "code pending"; no per-OS verifier stage exists yet |
+| 14 | UI honest, no silent fallback | Not yet applicable (no UI surface exists) | Review 2 §10 #14; cannot be judged until UI exists |
+| 15 | Remaining protocol choices clearly OPEN | Satisfied | §16 items 4–7 open, 1–3 PROPOSED; selection doc header confirms |
+| 16 | Parity-plan modification deferred | Satisfied | Parity matrix untouched pending acceptance |
+
+#### Genuinely open or ambiguous items
+
+1. **Owner sign-off on §16 items 1–3** — selections implemented in phase code
+   but the selection document remains PROPOSED; the reducer/enrollment phase-1
+   gates cannot lift without it. This is the primary blocker, unchanged since
+   both reviews.
+2. **§16 items 4–6 unresolved** — privacy profiles, retention, and performance
+   acceptance have plans but no approved values or measured budgets.
+3. **§17 item 8** — transition/residue/restart behavior is explicit in design
+   (§6) but the live stage (`blind_relay_transition_residue`, §13.2) has not
+   run; implementation deferred to §14.7.
+4. **§17 item 13** — per-OS enforcement (§14.8) unbuilt; no macOS/Windows
+   verifier evidence exists.
+5. **§17 item 14** — no UI surface exists; the item is vacuous until one does,
+   and the checklist requires "yes" — it is neither satisfied nor refutable.
+6. **§13.2 live-lab stages have never run** —
+   `blind_relay_identity_privacy`, `_protocol_negatives`, `_resource_limits`,
+   `_transition_residue`, `_revocation`, `_platform_verifier`: no live
+   evidence recorded in `live_lab_node_run_matrix.csv` for any of them.
+7. **Unpushed state** — local `main` (`eeff5ba7`) is ahead of `origin/main`
+   (`8abea28b`); the Phase A/B commits below are not yet on the public branch.
+
+#### Phase A and Phase B integrity on current main — CONFIRMED INTACT
+
+Both phases are described in `BlindRelayAdversarialReview2_2026-08-29.md`
+(§13 = Phase A defect closure, §14 = Phase B runtime wiring); the design doc
+itself does not narrate them. Verification performed at `eeff5ba7`:
+
+- **Phase A (`0e8ab840`, "Close blind_relay review defects F5 and F4 before
+  go-live") is an ancestor of `eeff5ba7`** (`git merge-base --is-ancestor`
+  confirms) and is the most recent commit touching
+  `blind_relay_listener.rs`. F5 fix present: the daemon alignment check now
+  performs the exact-set compare (`daemon.rs:2126`, `len() == 2 &&
+  contains(RelayHost) && contains(BlindRelay)`) with verification test
+  `blind_relay_membership_alignment_is_exact_set_rejecting_future_capabilities`
+  (`daemon.rs:19871`). F4 fix present: `BlindPairedCircuits` (`:887`) with
+  `MAX_BLIND_PAIRED_TRACKING_ENTRIES = 256` (`:128`), wired at construction
+  (`:1103`), with tests `post_pair_third_leg_is_quarantined_never_re_admitted`
+  (`:2406`) and `paired_tracking_is_bounded_and_expiring` (`:2505`).
+- **Phase B (`b05ae32e`, "Wire blind_relay v2 listener into relay runtime
+  (review O1/O2, gate unchanged)") is an ancestor of `eeff5ba7`.** All named
+  symbols present in `crates/rustynet-relay/src/main.rs`:
+  `build_blind_listener_config` (`:581`, called `:672`), the v2 frame
+  discriminator `is_blind_relay_hello_v2_frame` (`:534`, routed `:867–868`),
+  `handle_blind_relay_v2_frame` (`:917`), the `[0x05]` artifact-response type
+  (`:324`), and the `--blind-relay-listener` operator flag (`:3032`). Dormancy
+  tests present (`default_relay_stays_dormant_and_routes_v2_frames_as_unknown_type`,
+  `:6268`; gate-config test `:6109`).
+- **No commit after either phase touched any blind-relay code file:**
+  `git log b05ae32e..HEAD -- <the seven blind-relay source files>` returns
+  nothing, so neither phase was reverted or weakened by later work.
+- **The gate is unchanged:** `BLIND_RELAY_V2_ADVERSARIAL_REVIEW_APPROVED:
+  bool = false` (`blind_relay_listener.rs:83`); `try_open` (`:1042`) still
+  requires all three conditions in one `&&` chain and `build()` remains
+  module-private. Both review documents' NO-GO posture therefore still holds
+  mechanically, independent of any prose.
+
+Scope note: this snapshot is documentation only. No `.rs`/`.sh`/config file was
+modified, no gate was flipped, and no go/no-go recommendation is expressed.
