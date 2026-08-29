@@ -16,6 +16,7 @@ pub mod role_signing_subflow;
 pub mod roles;
 pub mod scale;
 pub mod tandem_dns;
+pub mod tandem_dns_redirect;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;

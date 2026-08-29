@@ -136,3 +136,22 @@ RustyDNS process management/startup, the real §6.2 compound readiness probe
 (phase-1 `RustydnsReadinessProvider` remains the abstract seam), the signed
 `ServiceCapabilityV1`/`TandemDnsPolicyV1`/`ManagedDnsAssignmentV1` wire
 formats, cross-repo RustyDNS calls, and any live-lab evidence.
+
+## D-6c delivered — 2026-08-29 (exit :53 transparent NAT redirect: control plane + Linux nft render)
+
+Implemented (control plane + Linux render only; no installer wiring, no live dataplane mutation):
+
+- **Decision fn** `rustynet-control::tandem_dns_redirect::tandem_dns_redirect_decision` — pure, total, fail-closed. `Active(ManagedRedirect)` + ready + scope + on-mesh endpoint + `ProvenSameExit` ⇒ `Redirect{ManagedRedirect, scope, service_address}`; `Off`/`PreparingContained`/`Prepared`/`Draining`/`Active(Managed)` ⇒ `NoRedirect{reason: Option<TandemReasonCode>}` (benign absence `None`, `ResidueError` ⇒ `Some(Residue)`); `RuntimeContained` or any readiness/scope/endpoint/prefix failure ⇒ `ContainNoRedirect{reason}` — **contained posture generates no redirect and the base DNS-fail-closed layer keeps blocking, so no plaintext escape**. No new reason codes (24-variant closed vocabulary unchanged).
+- **Linux nft render** `rustynetd::linux_tandem_dns_redirect` — validate-then-format (`render refused` errors): `ip rustynet_tdns_nat4_g<N>` prerouting dstnat DNAT `dport 53 udp/tcp → <svc>:53` (`daddr != svc`, tunnel-iface + selected-source scoped; `AllClientsUsingExit` ⇒ iface-scoped, `NodeIds` ⇒ explicit validated set) + `inet rustynet_tdns_filter_g<N>` forward containment (accept post-DNAT to svc:53, drop selected-source port-53 not translated). **Exact teardown** = `delete table ip rustynet_tdns_nat4_g<N>` + `delete table inet rustynet_tdns_filter_g<N>` only — residue-free (§10.7). Tables additive to / disjoint from base `rustynet_nat_g<N>` exit NAT and killswitch tables.
+- **Privileged-helper allowlist** extended with `rustynet_tdns_` prefix (`is_owned_tandem_dns_table_token`, folded into `is_owned_nft_table_token`, negative pins kept) — **security-sensitive widen of the argv-only helper's table ownership tokens**.
+
+Flagged (owner decisions, not shipped here):
+
+- **macOS pf** (§9.2): needs a new reviewed pf `rdr` spec kind in `MacosPfLoadSpec` (today only `nat` kind) + anchor ordering — dataplane flagged, not implemented.
+- **Windows WFP** (§9.3): redirect unproven; `PlatformRedirectUnsupported` pre-mutation refusal required — flagged, not implemented.
+- **DoT/:853 + DoH-endpoint blocking**: stays OFF per §5.4 defaults; blocklist carries false-positive risk (blocking legit DoH). Owner options: off by default / configurable allowlist-backed blocklist. D-6c ships only the plain :53 redirect.
+- **Mesh-IP signed carriage**: still owner-gated (carried from D-6b).
+
+Evidence: control 556+ tests green (14 new decision tests), rustynetd 8 new render tests + helper allowlist pins green; fmt / clippy (`--workspace --all-targets --all-features --locked -D warnings`) / `cargo audit --deny warnings` / `cargo deny check` pass. One pre-existing environment-dependent phase10 macOS test (`macos_assert_dns_protection_requires_active_dns_rules`, host `networksetup` dependency) fails identically on clean HEAD — not this change.
+
+Still open beyond D-6c: rule **installer** wiring (apply/roll-back lifecycle against the privileged path, §9.1 one-transaction readiness flip), per-OS dataplanes above, RustyDNS process management/startup, the real §6.2 compound readiness probe, the signed wire formats, cross-repo RustyDNS calls, and live-lab evidence.
