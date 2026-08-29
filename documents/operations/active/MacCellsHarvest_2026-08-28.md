@@ -2520,6 +2520,62 @@ custody provisioning), not env, not owner-gated.** MAC-D12 fixed the
 PASSPHRASE custody layer; MAC-D13 is the next layer — the signed-bundle
 SIGNING SECRET itself has no macOS custody path.
 
+**MAC-D13 DISPOSITION — FIXED IN CODE, 2026-08-29 (awaiting the next live
+exit run for confirmation).** Worktree `ai-edit/edit-1787999387371-56044-73`
+(crates/rustynet-cli/src/ops_e2e.rs only):
+
+1. **Per-platform path constants** replace the hardcoded Linux literals at
+   every issuer: `ASSIGNMENT_SIGNING_SECRET_PATH` (linux
+   `/etc/rustynet/assignment.signing.secret` — unchanged; macos
+   `/usr/local/etc/rustynet/assignment.signing.secret` — the canonical
+   config root `macos_runtime_acls.rs` already reviews at 0750 and
+   `secret_material::encrypted_secret_permission_policy` already arms;
+   windows `C:\ProgramData\RustyNet\config\assignment.signing.secret`) and
+   `MEMBERSHIP_OWNER_SIGNING_KEY_PATH` (macos arm =
+   `MACOS_OWNER_SIGNING_KEY_PATH`). Swept sites: the two-node auto-init +
+   issue/load, `e2e-issue-assignment-bundles-from-env`, the traversal
+   issuer, AND the dns-zone issuer — which signs with the membership OWNER
+   KEY (`/etc/rustynet/membership.owner.key` literal), not the assignment
+   secret, and would have been the NEXT MAC-D13-class failure at
+   `distribute_dns_zone`. Linux-only literals (host bootstrap, debian
+   two-node permission checks, refresh-env writer) intentionally untouched.
+2. **macOS genesis seeds the secret** (`execute_ops_e2e_bootstrap_macos`):
+   after the MAC-D4 keychain provision, it now runs
+   `rustynet assignment init-signing-secret --output
+   ASSIGNMENT_SIGNING_SECRET_PATH --signing-secret-passphrase-file
+   <staged passphrase> --force` — the exact Linux bootstrap contract. The
+   secret is minted from OS randomness and encrypted AT REST under the
+   SAME passphrase the genesis provisions into System.keychain as the
+   canonical `membership_signing_key_passphrase_descriptor` item, which is
+   exactly what `materialize_signing_passphrase_workspace` unwraps via
+   `MacosKeychainBackend` (MAC-D12, live-proven). Custody:
+   `write_encrypted_key_file` writes 0600 root-owned, sets the config root
+   to its reviewed 0750, validates ownership+modes; no plaintext secret at
+   rest.
+3. **Fail-closed preserved**: the issuers keep `ensure_regular_file` — a
+   node where genesis never ran still errors loudly ("assignment signing
+   secret missing"), never signs with nothing.
+4. **Test**: `macos_bootstrap_seeds_assignment_signing_secret_and_issuers_resolve_platform_paths`
+   (source-pin, mirrors the MAC-D12 pin): Linux bootstrap contract
+   preserved, macOS genesis contains the init-signing-secret seeding under
+   the keychain-provisioned passphrase, per-platform constants carry all
+   canonical arms, every issuer resolves the constant with no Linux
+   literal, and the fail-closed check remains. Windows genesis has the
+   same latent gap (no seeding) but Windows custody for this material is
+   unix-gated today — noted, out of MAC-D13 scope.
+5. **Gates**: fmt, clippy --workspace --all-targets --all-features
+   --locked -D warnings, check+test rustynet-cli --features vm-lab and
+   rustynetd, audit, deny, secrets_hygiene — all pass (one PRE-EXISTING
+   rustynetd env failure on this host,
+   `macos_assert_dns_protection_requires_active_dns_rules`, reproduces on
+   the clean tree via `networksetup` status=4; unrelated).
+
+Expectation for the re-run: with MAC-D12 live-confirmed and the secret now
+seeded at genesis, `distribute_assignments` should mint+issue bundles and
+the cell should proceed to `distribute_traversal` /
+`distribute_dns_zone` → `enforce_baseline_runtime` → `role_switch_matrix`
+→ `exit_handoff` → `active_exit` and the exit dataplane validations.
+
 ### 18.4 Exit dataplane stages + DnsFailclosed
 
 All downstream stages skipped fail-closed (52 skips) behind
