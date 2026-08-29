@@ -166,6 +166,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            inventory_path: None,
             macos_anchor_validators_elected: false,
         };
         assert!(matches!(
@@ -202,6 +203,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            inventory_path: None,
             macos_anchor_validators_elected: false,
         };
         let exit_key = "a".repeat(64);
@@ -299,6 +301,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            inventory_path: None,
             macos_anchor_validators_elected: false,
         };
         ctx.collected_pubkeys
@@ -334,6 +337,7 @@ mod tests {
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
+            inventory_path: None,
             macos_anchor_validators_elected: false,
         };
         ctx.node_ids

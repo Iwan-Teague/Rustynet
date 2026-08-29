@@ -253,11 +253,17 @@ pub(crate) fn execute_rust_native_orchestration(
     // (`--anchor-platform macos`), which dispatches deploy_macos_anchor_profile
     // + validate_macos_anchor_bundle_pull +
     // validate_macos_anchor_port_mapping_authority in this same invocation.
-    // `anchor_validation` consults this run-local flag (never persisted; a
-    // resumed context reloads `false`, the fail-closed direction) to grade a
-    // macOS anchor's bundle-pull runtime as delegated evidence rather than a
-    // reported skip.
+    // The actual election is tightened further down, AFTER the plan is built:
+    // the flag only stays true when the three validator stages really are in
+    // this run's plan, so `anchor_validation` grades delegated evidence only
+    // when the delegation actually dispatches (MAC-D3). A resumed context
+    // reloads `false`, the fail-closed direction.
     ctx.macos_anchor_validators_elected = config.anchor_platform.as_deref() == Some("macos");
+
+    // MAC-D3: the macOS anchor validator stages need the inventory path to
+    // resolve SSH targets inside the legacy vm_lab helpers they call. Run-local
+    // only; a resumed context reloads `None` and the stages fail closed.
+    ctx.inventory_path = Some(inventory_path.clone());
 
     // Collect node hosts first so we can auto-derive ssh_allow_cidrs when not
     // provided. This mirrors the bash orchestrator's auto-detection behaviour.
@@ -360,6 +366,21 @@ pub(crate) fn execute_rust_native_orchestration(
 
     let setup_stage_ids = rust_native_setup_stage_ids();
     let plan_stage_ids: Vec<orchestrator::stage::StageId> = stages.iter().map(|s| s.id()).collect();
+
+    // MAC-D3: tighten the MAC-D1 election — the flag only stays true when the
+    // three macOS anchor validator stages really are in THIS run's plan. When
+    // they were dropped (skip_live_suite / setup-only mode), the delegation
+    // would never dispatch, so `anchor_validation` must grade the runtime as
+    // a reported skip instead of delegated evidence. Never silently green.
+    ctx.macos_anchor_validators_elected = config.anchor_platform.as_deref() == Some("macos")
+        && [
+            orchestrator::stage::StageId::MacosAnchorProfileDeploy,
+            orchestrator::stage::StageId::MacosAnchorBundlePullValidation,
+            orchestrator::stage::StageId::MacosAnchorPortMappingAuthorityValidation,
+        ]
+        .iter()
+        .all(|id| plan_stage_ids.contains(id));
+
     let reuse_binding: Option<(Vec<orchestrator::stage::StageId>, String)> = if run_only {
         Some((
             setup_stage_ids.clone(),

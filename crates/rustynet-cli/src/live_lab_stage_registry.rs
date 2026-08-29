@@ -3094,7 +3094,10 @@ mod tests {
             // (cross_network_substrate_setup/teardown) — substrate
             // correctness, like the nat_classification/matrix rows.
             ("t0_core", 22),
-            ("t1_role", 18),
+            // +3 on 2026-08-29 (MAC-D3): the macOS anchor validator set
+            // (deploy_macos_anchor_profile + bundle_pull + port_mapping)
+            // joined T1Role as first-class --node stages.
+            ("t1_role", 21),
             ("t2_resilience", 13),
             ("t3_cross_os", 1),
             ("t4_security", 16),

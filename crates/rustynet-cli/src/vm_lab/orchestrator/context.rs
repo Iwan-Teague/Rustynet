@@ -226,6 +226,13 @@ pub struct OrchestrationContext {
     /// (this run) from one whose runtime has no evidence path (reported
     /// skip; MAC-D1).
     pub macos_anchor_validators_elected: bool,
+    /// Absolute path of the resolved inventory this run started from,
+    /// threaded so runtime stages can self-serve inventory lookups
+    /// (e.g. the macOS anchor validator set re-reading per-node lab
+    /// parameters; MAC-D3). Run-local only (never serialized): a resumed
+    /// context reloads as `None`, which the macOS anchor stages treat as a
+    /// fail-closed failure rather than a silent pass.
+    pub inventory_path: Option<std::path::PathBuf>,
 }
 
 impl OrchestrationContext {
@@ -252,6 +259,7 @@ impl OrchestrationContext {
             substrate: None,
             substrate_record: None,
             macos_anchor_validators_elected: false,
+            inventory_path: None,
         }
     }
 
@@ -378,6 +386,9 @@ impl OrchestrationContext {
             // runtime grades as a reported skip until the run is re-derived
             // from the `--anchor-platform macos` selector).
             macos_anchor_validators_elected: false,
+            // Same run-local rule: the absolute inventory path is never
+            // persisted; macOS anchor stages fail closed on `None`.
+            inventory_path: None,
         })
     }
 }
