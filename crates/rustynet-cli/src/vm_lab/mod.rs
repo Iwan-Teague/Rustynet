@@ -4034,8 +4034,16 @@ pub fn execute_ops_vm_lab_host_disk_status(
         config.known_hosts_path.as_deref(),
         timeout,
     )?;
+    // QH-03 conjunctive contract: success is exit 0 (checked in run_guest_script)
+    // AND a complete report fenced by DISK-BEGIN..DISK-END. A run that died
+    // mid-script is an error, never a short-but-valid report.
     let body = match out.split_once("DISK-BEGIN\n") {
-        Some((_, rest)) => rest.split_once("DISK-END").map(|(b, _)| b).unwrap_or(rest),
+        Some((_, rest)) => rest.split_once("DISK-END").map(|(b, _)| b).ok_or_else(|| {
+            format!(
+                "host {}: disk status report was truncated (no DISK-END — the script failed mid-run):\n{out}",
+                host.host_id
+            )
+        })?,
         None => {
             return Err(format!(
                 "host {}: disk status did not return a report:\n{out}",
@@ -52127,6 +52135,253 @@ mod recover_host_vms_tests {
         // destroy then start = clean boot + new DHCP lease, the whole point.
         assert!(s.contains(r#"virsh -c qemu:///system destroy "$d""#));
         assert!(s.contains(r#"virsh -c qemu:///system start "$d""#));
+    }
+}
+
+/// QH-03: fail-closed execution tests for the two host operational scripts that
+/// were genuinely fail-open (`HOST_RECOVER_VMS_SCRIPT` and
+/// `HOST_DISK_STATUS_SCRIPT` — zero non-zero exits, every probe `|| true`, and a
+/// terminal sentinel printed unconditionally, so a wholly failed run reported
+/// success).
+///
+/// Contract under test (the one the callers enforce): a run is a success only as
+/// **exit 0 AND the terminal sentinel** (`RECOVER-END` / `DISK-END`) present in
+/// stdout. Each test here executes the *rendered production template* (QH-02
+/// convention) under `bash` with a stub `virsh` first on `PATH`, so both halves
+/// of the conjunction are exercised for real — including the negative half the
+/// old unconditional sentinels could never express: a required step failing must
+/// exit non-zero WITHOUT the success sentinel and print a diagnosable
+/// `RECOVER-ERROR:` / `DISK-ERROR:` line, while a *tolerated* condition (a domain
+/// absent from the host, an advisory listing that cannot be produced) is
+/// reported visibly and the run still succeeds.
+#[cfg(test)]
+mod host_script_fail_closed_tests {
+    use super::script_template;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// Test stub for `virsh`: behaviour keyed by env vars the test sets, so a
+    /// scenario can make exactly one required step fail. No real libvirt, no
+    /// SSH, no network.
+    const VIRSH_STUB: &str = r#"#!/usr/bin/env bash
+# The real invocation is `virsh -c qemu:///system <subcommand> <args..>`; the
+# stub does not care about the URI, so step past it.
+if [ "$1" = "-c" ]; then shift 2; fi
+case "$1" in
+  list)
+    [ "${VIRSH_STUB_LIST_FAIL:-0}" = "1" ] && exit 1
+    printf '%s\n' ${VIRSH_STUB_DOMAINS:-}
+    exit 0
+    ;;
+  domstate)
+    [ "${VIRSH_STUB_DOMSTATE_FAIL:-0}" = "1" ] && exit 1
+    eval "echo \${VIRSH_STUB_STATE_${2}:-running}"
+    exit 0
+    ;;
+  domifaddr)
+    [ "${VIRSH_STUB_NO_IP:-0}" = "1" ] && exit 0
+    echo "52:54:00:ab:cd:ef 192.168.122.5/24"
+    exit 0
+    ;;
+  destroy) [ "${VIRSH_STUB_DESTROY_FAIL:-0}" = "1" ] && exit 1; exit 0 ;;
+  start)   [ "${VIRSH_STUB_START_FAIL:-0}" = "1" ] && exit 1; exit 0 ;;
+  resume)  [ "${VIRSH_STUB_RESUME_FAIL:-0}" = "1" ] && exit 1; exit 0 ;;
+esac
+exit 0
+"#;
+
+    fn stub_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-qh03-{tag}-{}", super::unique_suffix()));
+        std::fs::create_dir_all(dir.join("bin")).expect("create stub bin dir");
+        let stub = dir.join("bin/virsh");
+        std::fs::write(&stub, VIRSH_STUB).expect("write stub virsh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub virsh executable");
+        }
+        dir
+    }
+
+    /// Execute a rendered script with `dir/bin` (holding the stub virsh) first on
+    /// PATH. Returns (exit_ok, stdout, stderr).
+    fn run_script(script: &str, stub_dir: &Path, env: &[(&str, &str)]) -> (bool, String, String) {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(script).process_group(0).env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin",
+                stub_dir.join("bin").to_str().expect("utf-8 temp path")
+            ),
+        );
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("run rendered script");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn render_recover(force: bool, targets: &str) -> String {
+        script_template::render_host_recover_vms_script(force, targets)
+            .expect("benign force/targets must render")
+    }
+
+    // --- HOST_RECOVER_VMS_SCRIPT: success is exit 0 AND RECOVER-END. ---
+
+    #[test]
+    fn recover_healthy_skip_succeeds_with_sentinel() {
+        let dir = stub_dir("recover-healthy");
+        let (ok, stdout, stderr) = run_script(&render_recover(false, "d1"), &dir, &[]);
+        assert!(
+            ok,
+            "a healthy guest must be a successful no-op\nstderr: {stderr}"
+        );
+        assert!(stdout.contains("RECOVER-BEGIN") && stdout.contains("RECOVER-END"));
+        assert!(stdout.contains("skip (healthy: running"));
+        assert!(!stdout.contains("RECOVER-ERROR"));
+        assert!(!stderr.contains("RECOVER-ERROR"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_tolerated_missing_domain_is_visible_and_still_succeeds() {
+        let dir = stub_dir("recover-notfound");
+        let (ok, stdout, stderr) = run_script(
+            &render_recover(false, "ghost"),
+            &dir,
+            &[("VIRSH_STUB_DOMSTATE_FAIL", "1")],
+        );
+        assert!(
+            ok,
+            "a domain absent from the host is tolerated, visibly\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("RECOVER-END"),
+            "success sentinel present on a tolerated run"
+        );
+        assert!(
+            stdout.contains("NOT FOUND on this host (skipped)"),
+            "the tolerated skip must be visible, not silent: {stdout}"
+        );
+        assert!(!stderr.contains("RECOVER-ERROR"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_reset_success_reports_reset_with_sentinel() {
+        let dir = stub_dir("recover-reset");
+        let (ok, stdout, stderr) = run_script(
+            &render_recover(false, "d1"),
+            &dir,
+            &[("VIRSH_STUB_NO_IP", "1")],
+        );
+        assert!(
+            ok,
+            "a real reset that took effect must succeed\nstderr: {stderr}"
+        );
+        assert!(stdout.contains("RESET (was running"));
+        assert!(stdout.contains("RECOVER-END"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_failed_start_is_a_failure_no_sentinel() {
+        // NEGATIVE: the required start fails after the state read "shutoff" —
+        // the old script printed `STARTED` + `RECOVER-END` and exited 0 anyway.
+        let dir = stub_dir("recover-startfail");
+        let (ok, stdout, stderr) = run_script(
+            &render_recover(false, "d1"),
+            &dir,
+            &[
+                ("VIRSH_STUB_STATE_d1", "shutoff"),
+                ("VIRSH_STUB_START_FAIL", "1"),
+            ],
+        );
+        assert!(!ok, "a failed required step must exit non-zero");
+        assert!(
+            !stdout.contains("RECOVER-END"),
+            "the success sentinel must be absent on a failed run: {stdout}"
+        );
+        assert!(
+            stderr.contains("RECOVER-ERROR") && stderr.contains("d1"),
+            "the failure must be diagnosable: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_enumeration_failure_is_a_failure_no_sentinel() {
+        // NEGATIVE: with no explicit targets the script must enumerate the host;
+        // a failing `virsh list` is "cannot run the recovery", never "no guests".
+        let dir = stub_dir("recover-listfail");
+        let (ok, stdout, stderr) = run_script(
+            &render_recover(false, ""),
+            &dir,
+            &[("VIRSH_STUB_LIST_FAIL", "1")],
+        );
+        assert!(!ok, "a failed enumeration must exit non-zero");
+        assert!(!stdout.contains("RECOVER-END"));
+        assert!(
+            stderr.contains("cannot enumerate domains"),
+            "the failure must name the step: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- HOST_DISK_STATUS_SCRIPT: success is exit 0 AND DISK-END. ---
+
+    #[test]
+    fn disk_report_succeeds_with_sentinel_and_lists_files() {
+        let dir = stub_dir("disk-ok");
+        let pool = dir.join("pool");
+        std::fs::create_dir_all(&pool).expect("create pool dir");
+        std::fs::write(pool.join("base.qcow2"), b"x").expect("seed a pool file");
+        let script = script_template::render_host_disk_status_script(
+            pool.to_str().expect("utf-8 temp path"),
+        )
+        .expect("a benign pool must render");
+        let (ok, stdout, stderr) = run_script(&script, &dir, &[]);
+        assert!(
+            ok,
+            "an existing pool must report successfully\nstderr: {stderr}"
+        );
+        assert!(stdout.contains("DISK-BEGIN") && stdout.contains("DISK-END"));
+        assert!(
+            stdout.contains("base.qcow2"),
+            "the listing is the advisory answer: {stdout}"
+        );
+        assert!(!stderr.contains("DISK-ERROR"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_missing_pool_is_a_failure_no_sentinel() {
+        // NEGATIVE: the pool is the subject of the report — absent means the
+        // report cannot exist, not "an empty report succeeded".
+        let dir = stub_dir("disk-missing");
+        let pool = dir.join("no-such-pool");
+        let script = script_template::render_host_disk_status_script(
+            pool.to_str().expect("utf-8 temp path"),
+        )
+        .expect("a benign pool path must render");
+        let (ok, stdout, stderr) = run_script(&script, &dir, &[]);
+        assert!(!ok, "a missing pool must exit non-zero");
+        assert!(
+            !stdout.contains("DISK-END"),
+            "the success sentinel must be absent on a failed report: {stdout}"
+        );
+        assert!(
+            stderr.contains("DISK-ERROR") && stderr.contains("does not exist"),
+            "the failure must name the pool: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -236,7 +236,46 @@ Proposed fix / convention:
 Acceptance: for every control listed in the security-controls catalogue, deleting
 its enforcement call turns at least one named test red.
 
-### QH-03 — Host scripts continue after a failed step (fail-open shape)
+### QH-03 — Host scripts continue after a failed step (fail-open shape) — FIXED 2026-08-29
+
+> **FIXED 2026-08-29.** The two genuinely fail-open scripts named in the review
+> below — `HOST_RECOVER_VMS_SCRIPT` and `HOST_DISK_STATUS_SCRIPT` — are now
+> fail-closed, and the acceptance test was retargeted at exactly these two
+> (`vm_lab::host_script_fail_closed_tests`, 7 tests executing the rendered
+> production templates under `bash` with a stub `virsh`).
+>
+> How each script now distinguishes success from failure (contract: **exit 0 AND
+> terminal sentinel**; `run_guest_script` rejects non-zero, the callers require
+> the sentinel — and the disk caller no longer tolerates a *missing* `DISK-END`
+> (`unwrap_or(rest)` removed: a truncated run is an error, not a short report)):
+>
+> - **`HOST_RECOVER_VMS_SCRIPT`** — required steps print `RECOVER-ERROR: ...` to
+>   stderr and `exit 1` with NO `RECOVER-END`: domain enumeration when no targets
+>   were given (a failing `virsh list` is "cannot run the recovery", not "no
+>   guests"), every recovery action (`destroy`/`start`/`resume`, each leg of the
+>   paused-resume fallback), and a post-action `domstate` verification that the
+>   guest is actually `running` (a failed start after a successful destroy now
+>   reports "GUEST LEFT SHUT OFF" instead of printing success). Tolerated steps
+>   are visible, never `|| true`: a named domain absent from the host prints
+>   `NOT FOUND on this host (skipped)`; a healthy guest prints
+>   `skip (healthy: ...)`. `RECOVER-END` now prints only after the loop completes
+>   with no error.
+> - **`HOST_DISK_STATUS_SCRIPT`** — required: the pool directory must exist (it is
+>   the subject of the report; absent = `DISK-ERROR: pool directory ... does not
+>   exist` + exit 1, never an empty-but-successful report), `df -h "$POOL"` and
+>   `du -sh "$POOL"` (the two headline numbers) must succeed. Tolerated visibly:
+>   the advisory largest-files listing prints
+>   `(largest-files listing unavailable: ...)` when `ls` fails and
+>   `(size unavailable)` next to any file whose individual `du` fails. `DISK-END`
+>   prints only on success.
+>
+> Negative tests prove the conjunctive contract: a simulated failed `start`
+> (stub exits 1 on a `shutoff` guest) ⇒ non-zero exit, no `RECOVER-END`,
+> `RECOVER-ERROR` naming the domain; a simulated failed `virsh list` ⇒ same with
+> "cannot enumerate domains"; a missing pool ⇒ non-zero exit, no `DISK-END`,
+> `DISK-ERROR ... does not exist`. Positive tests assert exit-0 + sentinel on the
+> healthy-skip, reset, and full-report paths, and that tolerated skips are
+> *visible* in the output.
 
 > **[REVIEW 2026-07-25] REFUTED FOR THE SCRIPT IT NAMES; the real fail-open scripts are
 > two others.** Verified on `main` @ `f9388393`:
