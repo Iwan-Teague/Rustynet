@@ -17,7 +17,14 @@
 //!   post-DNAT queries (tunnel input + selected source + exact service
 //!   address + port 53) and drop any selected-source port-53 forwarding that
 //!   was NOT translated, so translation absence never opens a plaintext
-//!   escape while the redirect is active.
+//!   escape while the redirect is active. The SAME chain additionally
+//!   carries the owner-decision-3 DoT/DoH egress block, DEFAULT-ON whenever
+//!   the redirect is active: drop selected-source udp/tcp `:853` (DoT,
+//!   except the sanctioned path to the mesh resolver) and drop `:443` to
+//!   the pinned [`rustynet_control::tandem_dns_redirect::
+//!   KNOWN_DOH_RESOLVER_IPS`] set (tcp+udp). These drops are INSEPARABLE
+//!   from the redirect: same table, same generation, one teardown — no
+//!   residue (§10.7).
 //!
 //! Contained / non-redirect phases must NOT install these tables; the pure
 //! control-plane decision lives in `rustynet-control::tandem_dns_redirect`
@@ -25,7 +32,10 @@
 
 use rustynet_control::managed_dns_handoff::{ManagedDnsEndpoint, MeshIpv4Prefix};
 use rustynet_control::tandem_dns::TandemScope;
-use rustynet_control::tandem_dns_redirect::TANDEM_DNS_REDIRECT_PORT;
+use rustynet_control::tandem_dns_redirect::{
+    KNOWN_DOH_RESOLVER_IPS, TANDEM_DNS_DOH_BLOCK_PORT, TANDEM_DNS_DOT_PORT,
+    TANDEM_DNS_REDIRECT_PORT,
+};
 use std::net::Ipv4Addr;
 
 /// Maximum characters accepted for a Linux interface name (kernel limit 15).
@@ -236,6 +246,29 @@ pub fn render_tandem_dns_redirect_install(input: &TandemDnsRedirectRenderInput) 
             "        iifname \"{iface}\" {source_match}ip daddr != {service} {protocol} dport {port} drop\n"
         ));
     }
+    // DoT egress block (owner decision 3, default-on): selected sources may
+    // not bypass the redirect via DNS-over-TLS. The mesh resolver itself is
+    // exempt (the sanctioned tunnel path), mirroring the :53 loop guard.
+    for protocol in ["udp", "tcp"] {
+        out.push_str(&format!(
+            "        iifname \"{iface}\" {source_match}ip daddr != {service} {protocol} dport {dot} drop\n",
+            dot = TANDEM_DNS_DOT_PORT,
+        ));
+    }
+    // Known-DoH-endpoint block (owner decision 3, default-on): the pinned,
+    // versioned public-resolver set on :443 (tcp and udp — the latter covers
+    // HTTP/3 DoH; fail-closed prefers the closed-direction error). KNOWN
+    // MECHANISM LIMIT: DoH-over-:443 to an arbitrary host is indistinguish-
+    // able from HTTPS without SNI inspection and is a documented residual
+    // owned by an SNI-inspection follow-up, not an open door left by choice.
+    for ip in KNOWN_DOH_RESOLVER_IPS {
+        for protocol in ["tcp", "udp"] {
+            out.push_str(&format!(
+                "        iifname \"{iface}\" {source_match}ip daddr {ip} {protocol} dport {doh} drop\n",
+                doh = TANDEM_DNS_DOH_BLOCK_PORT,
+            ));
+        }
+    }
     out.push_str("    }\n");
     out.push_str("}\n");
     out
@@ -327,12 +360,14 @@ mod tests {
     fn node_ids_scope_renders_explicit_source_set() {
         let rendered = render_tandem_dns_redirect_install(&node_ids_input());
         assert!(rendered.contains("ip saddr { 100.64.0.11, 100.64.0.12 } "));
-        // Both DNAT and admission+drop carry the explicit set.
+        // The explicit set must appear on EVERY rule: 2 DNAT + 2 port-53
+        // admission + 2 port-53 drop + 2 DoT drop + 16 DoH drops (8 pinned
+        // IPs x tcp/udp) = 24.
         assert_eq!(
             rendered
                 .matches("ip saddr { 100.64.0.11, 100.64.0.12 } ")
                 .count(),
-            6
+            24
         );
     }
 
@@ -342,6 +377,62 @@ mod tests {
         assert!(rendered.contains("iifname \"utun9\" ip daddr 100.64.0.7 udp dport 53 accept"));
         assert!(rendered.contains("iifname \"utun9\" ip daddr != 100.64.0.7 udp dport 53 drop"));
         assert!(rendered.contains("type filter hook forward priority 0;"));
+    }
+
+    /// Owner decision 3: the DoT/DoH egress block is DEFAULT-ON and rendered
+    /// into the SAME generation-scoped filter table as the :53 redirect.
+    #[test]
+    fn dot_and_doh_blocks_render_in_the_generation_scoped_filter_table() {
+        let rendered = render_tandem_dns_redirect_install(&all_clients_input());
+        // DoT: udp+tcp :853, mesh resolver exempt.
+        assert!(rendered.contains("iifname \"utun9\" ip daddr != 100.64.0.7 udp dport 853 drop"));
+        assert!(rendered.contains("iifname \"utun9\" ip daddr != 100.64.0.7 tcp dport 853 drop"));
+        // DoH: every pinned IP on :443, tcp AND udp (HTTP/3 covered).
+        for ip in KNOWN_DOH_RESOLVER_IPS {
+            assert!(rendered.contains(&format!(
+                "iifname \"utun9\" ip daddr {ip} tcp dport 443 drop"
+            )));
+            assert!(rendered.contains(&format!(
+                "iifname \"utun9\" ip daddr {ip} udp dport 443 drop"
+            )));
+        }
+        // The :443 block is scoped to the pinned set only: exactly
+        // 2 x |pinned| drop lines name :443, nothing broader.
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|l| l.contains("dport 443 drop"))
+                .count(),
+            KNOWN_DOH_RESOLVER_IPS.len() * 2
+        );
+        // DoT/DoH never appears in the dstnat (translation) table.
+        let nat_half = rendered.split("table inet ").next().unwrap_or_default();
+        assert!(!nat_half.contains("dport 853"));
+        assert!(!nat_half.contains("dport 443"));
+    }
+
+    /// §10.7 teardown-together: the DoT/DoH drops live ONLY inside the two
+    /// tandem-owned tables, so the existing two-line table deletion removes
+    /// them together with the :53 redirect — nothing else to clean up.
+    #[test]
+    fn teardown_removes_dot_and_doh_drops_together_with_the_redirect() {
+        let install = render_tandem_dns_redirect_install(&all_clients_input());
+        let teardown = render_tandem_dns_redirect_teardown(3).unwrap();
+        // Every rule (including DoT/DoH) is inside a tdns table.
+        for line in install.lines() {
+            assert!(
+                !line.contains("dport 853") && !line.contains("dport 443")
+                    || install.contains("rustynet_tdns_filter_g3"),
+                "DoT/DoH drop outside the generation-scoped tandem table: {line}"
+            );
+        }
+        assert_eq!(
+            teardown,
+            "delete table ip rustynet_tdns_nat4_g3\ndelete table inet rustynet_tdns_filter_g3\n"
+        );
+        // No additional DoT/DoH-specific teardown statement exists.
+        assert!(!teardown.contains("853"));
+        assert!(!teardown.contains("443"));
     }
 
     #[test]
