@@ -2835,6 +2835,19 @@ was never selected.
 **Suggested first step:** record `~/.ssh/authorized_keys` mtime and a hash in the
 discovery summary, so the next occurrence carries a timestamp to correlate against.
 
+**Instrumentation landed (2026-08-29):** the discovery/readiness path now
+fingerprints `~/.ssh/authorized_keys` on every SSH-probed guest (Linux + macOS,
+the same gate as the auth probe). `LocalUtmReadyState` carries
+`authorized_keys_fingerprint { status, mtime_epoch_secs, sha256_hex }`
+(`crates/rustynet-cli/src/vm_lab/mod.rs`); the discovery JSON per-guest entry
+includes `authorized_keys_fingerprint`, and the one-line readiness summary
+appends `authorized_keys_mtime=` / `authorized_keys_sha256=` (`n/a` when probed
+but unreadable, `not-probed` when the guest was not SSH-probed). Sourcing is
+read-only (`stat` + `sha256sum`/`shasum`/`openssl` rungs over
+`capture_remote_shell_command`); a pinned read-only guard test forbids any
+mutating construct in the probe. Status stays OPEN until the next occurrence is
+correlated against run history.
+
 ### QH-45 — the `entry` role emits an nft rule the privileged helper's allowlist rejects
 
 **Status: OPEN, fully diagnosed. The fix is SECURITY-SENSITIVE and must not be a quick widen.**
