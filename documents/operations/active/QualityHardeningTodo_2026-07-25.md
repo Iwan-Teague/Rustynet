@@ -1710,6 +1710,56 @@ documented at both ends — the matcher and the generator.
 Worth pairing with QH-24: assertions over *generated text* are exactly the shape that is hard to
 test, because the test usually re-renders the text rather than exercising the live matcher.
 
+**Disposition 2026-08-29 — FIXED (swept + structurally hardened).** Full sweep of every runtime
+fail-closed self-assertion, classified by what it matches:
+
+- **Linux generated-text matchers (hardened):** `assert_nat_forwarding` and
+  `assert_firewall_ruleset` match the LIVE `nft list table` output against inline token arrays
+  that duplicated the argv the emitters (`ensure_failclosed_table`, `apply_firewall_killswitch`,
+  `apply_nat_forwarding`, `apply_dns_protection`) spelled inline — the exact drift hazard this
+  finding describes. Both sides now consume SHARED token builders (`loopback_accept_tokens`,
+  `established_related_accept_tokens`, `tunnel_interface_accept_tokens`,
+  `killswitch_egress_allow_tokens`, `wg_listen_port_allow_tokens`, `dns_off_tunnel_drop_tokens`,
+  `dns_accept_tokens`, `forward_tunnel_to_egress_tokens`, `forward_hairpin_accept_tokens`,
+  `nat_egress_masquerade_tokens`, `nat_hairpin_masquerade_tokens` in `phase10.rs`): a token
+  change now edits the generator and the matcher in the same commit by construction. The
+  observability-only `counter` token stays OUT of the builders — `nft_add_rule_argv` inserts it
+  before the verdict at emit time, and the substring semantics of `chain_contains_all_tokens`
+  (now documented at the builders, with the stale `phase10.rs:1160-1163` references replaced by
+  fn names) keep the matcher counter-agnostic.
+- **Agreement tests (new, `cfg(target_os = "linux")`, Debian CI):**
+  `nat_rule_tokens_agree_with_emitted_nft_argv` and
+  `killswitch_and_dns_rule_tokens_agree_with_emitted_nft_argv` drive the REAL emitters through
+  the privileged-capture helper and assert every matcher token set appears in the rendered
+  `nft add rule` argv — including a mutated-token negative control so the check cannot pass
+  vacuously. (Compile-verified only, mirroring the existing linux-gated test idiom, on this
+  macOS host; Debian CI executes them.)
+- **macOS (hardened):** `assert_killswitch`'s terminal default-deny requirement and
+  `render_macos_killswitch_pf_rules`'s terminal line now share one constant,
+  `MACOS_PF_TERMINAL_BLOCK_RULE`; new portable test
+  `macos_rendered_rules_satisfy_assert_killswitch_expectations` renders the real ruleset and
+  proves it satisfies every `assert_killswitch` expectation (terminal block LAST, loopback pass,
+  both `ruleset_contains_dns_rule` argument shapes accepted, mutated-token negative control).
+  `ruleset_contains_dns_rule` was already drift-aware (accepts pfctl-normalized port forms).
+- **Windows (verified, no change needed):** `assert_dns_protection` / `assert_killswitch` /
+  `assert_exit_serving` query LIVE OS state (Get-NetFirewallRule / Get-NetNat /
+  Get-NetIPInterface) keyed by the SAME shared rule-name constants the apply/delete paths use —
+  compile-time coupling, no rendered-text matching; documented at the PowerShell assert payloads.
+- **Verified NOT generated-text matchers (no change):** route assertions
+  (`assert_expected_bypass_routes` with its destination-normalizing
+  `route_destination_matches_rendered`, `assert_default_route_*`, `assert_rule_lookup_51820`,
+  `assert_probe_route_*`) match live `ip route/rule` output with documented rendering
+  normalization; `has_fail_closed_drop_rule` matches the live query for its own stable
+  `comment "rustynet_fail_closed_drop"` marker; `assert_blind_exit_posture` delegates to
+  `evaluate_linux_blind_exit_ruleset` (structural evaluator); DryRun asserts are trivial
+  op-order checks; `RuntimeSystem` asserts are pure delegation. macOS `assert_dns_protection`
+  re-renders via the same `render_pf_rules` the privileged helper replays — single-source,
+  covered by the new agreement test.
+
+No assertion was weakened: every previously-required token set is still required (error strings
+preserved verbatim, including the per-proto DNS messages); the change only makes format drift
+edit-time/CI-time loud instead of runtime-silent.
+
 ### QH-30 — Coverage that existed only as a side-effect of a bug disappears when the bug is fixed, silently
 **Severity: medium-high (a fail-closed branch is now wholly uncovered). Confidence: VERIFIED.**
 
