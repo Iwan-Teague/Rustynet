@@ -70,6 +70,10 @@ use crate::macos_exit_nat::{
     DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR, MacosExitNatPfConfig, evaluate_macos_exit_nat_pf_rules,
 };
 use crate::macos_pf_load_spec::MacosPfLoadSpec;
+use crate::macos_tandem_dns_redirect::{
+    MacosTandemDnsRedirectPfConfig, evaluate_macos_tandem_dns_redirect_filter,
+    evaluate_macos_tandem_dns_redirect_translation,
+};
 use crate::privileged_helper::{
     PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram, validate_request,
 };
@@ -82,6 +86,8 @@ use rustynet_backend_api::{
     AuthoritativeTransportIdentity, AuthoritativeTransportResponse, BackendError, BackendErrorKind,
     ExitMode, NodeId, PeerConfig, Route, RuntimeContext, SocketEndpoint, TunnelBackend,
 };
+use rustynet_control::managed_dns_handoff::MeshIpv4Prefix;
+use rustynet_control::tandem_dns_redirect::TandemDnsRedirectDecision;
 use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicySet, Decision, MembershipDirectory, MembershipStatus,
     Protocol, TrafficContext,
@@ -3500,6 +3506,11 @@ pub struct MacosCommandSystem {
     /// loaded, distinct from `anchor_name` (the killswitch filter anchor).
     /// `Some` means the exit NAT is active and teardown must flush it.
     exit_nat_anchor: Option<String>,
+    /// The generation-scoped tandem DNS redirect anchor
+    /// (`com.rustynet/tdns_g<generation>`, D-6c) once loaded — distinct from
+    /// `anchor_name` (killswitch) and `exit_nat_anchor` (`com.rustynet/nat`).
+    /// `Some` means the redirect is active and teardown must flush it.
+    tandem_dns_anchor: Option<String>,
     /// The forwarding value captured before the exit enabled forwarding, so
     /// teardown can restore the exact prior state instead of blindly forcing it
     /// off.
@@ -3544,6 +3555,7 @@ impl MacosCommandSystem {
             managed_peer_egress_endpoints: Vec::new(),
             blind_exit_pf_config: None,
             exit_nat_anchor: None,
+            tandem_dns_anchor: None,
             prior_ip_forwarding: None,
             exit_forwarding_key: None,
         })
@@ -3973,6 +3985,182 @@ impl MacosCommandSystem {
         self.exit_forwarding_key = None;
         Ok(())
     }
+
+    /// Activate the D-6c tandem transparent DNS redirect: load the
+    /// generation-scoped `com.rustynet/tdns_g<generation>` anchor holding the
+    /// reviewed `rdr` translation forms plus the containment filter. The
+    /// rendered rules come from the pure control-plane decision (this method
+    /// never re-decides); a contained/off decision is refused here so it can
+    /// never install a rule. Fail-closed preconditions, in order:
+    ///
+    /// 1. no blind exit (an irreversible blind exit never hosts the DNS
+    ///    service);
+    /// 2. the base DNS fail-closed posture (`dns_protected`) must already be
+    ///    live — the redirect ADDS translation on top of containment and must
+    ///    never be the only thing standing between a client and a leak;
+    /// 3. the decision must be `Redirect` (`NoRedirect`/`ContainNoRedirect`
+    ///    refuse, leaving the base posture as the only DNS behavior).
+    ///
+    /// After a successful load the live anchor is verified against the same
+    /// reviewed rule shapes (`pfctl -s nat` + `pfctl -s rules`); on drift the
+    /// anchor is torn back down and the error propagates, so the base
+    /// DNS-block posture is what remains.
+    ///
+    /// Public surface: the daemon's tandem reconcile loop is the (flagged)
+    /// follow-up wiring; the Linux D-6c renderer landed the same way — the
+    /// reviewed activation entry point exists and is proven, the caller is
+    /// tracked in the phase-2 notes.
+    pub fn activate_tandem_dns_redirect(
+        &mut self,
+        decision: &TandemDnsRedirectDecision,
+        mesh_prefix: &MeshIpv4Prefix,
+    ) -> Result<(), SystemError> {
+        if self.blind_exit_pf_config.is_some() {
+            return Err(SystemError::FirewallApplyFailed(
+                "tandem DNS redirect refused: blind exit is active and never hosts the DNS service"
+                    .to_owned(),
+            ));
+        }
+        if !self.dns_protected {
+            return Err(SystemError::FirewallApplyFailed(
+                "tandem DNS redirect refused: base DNS fail-closed posture is not active; a \
+                 redirect without containment underneath would be a plaintext escape"
+                    .to_owned(),
+            ));
+        }
+        let config = MacosTandemDnsRedirectPfConfig::from_redirect_decision(
+            &self.interface_name,
+            self.generation,
+            decision,
+            Some(mesh_prefix),
+        )
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+
+        self.ensure_pf_enabled()?;
+        let spec = MacosPfLoadSpec::TandemDnsRedirect {
+            config: config.clone(),
+        };
+        let args = spec.encode();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(PrivilegedCommandProgram::MacosPfLoad, &arg_refs)
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        let anchor = spec.anchor_name();
+        self.tandem_dns_anchor = Some(anchor.clone());
+
+        // Verify BOTH halves of the anchor against the reviewed shapes; on
+        // any drift tear the redirect back down so only the base posture
+        // remains.
+        if let Err(err) = self.verify_tandem_dns_redirect_anchor(&anchor, &config) {
+            let _ = self.teardown_tandem_dns_redirect();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Verify the live tandem anchor: `pfctl -a <anchor> -s nat` must be
+    /// exactly the reviewed rdr set and `pfctl -a <anchor> -s rules` exactly
+    /// the reviewed containment filter set.
+    fn verify_tandem_dns_redirect_anchor(
+        &self,
+        anchor: &str,
+        config: &MacosTandemDnsRedirectPfConfig,
+    ) -> Result<(), SystemError> {
+        let nat_output = self
+            .run_capture(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", anchor, "-s", "nat"],
+            )
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        if !nat_output.success() {
+            return Err(SystemError::FirewallApplyFailed(format!(
+                "tandem DNS redirect verification query failed: status={} stderr={}",
+                nat_output.status, nat_output.stderr
+            )));
+        }
+        let reasons =
+            evaluate_macos_tandem_dns_redirect_translation(nat_output.stdout.as_str(), config);
+        if !reasons.is_empty() {
+            return Err(SystemError::FirewallApplyFailed(format!(
+                "tandem DNS redirect translation verification failed: {}",
+                reasons.join("; ")
+            )));
+        }
+        let rules_output = self
+            .run_capture(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", anchor, "-s", "rules"],
+            )
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        if !rules_output.success() {
+            return Err(SystemError::FirewallApplyFailed(format!(
+                "tandem DNS redirect filter verification query failed: status={} stderr={}",
+                rules_output.status, rules_output.stderr
+            )));
+        }
+        let reasons =
+            evaluate_macos_tandem_dns_redirect_filter(rules_output.stdout.as_str(), config);
+        if !reasons.is_empty() {
+            return Err(SystemError::FirewallApplyFailed(format!(
+                "tandem DNS redirect filter verification failed: {}",
+                reasons.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Tear down the tandem DNS redirect: flush ONLY the generation-scoped
+    /// tandem anchor by reference, verify the flush, then clear the handle.
+    /// The base exit NAT (`com.rustynet/nat`), the killswitch
+    /// (`com.apple/rustynet_g*`), and the blind-exit anchor are never
+    /// referenced, so teardown cannot leave redirect residue nor damage base
+    /// posture. The handle stays `Some` until the flush is verified empty, so
+    /// a failed teardown is retryable instead of silently leaking the anchor.
+    fn teardown_tandem_dns_redirect(&mut self) -> Result<(), SystemError> {
+        let Some(anchor) = self.tandem_dns_anchor.clone() else {
+            return Ok(());
+        };
+        self.run_allow_failure(
+            PrivilegedCommandProgram::Pfctl,
+            &["-a", anchor.as_str(), "-F", "all"],
+        );
+        // Verify the anchor is actually empty before clearing the handle.
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Pfctl,
+            &["-a", anchor.as_str(), "-s", "nat"],
+        )?;
+        if output.success() && !output.stdout.trim().is_empty() {
+            return Err(SystemError::RollbackFailed(format!(
+                "tandem DNS redirect anchor {anchor} still holds translation rules after flush"
+            )));
+        }
+        self.tandem_dns_anchor = None;
+        Ok(())
+    }
+
+    /// List every tandem-owned anchor currently registered with pf
+    /// (`com.rustynet/tdns_g*`), for crash-residue sweeping. Mirrors
+    /// `list_owned_anchors`, which only sweeps the `com.apple/rustynet_g*`
+    /// killswitch namespace.
+    fn list_tandem_owned_anchors(&self) -> Result<Vec<String>, SystemError> {
+        let output = self.run_capture(PrivilegedCommandProgram::Pfctl, &["-s", "Anchors"])?;
+        if output.success() {
+            return Ok(output
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && line.starts_with("com.rustynet/tdns_g"))
+                .map(ToOwned::to_owned)
+                .collect());
+        }
+        let stderr = output.stderr.to_ascii_lowercase();
+        if stderr.contains("pf not enabled") {
+            return Ok(Vec::new());
+        }
+        Err(SystemError::Io(format!(
+            "pfctl anchor query failed: status={} stderr={}",
+            output.status, output.stderr
+        )))
+    }
 }
 
 impl MacosCommandSystem {
@@ -4153,6 +4341,21 @@ impl DataplaneSystem for MacosCommandSystem {
         // crash path (empty `active_stages`) skips that branch, so this secure
         // default stands.
         if !serving_exit {
+            // D-6c: the tandem DNS redirect anchor (`com.rustynet/tdns_g<N>`)
+            // lives OUTSIDE the killswitch sweep prefix
+            // (`com.apple/rustynet_g*`), and `teardown_tandem_dns_redirect`
+            // flushes only through the in-memory handle — lost on a crash. A
+            // node that crashed while redirecting and restarts as a non-exit
+            // would otherwise strand the rdr rules. Flush every tandem-owned
+            // anchor by name (the redirect requires a serving exit, so a
+            // non-exit must never keep one) and drop any stale handle.
+            for anchor in self.list_tandem_owned_anchors()? {
+                self.run_allow_failure(
+                    PrivilegedCommandProgram::Pfctl,
+                    &["-a", anchor.as_str(), "-F", "all"],
+                );
+            }
+            self.tandem_dns_anchor = None;
             self.run_allow_failure(
                 PrivilegedCommandProgram::Pfctl,
                 &["-a", DEFAULT_MACOS_EXIT_NAT_PF_ANCHOR, "-F", "all"],
@@ -4285,8 +4488,12 @@ impl DataplaneSystem for MacosCommandSystem {
             self.apply_dns_protection()?;
         } else {
             // Full-tunnel client consuming a remote exit: no local NAT or
-            // forwarding. Tear down any exit NAT left from a prior generation
-            // so a former exit that became a client leaves no residue.
+            // forwarding. Tear down any tandem DNS redirect FIRST (removing
+            // the translation restores the base DNS fail-closed posture while
+            // the rest of the teardown proceeds, CLAUDE.md §10.7 ordering),
+            // then any exit NAT left from a prior generation so a former exit
+            // that became a client leaves no residue.
+            self.teardown_tandem_dns_redirect()?;
             self.teardown_exit_nat()?;
         }
         Ok(())
@@ -4298,10 +4505,15 @@ impl DataplaneSystem for MacosCommandSystem {
                 .apply_pf_rules(false)
                 .map_err(|err| SystemError::RollbackFailed(err.to_string()));
         }
-        // Tear down the exit NAT (flush the translation anchor, then restore
-        // forwarding) BEFORE relaxing the filter, so NAT residue never
-        // outlives the exit capability (CLAUDE.md §10.7). The killswitch
-        // block-all stays installed throughout.
+        // Tear down the tandem DNS redirect first: flushing the translation
+        // anchor restores the base DNS fail-closed posture immediately, so
+        // plain DNS is blocked again while the rest of the rollback proceeds
+        // (CLAUDE.md §10.7). The killswitch block-all stays installed
+        // throughout.
+        self.teardown_tandem_dns_redirect()?;
+        // Then tear down the exit NAT (flush the translation anchor, then
+        // restore forwarding) BEFORE relaxing the filter, so NAT residue never
+        // outlives the exit capability (CLAUDE.md §10.7).
         self.teardown_exit_nat()?;
         self.allow_egress_interface = false;
         self.apply_pf_rules(false)
@@ -16382,6 +16594,109 @@ mod tests {
         system.dns_protected = true;
         DataplaneSystem::assert_dns_protection(&mut system)
             .expect("active macOS DNS protection must render tunnel-pass and egress-block rules");
+    }
+
+    /// A redirect decision for the tests below: active managed redirect for
+    /// all clients using this exit, service at 100.64.0.7.
+    fn tandem_redirect_decision() -> TandemDnsRedirectDecision {
+        TandemDnsRedirectDecision::Redirect {
+            mode: rustynet_control::tandem_dns::TandemMode::ManagedRedirect,
+            scope: rustynet_control::tandem_dns::TandemScope::AllClientsUsingExit,
+            service_address: std::net::Ipv4Addr::new(100, 64, 0, 7),
+        }
+    }
+
+    fn tandem_mesh_prefix() -> MeshIpv4Prefix {
+        MeshIpv4Prefix::new(std::net::Ipv4Addr::new(100, 64, 0, 0), 10)
+            .expect("mesh prefix should build")
+    }
+
+    /// Ordering pin (§10.7 / design §7.2): the redirect can never activate
+    /// before the base DNS fail-closed posture is live. The refusal returns
+    /// BEFORE any pf execution, so this test never invokes pfctl.
+    #[test]
+    fn macos_tandem_redirect_requires_base_dns_failclosed_posture_first() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.dns_protected = false;
+
+        let err = system
+            .activate_tandem_dns_redirect(&tandem_redirect_decision(), &tandem_mesh_prefix())
+            .expect_err("activation without the base DNS posture must fail closed");
+        let SystemError::FirewallApplyFailed(message) = err else {
+            panic!("expected FirewallApplyFailed, got {err:?}");
+        };
+        assert!(
+            message.contains("base DNS fail-closed posture is not active"),
+            "unexpected refusal: {message}"
+        );
+        assert!(system.tandem_dns_anchor.is_none());
+    }
+
+    /// A blind exit never hosts the tandem DNS service; activation refuses
+    /// before any pf execution.
+    #[test]
+    fn macos_tandem_redirect_refuses_blind_exit() {
+        let mut system = MacosCommandSystem::new("rustynet0", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.blind_exit_pf_config =
+            Some(MacosBlindExitPfConfig::new("rustynet0", "en0", "100.64.0.0/10").unwrap());
+        system.dns_protected = true;
+
+        let err = system
+            .activate_tandem_dns_redirect(&tandem_redirect_decision(), &tandem_mesh_prefix())
+            .expect_err("activation under blind exit must fail closed");
+        let SystemError::FirewallApplyFailed(message) = err else {
+            panic!("expected FirewallApplyFailed, got {err:?}");
+        };
+        assert!(
+            message.contains("blind exit"),
+            "unexpected refusal: {message}"
+        );
+        assert!(system.tandem_dns_anchor.is_none());
+    }
+
+    /// Contained / off tandem phases must never install a redirect rule: the
+    /// decision bridge refuses and the base posture remains the only DNS
+    /// behavior. The refusal returns BEFORE any pf execution.
+    #[test]
+    fn macos_tandem_redirect_refuses_contained_and_off_decisions() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.dns_protected = true;
+
+        let off = TandemDnsRedirectDecision::NoRedirect { reason: None };
+        let err = system
+            .activate_tandem_dns_redirect(&off, &tandem_mesh_prefix())
+            .expect_err("an off decision must never install a redirect rule");
+        let SystemError::FirewallApplyFailed(message) = err else {
+            panic!("expected FirewallApplyFailed, got {err:?}");
+        };
+        assert!(message.contains("decision is NoRedirect"));
+
+        let contained = TandemDnsRedirectDecision::ContainNoRedirect {
+            reason: rustynet_control::tandem_dns::TandemReasonCode::Residue,
+        };
+        let err = system
+            .activate_tandem_dns_redirect(&contained, &tandem_mesh_prefix())
+            .expect_err("a contained decision must never install a redirect rule");
+        let SystemError::FirewallApplyFailed(message) = err else {
+            panic!("expected FirewallApplyFailed, got {err:?}");
+        };
+        assert!(message.contains("decision is ContainNoRedirect"));
+        assert!(system.tandem_dns_anchor.is_none());
+    }
+
+    /// Teardown without an owned tandem anchor is an exact no-op (no pf
+    /// execution, no state change).
+    #[test]
+    fn macos_tandem_teardown_without_anchor_is_a_noop() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system
+            .teardown_tandem_dns_redirect()
+            .expect("teardown with no anchor must be a no-op");
+        assert!(system.tandem_dns_anchor.is_none());
     }
 
     #[test]
