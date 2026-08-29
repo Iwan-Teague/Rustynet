@@ -9,6 +9,14 @@ authors.workspace = true
 subtle = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand.workspace = true
+# Blind-relay v2 admission listener (phase 4): HMAC-SHA256 for the stateless
+# address-validation artifact, SHA-256 for replay digests and presenter-key
+# digests, zeroize for the address-validation HMAC key material. Versions are
+# pinned to match rustynet-control's existing hmac/sha2/zeroize usage so the
+# workspace resolves to one copy of each.
+hmac = "0.12"
+sha2 = "0.10"
+zeroize = "1"
 rustynet-control = { path = "../rustynet-control" }
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "sync", "time", "signal"], optional = true }
 tracing = { version = "0.1", optional = true }
