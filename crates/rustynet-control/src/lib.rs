@@ -6,6 +6,7 @@ pub mod credential_unwrap;
 pub mod enrollment;
 pub mod ga;
 pub mod key_rotation;
+pub mod managed_dns_handoff;
 pub mod membership;
 pub mod operations;
 pub mod persistence;
