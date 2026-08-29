@@ -113,15 +113,58 @@ pub fn issue_membership_owner_key(
 /// Runs `rustynet ops init-membership`, then adds each non-exit peer
 /// via `ops e2e-membership-add`, then reads back the snapshot bytes.
 /// Requires the SSH session to have sudo / admin privilege.
+/// Resolve the exit node's membership node id from the peers list.
+///
+/// The macOS genesis (`ops init-membership`) requires `RUSTYNET_NODE_ID`
+/// (MAC-D5): the daemon fails closed when it is missing. The id is sourced
+/// from the exit peer entry exactly like the Linux twin
+/// (`linux_membership.rs`); absent exit peer or an empty id is a LOUD
+/// error — never a blank/default node id.
+fn exit_node_id_from_peers(peers: &[NodeMembershipPeer]) -> Result<&str, AdapterError> {
+    let exit = peers
+        .iter()
+        .find(|p| p.role == NodeRole::Exit)
+        .map(|p| p.node_id.as_str());
+    match exit {
+        Some(id) if !id.is_empty() => Ok(id),
+        Some(_) => Err(AdapterError::Protocol {
+            message: "exit peer entry in `peers` has an empty membership node id; \
+                      refusing to run membership init with a blank RUSTYNET_NODE_ID"
+                .to_owned(),
+        }),
+        None => Err(AdapterError::Protocol {
+            message: "no NodeRole::Exit peer in `peers`; membership init on macOS \
+                      cannot source the required RUSTYNET_NODE_ID"
+                .to_owned(),
+        }),
+    }
+}
+
+/// Build the remote `ops init-membership` command for a macOS exit node.
+///
+/// Mirrors the Linux twin: `env` is placed AFTER `sudo -n` so sudo's
+/// `env_reset` cannot strip the role/node-id variables (the previous
+/// macOS form ran `env RUSTYNET_NODE_ROLE=admin sudo …`, which sudo
+/// stripped — leaving RUSTYNET_NODE_ID unset entirely).
+fn membership_init_script(exit_node_id_arg: &str) -> String {
+    format!(
+        "sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='{exit_node_id_arg}' \
+         '{MACOS_RUSTYNET_PATH}' ops init-membership"
+    )
+}
+
 pub fn init_membership_snapshot(
     conn: &NodeConnection,
     _owner_key: &MembershipOwnerKey,
     peers: &[NodeMembershipPeer],
 ) -> Result<MembershipSnapshot, AdapterError> {
-    // 1. Run ops init-membership (idempotent).
+    // 1. Run ops init-membership (idempotent). RUSTYNET_NODE_ID is required
+    //    by init-membership; sourced from the exit peer, fail-loud if absent.
+    let exit_node_id = exit_node_id_from_peers(peers)?;
+    let exit_node_id_arg = shell_safe_arg(exit_node_id)?;
     ssh::run_remote(
         conn,
-        &format!("env RUSTYNET_NODE_ROLE=admin sudo '{MACOS_RUSTYNET_PATH}' ops init-membership",),
+        &membership_init_script(&exit_node_id_arg),
         MEDIUM_TIMEOUT,
     )?;
 
@@ -559,6 +602,79 @@ mod tests {
         };
         let decoded = base64_decode(encoded.trim()).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    // ── MAC-D5: membership init must carry RUSTYNET_NODE_ID ─────────────────
+
+    fn peer(role: NodeRole, node_id: &str) -> NodeMembershipPeer {
+        NodeMembershipPeer {
+            alias: node_id.to_owned(),
+            role,
+            capabilities: Vec::new(),
+            node_id: node_id.to_owned(),
+            public_key_hex: "a".repeat(64),
+            gossip_identity: GossipIdentity::DeferredPlatform,
+        }
+    }
+
+    #[test]
+    fn membership_init_script_carries_node_id_after_sudo() {
+        // MAC-D5: the daemon fails closed without RUSTYNET_NODE_ID. The
+        // command must set it (and the role) INSIDE the sudo invocation —
+        // `env … sudo` has the variables stripped by sudo's env_reset.
+        let script = membership_init_script("node-exit-1");
+        assert!(
+            script
+                .starts_with("sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='node-exit-1'"),
+            "node id must be set after sudo -n env: {script}"
+        );
+        assert!(
+            script.contains("ops init-membership"),
+            "script must run init-membership: {script}"
+        );
+        assert!(
+            script.contains(MACOS_RUSTYNET_PATH),
+            "script must use the canonical macOS rustynet path: {script}"
+        );
+    }
+
+    #[test]
+    fn exit_node_id_resolution_sources_the_exit_peer() {
+        let peers = vec![
+            peer(NodeRole::Client, "node-client-1"),
+            peer(NodeRole::Exit, "node-exit-1"),
+        ];
+        assert_eq!(exit_node_id_from_peers(&peers).unwrap(), "node-exit-1");
+    }
+
+    #[test]
+    fn exit_node_id_resolution_fails_loud_without_exit_peer() {
+        let peers = vec![peer(NodeRole::Client, "node-client-1")];
+        let err = exit_node_id_from_peers(&peers).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no NodeRole::Exit peer") && msg.contains("RUSTYNET_NODE_ID"),
+            "missing exit peer must name the failure: {msg}"
+        );
+    }
+
+    #[test]
+    fn exit_node_id_resolution_fails_loud_on_blank_id() {
+        // A blank node id is a correctness hazard (empty env var), so an
+        // empty string on the exit peer must fail rather than default.
+        let peers = vec![peer(NodeRole::Exit, "")];
+        let err = exit_node_id_from_peers(&peers).unwrap_err();
+        assert!(
+            err.to_string().contains("empty membership node id"),
+            "blank id must fail loud: {err}"
+        );
+    }
+
+    #[test]
+    fn resolved_exit_node_id_survives_shell_safety_guard() {
+        let peers = vec![peer(NodeRole::Exit, "node-exit-1")];
+        let id = exit_node_id_from_peers(&peers).unwrap();
+        assert_eq!(shell_safe_arg(id).unwrap(), "node-exit-1");
     }
 }
 
