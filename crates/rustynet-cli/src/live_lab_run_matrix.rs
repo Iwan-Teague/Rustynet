@@ -4785,6 +4785,18 @@ mod registry_equivalence_tests {
                 // macos/windows columns that can only ever read `skip` would be
                 // noise rather than evidence.
                 vec!["linux".into()]
+            } else if matches!(
+                bare,
+                "deploy_macos_anchor_profile"
+                    | "validate_macos_anchor_bundle_pull"
+                    | "validate_macos_anchor_port_mapping_authority"
+            ) {
+                // MAC-D3: the three macOS anchor validators are rust-native
+                // stages now, but they are platform-gated behind an ELECTED
+                // macOS anchor. This fixture has no anchor node at all, so on
+                // macos/windows they can only ever read `skip` — same
+                // noise-not-evidence rule as the gossip special case above.
+                vec!["linux".into()]
             } else if oracle_is_rust_native(bare) {
                 vec!["linux".into(), "macos".into(), "windows".into()]
             } else {

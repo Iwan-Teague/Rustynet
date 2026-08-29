@@ -65,6 +65,11 @@ pub mod live_network_flap_validation;
 pub mod live_reboot_recovery_validation;
 pub mod live_secrets_not_in_logs_validation;
 pub mod live_two_hop_validation;
+// MAC-D3: the three macOS anchor validators, promoted from the bash-era
+// registry vocabulary into first-class --node engine stages.
+pub mod macos_anchor_bundle_pull_validation;
+pub mod macos_anchor_port_mapping_authority_validation;
+pub mod macos_anchor_profile_deploy;
 pub mod membership_init;
 pub mod mesh_status_validation;
 pub mod negative_control;
@@ -213,6 +218,14 @@ define_stage_catalog! {
     ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role,
     BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live / T1Role,
     LiveAnchor => "live_anchor" @ Live / T1Role,
+    // MAC-D3: macOS anchor validators, previously registry-only (bash era).
+    // Wire names match the legacy registry vocabulary so run-matrix evidence
+    // stays comparable. Gated Live: skipped-with-reason unless the macOS
+    // anchor validators are elected (--anchor-platform macos) and a macOS
+    // anchor node is assigned.
+    MacosAnchorProfileDeploy => "deploy_macos_anchor_profile" @ Live / T1Role,
+    MacosAnchorBundlePullValidation => "validate_macos_anchor_bundle_pull" @ Live / T1Role,
+    MacosAnchorPortMappingAuthorityValidation => "validate_macos_anchor_port_mapping_authority" @ Live / T1Role,
     LiveTwoHopValidation => "live_two_hop_validation" @ Live / T1Role,
     LiveManagedDnsValidation => "live_managed_dns_validation" @ Live / T1Role,
     LiveNetworkFlapValidation => "live_network_flap_validation" @ Live / T2Resilience,
