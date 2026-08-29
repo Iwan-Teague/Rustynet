@@ -1280,3 +1280,106 @@ peer, env after `sudo -n`, fail-closed on blank/missing id, tests pinning
 the wiring). Next step unchanged: re-run this exact §10.1 shape;
 membership_init should then pass and the exit stages run for the first
 time — until that run exists the cell stays 🔴, not green.
+
+## 11. Exit cell re-run after MAC-D5 — 2026-08-29 (latest session)
+
+Re-ran the §10.1 Cell-2 shape after MAC-D5 (`RUSTYNET_NODE_ID` on the macOS
+membership adapter, merge `7447c5a9`) landed. Worktree
+`ai-edit/edit-1787975740383-56044-41`, commit
+`571e6bf7cc6fe4f33c61bec134166bba148dd54c` (MAC-D5 merge `7447c5a9` is the
+parent — confirmed ancestor), tree clean at launch.
+
+### 11.1 Run
+
+- Ledger row `livelab-1787977339-571e6bf7cc6f` (verified in
+  `documents/operations/live_lab_node_run_matrix.csv`: commit, branch,
+  clean, topology macos-utm-1:exit + lenovo-exit-1:entry +
+  lenovo-client-1:client); internal run id `rust-1787975999`; report
+  `state/mac-cells/exit4-20260829-045950` (worktree-local, gitignored).
+- Exact §10.1 shape (`ops vm-lab-orchestrate-live-lab --node … --trust-
+  inventory-ready --ssh-identity-file ~/.ssh/rustynet_lab_ed25519
+  --known-hosts-file ~/.ssh/known_hosts`), fresh report dir, orchestrator
+  rebuilt from this commit before launch. macos-utm-1 was powered off at
+  session start; powered on via `utmctl` and SSH-verified before launch.
+  Guest run-exclusion locks clear; 143 GiB free.
+- 64 stages / 3 nodes: **9 pass / 1 fail / 54 skip**; overall fail,
+  `first_failed_stage = membership_init`; elapsed 22m20s. Profile
+  `mgmt_shared_smoke_v1` (derived, not enforced).
+- Passed: preflight, prepare_source_archive, verify_ssh_reachability,
+  cleanup_hosts, **bootstrap_hosts (19m40s — fresh bootstrap re-ran on
+  macos-utm-1, shipping the MAC-D5 binary)**,
+  cross_network_substrate_setup, collect_pubkeys; the Linux/lenovo setup
+  stages all green as in §8/§10.
+
+### 11.2 MAC-D5: LIVE-CONFIRMED — membership_init moved past the node-id failure
+
+The §10.3 failure signature — `membership node id is required
+(RUSTYNET_NODE_ID)` — is **gone**. Step 1 of the adapter
+(`membership_init_script`: `sudo -n env RUSTYNET_NODE_ROLE=admin
+RUSTYNET_NODE_ID='<exit-node-id>' … ops init-membership`, env AFTER
+`sudo -n`) **passed on macos-utm-1**: the id sourced from the exit peer
+was accepted and `init-membership` completed. MAC-D2 (owner-key read),
+MAC-D4 (genesis seed, re-exercised by this fresh bootstrap) and MAC-D5
+(node id) are therefore all live-confirmed together at the seed+node-id
+level. The chain now fails one step DEEPER, inside the same stage's
+peer-add loop.
+
+### 11.3 NEW BLOCKER (MAC-D6) — the peer-add loop calls an `ops` subcommand that does not exist
+
+`membership_init` FAIL rc=1, on the FIRST non-exit peer of the §11.1
+topology:
+
+```
+init_membership_snapshot: remote command failed (exit Some(64)): (stderr
+empty; stdout tail) error [bad_args (64)]: owner-approver-id contains
+unsupported characters: error [bad_args (64)]: unknown ops subcommand:
+owner-approver-id … none
+```
+
+Root cause (file:line):
+`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_membership.rs:197-202`.
+Step 2 of `init_membership_snapshot` primes the approver id with
+
+```
+owner_approver_id="$('{MACOS_RUSTYNET_PATH}' ops owner-approver-id 2>/dev/null || echo none)"
+```
+
+but **no `ops owner-approver-id` subcommand exists anywhere in the CLI**
+(grep: only `e2e-membership-add` / `e2e-membership-set-capabilities`
+CONSUME `--owner-approver-id`, `main.rs:5664/5671`). The CLI prints its
+`bad_args` error to **stdout**, so `2>/dev/null` suppresses nothing,
+`|| echo none` appends `none`, and the captured multi-line error text is
+passed as `--owner-approver-id '<error text>none'` — which
+`ensure_safe_token` (`ops_e2e.rs:1991`) rejects with exactly the
+"contains unsupported characters" error above.
+
+Fix shape (owner-gated): mirror the Linux twin —
+`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/linux_membership.rs:72-74`
+derives `owner_approver_id = "{exit_node_id}-owner"` with the explicit
+comment *"There is no `rustynet ops owner-approver-id` command; derive
+from the exit peer."* The macOS branch should do the same (one line, plus
+a pinning test that the approver id is derived, never shelled out).
+
+Consequence: the exit-stage skip chain re-arms a third time —
+`distribute_membership`, `exit_handoff`, `active_exit`,
+`exit_dns_failclosed_validation`, `exit_nat_lifecycle_validation`,
+`exit_demotion_residue_validation` all graded **skip** behind
+`membership_init` (54 skips). No exit stage has yet dispatched on macOS;
+DnsFailclosed remains unexercised on macOS exit (and the Linux-side
+`dns_failclosed_validation` also skipped this run behind
+`security_audit_validation`).
+
+Triage stub appended:
+`livelab-1787977339-571e6bf7cc6f::membership_init` in
+`documents/operations/live_lab_stage_triage.jsonl`.
+
+### 11.4 Verdict
+
+Exit cell: **BLOCKED-partial, but the membership chain advanced one
+rung** — MAC-D2 + MAC-D4 + MAC-D5 now live-confirmed on a fresh macOS
+bootstrap (owner-key seed + read + node id all work; `init-membership`
+completes); the first peer-add is blocked by MAC-D6, a one-line-class
+adapter defect (invented subcommand) with a known-good Linux-twin fix
+shape. Next step: land MAC-D6, re-run this exact §11.1 shape; the
+`e2e-membership-add` loop and steps 3+ (snapshot read-back, distribution,
+exit handoff) remain unproven until then.
