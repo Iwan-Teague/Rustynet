@@ -1031,6 +1031,55 @@ CPU count, or both. At minimum, distinguish "build exceeded its budget" from
 "build failed" in the stage outcome so a timeout is never read as a product
 defect.
 
+**STATUS 2026-08-29 — CLOSED.**
+
+1. **The build timeout is env-configurable.** `windows_install.rs` replaces the
+   hard-coded `BUILD_TIMEOUT` const with `DEFAULT_WINDOWS_BUILD_TIMEOUT_SECS
+   = 3600` plus `WINDOWS_BUILD_TIMEOUT_ENV = "RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS"`.
+   The new `windows_build_timeout_from_env()` treats unset/empty/whitespace as
+   the default, honors a positive integer of seconds, and **fails closed** with
+   a `Protocol` error naming the variable on any other value — no silent
+   fallback. `install_daemon` now resolves the budget at the build call site
+   and passes it to `run_remote_ps`.
+2. **The single-threaded default is gone.** `Bootstrap-RustyNetWindows.ps1`'s
+   `Ensure-CargoBuildJobsForWindowsLab` now defaults unset `CARGO_BUILD_JOBS`
+   to `[Math]::Max(1, [Environment]::ProcessorCount).ToString()` — the guest's
+   CPU count — instead of the historical `'1'` (introduced incidentally in
+   `4e6feb0e`, see the QH-17 note). An explicit `CARGO_BUILD_JOBS` still wins,
+   and the build/toolchain report readers (`New-BuildReleaseReport`,
+   `Write-BuildReleaseToolchainReport`) read the variable after the Ensure
+   runs, so reports keep recording the effective value.
+3. **Budget kills are relabelled, not recorded as product defects.** The new
+   `classify_windows_build_outcome()` matches the one signature
+   `ssh::run_remote` produces for a deadline kill (`AdapterError::Ssh` whose
+   message contains `timed out after`) and rewrites it to a `Protocol` error
+   stating the build **exceeded its timeout budget of Ns**, naming
+   `RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS` as the raise-the-budget knob and
+   explicitly marking it build-infrastructure under-provisioning (QH-15),
+   not a product defect — the build produced no verdict. Every other error
+   (real compile failure as `AdapterError::Command`, SSH transport failure)
+   passes through unchanged, so genuine failures keep their full fidelity in
+   the stage outcome and failure digest.
+
+Deliberately unchanged: `CARGO_TARGET_DIR` is still not redirected (the
+install hardcodes `<workdir>\target\release\`) and `target/` is still not
+wiped between runs on this path — the warm build cache is the point.
+
+Verification: unit tests in `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs` —
+`windows_build_timeout_defaults_when_env_unset_or_blank`,
+`windows_build_timeout_honors_positive_override`,
+`windows_build_timeout_fails_closed_on_invalid_override`,
+`windows_build_budget_timeout_is_relabelled_not_read_as_product_defect`,
+`windows_build_genuine_failure_passes_through_unrelabelled`, and the
+content-pin `windows_bootstrap_defaults_cargo_build_jobs_to_guest_cpu_count`
+(asserts the bootstrap contains `[Environment]::ProcessorCount` and no longer
+the forced `= '1'`). Gates: `cargo fmt --all -- --check` and
+`cargo clippy -p rustynet-cli --all-targets --all-features --locked -- -D
+warnings` clean. No Windows live-lab run — the Windows guest is offline — so
+the CPU-count default and relabelled outcome are proven by content-pin and
+unit test, not yet by a live `windows_stage` pass; the next live Windows
+build cell should confirm the toolchain report shows the derived job count.
+
 ### QH-16 — A gate run through a pipeline reports the PIPE's exit status, not the tool's
 **Severity: HIGH (falsifies evidence). Confidence: VERIFIED — it invalidated a real green result in this session. CLOSED 2026-08-29 — disposition below.**
 

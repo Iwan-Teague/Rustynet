@@ -3,12 +3,12 @@ use std::time::Duration;
 
 use base64::prelude::*;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::VmGuestPlatform;
 
 pub const WINDOWS_SERVICE_NAME: &str = "RustyNet";
 pub const WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
@@ -56,7 +56,16 @@ static VSCONFIG_FILE: &str =
     include_str!("../../../../../../scripts/bootstrap/windows/RustyNetBuildTools.vsconfig");
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
-const BUILD_TIMEOUT: Duration = Duration::from_secs(3600); // cold release build on Windows VM can take 30-60 min
+/// Default budget (seconds) for the cold Windows release build. A 2-vCPU guest
+/// can legitimately need 30-60 minutes, so this default leaves generous
+/// headroom; operators proving a slower cell can raise it without a rebuild
+/// via `RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS` (see
+/// [`WINDOWS_BUILD_TIMEOUT_ENV`] and [`windows_build_timeout_from_env`]).
+const DEFAULT_WINDOWS_BUILD_TIMEOUT_SECS: u64 = 3600;
+/// Environment variable overriding the Windows build-release timeout budget,
+/// in whole seconds (`RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS=5400`). Invalid
+/// values fail closed — there is no silent fallback to the default.
+pub const WINDOWS_BUILD_TIMEOUT_ENV: &str = "RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS";
 const WINDOWS_SERVICE_STOP_POLL_SECS: u64 = 30;
 const WINDOWS_SERVICE_START_POLL_ATTEMPTS: u64 = 60;
 const WINDOWS_SERVICE_START_POLL_INTERVAL_SECS: u64 = 2;
@@ -127,6 +136,59 @@ pub fn run_remote_ps_check(
 ) -> Result<bool, AdapterError> {
     let invocation = build_ps_invocation(script)?;
     ssh::run_remote_check(conn, &invocation, timeout)
+}
+
+// ── Windows build budget (QH-15) ─────────────────────────────────────────────
+
+/// Resolve the Windows build-release timeout budget from `RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS`.
+///
+/// `None` / empty / whitespace-only selects the 3600s default. A value parses
+/// as `u64` and is > 0 selects that many seconds. Anything else is a hard
+/// error naming the variable — fail closed, never a silent fallback, so a
+/// typo in the override cannot silently run the build on the wrong budget.
+pub fn windows_build_timeout_from_env(raw: Option<&str>) -> Result<Duration, AdapterError> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(Duration::from_secs(DEFAULT_WINDOWS_BUILD_TIMEOUT_SECS));
+    };
+    match raw.parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        _ => Err(AdapterError::Protocol {
+            message: format!(
+                "{WINDOWS_BUILD_TIMEOUT_ENV} must be a positive integer number of \
+                 seconds (got {raw:?}); the Windows build-release budget was NOT \
+                 applied and the default is not silently substituted"
+            ),
+        }),
+    }
+}
+
+/// Read the live environment for the Windows build-release timeout budget.
+fn windows_build_timeout() -> Result<Duration, AdapterError> {
+    windows_build_timeout_from_env(std::env::var(WINDOWS_BUILD_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Relabel a budget timeout on the Windows build-release step so the ledger
+/// never records "build exceeded its time budget" as a product defect (QH-15).
+///
+/// `ssh::run_remote` surfaces a deadline kill as `AdapterError::Ssh` whose
+/// message contains `timed out after`; every other error — including a real
+/// compile failure surfaced as `AdapterError::Command` and an SSH spawn
+/// failure — passes through unchanged.
+fn classify_windows_build_outcome(err: AdapterError, budget: Duration) -> AdapterError {
+    match err {
+        AdapterError::Ssh { message } if message.contains("timed out after") => {
+            AdapterError::Protocol {
+                message: format!(
+                    "Windows build-release exceeded its timeout budget of {}s \
+                     (set RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS to raise it). This is \
+                     build infrastructure under-provisioning (QH-15), not a product \
+                     defect; the build was killed at the budget and produced no verdict.",
+                    budget.as_secs()
+                ),
+            }
+        }
+        other => other,
+    }
 }
 
 // ── Install lifecycle ─────────────────────────────────────────────────────────
@@ -247,9 +309,16 @@ pub fn install_daemon(
         run_remote_ps(conn, &vendor_extract_script, Duration::from_secs(300))?;
     }
 
-    // Build release from synced workdir.
+    // Build release from synced workdir. The budget is env-overridable
+    // (QH-15) and a budget kill is relabeled as infrastructure
+    // under-provisioning so the stage outcome is never read as a product
+    // defect. CARGO_TARGET_DIR stays redirected-by-absence: the install
+    // hardcodes `<workdir>\target\release\` and `target/` is deliberately
+    // not wiped between runs on this path (warm cache).
     let build_script = build_windows_release_script(workdir, &remote_bootstrap)?;
-    run_remote_ps(conn, &build_script, BUILD_TIMEOUT)?;
+    let build_timeout = windows_build_timeout()?;
+    run_remote_ps(conn, &build_script, build_timeout)
+        .map_err(|err| classify_windows_build_outcome(err, build_timeout))?;
 
     // Install the service.
     let node_id = windows_lab_node_id(alias, ctx);
@@ -950,7 +1019,7 @@ fn run_windows_e2e_bootstrap(
 /// Returns `(verifier_key_file_content, trust_evidence_file_content)`.
 fn generate_local_trust_material() -> Result<(String, String), String> {
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::{TryRngCore, rngs::OsRng};
+    use rand::{rngs::OsRng, TryRngCore};
     use zeroize::Zeroize;
 
     let mut seed = [0u8; 32];
@@ -2130,6 +2199,138 @@ mod tests {
         assert!(
             WINDOWS_E2E_BOOTSTRAP_TIMEOUT.as_secs() > 120,
             "bootstrap timeout must leave budget for key init, membership init, and ACL checks"
+        );
+    }
+
+    // ── QH-15: Windows build budget is configurable and relabeled ───────────
+
+    fn build_outcome_message(err: &AdapterError) -> &str {
+        match err {
+            AdapterError::Ssh { message } => message,
+            AdapterError::Protocol { message } => message,
+            AdapterError::Command { stderr, .. } => stderr,
+            other => panic!("unexpected adapter error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_build_timeout_defaults_when_env_unset_or_blank() {
+        assert_eq!(
+            windows_build_timeout_from_env(None).unwrap(),
+            Duration::from_secs(DEFAULT_WINDOWS_BUILD_TIMEOUT_SECS),
+            "unset env must select the 3600s default"
+        );
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                windows_build_timeout_from_env(Some(blank)).unwrap(),
+                Duration::from_secs(DEFAULT_WINDOWS_BUILD_TIMEOUT_SECS),
+                "blank env {blank:?} must select the default, not fail"
+            );
+        }
+        assert_eq!(
+            DEFAULT_WINDOWS_BUILD_TIMEOUT_SECS, 3600,
+            "default budget must keep the historical 3600s headroom"
+        );
+    }
+
+    #[test]
+    fn windows_build_timeout_honors_positive_override() {
+        assert_eq!(
+            windows_build_timeout_from_env(Some("5400")).unwrap(),
+            Duration::from_secs(5400),
+            "a positive integer override must be honored verbatim"
+        );
+    }
+
+    #[test]
+    fn windows_build_timeout_fails_closed_on_invalid_override() {
+        for bad in ["abc", "0", "-120", "1.5", "3600s"] {
+            let err = windows_build_timeout_from_env(Some(bad))
+                .expect_err("invalid override must fail closed");
+            let message = build_outcome_message(&err);
+            assert!(
+                message.contains(WINDOWS_BUILD_TIMEOUT_ENV),
+                "error must name the env var {WINDOWS_BUILD_TIMEOUT_ENV}: {message}"
+            );
+            assert!(
+                !message.is_empty() && message.contains(bad),
+                "error must quote the rejected value: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_build_budget_timeout_is_relabelled_not_read_as_product_defect() {
+        let budget = Duration::from_secs(3600);
+        let ssh_timeout = AdapterError::Ssh {
+            message: "SSH spawn failed for win-lab: timed out after 3600 seconds".to_owned(),
+        };
+        let relabelled = classify_windows_build_outcome(ssh_timeout, budget);
+        let message = build_outcome_message(&relabelled);
+        assert!(
+            message.contains("exceeded its timeout budget"),
+            "budget kill must be relabelled as a timeout-budget event: {message}"
+        );
+        assert!(
+            message.contains("not a product defect"),
+            "relabelled outcome must state it is not a product defect: {message}"
+        );
+        assert!(
+            message.contains(WINDOWS_BUILD_TIMEOUT_ENV),
+            "relabelled outcome must name the override knob: {message}"
+        );
+        assert!(
+            message.contains("3600"),
+            "relabelled outcome must carry the budget in seconds: {message}"
+        );
+    }
+
+    #[test]
+    fn windows_build_genuine_failure_passes_through_unrelabelled() {
+        // A real compile failure surfaces as Command with exit code + stderr.
+        let failure = AdapterError::Command {
+            exit_code: Some(101),
+            stderr: "error[E0308]: mismatched types".to_owned(),
+        };
+        match classify_windows_build_outcome(failure, Duration::from_secs(3600)) {
+            AdapterError::Command { exit_code, stderr } => {
+                assert_eq!(exit_code, Some(101), "exit code must survive passthrough");
+                assert_eq!(
+                    stderr, "error[E0308]: mismatched types",
+                    "stderr must survive passthrough verbatim"
+                );
+            }
+            other => panic!("Command failure must pass through unchanged: {other:?}"),
+        }
+        // An SSH transport failure without the timeout marker also passes
+        // through — only the budget kill is relabelled.
+        let spawn_failure = AdapterError::Ssh {
+            message: "SSH spawn failed for win-lab: connection refused".to_owned(),
+        };
+        match classify_windows_build_outcome(spawn_failure, Duration::from_secs(3600)) {
+            AdapterError::Ssh { message } => assert!(
+                message.contains("connection refused"),
+                "non-timeout SSH failure must pass through: {message}"
+            ),
+            other => panic!("non-timeout SSH failure must pass through: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_bootstrap_defaults_cargo_build_jobs_to_guest_cpu_count() {
+        // QH-15: the unset-default must derive from the guest's CPU count via
+        // [Environment]::ProcessorCount, never the historical forced '1'.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("[Environment]::ProcessorCount"),
+            "Ensure-CargoBuildJobsForWindowsLab must default to the guest CPU count"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("$env:CARGO_BUILD_JOBS = '1'"),
+            "the forced single-threaded default must be gone from the bootstrap"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("Ensure-CargoBuildJobsForWindowsLab"),
+            "the Ensure function itself must remain present"
         );
     }
 }

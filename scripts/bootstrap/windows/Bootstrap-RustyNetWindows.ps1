@@ -307,7 +307,10 @@ function Write-BuildReleaseToolchainReport {
 
 function Ensure-CargoBuildJobsForWindowsLab {
     if ([string]::IsNullOrWhiteSpace($env:CARGO_BUILD_JOBS)) {
-        $env:CARGO_BUILD_JOBS = '1'
+        # QH-15: default to the guest's CPU count instead of serializing the
+        # build to '1' — a forced single job could consume the whole build
+        # budget on a 2-vCPU guest. An explicit CARGO_BUILD_JOBS still wins.
+        $env:CARGO_BUILD_JOBS = [Math]::Max(1, [Environment]::ProcessorCount).ToString()
     }
 }
 
