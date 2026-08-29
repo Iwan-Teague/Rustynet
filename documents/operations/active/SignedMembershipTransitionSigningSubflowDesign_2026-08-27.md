@@ -189,6 +189,56 @@ Yes, by re-run-from-start with convergent steps (chosen over checkpoint files):
 - No real signing, no IPC, no I/O, no new CLI verbs, no daemon changes. `CollectApproverSignatures`
   is deliberately abstract so the sequencer does not prejudge §8's owner decisions.
 
+### 6.1) 2026-08-28 — sequencer skeleton extended (non-owner-gated parts only)
+
+`crates/rustynet-control/src/role_signing_subflow.rs` gained the §10.7 enforcement and §4/§5
+models as pure, tested code. Nothing here decides an owner question; the six §8 decisions (§8.1
+driver placement, §8.2 quorum>1, §8.3 health-check semantics, §8.4 remove-path availability
+window, §8.5 signed-artifact TTL, §8.6 `role set` auto-emit — digest entries 9–14, plus the
+latent default 15) remain PARKED and unprejudged.
+
+Implemented:
+
+1. **Ordering validator** — `validate_step_ordering` + `OrderingViolation`: independently
+   VERIFIES any step sequence against every §10.7 invariant at the emission boundary —
+   per-service-kind deploy-before-emission (I-1) and undeploy-before-emission (I-2) for EVERY
+   `ServiceKind` present (relay/nas/llm/dns, generic over the kind set, not hardcoded to
+   relay), undeploy-not-before-deploy, the exit ADD inversion (advertise leads preflight),
+   exit teardown strictly before revocation emission (residue rule), and the fixed signing
+   phase (emit → sign → publish → refresh, refresh terminal; a sequence missing the phase
+   fails closed). 7 negative tests prove each violation class is rejected; one test proves
+   the validator accepts every sequenced matrix cell (producer/checker agreement).
+2. **Partial-failure state model** — `NodeTransitionState` (`initial` seeded from the plan's
+   SOURCE composition, so no-op-lifecycle transitions like relay→anchor replay correctly;
+   `replay`/`replay_healthy` over any step boundary) + `fail_closed_violations`
+   (`FailClosedViolation`): evaluated AT the publish boundary — destination-advertised
+   services must be running (I-1), undeployed services must be down (I-2), the exit pair
+   must be up for adds / fully down for removes. Health verification is ABSTRACT input
+   (`ServiceHealthVerdict`, §8.3 parked): an unhealthy deploy is never marked running, and a
+   test proves the checker flags `AdvertisedWithoutRunningService` at publish. Proven: NO
+   boundary of ANY SignedMembership matrix cell violates the invariants (every window is
+   availability-only), and pre-publish boundaries advertise nothing (unsigned/unapplied
+   record is inert).
+3. **Idempotency/resumability** — `NodeTransitionState::apply` effects are idempotent
+   set/flag updates; a test re-runs the FULL sequence from EVERY boundary of EVERY matrix
+   cell and proves convergence to the terminal state and a no-op second pass (§5's
+   chosen re-run-from-start model, now proven rather than asserted).
+4. **Recovery directives** — `recovery_directive(steps, completed, failure)` +
+   `StepFailure::{Failed, BelowQuorum}` → `RecoveryDirective::{RerunFromStart,
+   ResumeFromSignedArtifact, RefuseAndReport}`: death after the sign boundary resumes from
+   the signed artifact; deploy/undeploy/exit/sign/apply failures and below-quorum signing
+   refuse-and-report (§5's refuse list; below-quorum modeled as terminal-for-automation,
+   the threshold POLICY itself still §8.2-parked); primary rewrite, record emission, and
+   the idempotent refresh re-run; an out-of-sequence failure index fails closed to refusal.
+   `refusal_is_safe` exposes the refusal precondition (safe only while nothing has
+   published), tested across the matrix.
+
+Still NOT implemented (unchanged, by design): real signing wiring and key custody at
+transition time (§2/§8), driver placement (§8.1), quorum>1 automation (§8.2), real
+health-check probing (§8.3 — abstract `ServiceHealthVerdict` input only), remove-path
+window policy (§8.4), artifact TTL (§8.5), `role set` auto-emit (§8.6), and all live proof
+(D-4b).
+
 ## 7) Rejected design alternatives (beyond §2's)
 
 - **Sequencer inside `role_cli::plan_concrete_actions` itself** (extend `ConcreteAction` with
