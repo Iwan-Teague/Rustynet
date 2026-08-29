@@ -1475,6 +1475,18 @@ Minor: a session with a null `InternalSourceAddress` makes `.Split` raise a non-
 and skip that item (`$ErrorActionPreference` is `Continue` here); the assertion's verdict is
 unaffected.
 
+**Disposition 2026-08-29 — FIXED (tightened).** The identity check is implemented instead of only
+softening the claim: the client's mesh address (the orchestrator's `mesh_ips` map) is threaded
+through `NodeAdapter::assert_mesh_client_nat_session(Option<&str>)` into both the Linux (conntrack)
+and Windows (WinNAT) implementations. With the expected address supplied, the assertion accepts ONLY
+a session whose pre-translation source equals it — the probed client's identity is proven; without
+one, the honest weaker range claim stands. The assertion now returns the concrete
+`MeshClientNatSession` pair, and the stage writes it on pass to
+`<report_dir>/active_exit.egress_evidence.json` with an explicit `identity_proven` flag + claim
+sentence — the address pair, not a bare verdict, is the evidence. Unit tests cover the wrong-client
+rejection (Windows parse + Linux selection), the weaker-claim wording, and the evidence JSON in both
+identity branches.
+
 ### QH-26 — Three unreviewed delegated-edit WIP checkpoints are on `main`, one of which deleted a trust check and silently repurposed its own negative test
 **Severity: HIGH as a process failure. Confidence: VERIFIED end-to-end.**
 **★ Do NOT simply revert `f1ef83b1` — read the direction finding below first.**

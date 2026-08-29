@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
@@ -130,20 +131,42 @@ impl OrchestrationStage for ActiveExitStage {
         if let Some(client_alias) = client_alias
             && let Some(client_adapter) = ctx.adapters.get(client_alias.as_str())
         {
-            let egress_ok = (|| -> Result<(), String> {
+            // QH-25: the NAT-session assertion is an identity check when the
+            // client's mesh address is known — "THE probed client's session was
+            // translated" — and keeps its honest weaker range claim ("a
+            // mesh-sourced session was translated") when it is not.
+            let expected_client_mesh_addr = ctx.mesh_ips.get(client_alias.as_str());
+            let egress_ok = (|| -> Result<MeshClientNatSession, String> {
                 client_adapter
                     .drive_exit_egress_probe()
                     .map_err(|e| format!("drive egress traffic: {e}"))?;
                 exit_adapter
-                    .assert_mesh_client_nat_session()
-                    .map_err(|e| format!("assert NAT session: {e}"))?;
-                Ok(())
+                    .assert_mesh_client_nat_session(expected_client_mesh_addr.map(String::as_str))
+                    .map_err(|e| format!("assert NAT session: {e}"))
             })();
-            if let Err(reason) = egress_ok {
-                write_reported_skip_note_egress(ctx, &exit_alias, client_alias.as_str(), &reason);
-                return StageOutcome::Skipped(format!(
-                    "egress precondition not met on {exit_alias}: {reason}"
-                ));
+            match egress_ok {
+                Err(reason) => {
+                    write_reported_skip_note_egress(
+                        ctx,
+                        &exit_alias,
+                        client_alias.as_str(),
+                        &reason,
+                    );
+                    return StageOutcome::Skipped(format!(
+                        "egress precondition not met on {exit_alias}: {reason}"
+                    ));
+                }
+                Ok(session) => {
+                    let identity_proven = expected_client_mesh_addr
+                        .is_some_and(|expected| *expected == session.client_source);
+                    write_egress_evidence(
+                        ctx,
+                        &exit_alias,
+                        client_alias.as_str(),
+                        &session,
+                        identity_proven,
+                    );
+                }
             }
         }
 
@@ -222,6 +245,62 @@ fn write_reported_skip_note_egress(
     );
 }
 
+const EGRESS_EVIDENCE_FILENAME: &str = "active_exit.egress_evidence.json";
+
+/// Serialize the PASS-side egress evidence: the concrete observed address pair
+/// from the NAT-session assertion (QH-25: the pair is the checkable evidence,
+/// not a bare verdict). `identity_proven` records whether the observed source
+/// matched the probed client's known mesh address (identity check) or whether
+/// the claim is the honest weaker one (a mesh-sourced session was translated).
+fn egress_evidence_json_bytes(
+    exit_alias: &str,
+    client_alias: &str,
+    session: &MeshClientNatSession,
+    identity_proven: bool,
+) -> Vec<u8> {
+    let claim = if identity_proven {
+        format!(
+            "the client '{client_alias}'s full-tunnel traffic was translated by \
+             '{exit_alias}'s NAT (observed source matched the client's mesh address)"
+        )
+    } else {
+        format!(
+            "a mesh-sourced (100.64.0.0/10) NAT session was translated by '{exit_alias}' \
+             (client identity not matched: no mesh address was known for '{client_alias}')"
+        )
+    };
+    let body = serde_json::json!({
+        "stage": "active_exit",
+        "egress_evidence": {
+            "exit_alias": exit_alias,
+            "client_alias": client_alias,
+            "client_source": session.client_source,
+            "translated_side": session.translated_side,
+            "observed_via": session.observed_via,
+            "identity_proven": identity_proven,
+            "claim": claim,
+        },
+    });
+    serde_json::to_vec_pretty(&body).unwrap_or_default()
+}
+
+/// Write the egress evidence to
+/// `<report_dir>/active_exit.egress_evidence.json`. Best-effort: a write
+/// failure does not change the stage outcome.
+fn write_egress_evidence(
+    ctx: &OrchestrationContext,
+    exit_alias: &str,
+    client_alias: &str,
+    session: &MeshClientNatSession,
+    identity_proven: bool,
+) {
+    let path = ctx.report_dir.join(EGRESS_EVIDENCE_FILENAME);
+    let _ = std::fs::write(
+        &path,
+        egress_evidence_json_bytes(exit_alias, client_alias, session, identity_proven),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +342,52 @@ mod tests {
                 .unwrap_or("")
                 .contains("lab topology may lack internet egress")
         );
+    }
+
+    #[test]
+    fn egress_evidence_names_pair_and_identity_when_proven() {
+        // QH-25: identity-proven evidence names the concrete pair and claims
+        // THE probed client's traffic was translated.
+        let session = MeshClientNatSession {
+            client_source: "100.64.0.7".to_owned(),
+            translated_side: "203.0.113.9".to_owned(),
+            observed_via: "winnat",
+        };
+        let bytes = egress_evidence_json_bytes("exit1", "client1", &session, true);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["stage"], "active_exit");
+        assert_eq!(v["egress_evidence"]["exit_alias"], "exit1");
+        assert_eq!(v["egress_evidence"]["client_alias"], "client1");
+        assert_eq!(v["egress_evidence"]["client_source"], "100.64.0.7");
+        assert_eq!(v["egress_evidence"]["translated_side"], "203.0.113.9");
+        assert_eq!(v["egress_evidence"]["observed_via"], "winnat");
+        assert_eq!(v["egress_evidence"]["identity_proven"], true);
+        let claim = v["egress_evidence"]["claim"].as_str().unwrap_or("");
+        assert!(claim.contains("the client 'client1's"), "claim: {claim}");
+        assert!(!claim.contains("a mesh-sourced"), "claim: {claim}");
+    }
+
+    #[test]
+    fn egress_evidence_claim_is_weaker_without_identity() {
+        // QH-25: without a matched identity the claim must stay the honest
+        // weaker one — a mesh-sourced session was translated, nobody more.
+        let session = MeshClientNatSession {
+            client_source: "100.64.0.9".to_owned(),
+            translated_side: "198.51.100.4".to_owned(),
+            observed_via: "conntrack",
+        };
+        let bytes = egress_evidence_json_bytes("exit1", "client2", &session, false);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["egress_evidence"]["identity_proven"], false);
+        assert_eq!(v["egress_evidence"]["client_source"], "100.64.0.9");
+        assert_eq!(v["egress_evidence"]["translated_side"], "198.51.100.4");
+        assert_eq!(v["egress_evidence"]["observed_via"], "conntrack");
+        let claim = v["egress_evidence"]["claim"].as_str().unwrap_or("");
+        assert!(
+            claim.contains("a mesh-sourced (100.64.0.0/10) NAT session was translated"),
+            "claim: {claim}"
+        );
+        assert!(!claim.contains("the client 'client2's"), "claim: {claim}");
     }
 
     #[test]
