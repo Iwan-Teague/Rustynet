@@ -448,10 +448,18 @@ impl UserspaceEngine {
         let Some(peer_state) = self.peer_states.get_mut(node_id) else {
             return Err(BackendError::invalid_input("peer is not configured"));
         };
-        let mut encrypt_buf = vec![0u8; MAX_ENCRYPTED_PACKET_BYTES];
+        // Reuse the long-lived engine-owned scratch buffer instead of
+        // allocating a fresh `MAX_ENCRYPTED_PACKET_BYTES` vector on every
+        // handshake initiation. The field-level borrows below are disjoint
+        // (`peer_states` vs `encrypt_scratch` vs
+        // `recorded_tunnel_plaintext_packets`), mirroring
+        // `inject_plaintext_packet`. `format_handshake_initiation` reports
+        // only the bytes it wrote, so stale scratch content beyond the
+        // reported slice is never observable — the emitted handshake is
+        // byte-identical to the previous per-call-buffer behavior.
         let initial_result = peer_state
             .tunnel
-            .format_handshake_initiation(&mut encrypt_buf, force_resend);
+            .format_handshake_initiation(&mut self.encrypt_scratch, force_resend);
         drive_outbound_result(
             node_id,
             peer_state,
@@ -488,13 +496,21 @@ impl UserspaceEngine {
         sink: &mut S,
     ) -> Result<Vec<(NodeId, u64)>, BackendError> {
         let mut observed = Vec::new();
-        let mut timer_buf = vec![0u8; MAX_ENCRYPTED_PACKET_BYTES];
+        // Reuse the engine-owned scratch buffer for every peer's timer-driven
+        // packet (keepalive/rekey initiation) instead of allocating a fresh
+        // `MAX_ENCRYPTED_PACKET_BYTES` vector per tick. The field-level
+        // borrows inside the loop are disjoint (`peer_states` vs
+        // `encrypt_scratch` vs `recorded_tunnel_plaintext_packets`), and each
+        // `update_timers` call completes before the next peer borrows the
+        // scratch, so no live buffer is aliased. Only the bytes reported by
+        // boringtun are ever sent, so stale scratch content beyond the
+        // reported slice is never observable.
         let node_ids: Vec<NodeId> = self.peer_states.keys().cloned().collect();
         for node_id in node_ids {
             let Some(peer_state) = self.peer_states.get_mut(&node_id) else {
                 continue;
             };
-            let result = peer_state.tunnel.update_timers(&mut timer_buf);
+            let result = peer_state.tunnel.update_timers(&mut self.encrypt_scratch);
             // A timer tick can legitimately produce nothing (Done), a packet to
             // send (keepalive or rekey initiation), or a connection-expired
             // error. `drive_outbound_result` already routes each of those and
@@ -2330,5 +2346,286 @@ mod tests {
         assert_eq!(outcome, None);
         assert!(sink.events.is_empty(), "an initial Err must emit nothing");
         assert!(recorded.is_empty());
+    }
+
+    /// Regression test for the handshake-initiation scratch reuse: peers take
+    /// turns writing into ONE long-lived engine buffer, so each initiation
+    /// must emit a complete, valid, fixed-size handshake message with no
+    /// stale bytes from the previous writer's message.
+    #[test]
+    fn initiate_handshake_reuses_engine_scratch_with_byte_identical_output() {
+        let endpoint_x = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 80)), 51820);
+        let endpoint_y = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 81)), 51820);
+        let mut engine = fresh_engine(9);
+        let peer_x = configure_peer_at(&mut engine, "peer-x", endpoint_x, 0x55, "100.64.8.0/24");
+        let peer_y = configure_peer_at(&mut engine, "peer-y", endpoint_y, 0x66, "100.64.9.0/24");
+
+        let mut sink = RecordingSink::default();
+
+        // First initiation writes peer-x's handshake into the shared scratch.
+        // A fresh initiation has only STARTED the handshake; `observed` is the
+        // authenticated-handshake timestamp, which stays `None` until a full
+        // response exchange completes.
+        let observed = engine
+            .initiate_handshake(&peer_x, 1, false, &mut sink)
+            .expect("first initiation never errors");
+        assert_eq!(
+            observed, None,
+            "a fresh initiation has no completed handshake"
+        );
+        let payload_x: Vec<u8> = match sink.events.pop() {
+            Some(SinkEvent::Ciphertext { payload, .. }) => payload,
+            other => panic!("first initiation must emit one ciphertext event, got {other:?}"),
+        };
+
+        // A second peer reuses the SAME scratch, overwriting peer-x's bytes.
+        let observed = engine
+            .initiate_handshake(&peer_y, 1, false, &mut sink)
+            .expect("second initiation never errors");
+        assert_eq!(
+            observed, None,
+            "a fresh initiation has no completed handshake"
+        );
+        let payload_y: Vec<u8> = match sink.events.pop() {
+            Some(SinkEvent::Ciphertext { payload, .. }) => payload,
+            other => panic!("second initiation must emit one ciphertext event, got {other:?}"),
+        };
+        assert_ne!(
+            payload_x, payload_y,
+            "the shared scratch must have actually been overwritten by the second initiation"
+        );
+
+        // Re-initiating peer-x (`force_resend`) rewrites the shared scratch
+        // after peer-y dirtied it. Note the emitted bytes are NOT identical to
+        // the first initiation — that is boringtun's own contract, not a
+        // scratch artifact: every initiation (including a forced resend)
+        // consumes a fresh sender index, and the MACs cover it, so the whole
+        // message differs. What must hold is that the resent message is a
+        // complete, valid initiation of the exact fixed size, with peer-y's
+        // sender index gone from the header — no stale byte from the previous
+        // writer may leak into the reported slice.
+        engine
+            .initiate_handshake(&peer_x, 1, true, &mut sink)
+            .expect("resend never errors");
+        let payload_x_resent: Vec<u8> = match sink.events.pop() {
+            Some(SinkEvent::Ciphertext { payload, .. }) => payload,
+            other => panic!("resend must emit one ciphertext event, got {other:?}"),
+        };
+        // boringtun's private HANDSHAKE_INIT_SZ: a handshake initiation is a
+        // fixed-size 148-byte message, so every writer overwrites the whole
+        // reported slice each time.
+        assert_eq!(
+            payload_x.len(),
+            148,
+            "handshake initiation is a fixed-size message"
+        );
+        assert_eq!(
+            payload_y.len(),
+            148,
+            "handshake initiation is a fixed-size message"
+        );
+        assert_eq!(
+            payload_x_resent.len(),
+            148,
+            "forced resend over the dirty scratch must still emit a full-size initiation"
+        );
+        for (label, payload) in [
+            ("first", &payload_x),
+            ("second", &payload_y),
+            ("resent", &payload_x_resent),
+        ] {
+            assert_eq!(
+                payload[0], 1u8,
+                "{label} initiation must carry the handshake-initiation type byte"
+            );
+        }
+        let sender_index = |payload: &[u8]| -> u32 {
+            u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+        };
+        assert_ne!(
+            sender_index(&payload_x),
+            sender_index(&payload_y),
+            "peer-y's initiation must overwrite peer-x's sender index in the shared scratch"
+        );
+        assert_ne!(
+            sender_index(&payload_x_resent),
+            sender_index(&payload_y),
+            "the resent initiation must carry peer-x's fresh index, not peer-y's stale one"
+        );
+        assert!(sink.events.is_empty());
+    }
+
+    /// Builds a minimal IPv4 packet (no checksum — boringtun neither verifies
+    /// nor recomputes it on the encapsulate/decapsulate path) of
+    /// `payload_len` zero bytes destined for `100.64.8.1`, which falls inside
+    /// the test peer's allowed_ips.
+    fn ipv4_packet_for_peer(payload_len: usize) -> Vec<u8> {
+        let total_len = 20 + payload_len;
+        let mut packet = vec![0u8; total_len];
+        packet[0] = 0x45; // version 4, IHL 5
+        packet[8] = 64; // TTL
+        packet[9] = 6; // proto TCP (arbitrary; datapath does not inspect)
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[16..20].copy_from_slice(&[100, 64, 8, 1]); // destination
+        packet
+    }
+
+    /// Pops a single ciphertext event, returning its payload.
+    fn pop_ciphertext(sink: &mut RecordingSink, label: &str) -> Vec<u8> {
+        match sink.events.pop() {
+            Some(SinkEvent::Ciphertext { payload, .. }) => payload,
+            other => panic!("{label} must emit one ciphertext event, got {other:?}"),
+        }
+    }
+
+    /// End-to-end proof for the shared `encrypt_scratch`: a live WireGuard
+    /// session is established through the engine's public API (initiation →
+    /// counterpart tunnel response → engine decapsulate), after which data
+    /// frames of every interesting length are encapsulated into the SAME
+    /// scratch buffer the 148-byte handshake used. Each emitted ciphertext
+    /// must be exactly `32 + pad16(len)` bytes (never a byte more) and must
+    /// decrypt on the counterpart to the exact input — the byte-identity /
+    /// stale-bytes proof the scratch reuse requires. Finally, a persistent
+    /// keepalive (32 bytes, shorter than everything before it) is driven
+    /// through `update_peer_timers` over a scratch still holding the 65 KiB
+    /// max frame, and the counterpart must accept it.
+    #[test]
+    fn shared_scratch_roundtrips_handshake_then_variable_length_frames() {
+        use boringtun::noise::{Tunn, TunnResult};
+        use boringtun::x25519::{PublicKey, StaticSecret};
+
+        // The engine's static key is `[seed; 32]` (see `fresh_engine`); derive
+        // its public key and build a real counterpart tunnel around a peer key
+        // pair so the three-message handshake completes for real.
+        let engine_secret = StaticSecret::from([9u8; 32]);
+        let engine_public = PublicKey::from(&engine_secret);
+        let peer_secret = StaticSecret::from([0x55; 32]);
+        let peer_public_bytes = *PublicKey::from(&peer_secret).as_bytes();
+
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 80)), 51820);
+        let mut engine = fresh_engine(9);
+        let node_id = NodeId::new("peer-x").expect("node id");
+        engine
+            .configure_peer(&rustynet_backend_api::PeerConfig {
+                node_id: node_id.clone(),
+                endpoint: rustynet_backend_api::SocketEndpoint {
+                    addr: endpoint.ip(),
+                    port: endpoint.port(),
+                },
+                public_key: peer_public_bytes,
+                allowed_ips: vec!["100.64.8.0/24".to_owned()],
+                persistent_keepalive_secs: Some(1),
+            })
+            .expect("peer configures");
+        let mut counterpart = Tunn::new(peer_secret, engine_public, None, None, 0, None);
+
+        let mut sink = RecordingSink::default();
+
+        // msg1: engine initiates; scratch now holds the 148-byte handshake.
+        let observed = engine
+            .initiate_handshake(&node_id, 1, false, &mut sink)
+            .expect("initiation never errors");
+        assert_eq!(
+            observed, None,
+            "an initiation starts but does not complete a handshake"
+        );
+        let initiation = pop_ciphertext(&mut sink, "handshake initiation");
+        assert_eq!(initiation.len(), 148, "msg1 is a fixed-size message");
+
+        // msg2: the counterpart tunnel responds.
+        let mut counterpart_buf = vec![0u8; 65_567];
+        let response: Vec<u8> =
+            match counterpart.decapsulate(None, &initiation, &mut counterpart_buf) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("counterpart must answer the initiation, got {other:?}"),
+            };
+
+        // The engine consumes msg2 over the shared scratch pair; the session
+        // is now established on both sides. boringtun follows msg2 with a
+        // 32-byte empty transport packet (the initiator's ack), which the
+        // counterpart must accept as a keepalive.
+        let observed = engine
+            .process_inbound_ciphertext(endpoint, remote_addr(), &response, 1, &mut sink)
+            .expect("msg2 never errors");
+        let (observed_peer, _observed_at) =
+            observed.expect("msg2 completes the session; the handshake timestamps");
+        assert_eq!(
+            observed_peer, node_id,
+            "the completed handshake is peer-x's"
+        );
+        let ack = pop_ciphertext(&mut sink, "post-handshake empty transport packet");
+        assert_eq!(ack.len(), 32, "the ack is a bare empty transport packet");
+        match counterpart.decapsulate(None, &ack, &mut counterpart_buf) {
+            TunnResult::Done => {}
+            other => panic!("counterpart must accept the ack, got {other:?}"),
+        }
+
+        // Data frames: empty is not reachable through the TUN-facing
+        // `inject_plaintext_packet` (a zero-byte buffer carries no IP
+        // destination and is a keepalive, not a frame), so the length ladder
+        // covers min (28 = bare IPv4 header), odd (37), typical (1500), and
+        // WG max inner (65 503 = 65 535 - 32). The scratch's last writer is
+        // the 148-byte handshake for the first frame and each successive
+        // frame for the rest — every emission must be exactly the padded
+        // transport-header+tag length, and must decrypt back to the input.
+        let frame_lengths = [28usize, 37, 1500, 65_503];
+        for len in frame_lengths {
+            let plaintext = ipv4_packet_for_peer(len);
+            engine
+                .inject_plaintext_packet(&plaintext, 1, &mut sink)
+                .expect("frame with a matching allowed_ip never errors");
+            let ciphertext = pop_ciphertext(&mut sink, "data frame");
+            // This boringtun fork does not pad to 16 (session.rs: "spec
+            // requires padding to 16 bytes, but actually works fine without
+            // it"): the frame is exactly 16-byte transport header +
+            // plaintext + 16-byte AEAD tag.
+            assert_eq!(
+                ciphertext.len(),
+                plaintext.len() + 32,
+                "frame must emit exactly plaintext+32 ciphertext bytes"
+            );
+            let decrypted = match counterpart.decapsulate(None, &ciphertext, &mut counterpart_buf) {
+                TunnResult::WriteToTunnelV4(packet, _) => packet.to_vec(),
+                other => panic!("counterpart must decrypt the frame, got {other:?}"),
+            };
+            assert_eq!(
+                decrypted, plaintext,
+                "roundtrip through the shared scratch must be byte-identical"
+            );
+        }
+
+        // Shorter reuse over the dirtiest scratch: silence past the 1-second
+        // persistent keepalive, then tick. `update_peer_timers` must emit a
+        // bare 32-byte keepalive — the shortest message on this path — out of
+        // a scratch still holding the 65 KiB max frame, and the counterpart
+        // must accept it (Done: an empty inner payload is a keepalive, not a
+        // tunnel write). Any stale byte after the 32-byte slice would have
+        // been observable in the length or in the counterpart's MAC check.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let observed = engine
+            .update_peer_timers(1, &mut sink)
+            .expect("timer tick never errors");
+        // A live session makes `authenticated_handshake_unix` report the
+        // established handshake on every tick — that is not a NEW handshake;
+        // only the keepalive ciphertext is emitted.
+        assert!(
+            observed.iter().all(|(peer, _)| *peer == node_id),
+            "only peer-x's established session may be reported, got {observed:?}"
+        );
+        let keepalive = pop_ciphertext(&mut sink, "persistent keepalive");
+        assert_eq!(
+            keepalive.len(),
+            32,
+            "keepalive is the 32-byte minimum frame"
+        );
+        assert!(
+            sink.events.is_empty(),
+            "the tick must emit exactly one keepalive, got {:?}",
+            sink.events
+        );
+        match counterpart.decapsulate(None, &keepalive, &mut counterpart_buf) {
+            TunnResult::Done => {}
+            other => panic!("counterpart must accept the keepalive, got {other:?}"),
+        }
     }
 }
