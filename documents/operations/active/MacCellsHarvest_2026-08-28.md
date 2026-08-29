@@ -1160,3 +1160,98 @@ MAC-D2 reader demands); the §8.2 skip chain
 `exit_nat_lifecycle_validation` → `exit_demotion_residue_validation`)
 then runs for the first time. Watch §9.2's keychain-unwrap exposure in any
 membership-mutation stage.
+
+## 10. Exit cell re-run after MAC-D4 — 2026-08-29 (latest session)
+
+Re-ran the §8.1 Cell-2 shape after MAC-D4 (owner-key seed in the macOS
+bootstrap) landed. Worktree `ai-edit/edit-1787965142039-56044-35`, commit
+`494dc61437ef1479037932f73d41a238a290cbbf` (MAC-D4 merge `06f828a7`
+confirmed ancestor), tree clean.
+
+> Doc drift note: this file now carries **two** `## 9` headings (the
+> MAC-D4 disposition §9 above and the anchor re-run §9 in the previous
+> session). Headings below resume at §10; the drift is left as-is and
+> should be renumbered by whoever next restructures this document.
+
+### 10.1 Run
+
+- Run id `livelab-1787967356-494dc61437ef`, report
+  `state/mac-cells/exit3-20260829-021133` (worktree-local; also in
+  `documents/operations/live_lab_node_run_matrix.csv` via the automatic
+  ledger row — verified, commit + topology correct).
+- Shape (orchestrator now also demands `--known-hosts-file` when
+  `--node` flags are present, `native.rs:104`):
+  `ops vm-lab-orchestrate-live-lab --node macos-utm-1:exit --node
+  lenovo-exit-1:entry --node lenovo-client-1:client
+  --trust-inventory-ready --ssh-identity-file ~/.ssh/rustynet_lab_ed25519
+  --known-hosts-file ~/.ssh/known_hosts`.
+- 64 stages / 3 nodes: **9 pass / 1 fail / 54 skip**; overall fail,
+  `first_failed_stage = membership_init`; elapsed 19m58s. Profile
+  `mgmt_shared_smoke_v1` (derived, not enforced).
+- Passed: preflight, prepare_source_archive, verify_ssh_reachability,
+  cleanup_hosts, **bootstrap_hosts (18m11s — fresh bootstrap re-ran on
+  macos-utm-1)**, cross_network_substrate_setup, collect_pubkeys; the
+  Linux/lenovo setup stages all green as in §8.
+
+### 10.2 MAC-D2 + MAC-D4: LIVE-CONFIRMED (seed level)
+
+- `issue_membership_owner_key` — the exact MAC-D2 reader — **passed** on
+  macos-utm-1: the guest now has
+  `/usr/local/etc/rustynet/membership.owner.key.pub`, readable via
+  `sudo -n cat` (observed key
+  `980eb930fbedffe3d7639f5c79d59cbd1510ef79eeddf3b87699d46bf17a2e84`).
+- Before this run the guest had no `membership.owner.key` at all; the
+  fresh `bootstrap_hosts` run exercised MAC-D4's `seed_membership_genesis`
+  end-to-end (full-install path) and the genesis landed. MAC-D2's §8
+  failure signature ("pub key absent — seed never written") is gone.
+- §9.2's keychain-custody exposure **did not bite**: the stage moved past
+  owner-key read and failed on an env-var, not on an unwrap.
+
+### 10.3 NEW BLOCKER — membership_init (macOS adapter)
+
+`membership_init` FAIL rc=1:
+
+```
+init_membership_snapshot: remote command failed (exit Some(1)): (stderr
+empty; stdout tail) error [generic_failure (1)]: membership node id is
+required (RUSTYNET_NODE_ID)
+```
+
+Root cause (file:line): `crates/rustynet-cli/src/vm_lab/orchestrator/
+adapter/macos_membership.rs:117-123` — the macOS
+`init_membership_snapshot` runs
+
+```
+env RUSTYNET_NODE_ROLE=admin sudo <rustynet> ops init-membership
+```
+
+and **never sets `RUSTYNET_NODE_ID`**. The Linux twin
+(`linux_membership.rs:54-64`) sets
+`RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='{exit_node_id_arg}'`,
+sourcing the id from the exit peer
+(`peers.iter().find(|p| p.role == NodeRole::Exit).node_id`); the daemon
+fails closed when NODE_ID is missing. Secondary suspect: `env` placed
+before `sudo` may be stripped by sudo's `env_reset`, so even ROLE may not
+survive. Fix shape (owner-gated): mirror the Linux branch —
+`sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID=<exit-node-id>
+<rustynet> ops init-membership`.
+
+Consequence: the whole §8.2 skip chain re-arms — all four macOS exit
+stages (`active_exit`, `exit_dns_failclosed_validation`,
+`exit_nat_lifecycle_validation`, `exit_demotion_residue_validation`) plus
+`distribute_membership`/`exit_handoff` graded **skip** behind
+`membership_init` (54 skips). The exit cell's green still has **never**
+been reached; DnsFailclosed remains unexercised on macOS exit.
+
+Triage stub appended:
+`livelab-1787967356-494dc61437ef::membership_init` in
+`documents/operations/live_lab_stage_triage.jsonl`.
+
+### 10.4 Verdict
+
+Exit cell: **BLOCKED-partial** — MAC-D2/MAC-D4 live-confirmed (membership
+genesis seed + read path both work on a fresh macOS bootstrap), but the
+cell's first stage beyond the seed fails on the macOS membership adapter's
+missing `RUSTYNET_NODE_ID`. Next step after the owner fixes
+`macos_membership.rs`: re-run this exact §10.1 shape; membership_init
+should then pass and the exit stages run for the first time.
