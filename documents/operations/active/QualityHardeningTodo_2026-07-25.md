@@ -872,6 +872,44 @@ to persist. Finish it, so §3's one-hardened-path claim is actually true.
 
 ### QH-13 — Validate values for the sink they actually reach
 
+**CLOSED 2026-08-29.** The sink is quoted for the shell that actually parses it,
+at the chokepoint the review prescribed, not at eight call sites. `run_host_cmd`
+now builds the remote command through `remote_command_string`
+(`crates/rustynet-cli/src/vm_lab/mod.rs`), which single-`shell_quote`s every
+argument with this module's existing escaper (the same one `script_template`
+applies to `Binding::Literal` — no second POSIX quoter beside it) and refuses
+empty `args` (an empty command makes `sshd` open a login shell and return the
+MOTD as successful output, which the in-flight-run probe and two ledger readers
+would have misread). `run_host_git` delegates to `run_host_cmd`, so it inherits
+the same chokepoint. The false "argv-only (§4)" doc comment is replaced by a
+corrected description of the real sink behaviour: client-side argv does not
+survive as remote argv, and arguments are literals from here on (no caller
+relied on remote shell semantics — verified per call site; genuine shell
+semantics go through `run_guest_script` by design). The worse case, the
+stdout-derived `device`, still crosses remote output → remote argv, but it is
+inert as shell syntax at the same chokepoint, is refused if it carries control
+or text-direction characters by `ensure_no_control_chars` at capture, and is
+printed with `Debug` rather than `Display` in the refusal message. Enforcement
+is proven mutation-style: the tests in `run_host_cmd_quoting_tests`
+(`remote_command_words_are_shell_quoted`,
+`remote_command_string_is_inert_for_every_shell_metacharacter`,
+`an_empty_remote_command_is_refused`) assert on `remote_command_string` — the
+exact seam `run_host_cmd` calls — rather than re-implementing the map/join, so
+reverting the fix to an unquoted join turns both quoting tests red (verified by
+mutation during the fix); `control_characters_are_refused_across_the_whole_ascii_range`
+and `text_direction_overrides_are_refused_and_debug_also_escapes_them` pin the
+`device` guard. The mechanism was additionally confirmed once against a real lab
+host during the fix's adversarial review (a pre-fix payload executed; post-fix
+payloads arrived as literal text) — no further live exercising. Scope note: the
+`run_remote_shell_command`/`capture_remote_shell_command` family passes a whole
+script **by design** (the `RemoteExec` dispatch, `ssh_auth_shell`), a different
+sink from the argv-shaped one this item is about, and is unchanged. Commits:
+`496bf2fb` (quote remote command words for the shell that parses them), `cd573224`
+(fold the QH-13 review — bind the tests via the `remote_command_string` seam,
+guard `device`, empty-args fail-closed).
+
+Original report (pre-fix):
+
 > **[REVIEW 2026-07-25] UPGRADE: confidence INFERRED → VERIFIED; severity medium → HIGH.
 > This is the second-most-urgent item in the register.** No SSH needed to confirm it:
 > - **The mechanism is vendor-documented.** `ssh(1)` on this machine: *"If supplied, the
