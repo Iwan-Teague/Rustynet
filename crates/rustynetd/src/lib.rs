@@ -37,6 +37,7 @@ pub mod linux_mesh_status;
 pub mod linux_runtime_acls;
 pub mod linux_runtime_nftables;
 pub mod linux_service_hardening;
+pub mod linux_tandem_dns_redirect;
 pub mod macos_authenticode;
 pub mod macos_blind_exit;
 pub mod macos_dns_failclosed;
