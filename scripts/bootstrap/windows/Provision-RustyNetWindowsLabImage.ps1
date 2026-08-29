@@ -8,11 +8,14 @@
   Run elevated, ONCE, on a freshly installed Windows VM that will
   serve as a Rustynet lab node.  The script:
 
-    1. Sets machine-scoped environment variables so SYSTEM and the
-       lab user share the same toolchain layout:
+    1. Unless -SkipRustup is passed, sets machine-scoped environment
+       variables so SYSTEM and the lab user share the same toolchain
+       layout:
          RUSTUP_HOME = C:\RustupHome
          CARGO_HOME  = C:\CargoHome
-       and prepends C:\CargoHome\bin to the machine PATH.
+       and prepends C:\CargoHome\bin to the machine PATH.  A
+       -SkipRustup run leaves the machine cargo/rustup environment
+       untouched (QH-17).
 
     2. Downloads and runs rustup-init.exe with --no-modify-path so
        rustup writes only to the machine-scoped CARGO_HOME instead
@@ -21,8 +24,9 @@
        (rustynetd target).
 
     3. Downloads and runs vs_BuildTools.exe with --installPath
-       C:\BuildTools and the workloads / components Rustynet's MSVC
-       link step needs (VC.Tools.x86.x64, Windows 11 SDK).
+       C:\BuildTools and the component set from
+       RustyNetBuildTools.vsconfig (the single authoritative VS
+       component definition, shared with the bootstrap path).
 
     4. Verifies machine-scoped reachability by re-resolving cargo /
        rustc / VsDevCmd from a fresh PowerShell context.
@@ -59,8 +63,9 @@
   iterative debugging; not for a real lab image.
 
 .PARAMETER SkipRustup
-  Skip the rustup install step.  Useful for re-running just the VS
-  Build Tools step.
+  Skip the rustup install step AND the machine-scoped toolchain
+  environment mutation, leaving any existing cargo/rustup setup
+  untouched.  Useful for re-running just the VS Build Tools step.
 
 .NOTES
   Run from an elevated PowerShell.  Requires internet access on the
@@ -178,10 +183,18 @@ $result = [ordered]@{
 }
 
 # --- step 1: machine env ---------------------------------------------------
+# The machine-scoped toolchain environment is part of INSTALLING the
+# toolchain.  A -SkipRustup run is a re-run of some other step on a guest
+# that already has a toolchain, so it must leave the machine cargo/rustup
+# environment exactly as it found it (QH-17).
 
-Set-MachineEnv -Name 'RUSTUP_HOME' -Value $RustupHome
-Set-MachineEnv -Name 'CARGO_HOME'  -Value $CargoHome
-Add-MachinePathSegment -Segment (Join-Path $CargoHome 'bin')
+if ($SkipRustup) {
+    $result.notes += 'skipped machine toolchain env mutation (-SkipRustup)'
+} else {
+    Set-MachineEnv -Name 'RUSTUP_HOME' -Value $RustupHome
+    Set-MachineEnv -Name 'CARGO_HOME'  -Value $CargoHome
+    Add-MachinePathSegment -Segment (Join-Path $CargoHome 'bin')
+}
 
 foreach ($dir in @($RustupHome, $CargoHome, $BuildToolsInstallPath)) {
     if (-not (Test-Path -LiteralPath $dir)) {
@@ -266,11 +279,15 @@ if ($SkipBuildTools) {
     } else {
         $vsBootstrapper = Join-Path $workRoot 'vs_BuildTools.exe'
         Invoke-WebDownload -Uri 'https://aka.ms/vs/17/release/vs_BuildTools.exe' -OutFile $vsBootstrapper
+        # Single authoritative component set: the same vsconfig the
+        # bootstrap path uses (QH-17).  No inline --add components here.
+        $vsConfigPath = Join-Path $PSScriptRoot 'RustyNetBuildTools.vsconfig'
+        if (-not (Test-Path -LiteralPath $vsConfigPath)) {
+            throw "vsconfig not found at $vsConfigPath; keep RustyNetBuildTools.vsconfig next to this script"
+        }
         $vsArgs = @(
             '--installPath', $BuildToolsInstallPath,
-            '--add', 'Microsoft.VisualStudio.Workload.VCTools',
-            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
-            '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621',
+            '--config', $vsConfigPath,
             '--quiet', '--wait', '--norestart', '--nocache'
         )
         Write-Host "[provision] running vs_BuildTools.exe $($vsArgs -join ' ')"
