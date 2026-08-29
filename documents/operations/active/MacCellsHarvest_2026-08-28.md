@@ -2426,3 +2426,144 @@ the exit dataplane stages (`exit_handoff` → `active_exit` → the three exit
 dataplane validations), i.e. the first real macOS exit dataplane answer.
 **No lab run was performed in this fix session — live proof is still
 pending; the next exit-cell re-run is the verifying run.**
+
+## 18. Exit cell re-run after MAC-D12 — 2026-08-29 (run #9 of the exit chain)
+
+Re-ran the macOS `exit` cell now that MAC-D12 (platform-correct
+signing-passphrase unwrap in assignment issuance, §17.7) is merged. Worktree
+`ai-edit/edit-1787996625390-56044-70`, HEAD `041db969` (whose ancestors
+include the MAC-D12 merge `a9e41994`), tree clean, 0 commits behind
+`origin/main` at launch. Fresh bootstrap, fresh report dir, full 64-stage
+plan. TRIAGE ONLY — no code changed in this session.
+
+### 18.1 Run
+
+- Run `livelab-1787998474-041db969591e` (orchestrator-internal id
+  `rust-1787997135`), report dir
+  `state/mac-cells/exit9-20260829-105205` (worktree-local this time — the
+  sandboxed edit harness cannot write the main checkout's `state/`),
+  elapsed 22m19s, profile `mgmt_shared_smoke_v1` (derived, not enforced).
+  `--macos-promote-exit` remains retired (`vm_lab/mod.rs:10316` fails
+  closed on it), so the launch used the `--node` shape again:
+  `--node macos-utm-1:exit --node lenovo-exit-1:entry --node
+  lenovo-client-1:client`, `--trust-inventory-ready`, after real `nc`
+  TCP-22 probes of all three guests (`192.168.65.101`, `192.168.0.31`,
+  `192.168.0.30` — all open). Orchestrator rebuilt from this worktree's
+  HEAD immediately before launch (§2 handover rule). One launch-mechanics
+  note for successors: `--ssh-identity-file` is now a REQUIRED option
+  (`error [bad_args (64)]: missing required option`) — the CLI no longer
+  accepts the identity-file-free invocation §17.1 used; pass
+  `~/.ssh/rustynet_lab_ed25519` (+ `--known-hosts-file ~/.ssh/known_hosts`)
+  explicitly.
+- Lock coordination: `ps` scan found NO `vm-lab-orchestrate-live-lab`
+  process at launch; the run acquired all three guest locks cleanly and no
+  sibling run contended. The §17 launch-gate stub
+  (`livelab-1787995026-bf46947825c0::distribute_assignments`) was cleared
+  first by recording the MAC-D12 merge as its remedy.
+- 64 stages: **11 pass / 1 fail / 52 skip**, overall fail,
+  `first_failed_stage = distribute_assignments`. Passed before the failure:
+  `preflight`, `prepare_source_archive`, `verify_ssh_reachability`,
+  `cleanup_hosts`, **`bootstrap_hosts`** (fresh bootstrap, all three nodes),
+  `cross_network_substrate_setup`, `collect_pubkeys`, **`membership_init`**,
+  **`distribute_membership`**, plus the two teardown wrappers.
+
+### 18.2 MAC-D12: LIVE-CONFIRMED — the systemd-creds failure is gone
+
+`distribute_assignments` failed again, but with a COMPLETELY different error.
+The §17.3 signature — `decrypting signing passphrase credential failed:
+failed to spawn systemd-creds: No such file or directory` — did not recur.
+`materialize_signing_passphrase_workspace` now runs to completion on macOS
+through the `MacosKeychainBackend` dispatch (§17.7's fix), and the stage
+progressed past the passphrase layer to the NEXT custody check. The MAC-D12
+fix is live-proven on the exit topology.
+
+### 18.3 New blocker — MAC-D13: the assignment signing secret is never provisioned on macOS
+
+The new failure:
+
+```
+issue assignment bundles: remote command failed (exit Some(1)):
+(stdout tail) error [generic_failure (1)]: assignment signing secret
+missing (/etc/rustynet/assignment.signing.secret): No such file or
+directory (os error 2)
+  hint: unclassified failure; check the error message above
+```
+
+Root cause chain (single gap, one call site demands a file nothing creates
+on macOS):
+
+- The remote verb `e2e-issue-assignment-bundles`
+  (`execute_ops_e2e_issue_assignment_bundles_from_env`,
+  `crates/rustynet-cli/src/ops_e2e.rs:2930`, run as root on the macOS
+  signer) demands the secret pre-exist:
+  `ensure_regular_file(Path::new("/etc/rustynet/assignment.signing.secret"),
+  "assignment signing secret")` at **`ops_e2e.rs:3000`**.
+  `ensure_regular_file` (`ops_e2e.rs:5228`) emits
+  `{label} missing ({path}): {err}` — the run's error verbatim.
+- Nothing on the macOS path mints that file. The Linux E2E bootstrap
+  provisions it (`execute_ops_e2e_bootstrap_host`,
+  `assignment init-signing-secret` at `ops_e2e.rs:684`), and the two-node
+  assignment path auto-inits it when absent (`ops_e2e.rs:2759-2772`) — but
+  `execute_ops_e2e_bootstrap_macos` (`ops_e2e.rs:1263`) has no equivalent,
+  and the issue path itself does NOT auto-init. On a fresh macOS node there
+  is no `/etc/rustynet`, so the check fails closed (correct posture, loud —
+  the defect is the missing macOS provisioning half).
+- Latent: the traversal issuer hits the same hardcoded constant
+  (`ops_e2e.rs:3119`, `:3123`) and the dns-zone path the same workspace
+  pattern (`ops_e2e.rs:3225`), so both would fail identically once reached.
+  Fix the provisioning once (macOS bootstrap seeds the secret + passphrase
+  file, or the issue path gains the :2759-style auto-init behind the
+  keychain unwrap), not the callers.
+
+Classification: **macOS exit dataplane CODE GAP (assignment signing-secret
+custody provisioning), not env, not owner-gated.** MAC-D12 fixed the
+PASSPHRASE custody layer; MAC-D13 is the next layer — the signed-bundle
+SIGNING SECRET itself has no macOS custody path.
+
+### 18.4 Exit dataplane stages + DnsFailclosed
+
+All downstream stages skipped fail-closed (52 skips) behind
+`distribute_assignments`: `distribute_traversal`, `distribute_dns_zone`,
+`enforce_baseline_runtime`, `role_switch_matrix`, `exit_handoff`,
+`active_exit`, `exit_nat_lifecycle_validation`,
+`exit_demotion_residue_validation`, `exit_dns_failclosed_validation`, and
+the rest. **The first real macOS EXIT dataplane test still has not
+executed; DnsFailclosed (M1) remains unexercised on the exit role** — the
+owner-gated §8.2 question is untouched.
+
+### 18.5 Ledger + bookkeeping
+
+- Ledger row appended and verified in
+  `documents/operations/live_lab_node_run_matrix.csv`: run
+  `livelab-1787998474-041db969591e`, commit `041db969591e…`, branch
+  `ai-edit/edit-1787996625390-56044-70`, clean, overall fail,
+  `first_failed_stage = distribute_assignments`, notes "3 node(s), 64
+  stage(s); passed=11 failed=1 skipped=52".
+- Per-node rows verified (quote-aware) in
+  `live_lab_node_stage_results.csv`: macos-utm-1 (exit, macOS 26.5 arm64),
+  lenovo-exit-1 (entry), lenovo-client-1 (client) — all carrying the same
+  stage-level failure.
+- A triage stub WAS auto-created this time
+  (`live_lab_stage_triage.jsonl` line 128,
+  `livelab-1787998474-041db969591e::distribute_assignments`, patch:null);
+  the remedy was recorded as "none: MAC-D13 documented in
+  MacCellsHarvest §18.3, awaiting code worker" so the next launch gate is
+  not blocked by an unclassified stub.
+
+### 18.6 Verdict
+
+Exit cell: **BLOCKED at a NEW blocker (MAC-D13)** — one full custody layer
+deeper than §17: the MAC-D12 passphrase fix is live-confirmed and the
+failure moved from "cannot unwrap the passphrase" to "the signing secret
+the passphrase protects does not exist on macOS". Fix MAC-D13 (provision
+`/etc/rustynet/assignment.signing.secret` + its passphrase file on the
+macOS signer during the macOS bootstrap, or give the issue path the
+:2759-style auto-init), then re-run: the same expectation as §17.7 applies —
+`distribute_assignments` → traversal/dns-zone distribution →
+`exit_handoff` → `active_exit` → the three exit dataplane validations
+should finally execute.
+
+**Cell status: BLOCKED — MAC-D13 documented (`ops_e2e.rs:3000` via
+`:2930`; provisioning gap, macOS bootstrap has no equivalent of
+`ops_e2e.rs:684`; not owner-gated). Next action belongs to a code worker;
+this session changed no code.**
