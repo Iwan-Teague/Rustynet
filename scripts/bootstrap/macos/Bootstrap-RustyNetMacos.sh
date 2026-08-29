@@ -1365,6 +1365,32 @@ seed_membership_genesis() {
   chown root:rustynetd "${passphrase_file}"
   chmod 0600 "${passphrase_file}"
 
+  # MAC-D13 parity on the orchestrator bootstrap path: seed the encrypted
+  # assignment-signing secret at the macOS canonical config root so the
+  # signed-bundle issuance verbs the orchestrator drives over SSH
+  # (`e2e-issue-assignment-bundles-from-env` and the traversal issuer) find
+  # it at genesis. This mirrors BOTH the Linux host bootstrap (whose
+  # rn_bootstrap.sh runs `rustynet ops e2e-bootstrap-host`, which seeds
+  # /etc/rustynet/assignment.signing.secret) and the MAC-D13 step inside
+  # execute_ops_e2e_bootstrap_macos — which the Rust --node orchestrator
+  # never invokes for macOS, leaving the secret unseeded and
+  # distribute_assignments failing closed with "assignment signing secret
+  # missing (/usr/local/etc/rustynet/assignment.signing.secret)" even on a
+  # freshly rebuilt node. The secret is minted from OS randomness and
+  # encrypted at rest under the same owner passphrase this genesis just
+  # provisioned into System.keychain — exactly the credential the issuers
+  # unwrap via MacosKeychainBackend. Custody is enforced by the verb itself
+  # (persist_encrypted_secret_material: file 0600 root-owned, config root
+  # 0750, ownership and modes validated before returning); --force matches
+  # the per-bootstrap re-genesis above so the secret never outlives the
+  # owner keypair it is bound to. Fail-closed via set -e: a failed seed
+  # aborts the bootstrap, and an issuer on a node where genesis never
+  # seeded the secret still errors loudly rather than skipping signing.
+  "${RUSTYNET_BIN}" assignment init-signing-secret \
+    --output "${CONFIG_ROOT}/assignment.signing.secret" \
+    --signing-secret-passphrase-file "${passphrase_file}" \
+    --force
+
   # The public half is the MAC-D2 read target: pin deterministic ownership
   # and mode (membership init writes it under the process umask).
   chown root:rustynetd "${owner_key}.pub"

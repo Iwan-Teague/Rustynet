@@ -2623,3 +2623,55 @@ should finally execute.
 `:2930`; provisioning gap, macOS bootstrap has no equivalent of
 `ops_e2e.rs:684`; not owner-gated). Next action belongs to a code worker;
 this session changed no code.**
+
+## 19. MAC-D13 addendum — the orchestrator bootstrap path was missed; seeded in-script — 2026-08-29
+
+**Root cause of the persisting `distribute_assignments` failure after the §18.3
+fix.** The MAC-D13 seed landed only inside `execute_ops_e2e_bootstrap_macos`
+(`ops e2e-bootstrap-host`), a driver the Rust `--node` orchestrator never
+invokes for macOS. The orchestrator's macOS bootstrap runs
+`Bootstrap-RustyNetMacos.sh` directly, whose `seed_membership_genesis` (MAC-D4)
+seeded the owner key + keychain descriptor but no assignment signing secret —
+while the Linux `rn_bootstrap.sh` DOES call `ops e2e-bootstrap-host`, which is
+why Linux nodes held the secret. The "stale binary / rebuild_nodes" theory is
+disproven by run `livelab-1788024350` (commit `022952bc7e55`, which already
+contained MAC-D13 as ancestor `9fe7b90d`): `bootstrap_hosts` ran and passed
+(~8 min, all nodes rebuilt), then `distribute_assignments` still failed closed
+with `assignment signing secret missing (/usr/local/etc/rustynet/assignment.signing.secret)`.
+A fresh binary cannot mint a genesis artifact no code path on that guest ever ran.
+Two secondary observations from the same run: (a) the macOS bootstrap never
+writes a per-node log (its `install_daemon` uses `ssh::run_remote`, not the
+Linux path's `run_remote_with_log` into `logs/bootstrap_node_<alias>.log`), so
+the missing `bootstrap_node_macos-utm-1.log` was a logging gap, not evidence the
+rebuild was skipped; (b) the plain (workdir-less) macOS `install_daemon` scps the
+source archive but never sets `SOURCE_ARCHIVE` in the env file, which would fail
+loudly at the script's `tar -xzf` — the workdir path is the one that runs.
+
+**Fix (this worktree, awaiting the next live exit run).**
+`Bootstrap-RustyNetMacos.sh::seed_membership_genesis` now runs
+`rustynet assignment init-signing-secret --output
+${CONFIG_ROOT}/assignment.signing.secret --signing-secret-passphrase-file
+${passphrase_file} --force` after the keychain provisioning, mirroring both the
+Linux host-bootstrap step (`ops_e2e.rs:684`) and the §18.3 e2e-driver step.
+Custody is unchanged: the verb's `persist_encrypted_secret_material` writes the
+file 0600 root-owned at the 0750 config root; the passphrase is the same owner
+passphrase already provisioned into System.keychain (the credential the issuers
+unwrap via `MacosKeychainBackend`); `--force` keeps the secret re-seeded with
+each per-bootstrap re-genesis so it never outlives the owner keypair it is
+bound to; `set -e` makes a failed seed abort the bootstrap.
+
+**Regression pins** (`macos_install.rs::tests`):
+`bootstrap_script_seeds_assignment_signing_secret_at_canonical_path` (path,
+passphrase flag, `--force`, ordered after the keychain descriptor inside
+`seed_membership_genesis`, no `||` softening) and
+`bootstrap_script_assignment_secret_path_matches_issuance_verbs` (macOS-gated:
+the seeded path must equal `ops_e2e::ASSIGNMENT_SIGNING_SECRET_PATH`).
+
+**Windows note.** MAC-D13's Windows genesis seed (`execute_ops_e2e_enforce_host`
+/ bootstrap driver) has the same exposure: the Windows orchestrator bootstrap
+runs `rn_bootstrap_windows.ps1`, not the e2e driver. If the Windows exit cell
+reproduces this failure class, apply the same in-script seeding there — out of
+scope here (no live Windows runner exercised it).
+
+**Cell status: MAC-D13 fix extended to the path that actually runs; still
+awaiting the next live exit run for live confirmation.**
