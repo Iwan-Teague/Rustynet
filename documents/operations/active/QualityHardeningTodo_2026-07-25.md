@@ -944,7 +944,7 @@ CPU count, or both. At minimum, distinguish "build exceeded its budget" from
 defect.
 
 ### QH-16 — A gate run through a pipeline reports the PIPE's exit status, not the tool's
-**Severity: HIGH (falsifies evidence). Confidence: VERIFIED — it invalidated a real green result in this session.**
+**Severity: HIGH (falsifies evidence). Confidence: VERIFIED — it invalidated a real green result in this session. CLOSED 2026-08-29 — disposition below.**
 
 `cargo test --workspace --all-targets --all-features | tail -60` exits with **`tail`'s**
 status, which is essentially always `0`. A worker reported a green workspace test gate on
@@ -966,6 +966,26 @@ Proposed fix:
 
 Acceptance: a gate result is only accepted with the tool's own exit code, captured without
 a pipeline in the path.
+
+**Disposition 2026-08-29 — ENFORCED (mechanism, not just convention).**
+- The gate-runner MCP core was already fail-closed and is now pinned by tests:
+  `run_with_timeout` (`crates/rustynet-mcp/src/lib.rs`) spawns the gate argv-only with no
+  shell and classifies `CommandOutcome.success` as exited-0-and-not-killed — an unknown
+  (signaled) exit has `code: None` and `success: false`. New negative tests prove the two
+  dangerous shapes: a gate that *prints* `test result: ok. 100 passed` but exits 3 is a
+  FAILURE; a signal-killed gate is a FAILURE with unknown code. `outcome_to_result` is
+  asserted to render `is_error: Some(true)` + the real exit code on failure.
+- New `scripts/ci/gate_exit_code_gates.sh` enforces the convention across every
+  `scripts/ci/*.sh`: (1) non-dispatcher wrappers must `set -euo pipefail`; (2) a gate
+  invocation piped directly into `tail|head|grep|tee|awk|sed|wc` outside a `$(…)` capture
+  is rejected — the capture style (`out="$(gate 2>&1)" || exit 1`) is the compliant shape
+  because it checks the tool's exit separately from filtering output; (3) a built-in
+  self-test plants a violating line (must be rejected) and a compliant capture line (must
+  pass), and demonstrates the premise live: the same failing command reports exit 0 when
+  piped through `tail` and exit 3 when captured.
+- Pure `exec cargo run …` dispatchers are exempt from the pipefail rule: `exec` replaces
+  the shell, so the Rust binary's own exit status IS the script's exit status — nothing
+  to mask.
 
 ★ **THIS IS A FAMILY, NOT A ONE-OFF — four instances in a single session, each one a tool
 reporting success while doing nothing or reading the wrong thing.** Collected here because the
