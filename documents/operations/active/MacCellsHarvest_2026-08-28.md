@@ -2383,3 +2383,46 @@ real macOS exit dataplane answer.
 **Cell status: BLOCKED — MAC-D12 documented (`ops_e2e.rs:5451-5460` via
 `:2961`; macOS code gap, not owner-gated). Next action belongs to a code
 worker; this session changed no code.**
+
+### 17.7 MAC-D12 FIXED (code worker) — 2026-08-29
+
+Fixed in worktree `ai-edit/edit-1787995572752-56044-67`, branch
+`ai-edit/edit-1787995572752-56044-67`. `materialize_signing_passphrase_workspace`
+(`crates/rustynet-cli/src/ops_e2e.rs`, the §17.3 call site) no longer spawns
+`systemd-creds` unconditionally: it now delegates to the shared
+`stage_signing_passphrase_leaf` core (extracted from the live-proven
+`stage_membership_signing_passphrase` body), which dispatches through the
+`rustynet-control` `CredentialUnwrapBackend` per platform —
+`LinuxSystemdCredsBackend` on Linux (unchanged), `MacosKeychainBackend` on
+macOS (System.keychain, descriptor
+`membership_signing_key_passphrase_descriptor()`: account
+`membership-owner-signing-key`, service `signing_key_passphrase` — the same
+item the live-proven membership chain unwraps), `WindowsDpapiBackend` on
+Windows. Custody posture is unchanged: the passphrase lives in OS-secure
+storage and is materialized only into the 0600/0700 atomic workspace the
+callers already consume and clean up; fail-closed on missing/empty
+credential is preserved. Because the fix is in the shared helper, the
+latent traversal (`ops_e2e.rs:3080`) and dns-zone (`:3225`) call paths are
+covered too, as is the two-node assignment path.
+
+New verification test:
+`ops_e2e::tests::materialize_signing_passphrase_workspace_pins_platform_backend_dispatch`
+(source-pin: the materialize body must contain no `systemd-creds` and no
+`/etc/rustynet/credentials`, and must call `stage_signing_passphrase_leaf`;
+the core must dispatch all three backends).
+
+Sweep (remaining `systemd-creds` sites are NOT macOS-reachable; no change
+needed): the `systemd-creds encrypt` sites (`ops_e2e.rs:534/561`) live in
+`execute_ops_e2e_bootstrap_host`, whose only caller is the `e2e-bootstrap-host`
+CLI verb (main.rs:9276/9283) on the Linux-only Debian two-node E2E path; the
+macOS cell uses `execute_ops_e2e_bootstrap_macos`. The main.rs
+`systemd-creds` spawns are Linux membership paths; macOS has its own
+`ensure_signing_passphrase_material_macos` (hard-errors when the keychain
+account env is empty — MAC-D11).
+
+Expectation: `distribute_assignments` should now pass on the macOS exit
+cell, unblocking traversal/dns-zone distribution and letting the cell reach
+the exit dataplane stages (`exit_handoff` → `active_exit` → the three exit
+dataplane validations), i.e. the first real macOS exit dataplane answer.
+**No lab run was performed in this fix session — live proof is still
+pending; the next exit-cell re-run is the verifying run.**
