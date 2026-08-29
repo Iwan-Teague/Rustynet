@@ -31,8 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::env_file::{format_env_assignment, parse_env_value};
 use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
 use crate::live_lab_run_matrix::{
-    LiveLabRunMatrixAppendConfig, LiveLabRunMatrixRowRole, LiveLabRunMatrixStageOutcome,
-    append_live_lab_run_matrix_row,
+    GIT_DIRTY_STATE_EXCLUDE_PATHSPECS, LiveLabRunMatrixAppendConfig, LiveLabRunMatrixRowRole,
+    LiveLabRunMatrixStageOutcome, append_live_lab_run_matrix_row,
 };
 use crate::vm_lab::orchestrator::stage::StageId;
 use base64::prelude::*;
@@ -26444,24 +26444,19 @@ fn git_worktree_is_dirty() -> Result<bool, String> {
     command.current_dir(workspace_root_path());
     // The live-lab evidence ledgers are appended to BY THIS ORCHESTRATOR during a
     // run (the run-matrix row and gate-timing telemetry are written by design — see
-    // append_live_lab_run_matrix_row). They are documentation/telemetry, not deployed
-    // code, so their churn must not count as a dirty worktree for the setup->run git
-    // provenance check; otherwise a clean-tree run flips clean->dirty mid-run on the
-    // orchestrator's own evidence write and the provenance comparison fails closed on
-    // a non-code change. Any real code (or other tracked-file) change still surfaces
-    // here and still fails the provenance check.
-    command.args([
-        "status",
-        "--short",
-        "--",
-        ".",
-        ":(exclude)documents/operations/live_lab_run_matrix.csv",
-        ":(exclude)documents/operations/live_lab_node_run_matrix.csv",
-        ":(exclude)documents/operations/live_lab_node_stage_results.csv",
-        ":(exclude)documents/operations/live_lab_stage_triage.jsonl",
-        ":(exclude)documents/operations/gate_timings.csv",
-        ":(exclude)documents/operations/live_lab_stage_timings.csv",
-    ]);
+    // append_live_lab_run_matrix_row), and the live-VM inventory is refreshed with
+    // live guest IPs during readiness. All of it is documentation/telemetry, not
+    // deployed code, so its churn must not count as a dirty worktree for the
+    // setup->run git provenance check; otherwise a clean-tree run flips
+    // clean->dirty mid-run on the orchestrator's own evidence write and the
+    // provenance comparison fails closed on a non-code change. Any real code (or
+    // other tracked-file) change still surfaces here and still fails the
+    // provenance check. The list is shared with
+    // `live_lab_run_matrix::current_git_dirty_state` (QH-34: the inventory
+    // exclude lives there too, in the single source
+    // GIT_DIRTY_STATE_EXCLUDE_PATHSPECS).
+    command.args(["status", "--short", "--", "."]);
+    command.args(GIT_DIRTY_STATE_EXCLUDE_PATHSPECS);
     let output = run_output_with_timeout(
         &mut command,
         timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
