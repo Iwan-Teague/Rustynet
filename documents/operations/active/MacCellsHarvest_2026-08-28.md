@@ -1939,3 +1939,54 @@ the exit cell still cannot pass `membership_init`: new MAC-D9 blocker
 (`ops_e2e.rs:35`/`:7035`, chown group `root` does not exist on macOS; macOS
 code gap, not owner-gated). Fix MAC-D9, then re-run: the exit dataplane
 stages should finally execute.**
+
+### 15.7 MAC-D9 — FIXED in code (2026-08-29, worktree `edit-1787987733253-56044-55`)
+
+Disposition: the Linux-only `root:root` chown target was replaced with a
+platform-correct one. `ROOT_OWNER_GROUP` (`ops_e2e.rs:35`) is gone; a new
+`root_owner_group()` helper returns `root:wheel` on macOS and `root:root`
+elsewhere (macOS gid 0 is named `wheel`; there is no group `root`, so BSD
+chown failed with "chown: root: illegal group name"). Ownership semantics
+unchanged: the membership snapshot/log/watermark stay root-owned with the
+gid-0 group at mutation time (0600), and the daemon takes them back via the
+daemon-group fixture — the fix changes only the group NAME, per platform.
+
+Sites swept and fixed (all in `crates/rustynet-cli/src/ops_e2e.rs`; no other
+file carried a macOS-breaking root-group assumption):
+
+- `execute_ops_e2e_membership_add` — `set_membership_state_permissions_for(…,
+  root_owner_group())` (was `ROOT_OWNER_GROUP`).
+- `execute_ops_e2e_membership_set_capabilities` — same call site fixed.
+- `execute_ops_e2e_bootstrap_host` — the three literal `root:root` chowns
+  (wg credential, signing credential, trust evidence) now use
+  `root_owner_group()` too (defensive: that function is currently only
+  invoked on Linux nodes, but its body is OS-agnostic).
+
+Verification: `root_owner_group_uses_platform_gid0_group_name` unit test
+(ops_e2e tests module) pins `root:wheel` on macOS and `root:root` elsewhere.
+Fail-closed preserved: `set_membership_state_permissions_for` still returns
+`Err` on any chown failure (nonzero status → loud error), so wrong ownership
+can never pass silently.
+
+Swept, no change needed (already platform-correct):
+`scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh` and
+`Install-RustyNetMacosService.sh` use `root:wheel` / `root:rustynetd`;
+`vm_lab/orchestrator/adapter/macos_membership.rs` chowns/installs as
+`rustynetd:rustynetd` / `-g rustynetd`; the remaining literal `root:root`
+chowns live in Linux-only paths (`linux_install.rs`, `linux_membership.rs`,
+`linux_traffic.rs`, the Debian two-node e2e verify expectations in
+`ops_e2e.rs::execute_ops_run_debian_two_node_e2e`, and Linux-peer scripts in
+`vm_lab/mod.rs`). Windows membership chown is a documented no-op (NTFS ACLs).
+
+Gates: fmt + clippy (`-p rustynet-cli`, all targets/features, `-D warnings`)
+pass; workspace clippy `--locked -D warnings` clean; `cargo test -p
+rustynet-cli --all-features --bin rustynet-cli root_owner_group` green;
+`cargo audit --deny warnings` + `cargo deny check bans licenses sources
+advisories` clean. No lab run yet.
+
+**Expected effect: `membership_init` on the macOS exit cell should now pass
+— the chown succeeds with `root:wheel`, the mutation proceeds, and the 54
+fail-closed downstream stages (distribute/anchor/admin/exit dataplane)
+finally execute. A live re-run of the exit cell is still required to convert
+this code fix into lab-proven status; the cell stays BLOCKED-pending-re-run
+until then.**
