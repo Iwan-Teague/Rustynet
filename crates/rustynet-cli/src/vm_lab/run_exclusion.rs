@@ -385,6 +385,8 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         report_dir: _,
         source_mode: _,
         repo_ref: _,
+        // QH-08 Option A: records the --allow-dirty escape hatch; names no guest.
+        allow_dirty: _,
         max_parallel_node_workers: _,
         skip_gates: _,
         skip_soak: _,

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::live_lab_run_matrix::SOURCE_ARCHIVE_PROVENANCE_RELATIVE_PATH;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
@@ -177,11 +178,25 @@ fn append_source_commit_marker(
 
 pub struct PrepareSourceArchiveStage {
     source_mode: ArchiveSourceMode,
+    /// QH-08 Option A: when `false` (the default), a dirty git worktree fails
+    /// this stage — the archive must never be built from a tree whose exact
+    /// contents are not pinned. `--allow-dirty` sets this to `true` and the
+    /// fact is recorded in the run-matrix row via
+    /// [`SOURCE_ARCHIVE_PROVENANCE_RELATIVE_PATH`], so a dirty-tree run is
+    /// self-identifying forever.
+    allow_dirty: bool,
+    /// The tree this stage packages. Production runs from the repo root
+    /// (`"."`); tests point this at a scratch repository.
+    repo_dir: PathBuf,
 }
 
 impl PrepareSourceArchiveStage {
-    pub fn new(source_mode: ArchiveSourceMode) -> Self {
-        PrepareSourceArchiveStage { source_mode }
+    pub fn new(source_mode: ArchiveSourceMode, allow_dirty: bool) -> Self {
+        PrepareSourceArchiveStage {
+            source_mode,
+            allow_dirty,
+            repo_dir: PathBuf::from("."),
+        }
     }
 }
 
@@ -211,11 +226,48 @@ impl OrchestrationStage for PrepareSourceArchiveStage {
             p.push(format!("rn_source_{}.tar.gz", std::process::id()));
             p
         };
+        // QH-08 Option A: read the dirty state IMMEDIATELY before the archive
+        // is created (not earlier in launch) so the refusal-to-build window is
+        // as small as this stage can make it, then content-pin whatever the
+        // archive actually contains (sha256 + byte size) into the report-dir
+        // provenance artifact the run-matrix row picks up. A mutation landing
+        // between this check and the archive build can no longer pass
+        // unnoticed: the row's provenance would no longer match the pinned
+        // hash. Exclusions are the QH-34 single-source
+        // `GIT_DIRTY_STATE_EXCLUDE_PATHSPECS`, so the orchestrator's own
+        // telemetry writes never self-flag.
+        let dirty = match crate::vm_lab::git_worktree_is_dirty_in(&self.repo_dir) {
+            Ok(dirty) => dirty,
+            Err(err) => {
+                return StageOutcome::Failed(format!(
+                    "source archive dirty-state check failed: {err}"
+                ));
+            }
+        };
+        if dirty && !self.allow_dirty {
+            return StageOutcome::Failed(
+                "git worktree must be clean for this live-lab iteration; commit your \
+                 changes or pass --allow-dirty to record the divergence explicitly"
+                    .to_owned(),
+            );
+        }
         // The orchestrator runs from the repo root, so the working dir is the
         // source tree we want to package.
-        match build_source_tarball(Path::new("."), self.source_mode, &archive_path) {
+        match build_source_tarball(&self.repo_dir, self.source_mode, &archive_path) {
             Ok(()) => match SourceArchive::from_existing(archive_path) {
                 Ok(archive) => {
+                    if let Err(err) = write_source_archive_provenance(
+                        ctx.report_dir.as_path(),
+                        &self.repo_dir,
+                        archive.path(),
+                        self.source_mode,
+                        self.allow_dirty,
+                        dirty,
+                    ) {
+                        return StageOutcome::Failed(format!(
+                            "source archive provenance record failed: {err}"
+                        ));
+                    }
                     ctx.source_archive = Some(archive);
                     StageOutcome::Passed
                 }
@@ -224,6 +276,76 @@ impl OrchestrationStage for PrepareSourceArchiveStage {
             Err(e) => StageOutcome::Failed(e),
         }
     }
+}
+
+/// Record the content pin for the archive this stage just built.
+///
+/// Written to `<report_dir>/state/source_archive_provenance.json`; the
+/// run-matrix row builder reads it to populate the `source_archive_sha256`,
+/// `source_archive_bytes`, and `allow_dirty` columns. Any field that cannot
+/// be computed is a hard error — a half-pinned archive must fail the stage,
+/// not ship with unknown provenance (fail closed, QH-08 Option A).
+fn write_source_archive_provenance(
+    report_dir: &Path,
+    repo_dir: &Path,
+    archive_path: &Path,
+    source_mode: ArchiveSourceMode,
+    allow_dirty: bool,
+    dirty: bool,
+) -> Result<PathBuf, String> {
+    let sha256 = crate::vm_lab::file_sha256_hex(archive_path)?;
+    let bytes = std::fs::metadata(archive_path)
+        .map_err(|err| format!("stat source archive failed: {err}"))?
+        .len();
+    let commit = git_head_commit(repo_dir)?;
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "archive_file": archive_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+        "sha256": sha256,
+        "bytes": bytes,
+        "source_mode": if source_mode == ArchiveSourceMode::Head {
+            "head"
+        } else {
+            "working-tree"
+        },
+        "allow_dirty": allow_dirty,
+        "git_commit": commit,
+        "git_dirty": dirty,
+    });
+    let path = report_dir.join(SOURCE_ARCHIVE_PROVENANCE_RELATIVE_PATH);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("create provenance dir failed ({}): {err}", parent.display()))?;
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&body)
+            .map_err(|err| format!("serialize source archive provenance failed: {err}"))?,
+    )
+    .map_err(|err| {
+        format!(
+            "write source archive provenance failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn git_head_commit(repo_dir: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|err| format!("git rev-parse HEAD spawn failed: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("git rev-parse HEAD exited with {}", output.status));
+    }
+    String::from_utf8(output.stdout)
+        .map(|stdout| stdout.trim().to_owned())
+        .map_err(|err| format!("git rev-parse HEAD returned non-UTF-8 output: {err}"))
 }
 
 #[cfg(test)]
@@ -265,8 +387,126 @@ mod tests {
     #[test]
     fn already_present_archive_passes_immediately() {
         let (mut ctx, _f) = make_ctx_with_archive();
-        let outcome = PrepareSourceArchiveStage::new(ArchiveSourceMode::Head).execute(&mut ctx);
+        let outcome =
+            PrepareSourceArchiveStage::new(ArchiveSourceMode::Head, false).execute(&mut ctx);
         assert_eq!(outcome, StageOutcome::Passed);
+    }
+
+    /// A context with NO archive yet and a report dir the test controls, so
+    /// the stage actually executes and the provenance artifact is inspectable.
+    fn make_empty_ctx(report_dir: &Path) -> OrchestrationContext {
+        OrchestrationContext {
+            assignments: vec![],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: report_dir.to_path_buf(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
+            inventory_path: None,
+            macos_anchor_validators_elected: false,
+        }
+    }
+
+    /// Scratch git repo with one committed tracked file, then dirtied by an
+    /// uncommitted tracked edit. Point the stage's `repo_dir` here so the
+    /// dirty-state refusal/provenance paths run against a tree the test owns
+    /// instead of the real workspace.
+    fn dirty_scratch_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("tracked.txt"), b"committed\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-q", "-m", "initial"]);
+        std::fs::write(repo.join("tracked.txt"), b"dirty-uncommitted-edit\n").unwrap();
+        (tmp, repo)
+    }
+
+    fn stage_for(
+        repo: &Path,
+        mode: ArchiveSourceMode,
+        allow_dirty: bool,
+    ) -> PrepareSourceArchiveStage {
+        PrepareSourceArchiveStage {
+            source_mode: mode,
+            allow_dirty,
+            repo_dir: repo.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn dirty_tree_refuses_launch_by_default() {
+        let (_tmp, repo) = dirty_scratch_repo();
+        let report = tempfile::tempdir().unwrap();
+        let mut ctx = make_empty_ctx(report.path());
+
+        let outcome = stage_for(&repo, ArchiveSourceMode::Head, false).execute(&mut ctx);
+
+        assert_eq!(
+            outcome,
+            StageOutcome::Failed(
+                "git worktree must be clean for this live-lab iteration; commit your \
+                 changes or pass --allow-dirty to record the divergence explicitly"
+                    .to_owned()
+            ),
+            "a dirty worktree must refuse the launch by default (QH-08 Option A)"
+        );
+        assert!(
+            ctx.source_archive.is_none(),
+            "the refusal must happen before any archive is built"
+        );
+        assert!(
+            !report
+                .path()
+                .join("state/source_archive_provenance.json")
+                .exists(),
+            "the refusal must not write provenance for an archive that was never built"
+        );
+    }
+
+    #[test]
+    fn allow_dirty_bypasses_refusal_and_records_provenance() {
+        let (_tmp, repo) = dirty_scratch_repo();
+        let report = tempfile::tempdir().unwrap();
+        let mut ctx = make_empty_ctx(report.path());
+
+        let outcome = stage_for(&repo, ArchiveSourceMode::Head, true).execute(&mut ctx);
+
+        assert_eq!(outcome, StageOutcome::Passed);
+        let archive = ctx.source_archive.as_ref().expect("archive must be set");
+
+        let body =
+            std::fs::read_to_string(report.path().join("state/source_archive_provenance.json"))
+                .expect("provenance must be written next to the report dir");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["allow_dirty"], serde_json::Value::Bool(true));
+        assert_eq!(json["git_dirty"], serde_json::Value::Bool(true));
+        assert_eq!(json["source_mode"], "head");
+        assert_eq!(
+            json["git_commit"],
+            git_capture(&repo, &["rev-parse", "HEAD"]),
+            "provenance must pin the scratch repo's HEAD, not the workspace's"
+        );
+        assert_eq!(
+            json["sha256"],
+            crate::vm_lab::file_sha256_hex(archive.path()).unwrap(),
+            "provenance sha256 must match the archive actually shipped"
+        );
+        assert_eq!(
+            json["bytes"],
+            std::fs::metadata(archive.path()).unwrap().len(),
+            "provenance byte count must match the archive actually shipped"
+        );
     }
 
     #[test]

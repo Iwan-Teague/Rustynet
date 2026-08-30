@@ -4481,6 +4481,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 macos_promote_exit: parser.has_flag("--macos-promote-exit"),
                 stage_timeout_secs: parser.parse_u64_or_default("--stage-timeout-secs", 0)?,
                 skip_linux_live_suite: parser.has_flag("--skip-linux-live-suite"),
+                allow_dirty: parser.has_flag("--allow-dirty"),
                 resume_from: parser.value("--resume-from"),
                 rerun_stage: parser.value("--rerun-stage"),
             }),
