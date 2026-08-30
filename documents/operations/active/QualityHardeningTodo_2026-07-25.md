@@ -1566,6 +1566,44 @@ Two rules follow, and they are the transferable part:
 Acceptance: every interpolation site is classified by sink context, and its binding type or
 validator matches that context — not merely "it is escaped".
 
+**CLOSED 2026-08-30 (audit, no code change needed).** Re-read the QH-01 fix
+(`crates/rustynet-cli/src/vm_lab/script_template.rs`) against this item's own six-row table and
+confirmed every context already has a dedicated, tested control — the module's own doc header
+(`script_template.rs:23-57`) independently reproduces this same table, so the fix already
+generalised past the single defect it was written for:
+
+- **Single-/double-quoted position** → `Binding::Literal`, `shell_quote`d, `ensure_literal_binding_value`
+  additionally refuses `\0`/`\n`/`\r` (`script_template.rs:157-160,202-213`).
+- **Heredoc body** → dedicated `Binding::HeredocBody` variant: rejects any line equal to the
+  terminator and requires a trailing newline so the terminator starts at column 0 — quoting is
+  explicitly NOT the control here (`script_template.rs:134-137,177-180,239-261`). Exercised at the
+  `HOST_LAUNCH_SCRIPT`'s `<<'RUNNER_EOF'` site (`script_template.rs:822-826,874-879`), proven by
+  `a_newline_bearing_literal_cannot_close_the_runner_heredoc` and
+  `a_heredoc_body_cannot_smuggle_its_own_terminator`.
+- **Nested command string** (`script -qec`) → the one documented exception where a `Literal`'s
+  escaping is *not* by itself the control: the inner command string is single-quoted and the value
+  is exported as an env var so the INNER shell does its own expansion as one already-quoted word
+  (`HOST_GUEST_CONSOLE_SCRIPT`, `script_template.rs:500-546`), proven by
+  `guest_console_nested_command_string_is_single_quoted`. Caller-side validation
+  (`ensure_provision_guest_name`) is defense-in-depth with an honestly-documented gap (S6: no
+  `dry_run` path, so nothing goes red if that second check is deleted) — noted in the doc, not
+  hidden.
+- **SSH post-host argv** → closed by QH-13: `run_host_cmd` `shell_quote`s every argument
+  (`mod.rs:5349` + surrounding, referenced at `script_template.rs:4984-4986`).
+- **Path composition/confinement** → `ensure_provision_pool_path` (`mod.rs:4995-5014`): absolute-path
+  requirement, explicit `..`-segment rejection, and an allowlist alphabet — orthogonal to and
+  layered under the quoting, exactly as the acceptance criterion requires (an escaped
+  `../../etc/passwd` is still a valid shell word that traverses out of the pool).
+- **`Binding::Bare`** (unquoted position, e.g. numerics/toolchain channels) → alphabet-restricted to
+  `[A-Za-z0-9._-]+`, empty refused (`script_template.rs:127-128,215-237`).
+- **`Binding::RawFragment`** (verbatim syntax) → confined not by validation but by construction: the
+  variant is private and constructible only via `HostSshPath::binding`'s associated constants,
+  checked by the compiler, not a runtime rule (`script_template.rs:76-93`).
+
+No fix landed under this pass because none was needed — the existing controls already match every
+row of the table. QH-01's original three-defect fix generalised into this typed-`Binding` system
+before this item was ever revisited, so the backlog entry was stale, not the code.
+
 ### QH-20 — An environment-dependent unit test intermittently fails and always runs slowly
 **Severity: low-medium. Confidence: VERIFIED (four independent ways).**
 
