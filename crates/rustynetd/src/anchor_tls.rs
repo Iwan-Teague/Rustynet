@@ -87,7 +87,10 @@ impl std::error::Error for AnchorTlsError {}
 
 /// The anchor's long-lived TLS identity: DER certificate, DER private key,
 /// and the SHA-256 fingerprint of the DER certificate that clients pin.
-#[derive(Debug, Clone)]
+/// `Clone` is deliberately NOT derived: `PrivateKeyDer` is not `Clone` (key
+/// material must not be silently duplicated), and every consumer re-loads the
+/// same persisted identity instead of sharing a copy.
+#[derive(Debug)]
 pub struct AnchorTlsIdentity {
     pub certificate_der: CertificateDer<'static>,
     pub key_der: PrivateKeyDer<'static>,
@@ -303,7 +306,9 @@ fn build_certified_key(
     certificate_der: &CertificateDer<'static>,
     key_der: &PrivateKeyDer<'static>,
 ) -> Result<Arc<CertifiedKey>, AnchorTlsError> {
-    let signing_key = rustls::crypto::ring::signer::any_supported_type(key_der)
+    // rustls 0.23 names this module `sign` (the old `signer` path is gone);
+    // the ring feature is pinned in Cargo.toml so this is the only provider.
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(key_der)
         .map_err(|error| AnchorTlsError::KeyRejected(error.to_string()))?;
     Ok(Arc::new(CertifiedKey {
         cert: vec![certificate_der.clone()],
@@ -344,17 +349,17 @@ pub fn build_anchor_server_config(
 ) -> Result<rustls::ServerConfig, AnchorTlsError> {
     let certified_key = build_certified_key(&identity.certificate_der, &identity.key_der)?;
     let resolver: Arc<dyn ResolvesServerCert> = Arc::new(AnchorCertResolver(certified_key));
-    rustls::ServerConfig::builder_with_provider(ring_provider())
+    Ok(rustls::ServerConfig::builder_with_provider(ring_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| AnchorTlsError::ServerConfig(error.to_string()))?
         .with_no_client_auth()
-        .with_cert_resolver(resolver)
+        .with_cert_resolver(resolver))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::{SocketAddr, TcpListener, TcpStream};
 
     struct TempTlsDir(PathBuf);
@@ -516,7 +521,7 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            let mut conn = rustls::ServerConnection::new(config).expect("server connection");
+            let conn = rustls::ServerConnection::new(config).expect("server connection");
             let mut tls = rustls::StreamOwned::new(conn, stream);
             let mut buf = [0u8; 5];
             tls.read_exact(&mut buf).expect("read inside TLS");

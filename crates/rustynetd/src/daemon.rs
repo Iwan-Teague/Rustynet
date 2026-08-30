@@ -1540,7 +1540,9 @@ fn read_optional_anchor_bundle_pull_have_line<R: std::io::Read>(stream: &mut R) 
 /// inline serve loop open past the same budget the plaintext path had).
 enum AnchorControlStream {
     Plain(TcpStream),
-    Tls(rustls::StreamOwned<rustls::ServerConnection, TcpStream>),
+    // Boxed: the rustls stream is ~1.2KB against the 4-byte TcpStream and the
+    // enum is moved between accept and handler on every anchor connection.
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
 }
 
 impl AnchorControlStream {
@@ -1614,9 +1616,9 @@ fn anchor_control_stream(
                 .map_err(|err| {
                     DaemonError::Io(format!("anchor TLS server connection failed: {err}"))
                 })?;
-            Ok(AnchorControlStream::Tls(rustls::StreamOwned::new(
+            Ok(AnchorControlStream::Tls(Box::new(rustls::StreamOwned::new(
                 conn, stream,
-            )))
+            ))))
         }
     }
 }
@@ -17894,7 +17896,8 @@ mod tests {
     };
 
     use super::{
-        ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, AutoTunnelBundle, AutoTunnelWatermark,
+        ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, AnchorControlStream, AnchorListenerBinding,
+        AutoTunnelBundle, AutoTunnelWatermark,
         DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE,
         DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL,
         DaemonBackendMode, DaemonConfig, DaemonError, DaemonRuntime, DnsZoneBootstrapError,
@@ -18446,8 +18449,10 @@ mod tests {
             anchor_bundle_pull_allow_lan: false,
             ..DaemonConfig::default()
         };
-        bind_anchor_bundle_pull_listener(&config)
-            .expect_err("a LAN bind addr without allow-lan must fail closed");
+        assert!(
+            bind_anchor_bundle_pull_listener(&config).is_err(),
+            "a LAN bind addr without allow-lan must fail closed",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -18718,7 +18723,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
             handle_anchor_bundle_pull_stream(
-                stream,
+                AnchorControlStream::Plain(stream),
                 &token_path_for_thread,
                 &bundle_path,
                 "anchor-a",
@@ -22430,8 +22435,12 @@ mod tests {
         let dir = secure_test_dir("rustynetd-enroll-bind-cap-absent");
         let (config, _runtime) =
             enrollment_listener_fixture(&dir, anchor_caps_without_enrollment_endpoint());
-        let err = bind_anchor_enrollment_listener(&config)
-            .expect_err("listener must refuse to open without the signed capability");
+        // `expect_err` would require `Ok` to be `Debug`; the binding holds a
+        // live listener and derives no `Debug`, so destructure instead.
+        let err = match bind_anchor_enrollment_listener(&config) {
+            Ok(_) => panic!("listener must refuse to open without the signed capability"),
+            Err(err) => err,
+        };
         assert!(
             format!("{err}").contains("anchor.enrollment_endpoint"),
             "refusal must name the missing capability: {err}"
@@ -22482,8 +22491,10 @@ mod tests {
             enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
         std::fs::remove_file(&config.membership_snapshot_path)
             .expect("snapshot should be removable");
-        bind_anchor_enrollment_listener(&config)
-            .expect_err("a missing membership snapshot must refuse the bind");
+        assert!(
+            bind_anchor_enrollment_listener(&config).is_err(),
+            "a missing membership snapshot must refuse the bind",
+        );
     }
 
     /// §3 fail-closed: a symlinked snapshot is refused through the shared
@@ -22500,8 +22511,10 @@ mod tests {
             .expect("snapshot should be movable");
         std::os::unix::fs::symlink(&real, &config.membership_snapshot_path)
             .expect("symlink should be creatable");
-        bind_anchor_enrollment_listener(&config)
-            .expect_err("a symlinked membership snapshot must refuse the bind");
+        assert!(
+            bind_anchor_enrollment_listener(&config).is_err(),
+            "a symlinked membership snapshot must refuse the bind",
+        );
     }
 
     /// A configured listener addr without a provisioned enrollment
@@ -22513,8 +22526,12 @@ mod tests {
         let (mut config, _runtime) =
             enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
         config.enrollment_secret_path = None;
-        let err = bind_anchor_enrollment_listener(&config)
-            .expect_err("a listener addr without an enrollment secret must refuse");
+        // `expect_err` would require `Ok` to be `Debug`; the binding holds a
+        // live listener and derives no `Debug`, so destructure instead.
+        let err = match bind_anchor_enrollment_listener(&config) {
+            Ok(_) => panic!("a listener addr without an enrollment secret must refuse"),
+            Err(err) => err,
+        };
         assert!(
             format!("{err}").contains("secret path"),
             "refusal must name the missing provisioning: {err}"
@@ -22558,8 +22575,10 @@ mod tests {
             enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
         config.anchor_enrollment_addr = Some("192.168.1.10:51823".parse().expect("addr"));
         config.anchor_enrollment_allow_lan = false;
-        bind_anchor_enrollment_listener(&config)
-            .expect_err("a LAN bind addr without allow-lan must fail closed");
+        assert!(
+            bind_anchor_enrollment_listener(&config).is_err(),
+            "a LAN bind addr without allow-lan must fail closed",
+        );
     }
 
     /// The shared serve path must report no I/O on an idle listener
