@@ -18,11 +18,14 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
 2. Control-plane transport security:
 - Mesh control traffic rides the WireGuard tunnel's authenticated encryption
   (Noise IK handshake, ChaCha20-Poly1305; vendored at
-  `third_party/boringtun/src/noise/handshake.rs:13`). No control-plane TLS
-  terminator exists: the workspace contains no HTTP or gRPC server framework
-  at all (`axum`, `actix-web`, `hyper`, `tonic` are all absent from
-  `Cargo.lock`), and `rustynet-control` has no network listener — its binary
-  is a 49-line scaffold (`crates/rustynet-control/src/main.rs`).
+  `third_party/boringtun/src/noise/handshake.rs:13`). The workspace still
+  contains no HTTP or gRPC server framework at all (`axum`, `actix-web`,
+  `hyper`, `tonic` are all absent from `Cargo.lock`), and `rustynet-control`
+  has no network listener — its binary is a 49-line scaffold
+  (`crates/rustynet-control/src/main.rs`). One control-plane TLS terminator
+  now exists — the anchor bundle-pull and enrollment listeners (QH-26
+  correction below); everything outside those two opt-in LAN-exposed
+  listeners remains non-TLS as described here.
   - **CORRECTION 2026-07-27.** This control previously read "there is no
     separate TLS stack and no TLS library is a workspace dependency". The
     second half was false. `rustls` 0.23.41 **is** a workspace dependency
@@ -51,8 +54,10 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
     documentation edit. Corrected because the audit that wrote this block was
     working from a base that predated the amendment.
     What REMAINS true, and is the residual worth acting on — dead code shaped
-    like a control. Nothing in the tree negotiates TLS 1.3. The only enforcement
-    code —
+    like a control. This policy code still does not observe a real handshake;
+    TLS 1.3 IS now genuinely enforced in the tree, but by the anchor
+    control-plane stack (QH-26 correction below), not here. The only
+    transport-security enforcement code in that crate —
     `ControlPlaneTransportPolicy::validate_negotiated_tls`
     (`crates/rustynet-control/src/lib.rs:209`) and
     `ControlPlaneCore::validate_transport_security` (`:2327`) — receives the
@@ -63,6 +68,50 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
     amended away, the honest dispositions are to delete them or to wire them to a
     real handshake; leaving them is what let this be read as an enforced control
     in the first place.
+  - **CORRECTION 2026-08-30 — QH-26 landed anchor control-plane TLS.** The
+    "no control-plane TLS terminator exists" claim above is superseded for
+    the anchor listeners, and the "nothing in the tree negotiates TLS 1.3"
+    statement in the 2026-07-28 block is now false. What actually exists,
+    verified against the implementation (`crates/rustynetd/src/anchor_tls.rs`,
+    wired into `bind_anchor_bundle_pull_listener` and
+    `bind_anchor_enrollment_listener` in `crates/rustynetd/src/daemon.rs`):
+    - **Scope — opt-in LAN exposure only.** TLS is active on an anchor
+      listener if and only if its LAN-exposure flag is set
+      (`--anchor-bundle-pull-allow-lan` for bundle-pull,
+      `--anchor-enrollment-allow-lan` for enrollment-consume). Loopback-only
+      binds keep the existing plaintext local-IPC transport, unchanged.
+    - **TLS 1.3 only — structurally, not by configuration.** `rustls` 0.23 is
+      built with `default-features = false, features = ["ring", "std",
+      "logging"]` (`crates/rustynetd/Cargo.toml:41`): the `tls12` feature is
+      omitted, so TLS 1.2 support is not compiled in at all. The module
+      additionally restricts the enabled protocol versions to TLS 1.3.
+    - **Self-signed identity, no CA / PKI.** At first startup the anchor
+      generates an ECDSA P-256 certificate with `rcgen` (CN/SAN
+      `rustynet-anchor.local`, 10-year validity, one hour back-dated for
+      clock skew) and persists it under the state root as
+      `anchor-tls/anchor-cert.pem` + `anchor-key.pem` in a 0700 directory,
+      reusing it across restarts. The trust anchor is the SHA-256 fingerprint
+      of the DER certificate: verification is by fingerprint pin, never by
+      name or certificate chain. Both listeners share this ONE on-disk
+      identity, so a client pins the same fingerprint for enrollment and
+      bundle-pull.
+    - **Fail-closed, pre-bind.** The TLS identity is loaded or
+      first-boot-generated BEFORE the socket bind on each listener. An
+      `--allow-lan` listener whose identity cannot be loaded or generated
+      refuses to bind at all (startup error, `DaemonError::InvalidConfig`;
+      no plaintext fallback for a LAN-exposed anchor listener — every
+      accepted connection must complete the TLS 1.3 handshake before the
+      line protocol runs).
+    - **NOT yet done — the pin is server-side posture only so far.** There
+      is no client-side fingerprint pinning in `rustynet-cli`'s
+      bundle-pull/enroll commands yet: the only pin verifier in the tree is
+      a test-only `PinnedFingerprintVerifier` pattern inside
+      `anchor_tls.rs`'s own `#[cfg(test)]` module. There is also no
+      signed-bundle fingerprint distribution field yet, so no automated
+      out-of-band channel distributes the fingerprint today. Until both
+      exist, the fingerprint-pin trust model is design contract, not an
+      enforced end-to-end control — do not cite this item as client-side
+      authentication of the anchor.
 - Signed membership updates (gossip convergence, `membership apply-update`)
   are authenticated by ed25519 signature verification against the current
   approver set before being applied — fail closed on any verification error,
