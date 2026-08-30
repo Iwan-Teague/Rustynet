@@ -1291,6 +1291,16 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// the Linux live suite, so skipping the suite leaves them fully exercised.
     /// A full Linux live suite still runs when this is `false` (the default).
     pub skip_linux_live_suite: bool,
+    /// Allow the source-archive stage to ship a DIRTY working tree. By default
+    /// (QH-08) the stage refuses to archive a dirty tree, because evidence
+    /// recorded from a tree that does not match its commit is not reproducible
+    /// from that commit. With this flag the run proceeds but every
+    /// `git_dirty=true` divergence is written into the archive's provenance
+    /// (`state/source_archive_provenance.json`) and surfaced as an explicit
+    /// `allow_dirty` column in the run-matrix CSV, so a dirty-sourced run is
+    /// always identifiable in evidence instead of silently masquerading as a
+    /// clean-commit run.
+    pub allow_dirty: bool,
 }
 
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
@@ -26530,6 +26540,32 @@ fn git_worktree_is_dirty() -> Result<bool, String> {
     Ok(!stdout.trim().is_empty())
 }
 
+/// QH-08 Option A: dirty check for an ARBITRARY repo_dir, not just the
+/// workspace root. Same exclusion list (GIT_DIRTY_STATE_EXCLUDE_PATHSPECS,
+/// QH-34 single source) so the orchestrator's own evidence writes never
+/// count as dirt; only the run's source checkout (`repo_dir`) is judged.
+pub(crate) fn git_worktree_is_dirty_in(repo_dir: &Path) -> Result<bool, String> {
+    let mut command = Command::new("git");
+    command.current_dir(repo_dir);
+    // Exclusion rationale identical to git_worktree_is_dirty above — keep the
+    // two in lockstep, both sourcing GIT_DIRTY_STATE_EXCLUDE_PATHSPECS.
+    command.args(["status", "--short", "--", "."]);
+    command.args(GIT_DIRTY_STATE_EXCLUDE_PATHSPECS);
+    let output = run_output_with_timeout(
+        &mut command,
+        timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed with status {}",
+            status_code(output.status)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git status returned non-UTF-8 output: {err}"))?;
+    Ok(!stdout.trim().is_empty())
+}
+
 impl LiveLabProfile {
     fn required(&self, key: &str) -> Result<String, String> {
         self.values
@@ -50472,6 +50508,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             enable_negative_control: false,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
+            allow_dirty: false,
         }
     }
 
