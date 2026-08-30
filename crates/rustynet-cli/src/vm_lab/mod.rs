@@ -50508,6 +50508,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             enable_negative_control: false,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
+            allow_dirty: false,
         }
     }
 

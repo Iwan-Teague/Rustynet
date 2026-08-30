@@ -929,6 +929,7 @@ mod tests {
             enable_negative_control: false,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
+            allow_dirty: false,
         }
     }
 

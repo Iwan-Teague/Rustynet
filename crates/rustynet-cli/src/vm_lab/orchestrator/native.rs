@@ -1044,6 +1044,7 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
             false,
             false,
             false,
+            false,
             orchestrator::stage::cross_network::CrossNetworkOptions::default(),
             1,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
