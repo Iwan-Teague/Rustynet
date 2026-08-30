@@ -26530,6 +26530,32 @@ fn git_worktree_is_dirty() -> Result<bool, String> {
     Ok(!stdout.trim().is_empty())
 }
 
+/// QH-08 Option A: dirty check for an ARBITRARY repo_dir, not just the
+/// workspace root. Same exclusion list (GIT_DIRTY_STATE_EXCLUDE_PATHSPECS,
+/// QH-34 single source) so the orchestrator's own evidence writes never
+/// count as dirt; only the run's source checkout (`repo_dir`) is judged.
+pub(crate) fn git_worktree_is_dirty_in(repo_dir: &Path) -> Result<bool, String> {
+    let mut command = Command::new("git");
+    command.current_dir(repo_dir);
+    // Exclusion rationale identical to git_worktree_is_dirty above — keep the
+    // two in lockstep, both sourcing GIT_DIRTY_STATE_EXCLUDE_PATHSPECS.
+    command.args(["status", "--short", "--", "."]);
+    command.args(GIT_DIRTY_STATE_EXCLUDE_PATHSPECS);
+    let output = run_output_with_timeout(
+        &mut command,
+        timeout_or_default(30, DEFAULT_RUN_TIMEOUT_SECS),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed with status {}",
+            status_code(output.status)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git status returned non-UTF-8 output: {err}"))?;
+    Ok(!stdout.trim().is_empty())
+}
+
 impl LiveLabProfile {
     fn required(&self, key: &str) -> Result<String, String> {
         self.values
