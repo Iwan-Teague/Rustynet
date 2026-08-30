@@ -37,6 +37,13 @@
 /target-livelab/
 /target-deepseek-*/
 
+# CARGO_TARGET_DIR for local gate runs (CLAUDE.md/AGENTS.md §7). Missing here
+# left it untracked at the repo root, which trips the same setup->run
+# git-provenance check the .lock/.tmp entries above exist to avoid — every
+# live-lab launch this session failed "worktree must be clean" against this
+# one directory, not against real dirt.
+/target-gate/
+
 # Editor-local config (absolute machine paths; wire up via scripts/mcp/install.sh).
 /.zed/
 
