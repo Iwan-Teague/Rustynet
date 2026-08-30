@@ -1988,6 +1988,226 @@ honest test that fails for the right reason) or reverted on the merits — decid
 by default; (b) the two additive checkpoints are reviewed on their merits; (c) something prevents a
 "Review before merging" commit reaching `main` again; (d) DA-01 is resolved by the operator.
 
+#### QH-26 follow-up design — anchor control-plane TLS: the two deferred items (DESIGN ONLY, NOT IMPLEMENTED)
+
+QH-26's DA-01 resolution landed real TLS 1.3 for the anchor control-plane listeners
+(`crates/rustynetd/src/anchor_tls.rs`, wired into `crates/rustynetd/src/daemon.rs`): a LAN-exposed
+anchor bind (`--allow-lan`) now requires a completed TLS 1.3 handshake before any line protocol,
+with no plaintext fallback, and loopback binds remain plaintext. Two follow-up items were deferred
+as out of the original scope and both are more complex than their one-line descriptions suggest.
+This section is the design analysis for both. **Nothing here is implemented;** per the QH-60
+convention (this document, lines ~5642-5687) both items are security-sensitive and must pass the
+plan → adversarial-review cycle before any code is written.
+
+---
+
+**Item 1 — client-side fingerprint pinning is blocked by a prerequisite the task description
+omits: the client cannot reach a LAN anchor at all.**
+
+What the client does today (`crates/rustynet-cli/src/main.rs`, `AnchorCommand::PullBundle`
+handler, starts at line 7569):
+
+- It loads the pinned membership owner public key **before** any network I/O
+  (`load_membership_owner_key_pub`, main.rs:7581) and takes the rollback floor from the persistent
+  watermark store, not from `--output` (main.rs:7592-7594).
+- It resolves the target address and then **requires the resolved address to be loopback**:
+  `.find(|candidate| candidate.ip().is_loopback())` at main.rs:7598-7600, failing with
+  `"anchor bundle-pull addr must resolve to loopback"`. There is **no code path** — not even a
+  flag — by which this command connects to a non-loopback address. The "gap" is not that pinning
+  is missing on a network path; it is that the network path does not exist.
+- The connection is plain `TcpStream::connect_timeout` with a 5 s budget (main.rs:7601) and 5 s
+  read/write timeouts (main.rs:7603-7608). **No TLS exists anywhere in this client path.**
+- The line protocol is: write `{token}\n` plus an optional `have {epoch} {root}\n`
+  (main.rs:7646-7649); a forced-full counter (`increment_anchor_bundle_pull_counter` /
+  `anchor_bundle_pull_must_force_full`, main.rs:7640-7645) bounds how long a lying
+  `UNCHANGED` answer can keep a client stale; the response is read capped at
+  `MAX_MEMBERSHIP_SNAPSHOT_BYTES + 128` (main.rs:7655); the header is `UNCHANGED` or
+  `OK <size>` (main.rs:7658-7684).
+- The pulled bytes are then verified **before reaching disk** via
+  `verify_attested_snapshot(&bytes, &pinned_owner_pubkey_hex, now, …, max_attestation_age_secs)`
+  (main.rs:7619-7631 and 7692+) — signature, quorum, freshness. A locally-verified identity feeds
+  only the `have`/`UNCHANGED` shortcut (main.rs:7609-7618).
+
+Enrollment is **not** affected by the same constraint. In
+`parse_enrollment_command` (main.rs:6346), `mint` (main.rs:6353) and `verify` (main.rs:6369) are
+local file operations; `consume` takes `--push-addr` (main.rs:6383-6398) but executes entirely via
+daemon IPC — `send_command(IpcCommand::EnrollmentConsume…)` (main.rs:8224-8248) over a Unix domain
+socket (`send_command`, main.rs:17107-17118, `UnixStream::connect` guarded by
+`validate_control_socket_security`); `admit` (main.rs:6399-6465) is a local operator one-shot. The
+CLI never dials an anchor's network listener for enrollment; the **daemon** does, against
+`anchor_enrollment_addr`, which is already gated by `validate_anchor_enrollment_addr(addr,
+anchor_enrollment_allow_lan)` (daemon.rs:1887-1890; field at daemon.rs:2430, default `None` at
+daemon.rs:2559; default port 51823 per the tests at daemon.rs:22565).
+
+What the server side already enforces for LAN binds (context for the design): the listener binding
+carries `tls: Option<Arc<rustls::ServerConfig>>` (`AnchorListenerBinding`, daemon.rs:1599-1602)
+which is `Some` exactly when the bind is exposed beyond loopback; every accepted connection must
+complete the TLS 1.3 handshake before the line protocol (`anchor_control_stream`,
+daemon.rs:1608-1624); the TLS identity lives at `<snapshot parent>/anchor-tls/anchor-cert.pem` +
+`anchor-key.pem` with a 0700 directory (daemon.rs:1631-1641); `load_anchor_tls_server_config`
+(daemon.rs:1649-1664) is fail-closed — a LAN bind refuses to start if the identity cannot be
+loaded or generated. `handle_anchor_bundle_pull_stream` (daemon.rs:1666-1734) serves the persisted
+snapshot bytes verbatim (including the attestation block) with a capability gate
+(`ERR forbidden after revocation`, daemon.rs:1694-1699), an optional `have` fast path under a
+150 ms timeout (daemon.rs:1706-1720), and a `DeadlineWriter` write budget
+(daemon.rs:1721-1732).
+
+Design for Item 1, in dependency order:
+
+1. **Decide the network surface first.** Enabling the client to reach a `--allow-lan` anchor
+   means: replacing the loopback assertion at main.rs:7598-7600 with an explicit policy switch
+   (e.g. `--allow-lan-anchor`, default off), keeping loopback as the only default-allowed target.
+   A LAN pull must be **refused** unless (a) the pin option is supplied AND (b) the target is not
+   loopback (a loopback pull never needs a pin, preserving today's zero-config operator flow).
+   Recommendation: **do not add LAN client support yet.** Loopback pulls cover the actual
+   deployment shape today (anchor and operator on one host); shipping a network client before the
+   pin-distribution mechanism of Item 2 exists would force trust-on-first-use, which this
+   codebase's fail-closed rules (AGENTS.md §3) do not admit for a trust-relevant channel. Item 1
+   therefore waits on Item 2 by design, not by scheduling accident.
+
+2. **The pinning verifier, when it lands** — productionize the test-module pattern that already
+   exists in `anchor_tls.rs` (this is the shape to follow): `connect_pinned(addr,
+   expected_fingerprint_hex)` (anchor_tls.rs:575-602) builds a rustls client config with
+   `ServerName::try_from(ANCHOR_TLS_CERT_NAME)`, the ring provider, TLS 1.3 only
+   (`.with_protocol_versions(&[&rustls::version::TLS13])`), a
+   `.dangerous().with_custom_certificate_verifier(...)` and `.with_no_client_auth()`, then does an
+   eager flush so the pin failure surfaces at connect time. The verifier itself
+   (`PinnedFingerprintVerifier`, anchor_tls.rs:604-660, currently `#[cfg(test)]`) stores the
+   expected `[u8;32]` and the `WebPkiSupportedAlgorithms`; `verify_server_cert` SHA-256s the
+   end-entity DER and compares to the pin, returning
+   `Err(General("anchor TLS certificate fingerprint does not match the pinned value"))` on
+   mismatch, and `verify_tls12_signature` hard-rejects. Four changes are required to make it
+   production code, none of them cosmetic:
+   - **Move it out of the test module** into a real module (still in the backend/daemon layer,
+     not a domain crate — it is transport). Re-export or duplicate minimally for the CLI; the CLI
+     already depends on `rustls` types only via this path, keep it that way.
+   - **Constant-time comparison.** The test verifier compares digests with ordinary slice `==`.
+     A digest comparison on a fingerprint is low-risk, but this project's bar is "one hardened
+     execution path" (AGENTS.md §3) and the fix is one line: compare with a constant-time
+     equality (e.g. `subtle::ConstantTimeEq`, already an ecosystem standard) and note it in the
+     security-review section of the ledger.
+   - **Validate the pin string at the boundary.** The test verifier indexes the hex string
+     without a length check; production code must parse the pin as **exactly 64 lowercase hex
+     chars** (or 64 case-insensitive, normalized) at CLI-parse time, failing closed on anything
+     else, so no malformed pin can reach the verifier. The same validation should be reused when
+     Item 2 delivers the fingerprint inside a signed bundle.
+   - **Error taxonomy and pin storage.** Distinguish three client failures distinctly
+     (config-missing-pin for a non-loopback target; pin-format-invalid; pin-mismatch) so the
+     operator can tell a typo from an active MITM. The pin itself should live in operator config
+     next to the existing anchor settings, with the same custody rules as other operator-supplied
+     trust material; Item 2's signed-bundle field becomes the second, preferred source once it
+     exists.
+
+No change is needed on the enrollment path: it is already IPC-only (evidence above) and never
+terminates TLS in the CLI.
+
+---
+
+**Item 2 — carrying the anchor's TLS certificate fingerprint inside the SIGNED membership
+bundle**, so a client learns the trusted fingerprint from an already-verified bundle instead of
+pure TOFU.
+
+What is signed and transferred today (`crates/rustynet-control/src/membership.rs`): constants
+`MEMBERSHIP_SCHEMA_VERSION: u8 = 1` (membership.rs:21), `MEMBERSHIP_HEAD_ATTESTATION_VERSION: u8
+= 1` (membership.rs:31), domain tag `rustynet:membership-head:v1` (membership.rs:28).
+`SignedMembershipUpdate { record, approver_signatures }` (membership.rs:675-679) carries
+`MembershipSignature { approver_id, signature_hex, head_signature_hex: Option<String> }`
+(membership.rs:640-656). The canonical envelope (membership.rs:682-715) is the payload hex plus
+sorted signature lines; `canonical_payload` (membership.rs:491-589) writes `version=
+{MEMBERSHIP_SCHEMA_VERSION}` first (membership.rs:549), enforces the epoch chain +1
+(membership.rs:507), and newline-forgery-validates every operator-supplied field. The head
+attestation payload `head_attestation_canonical_payload(network_id, epoch, state_root_hex,
+attested_at_unix)` (membership.rs:946-959) is a domain line plus four sorted key=value lines and
+is **byte-pinned by test** (`head_attestation_canonical_payload_is_byte_pinned`,
+membership.rs:5598); the comment at membership.rs:944-945 says plainly that any change to this
+format invalidates every existing head signature. Per-signer head signatures are extracted by
+`head_attestation_from_signed_update` (membership.rs:1002-1014); a legacy update with no head
+signatures persists a snapshot **without** an attestation — that is not an error at the anchor
+(anchors never mint and are trust-inert, membership.rs:996-1001, 664-665), it fails later on the
+client. The snapshot's attestation block serializes `attestation.version=
+{MEMBERSHIP_HEAD_ATTESTATION_VERSION}` (membership.rs:1137) and its parser
+(`parse_snapshot_attestation_fields`, membership.rs:1266-1313) requires exactly v1 and fields
+`attestation.network_id/.epoch/.state_root/.attested_at_unix/.sig_count/.sig.{i}.approver_id/
+.sig.{i}.signature_hex`. `verify_attested_snapshot` (membership.rs:1360+) does structural parse →
+attestation-present → attests-exactly-this-state → verify every signature, pinned key must have
+signed, quorum over active approvers, freshness bounded to
+`MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS` (membership.rs:1370-1374). Two hard invariants bound
+the design: the membership log's chain hash is `sha256(index|prev|hex(canonical_envelope))`
+(`persist_membership_log`, membership.rs:1835-1850) — **any** envelope change breaks every
+persisted chain — and the schema has so far absorbed additive fields **without** a version bump
+(`parse_node_capabilities`, membership.rs:2794-2806, with the comment at membership.rs:2781-2785:
+`MEMBERSHIP_SCHEMA_VERSION` has never been bumped; the field is always written, absence is
+refused, re-issue the snapshot).
+
+Where the fingerprint belongs: **inside the signed portion, not beside it.** A fingerprint
+delivered unsigned is exactly the TOFU we are trying to remove. Two placements are viable:
+
+- **(A) An attestation-level field** — `attestation.anchor_tls_cert_fingerprint_sha256_hex`
+  added to the head-attestation payload and the snapshot attestation block. Pros: one value per
+  attestation, consumed exactly where `verify_attested_snapshot` already runs, no envelope
+  change. Cons: it changes the **byte-pinned** head-attestation payload (membership.rs:946-959),
+  which by its own comment invalidates every existing head signature — so this is the
+  **version-bump route**: a `rustynet:membership-head:v2` domain tag and
+  `MEMBERSHIP_HEAD_ATTESTATION_VERSION = 2`, with the v1 parser left intact for already-persisted
+  snapshots (fail-closed `UnsupportedVersion` already exists at membership.rs:1266-1313 for
+  anything ≠ the expected version, so old snapshots keep verifying as v1; new snapshots verify
+  as v2; a v2 field is simply absent from v1 and `verify_attested_snapshot` must treat its
+  absence as "no pin learned," never as an error).
+- **(B) A per-signature/record field using the FIS-0014 gating pattern** — the precedent is
+  `head_signature_hex: Option<String>` (membership.rs:640-656): an optional additive field that
+  participates in the canonical envelope **when present**, while legacy entries encode
+  **byte-identically** so pre-upgrade decoders fail closed on the changed `entry_hash` only when
+  a post-upgrade entry reaches them. Pros: no version bump; mixed fleets degrade to "no pin
+  learned" exactly like the existing no-head-signature path. Cons: it touches the canonical
+  envelope, so **it breaks the membership log chain hash** (membership.rs:1835-1850) for any
+  anchor whose persisted log mixes pre- and post-change entries — the anchor would have to
+  either re-issue its snapshot or accept a chain re-anchor, which is a bigger operational
+  decision than this field deserves.
+
+Recommendation: **placement (A) with an explicit attestation-version bump to 2.** It is
+confined to the attestation block (no envelope change, no chain-hash break, `canonical_payload`
+and `canonical_envelope` untouched), it inherits an existing fail-closed parser whose version
+check is already strict, and it matches the semantics: the fingerprint attests to the same state
+the head attestation covers, signed by the same quorum. Multi-anchor and rotation implications
+that the design must state explicitly: (i) the field carries **one** fingerprint; a fleet with
+multiple anchors needs either one attestation per anchor or a multi-value field — start with
+one-value-per-anchor-attestation (each anchor signs its own attestation block; the client pins
+per anchor identity it pulls from) and do not generalize until a second anchor actually exists;
+(ii) **rotation** — a rotated certificate changes the fingerprint, so the field must be
+updated by re-issuing the attestation, and the client's pin store must accept the *new*
+fingerprint only from an attestation that is itself verified (new epoch, fresh signatures,
+freshness bound) — never from an unverified pull. That makes rotation safe by construction:
+TOFU happens exactly once, at the first verified pull; every later change arrives through the
+signed channel. (iii) The certificate is currently self-signed and generated on first LAN bind
+(`load_or_generate_anchor_tls_identity`, anchor_tls.rs:122-139, fail-closed on a partial
+(true,false)/(false,true) pair via `AnchorTlsError::PartialIdentity`; rcgen ECDSA P-256
+self-signed at anchor_tls.rs:141-159; the fingerprint is lowercase hex SHA-256 over the DER
+certificate, anchor_tls.rs:100-108) — so the field's value is well-defined and cheap to compute
+today, but the design should note that deleting the identity file rotates the fingerprint, and
+the client-facing consequence is a deliberate re-pin, not a silent one.
+
+---
+
+**Sequencing and review requirements.**
+
+1. **Item 2 first, Item 1 second.** Item 1 (a LAN-capable TLS client) must not ship before its
+   pin source exists, or its only trust mode is TOFU, which the fail-closed rules exclude for a
+   trust-relevant channel. Item 2 delivers the pin source (learn the fingerprint from a verified
+   signed attestation), and it is independently useful (attested snapshots get strictly more
+   informative). Item 1 then becomes a small, well-specified client change: policy switch,
+   verifier productionization (constant-time compare, strict 64-hex parsing, three-way error
+   taxonomy), and the pin-precedence rule "config pin wins over bundle-learned pin; LAN pull
+   requires at least one of them."
+2. **Both items need an adversarial review pass before implementation**, per the QH-60
+   convention in this same document (lines ~5642-5687: full plan + adversarial review cycle
+   before any code; the blind-relay precedent at line ~1749). Item 2 is the higher-risk of the
+   two despite being "just a field": it touches a byte-pinned canonical format, a
+   version-gated parser, and the anchor persistence path — exactly the surface where a subtle
+   encoding mistake becomes either a signature-breaking incident or a smuggling vector. Item 1's
+   review should focus on the verifier (custom-certificate-verifier code is the classic place to
+   get certificate selection wrong: end-entity vs chain, SAN handling, `ServerName` choice) and
+   on the policy switch's default-deny posture.
+
 ### QH-27 — Rebasing across a moved base while holding uncommitted work silently reverts other lines' commits
 **Severity: medium-high (data loss, and it nearly landed twice). Confidence: VERIFIED — two independent near-misses in one session.**
 
