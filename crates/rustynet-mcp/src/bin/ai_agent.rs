@@ -630,6 +630,24 @@ impl EditSpend {
     }
 }
 
+/// True when a session ending with this spend is almost certainly a swallowed
+/// provider error, not a legitimate "the agent looked and made no changes"
+/// completion — even a no-op turn costs at least a system-prompt-sized API
+/// call, so genuine zero spend across a COMPLETE session-subtree walk means no
+/// call ever succeeded. Every observed instance of this shape was actually an
+/// account/balance error (insufficient funds, connection reset) that OpenCode
+/// never surfaced as a tool failure, so `ai_edit_result` reported `done` with
+/// `(no changes)` — indistinguishable from real "no work needed" and costly to
+/// debug three separate times in one session before this check existed.
+///
+/// Gated on `spend.complete`: an INCOMPLETE walk means tokens/raw are a lower
+/// bound, not a true zero (a sub-agent's spend may simply be unobserved), so
+/// treating that as a provider error would risk mislabeling a job that is
+/// actually fine. Fail closed toward the existing "done" behavior instead.
+fn edit_looks_like_provider_error(spend: &EditSpend) -> bool {
+    spend.complete && spend.tokens == 0 && spend.raw == 0
+}
+
 /// State of an async triage job: still running (with its start time, for elapsed
 /// reporting) or finished with its assembled report.
 enum TriageJob {
@@ -2858,7 +2876,7 @@ impl AiAgentServer {
                     rec["error"].as_str().unwrap_or("(no detail)")
                 ));
             }
-            "done" | "timed_out" | "halted_budget" => {
+            "done" | "timed_out" | "halted_budget" | "provider_error" => {
                 return self.edit_text(self.edit_terminal_summary(&rec));
             }
             "launching" => {
@@ -3077,7 +3095,20 @@ impl AiAgentServer {
 
         // Done (or finished with no activity). Capture the diff, stop the serve.
         kill_pid_group(serve_pid);
-        self.mark_edit_terminal(&mut rec, "done", None);
+        if edit_looks_like_provider_error(&spend) {
+            self.mark_edit_terminal(
+                &mut rec,
+                "provider_error",
+                Some(
+                    "zero token spend at completion — the provider almost certainly errored \
+                     before producing any output (insufficient balance/quota, connection reset, \
+                     bad model id). Check ~/.local/share/opencode/log/opencode.log for this \
+                     session's \"stream error\" entries, or retry with a different model/provider.",
+                ),
+            );
+        } else {
+            self.mark_edit_terminal(&mut rec, "done", None);
+        }
         self.persist_edit_diff(&mut rec, &worktree, &base_ref);
         self.write_job_record(&job_id, &rec);
         self.edit_text(self.edit_terminal_summary(&rec))
@@ -3271,6 +3302,7 @@ impl AiAgentServer {
             "done" => "COMPLETE",
             "timed_out" => "TIMED OUT",
             "halted_budget" => "HALTED — BUDGET",
+            "provider_error" => "PROVIDER ERROR — no work was done",
             other => other,
         };
         let reason = rec["reason"]
@@ -7775,6 +7807,9 @@ impl McpServer for AiAgentServer {
                     (RESTRICTED mode — a file edit is pending; the result includes the proposed \
                     diff, answer with ai_edit_approve/ai_edit_deny), `done` (finished — includes \
                     the branch's full diff to review + merge), `failed` (setup error), \
+                    `provider_error` (the session ended with ZERO token spend — the provider \
+                    almost certainly errored before producing anything, e.g. insufficient \
+                    balance; this is NOT the same as a real 'no changes needed' `done`), \
                     `timed_out` (overall or approval-watchdog timeout). Safe to call repeatedly."
                     .into(),
                 input_schema: json_schema_object(
@@ -8219,7 +8254,7 @@ mod tests {
         // The whole safety model is "review + merge the branch yourself" — the
         // summary must always surface the branch, in every terminal state.
         let s = server();
-        for state in ["done", "timed_out", "halted_budget"] {
+        for state in ["done", "timed_out", "halted_budget", "provider_error"] {
             let rec = json!({
                 "job_id": "edit-1-2-3",
                 "state": state,
@@ -8237,6 +8272,48 @@ mod tests {
                 "summary for state '{state}' must state the human-merge rule"
             );
         }
+    }
+
+    #[test]
+    fn zero_spend_on_a_complete_walk_reads_as_a_provider_error() {
+        let zero_spend = EditSpend {
+            tokens: 0,
+            raw: 0,
+            cost: 0.0,
+            subagents: 0,
+            complete: true,
+        };
+        assert!(
+            edit_looks_like_provider_error(&zero_spend),
+            "a complete walk with zero spend must be flagged — this is the exact \
+             shape every DeepSeek/Kimi/GLM insufficient-balance failure produced"
+        );
+
+        let real_completion = EditSpend {
+            tokens: 1,
+            raw: 1,
+            cost: 0.0,
+            subagents: 0,
+            complete: true,
+        };
+        assert!(
+            !edit_looks_like_provider_error(&real_completion),
+            "any nonzero spend is a real completion, never a provider error"
+        );
+
+        let incomplete_walk = EditSpend {
+            tokens: 0,
+            raw: 0,
+            cost: 0.0,
+            subagents: 0,
+            complete: false,
+        };
+        assert!(
+            !edit_looks_like_provider_error(&incomplete_walk),
+            "an INCOMPLETE walk's zero is a lower bound, not a true zero — must fail \
+             closed toward the existing 'done' behavior, not mislabel a job whose \
+             sub-agent spend simply could not be observed"
+        );
     }
 
     #[test]
