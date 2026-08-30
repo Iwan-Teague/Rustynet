@@ -789,6 +789,52 @@ Item stays OPEN until Option A (or a revised variant) is implemented with a
 verifying launch (refusal observed on a dirty tree, pass with
 `--allow-dirty`, hash column present in the appended matrix row).
 
+**Disposition 2026-08-29 — Option A IMPLEMENTED (code + tests).** The design
+above landed as `allow_dirty` end-to-end on the `--node` orchestrate path:
+
+- **Struct field:** `VmLabOrchestrateLiveLabConfig.allow_dirty: bool`
+  (`crates/rustynet-cli/src/vm_lab/mod.rs:1303`), defaulted `false` in both
+  test constructors (`vm_lab/mod.rs:50511`, `vm_lab/topology.rs:932`) and
+  threaded through `PlanBuilder::with_allow_dirty`
+  (`orchestrator/plan.rs:197`) into `PrepareSourceArchiveStage::new`
+  (`orchestrator/plan.rs:285`).
+- **CLI flag:** `--allow-dirty` on `vm-lab-orchestrate-live-lab`
+  (`crates/rustynet-cli/src/main.rs:4484`,
+  `allow_dirty: parser.has_flag("--allow-dirty")`).
+- **Dirty-check-refuse (fail closed):** `PrepareSourceArchiveStage` reads
+  `crate::vm_lab::git_worktree_is_dirty_in(&self.repo_dir)` immediately
+  before archiving (the TOCTOU gap #3 above closes) and errors
+  `"refusing to launch from a dirty worktree ... pass --allow-dirty ..."`
+  when dirty and not allowed
+  (`orchestrator/stage/source_archive.rs:239-250`).
+- **Provenance write:** `write_source_archive_provenance`
+  (`orchestrator/stage/source_archive.rs:288`) emits
+  `state/source_archive_provenance.json` with `source_archive_sha256`,
+  byte size, `allow_dirty`, and `git_dirty`; `--allow-dirty` bypasses the
+  refusal but every divergence is recorded. The dirty-tree stash snapshot
+  path (`source_archive.rs:71`) keeps a non-empty dirty archive from
+  silently archiving nothing.
+- **Run-matrix column:** `allow_dirty` is a schema column
+  (`crates/rustynet-cli/src/live_lab_run_matrix.rs:320`) populated from the
+  provenance file via `set_if_present` (`live_lab_run_matrix.rs:1259-1262`),
+  so a dirty-sourced row is self-identifying forever.
+- **Tests (all pass under `cargo test -p rustynet-cli --all-targets
+  --all-features`):** `dirty_tree_refuses_launch_by_default` and
+  `allow_dirty_bypasses_refusal_and_records_provenance`
+  (`orchestrator/stage/source_archive.rs:448,472`) and
+  `source_archive_provenance_populates_row_columns` /
+  `absent_source_archive_provenance_leaves_row_columns_blank`
+  (`live_lab_run_matrix.rs:4096,4139` region). The launch-side wiring is
+  compile-verified across `native.rs` (`build_rust_native_orchestration_stages`
+  takes `allow_dirty` and both test stage-list builders pass it,
+  `native.rs:911,1020,1043`), `run_exclusion.rs` (`run_exclusion.rs:388`), and
+  both `VmLabOrchestrateLiveLabConfig` literal sites above.
+
+Remaining for full closure: the live verifying launch named in the original
+"not done here" paragraph — a real orchestrator run observing the refusal on a
+dirty tree and a `--allow-dirty` run whose appended matrix row carries
+`allow_dirty=true` with the provenance sidecar in its report dir.
+
 ---
 
 ## P3 — Quality of life
