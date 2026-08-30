@@ -3664,6 +3664,10 @@ impl AiAgentServer {
             .get("dry_run")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let allow_dirty = args
+            .get("allow_dirty")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let rebuild = get_str(args, "rebuild_nodes")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -3943,6 +3947,7 @@ impl AiAgentServer {
                 macos_promote_exit,
                 rust_engine,
                 dry_run,
+                allow_dirty,
                 windows_only,
                 skip_linux_live_suite,
                 &cross_network,
@@ -6349,6 +6354,7 @@ fn build_orchestrator_args(
     macos_promote_exit: bool,
     rust_engine: bool,
     dry_run: bool,
+    allow_dirty: bool,
     windows_only: bool,
     skip_linux_live_suite: bool,
     cross_network: &CrossNetworkRunOptions,
@@ -6465,6 +6471,9 @@ fn build_orchestrator_args(
     }
     if dry_run {
         a.push("--dry-run".to_string());
+    }
+    if allow_dirty {
+        a.push("--allow-dirty".to_string());
     }
     a
 }
@@ -7563,6 +7572,7 @@ impl McpServer for AiAgentServer {
                         "windows_only": json!({"type": "boolean", "description": "Skip ALL Linux stages (incl. membership setup) and run ONLY the Windows bootstrap + validation stages; requires windows_vm. NOTE: this also skips membership distribution, so it only works when the Windows guest is already mesh-joined from a prior run — for a fresh Windows cell use skip_linux_live_suite instead (keeps setup)."}),
                         "allow_concurrent": json!({"type": "boolean", "description": "Opt into PARALLEL runs (default false = singleton). When true, up to 3 runs may overlap — you MUST give each disjoint guests (e.g. the macOS↔Windows pipeline: macOS on one Debian backbone, Windows on another). Each concurrent run gets its own CARGO_TARGET_DIR + report dir."}),
                         "dry_run": json!({"type": "boolean", "description": "Run the orchestrator in --dry-run mode (fast; verifies the launch wiring without a real lab pass)."}),
+                        "allow_dirty": json!({"type": "boolean", "description": "Default false. The orchestrator's prepare_source_archive stage refuses to launch against an uncommitted working tree — pass true to proceed anyway and record the divergence explicitly (--allow-dirty), instead of committing/stashing first. Prefer committing when the dirty state is legitimate evidence (e.g. auto-appended run-matrix rows); reach for this when you deliberately want to test uncommitted local changes."}),
                         "triage_on_failure": json!({"type": "boolean", "description": "Default true. When false, a failed live lab returns local report/log pointers without calling the external LLM API. Use this when external triage has not been explicitly approved."}),
                         "max_steps": json!({"type": "integer", "description": "Max tool-calling steps per triage agent on failure (default 12, cap 20)."}),
                         "skip_cross_network": json!({"type": "boolean", "description": "Default FALSE: cross-network traversal-substrate coverage now RUNS by default (LiveLabVmConnectivityRulebook §11.2 removed the old unconditional skip). Set true only when the run deliberately excludes cross-network stages, and say why in the area text."}),
@@ -9146,6 +9156,7 @@ mod tests {
             true,             // macos_promote_exit
             false,            // rust_engine
             false,            // dry_run
+            false,            // allow_dirty
             false,            // windows_only
             true,             // skip_linux_live_suite
             &CrossNetworkRunOptions::default(),
@@ -9201,6 +9212,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             &CrossNetworkRunOptions::default(),
         );
         assert!(d.iter().any(|x| x == "--dry-run"));
@@ -9216,6 +9228,66 @@ mod tests {
     }
 
     #[test]
+    fn allow_dirty_flag_is_passed_through_and_omitted_by_default() {
+        let default_args = build_orchestrator_args(
+            "inv",
+            "s",
+            "k",
+            "r",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &CrossNetworkRunOptions::default(),
+        );
+        assert!(
+            !default_args.iter().any(|x| x == "--allow-dirty"),
+            "allow_dirty defaults to false and must not emit the flag: {default_args:?}"
+        );
+        let dirty_args = build_orchestrator_args(
+            "inv",
+            "s",
+            "k",
+            "r",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            &CrossNetworkRunOptions::default(),
+        );
+        assert!(
+            dirty_args.iter().any(|x| x == "--allow-dirty"),
+            "allow_dirty=true must emit --allow-dirty: {dirty_args:?}"
+        );
+    }
+
+    #[test]
     fn cross_network_options_propagate_and_opt_out_is_explicit() {
         let opted_out = CrossNetworkRunOptions {
             skip_cross_network: true,
@@ -9223,7 +9295,7 @@ mod tests {
         };
         let a = build_orchestrator_args(
             "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None, None,
-            false, true, false, false, false, &opted_out,
+            false, true, false, false, false, false, &opted_out,
         );
         assert!(a.iter().any(|x| x == "--skip-cross-network"));
 
@@ -9236,7 +9308,7 @@ mod tests {
         };
         let b = build_orchestrator_args(
             "inv", "s", "k", "r", None, None, None, None, None, None, None, None, None, None, None,
-            false, true, false, false, false, &selected,
+            false, true, false, false, false, false, &selected,
         );
         assert!(!b.iter().any(|x| x == "--skip-cross-network"));
         assert!(
@@ -9373,6 +9445,7 @@ mod tests {
             false, // macos_promote_exit
             true,  // rust_engine
             false, // dry_run
+            false, // allow_dirty
             false, // windows_only
             false, // skip_linux_live_suite
             &CrossNetworkRunOptions::default(),
@@ -9412,6 +9485,7 @@ mod tests {
             false,
             true, // rust_engine
             false,
+            false, // allow_dirty
             false,
             false,
             &CrossNetworkRunOptions::default(),
@@ -9447,6 +9521,7 @@ mod tests {
             Some("debian-3"),
             true,
             true,
+            false,
             false,
             false,
             true,
