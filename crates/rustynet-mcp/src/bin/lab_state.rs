@@ -4920,7 +4920,12 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "list_jobs".into(),
-                description: "List all live-lab background jobs this server knows about, with their current state and report dir.".into(),
+                description: "List background jobs launched via THIS server's own start_live_lab_run / \
+                    launch_live_lab_on_host (job ids like `ll-<millis>-<pid>-<seq>`), with their current \
+                    state and report dir. This is a SEPARATE registry from ai_lab_run / ai_edit_run, which \
+                    are tracked by the rustynet-ai-agent server (job ids `labrun-*` / `edit-*`, state in \
+                    state/deepseek-mcp-jobs/) — those jobs never appear here no matter how recent. Poll \
+                    them with ai_live_lab_result / ai_edit_result instead.".into(),
                 input_schema: json_schema_object(json!({}), vec![]),
             },
             Tool {
@@ -6727,10 +6732,13 @@ impl LabStateServer {
 
     fn list_jobs(&self) -> ToolCallResult {
         let dir = self.jobs_dir();
-        let mut out = String::from("# Live-lab jobs\n\n");
+        const HEADER: &str = "# Live-lab jobs (this server's own registry only — ai_lab_run/ai_edit_run \
+            jobs are tracked separately by rustynet-ai-agent and never appear here; use \
+            ai_live_lab_result/ai_edit_result for those)\n\n";
+        let mut out = String::from(HEADER);
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(_) => return tool_success("# Live-lab jobs\n\nNo jobs yet.\n"),
+            Err(_) => return tool_success(&format!("{HEADER}No jobs yet.\n")),
         };
         let mut rows: Vec<(u64, String)> = Vec::new();
         for entry in entries.flatten() {
@@ -9415,6 +9423,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             jobs: Mutex::new(HashMap::new()),
             job_seq: AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn list_jobs_discloses_it_is_a_separate_registry_from_ai_lab_run() {
+        // This server's list_jobs and rustynet-ai-agent's ai_lab_run/ai_edit_run
+        // track completely separate job stores (this one: JOBS_SUBDIR under
+        // repo_root, ll-* ids; that one: state/deepseek-mcp-jobs/, labrun-*/edit-*
+        // ids). A caller who doesn't know that will look here for an ai_lab_run
+        // job, find nothing, and wrongly conclude it vanished — the header must
+        // say so plainly, in both the empty and populated cases.
+        let tmp = TempRoot::new("mcp-listjobs-empty");
+        let srv = test_server(&tmp);
+        let empty = srv.list_jobs();
+        let empty_text = empty.content.first().map(|c| c.text.as_str()).unwrap_or("");
+        assert!(
+            empty_text.contains("ai_lab_run") && empty_text.contains("separate"),
+            "empty list_jobs must disclose the separate-registry scope: {empty_text}"
+        );
+
+        let tmp2 = TempRoot::new("mcp-listjobs-populated");
+        std::fs::create_dir_all(tmp2.join(JOBS_SUBDIR)).unwrap();
+        let report = tmp2.join("report");
+        std::fs::create_dir_all(&report).unwrap();
+        std::fs::write(
+            tmp2.join(JOBS_SUBDIR).join("ll-1-2-3.json"),
+            r#"{"job_id":"ll-1-2-3","report_dir":"report","pid":0,"created_unix":1,"mode":"orchestrate"}"#,
+        )
+        .unwrap();
+        let srv2 = test_server(&tmp2);
+        let populated = srv2.list_jobs();
+        let populated_text = populated
+            .content
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap_or("");
+        assert!(
+            populated_text.contains("ai_lab_run") && populated_text.contains("separate"),
+            "populated list_jobs must ALSO disclose the separate-registry scope, not just \
+             the empty case: {populated_text}"
+        );
+        assert!(
+            populated_text.contains("ll-1-2-3"),
+            "the disclosure must not crowd out the actual job listing: {populated_text}"
+        );
     }
 
     #[test]
