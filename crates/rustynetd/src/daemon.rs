@@ -1867,13 +1867,30 @@ fn poll_anchor_bundle_pull_once(
 ///    startup coherence only — the per-request re-read inside
 ///    [`DaemonRuntime::handle_enrollment_consume`] remains the revocation
 ///    mechanism and is NOT replaced by it.
+///
+/// Fail-closed TLS posture: identical to
+/// [`bind_anchor_bundle_pull_listener`]. When `--anchor-enrollment-allow-lan`
+/// exposes this listener beyond loopback, the TLS 1.3 identity is a startup
+/// prerequisite — it is loaded (or first-boot generated) before the socket is
+/// created, and a failure refuses the bind outright. There is NO plaintext
+/// fallback for a LAN-exposed anchor listener: every accepted connection must
+/// complete the TLS 1.3 handshake before the line protocol runs. Loopback-only
+/// binds keep the plaintext local-IPC transport (no allow-lan, no TLS). Both
+/// anchor listeners share ONE on-disk TLS identity (see
+/// [`load_anchor_tls_server_config`]), so a client pins the same certificate
+/// fingerprint for enrollment and bundle-pull.
 fn bind_anchor_enrollment_listener(
     config: &DaemonConfig,
-) -> Result<Option<TcpListener>, DaemonError> {
+) -> Result<Option<AnchorListenerBinding>, DaemonError> {
     let Some(addr) = config.anchor_enrollment_addr else {
         return Ok(None);
     };
     validate_anchor_enrollment_addr(addr, config.anchor_enrollment_allow_lan)?;
+    let tls = if config.anchor_enrollment_allow_lan {
+        Some(std::sync::Arc::new(load_anchor_tls_server_config(config)?))
+    } else {
+        None
+    };
     let Some(secret_path) = config.enrollment_secret_path.as_deref() else {
         return Err(DaemonError::InvalidConfig(
             "anchor enrollment listener requires an enrollment secret path".to_owned(),
@@ -1900,8 +1917,11 @@ fn bind_anchor_enrollment_listener(
     listener
         .set_nonblocking(true)
         .map_err(|err| DaemonError::Io(format!("anchor enrollment nonblocking failed: {err}")))?;
-    log::info!("anchor_enrollment: listening addr={addr}");
-    Ok(Some(listener))
+    log::info!(
+        "anchor_enrollment: listening addr={addr} tls={}",
+        tls.is_some()
+    );
+    Ok(Some(AnchorListenerBinding { listener, tls }))
 }
 
 /// Serve exactly ONE anchor enrollment-consume request on an accepted
@@ -1936,7 +1956,7 @@ fn bind_anchor_enrollment_listener(
 /// parse checks all precede the enrollment ledger lock — a flood of
 /// invalid consumes is rejected without ever contending on the ledger.
 fn handle_anchor_enrollment_stream(
-    mut stream: TcpStream,
+    mut stream: AnchorControlStream,
     runtime: &mut DaemonRuntime,
 ) -> Result<String, DaemonError> {
     use std::io::Write as _;
@@ -2020,11 +2040,24 @@ fn handle_anchor_enrollment_stream(
 /// one malformed or hostile request must not kill the daemon. Portable so
 /// the Unix + Windows loops share one verified serve path.
 fn poll_anchor_enrollment_once(
-    listener: &TcpListener,
+    binding: &AnchorListenerBinding,
     runtime: &mut DaemonRuntime,
 ) -> Result<bool, DaemonError> {
-    match listener.accept() {
+    match binding.listener.accept() {
         Ok((stream, peer_addr)) => {
+            // Same TLS posture as `poll_anchor_bundle_pull_once`: in
+            // allow-lan mode the wrapper runs the TLS 1.3 handshake, and a
+            // connection that cannot complete it is logged and dropped —
+            // one hostile handshake must not kill the daemon.
+            let stream = match anchor_control_stream(stream, binding.tls.as_ref()) {
+                Ok(stream) => stream,
+                Err(err) => {
+                    log::warn!(
+                        "anchor_enrollment: TLS setup failed peer={peer_addr} reason={err}"
+                    );
+                    return Ok(true);
+                }
+            };
             match handle_anchor_enrollment_stream(stream, runtime) {
                 Ok(summary) => {
                     // `summary` is the handler's fixed-vocabulary success
@@ -22358,13 +22391,13 @@ mod tests {
     /// read, and the server closing early surfaces to the client as a
     /// broken pipe, which is the expected disposition, not a test failure.
     fn drive_enrollment_request(
-        listener: &std::net::TcpListener,
+        listener: &AnchorListenerBinding,
         runtime: &mut DaemonRuntime,
         request: Vec<u8>,
     ) -> String {
         use std::io::Read as _;
         use std::io::Write as _;
-        let addr = listener.local_addr().expect("listener addr");
+        let addr = listener.listener.local_addr().expect("listener addr");
         let client = std::thread::spawn(move || {
             let mut conn = std::net::TcpStream::connect(addr).expect("connect");
             conn.set_read_timeout(Some(Duration::from_secs(10)))
@@ -22418,6 +22451,7 @@ mod tests {
             .expect("a configured addr + capability ⇒ a listener");
         assert!(
             listener
+                .listener
                 .local_addr()
                 .expect("bound addr")
                 .ip()
