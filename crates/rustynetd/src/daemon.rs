@@ -1470,7 +1470,9 @@ fn read_line_bounded<R: std::io::Read>(
         .map_err(|_| DaemonError::InvalidConfig(format!("anchor {label} is not utf8")))
 }
 
-fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<String, DaemonError> {
+fn read_anchor_bundle_pull_request_token<R: std::io::Read>(
+    stream: &mut R,
+) -> Result<String, DaemonError> {
     Ok(read_line_bounded(
         stream,
         MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
@@ -1528,8 +1530,139 @@ fn read_optional_anchor_bundle_pull_have_line<R: std::io::Read>(stream: &mut R) 
     Some(line)
 }
 
+/// Transport for one accepted anchor control-plane connection: the raw TCP
+/// stream (loopback-only local-IPC mode) or a TLS 1.3 stream (`--allow-lan`
+/// mode, where TLS is mandatory). Implements Read/Write above the existing
+/// bounded line-protocol readers/writers so those stay unchanged; the TLS
+/// handshake runs lazily inside the first read/write, bounded by the
+/// socket's own 2-second timeouts (rustls drives the handshake over the
+/// underlying socket, so an unresponsive or hostile peer cannot hold the
+/// inline serve loop open past the same budget the plaintext path had).
+enum AnchorControlStream {
+    Plain(TcpStream),
+    Tls(rustls::StreamOwned<rustls::ServerConnection, TcpStream>),
+}
+
+impl AnchorControlStream {
+    /// The underlying socket. Socket-level timeouts apply to the TLS arm
+    /// through this handle: rustls performs its record I/O directly on the
+    /// socket, so a read/write timeout set here bounds both the handshake
+    /// and the post-handshake record exchanges.
+    fn socket(&self) -> &TcpStream {
+        match self {
+            AnchorControlStream::Plain(stream) => stream,
+            AnchorControlStream::Tls(tls) => &tls.sock,
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.socket().set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.socket().set_write_timeout(timeout)
+    }
+}
+
+impl std::io::Read for AnchorControlStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            AnchorControlStream::Plain(stream) => stream.read(buf),
+            AnchorControlStream::Tls(tls) => std::io::Read::read(tls, buf),
+        }
+    }
+}
+
+impl std::io::Write for AnchorControlStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            AnchorControlStream::Plain(stream) => stream.write(buf),
+            AnchorControlStream::Tls(tls) => std::io::Write::write(tls, buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            AnchorControlStream::Plain(stream) => stream.flush(),
+            AnchorControlStream::Tls(tls) => std::io::Write::flush(tls),
+        }
+    }
+}
+
+/// One bound anchor control-plane listener plus its TLS posture. `tls` is
+/// `Some` exactly when the listener is exposed beyond loopback
+/// (`--allow-lan`), and in that mode EVERY accepted connection must complete
+/// the TLS 1.3 handshake before any line protocol runs — there is no
+/// plaintext fallback in that mode (see [`anchor_control_stream`]).
+struct AnchorListenerBinding {
+    listener: TcpListener,
+    tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+}
+
+/// Wrap an accepted connection in the binding's transport. With `tls: Some`
+/// this builds a rustls server connection from the shared TLS-1.3-only
+/// server config; handshake completion is deferred to the first read/write
+/// inside the handler (bounded by the handler's socket timeouts).
+fn anchor_control_stream(
+    stream: TcpStream,
+    tls: Option<&std::sync::Arc<rustls::ServerConfig>>,
+) -> Result<AnchorControlStream, DaemonError> {
+    match tls {
+        None => Ok(AnchorControlStream::Plain(stream)),
+        Some(server_config) => {
+            let conn = rustls::ServerConnection::new(std::sync::Arc::clone(server_config))
+                .map_err(|err| {
+                    DaemonError::Io(format!("anchor TLS server connection failed: {err}"))
+                })?;
+            Ok(AnchorControlStream::Tls(rustls::StreamOwned::new(
+                conn, stream,
+            )))
+        }
+    }
+}
+
+/// On-disk location of the anchor control-plane TLS identity: a dedicated
+/// `anchor-tls/` subdirectory under the same state root as the signed
+/// membership snapshot. `load_or_generate_anchor_tls_identity` hardens the
+/// parent directory to 0700, so the identity owns this directory outright
+/// rather than tightening the shared state root.
+fn anchor_tls_identity_paths(config: &DaemonConfig) -> (PathBuf, PathBuf) {
+    let root = config
+        .membership_snapshot_path
+        .parent()
+        .map(|parent| parent.join("anchor-tls"))
+        .unwrap_or_else(|| PathBuf::from("anchor-tls"));
+    (
+        root.join("anchor-cert.pem"),
+        root.join("anchor-key.pem"),
+    )
+}
+
+/// Load (or first-boot generate) the anchor TLS identity and build the
+/// TLS-1.3-only server config from it. Both anchor control-plane listeners
+/// share this one on-disk identity so every client pins the same
+/// certificate fingerprint. Used by the bind paths in fail-closed position:
+/// an `--allow-lan` listener whose identity cannot be loaded or generated
+/// refuses to bind at all rather than serving plaintext.
+fn load_anchor_tls_server_config(
+    config: &DaemonConfig,
+) -> Result<rustls::ServerConfig, DaemonError> {
+    let (cert_path, key_path) = anchor_tls_identity_paths(config);
+    let identity = crate::anchor_tls::load_or_generate_anchor_tls_identity(
+        &cert_path,
+        &key_path,
+        "rustynet anchor control plane",
+    )
+    .map_err(|err| {
+        DaemonError::InvalidConfig(format!("anchor TLS identity unavailable: {err}"))
+    })?;
+    crate::anchor_tls::build_anchor_server_config(&identity).map_err(|err| {
+        DaemonError::InvalidConfig(format!("anchor TLS server config unavailable: {err}"))
+    })
+}
+
 fn handle_anchor_bundle_pull_stream(
-    mut stream: TcpStream,
+    mut stream: AnchorControlStream,
     token_path: &Path,
     bundle_path: &Path,
     local_node_id: &str,
@@ -1603,7 +1736,7 @@ fn anchor_bundle_pull_token_thumbprint(token: &str) -> String {
     encode_hex(&digest[..8])
 }
 
-/// Bind the anchor bundle-pull loopback listener if this node is configured to
+/// Bind the anchor bundle-pull listener if this node is configured to
 /// serve it (a configured token path implies the `anchor.bundle_pull` role).
 /// Returns `Ok(None)` when not configured. Validates the bind addr
 /// (loopback-only unless `allow_lan`) and that the token file is readable BEFORE
@@ -1612,9 +1745,17 @@ fn anchor_bundle_pull_token_thumbprint(token: &str) -> String {
 /// the Unix AND Windows daemon main loops share ONE verified bind path (the
 /// Windows reconcile loop had no anchor listener at all, so a Windows anchor
 /// never opened its bundle-pull port — this is the shared seam that closes it).
+///
+/// Fail-closed TLS posture: when `--allow-lan` exposes this listener beyond
+/// loopback, the TLS 1.3 identity is a startup prerequisite — it is loaded
+/// (or first-boot generated) before the socket is created, and a failure
+/// refuses the bind outright. There is NO plaintext fallback for a
+/// LAN-exposed anchor listener: every accepted connection must complete the
+/// TLS 1.3 handshake before the line protocol runs. Loopback-only binds
+/// keep the plaintext local-IPC transport (no `--allow-lan`, no TLS).
 fn bind_anchor_bundle_pull_listener(
     config: &DaemonConfig,
-) -> Result<Option<TcpListener>, DaemonError> {
+) -> Result<Option<AnchorListenerBinding>, DaemonError> {
     let Some(token_path) = config.anchor_bundle_pull_token_path.as_ref() else {
         return Ok(None);
     };
@@ -1624,6 +1765,11 @@ fn bind_anchor_bundle_pull_listener(
         )
     })?;
     validate_anchor_bundle_pull_addr(addr, config.anchor_bundle_pull_allow_lan)?;
+    let tls = if config.anchor_bundle_pull_allow_lan {
+        Some(std::sync::Arc::new(load_anchor_tls_server_config(config)?))
+    } else {
+        None
+    };
     // Fail fast at startup if the token file is missing/unreadable rather than
     // discovering it per-request.
     load_anchor_bundle_pull_token(token_path)?;
@@ -1632,8 +1778,11 @@ fn bind_anchor_bundle_pull_listener(
     listener
         .set_nonblocking(true)
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull nonblocking failed: {err}")))?;
-    log::info!("anchor_bundle_pull: listening addr={addr}");
-    Ok(Some(listener))
+    log::info!(
+        "anchor_bundle_pull: listening addr={addr} tls={}",
+        tls.is_some()
+    );
+    Ok(Some(AnchorListenerBinding { listener, tls }))
 }
 
 /// Accept and serve AT MOST ONE pending anchor bundle-pull connection on a
@@ -1645,14 +1794,23 @@ fn bind_anchor_bundle_pull_listener(
 /// swallowed (still `Ok(true)`): one malformed request must not kill the daemon.
 /// Portable so the Unix + Windows loops share one verified serve path.
 fn poll_anchor_bundle_pull_once(
-    listener: &TcpListener,
+    binding: &AnchorListenerBinding,
     config: &DaemonConfig,
 ) -> Result<bool, DaemonError> {
     let Some(token_path) = config.anchor_bundle_pull_token_path.as_ref() else {
         return Ok(false);
     };
-    match listener.accept() {
+    match binding.listener.accept() {
         Ok((stream, peer_addr)) => {
+            let stream = match anchor_control_stream(stream, binding.tls.as_ref()) {
+                Ok(stream) => stream,
+                Err(err) => {
+                    log::warn!(
+                        "anchor_bundle_pull: TLS setup failed peer={peer_addr} reason={err}"
+                    );
+                    return Ok(true);
+                }
+            };
             match handle_anchor_bundle_pull_stream(
                 stream,
                 token_path.as_path(),
