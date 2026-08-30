@@ -1291,6 +1291,16 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// the Linux live suite, so skipping the suite leaves them fully exercised.
     /// A full Linux live suite still runs when this is `false` (the default).
     pub skip_linux_live_suite: bool,
+    /// Allow the source-archive stage to ship a DIRTY working tree. By default
+    /// (QH-08) the stage refuses to archive a dirty tree, because evidence
+    /// recorded from a tree that does not match its commit is not reproducible
+    /// from that commit. With this flag the run proceeds but every
+    /// `git_dirty=true` divergence is written into the archive's provenance
+    /// (`state/source_archive_provenance.json`) and surfaced as an explicit
+    /// `allow_dirty` column in the run-matrix CSV, so a dirty-sourced run is
+    /// always identifiable in evidence instead of silently masquerading as a
+    /// clean-commit run.
+    pub allow_dirty: bool,
 }
 
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.

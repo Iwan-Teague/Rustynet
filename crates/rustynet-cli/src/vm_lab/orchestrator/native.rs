@@ -327,6 +327,7 @@ pub(crate) fn execute_rust_native_orchestration(
         build_rust_native_orchestration_stages(
             rebuild_only.clone(),
             source_mode,
+            config.allow_dirty,
             skip_live_suite,
             enable_chaos_suite,
             enable_negative_control,
@@ -907,6 +908,7 @@ pub(crate) fn execute_rust_native_orchestration(
 fn build_rust_native_orchestration_stages(
     rebuild_only: Option<Vec<String>>,
     source_mode: orchestrator::stage::source_archive::ArchiveSourceMode,
+    allow_dirty: bool,
     skip_live_suite: bool,
     enable_chaos_suite: bool,
     enable_negative_control: bool,
@@ -918,6 +920,7 @@ fn build_rust_native_orchestration_stages(
     orchestrator::plan::PlanBuilder::new()
         .with_rebuild_only(rebuild_only)
         .with_source_mode(source_mode)
+        .with_allow_dirty(allow_dirty)
         .with_skip_live_suite(skip_live_suite)
         .with_enable_chaos_suite(enable_chaos_suite)
         .with_enable_negative_control(enable_negative_control)
@@ -1014,6 +1017,7 @@ pub(crate) fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::
     build_rust_native_orchestration_stages(
         None,
         orchestrator::stage::source_archive::ArchiveSourceMode::Head,
+        false,
         false,
         false,
         false,
