@@ -204,7 +204,7 @@
         }
       }
     },
-    "glm": {
+    "zai-coding": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "GLM (Z.ai coding plan)",
       "options": {
