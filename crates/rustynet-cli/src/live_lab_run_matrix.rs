@@ -4039,6 +4039,116 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// QH-08 Option A: the provenance JSON the prepare_source_archive stage
+    /// writes must land in the built run-matrix row, and its absence must
+    /// leave every source-archive column blank (legacy/skipped runs).
+    #[test]
+    fn source_archive_provenance_populates_row_columns() {
+        let root = temp_dir("source-archive-provenance");
+        fs::create_dir_all(root.join("state")).expect("state dir");
+        fs::write(
+            root.join(super::SOURCE_ARCHIVE_PROVENANCE_RELATIVE_PATH),
+            r#"{
+  "schema_version": 1,
+  "archive_file": "rn_source_1.tar.gz",
+  "sha256": "abc123",
+  "bytes": 4567,
+  "source_mode": "working-tree",
+  "allow_dirty": true,
+  "git_commit": "deadbee",
+  "git_dirty": true
+}"#,
+        )
+        .expect("provenance");
+        let schema = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect::<Vec<_>>();
+
+        let values = build_live_lab_run_matrix_values(
+            &schema,
+            &LiveLabRunMatrixAppendConfig {
+                command_name: "vm-lab-orchestrate-live-lab",
+                report_dir: &root,
+                profile_path: None,
+                inventory_path: None,
+                extra_stage_outcomes: &[],
+                notes: None,
+                row_role: super::LiveLabRunMatrixRowRole::Final,
+            },
+        )
+        .expect("values");
+
+        assert_eq!(
+            values.get("source_archive_sha256").map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(
+            values.get("source_archive_bytes").map(String::as_str),
+            Some("4567")
+        );
+        assert_eq!(
+            values
+                .get("source_archive_source_mode")
+                .map(String::as_str),
+            Some("working-tree")
+        );
+        assert_eq!(values.get("allow_dirty").map(String::as_str), Some("true"));
+        assert_eq!(
+            values
+                .get("source_archive_git_commit")
+                .map(String::as_str),
+            Some("deadbee")
+        );
+        assert_eq!(
+            values
+                .get("source_archive_git_dirty")
+                .map(String::as_str),
+            Some("true")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absent_source_archive_provenance_leaves_row_columns_blank() {
+        let root = temp_dir("no-source-archive-provenance");
+        fs::create_dir_all(root.join("state")).expect("state dir");
+        let schema = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect::<Vec<_>>();
+
+        let values = build_live_lab_run_matrix_values(
+            &schema,
+            &LiveLabRunMatrixAppendConfig {
+                command_name: "vm-lab-orchestrate-live-lab",
+                report_dir: &root,
+                profile_path: None,
+                inventory_path: None,
+                extra_stage_outcomes: &[],
+                notes: None,
+                row_role: super::LiveLabRunMatrixRowRole::Final,
+            },
+        )
+        .expect("values");
+
+        for column in [
+            "source_archive_sha256",
+            "source_archive_bytes",
+            "source_archive_source_mode",
+            "allow_dirty",
+            "source_archive_git_commit",
+            "source_archive_git_dirty",
+        ] {
+            assert_eq!(
+                values.get(column).map(String::as_str).unwrap_or(""),
+                "",
+                "absent provenance must leave {column} blank"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rsa0055_csv_escape_neutralizes_formula_injection() {
         // Cells beginning with =,+,-,@,TAB,CR must be prefixed with ' so a
