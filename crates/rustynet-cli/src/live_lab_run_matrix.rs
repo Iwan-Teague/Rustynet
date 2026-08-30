@@ -18,6 +18,14 @@ const NODES_RELATIVE_PATH: &str = "state/nodes.tsv";
 const NODE_STAGE_PLAN_RELATIVE_PATH: &str = "state/node_stage_plan.json";
 const NODE_STAGE_RESULTS_RELATIVE_PATH: &str = "state/live_lab_node_stage_results.csv";
 
+/// QH-08 Option A: content pin for the source archive the
+/// `prepare_source_archive` stage built. Written by
+/// `orchestrator/stage/source_archive.rs`; the row builder below reads it to
+/// populate the `source_archive_*` and `allow_dirty` columns. Absent for
+/// legacy runs → blank columns.
+pub(crate) const SOURCE_ARCHIVE_PROVENANCE_RELATIVE_PATH: &str =
+    "state/source_archive_provenance.json";
+
 const NODE_STAGE_COLUMNS: &[&str] = &[
     "run_id",
     "run_started_utc",
@@ -306,6 +314,12 @@ pub(crate) const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "network_internet_mode",
     "network_evidence_path",
     "row_role",
+    "source_archive_sha256",
+    "source_archive_bytes",
+    "source_archive_source_mode",
+    "allow_dirty",
+    "source_archive_git_commit",
+    "source_archive_git_dirty",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1206,6 +1220,55 @@ fn build_live_lab_run_matrix_values(
             json_string_path(&network_record, &[key]).unwrap_or_default(),
         );
     }
+
+    // Source-archive provenance (QH-08 Option A): the content pin written by
+    // the prepare_source_archive stage. Absent (stage skipped, legacy runs)
+    // → blank columns, mirroring the network-record behavior above.
+    let source_archive_provenance = read_json_optional(
+        config
+            .report_dir
+            .join(SOURCE_ARCHIVE_PROVENANCE_RELATIVE_PATH)
+            .as_path(),
+    )?;
+    for (column, key) in [
+        ("source_archive_sha256", "sha256"),
+        ("source_archive_source_mode", "source_mode"),
+        ("source_archive_git_commit", "git_commit"),
+    ] {
+        set_if_present(
+            &mut values,
+            &schema_set,
+            column,
+            json_string_path(&source_archive_provenance, &[key]).unwrap_or_default(),
+        );
+    }
+    set_if_present(
+        &mut values,
+        &schema_set,
+        "source_archive_bytes",
+        source_archive_provenance
+            .as_ref()
+            .and_then(|record| record.get("bytes"))
+            .and_then(Value::as_u64)
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_default(),
+    );
+    set_if_present(
+        &mut values,
+        &schema_set,
+        "allow_dirty",
+        json_bool_path(&source_archive_provenance, &["allow_dirty"])
+            .map(|allowed| allowed.to_string())
+            .unwrap_or_default(),
+    );
+    set_if_present(
+        &mut values,
+        &schema_set,
+        "source_archive_git_dirty",
+        json_bool_path(&source_archive_provenance, &["git_dirty"])
+            .map(|dirty| dirty.to_string())
+            .unwrap_or_default(),
+    );
 
     populate_target_identity_values(&mut values, &schema_set, &target_evidence);
     populate_stage_values(
