@@ -31,7 +31,6 @@
 //!    `ORCHESTRATOR_STAGES` doc table and the `EXPECTED` list in
 //!    `orchestrator_stages_doc_matches_the_rust_planbuilder` (cross-crate
 //!    string gate; keep it equal to `StageId::ALL` order).
-use crate::vm_lab::orchestrator::stage::OrchestrationStage;
 use crate::vm_lab::orchestrator::stage::active_exit::ActiveExitStage;
 use crate::vm_lab::orchestrator::stage::admin_issue::AdminIssueStage;
 use crate::vm_lab::orchestrator::stage::anchor_validation::AnchorValidationStage;
@@ -104,6 +103,7 @@ use crate::vm_lab::orchestrator::stage::source_archive::{
 use crate::vm_lab::orchestrator::stage::traffic_test_matrix::TrafficTestMatrixStage;
 use crate::vm_lab::orchestrator::stage::validate_runtime::ValidateBaselineRuntimeStage;
 use crate::vm_lab::orchestrator::stage::verify_ssh::VerifySshReachabilityStage;
+use crate::vm_lab::orchestrator::stage::OrchestrationStage;
 
 /// Builds the ordered list of stages for a lab run.
 #[derive(Default)]
@@ -113,6 +113,11 @@ pub struct PlanBuilder {
     rebuild_only: Option<Vec<String>>,
     /// `--source-mode`: which tree the shipped source archive is built from.
     source_mode: ArchiveSourceMode,
+    /// `--allow-dirty`: when true, `PrepareSourceArchiveStage` may archive a
+    /// dirty working tree instead of refusing; the divergence is recorded in
+    /// the archive's provenance so run-matrix rows stay honest about what was
+    /// actually shipped (QH-08).
+    allow_dirty: bool,
     /// `--skip-linux-live-suite`: when true, drop the post-baseline live
     /// validation + role stages ([`Self::live_suite_stages`]) so the plan runs
     /// only setup → baseline → cleanup. The fast inner loop (mesh-health check /
@@ -187,6 +192,13 @@ impl PlanBuilder {
         self
     }
 
+    /// `--allow-dirty`: let the source-archive stage ship a dirty working
+    /// tree, recording the divergence in its provenance (QH-08).
+    pub fn with_allow_dirty(mut self, allow_dirty: bool) -> Self {
+        self.allow_dirty = allow_dirty;
+        self
+    }
+
     /// `--skip-linux-live-suite`: drop the post-baseline live-validation + role
     /// stages, keeping only setup → baseline → cleanup.
     pub fn with_skip_live_suite(mut self, skip_live_suite: bool) -> Self {
@@ -234,6 +246,7 @@ impl PlanBuilder {
         let PlanBuilder {
             rebuild_only,
             source_mode,
+            allow_dirty,
             skip_live_suite,
             enable_chaos_suite,
             enable_negative_control,
@@ -269,7 +282,7 @@ impl PlanBuilder {
                 match id {
                     StageId::Preflight => Box::new(PreflightStage),
                     StageId::PrepareSourceArchive => {
-                        Box::new(PrepareSourceArchiveStage::new(source_mode))
+                        Box::new(PrepareSourceArchiveStage::new(source_mode, allow_dirty))
                     }
                     StageId::VerifySshReachability => Box::new(VerifySshReachabilityStage),
                     // cleanup + bootstrap must share the same rebuild set: a
