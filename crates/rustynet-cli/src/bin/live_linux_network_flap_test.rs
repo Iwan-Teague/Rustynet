@@ -6,7 +6,8 @@
 //!
 //! Stages:
 //! 1. Assert baseline WG handshake is recent (within 180s).
-//! 2. Block WG UDP on client via nftables (output chain, udp dport 51820).
+//! 2. Block WG UDP on client via nftables (output chain, dport = the peer's
+//!    actual negotiated endpoint port read live from `wg show all`).
 //! 3. Wait 35s (exceeds WireGuard keepalive of 25s).
 //! 4. Assert no new handshake during blackout.
 //! 5. Remove nftables rule.
@@ -132,8 +133,6 @@ fn run() -> Result<(), String> {
     for host in [&exit_host, &client_host] {
         ctx.push_sudo_password(host)?;
     }
-
-    const WG_PORT: &str = "51820";
 
     // ── Stage 1: baseline handshake check ────────────────────────────────────
     // Pre-poll: capture initial WG state for diagnostics.
@@ -280,8 +279,34 @@ fn run() -> Result<(), String> {
     }
 
     // ── Stage 2: block WG UDP output on client ────────────────────────────────
+    // The block rule must target the peer's ACTUAL negotiated endpoint port,
+    // not the well-known 51820: under NAT the reachable port is remapped
+    // (`wg show all` on a cross-LAN run reported `endpoint: 192.168.0.29:41328`
+    // while the client's packets went to dport 41328), so a hardcoded dport
+    // silently never matches the real traffic. Fail closed when the port
+    // cannot be determined — a block rule against a guessed port is exactly
+    // the silent no-op class of defect this stage must never reintroduce.
+    let wg_show = match ctx.capture_root_allow_failure(&client_host, &["wg", "show", "all"]) {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(format!(
+                "failed to determine client's WireGuard peer endpoint port for block rule: \
+                 `wg show all` capture failed: {e}"
+            ));
+        }
+    };
+    let wg_port = match parse_wg_peer_endpoint_port(&wg_show) {
+        Some(port) => port,
+        None => {
+            return Err(
+                "failed to determine client's WireGuard peer endpoint port for block rule: \
+                 no `endpoint: <ip>:<port>` line parsable in `wg show all` output"
+                    .to_owned(),
+            );
+        }
+    };
     logger.line(format!(
-        "[network-flap] blocking WG UDP output port {WG_PORT} on client"
+        "[network-flap] blocking WG UDP output port {wg_port} on client"
     ))?;
     let flap_start = std::time::Instant::now();
     // nft table/chain may not pre-exist — create idempotently.
@@ -312,7 +337,7 @@ fn run() -> Result<(), String> {
             "output",
             "udp",
             "dport",
-            WG_PORT,
+            wg_port.as_str(),
             "drop",
         ],
     );
@@ -512,6 +537,29 @@ fn run() -> Result<(), String> {
         report_path.display()
     ))?;
     Ok(())
+}
+
+/// Extract the peer's endpoint port from `wg show all` output.
+///
+/// `wg show all` prints one field per line; the endpoint line has the form
+/// `endpoint: <ip>:<port>`, e.g. `endpoint: 192.168.0.29:41328`. Under NAT the
+/// reachable port is remapped away from 51820, so the nft block rule must use
+/// this port. IPv4-only deployment: the port is everything after the last `:`
+/// on the line. Returns `None` when no endpoint line is present or the port
+/// segment does not parse as a valid port number — unreadable must never fall
+/// back to a guess.
+fn parse_wg_peer_endpoint_port(wg_show_output: &str) -> Option<String> {
+    let line = wg_show_output
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("endpoint:"))?;
+    // Take everything after the LAST `:` — the port of an `IP:PORT` pair.
+    let port = line.rsplit(':').next().unwrap_or("").trim();
+    if port.parse::<u16>().is_ok() {
+        Some(port.to_owned())
+    } else {
+        None
+    }
 }
 
 /// Age in seconds of the peer handshake the daemon last observed, or `None`
