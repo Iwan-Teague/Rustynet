@@ -139,8 +139,11 @@ pub(crate) fn build_bundle_env(
                     .get(&a.alias)
                     .map(|nid| {
                         // The exit node itself gets `-` (no exit assignment);
-                        // client nodes get assigned to the exit node.
-                        let exit_part = if a.role == NodeRole::Exit {
+                        // client nodes get assigned to the exit node. A
+                        // blind_exit node is exit-family (it holds ExitServer
+                        // itself), so like the plain exit it must not be
+                        // assigned to consume the primary exit's traffic.
+                        let exit_part = if matches!(a.role, NodeRole::Exit | NodeRole::BlindExit) {
                             "-"
                         } else {
                             exit_node_id.as_str()
