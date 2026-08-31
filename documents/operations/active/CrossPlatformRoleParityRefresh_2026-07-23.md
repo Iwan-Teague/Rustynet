@@ -60,10 +60,23 @@ not count toward release.** On the engine of record:
   conclusion is unchanged, but the magnitude was overstated.
 - **macOS is partially stage-green** (admin, relay-lifecycle, core, security stages
   pass in isolation) but **no macOS run passes overall** — `two_hop` fails every
-  time, and `blind_exit` has never been elected onto a macOS `--node`. *Update
-  2026-08-28: `anchor` and `exit` were elected for the FIRST time on `--node`
-  (runs 47/48) — both blocked with the blocker located, then both blockers fixed
-  in code (MAC-D1 `8ec851a9`, MAC-D2 `03619d0f`); re-runs pending.*
+  time. *Update 2026-08-28: `anchor` and `exit` were elected for the FIRST time
+  on `--node` (runs 47/48) — both blocked with the blocker located, then both
+  blockers fixed in code (MAC-D1 `8ec851a9`, MAC-D2 `03619d0f`); re-runs pending.*
+  *Update 2026-08-31: both reruns CONFIRMED — anchor cell green across all 6
+  baseline validators including `DnsFailclosed` (`livelab-1788165016205-17194-3`,
+  `5db953ad`); exit cell reaches the known, dispositioned `DnsFailclosed` design
+  gap as expected (`livelab-1788164004680-17194-2`, `a80c4de3`, required one more
+  same-session fix — a macOS/Linux issue-dir-permissions parity gap in the
+  orchestrator's bundle-issuance adapter, `a80c4de3`). Separately, `blind_exit`
+  was elected onto a macOS `--node` for the FIRST time this same session and now
+  PASSES clean (`livelab-1788172934687-17194-11`, `7bdcfe60`, 17 pass/0 fail/2
+  skip) — three genuine lab-tooling bugs found and fixed en route (an
+  assignment-builder logic gap treating `BlindExit` as an exit-traffic consumer;
+  the runtime validator invoking a nonexistent `rustynet ops status` instead of
+  the top-level `rustynet status`; and the validator's role-check assuming the
+  wrong daemon-status output format). None of these three were daemon/product
+  defects — all were bugs in the `--node` lab orchestrator itself.*
 
 Both old docs also record their Definition-of-Done evidence against the **bash
 archive** (ParityPlan §5/§8; Roadmap §10) — a stale pointer for G2.
@@ -86,7 +99,7 @@ Every cell here is "as proven on `--node`," independent of the bash archive.
 | **relay** (frame-forwarding) | 🔒 HP-3 (unproven on ALL OS) | 🔒 HP-3 |
 | **anchor** | 🟡 **MAC-D1 rerun CONFIRMED 2026-08-31** (`livelab-1788165016205-17194-3`, commit `5db953ad`, clean, 16 pass/0 fail/3 skip). `bootstrap_hosts` → `validate_baseline_runtime` all pass, and critically **all six baseline validators pass on macos-utm-1 including `DnsFailclosed`** (RuntimeAcls/ServiceHardening/KeyCustody/Authenticode/MeshStatus/DnsFailclosed all `passed:true` — the DnsFailclosed enforcement gap [[exit row below]] evidently only bites in the exit/protected-DNS-mode posture, not plain anchor). `anchor_validation` itself still `skip`s ("no node executed this validation; 1 node(s) reported a runtime skip") — this is a **separate, still-open** bundle-pull `is_supported_for_platform` posture-gate issue, distinct from MAC-D1's launch-gate circularity which is now confirmed fixed. `live_anchor` was not dispatched (`--skip-linux-live-suite`). See MacCellsHarvest §2 | ⬛ never exercised |
 | **exit** | 🟡 **MAC-D2 rerun CONFIRMED 2026-08-31** (`livelab-1788164004680-17194-2`, commit `a80c4de3`, clean). `membership_init`/`distribute_membership`/`distribute_assignments` all now pass on macos-utm-1-as-exit (distribute_assignments required an additional same-session fix, commit `a80c4de3` — the macOS bundle-issuance adapter never re-widened its issue-dir permissions after root wrote the signed bundles at `0700`, unlike the already-fixed Linux adapter; parity restored). Run then hit `validate_baseline_runtime`/`DnsFailclosed` as expected — confirmed **design-only/owner-gated**, dispositioned 2026-08-28 (`1278af04`, MacosDnsFailclosedEnforcementGap_2026-08-28.md): the enforcement posture is written to files the OS does not consult. This is the first-ever real forward dispatch of the exit cell past `membership_init`. `DnsFailclosed` will stay red on the exit cell until that enforcement design lands (§5) — the anchor cell's clean pass above shows the gap is exit-role-specific, not a blanket macOS DNS defect. See MacCellsHarvest §4 | 🔒 WinNAT hardware (§4) |
-| **blind_exit** | ⬛ never elected on `--node` | 🚫 out-of-scope by design |
+| **blind_exit** | 🟢 **FIRST ELECTION + PASS 2026-08-31** (`livelab-1788172934687-17194-11`, commit `7bdcfe60`, clean, 17 pass/0 fail/2 skip). Never elected on `--node` before this session. Three lab-orchestrator bugs found and fixed en route (all commits this session): `build_bundle_env`'s `ASSIGNMENTS_SPEC` treated `NodeRole::BlindExit` as a client that should consume the primary exit's traffic (it is itself exit-family and must not) — `5b14669e`; the `blind_exit` runtime validator invoked the nonexistent `rustynet ops status` instead of the top-level `rustynet status` — `3aacdc2c`; the validator's role-check then searched for colon-space `role: blind_exit` against the real single-line `key=value` daemon status output (`node_role=blind_exit`) — `7bdcfe60`. None were daemon/product defects. `two_hop`-style cross-node traffic was not exercised in this topology (client=debian-headless-2, exit=debian-headless-4, blind_exit=macos-utm-1, no CP-1 macOS↔Debian pairing involved) | 🚫 out-of-scope by design |
 | **role-transition** | ⬛ never run on `--node` | ⬛ never run on `--node` |
 
 **Crucial nuance: the stages EXIST.** The `--node` registry already carries
