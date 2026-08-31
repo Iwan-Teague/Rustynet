@@ -56,8 +56,8 @@ pub fn validate_blind_exit_runtime(
         ));
     }
     let has_blind_exit_role = status_str
-        .lines()
-        .any(|l| l.contains("role: blind_exit") || l.contains("node_role: blind_exit"));
+        .split_whitespace()
+        .any(|token| token == "node_role=blind_exit");
     if !has_blind_exit_role {
         return Err(format!(
             "{alias}: daemon does not report blind_exit role; status={}",
@@ -152,7 +152,11 @@ mod tests {
     #[test]
     fn fails_closed_when_role_not_reported() {
         let shell = MockShellHost::new();
-        program_status(&shell, "role: exit\npeers: 2\n", 0);
+        program_status(
+            &shell,
+            "node_id=test-node node_role=exit state=ExitActive",
+            0,
+        );
         let err = validate_blind_exit_runtime(&shell, VmGuestPlatform::Linux, "node1")
             .expect_err("missing blind_exit role should fail closed");
         assert!(err.contains("does not report blind_exit role"), "{err}");
@@ -161,7 +165,11 @@ mod tests {
     #[test]
     fn linux_passes_when_forwarding_rules_present() {
         let shell = MockShellHost::new();
-        program_status(&shell, "role: blind_exit\n", 0);
+        program_status(
+            &shell,
+            "node_id=test-node node_role=blind_exit state=ExitActive",
+            0,
+        );
         shell.program_run_response(
             &[
                 "sh",
@@ -181,7 +189,11 @@ mod tests {
     #[test]
     fn linux_fails_closed_when_no_forwarding_rules() {
         let shell = MockShellHost::new();
-        program_status(&shell, "role: blind_exit\n", 0);
+        program_status(
+            &shell,
+            "node_id=test-node node_role=blind_exit state=ExitActive",
+            0,
+        );
         shell.program_run_response(
             &[
                 "sh",
@@ -202,7 +214,11 @@ mod tests {
     #[test]
     fn macos_passes_when_pf_nat_rules_present() {
         let shell = MockShellHost::new();
-        program_status(&shell, "node_role: blind_exit\n", 0);
+        program_status(
+            &shell,
+            "node_id=test-node node_role=blind_exit state=ExitActive",
+            0,
+        );
         shell.program_run_response(
             &[
                 "sh",
@@ -222,7 +238,11 @@ mod tests {
     #[test]
     fn macos_fails_closed_on_no_pf_nat_sentinel() {
         let shell = MockShellHost::new();
-        program_status(&shell, "role: blind_exit\n", 0);
+        program_status(
+            &shell,
+            "node_id=test-node node_role=blind_exit state=ExitActive",
+            0,
+        );
         shell.program_run_response(
             &[
                 "sh",
@@ -243,7 +263,11 @@ mod tests {
     #[test]
     fn macos_fails_closed_on_empty_pf_output() {
         let shell = MockShellHost::new();
-        program_status(&shell, "role: blind_exit\n", 0);
+        program_status(
+            &shell,
+            "node_id=test-node node_role=blind_exit state=ExitActive",
+            0,
+        );
         shell.program_run_response(
             &[
                 "sh",
@@ -264,7 +288,11 @@ mod tests {
     #[test]
     fn windows_passes_when_netnat_present() {
         let shell = MockShellHost::new();
-        program_status(&shell, "role: blind_exit\n", 0);
+        program_status(
+            &shell,
+            "node_id=test-node node_role=blind_exit state=ExitActive",
+            0,
+        );
         shell.program_run_response(
             &["powershell", "-Command", "Get-NetNat 2>$null"],
             RemoteExitStatus {
@@ -280,7 +308,11 @@ mod tests {
     #[test]
     fn windows_fails_closed_when_no_netnat() {
         let shell = MockShellHost::new();
-        program_status(&shell, "role: blind_exit\n", 0);
+        program_status(
+            &shell,
+            "node_id=test-node node_role=blind_exit state=ExitActive",
+            0,
+        );
         shell.program_run_response(
             &["powershell", "-Command", "Get-NetNat 2>$null"],
             RemoteExitStatus {
