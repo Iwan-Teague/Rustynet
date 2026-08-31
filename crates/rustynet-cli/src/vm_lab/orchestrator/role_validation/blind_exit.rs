@@ -7,7 +7,7 @@ pub fn blind_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
 }
 
 /// The `rustynet` CLI by absolute install path per OS. The POSIX backend runs
-/// `ops status` under `sudo -n`, and RHEL-family `sudo` (Rocky) ships a
+/// `status` under `sudo -n`, and RHEL-family `sudo` (Rocky) ships a
 /// `secure_path` that omits `/usr/local/bin`, so a bare `rustynet` name fails
 /// "command not found". Name it absolutely (mirrors anchor.rs). Windows uses
 /// the `.exe` on PATH; blind_exit is blocked on Windows in production, but the
@@ -19,18 +19,39 @@ fn rustynet_program(platform: VmGuestPlatform) -> &'static str {
     }
 }
 
+/// The daemon's local control-socket path per OS, passed to `rustynet status`
+/// via the `RUSTYNET_DAEMON_SOCKET` env var (mirrors
+/// `capture_daemon_status_for_platform` in live_lab_bin_support). `status` is a
+/// top-level command, not an `ops` subcommand, and it connects to a socket
+/// path that differs by OS: macOS runs the daemon under `/private/var/run`
+/// (the bare `/var/run` symlink resolves there on macOS hosts; the
+/// `/usr/local/var/rustynet` state root is a different, wrong path).
+fn daemon_socket_path(platform: VmGuestPlatform) -> &'static str {
+    match platform {
+        VmGuestPlatform::Macos => "/private/var/run/rustynet/rustynetd.sock",
+        // Linux path is the production default; Windows is unreachable here in
+        // production (blind_exit_runtime_implemented is false) but the match
+        // must stay exhaustive and sensible.
+        _ => "/run/rustynet/rustynetd.sock",
+    }
+}
+
 pub fn validate_blind_exit_runtime(
     shell: &dyn RemoteShellHost,
     platform: VmGuestPlatform,
     alias: &str,
 ) -> Result<(), String> {
     let status_out = shell
-        .run_argv(&[rustynet_program(platform), "ops", "status"], &[], &[])
-        .map_err(|e| format!("{alias}: failed to run rustynet ops status: {e}"))?;
+        .run_argv(
+            &[rustynet_program(platform), "status"],
+            &[("RUSTYNET_DAEMON_SOCKET", daemon_socket_path(platform))],
+            &[],
+        )
+        .map_err(|e| format!("{alias}: failed to run rustynet status: {e}"))?;
     let status_str = String::from_utf8_lossy(&status_out.stdout);
     if !status_out.is_success() {
         return Err(format!(
-            "{alias}: rustynet ops status exited non-zero: {}",
+            "{alias}: rustynet status exited non-zero: {}",
             status_str.trim()
         ));
     }
@@ -102,7 +123,7 @@ mod tests {
         // .exe on Windows) and will match whichever key it uses.
         for program in ["/usr/local/bin/rustynet", "rustynet.exe"] {
             shell.program_run_response(
-                &[program, "ops", "status"],
+                &[program, "status"],
                 RemoteExitStatus {
                     code,
                     stdout: role_line.as_bytes().to_vec(),
