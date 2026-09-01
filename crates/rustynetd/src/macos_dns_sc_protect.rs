@@ -22,7 +22,10 @@
 //!   before enforcement) and its save/load round-trip,
 //! - the startup-recovery decision function that bounds M1's known crash
 //!   risk (SC DNS persists across reboot; a crash without teardown would
-//!   otherwise strand host DNS on the dead loopback port).
+//!   otherwise strand host DNS on the dead loopback port), widened by S4
+//!   with a per-service DNS observation (scutil primary OR any enabled
+//!   service pinned loopback-only; degrade-with-loud-warning when the
+//!   helper is unobservable),
 //!
 //! The IMPURE half (actually running the privileged program, sequencing
 //! apply/assert/rollback) lives in `phase10.rs`
@@ -493,8 +496,11 @@ pub enum StartupRecoveryDecision {
 ///
 /// Inputs are deliberately plain booleans so the decision itself is pure and
 /// unit-testable:
-/// - `sc_dns_is_loopback`: the SC posture is the M1 fail-closed posture
-///   (primary resolver loopback / services on 127.0.0.1),
+/// - `residue_evidence`: the SC posture carries M1's durable residue marker
+///   (S4-widened meaning: the scutil primary resolver advertises loopback OR
+///   any enabled service observes a loopback-only pin — see
+///   `residue_evidence_from_observation`; the signature and truth table are
+///   unchanged, only the meaning of this first argument widened),
 /// - `dns_protection_running`: RustyNet DNS protection is currently applied,
 /// - `backup_readable`: a valid backup document exists at
 ///   `NETWORKSETUP_DNS_BACKUP_PATH`.
@@ -506,11 +512,11 @@ pub enum StartupRecoveryDecision {
 /// automatic restore (backup present) or a loud, actionable refusal
 /// (backup lost) — never a silent strand.
 pub fn decide_startup_recovery(
-    sc_dns_is_loopback: bool,
+    residue_evidence: bool,
     dns_protection_running: bool,
     backup_readable: bool,
 ) -> StartupRecoveryDecision {
-    if !sc_dns_is_loopback || dns_protection_running {
+    if !residue_evidence || dns_protection_running {
         return StartupRecoveryDecision::NoAction;
     }
     if backup_readable {
@@ -518,6 +524,237 @@ pub fn decide_startup_recovery(
     } else {
         StartupRecoveryDecision::FailLoudManualRestoreRequired
     }
+}
+
+/// Per-service DNS posture classification for the startup guard's per-service
+/// observation (S4). One enabled service's `-getdnsservers` state, classified
+/// against the M1 pin posture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceDnsPosture {
+    /// The service has no DNS servers configured.
+    None,
+    /// Every configured server is a loopback address — the exact posture M1
+    /// pins, so outside a running protection this is residue.
+    LoopbackOnly,
+    /// At least one configured server is not loopback.
+    NonLoopback,
+}
+
+/// Outcome of the startup guard's per-service DNS observation (S4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceDnsObservation {
+    /// Enumeration and every per-service read completed; carries the
+    /// classification per enabled service.
+    Observed(Vec<(String, ServiceDnsPosture)>),
+    /// The helper socket is absent, or a round trip failed, or an output had
+    /// an unparsable shape: the per-service posture is unobservable this
+    /// startup. The guard degrades (scutil-only signal) with a loud warning
+    /// rather than refusing startup — refusal is reserved for
+    /// confirmed-residue + unrecoverable (design §3.2(4)).
+    ObservationUnavailable(String),
+}
+
+/// Classify one service's `-getdnsservers` output (S4). Reuses the module's
+/// existing parser and loopback detector; any unparsable shape is an error,
+/// never a guess (fail closed at the observation layer — the caller degrades).
+pub fn classify_getdns_output(output: &str) -> Result<ServiceDnsPosture, String> {
+    match parse_networksetup_getdns_output(output)? {
+        NetworksetupDnsServers::None => Ok(ServiceDnsPosture::None),
+        NetworksetupDnsServers::Servers(servers) => {
+            if is_loopback_dns_server_list(&servers) {
+                Ok(ServiceDnsPosture::LoopbackOnly)
+            } else {
+                Ok(ServiceDnsPosture::NonLoopback)
+            }
+        }
+    }
+}
+
+/// Aggregate the S4-widened residue-evidence bit from the scutil primary
+/// signal and the per-service observation. Degradation is built in: when the
+/// observation is unavailable the scutil-only signal (the pre-S4 behavior)
+/// is used, so an unobservable posture can never manufacture residue
+/// evidence — but neither can it hide the scutil half.
+pub fn residue_evidence_from_observation(
+    sc_dns_is_loopback: bool,
+    observation: &ServiceDnsObservation,
+) -> bool {
+    match observation {
+        ServiceDnsObservation::Observed(postures) => {
+            sc_dns_is_loopback
+                || postures
+                    .iter()
+                    .any(|(_, posture)| *posture == ServiceDnsPosture::LoopbackOnly)
+        }
+        ServiceDnsObservation::ObservationUnavailable(_) => sc_dns_is_loopback,
+    }
+}
+
+/// The still-loopback-pinned service names from a completed per-service
+/// observation (S4-A2). Empty for an `ObservationUnavailable` — callers
+/// tri-state on the observation itself; an unavailable observation never
+/// manufactures a survivor list.
+fn surviving_loopback_services(observation: &ServiceDnsObservation) -> Vec<String> {
+    match observation {
+        ServiceDnsObservation::Observed(postures) => postures
+            .iter()
+            .filter(|(_, posture)| *posture == ServiceDnsPosture::LoopbackOnly)
+            .map(|(service, _)| service.clone())
+            .collect(),
+        ServiceDnsObservation::ObservationUnavailable(_) => Vec::new(),
+    }
+}
+
+/// The loud startup warning emitted when per-service observation degrades:
+/// names the blind spot so a degraded startup is never silent.
+pub fn observation_unavailable_warning(reason: &str) -> String {
+    format!(
+        "RustyNet DNS fail-closed startup guard: per-service DNS observation unavailable ({reason}); partial SC loopback residue may be missed until the first apply. Proceeding with the scutil primary-resolver signal only."
+    )
+}
+
+/// The concrete service list the loud refusal names (S4): the observed
+/// loopback-pinned services first, then the backup's recorded entries as a
+/// fallback, deduplicated in order. With per-service observation there is
+/// always a concrete list to name; an empty result means neither source
+/// yielded a name and the caller falls back to the backup-shape hint.
+fn fail_loud_service_list(
+    observation: &ServiceDnsObservation,
+    backup: &Result<Option<NetworksetupDnsBackup>, String>,
+) -> Vec<String> {
+    let mut services = Vec::new();
+    if let ServiceDnsObservation::Observed(postures) = observation {
+        for (service, posture) in postures {
+            if *posture == ServiceDnsPosture::LoopbackOnly && !services.contains(service) {
+                services.push(service.clone());
+            }
+        }
+    }
+    if let Ok(Some(backup)) = backup {
+        for entry in &backup.services {
+            if !services.contains(&entry.service) {
+                services.push(entry.service.clone());
+            }
+        }
+    }
+    services
+}
+
+/// The exact per-entry argv the startup restore loop issues (pure so the
+/// widened guard's restore behavior is pinned by unit test): a recorded
+/// server list restores exactly, a recorded no-servers state restores with
+/// `Empty`.
+fn startup_restore_argv_for_entry(
+    entry: &NetworksetupDnsBackupEntry,
+) -> Result<Vec<String>, String> {
+    match &entry.servers {
+        Some(servers) => {
+            let server_refs: Vec<&str> = servers.iter().map(String::as_str).collect();
+            networksetup_setdns_restore_args(&entry.service, &server_refs)
+                .map(|argv| argv.into_iter().map(str::to_owned).collect())
+        }
+        None => networksetup_setdns_empty_args(&entry.service)
+            .map(|argv| argv.into_iter().map(str::to_owned).collect()),
+    }
+}
+
+/// Observe every enabled service's DNS posture through the privileged helper
+/// (S4). Fails by degrading: any construction/round-trip/parse failure
+/// returns `ObservationUnavailable` naming the reason, never a guess. This
+/// is the impure wiring; the round-trip shape itself is
+/// `observe_service_dns_postures_with` (unit-tested over faked round trips).
+pub fn observe_service_dns_postures(
+    helper_socket_path: Option<&std::path::Path>,
+    helper_timeout: std::time::Duration,
+) -> ServiceDnsObservation {
+    let Some(socket) = helper_socket_path else {
+        return ServiceDnsObservation::ObservationUnavailable(
+            "no privileged helper socket is configured".to_owned(),
+        );
+    };
+    let client = match crate::privileged_helper::PrivilegedCommandClient::new(
+        socket.to_path_buf(),
+        helper_timeout,
+    ) {
+        Ok(client) => client,
+        Err(e) => return ServiceDnsObservation::ObservationUnavailable(e),
+    };
+    observe_service_dns_postures_with(
+        || {
+            let output = client.run_capture(
+                crate::privileged_helper::PrivilegedCommandProgram::NetworkSetup,
+                &networksetup_listall_args(),
+            )?;
+            if !output.success() {
+                return Err(format!(
+                    "networksetup -listallnetworkservices failed: status={} stderr={}",
+                    output.status, output.stderr
+                ));
+            }
+            Ok(output.stdout)
+        },
+        |service| {
+            let argv = networksetup_getdns_args(service)?;
+            let output = client.run_capture(
+                crate::privileged_helper::PrivilegedCommandProgram::NetworkSetup,
+                &argv,
+            )?;
+            if !output.success() {
+                return Err(format!(
+                    "networksetup -getdnsservers failed: status={} stderr={}",
+                    output.status, output.stderr
+                ));
+            }
+            Ok(output.stdout)
+        },
+    )
+}
+
+/// The observation round-trip shape over injected enumerate/`getdns` runners
+/// (pure; tests fake the helpers). Issues exactly the module's allowlisted
+/// argv forms via the existing builders: one
+/// `networksetup_listallnetworkservices` read, then one
+/// `networksetup -getdnsservers <service>` per enumerated enabled service.
+/// Any failure degrades the WHOLE observation (the guard falls back to the
+/// scutil-only signal) rather than acting on a partial view.
+pub fn observe_service_dns_postures_with(
+    mut enumerate: impl FnMut() -> Result<String, String>,
+    mut getdns: impl FnMut(&str) -> Result<String, String>,
+) -> ServiceDnsObservation {
+    let services = match enumerate() {
+        Ok(stdout) => match parse_networksetup_service_list(&stdout) {
+            Ok(services) => services,
+            Err(e) => {
+                return ServiceDnsObservation::ObservationUnavailable(format!(
+                    "service enumeration unparsable: {e}"
+                ));
+            }
+        },
+        Err(e) => {
+            return ServiceDnsObservation::ObservationUnavailable(format!(
+                "service enumeration failed: {e}"
+            ));
+        }
+    };
+    let mut postures = Vec::with_capacity(services.len());
+    for service in &services {
+        match getdns(service) {
+            Ok(stdout) => match classify_getdns_output(&stdout) {
+                Ok(posture) => postures.push((service.clone(), posture)),
+                Err(e) => {
+                    return ServiceDnsObservation::ObservationUnavailable(format!(
+                        "per-service DNS read for {service:?} unparsable: {e}"
+                    ));
+                }
+            },
+            Err(e) => {
+                return ServiceDnsObservation::ObservationUnavailable(format!(
+                    "per-service DNS read for {service:?} failed: {e}"
+                ));
+            }
+        }
+    }
+    ServiceDnsObservation::Observed(postures)
 }
 
 /// The operator-actionable message for the backup-lost strand. Names the
@@ -543,9 +780,20 @@ pub fn startup_recovery_manual_restore_message(services: &[String]) -> String {
 /// a missing or corrupt backup it refuses to start, loudly, naming the manual
 /// fix — never a silent strand.
 ///
+/// S4 widening: residue evidence is no longer the scutil primary resolver
+/// alone. The guard also observes every enabled service's DNS through the
+/// privileged helper (`observe_service_dns_postures`), so a crash mid-pin
+/// that left a non-primary service pinned loopback is detected even when the
+/// scutil primary is clean. When that observation is unavailable the guard
+/// degrades rather than strands: it proceeds with the scutil-only signal and
+/// emits a loud warning naming the blind spot (refusal is reserved for
+/// confirmed-residue + unrecoverable; S1's runtime posture assert closes the
+/// degraded window within one cadence).
+///
 /// `helper_socket_path` is the daemon's privileged-helper socket (when one is
-/// configured); restoring requires it, because `networksetup -setdnsservers`
-/// is a privileged operation.
+/// configured); restoring and observing require it, because
+/// `networksetup -setdnsservers` / `-getdnsservers` are privileged
+/// operations.
 pub fn run_startup_dns_recovery(
     helper_socket_path: Option<&std::path::Path>,
     helper_timeout: std::time::Duration,
@@ -561,27 +809,29 @@ pub fn run_startup_dns_recovery(
         // there is no residue evidence — never act on unobservable state.
         None => false,
     };
+    let observation = observe_service_dns_postures(helper_socket_path, helper_timeout);
+    if let ServiceDnsObservation::ObservationUnavailable(reason) = &observation {
+        log::warn!("{}", observation_unavailable_warning(reason));
+    }
+    let residue_evidence = residue_evidence_from_observation(sc_dns_is_loopback, &observation);
     let backup = read_networksetup_dns_backup(std::path::Path::new(NETWORKSETUP_DNS_BACKUP_PATH));
     let backup_readable = matches!(backup, Ok(Some(_)));
-    match decide_startup_recovery(sc_dns_is_loopback, false, backup_readable) {
+    match decide_startup_recovery(residue_evidence, false, backup_readable) {
         StartupRecoveryDecision::NoAction => Ok(()),
         StartupRecoveryDecision::FailLoudManualRestoreRequired => {
-            let services = match &backup {
-                Ok(Some(b)) => b
-                    .services
-                    .iter()
-                    .map(|e| e.service.clone())
-                    .collect::<Vec<String>>(),
-                _ => {
-                    // Backup corrupt/absent with unknown service names: still
-                    // loud, still actionable — enumerate nothing, name the fix
-                    // shape and the backup path.
-                    return Err(format!(
-                        "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback, no RustyNet DNS protection is running, and the backup at {} is missing or unreadable. List services with `networksetup -listallnetworkservices` and restore each with:\n  sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}\nThen restart rustynetd.",
-                        NETWORKSETUP_DNS_BACKUP_PATH
-                    ));
-                }
-            };
+            // S4: name the OBSERVED loopback-pinned services (with the
+            // backup's recorded entries as fallback), so the loud refusal is
+            // actionable even when the backup is missing or corrupt.
+            let services = fail_loud_service_list(&observation, &backup);
+            if services.is_empty() {
+                // Neither observation nor backup yielded a concrete name:
+                // still loud, still actionable — name the fix shape and the
+                // backup path.
+                return Err(format!(
+                    "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback, no RustyNet DNS protection is running, and the backup at {} is missing or unreadable. List services with `networksetup -listallnetworkservices` and restore each with:\n  sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}\nThen restart rustynetd.",
+                    NETWORKSETUP_DNS_BACKUP_PATH
+                ));
+            }
             Err(startup_recovery_manual_restore_message(&services))
         }
         StartupRecoveryDecision::RestoreFromBackup => {
@@ -607,16 +857,11 @@ pub fn run_startup_dns_recovery(
                 helper_timeout,
             )?;
             for entry in &backup.services {
-                let argv = match &entry.servers {
-                    Some(servers) => {
-                        let server_refs: Vec<&str> = servers.iter().map(String::as_str).collect();
-                        networksetup_setdns_restore_args(&entry.service, &server_refs)?
-                    }
-                    None => networksetup_setdns_empty_args(&entry.service)?.to_vec(),
-                };
+                let argv = startup_restore_argv_for_entry(entry)?;
+                let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 let output = client.run_capture(
                     crate::privileged_helper::PrivilegedCommandProgram::NetworkSetup,
-                    &argv,
+                    &argv_refs,
                 )?;
                 if !output.success() {
                     return Err(format!(
@@ -629,11 +874,56 @@ pub fn run_startup_dns_recovery(
                     ));
                 }
             }
-            remove_networksetup_dns_backup(std::path::Path::new(NETWORKSETUP_DNS_BACKUP_PATH))?;
-            log::info!(
-                "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)"
-            );
-            Ok(())
+            // S4-A2: verify the restore actually cleared residue before
+            // deleting the backup. The backup only covers the services it
+            // recorded; a service observed loopback-pinned but absent from
+            // the backup would otherwise survive silently once the backup is
+            // removed.
+            let post = observe_service_dns_postures(helper_socket_path, helper_timeout);
+            match &post {
+                ServiceDnsObservation::Observed(_) => {
+                    let survivors = surviving_loopback_services(&post);
+                    if survivors.is_empty() {
+                        // Residue confirmed cleared: retire the backup.
+                        remove_networksetup_dns_backup(std::path::Path::new(
+                            NETWORKSETUP_DNS_BACKUP_PATH,
+                        ))?;
+                        log::info!(
+                            "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)"
+                        );
+                        Ok(())
+                    } else {
+                        // Restore did NOT clear residue (an observed-loopback
+                        // service is absent from the backup): fail loud,
+                        // retain the backup, name the manual fix.
+                        Err(format!(
+                            "RustyNet DNS fail-closed startup recovery: the automatic backup restore completed, but these services remain loopback-pinned and are not covered by the backup at {}: {}. Backup RETAINED at {}. Restore each manually with `sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}`, then restart rustynetd.",
+                            NETWORKSETUP_DNS_BACKUP_PATH,
+                            surviving_loopback_services(&post).join(", "),
+                            NETWORKSETUP_DNS_BACKUP_PATH,
+                        ))
+                    }
+                }
+                ServiceDnsObservation::ObservationUnavailable(reason) => {
+                    // Degrade-not-strand: the backup restore itself
+                    // succeeded, so the host is not stranded — but the
+                    // post-restore verification could not run, so this is
+                    // never silent. Retire the backup (it did its job for the
+                    // services it covered) and name the blind spot.
+                    remove_networksetup_dns_backup(std::path::Path::new(
+                        NETWORKSETUP_DNS_BACKUP_PATH,
+                    ))?;
+                    log::warn!(
+                        "RustyNet DNS fail-closed startup guard: post-restore DNS observation unavailable ({}); loopback residue in services absent from the backup at {} may persist until the first apply. The backup restore itself completed.",
+                        reason,
+                        NETWORKSETUP_DNS_BACKUP_PATH
+                    );
+                    log::info!(
+                        "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)"
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -987,5 +1277,401 @@ Thunderbolt Bridge
         assert!(message.contains("-setdnsservers \"Wi-Fi\" Empty"));
         assert!(message.contains("-setdnsservers \"Ethernet\" Empty"));
         assert!(message.contains("/usr/sbin/networksetup"));
+    }
+
+    // ---- S4: startup guard sees partial per-service SC loopback residue ----
+
+    /// A fake per-service getdns reply for a service pinned to the loopback
+    /// resolvers M1 enforces.
+    fn loopback_getdns_output() -> String {
+        "127.0.0.1\n".to_owned()
+    }
+
+    #[test]
+    fn service_observation_classifies_none_loopback_and_nonloopback() {
+        assert_eq!(
+            classify_getdns_output("There aren't any DNS Servers set on Wi-Fi.\n")
+                .expect("none reply"),
+            ServiceDnsPosture::None
+        );
+        assert_eq!(
+            classify_getdns_output("127.0.0.1\n::1\n").expect("loopback list"),
+            ServiceDnsPosture::LoopbackOnly
+        );
+        assert_eq!(
+            classify_getdns_output("8.8.8.8\n").expect("real resolver"),
+            ServiceDnsPosture::NonLoopback
+        );
+        // A mixed list is NOT the pure loopback pin posture.
+        assert_eq!(
+            classify_getdns_output("127.0.0.1\n8.8.8.8\n").expect("mixed list"),
+            ServiceDnsPosture::NonLoopback
+        );
+        // Unparsable shapes are errors, never a classification guess.
+        assert!(classify_getdns_output("").is_err());
+        assert!(classify_getdns_output("some error text\n").is_err());
+        assert!(classify_getdns_output("8.8.8.8\nnot-an-ip\n").is_err());
+    }
+
+    #[test]
+    fn widened_decision_service_only_residue_with_readable_backup_restores() {
+        // Service-only residue (scutil primary clean) + readable backup:
+        // restore.
+        let observation = ServiceDnsObservation::Observed(vec![
+            ("Wi-Fi".to_owned(), ServiceDnsPosture::NonLoopback),
+            ("Ethernet".to_owned(), ServiceDnsPosture::LoopbackOnly),
+        ]);
+        let residue = residue_evidence_from_observation(false, &observation);
+        assert!(residue, "an observed loopback-only pin is residue evidence");
+        assert_eq!(
+            decide_startup_recovery(residue, false, true),
+            StartupRecoveryDecision::RestoreFromBackup
+        );
+    }
+
+    #[test]
+    fn widened_decision_service_only_residue_without_backup_fails_loud() {
+        let observation = ServiceDnsObservation::Observed(vec![(
+            "Ethernet".to_owned(),
+            ServiceDnsPosture::LoopbackOnly,
+        )]);
+        let residue = residue_evidence_from_observation(false, &observation);
+        assert_eq!(
+            decide_startup_recovery(residue, false, false),
+            StartupRecoveryDecision::FailLoudManualRestoreRequired
+        );
+    }
+
+    #[test]
+    fn widened_decision_no_residue_is_no_action_regardless_of_backup() {
+        // Every service observed non-loopback (or with no servers), scutil
+        // clean: no residue evidence, no action — even with a backup around.
+        let observation = ServiceDnsObservation::Observed(vec![
+            ("Wi-Fi".to_owned(), ServiceDnsPosture::NonLoopback),
+            ("Ethernet".to_owned(), ServiceDnsPosture::None),
+        ]);
+        assert!(!residue_evidence_from_observation(false, &observation));
+        assert_eq!(
+            decide_startup_recovery(false, false, true),
+            StartupRecoveryDecision::NoAction
+        );
+        assert_eq!(
+            decide_startup_recovery(false, false, false),
+            StartupRecoveryDecision::NoAction
+        );
+        // Protection running still owns a loopback posture (unchanged rule).
+        assert_eq!(
+            decide_startup_recovery(true, true, true),
+            StartupRecoveryDecision::NoAction
+        );
+    }
+
+    #[test]
+    fn partial_residue_with_clean_scutil_primary_is_detected() {
+        // THE S4 REGRESSION: a crash mid-pin left a SECONDARY service pinned
+        // loopback while the scutil primary resolver reports a real
+        // resolver. The pre-fix guard derived residue solely from scutil and
+        // took NoAction (silent strand); the widened guard must restore from
+        // the surviving backup instead.
+        let observation = ServiceDnsObservation::Observed(vec![
+            ("Wi-Fi".to_owned(), ServiceDnsPosture::NonLoopback),
+            ("Ethernet".to_owned(), ServiceDnsPosture::LoopbackOnly),
+        ]);
+        let residue = residue_evidence_from_observation(false, &observation);
+        assert_eq!(
+            decide_startup_recovery(residue, false, true),
+            StartupRecoveryDecision::RestoreFromBackup,
+            "a loopback-pinned secondary service with a clean scutil primary is partial residue and must be restored, not ignored"
+        );
+        // Same scenario with scutil reporting nothing at all (the None means
+        // "no scutil evidence", pre-fix treated as false).
+        assert_eq!(
+            decide_startup_recovery(
+                residue_evidence_from_observation(false, &observation),
+                false,
+                true
+            ),
+            StartupRecoveryDecision::RestoreFromBackup
+        );
+    }
+
+    #[test]
+    fn fail_loud_message_names_observed_services() {
+        // Residue evidence with no readable backup: the refusal must name the
+        // observed loopback-pinned services, not merely a backup-shape hint.
+        let observation = ServiceDnsObservation::Observed(vec![
+            ("Wi-Fi".to_owned(), ServiceDnsPosture::NonLoopback),
+            ("Ethernet".to_owned(), ServiceDnsPosture::LoopbackOnly),
+            (
+                "Thunderbolt Bridge".to_owned(),
+                ServiceDnsPosture::LoopbackOnly,
+            ),
+        ]);
+        let no_backup: Result<Option<NetworksetupDnsBackup>, String> = Ok(None);
+        let services = fail_loud_service_list(&observation, &no_backup);
+        assert_eq!(
+            services,
+            vec!["Ethernet".to_owned(), "Thunderbolt Bridge".to_owned()]
+        );
+        let message = startup_recovery_manual_restore_message(&services);
+        assert!(message.contains("-setdnsservers \"Ethernet\" Empty"));
+        assert!(message.contains("-setdnsservers \"Thunderbolt Bridge\" Empty"));
+
+        // Corrupt backup still yields the observed list (observation wins).
+        let corrupt: Result<Option<NetworksetupDnsBackup>, String> =
+            Err("backup parse failed".to_owned());
+        assert_eq!(
+            fail_loud_service_list(&observation, &corrupt),
+            vec!["Ethernet".to_owned(), "Thunderbolt Bridge".to_owned()]
+        );
+
+        // Backup entries are the fallback when observation cannot name any
+        // loopback service (e.g. scutil-only residue), deduplicated in order.
+        let scutil_only = ServiceDnsObservation::Observed(vec![(
+            "Wi-Fi".to_owned(),
+            ServiceDnsPosture::NonLoopback,
+        )]);
+        let backup = build_networksetup_dns_backup(vec![
+            NetworksetupDnsBackupEntry {
+                service: "Wi-Fi".to_owned(),
+                servers: Some(vec!["8.8.8.8".to_owned()]),
+            },
+            NetworksetupDnsBackupEntry {
+                service: "Ethernet".to_owned(),
+                servers: None,
+            },
+        ])
+        .expect("valid backup");
+        let services = fail_loud_service_list(&scutil_only, &Ok(Some(backup)));
+        assert_eq!(services, vec!["Wi-Fi".to_owned(), "Ethernet".to_owned()]);
+
+        // Neither source yields a name: the caller falls back to the
+        // backup-shape hint message (still loud, still actionable).
+        let unavailable = ServiceDnsObservation::ObservationUnavailable("helper down".to_owned());
+        let empty: Result<Option<NetworksetupDnsBackup>, String> = Ok(None);
+        assert!(fail_loud_service_list(&unavailable, &empty).is_empty());
+    }
+
+    #[test]
+    fn observation_unavailable_degrades_without_stranding() {
+        // Helper unobservable + clean scutil: degrade to the scutil-only
+        // signal — NO residue evidence, so the guard must NOT refuse startup.
+        let unavailable = ServiceDnsObservation::ObservationUnavailable(
+            "helper socket connect failed".to_owned(),
+        );
+        assert!(!residue_evidence_from_observation(false, &unavailable));
+        assert_eq!(
+            decide_startup_recovery(false, false, false),
+            StartupRecoveryDecision::NoAction
+        );
+        // Degradation must not suppress the scutil half either.
+        assert!(residue_evidence_from_observation(true, &unavailable));
+        assert_eq!(
+            decide_startup_recovery(true, false, true),
+            StartupRecoveryDecision::RestoreFromBackup
+        );
+        // The degrade path is LOUD: the warning names the blind spot.
+        let warning = observation_unavailable_warning("helper socket connect failed");
+        assert!(warning.contains("per-service DNS observation unavailable"));
+        assert!(warning.contains("partial SC loopback residue may be missed"));
+        // The observation shape itself degrades on any round-trip failure.
+        let degraded = observe_service_dns_postures_with(
+            || Err("privileged helper connect failed: no socket".to_owned()),
+            |_| Ok(loopback_getdns_output()),
+        );
+        assert_eq!(
+            degraded,
+            ServiceDnsObservation::ObservationUnavailable(
+                "service enumeration failed: privileged helper connect failed: no socket"
+                    .to_owned()
+            )
+        );
+        // And a per-service round-trip failure degrades the whole
+        // observation (never a partial view).
+        let degraded_mid = observe_service_dns_postures_with(
+            || {
+                Ok(format!(
+                    "{NETWORKSETUP_SERVICE_LIST_LEGEND}\nWi-Fi\nEthernet\n"
+                ))
+            },
+            |service| {
+                if service == "Ethernet" {
+                    Err("networksetup -getdnsservers failed: status=1".to_owned())
+                } else {
+                    Ok(loopback_getdns_output())
+                }
+            },
+        );
+        assert!(matches!(
+            degraded_mid,
+            ServiceDnsObservation::ObservationUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn restore_heals_exactly_backup_entries() {
+        // Pin the restore loop's per-entry behavior: every recorded backup
+        // entry maps to exactly one allowlisted restore argv (exact list or
+        // Empty), in document order — the widened guard must not be able to
+        // regress what the restore heals.
+        let backup = build_networksetup_dns_backup(vec![
+            NetworksetupDnsBackupEntry {
+                service: "Wi-Fi".to_owned(),
+                servers: Some(vec!["8.8.8.8".to_owned(), "1.1.1.1".to_owned()]),
+            },
+            NetworksetupDnsBackupEntry {
+                service: "Ethernet".to_owned(),
+                servers: None,
+            },
+        ])
+        .expect("valid backup");
+        let restored: Vec<Vec<String>> = backup
+            .services
+            .iter()
+            .map(startup_restore_argv_for_entry)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every backup entry must yield a valid restore argv");
+        assert_eq!(
+            restored,
+            vec![
+                vec![
+                    "-setdnsservers".to_owned(),
+                    "Wi-Fi".to_owned(),
+                    "8.8.8.8".to_owned(),
+                    "1.1.1.1".to_owned(),
+                ],
+                vec![
+                    "-setdnsservers".to_owned(),
+                    "Ethernet".to_owned(),
+                    NETWORKSETUP_EMPTY_DNS_KEYWORD.to_owned(),
+                ],
+            ]
+        );
+        // A recorded server list that fails argv validation can never cross
+        // the helper boundary — the loop errors instead of guessing.
+        let hostile = NetworksetupDnsBackupEntry {
+            service: "Wi-Fi".to_owned(),
+            servers: Some(vec!["not-an-ip".to_owned()]),
+        };
+        assert!(startup_restore_argv_for_entry(&hostile).is_err());
+    }
+
+    #[test]
+    fn observation_through_helper_uses_allowlisted_argv_only() {
+        // The S4 observation must issue EXACTLY the allowlisted argv forms —
+        // one `-listallnetworkservices` read, then one `-getdnsservers
+        // <service>` per enumerated enabled service — and nothing else (no
+        // argv side door).
+        // `issued` is shared between two FnMut closures, so it needs interior
+        // mutability (two simultaneous `&mut` captures are E0499). RefCell is
+        // the right tool in a single-threaded test; borrows are released at the
+        // end of each `push` expression, well before the other closure runs.
+        let issued: std::cell::RefCell<Vec<Vec<String>>> = std::cell::RefCell::new(Vec::new());
+        let observation = observe_service_dns_postures_with(
+            || {
+                issued.borrow_mut().push(
+                    networksetup_listall_args()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                );
+                Ok(format!(
+                    "{NETWORKSETUP_SERVICE_LIST_LEGEND}\nWi-Fi\n*Bluetooth PAN\nEthernet\n"
+                ))
+            },
+            |service| {
+                issued.borrow_mut().push(
+                    networksetup_getdns_args(service)
+                        .expect("test service names are valid")
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                );
+                if service == "Ethernet" {
+                    Ok("8.8.8.8\n".to_owned())
+                } else {
+                    Ok(loopback_getdns_output())
+                }
+            },
+        );
+        // Both closures have returned; reclaim the plain Vec for assertions.
+        let issued = issued.into_inner();
+        assert_eq!(
+            observation,
+            ServiceDnsObservation::Observed(vec![
+                ("Wi-Fi".to_owned(), ServiceDnsPosture::LoopbackOnly),
+                ("Ethernet".to_owned(), ServiceDnsPosture::NonLoopback),
+            ])
+        );
+        assert_eq!(
+            issued,
+            vec![
+                vec!["-listallnetworkservices".to_owned()],
+                vec!["-getdnsservers".to_owned(), "Wi-Fi".to_owned()],
+                vec!["-getdnsservers".to_owned(), "Ethernet".to_owned()],
+            ]
+        );
+        // Disabled services are never observed (out of M1 scope, §5.2).
+        assert!(
+            !issued
+                .iter()
+                .any(|argv| argv.contains(&"Bluetooth PAN".to_owned()))
+        );
+    }
+
+    // ---- S4-A1/S4-A2: adversarial hardening of the startup-guard seam ----
+
+    #[test]
+    fn observation_unavailable_on_any_per_service_error() {
+        // S4-A1 pin: one failing per-service read degrades the WHOLE
+        // observation — never a partial Observed view.
+        let observation = observe_service_dns_postures_with(
+            || Ok(SAMPLE_SERVICE_LIST.to_owned()),
+            |service| {
+                if service == "Wi-Fi" {
+                    Ok(loopback_getdns_output())
+                } else {
+                    Err("getdns probe failed".to_owned())
+                }
+            },
+        );
+        assert!(matches!(
+            observation,
+            ServiceDnsObservation::ObservationUnavailable(_)
+        ));
+        // The enumerate step errors the same way: whole observation degrades.
+        let observation = observe_service_dns_postures_with(
+            || Err("listallnetworkservices failed".to_owned()),
+            |_| Ok(loopback_getdns_output()),
+        );
+        assert!(matches!(
+            observation,
+            ServiceDnsObservation::ObservationUnavailable(_)
+        ));
+    }
+
+    #[test]
+    fn observed_loopback_service_missing_from_backup_fails_loud_not_silent_restore() {
+        // S4-A2 pin: the pure survivor list the restore arm must tri-state on.
+        // One loopback-pinned survivor among an observed set.
+        let observation = ServiceDnsObservation::Observed(vec![
+            ("Wi-Fi".to_owned(), ServiceDnsPosture::LoopbackOnly),
+            ("Ethernet".to_owned(), ServiceDnsPosture::NonLoopback),
+        ]);
+        assert_eq!(
+            surviving_loopback_services(&observation),
+            vec!["Wi-Fi".to_owned()]
+        );
+        // All clean: no survivors, the restore may retire the backup.
+        let observation = ServiceDnsObservation::Observed(vec![
+            ("Wi-Fi".to_owned(), ServiceDnsPosture::NonLoopback),
+            ("Ethernet".to_owned(), ServiceDnsPosture::None),
+        ]);
+        assert!(surviving_loopback_services(&observation).is_empty());
+        // An unavailable observation never manufactures a survivor list.
+        let observation = ServiceDnsObservation::ObservationUnavailable(
+            "helper socket connect failed".to_owned(),
+        );
+        assert!(surviving_loopback_services(&observation).is_empty());
     }
 }
