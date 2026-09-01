@@ -17,10 +17,11 @@
 
 use ed25519_dalek::SigningKey;
 use rustynet_control::membership::{
-    apply_signed_update, preview_next_state, sign_update_record, MembershipApprover,
-    MembershipApproverRole, MembershipApproverStatus, MembershipError, MembershipNode,
-    MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipState,
-    MembershipUpdateRecord, MembershipWatermark, SignedMembershipUpdate, MEMBERSHIP_SCHEMA_VERSION,
+    MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+    MembershipApproverStatus, MembershipError, MembershipNode, MembershipNodeStatus,
+    MembershipOperation, MembershipReplayCache, MembershipState, MembershipUpdateRecord,
+    MembershipWatermark, SignedMembershipUpdate, apply_signed_update, preview_next_state,
+    sign_update_record,
 };
 use rustynet_control::roles::RoleCapability;
 
