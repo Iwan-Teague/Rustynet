@@ -43,6 +43,10 @@ use std::fmt;
 
 use super::substrate::{LeafOutput, NetLeafRunner};
 
+// exercised by tests now; live failback_roaming wiring lands when the lab is
+// up (GAP-3 §2.2)
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod acl_deny_failover_verdict;
 pub mod baseline;
 pub mod controller_switch;
 pub mod direct_remote_exit;
